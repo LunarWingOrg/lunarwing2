@@ -189,10 +189,17 @@ pub struct PendingApproval {
     #[serde(default)]
     pub user_timezone: Option<String>,
     /// Whether the "always" auto-approve option should be offered to the user.
-    /// `false` when the tool returned `ApprovalRequirement::Always` (e.g.
-    /// destructive shell commands), meaning every invocation must be confirmed.
+    /// Usually false for `ApprovalRequirement::Always`; constrained tools may
+    /// explicitly opt in.
     #[serde(default = "default_true")]
     pub allow_always: bool,
+}
+
+impl PendingApproval {
+    /// Ignore forged/stale `always=true` responses when prompt did not offer it.
+    pub(crate) fn clamp_always(&self, requested: bool) -> bool {
+        requested && self.allow_always
+    }
 }
 
 fn default_true() -> bool {
@@ -351,6 +358,15 @@ impl Thread {
     pub fn complete_turn(&mut self, response: impl Into<String>) {
         if let Some(turn) = self.turns.last_mut() {
             turn.complete(response);
+        }
+        self.state = ThreadState::Idle;
+        self.updated_at = Utc::now();
+    }
+
+    /// Complete the current turn without retaining an assistant response.
+    pub fn suppress_turn(&mut self) {
+        if let Some(turn) = self.turns.last_mut() {
+            turn.suppress();
         }
         self.state = ThreadState::Idle;
         self.updated_at = Utc::now();
@@ -644,6 +660,14 @@ impl Turn {
         self.state = TurnState::Completed;
         self.completed_at = Some(Utc::now());
         // Free image data — only needed for the initial LLM call, not subsequent turns
+        self.image_content_parts.clear();
+    }
+
+    /// Complete this turn while suppressing its assistant response.
+    pub fn suppress(&mut self) {
+        self.response = None;
+        self.state = TurnState::Completed;
+        self.completed_at = Some(Utc::now());
         self.image_content_parts.clear();
     }
 
@@ -1197,6 +1221,7 @@ mod tests {
             user_timezone: None,
             allow_always: false,
         };
+        assert!(!approval.clamp_always(true));
 
         thread.await_approval(approval);
         assert_eq!(thread.state, ThreadState::AwaitingApproval);
@@ -1224,6 +1249,8 @@ mod tests {
             user_timezone: None,
             allow_always: true,
         };
+        assert!(approval.clamp_always(true));
+        assert!(!approval.clamp_always(false));
 
         thread.await_approval(approval);
         thread.clear_pending_approval();

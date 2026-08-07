@@ -1,6 +1,20 @@
 # Explanation
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** The `render-units`
+> **Current status (2026-07-31, branch `aj/kimi-2-20260731-0001`): FIXED at
+> health and service-lifecycle layers.** The per-tenant `enable_weechat` flag
+> (default: enabled) controls health classification, rendered units, daemon
+> dependencies, startup, and boot persistence on systemd user managers and
+> OpenRC. `disable-weechat <tenant>` first requires WeeChat stop/disable to
+> succeed, then records `enable_weechat=false` and re-renders without the units
+> or dependencies. `enable-weechat <tenant>` records true, restores unit files
+> and dependencies, then strictly enables and starts both services. Disabled
+> units remain `skipped` in health; absent flag / unreadable registry / missing
+> jq retain old fail-safe behavior. The tmux duplicate-session start failure
+> itself (option 3) remains open. Regression coverage:
+> `test-weechat-lifecycle-gating.sh`, test-health-openrc.sh S9–S11, and
+> test-health-systemd.sh E–F.
+>
+> **Previous status (2026-07-20, rev `50c8f99`): PARTIAL.** The `render-units`
 > verb and PostgreSQL readiness fix landed. The optional-WeeChat footgun surfaced
 > here remains open: backend units are still rendered without a tenant-level
 > enablement gate and can be classified unhealthy when intentionally unused.

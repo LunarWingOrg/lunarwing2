@@ -115,3 +115,41 @@ async def test_copy_from_chat_forces_plain_text(page):
     assert copied["defaultPrevented"] is True
     assert "Copy me into Sheets" in copied["text"]
     assert copied["html"] == ""
+
+
+async def test_live_work_and_reasoning_stay_separate_from_final_answer(page):
+    """Intermediate work remains inspectable without becoming final response text."""
+    result = await page.evaluate(
+        """
+        () => {
+          finalizeActivityGroup();
+          resetStreamingState();
+          const container = document.getElementById('chat-messages');
+          container.replaceChildren();
+
+          showActivityReasoning(
+            'Selected 1 tool based on task requirements and available context.',
+            [{tool_name: 'web_search', rationale: 'Gather current external information relevant to the request.'}],
+          );
+          getOrCreateStreamingMessage('test-thread');
+          _streamBuffer = 'private working draft';
+          flushStreamBuffer();
+          finishStreamingWork('test-thread');
+          finalizeActivityGroup();
+          addMessage('assistant', 'Authoritative final answer');
+
+          return {
+            workLog: container.querySelector('.activity-summary')?.textContent || '',
+            liveWork: container.querySelector('.activity-live-work-output')?.textContent || '',
+            rationale: container.querySelector('.reasoning-decision-rationale')?.textContent || '',
+            finalText: container.querySelector('.message.assistant .message-content')?.textContent || '',
+          };
+        }
+        """
+    )
+
+    assert "Work log" in result["workLog"]
+    assert result["liveWork"] == "private working draft"
+    assert "external information" in result["rationale"]
+    assert result["finalText"] == "Authoritative final answer"
+    assert "working draft" not in result["finalText"]

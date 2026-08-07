@@ -202,6 +202,7 @@ mod tests {
             build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None).await;
         assert!(prompt.contains("Python REPL environment"));
         assert!(prompt.contains("Strategy"));
+        assert!(prompt.contains("Only `FINAL(answer)` becomes the durable user response"));
         assert!(!prompt.contains("Learned Rules"));
     }
 
@@ -294,7 +295,7 @@ mod tests {
             database_backend: Some("libsql".into()),
             active_channels: vec!["xmpp".into(), "cli".into()],
             owner_id: Some("alice.near".into()),
-            repo_url: Some("https://github.com/LunarWingOrg/lunarwing".into()),
+            repo_url: Some("https://git.lunarwing.org/lunarwing/lunarwing2".into()),
         };
         let prompt =
             build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), Some(&info)).await;
@@ -305,7 +306,7 @@ mod tests {
         assert!(prompt.contains("libsql"));
         assert!(prompt.contains("xmpp"));
         assert!(prompt.contains("alice.near"));
-        assert!(prompt.contains("github.com/LunarWingOrg/lunarwing"));
+        assert!(prompt.contains("git.lunarwing.org/lunarwing/lunarwing2"));
     }
 
     #[tokio::test]

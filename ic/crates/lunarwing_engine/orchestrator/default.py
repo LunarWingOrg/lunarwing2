@@ -30,6 +30,11 @@
 CHARS_PER_TOKEN = 4
 MESSAGE_OVERHEAD_CHARS = 4
 MAX_ACTION_OUTPUT_CHARS = 8000
+RECOVERY_SCHEMA_VERSION = 1
+RECOVERY_STATE_KEY = "_failure_recovery"
+NO_PROGRESS_FAILURE_THRESHOLD = 3
+MAX_RECOVERY_ITERATIONS = 3
+RECOVERY_CONTEXT_MAX_CHARS = 24000
 
 
 # ── Helper functions (self-modifiable glue) ──────────────────
@@ -162,6 +167,75 @@ def signals_execution_intent(text):
     return any(phrase in lower for phrase in exec_phrases)
 
 
+def strip_stage_directions(text):
+    """Remove paired *roleplay directions* before classifying prose."""
+    parts = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("*", cursor)
+        if start < 0:
+            parts.append(text[cursor:])
+            break
+        end = text.find("*", start + 1)
+        if end < 0:
+            parts.append(text[cursor:])
+            break
+        parts.append(text[cursor:start])
+        cursor = end + 1
+    return "".join(parts).strip()
+
+
+def is_simple_goal(goal):
+    """Return whether a short goal is conversational rather than task-oriented."""
+    goal_lower = goal.lower().strip()
+    if len(goal_lower) >= 60:
+        return False
+
+    normalized = goal_lower
+    for punctuation in [".", ",", "!", "?", ";", ":"]:
+        normalized = normalized.replace(punctuation, " ")
+    normalized = " ".join(normalized.split())
+    if normalized in ["restarted", "restart complete", "rebooted", "back online"]:
+        return True
+
+    padded = " " + normalized + " "
+    simple_patterns = [
+        "standby", "thanks", "thank you", "hello", "got it",
+        "understood", "ok", "okay", "ready", "proceed",
+    ]
+    for pattern in simple_patterns:
+        if " " + pattern + " " in padded:
+            return True
+    return False
+
+
+def signals_leaked_roleplay_or_meta(text):
+    """Detect strong roleplay or retry/meta leakage in a text response."""
+    cleaned = strip_stage_directions(text)
+    lower = cleaned.lower()
+    meta_patterns = [
+        "oops", "let me fix", "let me try again", "i need to retry",
+        "i should retry", "my mistake", "i made a mistake",
+    ]
+    normalized = lower
+    for punctuation in [".", ",", "!", "?", ";", ":", "-"]:
+        normalized = normalized.replace(punctuation, " ")
+    padded = " " + " ".join(normalized.split()) + " "
+    for pattern in meta_patterns:
+        if " " + pattern + " " in padded:
+            return True
+
+    if cleaned:
+        return False
+
+    lower_text = text.lower()
+    roleplay_patterns = [
+        "chortle", "flicks tail", "tail flick", "smirks", "grins",
+        "nods", "sighs", "laughs", "giggles", "purrs", "growls",
+    ]
+    return any(pattern in lower_text for pattern in roleplay_patterns)
+
+
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
     parts = []
@@ -245,6 +319,10 @@ def compact_if_needed(state, config):
     """
     if not config.get("enable_compaction", False):
         return False
+    recovery = state.get(RECOVERY_STATE_KEY)
+    if (isinstance(recovery, dict)
+            and recovery.get("pending_model_error") is not None):
+        return False
 
     context_limit = config.get("model_context_limit", 128000)
     threshold_pct = config.get("compaction_threshold", 0.85)
@@ -265,12 +343,6 @@ def compact_if_needed(state, config):
         state["history"] = history
 
     compaction_count = state.get("compaction_count", 0) + 1
-    history.append({
-        "kind": "compaction",
-        "index": compaction_count,
-        "tokens_before": current_tokens,
-        "messages": snapshot,
-    })
 
     summary_prompt = (
         "Summarize progress so far in a concise but complete way.\n"
@@ -285,6 +357,15 @@ def compact_if_needed(state, config):
     summary_messages = list(snapshot)
     summary_messages.append({"role": "User", "content": summary_prompt})
     summary_resp = __llm_complete__(summary_messages, None, {"force_text": True})
+    if summary_resp.get("type") == "model_error":
+        return summary_resp
+
+    history.append({
+        "kind": "compaction",
+        "index": compaction_count,
+        "tokens_before": current_tokens,
+        "messages": snapshot,
+    })
 
     summary_text = summary_resp.get("content", "")
     if not summary_text:
@@ -477,6 +558,277 @@ def complete_result(state, outcome, response=None, error=None, extra=None):
     return result
 
 
+def ensure_failure_recovery(state):
+    """Load bounded recovery accounting, replacing malformed state safely."""
+    recovery = state.get(RECOVERY_STATE_KEY)
+    if (not isinstance(recovery, dict)
+            or recovery.get("schema_version") != RECOVERY_SCHEMA_VERSION):
+        recovery = {
+            "schema_version": RECOVERY_SCHEMA_VERSION,
+            "terminal_attempted": [],
+            "pending_terminal": None,
+            "active_terminal": None,
+            "model_recovery_attempted": False,
+            "pending_model_error": None,
+            "consecutive_failed_work": 0,
+        }
+        state[RECOVERY_STATE_KEY] = recovery
+        return recovery
+
+    if not isinstance(recovery.get("terminal_attempted"), list):
+        recovery["terminal_attempted"] = []
+    if not isinstance(recovery.get("model_recovery_attempted"), bool):
+        recovery["model_recovery_attempted"] = False
+    if not isinstance(recovery.get("consecutive_failed_work"), int):
+        recovery["consecutive_failed_work"] = 0
+    return recovery
+
+
+def schedule_terminal_warning(state, kind, limit=None, repeated_failures=None):
+    """Schedule one checkpointed warning per terminal class."""
+    recovery = ensure_failure_recovery(state)
+    if (recovery.get("pending_terminal") is not None
+            or recovery.get("active_terminal") is not None
+            or kind in recovery["terminal_attempted"]):
+        return False
+    recovery["terminal_attempted"].append(kind)
+    recovery["pending_terminal"] = {
+        "kind": kind,
+        "limit": limit,
+        "repeated_failures": repeated_failures,
+    }
+    return True
+
+
+def terminal_warning_instruction(observation):
+    """Render only typed, bounded terminal facts into model control text."""
+    kind = observation.get("kind") if isinstance(observation, dict) else ""
+    if kind == "iteration_limit":
+        limit = observation.get("limit", 0)
+        return (
+            "Loop warning: iteration limit " + str(limit) +
+            " reached. This is the final recovery iteration. Complete the task "
+            "or provide the best final answer now."
+        )
+    if kind == "no_progress":
+        count = observation.get("repeated_failures", NO_PROGRESS_FAILURE_THRESHOLD)
+        return (
+            "Loop warning: no progress after " + str(count) +
+            " consecutive failed tool or code steps. Change approach, use a "
+            "different allowed capability or parameters, or provide the best "
+            "final answer now."
+        )
+    if kind == "consecutive_errors":
+        count = observation.get("repeated_failures", 1)
+        return (
+            "Loop warning: " + str(count) +
+            " consecutive code steps failed. This is the final recovery "
+            "iteration. Change approach or provide the best final answer now."
+        )
+    return "Loop warning: finish with the best available answer now."
+
+
+def messages_with_recovery_controls(state, working_messages):
+    """Build one request with ephemeral recovery controls."""
+    recovery = ensure_failure_recovery(state)
+    controls = []
+    model_error = recovery.get("pending_model_error")
+    if isinstance(model_error, dict):
+        instruction = model_error.get("instruction", "")
+        if isinstance(instruction, str) and instruction:
+            controls.append(instruction)
+    terminal = recovery.get("pending_terminal")
+    if isinstance(terminal, dict):
+        controls.append(terminal_warning_instruction(terminal))
+    if not controls:
+        return working_messages
+
+    control_text = "\n\n".join(controls)
+    messages = []
+    injected = False
+    for msg in working_messages:
+        if not injected and msg.get("role") in ("System", "system"):
+            content = msg.get("content", "")
+            messages.append({
+                "role": "System",
+                "content": content + "\n\n" + control_text,
+            })
+            injected = True
+        else:
+            messages.append(msg)
+    if not injected:
+        messages.insert(0, {"role": "System", "content": control_text})
+    return messages
+
+
+def activate_delivered_recovery(state):
+    """Consume controls only after a successful model response."""
+    recovery = ensure_failure_recovery(state)
+    changed = False
+    if recovery.get("pending_model_error") is not None:
+        recovery["pending_model_error"] = None
+        recovery["model_recovery_attempted"] = False
+        changed = True
+    terminal = recovery.get("pending_terminal")
+    if isinstance(terminal, dict):
+        recovery["active_terminal"] = terminal.get("kind")
+        recovery["pending_terminal"] = None
+        changed = True
+    return changed
+
+
+def shrink_context_for_model_recovery(state, goal):
+    """Replace oversized protocol history with a bounded plain-text view."""
+    messages = state.get("working_messages", [])
+    system_message = None
+    recent = []
+    remaining = RECOVERY_CONTEXT_MAX_CHARS
+
+    for msg in messages:
+        if msg.get("role") in ("System", "system"):
+            system_message = {
+                "role": "System",
+                "content": msg.get("content", ""),
+            }
+            break
+
+    goal_text = str(goal)
+    if len(goal_text) > 8000:
+        goal_text = goal_text[:8000] + "\n... (goal truncated for recovery)"
+    remaining -= len(goal_text)
+
+    for msg in reversed(messages):
+        role = msg.get("role", "Message")
+        if role in ("System", "system"):
+            continue
+        content = str(msg.get("content", ""))
+        if not content:
+            continue
+        if len(content) > 2000:
+            content = content[:2000] + "\n... (message truncated for recovery)"
+        line = str(role) + ": " + content
+        if len(line) > remaining:
+            continue
+        recent.append(line)
+        remaining -= len(line)
+        if remaining <= 0:
+            break
+    recent.reverse()
+
+    reduced = []
+    if system_message is not None:
+        reduced.append(system_message)
+    reduced.append({
+        "role": "User",
+        "content": (
+            "Context was reduced after provider context overflow.\n"
+            "Original goal:\n" + goal_text + "\n\nRecent bounded context:\n" +
+            "\n\n".join(recent)
+        ),
+    })
+    state["working_messages"] = reduced
+
+
+def model_failure_result(state, response):
+    """Create typed terminal failure without exposing provider diagnostics."""
+    kind = response.get("kind", "internal")
+    if not isinstance(kind, str) or not kind:
+        kind = "internal"
+    message = response.get("terminal_message", "The model gateway failed. Retry later.")
+    if not isinstance(message, str) or not message:
+        message = "The model gateway failed. Retry later."
+    __transition_to__("failed", "model failure: " + kind)
+    return complete_result(
+        state,
+        "failed",
+        error=message,
+        extra={"failure_kind": "model_" + kind},
+    )
+
+
+def terminal_recovery_result(state, kind):
+    """Finalize a terminal condition after its warning turn was consumed."""
+    if kind == "iteration_limit":
+        __transition_to__("failed", "iteration limit reached after recovery")
+        return complete_result(state, "max_iterations")
+    if kind == "consecutive_errors":
+        __transition_to__("failed", "consecutive code errors after recovery")
+        return complete_result(
+            state,
+            "failed",
+            error=(
+                "Code execution kept failing after a final recovery attempt. "
+                "Change approach, parameters, or required capabilities, then retry."
+            ),
+            extra={"failure_kind": "consecutive_errors"},
+        )
+    __transition_to__("failed", "no progress after recovery")
+    return complete_result(
+        state,
+        "failed",
+        error=(
+            "Execution made no progress after a final recovery attempt. Change "
+            "approach, enable the required capability, or retry with clearer constraints."
+        ),
+        extra={"failure_kind": "no_progress"},
+    )
+
+
+def observe_work_progress(state, failed):
+    """Track only consecutive failed work; successful work resets detection."""
+    recovery = ensure_failure_recovery(state)
+    active = recovery.get("active_terminal")
+    if active == "iteration_limit":
+        recovery["active_terminal"] = None
+        return "iteration_limit"
+    if active in ("no_progress", "consecutive_errors"):
+        recovery["active_terminal"] = None
+        recovery["consecutive_failed_work"] = 0
+        return active if failed else None
+
+    if not failed:
+        recovery["consecutive_failed_work"] = 0
+        return None
+
+    count = recovery.get("consecutive_failed_work", 0) + 1
+    recovery["consecutive_failed_work"] = count
+    if count < NO_PROGRESS_FAILURE_THRESHOLD:
+        return None
+
+    recovery["consecutive_failed_work"] = 0
+    if schedule_terminal_warning(
+            state,
+            "no_progress",
+            repeated_failures=count):
+        return "warning_scheduled"
+    return "no_progress"
+
+
+def code_step_failed(result):
+    """Count a code step failed only when it produced no successful work."""
+    if not result.get("had_error", False):
+        return False
+    for action_result in result.get("action_results", []):
+        if not action_result.get("is_error", False):
+            return False
+    return result.get("return_value") is None
+
+
+def action_batch_failed(calls, results):
+    """Count a structured batch failed only when every requested action failed."""
+    if not calls:
+        return True
+    for result in results:
+        if result is not None and not result.get("is_error", False):
+            return False
+    return True
+
+
+def mark_gate_pause(state):
+    """Keep warning accounting across gate resume without replaying warning text."""
+    ensure_failure_recovery(state)["gate_paused"] = True
+
+
 # ── Main execution loop ─────────────────────────────────────
 
 
@@ -486,6 +838,8 @@ def run_loop(context, goal, actions, state, config):
     max_nudges = config.get("max_tool_intent_nudges", 2)
     nudge_enabled = config.get("enable_tool_intent_nudge", True)
     max_consecutive_errors = config.get("max_consecutive_errors", 5)
+    if max_consecutive_errors is None:
+        max_consecutive_errors = 5
     obligation_enabled = config.get("require_action_attempt", False)
     max_obligation_nudges = config.get("max_action_requirement_nudges", 2)
     consecutive_nudges = 0
@@ -497,6 +851,10 @@ def run_loop(context, goal, actions, state, config):
     state.setdefault("compaction_count", 0)
     state.setdefault("_obligation_resolved", False)
     state.setdefault("_obligation_nudge_count", 0)
+    recovery = ensure_failure_recovery(state)
+    if recovery.get("gate_paused", False):
+        recovery["gate_paused"] = False
+        recovery["active_terminal"] = None
     if not obligation_enabled and context:
         for msg in reversed(context):
             if msg.get("role") in ("User", "user"):
@@ -507,7 +865,8 @@ def run_loop(context, goal, actions, state, config):
                 break
     working_messages = ensure_working_messages(state, context)
 
-    for step in range(step_count, max_iterations):
+    hard_iteration_limit = max_iterations + MAX_RECOVERY_ITERATIONS
+    for step in range(step_count, hard_iteration_limit):
         # 1. Check signals
         signal = __check_signals__()
         if signal == "stop":
@@ -525,6 +884,22 @@ def run_loop(context, goal, actions, state, config):
                 obligation_enabled = True
                 state["_obligation_resolved"] = False
                 state["_obligation_nudge_count"] = 0
+
+        recovery = ensure_failure_recovery(state)
+        if recovery.get("active_terminal") is not None:
+            return terminal_recovery_result(state, recovery["active_terminal"])
+        if step >= max_iterations and recovery.get("pending_terminal") is None:
+            if schedule_terminal_warning(
+                    state,
+                    "iteration_limit",
+                    limit=max_iterations):
+                __save_checkpoint__(state, {
+                    "nudge_count": consecutive_nudges,
+                    "consecutive_errors": consecutive_errors,
+                    "compaction_count": state.get("compaction_count", 0),
+                })
+            else:
+                return terminal_recovery_result(state, "iteration_limit")
 
         # 2. Check budget
         budget = __check_budget__()
@@ -563,12 +938,16 @@ def run_loop(context, goal, actions, state, config):
                         state["skill_snippet_names"].append(sn.get("name", ""))
 
         # 3.5 Compact context before the next model call when needed.
-        compact_if_needed(state, config)
+        compaction_result = compact_if_needed(state, config)
         working_messages = ensure_working_messages(state, context)
 
         # 4. Call LLM
         __emit_event__("step_started", step=step)
-        response = __llm_complete__(working_messages, actions, None)
+        if isinstance(compaction_result, dict):
+            response = compaction_result
+        else:
+            request_messages = messages_with_recovery_controls(state, working_messages)
+            response = __llm_complete__(request_messages, actions, None)
         __emit_event__("step_completed", step=step,
                        input_tokens=response.get("usage", {}).get("input_tokens", 0),
                        output_tokens=response.get("usage", {}).get("output_tokens", 0))
@@ -576,9 +955,43 @@ def run_loop(context, goal, actions, state, config):
         # 5. Handle response based on type
         resp_type = response.get("type", "text")
 
+        if resp_type == "model_error":
+            recovery = ensure_failure_recovery(state)
+            if (not response.get("recoverable", False)
+                    or recovery.get("model_recovery_attempted", False)):
+                return model_failure_result(state, response)
+
+            recovery["model_recovery_attempted"] = True
+            recovery["pending_model_error"] = {
+                "kind": response.get("kind", "internal"),
+                "instruction": response.get(
+                    "instruction",
+                    "Model request failed. Continue concisely from current state.",
+                ),
+            }
+            if response.get("kind") == "context_overflow":
+                shrink_context_for_model_recovery(state, goal)
+                working_messages = ensure_working_messages(state, context)
+            __save_checkpoint__(state, {
+                "nudge_count": consecutive_nudges,
+                "consecutive_errors": consecutive_errors,
+                "compaction_count": state.get("compaction_count", 0),
+                "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+            })
+            continue
+
+        delivered_recovery = activate_delivered_recovery(state)
+
         if resp_type == "text":
             text = response.get("content", "")
             append_message(working_messages, "Assistant", text)
+            if delivered_recovery:
+                __save_checkpoint__(state, {
+                    "nudge_count": consecutive_nudges,
+                    "consecutive_errors": consecutive_errors,
+                    "compaction_count": state.get("compaction_count", 0),
+                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                })
 
             # Check for FINAL()
             final_answer = extract_final(text)
@@ -586,8 +999,8 @@ def run_loop(context, goal, actions, state, config):
                 __transition_to__("completed", "FINAL() in text")
                 return complete_result(state, "completed", final_answer)
 
-            # Check for tool intent nudge (V1 semantics: consecutive counter,
-            # only resets on non-intent text, NOT on action/code responses)
+            # Check for tool intent nudge. The same bounded counter also guards
+            # format-recovery nudges below.
             if nudge_enabled and consecutive_nudges < max_nudges and signals_tool_intent(text):
                 consecutive_nudges += 1
                 append_message(
@@ -596,6 +1009,22 @@ def run_loop(context, goal, actions, state, config):
                     "You said you would perform an action, but you did not include any tool calls.\n"
                     "Do NOT describe what you intend to do — actually call the tool now.\n"
                     "Use the tool_calls mechanism to invoke the appropriate tool.",
+                )
+                continue
+
+            # Strong roleplay or retry/meta leakage means the model slipped out
+            # of CodeAct mode. Concise plain-text answers are valid completions.
+            if (nudge_enabled
+                    and consecutive_nudges < max_nudges
+                    and not is_simple_goal(goal)
+                    and signals_leaked_roleplay_or_meta(text)):
+                consecutive_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "Your last response contained roleplay or retry commentary and did not complete this task.\n"
+                    "Respond with a ```repl code block containing tool calls or FINAL().\n"
+                    "Do not respond with plain text only.",
                 )
                 continue
 
@@ -627,6 +1056,13 @@ def run_loop(context, goal, actions, state, config):
             state["_obligation_resolved"] = True
             code = response.get("code", "")
             append_message(working_messages, "Assistant", "```repl\n" + code + "\n```")
+            if delivered_recovery:
+                __save_checkpoint__(state, {
+                    "nudge_count": consecutive_nudges,
+                    "consecutive_errors": consecutive_errors,
+                    "compaction_count": state.get("compaction_count", 0),
+                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                })
 
             # Execute code in nested Monty VM
             result = __execute_code_step__(code, state)
@@ -642,6 +1078,20 @@ def run_loop(context, goal, actions, state, config):
             output = format_output(result)
             append_message(working_messages, "User", output)
 
+            if (result.get("had_error")
+                    and "SyntaxError" in output
+                    and nudge_enabled
+                    and consecutive_nudges < max_nudges):
+                consecutive_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "Your last ```repl block was not valid Python.\n"
+                    "Respond with a corrected ```repl block containing tool calls or FINAL().",
+                )
+            elif not result.get("had_error"):
+                consecutive_nudges = 0
+
             # Check for FINAL() in code output
             if result.get("final_answer") is not None:
                 __transition_to__("completed", "FINAL() in code")
@@ -652,6 +1102,7 @@ def run_loop(context, goal, actions, state, config):
             if gate is None:
                 gate = result.get("need_approval")
             if gate is not None and isinstance(gate, dict) and gate.get("gate_paused"):
+                mark_gate_pause(state)
                 __save_checkpoint__(state, {
                     "nudge_count": consecutive_nudges,
                     "consecutive_errors": consecutive_errors,
@@ -673,6 +1124,7 @@ def run_loop(context, goal, actions, state, config):
             # Check for approval or authentication needed (legacy path)
             if result.get("need_approval") is not None:
                 approval = result["need_approval"]
+                mark_gate_pause(state)
                 __save_checkpoint__(state, {
                     "nudge_count": consecutive_nudges,
                     "consecutive_errors": consecutive_errors,
@@ -698,16 +1150,21 @@ def run_loop(context, goal, actions, state, config):
                     "parameters": approval.get("parameters", {}),
                 }
 
+            progress = observe_work_progress(state, code_step_failed(result))
+            if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
+                return terminal_recovery_result(state, progress)
+
             # Track consecutive errors
             if result.get("had_error"):
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
-                    __transition_to__("failed", "too many consecutive errors")
-                    return complete_result(
-                        state,
-                        "failed",
-                        error=str(max_consecutive_errors) + " consecutive code errors",
-                    )
+                    if schedule_terminal_warning(
+                            state,
+                            "consecutive_errors",
+                            repeated_failures=consecutive_errors):
+                        progress = "warning_scheduled"
+                    else:
+                        return terminal_recovery_result(state, "consecutive_errors")
             else:
                 consecutive_errors = 0
 
@@ -717,12 +1174,14 @@ def run_loop(context, goal, actions, state, config):
                 "compaction_count": state.get("compaction_count", 0),
                 "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
             })
+            if progress == "warning_scheduled":
+                continue
 
         elif resp_type == "actions":
             state["_obligation_resolved"] = True
             # Tier 0: structured tool calls.
-            # NOTE: consecutive_nudges is NOT reset here (V1 semantics).
-            # Only non-intent text responses reset the counter.
+            # Structured calls do not reset the counter; successful CodeAct
+            # execution and accepted non-intent text do.
             calls = response.get("calls", [])
             append_message(
                 working_messages,
@@ -730,6 +1189,13 @@ def run_loop(context, goal, actions, state, config):
                 response.get("content", "") or "",
                 action_calls=calls,
             )
+            if delivered_recovery:
+                __save_checkpoint__(state, {
+                    "nudge_count": consecutive_nudges,
+                    "consecutive_errors": consecutive_errors,
+                    "compaction_count": state.get("compaction_count", 0),
+                    "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
+                })
 
             # Execute all tool calls in parallel via the batch host function.
             # Rust handles preflight (lease/policy), parallel execution via
@@ -759,6 +1225,7 @@ def run_loop(context, goal, actions, state, config):
 
                 if r.get("gate_paused"):
                     # Unified gate pause (replaces separate need_approval/need_authentication)
+                    mark_gate_pause(state)
                     __save_checkpoint__(state, {
                         "nudge_count": consecutive_nudges,
                         "consecutive_errors": consecutive_errors,
@@ -781,6 +1248,7 @@ def run_loop(context, goal, actions, state, config):
                     }
 
                 if r.get("need_authentication"):
+                    mark_gate_pause(state)
                     __save_checkpoint__(state, {
                         "nudge_count": consecutive_nudges,
                         "consecutive_errors": consecutive_errors,
@@ -798,6 +1266,7 @@ def run_loop(context, goal, actions, state, config):
                     }
 
                 if r.get("need_approval"):
+                    mark_gate_pause(state)
                     __save_checkpoint__(state, {
                         "nudge_count": consecutive_nudges,
                         "consecutive_errors": consecutive_errors,
@@ -813,16 +1282,20 @@ def run_loop(context, goal, actions, state, config):
                         "parameters": r.get("parameters", {}),
                     }
 
+            progress = observe_work_progress(state, action_batch_failed(calls, results))
+            if progress in ("iteration_limit", "no_progress", "consecutive_errors"):
+                return terminal_recovery_result(state, progress)
+
             __save_checkpoint__(state, {
                 "nudge_count": consecutive_nudges,
                 "consecutive_errors": consecutive_errors,
                 "compaction_count": state.get("compaction_count", 0),
                 "obligation_nudge_count": state.get("_obligation_nudge_count", 0),
             })
+            if progress == "warning_scheduled":
+                continue
 
-    # Max iterations reached
-    __transition_to__("completed", "max iterations reached")
-    return complete_result(state, "max_iterations")
+    return terminal_recovery_result(state, "iteration_limit")
 
 
 # Entry point: call run_loop with injected context variables

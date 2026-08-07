@@ -38,7 +38,7 @@ use crate::history::{
     AgentJobRecord, AgentJobSummary, ConversationMessage, ConversationSummary, JobEventRecord,
     LlmCallRecord, SandboxJobRecord, SandboxJobSummary, SettingRow,
 };
-use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry};
+use crate::workspace::{MemoryChunk, MemoryDocument, WorkspaceEntry, WorkspaceFileContent};
 use crate::workspace::{SearchConfig, SearchResult};
 
 /// Create a database backend from configuration, run migrations, and return it.
@@ -733,15 +733,20 @@ pub trait SettingsStore: Send + Sync {
 
 #[async_trait]
 pub trait ReflexStore: Send + Sync {
-    /// Find job descriptions that appear at least `min_count` times.
+    /// Find job descriptions that appear at least `min_count` times for a given user.
     /// Returns up to `limit` recurring patterns.
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError>;
 
     /// Insert or update a reflex pattern mapping.
+    ///
+    /// On conflict (pattern already known), the row is (re)activated with the
+    /// new `tool_name` and `compilation_attempts` is reset, so a successful
+    /// build always supersedes earlier failed attempts.
     async fn upsert_reflex_pattern(
         &self,
         user_id: &str,
@@ -766,11 +771,44 @@ pub trait ReflexStore: Send + Sync {
     /// Disable a reflex pattern by ID.
     async fn disable_reflex_pattern(&self, id: Uuid) -> Result<bool, DatabaseError>;
 
-    /// Increment match count and update last_matched_at for a pattern.
+    /// Increment match counts and update timestamps for a batch of patterns.
+    ///
+    /// Implementations must use one backend batch/transaction and apply each
+    /// delta additively. An empty batch is a no-op.
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError>;
+
+    /// Increment one pattern by one match.
     async fn bump_reflex_pattern_match(
         &self,
         user_id: &str,
         normalized_pattern: &str,
+    ) -> Result<(), DatabaseError> {
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
+    }
+
+    /// Record a failed compilation attempt for a reflex pattern.
+    ///
+    /// Inserts the pattern with status `'failed'` when it is not yet known,
+    /// otherwise increments `compilation_attempts`. If the count reaches
+    /// `max_attempts`, the pattern is disabled (status set to `'disabled'`)
+    /// so the compiler stops retrying it. A later successful build reactivates
+    /// the row via `upsert_reflex_pattern`.
+    async fn record_reflex_compilation_failure(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
+        max_attempts: i32,
     ) -> Result<(), DatabaseError>;
 
     /// Prune (auto-disable) reflex patterns that haven't been matched
@@ -807,6 +845,14 @@ pub trait ReflexStore: Send + Sync {
         query_embedding: &[f32],
         limit: i32,
     ) -> Result<Vec<(ReflexPatternRecord, f64)>, DatabaseError>;
+}
+
+/// Additive reflex match-count update used by write-behind batching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflexPatternHit {
+    pub user_id: String,
+    pub normalized_pattern: String,
+    pub count: u64,
 }
 
 /// A persisted reflex pattern record.
@@ -877,6 +923,25 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
         directory: &str,
     ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// List bounded direct files whose names end with `suffix`.
+    async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError>;
+    /// Fetch bounded direct files and their content in deterministic path order.
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError>;
     async fn list_all_paths(
         &self,
         user_id: &str,
@@ -955,7 +1020,46 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
     ) -> Result<Vec<crate::workspace::MemoryDocument>, crate::error::WorkspaceError>;
 
-    // ==================== Versioning ====================
+    // ==================== Study-Notes knowledge store ====================
+    //
+    // Study notes are workspace documents under `study-notes/<agent>/<topic>.md`
+    // tagged with `metadata.provenance = "study-note"`. These methods are
+    // multi-scope by design: callers pass the private scope plus the shared
+    // herd scope (`workspace::KNOWLEDGE_SHARED_SCOPE`) as `user_ids`.
+
+    /// PostgreSQL FTS over study-note chunks across scopes.
+    ///
+    /// Returns the best-ranked chunk per matching note, honouring the
+    /// metadata filters in `filter`. Ordered by rank descending, bounded by
+    /// `limit`.
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, crate::error::WorkspaceError>;
+
+    /// List every per-agent version of one canonical topic across scopes,
+    /// newest first.
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<crate::workspace::MemoryDocument>, crate::error::WorkspaceError>;
+
+    /// Scan study-note metadata (no content) across scopes, newest first.
+    ///
+    /// Used by stale detection and statistics; bounded by `limit`.
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, crate::error::WorkspaceError>;
+
     //
     // **Trust boundary:** same as metadata — these accept bare `document_id`
     // UUIDs and trust the caller to have verified ownership first.

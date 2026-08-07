@@ -1,0 +1,13 @@
+# Environment
+.env
+
+# Node
+scripts/node_modules/
+scripts/package-lock.json
+
+# tsc build output
+scripts/*.js
+
+# Volumes
+workspace/*
+!workspace/.gitkeep

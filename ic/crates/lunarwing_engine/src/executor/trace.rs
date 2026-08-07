@@ -71,6 +71,13 @@ pub enum IssueSeverity {
     Info,
 }
 
+impl IssueSeverity {
+    /// Whether this issue warrants a self-improvement mission run.
+    pub fn is_actionable(&self) -> bool {
+        !matches!(self, Self::Info)
+    }
+}
+
 /// Build a trace from a completed thread.
 pub fn build_trace(thread: &Thread) -> ExecutionTrace {
     let messages: Vec<MessageRecord> = thread
@@ -523,6 +530,28 @@ mod tests {
             "test-user",
             ThreadConfig::default(),
         )
+    }
+
+    #[test]
+    fn only_warning_and_error_severities_are_actionable() {
+        assert!(IssueSeverity::Error.is_actionable());
+        assert!(IssueSeverity::Warning.is_actionable());
+        assert!(!IssueSeverity::Info.is_actionable());
+    }
+
+    #[test]
+    fn one_step_toolless_response_remains_informational() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::assistant("hello"));
+        thread.step_count = 1;
+
+        let issues = analyze_trace(&thread);
+        let issue = issues
+            .iter()
+            .find(|issue| issue.category == "no_tools_used")
+            .expect("tool-less response should remain visible in trace telemetry");
+        assert_eq!(issue.severity, IssueSeverity::Info);
+        assert!(!issue.severity.is_actionable());
     }
 
     // ── empty_call_id detection (OpenAI / Codex rejection) ───

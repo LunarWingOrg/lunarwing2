@@ -14,6 +14,7 @@ pub(crate) mod embeddings;
 mod heartbeat;
 pub(crate) mod helpers;
 mod hygiene;
+mod knowledge;
 pub(crate) mod llm;
 pub mod oauth;
 mod routines;
@@ -37,7 +38,7 @@ use crate::error::ConfigError;
 use crate::settings::Settings;
 
 // Re-export all public types so `crate::config::FooConfig` continues to work.
-pub use self::agent::{AgentConfig, ReflexConfig};
+pub use self::agent::{AgentConfig, LorebookConfig, ReflexConfig};
 pub use self::builder::BuilderModeConfig;
 pub use self::channels::{
     ChannelsConfig, CliConfig, DEFAULT_GATEWAY_PORT, GatewayConfig, HttpConfig, SignalConfig,
@@ -47,6 +48,7 @@ pub use self::database::{DatabaseBackend, DatabaseConfig, SslMode, default_libsq
 pub use self::embeddings::{DEFAULT_EMBEDDING_CACHE_SIZE, EmbeddingsConfig};
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
+pub use self::knowledge::KnowledgeSweepConfig;
 pub use self::llm::default_session_path;
 pub use self::oauth::OAuthConfig;
 pub use self::routines::RoutineConfig;
@@ -108,6 +110,7 @@ pub struct Config {
     pub builder: BuilderModeConfig,
     pub heartbeat: HeartbeatConfig,
     pub hygiene: HygieneConfig,
+    pub knowledge_sweep: KnowledgeSweepConfig,
     pub routines: RoutineConfig,
     pub sandbox: SandboxModeConfig,
     pub acp: AcpModeConfig,
@@ -180,6 +183,7 @@ impl Config {
             },
             heartbeat: HeartbeatConfig::default(),
             hygiene: HygieneConfig::default(),
+            knowledge_sweep: KnowledgeSweepConfig::default(),
             routines: RoutineConfig {
                 enabled: false,
                 ..RoutineConfig::default()
@@ -363,6 +367,7 @@ impl Config {
             builder: BuilderModeConfig::resolve(settings)?,
             heartbeat: HeartbeatConfig::resolve(settings)?,
             hygiene: HygieneConfig::resolve()?,
+            knowledge_sweep: KnowledgeSweepConfig::resolve()?,
             routines: RoutineConfig::resolve()?,
             sandbox: SandboxModeConfig::resolve(settings)?,
             acp: AcpModeConfig::resolve(settings)?,

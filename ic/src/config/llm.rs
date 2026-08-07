@@ -478,6 +478,19 @@ mod tests {
         }
     }
 
+    /// Point LunarWing Cloud URLs at loopback so tests never depend on
+    /// external private DNS: production validation resolves the configured
+    /// hostname at config time, and the default `https://private.lunarwing.org`
+    /// is intentionally not resolvable from this environment. The loopback
+    /// `http://127.0.0.1` passes validation via the localhost exemption.
+    fn use_loopback_cloud_urls() {
+        // SAFETY: Only called under ENV_MUTEX in tests.
+        unsafe {
+            std::env::set_var("LUNARWING_CLOUD_AUTH_URL", "http://127.0.0.1");
+            std::env::set_var("LUNARWING_CLOUD_BASE_URL", "http://127.0.0.1");
+        }
+    }
+
     #[test]
     fn openai_compatible_uses_selected_model_when_llm_model_unset() {
         let _guard = lock_env();
@@ -750,6 +763,7 @@ mod tests {
     #[test]
     fn lunarwing_cloud_backend_has_no_registry_provider() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
@@ -814,6 +828,7 @@ mod tests {
     #[test]
     fn lunarwing_cloud_backend_resolves_to_lunarwing_cloud() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
 
         // SAFETY: Under ENV_MUTEX.
         unsafe {
@@ -878,37 +893,32 @@ mod tests {
     #[test]
     fn test_request_timeout_default() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_REQUEST_TIMEOUT_SECS");
-            std::env::set_var("LUNARWING_CLOUD_AUTH_URL", "http://127.0.0.1");
-            std::env::set_var("LUNARWING_CLOUD_BASE_URL", "http://127.0.0.1");
         }
         let config = LlmConfig::resolve(&Settings::default()).expect("resolve");
         assert_eq!(config.request_timeout_secs, 120);
         // SAFETY: Cleanup
         unsafe {
-            std::env::remove_var("LUNARWING_CLOUD_AUTH_URL");
-            std::env::remove_var("LUNARWING_CLOUD_BASE_URL");
+            std::env::remove_var("LLM_REQUEST_TIMEOUT_SECS");
         }
     }
 
     #[test]
     fn test_request_timeout_configurable() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::set_var("LLM_REQUEST_TIMEOUT_SECS", "300");
-            std::env::set_var("LUNARWING_CLOUD_AUTH_URL", "http://127.0.0.1");
-            std::env::set_var("LUNARWING_CLOUD_BASE_URL", "http://127.0.0.1");
         }
         let config = LlmConfig::resolve(&Settings::default()).expect("resolve");
         assert_eq!(config.request_timeout_secs, 300);
         // SAFETY: Cleanup
         unsafe {
             std::env::remove_var("LLM_REQUEST_TIMEOUT_SECS");
-            std::env::remove_var("LUNARWING_CLOUD_AUTH_URL");
-            std::env::remove_var("LUNARWING_CLOUD_BASE_URL");
         }
     }
 
@@ -917,6 +927,7 @@ mod tests {
     #[test]
     fn llm_max_retries_overrides_lunarwing_cloud_default() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
@@ -935,6 +946,7 @@ mod tests {
     #[test]
     fn llm_max_retries_falls_back_to_lunarwing_cloud() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
@@ -951,6 +963,7 @@ mod tests {
     #[test]
     fn llm_max_retries_rejects_invalid() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
@@ -973,6 +986,7 @@ mod tests {
     #[test]
     fn llm_response_cache_enabled_overrides_lunarwing_cloud() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");
@@ -991,6 +1005,7 @@ mod tests {
     #[test]
     fn llm_circuit_breaker_threshold_overrides_lunarwing_cloud() {
         let _guard = lock_env();
+        use_loopback_cloud_urls();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::remove_var("LLM_BACKEND");

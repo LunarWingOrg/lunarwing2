@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-07-20)
+**Date:** 2026-06-13 (revalidated 2026-08-05)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -15,13 +15,14 @@ It can be opted out with `--no-health`.
 
 The watchdog installer (`install-lunarwing-watchdog.sh`) is a separate,
 manually-run host-level step focused on the **service-level watchdog** (restarts
-`lunarwing.service` if down). It also copies the self-heal scripts into
+`lunarwing.service` if down). On systemd and OpenRC, it also copies the self-heal scripts into
 `/usr/local/sbin` but does **not** schedule them — that scheduling is now handled
 by the `add-tenant` `ensure_health_pipeline()` flow.
 
 > **Scheduling ownership:** the self-heal pipeline is scheduled exclusively by
 > `add-tenant` / `ensure_health_pipeline()`. The `install-lunarwing-watchdog.sh`
-> installer copies the self-heal scripts to `/usr/local/sbin` but will never
+> installer copies the self-heal scripts to `/usr/local/sbin` on systemd and
+> OpenRC but will never
 > schedule them. On a host where the watchdog installer ran but `add-tenant`
 > hasn't, the scripts are on disk but unscheduled.
 
@@ -52,6 +53,10 @@ cron-wrapper.sh
 Health-check failures don't abort the run — `cron-wrapper.sh` always proceeds to
 self-heal so a partial report can still drive remediation.
 
+NetBird readiness is opt-in (`HEALTH_NETBIRD_ENABLED=true`) because enrollment
+and daemon lifecycle are operator-owned. Failure escalates without daemon
+restart unless operator also sets `SELF_HEAL_NETBIRD_REMEDIATE=true`.
+
 ## How it actually gets onto a host
 
 There are two installation paths:
@@ -66,8 +71,10 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 2. Creates the host-level report/state dir.
 3. Writes a config env file (`/etc/lunarwing/health.env`, mode 0600) if absent —
    includes `LUNARWING_BASE_DIR`, `LUNARWING_SERVICE_MANAGER`, tenant registry
-   path, and MT-hardening flags. If the file already exists, only the
-   `LUNARWING_SERVICE_MANAGER` line is reconciled (preserving operator edits).
+   path, `SELF_HEAL_SYSTEMD_SCOPE=system`, disabled-by-default NetBird probing,
+   and MT-hardening flags. If the file already exists, only the
+   `LUNARWING_SERVICE_MANAGER` and `SELF_HEAL_TENANTS_FILE` lines are
+   reconciled (preserving operator edits).
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
 5. Schedules the launcher:
    - **systemd**: installs + enables `lunarwing-mt-health.{service,timer}`
@@ -83,7 +90,8 @@ without duplicating the schedule.
 
 ### Path 2: `install-lunarwing-watchdog.sh` (manual, complementary)
 
-`ic/scripts/install-lunarwing-watchdog.sh` (run as root, **once per host**;
+`ic/scripts/install-lunarwing-watchdog.sh` (run as root on systemd/OpenRC —
+launchd runs rootless as a user agent — **once per host**;
 auto-detects systemd / OpenRC / launchd) is the installer for the **service-level
 watchdog**. On systemd it:
 
@@ -109,11 +117,14 @@ the final step of tenant provisioning (unless `--no-health` is passed). The full
 1. Allocate a port block (registry)
 2. Create the tenant OS user
 3. Clone the tenant repo
-4. Write env files (lunarwing / bridge / proxy / gotify)
-5. Start the per-tenant PostgreSQL container
-6. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
+4. Write env/config files (vision / LunarWing / bridge / optional proxy and
+   DarkIRC / Gotify / external workers)
+5. Bootstrap the WeeChat relay, provision the SSH harness, and build the vision
+   sidecar image if it is missing
+6. Start the per-tenant PostgreSQL container
+7. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
    `lunarwing-proxy-<name>`, weechat adapter, …)
-7. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
+8. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
    health-check → self-heal pipeline (covers all tenants automatically).
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
@@ -134,6 +145,12 @@ installed per tenant:
   owning tenant via the registry and restarts it on that user's bus
   (`sudo -u <user> systemctl --user restart …`) or via `rc-service` on OpenRC.
 
+Non-tenant base units use `SELF_HEAL_SYSTEMD_SCOPE`: host-global MT installs use
+`system`; manually scheduled single-node user timers must set `user`. Tenant
+units ignore this setting and always route through registry owner user bus.
+Both base-unit health probes and remediation honor the selected scope.
+Host-global NetBird daemon always uses system bus when restart is delegated.
+
 ## Net effect on a fresh MT host
 
 When provisioning a tenant via `lunarwing-mt-admin.sh add-tenant` (the default,
@@ -144,7 +161,7 @@ tenants requires no self-heal changes.
 
 The watchdog installer (`install-lunarwing-watchdog.sh`) remains a separate,
 manually-run step for the **service-level watchdog** (restarts `lunarwing.service`
-if down). It also copies the self-heal scripts but does not schedule them —
+if down). On systemd and OpenRC, it also copies the self-heal scripts but does not schedule them —
 that is handled by `add-tenant`. On hosts that have not run `add-tenant` (e.g.
 single-instance setups), the operator must schedule the pipeline manually per
 `ic-infrastructure-health-check/README.md`.
@@ -154,7 +171,8 @@ single-instance setups), the operator must schedule the pipeline manually per
 The following gaps were documented before `ensure_health_pipeline()` was added
 to `add-tenant`:
 
-- **G1 — self-heal installed but not scheduled.** `install-lunarwing-watchdog.sh`
+- **G1 — self-heal installed but not scheduled.** On systemd and OpenRC,
+  `install-lunarwing-watchdog.sh`
   copies `lunarwing-self-heal` and `lunarwing-health-cron` to `/usr/local/sbin`
   but enables no timer for them. **Resolved:** `add-tenant` now calls
   `ensure_health_pipeline()` which schedules the pipeline via systemd timer

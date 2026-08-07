@@ -32,13 +32,13 @@ use tracing::debug;
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
 use crate::memory::RetrievalEngine;
-use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
+use crate::runtime::messaging::{SignalReceiver, ThreadFailureKind, ThreadOutcome, ThreadSignal};
 use crate::traits::effect::{
     EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
 };
 use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
 use crate::traits::store::Store;
-use crate::types::error::EngineError;
+use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
@@ -48,10 +48,15 @@ use crate::types::step::{ActionCall, LlmResponse, StepId, TokenUsage};
 use crate::types::thread::{Thread, ThreadState};
 
 use super::llm_stream::collect_llm_stream;
-use super::scripting::{execute_code, json_to_monty, monty_to_json, monty_to_string};
+use super::scripting::{
+    execute_code_with_action_limit, json_to_monty, monty_to_json, monty_to_string,
+};
 
 /// The compiled-in default orchestrator (v0).
 pub(crate) const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
+
+/// Persisted-state key for bounded model and terminal recovery accounting.
+pub(crate) const RECOVERY_STATE_KEY: &str = "_failure_recovery";
 
 /// Opaque in-memory lookup key carried through the Python transcript.
 const TRANSIENT_CONTENT_ID_FIELD: &str = "__transient_content_id";
@@ -68,6 +73,19 @@ pub struct OrchestratorResult {
     pub outcome: ThreadOutcome,
     /// Total tokens used by LLM calls within the orchestrator.
     pub tokens_used: TokenUsage,
+}
+
+fn stopped_orchestrator_result(
+    thread: &mut Thread,
+    tokens_used: TokenUsage,
+) -> Result<OrchestratorResult, EngineError> {
+    if thread.state == ThreadState::Running {
+        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
+    }
+    Ok(OrchestratorResult {
+        outcome: ThreadOutcome::Stopped,
+        tokens_used,
+    })
 }
 
 /// Extract source_channel from thread metadata (set by ConversationManager).
@@ -379,6 +397,7 @@ pub async fn execute_orchestrator(
     // Drive the orchestrator dispatch loop
     let mut final_result: Option<serde_json::Value> = None;
     let mut active_vm_duration = std::time::Duration::ZERO;
+    let mut actions_this_step = 0usize;
 
     loop {
         match progress {
@@ -418,6 +437,7 @@ pub async fn execute_orchestrator(
 
                     // __llm_complete__(messages, actions, config)
                     "__llm_complete__" => {
+                        actions_this_step = 0;
                         match handle_llm_complete(
                             args,
                             thread,
@@ -455,26 +475,68 @@ pub async fn execute_orchestrator(
 
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
-                        handle_execute_code_step(
-                            args, kwargs, thread, llm, effects, leases, policy, event_tx,
+                        match handle_execute_code_step(
+                            args,
+                            kwargs,
+                            thread,
+                            llm,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
+                            store,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __execute_action__(name, params, call_id=...)
                     "__execute_action__" => {
-                        handle_execute_action(
-                            args, kwargs, thread, effects, leases, policy, event_tx,
+                        match handle_execute_action(
+                            HostCallArguments { args, kwargs },
+                            thread,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __execute_actions_parallel__(calls)
                     "__execute_actions_parallel__" => {
-                        handle_execute_actions_parallel(
-                            args, thread, effects, leases, policy, event_tx,
+                        match handle_execute_actions_parallel(
+                            args,
+                            thread,
+                            effects,
+                            leases,
+                            policy,
+                            &mut actions_this_step,
+                            event_tx,
                         )
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(EngineError::ExecutionStopped) => {
+                                return stopped_orchestrator_result(thread, total_tokens);
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
 
                     // __check_signals__()
@@ -741,10 +803,18 @@ fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFun
 }
 
 fn llm_error_result(error: EngineError) -> ExtFunctionResult {
-    ExtFunctionResult::Error(monty::MontyException::new(
-        monty::ExcType::RuntimeError,
-        Some(format!("LLM call failed: {error}")),
-    ))
+    let kind = match error {
+        EngineError::Llm { kind, .. } => kind,
+        _ => ModelFailureKind::Internal,
+    };
+    tracing::warn!(failure_kind = %kind, "model request failed after provider recovery");
+    ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
+        "type": "model_error",
+        "kind": kind.as_str(),
+        "recoverable": kind.is_recoverable(),
+        "instruction": kind.recovery_instruction(),
+        "terminal_message": kind.terminal_message(),
+    })))
 }
 
 /// Handle `__execute_code_step__(code, state)`.
@@ -760,15 +830,17 @@ async fn handle_execute_code_step(
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
+    store: Option<&Arc<dyn Store>>,
+) -> Result<ExtFunctionResult, EngineError> {
     let code = match args.first() {
         Some(obj) => monty_to_string(obj),
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_code_step__ requires a code string".into()),
-            ));
+            )));
         }
     };
 
@@ -786,12 +858,14 @@ async fn handle_execute_code_step(
         current_call_id: None,
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
+        shared_conversation: thread.config.shared_conversation,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
         prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
 
     // Run user code in a nested Monty VM (same pattern as rlm_query)
-    match Box::pin(execute_code(
+    let remaining_actions = super::MAX_ACTIONS_PER_STEP.saturating_sub(*actions_this_step);
+    match Box::pin(execute_code_with_action_limit(
         &code,
         thread,
         llm,
@@ -801,10 +875,16 @@ async fn handle_execute_code_step(
         &exec_ctx,
         &[],
         &state,
+        store,
+        remaining_actions,
     ))
     .await
     {
         Ok(result) => {
+            *actions_this_step = (*actions_this_step).saturating_add(result.action_calls_attempted);
+            if matches!(&result.need_approval, Some(ThreadOutcome::Stopped)) {
+                return Err(EngineError::ExecutionStopped);
+            }
             // Broadcast events from code execution to the thread and event channel.
             // Without this, ActionExecuted events from CodeAct tool calls are lost
             // and never appear in traces.
@@ -852,12 +932,12 @@ async fn handle_execute_code_step(
                 }),
             });
 
-            ExtFunctionResult::Return(json_to_monty(&result_json))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result_json)))
         }
-        Err(e) => ExtFunctionResult::Error(monty::MontyException::new(
+        Err(e) => Ok(ExtFunctionResult::Error(monty::MontyException::new(
             monty::ExcType::RuntimeError,
             Some(format!("Code execution failed: {e}")),
-        )),
+        ))),
     }
 }
 
@@ -872,31 +952,37 @@ async fn handle_execute_code_step(
 ///
 /// Python owns the working transcript and decides how tool outputs are
 /// represented in internal message history.
+struct HostCallArguments<'a> {
+    args: &'a [MontyObject],
+    kwargs: &'a [(MontyObject, MontyObject)],
+}
+
 async fn handle_execute_action(
-    args: &[MontyObject],
-    kwargs: &[(MontyObject, MontyObject)],
+    call: HostCallArguments<'_>,
     thread: &mut Thread,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
-    let name = match extract_string_arg(args, kwargs, "name", 0) {
+) -> Result<ExtFunctionResult, EngineError> {
+    let name = match extract_string_arg(call.args, call.kwargs, "name", 0) {
         Some(n) => n,
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_action__ requires a name argument".into()),
-            ));
+            )));
         }
     };
 
-    let params = args
+    let params = call
+        .args
         .get(1)
         .map(monty_to_json)
         .unwrap_or(serde_json::json!({}));
 
-    let call_id = extract_string_kwarg(kwargs, "call_id").unwrap_or_default();
+    let call_id = extract_string_kwarg(call.kwargs, "call_id").unwrap_or_default();
 
     let exec_ctx = ThreadExecutionContext {
         thread_id: thread.id,
@@ -907,6 +993,7 @@ async fn handle_execute_action(
         current_call_id: Some(call_id.clone()),
         source_channel: thread_source_channel(thread),
         supervised_mode: thread.config.supervised_mode,
+        shared_conversation: thread.config.shared_conversation,
         supervised_timeout_secs: thread.config.supervised_timeout_secs,
         prompt_context: prompt_context_from_thread_messages(&thread.messages),
     };
@@ -926,12 +1013,42 @@ async fn handle_execute_action(
         thread.updated_at = chrono::Utc::now();
     };
 
+    let action_index = *actions_this_step;
+    *actions_this_step = (*actions_this_step).saturating_add(1);
+    if action_index >= super::MAX_ACTIONS_PER_STEP {
+        let error = format!(
+            "Tool call limit reached ({} per step). Break your task into multiple steps.",
+            super::MAX_ACTIONS_PER_STEP
+        );
+        let output = serde_json::json!({"error": &error});
+        let params_summary = summarize_params(&name, &params);
+        emit_and_record(
+            thread,
+            event_tx,
+            EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name,
+                call_id,
+                error,
+                params_summary,
+            },
+            "",
+            "",
+            &output,
+        );
+        return Ok(ExtFunctionResult::Return(json_to_monty(
+            &serde_json::json!({"output": output, "is_error": true}),
+        )));
+    }
+
     // 1. Find lease for this action
     let lease = match leases.find_lease_for_action(thread.id, &name).await {
         Some(l) => l,
         None => {
             let error = format!("No lease for action '{name}'");
-            let output = serde_json::json!({"error": &error});
+            let output = serde_json::json!({
+                "error": super::capability_unavailable_message(&name)
+            });
             emit_and_record(
                 thread,
                 event_tx,
@@ -950,7 +1067,7 @@ async fn handle_execute_action(
                 "output": output,
                 "is_error": true,
             });
-            return ExtFunctionResult::Return(json_to_monty(&result));
+            return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
         }
     };
 
@@ -964,7 +1081,9 @@ async fn handle_execute_action(
     if let Some(ref ad) = action_def {
         match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
             crate::capability::policy::PolicyDecision::Deny { reason } => {
-                let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                let output = serde_json::json!({
+                    "error": super::policy_denied_message(&reason)
+                });
                 emit_and_record(
                     thread,
                     event_tx,
@@ -983,7 +1102,7 @@ async fn handle_execute_action(
                     "output": output,
                     "is_error": true,
                 });
-                return ExtFunctionResult::Return(json_to_monty(&result));
+                return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
             }
             crate::capability::policy::PolicyDecision::RequireApproval { .. } => {
                 let output = serde_json::json!({"status": "gate_paused", "gate_name": "approval"});
@@ -1014,7 +1133,7 @@ async fn handle_execute_action(
                     })
                     .unwrap_or_default(),
                 });
-                return ExtFunctionResult::Return(json_to_monty(&result));
+                return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
             }
             crate::capability::policy::PolicyDecision::Allow => {}
         }
@@ -1022,7 +1141,29 @@ async fn handle_execute_action(
 
     // 3. Consume a lease use
     if let Err(e) = leases.consume_use(lease.id).await {
-        debug!(error = %e, "lease consumption failed (non-fatal)");
+        let error = format!("lease unavailable: {e}");
+        let output = serde_json::json!({
+            "error": super::capability_lease_unavailable_message(&name)
+        });
+        emit_and_record(
+            thread,
+            event_tx,
+            EventKind::ActionFailed {
+                step_id: exec_ctx.step_id,
+                action_name: name.clone(),
+                call_id: call_id.clone(),
+                error,
+                params_summary: summarize_params(&name, &params),
+            },
+            &call_id,
+            &name,
+            &output,
+        );
+        let result = serde_json::json!({
+            "output": output,
+            "is_error": true,
+        });
+        return Ok(ExtFunctionResult::Return(json_to_monty(&result)));
     }
 
     // 4. Execute
@@ -1053,7 +1194,7 @@ async fn handle_execute_action(
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
         }
         Err(EngineError::GatePaused {
             gate_name,
@@ -1098,7 +1239,11 @@ async fn handle_execute_action(
                 "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                 "resume_output": resume_output,
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
+        }
+        Err(EngineError::ExecutionStopped) => {
+            let _ = leases.refund_use(lease.id).await;
+            Err(EngineError::ExecutionStopped)
         }
         Err(e) => {
             let output = serde_json::json!({"error": e.to_string()});
@@ -1120,7 +1265,7 @@ async fn handle_execute_action(
                 "output": output,
                 "is_error": true,
             });
-            ExtFunctionResult::Return(json_to_monty(&result))
+            Ok(ExtFunctionResult::Return(json_to_monty(&result)))
         }
     }
 }
@@ -1133,15 +1278,17 @@ async fn handle_execute_action(
 /// Returns a list of result dicts (one per call, in order). Each result has the
 /// same shape as `__execute_action__` output, plus an optional gate pause payload.
 ///
-/// Events are emitted in original call order after all parallel executions complete.
+/// On normal completion, events are emitted in original call order. A stop aborts
+/// and drains unfinished siblings without emitting their events.
 async fn handle_execute_actions_parallel(
     args: &[MontyObject],
     thread: &mut Thread,
     effects: &Arc<dyn EffectExecutor>,
     leases: &Arc<LeaseManager>,
     policy: &Arc<PolicyEngine>,
+    actions_this_step: &mut usize,
     event_tx: Option<&tokio::sync::broadcast::Sender<ThreadEvent>>,
-) -> ExtFunctionResult {
+) -> Result<ExtFunctionResult, EngineError> {
     // Parse the calls list from the first argument (list of dicts)
     let calls_json = args
         .first()
@@ -1150,16 +1297,21 @@ async fn handle_execute_actions_parallel(
     let calls_array = match calls_json.as_array() {
         Some(arr) => arr.clone(),
         None => {
-            return ExtFunctionResult::Error(monty::MontyException::new(
+            return Ok(ExtFunctionResult::Error(monty::MontyException::new(
                 monty::ExcType::TypeError,
                 Some("__execute_actions_parallel__ requires a list of call dicts".into()),
-            ));
+            )));
         }
     };
 
     if calls_array.is_empty() {
-        return ExtFunctionResult::Return(json_to_monty(&serde_json::json!([])));
+        return Ok(ExtFunctionResult::Return(json_to_monty(
+            &serde_json::json!([]),
+        )));
     }
+
+    let first_action_index = *actions_this_step;
+    *actions_this_step = (*actions_this_step).saturating_add(calls_array.len());
 
     // Parse each call dict into (name, params, call_id)
     struct ParsedCall {
@@ -1206,13 +1358,38 @@ async fn handle_execute_actions_parallel(
 
     let mut preflight: Vec<Option<PfOutcome>> = Vec::with_capacity(parsed.len());
 
-    for pc in &parsed {
+    for (idx, pc) in parsed.iter().enumerate() {
+        if first_action_index.saturating_add(idx) >= super::MAX_ACTIONS_PER_STEP {
+            let error = format!(
+                "Tool call limit reached ({} per step). Break your task into multiple steps.",
+                super::MAX_ACTIONS_PER_STEP
+            );
+            let output = serde_json::json!({"error": &error});
+            preflight.push(Some(PfOutcome::Error {
+                result_json: serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                }),
+                event: EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: summarize_params(&pc.name, &pc.params),
+                },
+                output,
+            }));
+            continue;
+        }
+
         // Find lease
         let lease = match leases.find_lease_for_action(thread.id, &pc.name).await {
             Some(l) => l,
             None => {
                 let error = format!("No lease for action '{}'", pc.name);
-                let output = serde_json::json!({"error": &error});
+                let output = serde_json::json!({
+                    "error": super::capability_unavailable_message(&pc.name)
+                });
                 let result_json = serde_json::json!({
                     "output": &output,
                     "is_error": true,
@@ -1243,7 +1420,9 @@ async fn handle_execute_actions_parallel(
         if let Some(ref ad) = action_def {
             match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
                 crate::capability::policy::PolicyDecision::Deny { reason } => {
-                    let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                    let output = serde_json::json!({
+                        "error": super::policy_denied_message(&reason)
+                    });
                     let result_json = serde_json::json!({
                         "output": &output,
                         "is_error": true,
@@ -1279,7 +1458,11 @@ async fn handle_execute_actions_parallel(
                                 thread.events.push(ev);
                                 results_json.push(result_json);
                             }
-                            Some(PfOutcome::Runnable { .. }) | None => {
+                            Some(PfOutcome::Runnable { lease }) => {
+                                let _ = leases.refund_use(lease.id).await;
+                                results_json.push(serde_json::json!(null));
+                            }
+                            None => {
                                 results_json.push(serde_json::json!(null));
                             }
                         }
@@ -1314,8 +1497,8 @@ async fn handle_execute_actions_parallel(
                         })
                         .unwrap_or_default(),
                     }));
-                    return ExtFunctionResult::Return(json_to_monty(&serde_json::json!(
-                        results_json
+                    return Ok(ExtFunctionResult::Return(json_to_monty(
+                        &serde_json::json!(results_json),
                     )));
                 }
                 crate::capability::policy::PolicyDecision::Allow => {}
@@ -1324,7 +1507,25 @@ async fn handle_execute_actions_parallel(
 
         // Consume lease
         if let Err(e) = leases.consume_use(lease.id).await {
-            debug!(error = %e, "lease consumption failed (non-fatal)");
+            let error = format!("lease unavailable: {e}");
+            let output = serde_json::json!({
+                "error": super::capability_lease_unavailable_message(&pc.name)
+            });
+            preflight.push(Some(PfOutcome::Error {
+                result_json: serde_json::json!({
+                    "output": &output,
+                    "is_error": true,
+                }),
+                event: EventKind::ActionFailed {
+                    step_id,
+                    action_name: pc.name.clone(),
+                    call_id: pc.call_id.clone(),
+                    error,
+                    params_summary: summarize_params(&pc.name, &pc.params),
+                },
+                output,
+            }));
+            continue;
         }
 
         preflight.push(Some(PfOutcome::Runnable { lease }));
@@ -1371,11 +1572,12 @@ async fn handle_execute_actions_parallel(
             current_call_id: Some(pc.call_id.clone()),
             source_channel: None,
             supervised_mode: thread.config.supervised_mode,
+            shared_conversation: thread.config.shared_conversation,
             supervised_timeout_secs: thread.config.supervised_timeout_secs,
             prompt_context: Arc::clone(&prompt_context),
         };
         let ps = summarize_params(&pc.name, &pc.params);
-        let (result_json, event, output) = execute_single_action(
+        let execution = execute_single_action(
             effects,
             &pc.name,
             pc.params.clone(),
@@ -1385,6 +1587,14 @@ async fn handle_execute_actions_parallel(
             ps,
         )
         .await;
+        let (result_json, event, output) = match execution {
+            Ok(result) => result,
+            Err(EngineError::ExecutionStopped) => {
+                let _ = leases.refund_use(lease.id).await;
+                return Err(EngineError::ExecutionStopped);
+            }
+            Err(error) => return Err(error),
+        };
         if interrupted_result_needs_refund(&result_json) {
             let _ = leases.refund_use(lease.id).await;
         }
@@ -1396,6 +1606,7 @@ async fn handle_execute_actions_parallel(
         let mut join_set = tokio::task::JoinSet::new();
         let effects = effects.clone();
 
+        let mut pending_lease_uses = Vec::with_capacity(runnable.len());
         for (idx, lease) in runnable {
             let pc_name = parsed[idx].name.clone();
             let pc_params = parsed[idx].params.clone();
@@ -1411,13 +1622,15 @@ async fn handle_execute_actions_parallel(
                 current_call_id: Some(pc_call_id.clone()),
                 source_channel: None,
                 supervised_mode: thread.config.supervised_mode,
+                shared_conversation: thread.config.shared_conversation,
                 supervised_timeout_secs: thread.config.supervised_timeout_secs,
                 prompt_context: Arc::clone(&prompt_context),
             };
             let ps = summarize_params(&pc_name, &pc_params);
 
+            pending_lease_uses.push(lease.id);
             join_set.spawn(async move {
-                let (result_json, event, output) = execute_single_action(
+                let result = execute_single_action(
                     &effects,
                     &pc_name,
                     pc_params,
@@ -1427,24 +1640,49 @@ async fn handle_execute_actions_parallel(
                     ps,
                 )
                 .await;
-                (idx, lease.id, result_json, event, output)
+                (idx, lease.id, result)
             });
         }
 
+        let mut execution_stopped = false;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok((idx, lease_id, result_json, event, output)) => {
-                    if interrupted_result_needs_refund(&result_json) {
-                        let _ = leases.refund_use(lease_id).await;
+                Ok((idx, lease_id, result)) => {
+                    if let Some(position) = pending_lease_uses
+                        .iter()
+                        .position(|pending_id| *pending_id == lease_id)
+                    {
+                        pending_lease_uses.swap_remove(position);
                     }
-                    slot_results[idx] = Some(result_json);
-                    slot_events[idx] = Some(event);
-                    slot_outputs[idx] = Some(output);
+                    match result {
+                        Ok((result_json, event, output)) => {
+                            if interrupted_result_needs_refund(&result_json) {
+                                let _ = leases.refund_use(lease_id).await;
+                            }
+                            slot_results[idx] = Some(result_json);
+                            slot_events[idx] = Some(event);
+                            slot_outputs[idx] = Some(output);
+                        }
+                        Err(EngineError::ExecutionStopped) => {
+                            if !execution_stopped {
+                                execution_stopped = true;
+                                join_set.abort_all();
+                            }
+                            let _ = leases.refund_use(lease_id).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
                 Err(e) => {
-                    debug!("parallel action execution task panicked: {e}");
+                    debug!("parallel action execution task failed: {e}");
                 }
             }
+        }
+        if execution_stopped {
+            for lease_id in pending_lease_uses {
+                let _ = leases.refund_use(lease_id).await;
+            }
+            return Err(EngineError::ExecutionStopped);
         }
     }
 
@@ -1471,7 +1709,9 @@ async fn handle_execute_actions_parallel(
     }
 
     thread.updated_at = chrono::Utc::now();
-    ExtFunctionResult::Return(json_to_monty(&serde_json::json!(results_json)))
+    Ok(ExtFunctionResult::Return(json_to_monty(
+        &serde_json::json!(results_json),
+    )))
 }
 
 /// Execute a single action and return (result_json, event, output) for the
@@ -1484,7 +1724,7 @@ async fn execute_single_action(
     lease: &crate::types::capability::CapabilityLease,
     exec_ctx: &ThreadExecutionContext,
     params_summary: Option<String>,
-) -> (serde_json::Value, EventKind, serde_json::Value) {
+) -> Result<(serde_json::Value, EventKind, serde_json::Value), EngineError> {
     match effects.execute_action(name, params, lease, exec_ctx).await {
         Ok(r) => {
             let event = EventKind::ActionExecuted {
@@ -1501,7 +1741,7 @@ async fn execute_single_action(
                 "is_error": r.is_error,
                 "duration_ms": r.duration.as_millis(),
             });
-            (result_json, event, r.output)
+            Ok((result_json, event, r.output))
         }
         Err(EngineError::GatePaused {
             gate_name,
@@ -1533,8 +1773,9 @@ async fn execute_single_action(
                 "resume_kind": serde_json::to_value(&*resume_kind).unwrap_or_default(),
                 "resume_output": resume_output,
             });
-            (result_json, event, output)
+            Ok((result_json, event, output))
         }
+        Err(EngineError::ExecutionStopped) => Err(EngineError::ExecutionStopped),
         Err(e) => {
             let output = serde_json::json!({"error": e.to_string()});
             let event = EventKind::ActionFailed {
@@ -1548,7 +1789,7 @@ async fn execute_single_action(
                 "output": &output,
                 "is_error": true,
             });
-            (result_json, event, output)
+            Ok((result_json, event, output))
         }
     }
 }
@@ -2292,6 +2533,7 @@ fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
         "stopped" => ThreadOutcome::Stopped,
         "max_iterations" => ThreadOutcome::MaxIterations,
         "failed" => ThreadOutcome::Failed {
+            kind: parse_thread_failure_kind(result),
             error: result
                 .get("error")
                 .and_then(|v| v.as_str())
@@ -2333,6 +2575,27 @@ fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
             }
         }
         _ => ThreadOutcome::Completed { response: None },
+    }
+}
+
+fn parse_thread_failure_kind(result: &serde_json::Value) -> ThreadFailureKind {
+    let Some(value) = result
+        .get("failure_kind")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ThreadFailureKind::Unknown;
+    };
+    if let Some(model_kind) = value
+        .strip_prefix("model_")
+        .and_then(ModelFailureKind::parse)
+    {
+        return ThreadFailureKind::Model(model_kind);
+    }
+    match value {
+        "no_progress" => ThreadFailureKind::NoProgress,
+        "consecutive_errors" => ThreadFailureKind::ConsecutiveErrors,
+        "orchestrator" => ThreadFailureKind::Orchestrator,
+        _ => ThreadFailureKind::Unknown,
     }
 }
 
@@ -2380,13 +2643,14 @@ mod tests {
     use super::*;
     use crate::runtime::messaging::{ThreadSignal, signal_channel};
     use crate::traits::llm::{LlmStream, LlmStreamChunk};
-    use crate::types::capability::CapabilityLease;
+    use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
     use crate::types::memory::{DocType, MemoryDoc};
     use crate::types::message::{MessageRole, TransientContentPart};
     use crate::types::project::ProjectId;
     use crate::types::step::ActionResult;
     use crate::types::thread::{ThreadConfig, ThreadType};
     use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     // ── Python helper unit tests via Monty ──────────────────────
@@ -2778,6 +3042,44 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn simple_goal_classification_is_short_and_conversational() {
+        assert!(eval_python_bool(r#"is_simple_goal("standby for rebuild")"#));
+        assert!(eval_python_bool(r#"is_simple_goal("Thanks!")"#));
+        assert!(eval_python_bool(r#"is_simple_goal("restarted")"#));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("restarted, now run tests")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("standby for rebuild and restart, then test crafted attachment URLs against the SSRF policy")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"is_simple_goal("investigate the orchestrator")"#
+        ));
+    }
+
+    #[test]
+    fn leaked_roleplay_or_meta_classification_is_strong_signal_only() {
+        assert!(eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*chortles* Oops - let me fix that!")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("The answer is 42")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Loops are useful")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("Wrong answers should be corrected with evidence.")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*chortles and flicks tail*")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_leaked_roleplay_or_meta("*Important*")"#
+        ));
+    }
+
     #[tokio::test]
     async fn load_orchestrator_without_store_returns_default() {
         let (code, version) = load_orchestrator(None, ProjectId::new(), true).await;
@@ -3000,9 +3302,19 @@ mod tests {
 
     #[test]
     fn parse_outcome_failed() {
-        let result = serde_json::json!({"outcome": "failed", "error": "boom"});
+        let result = serde_json::json!({
+            "outcome": "failed",
+            "failure_kind": "model_context_overflow",
+            "error": "boom"
+        });
         let outcome = parse_outcome(&result);
-        assert!(matches!(outcome, ThreadOutcome::Failed { error } if error == "boom"));
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(ModelFailureKind::ContextOverflow),
+                error,
+            } if error == "boom"
+        ));
     }
 
     #[test]
@@ -3075,6 +3387,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
@@ -3098,6 +3411,85 @@ mod tests {
     }
 
     struct EmptyEffects;
+
+    struct StoppedEffects;
+
+    struct StopAndHangEffects {
+        started: tokio::sync::Barrier,
+    }
+
+    struct CountingEffects {
+        actions: Vec<ActionDef>,
+        executions: AtomicUsize,
+    }
+
+    struct ExhaustLeaseEffects {
+        leases: Arc<LeaseManager>,
+        executions: AtomicUsize,
+    }
+
+    impl StopAndHangEffects {
+        fn new() -> Self {
+            Self {
+                started: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for CountingEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(self.actions.clone())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ExhaustLeaseEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            self.leases.consume_use(leases[0].id).await?;
+            Ok(vec![test_action_def("echo")])
+        }
+    }
 
     #[async_trait::async_trait]
     impl EffectExecutor for EmptyEffects {
@@ -3123,6 +3515,303 @@ mod tests {
         ) -> Result<Vec<crate::types::capability::ActionDef>, EngineError> {
             Ok(vec![])
         }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StoppedEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Err(EngineError::ExecutionStopped)
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![ActionDef {
+                name: "blocked_tool".into(),
+                description: "blocked tool".into(),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                effects: vec![EffectType::ReadLocal],
+                requires_approval: false,
+            }])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for StopAndHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.started.wait().await;
+            if action_name == "stop_tool" {
+                Err(EngineError::ExecutionStopped)
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![
+                test_action_def("stop_tool"),
+                test_action_def("hang_tool"),
+            ])
+        }
+    }
+
+    fn test_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            name: name.into(),
+            description: format!("{name} test tool"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            effects: vec![EffectType::ReadLocal],
+            requires_approval: false,
+        }
+    }
+
+    fn approval_action_def(name: &str) -> ActionDef {
+        ActionDef {
+            requires_approval: true,
+            ..test_action_def(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn parallel_preflight_approval_refunds_earlier_lease_reservations() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![
+                test_action_def("echo"),
+                approval_action_def("approval_tool"),
+            ],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let args = vec![json_to_monty(&serde_json::json!([
+            {"name": "echo", "params": {}, "call_id": "echo"},
+            {"name": "approval_tool", "params": {}, "call_id": "approval"}
+        ]))];
+
+        let mut actions_this_step = 0;
+        handle_execute_actions_parallel(
+            &args,
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_action_does_not_execute_after_lease_consumption_failure() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let effects = Arc::new(ExhaustLeaseEffects {
+            leases: Arc::clone(&leases),
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let args = vec![
+            MontyObject::String("echo".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let kwargs = vec![(
+            MontyObject::String("call_id".into()),
+            MontyObject::String("echo-call".into()),
+        )];
+
+        let mut actions_this_step = 0;
+        handle_execute_action(
+            HostCallArguments {
+                args: &args,
+                kwargs: &kwargs,
+            },
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &Arc::new(PolicyEngine::new()),
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        assert!(thread.events.iter().any(|event| {
+            matches!(event.kind, EventKind::ActionFailed { ref call_id, .. } if call_id == "echo-call")
+        }));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_action_limit_spans_single_and_parallel_host_calls() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("echo")],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(3))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let mut actions_this_step = super::super::MAX_ACTIONS_PER_STEP - 1;
+
+        handle_execute_action(
+            HostCallArguments {
+                args: &[
+                    MontyObject::String("echo".into()),
+                    json_to_monty(&serde_json::json!({})),
+                ],
+                kwargs: &[(
+                    MontyObject::String("call_id".into()),
+                    MontyObject::String("single".into()),
+                )],
+            },
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        handle_execute_actions_parallel(
+            &[json_to_monty(&serde_json::json!([
+                {"name": "echo", "params": {}, "call_id": "parallel-1"},
+                {"name": "echo", "params": {}, "call_id": "parallel-2"}
+            ]))],
+            &mut thread,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut actions_this_step,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(actions_this_step, super::super::MAX_ACTIONS_PER_STEP + 2);
+        assert_eq!(
+            thread
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    EventKind::ActionFailed { error, .. }
+                        if error.contains("Tool call limit reached")
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrator_action_limit_spans_repeated_code_steps() {
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("echo")],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let args = [
+            MontyObject::String("result = await echo()".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let mut actions_this_step = super::super::MAX_ACTIONS_PER_STEP - 1;
+
+        for _ in 0..2 {
+            handle_execute_code_step(
+                &args,
+                &[],
+                &mut thread,
+                &llm,
+                &effects_dyn,
+                &leases,
+                &policy,
+                &mut actions_this_step,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 1);
+        assert_eq!(actions_this_step, super::super::MAX_ACTIONS_PER_STEP + 1);
+        assert!(thread.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ActionFailed { error, .. }
+                    if error.contains("Tool call limit reached")
+            )
+        }));
     }
 
     #[tokio::test]
@@ -3192,6 +3881,124 @@ mod tests {
                 .messages
                 .iter()
                 .any(|message| message.role == MessageRole::Assistant)
+        );
+    }
+
+    #[tokio::test]
+    async fn host_policy_stop_terminates_without_error_event() {
+        let code = "__execute_action__('blocked_tool', {}, call_id='blocked')\nFINAL('unreached')";
+        let project = ProjectId::new();
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            project,
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StoppedEffects);
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+        let token = CancellationToken::new();
+
+        let result = execute_orchestrator(
+            code,
+            &mut thread,
+            &llm,
+            &effects,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &token,
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            thread
+                .events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ActionFailed { .. }))
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_host_policy_stop_aborts_hanging_sibling() {
+        let code = r#"
+__execute_actions_parallel__([
+    {"name": "stop_tool", "params": {}, "call_id": "stop"},
+    {"name": "hang_tool", "params": {}, "call_id": "hang"},
+])
+FINAL("unreached")
+"#;
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(StopAndHangEffects::new());
+        let leases = Arc::new(LeaseManager::new());
+        let lease = leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(2))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_orchestrator(
+                code,
+                &mut thread,
+                &llm,
+                &effects,
+                &leases,
+                &policy,
+                &mut signal_rx,
+                &CancellationToken::new(),
+                None,
+                None,
+                None,
+                &serde_json::json!({}),
+            ),
+        )
+        .await
+        .expect("stop should abort and drain the hanging sibling promptly")
+        .expect("orchestrator should return Ok");
+
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(
+            thread
+                .events
+                .iter()
+                .all(|event| !matches!(event.kind, EventKind::ActionFailed { .. }))
+        );
+        assert_eq!(
+            leases.check(lease.id).await.unwrap().uses_remaining,
+            Some(2)
         );
     }
 

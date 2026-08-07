@@ -1,5 +1,13 @@
 # Near-Removal Completion Audit
 
+> **Historical point-in-time audit.** The findings and tally below apply to the
+> 2026-07-12 tree only. Several cited active paths (including Nanocode and
+> `lunarcode4lunarwing` surfaces) were removed or retired afterward, while some
+> compatibility aliases intentionally remain. Do not use this verdict as a
+> current removal-status report; re-run the allowlisted search against the target
+> commit and the current [`../specs/Near-Removal.md`](../specs/Near-Removal.md)
+> requirements before making release claims.
+
 **Audited:** 2026-07-12
 **Plan:** `docs/plans/Near-Removal.md` (`plan status: done`, line 4)
 **Method:** static whole-tree `rg -uu -n -i` searches and source/document reads only. `.git/` was excluded; ignored files were included. Negative-result searches excluded this findings file and treated the plan/spec plus historical/generated directories as an explicit allowlist. No Cargo command, build, test, formatter, or linter was run, as required by the task.

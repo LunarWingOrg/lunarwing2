@@ -128,7 +128,11 @@ acquire_ports_lock() {
   LOCK_CALLS=$((LOCK_CALLS + 1))
   PORTS_LOCK_HELD="true"
 }
-release_ports_lock() { PORTS_LOCK_HELD="false"; }
+release_ports_lock() {
+  # Consumed by sourced registry-lock helpers through fixture composition.
+  # shellcheck disable=SC2034
+  PORTS_LOCK_HELD="false"
+}
 ports_registry_init 2>/dev/null
 assert_eq "v11 repair acquires registry lock" "$LOCK_CALLS" "1"
 assert_eq "v11 repair assigns darkirc adapter" \

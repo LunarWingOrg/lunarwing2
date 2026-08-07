@@ -121,8 +121,6 @@ const _streamSnapshots = new Map();
 let _chatScrollFrame = null;
 let _chatAutoScroll = true;
 let _chatScrollForced = false;
-let _codeHighlightFrame = null;
-const _codeHighlightRoots = new Set();
 
 // --- Connection Status Banner State ---
 let _connectionLostTimer = null;
@@ -163,11 +161,15 @@ let _slashMatches = [];
 let _activeGroup = null;
 let _activeToolCards = {};
 let _activityThinking = null;
+let _activityReasoning = null;
+let _activityReasoningDecisions = new Map();
+const LIVE_WORK_MAX_CHARS = 12000;
 
 // --- Auth ---
 
 function authenticate() {
   token = document.getElementById('token-input').value.trim();
+  _authExpired = false; // allow a future expiry to trigger the auth screen again
   if (!token) {
     document.getElementById('auth-error').textContent = I18n.t('auth.errorRequired');
     return;
@@ -265,6 +267,36 @@ document.getElementById('token-input').addEventListener('keydown', (e) => {
 
 // --- API helper ---
 
+// M7: a revoked/rotated token used to leave the UI in an infinite reconnect
+// loop. Route any 401/403 back to the auth screen exactly once.
+let _authExpired = false;
+
+function handleAuthExpiry() {
+  if (_authExpired) return;
+  _authExpired = true;
+  sessionStorage.removeItem('lunarwing_token');
+  token = '';
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  if (logEventSource) { logEventSource.close(); logEventSource = null; }
+  if (gatewayStatusInterval) { clearInterval(gatewayStatusInterval); gatewayStatusInterval = null; }
+  stopPairingPoll();
+  if (_connectionLostTimer) { clearTimeout(_connectionLostTimer); _connectionLostTimer = null; }
+  const banner = document.getElementById('connection-banner');
+  if (banner) banner.remove();
+  const app = document.getElementById('app');
+  if (app) {
+    app.classList.remove('visible');
+    app.style.display = 'none';
+  }
+  const authScreen = document.getElementById('auth-screen');
+  if (authScreen) {
+    authScreen.style.display = '';
+    authScreen.style.opacity = '';
+  }
+  const errEl = document.getElementById('auth-error');
+  if (errEl) errEl.textContent = I18n.t('auth.sessionExpired');
+}
+
 function apiFetch(path, options) {
   const opts = options || {};
   opts.headers = opts.headers || {};
@@ -274,6 +306,9 @@ function apiFetch(path, options) {
     opts.body = JSON.stringify(opts.body);
   }
   return fetch(path, opts).then((res) => {
+    if (res.status === 401 || res.status === 403) {
+      handleAuthExpiry();
+    }
     if (!res.ok) {
       return res.text().then(function(body) {
         const err = new Error(body || (res.status + ' ' + res.statusText));
@@ -395,10 +430,45 @@ function saveCaveponyMode(requestedMode) {
 
 let isRestarting = false; // Track if we're currently restarting
 let restartEnabled = false; // Track if restart is available in this deployment
+// M8: watchdog that swaps the restart loader to an error state (with an
+// escape hatch) when the process does not come back in time.
+const RESTART_WATCHDOG_MS = 90000;
+let _restartWatchdog = null;
+
+function showRestartLoader() {
+  const loaderEl = document.getElementById('restart-loader');
+  document.getElementById('restart-loader-progress').style.display = '';
+  document.getElementById('restart-loader-error').style.display = 'none';
+  loaderEl.style.display = 'flex';
+  if (_restartWatchdog) clearTimeout(_restartWatchdog);
+  _restartWatchdog = setTimeout(() => {
+    _restartWatchdog = null;
+    document.getElementById('restart-loader-progress').style.display = 'none';
+    document.getElementById('restart-loader-error').style.display = '';
+  }, RESTART_WATCHDOG_MS);
+}
+
+function hideRestartLoader(keepWatchdog) {
+  if (!keepWatchdog && _restartWatchdog) {
+    clearTimeout(_restartWatchdog);
+    _restartWatchdog = null;
+  }
+  const loaderEl = document.getElementById('restart-loader');
+  if (loaderEl) loaderEl.style.display = 'none';
+}
+
+function dismissRestartLoader() {
+  hideRestartLoader();
+  isRestarting = false;
+  const restartBtn = document.getElementById('restart-btn');
+  const restartIcon = document.getElementById('restart-icon');
+  if (restartBtn) restartBtn.disabled = false;
+  if (restartIcon) restartIcon.classList.remove('spinning');
+}
 
 function triggerRestart() {
   if (!currentThreadId) {
-    alert(I18n.t('error.startConversation'));
+    showToast(I18n.t('error.startConversation'), 'error');
     return;
   }
 
@@ -409,7 +479,7 @@ function triggerRestart() {
 
 function confirmRestart() {
   if (!currentThreadId) {
-    alert(I18n.t('error.startConversation'));
+    showToast(I18n.t('error.startConversation'), 'error');
     return;
   }
 
@@ -425,12 +495,10 @@ function confirmRestart() {
   restartBtn.disabled = true;
   if (restartIcon) restartIcon.classList.add('spinning');
 
-  // Show progress modal
-  const loaderEl = document.getElementById('restart-loader');
-  loaderEl.style.display = 'flex';
+  // Show progress modal (with watchdog escape hatch)
+  showRestartLoader();
 
   // Send restart command via chat
-  console.log('[confirmRestart] Sending /restart command to server');
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: {
@@ -439,16 +507,10 @@ function confirmRestart() {
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     },
   })
-    .then((response) => {
-      console.log('[confirmRestart] API call succeeded, response:', response);
-    })
     .catch((err) => {
       console.error('[confirmRestart] Restart request failed:', err);
       addMessage('system', I18n.t('error.restartFailed', { message: err.message }));
-      isRestarting = false;
-      restartBtn.disabled = false;
-      if (restartIcon) restartIcon.classList.remove('spinning');
-      loaderEl.style.display = 'none';
+      dismissRestartLoader();
     });
 }
 
@@ -466,9 +528,8 @@ function tryShowRestartModal() {
     restartBtn.disabled = true;
     if (restartIcon) restartIcon.classList.add('spinning');
 
-    // Show progress modal
-    const loaderEl = document.getElementById('restart-loader');
-    loaderEl.style.display = 'flex';
+    // Show progress modal (with watchdog escape hatch)
+    showRestartLoader();
   }
 }
 
@@ -492,6 +553,7 @@ function connectSSE() {
 
   eventSource.onopen = () => {
     document.getElementById('sse-dot').classList.remove('disconnected');
+    document.getElementById('mobile-status-dot').classList.remove('disconnected');
     document.getElementById('sse-status').textContent = I18n.t('status.connected');
     _reconnectAttempts = 0;
 
@@ -502,7 +564,7 @@ function connectSSE() {
     }
     const lostBanner = document.getElementById('connection-banner');
     if (lostBanner) {
-      lostBanner.textContent = 'Reconnected';
+      lostBanner.textContent = I18n.t('status.reconnected');
       lostBanner.className = 'connection-banner connection-banner-success';
       setTimeout(() => { lostBanner.remove(); }, 2000);
       _connectionLostAt = null;
@@ -510,13 +572,7 @@ function connectSSE() {
 
     // If we were restarting, close the modal and reset button now that server is back
     if (isRestarting) {
-      const loaderEl = document.getElementById('restart-loader');
-      if (loaderEl) loaderEl.style.display = 'none';
-      const restartBtn = document.getElementById('restart-btn');
-      const restartIcon = document.getElementById('restart-icon');
-      if (restartBtn) restartBtn.disabled = false;
-      if (restartIcon) restartIcon.classList.remove('spinning');
-      isRestarting = false;
+      dismissRestartLoader();
     }
 
     if (sseHasConnectedBefore && currentThreadId) {
@@ -531,12 +587,20 @@ function connectSSE() {
   eventSource.onerror = () => {
     _reconnectAttempts++;
     document.getElementById('sse-dot').classList.add('disconnected');
+    document.getElementById('mobile-status-dot').classList.add('disconnected');
     document.getElementById('sse-status').textContent = I18n.t('status.reconnecting');
+
+    // M7: EventSource retries forever on any error, including 401s.
+    // Probe once per disconnect streak so an expired token routes back
+    // to the auth screen instead of an endless reconnect loop.
+    if (_reconnectAttempts === 2) {
+      apiFetch('/api/chat/threads').catch(() => {});
+    }
 
     // Update existing banner with attempt count
     const existingBanner = document.getElementById('connection-banner');
     if (existingBanner && existingBanner.classList.contains('connection-banner-warning')) {
-      existingBanner.textContent = 'Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')';
+      existingBanner.textContent = I18n.t('status.connectionLost', { attempt: _reconnectAttempts });
     }
 
     // Start connection-lost banner timer (3s delay)
@@ -547,7 +611,7 @@ function connectSSE() {
         // Only show if still disconnected
         const dot = document.getElementById('sse-dot');
         if (dot?.classList.contains('disconnected')) {
-          showConnectionBanner('Connection lost. Reconnecting... (attempt ' + _reconnectAttempts + ')', 'warning');
+          showConnectionBanner(I18n.t('status.connectionLost', { attempt: _reconnectAttempts }), 'warning');
         }
       }, 3000);
     }
@@ -564,10 +628,9 @@ function connectSSE() {
       return;
     }
 
+    finishStreamingWork(data.thread_id);
     finalizeActivityGroup();
-    if (!finalizeStreamingMessage(data.thread_id, data.content)) {
-      addMessage('assistant', data.content);
-    }
+    addMessage('assistant', data.content);
     enableChatInput();
     // Refresh thread list so new titles appear after first message
     debouncedLoadThreads();
@@ -586,6 +649,12 @@ function connectSSE() {
     }
     clearSuggestionChips();
     showActivityThinking(data.message);
+  });
+
+  eventSource.addEventListener('reasoning_update', (e) => {
+    const data = JSON.parse(e.data);
+    if (!isCurrentThread(data.thread_id)) return;
+    showActivityReasoning(data.narrative, data.decisions || []);
   });
 
   eventSource.addEventListener('suggestions', (e) => {
@@ -622,7 +691,6 @@ function connectSSE() {
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) return;
-    finalizeActivityGroup();
     getOrCreateStreamingMessage(data.thread_id);
     _streamBuffer += data.content || '';
     scheduleStreamRender();
@@ -642,6 +710,7 @@ function connectSSE() {
     // the response SSE event is empty or lost.
     // Status text is not displayed — inline activity cards handle visual feedback.
     if (data.message === 'Done' || data.message === 'Awaiting approval') {
+      finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       enableChatInput();
     }
@@ -695,7 +764,7 @@ function connectSSE() {
         clearStreamingSnapshot(data.thread_id);
         return;
       }
-      clearStreamingSnapshot(data.thread_id);
+      finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       addMessage('system', 'Error: ' + data.message);
       enableChatInput();
@@ -842,13 +911,17 @@ function sendMessage() {
     renderImagePreviews();
   }
 
+  sendChatPayload(body, userMsg);
+}
+
+function sendChatPayload(body, userMsg) {
   apiFetch('/api/chat/send', {
     method: 'POST',
     body: body,
   }).catch((err) => {
     // Handle rate limiting (429)
     if (err.status === 429) {
-      showToast('Rate limited. Please wait.', 'error');
+      showToast(I18n.t('chat.rateLimited'), 'error');
       _sendCooldown = true;
       const sendBtn = document.getElementById('send-btn');
       if (sendBtn) sendBtn.disabled = true;
@@ -857,19 +930,21 @@ function sendMessage() {
         if (sendBtn) sendBtn.disabled = false;
       }, 2000);
     }
-    // Keep the user message in DOM, add a retry link
+    // Keep the user message in DOM, add a retry link. M10: the retry
+    // resubmits the original payload, including any image attachments.
     if (userMsg) {
       userMsg.classList.add('send-failed');
       userMsg.style.borderStyle = 'dashed';
       const retryLink = document.createElement('a');
       retryLink.className = 'retry-link';
       retryLink.href = '#';
-      retryLink.textContent = 'Retry';
+      retryLink.textContent = I18n.t('chat.retry');
       retryLink.addEventListener('click', (e) => {
         e.preventDefault();
-        if (userMsg.parentNode) userMsg.parentNode.removeChild(userMsg);
-        input.value = content;
-        sendMessage();
+        retryLink.remove();
+        userMsg.classList.remove('send-failed');
+        userMsg.style.borderStyle = '';
+        sendChatPayload(body, userMsg);
       });
       userMsg.appendChild(retryLink);
     }
@@ -916,20 +991,42 @@ function renderImagePreviews() {
 
 const MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024; // 5 MB per image
 const MAX_STAGED_IMAGES = 5;
+// Readers that have been started but not yet pushed into stagedImages.
+// Counting them reserves slots so concurrent batches cannot exceed the
+// staging limit (M11).
+let _pendingImageReads = 0;
 
 function handleImageFiles(files) {
+  // Validate and slice synchronously: stagedImages only grows inside async
+  // FileReader callbacks, so checking it per file in this loop would let a
+  // multi-file selection overshoot MAX_STAGED_IMAGES.
+  const available = MAX_STAGED_IMAGES - stagedImages.length - _pendingImageReads;
+  const accepted = [];
+  let rejectedSize = 0;
+  let rejectedOverflow = 0;
   Array.from(files).forEach(file => {
     if (!file.type.startsWith('image/')) return;
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      alert(`Image "${file.name}" exceeds 5 MB limit (${(file.size / 1024 / 1024).toFixed(1)} MB)`);
+      rejectedSize++;
       return;
     }
-    if (stagedImages.length >= MAX_STAGED_IMAGES) {
-      alert(`Maximum ${MAX_STAGED_IMAGES} images allowed per message`);
+    if (accepted.length >= available) {
+      rejectedOverflow++;
       return;
     }
+    accepted.push(file);
+  });
+  if (rejectedSize > 0) {
+    showToast(I18n.t('chat.imageTooLarge', { count: rejectedSize }), 'error');
+  }
+  if (rejectedOverflow > 0) {
+    showToast(I18n.t('chat.imageLimit', { max: MAX_STAGED_IMAGES }), 'error');
+  }
+  accepted.forEach(file => {
+    _pendingImageReads++;
     const reader = new FileReader();
     reader.onload = function(e) {
+      _pendingImageReads--;
       const dataUrl = e.target.result;
       const commaIdx = dataUrl.indexOf(',');
       const meta = dataUrl.substring(0, commaIdx); // e.g. "data:image/png;base64"
@@ -937,6 +1034,10 @@ function handleImageFiles(files) {
       const mediaType = meta.replace('data:', '').replace(';base64', '');
       stagedImages.push({ media_type: mediaType, data: base64, dataUrl: dataUrl });
       renderImagePreviews();
+    };
+    reader.onerror = function() {
+      _pendingImageReads--;
+      showToast(I18n.t('chat.imageReadFailed'), 'error');
     };
     reader.readAsDataURL(file);
   });
@@ -1091,7 +1192,7 @@ function sendApprovalAction(requestId, action) {
 }
 
 function renderMarkdown(text) {
-  if (typeof marked !== 'undefined') {
+  if (typeof marked !== 'undefined' && typeof DOMPurify !== 'undefined') {
     // Escape raw HTML error pages instead of rendering them as markup.
     // Only triggers when the text *starts with* a doctype or <html> tag
     // (after optional whitespace), so normal messages that mention HTML
@@ -1106,7 +1207,10 @@ function renderMarkdown(text) {
     html = html.replace(/<pre>/g, '<pre class="code-block-wrapper"><button class="copy-btn" data-action="copy-code">Copy</button>');
     return html;
   }
-  return escapeHtml(text);
+  // Degraded mode (marked or DOMPurify failed to load): never inject
+  // unsanitized HTML — show the message content as escaped plain text
+  // with line breaks preserved instead of a blank or unformatted blob.
+  return escapeHtml(text).replace(/\n/g, '<br>');
 }
 
 // Sanitize rendered HTML using DOMPurify to prevent XSS from tool output
@@ -1121,7 +1225,8 @@ function sanitizeRenderedHtml(html) {
       FORBID_ATTR: ['style', 'onerror', 'onload']
     });
   }
-  // DOMPurify not available (CDN unreachable) — return empty string rather than unsanitized HTML
+  // DOMPurify not available — never return unsanitized HTML. Callers
+  // (renderMarkdown) fall back to escaped plain text before reaching this.
   return '';
 }
 
@@ -1196,21 +1301,6 @@ function scheduleChatScrollToBottom(force) {
   });
 }
 
-function scheduleCodeHighlight(root) {
-  if (typeof hljs === 'undefined') return;
-  _codeHighlightRoots.add(root);
-  if (_codeHighlightFrame !== null) return;
-  _codeHighlightFrame = requestAnimationFrame(() => {
-    _codeHighlightFrame = null;
-    for (const highlightRoot of _codeHighlightRoots) {
-      highlightRoot.querySelectorAll('pre code').forEach((block) => {
-        hljs.highlightElement(block);
-      });
-    }
-    _codeHighlightRoots.clear();
-  });
-}
-
 function addMessage(role, content) {
   const container = document.getElementById('chat-messages');
   maybeInsertTimeSeparator(container);
@@ -1246,7 +1336,11 @@ function hasActiveStreamForThread(threadId) {
 
 function stashStreamingState() {
   if (_streamingThreadId) {
-    _streamSnapshots.set(_streamingThreadId, currentStreamingText());
+    let text = currentStreamingText();
+    if (text.length > LIVE_WORK_MAX_CHARS) {
+      text = '... earlier live work omitted ...\n' + text.slice(-LIVE_WORK_MAX_CHARS);
+    }
+    _streamSnapshots.set(_streamingThreadId, text);
   }
   resetStreamingState();
 }
@@ -1267,11 +1361,32 @@ function getOrCreateStreamingMessage(threadId) {
 
   const initialText = _streamSnapshots.get(threadId) || '';
   _streamSnapshots.delete(threadId);
-  const container = document.getElementById('chat-messages');
-  maybeInsertTimeSeparator(container);
-  const message = createMessageElement('assistant', initialText, { plainText: true, streaming: true });
+  const group = getOrCreateActivityGroup();
+  const message = document.createElement('div');
+  message.className = 'activity-live-work';
   message.setAttribute('data-streaming', 'true');
-  container.appendChild(message);
+
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'activity-detail-header expanded';
+  header.setAttribute('aria-expanded', 'true');
+  header.innerHTML = '<span class="activity-detail-chevron">&#9656;</span>'
+    + '<span class="activity-detail-label">Live work</span>';
+
+  const body = document.createElement('div');
+  body.className = 'activity-live-work-body expanded';
+  const output = document.createElement('pre');
+  output.className = 'activity-live-work-output';
+  output.textContent = initialText;
+  body.appendChild(output);
+  header.addEventListener('click', () => {
+    const expanded = body.classList.toggle('expanded');
+    header.classList.toggle('expanded', expanded);
+    header.setAttribute('aria-expanded', String(expanded));
+  });
+  message.appendChild(header);
+  message.appendChild(body);
+  group.appendChild(message);
   _streamParts = initialText ? [initialText] : [];
   _streamingMessage = message;
   _streamingThreadId = threadId;
@@ -1284,11 +1399,14 @@ function flushStreamBuffer() {
   const chunk = _streamBuffer;
   _streamBuffer = '';
   _streamParts.push(chunk);
-  const content = _streamingMessage.querySelector('.message-content');
-  if (content?.firstChild) {
-    content.firstChild.appendData(chunk);
-  } else if (content) {
-    content.appendChild(document.createTextNode(chunk));
+  let text = _streamParts.join('');
+  if (text.length > LIVE_WORK_MAX_CHARS) {
+    text = '... earlier live work omitted ...\n' + text.slice(-LIVE_WORK_MAX_CHARS);
+    _streamParts = [text];
+  }
+  const content = _streamingMessage.querySelector('.activity-live-work-output');
+  if (content) {
+    content.textContent = text;
   }
   scheduleChatScrollToBottom();
 }
@@ -1301,38 +1419,23 @@ function scheduleStreamRender() {
   });
 }
 
-function finalizeStreamingMessage(threadId, content) {
+function finishStreamingWork(threadId) {
   _streamSnapshots.delete(threadId);
-  if (!_streamingMessage?.isConnected || _streamingThreadId !== threadId) {
-    return false;
+  if (_streamingThreadId === threadId) {
+    if (_streamRenderFrame !== null) {
+      cancelAnimationFrame(_streamRenderFrame);
+      _streamRenderFrame = null;
+    }
+    flushStreamBuffer();
+    resetStreamingState();
   }
-
-  if (_streamRenderFrame !== null) cancelAnimationFrame(_streamRenderFrame);
-  const message = _streamingMessage;
-  const streamedText = currentStreamingText();
-  const finalText = typeof content === 'string' ? content : streamedText;
-  _streamRenderFrame = null;
-  _streamBuffer = '';
-  _streamParts = [];
-  _streamingMessage = null;
-  _streamingThreadId = null;
-
-  message.removeAttribute('data-streaming');
-  message.setAttribute('data-raw', finalText);
-  message.removeAttribute('data-copy-text');
-  const contentElement = message.querySelector('.message-content');
-  if (contentElement) {
-    contentElement.innerHTML = renderMarkdown(finalText);
-    scheduleCodeHighlight(contentElement);
-  }
-  scheduleChatScrollToBottom();
-  return true;
 }
 
 // --- Inline Tool Activity Cards ---
 
 function getOrCreateActivityGroup() {
-  if (_activeGroup) return _activeGroup;
+  if (_activeGroup?.isConnected) return _activeGroup;
+  resetActivityState();
   const container = document.getElementById('chat-messages');
   const group = document.createElement('div');
   group.className = 'activity-group';
@@ -1340,7 +1443,20 @@ function getOrCreateActivityGroup() {
   scheduleChatScrollToBottom();
   _activeGroup = group;
   _activeToolCards = {};
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
   return group;
+}
+
+function resetActivityState() {
+  for (const name in _activeToolCards) {
+    for (const entry of _activeToolCards[name]) clearInterval(entry.timer);
+  }
+  _activeGroup = null;
+  _activeToolCards = {};
+  _activityThinking = null;
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
 }
 
 function showActivityThinking(message) {
@@ -1370,6 +1486,35 @@ function removeActivityThinking() {
     _activityThinking.remove();
     _activityThinking = null;
   }
+}
+
+function showActivityReasoning(narrative, decisions) {
+  const group = getOrCreateActivityGroup();
+  for (const decision of decisions) {
+    if (decision?.tool_name) {
+      _activityReasoningDecisions.set(decision.tool_name, decision.rationale || '');
+    }
+  }
+  const decisionCount = _activityReasoningDecisions.size;
+  const generatedNarrative = /^Selected \d+ tools? based on task requirements and available context\.$/.test(narrative || '');
+  const toolWord = decisionCount === 1 ? 'tool' : 'tools';
+  const reasoning = {
+    narrative: generatedNarrative
+      ? 'Selected ' + decisionCount + ' ' + toolWord + ' based on task requirements and available context.'
+      : (narrative || 'Selected tools based on task requirements and available context.'),
+    decisions: Array.from(_activityReasoningDecisions, ([tool_name, rationale]) => ({
+      tool_name,
+      rationale,
+    })),
+  };
+  if (!_activityReasoning) {
+    _activityReasoning = createReasoningSummaryElement(reasoning, true);
+    _activityReasoning.classList.add('activity-reasoning');
+    group.appendChild(_activityReasoning);
+  } else {
+    renderReasoningSummary(_activityReasoning, reasoning);
+  }
+  scheduleChatScrollToBottom();
 }
 
 function addToolCard(name) {
@@ -1529,32 +1674,35 @@ function finalizeActivityGroup() {
     }
   }
 
-  if (toolCount === 0) {
-    // No tools were used — remove the empty group
+  const detailNodes = Array.from(_activeGroup.children);
+  if (detailNodes.length === 0) {
     _activeGroup.remove();
     _activeGroup = null;
     _activeToolCards = {};
+    _activityReasoning = null;
+    _activityReasoningDecisions = new Map();
     return;
   }
 
-  // Wrap existing cards into a hidden container
+  // Keep live work, reasoning, and tools together under one durable work-log rail.
   const cardsContainer = document.createElement('div');
   cardsContainer.className = 'activity-cards-container';
   cardsContainer.style.display = 'none';
 
-  const cards = _activeGroup.querySelectorAll('.activity-tool-card');
-  for (let k = 0; k < cards.length; k++) {
-    cardsContainer.appendChild(cards[k]);
+  for (const node of detailNodes) {
+    cardsContainer.appendChild(node);
   }
 
   // Build summary line
   const durationStr = totalDuration < 10 ? totalDuration.toFixed(1) + 's' : Math.floor(totalDuration) + 's';
   const toolWord = toolCount === 1 ? 'tool' : 'tools';
+  const summaryText = toolCount > 0 ? 'Work log - Used ' + toolCount + ' ' + toolWord : 'Work log';
   const summary = document.createElement('div');
   summary.className = 'activity-summary';
   summary.innerHTML = '<span class="activity-summary-chevron">&#9656;</span>'
-    + '<span class="activity-summary-text">Used ' + toolCount + ' ' + toolWord + '</span>'
-    + '<span class="activity-summary-duration">(' + durationStr + ')</span>';
+    + '<span class="activity-summary-text"></span>'
+    + (toolCount > 0 ? '<span class="activity-summary-duration">(' + durationStr + ')</span>' : '');
+  summary.querySelector('.activity-summary-text').textContent = summaryText;
 
   summary.addEventListener('click', () => {
     const isOpen = cardsContainer.style.display !== 'none';
@@ -1570,6 +1718,8 @@ function finalizeActivityGroup() {
 
   _activeGroup = null;
   _activeToolCards = {};
+  _activityReasoning = null;
+  _activityReasoningDecisions = new Map();
 }
 
 function humanizeToolName(rawName) {
@@ -1693,6 +1843,7 @@ function showJobCard(data) {
     browseBtn.className = 'job-card-browse';
     browseBtn.href = data.browse_url;
     browseBtn.target = '_blank';
+    browseBtn.rel = 'noopener noreferrer';
     browseBtn.textContent = I18n.t('jobs.browse');
     card.appendChild(browseBtn);
   }
@@ -1806,6 +1957,7 @@ function showAuthCard(data) {
     const setupLink = document.createElement('a');
     setupLink.href = data.setup_url;
     setupLink.target = '_blank';
+    setupLink.rel = 'noopener noreferrer';
     setupLink.textContent = I18n.t('authRequired.getToken');
     links.appendChild(setupLink);
   }
@@ -1982,17 +2134,22 @@ function loadHistory(before) {
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
         if (turn.user_input) {
-          maybeInsertTimeSeparator(fragment);
-          fragment.appendChild(createMessageElement('user', turn.user_input));
+          maybeInsertTimeSeparator(fragment, turn.started_at);
+          fragment.appendChild(createMessageElement('user', turn.user_input, { timestamp: turn.started_at }));
+        }
+        if (turn.reasoning) {
+          fragment.appendChild(createReasoningSummaryElement(turn.reasoning, false));
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
         if (turn.response) {
-          maybeInsertTimeSeparator(fragment);
-          fragment.appendChild(createMessageElement('assistant', turn.response));
+          const responseTs = turn.completed_at || turn.started_at;
+          maybeInsertTimeSeparator(fragment, responseTs);
+          fragment.appendChild(createMessageElement('assistant', turn.response, { timestamp: responseTs }));
         }
       }
+      resetActivityState();
       container.replaceChildren(fragment);
       // Show welcome card when history is empty
       if (data.turns.length === 0) {
@@ -2023,14 +2180,17 @@ function loadHistory(before) {
       const fragment = document.createDocumentFragment();
       for (const turn of data.turns) {
         if (turn.user_input) {
-          const userDiv = createMessageElement('user', turn.user_input);
+          const userDiv = createMessageElement('user', turn.user_input, { timestamp: turn.started_at });
           fragment.appendChild(userDiv);
+        }
+        if (turn.reasoning) {
+          fragment.appendChild(createReasoningSummaryElement(turn.reasoning, false));
         }
         if (turn.tool_calls && turn.tool_calls.length > 0) {
           fragment.appendChild(createToolCallsSummaryElement(turn.tool_calls));
         }
         if (turn.response) {
-          const assistantDiv = createMessageElement('assistant', turn.response);
+          const assistantDiv = createMessageElement('assistant', turn.response, { timestamp: turn.completed_at || turn.started_at });
           fragment.appendChild(assistantDiv);
         }
       }
@@ -2058,7 +2218,11 @@ function createMessageElement(role, content, options) {
 
   const ts = document.createElement('span');
   ts.className = 'message-timestamp';
-  ts.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  // M6: history loads pass the server timestamp via options.timestamp so
+  // reloaded threads show real send times instead of the page-load time.
+  let tsDate = options && options.timestamp ? new Date(options.timestamp) : new Date();
+  if (isNaN(tsDate.getTime())) tsDate = new Date();
+  ts.textContent = tsDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   div.appendChild(ts);
 
   // Message content
@@ -2072,7 +2236,6 @@ function createMessageElement(role, content, options) {
       contentEl.textContent = content;
     } else {
       contentEl.innerHTML = renderMarkdown(content);
-      scheduleCodeHighlight(contentEl);
     }
   }
   div.appendChild(contentEl);
@@ -2099,6 +2262,62 @@ function addToolCallsSummary(toolCalls) {
   const container = document.getElementById('chat-messages');
   container.appendChild(createToolCallsSummaryElement(toolCalls));
   scheduleChatScrollToBottom();
+}
+
+function createReasoningSummaryElement(reasoning, expanded) {
+  const div = document.createElement('div');
+  div.className = 'reasoning-summary';
+
+  const header = document.createElement('button');
+  header.type = 'button';
+  header.className = 'reasoning-summary-header';
+  header.setAttribute('aria-expanded', String(!!expanded));
+  header.innerHTML = '<span class="reasoning-summary-chevron">&#9656;</span>'
+    + '<span>Reasoning summary</span>';
+
+  const body = document.createElement('div');
+  body.className = 'reasoning-summary-body';
+  if (expanded) {
+    header.classList.add('expanded');
+    body.classList.add('expanded');
+  }
+  header.addEventListener('click', () => {
+    const isExpanded = body.classList.toggle('expanded');
+    header.classList.toggle('expanded', isExpanded);
+    header.setAttribute('aria-expanded', String(isExpanded));
+  });
+
+  const narrative = document.createElement('div');
+  narrative.className = 'reasoning-summary-narrative';
+  const decisions = document.createElement('div');
+  decisions.className = 'reasoning-summary-decisions';
+  body.appendChild(narrative);
+  body.appendChild(decisions);
+  div.appendChild(header);
+  div.appendChild(body);
+  renderReasoningSummary(div, reasoning);
+  return div;
+}
+
+function renderReasoningSummary(element, reasoning) {
+  const narrative = element.querySelector('.reasoning-summary-narrative');
+  const decisions = element.querySelector('.reasoning-summary-decisions');
+  if (narrative) narrative.textContent = reasoning?.narrative || '';
+  if (!decisions) return;
+  decisions.replaceChildren();
+  for (const decision of reasoning?.decisions || []) {
+    const row = document.createElement('div');
+    row.className = 'reasoning-decision';
+    const tool = document.createElement('span');
+    tool.className = 'reasoning-decision-tool';
+    tool.textContent = decision.tool_name;
+    const rationale = document.createElement('span');
+    rationale.className = 'reasoning-decision-rationale';
+    rationale.textContent = decision.rationale;
+    row.appendChild(tool);
+    row.appendChild(rationale);
+    decisions.appendChild(row);
+  }
 }
 
 function createToolCallsSummaryElement(toolCalls) {
@@ -2471,7 +2690,7 @@ document.getElementById('chat-messages').addEventListener('scroll', function () 
     const spinner = document.createElement('div');
     spinner.id = 'scroll-load-spinner';
     spinner.className = 'scroll-load-spinner';
-    spinner.innerHTML = '<div class="spinner"></div> Loading older messages...';
+    spinner.innerHTML = '<div class="spinner"></div> ' + escapeHtml(I18n.t('chat.loadingOlder'));
     this.insertBefore(spinner, this.firstChild);
     loadHistory(oldestTimestamp);
   }
@@ -2557,6 +2776,12 @@ window.addEventListener('resize', scheduleTabIndicatorUpdate);
 let memorySearchTimeout = null;
 let currentMemoryPath = null;
 let currentMemoryContent = null;
+// Monotonic guard against out-of-order memory reads (H3)
+let _memoryReadRequestId = 0;
+// Path captured when the editor was opened; save refuses mismatches (H3)
+let memoryEditorPath = null;
+// Baseline for dirty-state tracking of the memory editor (M12)
+let _memoryEditBaseline = null;
 // Tree state: nested nodes persisted across renders
 // { name, path, is_dir, children: [] | null, expanded: bool, loaded: bool }
 let memoryTreeState = null;
@@ -2583,14 +2808,29 @@ function loadMemoryTree() {
       loaded: false,
     }));
     renderTree();
-  }).catch(() => {});
+  }).catch((err) => {
+    // L1: a failed load must not look like an empty workspace
+    memoryTreeState = null;
+    const container = document.getElementById('memory-tree');
+    container.innerHTML = '';
+    const row = document.createElement('div');
+    row.className = 'tree-item';
+    row.style.color = 'var(--text-secondary)';
+    row.textContent = I18n.t('memory.loadFailed') + ': ' + err.message + ' ';
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'btn-secondary';
+    retryBtn.textContent = I18n.t('chat.retry');
+    retryBtn.addEventListener('click', () => loadMemoryTree());
+    row.appendChild(retryBtn);
+    container.appendChild(row);
+  });
 }
 
 function renderTree() {
   const container = document.getElementById('memory-tree');
   container.innerHTML = '';
   if (!memoryTreeState || memoryTreeState.length === 0) {
-    container.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No files in workspace</div>';
+    container.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">' + escapeHtml(I18n.t('memory.empty')) + '</div>';
     return;
   }
   renderNodes(memoryTreeState, container, 0);
@@ -2676,17 +2916,50 @@ function toggleExpand(node) {
   }).catch(() => {});
 }
 
+function isMemoryEditDirty() {
+  const editor = document.getElementById('memory-editor');
+  if (!editor || editor.style.display === 'none') return false;
+  if (_memoryEditBaseline === null) return false;
+  return document.getElementById('memory-edit-textarea').value !== _memoryEditBaseline;
+}
+
 function readMemoryFile(path) {
+  // M12: never silently discard unsaved edits when switching files
+  if (path !== currentMemoryPath && isMemoryEditDirty()) {
+    showConfirmModal(
+      I18n.t('memory.unsavedTitle'),
+      I18n.t('memory.unsavedMessage', { path: currentMemoryPath }),
+      function () {
+        _memoryEditBaseline = null;
+        memoryEditorPath = null;
+        readMemoryFile(path);
+      },
+      I18n.t('btn.discard'),
+      'btn-danger'
+    );
+    return;
+  }
+
   currentMemoryPath = path;
   // Update breadcrumb
   document.getElementById('memory-breadcrumb-path').innerHTML = buildBreadcrumb(path);
-  document.getElementById('memory-edit-btn').style.display = 'inline-block';
 
   // Exit edit mode if active
   cancelMemoryEdit();
 
+  // H3: clear stale content, show a loading state, and hide Edit while the
+  // read is in flight so the editor can never open another file's content.
+  const requestId = ++_memoryReadRequestId;
+  currentMemoryContent = null;
+  document.getElementById('memory-edit-btn').style.display = 'none';
+  const viewer = document.getElementById('memory-viewer');
+  viewer.classList.remove('rendered');
+  viewer.innerHTML = '<div class="empty">' + escapeHtml(I18n.t('memory.loading')) + '</div>';
+
   apiFetch('/api/memory/read?path=' + encodeURIComponent(path)).then((data) => {
+    if (requestId !== _memoryReadRequestId) return;
     currentMemoryContent = data.content;
+    document.getElementById('memory-edit-btn').style.display = 'inline-block';
     const viewer = document.getElementById('memory-viewer');
     // Render markdown if it's a .md file
     if (path.endsWith('.md')) {
@@ -2697,6 +2970,7 @@ function readMemoryFile(path) {
       viewer.classList.remove('rendered');
     }
   }).catch((err) => {
+    if (requestId !== _memoryReadRequestId) return;
     currentMemoryContent = null;
     document.getElementById('memory-viewer').innerHTML = '<div class="empty">Error: ' + escapeHtml(err.message) + '</div>';
   });
@@ -2709,26 +2983,37 @@ function startMemoryEdit() {
   editor.style.display = 'flex';
   const textarea = document.getElementById('memory-edit-textarea');
   textarea.value = currentMemoryContent;
+  memoryEditorPath = currentMemoryPath;
+  _memoryEditBaseline = currentMemoryContent;
   textarea.focus();
 }
 
 function cancelMemoryEdit() {
   document.getElementById('memory-viewer').style.display = '';
   document.getElementById('memory-editor').style.display = 'none';
+  memoryEditorPath = null;
+  _memoryEditBaseline = null;
 }
 
 function saveMemoryEdit() {
-  if (!currentMemoryPath) return;
+  // H3: save to the path the editor was opened for, never to whatever file
+  // happens to be selected now.
+  if (!memoryEditorPath) return;
+  if (memoryEditorPath !== currentMemoryPath) {
+    showToast(I18n.t('memory.saveMismatch'), 'error');
+    return;
+  }
+  const path = memoryEditorPath;
   const content = document.getElementById('memory-edit-textarea').value;
   apiFetch('/api/memory/write', {
     method: 'POST',
-    body: { path: currentMemoryPath, content: content },
+    body: { path: path, content: content },
   }).then(() => {
-    showToast('Saved ' + currentMemoryPath, 'success');
+    showToast(I18n.t('memory.saved', { path: path }), 'success');
     cancelMemoryEdit();
-    readMemoryFile(currentMemoryPath);
+    readMemoryFile(path);
   }).catch((err) => {
-    showToast('Save failed: ' + err.message, 'error');
+    showToast(I18n.t('memory.saveFailed', { message: err.message }), 'error');
   });
 }
 
@@ -2738,7 +3023,7 @@ function buildBreadcrumb(path) {
   let current = '';
   for (const part of parts) {
     current += (current ? '/' : '') + part;
-    html += ' / <a data-action="breadcrumb-file" data-path="' + escapeHtml(current) + '" href="#">' + escapeHtml(part) + '</a>';
+    html += ' / <a data-action="breadcrumb-file" data-path="' + escapeAttr(current) + '" href="#">' + escapeHtml(part) + '</a>';
   }
   return html;
 }
@@ -2754,7 +3039,7 @@ function searchMemory(query) {
     const tree = document.getElementById('memory-tree');
     tree.innerHTML = '';
     if (data.results.length === 0) {
-      tree.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">No results</div>';
+      tree.innerHTML = '<div class="tree-item" style="color:var(--text-secondary)">' + escapeHtml(I18n.t('memory.noResults')) + '</div>';
       return;
     }
     for (const result of data.results) {
@@ -2900,11 +3185,21 @@ function flushLogEntries() {
     output.removeChild(output.lastChild);
   }
 
-  // Auto-scroll to top (newest entries are at the top)
-  if (document.getElementById('logs-autoscroll').checked) {
+  // Auto-scroll to top (newest entries are at the top) — but only when the
+  // user is already near the top, mirroring the chat view's near-bottom
+  // tracking (M4). Scrolling down to read older entries must not be yanked
+  // back on every batch.
+  if (document.getElementById('logs-autoscroll').checked && _logsStickToTop) {
     output.scrollTop = 0;
   }
 }
+
+// M4: track "near top" on the logs view (newest entries prepend at the top).
+let _logsStickToTop = true;
+
+document.getElementById('logs-output').addEventListener('scroll', function () {
+  _logsStickToTop = this.scrollTop < 40;
+});
 
 function queueLogEntry(entry) {
   if (currentTab !== 'logs') {
@@ -2944,18 +3239,25 @@ function toggleLogsPause() {
 }
 
 function clearLogs() {
-  if (!confirm('Clear all logs?')) return;
-  document.getElementById('logs-output').innerHTML = '';
-  logBuffer = [];
-  _deferredLogEntries = [];
-  _pendingLogEntries = [];
-  if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
-  _logRenderFrame = null;
+  showConfirmModal(I18n.t('logs.confirmClear'), '', function() {
+    document.getElementById('logs-output').innerHTML = '';
+    logBuffer = [];
+    _deferredLogEntries = [];
+    _pendingLogEntries = [];
+    _logsStickToTop = true;
+    if (_logRenderFrame !== null) cancelAnimationFrame(_logRenderFrame);
+    _logRenderFrame = null;
+  }, I18n.t('logs.clear'), 'btn-danger');
 }
 
 // Re-apply filters when level or target changes
 document.getElementById('logs-level-filter').addEventListener('change', scheduleLogFilters);
-document.getElementById('logs-target-filter').addEventListener('input', scheduleLogFilters);
+// L2: debounce the target filter — it rewrites visibility on every log entry
+let _logTargetFilterDebounce = null;
+document.getElementById('logs-target-filter').addEventListener('input', () => {
+  clearTimeout(_logTargetFilterDebounce);
+  _logTargetFilterDebounce = setTimeout(scheduleLogFilters, 150);
+});
 
 function scheduleLogFilters() {
   if (_logFilterFrame !== null) return;
@@ -3164,11 +3466,28 @@ function renderMcpServerCard(entry, installedExt) {
     card.appendChild(endpoint);
   }
 
+  if (installedExt && installedExt.activation_error) {
+    var errorDiv = document.createElement('div');
+    errorDiv.className = 'ext-error';
+    errorDiv.textContent = installedExt.activation_error;
+    card.appendChild(errorDiv);
+  }
+
   var actions = document.createElement('div');
   actions.className = 'ext-actions';
 
   if (installedExt) {
-    if (!installedExt.active) {
+    if (installedExt.recovering) {
+      var recoveringLabel = document.createElement('span');
+      recoveringLabel.className = 'ext-active-label inactive';
+      recoveringLabel.textContent = I18n.t('ext.recovering');
+      actions.appendChild(recoveringLabel);
+      var recoveringDeactivateBtn = document.createElement('button');
+      recoveringDeactivateBtn.className = 'btn-ext deactivate';
+      recoveringDeactivateBtn.textContent = I18n.t('common.deactivate');
+      recoveringDeactivateBtn.addEventListener('click', function() { deactivateExtension(installedExt.name); });
+      actions.appendChild(recoveringDeactivateBtn);
+    } else if (!installedExt.active) {
       var inactiveLabel = document.createElement('span');
       inactiveLabel.className = 'ext-active-label inactive';
       inactiveLabel.textContent = installedExt.enabled === false
@@ -3316,8 +3635,8 @@ function renderExtensionCard(ext) {
     card.appendChild(tools);
   }
 
-  // Show activation error for WASM channels
-  if (ext.kind === 'wasm_channel' && ext.activation_error) {
+  // Show terminal activation/recovery errors.
+  if ((ext.kind === 'wasm_channel' || ext.kind === 'mcp_server') && ext.activation_error) {
     const errorDiv = document.createElement('div');
     errorDiv.className = 'ext-error';
     errorDiv.textContent = ext.activation_error;
@@ -3357,16 +3676,18 @@ function renderExtensionCard(ext) {
     // WASM tools / MCP servers
     const activeLabel = document.createElement('span');
     activeLabel.className = 'ext-active-label';
-    activeLabel.textContent = ext.active
-      ? I18n.t('ext.active')
-      : (ext.kind === 'mcp_server' && ext.enabled === false
-        ? I18n.t('ext.inactive')
-        : I18n.t('status.installed'));
+    activeLabel.textContent = ext.recovering
+      ? I18n.t('ext.recovering')
+      : (ext.active
+        ? I18n.t('ext.active')
+        : (ext.kind === 'mcp_server' && ext.enabled === false
+          ? I18n.t('ext.inactive')
+          : I18n.t('status.installed')));
     if (!ext.active) activeLabel.classList.add('inactive');
     actions.appendChild(activeLabel);
 
     // MCP servers and channel-relay extensions may be installed but inactive — show Activate button
-    if ((ext.kind === 'mcp_server' || ext.kind === 'channel_relay') && !ext.active) {
+    if ((ext.kind === 'mcp_server' || ext.kind === 'channel_relay') && !ext.active && !ext.recovering) {
       const activateBtn = document.createElement('button');
       activateBtn.className = 'btn-ext activate';
       activateBtn.textContent = I18n.t('common.activate');
@@ -3374,7 +3695,7 @@ function renderExtensionCard(ext) {
       actions.appendChild(activateBtn);
     }
 
-    if (ext.kind === 'mcp_server' && ext.active) {
+    if (ext.kind === 'mcp_server' && (ext.active || ext.recovering)) {
       const deactivateBtn = document.createElement('button');
       deactivateBtn.className = 'btn-ext deactivate';
       deactivateBtn.textContent = I18n.t('common.deactivate');
@@ -3789,12 +4110,17 @@ function approvePairing(channel, code, container) {
   }).catch(err => showToast('Error: ' + err.message, 'error'));
 }
 
+function refreshPairingRequests() {
+  document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
+    loadPairingRequests(el.getAttribute('data-channel'), el);
+  });
+}
+
 function startPairingPoll() {
   stopPairingPoll();
   pairingPollInterval = setInterval(function() {
-    document.querySelectorAll('.ext-pairing[data-channel]').forEach(function(el) {
-      loadPairingRequests(el.getAttribute('data-channel'), el);
-    });
+    if (document.hidden) return; // L7: no background polling in hidden tabs
+    refreshPairingRequests();
   }, 10000);
 }
 
@@ -3804,6 +4130,14 @@ function stopPairingPoll() {
     pairingPollInterval = null;
   }
 }
+
+// L7: skip poll ticks while the tab is hidden and refresh once when the
+// user comes back, instead of polling a backgrounded tab forever.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (gatewayStatusInterval) fetchGatewayStatus();
+  if (pairingPollInterval) refreshPairingRequests();
+});
 
 // --- WASM channel stepper ---
 
@@ -3884,10 +4218,17 @@ function loadJobs() {
   if (!document.getElementById('jobs-summary')) {
     container.innerHTML =
       '<div class="jobs-summary" id="jobs-summary"></div>'
+      + '<div class="table-scroll">'
       + '<table class="jobs-table" id="jobs-table"><thead><tr>'
-      + '<th>ID</th><th>Title</th><th>Status</th><th>Created</th><th>Actions</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.id')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.title')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.status')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.created')) + '</th>'
+      + '<th>' + escapeHtml(I18n.t('jobs.actions')) + '</th>'
       + '</tr></thead><tbody id="jobs-tbody"></tbody></table>'
-      + '<div class="empty-state" id="jobs-empty" style="display:none">No jobs found</div>';
+      + '</div>'
+      + '<div class="empty-state" id="jobs-empty" style="display:none">'
+      + escapeHtml(I18n.t('jobs.empty')) + '</div>';
   }
 
   Promise.all([
@@ -3932,12 +4273,12 @@ function renderJobsList(jobs) {
 
     let actionBtns = '';
     if (job.state === 'pending' || job.state === 'in_progress') {
-      actionBtns = '<button class="btn-cancel" data-action="cancel-job" data-id="' + escapeHtml(job.id) + '">Cancel</button>';
+      actionBtns = '<button class="btn-cancel" data-action="cancel-job" data-id="' + escapeAttr(job.id) + '">Cancel</button>';
     }
     // Retry is only shown in the detail view where can_restart is available.
 
-    return '<tr class="job-row" data-action="open-job" data-id="' + escapeHtml(job.id) + '">'
-      + '<td title="' + escapeHtml(job.id) + '">' + shortId + '</td>'
+    return '<tr class="job-row" data-action="open-job" data-id="' + escapeAttr(job.id) + '">'
+      + '<td title="' + escapeAttr(job.id) + '">' + shortId + '</td>'
       + '<td>' + escapeHtml(job.title) + '</td>'
       + '<td><span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span></td>'
       + '<td>' + formatDate(job.created_at) + '</td>'
@@ -3947,16 +4288,17 @@ function renderJobsList(jobs) {
 }
 
 function cancelJob(jobId) {
-  if (!confirm('Cancel this job?')) return;
-  apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' })
-    .then(() => {
-      showToast('Job cancelled', 'success');
-      if (currentJobId) openJobDetail(currentJobId);
-      else loadJobs();
-    })
-    .catch((err) => {
-      showToast('Failed to cancel job: ' + err.message, 'error');
-    });
+  showConfirmModal(I18n.t('jobs.confirmCancel'), '', function() {
+    apiFetch('/api/jobs/' + jobId + '/cancel', { method: 'POST' })
+      .then(() => {
+        showToast(I18n.t('jobs.cancelled'), 'success');
+        if (currentJobId) openJobDetail(currentJobId);
+        else loadJobs();
+      })
+      .catch((err) => {
+        showToast(I18n.t('jobs.cancelFailed', { message: err.message }), 'error');
+      });
+  }, I18n.t('btn.confirm'), 'btn-danger');
 }
 
 function restartJob(jobId) {
@@ -4004,10 +4346,10 @@ function renderJobDetail(job) {
     + '<span class="badge ' + stateClass + '">' + escapeHtml(job.state) + '</span>';
 
   if ((job.state === 'failed' || job.state === 'interrupted') && job.can_restart === true) {
-    headerHtml += '<button class="btn-restart" data-action="restart-job" data-id="' + escapeHtml(job.id) + '">Retry</button>';
+    headerHtml += '<button class="btn-restart" data-action="restart-job" data-id="' + escapeAttr(job.id) + '">Retry</button>';
   }
   if (job.browse_url) {
-    headerHtml += '<a class="btn-browse" href="' + escapeHtml(job.browse_url) + '" target="_blank">Browse Files</a>';
+    headerHtml += '<a class="btn-browse" href="' + escapeAttr(job.browse_url) + '" target="_blank" rel="noopener noreferrer">Browse Files</a>';
   }
 
   header.innerHTML = headerHtml;
@@ -4461,10 +4803,10 @@ function renderRoutinesList(routines) {
     const toggleLabel = r.enabled ? 'Disable' : 'Enable';
     const toggleClass = r.enabled ? 'btn-cancel' : 'btn-restart';
     const triggerTitle = (r.trigger_type === 'cron' && r.trigger_raw)
-      ? ' title="' + escapeHtml(r.trigger_raw) + '"'
+      ? ' title="' + escapeAttr(r.trigger_raw) + '"'
       : '';
 
-    return '<tr class="routine-row" data-action="open-routine" data-id="' + escapeHtml(r.id) + '">'
+    return '<tr class="routine-row" data-action="open-routine" data-id="' + escapeAttr(r.id) + '">'
       + '<td>' + escapeHtml(r.name) + '</td>'
       + '<td' + triggerTitle + '>' + escapeHtml(r.trigger_summary) + '</td>'
       + '<td>' + escapeHtml(r.action_type) + '</td>'
@@ -4473,9 +4815,9 @@ function renderRoutinesList(routines) {
       + '<td>' + r.run_count + '</td>'
       + '<td><span class="badge ' + statusClass + '">' + escapeHtml(r.status) + '</span></td>'
       + '<td>'
-      + '<button class="' + toggleClass + '" data-action="toggle-routine" data-id="' + escapeHtml(r.id) + '">' + toggleLabel + '</button> '
-      + '<button class="btn-restart" data-action="trigger-routine" data-id="' + escapeHtml(r.id) + '">Run</button> '
-      + '<button class="btn-cancel" data-action="delete-routine" data-id="' + escapeHtml(r.id) + '" data-name="' + escapeHtml(r.name) + '">Delete</button>'
+      + '<button class="' + toggleClass + '" data-action="toggle-routine" data-id="' + escapeAttr(r.id) + '">' + toggleLabel + '</button> '
+      + '<button class="btn-restart" data-action="trigger-routine" data-id="' + escapeAttr(r.id) + '">Run</button> '
+      + '<button class="btn-cancel" data-action="delete-routine" data-id="' + escapeAttr(r.id) + '" data-name="' + escapeAttr(r.name) + '">Delete</button>'
       + '</td>'
       + '</tr>';
   }).join('');
@@ -4572,7 +4914,7 @@ function renderRoutineDetail(routine) {
         + '<td>' + formatDate(run.completed_at) + '</td>'
         + '<td><span class="badge ' + runStatusClass + '">' + escapeHtml(run.status) + '</span></td>'
         + '<td>' + escapeHtml(run.result_summary || '-')
-          + (run.job_id ? ' <a href="#" data-action="view-run-job" data-id="' + escapeHtml(run.job_id) + '">[view job]</a>' : '')
+          + (run.job_id ? ' <a href="#" data-action="view-run-job" data-id="' + escapeAttr(run.job_id) + '">[view job]</a>' : '')
           + '</td>'
         + '<td>' + (run.tokens_used != null ? run.tokens_used : '-') + '</td>'
         + '</tr>';
@@ -4604,14 +4946,15 @@ function toggleRoutine(id) {
 }
 
 function deleteRoutine(id, name) {
-  if (!confirm('Delete routine "' + name + '"?')) return;
-  apiFetch('/api/routines/' + id, { method: 'DELETE' })
-    .then(() => {
-      showToast('Routine deleted', 'success');
-      if (currentRoutineId === id) closeRoutineDetail();
-      else loadRoutines();
-    })
-    .catch((err) => showToast('Delete failed: ' + err.message, 'error'));
+  showConfirmModal(I18n.t('routines.confirmDelete', { name: name }), '', function() {
+    apiFetch('/api/routines/' + id, { method: 'DELETE' })
+      .then(() => {
+        showToast(I18n.t('routines.deleted'), 'success');
+        if (currentRoutineId === id) closeRoutineDetail();
+        else loadRoutines();
+      })
+      .catch((err) => showToast(I18n.t('routines.deleteFailed', { message: err.message }), 'error'));
+  }, I18n.t('btn.confirm'), 'btn-danger');
 }
 
 function formatRelativeTime(isoString) {
@@ -4642,7 +4985,10 @@ let gatewayStatusInterval = null;
 
 function startGatewayStatusPolling() {
   fetchGatewayStatus();
-  gatewayStatusInterval = setInterval(fetchGatewayStatus, 30000);
+  gatewayStatusInterval = setInterval(function() {
+    if (document.hidden) return; // L7: no background polling in hidden tabs
+    fetchGatewayStatus();
+  }, 30000);
 }
 
 function formatTokenCount(n) {
@@ -4723,13 +5069,58 @@ function fetchGatewayStatus() {
   }).catch(function() {});
 }
 
-// Show/hide popover on hover
-document.getElementById('gateway-status-trigger').addEventListener('mouseenter', () => {
-  document.getElementById('gateway-popover').classList.add('visible');
-});
-document.getElementById('gateway-status-trigger').addEventListener('mouseleave', () => {
-  document.getElementById('gateway-popover').classList.remove('visible');
-});
+// L6: popovers must be reachable on touch and keyboard, not hover-only.
+// The triggers stay <div>s because the TEE popover nests an interactive
+// copy button (invalid inside <button>), so they get button semantics:
+// role/tabindex/aria-expanded, click toggle, keyboard open, Escape close.
+function setupPopoverTrigger(triggerId, popoverId, onOpen) {
+  const trigger = document.getElementById(triggerId);
+  const popover = document.getElementById(popoverId);
+  if (!trigger || !popover) return;
+  trigger.setAttribute('role', 'button');
+  trigger.setAttribute('tabindex', '0');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('aria-controls', popoverId);
+
+  const open = () => {
+    if (onOpen) onOpen();
+    popover.classList.add('visible');
+    trigger.setAttribute('aria-expanded', 'true');
+  };
+  const close = () => {
+    popover.classList.remove('visible');
+    trigger.setAttribute('aria-expanded', 'false');
+  };
+  const toggle = () => {
+    if (popover.classList.contains('visible')) close(); else open();
+  };
+
+  let pointerDown = false;
+  trigger.addEventListener('pointerdown', () => { pointerDown = true; });
+  trigger.addEventListener('mouseenter', open);
+  trigger.addEventListener('mouseleave', close);
+  trigger.addEventListener('click', (e) => {
+    // Don't toggle when interacting with content inside the popover
+    if (popover.contains(e.target)) return;
+    toggle();
+  });
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    if (e.key === 'Escape') close();
+  });
+  trigger.addEventListener('focus', () => {
+    // Only open on keyboard focus; pointer clicks toggle via the click handler
+    if (!pointerDown) open();
+    pointerDown = false;
+  });
+  trigger.addEventListener('blur', (e) => {
+    if (e.relatedTarget && trigger.contains(e.relatedTarget)) return;
+    close();
+  });
+}
+
+// Show/hide popover on hover, focus, or tap (L6)
+setupPopoverTrigger('gateway-status-trigger', 'gateway-popover');
 
 // --- TEE attestation ---
 
@@ -4828,13 +5219,8 @@ function copyTeeReport() {
   });
 }
 
-document.getElementById('tee-shield').addEventListener('mouseenter', function() {
-  fetchTeeReport();
-  document.getElementById('tee-popover').classList.add('visible');
-});
-document.getElementById('tee-shield').addEventListener('mouseleave', function() {
-  document.getElementById('tee-popover').classList.remove('visible');
-});
+// Show/hide TEE popover on hover, focus, or tap; fetches the report on open (L6)
+setupPopoverTrigger('tee-shield', 'tee-popover', fetchTeeReport);
 
 // --- Extension install ---
 
@@ -4913,9 +5299,32 @@ function addMcpServer() {
       }
       env[key] = line.slice(separator + 1);
     }
+    var envSecrets = {};
+    var secretEnvLines = document.getElementById('mcp-install-env-secrets').value.split(/\r?\n/);
+    for (var j = 0; j < secretEnvLines.length; j++) {
+      var secretLine = secretEnvLines[j].trim();
+      if (!secretLine) continue;
+      var secretSeparator = secretLine.indexOf('=');
+      var envName = secretSeparator >= 0 ? secretLine.slice(0, secretSeparator).trim() : '';
+      var secretName = secretSeparator >= 0 ? secretLine.slice(secretSeparator + 1).trim() : '';
+      if (!envName || !secretName) {
+        showToast('Secret environment line ' + (j + 1) + ' must use KEY=SECRET_NAME', 'error');
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(envSecrets, envName)) {
+        showToast('Secret environment variable ' + envName + ' is duplicated', 'error');
+        return;
+      }
+      if (Object.prototype.hasOwnProperty.call(env, envName)) {
+        showToast('Environment variable ' + envName + ' cannot have both a plain value and a secret reference', 'error');
+        return;
+      }
+      envSecrets[envName] = secretName;
+    }
     body.command = command;
     body.args = args;
     body.env = env;
+    body.env_secrets = envSecrets;
   }
 
   apiFetch('/api/extensions/install', {
@@ -4945,7 +5354,7 @@ function setMcpInstallTransport(transport) {
 }
 
 function resetMcpInstallForm() {
-  ['mcp-install-name', 'mcp-install-url', 'mcp-install-command', 'mcp-install-args', 'mcp-install-env']
+  ['mcp-install-name', 'mcp-install-url', 'mcp-install-command', 'mcp-install-args', 'mcp-install-env', 'mcp-install-env-secrets']
     .forEach(function(id) { document.getElementById(id).value = ''; });
   setMcpInstallTransport('http');
 }
@@ -5038,26 +5447,29 @@ function renderSkillCard(skill) {
 // the bridge enforces eligibility (Trusted + proven confidence/usage) and
 // leak-scans before sending. Requires CLAWHUB_TOKEN to be set server-side.
 function publishSkill(skill) {
-  var slug = window.prompt(I18n.t('skills.publishSlugPrompt'), skill.name);
-  if (!slug) return;
-  var version = window.prompt(I18n.t('skills.publishVersionPrompt'), '1.0.0');
-  if (!version) return;
-  // The publish endpoint takes the engine V2 doc_id, but the skills list (v1)
-  // only carries the name. For now the publish flow is wired through the
-  // engine store; a doc_id lookup by name would require an extra endpoint.
-  // Until then, surface a clear message pointing to the proposals surface.
-  apiFetch('/api/skills/publish/' + encodeURIComponent(skill.doc_id || skill.name), {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({slug: slug, version: version, changelog: '', tags: []}),
-  }).then(function(resp) {
-    if (resp && resp.ok) {
-      showToast(I18n.t('skills.publishOk', {slug: slug, version: version}), 'success');
-    } else {
-      showToast((resp && resp.error) || I18n.t('skills.publishFailed'), 'error');
-    }
-  }).catch(function(err) {
-    showToast(I18n.t('skills.publishFailed') + ': ' + err.message, 'error');
+  showPromptModal(I18n.t('skills.publishTitle'), [
+    { key: 'slug', label: I18n.t('skills.publishSlugPrompt'), value: skill.name },
+    { key: 'version', label: I18n.t('skills.publishVersionPrompt'), value: '1.0.0' },
+  ], function(values) {
+    var slug = values.slug;
+    var version = values.version;
+    // The publish endpoint takes the engine V2 doc_id, but the skills list (v1)
+    // only carries the name. For now the publish flow is wired through the
+    // engine store; a doc_id lookup by name would require an extra endpoint.
+    // Until then, surface a clear message pointing to the proposals surface.
+    apiFetch('/api/skills/publish/' + encodeURIComponent(skill.doc_id || skill.name), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({slug: slug, version: version, changelog: '', tags: []}),
+    }).then(function(resp) {
+      if (resp && resp.ok) {
+        showToast(I18n.t('skills.publishOk', {slug: slug, version: version}), 'success');
+      } else {
+        showToast((resp && resp.error) || I18n.t('skills.publishFailed'), 'error');
+      }
+    }).catch(function(err) {
+      showToast(I18n.t('skills.publishFailed') + ': ' + err.message, 'error');
+    });
   });
 }
 
@@ -5353,10 +5765,11 @@ function renderCatalogSkillCard(entry, installedNames) {
     installBtn.textContent = I18n.t('extensions.install');
     installBtn.addEventListener('click', (function(s, version, owner, btn) {
       return function() {
-        if (!confirm('Install skill "' + s + '" from ClawHub?')) return;
-        btn.disabled = true;
-        btn.textContent = I18n.t('extensions.installing');
-        installSkill(s, null, btn, version, owner);
+        showConfirmModal(I18n.t('skills.confirmInstallHub', { name: s }), '', function() {
+          btn.disabled = true;
+          btn.textContent = I18n.t('extensions.installing');
+          installSkill(s, null, btn, version, owner);
+        }, I18n.t('extensions.install'), 'btn-primary');
       };
     })(slug, entry.version, entry.owner, installBtn));
     actions.appendChild(installBtn);
@@ -5437,10 +5850,11 @@ function installSkillFromForm() {
     showToast('URL must use HTTPS', 'error');
     return;
   }
-  if (!confirm('Install skill "' + name + '"?')) return;
-  installSkill(name, url, null);
-  document.getElementById('skill-install-name').value = '';
-  document.getElementById('skill-install-url').value = '';
+  showConfirmModal(I18n.t('skills.confirmInstall', { name: name }), '', function() {
+    installSkill(name, url, null);
+    document.getElementById('skill-install-name').value = '';
+    document.getElementById('skill-install-url').value = '';
+  }, I18n.t('extensions.install'), 'btn-primary');
 }
 
 // Wire up Enter key on search input
@@ -6258,10 +6672,13 @@ function showToast(message, type) {
   const container = document.getElementById('toasts');
   const toast = document.createElement('div');
   toast.className = 'toast toast-' + (type || 'info');
+  // M13: the host is a polite live region; urgent errors assert themselves.
+  toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
 
   // Icon prefix
   const icon = document.createElement('span');
   icon.className = 'toast-icon';
+  icon.setAttribute('aria-hidden', 'true');
   if (type === 'success') icon.textContent = '\u2713';
   else if (type === 'error') icon.textContent = '\u2717';
   else icon.textContent = '\u2139';
@@ -6437,6 +6854,11 @@ function closeModals() {
   // Close restart confirmation modal
   const restartModal = document.getElementById('restart-confirm-modal');
   if (restartModal) restartModal.style.display = 'none';
+
+  // M8: Escape also closes the restart progress loader. The watchdog is
+  // kept running so a failed restart still surfaces the error state, and
+  // a successful reconnect resets the restart state.
+  hideRestartLoader(true);
 }
 
 // --- ARIA Accessibility (Phase 5.2) ---
@@ -6446,18 +6868,47 @@ function applyAriaAttributes() {
   if (tabBar) tabBar.setAttribute('role', 'tablist');
 
   document.querySelectorAll('.tab-bar button[data-tab]').forEach(btn => {
+    const tab = btn.getAttribute('data-tab');
+    const isActive = btn.classList.contains('active');
     btn.setAttribute('role', 'tab');
-    btn.setAttribute('aria-selected', btn.classList.contains('active') ? 'true' : 'false');
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    // L10: connect tabs to their panels and keep only the active tab in
+    // the Tab sequence (roving tabindex)
+    if (!btn.id) btn.id = 'tab-btn-' + tab;
+    btn.setAttribute('aria-controls', 'tab-' + tab);
+    btn.tabIndex = isActive ? 0 : -1;
   });
 
   document.querySelectorAll('.tab-panel').forEach(panel => {
     panel.setAttribute('role', 'tabpanel');
     panel.setAttribute('aria-hidden', panel.classList.contains('active') ? 'false' : 'true');
+    const tab = panel.id.replace(/^tab-/, '');
+    const btn = document.getElementById('tab-btn-' + tab);
+    if (btn) panel.setAttribute('aria-labelledby', btn.id);
   });
 }
 
 // Apply ARIA attributes on initial load
 applyAriaAttributes();
+
+// L10: arrow-key tab navigation with roving tabindex; selection follows
+// focus as keyboard and screen-reader users expect from a tablist.
+document.querySelector('.tab-bar').addEventListener('keydown', (e) => {
+  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+  // Only consider visible tabs (mobile hides the Logs button)
+  const tabs = Array.from(document.querySelectorAll('.tab-bar button[data-tab]'))
+    .filter((b) => b.offsetParent !== null);
+  const currentIndex = tabs.indexOf(document.activeElement);
+  if (currentIndex < 0) return;
+  e.preventDefault();
+  let nextIndex;
+  if (e.key === 'Home') nextIndex = 0;
+  else if (e.key === 'End') nextIndex = tabs.length - 1;
+  else nextIndex = (currentIndex + (e.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+  const next = tabs[nextIndex];
+  next.focus();
+  switchTab(next.getAttribute('data-tab'));
+});
 
 // --- Utilities ---
 
@@ -6465,6 +6916,12 @@ function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
+}
+
+// M9: escapeHtml() escapes & < > but not quotes, so it is not safe for
+// values interpolated into quoted HTML attributes. Use this for those.
+function escapeAttr(value) {
+  return escapeHtml(value).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function formatDate(isoString) {
@@ -6481,6 +6938,8 @@ document.getElementById('restart-close-btn').addEventListener('click', () => can
 document.getElementById('restart-cancel-btn').addEventListener('click', () => cancelRestart());
 document.getElementById('restart-confirm-btn').addEventListener('click', () => confirmRestart());
 document.getElementById('restart-btn').addEventListener('click', () => triggerRestart());
+document.getElementById('restart-reload-btn').addEventListener('click', () => window.location.reload());
+document.getElementById('restart-dismiss-btn').addEventListener('click', () => dismissRestartLoader());
 document.getElementById('thread-new-btn').addEventListener('click', () => createNewThread());
 document.getElementById('thread-toggle-btn').addEventListener('click', () => toggleThreadSidebar());
 document.getElementById('assistant-thread').addEventListener('click', () => switchToAssistant());
@@ -6583,6 +7042,35 @@ document.getElementById('language-btn').addEventListener('click', function() {
   if (typeof toggleLanguageMenu === 'function') toggleLanguageMenu();
 });
 
+// --- H2: mobile "More" overflow menu (Logs, theme, language) ---
+(function setupMoreMenu() {
+  const moreBtn = document.getElementById('more-btn');
+  const moreMenu = document.getElementById('more-menu');
+  if (!moreBtn || !moreMenu) return;
+  const setOpen = (open) => {
+    moreMenu.style.display = open ? 'flex' : 'none';
+    moreBtn.setAttribute('aria-expanded', String(open));
+  };
+  moreBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setOpen(moreMenu.style.display !== 'flex');
+  });
+  document.addEventListener('click', (e) => {
+    if (moreMenu.style.display !== 'flex') return;
+    if (!moreMenu.contains(e.target) && !moreBtn.contains(e.target)) setOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setOpen(false);
+  });
+  document.getElementById('more-logs-btn').addEventListener('click', () => {
+    setOpen(false);
+    switchTab('logs');
+  });
+  document.getElementById('more-theme-btn').addEventListener('click', () => {
+    toggleTheme();
+  });
+})();
+
 // --- Confirmation Modal ---
 
 var _confirmModalCallback = null;
@@ -6613,9 +7101,71 @@ document.getElementById('confirm-modal-cancel-btn').addEventListener('click', cl
 document.getElementById('confirm-modal').addEventListener('click', function(e) {
   if (e.target === this) closeConfirmModal();
 });
+
+// --- Generic Prompt Modal (L9: replaces blocking window.prompt) ---
+
+var _promptModalCallback = null;
+
+// fields: [{ key, label, value? }]. onSubmit receives { key: trimmedValue }.
+// The modal stays open until every field is non-empty.
+function showPromptModal(title, fields, onSubmit) {
+  var modal = document.getElementById('prompt-modal');
+  document.getElementById('prompt-modal-title').textContent = title;
+  var container = document.getElementById('prompt-modal-fields');
+  container.innerHTML = '';
+  fields.forEach(function(f) {
+    var label = document.createElement('label');
+    label.className = 'prompt-modal-field';
+    var caption = document.createElement('span');
+    caption.textContent = f.label;
+    var input = document.createElement('input');
+    input.type = 'text';
+    input.id = 'prompt-modal-field-' + f.key;
+    input.value = f.value || '';
+    label.appendChild(caption);
+    label.appendChild(input);
+    container.appendChild(label);
+  });
+  _promptModalCallback = function() {
+    var values = {};
+    for (var i = 0; i < fields.length; i++) {
+      var v = document.getElementById('prompt-modal-field-' + fields[i].key).value.trim();
+      if (v === '') return false;
+      values[fields[i].key] = v;
+    }
+    onSubmit(values);
+    return true;
+  };
+  modal.style.display = 'flex';
+  var first = container.querySelector('input');
+  if (first) first.focus();
+}
+
+function closePromptModal() {
+  document.getElementById('prompt-modal').style.display = 'none';
+  _promptModalCallback = null;
+}
+
+document.getElementById('prompt-modal-btn').addEventListener('click', function() {
+  if (_promptModalCallback && _promptModalCallback() === false) return;
+  closePromptModal();
+});
+document.getElementById('prompt-modal-cancel-btn').addEventListener('click', closePromptModal);
+document.getElementById('prompt-modal').addEventListener('click', function(e) {
+  if (e.target === this) closePromptModal();
+});
+document.getElementById('prompt-modal-fields').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    document.getElementById('prompt-modal-btn').click();
+  }
+});
 document.addEventListener('keydown', function(e) {
   if (e.key === 'Escape' && document.getElementById('confirm-modal').style.display === 'flex') {
     closeConfirmModal();
+  }
+  if (e.key === 'Escape' && document.getElementById('prompt-modal').style.display === 'flex') {
+    closePromptModal();
   }
 });
 

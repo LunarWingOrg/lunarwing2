@@ -126,7 +126,8 @@ export BUILD_LOCK="$fixture/build.lock"
 move_ref_on_stop=false
 tenant_lw_root() { printf '%s\n' "$fixture_repo"; }
 tenant_repo() { printf '%s/ic\n' "$fixture_repo"; }
-tenant_worker_enabled() { [[ "$1" == "fixture" && "$2" == "opencode" ]]; }
+with_tenant_lifecycle_lock() { shift; "$@"; }
+tenant_worker_enabled() { [[ "$1" == "fixture" && ( "$2" == "opencode" || "$2" == "kimi" ) ]]; }
 stop_tenant() {
   : >"$stopped_marker"
   if [[ "$move_ref_on_stop" == "true" ]]; then
@@ -191,8 +192,8 @@ else
   fail "upgrade did not pin moving target commit: $output"
 fi
 if [[ -f "$build_args_file" ]] \
-  && [[ "$(<"$build_args_file")" == "fixture true false false true false true" ]]; then
-  pass 'upgrade rebuilds selected OpenCode worker with strict WASM build'
+  && [[ "$(<"$build_args_file")" == "fixture true false true true false true" ]]; then
+  pass 'upgrade rebuilds selected OpenCode and Kimi workers with strict WASM build'
 else
   fail "upgrade forwarded wrong build flags: $(cat "$build_args_file" 2>/dev/null || true)"
 fi

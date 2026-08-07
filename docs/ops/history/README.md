@@ -11,4 +11,4 @@ inaccurate against the current tree — do not rely on them for current procedur
 Additional stale ops files (scratch notes, review notes, one-liners) were moved to
 `docs/internal/history/archive/ops/` during the 1.1.9 stale-doc cleanup.
 
-Current release planning lives in `docs/ops/GOALS_1.1.9.md`.
+Current release planning lives in `docs/ops/AGENT_GOALS_2.0.4.0.md`.

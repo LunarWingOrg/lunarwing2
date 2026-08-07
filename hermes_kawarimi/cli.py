@@ -15,7 +15,7 @@ import argparse
 import re
 
 from hermes_kawarimi import __version__
-from hermes_kawarimi.config import ImportPlan
+from hermes_kawarimi.config import ImportPlan, ImportPlanFormatError
 from hermes_kawarimi.extract import extract
 from hermes_kawarimi.mapper import map_agent
 from hermes_kawarimi.model import MappedAgent
@@ -97,7 +97,11 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
-    plan = _plan_from_args(args)
+    try:
+        plan = _plan_from_args(args)
+    except (ImportPlanFormatError, OSError, ValueError) as exc:
+        out(f"[red]error:[/red] {exc}")
+        return 2
     err = plan.validate()
     if err:
         out(f"[red]error:[/red] {err}")
@@ -174,9 +178,9 @@ def _plan_from_args(args: argparse.Namespace) -> ImportPlan:
     plan.start = plan.start or bool(args.start)
     plan.force = plan.force or bool(args.force)
     plan.docker_group = plan.docker_group or bool(args.docker_group)
-    plan.with_nanocode = plan.with_nanocode or bool(args.with_nanocode)
     plan.with_pebble = plan.with_pebble or bool(args.with_pebble)
     plan.with_opencode = plan.with_opencode or bool(args.with_opencode)
+    plan.with_kimi = plan.with_kimi or bool(args.with_kimi)
     plan.with_toolchains = plan.with_toolchains or bool(args.with_toolchains)
     plan.with_vision = plan.with_vision or bool(args.with_vision)
     if args.tensorzero_url:
@@ -210,9 +214,9 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--start", action="store_true", help="start the tenant after import")
     imp.add_argument("--force", action="store_true", help="reuse an existing tenant name")
     imp.add_argument("--docker-group", action="store_true", help="pass --docker-group to add-tenant")
-    imp.add_argument("--with-nanocode", action="store_true")
     imp.add_argument("--with-pebble", action="store_true")
     imp.add_argument("--with-opencode", action="store_true")
+    imp.add_argument("--with-kimi", action="store_true")
     imp.add_argument("--with-toolchains", action="store_true", help="pass --with-toolchains to build-tenant")
     imp.add_argument("--with-vision", action="store_true", help="unsupported by mt-admin — will fail in preflight")
     imp.add_argument("--tensorzero-url", default="")

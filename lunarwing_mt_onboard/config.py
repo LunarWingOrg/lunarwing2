@@ -17,15 +17,23 @@ from typing import Any
 
 TENANT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-RESERVED_PREFIXES = ("pg-", "proxy-", "nanocode-", "pebble-", "opencode-", "weechat-")
+RESERVED_PREFIXES = (
+    "pg-",
+    "proxy-",
+    "nanocode-",
+    "pebble-",
+    "opencode-",
+    "kimi-",
+    "weechat-",
+)
 
 
 class WorkerType(str, Enum):
     """Selectable external worker container types."""
 
-    NANOCODE = "nanocode"
     PEBBLE = "pebble"
     OPENCODE = "opencode"
+    KIMI = "kimi"
 
 
 @dataclass
@@ -48,10 +56,11 @@ class TenantConfig:
     toolchains: bool = False
     llm_base_url: str = ""
     llm_model: str = "tensorzero::function_name::lunarwing"
-    nanocode_model: str = ""
-    nanocode_base_url: str = ""
     opencode_model: str = ""
     opencode_base_url: str = ""
+    kimi_model: str = ""
+    kimi_base_url: str = ""
+    kimi_api_key: str = ""
     llm_api_key: str = ""
     secrets_master_key: str = ""
     no_ssh: bool = False
@@ -97,6 +106,8 @@ class TenantConfig:
     def from_dict(cls, data: dict[str, Any]) -> "TenantConfig":
         """Reconstruct a config from a deserialized dict."""
         workers_raw = data.get("workers", [])
+        if "nanocode" in workers_raw:
+            raise ValueError("Nanocode worker is retired; remove it from the saved plan")
         workers = [WorkerType(w) for w in workers_raw]
         return cls(
             name=data.get("name", ""),
@@ -117,10 +128,11 @@ class TenantConfig:
             llm_model=data.get(
                 "llm_model", "tensorzero::function_name::lunarwing"
             ),
-            nanocode_model=data.get("nanocode_model", ""),
-            nanocode_base_url=data.get("nanocode_base_url", ""),
             opencode_model=data.get("opencode_model", ""),
             opencode_base_url=data.get("opencode_base_url", ""),
+            kimi_model=data.get("kimi_model", ""),
+            kimi_base_url=data.get("kimi_base_url", ""),
+            kimi_api_key=data.get("kimi_api_key", ""),
             llm_api_key=data.get("llm_api_key", ""),
             secrets_master_key=data.get("secrets_master_key", ""),
             no_ssh=data.get("no_ssh", False),

@@ -35,6 +35,12 @@ The main agent provides generic infrastructure; tools are self-contained units t
 - Rate limits and timeouts
 - Auth setup instructions (see below)
 - Workspace paths the tool can read
+- Approval policy: `never` (default), `unless_auto_approved`, or `always`
+
+`always` cannot be bypassed by global auto-approval. It also rejects user
+`Always` grants unless tool explicitly opts in; built-in `ssh` is narrow
+exception. WASM tools with SSH capability always use non-bypassable `always`,
+regardless of declared policy.
 
 ### What Does NOT Go in Main Agent
 
@@ -119,8 +125,26 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 
 - Growing ecosystem of pre-built servers (GitHub, Notion, Postgres, etc.)
 - Any language (TypeScript/Python most common)
-- Can do websockets, streaming, background polling
-- Cost: external process with full system access (no sandbox), manages own credentials, LunarWing can't prevent leaks
+- LunarWing transports: HTTP/HTTPS, stdio, and Unix domain sockets
+- Servers may maintain their own state or background work, but LunarWing currently
+  exposes MCP tools only; it does not expose resources, prompts, subscriptions, or
+  a WebSocket MCP transport
+- Cost: host-local stdio is an external process with LunarWing service-account
+  privileges, not an OS sandbox; raw credentials given to that process can be read
+  or leaked by it
+
+#### Current MCP support
+
+| Area | Current behavior |
+|------|------------------|
+| Install | Registry CLI, `lunarwing mcp add`, conversational `tool_install`, authenticated web API, and browser MCP install form accept validated HTTP or structured stdio config. Install persists config but does not activate it. |
+| Activate/deactivate | `ExtensionManager` initializes clients, discovers tools, tracks exact tool ownership, and tears down transport/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated gateway when available, falls back to persisted state when unavailable, and accepts `--offline` to request persisted-only behavior explicitly. |
+| Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, but unchanged persisted intent is disabled until explicit activation. Inspect returned message and active status. |
+| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default. Persisted removal happens before active tool/runtime cleanup so a crash cannot restore stale intent; `--offline` is explicit persisted-only cleanup. |
+| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, and stdio command availability. |
+| Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
+| Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
+| Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Recovery uses isolated cancellable tasks, five-attempt circuit breaking, a 30-second stability window, jittered bounded backoff, all-or-none tool registration, and internal cleanup deadlines. Configurable per-server lifecycle timeout controls are not implemented. |
 
 #### Host-local stdio MCP servers
 
@@ -132,7 +156,8 @@ lunarwing mcp add local-files \
   --transport stdio \
   --command local-files-mcp \
   --arg /srv/data \
-  --env LOG_LEVEL=warn
+  --env LOG_LEVEL=warn \
+  --secret-env API_TOKEN=local_files_token
 ```
 
 The same structured fields are available in the web MCP settings form and the
@@ -145,14 +170,41 @@ conversational `tool_install` tool:
   "transport": "stdio",
   "command": "local-files-mcp",
   "args": ["/srv/data"],
-  "env": {"LOG_LEVEL": "warn"}
+  "env": {"LOG_LEVEL": "warn"},
+  "env_secrets": {"API_TOKEN": "local_files_token"}
 }
 ```
 
 Installation persists configuration only. Activation starts the child process,
 negotiates MCP, and registers its tools. Treat the executable as trusted installed
-code: stdio servers are not sandboxed. Values in `env` are plain configuration,
-not secret storage; use LunarWing's credential systems for secrets.
+code: stdio servers are not sandboxed. Values in `env` are plain configuration.
+`env_secrets` maps environment variable names to owner-scoped LunarWing secret
+names. Only names are persisted; values are decrypted at activation, zeroized from
+resolver-owned memory after spawn, and exposed to the child process. No resolved
+value is retained as restart configuration. Missing or wrong-owner secrets fail
+activation without starting the server. Conversational installs containing secret
+references and all conversational MCP updates require explicit approval.
+
+Managed stdio children do not inherit LunarWing's full service environment. They
+receive a small compatibility allowlist (`PATH`, home/user, locale, temporary and
+XDG paths, TLS certificate paths) plus explicitly configured `env` and
+`env_secrets`. Add other required non-secret variables explicitly. Raw secret
+values remain visible to the trusted child and potentially to other processes with
+the same OS privileges; use WASM tools when host-side credential injection is
+required. When `env_secrets` is non-empty, LunarWing suppresses raw MCP child
+stderr content to avoid copying an accidentally printed secret into daemon logs.
+
+If an active managed stdio child exits unexpectedly, `ExtensionManager` removes its
+dead wrappers, re-reads the owner's enabled config, resolves secret references again,
+starts and initializes a fresh client, rediscovers tools, and atomically registers the
+replacement wrappers. Each server recovers in its own cancellable task. Five unstable
+restart attempts use jittered exponential backoff; 30 healthy seconds reset the
+attempt window. Further failure opens a visible circuit and requires explicit
+activation instead of restart-storming. Disable, update, remove, and application
+shutdown cancel and serialize with recovery so they cannot resurrect the old runtime.
+Recovery and child cleanup have internal deadlines. This supervision does not install
+missing commands or packages; initial activation still fails explicitly when the
+configured executable or required secret is unavailable.
 
 MCP servers can be deactivated without uninstalling them. Deactivation unloads
 only that server's registered tools, closes its transport and session, stops a
@@ -171,7 +223,134 @@ the next startup. Pass `--offline` to request that behavior explicitly. A custom
 `--url` also requires an explicit `--token`, so a stored gateway credential is
 never forwarded to an overridden origin.
 
+Removal also uses the authenticated gateway by default so `ExtensionManager` can
+stop the transport, unregister owned tools, and delete persisted configuration as
+one lifecycle operation:
+
+```bash
+lunarwing mcp remove local-files
+```
+
+Removal does not fall back to offline deletion if the gateway cannot be reached.
+Because a connection can fail after request delivery, inspect status before retrying.
+After stopping LunarWing, `lunarwing mcp remove local-files --offline` performs an
+explicit persisted-only removal. As with toggle, custom `--url` requires explicit
+`--token`.
+
+#### Automatic npm/pip installation, provenance, and sandboxing
+
+Automatic npm/pip MCP installation is **not implemented**. LunarWing runs the
+configured stdio command directly and assumes an operator already installed it.
+The MCP registry records command, arguments, and environment configuration; it
+does not download, sign, upgrade, or roll back Node/Python packages.
+
+Package provenance **is implemented** for host-local stdio servers as an
+operator-driven pinning flow:
+
+```bash
+lunarwing mcp pin local-files \
+  --package @example/local-files-mcp --ecosystem npm \
+  --version 1.4.0 --publisher example
+lunarwing mcp list --verbose     # shows trust state and digest
+lunarwing mcp revoke local-files # block activation + disable
+lunarwing mcp unpin local-files  # back to unverified legacy behavior
+```
+
+`mcp pin` resolves the configured command exactly as activation would (explicit
+path or `PATH` search), records its SHA-256 digest plus the optional package
+identity (canonical id, ecosystem, immutable version, source, publisher), and
+marks the server `pinned`. Every later activation — startup, manual activation,
+and crash recovery alike — re-hashes the resolved executable and **fails
+closed** on mismatch, so a silently replaced or upgraded binary cannot start
+until the operator re-pins. `mcp revoke` records `revoked` trust (blocking
+activation for any transport) and disables the server; a revoked server stays
+blocked until it is re-pinned or unpinned. Servers without a provenance record
+keep the legacy unverified behavior. `mcp update` retains the record for stdio
+servers; switching transports drops the digest. Web and conversational update
+requests do not carry provenance and reset the record — re-pin after using
+them.
+
+What this does not yet cover: publisher signatures and trusted signing keys,
+locked dependency graphs, upgrade diffs, marketplace trust roots, and
+compromised-publisher revocation distribution. WASM artifact checksums remain
+separate from stdio executable digests.
+
+Safe automatic installation would improve usability: one-command installs, exact
+version selection, reproducible tenants, and managed upgrades/rollback. It also
+creates a package-supply-chain execution path. npm/pip packages and dependencies can
+run install/build hooks; package names can be typosquatted; publishers or registry
+entries can be compromised; and unpinned dependency resolution can drift between
+tenants.
+
+Before automatic installation, package provenance must cover:
+
+- Canonical package identity, source registry, and immutable version.
+- Artifact digest, publisher signature, and trusted signing key.
+- Locked dependency graph or equivalent reproducible package bundle.
+- Publisher/package trust state, revocation, and compromised-version handling.
+- Requested capabilities and placement, with upgrade diffs before grants expand.
+- Transactional install, health check, rollback, and auditable install history.
+
+Provenance answers **what code is this and who supplied it**. It does not prove code
+is safe. Installation and runtime still need containment: non-root execution,
+isolated writable paths, controlled network egress, bounded CPU/memory/processes,
+no implicit host devices or daemon credentials, and reliable teardown. Sandboxing
+answers **what can this code damage if it is malicious or compromised**. Neither
+control replaces the other.
+
+Automatic install is optional, not required for MCP support. Operators can keep
+using manually installed pinned commands, verified extension bundles, or prebuilt
+worker images. Preinstalled or verified packages are the safer prerequisite for a
+worker-local prototype; arbitrary network package installation during a job should
+not be the default.
+
+#### Worker-local MCP
+
+Generic worker-local MCP is **not implemented**. The core per-job worker creates its
+own tool registry but does not receive LunarWing MCP configs, construct MCP clients,
+or register MCP tool wrappers. Some external workers can independently configure
+their own MCP integrations; that is not generic LunarWing placement of an installed
+MCP package into a job worker.
+
+Worker-local placement would start an approved MCP server inside the job container.
+Potential benefits depend on enforced mounts, network policy, grants, resource
+limits, and teardown:
+
+- Direct access to that job's `/workspace` and installed language toolchains.
+- Isolation of arbitrary server code from the LunarWing daemon and host filesystem.
+- Job-scoped files, credentials, package versions, limits, and teardown.
+- Safe coexistence of jobs requiring conflicting dependencies or server versions.
+- MCP child failures remain isolated from the host daemon and can be reported
+  separately from worker failure.
+- Strong fit for repository inspection, code generation, testing, and project-local
+  native tools.
+
+Worker-local MCP is useful when a server must operate on the current project, needs
+native dependencies, or should not be trusted with LunarWing service-account host
+privileges.
+It is unnecessary for a trusted operator-installed host process, an existing hosted
+HTTP MCP endpoint, or a durable heavyweight service better placed in a dedicated
+worker or gateway.
+
+Costs include per-job startup, image/package availability, descriptor and grant
+delivery, separate MCP-versus-worker health reporting, credential exposure inside
+the worker when raw secrets are required, and reliable cancellation/teardown.
+Worker isolation limits blast radius but does not remove package-provenance needs.
+
+Recommended order: define package/policy vocabulary, run worker-local MCP only from
+preinstalled or verified packages, then add automatic package installation after
+provenance, capability review, sandbox, audit, revocation, upgrade, and rollback
+contracts exist.
+
 #### LunarWing Study Notes
+
+> **v2.0.6.0+:** the native `knowledge_*` built-in tools
+> (`knowledge_search`, `knowledge_get_topic`, `knowledge_submit_note`,
+> `knowledge_list_stale`, `knowledge_stats` — see
+> `src/workspace/README.md` § Study-Notes Knowledge Store) are the primary
+> study-notes path and need no external server. The bundled `study-notes`
+> skill (v3) uses them directly. The external lw2studymcp setup below remains
+> for backward compatibility with existing deployments.
 
 LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
 checkout as a managed stdio server. Read-only mode is default. Clone it at an
@@ -185,8 +364,8 @@ export LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
 
 Startup validates the canonical layout and creates or refreshes its managed
 `study_notes` config. Refresh preserves a disabled managed config. A user-owned
-config with the same name wins. A bundled trusted skill activates only when
-`LW2STUDYMCP_HOME` and `python3` are available.
+config with the same name wins. (Before v2.0.6.0 the bundled skill was gated on
+`LW2STUDYMCP_HOME`; the v3 skill uses the native tools and is always available.)
 
 Write mode requires mutable state separate from executable code and skill content:
 
@@ -256,6 +435,6 @@ The LLM-facing interface is identical for both (tool name, schema, execute), so 
 Local and Docker `create_job` workers default to 200 agent-loop iterations.
 Callers may set `max_iterations` from 1 through 500; large multi-fix write jobs
 should usually request 300 or more. Named external workers such as OpenCode,
-NanoCode, and Pebble control their own iteration policy and reject this option.
+OpenCode, Kimi Code, and Pebble control their own iteration policy and reject this option.
 
 This budget is separate from interactive chat's `AGENT_MAX_TOOL_ITERATIONS`.

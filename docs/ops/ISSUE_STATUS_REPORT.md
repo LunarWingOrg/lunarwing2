@@ -1,6 +1,12 @@
-# GitHub Issue Status Report
+# Historical GitHub Issue Status Report
+
+> **Snapshot only (2026-07-09).** Issue counts, states, priorities, paths, and
+> recommendations below were not re-queried for v2.0.4.0. The active project is
+> hosted on GitLab; do not use this report as a current issue tracker. It is
+> retained as provenance for the cited GitHub review.
+
 **Generated**: 2026-07-09 (item #5 from AGENT_GOALS_1.1.9.md)
-**Source**: https://github.com/LunarWingOrg/lunarwing/issues
+**Source at the time**: https://github.com/LunarWingOrg/lunarwing/issues
 
 ---
 
@@ -50,11 +56,19 @@ The issue mentions improving integration tests on the Gentoo VM and writing a he
 ---
 
 ### #223 — Create DarkIRC key exchange
-**Status**: 🟡 Open
+**Status**: 🟠 Partially implemented (secure Stage A)
 
-Request for an automated DarkIRC key exchange script. DarkIRC is still opt-in (`--enable-darkirc`), and no key exchange automation script was found in `ic/scripts/` or `docs/`.
+Phase 0/1 and Stage A now provide measured compatibility attestation,
+contact-preserving config ownership, stable tenant scopes, adoption and
+structured migration, plus public-only `prepare`, `respond`, deferred
+`complete`, `cancel`, inspection, and recovery through mt-admin. Full peer
+fingerprint authorization is mandatory and completion stops at `Installed`.
 
-**Verdict**: **Genuinely open.** No key exchange automation exists.
+**Verdict**: **Stage A implemented; live acceptance pending.** Source-audit and
+fixture gates are closed. Dedicated real systemd-user and OpenRC two-user
+isolation/leak runs remain. Activation/rollback, round-trip confirmation,
+rotation, revocation, same-host pairing, and delivery surfaces remain disabled
+pending their separate security stages.
 
 ---
 
@@ -123,7 +137,8 @@ Internal planning issue. Closed as completed.
 **Closed**: 2026-07-08
 **Status**: ✅ Resolved
 
-`lunarcode4lunarwing/` exists with a Dockerfile (187 lines). The source was refactored. `docs/internal/vendored/nanocode-config/` no longer exists (removed per #180).
+Historical resolution. Nanocode was subsequently retired; active source and
+image-build definitions no longer exist. See `NANOCODE-REMOVAL.md`.
 
 ---
 
@@ -215,7 +230,6 @@ Based on codebase verification:
 |---|-------|----------|-------|
 | #240 | crate updates k 2 | Low (deferred to 2.0.0) | `rand`, `base64`, `tower-http` intentionally deferred |
 | #232 | Integration Test Improvements | Medium | Gentoo VM test improvements + health check checklist |
-| #223 | DarkIRC key exchange | Low | DarkIRC is opt-in; key exchange automation missing |
+| #223 | DarkIRC key exchange | High | Stage A implemented; real systemd-user/OpenRC H3 acceptance and final release CI remain pending. Later Stages B-D stay separately gated. |
 | #201 | memory de-duping routines | Low | Stub issue, no work started |
 | #5 | Reflex Compiler Integration | Medium | Full 8-phase validation largely uncompleted |
-

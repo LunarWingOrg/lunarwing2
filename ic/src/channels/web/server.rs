@@ -53,7 +53,9 @@ use crate::channels::web::handlers::skills::{
 use crate::channels::web::log_layer::LogBroadcaster;
 use crate::channels::web::sse::SseManager;
 use crate::channels::web::types::*;
-use crate::channels::web::util::{build_turns_from_db_messages, truncate_preview};
+use crate::channels::web::util::{
+    build_turns_from_db_messages, reasoning_summary, truncate_preview,
+};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -598,6 +600,8 @@ pub async fn start_server(
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
         .route("/i18n-app.js", get(i18n_app_handler))
+        .route("/vendor/purify.min.js", get(vendor_purify_handler))
+        .route("/vendor/marked.umd.min.js", get(vendor_marked_handler))
         .layer(CompressionLayer::new().gzip(true));
 
     // Project file serving (behind auth to prevent unauthorized file access).
@@ -652,7 +656,7 @@ pub async fn start_server(
             header::HeaderName::from_static("content-security-policy"),
             header::HeaderValue::from_static(
                 "default-src 'self'; \
-                 script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; \
+                 script-src 'self'; \
                  style-src 'self' 'unsafe-inline'; \
                  font-src 'self'; \
                  connect-src 'self'; \
@@ -845,6 +849,29 @@ async fn i18n_app_handler() -> impl IntoResponse {
             (header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("static/i18n-app.js"),
+    )
+}
+
+// Vendored frontend libraries (embedded in the binary). Content is pinned to a
+// specific upstream release (see static/vendor/README.md), so a long cache
+// lifetime is safe.
+async fn vendor_purify_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_str!("static/vendor/purify.min.js"),
+    )
+}
+
+async fn vendor_marked_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
+        ],
+        include_str!("static/vendor/marked.umd.min.js"),
     )
 }
 
@@ -1725,14 +1752,8 @@ async fn chat_history_handler(
         let turns: Vec<TurnInfo> = thread
             .turns
             .iter()
-            .map(|t| TurnInfo {
-                turn_number: t.turn_number,
-                user_input: t.user_input.clone(),
-                response: t.response.clone(),
-                state: format!("{:?}", t.state),
-                started_at: t.started_at.to_rfc3339(),
-                completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
-                tool_calls: t
+            .map(|t| {
+                let tool_calls = t
                     .tool_calls
                     .iter()
                     .map(|tc| ToolCallInfo {
@@ -1748,7 +1769,18 @@ async fn chat_history_handler(
                         }),
                         error: tc.error.clone(),
                     })
-                    .collect(),
+                    .collect::<Vec<_>>();
+                let reasoning = reasoning_summary(&tool_calls);
+                TurnInfo {
+                    turn_number: t.turn_number,
+                    user_input: t.user_input.clone(),
+                    response: t.response.clone(),
+                    state: format!("{:?}", t.state),
+                    started_at: t.started_at.to_rfc3339(),
+                    completed_at: t.completed_at.map(|dt| dt.to_rfc3339()),
+                    tool_calls,
+                    reasoning,
+                }
             })
             .collect();
 
@@ -2106,6 +2138,7 @@ async fn extensions_list_handler(
                 command: ext.command,
                 authenticated: ext.authenticated,
                 active: ext.active,
+                recovering: ext.recovering,
                 enabled: ext.enabled,
                 tools: ext.tools,
                 needs_setup: ext.needs_setup,
@@ -2389,11 +2422,12 @@ async fn extensions_update_handler(
                     "command is required for stdio transport".to_string(),
                 )
             })?;
-            crate::tools::mcp::McpServerConfig::new_stdio(
+            crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
                 &name,
                 command,
                 req.args.clone(),
                 req.env.clone(),
+                req.env_secrets.clone(),
             )
         }
         _ => {
@@ -3130,6 +3164,7 @@ mod tests {
             command: None,
             authenticated: true,
             active: true,
+            recovering: false,
             enabled: None,
             tools: Vec::new(),
             needs_setup: true,
@@ -3295,6 +3330,16 @@ mod tests {
         ] {
             assert!(app_js.contains(key), "missing networking setting: {key}");
         }
+    }
+
+    #[test]
+    fn chat_ui_separates_live_work_reasoning_and_final_response() {
+        let app_js = include_str!("static/app.js");
+        assert!(app_js.contains("addEventListener('reasoning_update'"));
+        assert!(app_js.contains("activity-live-work-output"));
+        assert!(app_js.contains("createReasoningSummaryElement(turn.reasoning, false)"));
+        assert!(app_js.contains("finishStreamingWork(data.thread_id)"));
+        assert!(!app_js.contains("finalizeStreamingMessage(data.thread_id, data.content)"));
     }
 
     /// Build a test router with just the OAuth callback route.
@@ -3487,10 +3532,12 @@ mod tests {
             "CSP must contain default-src"
         );
         assert!(
-            csp_str.contains(
-                "script-src 'self' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com"
-            ),
-            "CSP must allow both marked and DOMPurify script CDNs"
+            csp_str.contains("script-src 'self';"),
+            "CSP script-src must be 'self' only (marked/DOMPurify are vendored)"
+        );
+        assert!(
+            !csp_str.contains("cdn.jsdelivr.net") && !csp_str.contains("cdnjs.cloudflare.com"),
+            "CSP must not reference script CDNs (libraries are vendored)"
         );
         assert!(
             csp_str.contains("object-src 'none'"),

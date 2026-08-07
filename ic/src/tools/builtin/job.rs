@@ -846,7 +846,7 @@ impl CreateJobTool {
         }
     }
 
-    /// Execute via an external worker (nanocode, opencode, etc.).
+    /// Execute via an external worker (opencode, kimi, pebble, etc.).
     async fn execute_external(
         &self,
         task: &str,

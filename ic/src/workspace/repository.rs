@@ -13,6 +13,7 @@ use crate::error::WorkspaceError;
 
 use crate::workspace::document::{
     DocumentVersion, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
+    WorkspaceFileContent,
 };
 use crate::workspace::search::{RankedResult, SearchConfig, SearchResult, fuse_results};
 
@@ -243,6 +244,114 @@ impl Repository {
                     updated_at,
                     content_preview: row.get("content_preview"),
                 }
+            })
+            .collect())
+    }
+
+    /// List at most `limit` direct files in a directory with a suffix.
+    pub async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = conn
+            .query(
+                r#"
+                SELECT path, updated_at, LEFT(content, 200) AS content_preview
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
+                  AND POSITION('/' IN SUBSTRING(path FROM CHAR_LENGTH($3) + 1)) = 0
+                  AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
+                ORDER BY path
+                LIMIT $5
+                "#,
+                &[&user_id, &agent_id, &prefix, &suffix, &limit],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Limited file listing failed: {e}"),
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceEntry {
+                path: row.get("path"),
+                is_directory: false,
+                updated_at: row.get("updated_at"),
+                content_preview: row.get("content_preview"),
+            })
+            .collect())
+    }
+
+    /// Fetch at most `limit` direct files and their content, ordered by path.
+    pub async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let directory = directory.trim_end_matches('/');
+        let prefix = if directory.is_empty() {
+            String::new()
+        } else {
+            format!("{directory}/")
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let max_file_bytes = i64::try_from(max_file_bytes).unwrap_or(i64::MAX);
+        let rows = conn
+            .query(
+                r#"
+                WITH limited AS (
+                SELECT path, content, updated_at
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND ($3 = '' OR LEFT(path, CHAR_LENGTH($3)) = $3)
+                  AND POSITION('/' IN SUBSTRING(path FROM CHAR_LENGTH($3) + 1)) = 0
+                  AND ($4 = '' OR LOWER(RIGHT(path, CHAR_LENGTH($4))) = LOWER($4))
+                ORDER BY path
+                LIMIT $5
+                )
+                SELECT path, content, updated_at
+                FROM limited
+                WHERE OCTET_LENGTH(content) <= $6
+                ORDER BY path
+                "#,
+                &[
+                    &user_id,
+                    &agent_id,
+                    &prefix,
+                    &suffix,
+                    &limit,
+                    &max_file_bytes,
+                ],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Bounded file fetch failed: {e}"),
+            })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| WorkspaceFileContent {
+                path: row.get("path"),
+                content: row.get("content"),
+                updated_at: row.get("updated_at"),
             })
             .collect())
     }
@@ -852,6 +961,156 @@ impl Repository {
             all_entries.extend(self.list_directory(uid, agent_id, directory).await?);
         }
         Ok(crate::workspace::merge_workspace_entries(all_entries))
+    }
+
+    // ==================== Study-Notes Knowledge ====================
+
+    /// PostgreSQL FTS over study-note chunks across scopes.
+    ///
+    /// Returns the best-ranked chunk per matching note. Optional metadata
+    /// filters are applied with the `$n IS NULL OR ...` pattern so one static
+    /// query covers all filter combinations.
+    pub async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let status = filter.status.map(|s| s.as_str());
+        let tags: Option<Vec<String>> = if filter.tags.is_empty() {
+            None
+        } else {
+            Some(filter.tags.clone())
+        };
+        let rows = conn
+            .query(
+                r#"
+                SELECT scope, path, metadata, snippet, rank FROM (
+                    SELECT DISTINCT ON (d.id)
+                           d.user_id AS scope, d.path, d.metadata,
+                           c.content AS snippet,
+                           ts_rank_cd(c.content_tsv, plainto_tsquery('english', $3)) AS rank
+                    FROM memory_chunks c
+                    JOIN memory_documents d ON d.id = c.document_id
+                    WHERE d.user_id = ANY($1)
+                      AND d.agent_id IS NOT DISTINCT FROM $2
+                      AND c.content_tsv @@ plainto_tsquery('english', $3)
+                      AND d.path LIKE 'study-notes/%'
+                      AND d.metadata ->> 'provenance' = 'study-note'
+                      AND ($4::text IS NULL OR d.metadata ->> 'topic' = $4)
+                      AND ($5::text IS NULL OR d.metadata ->> 'agent' = $5)
+                      AND ($6::text IS NULL OR d.metadata ->> 'status' = $6)
+                      AND ($7::text[] IS NULL OR d.metadata -> 'tags' ?| $7)
+                    ORDER BY d.id, rank DESC
+                ) hits
+                ORDER BY rank DESC
+                LIMIT $8
+                "#,
+                &[
+                    &user_ids,
+                    &agent_id,
+                    &query,
+                    &filter.topic,
+                    &filter.agent,
+                    &status,
+                    &tags,
+                    &(limit as i64),
+                ],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge FTS query failed: {e}"),
+            })?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let metadata: serde_json::Value = row.get("metadata");
+                Some(crate::workspace::KnowledgeSearchHit {
+                    scope: row.get("scope"),
+                    path: row.get("path"),
+                    snippet: row.get("snippet"),
+                    rank: row.get("rank"),
+                    meta: crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)?,
+                })
+            })
+            .collect())
+    }
+
+    /// List every per-agent version of one canonical topic across scopes.
+    ///
+    /// Bounded to 64 versions: topics accrue one version per agent, and this
+    /// keeps pathological scans out of the knowledge tools.
+    pub async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT id, user_id, agent_id, path, content,
+                       created_at, updated_at, metadata
+                FROM memory_documents
+                WHERE user_id = ANY($1)
+                  AND agent_id IS NOT DISTINCT FROM $2
+                  AND metadata ->> 'provenance' = 'study-note'
+                  AND metadata ->> 'topic' = $3
+                ORDER BY updated_at DESC
+                LIMIT 64
+                "#,
+                &[&user_ids, &agent_id, &topic],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge topic query failed: {e}"),
+            })?;
+        Ok(rows.iter().map(|r| self.row_to_document(r)).collect())
+    }
+
+    /// Scan study-note metadata (no content) across scopes, newest first.
+    ///
+    /// Rows whose metadata no longer parses as a study note are skipped.
+    pub async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        let conn = self.conn().await?;
+        let rows = conn
+            .query(
+                r#"
+                SELECT user_id AS scope, path, metadata, updated_at
+                FROM memory_documents
+                WHERE user_id = ANY($1)
+                  AND agent_id IS NOT DISTINCT FROM $2
+                  AND metadata ->> 'provenance' = 'study-note'
+                ORDER BY updated_at DESC
+                LIMIT $3
+                "#,
+                &[&user_ids, &agent_id, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Knowledge list query failed: {e}"),
+            })?;
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                let metadata: serde_json::Value = row.get("metadata");
+                Some(crate::workspace::KnowledgeNoteRow {
+                    scope: row.get("scope"),
+                    path: row.get("path"),
+                    updated_at: row.get("updated_at"),
+                    meta: crate::workspace::KnowledgeNoteMeta::from_metadata_json(&metadata)?,
+                })
+            })
+            .collect())
     }
 
     // ==================== Metadata ====================

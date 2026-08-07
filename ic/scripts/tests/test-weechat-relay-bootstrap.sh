@@ -430,6 +430,8 @@ write_fixture_env "$happy_tenant"
 rm -rf "$WEECHAT_CALL_DIR"
 mkdir -p "$WEECHAT_CALL_DIR"
 
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 configure_weechat_relay "$happy_tenant" >/dev/null
 
 target_dir="$(tenant_weechat_home "$happy_tenant")"
@@ -712,6 +714,8 @@ unique_parent="$(tenant_home "$unique_tenant")/.config"
 mkdir -p "$unique_parent/.weechat-bootstrap-tmp.$$"
 printf 'preserve-sentinel\n' >"$unique_parent/.weechat-bootstrap-tmp.$$/sentinel"
 write_fixture_env "$unique_tenant"
+# Function comes from sourced mt-admin later in ShellCheck's composed parse.
+# shellcheck disable=SC2218
 configure_weechat_relay "$unique_tenant" >/dev/null
 assert_eq "bootstrap uses a unique temp directory" \
   "$(<"$unique_parent/.weechat-bootstrap-tmp.$$/sentinel")" "preserve-sentinel"
@@ -807,6 +811,7 @@ write_tenant_lunarwing_env() { echo "env-created" >>"$call_order_log"; }
 write_tenant_bridge_env() { :; }
 write_tenant_gotify_config() { :; }
 ensure_external_worker_config() { :; }
+retire_tenant_nanocode() { :; }
 ensure_container_runtime() { :; }
 build_vision_sidecar_image() { :; }
 ensure_init_system() { :; }

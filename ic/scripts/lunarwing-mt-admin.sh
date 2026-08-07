@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2178  # DarkIRC argument parsers use intentional array namerefs.
 set -euo pipefail
 
 # ── Production Multi-Tenant Admin ─────────────────────────────────────────────
@@ -18,18 +19,54 @@ PORT_RANGE_START=10000
 PORT_RANGE_END=19999
 PORT_BLOCK_SIZE=10
 BUILD_LOCK="/var/lock/lunarwing-build.lock"
+TENANT_LIFECYCLE_LOCK_DIR="${LUNARWING_MT_LIFECYCLE_LOCK_DIR:-/run/lock/lunarwing-tenants}"
+unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
 PORTS_LOCK_HELD="false"
 PROFILE="${LUNARWING_MT_PROFILE:-release}"
+# ── BUG-005 resource bounding ────────────────────────────────────────────────
+# Transient heavy workloads (agent shell commands, compiles) must not live in
+# the daemon's own service cgroup. On systemd, the daemon spawns them as
+# transient scopes in WORKLOAD_SLICE (see ic/src/tools/process.rs) and
+# build_tenant runs cargo in BUILD_SLICE; both slices are rendered per-tenant
+# with the caps below. The daemon unit itself gets DAEMON_* caps so a runaway
+# daemon is bounded independently of its workloads.
+WORKLOAD_SLICE="${LUNARWING_MT_WORKLOAD_SLICE:-lunarwing-workloads.slice}"
+WORKLOAD_MEMORY_HIGH="${LUNARWING_MT_WORKLOAD_MEMORY_HIGH:-6G}"
+WORKLOAD_MEMORY_MAX="${LUNARWING_MT_WORKLOAD_MEMORY_MAX:-8G}"
+WORKLOAD_CPU_QUOTA="${LUNARWING_MT_WORKLOAD_CPU_QUOTA:-800%}"
+WORKLOAD_TASKS_MAX="${LUNARWING_MT_WORKLOAD_TASKS_MAX:-2048}"
+BUILD_SLICE="${LUNARWING_MT_BUILD_SLICE:-lunarwing-build.slice}"
+BUILD_JOBS="${LUNARWING_MT_BUILD_JOBS:-$(nproc)}"
+BUILD_MEMORY_HIGH="${LUNARWING_MT_BUILD_MEMORY_HIGH:-16G}"
+BUILD_MEMORY_MAX="${LUNARWING_MT_BUILD_MEMORY_MAX:-24G}"
+DAEMON_MEMORY_HIGH="${LUNARWING_MT_DAEMON_MEMORY_HIGH:-1536M}"
+DAEMON_MEMORY_MAX="${LUNARWING_MT_DAEMON_MEMORY_MAX:-2G}"
+DAEMON_TASKS_MAX="${LUNARWING_MT_DAEMON_TASKS_MAX:-512}"
 SOURCE_REPO="${LUNARWING_MT_SOURCE_REPO:-$LUNARWING_ROOT}"
 DARKIRC_SOURCE="${LUNARWING_MT_DARKIRC_SOURCE:-}"
-DARKIRC_BIN="${LUNARWING_MT_DARKIRC_BIN:-/usr/local/bin/darkirc}"
-# darkfi source for build-darkirc auto-clone. The source is cloned + built as the
-# tenant (or invoking) user, never root, so there are no root-owned artifacts and
-# the user's own rust toolchain is used. Override for a pinned rev or local mirror.
+# Managed exchange accepts only this pinned, root-attested DarkFi profile. Build
+# recipes execute in a disposable tree as a dedicated unprivileged account.
 DARKIRC_REPO="${LUNARWING_MT_DARKIRC_REPO:-https://github.com/darkrenaissance/darkfi}"
-DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-a05956d412a091e8b54c1cd4f4264c33b941203d}"
+DARKIRC_APPROVED_REV="a05956d412a091e8b54c1cd4f4264c33b941203d"
+DARKIRC_REV="${LUNARWING_MT_DARKIRC_REV:-$DARKIRC_APPROVED_REV}"
+DARKIRC_BUILD_USER="${LUNARWING_MT_DARKIRC_BUILD_USER:-lunarwing-build}"
+DARKIRC_BUILD_HOME="${LUNARWING_MT_DARKIRC_BUILD_HOME:-/var/cache/lunarwing/build-home}"
+DARKIRC_BUILD_ROOT="${LUNARWING_MT_DARKIRC_BUILD_ROOT:-/var/cache/lunarwing/darkirc-builds}"
+DARKIRC_KEY_HELPER_BUILD_ROOT="${LUNARWING_MT_DARKIRC_KEY_HELPER_BUILD_ROOT:-/var/cache/lunarwing/darkirc-key-helper-target}"
+DARKIRC_RELEASE_ROOT="${LUNARWING_MT_DARKIRC_RELEASE_ROOT:-/usr/local/lib/lunarwing/darkirc}"
+DARKIRC_RELEASES_DIR="$DARKIRC_RELEASE_ROOT/releases"
+DARKIRC_RELEASE_SELECTOR="$DARKIRC_RELEASE_ROOT/current"
+DARKIRC_RELEASE_DAEMON="$DARKIRC_RELEASE_SELECTOR/darkirc"
+DARKIRC_WRITER_LOCK_DIR="${LUNARWING_MT_DARKIRC_WRITER_LOCK_DIR:-/run/lock/lunarwing-darkirc}"
+DARKIRC_WRITER_LOCK_HELD="false"
+DARKIRC_WRITER_LOCK_FD=""
+DARKIRC_WRITER_SCOPE=""
+DARKIRC_WRITER_LOCK_INHERITED="false"
 OPENRC_ENV_EXEC_SRC="$SCRIPT_DIR/lunarwing-openrc-env-exec.sh"
 OPENRC_ENV_EXEC="/usr/local/libexec/lunarwing-openrc-env-exec"
+OPENRC_INITD_DIR="${LUNARWING_MT_OPENRC_INITD_DIR:-/etc/init.d}"
+OPENRC_CONFD_DIR="${LUNARWING_MT_OPENRC_CONFD_DIR:-/etc/conf.d}"
+OPENRC_RUNLEVELS_DIR="${LUNARWING_MT_OPENRC_RUNLEVELS_DIR:-/etc/runlevels}"
 TEMPLATES_DIR="${SCRIPT_DIR}/templates"
 DEFAULT_TENSORZERO_URL="${LUNARWING_MT_TENSORZERO_URL:-http://192.168.1.157:3000/openai/v1}"
 # Fleet-wide default VL (vision-language) backend URL the OCR sidecar proxies to.
@@ -123,12 +160,140 @@ release_ports_lock() {
   PORTS_LOCK_HELD="false"
 }
 
+# Check identity and held state without converting an unlocked forged descriptor
+# into a valid boundary. A separate open-file description must remain blocked.
+inherited_lock_fd_is_held() {
+  local lock_fd="$1" lock_file="$2" probe_fd
+  [[ "$lock_fd" =~ ^[0-9]+$ && -e "/proc/self/fd/$lock_fd" \
+    && -f "$lock_file" && ! -L "$lock_file" \
+    && "$(stat -Lc '%d:%i' "/proc/self/fd/$lock_fd" 2>/dev/null)" \
+      == "$(stat -c '%d:%i' "$lock_file" 2>/dev/null)" ]] || return 1
+  exec {probe_fd}>"$lock_file" || return 1
+  if flock -x -n "$probe_fd"; then
+    flock -u "$probe_fd" || true
+    exec {probe_fd}>&-
+    return 1
+  fi
+  exec {probe_fd}>&-
+  # Probe proved some open-file description holds this inode. This succeeds
+  # without changing lock ownership only when inherited FD is that description;
+  # an unlocked same-inode FD remains blocked by holder and must fail.
+  flock -x -n "$lock_fd"
+}
+
+with_tenant_lifecycle_lock() {
+  local name="$1"
+  shift
+  [[ "$name" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] \
+    || die "invalid tenant name for lifecycle lock"
+  require_cmd flock
+  [[ ! -L "$TENANT_LIFECYCLE_LOCK_DIR" ]]
+  install -d -o root -g root -m 0700 "$TENANT_LIFECYCLE_LOCK_DIR"
+  [[ "$(stat -c '%u:%a' "$TENANT_LIFECYCLE_LOCK_DIR" 2>/dev/null)" == "0:700" ]] \
+    || die "unsafe tenant lifecycle lock directory"
+  local lock_fd result
+  if [[ -n "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD:-}" ]]; then
+    lock_fd="$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    [[ "${LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
+      && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
+      || die "invalid active tenant lifecycle lock"
+    "$@"
+    return
+  fi
+  if [[ -n "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD:-}" ]]; then
+    lock_fd="$LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
+    [[ "${LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT:-}" == "$name" ]] \
+      && inherited_lock_fd_is_held "$lock_fd" "$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" \
+      || die "invalid inherited tenant lifecycle lock"
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
+    LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
+    "$@" || result=$?
+    result="${result:-0}"
+    unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
+    return "$result"
+  fi
+  exec {lock_fd}>"$TENANT_LIFECYCLE_LOCK_DIR/${name}.lock" || return 1
+  if ! flock -x "$lock_fd"; then
+    exec {lock_fd}>&-
+    return 1
+  fi
+  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD="$lock_fd"
+  LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT="$name"
+  "$@" || result=$?
+  result="${result:-0}"
+  unset LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_TENANT
+  flock -u "$lock_fd" || result=1
+  exec {lock_fd}>&-
+  return "$result"
+}
+
 generate_token() {
   if command -v od >/dev/null 2>&1; then
     dd if=/dev/urandom bs=32 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n'
   else
     printf 'replace-with-random-token-%s' "$(date +%s)"
   fi
+}
+
+# Generate a non-secret registry identity. Callers hold the ports lock while
+# checking uniqueness and persisting the value.
+generate_darkirc_scope_id() {
+  require_cmd od
+  local scope_id
+  scope_id="$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+  [[ "$scope_id" =~ ^[0-9a-f]{32}$ && "$scope_id" != "00000000000000000000000000000000" ]] \
+    || die "failed to generate DarkIRC scope ID"
+  printf '%s' "$scope_id"
+}
+
+generate_unique_darkirc_scope_id() {
+  local scope_id attempts=0 jq_status
+  while (( attempts < 16 )); do
+    scope_id="$(generate_darkirc_scope_id)"
+    if jq -e --arg scope "$scope_id" \
+        '[.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope)] | length == 0' \
+        "$PORTS_REGISTRY" >/dev/null 2>&1; then
+      printf '%s' "$scope_id"
+      return 0
+    fi
+    jq_status=$?
+    [[ "$jq_status" == "1" ]] || die "failed to validate DarkIRC scope ID uniqueness"
+    attempts=$((attempts + 1))
+  done
+  die "failed to allocate unique DarkIRC scope ID"
+}
+
+ensure_darkirc_scope_id() {
+  local name="$1" current matches scope_id tmp
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  jq -e --arg name "$name" \
+    '(.tenants // {}) | has($name) and (.[$name].enable_darkirc == true)' \
+    "$PORTS_REGISTRY" >/dev/null 2>&1 || die "tenant '$name' is missing or DarkIRC is disabled"
+  current="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' \
+    "$PORTS_REGISTRY" 2>/dev/null)" || die "failed to read DarkIRC scope ID for tenant '$name'"
+  if [[ -n "$current" ]]; then
+    validate_darkirc_scope_id "$current"
+    matches="$(jq -r --arg scope "$current" \
+      '[.tenants // {} | to_entries[] | select(.value.darkirc_scope_id == $scope)] | length' \
+      "$PORTS_REGISTRY" 2>/dev/null)" || die "failed to validate DarkIRC scope ID for tenant '$name'"
+    [[ "$matches" == "1" ]] || die "duplicate DarkIRC scope ID for tenant '$name'"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    printf '%s' "$current"
+    return 0
+  fi
+
+  scope_id="$(generate_unique_darkirc_scope_id)"
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg scope "$scope_id" \
+      '.tenants[$name].darkirc_scope_id = $scope' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    die "failed to store DarkIRC scope ID for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
+  printf '%s' "$scope_id"
 }
 
 sanitize_name() {
@@ -150,6 +315,11 @@ OPENCODE_CONTAINER_UID="10001"
 OPENCODE_CONTAINER_GID="10001"
 OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
 OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS}"
+
+KIMI_CONTAINER_UID="10002"
+KIMI_CONTAINER_GID="10002"
+KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
+KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS}"
 
 # ── Container config-hash tracking ────────────────────────────────────────────
 #
@@ -229,7 +399,19 @@ tenant_proxy_enabled() {
   [[ "$val" == "true" ]]
 }
 
-# Whether a given external worker (nanocode|pebble|opencode) is selected for this
+# Whether WeeChat is enabled for this tenant. Default TRUE: the flag is
+# absent on tenants created before the health-gate existed, and a missing or
+# unreadable registry must fail safe to the old behavior (weechat managed).
+# Used to make disable-weechat authoritative for lifecycle, not just health
+# classification (ISSUE-006). Explicit ==false test: jq `//` misreads false.
+tenant_weechat_enabled() {
+  local name="$1"
+  local val
+  val="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$val" != "false" ]]
+}
+
+# Whether a supported external worker (pebble|opencode|kimi) is selected for this
 # tenant. The selection is persisted at add-tenant into
 # .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
 # tenant would start every worker whose SHARED host image happens to exist,
@@ -241,6 +423,33 @@ tenant_worker_enabled() {
   local val
   val="$(jq -r ".tenants[\"$name\"].workers[\"$worker\"] // false" "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$val" == "true" ]]
+}
+
+# OpenRC worker pause state. Existing enabled workers default to running when
+# this optional field is absent; stop-worker/kill-worker persist false and
+# start-worker restores true. Kept separate from .workers because selection and
+# operator-requested runtime state are different concerns.
+tenant_worker_desired_running() {
+  local name="$1" worker="$2" val
+  tenant_worker_enabled "$name" "$worker" || return 1
+  val="$(jq -r --arg name "$name" --arg worker "$worker" '
+    if .tenants[$name].worker_runtime[$worker].desired_running == false
+    then "false" else "true" end
+  ' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  [[ "$val" == "true" ]]
+}
+
+# Cleanup may stop live services, so unknown registry state must fail safe. Only
+# an explicit unselected worker or desired_running=false authorizes OpenRC stop.
+tenant_worker_openrc_stop_requested() {
+  local name="$1" worker="$2" val
+  val="$(jq -r --arg name "$name" --arg worker "$worker" '
+    if .tenants[$name] == null then "unknown"
+    elif .tenants[$name].workers[$worker] != true then "stopped"
+    elif .tenants[$name].worker_runtime[$worker].desired_running == false then "stopped"
+    else "running" end
+  ' "$PORTS_REGISTRY" 2>/dev/null)" || return 1
+  [[ "$val" == "stopped" ]]
 }
 
 # Per-tenant PostgreSQL password. The source of truth is a 0600, tenant-owned
@@ -299,20 +508,19 @@ Commands:
                                    minimal weechat.env; services remain rendered)
     --enable-darkirc               Provision DarkIRC daemon + adapter for this tenant
                                    (disabled by default; darkirc services are NOT created)
-    --with-nanocode                Select the nanocode worker for this tenant (recorded
-                                   in the port registry; start-tenant only starts workers
-                                   the tenant selected — see --with-* on build-tenant to
-                                   also build the image). Off by default.
     --with-pebble                  Select the pebble worker for this tenant (as above)
     --with-opencode                Select the opencode worker for this tenant (as above)
-    --nanocode-model <model>       Override the nanocode worker's LLM model
-                                   (written to lunarwing.env as NANOCODE_MODEL)
-    --nanocode-base-url <url>      Override the nanocode worker's TensorZero baseURL
-                                   (written to lunarwing.env as NANOCODE_BASE_URL)
+    --with-kimi                    Select the kimi worker for this tenant (as above)
     --opencode-model <model>       Override the opencode worker's LLM model
                                    (written to lunarwing.env as OPENCODE_MODEL)
     --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
                                    (written to lunarwing.env as OPENCODE_BASE_URL)
+    --kimi-model <model>           Override the kimi worker's LLM model
+                                   (written to lunarwing.env as KIMI_MODEL)
+    --kimi-base-url <url>          Override the kimi worker's API base URL
+                                   (written to lunarwing.env as KIMI_BASE_URL)
+    --kimi-api-key-file <path>     Read kimi API key from a file, never argv
+                                   (written to lunarwing.env as KIMI_API_KEY)
     --llm-model <model>            Override LLM_MODEL (default:
                                    tensorzero::function_name::lunarwing)
     --gateway-host <host>          Override GATEWAY_HOST bind address (default:
@@ -323,7 +531,8 @@ Commands:
 
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
-      --nanocode-model/--nanocode-base-url, --opencode-model/--opencode-base-url,
+       --opencode-model/--opencode-base-url, --kimi-model/--kimi-base-url/
+       --kimi-api-key-file,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
@@ -332,21 +541,23 @@ Commands:
   build-tenant <name>             Build binaries for one tenant (OOM-safe flock)
     --with-wasm                    Also build WASM extensions
     --require-wasm                 Fail instead of preserving stale WASM (requires --with-wasm)
-    --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
+    --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected pebble, opencode,
+                                   and kimi worker images (default: slim)
 
   build-all                        Build each tenant sequentially
     --with-wasm                    Also build WASM extensions
-    --with-nanocode                Also build the nanocode worker Docker image
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
-
-  build-nanocode-worker            Build the nanocode worker Docker image
-    --no-cache                     Force a full rebuild without Docker cache
+    --with-kimi                    Also build the kimi worker Docker image
+    --with-toolchains              Include toolchains in selected pebble, opencode,
+                                   and kimi worker images (default: slim)
 
   build-pebble-worker             Build the pebble worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
+    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-opencode-worker            Build the opencode worker Docker image
     --no-cache                     Force a full rebuild without Docker cache
@@ -354,9 +565,15 @@ Commands:
                                    caching intermediate build layers)
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
+  build-kimi-worker                Build the kimi worker Docker image
+    --no-cache                     Force a full rebuild without container cache
+    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
+    --kimi-code-version <version>  Override kimi-code package version
+
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
 
   build-darkirc                   Build darkirc daemon from external source
+  ensure-darkirc-release <name>   Build the atomic release set when required
                                    (shared binary, not per-tenant)
 
   install-wasm <name>             Install built WASM tools/channels into tenant state dir
@@ -364,18 +581,25 @@ Commands:
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
+  cleanup-legacy-weechat <name>   Remove obsolete weechat-<name> service
+  restart-weechat-adapter <name>  Restart adapter through detected init system
+  stop-tenant-for-upgrade <name>  Verify settled DarkIRC state and stop atomically
+  migration-export-boundary <name> [export options]
+                                  Run export under retained lifecycle/DarkIRC locks
   restart-tenant <name>           Stop then start
+  start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
+  stop-pg <name>                  Stop only the tenant's PostgreSQL
   start-worker <name> <worker>    Start one enabled external worker
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
-                                   Workers: nanocode, pebble, opencode
+                                   Workers: pebble, opencode, kimi
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
                                   In-place upgrade: backup, fetch, clean-tree gate,
                                   stop, checkout <ref> (as tenant user), rebuild
-                                  with WASM and selected OpenCode worker, re-render
+                                   with WASM and selected OpenCode/Kimi workers, re-render
                                   units, patch env, start.
                                   Long-running — run inside tmux.
     --source-repo <path>           Point the tenant's git origin at this repo first
@@ -391,14 +615,15 @@ Commands:
     --nanogpt-api-key <key>        NanoGPT API key
     --model <model>                Pebble model (default: openai/gpt-5.2)
 
-  configure-nanocode <name>        Set nanocode worker LLM overrides for a tenant
-    --model <model>                TensorZero model (NANOCODE_MODEL; any string)
-    --base-url <url>               TensorZero baseURL (NANOCODE_BASE_URL; full URL)
-                                   (restart the worker after: stop-tenant && start-tenant)
-
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
+                                   (restart the worker after: stop-tenant && start-tenant)
+
+  configure-kimi <name>            Set kimi worker LLM overrides for a tenant
+    --model <model>                Kimi model (KIMI_MODEL; any string)
+    --base-url <url>               Kimi API base URL (KIMI_BASE_URL; full URL)
+    --api-key-file <path>          Read Kimi API key from a file, never argv
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
@@ -416,8 +641,27 @@ Commands:
                                    Preserves existing config: fails on any
                                    non-empty ~/.config/weechat without modifying it.
 
+  disable-weechat <name>           Disable WeeChat for a tenant: stops its (optional)
+  enable-weechat <name>            weechat units and removes their boot persistence
+                                   (systemd disable / OpenRC runlevel removal), and
+                                   health checks report them `skipped` when down so
+                                   self-heal will not restart-storm them. start-tenant
+                                   leaves them off. enable-weechat re-enables + starts
+                                   them. Default is enabled (absent flag == enabled).
+
   patch-env <name>                 Add missing env vars (e.g. ORCHESTRATOR_PORT)
   patch-env-all                    Patch env for all registered tenants
+
+  darkirc-contact list|status|doctor|adopt ...
+                                   Inventory/adopt contacts using fingerprints only
+  darkirc-contact prepare|respond|complete|cancel|exchanges ...
+                                   Public-only Stage A exchange; complete is deferred
+  darkirc-contact export-migration|stage-migration|import-migration|migration-ready|recover ...
+                                   Structured, settled-state DarkIRC migration
+  darkirc-contact validate-migration --in - [--unbound]
+                                   Validate a manifest without tenant-state writes
+  darkirc-health <tenant> --strict [--json]
+                                   Diagnostic daemon/adapter connectivity check
 
   migrate-owner-scope <name>       Rekey DB data from 'default' to tenant scope
     --from <old_scope>             Old owner_id (default: 'default')
@@ -471,21 +715,22 @@ EOF
 render_template() {
   local template="$1" out="$2"
   shift 2
+  render_template_content "$template" "$@" >"$out"
+}
 
+render_template_content() {
+  local template="$1"
+  shift
   [[ "$template" = /* ]] || template="$TEMPLATES_DIR/$template"
   [[ -f "$template" ]] || die "template not found: $template"
-
-  local content
+  local content pair var val
   content="$(<"$template")"
-
-  local pair var val
   for pair; do
     var="${pair%%=*}"
     val="${pair#*=}"
     content="${content//__${var}__/${val}}"
   done
-
-  printf '%s\n' "$content" > "$out"
+  printf '%s\n' "$content"
 }
 # ── Root check ────────────────────────────────────────────────────────────────
 
@@ -713,7 +958,7 @@ _ensure_tenant_image() {
   return 1
 }
 
-# Render a dedicated OpenRC unit for a tenant's external worker (nanocode/pebble),
+# Render a dedicated OpenRC unit for a tenant's supported external worker,
 # modeled on the lunarwing-pg-<t> unit. Health-aware status() checks the worker's
 # /health endpoint (curl is present in both worker images) so the host self-heal
 # pipeline — which auto-discovers /etc/init.d/lunarwing-* units — can detect and
@@ -957,7 +1202,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "11" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "14" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -983,7 +1228,17 @@ ENDJSON
   fi
 
   ports_migrate
+  # ports_migrate may have bumped to the current version; verify and release.
   release_ports_lock
+}
+
+# Inspection commands must not create or migrate host state.
+ports_registry_require_readonly() {
+  require_cmd jq
+  [[ -f "$PORTS_REGISTRY" && ! -L "$PORTS_REGISTRY" ]] \
+    || die "port registry not found: $PORTS_REGISTRY"
+  jq -e '.tenants | type == "object"' "$PORTS_REGISTRY" >/dev/null 2>&1 \
+    || die "invalid port registry: $PORTS_REGISTRY"
 }
 
 ports_migrate_v2() {
@@ -1187,6 +1442,9 @@ ports_migrate() {
   if [[ "$current_version" -lt 9 ]]; then ports_migrate_v9; fi
   if [[ "$current_version" -lt 10 ]]; then ports_migrate_v10; fi
   if [[ "$current_version" -lt 11 ]]; then ports_migrate_v11; fi
+  if [[ "$current_version" -lt 12 ]]; then ports_migrate_v12; fi
+  if [[ "$current_version" -lt 13 ]]; then ports_migrate_v13; fi
+  if [[ "$current_version" -lt 14 ]]; then ports_migrate_v14; fi
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1295,20 +1553,140 @@ ports_migrate_v11() {
   mv "$tmp" "$PORTS_REGISTRY"
 }
 
+# v11 -> v12: add a dedicated kimi port range (30000-39999, block_size 2)
+# with per-tenant kimi_ports {kimi_wss, kimi_health}. The existing extended
+# block (20000-29999, block_size 10) has only one free slot (reserved_9), which
+# is insufficient for two ports. Using a separate range avoids re-spacing
+# existing tenants' extended blocks (which would require re-render + restart
+# of every running tenant) and is fully non-disruptive.
+ports_migrate_v12() {
+  if ! jq -e '.tenants | to_entries[] | select(.value.kimi_ports | has("kimi_wss") | not)' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    # No tenants need kimi_ports; just bump the version.
+    local tmp
+    tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+    jq '.version = 12
+      | .kimi_range = ((.kimi_range) // {"start": 30000, "end": 39999})
+      | .kimi_block_size = ((.kimi_block_size) // 2)' "$PORTS_REGISTRY" >"$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$PORTS_REGISTRY"
+    return 0
+  fi
+
+  say "migrating port registry -> v12 (add kimi_wss + kimi_health from dedicated range) ..."
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 12
+    | .kimi_range = ((.kimi_range) // {"start": 30000, "end": 39999})
+    | .kimi_block_size = ((.kimi_block_size) // 2)
+    | ( .range.start // 10000 ) as $rstart
+    | ( .kimi_range.start ) as $kstart
+    | .tenants |= with_entries(
+        .value |= (
+          if .base_port then
+            ( .base_port - $rstart + $kstart ) as $kbase
+            | .kimi_base = $kbase
+            | .kimi_ports = {
+                kimi_wss: ($kbase + 0),
+                kimi_health: ($kbase + 1)
+              }
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v12 (kimi_wss + kimi_health dedicated in kimi_range 30000-39999)"
+}
+
+# v12 -> v13: dedicate the final extended slot to the per-tenant coordination
+# admin server. Existing units are unaffected until coordination is enabled.
+ports_migrate_v13() {
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 13
+    | .tenants |= with_entries(
+        .value |= (
+          if (.extended_base | type) == "number" and ((.extended_ports | type) != "object" or (.extended_ports | has("coord_admin") | not)) then
+            .extended_ports = (if (.extended_ports | type) == "object" then .extended_ports else {} end)
+            | .extended_ports.coord_admin = (.extended_ports.reserved_9 // (.extended_base + 9))
+            | .extended_ports |= del(.reserved_9)
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v13 (coord_admin dedicated at extended_base+9)"
+}
+
+# v13 -> v14: stable non-secret identity for every DarkIRC-enabled tenant.
+ports_migrate_v14() {
+  local name tmp next scope
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  cp "$PORTS_REGISTRY" "$tmp"
+  if ! jq -e '
+      [(.tenants // {}) | to_entries[]
+        | select(.value.enable_darkirc == true)
+        | (.value.darkirc_scope_id // "")
+        | select(length > 0)] as $ids
+      | all($ids[]; test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000")
+      and (($ids | unique | length) == ($ids | length))
+    ' "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    die "failed to migrate port registry to v14: invalid or duplicate scope ID"
+  fi
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    scope="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' "$tmp")"
+    [[ -z "$scope" ]] || continue
+    while :; do
+      scope="$(generate_darkirc_scope_id)"
+      if ! jq -e --arg scope "$scope" \
+        '.tenants // {} | to_entries | any(.value.darkirc_scope_id == $scope)' \
+        "$tmp" >/dev/null; then
+        break
+      fi
+    done
+    next="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+    jq --arg name "$name" --arg scope "$scope" \
+      '.tenants[$name].darkirc_scope_id = $scope' "$tmp" >"$next" \
+      || { rm -f "$tmp" "$next"; die "failed to assign DarkIRC scope ID"; }
+    mv "$next" "$tmp"
+  done < <(jq -r '.tenants // {} | to_entries[] | select(.value.enable_darkirc == true) | .key' "$tmp")
+  next="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '.version = 14' "$tmp" >"$next" \
+    || { rm -f "$tmp" "$next"; die "failed to migrate port registry to v14"; }
+  mv "$next" "$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v14 (stable DarkIRC scope IDs)"
+}
+
 ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
   local enable_proxy="${3:-false}"
-  # Selected external workers, as a JSON object literal
-  # (e.g. '{"nanocode":true,"pebble":false,"opencode":false}'). Persisted so
+  # Selected external workers, as a JSON object literal. Persisted so
   # start_tenant_<worker> can gate on the tenant's choice; see
   # tenant_worker_enabled. NOTE: assign in two steps — `${4:-{}}` mis-parses
   # (bash closes the ${...} at the first `}`, appending a stray `}` and
   # corrupting the JSON), so default explicitly instead.
   local workers_json="${4:-}"
+  local requested_darkirc_scope="${5:-}"
   [[ -n "$workers_json" ]] || workers_json='{}'
   require_cmd jq
   acquire_ports_lock
+  if [[ -n "$requested_darkirc_scope" ]]; then
+    [[ "$enable_darkirc" == "true" ]] \
+      || die "DarkIRC import scope requires --enable-darkirc"
+    validate_darkirc_scope_id "$requested_darkirc_scope"
+    jq -e --arg scope "$requested_darkirc_scope" --arg name "$name" \
+      '.tenants // {} | to_entries | any(.key != $name and .value.darkirc_scope_id == $scope)' \
+      "$PORTS_REGISTRY" >/dev/null 2>&1 \
+      && die "DarkIRC import scope is already assigned"
+  fi
 
   # Resumable (F4): if this tenant already has a block, reuse it (echo its
   # base_port) instead of dying — so re-running add-tenant after a mid-flow failure
@@ -1317,6 +1695,12 @@ ports_allocate() {
   local existing
   existing="$(jq -r ".tenants[\"$name\"].base_port // empty" "$PORTS_REGISTRY" 2>/dev/null || true)"
   if [[ -n "$existing" ]]; then
+    if [[ -n "$requested_darkirc_scope" ]]; then
+      local existing_scope
+      existing_scope="$(jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' "$PORTS_REGISTRY")"
+      [[ "$existing_scope" == "$requested_darkirc_scope" ]] \
+        || die "existing tenant has a different DarkIRC scope"
+    fi
     say "tenant '$name' already has ports allocated (base $existing); reusing for resume" >&2
     # Reconcile the darkirc flag on resume (H2): add_tenant()'s env/unit writers
     # (write_tenant_lunarwing_env, render_tenant_*_units, start_tenant_*) gate on
@@ -1331,7 +1715,7 @@ ports_allocate() {
     # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
     # worker on; omitting the flag never turns one off (disabling is manual).
     local _w
-    for _w in nanocode pebble opencode; do
+    for _w in pebble opencode kimi; do
       if [[ "$(jq -r --arg w "$_w" '.[$w] // false' <<<"$workers_json" 2>/dev/null)" == "true" ]]; then
         ports_enable_worker "$name" "$_w"
       fi
@@ -1358,25 +1742,34 @@ ports_allocate() {
   [[ "$enable_darkirc" == "true" ]] && darkirc_json="true"
   local proxy_json="false"
   [[ "$enable_proxy" == "true" ]] && proxy_json="true"
-  # Normalize the workers spec to a full {nanocode,pebble,opencode} bool map so
-  # every tenant object has a stable, explicit shape (missing/garbage -> all off).
+  # Keep the retired nanocode field false so existing registry consumers retain
+  # a stable shape and no historical port or worker slot gets reused.
   local workers_norm
   workers_norm="$(jq -c '{
-      nanocode: (.nanocode // false),
+      nanocode: false,
       pebble:   (.pebble   // false),
-      opencode: (.opencode // false)
-    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false}')"
-  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
+      opencode: (.opencode // false),
+      kimi:     (.kimi     // false)
+    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false}')"
+  local darkirc_scope=""
+  if [[ "$enable_darkirc" == true ]]; then
+    darkirc_scope="${requested_darkirc_scope:-$(generate_unique_darkirc_scope_id)}"
+  fi
+  jq --arg name "$name" --argjson base "$base" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --argjson darkirc "$darkirc_json" --arg scope "$darkirc_scope" --argjson proxy "$proxy_json" --argjson workers "$workers_norm" '
     ( .range.start // 10000 ) as $rstart
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
+    | ( .kimi_range.start // 30000 ) as $kstart
     | ( $base - $rstart + $estart ) as $ebase
+    | ( $base - $rstart + $kstart ) as $kbase
     | .tenants[$name] = {
         base_port: $base,
         user: $name,
         created_at: $ts,
         enable_darkirc: $darkirc,
+        darkirc_scope_id: (if $darkirc then $scope else null end),
         enable_proxy: $proxy,
+        enable_weechat: true,
         workers: $workers,
         ports: {
           gateway:          ($base + 0),
@@ -1401,10 +1794,16 @@ ports_allocate() {
             vision_service: ($ebase + 5),
             vision_health: ($ebase + 6),
             opencode_wss: ($ebase + 7),
-            opencode_health: ($ebase + 8)
+            opencode_health: ($ebase + 8),
+            coord_admin: ($ebase + 9)
           }
-          + (reduce range(9; $ebs) as $i ({}; . + { ("reserved_\($i)"): ($ebase + $i) }))
-        )
+          + (reduce range(10; $ebs) as $i ({}; . + { ("reserved_\($i)"): ($ebase + $i) }))
+        ),
+        kimi_base: $kbase,
+        kimi_ports: {
+          kimi_wss: ($kbase + 0),
+          kimi_health: ($kbase + 1)
+        }
       }
   ' "$PORTS_REGISTRY" >"$tmp"
   chmod 0644 "$tmp"
@@ -1422,19 +1821,37 @@ ports_allocate() {
 ports_enable_darkirc() {
   local name="$1"
   require_cmd jq
+  # ISSUE-012 (follow-up): registry read-modify-rename must run under the shared
+  # ports lock, same as ports_set_weechat. Reentrancy-safe: when called from
+  # ports_allocate() (which already holds the lock) acquire is a no-op and we
+  # must NOT release the caller's lock — only release if we acquired it here.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_darkirc // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    ensure_darkirc_scope_id "$name" >/dev/null
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
-  local tmp
+  local tmp scope_id
+  scope_id="$(generate_unique_darkirc_scope_id)"
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
-  if ! jq --arg name "$name" '.tenants[$name].enable_darkirc = true' \
+  if ! jq --arg name "$name" --arg scope "$scope_id" \
+      '.tenants[$name].enable_darkirc = true | .tenants[$name].darkirc_scope_id = $scope' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable darkirc flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "darkirc for tenant '$name': disabled -> enabled" >&2
 }
 
@@ -1443,23 +1860,84 @@ ports_enable_darkirc() {
 ports_enable_proxy() {
   local name="$1"
   require_cmd jq
+  # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
+  # ports_enable_darkirc — see comment there for the reentrancy contract.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].enable_proxy // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
   if ! jq --arg name "$name" '.tenants[$name].enable_proxy = true' \
       "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable proxy flag for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "proxy for tenant '$name': disabled -> enabled" >&2
 }
 
-# Mark a single external worker (nanocode|pebble|opencode) enabled for a tenant
+# Set the per-tenant WeeChat health-gate flag in the registry (bidirectional).
+# enable_weechat=false tells the infrastructure health checks (health-openrc.sh /
+# health-systemd.sh) to classify the tenant's OPTIONAL lunarwing-weechat-<t> and
+# lunarwing-weechat-adapter-<t> units as `skipped` when down, so an intentionally
+# unused WeeChat backend no longer reads critical and self-heal does not
+# restart-storm (flap) a unit that cannot come up. Absent flag == enabled, so
+# tenants created before this field existed keep the old behavior.
+# The flag is authoritative for lifecycle too (ISSUE-006): the
+# disable-weechat / enable-weechat verbs stop/disable resp. enable/start the
+# units after flipping it, and start-tenant respects it on both init systems.
+# This function only mutates the registry (under the shared ports lock).
+# ISSUE-012: runs under the shared ports lock like every other registry
+# mutation, and revalidates tenant existence while holding it — two unlocked
+# read-modify-rename writers could drop each other's updates, and a concurrent
+# remove-tenant could be followed by recreation of a partial tenant object.
+ports_set_weechat() {
+  local name="$1" enabled="$2"
+  require_cmd jq
+  case "$enabled" in true|false) ;; *) die "ports_set_weechat: enabled must be true or false" ;; esac
+  acquire_ports_lock
+  local current
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
+  # Explicit ==false test: jq's `//` treats false as empty, so
+  # `.enable_weechat // true` would misread a disabled tenant as enabled and
+  # `enable-weechat` could never flip it back.
+  current="$(jq -r --arg name "$name" 'if .tenants[$name].enable_weechat == false then "false" else "true" end' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  if [[ "$current" == "$enabled" ]]; then
+    say "weechat for tenant '$name': already $enabled" >&2
+    release_ports_lock
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --argjson enabled "$enabled" '.tenants[$name].enable_weechat = $enabled' \
+      "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    release_ports_lock
+    die "failed to set weechat flag for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
+  say "weechat for tenant '$name': $current -> $enabled" >&2
+}
+
+# Mark a supported external worker (pebble|opencode|kimi) enabled for a tenant
 # (one-directional: false -> true). Idempotent. Used by ports_allocate()'s resume
 # path so `add-tenant <existing> --with-<worker>` flips the registry, mirroring
 # ports_enable_darkirc/proxy. Ensures a .workers object exists on older tenant
@@ -1467,13 +1945,24 @@ ports_enable_proxy() {
 ports_enable_worker() {
   local name="$1" worker="$2"
   require_cmd jq
-  case "$worker" in
-    nanocode|pebble|opencode) ;;
+    case "$worker" in
+    pebble|opencode|kimi) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
+  # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
+  # ports_enable_darkirc — see comment there for the reentrancy contract.
+  local had_lock="$PORTS_LOCK_HELD"
+  acquire_ports_lock
+  if ! jq -e ".tenants[\"$name\"]" "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
   local current
   current="$(jq -r ".tenants[\"$name\"].workers[\"$worker\"] // false" "$PORTS_REGISTRY" 2>/dev/null || true)"
-  [[ "$current" == "true" ]] && return 0
+  if [[ "$current" == "true" ]]; then
+    [[ "$had_lock" == "true" ]] || release_ports_lock
+    return 0
+  fi
 
   local tmp
   tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
@@ -1481,11 +1970,69 @@ ports_enable_worker() {
       .tenants[$name].workers = ((.tenants[$name].workers // {}) + { ($w): true })
     ' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
     rm -f "$tmp"
+    [[ "$had_lock" == "true" ]] || release_ports_lock
     die "failed to enable worker '$worker' for tenant '$name'"
   fi
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
+  [[ "$had_lock" == "true" ]] || release_ports_lock
   say "worker '$worker' for tenant '$name': disabled -> enabled" >&2
+}
+
+# Persist OpenRC worker runtime intent without changing worker selection.
+# Optional field: enabled workers without it retain historical auto-start.
+ports_set_worker_desired_running() {
+  local name="$1" worker="$2" desired="$3"
+  require_cmd jq
+  case "$worker" in
+    pebble|opencode|kimi) ;;
+    *) die "ports_set_worker_desired_running: unknown worker '$worker'" ;;
+  esac
+  case "$desired" in true|false) ;; *) die "worker desired_running must be true or false" ;; esac
+
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
+
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg worker "$worker" --argjson desired "$desired" '
+      .tenants[$name].worker_runtime = (.tenants[$name].worker_runtime // {})
+      | .tenants[$name].worker_runtime[$worker] =
+          ((.tenants[$name].worker_runtime[$worker] // {}) + {desired_running: $desired})
+    ' "$PORTS_REGISTRY" >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    release_ports_lock
+    die "failed to set desired state for worker '$worker' on tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
+}
+
+# Preserve the legacy registry field while making retirement explicit. This runs
+# only after supervision and containers are confirmed stopped.
+ports_retire_nanocode() {
+  local name="$1" tmp
+  require_cmd jq
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    return 0
+  fi
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" '
+      .tenants[$name].workers = ((.tenants[$name].workers // {}) + {nanocode: false})
+    ' "$PORTS_REGISTRY" >"$tmp"; then
+    rm -f "$tmp"
+    release_ports_lock
+    return 1
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
 }
 
 ports_deallocate() {
@@ -1523,6 +2070,11 @@ ports_get() {
     printf '%s' "$port"
     return 0
   fi
+  port="$(jq -r ".tenants[\"$name\"].kimi_ports.$port_name // empty" "$PORTS_REGISTRY")"
+  if [[ -n "$port" ]]; then
+    printf '%s' "$port"
+    return 0
+  fi
   # Back-compat: pre-v9 registries had `reserved_5` where `vision_service` now
   # lives. Read either name; new tenants only ever carry `vision_service`.
   if [[ "$port_name" == "vision_service" ]]; then
@@ -1541,6 +2093,12 @@ ports_get() {
     port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_8 // empty" "$PORTS_REGISTRY")"
     [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
   fi
+  if [[ "$port_name" == "coord_admin" ]]; then
+    port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_9 // empty" "$PORTS_REGISTRY")"
+    [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
+    port="$(jq -r ".tenants[\"$name\"].extended_base // empty" "$PORTS_REGISTRY")"
+    [[ "$port" =~ ^[0-9]+$ ]] && { printf '%s' "$((port + 9))"; return 0; }
+  fi
   return 1
 }
 
@@ -1551,7 +2109,7 @@ ports_list() {
     return 0
   fi
   jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")"' "$PORTS_REGISTRY" \
-    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NANOCODE,PEBBLE,VISION_SVC,VISION_HLTH"
+    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH"
 }
 
 tenant_exists_in_registry() {
@@ -1835,12 +2393,35 @@ clone_tenant_repo() {
 
 # ── Build management ─────────────────────────────────────────────────────────
 
+# Run one tenant build step with resource bounding (BUG-005). On systemd the
+# step runs as a transient scope in BUILD_SLICE via the tenant's own user
+# manager, so cargo/rustc memory is capped and accounted outside both the
+# operator's session and the daemon service. Falls back to a plain nice'd
+# invocation when no user manager is reachable (OpenRC, or not yet started).
+_run_tenant_build() {
+  local name="$1" build_cmd="$2"
+  local uid
+  uid="$(id -u "$name")"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd* ]] && command -v systemd-run >/dev/null 2>&1 \
+    && sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" systemctl --user show --property=Version >/dev/null 2>&1; then
+    sudo -u "$name" XDG_RUNTIME_DIR="/run/user/$uid" \
+      systemd-run --user --scope --quiet --collect \
+      --slice="$BUILD_SLICE" \
+      --property="MemoryHigh=$BUILD_MEMORY_HIGH" \
+      --property="MemoryMax=$BUILD_MEMORY_MAX" \
+      bash -c "$build_cmd"
+  else
+    sudo -u "$name" nice -n 10 bash -c "$build_cmd"
+  fi
+}
+
 build_tenant() {
   local name="$1"
   local with_wasm="${2:-false}"
-  local with_nanocode="${3:-false}"
-  local with_pebble="${4:-false}"
-  local with_opencode="${5:-false}"
+  local with_pebble="${3:-false}"
+  local with_opencode="${4:-false}"
+  local with_kimi="${5:-false}"
   local with_toolchains="${6:-false}"
   local require_wasm="${7:-false}"
   local repo
@@ -1859,18 +2440,18 @@ build_tenant() {
     local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
 
     say "building lunarwing for $name ..."
-    sudo -u "$name" bash -c "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing" \
+    _run_tenant_build "$name" "$cargo_env cd '$repo' && cargo build --profile $PROFILE --bin lunarwing -j$BUILD_JOBS" \
       || die "lunarwing build failed for $name"
 
     say "building xmpp-bridge for $name ..."
-    sudo -u "$name" bash -c "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE" \
+    _run_tenant_build "$name" "$cargo_env cd '$repo/bridges/xmpp-bridge' && cargo build --profile $PROFILE -j$BUILD_JOBS" \
       || die "xmpp-bridge build failed for $name"
 
     if [[ "$with_wasm" == "true" ]]; then
       if ensure_tenant_wasm_toolchain "$name"; then
         say "building WASM extensions for $name ..."
         local wasm_build_ok="true"
-        if ! sudo -u "$name" bash -c "$cargo_env cd '$repo' && bash scripts/build-wasm-extensions.sh"; then
+        if ! _run_tenant_build "$name" "$cargo_env cd '$repo' && CARGO_BUILD_JOBS=$BUILD_JOBS bash scripts/build-wasm-extensions.sh"; then
           if [[ "$require_wasm" == "true" ]]; then
             die "WASM extension build failed for $name; refusing to install stale artifacts"
           fi
@@ -1898,22 +2479,22 @@ build_tenant() {
     say "  e.g.  LLM_API_KEY=sk-..."
   ) 200>"$BUILD_LOCK" || return $?
 
-  if [[ "$with_nanocode" == "true" ]]; then
-    say ""
-    say "=== Building nanocode worker image ==="
-    build_nanocode_worker "false" "$with_toolchains"
-  fi
-
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false"
+    build_pebble_worker "false" "$with_toolchains"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
     say ""
     say "=== Building opencode worker image ==="
-    build_opencode_worker "false" "$with_toolchains"
+    build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
+  fi
+
+  if [[ "$with_kimi" == "true" ]]; then
+    say ""
+    say "=== Building kimi worker image ==="
+    build_kimi_worker "false" "$with_toolchains" "" "$(tenant_lw_root "$name")"
   fi
 
   # After a rebuild, the tenant will be restarted with the new binary. If the
@@ -1931,73 +2512,460 @@ build_tenant() {
 
 # ── Darkirc daemon build (shared, not per-tenant) ────────────────────────────
 
-build_darkirc() {
-  local tenant_name="${1:-}" darkirc_src="" build_user=""
+darkirc_validate_root_owned_directory() {
+  local path="$1" rest component current="" owner mode
+  [[ "$path" == /* && -d "$path" ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="$current/$component"
+    [[ -d "$current" && ! -L "$current" ]] || return 1
+    owner="$(stat -c '%u' "$current" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$current" 2>/dev/null || true)"
+    [[ "$owner" == 0 && "$mode" =~ ^[0-7]+$ ]] || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
 
-  if [[ -n "$tenant_name" ]]; then
-    build_user="$tenant_name"
-    local envf
-    envf="$(tenant_env_dir "$tenant_name")/lunarwing.env"
-    if [[ -f "$envf" ]]; then
-      darkirc_src="$(grep -s '^DARKIRC_SOURCE=' "$envf" | cut -d= -f2-)" || true
-    fi
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$(tenant_home "$tenant_name")/darkfi"
-  else
-    # Fleet-wide build: run as the invoking (sudo) user, never root. Root has no
-    # per-user rust toolchain under rustup, and root-owned source/artifacts break
-    # the tenant-run daemon.
-    build_user="${SUDO_USER:-$(id -un)}"
-    [[ -n "$darkirc_src" ]] || darkirc_src="$DARKIRC_SOURCE"
-    [[ -n "$darkirc_src" ]] || die "darkirc source path not configured — set DARKIRC_SOURCE/LUNARWING_MT_DARKIRC_SOURCE or pass --tenant <name>"
+darkirc_validate_clean_root_checkout() {
+  local path="$1" expected_revision="${2:-}" revision dirty git_dir common_dir unsafe
+  darkirc_validate_root_owned_directory "$path" || return 1
+  revision="$(git -C "$path" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ -z "$expected_revision" || "$revision" == "$expected_revision" ]] || return 1
+  dirty="$(git -C "$path" status --porcelain --untracked-files=all 2>/dev/null)" || return 1
+  [[ -z "$dirty" ]] || return 1
+  git_dir="$(git -C "$path" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  common_dir="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  for git_path in "$git_dir" "$common_dir"; do
+    darkirc_validate_root_owned_directory "$git_path" || return 1
+    unsafe="$(find "$git_path" -xdev \( -type l -o ! -user root -o -perm /022 \) -print -quit 2>/dev/null)" \
+      || return 1
+    [[ -z "$unsafe" ]] || return 1
+  done
+  ! git -C "$path" ls-tree -r "$revision" | grep -Eq '^(120000|160000) '
+}
+
+ensure_darkirc_build_user() {
+  require_cmd useradd
+  require_cmd passwd
+  require_cmd setpriv
+  if ! id "$DARKIRC_BUILD_USER" >/dev/null 2>&1; then
+    useradd --system --no-create-home --home-dir "$DARKIRC_BUILD_HOME" \
+      --shell "$(command -v nologin || printf '/sbin/nologin')" \
+      --comment "LunarWing unprivileged build worker" "$DARKIRC_BUILD_USER"
   fi
+  local build_uid build_gid build_groups account_home account_shell account_state
+  build_uid="$(id -u "$DARKIRC_BUILD_USER")"
+  build_gid="$(id -g "$DARKIRC_BUILD_USER")"
+  build_groups="$(id -G "$DARKIRC_BUILD_USER")"
+  account_home="$(getent passwd "$DARKIRC_BUILD_USER" | cut -d: -f6)"
+  account_shell="$(getent passwd "$DARKIRC_BUILD_USER" | cut -d: -f7)"
+  account_state="$(passwd -S "$DARKIRC_BUILD_USER" 2>/dev/null | awk '{print $2}')"
+  [[ "$build_uid" -ne 0 && "$build_groups" == "$build_gid" \
+    && "$account_home" == "$DARKIRC_BUILD_HOME" \
+    && "$account_shell" == */nologin \
+    && ( "$account_state" == L || "$account_state" == LK ) ]] \
+    || die "DarkIRC build account must be locked, dedicated, and have no supplementary groups"
+  DARKIRC_BUILD_GROUP="$(id -gn "$DARKIRC_BUILD_USER")"
+  [[ ! -L "$DARKIRC_BUILD_HOME" && ( ! -e "$DARKIRC_BUILD_HOME" || -d "$DARKIRC_BUILD_HOME" ) ]] \
+    || die "unsafe DarkIRC build home"
+  install -d -o root -g root -m 0711 "$DARKIRC_BUILD_HOME"
+  [[ "$(stat -c '%u:%a' "$DARKIRC_BUILD_HOME" 2>/dev/null)" == "0:711" ]] \
+    || die "DarkIRC build home must be root-owned mode 0711"
+}
 
-  [[ "$build_user" != "root" ]] || die "refusing to build darkirc as root — pass --tenant <name>, or invoke via sudo from a user that has a rust toolchain"
+darkirc_validate_build_artifact() {
+  local artifact="$1" owner links
+  [[ -f "$artifact" && ! -L "$artifact" && -x "$artifact" ]] || return 1
+  owner="$(stat -c '%U' "$artifact" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$artifact" 2>/dev/null || true)"
+  [[ "$owner" == "$DARKIRC_BUILD_USER" && "$links" == 1 ]]
+}
+
+darkirc_path_components_safe() {
+  local path="$1" rest component current=""
+  [[ "$path" == /* ]] || return 1
+  rest="${path#/}"
+  while [[ -n "$rest" ]]; do
+    component="${rest%%/*}"
+    [[ -n "$component" && "$component" != . && "$component" != .. ]] || return 1
+    current="$current/$component"
+    [[ ! -L "$current" ]] || return 1
+    if [[ "$rest" == */* ]]; then rest="${rest#*/}"; else rest=""; fi
+  done
+}
+
+darkirc_validate_root_executable() {
+  local path="$1" mode owner links
+  darkirc_path_components_safe "$path" || return 1
+  darkirc_validate_root_owned_directory "$(dirname "$path")" || return 1
+  [[ -f "$path" && ! -L "$path" && -x "$path" ]] || return 1
+  mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$path" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$path" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$mode & 07022) == 0 ))
+}
+
+darkirc_current_helper_source_revision() {
+  local revision
+  revision="$(git -C "$LUNARWING_ROOT" rev-parse HEAD 2>/dev/null)" || return 1
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s' "$revision"
+}
+
+install_darkirc_key_helper() {
+  local archive_root cargo_home artifact source_revision
+  require_cmd cargo
+  require_cmd taskset
+  require_cmd tar
+  darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
+    || die "trusted LunarWing admin checkout must be root-owned, non-writable, and clean"
+  source_revision="$(darkirc_current_helper_source_revision)" \
+    || die "could not attest LunarWing helper source revision"
+  ensure_darkirc_build_user
+  [[ "$DARKIRC_KEY_HELPER_BUILD_ROOT" == /var/cache/lunarwing/* \
+    && "$DARKIRC_KEY_HELPER_BUILD_ROOT" != *'/../'* \
+    && ! -L "$DARKIRC_KEY_HELPER_BUILD_ROOT" ]] \
+    || die "DarkIRC helper build root must be a safe /var/cache/lunarwing path"
+  rm -rf -- "$DARKIRC_KEY_HELPER_BUILD_ROOT"
+  install -d -o "$DARKIRC_BUILD_USER" -g "$DARKIRC_BUILD_GROUP" -m 0700 \
+    "$DARKIRC_KEY_HELPER_BUILD_ROOT"
+  archive_root="$DARKIRC_KEY_HELPER_BUILD_ROOT/source"
+  install -d -o root -g root -m 0700 "$archive_root"
+  git -C "$LUNARWING_ROOT" archive --format=tar HEAD | tar -x -C "$archive_root"
+  chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$archive_root"
+  cargo_home="$(mktemp -d "$DARKIRC_BUILD_HOME/cargo.XXXXXX")"
+  install -d -o root -g root -m 0700 "$cargo_home/.cargo"
+  chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$cargo_home"
+  say "building trusted DarkIRC key helper as $DARKIRC_BUILD_USER ..."
+  setpriv --reuid="$(id -u "$DARKIRC_BUILD_USER")" \
+    --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
+    env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
+    CARGO_TARGET_DIR="$DARKIRC_KEY_HELPER_BUILD_ROOT" \
+    taskset -c 0-7 cargo build --manifest-path "$archive_root/ic/Cargo.toml" \
+      --release -j8 --bin lunarwing-darkirc-key-helper \
+    || die "DarkIRC key helper build failed"
+  darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" \
+    || die "DarkIRC helper build changed trusted LunarWing checkout"
+  rm -rf -- "$cargo_home"
+  artifact="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/lunarwing-darkirc-key-helper"
+  # Cargo hard-links release/<bin> to deps/<bin>-<hash> on capable filesystems,
+  # so the artifact would have st_nlink=2 and fail validation. Copy over itself
+  # to break the link (same bytes, fresh inode) before checking ownership.
+  local unlinked="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/.lunarwing-darkirc-key-helper.unlinked"
+  cp -f "$artifact" "$unlinked" && mv -f "$unlinked" "$artifact"
+  chown "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$artifact"
+  darkirc_validate_build_artifact "$artifact" \
+    || die "DarkIRC key helper artifact failed ownership validation"
+  DARKIRC_HELPER_ARTIFACT="$artifact"
+  DARKIRC_HELPER_SOURCE_REVISION="$source_revision"
+}
+
+write_darkirc_compatibility() {
+  local release_dir="$1" release_id="$2" source_revision="$3" test_user="$4"
+  local daemon_digest="$5" helper_digest="$6" helper_source_revision="$7"
+  local tmp="$release_dir/attestation.json"
+  require_cmd jq
+  [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
+    || die "DarkIRC source revision is not approved for managed config"
+  [[ "$helper_source_revision" =~ ^[0-9a-f]{40}$ ]] \
+    || die "LunarWing helper source revision is invalid"
+  darkirc_validate_root_executable "$release_dir/darkirc" \
+    || die "staged DarkIRC daemon is unsafe"
+  darkirc_validate_root_executable "$release_dir/lunarwing-darkirc-key-helper" \
+    || die "staged DarkIRC key helper is unsafe"
+  id "$test_user" >/dev/null 2>&1 || die "DarkIRC self-test user '$test_user' does not exist"
+  jq -n --arg release "$release_id" --arg daemon "$daemon_digest" \
+    --arg helper "$helper_digest" --arg revision "$source_revision" \
+    --arg helper_revision "$helper_source_revision" \
+    '{schema:"lunarwing.darkirc-compat/v2",release_id:$release,profile_id:"darkfi-a05956d41-chacha-v1",daemon_sha256:$daemon,helper_sha256:$helper,helper_source_revision:$helper_revision,key_format:"darkfi-chacha-base58-32",source_revision:$revision}' \
+    >"$tmp" || die "failed to create DarkIRC compatibility attestation"
+  chmod 0444 "$tmp"
+  chown root:root "$tmp"
+  sudo -u "$test_user" env -i HOME="$(getent passwd "$test_user" | cut -d: -f6)" PATH="/usr/bin:/bin" \
+    "$release_dir/lunarwing-darkirc-key-helper" self-test-generator \
+    --generator-profile darkfi-a05956d41-chacha-v1 \
+    --binary-sha256 "$daemon_digest" --binary-path "$release_dir/darkirc" \
+    --helper-sha256 "$helper_digest" --release-id "$release_id" \
+    --key-format darkfi-chacha-base58-32 --source-revision "$source_revision" >/dev/null \
+    || die "staged DarkIRC generator failed compatibility self-test"
+}
+
+darkirc_fsync_path() {
+  sync -f -- "$1" || die "could not durably sync DarkIRC release path: $1"
+}
+
+darkirc_sync_release_durability() {
+  local release_dir="$1"
+  darkirc_fsync_path "$release_dir/darkirc" || return 1
+  darkirc_fsync_path "$release_dir/lunarwing-darkirc-key-helper" || return 1
+  darkirc_fsync_path "$release_dir/attestation.json" || return 1
+  darkirc_fsync_path "$release_dir" || return 1
+  darkirc_fsync_path "$DARKIRC_RELEASES_DIR" || return 1
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT" || return 1
+  darkirc_fsync_path "$(dirname "$DARKIRC_RELEASE_ROOT")" || return 1
+}
+
+reject_legacy_darkirc_path_overrides() {
+  local variable
+  for variable in LUNARWING_MT_DARKIRC_BIN LUNARWING_MT_DARKIRC_COMPAT_FILE \
+                  LUNARWING_MT_DARKIRC_KEY_HELPER; do
+    [[ -z "${!variable:-}" ]] \
+      || die "$variable is unsupported with atomic DarkIRC releases; use LUNARWING_MT_DARKIRC_RELEASE_ROOT"
+  done
+}
+
+darkirc_validate_release_id() {
+  [[ "$1" =~ ^[a-f0-9]{40}-[a-f0-9]{16}-[a-f0-9]{16}-[a-f0-9]{16}$ ]]
+}
+
+darkirc_validate_release_directory() {
+  local release_dir="$1" expected_id="${2:-}" mode owner links
+  [[ "$release_dir" == "$DARKIRC_RELEASES_DIR/"* ]] || return 1
+  local release_id="${release_dir##*/}"
+  darkirc_validate_release_id "$release_id" || return 1
+  [[ -z "$expected_id" || "$release_id" == "$expected_id" ]] || return 1
+  darkirc_validate_root_owned_directory "$release_dir" || return 1
+  mode="$(stat -c '%a' "$release_dir" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$release_dir" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$release_dir" 2>/dev/null || true)"
+  [[ "$mode" == 555 && "$owner" == 0 && "$links" == 2 ]] || return 1
+  darkirc_validate_root_executable "$release_dir/darkirc" || return 1
+  darkirc_validate_root_executable "$release_dir/lunarwing-darkirc-key-helper" || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/darkirc" 2>/dev/null)" == "0:555:1" ]] || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/lunarwing-darkirc-key-helper" 2>/dev/null)" == "0:555:1" ]] || return 1
+  [[ -f "$release_dir/attestation.json" && ! -L "$release_dir/attestation.json" ]] || return 1
+  [[ "$(stat -c '%u:%a:%h' "$release_dir/attestation.json" 2>/dev/null)" == "0:444:1" ]] || return 1
+  [[ "$(find "$release_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null | LC_ALL=C sort | tr '\n' ' ')" \
+    == "attestation.json darkirc lunarwing-darkirc-key-helper " ]]
+}
+
+darkirc_validate_release_contents() {
+  local release_dir="$1" release_id="$2" daemon_digest="$3" helper_digest="$4"
+  local helper_source_revision="$5"
+  local attestation="$release_dir/attestation.json"
+  darkirc_validate_release_directory "$release_dir" "$release_id" || return 1
+  [[ "sha256:$(sha256sum "$release_dir/darkirc" | cut -d' ' -f1)" == "$daemon_digest" ]] \
+    || return 1
+  [[ "sha256:$(sha256sum "$release_dir/lunarwing-darkirc-key-helper" | cut -d' ' -f1)" == "$helper_digest" ]] \
+    || return 1
+  jq -e --arg release "$release_id" --arg daemon "$daemon_digest" \
+    --arg helper "$helper_digest" --arg revision "$DARKIRC_APPROVED_REV" \
+    --arg helper_revision "$helper_source_revision" \
+    'type == "object" and
+     (keys == ["daemon_sha256","helper_sha256","helper_source_revision","key_format","profile_id","release_id","schema","source_revision"]) and
+     .schema == "lunarwing.darkirc-compat/v2" and .release_id == $release and
+     .profile_id == "darkfi-a05956d41-chacha-v1" and .daemon_sha256 == $daemon and
+     .helper_sha256 == $helper and .helper_source_revision == $helper_revision and
+     .key_format == "darkfi-chacha-base58-32" and
+     .source_revision == $revision' "$attestation" >/dev/null 2>&1
+}
+
+darkirc_resolve_release() {
+  local target release_id selector_owner selector_links
+  reject_legacy_darkirc_path_overrides
+  darkirc_path_components_safe "$DARKIRC_RELEASE_ROOT" || return 1
+  darkirc_validate_root_owned_directory "$DARKIRC_RELEASE_ROOT" || return 1
+  [[ -L "$DARKIRC_RELEASE_SELECTOR" ]] || return 1
+  selector_owner="$(stat -c '%u' "$DARKIRC_RELEASE_SELECTOR" 2>/dev/null || true)"
+  selector_links="$(stat -c '%h' "$DARKIRC_RELEASE_SELECTOR" 2>/dev/null || true)"
+  [[ "$selector_owner" == 0 && "$selector_links" == 1 ]] || return 1
+  target="$(readlink -- "$DARKIRC_RELEASE_SELECTOR")" || return 1
+  [[ "$target" == releases/* && "$target" != */*/* ]] || return 1
+  release_id="${target#releases/}"
+  darkirc_validate_release_id "$release_id" || return 1
+  DARKIRC_PINNED_RELEASE="$DARKIRC_RELEASES_DIR/$release_id"
+  darkirc_validate_release_directory "$DARKIRC_PINNED_RELEASE" "$release_id"
+}
+
+darkirc_publish_selector() {
+  local release_id="$1" selector_tmp
+  selector_tmp="$DARKIRC_RELEASE_ROOT/.current.$$.tmp"
+  rm -f -- "$selector_tmp"
+  ln -s -- "releases/$release_id" "$selector_tmp" || return 1
+  chown -h root:root "$selector_tmp"
+  if ! mv -Tf -- "$selector_tmp" "$DARKIRC_RELEASE_SELECTOR"; then
+    rm -f -- "$selector_tmp"
+    return 1
+  fi
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT"
+}
+
+build_darkirc() {
+  local tenant_name="${1:-}" darkirc_src test_user build_tree built_bin source_revision cargo_home
+  local staging_root="" staging_dir="" release_dir release_id daemon_digest helper_digest
+  darkirc_src="${DARKIRC_SOURCE:-/var/cache/lunarwing/darkfi-source}"
+  test_user="${tenant_name:-${SUDO_USER:-nobody}}"
+  [[ "$test_user" != root ]] || test_user=nobody
+  reject_legacy_darkirc_path_overrides
 
   say "acquiring build lock for darkirc ..."
   (
     flock -x 200
-
-    # Clone darkfi as the build user if absent, so the source tree and build
-    # artifacts are owned by that user (no root-owned files) — "clone as the user".
+    [[ "$DARKIRC_REV" == "$DARKIRC_APPROVED_REV" ]] \
+      || die "DarkIRC revision is not approved: $DARKIRC_REV"
     if [[ ! -d "$darkirc_src/.git" ]]; then
-      say "darkirc source not present at $darkirc_src — cloning $DARKIRC_REPO ($DARKIRC_REV) as $build_user ..."
-      sudo -u "$build_user" git clone "$DARKIRC_REPO" "$darkirc_src" || die "darkirc clone failed"
-      if [[ -n "$DARKIRC_REV" && "$DARKIRC_REV" != "master" ]]; then
-        sudo -u "$build_user" git -C "$darkirc_src" checkout "$DARKIRC_REV" || die "darkirc checkout '$DARKIRC_REV' failed"
-      fi
-    else
-      say "darkirc source present at $darkirc_src ($(sudo -u "$build_user" git -C "$darkirc_src" rev-parse --short HEAD 2>/dev/null || echo unknown)) — using as-is"
+      local source_parent
+      source_parent="$(dirname "$darkirc_src")"
+      [[ -d "$source_parent" ]] || install -d -o root -g root -m 0700 "$source_parent"
+      darkirc_validate_root_owned_directory "$source_parent" \
+        || die "DarkIRC source parent must be root-owned and non-writable"
+      say "darkirc source not present at $darkirc_src — cloning pinned source as root ..."
+      git clone "$DARKIRC_REPO" "$darkirc_src" || die "darkirc clone failed"
+      git -C "$darkirc_src" checkout --detach "$DARKIRC_REV" \
+        || die "darkirc checkout '$DARKIRC_REV' failed"
     fi
+    darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
+      || die "DarkIRC source must be root-owned, clean, and at approved revision"
+    [[ -f "$darkirc_src/Makefile" && -f "$darkirc_src/bin/darkirc/Cargo.toml" ]] \
+      || die "approved DarkIRC source layout is incomplete"
 
-    [[ -f "$darkirc_src/Makefile" ]] || die "darkirc Makefile not found (expected darkfi repo root)"
-    [[ -f "$darkirc_src/bin/darkirc/Cargo.toml" ]] || die "darkirc Cargo.toml not found"
-
-    local cargo_env="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; else export PATH=\"\$HOME/.cargo/bin:\$PATH\"; fi;"
-
-    # Build with darkfi's make as the build user (mirrors build_tenant): uses that
-    # user's rust toolchain and leaves no root-owned artifacts.
-    say "building darkirc from $darkirc_src via make (as $build_user) ..."
-    sudo -u "$build_user" bash -c "$cargo_env cd '$darkirc_src' && make darkirc" \
+    ensure_darkirc_build_user
+    # The build account must be able to traverse into DARKIRC_BUILD_ROOT and
+    # DARKIRC_BUILD_HOME; a restrictive ambient umask can otherwise leave the
+    # shared parent non-traversable (e.g. 0700) and fail the unprivileged build.
+    install -d -o root -g root -m 0711 "$(dirname "$DARKIRC_BUILD_ROOT")"
+    install -d -o root -g root -m 0711 "$DARKIRC_BUILD_ROOT"
+    build_tree="$(mktemp -d "$DARKIRC_BUILD_ROOT/build.XXXXXX")"
+    cleanup_darkirc_build() {
+      [[ -z "$staging_root" ]] || rm -rf -- "$staging_root"
+      [[ -z "${build_tree:-}" ]] || rm -rf -- "$build_tree"
+      [[ -z "${cargo_home:-}" ]] || rm -rf -- "$cargo_home"
+    }
+    trap cleanup_darkirc_build EXIT
+    git -C "$darkirc_src" archive --format=tar "$DARKIRC_APPROVED_REV" | tar -x -C "$build_tree"
+    chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$build_tree"
+    cargo_home="$(mktemp -d "$DARKIRC_BUILD_HOME/cargo.XXXXXX")"
+    install -d -o root -g root -m 0700 "$cargo_home/.cargo"
+    chown -R "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$cargo_home"
+    say "building darkirc as $DARKIRC_BUILD_USER from disposable source copy ..."
+    # The build tree is a git-archive extraction (no .git), so darkirc's
+    # build.rs cannot derive COMMITISH. Provide it from the attested checkout
+    # so the embedded version string still carries the approved revision.
+    setpriv --reuid="$(id -u "$DARKIRC_BUILD_USER")" \
+      --regid="$(id -g "$DARKIRC_BUILD_USER")" --clear-groups --no-new-privs -- \
+      env -i HOME="$cargo_home" PATH="/usr/bin:/bin" CARGO_HOME="$cargo_home/.cargo" \
+      COMMITISH="$(git -C "$darkirc_src" rev-parse --short HEAD)" \
+      MAKEFLAGS=-j8 taskset -c 0-7 make -C "$build_tree" darkirc \
       || die "darkirc build failed"
+    darkirc_validate_clean_root_checkout "$darkirc_src" "$DARKIRC_REV" \
+      || die "DarkIRC build changed trusted source checkout"
+    built_bin="$build_tree/darkirc"
+    darkirc_validate_build_artifact "$built_bin" \
+      || die "darkirc build artifact failed ownership validation"
+    source_revision="$(git -C "$darkirc_src" rev-parse HEAD 2>/dev/null)" \
+      || die "could not attest DarkIRC source revision"
+    [[ "$source_revision" == "$DARKIRC_APPROVED_REV" ]] \
+      || die "DarkIRC checkout is at unapproved revision $source_revision"
 
-    local built_bin="$darkirc_src/darkirc"
-    [[ -x "$built_bin" ]] || die "darkirc binary not found at $built_bin"
-
-    # Install the shared daemon binary — the only root-privileged step.
-    say "installing darkirc to $DARKIRC_BIN ..."
-    install -m 0755 "$built_bin" "$DARKIRC_BIN"
-
-    say "darkirc build complete: $DARKIRC_BIN"
-    "$DARKIRC_BIN" --version || say "(darkirc --version not supported, skipping)"
+    install_darkirc_key_helper
+    daemon_digest="sha256:$(sha256sum "$built_bin" | cut -d' ' -f1)"
+    helper_digest="sha256:$(sha256sum "$DARKIRC_HELPER_ARTIFACT" | cut -d' ' -f1)"
+    release_id="${source_revision}-${DARKIRC_HELPER_SOURCE_REVISION:0:16}-${daemon_digest:7:16}-${helper_digest:7:16}"
+    local release_parent
+    release_parent="$(dirname "$DARKIRC_RELEASE_ROOT")"
+    install -d -o root -g root -m 0755 "$release_parent"
+    darkirc_fsync_path "$release_parent"
+    darkirc_fsync_path "$(dirname "$release_parent")"
+    install -d -o root -g root -m 0755 "$DARKIRC_RELEASE_ROOT" "$DARKIRC_RELEASES_DIR"
+    staging_root="$(mktemp -d "$DARKIRC_RELEASES_DIR/.staging.XXXXXX")"
+    chown root:root "$staging_root"
+    chmod 0755 "$staging_root"
+    staging_dir="$staging_root/$release_id"
+    install -d -o root -g root -m 0755 "$staging_dir"
+    install -o root -g root -m 0555 "$built_bin" "$staging_dir/darkirc"
+    install -o root -g root -m 0555 "$DARKIRC_HELPER_ARTIFACT" "$staging_dir/lunarwing-darkirc-key-helper"
+    write_darkirc_compatibility "$staging_dir" "$release_id" "$source_revision" "$test_user" \
+      "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION"
+    darkirc_fsync_path "$staging_dir/darkirc"
+    darkirc_fsync_path "$staging_dir/lunarwing-darkirc-key-helper"
+    darkirc_fsync_path "$staging_dir/attestation.json"
+    chmod 0555 "$staging_dir"
+    darkirc_fsync_path "$staging_dir"
+    release_dir="$DARKIRC_RELEASES_DIR/$release_id"
+    if [[ -e "$release_dir" || -L "$release_dir" ]]; then
+      darkirc_validate_release_contents "$release_dir" "$release_id" \
+        "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION" \
+        || die "existing immutable DarkIRC release conflicts with build: $release_id"
+      rm -rf -- "$staging_root"
+      staging_root=""; staging_dir=""
+    else
+      mv -- "$staging_dir" "$release_dir"
+      staging_dir=""
+      rmdir -- "$staging_root"
+      staging_root=""
+      darkirc_fsync_path "$DARKIRC_RELEASES_DIR"
+    fi
+    darkirc_validate_release_contents "$release_dir" "$release_id" \
+      "$daemon_digest" "$helper_digest" "$DARKIRC_HELPER_SOURCE_REVISION" \
+      || die "published DarkIRC release failed validation"
+    darkirc_sync_release_durability "$release_dir" \
+      || die "published DarkIRC release could not be made durable"
+    darkirc_publish_selector "$release_id"
+    darkirc_resolve_release || die "published DarkIRC selector failed validation"
+    rm -rf -- "$build_tree" "$cargo_home"
+    build_tree=""; cargo_home=""
+    say "darkirc build complete: $release_dir"
+    sudo -u "$test_user" "$DARKIRC_RELEASE_DAEMON" --version \
+      || say "(darkirc --version not supported, skipping)"
   ) 200>"$BUILD_LOCK"
+}
+
+ensure_darkirc_release() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if ! tenant_darkirc_enabled "$name"; then
+    say "DarkIRC is disabled for $name; no shared release required"
+    return 0
+  fi
+  if (
+    darkirc_load_compatibility >/dev/null 2>&1 \
+      && darkirc_release_matches_current_helper_source
+  ); then
+    say "atomic DarkIRC release already ready for $name"
+    return 0
+  fi
+  say "atomic DarkIRC release missing or invalid; rebuilding before unit activation"
+  build_darkirc "$name"
+  darkirc_load_compatibility >/dev/null \
+    || die "DarkIRC release remained invalid after rebuild"
+}
+
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi>
+  local names="$1" with_opencode="$2" with_kimi="$3"
+  local name root commit dirty expected_commit="" selected_root=""
+  local -a worker_paths=()
+  [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
+  [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    root="$(tenant_lw_root "$name")"
+    commit="$(sudo -u "$name" git -C "$root" rev-parse HEAD 2>/dev/null)" \
+      || die "cannot resolve tenant checkout for worker build: $name"
+    dirty="$(sudo -u "$name" git -C "$root" status --porcelain --untracked-files=all -- "${worker_paths[@]}")" \
+      || die "cannot inspect tenant worker source: $name"
+    [[ -z "$dirty" ]] \
+      || die "build-all refuses dirty worker source in tenant checkout: $name"
+    if [[ -z "$expected_commit" ]]; then
+      expected_commit="$commit"
+      selected_root="$root"
+    elif [[ "$commit" != "$expected_commit" ]]; then
+      die "build-all cannot publish one shared worker image from mixed tenant revisions"
+    fi
+  done <<<"$names"
+  [[ -n "$selected_root" ]] || die "no tenant checkout available for worker build"
+  printf '%s\n' "$selected_root"
 }
 
 build_all() {
   local with_wasm="${1:-false}"
-  local with_nanocode="${2:-false}"
-  local with_pebble="${3:-false}"
-  local with_opencode="${4:-false}"
+  local with_pebble="${2:-false}"
+  local with_opencode="${3:-false}"
+  local with_kimi="${4:-false}"
   local with_toolchains="${5:-false}"
   local names
   names="$(all_tenant_names)"
@@ -2007,98 +2975,73 @@ build_all() {
     return 0
   fi
 
-  if [[ "$with_nanocode" == "true" ]]; then
-    say ""
-    say "=== Building nanocode worker image ==="
-    build_nanocode_worker "false" "$with_toolchains"
+  local worker_source_root=""
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi")"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
     say ""
     say "=== Building pebble worker image ==="
-    build_pebble_worker "false"
+    build_pebble_worker "false" "$with_toolchains"
   fi
 
   if [[ "$with_opencode" == "true" ]]; then
     say ""
     say "=== Building opencode worker image ==="
-    build_opencode_worker "false" "$with_toolchains"
+    build_opencode_worker "false" "$with_toolchains" "$worker_source_root"
+  fi
+
+  if [[ "$with_kimi" == "true" ]]; then
+    say ""
+    say "=== Building kimi worker image ==="
+    build_kimi_worker "false" "$with_toolchains" "" "$worker_source_root"
   fi
 
   while IFS= read -r name; do
     say ""
     say "=== Building tenant: $name ==="
-    build_tenant "$name" "$with_wasm" "false" "false"
+    build_tenant "$name" "$with_wasm" "false" "false" "false" "$with_toolchains" "false"
   done <<< "$names"
-}
-
-# ── Nanocode worker Docker image build ────────────────────────────────────────
-
-build_nanocode_worker() {
-  local no_cache="${1:-false}"
-  local with_toolchains="${2:-false}"
-  local nanocode_ref="${3:-v1.2.28}"
-  local nanocode_dir="${LUNARWING_ROOT}/lunarcode4lunarwing"
-
-  [[ -d "$nanocode_dir" ]] || die "nanocode worker dir not found at $nanocode_dir"
-
-  ensure_container_runtime
-
-  say "building nanocode worker Docker image (nanocode ref: ${nanocode_ref}) ..."
-  local cache_flag=""
-  [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
-
-  local toolchain_arg=""
-  [[ "$with_toolchains" == "true" ]] && toolchain_arg="--build-arg WITH_TOOLCHAINS=true"
-
-  if [[ "$CONTAINER_RT" == "podman" ]]; then
-    # --network=host (F8): rootless/rootful podman's default build network can't
-    # reach the internet for RUN steps (apt) on hosts where the bridge/pasta path
-    # is broken or IPv6 is preferred-but-unrouted; the host netns has working IPv4.
-    # --format docker (O4): podman defaults to OCI, which drops the Dockerfile
-    # HEALTHCHECK ("not supported for OCI image format"); build docker-format so the
-    # baked healthcheck survives (harmless for the OpenRC init-unit probe, correct
-    # if the image is ever run directly / under a healthcheck-honouring runtime).
-    podman build $cache_flag $toolchain_arg --network=host --format docker --build-arg NANOCODE_REF="${nanocode_ref}" -t lunarwing-worker-nanocode:latest "$nanocode_dir" \
-      || die "nanocode worker image build failed"
-  else
-    docker build $cache_flag $toolchain_arg --build-arg NANOCODE_REF="${nanocode_ref}" -t lunarwing-worker-nanocode:latest "$nanocode_dir" \
-      || die "nanocode worker image build failed"
-  fi
-
-  say "nanocode worker image built: lunarwing-worker-nanocode:latest"
 }
 
 build_pebble_worker() {
   local no_cache="${1:-false}"
+  local with_toolchains="${2:-false}"
   local pebble_dir="${LUNARWING_ROOT}/pebble4lunarwing"
 
   [[ -d "$pebble_dir" ]] || die "pebble worker dir not found at $pebble_dir"
 
   ensure_container_runtime
 
-  say "building pebble worker Docker image ..."
+  local toolchain_desc="slim (no toolchains)"
+  [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
+  say "building pebble worker Docker image [$toolchain_desc] ..."
   local cache_flag=""
   [[ "$no_cache" == "true" ]] && cache_flag="--no-cache"
 
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
+
   if [[ "$CONTAINER_RT" == "podman" ]]; then
-    # --network=host (F8): see build_nanocode_worker — podman build's default network
+    # --network=host: podman's default build network
     # can't reach the internet for RUN steps on this host; the host netns has IPv4.
     # --format docker (O4): preserve the Dockerfile HEALTHCHECK (podman OCI drops it).
-    podman build $cache_flag --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    podman build $cache_flag "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   else
-    docker build $cache_flag -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
+    docker build $cache_flag "${toolchain_args[@]}" -t lunarwing-worker-pebble:latest -f "$pebble_dir/Dockerfile" "$LUNARWING_ROOT" \
       || die "pebble worker image build failed"
   fi
 
-  say "pebble worker image built: lunarwing-worker-pebble:latest"
+  say "pebble worker image built: lunarwing-worker-pebble:latest [$toolchain_desc]"
 }
 
 build_opencode_worker() {
   local no_cache="${1:-false}"
   local with_toolchains="${2:-false}"
-  local opencode_dir="${LUNARWING_ROOT}/opencode4lunarwing"
+  local source_root="${3:-$LUNARWING_ROOT}"
+  local opencode_dir="${source_root}/opencode4lunarwing"
 
   [[ -d "$opencode_dir" ]] || die "opencode worker dir not found at $opencode_dir"
 
@@ -2134,6 +3077,51 @@ build_opencode_worker() {
   fi
 
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc]"
+}
+
+build_kimi_worker() {
+  local no_cache="${1:-false}"
+  local with_toolchains="${2:-false}"
+  local kimi_code_version="${3:-}"
+  local source_root="${4:-$LUNARWING_ROOT}"
+  local kimi_dir="${source_root}/kimicode4lunarwing"
+
+  [[ -d "$kimi_dir" ]] || die "kimi worker dir not found at $kimi_dir"
+
+  ensure_container_runtime
+
+  local toolchain_desc="slim (no toolchains)"
+  [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
+  local version_desc="Dockerfile default"
+  [[ -z "$kimi_code_version" ]] || version_desc="$kimi_code_version"
+  say "building kimi worker Docker image [$toolchain_desc] (kimi-code version: ${version_desc}) ..."
+
+  local -a cache_args=()
+  [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
+
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
+
+  local -a version_args=()
+  [[ -z "$kimi_code_version" ]] || version_args=(--build-arg KIMI_CODE_VERSION="${kimi_code_version}")
+
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    local -a layer_args=()
+    if [[ "$no_cache" == "true" ]]; then
+      say "pruning dangling Podman images before uncached Kimi build ..."
+      if ! podman image prune -f >/dev/null; then
+        say "WARNING: failed to prune dangling Podman images; continuing build" >&2
+      fi
+      layer_args=(--layers=false)
+    fi
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" --network=host --format docker -t lunarwing-worker-kimi:latest "$kimi_dir" \
+      || die "kimi worker image build failed"
+  else
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" "${version_args[@]}" -t lunarwing-worker-kimi:latest "$kimi_dir" \
+      || die "kimi worker image build failed"
+  fi
+
+  say "kimi worker image built: lunarwing-worker-kimi:latest [$toolchain_desc]"
 }
 
 # ── WASM install ─────────────────────────────────────────────────────────────
@@ -2214,6 +3202,12 @@ install_wasm_tenant() {
     installed=$((installed + 1))
   done
 
+  # Patch WeeChat channel caps with per-tenant ports from the registry.
+  # The source caps file has generic default ports (9001/6681) that are wrong
+  # for every multi-tenant host. This runs after every install-wasm so the
+  # tenant's allocated ports are always correct, even after a fresh copy.
+  patch_weechat_caps "$name"
+
   say "installing WASM tools to $tools_dir..."
   for dir in "$repo/tools-src"/*/; do
     [[ -d "$dir" ]] || continue
@@ -2285,8 +3279,7 @@ install_wasm_all() {
 # Echo the existing VALUE of KEY from a tenant env file (empty if file/key absent).
 # Used to PRESERVE secrets across re-runs so re-provisioning never rotates them.
 _env_existing() {  # <env_file> <KEY>
-  [[ -f "$1" ]] || return 0
-  sed -n "s/^$2=//p" "$1" | head -1
+  _read_env_value "$1" "$2"
 }
 
 validate_study_notes_path() {  # <absolute path> <label>
@@ -2435,7 +3428,116 @@ tenant_weechat_home() {  # <tenant>
 # Returns empty if file or key is absent. Never prints the file's other content.
 _read_env_value() {  # <file> <KEY>
   [[ -f "$1" ]] || return 0
-  sed -n "s/^$2=//p" "$1" | tail -1
+  local value
+  value="$(sed -n "s/^$2=//p" "$1" | tail -1)"
+  # Current writers use systemd-compatible double quotes. Keep decoding the
+  # older onboarding client's single-quoted representation during migration.
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
+  fi
+  printf '%s\n' "$value"
+}
+
+# Read one value without opening tenant-controlled paths as root. The tenant-side
+# process rejects unsafe ownership, permissions, symlinks, and shared hard links.
+read_tenant_env_value() {  # <tenant> <file> <KEY>
+  local name="$1" target="$2" key="$3" value
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid tenant env key"
+  darkirc_path_components_safe "$target" || die "unsafe tenant env path: $target"
+  value="$(sudo -u "$name" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$target" TARGET_KEY="$key" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
+      parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ ! -e "$target" ]] && exit 0
+      [[ -f "$target" && ! -L "$target" ]] || exit 73
+      owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
+      mode="$(stat -c %a "$target" 2>/dev/null || true)"
+      links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+      [[ "$owner" == "$uid" && "$links" == 1 && "$mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$mode & 077) == 0 && (8#$mode & 0400) != 0 )) || exit 73
+      prefix="$TARGET_KEY="
+      value=""
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == "$prefix"* ]] && value="${line#"$prefix"}"
+      done <"$target"
+      printf "%s\n" "$value"
+    ')" || return 1
+  if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\"/\"}"
+    value="${value//\\\\/\\}"
+  elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+    value="${BASH_REMATCH[1]}"
+    value="${value//\\\'/\'}"
+    value="${value//\\\\/\\}"
+  fi
+  printf '%s\n' "$value"
+}
+
+# Write stdin to a tenant-owned file through a same-directory candidate. Root
+# never opens the destination for writing and secret contents never enter argv.
+write_tenant_file_atomic() {  # <tenant> <file> [mode]
+  local name="$1" target="$2" mode="${3:-600}"
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "invalid tenant file mode"
+  darkirc_path_components_safe "$target" || die "unsafe tenant file path: $target"
+  sudo -u "$name" env -i PATH="/usr/bin:/bin" \
+    TARGET_PATH="$target" TARGET_MODE="$mode" bash -c '
+      set -euo pipefail
+      target="$TARGET_PATH"
+      parent="${target%/*}"
+      base="${target##*/}"
+      uid="$(id -u)"
+      [[ -d "$parent" && ! -L "$parent" ]] || exit 73
+      parent_owner="$(stat -c %u "$parent" 2>/dev/null || printf -- -1)"
+      parent_mode="$(stat -c %a "$parent" 2>/dev/null || true)"
+      [[ "$parent_owner" == "$uid" && "$parent_mode" =~ ^[0-7]+$ ]] || exit 73
+      (( (8#$parent_mode & 077) == 0 )) || exit 73
+      [[ ! -L "$target" && ( ! -e "$target" || -f "$target" ) ]] || exit 73
+      if [[ -e "$target" ]]; then
+        owner="$(stat -c %u "$target" 2>/dev/null || printf -- -1)"
+        links="$(stat -c %h "$target" 2>/dev/null || printf 0)"
+        [[ "$owner" == "$uid" && "$links" == 1 ]] || exit 73
+      fi
+      umask 077
+      tmp="$(mktemp "$parent/.${base}.next.XXXXXX")"
+      trap '"'"'rm -f -- "$tmp"'"'"' EXIT
+      cat >"$tmp"
+      chmod "$TARGET_MODE" "$tmp"
+      mv -T -f -- "$tmp" "$target"
+      trap - EXIT
+    '
+}
+
+_quote_env_value() {  # <one-line value>
+  local value="$1"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "environment values cannot contain newlines"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "$value"
+}
+
+_read_secret_file() {  # <path> <description>
+  local path="$1" description="$2" value
+  [[ -f "$path" && -r "$path" ]] || die "$description file is not readable: $path"
+  value="$(<"$path")"
+  [[ -n "$value" ]] || die "$description file is empty: $path"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "$description file must contain exactly one line"
+  printf '%s\n' "$value"
 }
 
 # Success when <dir> contains any entry (normal or dotfile).
@@ -2636,15 +3738,16 @@ write_tenant_lunarwing_env() {
   local tensorzero_url="${4:-$DEFAULT_TENSORZERO_URL}"
   local llm_api_key="${5:-}"
   local llm_base_url="${6:-}"
-  local nanocode_model="${7:-}"
-  local nanocode_base_url="${8:-}"
-  local llm_model="${9:-}"
-  local gateway_host="${10:-}"
-  local xmpp_allow_from="${11:-}"
-  local opencode_model="${12:-}"
-  local opencode_base_url="${13:-}"
+  local llm_model="${7:-}"
+  local gateway_host="${8:-}"
+  local xmpp_allow_from="${9:-}"
+  local opencode_model="${10:-}"
+  local opencode_base_url="${11:-}"
+  local kimi_model="${12:-}"
+  local kimi_base_url="${13:-}"
+  local kimi_api_key="${14:-}"
 
-  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port nanocode_wss_port pebble_wss_port opencode_wss_port
+  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port
   path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
   http_port="$(ports_get "$name" http)"
@@ -2654,9 +3757,9 @@ write_tenant_lunarwing_env() {
   weechat_port="$(ports_get "$name" weechat)"
   weechat_adapter_port="$(ports_get "$name" weechat_adapter)"
   orchestrator_port="$(ports_get "$name" orchestrator)"
-  nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   opencode_wss_port="$(ports_get "$name" opencode_wss)"
+  kimi_wss_port="$(ports_get "$name" kimi_wss)"
 
   local state_dir run_dir
   state_dir="$(tenant_state_dir "$name")"
@@ -2668,24 +3771,35 @@ write_tenant_lunarwing_env() {
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
+  local coord_enabled coord_agent_id coord_agent_aliases coord_channels coord_admin_users coord_admin_token coord_admin_port
   local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
   secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
   webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
+  coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
+  coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
+  coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
+  coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
+  coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
+  coord_admin_port="$(_env_existing "$path" COORD_ADMIN_PORT)"
+  if [[ -z "$coord_admin_port" ]]; then
+    coord_admin_port="$(ports_get "$name" coord_admin || true)"
+    [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
+  fi
   if tenant_darkirc_enabled "$name"; then
     darkirc_adapter_secret="$(_env_existing "$path" DARKIRC_ADAPTER_SECRET)"
   fi
   # XMPP password: an explicit --xmpp-password wins; else preserve an existing one;
   # else mint a fresh one (first-time provision).
   [[ -n "$xmpp_password" ]] || { xmpp_password="$(_env_existing "$path" XMPP_PASSWORD)"; xmpp_password="${xmpp_password:-$(generate_token | cut -c1-32)}"; }
-  # Nanocode model/base_url overrides: an explicit flag wins; else preserve an
-  # existing value so re-running add-tenant without the flags keeps prior settings.
-  [[ -n "$nanocode_model" ]]    || nanocode_model="$(_env_existing "$path" NANOCODE_MODEL)"
-  [[ -n "$nanocode_base_url" ]] || nanocode_base_url="$(_env_existing "$path" NANOCODE_BASE_URL)"
   [[ -n "$opencode_model" ]]    || opencode_model="$(_env_existing "$path" OPENCODE_MODEL)"
   [[ -n "$opencode_base_url" ]] || opencode_base_url="$(_env_existing "$path" OPENCODE_BASE_URL)"
+  [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
+  [[ -n "$kimi_base_url" ]]     || kimi_base_url="$(_env_existing "$path" KIMI_BASE_URL)"
+  [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
@@ -2766,6 +3880,15 @@ AGENT_NAME=$name
 LUNARWING_OWNER_ID=$name
 SECRETS_MASTER_KEY=$secrets_key
 
+# Multi-agent coordination (disabled until channels are configured explicitly)
+COORD_ENABLED=$coord_enabled
+COORD_AGENT_ID=$coord_agent_id
+COORD_AGENT_ALIASES=$coord_agent_aliases
+COORD_CHANNELS=$coord_channels
+COORD_ADMIN_USERS=$coord_admin_users
+COORD_ADMIN_TOKEN=$coord_admin_token
+COORD_ADMIN_PORT=$coord_admin_port
+
 # XMPP
 XMPP_BRIDGE_URL=http://127.0.0.1:${bridge_port}
 XMPP_BRIDGE_TOKEN=$bridge_token
@@ -2800,11 +3923,11 @@ HTTP_WEBHOOK_SECRET=$webhook_secret
 # Orchestrator (sandbox container callback)
 ORCHESTRATOR_PORT=$orchestrator_port
 
-# Nanocode worker (WebSocket port for agent communication)
-NANOCODE_WSS_PORT=$nanocode_wss_port
-
 # Opencode worker (WebSocket port for agent communication)
 OPENCODE_WSS_PORT=$opencode_wss_port
+
+# Kimi worker (WebSocket port for agent communication)
+KIMI_WSS_PORT=$kimi_wss_port
 
 # Pebble worker (WebSocket port for agent communication)
 PEBBLE_WSS_PORT=$pebble_wss_port
@@ -2846,13 +3969,12 @@ ENVEOF
     printf '\nVISION_SERVICE_URL=http://127.0.0.1:%s\nVISION_AUTH_TOKEN=%s\n' \
       "$vision_port" "$vision_token" >> "$path"
   fi
-  # Nanocode worker LLM overrides (consumed by the worker container via env;
-  # see start_tenant_nanocode / render_worker_quadlet). Written only when set so
-  # an unconfigured tenant gets the image's baked-in nanocode.json defaults.
-  [[ -n "$nanocode_model" ]]    && printf '\nNANOCODE_MODEL=%s\n'    "$nanocode_model"     >> "$path"
-  [[ -n "$nanocode_base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$nanocode_base_url" >> "$path"
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
+  [[ -n "$kimi_model" ]]        && printf '\nKIMI_MODEL=%s\n'        "$kimi_model"        >> "$path"
+  [[ -n "$kimi_base_url" ]]     && printf 'KIMI_BASE_URL=%s\n'     "$kimi_base_url"     >> "$path"
+  [[ -n "$kimi_api_key" ]] \
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$path"
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
       "$study_notes_home" >> "$path"
@@ -2880,11 +4002,11 @@ write_tenant_bridge_env() {
 
   local state_dir bridge_token
   state_dir="$(tenant_state_dir "$name")"
-  bridge_token="$(grep -s '^XMPP_BRIDGE_TOKEN=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+  bridge_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_BRIDGE_TOKEN)"
   [[ -n "$bridge_token" ]] || bridge_token="$(generate_token | cut -c1-32)"
 
   local xmpp_pass_val
-  xmpp_pass_val="$(grep -s '^XMPP_PASSWORD=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+  xmpp_pass_val="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_PASSWORD)"
   [[ -n "$xmpp_pass_val" ]] || xmpp_pass_val="${xmpp_password:-$(generate_token | cut -c1-32)}"
 
   # Idempotent XMPP allow-from JSON: an explicit flag wins; else re-derive from
@@ -2895,7 +4017,7 @@ write_tenant_bridge_env() {
     xmpp_allow_from_json_effective="$(build_xmpp_allow_from_json "$xmpp_jid" "$xmpp_allow_from")"
   else
     local daemon_csv
-    daemon_csv="$(grep -s '^XMPP_ALLOW_FROM=' "$(tenant_env_dir "$name")/lunarwing.env" | cut -d= -f2- || true)"
+    daemon_csv="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" XMPP_ALLOW_FROM)"
     if [[ -n "$daemon_csv" && "$daemon_csv" != "$xmpp_jid" ]]; then
       # Daemon has extras: rebuild JSON from owner + the extras (everything
       # after the leading owner entry, which build_xmpp_allow_from re-prepends).
@@ -2955,29 +4077,31 @@ ENVEOF
 }
 
 write_tenant_darkirc_adapter_env() {
-  local name="$1"
+  local name="$1" lock_owned="false"
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != "true" ]]; then
+    darkirc_writer_lock "$name"
+    lock_owned="true"
+  fi
 
-  local path adapter_port darkirc_irc_port lunarwing_env
+  local path adapter_port darkirc_irc_port lunarwing_env adapter_secret
   path="$(tenant_env_dir "$name")/darkirc-adapter.env"
   lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
   adapter_port="$(ports_get "$name" darkirc_adapter)" || true
   darkirc_irc_port="$(ports_get "$name" darkirc_irc)" || true
-
-  local adapter_secret
-  adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$lunarwing_env" | cut -d= -f2- || true)"
+  adapter_secret="$(read_tenant_env_value "$name" "$lunarwing_env" DARKIRC_ADAPTER_SECRET)" \
+    || die "could not safely read DarkIRC adapter secret for tenant '$name'"
   [[ -n "$adapter_secret" ]] || adapter_secret="$(generate_token | cut -c1-32)"
 
   if [[ -f "$TEMPLATES_DIR/darkirc-adapter.env.template" ]]; then
-    render_template \
-      "darkirc-adapter.env.template" "$path" \
+    render_template_content \
+      "darkirc-adapter.env.template" \
       "TENANT_NAME=$name" \
       "DARKIRC_IRC_PORT=$darkirc_irc_port" \
       "DARKIRC_ADAPTER_PORT=$adapter_port" \
-      "ADAPTER_SECRET=$adapter_secret"
+      "ADAPTER_SECRET=$adapter_secret" \
+      | write_tenant_file_atomic "$name" "$path" 600
   else
-    (
-      umask 077
-      cat >"$path" <<ENVEOF
+    cat <<ENVEOF | write_tenant_file_atomic "$name" "$path" 600
 DARKIRC_HOST=127.0.0.1
 DARKIRC_PORT=$darkirc_irc_port
 DARKIRC_NICK=${name}-bridge
@@ -2988,59 +4112,456 @@ ADAPTER_PORT=$adapter_port
 ADAPTER_SECRET=$adapter_secret
 ADAPTER_LOG_LEVEL=INFO
 ENVEOF
-    )
   fi
-  chmod 0600 "$path"
-  chown "$name:$name" "$path"
   say "wrote: $path"
+  if [[ "$lock_owned" == "true" ]]; then
+    darkirc_writer_unlock
+  fi
+}
+
+darkirc_scope_id() {
+  local name="$1"
+  jq -r --arg name "$name" '.tenants[$name].darkirc_scope_id // empty' \
+    "$PORTS_REGISTRY" 2>/dev/null
+}
+
+validate_darkirc_scope_id() {
+  local scope_id="$1"
+  [[ "$scope_id" =~ ^[0-9a-f]{32}$ && "$scope_id" != "00000000000000000000000000000000" ]] \
+    || die "invalid DarkIRC scope ID"
+}
+
+darkirc_writer_lock() {
+  local name="$1" scope_id lock_file mode owner links enabled current_scope current_enabled
+  [[ "$PORTS_LOCK_HELD" != "true" ]] \
+    || die "DarkIRC writer lock must be acquired before registry lock"
+  acquire_ports_lock
+  scope_id="$(darkirc_scope_id "$name")"
+  enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_darkirc // false' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  release_ports_lock
+  [[ "$enabled" == true ]] || die "DarkIRC is disabled for tenant '$name'"
+  validate_darkirc_scope_id "$scope_id"
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == "true" ]]; then
+    [[ "$DARKIRC_WRITER_SCOPE" == "$scope_id" ]] \
+      || die "cannot nest DarkIRC writer locks for different tenants"
+    return 0
+  fi
+  require_cmd flock
+  darkirc_path_components_safe "$(dirname "$DARKIRC_WRITER_LOCK_DIR")" \
+    || die "unsafe DarkIRC writer lock parent"
+  install -d -o root -g root -m 0700 "$DARKIRC_WRITER_LOCK_DIR"
+  mode="$(stat -c '%a' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
+  owner="$(stat -c '%u' "$DARKIRC_WRITER_LOCK_DIR" 2>/dev/null || true)"
+  [[ "$mode" == 700 && "$owner" == 0 && ! -L "$DARKIRC_WRITER_LOCK_DIR" ]] \
+    || die "unsafe DarkIRC writer lock directory"
+  lock_file="$DARKIRC_WRITER_LOCK_DIR/$scope_id.lock"
+  [[ ! -L "$lock_file" && ( ! -e "$lock_file" || -f "$lock_file" ) ]] \
+    || die "unsafe DarkIRC writer lock file"
+  if [[ ! -e "$lock_file" ]]; then
+    (umask 077; : >"$lock_file")
+  fi
+  chmod 0600 "$lock_file"
+  owner="$(stat -c '%u' "$lock_file" 2>/dev/null || true)"
+  mode="$(stat -c '%a' "$lock_file" 2>/dev/null || true)"
+  links="$(stat -c '%h' "$lock_file" 2>/dev/null || true)"
+  [[ "$owner" == 0 && "$mode" == 600 && "$links" == 1 ]] \
+    || die "unsafe DarkIRC writer lock file"
+  if [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}" ]]; then
+    local inherited_fd="$LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD"
+    local inherited_scope="${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}"
+    [[ "$inherited_scope" == "$scope_id" ]] \
+      || die "invalid inherited DarkIRC writer lock"
+    inherited_lock_fd_is_held "$inherited_fd" "$lock_file" \
+      || die "inherited DarkIRC writer lock does not match tenant scope"
+    DARKIRC_WRITER_LOCK_FD="$inherited_fd"
+    DARKIRC_WRITER_LOCK_INHERITED="true"
+  else
+    exec {DARKIRC_WRITER_LOCK_FD}>"$lock_file"
+    flock -x -w 10 "$DARKIRC_WRITER_LOCK_FD" \
+      || die "DarkIRC config update is busy for tenant '$name'"
+  fi
+  acquire_ports_lock
+  current_scope="$(darkirc_scope_id "$name")"
+  current_enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_darkirc // false' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  release_ports_lock
+  [[ "$current_enabled" == true && "$current_scope" == "$scope_id" ]] \
+    || die "DarkIRC tenant identity changed while acquiring writer lock"
+  DARKIRC_WRITER_LOCK_HELD="true"
+  DARKIRC_WRITER_SCOPE="$scope_id"
+}
+
+darkirc_writer_unlock() {
+  [[ "$DARKIRC_WRITER_LOCK_HELD" == "true" ]] || return 0
+  if [[ "$DARKIRC_WRITER_LOCK_INHERITED" != "true" ]]; then
+    flock -u "$DARKIRC_WRITER_LOCK_FD"
+    eval "exec ${DARKIRC_WRITER_LOCK_FD}>&-"
+  fi
+  DARKIRC_WRITER_LOCK_HELD="false"
+  DARKIRC_WRITER_LOCK_FD=""
+  DARKIRC_WRITER_SCOPE=""
+  DARKIRC_WRITER_LOCK_INHERITED="false"
+}
+
+with_darkirc_writer_lock() {
+  local name="$1" result=0
+  shift
+  darkirc_writer_lock "$name"
+  "$@" || result=$?
+  darkirc_writer_unlock
+  return "$result"
+}
+
+darkirc_load_compatibility() {
+  require_cmd jq
+  require_cmd sha256sum
+  darkirc_resolve_release || die "DarkIRC release selector is missing or unsafe"
+  darkirc_sync_release_durability "$DARKIRC_PINNED_RELEASE" \
+    || die "DarkIRC release durability repair failed"
+  darkirc_fsync_path "$DARKIRC_RELEASE_ROOT" \
+    || die "DarkIRC selector durability repair failed"
+  local attestation="$DARKIRC_PINNED_RELEASE/attestation.json"
+  local shape schema release_id profile digest helper_digest helper_source_revision
+  local key_format source_revision expected_release_id actual helper_actual
+  shape="$(jq -r 'if type == "object" and
+    (keys == ["daemon_sha256","helper_sha256","helper_source_revision","key_format","profile_id","release_id","schema","source_revision"])
+    then "valid" else empty end' "$attestation" 2>/dev/null || true)"
+  schema="$(jq -r '.schema // empty' "$attestation" 2>/dev/null || true)"
+  release_id="$(jq -r '.release_id // empty' "$attestation" 2>/dev/null || true)"
+  profile="$(jq -r '.profile_id // empty' "$attestation" 2>/dev/null || true)"
+  digest="$(jq -r '.daemon_sha256 // empty' "$attestation" 2>/dev/null || true)"
+  helper_digest="$(jq -r '.helper_sha256 // empty' "$attestation" 2>/dev/null || true)"
+  helper_source_revision="$(jq -r '.helper_source_revision // empty' "$attestation" 2>/dev/null || true)"
+  key_format="$(jq -r '.key_format // empty' "$attestation" 2>/dev/null || true)"
+  source_revision="$(jq -r '.source_revision // empty' "$attestation" 2>/dev/null || true)"
+  expected_release_id="${source_revision}-${helper_source_revision:0:16}-${digest:7:16}-${helper_digest:7:16}"
+  [[ "$shape" == valid \
+    && "$schema" == "lunarwing.darkirc-compat/v2" \
+    && "$release_id" == "${DARKIRC_PINNED_RELEASE##*/}" \
+    && "$profile" == "darkfi-a05956d41-chacha-v1" \
+    && "$key_format" == "darkfi-chacha-base58-32" \
+    && "$source_revision" == "$DARKIRC_APPROVED_REV" \
+    && "$helper_source_revision" =~ ^[0-9a-f]{40}$ \
+    && "$digest" =~ ^sha256:[0-9a-f]{64}$ \
+    && "$helper_digest" =~ ^sha256:[0-9a-f]{64}$ \
+    && "$release_id" == "$expected_release_id" ]] \
+    || die "unsupported DarkIRC compatibility attestation"
+  actual="$(sha256sum "$DARKIRC_PINNED_RELEASE/darkirc")"
+  actual="sha256:${actual%% *}"
+  [[ "$actual" == "$digest" ]] || die "DarkIRC binary digest does not match attestation"
+  helper_actual="$(sha256sum "$DARKIRC_PINNED_RELEASE/lunarwing-darkirc-key-helper")"
+  helper_actual="sha256:${helper_actual%% *}"
+  [[ "$helper_actual" == "$helper_digest" ]] \
+    || die "DarkIRC helper digest does not match attestation"
+  DARKIRC_PINNED_HELPER="$DARKIRC_PINNED_RELEASE/lunarwing-darkirc-key-helper"
+  DARKIRC_PINNED_HELPER_SOURCE_REVISION="$helper_source_revision"
+  DARKIRC_COMPAT_ARGS=(
+    --generator-profile "$profile"
+    --binary-sha256 "$digest"
+    --binary-path "$DARKIRC_PINNED_RELEASE/darkirc"
+    --helper-sha256 "$helper_digest"
+    --release-id "$release_id"
+    --key-format "$key_format"
+    --source-revision "$source_revision"
+  )
+}
+
+darkirc_release_matches_current_helper_source() {
+  local current_revision
+  darkirc_validate_clean_root_checkout "$LUNARWING_ROOT" || return 1
+  current_revision="$(darkirc_current_helper_source_revision)" || return 1
+  [[ "${DARKIRC_PINNED_HELPER_SOURCE_REVISION:-}" == "$current_revision" ]]
+}
+
+run_darkirc_manifest_validator() {
+  local unbound="${1:-false}"
+  darkirc_load_compatibility
+  if [[ "$unbound" == "true" ]]; then
+    "$DARKIRC_PINNED_HELPER" validate-migration --json --unbound
+  else
+    "$DARKIRC_PINNED_HELPER" validate-migration --json "${DARKIRC_COMPAT_ARGS[@]}"
+  fi
+}
+
+run_darkirc_key_helper() {
+  local name="$1"
+  shift
+  darkirc_load_compatibility
+  local uid gid home
+  uid="$(id -u "$name")" || die "cannot resolve uid for tenant '$name'"
+  gid="$(id -g "$name")" || die "cannot resolve gid for tenant '$name'"
+  home="$(tenant_home "$name")"
+  (
+    cd "$home"
+    exec sudo -u "$name" env -i HOME="$home" PATH="/usr/bin:/bin" \
+      "$DARKIRC_PINNED_HELPER" "$@" "${DARKIRC_COMPAT_ARGS[@]}" \
+      --expected-uid "$uid" --expected-gid "$gid"
+  )
+}
+
+darkirc_contact_command() {
+  local operation="${1:-}" name="${2:-}"
+  if [[ "$operation" == doctor && "$name" == --all ]]; then
+    [[ $# -eq 2 ]] || die "darkirc-contact doctor --all accepts no extra arguments"
+    darkirc_contact_doctor_all
+    return
+  fi
+  [[ -n "$operation" && -n "$name" ]] \
+    || die "usage: darkirc-contact <operation> <tenant> [contact] [options]"
+  shift 2
+  name="$(sanitize_name "$name")"
+  case "$operation" in
+    list|status|doctor|exchanges)
+      _darkirc_contact_command_locked "$operation" "$name" "$@"
+      ;;
+    *)
+      with_tenant_lifecycle_lock "$name" _darkirc_contact_command_locked \
+        "$operation" "$name" "$@"
+      ;;
+  esac
+}
+
+restore_darkirc_migration_locked() {
+  local name="$1" scope_id="$2"
+  run_darkirc_key_helper "$name" stage-migration \
+    --tenant "$name" --scope-id "$scope_id"
+  run_darkirc_key_helper "$name" import-migration \
+    --tenant "$name" --scope-id "$scope_id"
+}
+
+_darkirc_contact_command_locked() {
+  local operation="$1" name="$2" contact=""
+  shift 2
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  tenant_darkirc_enabled "$name" || die "DarkIRC is disabled for tenant '$name'"
+  local scope_id
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+
+  local -a helper_args=("$operation" --tenant "$name" --scope-id "$scope_id")
+  case "$operation" in
+    status)
+      contact="${1:-}"
+      [[ -n "$contact" && $# -eq 1 ]] || die "darkirc-contact status requires exactly one contact name"
+      helper_args+=(--contact "$contact" --json)
+      ;;
+    prepare)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact prepare requires contact name"
+      shift
+      darkirc_exchange_prepare_args helper_args "$contact" "$@"
+      ;;
+    respond)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact respond requires contact name"
+      shift
+      darkirc_exchange_respond_args helper_args "$contact" "$@"
+      ;;
+    complete)
+      contact="${1:-}"
+      [[ -n "$contact" ]] || die "darkirc-contact complete requires contact name"
+      shift
+      darkirc_exchange_complete_args helper_args "$contact" "$@"
+      ;;
+    cancel)
+      darkirc_exchange_cancel_args helper_args "$@"
+      ;;
+    list|doctor|exchanges)
+      [[ $# -eq 0 ]] || die "darkirc-contact $operation accepts no extra arguments"
+      helper_args+=(--json)
+      ;;
+    adopt)
+      [[ $# -eq 1 && "$1" == --yes ]] || die "adoption requires --yes"
+      helper_args+=(--yes --json)
+      ;;
+    recover|migration-ready|export-migration|import-migration)
+      [[ $# -eq 0 ]] || die "darkirc-contact $operation accepts no extra arguments"
+      helper_args+=(--json)
+      ;;
+    stage-migration)
+      [[ $# -eq 2 && "$1" == --in && "$2" == - ]] \
+        || die "stage-migration requires --in -"
+      ;;
+    restore-migration)
+      [[ $# -eq 0 ]] || die "restore-migration accepts no extra arguments"
+      ;;
+    *) die "unsupported DarkIRC contact operation '$operation'" ;;
+  esac
+
+  if [[ "$operation" == restore-migration ]]; then
+    with_darkirc_writer_lock "$name" restore_darkirc_migration_locked "$name" "$scope_id"
+    return 0
+  fi
+
+  case "$operation" in
+    adopt|prepare|respond|complete|cancel|recover|migration-ready|export-migration|stage-migration|import-migration)
+      with_darkirc_writer_lock "$name" run_darkirc_key_helper "$name" "${helper_args[@]}"
+      ;;
+    list|status|doctor|exchanges)
+      run_darkirc_key_helper "$name" "${helper_args[@]}"
+      ;;
+  esac
+}
+
+darkirc_exchange_prepare_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
+  local -n args_ref="$1"
+  local contact="$2" out="" expires="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --out) [[ $# -ge 2 && -z "$out" ]] || die "prepare requires one --out value"; out="$2"; shift 2 ;;
+      --expires) [[ $# -ge 2 && -z "$expires" ]] || die "prepare accepts one --expires value"; expires="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown prepare argument: $1" ;;
+    esac
+  done
+  [[ -n "$out" ]] || die "prepare requires --out <file|->"
+  args_ref+=(--contact "$contact" --out "$out")
+  [[ -z "$expires" ]] || args_ref+=(--expires "$expires")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_respond_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
+  local -n args_ref="$1"
+  local contact="$2" input="" out="" fingerprint="" expires="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --in) [[ $# -ge 2 && -z "$input" ]] || die "respond requires one --in value"; input="$2"; shift 2 ;;
+      --out) [[ $# -ge 2 && -z "$out" ]] || die "respond requires one --out value"; out="$2"; shift 2 ;;
+      --expect-peer-fingerprint) [[ $# -ge 2 && -z "$fingerprint" ]] || die "respond requires one fingerprint"; fingerprint="$2"; shift 2 ;;
+      --expires) [[ $# -ge 2 && -z "$expires" ]] || die "respond accepts one --expires value"; expires="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown respond argument: $1" ;;
+    esac
+  done
+  [[ -n "$input" && -n "$out" && -n "$fingerprint" ]] \
+    || die "respond requires --in, --out, and --expect-peer-fingerprint"
+  args_ref+=(--contact "$contact" --in "$input" --out "$out" --expect-peer-fingerprint "$fingerprint")
+  [[ -z "$expires" ]] || args_ref+=(--expires "$expires")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_complete_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
+  local -n args_ref="$1"
+  local contact="$2" input="" exchange_id="" fingerprint="" json=false
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --in) [[ $# -ge 2 && -z "$input" ]] || die "complete requires one --in value"; input="$2"; shift 2 ;;
+      --exchange-id) [[ $# -ge 2 && -z "$exchange_id" ]] || die "complete requires one exchange ID"; exchange_id="$2"; shift 2 ;;
+      --expect-peer-fingerprint) [[ $# -ge 2 && -z "$fingerprint" ]] || die "complete requires one fingerprint"; fingerprint="$2"; shift 2 ;;
+      --defer-apply) shift ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown complete argument: $1" ;;
+    esac
+  done
+  [[ -n "$input" && -n "$exchange_id" && -n "$fingerprint" ]] \
+    || die "complete requires --in, --exchange-id, and --expect-peer-fingerprint"
+  args_ref+=(--contact "$contact" --in "$input" --exchange-id "$exchange_id" \
+    --expect-peer-fingerprint "$fingerprint" --defer-apply)
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_exchange_cancel_args() {
+  # shellcheck disable=SC2178  # args_ref is intentionally an array nameref.
+  local -n args_ref="$1"
+  local exchange_id="" json=false
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --exchange-id) [[ $# -ge 2 && -z "$exchange_id" ]] || die "cancel requires one exchange ID"; exchange_id="$2"; shift 2 ;;
+      --json) [[ "$json" == false ]] || die "duplicate --json"; json=true; shift ;;
+      *) die "unknown cancel argument: $1" ;;
+    esac
+  done
+  [[ -n "$exchange_id" ]] || die "cancel requires --exchange-id"
+  args_ref+=(--exchange-id "$exchange_id")
+  [[ "$json" == false ]] || args_ref+=(--json)
+}
+
+darkirc_contact_doctor_all() {
+  local name
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    if tenant_darkirc_enabled "$name"; then
+      _darkirc_contact_command_locked doctor "$name"
+    fi
+  done < <(all_tenant_names)
+}
+
+darkirc_prepare_tenant_dirs() {
+  local name="$1" state_dir config_dir datastore_dir path
+  state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
+  datastore_dir="$config_dir/datastore"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  sudo -u "$name" mkdir -p "$config_dir" "$datastore_dir" \
+    || die "could not create DarkIRC state directories for '$name'"
+  sudo -u "$name" chmod 0700 "$config_dir" "$datastore_dir" \
+    || die "could not secure DarkIRC state directories for '$name'"
+  for path in "$state_dir" "$config_dir" "$datastore_dir"; do
+    darkirc_path_components_safe "$path" \
+      || die "unsafe DarkIRC state path for tenant '$name': $path"
+  done
+  [[ -d "$config_dir" && ! -L "$config_dir" \
+    && -d "$datastore_dir" && ! -L "$datastore_dir" ]] \
+    || die "DarkIRC state path is not a regular directory for '$name'"
 }
 
 generate_darkirc_config() {
-  local name="$1"
-  local state_dir
+  local name="$1" state_dir config_dir irc_port rpc_port log_dir scope_id baseline
+  local registry_lock_owned="false" writer_lock_owned="false"
   state_dir="$(tenant_state_dir "$name")"
+  config_dir="$state_dir/darkirc"
 
-  local config_dir="$state_dir/darkirc"
-  mkdir -p "$config_dir" "$config_dir/datastore" 2>/dev/null || true
-  chmod 0700 "$config_dir"
-
-  mkdir -p "$state_dir/logs" 2>/dev/null || true
-
-  local irc_port rpc_port
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" != "true" ]]; then
+    darkirc_writer_lock "$name"
+    writer_lock_owned="true"
+  fi
+  if [[ "$PORTS_LOCK_HELD" != "true" ]]; then
+    acquire_ports_lock
+    registry_lock_owned="true"
+  fi
+  scope_id="$(ensure_darkirc_scope_id "$name")"
   irc_port="$(ports_get "$name" darkirc_irc)" || die "no darkirc_irc port for tenant '$name'"
   rpc_port="$(ports_get "$name" darkirc_rpc)" || die "no darkirc_rpc port for tenant '$name'"
-
-  local log_dir
   log_dir="$(tenant_log_dir "$name")"
 
-  local toml_out="$config_dir/darkirc_config.toml"
-  if [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]]; then
-    render_template \
-      "darkirc_config.toml.template" "$toml_out" \
-      "TENANT_NAME=$name" \
-      "IRC_PORT=$irc_port" \
-      "RPC_PORT=$rpc_port" \
-      "CONFIG_DIR=$config_dir" \
-      "LOG_DIR=$log_dir"
-  else
-    die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
+  # Keep the registry snapshot locked through the semantic config commit so its
+  # scope and target ports cannot diverge from the generated baseline.
+  darkirc_prepare_tenant_dirs "$name"
+  [[ -f "$TEMPLATES_DIR/darkirc_config.toml.template" ]] \
+    || die "darkirc config template not found at $TEMPLATES_DIR/darkirc_config.toml.template"
+  baseline="$(render_template_content \
+    "darkirc_config.toml.template" \
+    "TENANT_NAME=$name" \
+    "IRC_PORT=$irc_port" \
+    "RPC_PORT=$rpc_port" \
+    "CONFIG_DIR=$config_dir" \
+    "LOG_DIR=$log_dir")"
+  printf '%s' "$baseline" | run_darkirc_key_helper "$name" rewrite-baseline \
+    --tenant "$name" --scope-id "$scope_id" >/dev/null \
+    || die "DarkIRC semantic config update failed for tenant '$name'"
+  [[ -f "$config_dir/darkirc_config.toml" && ! -L "$config_dir/darkirc_config.toml" ]] \
+    || die "DarkIRC helper did not produce a config for '$name'"
+  if [[ "$registry_lock_owned" == "true" ]]; then
+    release_ports_lock
   fi
-
-  chmod 0700 "$config_dir"
-  chmod 0600 "$toml_out"
-
-  # The darkirc daemon runs as the tenant user, so it must own its config dir,
-  # rendered config, and datastore. This function runs as root during add-tenant,
-  # so chown the whole tree to the tenant — otherwise the daemon gets EACCES on
-  # its config and fails to start.
-  chown -R "$name:$name" "$config_dir"
-
-  say "darkirc config generated for $name (irc=$irc_port rpc=$rpc_port)"
+  if [[ "$writer_lock_owned" == "true" ]]; then
+    darkirc_writer_unlock
+  fi
+  say "darkirc config updated for $name (irc=$irc_port rpc=$rpc_port scope=$scope_id)"
 }
 
 # ── External-worker config.toml generation ────────────────────────────────────
 #
-# External workers (nanocode, pebble, …) speak the lunarwing-agent-v1 WebSocket
+# External workers speak the lunarwing-agent-v1 WebSocket
 # protocol (legacy alias ironclaw-agent-v1 is still accepted for back-compat)
 # and are routed by the agent's `create_job(mode: "<worker>")` tool.
 # The daemon discovers them from `[[sandbox.external_workers]]` blocks in
@@ -3049,8 +4570,8 @@ generate_darkirc_config() {
 # and never logs `External workers configured: <worker>` on startup.
 #
 # The worker container binds 127.0.0.1:<wss_port> (path /ws/agent) and is
-# launched with AGENT_AUTH_TOKEN set to the tenant's GATEWAY_AUTH_TOKEN (see
-# start_tenant_nanocode), so the daemon side must present that same token as the
+# launched with AGENT_AUTH_TOKEN set to the tenant's GATEWAY_AUTH_TOKEN, so the
+# daemon side must present that same token as the
 # WebSocket bearer — hence auth_token mirrors GATEWAY_AUTH_TOKEN here.
 #
 # Idempotent: a tenant entry is written once and skipped on re-runs. Exact legacy
@@ -3120,10 +4641,15 @@ upgrade_external_worker_timeout() {
 
 ensure_external_worker_config() {
   local name="$1"      # tenant name
-  local worker="$2"    # logical worker name, matches create_job mode (e.g. "nanocode")
-  local port_key="$3"  # ports-registry key for its WSS port (e.g. "nanocode_wss")
+  local worker="$2"    # logical worker name, matches create_job mode
+  local port_key="$3"  # ports-registry key for its WSS port
 
   local state_dir env_path config_path wss_port auth_token
+
+  if [[ "$worker" == "kimi" ]] && ! tenant_worker_enabled "$name" kimi; then
+    say "kimi worker not selected for $name (skipping external-worker config)"
+    return 0
+  fi
   state_dir="$(tenant_state_dir "$name")"
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   config_path="$state_dir/config.toml"
@@ -3153,7 +4679,7 @@ ensure_external_worker_config() {
     return 0
   fi
 
-  auth_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  auth_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -3192,6 +4718,337 @@ HDR
   chown "$name:$name" "$config_path"
   chmod 600 "$config_path"
   say "wrote $worker external-worker config to $config_path (ws://127.0.0.1:$wss_port/ws/agent)"
+}
+
+# Remove one external-worker array entry plus any nested child tables. Preserve
+# unrelated TOML text/comments, validate before and after, and retain one secure
+# rollback copy. Returns success when no Nanocode entry exists.
+remove_external_worker_config() {
+  local name="$1" worker="$2" config_path temp_path backup_path rc=0
+  config_path="$(tenant_state_dir "$name")/config.toml"
+  [[ -f "$config_path" ]] || return 0
+  [[ ! -L "$config_path" ]] || { say "refusing symlinked tenant config: $config_path" >&2; return 1; }
+  require_cmd python3
+  temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"
+  backup_path="${config_path}.pre-${worker}-retirement"
+
+  python3 - "$config_path" "$temp_path" "$backup_path" "$worker" <<'PY' || rc=$?
+import os
+import re
+import stat
+import sys
+import tomllib
+from pathlib import Path
+
+source, target, backup = map(Path, sys.argv[1:4])
+worker = sys.argv[4]
+source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+source_stat = os.fstat(source_fd)
+if not stat.S_ISREG(source_stat.st_mode):
+    os.close(source_fd)
+    raise RuntimeError("tenant config is not a regular file")
+with os.fdopen(source_fd, encoding="utf-8") as handle:
+    text = handle.read()
+tomllib.loads(text)
+lines = text.splitlines(keepends=True)
+root = "sandbox.external_workers"
+header_re = re.compile(r"^\s*(\[\[?)([^\]]+)(\]\]?)\s*(?:#.*)?$")
+name_re = re.compile(rf"^\s*name\s*=\s*(['\"]){re.escape(worker)}\1\s*(?:#.*)?$")
+
+def header(line: str):
+    match = header_re.match(line.rstrip("\r\n"))
+    if not match or len(match.group(1)) != len(match.group(3)):
+        return None
+    return len(match.group(1)), "".join(match.group(2).split())
+
+ranges = []
+index = 0
+while index < len(lines):
+    info = header(lines[index])
+    if info != (2, root):
+        index += 1
+        continue
+    end = len(lines)
+    scalar_end = len(lines)
+    for cursor in range(index + 1, len(lines)):
+        child = header(lines[cursor])
+        if child is None:
+            continue
+        if scalar_end == len(lines):
+            scalar_end = cursor
+        if child[1] == root or not child[1].startswith(root + "."):
+            end = cursor
+            break
+    if any(name_re.match(line.rstrip("\r\n")) for line in lines[index + 1:scalar_end]):
+        start = index
+        cursor = index - 1
+        if cursor >= 0 and re.match(
+            rf"^\s*#\s*External worker:\s*{re.escape(worker)}\b",
+            lines[cursor],
+            re.IGNORECASE,
+        ):
+            start = cursor
+            if start > 0 and not lines[start - 1].strip():
+                start -= 1
+        ranges.append((start, end))
+    index = end
+
+if not ranges:
+    raise SystemExit(3)
+
+kept = []
+cursor = 0
+for start, end in ranges:
+    kept.extend(lines[cursor:start])
+    cursor = end
+kept.extend(lines[cursor:])
+result = "".join(kept)
+parsed = tomllib.loads(result)
+workers = parsed.get("sandbox", {}).get("external_workers", [])
+if any(isinstance(item, dict) and item.get("name") == worker for item in workers):
+    raise RuntimeError(f"failed to remove external worker {worker!r}")
+
+def write_secure(path: Path, content: str, flags: int) -> None:
+    fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError(f"unsafe retirement output: {path}")
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+if backup.exists() or backup.is_symlink():
+    backup_stat = os.lstat(backup)
+    if not stat.S_ISREG(backup_stat.st_mode):
+        raise RuntimeError(f"unsafe retirement backup: {backup}")
+else:
+    write_secure(backup, text, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+write_secure(target, result, os.O_WRONLY | os.O_TRUNC)
+os.replace(target, source)
+PY
+  if [[ "$rc" -eq 3 ]]; then
+    rm -f "$temp_path"
+    return 0
+  fi
+  if [[ "$rc" -ne 0 ]]; then
+    rm -f "$temp_path"
+    say "failed to remove external worker '$worker' from $config_path" >&2
+    return 1
+  fi
+  say "removed retired '$worker' route from $config_path"
+}
+
+_nanocode_openrc_service_known() {
+  local svc="$1" link
+  [[ -e "$OPENRC_INITD_DIR/$svc" || -e "$OPENRC_CONFD_DIR/$svc" ]] && return 0
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] && return 0
+  done
+  return 1
+}
+
+_stop_nanocode_supervision() {
+  local name="$1"
+  local unit="lunarwing-nanocode-${name}.service"
+  local container="lunarwing-nanocode-${name}" load_state="" user_unit_dir
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+    if id -u "$name" >/dev/null 2>&1; then
+      load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null || true)"
+      if [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
+          || -e "$user_unit_dir/$unit" || "$load_state" == "loaded" ]]; then
+        _systemctl_user "$name" stop "$unit" >/dev/null 2>&1 \
+          || { say "failed to stop legacy $unit" >&2; return 1; }
+        if _systemctl_user "$name" is-active --quiet "$unit" 2>/dev/null; then
+          say "legacy $unit remained active after stop" >&2
+          return 1
+        fi
+      fi
+    elif [[ -e "$(tenant_quadlet_dir "$name")/${container}.container" \
+        || -e "$user_unit_dir/$unit" ]]; then
+      say "tenant user '$name' absent; cannot stop legacy $unit" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  local svc
+  for svc in "${container}-sup" "$container"; do
+    _nanocode_openrc_service_known "$svc" || continue
+    rc-service "$svc" stop >/dev/null 2>&1 \
+      || { say "failed to stop legacy OpenRC service $svc" >&2; return 1; }
+  done
+}
+
+_stop_nanocode_container_store() {
+  local label="$1" container="$2"
+  shift 2
+  local -a runtime=("$@")
+  "${runtime[@]}" inspect "$container" >/dev/null 2>&1 || return 0
+  if ! "${runtime[@]}" stop --time 30 "$container" >/dev/null 2>&1; then
+    say "failed to stop legacy $container in $label" >&2
+    return 1
+  fi
+  if [[ "$("${runtime[@]}" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)" == "true" ]]; then
+    say "legacy $container still running in $label" >&2
+    return 1
+  fi
+  say "stopped legacy $container in $label"
+}
+
+_stop_nanocode_containers() {
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" uid home
+  if command -v docker >/dev/null 2>&1; then
+    _stop_nanocode_container_store "root Docker store" "$container" docker || return 1
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    _stop_nanocode_container_store "root Podman store" "$container" podman || return 1
+    if id -u "$name" >/dev/null 2>&1; then
+      uid="$(id -u "$name")"
+      home="$(getent passwd "$name" | cut -d: -f6)"
+      _stop_nanocode_container_store "tenant $name rootless Podman store" "$container" \
+        sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" podman || return 1
+    fi
+  fi
+}
+
+_remove_nanocode_supervision() {
+  local name="$1"
+  local container="lunarwing-nanocode-${name}" svc link runlevel
+  rm -f -- \
+    "$(tenant_quadlet_dir "$name")/${container}.container" \
+    "$(tenant_home "$name")/.config/systemd/user/${container}.service" \
+    "$(tenant_home "$name")/.config/systemd/user/default.target.wants/${container}.service" \
+    "$(_hash_dir "$name")/${container}.hash"
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && id -u "$name" >/dev/null 2>&1; then
+    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 \
+      || { say "WARNING: could not reload tenant user manager after Nanocode retirement (non-fatal)" >&2; true; }
+  fi
+
+  for svc in "${container}-sup" "$container"; do
+    for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+      [[ -e "$link" || -L "$link" ]] || continue
+      runlevel="$(basename "$(dirname "$link")")"
+      if command -v rc-update >/dev/null 2>&1; then
+        rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+          || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
+      else
+        rm -f -- "$link"
+      fi
+    done
+    rm -f -- "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
+  done
+}
+
+_archive_nanocode_env() {
+  local name="$1" env_dir env_path legacy archive backup temp rc=0
+  env_dir="$(tenant_env_dir "$name")"
+  env_path="$env_dir/lunarwing.env"
+  legacy="$env_dir/nanocode.env"
+  require_cmd python3
+  if [[ -e "$env_path" || -L "$env_path" ]]; then
+    backup="$env_path.pre-nanocode-retirement"
+    temp="$(mktemp "${env_path}.tmp.XXXXXX")"
+    python3 - "$env_path" "$temp" "$backup" <<'PY' || rc=$?
+import os
+import stat
+import sys
+from pathlib import Path
+
+source, target, backup = map(Path, sys.argv[1:4])
+source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+source_stat = os.fstat(source_fd)
+if not stat.S_ISREG(source_stat.st_mode):
+    os.close(source_fd)
+    raise RuntimeError("tenant env is not a regular file")
+with os.fdopen(source_fd, encoding="utf-8") as handle:
+    text = handle.read()
+lines = text.splitlines(keepends=True)
+if not any(line.startswith("NANOCODE_") for line in lines):
+    raise SystemExit(3)
+result = "".join(line for line in lines if not line.startswith("NANOCODE_"))
+
+def write_secure(path: Path, content: str, flags: int) -> None:
+    fd = os.open(path, flags | os.O_NOFOLLOW, 0o600)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise RuntimeError(f"unsafe retirement output: {path}")
+        os.fchmod(fd, 0o600)
+        os.fchown(fd, source_stat.st_uid, source_stat.st_gid)
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(fd)
+
+if backup.exists() or backup.is_symlink():
+    if not stat.S_ISREG(os.lstat(backup).st_mode):
+        raise RuntimeError(f"unsafe retirement backup: {backup}")
+else:
+    write_secure(backup, text, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+write_secure(target, result, os.O_WRONLY | os.O_TRUNC)
+os.replace(target, source)
+PY
+    if [[ "$rc" -eq 3 ]]; then
+      rm -f -- "$temp"
+    elif [[ "$rc" -ne 0 ]]; then
+      rm -f -- "$temp"
+      say "failed to remove retired NANOCODE_* settings from $env_path" >&2
+      return 1
+    else
+      say "removed retired NANOCODE_* settings from $env_path"
+    fi
+  fi
+  if [[ -e "$legacy" || -L "$legacy" ]]; then
+    archive="$legacy.retired"
+    [[ ! -e "$archive" ]] || archive="$archive.$(date -u +%Y%m%dT%H%M%SZ).$$"
+    python3 - "$legacy" "$archive" <<'PY' || return 1
+import os
+import stat
+import sys
+from pathlib import Path
+
+source, archive = map(Path, sys.argv[1:3])
+fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+try:
+    source_stat = os.fstat(fd)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise RuntimeError("legacy env is not a regular file")
+    os.fchmod(fd, 0o600)
+    current = os.lstat(source)
+    if (current.st_dev, current.st_ino) != (source_stat.st_dev, source_stat.st_ino):
+        raise RuntimeError("legacy env changed during retirement")
+    os.link(source, archive, follow_symlinks=False)
+    os.unlink(source)
+finally:
+    os.close(fd)
+PY
+    say "archived legacy Nanocode env as $archive"
+  fi
+}
+
+_retire_tenant_nanocode() {
+  local name="$1"
+  _stop_nanocode_supervision "$name" || return 1
+  _stop_nanocode_containers "$name" || return 1
+  _remove_nanocode_supervision "$name" || return 1
+  remove_external_worker_config "$name" nanocode || return 1
+  _archive_nanocode_env "$name" || return 1
+  ports_retire_nanocode "$name" || return 1
+  say "Nanocode retired for tenant '$name' (data, stopped containers, and images preserved)"
+}
+
+retire_tenant_nanocode() {
+  local name="$1"
+  with_tenant_lifecycle_lock "$name" _retire_tenant_nanocode "$name"
 }
 
 # ── SSH harness config.toml generation ────────────────────────────────────────
@@ -3311,6 +5168,46 @@ patch_ssh_tool_allowlist() {
 _probe_tcp() {
   local host="$1" port="$2"
   timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
+}
+
+# Patch the WeeChat WASM channel capabilities with the tenant's allocated ports
+# from the registry. The source caps file (channels-src/weechat/*.capabilities.json)
+# has generic default ports (9001/6681) that are wrong for every multi-tenant host.
+# This is called after install-wasm and on tenant start so the ports are always
+# correct. Idempotent: always derived from the registry.
+patch_weechat_caps() {
+  local name="$1" caps_path weechat_port adapter_port tmp
+  caps_path="$(tenant_state_dir "$name")/channels/weechat.capabilities.json"
+
+  if [[ ! -f "$caps_path" ]]; then
+    say "  weechat caps: weechat channel not installed — nothing to patch"
+    return 0
+  fi
+
+  command -v jq >/dev/null 2>&1 \
+    || { say "WARNING: jq not installed; weechat caps left unchanged" >&2; return 0; }
+
+  weechat_port="$(ports_get "$name" weechat)" \
+    || { say "WARNING: could not read weechat port for $name; caps left unchanged" >&2; return 0; }
+  adapter_port="$(ports_get "$name" weechat_adapter)" \
+    || { say "WARNING: could not read weechat_adapter port for $name; caps left unchanged" >&2; return 0; }
+
+  local relay_url="http://127.0.0.1:${weechat_port}"
+  local adapter_url="http://127.0.0.1:${adapter_port}"
+
+  # Same-directory temp file so mv is atomic.
+  tmp="$(mktemp "${caps_path}.tmp.XXXXXX")" \
+    || { say "WARNING: mktemp failed; weechat caps left unchanged" >&2; return 0; }
+  if jq --arg relay "$relay_url" --arg adapter "$adapter_url" \
+       '.config.relay_url = $relay | .config.ws_adapter_url = $adapter' \
+       "$caps_path" >"$tmp" 2>/dev/null \
+    && mv "$tmp" "$caps_path" \
+    && chown "$name:$name" "$caps_path"; then
+    say "  weechat caps patched: relay=$relay_url adapter=$adapter_url"
+  else
+    rm -f "$tmp"
+    say "WARNING: failed to patch weechat caps at $caps_path" >&2
+  fi
 }
 
 # Warn (never fail) if the tenant's configured loopback SSH host has no sshd
@@ -3437,11 +5334,11 @@ upload_tenant_darkirc_secret() {
 
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
 
-  darkirc_adapter_secret="$(grep -s '^DARKIRC_ADAPTER_SECRET=' "$env_path" | cut -d= -f2- || true)"
+  darkirc_adapter_secret="$(_read_env_value "$env_path" DARKIRC_ADAPTER_SECRET)"
   # The secret is optional — nothing to upload if it is not set.
   [[ -n "$darkirc_adapter_secret" ]] || return 0
 
-  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
   if [[ -z "$gateway_token" ]]; then
     say "WARNING: GATEWAY_AUTH_TOKEN not found in $env_path; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
     return 1
@@ -3478,10 +5375,59 @@ upload_tenant_darkirc_secret() {
   fi
 }
 
+patch_tenant_coordination_env() {
+  local name="$1" env_path="$2"
+  local coord_admin_port coord_admin_token
+  chmod 0600 "$env_path"
+  coord_admin_port="$(_env_existing "$env_path" COORD_ADMIN_PORT)"
+  if [[ -z "$coord_admin_port" ]]; then
+    coord_admin_port="$(ports_get "$name" coord_admin || true)"
+    [[ -n "$coord_admin_port" ]] || die "coordination admin port missing for tenant '$name'"
+  fi
+  coord_admin_token="$(_env_existing "$env_path" COORD_ADMIN_TOKEN)"
+  [[ -n "$coord_admin_token" ]] || coord_admin_token="$(generate_token)"
+  if ! grep -q '^COORD_ENABLED=' "$env_path"; then
+    printf '\n# Multi-agent coordination (disabled until channels are configured explicitly)\nCOORD_ENABLED=false\n' >>"$env_path"
+    say "added COORD_ENABLED=false to $env_path"
+  fi
+  if ! grep -q '^COORD_AGENT_ID=' "$env_path"; then
+    printf 'COORD_AGENT_ID=%s\n' "$name" >>"$env_path"
+    say "added COORD_AGENT_ID=$name to $env_path"
+  fi
+  if ! grep -q '^COORD_CHANNELS=' "$env_path"; then
+    printf 'COORD_CHANNELS=\n' >>"$env_path"
+    say "added COORD_CHANNELS to $env_path"
+  fi
+  if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
+    printf 'COORD_AGENT_ALIASES=\n' >>"$env_path"
+    say "added COORD_AGENT_ALIASES to $env_path"
+  fi
+  if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
+    printf 'COORD_ADMIN_USERS=\n' >>"$env_path"
+    say "added COORD_ADMIN_USERS to $env_path"
+  fi
+  if grep -q '^COORD_ADMIN_TOKEN=$' "$env_path"; then
+    sed -i "s/^COORD_ADMIN_TOKEN=$/COORD_ADMIN_TOKEN=$coord_admin_token/" "$env_path"
+    say "repaired empty COORD_ADMIN_TOKEN in $env_path"
+  elif ! grep -q '^COORD_ADMIN_TOKEN=' "$env_path"; then
+    printf 'COORD_ADMIN_TOKEN=%s\n' "$coord_admin_token" >>"$env_path"
+    say "added COORD_ADMIN_TOKEN to $env_path"
+  fi
+  if grep -q '^COORD_ADMIN_PORT=$' "$env_path"; then
+    sed -i "s/^COORD_ADMIN_PORT=$/COORD_ADMIN_PORT=$coord_admin_port/" "$env_path"
+    say "repaired empty COORD_ADMIN_PORT=$coord_admin_port in $env_path"
+  elif ! grep -q '^COORD_ADMIN_PORT=' "$env_path"; then
+    printf 'COORD_ADMIN_PORT=%s\n' "$coord_admin_port" >>"$env_path"
+    say "added COORD_ADMIN_PORT=$coord_admin_port to $env_path"
+  fi
+}
+
 patch_tenant_env() {
   local name="$1"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'"
 
   local env_path
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
@@ -3513,17 +5459,6 @@ patch_tenant_env() {
     say "added ORCHESTRATOR_PORT=$orchestrator_port to $env_path"
   fi
 
-  local nanocode_wss_port
-  nanocode_wss_port="$(ports_get "$name" nanocode_wss)"
-  if [[ -n "$nanocode_wss_port" ]]; then
-    if grep -q '^NANOCODE_WSS_PORT=' "$env_path"; then
-      say "NANOCODE_WSS_PORT already set in $env_path (skipping)"
-    else
-      printf '\n# Nanocode worker (WebSocket port for agent communication)\nNANOCODE_WSS_PORT=%s\n' "$nanocode_wss_port" >>"$env_path"
-      say "added NANOCODE_WSS_PORT=$nanocode_wss_port to $env_path"
-    fi
-  fi
-
   local pebble_wss_port
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   if [[ -n "$pebble_wss_port" ]]; then
@@ -3543,6 +5478,17 @@ patch_tenant_env() {
     else
       printf '\n# Opencode worker (WebSocket port for agent communication)\nOPENCODE_WSS_PORT=%s\n' "$opencode_wss_port" >>"$env_path"
       say "added OPENCODE_WSS_PORT=$opencode_wss_port to $env_path"
+    fi
+  fi
+
+  local kimi_wss_port
+  kimi_wss_port="$(ports_get "$name" kimi_wss)" || true
+  if [[ -n "$kimi_wss_port" ]]; then
+    if grep -q '^KIMI_WSS_PORT=' "$env_path"; then
+      say "KIMI_WSS_PORT already set in $env_path (skipping)"
+    else
+      printf '\n# Kimi worker (WebSocket port for agent communication)\nKIMI_WSS_PORT=%s\n' "$kimi_wss_port" >>"$env_path"
+      say "added KIMI_WSS_PORT=$kimi_wss_port to $env_path"
     fi
   fi
 
@@ -3577,6 +5523,8 @@ patch_tenant_env() {
     fi
   fi
 
+  patch_tenant_coordination_env "$name" "$env_path"
+
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_port
     darkirc_adapter_port="$(ports_get "$name" darkirc_adapter)" || true
@@ -3602,12 +5550,12 @@ patch_tenant_env() {
     fi
   fi
 
-  # Wire the nanocode/pebble/opencode external workers into config.toml so
+  # Wire supported external workers into config.toml so
   # existing tenants get create_job(mode: ...) routing without a hand-edited
   # config file.
-  ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss"
 }
 
 # ── Owner-scope DB migration ──────────────────────────────────────────────────
@@ -3955,214 +5903,6 @@ configure_pebble() {
   fi
 }
 
-# ── Nanocode worker LLM configuration ─────────────────────────────────────────
-#
-# Sets the nanocode worker's TensorZero model + baseURL overrides for a tenant by
-# upserting NANOCODE_MODEL / NANOCODE_BASE_URL into lunarwing.env (the same source
-# add-tenant writes, and that both init paths inject into the container). Mirrors
-# configure-pebble, but stored in lunarwing.env (not a separate nanocode.env).
-
-configure_nanocode() {
-  local name="$1"
-  local model="${2:-}"
-  local base_url="${3:-}"
-
-  name="$(sanitize_name "$name")"
-  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-  [[ -n "$model" || -n "$base_url" ]] \
-    || die "configure-nanocode: pass --model <model> and/or --base-url <url>"
-
-  local env_path
-  env_path="$(tenant_env_dir "$name")/lunarwing.env"
-  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
-
-  # Upsert: drop any existing override lines, then append the provided values.
-  local tmp
-  tmp="$(mktemp)"
-  grep -v -e '^NANOCODE_MODEL=' -e '^NANOCODE_BASE_URL=' "$env_path" >"$tmp" || true
-  [[ -n "$model" ]]    && printf 'NANOCODE_MODEL=%s\n'    "$model"    >>"$tmp"
-  [[ -n "$base_url" ]] && printf 'NANOCODE_BASE_URL=%s\n' "$base_url" >>"$tmp"
-  cat "$tmp" >"$env_path"
-  rm -f "$tmp"
-  chown "$name:$name" "$env_path"
-  chmod 600 "$env_path"
-  say "nanocode LLM overrides written to $env_path for tenant '$name'"
-
-  local container_name="lunarwing-nanocode-$name"
-  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
-    say "note: restart the nanocode worker to pick up the new config:"
-    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
-  fi
-}
-
-# ── Nanocode worker container ─────────────────────────────────────────────────
-
-start_tenant_nanocode() {
-  local name="$1"
-  ensure_container_runtime
-
-  local wss_port container_name nanocode_dir
-  wss_port="$(ports_get "$name" nanocode_wss)"
-  container_name="lunarwing-nanocode-$name"
-  nanocode_dir="${LUNARWING_ROOT}/lunarcode4lunarwing"
-
-  if [[ -z "$wss_port" ]]; then
-    say "no nanocode_wss port allocated for $name (skipping nanocode worker)"
-    return 0
-  fi
-
-  # Ensure the image is available to whoever runs the container (rootless: load it
-  # into the tenant's store via save|load; rootful: must already be built in root).
-  if ! _ensure_tenant_image "$name" lunarwing-worker-nanocode:latest; then
-    say "nanocode worker image not available; run 'build-nanocode-worker' first (skipping)"
-    return 0
-  fi
-
-  # systemd + rootless podman: Quadlet .container owns the lifecycle (the unit's
-  # [Container] spec creates+runs it), so skip the imperative `_ctr run` below.
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-    _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-nanocode-${name}.container"
-    render_worker_quadlet "$name" nanocode 8443
-    _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    # Force-recreate if the quadlet config changed since the container was
-    # last created (Quadlet restarts the existing container without picking
-    # up new env vars / volumes).
-    if _container_config_changed "$name" "lunarwing-nanocode-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-nanocode-${name}.service" "lunarwing-nanocode-${name}"
-    fi
-    if _systemctl_user "$name" start "lunarwing-nanocode-${name}.service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-nanocode-${name}" "$quadlet_file"
-      say "nanocode worker ready via quadlet (lunarwing-nanocode-${name}.service, WSS port $wss_port)"
-    else
-      say "WARNING: lunarwing-nanocode-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-nanocode-${name}.service" --no-pager >&2 || true
-    fi
-    return 0
-  fi
-
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    # Check if the container's config is stale (env vars / volumes changed
-    # since it was created). The imperative path hashes lunarwing.env since
-    # there's no quadlet file to compare against.
-    local env_file_for_hash
-    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
-    if _container_config_changed "$name" "$container_name" "$env_file_for_hash"; then
-      say "config changed for $container_name; force-recreating"
-      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
-    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
-      say "nanocode worker already running ($container_name, WSS port $wss_port)"
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
-      _register_worker_unit "$name" nanocode
-      return 0
-    else
-      say "starting existing nanocode worker container $container_name"
-      _ctr "$name" start "$container_name" >/dev/null
-      _store_container_hash "$name" "$container_name" "$env_file_for_hash"
-      _register_worker_unit "$name" nanocode
-      say "nanocode worker ready ($container_name, WSS port $wss_port)"
-      return 0
-    fi
-  fi
-
-  # Container doesn't exist (or was force-removed above) — create it fresh.
-  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
-    say "creating nanocode worker container $container_name on WSS port $wss_port"
-
-    # Read tenant env for secrets to pass through
-    local tenant_env_path
-    tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
-
-    # Read nanocode-specific env if it exists
-    local nanocode_env_path
-    nanocode_env_path="$(tenant_env_dir "$name")/nanocode.env"
-
-    local env_flags=()
-    # Core env vars from tenant lunarwing.env
-    if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
-
-      local llm_api_key
-      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
-      [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
-
-      # Nanocode LLM overrides (model / TensorZero baseURL), if set on the tenant.
-      local nanocode_model nanocode_base_url
-      nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
-      [[ -n "$nanocode_model" ]] && env_flags+=(-e "NANOCODE_MODEL=$nanocode_model")
-      nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
-      [[ -n "$nanocode_base_url" ]] && env_flags+=(-e "NANOCODE_BASE_URL=$nanocode_base_url")
-    fi
-
-    # Override with nanocode-specific env file if present
-    if [[ -f "$nanocode_env_path" ]]; then
-      env_flags+=(--env-file "$nanocode_env_path")
-    fi
-
-    local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/nanocode-workspace"
-    mkdir -p "$workspace_dir"
-    chown "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
-
-    # HEALTH_PORT=8443 matches the image's baked HEALTHCHECK (in-container).
-    # v8: also publish the tenant's dedicated nanocode_health port -> container
-    # 8443, so the host self-heal pipeline can probe /health directly.
-    local -a restart_arg=()
-    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
-    local -a health_publish=()
-    local host_health_port
-    host_health_port="$(ports_get "$name" nanocode_health)" || true
-    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    # SSH agent socket (always included — daemon creates it at startup).
-    # :z label so SELinux (Enforcing on Fedora) permits container_t to access the
-    # tenant-home-labeled socket; without it SSH_AUTH_SOCK reads fail despite 0666 mode.
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
-    _ctr "$name" run -d \
-      --name "$container_name" \
-      -e LUNARWING_WORKER_ID="worker-nanocode-${name}" \
-      -e WS_PORT="$wss_port" \
-      -e HEALTH_PORT="8443" \
-      -e NANOCODE_MODE=websocket \
-      -e WS_ROLE=server \
-      -e WS_BIND_HOST=0.0.0.0 \
-      -e WS_PATH=/ws/agent \
-      "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
-      -p "127.0.0.1:${wss_port}:${wss_port}" \
-      "${health_publish[@]}" \
-      -v "$workspace_dir:/workspace:z" \
-      "${restart_arg[@]}" \
-      lunarwing-worker-nanocode:latest \
-      --mode websocket >/dev/null
-    _store_container_hash "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env"
-  fi
-
-  _register_worker_unit "$name" nanocode
-  say "nanocode worker ready ($container_name, WSS port $wss_port)"
-}
-
-stop_tenant_nanocode() {
-  local name="$1"
-  ensure_container_runtime
-
-  local container_name="lunarwing-nanocode-$name"
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-    say "nanocode worker stopped ($container_name)"
-  fi
-}
-
 # ── OpenCode worker container ──────────────────────────────────────────────────
 
 configure_opencode() {
@@ -4396,7 +6136,8 @@ start_tenant_opencode() {
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
     local opencode_service="lunarwing-opencode-${name}.service"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode-${name}.container"
     render_worker_quadlet "$name" opencode 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-opencode-${name}" "$quadlet_file"; then
@@ -4495,11 +6236,7 @@ start_tenant_opencode() {
     fi
 
     local workspace_dir
-    workspace_dir="$(tenant_lw_root "$name")/opencode-workspace"
-    mkdir -p "$workspace_dir"
-    # Migrate files created under an older rootless UID mapping before keep-id.
-    chown -R "$name:$name" "$workspace_dir"
-    chmod 777 "$workspace_dir"
+    workspace_dir="$(prepare_worker_workspace "$name" opencode)"
 
     local -a restart_arg=()
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
@@ -4507,7 +6244,8 @@ start_tenant_opencode() {
     local host_health_port
     host_health_port="$(ports_get "$name" opencode_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
@@ -4553,6 +6291,252 @@ stop_tenant_opencode() {
   fi
 }
 
+# ── Kimi Code worker container ────────────────────────────────────────────────
+
+prepare_worker_workspace() {
+  local name="$1" worker="$2" workspace_dir container_uid container_gid
+  workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
+  mkdir -p "$workspace_dir"
+
+  case "$worker" in
+    opencode)
+      container_uid="$OPENCODE_CONTAINER_UID"
+      container_gid="$OPENCODE_CONTAINER_GID"
+      ;;
+    kimi)
+      container_uid="$KIMI_CONTAINER_UID"
+      container_gid="$KIMI_CONTAINER_GID"
+      ;;
+    *) die "unsupported private worker workspace: $worker" ;;
+  esac
+
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    # Rootful runtimes do not apply keep-id, so bind mounts must use image IDs.
+    chown -R "$container_uid:$container_gid" "$workspace_dir"
+  else
+    chown -R "$name:$name" "$workspace_dir"
+  fi
+  chmod 2770 "$workspace_dir"
+  printf '%s\n' "$workspace_dir"
+}
+
+write_kimi_runtime_env() {
+  local name="$1" source_path target_path temporary key value
+  source_path="$(tenant_env_dir "$name")/lunarwing.env"
+  target_path="$(tenant_env_dir "$name")/kimi-runtime.env"
+  temporary="$(mktemp "${target_path}.tmp.XXXXXX")"
+  chmod 600 "$temporary"
+
+  for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
+    value="$(_read_env_value "$source_path" "$key")"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+      || { rm -f "$temporary"; die "$key cannot contain a newline"; }
+    [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value" >>"$temporary"
+  done
+
+  value="$(_read_env_value "$source_path" GATEWAY_AUTH_TOKEN)"
+  [[ -n "$value" ]] \
+    || { rm -f "$temporary"; die "Kimi worker requires GATEWAY_AUTH_TOKEN"; }
+  # Worker bridge expects AGENT_AUTH_TOKEN, not daemon's gateway variable name.
+  printf 'AGENT_AUTH_TOKEN=%s\n' "$value" >>"$temporary"
+  chown "$name:$name" "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$target_path"
+  printf '%s\n' "$target_path"
+}
+
+configure_kimi() {
+  local name="$1"
+  local model="${2:-}"
+  local base_url="${3:-}"
+  local api_key="${4:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  [[ -n "$model" || -n "$base_url" || -n "$api_key" ]] \
+    || die "configure-kimi: pass --model <model>, --base-url <url>, or --api-key-file <path>"
+
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+
+  local tmp existing_model existing_base_url existing_api_key
+  existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
+  existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
+  [[ -n "$model" ]] || model="$existing_model"
+  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  [[ -n "$api_key" ]] || api_key="$existing_api_key"
+  tmp="$(mktemp)"
+  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
+  [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$api_key" ]] \
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$api_key")" >>"$tmp"
+  cat "$tmp" >"$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+  say "kimi LLM overrides written to $env_path for tenant '$name'"
+
+  local container_name="lunarwing-kimi-$name"
+  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+    say "note: restart the kimi worker to pick up the new config:"
+    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
+  fi
+}
+
+start_tenant_kimi() {
+  local name="$1"
+  ensure_container_runtime
+
+  local kimi_launch_contract=""
+  local -a kimi_userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    kimi_launch_contract="$KIMI_ROOTLESS_LAUNCH_CONTRACT"
+    kimi_userns_args=(--userns "$KIMI_USERNS")
+  fi
+
+  local wss_port container_name kimi_dir
+  wss_port="$(ports_get "$name" kimi_wss)" || true
+  container_name="lunarwing-kimi-$name"
+  kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+
+  if [[ -z "$wss_port" ]]; then
+    say "no kimi_wss port allocated for $name (skipping kimi worker)"
+    return 0
+  fi
+
+  if ! _ensure_tenant_image "$name" lunarwing-worker-kimi:latest; then
+    say "kimi worker image not available; run 'build-kimi-worker' first (skipping)"
+    return 0
+  fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-kimi:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    *)
+      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      ;;
+  esac
+
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    _wait_user_manager "$name"
+    local kimi_service="lunarwing-kimi-${name}.service"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
+    render_worker_quadlet "$name" kimi 8443
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file"; then
+      _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
+    fi
+    _systemctl_user "$name" reset-failed "$kimi_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$kimi_service" >/dev/null 2>&1; then
+      _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file"
+      say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
+    else
+      say "WARNING: $kimi_service failed to start" >&2
+      _systemctl_user "$name" status "$kimi_service" --no-pager --full >&2 || true
+    fi
+    return 0
+  fi
+
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    local env_file_for_hash
+    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"; then
+      say "config changed for $container_name; force-recreating"
+      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
+    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+      say "kimi worker already running ($container_name, WSS port $wss_port)"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      return 0
+    else
+      say "starting existing kimi worker container $container_name"
+      _ctr "$name" start "$container_name" >/dev/null
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      say "kimi worker ready ($container_name, WSS port $wss_port)"
+      return 0
+    fi
+  fi
+
+  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+    say "creating kimi worker container $container_name on WSS port $wss_port"
+
+    local kimi_env_path
+    kimi_env_path="$(tenant_env_dir "$name")/kimi.env"
+
+    local runtime_env_path
+    runtime_env_path="$(write_kimi_runtime_env "$name")"
+    local env_flags=(--env-file "$runtime_env_path")
+
+    if [[ -f "$kimi_env_path" ]]; then
+      env_flags+=(--env-file "$kimi_env_path")
+    fi
+
+    local workspace_dir
+    workspace_dir="$(prepare_worker_workspace "$name" kimi)"
+
+    local -a restart_arg=()
+    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+    local -a health_publish=()
+    local host_health_port
+    host_health_port="$(ports_get "$name" kimi_health)" || true
+    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    _ctr "$name" run -d \
+      --name "$container_name" \
+      "${kimi_userns_args[@]}" \
+      -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
+      -e WS_PORT="$wss_port" \
+      -e HEALTH_PORT="8443" \
+      -e KIMI_MODE=websocket \
+      -e WS_ROLE=server \
+      -e WS_BIND_HOST=0.0.0.0 \
+      -e WS_PATH=/ws/agent \
+      "${env_flags[@]}" \
+      "${ssh_mount[@]}" \
+      -p "127.0.0.1:${wss_port}:${wss_port}" \
+      "${health_publish[@]}" \
+      -v "$workspace_dir:/workspace:z" \
+      "${restart_arg[@]}" \
+      lunarwing-worker-kimi:latest \
+      --mode websocket >/dev/null
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$kimi_launch_contract"
+  fi
+
+  _register_worker_unit "$name" kimi
+  say "kimi worker ready ($container_name, WSS port $wss_port)"
+}
+
+stop_tenant_kimi() {
+  local name="$1"
+  ensure_container_runtime
+
+  local container_name="lunarwing-kimi-$name"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
+    _deregister_babysitter "$container_name"
+    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    say "kimi worker stopped ($container_name)"
+  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+    say "kimi worker stopped ($container_name)"
+  fi
+}
+
 # ── Pebble worker container ──────────────────────────────────────────────────
 
 start_tenant_pebble() {
@@ -4578,7 +6562,8 @@ start_tenant_pebble() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file"; then
@@ -4652,9 +6637,10 @@ start_tenant_pebble() {
     host_health_port="$(ports_get "$name" pebble_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
     # SSH agent socket (always included — daemon creates it at startup).
-    # :z label for SELinux (Enforcing on Fedora) — see start_tenant_nanocode.
+    # :z label for SELinux (Enforcing on Fedora).
     local -a ssh_mount=()
-    local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
     ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
@@ -4771,7 +6757,8 @@ start_tenant_vision() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-vision-${name}.container"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-vision-${name}.container"
     render_vision_quadlet "$name"
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-vision-${name}" "$quadlet_file"; then
@@ -4804,7 +6791,7 @@ start_tenant_vision() {
 
     # v10: also publish the tenant's dedicated vision_health port -> container
     # 8089, so the host self-heal pipeline can probe /health directly (mirrors
-    # the nanocode/pebble health_publish pattern).
+    # the external-worker health_publish pattern).
     local -a health_publish=()
     local host_health_port
     host_health_port="$(ports_get "$name" vision_health)" || true
@@ -4934,7 +6921,7 @@ render_vision_quadlet() {
   vision_health_port="$(ports_get "$name" vision_health)" || true
   env_path="$(tenant_env_dir "$name")/vision.env"
   [[ -f "$env_path" ]] || write_tenant_vision_env "$name" >/dev/null
-  token="$(grep '^LUNARWING_AUTH_TOKEN=' "$env_path" 2>/dev/null | cut -d= -f2- || true)"
+  token="$(_read_env_value "$env_path" LUNARWING_AUTH_TOKEN)"
   token="${token//%/%%}"
   mkdir -p "$qdir"
 
@@ -5362,14 +7349,20 @@ EOF
   chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
 }
 
-# Render a per-tenant Quadlet .container for an external worker (nanocode/pebble).
+# Render a per-tenant Quadlet .container for an external worker.
 # Mirrors the imperative env from start_tenant_<worker>: the GATEWAY_AUTH_TOKEN ->
 # AGENT_AUTH_TOKEN and LLM_API_KEY -> TENSORZERO_API_KEY remap is resolved here and
-# inlined as Environment= in a 0600 tenant-owned unit (no secret leaves the file).
+# inlined as Environment= in a 0600 tenant-owned unit. Kimi uses a separate
+# mode-0600 runtime env file so its API key never enters generated unit commands.
 # Returns early (no unit) when the worker has no allocated wss port.
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
+  case "$worker" in
+    pebble|opencode|kimi) ;;
+    *) die "unsupported external worker '$worker'" ;;
+  esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
+  local runtime_env_path="" runtime_env_hash="" health_path="health"
   qdir="$(tenant_quadlet_dir "$name")"
   wss_port="$(ports_get "$name" "${worker}_wss")"
   host_health_port="$(ports_get "$name" "${worker}_health")"
@@ -5379,21 +7372,21 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   mkdir -p "$workspace_dir"
-  if [[ "$worker" == "opencode" ]]; then
-    # Migrate files created under OpenCode's older rootless UID mapping.
-    chown -R "$name:$name" "$workspace_dir"
+  if [[ "$worker" == "kimi" || "$worker" == "opencode" ]]; then
+    workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
   else
     chown "$name:$name" "$workspace_dir"
   fi
-  chmod 777 "$workspace_dir"
+  [[ "$worker" == "kimi" || "$worker" == "opencode" ]] || chmod 777 "$workspace_dir"
+  [[ "$worker" != "kimi" ]] || runtime_env_path="$(write_kimi_runtime_env "$name")"
+  [[ -z "$runtime_env_path" ]] \
+    || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"
+  [[ "$worker" != "kimi" ]] || health_path="ready"
   mkdir -p "$qdir"
 
   local agent_token tz_key
   agent_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
   tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
-  local nanocode_model nanocode_base_url
-  nanocode_model="$(_read_env_value "$tenant_env_path" NANOCODE_MODEL)"
-  nanocode_base_url="$(_read_env_value "$tenant_env_path" NANOCODE_BASE_URL)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"
   tz_key="${tz_key//%/%%}"
@@ -5407,7 +7400,8 @@ render_worker_quadlet() {
   # create_job with SSH commands is invoked, well after startup). If SSH is
   # not configured for the tenant, the socket simply won't exist and SSH
   # commands from the worker will fail with a clear "no agent" error.
-  local ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+  local ssh_agent_socket
+  ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
   local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
   if [[ "$worker" == "opencode" ]]; then
     study_notes_home="$(tenant_study_notes_home "$name")"
@@ -5455,6 +7449,8 @@ EOF
     fi
     if [[ "$worker" == "opencode" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE_USERNS"
+    elif [[ "$worker" == "kimi" ]]; then
+      printf 'UserNS=%s\n' "$KIMI_USERNS"
     fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
@@ -5464,34 +7460,36 @@ EOF
     printf 'Volume=%s:/tmp/ssh-agent.sock:z\n' "$ssh_agent_socket"
     printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent.sock\n'
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
-    # the host self-heal pipeline can probe /health directly. The container still
-    # listens on HEALTH_PORT=8443 internally (matches the image's baked HEALTHCHECK).
+    # the host self-heal pipeline can probe the worker directly. Container still
+    # listens on HEALTH_PORT=8443 internally (matches image healthcheck).
     [[ -n "$host_health_port" ]] && printf 'PublishPort=127.0.0.1:%s:8443\n' "$host_health_port"
-    if [[ "$worker" == "nanocode" ]]; then
-      printf 'Environment=NANOCODE_MODE=websocket\n'
-      printf 'Environment=WS_ROLE=server\n'
-    elif [[ "$worker" == "pebble" ]]; then
+    if [[ "$worker" == "pebble" ]]; then
       printf 'Environment=PEBBLE_MODE=websocket\n'
     elif [[ "$worker" == "opencode" ]]; then
       printf 'Environment=OPENCODE_MODE=websocket\n'
       printf 'Environment=WS_ROLE=server\n'
+    elif [[ "$worker" == "kimi" ]]; then
+      printf 'Environment=KIMI_MODE=websocket\n'
+      printf 'Environment=WS_ROLE=server\n'
     fi
-    [[ -n "$agent_token" ]] && printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
-    [[ "$worker" == "nanocode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
-    [[ "$worker" == "nanocode" && -n "$nanocode_model" ]] && printf 'Environment=NANOCODE_MODEL=%s\n' "$nanocode_model"
-    [[ "$worker" == "nanocode" && -n "$nanocode_base_url" ]] && printf 'Environment=NANOCODE_BASE_URL=%s\n' "$nanocode_base_url"
+    [[ "$worker" == "kimi" || -z "$agent_token" ]] \
+      || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
     [[ "$worker" == "opencode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
     oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
     oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
+    if [[ -n "$runtime_env_path" ]]; then
+      printf '# RuntimeEnvHash=%s\n' "$runtime_env_hash"
+      printf 'EnvironmentFile=%s\n' "$runtime_env_path"
+    fi
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
-    [[ "$worker" == "nanocode" || "$worker" == "opencode" ]] && printf 'Exec=--mode websocket\n'
+    [[ "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
-HealthCmd=curl -sf http://127.0.0.1:${health_port}/health || exit 1
+HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
 HealthInterval=15s
 HealthTimeout=5s
 HealthRetries=3
@@ -5565,6 +7563,8 @@ render_tenant_systemd_units() {
 
   local ws_adapter_path
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   # Proxy unit (only when enabled)
   if tenant_proxy_enabled "$name"; then
@@ -5586,16 +7586,17 @@ WantedBy=default.target
 EOF
   fi
 
-  # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
-  local weechat_home
-  weechat_home="$(tenant_home "$name")/.config/weechat"
-  mkdir -p "$weechat_home"
-  chown "$name:$name" "$weechat_home"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # WeeChat unit (runs in tmux so you can attach: tmux -L weechat-${name} attach)
+    local weechat_home
+    weechat_home="$(tenant_home "$name")/.config/weechat"
+    mkdir -p "$weechat_home"
+    chown "$name:$name" "$weechat_home"
 
-  _render_weechat_systemd_unit "$name" "$user_unit_dir"
+    _render_weechat_systemd_unit "$name" "$user_unit_dir"
 
-  # WeeChat WS adapter unit
-  cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
+    # WeeChat WS adapter unit
+    cat >"$user_unit_dir/lunarwing-weechat-adapter-${name}.service" <<EOF
 [Unit]
 Description=LunarWing WeeChat WS adapter ($name)
 After=network.target lunarwing-weechat-${name}.service
@@ -5614,6 +7615,15 @@ NoNewPrivileges=true
 [Install]
 WantedBy=default.target
 EOF
+  else
+    # Remove stale files and enablement links so render-units also reconciles a
+    # tenant whose registry flag was changed outside the lifecycle command.
+    rm -f \
+      "$user_unit_dir/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-${name}.service" \
+      "$user_unit_dir/default.target.wants/lunarwing-weechat-adapter-${name}.service"
+  fi
 
   if tenant_darkirc_enabled "$name"; then
     local darkirc_adapter_path
@@ -5645,7 +7655,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$DARKIRC_BIN --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml
+ExecStart=$DARKIRC_RELEASE_DAEMON --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml
 Restart=always
 RestartSec=10
 NoNewPrivileges=true
@@ -5698,12 +7708,18 @@ EOF
     proxy_sd_wants=" lunarwing-proxy-${name}.service"
   fi
 
+  local weechat_sd_after="" weechat_sd_wants=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_sd_after=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+    weechat_sd_wants=" lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service"
+  fi
+
   # Main daemon unit
   cat >"$user_unit_dir/lunarwing-${name}.service" <<EOF
 [Unit]
 Description=LunarWing AI assistant ($name)
-After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_after}
-  Wants=xmpp-bridge-${name}.service${proxy_sd_wants} lunarwing-weechat-${name}.service lunarwing-weechat-adapter-${name}.service${darkirc_sd_wants}
+After=network.target ${pg_dep_after}xmpp-bridge-${name}.service${proxy_sd_after}${weechat_sd_after}${darkirc_sd_after}
+Wants=xmpp-bridge-${name}.service${proxy_sd_wants}${weechat_sd_wants}${darkirc_sd_wants}
 ${pg_dep_requires}
 
 [Service]
@@ -5720,9 +7736,39 @@ KillSignal=SIGTERM
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+# BUG-005: the daemon is capped separately from its transient workloads;
+# shell/compile jobs run in lunarwing-workloads.slice scopes (see
+# ic/src/tools/process.rs), so their memory never lands here.
+MemoryHigh=$DAEMON_MEMORY_HIGH
+MemoryMax=$DAEMON_MEMORY_MAX
+TasksMax=$DAEMON_TASKS_MAX
 
 [Install]
 WantedBy=default.target
+EOF
+
+  # BUG-005: transient workload slices. Agent-spawned shell/compile jobs run
+  # as scopes under lunarwing-workloads.slice; operator-driven builds
+  # (build_tenant) run under lunarwing-build.slice. Slice names are constant
+  # across tenants because each tenant has its own systemd user manager.
+  cat >"$user_unit_dir/$WORKLOAD_SLICE" <<EOF
+[Unit]
+Description=LunarWing transient agent workloads ($name)
+
+[Slice]
+MemoryHigh=$WORKLOAD_MEMORY_HIGH
+MemoryMax=$WORKLOAD_MEMORY_MAX
+CPUQuota=$WORKLOAD_CPU_QUOTA
+TasksMax=$WORKLOAD_TASKS_MAX
+EOF
+
+  cat >"$user_unit_dir/$BUILD_SLICE" <<EOF
+[Unit]
+Description=LunarWing operator build workloads ($name)
+
+[Slice]
+MemoryHigh=$BUILD_MEMORY_HIGH
+MemoryMax=$BUILD_MEMORY_MAX
 EOF
 
   # The pg + worker Quadlet .container units are rendered by the start functions
@@ -5759,7 +7805,11 @@ _wait_user_manager() {
 start_tenant_systemd() {
   local name="$1"
   _systemctl_user "$name" daemon-reload
-  # Quadlet-generated units (pg, nanocode, pebble, vision) are NOT in the
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_service_uses_release_selector "$name" \
+      || die "effective DarkIRC systemd unit is stale or overridden; run render-units $name"
+  fi
+  # Quadlet-generated units (pg, supported workers, vision) are NOT in the
   # enable_list: `systemctl enable` fails on generated/transient units with
   # "Failed to enable unit: ... is transient or generated", and under
   # `set -euo pipefail` that non-zero exit aborts the entire enable batch —
@@ -5767,7 +7817,13 @@ start_tenant_systemd() {
   # started by its own start_tenant_* function (which renders the quadlet,
   # reloads the daemon, and starts the unit). The imperative `start` below
   # is belt-and-suspenders for the vision unit (harmless if already running).
-  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service")
+  # WeeChat units join the enable list only when the tenant's registry flag
+  # allows them (ISSUE-006): a disabled tenant must not be re-enabled for
+  # future boots by start-tenant.
+  if tenant_weechat_enabled "$name"; then
+    enable_list+=("lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service")
+  fi
   if tenant_proxy_enabled "$name"; then
     enable_list+=("lunarwing-proxy-${name}.service")
   fi
@@ -5796,7 +7852,7 @@ stop_tenant_systemd() {
   local uid
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-pg-${name}.service"; do
     if _systemctl_user "$name" is-active --quiet "$svc" 2>/dev/null; then
       _systemctl_user "$name" stop "$svc"
       say "stopped $svc"
@@ -5822,9 +7878,13 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-nanocode-${name}.container" \
         "$qdir/lunarwing-pebble-${name}.container" \
         "$qdir/lunarwing-opencode-${name}.container" \
+        "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
-    for w in nanocode pebble opencode; do
+    # Retirement preserves stopped Nanocode containers for rollback and manual
+    # recovery. Supported workers remain disposable because their state lives
+    # in bind-mounted workspaces.
+    for w in pebble opencode kimi; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
@@ -5869,6 +7929,7 @@ description="WeeChat IRC client ($name)"
 command="\${weechat_openrc_env_exec}"
 command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
+pidfile="\${weechat_pidfile}"
 required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_start_helper} \${weechat_env_file}"
 
 depend() {
@@ -5887,7 +7948,43 @@ start() {
         --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
         -L weechat-${name} new-session -d -s weechat \
         "\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
-    eend \$?
+    start_rc=\$?
+    if [ "\${start_rc}" -eq 0 ]; then
+        # tmux new-session -d returns immediately and the real work runs in the
+        # detached tmux server, leaving OpenRC with no process to track (which
+        # surfaces as "status: crashed"). Record the tmux server PID so the
+        # pidfile, status, and health checks see the real process.
+        tmux_pid=""
+        i=0
+        while [ "\$i" -lt 50 ]; do
+            tmux_pid="\$(start-stop-daemon --start \\
+                --chuid "\${weechat_user}:\${weechat_group}" \\
+                --exec "\${weechat_command}" -- \\
+                -L "weechat-${name}" display-message -p '#{pid}' 2>/dev/null)"
+            [ -n "\$tmux_pid" ] && break
+            i=\$((i + 1))
+            sleep 0.1
+        done
+        if [ -n "\$tmux_pid" ]; then
+            printf '%s\n' "\$tmux_pid" >"\${weechat_pidfile}"
+            chown "\${weechat_user}:\${weechat_group}" "\${weechat_pidfile}" 2>/dev/null || true
+        fi
+    fi
+    eend "\${start_rc}"
+}
+
+status() {
+    # Probe the real tmux session instead of only the OpenRC state file, so a
+    # live session never reports as crashed.
+    if start-stop-daemon --start \\
+        --chuid "\${weechat_user}:\${weechat_group}" \\
+        --exec "\${weechat_command}" -- \\
+        -L "weechat-${name}" has-session -t weechat 2>/dev/null; then
+        einfo "WeeChat ($name) session is up"
+        return 0
+    fi
+    einfo "WeeChat ($name) session is not running"
+    return 1
 }
 
 stop() {
@@ -5919,6 +8016,7 @@ stop() {
         ) >/dev/null 2>&1
         stop_rc=\$?
     fi
+    [ "\${stop_rc}" -eq 0 ] && rm -f "\${weechat_pidfile}"
     eend "\${stop_rc}"
     return "\${stop_rc}"
 }
@@ -5965,6 +8063,7 @@ render_tenant_openrc_units() {
   log_dir="$(tenant_log_dir "$name")"
   run_dir="$(tenant_run_dir "$name")"
   install_openrc_env_exec
+  mkdir -p "$OPENRC_INITD_DIR" "$OPENRC_CONFD_DIR"
 
   local proxy_port bridge_port weechat_port
   proxy_port="$(ports_get "$name" proxy)"
@@ -5980,6 +8079,8 @@ render_tenant_openrc_units() {
   ws_adapter_path="$(tenant_lw_root "$name")/lunarwing_weechat_wss/weechat_relay/ws_adapter.py"
   local ws_adapter_dir
   ws_adapter_dir="$(dirname "$ws_adapter_path")"
+  local weechat_enabled=false
+  tenant_weechat_enabled "$name" && weechat_enabled=true
 
   local darkirc_rc_after=""
   if tenant_darkirc_enabled "$name"; then
@@ -5989,6 +8090,11 @@ render_tenant_openrc_units() {
   local proxy_rc_after=""
   if tenant_proxy_enabled "$name"; then
     proxy_rc_after=" lunarwing-proxy-${name}"
+  fi
+
+  local weechat_rc_after=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_after=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
   fi
 
   local weechat_home
@@ -6008,7 +8114,7 @@ render_tenant_openrc_units() {
   # A first-class unit (not a daemon start_pre side-effect) so the host self-heal
   # pipeline — which auto-discovers /etc/init.d units — can remediate a crashed
   # Postgres independently.
-  cat >"/etc/init.d/lunarwing-pg-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-pg-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing Postgres container ($name)"
@@ -6075,11 +8181,11 @@ status() {
     einfo "\${pg_container}: stopped"; return 3
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-pg-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-pg-${name}"
   render_container_babysitter_unit "$name" pg "$pg_container" "$pg_uid" "$pg_home"
 
   # ── Main daemon init script ──
-  cat >"/etc/init.d/lunarwing-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing AI assistant ($name)"
@@ -6119,8 +8225,9 @@ required_files="\${lunarwing_openrc_env_exec} \${lunarwing_command} \${lunarwing
 
 depend() {
     need net localmount lunarwing-pg-${name}
+    want \${lunarwing_rc_need}
     use dns logger
-    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after} weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_after}
+    after firewall lunarwing-pg-${name} xmpp-bridge-${name}${proxy_rc_after}${weechat_rc_after}${darkirc_rc_after}
 }
 
 start_pre() {
@@ -6134,10 +8241,10 @@ start_pre() {
     umask "\${lunarwing_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-${name}"
 
   # ── XMPP bridge init script ──
-  cat >"/etc/init.d/xmpp-bridge-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/xmpp-bridge-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing XMPP bridge ($name)"
@@ -6190,16 +8297,16 @@ start_pre() {
     umask "\${xmpp_bridge_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/xmpp-bridge-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/xmpp-bridge-${name}"
 
   # ── DarkIRC daemon init script (only when enabled) ──
   if tenant_darkirc_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-darkirc-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC daemon ($name)"
 
-: "\${darkirc_command:=$DARKIRC_BIN}"
+darkirc_command="$DARKIRC_RELEASE_DAEMON"
 : "\${darkirc_args:=--config $state_dir/darkirc/darkirc_config.toml}"
 : "\${darkirc_user:=$name}"
 : "\${darkirc_group:=$name}"
@@ -6246,12 +8353,12 @@ start_pre() {
     umask "\${darkirc_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
   fi
 
   # ── TensorZero proxy init script (only when enabled) ──
   if tenant_proxy_enabled "$name"; then
-  cat >"/etc/init.d/lunarwing-proxy-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-proxy-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing TensorZero proxy ($name)"
@@ -6301,14 +8408,15 @@ start_pre() {
     umask "\${proxy_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-proxy-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-proxy-${name}"
   fi
 
-  # ── WeeChat init script (tmux-based) ──
-  _render_weechat_openrc_unit "$name" "/etc/init.d/lunarwing-weechat-${name}"
+  if [[ "$weechat_enabled" == "true" ]]; then
+    # ── WeeChat init script (tmux-based) ──
+    _render_weechat_openrc_unit "$name" "$OPENRC_INITD_DIR/lunarwing-weechat-${name}"
 
-  # WeeChat WS adapter init script
-  cat >"/etc/init.d/lunarwing-weechat-adapter-${name}" <<INITEOF
+    # WeeChat WS adapter init script
+    cat >"$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing WeeChat WS adapter ($name)"
@@ -6359,7 +8467,16 @@ start_pre() {
     umask "\${adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-weechat-adapter-${name}"
+    chmod 0755 "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}"
+  else
+    rm -f \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" \
+      "$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-${name}" \
+      "$OPENRC_RUNLEVELS_DIR"/*/"lunarwing-weechat-adapter-${name}"
+  fi
 
   # DarkIRC adapter init script (only when enabled)
   if tenant_darkirc_enabled "$name"; then
@@ -6367,7 +8484,7 @@ INITEOF
   darkirc_adapter_path="$(tenant_lw_root "$name")/darkirc_channel_for_lunarwing/darkirc/adapter/darkirc_adapter.py"
   darkirc_adapter_dir="$(dirname "$darkirc_adapter_path")"
 
-  cat >"/etc/init.d/lunarwing-darkirc-adapter-${name}" <<INITEOF
+  cat >"$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing DarkIRC adapter ($name)"
@@ -6418,7 +8535,7 @@ start_pre() {
     umask "\${darkirc_adapter_umask}"
 }
 INITEOF
-  chmod 0755 "/etc/init.d/lunarwing-darkirc-adapter-${name}"
+  chmod 0755 "$OPENRC_INITD_DIR/lunarwing-darkirc-adapter-${name}"
   fi
 
   # ── Conf.d files ──
@@ -6430,32 +8547,46 @@ INITEOF
   if tenant_proxy_enabled "$name"; then
     proxy_rc_need=" lunarwing-proxy-${name}"
   fi
-  cat >"/etc/conf.d/lunarwing-${name}" <<CONFD
+  local weechat_rc_need=""
+  if [[ "$weechat_enabled" == "true" ]]; then
+    weechat_rc_need=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
+  fi
+  cat >"$OPENRC_CONFD_DIR/lunarwing-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
-lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need} lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}${darkirc_rc_need}"
+lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
+
+# BUG-005 note: agent-spawned shell/compile workloads are isolated into their
+# own process group and reaped on timeout/cancel by the daemon itself (see
+# ic/src/tools/process.rs), so runaway trees cannot leak on any init system.
+# Hard cgroup memory/CPU caps for those workloads are currently applied only
+# on systemd hosts (lunarwing-workloads.slice); OpenRC has no equivalent
+# transient-scope mechanism. Optional process-level caps can be added here:
+#rc_ulimit="-v 8388608"
 CONFD
 
-  cat >"/etc/conf.d/xmpp-bridge-${name}" <<CONFD
+  cat >"$OPENRC_CONFD_DIR/xmpp-bridge-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 xmpp_bridge_rc_before="lunarwing-${name}"
 CONFD
 
   if tenant_proxy_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-proxy-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-proxy-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
 
-  cat >"/etc/conf.d/lunarwing-weechat-${name}" <<CONFD
+  if [[ "$weechat_enabled" == "true" ]]; then
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
 
-  cat >"/etc/conf.d/lunarwing-weechat-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-weechat-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
+  fi
 
   if tenant_darkirc_enabled "$name"; then
-    cat >"/etc/conf.d/lunarwing-darkirc-adapter-${name}" <<CONFD
+    cat >"$OPENRC_CONFD_DIR/lunarwing-darkirc-adapter-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 CONFD
   fi
@@ -6479,27 +8610,43 @@ start_tenant_openrc() {
   # Start PG babysitter (supervises the container via podman wait)
   rc-service "lunarwing-pg-${name}-sup" start 2>/dev/null || true
   # Optional channels next, non-fatal: a missing weechat/aiohttp must not abort
-  # the core stack (the main daemon does not depend on them).
-  rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
-  rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  # the core stack (the main daemon does not depend on them). WeeChat units are
+  # skipped entirely when the tenant's registry flag disables them (ISSUE-006):
+  # start-tenant must not reactivate a service the operator turned off.
+  if tenant_weechat_enabled "$name"; then
+    rc-service "lunarwing-weechat-${name}" start 2>/dev/null || say "  (lunarwing-weechat-${name} skipped — optional)"
+    rc-service "lunarwing-weechat-adapter-${name}" start 2>/dev/null || say "  (lunarwing-weechat-adapter-${name} skipped — optional)"
+  else
+    say "  (weechat disabled for $name — not starting lunarwing-weechat{,-adapter}-${name})"
+  fi
   if tenant_darkirc_enabled "$name"; then
-    rc-service "lunarwing-darkirc-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-${name} skipped — optional)"
-    rc-service "lunarwing-darkirc-adapter-${name}" start 2>/dev/null || say "  (lunarwing-darkirc-adapter-${name} skipped — optional)"
+    rc-service "lunarwing-darkirc-${name}" start \
+      || die "failed to start OpenRC service lunarwing-darkirc-${name}"
+    rc-service "lunarwing-darkirc-adapter-${name}" start \
+      || die "failed to start OpenRC service lunarwing-darkirc-adapter-${name}"
   fi
   if tenant_proxy_enabled "$name"; then
     rc-service "lunarwing-proxy-${name}" start
   fi
   rc-service "xmpp-bridge-${name}" start
   rc-service "lunarwing-${name}" start
-  # Start worker babysitters (if workers are configured)
-  for worker in nanocode pebble opencode; do
-    rc-service "lunarwing-${worker}-${name}-sup" start 2>/dev/null || true
+  # Remove stale worker supervision for unselected or intentionally stopped
+  # workers. Selected running workers register/start their own units after the
+  # daemon is ready, preserving the SSH-agent socket ordering.
+  for worker in pebble opencode kimi; do
+    if tenant_worker_openrc_stop_requested "$name" "$worker"; then
+      openrc_worker_stop_disable "$name" "$worker" \
+        || die "failed to disable OpenRC worker $worker for tenant '$name'"
+    fi
   done
   say "OpenRC services started for $name"
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-vision-${name}")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}")
+  if tenant_weechat_enabled "$name"; then
+    boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
+  fi
   if tenant_proxy_enabled "$name"; then
     boot_svcs+=("lunarwing-proxy-${name}")
   fi
@@ -6509,12 +8656,6 @@ start_tenant_openrc() {
   for svc in "${boot_svcs[@]}"; do
     if rc-service "$svc" status >/dev/null 2>&1; then
       rc-update add "$svc" default >/dev/null 2>&1 || true
-    fi
-  done
-  # Auto-enable worker babysitters
-  for worker in nanocode pebble opencode; do
-    if rc-service "lunarwing-${worker}-${name}-sup" status >/dev/null 2>&1; then
-      rc-update add "lunarwing-${worker}-${name}-sup" default >/dev/null 2>&1 || true
     fi
   done
   say "enabled boot persistence (default runlevel) for $name's running services"
@@ -6532,10 +8673,16 @@ stop_tenant_openrc() {
       return 1
     fi
   fi
-  rc-service "lunarwing-darkirc-adapter-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-darkirc-${name}" stop 2>/dev/null || true
+  if tenant_darkirc_enabled "$name"; then
+    rc-service "lunarwing-darkirc-adapter-${name}" stop \
+      || rc-service "lunarwing-darkirc-adapter-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+      || die "failed to stop OpenRC service lunarwing-darkirc-adapter-${name}"
+    rc-service "lunarwing-darkirc-${name}" stop \
+      || rc-service "lunarwing-darkirc-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+      || die "failed to stop OpenRC service lunarwing-darkirc-${name}"
+  fi
   # Worker babysitters: stop the supervisors so they don't respawn the stopped containers.
-  for worker in nanocode pebble opencode; do
+  for worker in nanocode pebble opencode kimi; do
     rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
   done
   rc-service "lunarwing-vision-${name}" stop 2>/dev/null || true
@@ -6545,11 +8692,473 @@ stop_tenant_openrc() {
   say "OpenRC services stopped for $name"
 }
 
+cleanup_legacy_weechat_systemd() {
+  local name="$1" unit unit_dir unit_path link load_state known=false
+  local changed=false
+  unit="weechat-${name}.service"
+  unit_dir="$(tenant_home "$name")/.config/systemd/user"
+  unit_path="$unit_dir/$unit"
+
+  load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null)" \
+    || return 1
+  [[ "$load_state" == not-found ]] || known=true
+  if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+    [[ -f "$unit_path" && ! -L "$unit_path" ]] \
+      || die "refusing to operate on non-regular legacy unit: $unit_path"
+    known=true
+  fi
+  if [[ "$known" == true ]]; then
+    _systemctl_user "$name" disable --now "$unit" || return 1
+    changed=true
+  fi
+  if [[ -e "$unit_path" || -L "$unit_path" ]]; then
+    sudo -u "$name" -- rm -- "$unit_path" || return 1
+  fi
+
+  for link in "$unit_dir"/*.wants/"$unit" "$unit_dir"/*.requires/"$unit"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "refusing to remove non-symlink legacy enablement: $link"
+    sudo -u "$name" -- rm -- "$link" || return 1
+    changed=true
+  done
+
+  if [[ "$changed" == true ]]; then
+    _systemctl_user "$name" daemon-reload || return 1
+    say "removed legacy systemd user unit $unit for $name"
+  else
+    say "legacy systemd user unit $unit absent for $name"
+  fi
+}
+
+cleanup_legacy_weechat_openrc() {
+  local name="$1" service init_path conf_path link runlevel
+  local changed=false
+  service="weechat-${name}"
+  init_path="$OPENRC_INITD_DIR/$service"
+  conf_path="$OPENRC_CONFD_DIR/$service"
+
+  if [[ -e "$init_path" || -L "$init_path" ]]; then
+    [[ -f "$init_path" && ! -L "$init_path" ]] \
+      || die "refusing to operate on non-regular legacy OpenRC service: $init_path"
+    rc-service "$service" stop || return 1
+  fi
+
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$service"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -L "$link" ]] || die "refusing to remove non-symlink legacy runlevel entry: $link"
+    runlevel="$(basename "$(dirname "$link")")"
+    rc-update del "$service" "$runlevel" || return 1
+    if [[ -e "$link" || -L "$link" ]]; then
+      rm -- "$link" || return 1
+    fi
+    changed=true
+  done
+
+  for link in "$init_path" "$conf_path"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    [[ -f "$link" && ! -L "$link" ]] \
+      || die "refusing to remove non-regular legacy OpenRC path: $link"
+    rm -- "$link" || return 1
+    changed=true
+  done
+
+  if [[ "$changed" == true ]]; then
+    say "removed legacy OpenRC service $service for $name"
+  else
+    say "legacy OpenRC service $service absent for $name"
+  fi
+}
+
+cleanup_legacy_weechat() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  case "$INIT_SYSTEM" in
+    systemd) cleanup_legacy_weechat_systemd "$name" ;;
+    openrc) cleanup_legacy_weechat_openrc "$name" ;;
+    *) die "unsupported init system: $INIT_SYSTEM" ;;
+  esac
+}
+
+restart_weechat_adapter() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  case "$INIT_SYSTEM" in
+    systemd)
+      _systemctl_user "$name" restart "lunarwing-weechat-adapter-${name}.service"
+      ;;
+    openrc)
+      rc-service "lunarwing-weechat-adapter-${name}" restart
+      ;;
+    *) die "unsupported init system: $INIT_SYSTEM" ;;
+  esac
+}
+
+darkirc_service_uses_release_selector() {
+  local name="$1" service_path expected command_prefix fragment drop_ins
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    service_path="$(tenant_home "$name")/.config/systemd/user/lunarwing-darkirc-${name}.service"
+    expected="ExecStart=$DARKIRC_RELEASE_DAEMON --config $(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
+    command_prefix='ExecStart='
+  else
+    service_path="$OPENRC_INITD_DIR/lunarwing-darkirc-${name}"
+    expected="darkirc_command=\"$DARKIRC_RELEASE_DAEMON\""
+    command_prefix='darkirc_command='
+  fi
+  [[ -f "$service_path" && ! -L "$service_path" ]] || return 1
+  [[ "$(grep -Fxc -- "$expected" "$service_path")" -eq 1 \
+    && "$(grep -Fc -- "$command_prefix" "$service_path")" -eq 1 ]] || return 1
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" daemon-reload >/dev/null || return 1
+    fragment="$(_systemctl_user "$name" show --value -p FragmentPath \
+      "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
+    drop_ins="$(_systemctl_user "$name" show --value -p DropInPaths \
+      "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
+    [[ "$fragment" == "$service_path" && -z "$drop_ins" ]]
+  fi
+}
+
+# ISSUE-006: enable_weechat is authoritative for lifecycle, not just health
+# classification. disable-weechat stops the optional weechat units and removes
+# their boot persistence (ending any systemd restart loop); enable-weechat
+# re-enables and starts them. Both are idempotent and tolerate never-rendered
+# or missing units on either init system.
+weechat_lifecycle_stop_disable() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; cannot stop/disable WeeChat" >&2
+        return 1
+      fi
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      _systemctl_user "$name" show-environment >/dev/null || return 1
+      local units=() unit load_state
+      for unit in "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service"; do
+        if ! load_state="$(_systemctl_user "$name" show --value -p LoadState "$unit" 2>/dev/null)"; then
+          return 1
+        fi
+        if [[ -f "$user_unit_dir/$unit" || ( -n "$load_state" && "$load_state" != "not-found" ) ]]; then
+          units+=("$unit")
+        fi
+      done
+      if ((${#units[@]} > 0)); then
+        _systemctl_user "$name" stop "${units[@]}" || return 1
+        _systemctl_user "$name" disable "${units[@]}" || return 1
+      fi
+      say "stopped + disabled lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      local svc link runlevel
+      for svc in "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"; do
+        if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
+          rc-service "$svc" stop || return 1
+        fi
+        for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+          [[ -e "$link" || -L "$link" ]] || continue
+          runlevel="$(basename "$(dirname "$link")")"
+          rc-update del "$svc" "$runlevel" || return 1
+        done
+      done
+      say "stopped + removed from runlevels: lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+weechat_lifecycle_enable_start() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      if ! id -u "$name" >/dev/null 2>&1; then
+        say "tenant user '$name' absent; cannot enable/start WeeChat" >&2
+        return 1
+      fi
+      local user_unit_dir
+      user_unit_dir="$(tenant_home "$name")/.config/systemd/user"
+      if [[ ! -f "$user_unit_dir/lunarwing-weechat-${name}.service" \
+        || ! -f "$user_unit_dir/lunarwing-weechat-adapter-${name}.service" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
+      fi
+      _systemctl_user "$name" daemon-reload || return 1
+      _systemctl_user "$name" enable "lunarwing-weechat-${name}.service" "lunarwing-weechat-adapter-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-${name}.service" || return 1
+      _systemctl_user "$name" start "lunarwing-weechat-adapter-${name}.service" || return 1
+      say "enabled + started lunarwing-weechat{,-adapter}-${name}.service (systemd)"
+      ;;
+    openrc)
+      if [[ ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-${name}" \
+        || ! -x "$OPENRC_INITD_DIR/lunarwing-weechat-adapter-${name}" ]]; then
+        say "weechat units not rendered for '$name'" >&2
+        return 1
+      fi
+      rc-update add "lunarwing-weechat-${name}" default || return 1
+      rc-update add "lunarwing-weechat-adapter-${name}" default || return 1
+      rc-service "lunarwing-weechat-${name}" start || return 1
+      rc-service "lunarwing-weechat-adapter-${name}" start || return 1
+      say "enabled + started lunarwing-weechat{,-adapter}-${name} (OpenRC)"
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+weechat_reconcile_units() {
+  local name="$1"
+  case "$INIT_SYSTEM" in
+    systemd)
+      (render_tenant_systemd_units "$name") || return 1
+      _systemctl_user "$name" daemon-reload || return 1
+      ;;
+    openrc)
+      (render_tenant_openrc_units "$name") || return 1
+      ;;
+    *)
+      say "weechat lifecycle: unsupported INIT_SYSTEM=$INIT_SYSTEM" >&2
+      return 1
+      ;;
+  esac
+}
+
+set_tenant_weechat_enabled() {
+  local name="$1" enabled="$2"
+  with_tenant_lifecycle_lock "$name" _set_tenant_weechat_enabled_locked "$name" "$enabled"
+}
+
+_set_tenant_weechat_enabled_locked() {
+  local name="$1" enabled="$2"
+  case "$enabled" in true|false) ;; *) return 2 ;; esac
+
+  ensure_init_system || return 1
+  if [[ "$enabled" == "false" ]]; then
+    # Stop first: health must not mask a unit until init confirms that its
+    # process and boot persistence are gone.
+    weechat_lifecycle_stop_disable "$name" || return 1
+    ports_set_weechat "$name" false || return 1
+    if ! weechat_reconcile_units "$name"; then
+      # Reconciliation failed after the flag changed. Restore fail-loud health
+      # semantics and make a best effort to restore the prior unit graph.
+      say "disabled WeeChat unit reconciliation failed; restoring enabled flag" >&2
+      ports_set_weechat "$name" true \
+        || say "WARNING: failed to restore enable_weechat=true for '$name'" >&2
+      weechat_reconcile_units "$name" \
+        || say "WARNING: failed to restore enabled WeeChat units for '$name'" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # Enabled is fail-loud: health remains critical if rendering or startup fails.
+  ports_set_weechat "$name" true || return 1
+  weechat_reconcile_units "$name" || return 1
+  weechat_lifecycle_enable_start "$name" || return 1
+}
+
+# Stop only services that can mutate a migration snapshot. PostgreSQL remains
+# running so export can take a consistent pg_dump after quiescence.
+tenant_writer_services() {
+  local name="$1"
+  printf '%s\n' "lunarwing-${name}" "xmpp-bridge-${name}"
+  tenant_proxy_enabled "$name" && printf '%s\n' "lunarwing-proxy-${name}"
+  if tenant_weechat_enabled "$name"; then
+    printf '%s\n' "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}"
+  fi
+  if tenant_darkirc_enabled "$name"; then
+    printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
+  fi
+  printf '%s\n' "lunarwing-vision-${name}"
+  local worker
+  for worker in pebble opencode kimi; do
+    if tenant_worker_enabled "$name" "$worker"; then
+      printf '%s\n' "lunarwing-${worker}-${name}"
+      [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup"
+    fi
+  done
+}
+
+tenant_writer_containers() {
+  local name="$1" worker
+  for worker in pebble opencode kimi vision; do
+    printf 'lunarwing-%s-%s\n' "$worker" "$name"
+  done
+}
+
+container_name_list_has() {
+  local names="$1" expected="$2" current
+  while IFS= read -r current; do
+    [[ "$current" == "$expected" ]] && return 0
+  done <<<"$names"
+  return 1
+}
+
+stop_tenant_writers() {
+  local name="$1" service state rc worker container names running writer_rc
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      rc=0
+      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+      case "$state" in
+        active|activating|reloading|deactivating)
+          _systemctl_user "$name" stop "${service}.service" >/dev/null \
+            || die "failed to stop writer ${service}.service" ;;
+        inactive|dead|failed|maintenance) ;;
+        unknown) [[ "$rc" -eq 4 ]] || die "could not inspect writer ${service}.service" ;;
+        *) [[ "$rc" -eq 4 ]] || die "could not classify writer ${service}.service state '$state'" ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
+      rc-service "$service" stop >/dev/null 2>&1 \
+        || rc-service "$service" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
+        || die "failed to stop writer $service"
+    done < <(tenant_writer_services "$name")
+  fi
+
+  for worker in pebble opencode kimi; do
+    stop_worker "$name" "$worker"
+  done
+  stop_tenant_vision "$name"
+
+  ensure_container_runtime
+  names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" \
+    || die "could not inspect tenant container store"
+  while IFS= read -r container; do
+    container_name_list_has "$names" "$container" || continue
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+      || die "could not inspect writer container $container"
+    case "$running" in
+      true) _ctr "$name" stop --time 0 "$container" >/dev/null \
+        || die "failed to stop writer container $container" ;;
+      false) ;;
+      *) die "could not classify writer container $container" ;;
+    esac
+  done < <(tenant_writer_containers "$name")
+
+  writer_rc=0
+  tenant_writers_active "$name" || writer_rc=$?
+  case "$writer_rc" in
+    0) die "tenant '$name' still has active writers after stop" ;;
+    1) ;;
+    *) die "could not verify writer quiescence for tenant '$name'" ;;
+  esac
+  say "tenant writers stopped for $name (PostgreSQL left running)"
+}
+
+# Returns 0 when any writer is active, 1 when all are stopped/absent, and 2
+# when state cannot be classified safely.
+tenant_writers_active() {
+  local name="$1" service state rc container running names
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 2
+  ensure_init_system || return 2
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    while IFS= read -r service; do
+      rc=0
+      state="$(_systemctl_user "$name" is-active "${service}.service" 2>/dev/null)" || rc=$?
+      case "$state" in
+        active|activating|reloading|deactivating) return 0 ;;
+        inactive|dead|failed|maintenance) ;;
+        unknown) [[ "$rc" -eq 4 ]] || return 2 ;;
+        *) [[ "$rc" -eq 4 ]] || return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  else
+    while IFS= read -r service; do
+      [[ -x "$OPENRC_INITD_DIR/$service" ]] || continue
+      rc=0
+      state="$(rc-service "$service" status 2>&1)" || rc=$?
+      case "$state" in
+        *stopped*|*inactive*|*dead*) ;;
+        *started*|*running*|*active*) return 0 ;;
+        *) [[ "$rc" -eq 3 ]] || return 2 ;;
+      esac
+    done < <(tenant_writer_services "$name")
+  fi
+
+  ensure_container_runtime || return 2
+  names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" || return 2
+  while IFS= read -r container; do
+    container_name_list_has "$names" "$container" || continue
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" \
+      || return 2
+    [[ "$running" != true ]] || return 0
+    [[ "$running" == false ]] || return 2
+  done < <(tenant_writer_containers "$name")
+  return 1
+}
+
+tenant_writers_probe_status() {
+  local rc=0
+  tenant_writers_active "$1" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 10 ;;
+    *) return 2 ;;
+  esac
+}
+
+# Diagnostic-only in Stage A. Both init-managed services and authenticated
+# adapter connectivity must be healthy; this does not activate an exchange.
+darkirc_health_strict() {
+  local name="$1" attempts="${2:-10}" quiet="${3:-false}"
+  local adapter_port env_path secret response attempt
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || return 1
+  tenant_darkirc_enabled "$name" || return 1
+  ensure_init_system
+
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-${name}.service" \
+      || return 1
+    _systemctl_user "$name" is-active --quiet "lunarwing-darkirc-adapter-${name}.service" \
+      || return 1
+  else
+    rc-service "lunarwing-darkirc-${name}" status >/dev/null 2>&1 || return 1
+    rc-service "lunarwing-darkirc-adapter-${name}" status >/dev/null 2>&1 || return 1
+  fi
+
+  adapter_port="$(ports_get "$name" darkirc_adapter 2>/dev/null || true)"
+  [[ "$adapter_port" =~ ^[0-9]+$ ]] || return 1
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  secret="$(read_tenant_env_value \
+    "$name" "$env_path" DARKIRC_ADAPTER_SECRET 2>/dev/null)" || return 1
+  [[ -n "$secret" ]] || return 1
+  require_cmd curl
+  require_cmd jq
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    response="$(printf 'Authorization: Bearer %s\n' "$secret" | \
+      curl -fsS --max-time 2 --header @- \
+        "http://127.0.0.1:${adapter_port}/health" 2>/dev/null || true)"
+    if jq -e '(.status == "ok") and (.irc_connected == true)' <<<"$response" \
+      >/dev/null 2>&1; then
+      [[ "$quiet" == true ]] || say "strict DarkIRC health passed for $name"
+      return 0
+    fi
+    [[ "$attempt" -lt "$attempts" ]] && sleep 1
+  done
+  say "strict DarkIRC health failed for $name" >&2
+  return 1
+}
+
 uninstall_tenant_openrc() {
   local name="$1"
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup"; do
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
-    rm -f "/etc/init.d/$svc" "/etc/conf.d/$svc"
+    rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
   say "uninstalled OpenRC services for $name"
 }
@@ -6696,9 +9305,11 @@ SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY
 # checks that are N/A host-globally; page only on self-heal escalation (not on
 # every non-healthy run); ignore stale reports.
 SELF_HEAL_REMEDY_LOGICAL=false
+SELF_HEAL_SYSTEMD_SCOPE=system
 HEALTH_XMPP_SERVER=
 HEALTH_MODELS_ENABLED=false
 HEALTH_OMEMO_ENABLED=false
+HEALTH_NETBIRD_ENABLED=false
 HEALTHCHECK_NOTIFY=false
 SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 
@@ -6707,6 +9318,11 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # (single-node still falls back to http://127.0.0.1:8088). Only set the URL
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
+
+# NetBird is operator-owned and disabled by default. To monitor readiness, set
+# HEALTH_NETBIRD_ENABLED=true. Automatic daemon restart also requires explicit
+# SELF_HEAL_NETBIRD_REMEDIATE=true; otherwise failures only escalate.
+# SELF_HEAL_NETBIRD_REMEDIATE=false
 
 # Escalation notifications (fill in to enable Gotify pushes).
 GOTIFY_URL=$HEALTH_GOTIFY_URL
@@ -6732,6 +9348,23 @@ ENVEOF
       cat "$_tmp" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
       rm -f "$_tmp"
       say "reconciled LUNARWING_SERVICE_MANAGER=$INIT_SYSTEM in $HEALTH_ENV_FILE"
+    fi
+    # Reconcile the tenants-file line with the ACTIVE ports registry
+    # (ISSUE-012): the file is write-once, so if PORTS_REGISTRY moved after
+    # first install, health kept reading the old registry while admin
+    # commands updated the new one. Same targeted-line rewrite as above;
+    # operator edits and file mode/owner are preserved.
+    if ! grep -q "^SELF_HEAL_TENANTS_FILE=${PORTS_REGISTRY}$" "$HEALTH_ENV_FILE"; then
+      local _tmp2; _tmp2="$(mktemp)"
+      if grep -q '^SELF_HEAL_TENANTS_FILE=' "$HEALTH_ENV_FILE"; then
+        awk -v v="$PORTS_REGISTRY" '/^SELF_HEAL_TENANTS_FILE=/{print "SELF_HEAL_TENANTS_FILE=" v; next} {print}' "$HEALTH_ENV_FILE" > "$_tmp2"
+      else
+        cp "$HEALTH_ENV_FILE" "$_tmp2"
+        printf 'SELF_HEAL_TENANTS_FILE=%s\n' "$PORTS_REGISTRY" >> "$_tmp2"
+      fi
+      cat "$_tmp2" > "$HEALTH_ENV_FILE"   # overwrite content, preserve mode/owner
+      rm -f "$_tmp2"
+      say "reconciled SELF_HEAL_TENANTS_FILE=$PORTS_REGISTRY in $HEALTH_ENV_FILE"
     fi
   fi
 
@@ -6790,19 +9423,21 @@ add_tenant() {
   local llm_base_url="${9:-$DEFAULT_LLM_BASE_URL}"
   local enable_darkirc="${10:-false}"
   local enable_proxy="${11:-false}"
-  local nanocode_model="${12:-}"
-  local nanocode_base_url="${13:-}"
-  local llm_model="${14:-}"
-  local gateway_host="${15:-}"
-  local xmpp_allow_from="${16:-}"
-  local opencode_model="${17:-}"
-  local opencode_base_url="${18:-}"
+  local llm_model="${12:-}"
+  local gateway_host="${13:-}"
+  local xmpp_allow_from="${14:-}"
+  local opencode_model="${15:-}"
+  local opencode_base_url="${16:-}"
   # External worker selection (default off). Persisted into the port registry so
   # start_tenant_<worker> starts only what this tenant chose, not every worker
   # whose shared host image happens to exist. See PER_TENANT_WORKER_GATING.md.
-  local with_nanocode="${19:-false}"
-  local with_pebble="${20:-false}"
-  local with_opencode="${21:-false}"
+  local with_pebble="${17:-false}"
+  local with_opencode="${18:-false}"
+  local with_kimi="${19:-false}"
+  local kimi_model="${20:-}"
+  local kimi_base_url="${21:-}"
+  local kimi_api_key="${22:-}"
+  local darkirc_scope_override="${23:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -6814,8 +9449,8 @@ add_tenant() {
   # unit and could mask a real outage as `skipped`), so forbid such names at the
   # source. (weechat-* also covers weechat-adapter-*.)
   case "$name" in
-    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|weechat-*)
-      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/weechat-/weechat-adapter-); choose another name" ;;
+    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|weechat-*)
+      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
@@ -6833,9 +9468,9 @@ add_tenant() {
 
   ports_registry_init
   local base_port workers_json
-  workers_json="$(printf '{"nanocode":%s,"pebble":%s,"opencode":%s}' \
-    "$with_nanocode" "$with_pebble" "$with_opencode")"
-  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json")"
+  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s}' \
+    "$with_pebble" "$with_opencode" "$with_kimi")"
+  base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json" "$darkirc_scope_override")"
   say ""
 
   create_tenant_user "$name" "$docker_group"
@@ -6846,21 +9481,30 @@ add_tenant() {
   clone_tenant_repo "$name"
   say ""
 
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'"
+  say ""
+
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
-  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url"
+  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
     write_tenant_proxy_env "$name" "$tensorzero_url"
   fi
   if [[ "$enable_darkirc" == "true" ]]; then
+    ensure_darkirc_scope_id "$name" >/dev/null
     write_tenant_darkirc_adapter_env "$name"
-    generate_darkirc_config "$name"
+    if darkirc_resolve_release; then
+      generate_darkirc_config "$name"
+    else
+      say "DarkIRC config deferred until build-darkirc installs the attested helper"
+    fi
   fi
   write_tenant_gotify_config "$name" "$gotify_url" "$gotify_title"
-  ensure_external_worker_config "$name" "nanocode" "nanocode_wss"
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
+  ensure_external_worker_config "$name" "kimi" "kimi_wss"
 
   # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
   # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
@@ -6931,18 +9575,19 @@ add_tenant() {
   say "  proxy:            $(ports_get "$name" proxy)"
   say "  weechat:          $(ports_get "$name" weechat)"
   say "  orchestrator:     $(ports_get "$name" orchestrator)"
-  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
+  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
-  say "  workers:          $( _selected="$( [[ "$with_nanocode" == "true" ]] && printf 'nanocode '; [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-nanocode/--with-pebble/--with-opencode to select)" )"
+  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say ""
   say "Next steps:"
-  say "  sudo $0 build-tenant $name --with-wasm --with-nanocode"
+  say "  sudo $0 build-tenant $name --with-wasm"
   say "  sudo $0 start-tenant $name"
 }
 
@@ -6970,6 +9615,9 @@ remove_tenant() {
   name="$(sanitize_name "$name")"
   say "=== Removing tenant: $name ==="
   say ""
+
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing removal"
 
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -7012,6 +9660,13 @@ render_tenant_units() {
   local name="$1"
   name="$(sanitize_name "$name")"
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  with_tenant_lifecycle_lock "$name" _render_tenant_units_locked "$name" \
+    || die "failed to re-render units for tenant '$name'"
+}
+
+_render_tenant_units_locked() {
+  local name="$1"
+  _retire_tenant_nanocode "$name" || return 1
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
@@ -7053,7 +9708,7 @@ _wait_tenant_gateway() {
   local name="$1" env_path gateway_port gateway_token auth_header i=0
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
-  gateway_token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+  gateway_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
   [[ -n "$gateway_token" ]] || return 1
   auth_header="Authorization: Bearer ${gateway_token}"
   while ! curl -sf --max-time 2 \
@@ -7064,6 +9719,16 @@ _wait_tenant_gateway() {
     sleep 2
   done
   return 0
+}
+
+_start_tenant_init_services() {
+  local name="$1"
+  ensure_init_system || return 1
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    start_tenant_systemd "$name"
+  else
+    start_tenant_openrc "$name"
+  fi
 }
 
 # Restart ONLY the lunarwing daemon unit for a tenant (not the full stack).
@@ -7086,6 +9751,22 @@ start_tenant() {
   tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
 
   say "=== Starting tenant: $name ==="
+
+  local darkirc_config
+  darkirc_config="$(tenant_state_dir "$name")/darkirc/darkirc_config.toml"
+  if tenant_darkirc_enabled "$name"; then
+    darkirc_load_compatibility \
+      || die "attested DarkIRC release is unavailable; run ensure-darkirc-release $name"
+    darkirc_service_uses_release_selector "$name" \
+      || die "DarkIRC service unit is stale or unsafe; run render-units $name"
+    if [[ ! -f "$darkirc_config" || -L "$darkirc_config" ]]; then
+      say "finalizing deferred DarkIRC config before start ..."
+      generate_darkirc_config "$name"
+    fi
+  fi
+
+  retire_tenant_nanocode "$name" \
+    || die "failed to retire legacy Nanocode resources for tenant '$name'; refusing start"
 
   # Safety net: if the tenant has LUNARWING_OWNER_ID set but the DB still has
   # orphaned 'default'-scoped rows (e.g. an upgrade that didn't run patch-env),
@@ -7117,12 +9798,8 @@ start_tenant() {
   start_tenant_postgres "$name"
   start_tenant_vision "$name"
 
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    start_tenant_systemd "$name"
-  else
-    start_tenant_openrc "$name"
-  fi
+  with_tenant_lifecycle_lock "$name" _start_tenant_init_services "$name" \
+    || die "failed to start init services for tenant '$name'"
 
   # Upload the staged SSH key to the secrets store (if one was provisioned by
   # add-tenant but not yet uploaded), BEFORE the workers start. If a key was
@@ -7155,6 +9832,11 @@ start_tenant() {
   # live from the store, so no daemon restart is required.
   upload_tenant_darkirc_secret "$name" || true
 
+  # Patch WeeChat channel caps with the tenant's allocated ports. This ensures
+  # the ports are correct even if install-wasm wasn't run or the caps were
+  # manually edited. Runs before workers start so the channel connects immediately.
+  patch_weechat_caps "$name"
+
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.
   #
@@ -7164,9 +9846,12 @@ start_tenant() {
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
   local _w
-  for _w in nanocode pebble opencode; do
-    if tenant_worker_enabled "$name" "$_w"; then
+  for _w in pebble opencode kimi; do
+    if tenant_worker_enabled "$name" "$_w" \
+        && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
       "start_tenant_${_w}" "$name"
+    elif [[ "$INIT_SYSTEM" == "openrc" ]] && tenant_worker_enabled "$name" "$_w"; then
+      say "$_w worker intentionally stopped for $name (skipping; use 'start-worker $name $_w')"
     else
       say "$_w worker not selected for $name (skipping; enable with 'add-tenant $name --with-$_w')"
     fi
@@ -7190,9 +9875,171 @@ stop_tenant() {
 
   stop_tenant_vision "$name"
   stop_tenant_pebble "$name"
-  stop_tenant_nanocode "$name"
   stop_tenant_opencode "$name"
+  stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"
+
+  # Shutdown must not be blocked by malformed legacy config or an unsafe
+  # rollback path. Retire Nanocode only after every supported service is down.
+  retire_tenant_nanocode "$name" \
+    || die "tenant '$name' stopped, but legacy Nanocode retirement failed"
+}
+
+# External upgrade wrappers use this boundary so migration readiness cannot race
+# another DarkIRC writer between the check and the completed tenant stop.
+stop_tenant_for_upgrade() {
+  local name="$1" scope_id result=0 writer_lock_owned=false
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+
+  if tenant_darkirc_enabled "$name"; then
+    if [[ "$DARKIRC_WRITER_LOCK_HELD" != true ]]; then
+      darkirc_writer_lock "$name"
+      writer_lock_owned=true
+    fi
+    scope_id="$(darkirc_scope_id "$name")"
+    validate_darkirc_scope_id "$scope_id"
+    run_darkirc_key_helper "$name" migration-ready \
+      --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+      || die "DarkIRC migration state is not settled; refusing upgrade"
+  fi
+
+  stop_tenant "$name" || result=$?
+  if [[ "$writer_lock_owned" == true ]]; then
+    darkirc_writer_unlock
+  fi
+  return "$result"
+}
+
+# Machine export runs as a child so its existing passphrase and archive handling
+# stay in export-tenant.sh. Both inherited lock descriptors remain open until that
+# child has validated readiness, stopped/verified writers, pinned DarkIRC state,
+# and sealed the final bundle.
+migration_export_child() {
+  local name="$1"
+  shift
+  local -a inherited_env=(
+    "LUNARWING_MT_EXPORT_BOUNDARY_TENANT=$name"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT=$name"
+  )
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]]; then
+    inherited_env+=(
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD=$DARKIRC_WRITER_LOCK_FD"
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE=$DARKIRC_WRITER_SCOPE"
+    )
+  fi
+  env "${inherited_env[@]}" "$SCRIPT_DIR/export-tenant.sh" "$name" "$@"
+}
+
+migration_export_darkirc_locked() {
+  local name="$1" scope_id
+  shift
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+  run_darkirc_key_helper "$name" migration-ready \
+    --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+    || die "DarkIRC migration state is not settled; refusing export"
+  migration_export_child "$name" "$@"
+}
+
+migration_export_boundary_locked() {
+  local name="$1"
+  shift
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" migration_export_darkirc_locked "$name" "$@"
+  else
+    migration_export_child "$name" "$@"
+  fi
+}
+
+migration_export_boundary() {
+  local name="$1"
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" migration_export_boundary_locked "$name" "$@"
+}
+
+upgrade_wrapper_child() {
+  local name="$1"
+  shift
+  local -a inherited_env=(
+    "LUNARWING_MT_UPGRADE_BOUNDARY_TENANT=$name"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD=$LUNARWING_MT_ACTIVE_LIFECYCLE_LOCK_FD"
+    "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_TENANT=$name"
+    "LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD=$LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD"
+  )
+  if [[ "$DARKIRC_WRITER_LOCK_HELD" == true ]]; then
+    inherited_env+=(
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD=$DARKIRC_WRITER_LOCK_FD"
+      "LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE=$DARKIRC_WRITER_SCOPE"
+    )
+  fi
+  env "${inherited_env[@]}" "$SCRIPT_DIR/upgrade-tenant.sh" "$@"
+}
+
+upgrade_wrapper_boundary_locked() {
+  local name="$1" upgrade_lock_fd result=0
+  shift
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
+    || die "failed to open tenant upgrade lock"
+  flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
+  LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD="$upgrade_lock_fd"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" upgrade_wrapper_child "$name" "$@" || result=$?
+  else
+    upgrade_wrapper_child "$name" "$@" || result=$?
+  fi
+  unset LUNARWING_MT_ACTIVE_UPGRADE_LOCK_FD
+  flock -u "$upgrade_lock_fd" || result=1
+  exec {upgrade_lock_fd}>&-
+  return "$result"
+}
+
+upgrade_wrapper_boundary() {
+  local name="$1"
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" upgrade_wrapper_boundary_locked "$name" "$@"
+}
+
+validate_upgrade_wrapper_boundary_locked() {
+  local name="$1" upgrade_fd="${LUNARWING_MT_INHERITED_UPGRADE_LOCK_FD:-}"
+  [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" == "$name" ]] \
+    || die "upgrade wrapper boundary tenant marker mismatch"
+  inherited_lock_fd_is_held "$upgrade_fd" "${BUILD_LOCK}.${name}.upgrade" \
+    || die "invalid inherited tenant upgrade lock"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" true
+  elif [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}" ]]; then
+    die "unexpected inherited DarkIRC writer lock for disabled tenant '$name'"
+  fi
+}
+
+validate_upgrade_wrapper_boundary() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" validate_upgrade_wrapper_boundary_locked "$name"
+}
+
+validate_migration_export_boundary_locked() {
+  local name="$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  if tenant_darkirc_enabled "$name"; then
+    with_darkirc_writer_lock "$name" true
+  elif [[ -n "${LUNARWING_MT_INHERITED_DARKIRC_LOCK_FD:-}${LUNARWING_MT_INHERITED_DARKIRC_LOCK_SCOPE:-}" ]]; then
+    die "unexpected inherited DarkIRC writer lock for disabled tenant '$name'"
+  fi
+}
+
+validate_migration_export_boundary() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  [[ "${LUNARWING_MT_EXPORT_BOUNDARY_TENANT:-}" == "$name" ]] \
+    || die "migration export boundary tenant marker mismatch"
+  with_tenant_lifecycle_lock "$name" validate_migration_export_boundary_locked "$name"
 }
 
 restart_tenant() {
@@ -7203,8 +10050,9 @@ restart_tenant() {
 
 require_worker_name() {
   case "${1:-}" in
-    nanocode|pebble|opencode) ;;
-    *) die "unknown worker '${1:-}'; expected nanocode, pebble, or opencode" ;;
+    nanocode) die "Nanocode worker is retired" ;;
+    pebble|opencode|kimi) ;;
+    *) die "unknown worker '${1:-}'; expected pebble, opencode, or kimi" ;;
   esac
 }
 
@@ -7217,12 +10065,40 @@ prepare_worker_lifecycle() {
   printf '%s %s\n' "$name" "$worker"
 }
 
+openrc_service_remove_runlevels() {
+  local svc="$1" link runlevel
+  for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
+    [[ -e "$link" || -L "$link" ]] || continue
+    runlevel="$(basename "$(dirname "$link")")"
+    rc-update del "$svc" "$runlevel" >/dev/null 2>&1 \
+      || { say "failed to remove $svc from OpenRC runlevel $runlevel" >&2; return 1; }
+  done
+}
+
+# Stop both worker units and remove every boot path. Init scripts stay rendered
+# so an explicit start-worker can re-enable them without reprovisioning.
+openrc_worker_stop_disable() {
+  local name="$1" worker="$2" container svc
+  container="lunarwing-${worker}-${name}"
+  for svc in "${container}-sup" "$container"; do
+    if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
+      rc-service "$svc" stop >/dev/null 2>&1 \
+        || { say "failed to stop OpenRC service $svc" >&2; return 1; }
+    fi
+    openrc_service_remove_runlevels "$svc" || return 1
+  done
+}
+
 start_worker() {
   local prepared name worker
   prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
   read -r name worker <<<"$prepared"
   tenant_worker_enabled "$name" "$worker" \
     || die "worker '$worker' is not enabled for tenant '$name'"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    ports_set_worker_desired_running "$name" "$worker" true
+  fi
   "start_tenant_${worker}" "$name"
 }
 
@@ -7241,16 +10117,11 @@ stop_worker() {
       || _ctr "$name" stop "$container" >/dev/null 2>&1 \
       || die "failed to stop $service"
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    if [[ -f "/etc/init.d/${container}-sup" ]]; then
-      rc-service "${container}-sup" stop >/dev/null 2>&1 \
-        || die "failed to stop OpenRC supervisor ${container}-sup"
-    else
-      rc-service "${container}-sup" stop >/dev/null 2>&1 || true
-    fi
-    if [[ -f "/etc/init.d/${container}" ]]; then
-      rc-service "$container" stop >/dev/null 2>&1 \
-        || die "failed to stop OpenRC service $container"
-    elif _ctr "$name" inspect "$container" &>/dev/null; then
+    ports_set_worker_desired_running "$name" "$worker" false
+    openrc_worker_stop_disable "$name" "$worker" \
+      || die "failed to stop and disable OpenRC worker $worker for tenant '$name'"
+    if [[ ! -x "$OPENRC_INITD_DIR/$container" ]] \
+        && _ctr "$name" inspect "$container" &>/dev/null; then
       _ctr "$name" stop "$container" >/dev/null 2>&1 \
         || die "failed to stop container $container"
     fi
@@ -7276,7 +10147,12 @@ kill_worker() {
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
   elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    ports_set_worker_desired_running "$name" "$worker" false
     rc-service "${container}-sup" stop >/dev/null 2>&1 || true
+    openrc_service_remove_runlevels "${container}-sup" \
+      || die "failed to disable OpenRC supervisor ${container}-sup"
+    openrc_service_remove_runlevels "$container" \
+      || die "failed to disable OpenRC service $container"
   fi
 
   if _ctr "$name" inspect "$container" &>/dev/null; then
@@ -7287,7 +10163,7 @@ kill_worker() {
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
       && podman_supports_quadlet; then
     _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
-  elif [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container}" ]]; then
+  elif [[ "$INIT_SYSTEM" == "openrc" && -x "$OPENRC_INITD_DIR/${container}" ]]; then
     rc-service "$container" stop >/dev/null 2>&1 || true
   fi
   say "$worker worker killed and left stopped for $name"
@@ -7364,6 +10240,24 @@ recover_failed_tenant_checkout() {
   die "git checkout $target failed after repository state changed; tenant remains stopped for inspection"
 }
 
+darkirc_managed_state_exists() {
+  local state_root
+  state_root="$(tenant_state_dir "$1")/darkirc/key-exchange"
+  [[ -e "$state_root" || -L "$state_root" ]]
+}
+
+upgrade_tenant_darkirc_locked() {
+  local name="$1" scope_id
+  scope_id="$(darkirc_scope_id "$name")"
+  validate_darkirc_scope_id "$scope_id"
+  run_darkirc_key_helper "$name" migration-ready \
+    --tenant "$name" --scope-id "$scope_id" --json >/dev/null \
+    || die "DarkIRC managed state is not settled; upgrade refused"
+  # The caller retains the DarkIRC writer lock while upgrade_tenant_locked stops
+  # the tenant, closing the readiness-check/stop race.
+  upgrade_tenant_locked "$@"
+}
+
 # In-place tenant upgrade: composes the verified sequence (backup -> fetch ->
 # clean-tree gate -> stop -> checkout as the tenant user -> rebuild with WASM ->
 # re-render units -> patch env -> start). The verbs it calls dispatch
@@ -7371,12 +10265,22 @@ recover_failed_tenant_checkout() {
 # docs/ops/TENANT-RENAME-MIGRATION-1.1.9.md for the 1.1.9 rename specifics.
 upgrade_tenant() {
   local name="$1"
-  local upgrade_lock_fd
+  shift
+  name="$(sanitize_name "$name")"
+  with_tenant_lifecycle_lock "$name" _upgrade_tenant_lifecycle_locked "$name" "$@"
+}
+
+_upgrade_tenant_lifecycle_locked() {
+  local name="$1" upgrade_lock_fd
   say "acquiring tenant upgrade lock ..."
   exec {upgrade_lock_fd}>"${BUILD_LOCK}.${name}.upgrade" \
     || die "failed to open tenant upgrade lock"
   flock -x "$upgrade_lock_fd" || die "failed to acquire tenant upgrade lock"
-  upgrade_tenant_locked "$@"
+  if tenant_darkirc_enabled "$name" && darkirc_managed_state_exists "$name"; then
+    with_darkirc_writer_lock "$name" upgrade_tenant_darkirc_locked "$@"
+  else
+    upgrade_tenant_locked "$@"
+  fi
   flock -u "$upgrade_lock_fd" || die "failed to release tenant upgrade lock"
   exec {upgrade_lock_fd}>&-
 }
@@ -7453,7 +10357,11 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" opencode; then
     with_opencode="true"
   fi
-  build_tenant "$name" "true" "false" "false" "$with_opencode" "false" "true"
+  local with_kimi="false"
+  if tenant_worker_enabled "$name" kimi; then
+    with_kimi="true"
+  fi
+  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
@@ -7499,9 +10407,10 @@ status_tenant() {
   say "  proxy:            $(ports_get "$name" proxy)"
   say "  weechat:          $(ports_get "$name" weechat)"
   say "  orchestrator:     $(ports_get "$name" orchestrator)"
-  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss)"
+  say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say ""
 
@@ -7515,11 +10424,11 @@ status_tenant() {
 
   local nanocode_container="lunarwing-nanocode-$name"
   if _ctr "$name" inspect -f '{{.State.Running}}' "$nanocode_container" 2>/dev/null | grep -q true; then
-    say "Nanocode worker: running ($nanocode_container, WSS port $(ports_get "$name" nanocode_wss))"
+    say "Nanocode (retired): WARNING still running ($nanocode_container)"
   elif _ctr "$name" inspect "$nanocode_container" &>/dev/null; then
-    say "Nanocode worker: stopped ($nanocode_container)"
+    say "Nanocode (retired): stopped container preserved ($nanocode_container)"
   else
-    say "Nanocode worker: not created"
+    say "Nanocode (retired): no container in active runtime store"
   fi
 
   local pebble_container="lunarwing-pebble-$name"
@@ -7540,6 +10449,15 @@ status_tenant() {
     say "OpenCode worker: not created"
   fi
 
+  local kimi_container="lunarwing-kimi-$name"
+  if _ctr "$name" inspect -f '{{.State.Running}}' "$kimi_container" 2>/dev/null | grep -q true; then
+    say "Kimi worker: running ($kimi_container, WSS port $(ports_get "$name" kimi_wss))"
+  elif _ctr "$name" inspect "$kimi_container" &>/dev/null; then
+    say "Kimi worker: stopped ($kimi_container)"
+  else
+    say "Kimi worker: not created"
+  fi
+
   ensure_init_system
   say ""
   say "Services ($INIT_SYSTEM):"
@@ -7552,7 +10470,7 @@ status_tenant() {
     # pg + workers are Quadlet units only on rootless podman; on rootful docker
     # they run as plain containers (shown above), not systemd units.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-      svcs+=("lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}")
+      svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
     fi
     local svc state
     for svc in "${svcs[@]}"; do
@@ -7565,9 +10483,9 @@ status_tenant() {
     if tenant_darkirc_enabled "$name"; then
       rc_svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi
-    rc_svcs+=("lunarwing-nanocode-${name}" "lunarwing-nanocode-${name}-sup" \
-              "lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
-              "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup")
+    rc_svcs+=("lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
+              "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
+              "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup")
     local svc state
     for svc in "${rc_svcs[@]}"; do
       state="$(rc-service "$svc" status 2>/dev/null | grep -oE 'started|stopped|crashed' || echo "unknown")"
@@ -7588,13 +10506,13 @@ list_tenants() {
     return 0
   fi
 
-  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
-    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NANOCODE" "PEBBLE" "OPENCODE"
-  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
-    "------" "-------" "----" "------" "--" "-----" "-------" "-------" "----" "--------" "------" "--------"
+  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    "TENANT" "GATEWAY" "HTTP" "BRIDGE" "PG" "PROXY" "WEECHAT" "WS_ADPT" "ORCH" "NC_RSVD" "PEBBLE" "OPENCODE" "KIMI"
+  printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    "------" "-------" "----" "------" "--" "-----" "-------" "-------" "----" "--------" "------" "--------" "----"
 
   while IFS= read -r name; do
-    printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
+    printf '%-15s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s %-8s\n' \
       "$name" \
       "$(ports_get "$name" gateway)" \
       "$(ports_get "$name" http)" \
@@ -7606,7 +10524,8 @@ list_tenants() {
       "$(ports_get "$name" orchestrator)" \
       "$(ports_get "$name" nanocode_wss)" \
       "$(ports_get "$name" pebble_wss)" \
-      "$(ports_get "$name" opencode_wss)"
+      "$(ports_get "$name" opencode_wss)" \
+      "$(ports_get "$name" kimi_wss)"
   done <<< "$names"
 }
 
@@ -7632,7 +10551,7 @@ show_tokens() {
     local env_path gateway_port token
     env_path="$(tenant_env_dir "$name")/lunarwing.env"
     gateway_port="$(ports_get "$name" gateway)"
-    token="$(grep -s '^GATEWAY_AUTH_TOKEN=' "$env_path" | cut -d= -f2- || true)"
+    token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
     say "$name (port $gateway_port): ${token:-<not set>}"
   done <<< "$names"
 }
@@ -7736,23 +10655,23 @@ doctor() {
   if [[ "$DEFAULT_HEALTH_ENABLED" == "true" ]]; then
     _check "health pipeline scheduled" bash -c 'systemctl is-enabled lunarwing-mt-health.timer >/dev/null 2>&1 || crontab -l 2>/dev/null | grep -q lunarwing-mt-health || { command -v fcrontab >/dev/null 2>&1 && fcrontab -l 2>/dev/null | grep -q lunarwing-mt-health; }'
   fi
-  _check "nanocode worker dir exists" test -d "$LUNARWING_ROOT/lunarcode4lunarwing"
-  _check "nanocode worker Dockerfile exists" test -f "$LUNARWING_ROOT/lunarcode4lunarwing/Dockerfile"
   _check "pebble worker dir exists" test -d "$LUNARWING_ROOT/pebble4lunarwing"
   _check "pebble worker Dockerfile exists" test -f "$LUNARWING_ROOT/pebble4lunarwing/Dockerfile"
   _check "opencode worker dir exists" test -d "$LUNARWING_ROOT/opencode4lunarwing"
   _check "opencode worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
+  _check "kimi worker dir exists" test -d "$LUNARWING_ROOT/kimicode4lunarwing"
+  _check "kimi worker Dockerfile exists" test -f "$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
 
   # Check if worker images are built
   if command -v docker >/dev/null 2>&1; then
-    _check "nanocode worker image exists" docker image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" docker image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" docker image inspect lunarwing-worker-opencode:latest
+    _check "kimi worker image exists" docker image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" docker image inspect "$VISION_SIDECAR_IMAGE"
   elif command -v podman >/dev/null 2>&1; then
-    _check "nanocode worker image exists" podman image inspect lunarwing-worker-nanocode:latest
     _check "pebble worker image exists" podman image inspect lunarwing-worker-pebble:latest
     _check "opencode worker image exists" podman image inspect lunarwing-worker-opencode:latest
+    _check "kimi worker image exists" podman image inspect lunarwing-worker-kimi:latest
     _check "vision sidecar image exists" podman image inspect "$VISION_SIDECAR_IMAGE"
   fi
 
@@ -7781,7 +10700,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" darkirc_scope_override=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7790,20 +10709,24 @@ main() {
           --no-ssh)          SSH_OPT_OUT=true; shift ;;
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
+          --darkirc-scope-id) [[ $# -ge 2 ]] || die "--darkirc-scope-id requires a value"; darkirc_scope_override="$2"; shift 2 ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --nanocode-model)    nanocode_model="$2"; shift 2 ;;
-          --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --kimi-model)        kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -7818,12 +10741,13 @@ main() {
       [[ -n "$name" ]] || die "usage: add-tenant <name> [--docker-group] [--xmpp-jid <jid>]"
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
-      add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+      name="$(sanitize_name "$name")"
+      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" nanocode_model="" nanocode_base_url="" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" with_nanocode="false" with_pebble="false" with_opencode="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -7833,18 +10757,21 @@ main() {
           --no-weechat-bootstrap) WEECHAT_BOOTSTRAP_OPT_OUT=true; shift ;;
           --enable-darkirc)  enable_darkirc="true"; shift ;;
           --enable-proxy)    enable_proxy="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode|--nanocode-model|--nanocode-base-url) die "Nanocode worker is retired; remove $1" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
           --gotify-url)      gotify_url="$2"; shift 2 ;;
           --gotify-title)    gotify_title="$2"; shift 2 ;;
-          --nanocode-model)    nanocode_model="$2"; shift 2 ;;
-          --nanocode-base-url) nanocode_base_url="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --kimi-model)        kimi_model="$2"; shift 2 ;;
+          --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
+          --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --kimi-api-key)      die "--kimi-api-key was removed; use --kimi-api-key-file" ;;
           --llm-model)         llm_model="$2"; shift 2 ;;
           --gateway-host)      gateway_host="$2"; shift 2 ;;
           --xmpp-allow-from)   xmpp_allow_from="$2"; shift 2 ;;
@@ -7869,7 +10796,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$nanocode_model" "$nanocode_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_nanocode" "$with_pebble" "$with_opencode"
+        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       done
       ;;
 
@@ -7888,19 +10815,21 @@ main() {
         esac
       done
       [[ -n "$name" ]] || die "usage: remove-tenant <name> [--purge]"
-      remove_tenant "$name" "$purge"
+      name="$(sanitize_name "$name")"
+      with_tenant_lifecycle_lock "$name" remove_tenant "$name" "$purge"
       ;;
 
     build-tenant)
       require_root
-      local name="" with_wasm="false" require_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
+      local name="" with_wasm="false" require_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
           --require-wasm)    require_wasm="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)
@@ -7910,26 +10839,27 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-nanocode] [--with-pebble] [--with-opencode] [--with-toolchains]"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]"
       [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
-      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains" "$require_wasm"
+      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm"
       ;;
 
     build-all)
       require_root
-      local with_wasm="false" with_nanocode="false" with_pebble="false" with_opencode="false" with_toolchains="false"
+      local with_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
-          --with-nanocode)   with_nanocode="true"; shift ;;
+          --with-nanocode)   die "Nanocode worker is retired; remove --with-nanocode" ;;
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
+          --with-kimi)       with_kimi="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)                 die "unexpected argument: $1" ;;
         esac
       done
-      build_all "$with_wasm" "$with_nanocode" "$with_pebble" "$with_opencode" "$with_toolchains"
+      build_all "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains"
       ;;
 
     build-darkirc)
@@ -7945,34 +10875,30 @@ main() {
       build_darkirc "$darkirc_tenant"
       ;;
 
-    build-nanocode-worker)
+    ensure-darkirc-release)
       require_root
-      local no_cache="false"
-      local with_toolchains="false"
-      local nanocode_ref="v1.2.28"
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --no-cache)        no_cache="true"; shift ;;
-          --with-toolchains) with_toolchains="true"; shift ;;
-          --nanocode-ref)    nanocode_ref="$2"; shift 2 ;;
-          -*)                die "unknown flag: $1" ;;
-          *)                 die "unexpected argument: $1" ;;
-        esac
-      done
-      build_nanocode_worker "$no_cache" "$with_toolchains" "$nanocode_ref"
+      [[ $# -eq 1 ]] || die "usage: ensure-darkirc-release <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" ensure_darkirc_release "$_lifecycle_name"
+      ;;
+
+    build-nanocode-worker)
+      die "Nanocode worker is retired; build-nanocode-worker is unavailable"
       ;;
 
     build-pebble-worker)
       require_root
       local no_cache="false"
+      local with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --no-cache) no_cache="true"; shift ;;
+          --with-toolchains) with_toolchains="true"; shift ;;
           -*)         die "unknown flag: $1" ;;
           *)          die "unexpected argument: $1" ;;
         esac
       done
-      build_pebble_worker "$no_cache"
+      build_pebble_worker "$no_cache" "$with_toolchains"
       ;;
 
     build-opencode-worker)
@@ -7988,6 +10914,23 @@ main() {
         esac
       done
       build_opencode_worker "$no_cache" "$with_toolchains"
+      ;;
+
+    build-kimi-worker)
+      require_root
+      local no_cache="false"
+      local with_toolchains="false"
+      local kimi_code_version=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-cache)          no_cache="true"; shift ;;
+          --with-toolchains)   with_toolchains="true"; shift ;;
+          --kimi-code-version) kimi_code_version="$2"; shift 2 ;;
+          -*)                  die "unknown flag: $1" ;;
+          *)                   die "unexpected argument: $1" ;;
+        esac
+      done
+      build_kimi_worker "$no_cache" "$with_toolchains" "$kimi_code_version"
       ;;
 
     build-vision-sidecar)
@@ -8009,24 +10952,122 @@ main() {
     start-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: start-tenant <name>"
-      start_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" start_tenant "$_lifecycle_name"
       ;;
 
     stop-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: stop-tenant <name>"
-      stop_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant "$_lifecycle_name"
+      ;;
+
+    cleanup-legacy-weechat)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: cleanup-legacy-weechat <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" cleanup_legacy_weechat "$_lifecycle_name"
+      ;;
+
+    restart-weechat-adapter)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: restart-weechat-adapter <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" restart_weechat_adapter "$_lifecycle_name"
+      ;;
+
+    stop-tenant-for-upgrade)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: stop-tenant-for-upgrade <name>"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" stop_tenant_for_upgrade "$_lifecycle_name"
+      ;;
+
+    migration-export-boundary)
+      require_root
+      [[ $# -ge 1 ]] || die "usage: migration-export-boundary <name> [export options]"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      shift
+      migration_export_boundary "$_lifecycle_name" "$@"
+      ;;
+
+    upgrade-wrapper-boundary)
+      require_root
+      [[ $# -ge 1 ]] || die "usage: upgrade-wrapper-boundary <name> [upgrade options]"
+      ports_registry_init
+      _lifecycle_name="$(sanitize_name "$1")"
+      shift
+      upgrade_wrapper_boundary "$_lifecycle_name" "$@"
+      ;;
+
+    validate-upgrade-wrapper-boundary)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: validate-upgrade-wrapper-boundary <name>"
+      ports_registry_require_readonly
+      validate_upgrade_wrapper_boundary "$1"
+      ;;
+
+    validate-migration-export-boundary)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: validate-migration-export-boundary <name>"
+      ports_registry_require_readonly
+      validate_migration_export_boundary "$1"
       ;;
 
     restart-tenant)
       require_root
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
-      restart_tenant "$1"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" restart_tenant "$_lifecycle_name"
+      ;;
+
+    stop-writers)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: stop-writers <name>"
+      ports_registry_init
+      _writer_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_writer_name" stop_tenant_writers "$_writer_name"
+      ;;
+
+    writers-active)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: writers-active <name>"
+      ports_registry_require_readonly
+      _writer_name="$(sanitize_name "$1")"
+      _writer_rc=0
+      with_tenant_lifecycle_lock "$_writer_name" tenant_writers_probe_status "$_writer_name" \
+        || _writer_rc=$?
+      case "$_writer_rc" in
+        0) say "active"; return 0 ;;
+        10) say "stopped"; return 1 ;;
+        *) say "could not determine tenant writer state" >&2; return 2 ;;
+      esac
+      ;;
+
+    start-pg)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: start-pg <name>"
+      # PG-only window for offline population (e.g. hermes_kawarimi loader):
+      # daemon stays down while rows are written with nothing racing.
+      _pg_only_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
+      start_tenant_postgres "$_pg_only_name"
+      ;;
+
+    stop-pg)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: stop-pg <name>"
+      _pg_only_name="$(sanitize_name "$1")"
+      tenant_exists_in_registry "$_pg_only_name" || die "tenant '$1' not found in registry"
+      stop_tenant_postgres "$_pg_only_name"
       ;;
 
     start-worker|stop-worker|restart-worker|kill-worker)
       require_root
-      [[ $# -eq 2 ]] || die "usage: $command_name <name> <nanocode|pebble|opencode>"
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <pebble|opencode|kimi>"
       case "$command_name" in
         start-worker) start_worker "$1" "$2" ;;
         stop-worker) stop_worker "$1" "$2" ;;
@@ -8083,6 +11124,55 @@ main() {
       status_tenant "$1"
       ;;
 
+    darkirc-contact)
+      require_root
+      local darkirc_operation="${1:-}"
+      if [[ "$darkirc_operation" == validate-migration ]]; then
+        shift
+        local darkirc_input=false darkirc_unbound=false
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --in) [[ $# -ge 2 && "$2" == - ]] || die "validate-migration accepts stdin only (--in -)"; darkirc_input=true; shift 2 ;;
+            --json) shift ;;
+            --unbound) darkirc_unbound=true; shift ;;
+            *) die "unexpected validate-migration argument: $1" ;;
+          esac
+        done
+        [[ "$darkirc_input" == true ]] || die "validate-migration requires --in -"
+        run_darkirc_manifest_validator "$darkirc_unbound"
+      else
+        case "$darkirc_operation" in
+          list|status|doctor|exchanges) ports_registry_require_readonly ;;
+          *) ports_registry_init ;;
+        esac
+        darkirc_contact_command "$darkirc_operation" "${@:2}"
+      fi
+      ;;
+
+    darkirc-health)
+      require_root
+      local health_tenant="" health_strict=false health_json=false
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --strict) health_strict=true; shift ;;
+          --json) health_json=true; shift ;;
+          -*) die "unknown flag: $1" ;;
+          *) [[ -z "$health_tenant" ]] || die "unexpected argument: $1"; health_tenant="$1"; shift ;;
+        esac
+      done
+      [[ "$health_strict" == true && -n "$health_tenant" ]] \
+        || die "darkirc-health requires <tenant> --strict"
+      health_tenant="$(sanitize_name "$health_tenant")"
+      ports_registry_require_readonly
+      if darkirc_health_strict "$health_tenant" 10 "$health_json"; then
+        if [[ "$health_json" == true ]]; then
+          printf '{"status":"ok","tenant":"%s","irc_connected":true}\n' "$health_tenant"
+        fi
+      else
+        die "strict DarkIRC health failed for tenant '$health_tenant'"
+      fi
+      ;;
+
     tokens)
       show_tokens "${1:-}"
       ;;
@@ -8120,22 +11210,7 @@ main() {
       ;;
 
     configure-nanocode)
-      require_root
-      local name="" nc_model="" nc_base_url=""
-      while [[ $# -gt 0 ]]; do
-        case "$1" in
-          --model)    nc_model="$2"; shift 2 ;;
-          --base-url) nc_base_url="$2"; shift 2 ;;
-          -*)         die "unknown flag: $1" ;;
-          *)
-            if [[ -z "$name" ]]; then name="$1"; shift
-            else die "unexpected argument: $1"
-            fi
-            ;;
-        esac
-      done
-      [[ -n "$name" ]] || die "usage: configure-nanocode <name> [--model <model>] [--base-url <url>]"
-      configure_nanocode "$name" "$nc_model" "$nc_base_url"
+      die "Nanocode worker is retired; configure-nanocode is unavailable"
       ;;
 
     configure-opencode)
@@ -8155,6 +11230,27 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-opencode <name> [--model <model>] [--base-url <url>]"
       configure_opencode "$name" "$oc_model" "$oc_base_url"
+      ;;
+
+    configure-kimi)
+      require_root
+      local name="" kimi_model="" kimi_base_url="" kimi_api_key=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model)    kimi_model="$2"; shift 2 ;;
+          --base-url) kimi_base_url="$2"; shift 2 ;;
+          --api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
+          --api-key)  die "--api-key was removed; use --api-key-file" ;;
+          -*)         die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "usage: configure-kimi <name> [--model <model>] [--base-url <url>] [--api-key-file <path>]"
+      configure_kimi "$name" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
       ;;
 
     configure-study-mcp)
@@ -8216,6 +11312,25 @@ main() {
       ports_registry_init
       tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
       configure_weechat_relay "$name"
+      ;;
+
+    disable-weechat|enable-weechat)
+      [[ -n "${1:-}" ]] || die "usage: $command_name <name>"
+      [[ $# -eq 1 ]]   || die "usage: $command_name <name> (unexpected extra arguments)"
+      require_root
+      local name
+      name="$(sanitize_name "$1")"
+      ports_registry_init
+      tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+      if [[ "$command_name" == "disable-weechat" ]]; then
+        set_tenant_weechat_enabled "$name" false \
+          || die "failed to stop/disable WeeChat for tenant '$name'"
+        say "WeeChat disabled for tenant '$name': units stopped + boot persistence removed; health reports them skipped (never critical)"
+      else
+        set_tenant_weechat_enabled "$name" true \
+          || die "failed to enable/start WeeChat for tenant '$name'"
+        say "WeeChat enabled for tenant '$name': units enabled + started; health reports critical when down"
+      fi
       ;;
 
     patch-env)

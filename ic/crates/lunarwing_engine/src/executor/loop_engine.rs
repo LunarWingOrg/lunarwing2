@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
-use crate::runtime::messaging::{SignalReceiver, ThreadOutcome};
+use crate::runtime::messaging::{SignalReceiver, ThreadFailureKind, ThreadOutcome};
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::types::error::EngineError;
@@ -22,7 +22,8 @@ use crate::types::message::ThreadMessage;
 use crate::types::step::Step;
 use crate::types::thread::{Thread, ThreadState};
 
-const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
+pub(crate) const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
+pub(crate) const INITIAL_PERSISTED_STATE_METADATA_KEY: &str = "initial_persisted_state";
 
 /// Persisted state from a prior execution, used to resume threads.
 /// The Python orchestrator manages loop counters internally; Rust only
@@ -155,8 +156,25 @@ impl ExecutionLoop {
         self.thread.updated_at = chrono::Utc::now();
     }
 
+    /// Transition thread state and broadcast the `StateChanged` event so
+    /// subscribers (e.g. the mission event listener) observe it. Unlike
+    /// `emit_event`, this validates the transition via `Thread::transition_to`.
+    fn transition_to_broadcast(
+        &mut self,
+        new_state: crate::types::thread::ThreadState,
+        reason: Option<String>,
+    ) -> Result<(), EngineError> {
+        self.thread.transition_to(new_state, reason)?;
+        if let Some(ref tx) = self.event_tx
+            && let Some(event) = self.thread.events.last()
+        {
+            let _ = tx.send(event.clone());
+        }
+        Ok(())
+    }
+
     fn load_runtime_checkpoint(&self) -> RuntimeCheckpoint {
-        let persisted_state = self
+        let mut persisted_state = self
             .thread
             .metadata
             .get(RUNTIME_CHECKPOINT_METADATA_KEY)
@@ -164,12 +182,28 @@ impl ExecutionLoop {
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
 
+        if !persisted_state.is_object() {
+            persisted_state = serde_json::json!({});
+        }
+        if let Some(initial_state) = self
+            .thread
+            .metadata
+            .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+            .and_then(serde_json::Value::as_object)
+            && let Some(state) = persisted_state.as_object_mut()
+        {
+            for (key, value) in initial_state {
+                state.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+
         RuntimeCheckpoint { persisted_state }
     }
 
     fn clear_runtime_checkpoint(&mut self) {
         if let Some(metadata) = self.thread.metadata.as_object_mut() {
             metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
         }
         self.thread.updated_at = chrono::Utc::now();
     }
@@ -349,7 +383,9 @@ impl ExecutionLoop {
                 }
                 let _ = &orch_result.tokens_used;
 
-                self.clear_runtime_checkpoint();
+                if !matches!(orch_result.outcome, ThreadOutcome::GatePaused { .. }) {
+                    self.clear_runtime_checkpoint();
+                }
                 self.persist_runtime_state(None, &mut persisted_event_count)
                     .await?;
                 Ok(orch_result.outcome)
@@ -387,7 +423,7 @@ impl ExecutionLoop {
                     && self.thread.state != ThreadState::Failed
                     && self.thread.state != ThreadState::Done
                 {
-                    let _ = self.thread.transition_to(
+                    let _ = self.transition_to_broadcast(
                         ThreadState::Failed,
                         Some(format!("orchestrator error: {e}")),
                     );
@@ -396,6 +432,7 @@ impl ExecutionLoop {
                 self.persist_runtime_state(None, &mut persisted_event_count)
                     .await?;
                 Ok(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Orchestrator,
                     error: format!("Orchestrator error: {e}"),
                 })
             }
@@ -479,13 +516,19 @@ mod tests {
 
     struct MockLlm {
         responses: Mutex<Vec<LlmOutput>>,
+        requests: Mutex<Vec<Vec<ThreadMessage>>>,
     }
 
     impl MockLlm {
         fn new(responses: Vec<LlmOutput>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<Vec<ThreadMessage>> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -493,10 +536,11 @@ mod tests {
     impl LlmBackend for MockLlm {
         async fn complete(
             &self,
-            _messages: &[ThreadMessage],
+            messages: &[ThreadMessage],
             _actions: &[ActionDef],
             _config: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Ok(LlmOutput {
@@ -510,6 +554,41 @@ mod tests {
 
         fn model_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct ResultMockLlm {
+        responses: Mutex<Vec<Result<LlmOutput, EngineError>>>,
+        requests: Mutex<Vec<Vec<ThreadMessage>>>,
+    }
+
+    impl ResultMockLlm {
+        fn new(responses: Vec<Result<LlmOutput, EngineError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<Vec<ThreadMessage>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ResultMockLlm {
+        async fn complete(
+            &self,
+            messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.responses.lock().unwrap().remove(0)
+        }
+
+        fn model_name(&self) -> &str {
+            "result-mock"
         }
     }
 
@@ -539,6 +618,7 @@ mod tests {
         ) -> Result<LlmOutput, EngineError> {
             self.blocking_calls.fetch_add(1, Ordering::Relaxed);
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".to_string(),
             })
         }
@@ -558,6 +638,7 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .pop_front()
                 .ok_or_else(|| EngineError::Llm {
+                    kind: crate::types::error::ModelFailureKind::Internal,
                     reason: "no scripted engine stream remains".to_string(),
                 })?;
             Ok(futures::stream::iter(items).boxed())
@@ -703,6 +784,61 @@ mod tests {
     // ── Tests ───────────────────────────────────────────────
 
     #[tokio::test]
+    async fn gate_pause_preserves_initial_trigger_payload() {
+        let gate_error = EngineError::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "test_tool".into(),
+            call_id: "call-1".into(),
+            parameters: Box::new(serde_json::json!({})),
+            resume_kind: Box::new(crate::gate::ResumeKind::Approval {
+                allow_always: false,
+            }),
+            resume_output: None,
+        };
+        let (mut exec, _signal_tx) = make_loop(
+            vec![action_response("test_tool", "call-1")],
+            vec![Err(gate_error)],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.metadata = serde_json::json!({
+            INITIAL_PERSISTED_STATE_METADATA_KEY: {
+                "trigger_payload": {"source_thread_id": "source-1"}
+            }
+        });
+
+        let outcome = exec.run().await.expect("gate pause should be an outcome");
+
+        assert!(matches!(outcome, ThreadOutcome::GatePaused { .. }));
+        assert_eq!(
+            exec.thread
+                .metadata
+                .pointer("/runtime_checkpoint/persisted_state/trigger_payload/source_thread_id"),
+            Some(&serde_json::json!("source-1"))
+        );
+        assert!(
+            exec.thread
+                .metadata
+                .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+                .is_some()
+        );
+
+        exec.clear_runtime_checkpoint();
+        assert!(
+            exec.thread
+                .metadata
+                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+                .is_none()
+        );
+        assert!(
+            exec.thread
+                .metadata
+                .get(INITIAL_PERSISTED_STATE_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn channel_context_is_injected_into_system_prompt() {
         // Regression: DarkIRC replies ignored the transport's byte/pacing
         // budget because the engine system prompt had no channel constraints.
@@ -711,6 +847,7 @@ mod tests {
             ..ThreadConfig::default()
         };
         let (mut exec, _signal_tx) = make_loop(vec![text_response("ok")], Vec::new(), config).await;
+        exec.thread.goal = "ok".to_string();
         exec.run().await.expect("run should complete");
 
         let system = exec
@@ -731,6 +868,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "ok".to_string();
         exec.run().await.expect("run should complete");
 
         let system = exec
@@ -761,6 +899,7 @@ mod tests {
             make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
         let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
         let mut exec = exec.with_event_tx(event_tx);
+        exec.thread.goal = "hello".to_string();
 
         let outcome = exec.run().await.expect("streamed orchestrator should run");
 
@@ -848,7 +987,7 @@ mod tests {
                 }),
             ],
             vec![
-                Ok(LlmStreamChunk::TextDelta("Done!".to_string())),
+                Ok(LlmStreamChunk::TextDelta("FINAL(\"Done!\")".to_string())),
                 Ok(LlmStreamChunk::Done {
                     usage: Some(TokenUsage {
                         input_tokens: 5,
@@ -890,6 +1029,7 @@ mod tests {
         let llm = Arc::new(StreamingMockLlm::new(vec![vec![
             Ok(LlmStreamChunk::TextDelta("partial".to_string())),
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
                 reason: "mid-stream failure".to_string(),
             }),
         ]]));
@@ -925,6 +1065,7 @@ mod tests {
         ]]));
         let (mut execution, _signal_tx) =
             make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        execution.thread.goal = "hello".to_string();
 
         let outcome = execution
             .run()
@@ -946,6 +1087,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "hello".to_string();
 
         let outcome = exec.run().await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Hello!"));
@@ -959,7 +1101,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_1"),
-                text_response("Done!"),
+                text_response("FINAL(\"Done!\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: "call_1".into(),
@@ -1008,20 +1150,175 @@ mod tests {
             ..ThreadConfig::default()
         };
 
-        let (mut exec, _tx) = make_loop(many_actions, many_results, config).await;
+        let llm = Arc::new(MockLlm::new(many_actions));
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), many_results, config).await;
 
         let outcome = exec.run().await.unwrap();
-        // The last iteration forces text mode, and MockLlm returns action_response
-        // which gets treated as the 3rd iteration, then on the 3rd iteration force_text
-        // is set. But MockLlm ignores force_text. So we get MaxIterations after 3 iterations.
-        // Actually, max_iterations=3, and force_text is set when iteration >= max-1 = 2,
-        // so iteration 2 (0-indexed) has force_text. The MockLlm still returns action calls,
-        // so we loop 3 times and exit.
+        assert!(matches!(outcome, ThreadOutcome::MaxIterations));
+        assert_eq!(exec.thread.step_count, 4);
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("final recovery iteration")
+        }));
+    }
+
+    #[tokio::test]
+    async fn transient_model_failure_gets_one_safe_recovery_request() {
+        let diagnostic = "upstream diagnostic with private provider details";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
         assert!(matches!(
             outcome,
-            ThreadOutcome::MaxIterations | ThreadOutcome::Completed { .. }
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
         ));
-        assert!(exec.thread.step_count <= 3);
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("provider temporarily failed")
+        }));
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains(diagnostic))
+        );
+    }
+
+    #[tokio::test]
+    async fn context_overflow_recovery_uses_bounded_plain_text_context() {
+        let diagnostic = "context limit diagnostic with provider internals";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: diagnostic.into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::User
+                && message.content.contains("Context was reduced")
+        }));
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("context overflowed")
+        }));
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains(diagnostic))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_model_failure_returns_typed_safe_failure() {
+        let diagnostic = "private provider failure body";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+        ]));
+        let (mut exec, _tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::Transient
+                ),
+                error,
+            } if !error.contains(diagnostic) && error.contains("after retries")
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_action_batches_get_one_warning_turn() {
+        let responses = (0..4)
+            .map(|index| action_response("test_tool", &format!("call_{index}")))
+            .collect();
+        let results = (0..4)
+            .map(|index| {
+                Ok(ActionResult {
+                    call_id: format!("call_{index}"),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"error": "failed"}),
+                    is_error: true,
+                    duration: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let llm = Arc::new(MockLlm::new(responses));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), results, ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::NoProgress,
+                ..
+            }
+        ));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("no progress")
+        }));
+    }
+
+    #[tokio::test]
+    async fn no_progress_warning_can_recover_with_final_text() {
+        let mut responses = (0..3)
+            .map(|index| action_response("test_tool", &format!("call_{index}")))
+            .collect::<Vec<_>>();
+        responses.push(text_response("changed approach"));
+        let results = (0..3)
+            .map(|index| {
+                Ok(ActionResult {
+                    call_id: format!("call_{index}"),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"error": "failed"}),
+                    is_error: true,
+                    duration: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let (mut exec, _tx) = make_loop(responses, results, ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "changed approach"
+        ));
     }
 
     #[tokio::test]
@@ -1060,6 +1357,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "got it".to_string();
 
         tx.send(ThreadSignal::InjectMessage(ThreadMessage::user(
             "injected!",
@@ -1082,7 +1380,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 text_response("Let me search for that"),
-                text_response("The answer is 42"),
+                text_response("FINAL(\"The answer is 42\")"),
             ],
             vec![],
             ThreadConfig {
@@ -1108,6 +1406,181 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leaked_prose_is_nudged_back_to_codeact() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops - let me fix that!"),
+                code_response("FINAL('recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|message| { message.content.contains("roleplay or retry commentary") })
+        );
+    }
+
+    #[tokio::test]
+    async fn leaked_roleplay_only_is_nudged_back_to_codeact() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles and flicks tail*"),
+                code_response("FINAL('recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
+    }
+
+    #[tokio::test]
+    async fn conversational_goal_accepts_short_text() {
+        let (mut exec, _tx) = make_loop(
+            vec![text_response("*tail flicks* Standing by.")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.goal = "standby for rebuild".to_string();
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "*tail flicks* Standing by."
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn restarted_goal_accepts_short_text_without_retry() {
+        let (mut exec, _tx) = make_loop(
+            vec![text_response("*tail flicks* Back online.")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+        exec.thread.goal = "restarted".to_string();
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "*tail flicks* Back online."
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn concise_plain_text_answer_is_accepted() {
+        let answer = "The answer is 42";
+        let (mut exec, _tx) =
+            make_loop(vec![text_response(answer)], vec![], ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == answer
+        ));
+        assert_eq!(exec.thread.step_count, 1);
+    }
+
+    #[tokio::test]
+    async fn leaked_prose_nudge_cap_accepts_last_response() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops."),
+                text_response("*tail flicks* Let me try again."),
+                text_response("Still not code."),
+            ],
+            vec![],
+            ThreadConfig {
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "Still not code."
+        ));
+        assert_eq!(exec.thread.step_count, 3);
+    }
+
+    #[tokio::test]
+    async fn successful_code_resets_prose_nudge_counter() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("*chortles* Oops."),
+                code_response("value = 42"),
+                text_response("*tail flicks* Let me try again."),
+                text_response("Oops, I need to retry."),
+                code_response("FINAL('recovered after reset')"),
+            ],
+            vec![],
+            ThreadConfig {
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) }
+                if response == "recovered after reset"
+        ));
+        assert_eq!(exec.thread.step_count, 5);
+    }
+
+    #[tokio::test]
+    async fn prose_inside_code_block_gets_syntax_nudge() {
+        let (mut exec, _tx) = make_loop(
+            vec![
+                code_response("This is prose, not valid Python."),
+                code_response("FINAL('syntax recovered')"),
+            ],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "syntax recovered"
+        ));
+        assert_eq!(exec.thread.step_count, 2);
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|message| { message.content.contains("was not valid Python") })
+        );
+    }
+
+    #[tokio::test]
     async fn events_are_recorded() {
         let (mut exec, _tx) = make_loop(
             vec![text_response("Hello!")],
@@ -1115,6 +1588,7 @@ mod tests {
             ThreadConfig::default(),
         )
         .await;
+        exec.thread.goal = "hello".to_string();
 
         exec.run().await.unwrap();
 
@@ -1466,7 +1940,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_xK9mZq123"),
-                text_response("Done!"),
+                text_response("FINAL(\"Done!\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(), // EffectExecutor returns empty
@@ -1510,7 +1984,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_evt_id_42"),
-                text_response("ok"),
+                text_response("FINAL(\"ok\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(),
@@ -1591,7 +2065,7 @@ mod tests {
                 },
                 usage: TokenUsage::default(),
             },
-            text_response("I couldn't access that tool"),
+            text_response("FINAL(\"I couldn't access that tool\")"),
         ]));
         let effects = Arc::new(MockEffects::new(vec![missing_action], vec![]));
         let leases = Arc::new(LeaseManager::new());
@@ -1652,7 +2126,7 @@ mod tests {
         let (mut exec, _tx) = make_loop(
             vec![
                 action_response("test_tool", "call_clean_id"),
-                text_response("All done"),
+                text_response("FINAL(\"All done\")"),
             ],
             vec![Ok(ActionResult {
                 call_id: String::new(),
@@ -1695,6 +2169,7 @@ mod tests {
             _config: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }

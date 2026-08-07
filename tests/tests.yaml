@@ -3,10 +3,10 @@
 version: "1.0"
 
 workers:
-  nanocode:
-    deploy: nanocode_worker
-    health_port: 8444
-    ws_port: 9090
+  opencode:
+    deploy: opencode_worker
+    health_port: 8445
+    ws_port: 9091
     auth_token: test-token
     scenarios:
       - name: health
@@ -27,10 +27,10 @@ workers:
           first_message: ready
           payload_has: [worker_id, version, mode]
 
-  opencode:
-    deploy: opencode_worker
-    health_port: 8445
-    ws_port: 9091
+  kimi:
+    deploy: kimi_worker
+    health_port: 8447
+    ws_port: 9093
     auth_token: test-token
     scenarios:
       - name: health

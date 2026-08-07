@@ -2,9 +2,12 @@
 
 Several container images provide sandboxed and persistent job execution for LunarWing.
 
+Nanocode is retired and has no active source, build, or runtime image definition.
+See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
+
 ## LunarWing Worker
 
-The main sandbox worker. Includes dev tools (git, build-essential, Node.js, Python3, Rust, GitHub CLI) and Claude Code CLI. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
+The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
 
 **Dockerfile:** `ic/Dockerfile.worker`
 
@@ -14,25 +17,6 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 ```
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
-
-## Nanocode Worker
-
-Bun-based Nanocode agent. Runs nanocode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.
-
-**Dockerfile:** `lunarcode4lunarwing/Dockerfile`
-
-```bash
-# Copy nanocode source (required, not checked in)
-cp -R nanocode-config/nanocode lunarcode4lunarwing/nanocode
-
-cd lunarcode4lunarwing
-docker build -t lunarwing-nanocode-worker:latest .
-
-# Or via docker-compose
-docker compose up --build
-```
-
-Modes: `--mode websocket` (default, persistent), `--mode cli` (one-shot), `--mode acp`. Requires `AGENT_AUTH_TOKEN` for WebSocket auth. See `lunarcode4lunarwing/CLAUDE.md` for full env var reference.
 
 ## Pebble Worker
 
@@ -44,7 +28,8 @@ Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble`
 cd pebble4lunarwing
 docker build -t lunarwing-worker-pebble:latest .
 
-# Or via the mt-admin lifecycle
+# Or select the worker per tenant and build the shared image via mt-admin
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
@@ -60,38 +45,59 @@ Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` fo
 cd opencode4lunarwing
 docker build -t lunarwing-worker-opencode:latest .
 
-# Or via the mt-admin lifecycle
+# Select the worker per tenant, then build the shared image via mt-admin
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker
 
-# Or as part of a per-tenant build
+# Or build the shared image as part of a per-tenant build
 sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode
 
 # Include Rust, Go, and C/C++ compilers for build/test jobs
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker --with-toolchains
 ```
 
-The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> --home <absolute-checkout>` gives core and OpenCode the same lw2studymcp data. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. The opencode upstream is cloned at build time and pinned to a release tag via the `OPENCODE_REF` build arg (default `v1.17.13`); override with `podman build --build-arg OPENCODE_REF=<tag>`. See `opencode4lunarwing/CLAUDE.md` for the full env var reference.
+The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> --home <absolute-checkout>` gives core and OpenCode the same lw2studymcp data. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. The opencode upstream is cloned at build time and pinned to a release tag via the `OPENCODE_REF` build arg (default `v1.17.13`); override with `podman build --build-arg OPENCODE_REF=<tag>`. See `opencode4lunarwing/README.md` for the full env var reference.
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
 Multi-tenant worker configuration sets the task deadline to `3600000ms` (one hour), configurable for new tenant entries with `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS`. Re-running mt-admin migrates exact legacy `300000ms` entries; set `LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false` to preserve an intentional five-minute value. External jobs default to asynchronous dispatch (`wait=false`) so they outlive the current conversation turn; completion and progress remain available through job events/status. Explicit `wait=true` remains available for short tasks, but synchronous execution is still bounded by the parent conversation deadline.
 
-## OpenCode Worker (old section)
+## Kimi Code Worker
 
-Bun-based upstream opencode agent (sst/opencode). Runs opencode headless server internally (port 4096) with a TypeScript bridge to the WebSocket protocol. Health on 8443, WebSocket on 9090.
+MoonshotAI/kimi-code is integrated as a persistent LunarWing external worker. A Node.js/TypeScript bridge spawns a `kimi -p` subprocess for each task and translates its streamed output to the `lunarwing-agent-v1` WebSocket protocol. Health is exposed on 8443 and WebSocket traffic on 9090.
 
-**Dockerfile:** `opencode4lunarwing/Dockerfile`
+**Dockerfile:** `kimicode4lunarwing/Dockerfile`
 
 ```bash
-cd opencode4lunarwing
-docker build -t lunarwing-worker-opencode:latest .
+cd kimicode4lunarwing
+docker build -t lunarwing-worker-kimi:latest .
 
-# Or via docker-compose
-docker compose up --build
+# Or via the mt-admin lifecycle
+sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
+
+# Include same Rust/Go/C/C++/Python/native toolchains as OpenCode worker
+sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker --with-toolchains
+
+# Or as part of tenant provisioning and build
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-kimi
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-kimi
+
+# Configure per-tenant provider settings
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <name> --model <model> --base-url <url> --api-key-file /secure/path/kimi-api-key
 ```
 
-Modes: `--mode websocket` (default, persistent), `--mode cli` (one-shot), `--mode acp`. Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports optional Paseo MCP integration via `PASEO_URL`/`PASEO_TOKEN` env vars. See `opencode4lunarwing/CLAUDE.md` for full env var reference.
+Default Kimi image is slim. `--with-toolchains` enables Rust 1.96.1, Go 1.24.3,
+C/C++, Python headers, native build systems, and same development libraries as
+OpenCode profile. Server mode requires `AGENT_AUTH_TOKEN`, even on loopback;
+Compose rejects a missing value before container launch. `KIMI_API_KEY` remains
+optional for OAuth-backed setups. mt-admin keeps both credentials out of process
+arguments by materializing private `kimi-runtime.env`; API key input uses file
+path rather than plaintext argv.
 
+For every persistent worker, `add-tenant --with-<worker>` controls the tenant's
+selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
+standalone build commands build shared images but do not select a worker for a
+tenant.
 
 ## Shared Protocol
 

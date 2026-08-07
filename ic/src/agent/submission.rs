@@ -209,7 +209,7 @@ pub enum Submission {
         request_id: Uuid,
         /// Whether the execution was approved.
         approved: bool,
-        /// If true, auto-approve this tool for the rest of the session.
+        /// If true, apply the tool's supported `Always` approval scope.
         always: bool,
     },
 
@@ -217,7 +217,7 @@ pub enum Submission {
     ApprovalResponse {
         /// Whether the execution was approved.
         approved: bool,
-        /// If true, auto-approve this tool for the rest of the session.
+        /// If true, apply the tool's supported `Always` approval scope.
         always: bool,
     },
 
@@ -371,6 +371,9 @@ pub enum SubmissionResult {
         /// The agent's response.
         content: String,
     },
+
+    /// Turn completed, but response policy suppressed delivery and persistence.
+    Suppressed,
 
     /// Need approval before continuing.
     NeedApproval {

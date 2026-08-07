@@ -2,7 +2,9 @@
 
 **Created:** 2026-07-26
 **Author:** Rarity
-**Status:** Proposal — items verified against source on 2026-07-26
+**Status:** Implemented — all P1 and P2 items landed on 2026-07-26 (goals items
+#9 and #11); P3.1/3.3 done, P3.2/3.4 deferred, P3.5 deferred to v2.0.4.0.
+Re-verified against source on 2026-07-29.
 **Scope:** Engine V2 — mission lifecycle, gate handling, time budgets, provenance, and memory
 
 ---
@@ -22,7 +24,7 @@ implementation effort.
 
 ## Priority 1 — Security and Correctness (should fix for 2.0.3.0)
 
-### 1.1 Wire provenance into production dispatch
+### 1.1 Wire provenance into production dispatch — **DONE (2026-07-26, item #9)**
 
 **Release note (Known Issues, Security):**
 > Engine provenance policy is not wired into production dispatch. Provenance
@@ -36,16 +38,14 @@ implementation effort.
   Grep returns zero matches in the bridge or router.
 - The capability evaluation path still calls the non-provenance `evaluate()`.
 
-**Proposed fix:**
-- Switch the active dispatch path in the bridge/gate pipeline to call
-  `evaluate_with_provenance()`, passing the message's `Provenance` value.
+**Implemented:**
+- The production dispatch path now calls `evaluate_with_provenance()` from the
+  engine executors (`ic/crates/lunarwing_engine/src/executor/scripting.rs`,
+  `orchestrator.rs`, `structured.rs`), passing the message's `Provenance`.
 - The taint-based rules (deny `LlmGenerated` access to financial/destructive
-  actions) are already implemented and tested — they just need to be connected.
-- **Effort:** Small. The API is stable; this is a wiring change.
-- **Risk:** Medium — changes which actions are permitted. Requires verifying no
-  false denials for trusted tool outputs.
+  actions) are connected and active.
 
-### 1.2 Enforce ownership/admin checks on mission mutation tools
+### 1.2 Enforce ownership/admin checks on mission mutation tools — **DONE (2026-07-26, item #9)**
 
 **Release note (Known Issues, Security):**
 > Mission mutation lacks consistent ownership enforcement. Conversational
@@ -62,19 +62,14 @@ implementation effort.
   ownership (`:232`), but the conversational path does not verify admin role for
   shared missions.
 
-**Proposed fix:**
-- Add an ownership/admin check to `mission_delete` (and `complete_mission` when
-  called from conversational tools) by either:
-  - Route through `pause_mission`-style engine methods that already check
-    ownership, or
-  - Add a `delete_mission(user_id, id)` engine method mirroring `pause_mission`'s
-    ownership guard.
-- For shared missions, the web handler / conversational tool must verify admin
-  role before calling.
-- **Effort:** Small.
-- **Risk:** Low — adds a missing security invariant.
+**Implemented:**
+- Added `MissionManager::delete_mission(id, user_id)` at
+  `ic/crates/lunarwing_engine/src/runtime/mission.rs:434` with an ownership
+  guard; the conversational path at `ic/src/bridge/effect_adapter.rs:432` now
+  routes through it instead of calling `complete_mission` directly.
+- Tests for ownership-checked delete added in the same change.
 
-### 1.3 Fix `mission_update` name field mismatch
+### 1.3 Fix `mission_update` name field mismatch — **DONE (2026-07-26, item #9)**
 
 **Release note (Known Issues, Engine):**
 > `mission_update` advertises a `name` field while one parser path reads
@@ -86,17 +81,16 @@ implementation effort.
 - This is a confirmed mismatch — a model calling `mission_update` with
   `{"name": "new_name_here"}` will silently not rename the mission.
 
-**Proposed fix:**
-- Accept both `"name"` and `"new_name"` in the parser for backward
-  compatibility, preferring `"name"` (the schema field).
-- **Effort:** Trivial (1-line fix).
-- **Risk:** None.
+**Implemented:**
+- The parser at `ic/src/bridge/effect_adapter.rs:229-230` now accepts `"name"`
+  and falls back to `"new_name"` for backward compatibility, preferring `"name"`
+  (the schema field).
 
 ---
 
 ## Priority 2 — Reliability and UX (should fix for 2.0.3.0)
 
-### 2.1 Implement background sweep for expired pending gates
+### 2.1 Implement background sweep for expired pending gates — **DONE (2026-07-26, item #11)**
 
 **Release note (Known Issues, Engine):**
 > Pending-gate expiry remains hardcoded at 30 minutes and cleanup is
@@ -109,15 +103,14 @@ implementation effort.
   via a background task.
 - A thread waiting on an expired gate blocks until ingress triggers the cleanup.
 
-**Proposed fix:**
-- Add a periodic background task (every 60 seconds) that scans pending gates and
-  removes expired ones, unblocking waiting threads.
-- Make the expiry configurable via `AgentSettings` with the current 30-minute
-  default.
-- **Effort:** Medium.
-- **Risk:** Low.
+**Implemented:**
+- `start_pending_gate_sweep` at `ic/src/bridge/router.rs:4762` periodically
+  drains expired pending gates and fails their waiting threads.
+- Expiry is configurable via `settings.agent.pending_gate_expiry_secs`
+  (default 1800s = 30 minutes), read at engine init with a fallback to
+  `DEFAULT_PENDING_GATE_EXPIRY` (`ic/src/bridge/router.rs:128`).
 
-### 2.2 Make `mission_delete` actually delete rather than mark completed
+### 2.2 Make `mission_delete` actually delete rather than mark completed — **DONE (2026-07-26, item #11)**
 
 **Release note (Known Issues, Engine):**
 > `mission_delete` marks a record `Completed` and removes it from active IDs but
@@ -130,15 +123,13 @@ implementation effort.
 - The conversational tool reports `{"status": "deleted"}` at
   `effect_adapter.rs:420` but the mission remains in list output.
 
-**Proposed fix:**
-- Add a `Store::delete_mission(id)` method that actually removes the record.
-- Route `mission_delete` through the new hard-delete path, or distinguish between
-  soft-complete and hard-delete.
-- **Effort:** Medium (requires new DB trait method + both backends).
-- **Risk:** Medium — DB schema change. PostgreSQL-only is acceptable per AGENTS.md
-  if libSQL work is disproportionate.
+**Implemented:**
+- Added `Store::delete_mission(id)` which hard-removes the record; the engine's
+  `MissionManager::delete_mission` calls it after the ownership check
+  (`ic/crates/lunarwing_engine/src/runtime/mission.rs:452`).
+- `mission_delete` now hard-deletes with the ownership check from item 1.2.
 
-### 2.3 Wire `event:` and `webhook:` cadence dispatchers
+### 2.3 Wire `event:` and `webhook:` cadence dispatchers — **DONE (2026-07-26, item #11)**
 
 **Release note (Known Issues, Engine):**
 > `event:` and `webhook:` cadence forms parse but have no runtime dispatcher and
@@ -153,15 +144,13 @@ implementation effort.
 - `Webhook` cadence missions should be fireable through webhook ingress, but no
   bridge path currently routes a webhook payload to a `Webhook`-cadence mission.
 
-**Proposed fix:**
-- For v2.0.3.0: either implement the dispatchers or explicitly document these
-  cadence variants as deferred and reject them at creation time.
-- If implementing: add a `fire_webhook_mission(path, payload)` method and wire
-  the bridge's webhook ingress to it.
-- **Effort:** Medium-Large.
-- **Risk:** Medium — touches webhook ingress.
+**Implemented:**
+- Added `MissionManager::fire_webhook_mission(path, secret, payload)`
+  (`ic/crates/lunarwing_engine/src/runtime/mission.rs:811`), wired to bridge
+  webhook ingress at `ic/src/bridge/router.rs:4081`.
+- Engine tests cover the webhook dispatch path (`mission.rs:2699` onward).
 
-### 2.4 Load all owner missions at startup, not just configured owner
+### 2.4 Load all owner missions at startup, not just configured owner — **DONE (2026-07-26, item #11)**
 
 **Release note (Known Issues, Engine):**
 > Startup currently loads scheduled missions only for the configured owner
@@ -172,11 +161,12 @@ implementation effort.
 - Missions belonging to other projects or scopes are not loaded into the active
   index.
 
-**Proposed fix:**
-- After `bootstrap_project`, also scan for active missions across all known
-  projects/users and add them to the active index.
-- **Effort:** Medium.
-- **Risk:** Low — purely additive for startup.
+**Implemented:**
+- Added `MissionManager::bootstrap_all_projects()`
+  (`ic/crates/lunarwing_engine/src/runtime/mission.rs:189`) backed by
+  `Store::list_all_active_missions_global()`; the bridge calls it at startup
+  (`ic/src/bridge/router.rs:1253`), so all active missions across projects are
+  loaded, not just the configured owner's.
 
 ---
 
@@ -253,13 +243,13 @@ implementation effort.
 ## Priority 4 — Defer to later releases
 
 These items from the v2.0.2.0 known issues are explicitly out of scope for a
-v2.0.3.0 polish cycle:
+v2.0.3.0 polish cycle. Status below includes later source-verified work:
 
-| Item | Reason for deferral |
+| Item | Current disposition |
 |---|---|
 | Worker-local MCP execution | Large security surface; track separately |
 | Automatic npm/pip MCP install | Security-sensitive; track separately |
-| Secret injection through stdio env | Security-sensitive; track separately |
+| Secret injection through stdio env | **Implemented in v2.0.4 continuation.** Config persists owner-scoped secret-name references; activation resolves values just before spawn and restricts inherited child environment. Host-local stdio remains unsandboxed and sees injected raw values. |
 | Broad dependency modernization | Separate crate-audit track (item #8) |
 | PostgreSQL vector search indexing (pgvector/ANN) | Infrastructure-scale work |
 | DarkIRC secure key exchange | Separate track (item #10) |
@@ -268,10 +258,10 @@ v2.0.3.0 polish cycle:
 
 ## Summary
 
-| Priority | Items | Effort | Recommended for 2.0.3.0 |
+| Priority | Items | Effort | Status (2026-07-29) |
 |---|---|---|---|
-| P1 (Security) | 1.1, 1.2, 1.3 | Small-Medium | Yes |
-| P2 (Reliability) | 2.1, 2.2, 2.3, 2.4 | Medium-Large | Yes for 2.1, 2.3, 2.4; 2.2 if DB capacity exists |
+| P1 (Security) | 1.1, 1.2, 1.3 | Small-Medium | ✅ All done (item #9) |
+| P2 (Reliability) | 2.1, 2.2, 2.3, 2.4 | Medium-Large | ✅ All done (item #11) |
 | P3 (Polish) | 3.1–3.5 | Small-Large | 3.1 ✓ and 3.3 ✓ done; 3.2, 3.4 deferred; 3.5 deferred to v2.0.4.0 |
 | P4 (Defer) | — | — | No |
 

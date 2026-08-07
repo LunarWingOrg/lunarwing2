@@ -144,6 +144,37 @@ impl SoftwareBuilder for FailingSoftwareBuilder {
     }
 }
 
+/// A `SoftwareBuilder` whose `build()` returns `Err(ToolError)`, simulating a
+/// transient infrastructure failure (LLM timeout, network, provider outage)
+/// rather than a genuine build failure.
+struct ErrorSoftwareBuilder;
+
+#[async_trait]
+impl SoftwareBuilder for ErrorSoftwareBuilder {
+    async fn analyze(&self, description: &str) -> Result<BuildRequirement, ToolError> {
+        Ok(BuildRequirement {
+            name: format!("err_{}", description.replace(' ', "_")),
+            description: description.to_string(),
+            software_type: SoftwareType::WasmTool,
+            language: Language::Rust,
+            input_spec: None,
+            output_spec: None,
+            dependencies: vec![],
+            capabilities: vec![],
+        })
+    }
+
+    async fn build(&self, _requirement: &BuildRequirement) -> Result<BuildResult, ToolError> {
+        Err(ToolError::BuilderFailed(
+            "mock infrastructure failure: provider unreachable".into(),
+        ))
+    }
+
+    async fn repair(&self, result: &BuildResult, _error: &str) -> Result<BuildResult, ToolError> {
+        Ok(result.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -193,9 +224,11 @@ fn make_compiler(
     ReflexCompiler::new(
         builder,
         store,
+        "default".to_string(),
         Duration::from_secs(3600),
         min_match,
         max_per_run,
+        50,
     )
 }
 
@@ -275,23 +308,108 @@ async fn e2e_below_threshold_not_compiled() {
     );
 }
 
-/// A failed build should NOT leave an active pattern in the DB.
+/// A failed build must NOT leave an active pattern in the DB — but the
+/// failure is tracked (status `'failed'`, attempts counted) so the compiler
+/// can stop retrying after the configured maximum.
 #[tokio::test]
-async fn e2e_failed_build_not_persisted() {
+async fn e2e_failed_build_tracked_not_active() {
     let (backend, store) = fresh_backend().await;
     seed_completed_jobs(&backend, "exploding operation", 5).await;
 
     let compiler = make_compiler(Arc::new(FailingSoftwareBuilder), Arc::clone(&store), 3, 10);
     compiler.compile_patterns().await;
 
-    let pattern = store
+    let (_, status) = store
         .get_reflex_pattern("default", "exploding operation")
         .await
-        .expect("get_reflex_pattern");
+        .expect("get_reflex_pattern")
+        .expect("failed build should be tracked");
 
+    assert_eq!(status, "failed", "failed build should not be active");
+
+    // The tracked failure must not be routable (router only loads active rows).
+    let router = ReflexRouter::new();
+    router.refresh(Arc::clone(&store), "default").await;
     assert!(
-        pattern.is_none(),
-        "failed build should not persist an active pattern"
+        router.try_route("exploding operation").await.is_none(),
+        "failed pattern should not route"
+    );
+}
+
+/// Repeated build failures auto-disable the pattern once the attempt limit
+/// (3) is reached; a disabled pattern is not retried by later sweeps.
+#[tokio::test]
+async fn e2e_failed_builds_disable_after_max_attempts() {
+    let (backend, store) = fresh_backend().await;
+    seed_completed_jobs(&backend, "always broken", 5).await;
+
+    let compiler = make_compiler(Arc::new(FailingSoftwareBuilder), Arc::clone(&store), 3, 10);
+    for _ in 0..3 {
+        compiler.compile_patterns().await;
+    }
+
+    let (_, status) = store
+        .get_reflex_pattern("default", "always broken")
+        .await
+        .expect("get_reflex_pattern")
+        .expect("pattern should be tracked");
+    assert_eq!(status, "disabled", "3 failed attempts should disable");
+
+    let attempts = store
+        .list_reflex_patterns("default")
+        .await
+        .expect("list_reflex_patterns")
+        .iter()
+        .find(|p| p.normalized_pattern == "always broken")
+        .map(|p| p.compilation_attempts)
+        .expect("pattern should exist");
+    assert_eq!(attempts, 3, "attempts should stop at the limit");
+
+    // A fourth sweep must not retry (pattern stays disabled, attempts stay 3).
+    compiler.compile_patterns().await;
+    let (_, status) = store
+        .get_reflex_pattern("default", "always broken")
+        .await
+        .expect("get_reflex_pattern")
+        .expect("pattern should still exist");
+    assert_eq!(status, "disabled", "disabled pattern must not be retried");
+}
+
+/// A user-disabled pattern (e.g. via `lunarwing reflex delete`) must not be
+/// resurrected by later compile sweeps.
+#[tokio::test]
+async fn e2e_disabled_pattern_not_resurrected() {
+    let (backend, store) = fresh_backend().await;
+    seed_completed_jobs(&backend, "retired command", 5).await;
+
+    let compiler = make_compiler(Arc::new(MockSoftwareBuilder), Arc::clone(&store), 3, 10);
+    compiler.compile_patterns().await;
+
+    let patterns = store
+        .list_reflex_patterns("default")
+        .await
+        .expect("list_reflex_patterns");
+    let pattern = patterns
+        .iter()
+        .find(|p| p.normalized_pattern == "retired command")
+        .expect("pattern should exist after compile");
+    assert_eq!(pattern.status, "active");
+    store
+        .disable_reflex_pattern(pattern.id)
+        .await
+        .expect("disable_reflex_pattern");
+
+    // Recurring jobs still qualify, but the sweep must skip disabled rows.
+    compiler.compile_patterns().await;
+
+    let (_, status) = store
+        .get_reflex_pattern("default", "retired command")
+        .await
+        .expect("get_reflex_pattern")
+        .expect("pattern should still exist");
+    assert_eq!(
+        status, "disabled",
+        "disabled pattern must not be resurrected"
     );
 }
 
@@ -445,5 +563,56 @@ async fn e2e_max_patterns_per_run_respected() {
         all.len(),
         2,
         "only 2 patterns should be compiled when max_patterns_per_run = 2"
+    );
+}
+
+/// Infrastructure errors (`build()` returning `Err(ToolError)`, e.g. LLM
+/// timeout or provider outage) are transient: they must NOT record a
+/// compilation failure, must NOT increment attempts, and must NOT prevent
+/// the pattern from compiling successfully once the provider recovers.
+#[tokio::test]
+async fn e2e_infra_error_not_recorded_and_pattern_recovers() {
+    let (backend, store) = fresh_backend().await;
+    seed_completed_jobs(&backend, "transient provider task", 5).await;
+
+    // Provider is down: build() returns Err(ToolError).
+    let error_compiler = make_compiler(Arc::new(ErrorSoftwareBuilder), Arc::clone(&store), 3, 10);
+    error_compiler.compile_patterns().await;
+
+    // No 'failed' row, no attempts — the pattern must remain untracked so it
+    // is retried on the next sweep without accruing failure state.
+    let pattern = store
+        .get_reflex_pattern("default", "transient provider task")
+        .await
+        .expect("get_reflex_pattern");
+    assert!(
+        pattern.is_none(),
+        "infra error must not record a reflex pattern row"
+    );
+
+    // A second failing sweep still records nothing.
+    error_compiler.compile_patterns().await;
+    let all = store
+        .list_reflex_patterns("default")
+        .await
+        .expect("list_reflex_patterns");
+    assert!(
+        all.is_empty(),
+        "repeated infra errors must not accrue failure state"
+    );
+
+    // Provider recovers: the same pattern compiles to active immediately,
+    // proving the earlier infra errors did not poison it.
+    let compiler = make_compiler(Arc::new(MockSoftwareBuilder), Arc::clone(&store), 3, 10);
+    compiler.compile_patterns().await;
+
+    let (_, status) = store
+        .get_reflex_pattern("default", "transient provider task")
+        .await
+        .expect("get_reflex_pattern")
+        .expect("pattern should compile after provider recovery");
+    assert_eq!(
+        status, "active",
+        "pattern should compile cleanly once infra errors stop"
     );
 }

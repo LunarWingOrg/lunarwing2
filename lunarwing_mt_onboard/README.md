@@ -11,7 +11,7 @@ Guides an operator through the full provisioning lifecycle for a new tenant:
 2. Secrets generation (gateway token, PG password, SECRETS_MASTER_KEY)
 3. LLM provider configuration
 4. XMPP and Gotify channel setup
-5. External worker selection (nanocode, pebble, opencode)
+5. External worker selection (Pebble, OpenCode, Kimi Code)
 6. Build (with live log output)
 7. Start and post-start verification
 
@@ -275,7 +275,7 @@ unittest.TextTestRunner(verbosity=2).run(
   "gotify_enabled": false,
   "gotify_url": "",
   "gotify_title": "",
-  "workers": ["nanocode", "opencode"],
+  "workers": ["pebble", "opencode"],
   "toolchains": false,
   "llm_base_url": "",
   "llm_model": "tensorzero::function_name::FrontierCODE",

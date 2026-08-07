@@ -18,7 +18,7 @@ use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::dispatch::{
     DEFERRED_QUEUE_FULL_RESPONSE, DeferredMessages, is_priority_interrupt,
 };
-use crate::agent::heartbeat::spawn_heartbeat;
+use crate::agent::heartbeat::spawn_heartbeat_with_sweep;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
 use crate::agent::self_repair::{DefaultSelfRepair, RepairResult, SelfRepair};
 use crate::agent::session::ThreadState;
@@ -255,6 +255,17 @@ pub struct AgentDeps {
     /// Resolved LLM backend identifier (e.g., "lunarwing_cloud", "openai_compatible", "ollama").
     /// Used by `/model` persistence to determine which env var to update.
     pub llm_backend: String,
+    /// Coordination gate shared with the hooks' violation store. When set,
+    /// the engine v2 effect adapter blocks tool execution for disabled
+    /// agents (ISSUE-003).
+    pub coordination_gate: Option<Arc<crate::gate::coordination::CoordinationGate>>,
+    /// Host-authored response-format instruction for configured coordination
+    /// destinations. Keeps persona/style prompts from causing schema strikes.
+    pub coordination_prompt_policy: Option<crate::hooks::CoordinationPromptPolicy>,
+    /// Shared outbound coalesce buffer for coordination channels (Phase 4,
+    /// ISSUE-002). Transport-independent: lives at the agent's outbound
+    /// boundary so native and installable WASM channels coalesce alike.
+    pub coordination_coalesce: Option<crate::channels::coalesce::CoalesceBuffer>,
 }
 
 /// The main agent that coordinates all components.
@@ -269,6 +280,7 @@ pub struct Agent {
     pub(super) context_monitor: ContextMonitor,
     pub(super) heartbeat_config: Option<HeartbeatConfig>,
     pub(super) hygiene_config: Option<crate::config::HygieneConfig>,
+    pub(super) knowledge_sweep_config: Option<crate::config::KnowledgeSweepConfig>,
     pub(super) routine_config: Option<RoutineConfig>,
     /// Shared routine-engine slot used for internal event matching and for exposing
     /// the engine to gateway/manual trigger entry points.
@@ -279,6 +291,8 @@ pub struct Agent {
         Arc<tokio::sync::RwLock<Option<Arc<lunarwing_engine::MissionManager>>>>,
     /// Reflex router for fast-path pattern matching.
     pub(super) reflex_router: Arc<crate::agent::reflex::ReflexRouter>,
+    /// Non-blocking write-behind counter for successful reflex routes.
+    pub(super) reflex_hits: Arc<crate::agent::reflex::ReflexHitAccumulator>,
 }
 
 impl Agent {
@@ -334,6 +348,26 @@ impl Agent {
         }
         let scheduler = Arc::new(scheduler);
 
+        // Extract the embedding provider before moving `deps` into the struct.
+        let embedding_provider = deps
+            .workspace
+            .as_ref()
+            .and_then(|ws| ws.embedding_provider());
+
+        let reflex_router = {
+            let mut router = crate::agent::reflex::ReflexRouter::new()
+                .with_fuzzy_config(crate::agent::reflex::FuzzyConfig {
+                    threshold: config.reflex.fuzzy_threshold,
+                    ..Default::default()
+                })
+                .with_semantic_enabled(config.reflex.semantic_enabled)
+                .with_semantic_threshold(config.reflex.semantic_threshold);
+            if let Some(provider) = embedding_provider {
+                router = router.with_embedding_provider(provider);
+            }
+            Arc::new(router)
+        };
+
         Self {
             config,
             deps,
@@ -345,10 +379,12 @@ impl Agent {
             context_monitor: ContextMonitor::new(),
             heartbeat_config,
             hygiene_config,
+            knowledge_sweep_config: None,
             routine_config,
             routine_engine_slot: Arc::new(tokio::sync::RwLock::new(None)),
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
-            reflex_router: Arc::new(crate::agent::reflex::ReflexRouter::new()),
+            reflex_router,
+            reflex_hits: Arc::new(crate::agent::reflex::ReflexHitAccumulator::default()),
         }
     }
 
@@ -359,6 +395,12 @@ impl Agent {
         slot: Arc<tokio::sync::RwLock<Option<Arc<crate::agent::routine_engine::RoutineEngine>>>>,
     ) {
         self.routine_engine_slot = slot;
+    }
+
+    /// Set the study-notes stale-sweep configuration (called after construction
+    /// to avoid growing the `Agent::new` parameter list).
+    pub fn set_knowledge_sweep_config(&mut self, config: crate::config::KnowledgeSweepConfig) {
+        self.knowledge_sweep_config = Some(config);
     }
 
     async fn routine_engine(&self) -> Option<Arc<crate::agent::routine_engine::RoutineEngine>> {
@@ -774,9 +816,16 @@ impl Agent {
                         .map(|h| h.to_workspace_config())
                         .unwrap_or_default();
 
-                    Some(spawn_heartbeat(
+                    let knowledge_sweep = self
+                        .knowledge_sweep_config
+                        .as_ref()
+                        .map(|k| k.to_workspace_config())
+                        .unwrap_or_default();
+
+                    Some(spawn_heartbeat_with_sweep(
                         config,
                         hygiene,
+                        knowledge_sweep,
                         workspace.clone(),
                         self.cheap_llm().clone(),
                         Some(notify_tx),
@@ -793,10 +842,12 @@ impl Agent {
             None
         };
 
-        // Spawn reflex compiler and cache refresh if enabled
-        let (_reflex_compiler_handle, _reflex_cache_handle) = if self.config.reflex.enabled {
-            let compiler_handle =
-                if let (Some(store), Some(builder)) = (self.store(), self.deps.builder.clone()) {
+        // Spawn reflex compiler, cache refresh, and evictor if enabled
+        let (reflex_compiler_handle, reflex_cache_handle, reflex_evictor_handle) =
+            if self.config.reflex.enabled {
+                let compiler_handle = if let (Some(store), Some(builder)) =
+                    (self.store(), self.deps.builder.clone())
+                {
                     tracing::info!(
                         "Reflex compiler enabled: checking every {}s, min {} matches",
                         self.config.reflex.check_interval.as_secs(),
@@ -805,33 +856,64 @@ impl Agent {
                     Some(crate::agent::reflex::spawn_reflex_compiler(
                         builder,
                         Arc::clone(store),
+                        self.owner_id().to_string(),
                         self.config.reflex.check_interval,
                         self.config.reflex.min_match_count,
                         self.config.reflex.max_patterns_per_run,
+                        self.config.reflex.max_patterns_per_user,
                     ))
                 } else {
                     tracing::warn!("Reflex compiler enabled but store or builder not available");
                     None
                 };
 
-            let cache_handle = if let Some(store) = self.store() {
-                tracing::debug!(
-                    "Reflex cache refresh enabled: refreshing every {}s",
-                    self.config.reflex.check_interval.as_secs()
-                );
-                Some(crate::agent::reflex::spawn_reflex_cache_refresh(
-                    Arc::clone(&self.reflex_router),
-                    Arc::clone(store),
-                    self.owner_id().to_string(),
-                    self.config.reflex.check_interval,
-                ))
+                let cache_handle = if let Some(store) = self.store() {
+                    tracing::debug!(
+                        "Reflex cache refresh enabled: refreshing every {}s",
+                        self.config.reflex.check_interval.as_secs()
+                    );
+                    Some(crate::agent::reflex::spawn_reflex_cache_refresh(
+                        Arc::clone(&self.reflex_router),
+                        Arc::clone(store),
+                        self.owner_id().to_string(),
+                        self.config.reflex.check_interval,
+                    ))
+                } else {
+                    None
+                };
+
+                let evictor_handle = if let Some(store) = self.store() {
+                    tracing::info!(
+                        "Spawning reflex evictor (stale_after_days: {}, check_interval: {}s)",
+                        self.config.reflex.eviction_stale_days,
+                        self.config.reflex.eviction_check_interval.as_secs()
+                    );
+                    Some(crate::agent::reflex::spawn_reflex_evictor(
+                        Arc::clone(store),
+                        crate::agent::reflex::EvictionConfig::new(
+                            self.config.reflex.eviction_check_interval,
+                            self.config.reflex.eviction_stale_days,
+                        ),
+                    ))
+                } else {
+                    None
+                };
+
+                (compiler_handle, cache_handle, evictor_handle)
             } else {
-                None
+                (None, None, None)
             };
 
-            (compiler_handle, cache_handle)
+        let reflex_hit_flusher = if self.config.reflex.enabled {
+            self.store().map(|store| {
+                crate::agent::reflex::spawn_reflex_hit_flusher(
+                    Arc::clone(&self.reflex_hits),
+                    Arc::clone(store),
+                    crate::agent::reflex::REFLEX_HIT_FLUSH_INTERVAL,
+                )
+            })
         } else {
-            (None, None)
+            None
         };
 
         // Spawn routine engine if enabled
@@ -1115,6 +1197,27 @@ impl Agent {
         if let Some((cron_handle, _)) = routine_handle {
             cron_handle.abort();
         }
+        for handle in [
+            reflex_compiler_handle,
+            reflex_cache_handle,
+            reflex_evictor_handle,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(flusher) = reflex_hit_flusher {
+            flusher
+                .shutdown(crate::agent::reflex::REFLEX_HIT_SHUTDOWN_TIMEOUT)
+                .await;
+        }
+        // Flush pending coalesced coordination messages before channels go
+        // away so buffered content is not lost on shutdown (ISSUE-002).
+        if let Some(buffer) = &self.deps.coordination_coalesce {
+            buffer.flush_all().await;
+        }
         self.scheduler.stop_all().await;
         self.channels.shutdown_all().await?;
 
@@ -1182,39 +1285,83 @@ impl Agent {
             channel: message.channel.clone(),
             content: response.clone(),
             thread_id: message.thread_id.clone(),
+            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
         };
-        match self.hooks().run(&event).await {
+        // Hooks first (they may modify or block), then the shared coalesce
+        // buffer, then the channel send (whose transport rate limiter sees
+        // only flushed messages) — the ordering ISSUE-002 requires.
+        let final_text = match self.hooks().run(&event).await {
             Err(error) => {
                 tracing::warn!("BeforeOutbound hook blocked response: {error}");
+                None
             }
             Ok(crate::hooks::HookOutcome::Continue {
                 modified: Some(new_content),
-            }) => {
-                if let Err(error) = self
-                    .channels
-                    .respond(message, OutgoingResponse::text(new_content))
-                    .await
-                {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %error,
-                        "Failed to send response to channel"
-                    );
+            }) => Some(new_content),
+            _ => Some(response),
+        };
+        let Some(text) = final_text else {
+            return;
+        };
+
+        // Phase 4: transport-independent coalescing for coordination
+        // channels. Applies to every channel kind (native and installable
+        // WASM alike) because it lives at the agent's outbound boundary
+        // rather than inside any one channel (ISSUE-002).
+        if let Some(buffer) = &self.deps.coordination_coalesce {
+            let destination = crate::channels::routing_target_from_metadata(&message.metadata)
+                .unwrap_or_else(|| message.channel.clone());
+            let key = crate::channels::coalesce::ChannelKey::new(
+                self.deps.owner_id.clone(),
+                message.channel.clone(),
+                destination,
+                message
+                    .conversation_scope_id
+                    .clone()
+                    .or_else(|| message.thread_id.clone())
+                    .unwrap_or_default(),
+            );
+            let channels = Arc::clone(&self.channels);
+            let msg = coalesced_reply_context(message);
+            let flush: crate::channels::coalesce::FlushFn = Arc::new(move |content| {
+                let channels = Arc::clone(&channels);
+                let msg = msg.clone();
+                Box::pin(async move {
+                    if let Err(error) = channels
+                        .respond(&msg, OutgoingResponse::text(content))
+                        .await
+                    {
+                        tracing::error!(
+                            channel = %msg.channel,
+                            error = %error,
+                            "Failed to send coalesced response to channel"
+                        );
+                    }
+                })
+            });
+            match buffer.submit(key, text, flush).await {
+                crate::channels::coalesce::CoalesceDecision::SendNow(content) => {
+                    self.respond_and_log(message, content).await;
                 }
+                crate::channels::coalesce::CoalesceDecision::Buffered => {}
             }
-            _ => {
-                if let Err(error) = self
-                    .channels
-                    .respond(message, OutgoingResponse::text(response))
-                    .await
-                {
-                    tracing::error!(
-                        channel = %message.channel,
-                        error = %error,
-                        "Failed to send response to channel"
-                    );
-                }
-            }
+            return;
+        }
+
+        self.respond_and_log(message, text).await;
+    }
+
+    async fn respond_and_log(&self, message: &IncomingMessage, content: String) {
+        if let Err(error) = self
+            .channels
+            .respond(message, OutgoingResponse::text(content))
+            .await
+        {
+            tracing::error!(
+                channel = %message.channel,
+                error = %error,
+                "Failed to send response to channel"
+            );
         }
     }
 
@@ -1457,16 +1604,34 @@ impl Agent {
         if let Submission::UserInput { ref content } = submission {
             let event = crate::hooks::HookEvent::Inbound {
                 user_id: message.user_id.clone(),
+                sender_id: Some(message.sender_id.clone()),
                 channel: message.channel.clone(),
                 content: content.clone(),
                 thread_id: message.thread_id.clone(),
+                policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
             };
             match self.hooks().run(&event).await {
                 Err(crate::hooks::HookError::Rejected { reason }) => {
-                    return Ok(Some(format!("[Message rejected: {}]", reason)));
+                    // Typed suppression (ISSUE-004): return the empty response,
+                    // which the delivery layer drops, instead of manufacturing
+                    // channel text that would re-enter outbound hooks and be
+                    // mis-scored as this agent's own policy violation.
+                    tracing::debug!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        reason = %reason,
+                        "Inbound hook rejected message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Err(err) => {
-                    return Ok(Some(format!("[Message blocked by hook policy: {}]", err)));
+                    tracing::warn!(
+                        channel = %message.channel,
+                        user = %message.user_id,
+                        error = %err,
+                        "Inbound hook blocked message; suppressing response"
+                    );
+                    return Ok(Some(String::new()));
                 }
                 Ok(crate::hooks::HookOutcome::Continue {
                     modified: Some(new_content),
@@ -1896,6 +2061,7 @@ impl Agent {
                     Ok(Some(content))
                 }
             }
+            SubmissionResult::Suppressed => Ok(Some(String::new())),
             SubmissionResult::Ok { message } => Ok(message),
             SubmissionResult::Error { message } => Ok(Some(format!("Error: {}", message))),
             SubmissionResult::Interrupted => Ok(Some("Interrupted.".into())),
@@ -1909,6 +2075,25 @@ impl Agent {
     }
 }
 
+fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
+    IncomingMessage {
+        id: message.id,
+        channel: message.channel.clone(),
+        user_id: message.user_id.clone(),
+        owner_id: message.owner_id.clone(),
+        sender_id: message.sender_id.clone(),
+        user_name: message.user_name.clone(),
+        content: String::new(),
+        thread_id: message.thread_id.clone(),
+        conversation_scope_id: message.conversation_scope_id.clone(),
+        received_at: message.received_at,
+        metadata: message.metadata.clone(),
+        timezone: message.timezone.clone(),
+        attachments: Vec::new(),
+        is_internal: message.is_internal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1919,15 +2104,46 @@ mod tests {
     #[cfg(feature = "libsql")]
     use super::Agent;
     use super::{
-        abort_and_wait, chat_tool_execution_metadata, resolve_routine_notification_user,
-        should_fallback_routine_notification, truncate_for_preview,
+        abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
+        resolve_routine_notification_user, should_fallback_routine_notification,
+        truncate_for_preview,
     };
     #[cfg(feature = "libsql")]
     use crate::channels::ChannelManager;
-    use crate::channels::IncomingMessage;
+    use crate::channels::{AttachmentKind, IncomingAttachment, IncomingMessage};
     #[cfg(feature = "libsql")]
     use crate::config::AgentConfig;
     use crate::error::ChannelError;
+
+    #[test]
+    fn coalesced_reply_context_drops_message_payload() {
+        let mut message = IncomingMessage::new("xmpp", "owner", "large prompt");
+        message.sender_id = "sender".into();
+        message.thread_id = Some("thread-1".into());
+        message.metadata = serde_json::json!({"xmpp_jid": "room@example.test"});
+        message.attachments.push(IncomingAttachment {
+            id: "large".into(),
+            kind: AttachmentKind::Document,
+            mime_type: "application/octet-stream".into(),
+            filename: None,
+            size_bytes: Some(1024 * 1024),
+            source_url: None,
+            storage_key: None,
+            extracted_text: Some("extracted payload".into()),
+            data: vec![7; 1024 * 1024],
+            duration_secs: None,
+        });
+
+        let context = coalesced_reply_context(&message);
+
+        assert_eq!(context.id, message.id);
+        assert_eq!(context.channel, message.channel);
+        assert_eq!(context.sender_id, message.sender_id);
+        assert_eq!(context.thread_id, message.thread_id);
+        assert_eq!(context.metadata, message.metadata);
+        assert!(context.content.is_empty());
+        assert!(context.attachments.is_empty());
+    }
 
     #[cfg(feature = "libsql")]
     async fn cavepony_test_agent() -> (Agent, Arc<dyn crate::db::Database>, tempfile::TempDir) {

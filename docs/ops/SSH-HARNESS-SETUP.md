@@ -1,6 +1,6 @@
 # SSH Harness — Setup & Operations
 
-How to give LunarWing workers (nanocode/pebble/codex), routines, and git
+How to give LunarWing workers (Pebble/OpenCode/Kimi Code), routines, and git
 operations SSH access to remote hosts, using the SSH agent harness.
 
 For the design and internals, see
@@ -209,7 +209,7 @@ Confirm the socket exists and is a socket:
 ls -l /home/<tenant>/lunarwing/run/ssh-agent.sock   # should show a 's' (socket) type
 ```
 
-### Inside a worker (e.g. nanocode)
+### Inside a worker (e.g. OpenCode)
 
 The socket is mounted at `/tmp/ssh-agent.sock` with `SSH_AUTH_SOCK` pointing at
 it. Standard SSH tooling picks it up automatically:
@@ -229,8 +229,9 @@ in the store, the daemon almost certainly needs a restart (see step 3).
 ## Agent-facing SSH tools
 
 Beyond worker mode, the agent has built-in tools that run SSH **in the gateway
-process** (no container). All take a configured `host` alias and require
-approval on every call. Full details + when-to-use each:
+process** (no container). All take a configured `host` alias. Built-in `ssh`
+prompts initially and supports explicit per-user **Always**; `ssh_git` and WASM
+SSH still require approval on every call. Full details + when-to-use each:
 [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md).
 
 - **`ssh`** — run one command on a configured host: `{host, command}` →

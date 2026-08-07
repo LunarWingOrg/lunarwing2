@@ -48,12 +48,10 @@ impl ExecutionGate for ApprovalGate {
         // orthogonal to ExecutionMode and takes precedence over the per-tool
         // ApprovalRequirement matching below.
         //
-        // Always-gated tools (ApprovalRequirement::Always) should not offer
-        // the "always approve" option in supervised mode either, so we set
-        // allow_always = false to be conservative.
+        // Supervision still gates every later action. Some constrained tools
+        // may nevertheless let the user persist a grant for normal mode.
         if ctx.supervised_mode {
-            let requirement = tool.requires_approval(ctx.parameters);
-            let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+            let allow_always = tool.allows_always_approval(ctx.parameters);
             return GateDecision::Pause {
                 reason: format!(
                     "[Supervised mode] Tool '{}' requires human approval before execution.",
@@ -88,21 +86,26 @@ impl ExecutionGate for ApprovalGate {
                                 "Tool '{}' requires approval to execute.",
                                 ctx.action_name
                             ),
-                            resume_kind: ResumeKind::Approval { allow_always: true },
+                            resume_kind: ResumeKind::Approval {
+                                allow_always: tool.allows_always_approval(ctx.parameters),
+                            },
                         }
                     }
                 }
-                ApprovalRequirement::Always => GateDecision::Pause {
-                    reason: format!(
-                        "Tool '{}' requires explicit approval for this operation.",
-                        ctx.action_name
-                    ),
-                    // Always-gated tools should NOT offer "always" button
-                    // (regression fix: 09e1c97a)
-                    resume_kind: ResumeKind::Approval {
-                        allow_always: false,
-                    },
-                },
+                ApprovalRequirement::Always => {
+                    let allow_always = tool.allows_always_approval(ctx.parameters);
+                    if allow_always && ctx.auto_approved.contains(ctx.action_name) {
+                        GateDecision::Allow
+                    } else {
+                        GateDecision::Pause {
+                            reason: format!(
+                                "Tool '{}' requires explicit approval for this operation.",
+                                ctx.action_name
+                            ),
+                            resume_kind: ResumeKind::Approval { allow_always },
+                        }
+                    }
+                }
             },
             ExecutionMode::InteractiveAutoApprove => match requirement {
                 ApprovalRequirement::Never | ApprovalRequirement::UnlessAutoApproved => {
@@ -112,16 +115,18 @@ impl ExecutionGate for ApprovalGate {
                     GateDecision::Allow
                 }
                 ApprovalRequirement::Always => {
-                    // Always-gated tools still require explicit approval even
-                    // in auto-approve mode — these are truly destructive operations.
-                    GateDecision::Pause {
-                        reason: format!(
-                            "Tool '{}' requires explicit approval (auto-approve does not cover this operation).",
-                            ctx.action_name
-                        ),
-                        resume_kind: ResumeKind::Approval {
-                            allow_always: false,
-                        },
+                    let allow_always = tool.allows_always_approval(ctx.parameters);
+                    if allow_always && ctx.auto_approved.contains(ctx.action_name) {
+                        GateDecision::Allow
+                    } else {
+                        // Global auto-approve alone never covers Always tools.
+                        GateDecision::Pause {
+                            reason: format!(
+                                "Tool '{}' requires explicit approval (auto-approve does not cover this operation).",
+                                ctx.action_name
+                            ),
+                            resume_kind: ResumeKind::Approval { allow_always },
+                        }
                     }
                 }
             },

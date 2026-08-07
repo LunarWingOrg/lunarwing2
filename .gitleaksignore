@@ -1,7 +1,7 @@
 .githooks/pre-commit:private-key:56
 docs/guides/lunarwing_weechat_wss/weechat_relay/INSTALL.md:curl-auth-user:110
+docs/guides/history/lunarwing_weechat_wss/weechat_relay/INSTALL.md:curl-auth-user:110
 docs/guides/lunarwing_weechat_wss/README.md:curl-auth-user:339
-docs/guides/MT-ADMIN-QUICKSTART.md:curl-auth-user:264
 ic/crates/lunarwing_safety/fuzz/corpus/fuzz_leak_detector/stripe_key:stripe-access-token:1
 ic/scripts/templates/darkirc_config.toml.template:generic-api-key:84
 ic/scripts/templates/darkirc_config.toml.template:generic-api-key:137
@@ -23,7 +23,6 @@ ic/src/channels/wasm/router.rs:generic-api-key:981
 ic/tests/e2e/conftest.py:generic-api-key:515
 ic/tests/config_round_trip.rs:generic-api-key:146
 lunarwing_mt_onboard/secrets_tests.py:generic-api-key:116
-lunarwing_mt_onboard_web/web_tests.py:generic-api-key:375
 ic/tests/test-pages/yahoo/source.html:generic-api-key:1835
 ic/tests/test-pages/yahoo/source.html:generic-api-key:1940
 ic/tests/test-pages/yahoo/source.html:generic-api-key:1967
@@ -32,4 +31,6 @@ ic/tests/test-pages/cnn/source.html:generic-api-key:1338
 ic/tests/test-pages/yahoo/source.html:generic-api-key:2516
 ic/tests/test-pages/cnn/source.html:generic-api-key:2466
 ic/tests/test-pages/cnn/source.html:generic-api-key:2468
-docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:167
+docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:172
+ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:31
+ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:32

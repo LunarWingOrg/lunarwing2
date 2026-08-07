@@ -1,9 +1,9 @@
 //! Thread manager — top-level orchestrator for thread lifecycle.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
@@ -12,12 +12,18 @@ use crate::capability::planner::LeasePlanner;
 use crate::capability::policy::PolicyEngine;
 use crate::capability::registry::CapabilityRegistry;
 use crate::executor::ExecutionLoop;
-use crate::runtime::messaging::{self, SignalSender, ThreadOutcome, ThreadSignal};
+use crate::executor::loop_engine::{
+    INITIAL_PERSISTED_STATE_METADATA_KEY, RUNTIME_CHECKPOINT_METADATA_KEY,
+};
+use crate::executor::orchestrator::RECOVERY_STATE_KEY;
+use crate::runtime::messaging::{
+    self, SignalSender, ThreadFailureKind, ThreadOutcome, ThreadSignal,
+};
 use crate::runtime::tree::ThreadTree;
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::traits::store::Store;
-use crate::types::capability::Capability;
+use crate::types::capability::{Capability, LeaseId};
 use crate::types::error::EngineError;
 use crate::types::event::{EventKind, ThreadEvent};
 use crate::types::message::{MessageRole, ThreadMessage};
@@ -33,6 +39,30 @@ struct RunningThread {
     handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
 }
 
+fn clear_waiting_checkpoint_preserving_recovery(
+    metadata: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    let recovery = metadata
+        .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+        .and_then(|checkpoint| checkpoint.get("persisted_state"))
+        .and_then(|state| state.get(RECOVERY_STATE_KEY))
+        .cloned();
+    metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+
+    let Some(recovery) = recovery else {
+        return;
+    };
+    let initial_state = metadata
+        .entry(INITIAL_PERSISTED_STATE_METADATA_KEY)
+        .or_insert_with(|| serde_json::json!({}));
+    if !initial_state.is_object() {
+        *initial_state = serde_json::json!({});
+    }
+    if let Some(initial_state) = initial_state.as_object_mut() {
+        initial_state.insert(RECOVERY_STATE_KEY.to_string(), recovery);
+    }
+}
+
 /// Top-level orchestrator for thread lifecycle.
 ///
 /// Manages thread spawning, supervision, signaling, and tree relationships.
@@ -45,8 +75,14 @@ pub struct ThreadManager {
     pub policy: Arc<PolicyEngine>,
     lease_planner: LeasePlanner,
     tree: RwLock<ThreadTree>,
+    resume_locks: AsyncMutex<HashMap<ThreadId, Weak<AsyncMutex<()>>>>,
     running: Arc<RwLock<HashMap<ThreadId, RunningThread>>>,
     completed: Arc<RwLock<HashMap<ThreadId, ThreadOutcome>>>,
+    /// Threads whose approved gate action is executing inline in the
+    /// approval-handling task (the "resolving" window between gate removal
+    /// and thread resume). Lets interrupt see and cancel that window instead
+    /// of reporting "nothing to interrupt" while a side effect runs.
+    resolving: Arc<RwLock<HashMap<ThreadId, CancellationToken>>>,
     /// Broadcast channel for thread events (for live status updates).
     event_tx: tokio::sync::broadcast::Sender<crate::types::event::ThreadEvent>,
     /// Tenant identity/persona preamble (from workspace IDENTITY.md/SOUL.md/
@@ -77,8 +113,10 @@ impl ThreadManager {
             policy,
             lease_planner: LeasePlanner::new(),
             tree: RwLock::new(ThreadTree::new()),
+            resume_locks: AsyncMutex::new(HashMap::new()),
             running: Arc::new(RwLock::new(HashMap::new())),
             completed: Arc::new(RwLock::new(HashMap::new())),
+            resolving: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             identity_preamble: None,
             skill_feedback_enabled: crate::skill_self_improvement_enabled(),
@@ -102,6 +140,37 @@ impl ThreadManager {
         &self,
     ) -> tokio::sync::broadcast::Receiver<crate::types::event::ThreadEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Mark a thread as resolving (approved gate action executing inline in
+    /// the approval task). Returns the token an interrupt can cancel.
+    pub async fn begin_resolving(&self, thread_id: ThreadId) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.resolving
+            .write()
+            .await
+            .insert(thread_id, token.clone());
+        token
+    }
+
+    /// Clear a thread's resolving marker after its inline action completes.
+    pub async fn end_resolving(&self, thread_id: ThreadId) {
+        self.resolving.write().await.remove(&thread_id);
+    }
+
+    /// Whether a thread is currently resolving a gate action inline.
+    pub async fn is_resolving(&self, thread_id: ThreadId) -> bool {
+        self.resolving.read().await.contains_key(&thread_id)
+    }
+
+    /// Cancel a thread's resolving window. Returns true when a marker existed.
+    pub async fn cancel_resolving(&self, thread_id: ThreadId) -> bool {
+        if let Some(token) = self.resolving.read().await.get(&thread_id) {
+            token.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     /// Persist and broadcast an event produced while a thread awaits a gate.
@@ -162,11 +231,17 @@ impl ThreadManager {
             user_id,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
 
-    /// Spawn a thread with initial conversation history.
+    /// Spawn a thread with initial conversation history and optional persisted state.
+    ///
+    /// `initial_state`, when present, seeds the orchestrator's `state` dict via
+    /// the runtime-checkpoint metadata key (read by
+    /// `ExecutionLoop::load_runtime_checkpoint`). Mission threads use this to
+    /// receive their `trigger_payload`.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_thread_with_history(
         &self,
@@ -178,6 +253,7 @@ impl ThreadManager {
         user_id: impl Into<String>,
         initial_messages: Vec<crate::types::message::ThreadMessage>,
         preferred_thread_id: Option<ThreadId>,
+        initial_state: Option<serde_json::Value>,
     ) -> Result<ThreadId, EngineError> {
         let current_message = ThreadMessage::user(goal.into());
         self.spawn_thread_with_history_and_message(
@@ -189,11 +265,12 @@ impl ThreadManager {
             user_id,
             initial_messages,
             preferred_thread_id,
+            initial_state,
         )
         .await
     }
 
-    /// Spawn a thread with history and a fully constructed current user message.
+    /// Spawn a thread with history, a current user message, and optional persisted state.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn_thread_with_history_and_message(
         &self,
@@ -205,10 +282,19 @@ impl ThreadManager {
         user_id: impl Into<String>,
         initial_messages: Vec<crate::types::message::ThreadMessage>,
         preferred_thread_id: Option<ThreadId>,
+        initial_state: Option<serde_json::Value>,
     ) -> Result<ThreadId, EngineError> {
         if current_message.role != MessageRole::User {
             return Err(EngineError::Store {
                 reason: "initial thread message must have the user role".to_string(),
+            });
+        }
+        if initial_state
+            .as_ref()
+            .is_some_and(|state| !state.is_object())
+        {
+            return Err(EngineError::Store {
+                reason: "initial thread state must be a JSON object".to_string(),
             });
         }
 
@@ -230,19 +316,36 @@ impl ThreadManager {
         if let Some(pid) = preferred_thread_id {
             thread.id = pid;
         }
-        let thread_id = thread.id;
-
-        // Register in tree
-        if let Some(pid) = parent_id {
-            self.tree.write().await.add_child(pid, thread_id);
+        // Seed initial orchestrator state (e.g. a mission's trigger_payload).
+        // `INITIAL_PERSISTED_STATE_METADATA_KEY` is the durable copy that
+        // survives a gate-pause resume discarding the live checkpoint;
+        // `RUNTIME_CHECKPOINT_METADATA_KEY` is what
+        // `ExecutionLoop::load_runtime_checkpoint` reads on the first step.
+        if let Some(initial_state) = initial_state
+            && let Some(metadata) = thread.metadata.as_object_mut()
+        {
+            metadata.insert(
+                INITIAL_PERSISTED_STATE_METADATA_KEY.into(),
+                initial_state.clone(),
+            );
+            metadata.insert(
+                RUNTIME_CHECKPOINT_METADATA_KEY.into(),
+                serde_json::json!({
+                    "persisted_state": initial_state,
+                    "nudge_count": 0,
+                    "consecutive_errors": 0,
+                    "compaction_count": 0,
+                }),
+            );
         }
+        let thread_id = thread.id;
 
         // Grant explicit capability leases based on thread type.
         for grant in self
             .lease_planner
             .plan_for_thread(thread_type, &self.capabilities)
         {
-            let lease = self
+            let lease = match self
                 .leases
                 .grant(
                     thread_id,
@@ -251,9 +354,38 @@ impl ThreadManager {
                     None,
                     None,
                 )
-                .await?;
-            self.store.save_lease(&lease).await?;
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.revoke_lease_ids(
+                        &thread.capability_leases,
+                        "thread spawn failed while granting leases",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.store.save_lease(&lease).await {
+                let mut rollback_ids = thread.capability_leases.clone();
+                rollback_ids.push(lease.id);
+                self.revoke_lease_ids(&rollback_ids, "thread spawn failed while persisting leases")
+                    .await;
+                return Err(error);
+            }
             thread.capability_leases.push(lease.id);
+        }
+
+        // Tool registries can gain actions after engine construction (notably
+        // recovered MCP servers). Lease every action the executor advertises
+        // now, so model-visible actions are executable by this new thread.
+        if let Err(error) = self.refresh_live_action_leases(&mut thread).await {
+            self.revoke_lease_ids(
+                &thread.capability_leases,
+                "thread spawn failed while refreshing live tool leases",
+            )
+            .await;
+            return Err(error);
         }
 
         // Add conversation history from prior threads (for context continuity)
@@ -264,10 +396,31 @@ impl ThreadManager {
         // Add the goal as the current user message so the LLM has context.
         thread.add_message(current_message);
 
-        // Persist
-        self.store.save_thread(&thread).await?;
+        // Persist before publishing tree state or starting execution. If this
+        // fails, revoke every lease granted for the uncreated thread.
+        if let Err(error) = self.store.save_thread(&thread).await {
+            self.revoke_lease_ids(
+                &thread.capability_leases,
+                "thread spawn failed before persistence",
+            )
+            .await;
+            return Err(error);
+        }
 
-        self.start_thread(thread, user_id, false).await
+        if let Some(pid) = parent_id {
+            self.tree.write().await.add_child(pid, thread_id);
+        }
+
+        let lease_ids = thread.capability_leases.clone();
+        match self.start_thread(thread, user_id, false).await {
+            Ok(thread_id) => Ok(thread_id),
+            Err(error) => {
+                self.tree.write().await.remove(thread_id);
+                self.revoke_lease_ids(&lease_ids, "thread failed to start")
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     /// Resume a persisted waiting or suspended thread.
@@ -279,6 +432,8 @@ impl ThreadManager {
         approval_event: Option<(String, bool)>,
         resolved_call_id: Option<String>,
     ) -> Result<(), EngineError> {
+        let resume_lock = self.resume_lock(thread_id).await;
+        let _resume_guard = resume_lock.lock().await;
         if self.is_running(thread_id).await {
             return Err(EngineError::Thread(
                 crate::types::error::ThreadError::AlreadyRunning(thread_id),
@@ -313,17 +468,19 @@ impl ThreadManager {
             });
         }
 
-        self.refresh_resumed_thread_leases(&mut thread).await?;
+        let refreshed_lease_ids = self.refresh_resumed_thread_leases(&mut thread).await?;
 
-        if let Some((call_id, approved)) = approval_event {
+        let approval_event = if let Some((call_id, approved)) = approval_event {
             let event = crate::types::event::ThreadEvent::new(
                 thread_id,
                 crate::types::event::EventKind::ApprovalReceived { call_id, approved },
             );
-            let _ = self.event_tx.send(event.clone());
-            thread.events.push(event);
+            thread.events.push(event.clone());
             thread.updated_at = chrono::Utc::now();
-        }
+            Some(event)
+        } else {
+            None
+        };
 
         if let Some(ref call_id) = resolved_call_id {
             thread
@@ -351,15 +508,39 @@ impl ThreadManager {
         if thread.state == crate::types::thread::ThreadState::Waiting
             && let Some(metadata) = thread.metadata.as_object_mut()
         {
-            metadata.remove("runtime_checkpoint");
+            clear_waiting_checkpoint_preserving_recovery(metadata);
         }
 
-        self.store.save_thread(&thread).await?;
-        self.start_thread(thread, uid, true).await?;
+        if let Err(error) = self.store.save_thread(&thread).await {
+            self.revoke_lease_ids(
+                &refreshed_lease_ids,
+                "thread resume failed before persistence",
+            )
+            .await;
+            return Err(error);
+        }
+        if let Some(event) = approval_event {
+            let _ = self.event_tx.send(event);
+        }
+        if let Err(error) = self.start_thread(thread, uid, true).await {
+            self.revoke_lease_ids(&refreshed_lease_ids, "thread failed to resume")
+                .await;
+            return Err(error);
+        }
         Ok(())
     }
 
-    async fn refresh_resumed_thread_leases(&self, thread: &mut Thread) -> Result<(), EngineError> {
+    async fn refresh_resumed_thread_leases(
+        &self,
+        thread: &mut Thread,
+    ) -> Result<Vec<LeaseId>, EngineError> {
+        self.refresh_live_action_leases(thread).await
+    }
+
+    async fn refresh_live_action_leases(
+        &self,
+        thread: &mut Thread,
+    ) -> Result<Vec<LeaseId>, EngineError> {
         let active_leases = self.leases.active_for_thread(thread.id).await;
         let available_actions = self.effects.available_actions(&active_leases).await?;
         let mut missing_actions = Vec::new();
@@ -374,22 +555,23 @@ impl ThreadManager {
             }
         }
         if missing_actions.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         let mut resumed_capabilities = CapabilityRegistry::new();
         resumed_capabilities.register(Capability {
-            name: "resumed_tools".into(),
-            description: "Tools activated while the thread was waiting".into(),
+            name: "live_tools".into(),
+            description: "Tools activated after engine initialization".into(),
             actions: missing_actions,
             knowledge: Vec::new(),
             policies: Vec::new(),
         });
+        let mut refreshed_lease_ids = Vec::new();
         for grant in self
             .lease_planner
             .plan_for_thread(thread.thread_type, &resumed_capabilities)
         {
-            let lease = self
+            let lease = match self
                 .leases
                 .grant(
                     thread.id,
@@ -398,11 +580,52 @@ impl ThreadManager {
                     None,
                     None,
                 )
-                .await?;
-            self.store.save_lease(&lease).await?;
+                .await
+            {
+                Ok(lease) => lease,
+                Err(error) => {
+                    self.revoke_lease_ids(
+                        &refreshed_lease_ids,
+                        "thread resume failed while granting leases",
+                    )
+                    .await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.store.save_lease(&lease).await {
+                refreshed_lease_ids.push(lease.id);
+                self.revoke_lease_ids(
+                    &refreshed_lease_ids,
+                    "thread resume failed while persisting leases",
+                )
+                .await;
+                return Err(error);
+            }
             thread.capability_leases.push(lease.id);
+            refreshed_lease_ids.push(lease.id);
         }
-        Ok(())
+        Ok(refreshed_lease_ids)
+    }
+
+    async fn revoke_lease_ids(&self, lease_ids: &[LeaseId], reason: &str) {
+        for lease_id in lease_ids.iter().copied() {
+            self.leases.revoke(lease_id, reason).await;
+            if let Err(error) = self.store.revoke_lease(lease_id, reason).await {
+                debug!(?lease_id, %error, "failed to persist lease rollback");
+            }
+        }
+        self.leases.expire_stale().await;
+    }
+
+    async fn resume_lock(&self, thread_id: ThreadId) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.resume_locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&thread_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(thread_id, Arc::downgrade(&lock));
+        lock
     }
 
     async fn start_thread(
@@ -443,13 +666,70 @@ impl ThreadManager {
 
         // Spawn background task
         let store_for_task = Arc::clone(&self.store);
+        let leases_for_task = Arc::clone(&self.leases);
         let running = Arc::clone(&self.running);
         let completed = Arc::clone(&self.completed);
+        let event_tx = self.event_tx.clone();
         let skill_feedback_enabled = self.skill_feedback_enabled;
         let handle = tokio::spawn(async move {
             let mut exec = exec_loop;
             let result = exec.run().await;
             debug!(thread_id = %thread_id, "thread execution finished");
+
+            let outcome = match result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let (kind, message) = match &error {
+                        EngineError::Llm { kind, .. } => (
+                            ThreadFailureKind::Model(*kind),
+                            kind.terminal_message().to_string(),
+                        ),
+                        _ => (ThreadFailureKind::Unknown, error.to_string()),
+                    };
+                    ThreadOutcome::Failed {
+                        kind,
+                        error: message,
+                    }
+                }
+            };
+
+            // ExecutionLoop can return an infrastructure error before it makes
+            // the thread terminal. Close that lifecycle here so leases and
+            // learning events cannot be stranded on a dead background task.
+            if let ThreadOutcome::Failed { error, .. } = &outcome
+                && !exec.thread.state.is_terminal()
+                && let Err(transition_error) = exec
+                    .thread
+                    .transition_to(ThreadState::Failed, Some(error.clone()))
+            {
+                tracing::debug!(
+                    thread_id = %thread_id,
+                    "failed to transition errored thread to Failed: {transition_error}"
+                );
+            }
+
+            // Transition Completed → Done
+            if exec.thread.state == ThreadState::Completed
+                && let Err(e) = exec.thread.transition_to(ThreadState::Done, None)
+            {
+                tracing::debug!(thread_id = %thread_id, "failed to transition to Done: {e}");
+            }
+            if exec.thread.state.is_terminal()
+                && let Some(metadata) = exec.thread.metadata.as_object_mut()
+            {
+                metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+                metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+            }
+            let terminal_event = exec.thread.events.iter().rev().find_map(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::StateChanged {
+                        to: ThreadState::Done | ThreadState::Failed,
+                        ..
+                    }
+                )
+                .then(|| event.clone())
+            });
 
             // Run retrospective trace analysis (non-LLM, always runs).
             // Issues are picked up by the self-improvement mission via event listener.
@@ -458,27 +738,11 @@ impl ThreadManager {
                 crate::executor::trace::log_trace_summary(&trace);
             }
 
-            // Transition Completed → Done
-            if exec.thread.state == crate::types::thread::ThreadState::Completed
-                && let Err(e) = exec
-                    .thread
-                    .transition_to(crate::types::thread::ThreadState::Done, None)
-            {
-                tracing::debug!(thread_id = %thread_id, "failed to transition to Done: {e}");
-            }
-
             // Write trace file if enabled
             if crate::executor::trace::is_trace_enabled() {
                 crate::executor::trace::log_trace_summary(&trace);
                 crate::executor::trace::write_trace(&trace);
             }
-
-            let outcome = match result {
-                Ok(outcome) => outcome,
-                Err(error) => ThreadOutcome::Failed {
-                    error: error.to_string(),
-                },
-            };
 
             crate::runtime::skill_feedback::record_terminal_skill_usage(
                 &mut exec.thread,
@@ -488,6 +752,26 @@ impl ThreadManager {
             )
             .await;
 
+            if exec.thread.state.is_terminal() {
+                const TERMINAL_LEASE_REASON: &str = "owning thread reached terminal state";
+                for lease_id in exec.thread.capability_leases.iter().copied() {
+                    leases_for_task
+                        .revoke(lease_id, TERMINAL_LEASE_REASON)
+                        .await;
+                    if let Err(e) = store_for_task
+                        .revoke_lease(lease_id, TERMINAL_LEASE_REASON)
+                        .await
+                    {
+                        tracing::debug!(
+                            thread_id = %thread_id,
+                            ?lease_id,
+                            "failed to persist terminal lease revocation: {e}"
+                        );
+                    }
+                }
+                leases_for_task.expire_stale().await;
+            }
+
             if let Err(e) = store_for_task.append_events(&exec.thread.events).await {
                 tracing::debug!(
                     thread_id = %thread_id,
@@ -496,11 +780,18 @@ impl ThreadManager {
             }
 
             // Save final thread state to store
-            if let Err(e) = store_for_task.save_thread(&exec.thread).await {
-                tracing::debug!(
-                    thread_id = %thread_id,
-                    "failed to save final thread state: {e}"
-                );
+            let thread_saved = match store_for_task.save_thread(&exec.thread).await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::debug!(
+                        thread_id = %thread_id,
+                        "failed to save final thread state: {e}"
+                    );
+                    false
+                }
+            };
+            if thread_saved && let Some(event) = terminal_event {
+                let _ = event_tx.send(event);
             }
 
             completed.write().await.insert(thread_id, outcome.clone());
@@ -559,6 +850,124 @@ impl ThreadManager {
             });
         }
         self.request_stop(thread_id).await
+    }
+
+    /// Finalize a persisted waiting/suspended thread when external policy stops it.
+    pub async fn finalize_waiting_thread_as_stopped(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let resume_lock = self.resume_lock(thread_id).await;
+        let _resume_guard = resume_lock.lock().await;
+        if self.is_running(thread_id).await {
+            return Err(EngineError::Thread(
+                crate::types::error::ThreadError::AlreadyRunning(thread_id),
+            ));
+        }
+
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .await?
+            .ok_or(EngineError::ThreadNotFound(thread_id))?;
+        if !thread.is_owned_by(user_id) {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        if thread.state.is_terminal() {
+            return Ok(());
+        }
+        if !matches!(thread.state, ThreadState::Waiting | ThreadState::Suspended) {
+            return Err(EngineError::Store {
+                reason: format!(
+                    "thread {thread_id} cannot be externally stopped from {:?}",
+                    thread.state
+                ),
+            });
+        }
+
+        let new_event_start = thread.events.len();
+        thread.transition_to(ThreadState::Completed, Some("execution stopped".into()))?;
+        thread.transition_to(ThreadState::Done, None)?;
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+        }
+        self.store.save_thread(&thread).await?;
+        if let Err(error) = self
+            .store
+            .append_events(&thread.events[new_event_start..])
+            .await
+        {
+            debug!(thread_id = %thread_id, %error, "failed to append external-stop events");
+        }
+        self.revoke_lease_ids(
+            &thread.capability_leases,
+            "owning thread externally stopped",
+        )
+        .await;
+        self.completed.write().await.remove(&thread_id);
+        if let Some(event) = thread.events.last().cloned() {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(())
+    }
+
+    /// Finalize a waiting thread as Failed (gate expiry/orphan reconciliation).
+    ///
+    /// Terminal transition with checkpoint strip, lease revocation, event
+    /// persistence, and broadcast — the same cleanup the stopped variant
+    /// performs, which direct store writes historically skipped (leaking
+    /// no-TTL leases and stale conversation tracking). Returns `Ok(false)`
+    /// when the thread is missing, not owned by `user_id`, not `Waiting`,
+    /// or currently running.
+    pub async fn finalize_waiting_thread_as_failed(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<bool, EngineError> {
+        let resume_lock = self.resume_lock(thread_id).await;
+        let _resume_guard = resume_lock.lock().await;
+        if self.is_running(thread_id).await {
+            return Ok(false);
+        }
+
+        let mut thread = match self.store.load_thread(thread_id).await? {
+            Some(thread) => thread,
+            None => return Ok(false),
+        };
+        if !thread.is_owned_by(user_id) || thread.state != ThreadState::Waiting {
+            return Ok(false);
+        }
+
+        let new_event_start = thread.events.len();
+        thread.transition_to(ThreadState::Failed, Some(reason.to_string()))?;
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.remove(RUNTIME_CHECKPOINT_METADATA_KEY);
+            metadata.remove(INITIAL_PERSISTED_STATE_METADATA_KEY);
+        }
+        self.store.save_thread(&thread).await?;
+        if let Err(error) = self
+            .store
+            .append_events(&thread.events[new_event_start..])
+            .await
+        {
+            debug!(thread_id = %thread_id, %error, "failed to append finalize-failed events");
+        }
+        self.revoke_lease_ids(
+            &thread.capability_leases,
+            "owning thread finalized as failed",
+        )
+        .await;
+        self.completed.write().await.remove(&thread_id);
+        if let Some(event) = thread.events.last().cloned() {
+            let _ = self.event_tx.send(event);
+        }
+        Ok(true)
     }
 
     /// Stop a running thread without ownership check (system operations).
@@ -652,6 +1061,7 @@ impl ThreadManager {
                     Err(e) => {
                         error!(thread_id = %thread_id, "thread task panicked: {e}");
                         Ok(ThreadOutcome::Failed {
+                            kind: ThreadFailureKind::Unknown,
                             error: format!("thread task panicked: {e}"),
                         })
                     }
@@ -813,6 +1223,45 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::Notify;
 
+    #[test]
+    fn waiting_checkpoint_reset_preserves_failure_recovery_state() {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            INITIAL_PERSISTED_STATE_METADATA_KEY.into(),
+            serde_json::json!({"trigger_payload": {"issue": 42}}),
+        );
+        metadata.insert(
+            RUNTIME_CHECKPOINT_METADATA_KEY.into(),
+            serde_json::json!({
+                "persisted_state": {
+                    "_failure_recovery": {
+                        "schema_version": 1,
+                        "terminal_attempted": ["no_progress"],
+                        "active_terminal": "no_progress",
+                        "gate_paused": true
+                    }
+                }
+            }),
+        );
+
+        clear_waiting_checkpoint_preserving_recovery(&mut metadata);
+
+        assert!(metadata.get(RUNTIME_CHECKPOINT_METADATA_KEY).is_none());
+        let metadata = serde_json::Value::Object(metadata);
+        assert_eq!(
+            metadata.pointer(&format!(
+                "/{INITIAL_PERSISTED_STATE_METADATA_KEY}/{RECOVERY_STATE_KEY}/active_terminal"
+            )),
+            Some(&serde_json::json!("no_progress"))
+        );
+        assert_eq!(
+            metadata.pointer(&format!(
+                "/{INITIAL_PERSISTED_STATE_METADATA_KEY}/trigger_payload/issue"
+            )),
+            Some(&serde_json::json!(42))
+        );
+    }
+
     // ── Mocks ───────────────────────────────────────────────
 
     struct MockLlm {
@@ -854,6 +1303,32 @@ mod tests {
         }
     }
 
+    struct ControlledLlm {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ControlledLlm {
+        async fn complete(
+            &self,
+            _: &[crate::types::message::ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(LlmOutput {
+                response: LlmResponse::Text("FINAL(\"done\")".into()),
+                usage: TokenUsage::default(),
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "controlled"
+        }
+    }
+
     struct MockEffects;
 
     #[async_trait::async_trait]
@@ -882,9 +1357,45 @@ mod tests {
         }
     }
 
+    struct ListingEffects;
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for ListingEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &crate::traits::effect::ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: String::new(),
+                output: serde_json::json!({}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![ActionDef {
+                name: "resumed_tool".into(),
+                description: "resumed tool".into(),
+                parameters_schema: serde_json::json!({}),
+                effects: vec![EffectType::ReadLocal],
+                requires_approval: false,
+            }])
+        }
+    }
+
     struct MockStore {
         threads: RwLock<HashMap<ThreadId, Thread>>,
         events: RwLock<HashMap<ThreadId, Vec<ThreadEvent>>>,
+        revoked_leases: RwLock<Vec<LeaseId>>,
+        fail_next_thread_save: AtomicBool,
     }
 
     impl MockStore {
@@ -892,6 +1403,8 @@ mod tests {
             Self {
                 threads: RwLock::new(HashMap::new()),
                 events: RwLock::new(HashMap::new()),
+                revoked_leases: RwLock::new(Vec::new()),
+                fail_next_thread_save: AtomicBool::new(false),
             }
         }
     }
@@ -899,6 +1412,11 @@ mod tests {
     #[async_trait::async_trait]
     impl Store for MockStore {
         async fn save_thread(&self, thread: &Thread) -> Result<(), EngineError> {
+            if self.fail_next_thread_save.swap(false, Ordering::SeqCst) {
+                return Err(EngineError::Store {
+                    reason: "injected thread save failure".into(),
+                });
+            }
             self.threads.write().await.insert(thread.id, thread.clone());
             Ok(())
         }
@@ -994,9 +1512,10 @@ mod tests {
         }
         async fn revoke_lease(
             &self,
-            _: crate::types::capability::LeaseId,
+            lease_id: crate::types::capability::LeaseId,
             _: &str,
         ) -> Result<(), EngineError> {
+            self.revoked_leases.write().await.push(lease_id);
             Ok(())
         }
         async fn save_mission(
@@ -1082,9 +1601,59 @@ mod tests {
     // ── Tests ───────────────────────────────────────────────
 
     #[tokio::test]
+    async fn finalize_waiting_thread_as_stopped_persists_terminal_state() {
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+        let mut thread = Thread::new(
+            "waiting",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        thread.metadata[RUNTIME_CHECKPOINT_METADATA_KEY] = serde_json::json!({"step": 1});
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        mgr.finalize_waiting_thread_as_stopped(thread_id, "user")
+            .await
+            .unwrap();
+
+        let saved = store.load_thread(thread_id).await.unwrap().unwrap();
+        assert_eq!(saved.state, ThreadState::Done);
+        assert!(saved.completed_at.is_some());
+        assert!(
+            saved
+                .metadata
+                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+                .is_none()
+        );
+        assert!(!mgr.is_running(thread_id).await);
+    }
+
+    #[tokio::test]
+    async fn resolving_window_tracks_cancellation() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let tid = ThreadId::new();
+        assert!(!mgr.is_resolving(tid).await);
+        let token = mgr.begin_resolving(tid).await;
+        assert!(mgr.is_resolving(tid).await);
+        assert!(!token.is_cancelled());
+        assert!(mgr.cancel_resolving(tid).await);
+        assert!(token.is_cancelled());
+        mgr.end_resolving(tid).await;
+        assert!(!mgr.is_resolving(tid).await);
+        assert!(!mgr.cancel_resolving(tid).await);
+    }
+
+    #[tokio::test]
     async fn spawn_and_join() {
-        let mgr = make_manager(MockLlm::text("Hello!"));
+        let store = Arc::new(MockStore::new());
+        let mgr = make_manager_with_store(MockLlm::text("FINAL(\"Hello!\")"), Arc::clone(&store));
         let project = ProjectId::new();
+        let mut events = mgr.subscribe_events();
 
         let tid = mgr
             .spawn_thread(
@@ -1100,6 +1669,401 @@ mod tests {
 
         let outcome = mgr.join_thread(tid).await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Hello!"));
+        assert!(mgr.leases.active_for_thread(tid).await.is_empty());
+
+        let terminal_event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("event channel should remain open");
+                if matches!(
+                    event.kind,
+                    EventKind::StateChanged {
+                        to: ThreadState::Done,
+                        ..
+                    }
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("terminal event should be broadcast");
+        let stored = store
+            .load_thread(terminal_event.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, ThreadState::Done);
+    }
+
+    #[tokio::test]
+    async fn spawn_leases_live_executor_actions_missing_from_registry() {
+        let store = Arc::new(MockStore::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let manager = ThreadManager::new(
+            Arc::new(ControlledLlm {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            Arc::new(ListingEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        );
+
+        let thread_id = manager
+            .spawn_thread(
+                "use recovered tool",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("thread should start");
+
+        let lease = manager
+            .leases
+            .find_lease_for_action(thread_id, "resumed_tool")
+            .await;
+        assert!(
+            lease.is_some(),
+            "model-advertised live tool must be leaseable"
+        );
+
+        release.notify_one();
+        manager.join_thread(thread_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_persistence_failure_rolls_back_granted_leases() {
+        let store = Arc::new(MockStore::new());
+        store.fail_next_thread_save.store(true, Ordering::SeqCst);
+        let mgr = make_manager_with_store(MockLlm::text("unused"), Arc::clone(&store));
+
+        let error = mgr
+            .spawn_thread(
+                "cannot persist",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected thread save failure"));
+        assert_eq!(store.revoked_leases.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execution_error_terminalizes_thread_and_revokes_leases() {
+        let store = Arc::new(MockStore::new());
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let llm = Arc::new(ControlledLlm {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let mgr = make_manager_with_store(llm, Arc::clone(&store));
+        let mut events = mgr.subscribe_events();
+        let thread_id = mgr
+            .spawn_thread(
+                "fail final persistence",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), entered.notified())
+            .await
+            .expect("LLM should start after initial thread persistence");
+        store.fail_next_thread_save.store(true, Ordering::SeqCst);
+        release.notify_one();
+
+        let outcome = mgr.join_thread(thread_id).await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Failed { .. }));
+        assert!(mgr.leases.active_for_thread(thread_id).await.is_empty());
+
+        let terminal_event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = events
+                    .recv()
+                    .await
+                    .expect("event channel should remain open");
+                if matches!(
+                    event.kind,
+                    EventKind::StateChanged {
+                        to: ThreadState::Failed,
+                        ..
+                    }
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .expect("failed terminal event should be broadcast");
+        let stored = store
+            .load_thread(terminal_event.thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, ThreadState::Failed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_starts_only_one_execution() {
+        let store = Arc::new(MockStore::new());
+        let mut thread = Thread::new(
+            "resume once",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mgr = make_manager_with_store(
+            Arc::new(ControlledLlm {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+            Arc::clone(&store),
+        );
+
+        let (first, second) = tokio::join!(
+            mgr.resume_thread(thread_id, "user", None, None, None),
+            mgr.resume_thread(thread_id, "user", None, None, None)
+        );
+
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(
+            matches!(first, Err(EngineError::Thread(crate::types::error::ThreadError::AlreadyRunning(id))) if id == thread_id)
+                || matches!(second, Err(EngineError::Thread(crate::types::error::ThreadError::AlreadyRunning(id))) if id == thread_id)
+        );
+        release.notify_one();
+        mgr.join_thread(thread_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_persistence_failure_rolls_back_leases_without_broadcasting_approval() {
+        let store = Arc::new(MockStore::new());
+        let mut thread = Thread::new(
+            "resume failure",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.transition_to(ThreadState::Waiting, None).unwrap();
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let mgr = ThreadManager::new(
+            MockLlm::text("unused"),
+            Arc::new(ListingEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        );
+        let mut events = mgr.subscribe_events();
+        store.fail_next_thread_save.store(true, Ordering::SeqCst);
+
+        let error = mgr
+            .resume_thread(thread_id, "user", None, Some(("call-1".into(), true)), None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("injected thread save failure"));
+        assert!(mgr.leases.active_for_thread(thread_id).await.is_empty());
+        assert_eq!(store.revoked_leases.read().await.len(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err(),
+            "unpersisted approval must not be broadcast"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_done_event_is_broadcast() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let project = ProjectId::new();
+        let mut receiver = mgr.subscribe_events();
+
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                project,
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        // The mission event listener depends on this broadcast: without it,
+        // learning missions never fire on thread completion.
+        let seen = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = receiver.recv().await.unwrap();
+                if event.thread_id == tid
+                    && matches!(
+                        event.kind,
+                        EventKind::StateChanged {
+                            to: ThreadState::Done,
+                            ..
+                        }
+                    )
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(seen.is_ok(), "expected terminal Done broadcast");
+        let _ = mgr.join_thread(tid).await;
+    }
+
+    #[tokio::test]
+    async fn leases_revoked_on_terminal_transition() {
+        let store = Arc::new(MockStore::new());
+        let leases = Arc::new(LeaseManager::new());
+        let mut caps = CapabilityRegistry::new();
+        caps.register(Capability {
+            name: "test".into(),
+            description: "Test capability".into(),
+            actions: vec![ActionDef {
+                name: "test_tool".into(),
+                description: "Test".into(),
+                parameters_schema: serde_json::json!({}),
+                effects: vec![EffectType::ReadLocal],
+                requires_approval: false,
+            }],
+            knowledge: vec![],
+            policies: vec![],
+        });
+        let mgr = ThreadManager::new(
+            MockLlm::text("done"),
+            Arc::new(MockEffects),
+            Arc::clone(&store) as Arc<dyn Store>,
+            Arc::new(caps),
+            Arc::clone(&leases),
+            Arc::new(PolicyEngine::new()),
+        );
+
+        let tid = mgr
+            .spawn_thread(
+                "test",
+                ThreadType::Foreground,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+            )
+            .await
+            .unwrap();
+
+        let outcome = mgr.join_thread(tid).await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+
+        // Leases were granted at spawn (recorded on the thread) and must all be
+        // revoked once the thread is terminal — no permanent-lease leak.
+        let saved = store.load_thread(tid).await.unwrap().unwrap();
+        assert!(
+            !saved.capability_leases.is_empty(),
+            "thread should have recorded granted leases"
+        );
+        assert!(
+            leases.active_for_thread(tid).await.is_empty(),
+            "terminal thread must hold no active leases"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_initial_state_seeds_runtime_checkpoint() {
+        // Blocks inside complete() until released, so the thread cannot reach
+        // the terminal cleanup (which consumes the checkpoint) mid-assertion.
+        struct BlockingLlm {
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmBackend for BlockingLlm {
+            async fn complete(
+                &self,
+                _: &[crate::types::message::ThreadMessage],
+                _: &[ActionDef],
+                _: &LlmCallConfig,
+            ) -> Result<LlmOutput, EngineError> {
+                self.release.notified().await;
+                Ok(LlmOutput {
+                    response: LlmResponse::Text("FINAL(\"done\")".into()),
+                    usage: TokenUsage::default(),
+                })
+            }
+
+            fn model_name(&self) -> &str {
+                "blocking"
+            }
+        }
+
+        let store = Arc::new(MockStore::new());
+        let llm = Arc::new(BlockingLlm {
+            release: tokio::sync::Notify::new(),
+        });
+        let mgr = make_manager_with_store(llm.clone(), Arc::clone(&store));
+
+        let seed = serde_json::json!({"trigger_payload": {"issue": 42}});
+        let tid = mgr
+            .spawn_thread_with_history(
+                "mission goal",
+                ThreadType::Mission,
+                ProjectId::new(),
+                ThreadConfig::default(),
+                None,
+                "user",
+                Vec::new(),
+                None,
+                Some(seed.clone()),
+            )
+            .await
+            .unwrap();
+
+        // While the run is blocked, the seed must be visible in the persisted
+        // runtime-checkpoint metadata — exactly where
+        // `ExecutionLoop::load_runtime_checkpoint` reads it on first run.
+        let saved = store.load_thread(tid).await.unwrap().unwrap();
+        assert_eq!(
+            saved.metadata["runtime_checkpoint"]["persisted_state"],
+            seed
+        );
+
+        llm.release.notify_one();
+        let outcome = mgr.join_thread(tid).await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
     }
 
     #[tokio::test]
@@ -1266,6 +2230,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
@@ -1321,6 +2286,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
@@ -1489,6 +2455,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }

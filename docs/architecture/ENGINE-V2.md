@@ -3,7 +3,7 @@
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
-uses Engine V2 by default when enabled. The bridge router (`src/bridge/router.rs`)
+uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
 present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching).
 
@@ -33,10 +33,10 @@ ic/crates/lunarwing_engine/src/
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
     mission.rs            Mission, MissionId, MissionCadence, MissionStatus
-    error.rs              EngineError, ThreadError, StepError, CapabilityError
+    error.rs              EngineError, ModelFailureKind, ThreadError, StepError, CapabilityError
   traits/                 External dependency abstractions (host implements these)
     llm.rs                LlmBackend trait
-    store.rs              Store trait (31 CRUD methods)
+    store.rs              Store trait (33 CRUD methods)
     effect.rs             EffectExecutor trait
   capability/             Capability management
     registry.rs           CapabilityRegistry (register/get/list capabilities)
@@ -53,7 +53,7 @@ ic/crates/lunarwing_engine/src/
     conversation.rs       ConversationManager (routes UI messages to threads)
     mission.rs            MissionManager (long-running goals that spawn threads on cadence)
     tree.rs               ThreadTree (parent-child relationships)
-    messaging.rs          ThreadSignal, ThreadOutcome, signal channels
+    messaging.rs          ThreadSignal, ThreadOutcome, ThreadFailureKind, signal channels
     skill_feedback.rs     Skill usage feedback events (feature-gated)
   executor/               Step execution
     loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
@@ -77,11 +77,13 @@ ic/crates/lunarwing_engine/src/
 ```
 Created --> Running --> Waiting --> Running (resume)
                    --> Suspended --> Running (resume)
-                   --> Completed --> Done
+                   --> Completed --> Done | Failed (finalization error)
                    --> Failed
 ```
 
-All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `ThreadError::InvalidTransition`.
+All transitions are validated by `ThreadState::can_transition_to()`. Terminal states: `Done`, `Failed`. Invalid transitions return `EngineError::InvalidTransition`.
+`Created`, `Running`, `Waiting`, `Suspended`, and `Completed` can transition to
+`Failed`; the last case closes failures during final persistence.
 
 ### Thread Types
 
@@ -98,12 +100,12 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 ```
 1. Check signals (Stop, InjectMessage) via mpsc::Receiver
 2. Build context (messages + available actions from active leases)
-3. Call LLM via LlmBackend::complete()
-4. If Text: check tool intent nudge, return if final response
+3. Call LLM via `LlmBackend::complete_stream()` (with a `complete()` fallback for non-streaming backends)
+4. If Text: check tool-intent and leaked-prose recovery, return accepted final response
 5. If ActionCalls (Tier 0): find lease -> check policy -> consume use -> execute -> record
 6. If Code (Tier 1): execute Python via Monty with context-as-variables
 7. Record Step, emit ThreadEvents
-8. Repeat until: text response, stop signal, max iterations, or approval needed
+8. Repeat until: accepted text response, stop signal, recovered terminal limit, typed failure, or approval needed
 ```
 
 ### Two Execution Tiers
@@ -125,11 +127,14 @@ Key characteristics:
 - **Context as variables**: thread messages injected as `context` Python variable, thread goal as `goal`, step index as `step_number`, prior action results as `previous_results` dict
 - **Tool dispatch**: unknown function calls suspend the VM, go through lease check + policy check + `EffectExecutor`, then result returns to Python
 - **Recursive LLM calls**: `llm_query(prompt, context)` suspends the VM, spawns a single-shot LLM call, returns text as a Python string. Results stay as variables (symbolic composition), not injected into the parent's attention window
-- **Compact output metadata**: between code steps, only a summary is added to chat context (e.g. `"[code output] stdout (4532 chars): The results show..."`) to prevent context bloat
+- **Compact output metadata**: between code steps, only a summary is added to chat context (`[FULL OUTPUT: N chars]`, `[TRUNCATED: last 8000 of N chars shown]`, a short return-value preview, or `[code executed, no output]`) to prevent context bloat
 - **Explicit termination**: `FINAL(answer)` or `FINAL_VAR(name)` for output
 - **Resource limits**: user CodeAct blocks default to a 30s timeout, 64MB memory,
   and 1M allocations. The orchestrator VM has a separate 600s/128MB/5M budget.
   Monty execution is wrapped in `catch_unwind` for panic safety.
+- **Action limit**: each model step can attempt at most 50 tool actions. The cap
+  applies independently to structured batches, CodeAct blocks, and the combined
+  single/parallel action host calls made by the Python orchestrator.
 
 ### Python Orchestrator
 
@@ -143,10 +148,43 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   `__list_skills__`, `__record_skill_usage__`, `__propose_skill_patch__`, and
   `__propose_skill_prune__`. Skill mutation/usage tracking is inert unless
   `SKILL_SELF_IMPROVEMENT=true`.
-- Can be patched by the self-improvement mission and versioned in the Store
+- Can be patched by the self-improvement mission and versioned in the Store when
+  `ORCHESTRATOR_SELF_MODIFY=true`
 - Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
-- Async dispatch of tool calls with `asyncio.gather()` for parallel execution
+- Nudges short roleplay or retry prose back into a `repl` block for non-conversational
+  goals, with a default two-attempt cap; substantive prose and short conversational
+  goals remain valid terminal responses. Syntax-invalid `repl` blocks use the same
+  bounded correction before terminal delivery through shared channels such as XMPP.
+- Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
+
+### Failure Recovery
+
+Engine V2 keeps provider retry, fallback-model selection, cooldown, and circuit
+breaking in the host LLM stack. When those paths return a final provider error,
+the bridge maps it to `ModelFailureKind`. The Python orchestrator receives only
+that safe class and fixed recovery text, never provider-supplied diagnostics.
+
+- Recoverable model failures get one extra model request. Context-overflow
+  recovery first replaces protocol history with a bounded plain-text view of
+  the original goal and recent context. A second failure becomes a typed
+  `ThreadFailureKind::Model` outcome with actionable user text.
+- Authentication and rejected-request failures skip model retry because an
+  unchanged request cannot repair credentials or compatibility. Their terminal
+  text names the operator action required.
+- Reaching `max_iterations` schedules one final tool-capable model request before
+  returning `ThreadOutcome::MaxIterations`.
+- Three consecutive code steps or structured action batches with no successful
+  work schedule one no-progress warning. Repeating failure on warning turn
+  returns `ThreadFailureKind::NoProgress`; successful work resets detector.
+- Missing/exhausted capability leases and policy denials return actionable model
+  observations naming allowed next steps instead of opaque denial strings.
+
+One-shot accounting lives in `state["_failure_recovery"]` with pending and active
+warning states. It is written before recovery request, consumed only after
+successful model response, and retained when approval/authentication resume
+discards rest of live checkpoint. Terminal cleanup removes it with normal
+runtime checkpoint state.
 
 ## Capability Leases
 
@@ -167,7 +205,7 @@ CapabilityLease {
 
 1. **Grant**: `LeaseManager::grant()` creates a lease for a thread
 2. **Check**: `LeaseManager::check()` verifies the lease is valid (not expired, not revoked, uses remaining)
-3. **Consume**: `LeaseManager::consume()` decrements the use counter
+3. **Consume**: `LeaseManager::consume_use()` decrements the use counter
 4. **Revoke**: `LeaseManager::revoke()` permanently disables the lease
 5. **Expire**: `LeaseManager::expire_stale()` cleans up time-expired leases
 
@@ -180,9 +218,9 @@ The `PolicyEngine` evaluates actions against leases deterministically:
 - Every action declares its side effects via `EffectType`. The policy engine uses these for allow/deny decisions
 - **Provenance types**: origin labels exist for user, system, tool, LLM, and
   memory-retrieval data. `PolicyEngine::evaluate_with_provenance()` implements
-  targeted approval rules for LLM-generated or tool-sourced data, but the
-  production execution paths still call `evaluate()`, so provenance-aware
-  enforcement is not wired into runtime action dispatch yet.
+  targeted approval rules for LLM-generated or tool-sourced data. Structured,
+  scripting, and orchestrator action dispatch all call the provenance-aware
+  evaluator for LLM-generated action inputs.
 
 ## Execution Gates
 
@@ -239,16 +277,31 @@ boundaries.
 `MissionManager::ensure_learning_missions()` provisions three baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
+These system-managed missions are recurring: one successful event run cannot
+mark them complete. Startup reconciliation repairs older terminal records and
+refreshes their compiled prompt, cadence, success criteria, and daily budget
+while preserving operator pauses and mission history.
+Event payloads are seeded into the mission thread's initial persisted state as
+`state["trigger_payload"]` before execution. Terminal thread events are published
+after final thread persistence so listeners can load complete source state.
+Initial mission state remains available across approval/authentication pauses,
+while normal terminal cleanup removes it. Conversation-insight cadence is
+tracked per project and user, preventing one user's completions from advancing
+another user's mission.
 
 ### Error Diagnosis (`self-improvement`)
 
-- **Trigger**: fires when a thread completes with trace issues
+- **Trigger**: fires when a thread completes with actionable Warning/Error trace
+  issues. Info observations remain trace telemetry and do not consume mission
+  budget.
 - **Action**: diagnoses root cause and applies prompt overlays or orchestrator patches
 
 ### Skill Extraction (`skill-extraction`)
 
 - **Trigger**: fires when a thread succeeds with 5+ steps and 3+ tool actions
-- **Action**: extracts reusable skills with activation metadata, CodeAct code snippets, and domain tags
+- **Action**: extracts reusable skills with activation metadata, evidence-backed
+  optional CodeAct snippets, and domain tags. The bounded trigger summary cannot
+  be expanded into invented commands, arguments, outputs, regexes, or snippets.
 - **Output**: stored as `DocType::Skill` MemoryDoc
 
 ### Conversation Insights (`conversation-insights`)
@@ -264,13 +317,21 @@ missions. They are event-driven; not every mission runs after thread completion.
 
 ### Skill Maintenance (`skill-maintenance`, feature-gated)
 
-- **Trigger**: `thread_completed_with_issues` events when
-  `SKILL_SELF_IMPROVEMENT=true`
+- **Trigger**: dedicated `skill_maintenance_due` events, emitted only when at
+  least one prune candidate exists and `SKILL_SELF_IMPROVEMENT=true`
 - **Action**: identifies confidently dead or quarantined skills and stages
   user-approved prune/archive proposals
 
 `self-improvement` is also feature-gated. With the flag disabled, skill usage
 tracking, automatic demotion, patch proposals, and prune proposals are inert.
+
+Capability leases are revoked in memory and persistence when their owning thread
+reaches `Done` or `Failed`. Startup cleanup also reconciles valid leases left by
+older versions for terminal or missing threads; waiting and suspended thread
+leases remain active for resume. Spawn/resume persistence failures roll back any
+leases granted during that attempt. Startup also revokes persisted leases absent
+from their owner's `capability_leases` list. Per-thread resume locks prevent
+duplicate approval/authentication callbacks from starting concurrent loops.
 
 ## V2 Skill System
 
@@ -312,9 +373,12 @@ Confidence: `1.0` if no recorded outcomes (benefit of the doubt), else `success_
 
 ## Bridge Adapters
 
-The daemon integrates the engine via three adapters in `src/bridge/`:
+The daemon integrates the engine via three adapters in `ic/src/bridge/`
+(the directory also hosts the SSH subsystem — `ssh.rs`, `ssh_agent.rs`,
+`ssh_api.rs`, `ssh_client.rs`, `ssh_hostkeys.rs`, `ssh_secrets.rs` — plus
+`auth_manager.rs` and `skill_migration.rs`, which are not engine adapters):
 
-### LlmBridgeAdapter (`src/bridge/llm_adapter.rs`)
+### LlmBridgeAdapter (`ic/src/bridge/llm_adapter.rs`)
 
 Wraps `LlmProvider` as `LlmBackend`:
 - Converts between `ThreadMessage` and `ChatMessage`
@@ -323,16 +387,16 @@ Wraps `LlmProvider` as `LlmBackend`:
 - Returns provider text to the engine; `LlmResponse::from_text()` in
   `types/step.rs` classifies fenced Python as CodeAct code
 
-### EffectBridgeAdapter (`src/bridge/effect_adapter.rs`)
+### EffectBridgeAdapter (`ic/src/bridge/effect_adapter.rs`)
 
 Wraps tool execution and safety layer as `EffectExecutor`:
 - Maps engine action calls to tool registry execution
 - Applies safety checks, timeout, serialization
 
-### HybridStore (`src/bridge/store_adapter.rs`)
+### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 31 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 33 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
@@ -415,8 +479,8 @@ The engine defines three traits that the host crate implements. This boundary en
 
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
-| `LlmBackend` | `complete(messages, actions, config) -> LlmOutput` | `LlmProvider` |
-| `Store` | 31 CRUD methods for all engine types | Workspace-backed `HybridStore` |
+| `LlmBackend` | `complete(...) -> LlmOutput`; `complete_stream(...) -> LlmStream` | `LlmProvider` |
+| `Store` | 33 CRUD methods for all engine types | Workspace-backed `HybridStore` |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -440,10 +504,14 @@ in-memory cache entries to bound RAM; workspace files remain. `load_thread()`,
 
 ## Event Sourcing
 
-Every thread records a complete event log via `ThreadEvent`. The `EventKind` enum has 20 variants covering the full lifecycle: thread creation, state transitions, message receipt, LLM calls, action execution, gate decisions, mission triggers, and more.
+Threads persist significant lifecycle and execution events via `ThreadEvent`.
+The 20 `EventKind` variants cover state, step, action, lease, message, child,
+approval, self-improvement, skill-activation, and orchestrator-rollback events.
+`ResponseDelta` is broadcast for live delivery but is not persisted.
 
 This enables:
-- Full replay of any thread's execution history
+- Inspection of recorded thread execution history (mid-thread replay/resume is
+  not generally supported)
 - Retrospective analysis via `executor/trace.rs`
 - Learning mission triggers based on event patterns
 - Debugging and auditing
@@ -456,11 +524,14 @@ ENGINE_V2_CHANNELS=            # Gateway only (default)
 ENGINE_V2_CHANNELS=xmpp        # Add XMPP
 ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle
+ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
 ```
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time.
 
 ## Build & Test
+
+Run these commands from `ic/`:
 
 ```bash
 taskset -c 0-5 cargo check -j6 -p lunarwing_engine
@@ -472,7 +543,7 @@ taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --test-threads=6
 
 1. **No dependency on main crate** -- clean separation, testable in isolation
 2. **No safety logic in engine** -- sanitization/leak detection applied at the adapter boundary (`EffectExecutor` impl)
-3. **Event sourcing from day one** -- every thread records a complete event log
+3. **Event sourcing from day one** -- threads persist significant lifecycle and execution events
 4. **Tier 0 + Tier 1** -- structured tool calls and embedded Python via Monty coexist
 5. **Engine owns its message type** -- `ThreadMessage` is simpler than `ChatMessage`; bridge adapters handle conversion
 6. **RLM pattern** -- context as variable (not attention input), recursive `llm_query()`, compact output metadata between steps

@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 use crate::secrets::{CredentialLocation, CredentialMapping};
 use crate::tools::wasm::{
     Capabilities, EndpointPattern, HttpCapability, RateLimitConfig, SecretsCapability,
-    SshCapability, ToolInvokeCapability, WebhookCapability, WorkspaceCapability,
+    SshCapability, ToolInvokeCapability, WasmApprovalPolicy, WebhookCapability,
+    WorkspaceCapability,
 };
 
 /// Root schema for a capabilities JSON file.
@@ -54,6 +55,10 @@ pub struct CapabilitiesFile {
     /// WIT interface version this extension was compiled against (semver).
     #[serde(default)]
     pub wit_version: Option<String>,
+
+    /// Approval policy applied before invoking the tool.
+    #[serde(default)]
+    pub approval: Option<WasmApprovalPolicy>,
 
     /// HTTP request capability.
     #[serde(default)]
@@ -154,6 +159,7 @@ impl CapabilitiesFile {
         if let Some(inner) = self.capabilities.take() {
             let inner = inner.resolve_nested_inner(depth + 1);
             self.description = self.description.or(inner.description);
+            self.approval = self.approval.or(inner.approval);
             self.http = self.http.or(inner.http);
             self.secrets = self.secrets.or(inner.secrets);
             self.tool_invoke = self.tool_invoke.or(inner.tool_invoke);
@@ -221,7 +227,10 @@ impl CapabilitiesFile {
 
     /// Convert to runtime Capabilities.
     pub fn to_capabilities(&self) -> Capabilities {
-        let mut caps = Capabilities::default();
+        let mut caps = Capabilities {
+            approval: self.approval.unwrap_or_default(),
+            ..Capabilities::default()
+        };
 
         if let Some(http) = &self.http {
             caps.http = Some(http.to_http_capability());
@@ -342,7 +351,9 @@ pub struct EndpointPatternSchema {
     /// Hostname (e.g., "api.example.com" or "*.example.com").
     pub host: String,
 
-    /// Optional path prefix (e.g., "/api/").
+    /// Optional path prefix (e.g., "/api/"). A leading `*` (e.g., "*/api/")
+    /// matches the remainder anywhere in the path at a segment boundary,
+    /// for servers deployed under an arbitrary base path.
     #[serde(default)]
     pub path_prefix: Option<String>,
 
@@ -777,6 +788,7 @@ fn default_tool_setup_field_input_type() -> ToolSetupFieldInputType {
 
 #[cfg(test)]
 mod tests {
+    use crate::tools::wasm::WasmApprovalPolicy;
     use crate::tools::wasm::capabilities_schema::{CapabilitiesFile, CredentialLocationSchema};
 
     #[test]
@@ -785,6 +797,16 @@ mod tests {
         let caps = CapabilitiesFile::from_json(json).unwrap();
         assert!(caps.http.is_none());
         assert!(caps.secrets.is_none());
+        assert_eq!(caps.to_capabilities().approval, WasmApprovalPolicy::Never);
+    }
+
+    #[test]
+    fn test_parse_nested_approval_policy() {
+        let json = r#"{
+            "capabilities": { "approval": "unless_auto_approved" }
+        }"#;
+        let caps = CapabilitiesFile::from_json(json).unwrap().to_capabilities();
+        assert_eq!(caps.approval, WasmApprovalPolicy::UnlessAutoApproved);
     }
 
     #[test]
@@ -802,6 +824,22 @@ mod tests {
         assert!(caps.ssh.is_none());
         assert!(caps.auth.is_none());
         assert!(caps.setup.is_none());
+    }
+
+    #[test]
+    fn gitlab_sidecar_pins_host_and_gates_approval() {
+        let json = include_str!("../../../tools-src/gitlab/gitlab-tool.capabilities.json");
+        let file = CapabilitiesFile::from_json(json).expect("GitLab sidecar should parse");
+        let caps = file.to_capabilities();
+
+        // Calls prompt by default, but the user may always-allow the tool
+        // (per-session or via global auto-approve config).
+        assert_eq!(caps.approval, WasmApprovalPolicy::UnlessAutoApproved);
+        let http = caps.http.expect("GitLab HTTP capability");
+        assert_eq!(http.allowlist.len(), 1);
+        assert_eq!(http.allowlist[0].host, "git.lunarwing.org");
+        assert_eq!(http.allowlist[0].path_prefix.as_deref(), Some("/api/v4/"));
+        assert!(http.credentials.contains_key("gitlab_token"));
     }
 
     #[test]

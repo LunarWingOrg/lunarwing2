@@ -1,8 +1,10 @@
 # External Worker Upgrades — Progress Checklist
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL RECORD.**
-> All waves remain present in current source. Test counts below are
-> point-in-time verification snapshots, and Codex references are historical.
+> **Current status (updated 2026-08-04): IMPLEMENTED / HISTORICAL RECORD.**
+> The shared orchestrator upgrades remain present. Test counts below are
+> point-in-time snapshots; Codex was removed and Nanocode was later retired.
+> Their completed worker-specific tasks remain documented as history. Supported
+> persistent workers are now Pebble, OpenCode, and Kimi Code.
 
 > Last updated: 2026-06-22. Tracks completed and remaining tasks for the external worker upgrades plan.
 

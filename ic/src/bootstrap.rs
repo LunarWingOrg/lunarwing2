@@ -19,9 +19,81 @@ use std::sync::LazyLock;
 
 const LUNARWING_BASE_DIR_ENV: &str = "LUNARWING_BASE_DIR";
 const LEGACY_IRONCLAW_BASE_DIR_ENV: &str = "IRONCLAW_BASE_DIR";
+const TOKIO_WORKER_THREADS_ENV: &str = "LUNARWING_TOKIO_WORKER_THREADS";
+const TOKIO_MAX_BLOCKING_THREADS_ENV: &str = "LUNARWING_TOKIO_MAX_BLOCKING_THREADS";
+const DEFAULT_TOKIO_WORKER_LIMIT: usize = 8;
+const DEFAULT_TOKIO_BLOCKING_LIMIT: usize = 4;
 
 /// Lazily computed LunarWing base directory, cached for the lifetime of the process.
 static LUNARWING_BASE_DIR: LazyLock<PathBuf> = LazyLock::new(compute_lunarwing_base_dir);
+
+/// Resolve main Tokio runtime worker count before asynchronous startup begins.
+///
+/// Host-sized defaults create unnecessary idle threads and allocator arenas on
+/// large tenant hosts. Eight workers preserve current behavior on typical
+/// deployments while keeping baseline memory independent of host CPU count.
+pub fn tokio_worker_threads() -> Result<usize, String> {
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    resolve_tokio_worker_threads(
+        std::env::var_os(TOKIO_WORKER_THREADS_ENV).as_deref(),
+        available,
+    )
+}
+
+/// Resolve the upper bound for Tokio's lazily-created blocking thread pool.
+pub fn tokio_max_blocking_threads() -> Result<usize, String> {
+    let available = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1);
+    resolve_tokio_max_blocking_threads(
+        std::env::var_os(TOKIO_MAX_BLOCKING_THREADS_ENV).as_deref(),
+        available,
+    )
+}
+
+fn resolve_tokio_worker_threads(
+    configured: Option<&std::ffi::OsStr>,
+    available: usize,
+) -> Result<usize, String> {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(available.clamp(1, DEFAULT_TOKIO_WORKER_LIMIT));
+    };
+    let configured = configured
+        .to_str()
+        .ok_or_else(|| format!("{TOKIO_WORKER_THREADS_ENV} must contain valid UTF-8"))?;
+    let workers = configured
+        .parse::<usize>()
+        .map_err(|_| format!("{TOKIO_WORKER_THREADS_ENV} must be a positive integer"))?;
+    if workers == 0 {
+        return Err(format!(
+            "{TOKIO_WORKER_THREADS_ENV} must be a positive integer"
+        ));
+    }
+    Ok(workers)
+}
+
+fn resolve_tokio_max_blocking_threads(
+    configured: Option<&std::ffi::OsStr>,
+    available: usize,
+) -> Result<usize, String> {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(available.clamp(1, DEFAULT_TOKIO_BLOCKING_LIMIT));
+    };
+    let configured = configured
+        .to_str()
+        .ok_or_else(|| format!("{TOKIO_MAX_BLOCKING_THREADS_ENV} must contain valid UTF-8"))?;
+    let threads = configured
+        .parse::<usize>()
+        .map_err(|_| format!("{TOKIO_MAX_BLOCKING_THREADS_ENV} must be a positive integer"))?;
+    if threads == 0 {
+        return Err(format!(
+            "{TOKIO_MAX_BLOCKING_THREADS_ENV} must be a positive integer"
+        ));
+    }
+    Ok(threads)
+}
 
 /// Compute the LunarWing base directory from environment.
 ///
@@ -603,6 +675,42 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn tokio_workers_are_bounded_by_default() {
+        assert_eq!(resolve_tokio_worker_threads(None, 1).unwrap(), 1);
+        assert_eq!(resolve_tokio_worker_threads(None, 8).unwrap(), 8);
+        assert_eq!(resolve_tokio_worker_threads(None, 64).unwrap(), 8);
+    }
+
+    #[test]
+    fn tokio_workers_accept_valid_override() {
+        assert_eq!(
+            resolve_tokio_worker_threads(Some(std::ffi::OsStr::new("16")), 64).unwrap(),
+            16
+        );
+        assert!(resolve_tokio_worker_threads(Some(std::ffi::OsStr::new("0")), 64).is_err());
+        assert!(resolve_tokio_worker_threads(Some(std::ffi::OsStr::new("many")), 64).is_err());
+    }
+
+    #[test]
+    fn tokio_blocking_threads_are_bounded_by_default() {
+        assert_eq!(resolve_tokio_max_blocking_threads(None, 1).unwrap(), 1);
+        assert_eq!(resolve_tokio_max_blocking_threads(None, 4).unwrap(), 4);
+        assert_eq!(resolve_tokio_max_blocking_threads(None, 64).unwrap(), 4);
+    }
+
+    #[test]
+    fn tokio_blocking_threads_accept_valid_override() {
+        assert_eq!(
+            resolve_tokio_max_blocking_threads(Some(std::ffi::OsStr::new("12")), 64).unwrap(),
+            12
+        );
+        assert!(resolve_tokio_max_blocking_threads(Some(std::ffi::OsStr::new("0")), 64).is_err());
+        assert!(
+            resolve_tokio_max_blocking_threads(Some(std::ffi::OsStr::new("many")), 64).is_err()
+        );
+    }
 
     #[test]
     fn test_save_and_load_database_url() {

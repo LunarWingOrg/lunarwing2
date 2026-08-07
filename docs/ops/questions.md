@@ -1,6 +1,11 @@
 # Questions
 
-Now let me catalog the changes the dev loop script needs for v2/Codeberg. Looking at lunarw
+> **Historical scratch note.** This predates the completed migration to the
+> self-hosted GitLab project and does not describe the current development loop,
+> authentication, merge-request tooling, checkout path, or goals file. Retained
+> only as migration provenance.
+
+Now let me catalog the changes the dev loop script needed for v2/Codeberg. Looking at lunarw
 ing-item.sh, here's what I see:                                                                
                                                                                                
     CURRENT → NEEDED                                                                           

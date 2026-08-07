@@ -1,45 +1,37 @@
-# Human Delay Mode - Documentation Index
+# Supervised Mode
 
-A quick overview of the Human Delay Mode feature and how to work with it.
+Supervised mode is LunarWing's global human-in-the-loop setting for tool execution. When enabled, every tool action requires explicit approval, regardless of the tool's normal approval tier or an auto-approve setting.
 
-## What is Human Delay Mode?
+The older "Human Delay Mode" phase documents referenced by this file no longer exist. The implemented feature is named **supervised mode** in the CLI, runtime configuration, thread state, Engine V2 gate context, and effect adapter.
 
-Human Delay Mode (HDM) adds human-in-the-loop approval to LunarWing tool execution. Tools can be configured to pause and require explicit human approval before executing — useful for safety-critical operations, sensitive commands, or simply adding a checkpoint before any action runs.
+## Enable It
 
-## Quick Links
-
-| Document | Purpose |
-|----------|---------|
-| [human-delay-mode-phase1-test-checklist.md](human-delay-mode-phase1-test-checklist.md) | Step-by-step instructions to test Phase 1 implementation |
-| [human-delay-mode-phase2-plan.md](human-delay-mode-phase2-plan.md) | Future work: timeouts, UI, gate pipeline integration |
-| [human-delay-mode-testing-guide.md](human-delay-mode-testing-guide.md) | How to run tests and verify the feature works |
-
-## Current Status (Phase 1)
-
-- ✅ `supervised_mode` flag in ThreadConfig
-- ✅ CLI flag (`--supervised`) and env var (`AGENT_SUPERVISED_MODE`)
-- ✅ Inline approval gating in effect adapter
-- ✅ Overrides auto-approve settings
-- ⏳ Timeout expiration (Phase 2)
-- ⏳ Gate pipeline integration (Phase 2)
-- ⏳ Modify UI option (Phase 2)
-
-## Usage
+Start LunarWing with the CLI flag:
 
 ```bash
-# Start with supervised mode via env var
-AGENT_SUPERVISED_MODE=true lunarwing
-
-# Start with supervised mode via CLI flag
 lunarwing --supervised
 ```
 
-## Next Steps
+Or set the startup environment value:
 
-1. **Test Phase 1** — Use the [test checklist](human-delay-mode-phase1-test-checklist.md) to verify everything works
-2. **Run `cargo test`** — Follow the [testing guide](human-delay-mode-testing-guide.md)
-3. **Plan Phase 2** — Review the [phase 2 plan](human-delay-mode-phase2-plan.md) for what's next
+```bash
+AGENT_SUPERVISED_MODE=true lunarwing
+```
 
----
+The CLI flag installs the same runtime configuration override. Enable it in the service environment when supervised behavior must persist across service restarts.
 
-*Part of LunarWing's safety and control features. See also: `docs/guides/security.md` for general security practices.*
+## Behavior
+
+- New thread configuration is marked `supervised_mode` when `AGENT_SUPERVISED_MODE` is `true` or `1`.
+- Every proposed tool action is sent through the approval path, including tools whose normal policy would not require approval.
+- Supervised mode takes precedence over global auto-approve behavior.
+- Approving an action authorizes that resolved action; it does not disable supervised mode for later actions.
+- Rejections return through the normal tool-result path so the agent can respond without running the rejected action.
+
+Approvals can be handled through the active channel or authenticated web experience according to the deployment's normal approval flow. Do not treat an approval request as proof that an action already ran.
+
+## Operational Notes
+
+Supervised mode is a safety control, not a substitute for least-privilege tool policies, sandboxing, or channel authentication. Operators should still restrict dangerous tools and protect approval channels.
+
+To verify the active startup configuration, inspect the service definition without exposing secret-bearing environment values, then run a harmless tool request and confirm it pauses for approval. On multi-tenant hosts, use `ic/scripts/lunarwing-mt-admin.sh status <tenant>` for tenant diagnostics rather than bare system-bus `systemctl`.

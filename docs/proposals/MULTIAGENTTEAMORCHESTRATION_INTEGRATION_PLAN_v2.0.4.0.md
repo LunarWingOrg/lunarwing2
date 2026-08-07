@@ -2,8 +2,17 @@
 
 **Created:** 2026-07-28
 **Author:** Rarity
-**Status:** Proposal — scoped for v2.0.4.0
+**Status:** Implemented for v2.0.4.0; retained as the release-scoped design record
 **Source material:** `docs/proposals/MULTIAGENTTEAMORCHESTRATION/` (6 files)
+
+All four phases shipped on 2026-07-30, with ISSUE-001…014 review fixes applied
+on 2026-07-31. Use
+[`MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`](MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md)
+for the current configuration and operational contract. Important final design
+differences are recorded alongside the acceptance criteria below: tag validation
+runs once at `transformResponse`, the gate is owned by `ic/src/gate/`, coalescing
+is transport-independent, strike-two alerting is a structured warning log, and
+first-responder claims remain process-local.
 
 ---
 
@@ -33,15 +42,18 @@ designated coordination channels:
   `COORD`, `ANNOUNCE`, `QUERY`), be single-line, and ≤420 characters.
 - **Secret detection:** inbound and outbound messages are scanned for API keys,
   private keys, JWTs, and high-entropy strings.
-- **Rate limiting:** 2 messages per hour per agent in coordination channels.
-- **Engagement policy:** agents only respond to @mentions, direct replies, or
-  DMs — not to every message in the channel.
-- **First-responder correlation:** prevents duplicate responses when multiple
-  agents could answer.
+- **Rate limiting:** 2 messages per agent per configured window by default
+  (`COORD_RATE_WINDOW_SECS=3600`).
+- **Engagement policy:** within configured coordination scopes, messages pass
+  when sent by the local agent/admin or when their text contains a configured
+  `COORD_AGENT_ALIASES` value. Direct-reply metadata is not inspected; DMs are
+  unaffected unless explicitly listed in `COORD_CHANNELS`.
+- **First-responder correlation:** opportunistically suppresses duplicate claims
+  among hooks sharing one daemon; separate tenant daemons can still both respond.
 - **Three-strike enforcement:** repeated violations auto-disable an agent for
   24 hours.
-- **Coalesce window:** 1.5–3 second pre-send buffer to merge rapid-fire
-  messages from the same agent.
+- **Coalesce window:** a 2-second pre-send buffer by default
+  (`COALESCE_WINDOW_SEC`) merges rapid-fire messages from the same agent.
 
 ### Existing Design Documents
 
@@ -61,16 +73,19 @@ Rarity verified every structural claim against v2.0.2.0 source. Key findings:
 - **Hook system** (`ic/src/hooks/`): HookPoint, HookEvent, HookOutcome,
   HookFailureMode, Hook trait, HookRegistry, RuleHook execution flow, workspace
   hook loading — all confirmed accurate.
-- **Gate system** (`ic/crates/lunarwing_engine/src/gate/`): ExecutionGate
-  trait, GateDecision, GateContext, GatePipeline — confirmed. No `silent` field
-  on `Deny` (Phase 3 proposes adding one or using a convention prefix).
-- **Hook timeout default:** 5 seconds, not 30 as the plan states. Minor
-  discrepancy; coordination hooks are sub-millisecond anyway.
-- **TransformResponse** has no `channel` field — identified as a blocker for
-  tag-schema enforcement on transform responses.
+- **Gate system** (`ic/crates/lunarwing_engine/src/gate/`): `ExecutionGate`,
+  `GateDecision`, `GateContext`, and `GatePipeline` remain the engine contract;
+  the application-owned coordination gate lives in `ic/src/gate/coordination.rs`
+  and uses the reviewed silent-reason convention.
+- **Hook timeout default:** 5 seconds, not 30 as the original source assessment
+  stated. Coordination hooks remain bounded and local.
+- **ResponseTransform scope:** `HookEvent::ResponseTransform` now carries optional
+  `channel` and canonical `policy_scope` fields for destination-aware policy.
 
-**Overall verdict:** Architecturally sound. Phases are feasible. Total
-estimated ~1,480 LOC across all 4 phases.
+**Overall verdict:** All four phases shipped. The original estimate was ~1,480
+LOC; the hardened implementation is larger because it includes bounded
+persistence, authenticated admin routes, delivery backpressure, shutdown
+barriers, and review regression tests.
 
 ---
 
@@ -78,25 +93,22 @@ estimated ~1,480 LOC across all 4 phases.
 
 ### What Ships in 2.0.4.0
 
-| Phase | Scope | Rust changes | Est. LOC | Target milestone |
-|-------|-------|-------------|----------|-----------------|
-| Phase 1 | Declarative hook bundle (secret detection, newline enforcement, length caps) | None | ~50 JSON | 2.0.4.0 alpha |
-| Phase 2 | Stateful Rust hooks (rate limiting, tag schema, engagement policy, first-responder, secret entropy) | Yes — new `ic/src/hooks/coordination.rs` | ~900 | 2.0.4.0 beta |
-| Phase 3 | Three-strike gate + auto-disable + admin HTTP | Yes — new gate + ViolationStore | ~320 | 2.0.4.0 RC |
-| Phase 4 | Coalesce window in channel adapter | Yes — new `ic/src/channels/coalesce.rs` | ~210 | 2.0.4.0 RC (stretch) |
+| Phase | Shipped scope | Primary implementation | Status |
+|-------|---------------|------------------------|--------|
+| Phase 1 | Declarative secret, newline, and length rules scoped to configured rooms | `ic/config/hooks/coordination.hook.json` | Shipped |
+| Phase 2 | Stateful rate limit, tag schema, engagement, first-responder, and entropy hooks | `ic/src/hooks/coordination.rs` | Shipped |
+| Phase 3 | Three-strike gate, bounded persistence, and authenticated localhost admin API | `ic/src/gate/`, `ic/src/channels/web/handlers/coord.rs` | Shipped |
+| Phase 4 | Transport-independent coalesce window with bounded delivery and shutdown drain | `ic/src/channels/coalesce.rs`, `ic/src/agent/agent_loop.rs` | Shipped |
 
-**Phase 1 can ship immediately** — it requires zero Rust changes and uses the
-existing `HookBundleConfig` system. The bundle JSON is already written and
-ready for deployment.
-
-**Phase 4 is stretch** — if the coalesce window proves too invasive for the
-channel adapter layer, it can slip to 2.0.5.0 without blocking the other
-phases.
+Phase 1 uses the existing `HookBundleConfig` system. Phase 4 moved to the agent
+outbound boundary during review, avoiding per-adapter implementations and
+covering native and installable channels uniformly.
 
 ### What Does NOT Ship in 2.0.4.0
 
-- **Cross-host first-responder store** (Redis/NFS-based): per-host is
-  sufficient for 2.0.4.0. Cross-host coordination deferred to 2.0.5.0+.
+- **Shared first-responder store** (host-local broker/file CAS or remote broker):
+  current claims are process-local, so separate tenant daemons on the same host
+  or different hosts can both respond. Shared coordination is deferred.
 - **Router-level engagement gating** (Option A from verification doc): the
   router refactor to respect BeforeInbound rejections for thread spawning is
   invasive and deferred. 2.0.4.0 uses Option B (thread spawns but agent
@@ -138,25 +150,24 @@ phases.
 
 ### Acceptance Criteria
 
-- [ ] Hook bundle loads without errors on daemon startup
-- [ ] Secret patterns (API keys, PEM headers, JWTs) are silently rejected
-- [ ] Inbound newlines are replaced with spaces
-- [ ] Outbound messages with newlines are silently rejected
-- [ ] Outbound messages >420 chars are silently rejected
-- [ ] Normal coordination messages pass through unaffected
+- [x] Hook bundle loads without errors on daemon startup
+- [x] Secret patterns (API keys, PEM headers, JWTs) are silently rejected
+- [x] Inbound newlines are replaced with spaces
+- [x] Outbound messages with newlines are silently rejected
+- [x] Outbound messages >420 chars are silently rejected
+- [x] Normal coordination messages pass through unaffected
 
 ---
 
 ## Phase 2: Stateful Rust Hooks
 
-### New Files
+### Implemented Files
 
-| File | Purpose | Est. LOC |
-|------|---------|----------|
-| `ic/src/hooks/coordination.rs` | CoordinationState, 5 hooks, config, helpers | ~500–600 |
-| `ic/src/hooks/coordination_test.rs` | Unit tests for all hooks | ~300 |
-| `ic/src/hooks/bundled.rs` (modified) | `register_coordination_hooks()` function | +40 |
-| `ic/src/hooks/bootstrap.rs` (modified) | Call site when `COORD_ENABLED=true` | +10 |
+| File | Purpose |
+|------|---------|
+| `ic/src/hooks/coordination.rs` | `CoordinationState`, five hooks, environment config, registration, and inline tests |
+| `ic/src/hooks/hook.rs` | Destination-aware `ResponseTransform` fields and canonical policy scope |
+| `ic/src/main.rs` | Shared violation-store construction and stateful hook registration |
 
 ### Components
 
@@ -173,12 +184,15 @@ phases.
    detection. FailOpen (non-coordination channels unaffected).
 
 4. **FirstResponderHook** (priority 16, BeforeInbound) — prevents duplicate
-   responses via correlation ID (content hash). Per-host store with TTL =
-   coalesce window. Claims expire after 2 seconds by default.
+   responses via a deterministic correlation ID. Claims are process-local and
+   expire after the configured 2-second TTL by default; they do not coordinate
+   separate tenant daemons.
 
-5. **TagSchemaHook** (priority 20, BeforeOutbound + TransformResponse) —
-   rejects messages in coordination channels not starting with an allowed tag.
-   FailClosed.
+5. **TagSchemaHook** (priority 14, BeforeInbound + TransformResponse) — rejects
+   messages in coordination channels not starting with an allowed tag. Inbound
+   failures are attributed to the channel sender and halt before generation.
+   Outbound enforcement remains single-point so one malformed model response
+   cannot consume two local-agent strikes. FailClosed.
 
 6. **RateLimitHook** (priority 25, BeforeOutbound) — 2 messages/hour per agent
    per coordination channel. Sliding window. FailClosed.
@@ -191,15 +205,16 @@ Environment variables (loaded by `CoordinationHookConfig::from_env()`):
 |----------|---------|-------------|
 | `COORD_ENABLED` | `false` | Enable coordination hooks |
 | `COORD_AGENT_ID` | (required) | This agent's unique identifier |
-| `COORD_AGENT_ALIASES` | (required) | Comma-separated @mentions |
-| `COORD_CHANNELS` | (required) | Comma-separated coordination channel JIDs |
-| `COORD_MAX_MESSAGES` | `2` | Max messages per hour per agent |
-| `COORD_COALESCE_MS` | `2000` | First-responder coalesce window (ms) |
+| `COORD_AGENT_ALIASES` | (empty) | Comma-separated @mentions targeting this agent |
+| `COORD_CHANNELS` | (required) | Comma-separated coordination policy scopes |
+| `COORD_MAX_MESSAGES` | `2` | Max messages per rate window per agent |
+| `COORD_RATE_WINDOW_SECS` | `3600` | Sliding rate-window duration |
+| `COORD_COALESCE_MS` | `2000` | First-responder claim TTL (ms) |
 | `COORD_ENTROPY_THRESHOLD` | `4.8` | Shannon entropy threshold |
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy check |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 
-### Concerns to Resolve Before Phase 2
+### Historical Concerns and Resolutions
 
 #### C1: EngagementPolicyHook + Router Integration
 
@@ -215,19 +230,16 @@ exits with no output. Token waste is minimal (system prompt load only).
 **Future (2.0.5.0+):** Option A — modify the router to respect BeforeInbound
 rejections for thread spawning decisions.
 
-#### C2: TransformResponse Has No Channel Field
+#### C2: ResponseTransform Originally Had No Destination Scope
 
-**Problem:** `HookEvent::ResponseTransform { user_id, thread_id, response }`
-has no `channel` field. TagSchemaHook cannot know if a transform is destined
-for a coordination channel.
+**Original problem:** `HookEvent::ResponseTransform { user_id, thread_id,
+response }` could not identify whether a transform targeted a coordination
+channel.
 
-**Resolution for 2.0.4.0:** Add an optional `channel: Option<String>` to the
-`ResponseTransform` variant. This is an additive change — existing match arms
-use `..` or named fields, so they won't break. The field is `None` for
-non-channel-scoped transforms.
-
-**Files affected:** `ic/src/hooks/hook.rs` (enum variant), all match sites on
-`ResponseTransform` (grep for `ResponseTransform` in `ic/src/`).
+**Implemented resolution:** `ResponseTransform` now carries optional `channel`
+and canonical `policy_scope` fields. Policy prefers `policy_scope`, falls back
+to `channel`, and remains a no-op when neither destination is known. Match sites
+were updated and regression-tested.
 
 #### C3: High-Entropy False Positives
 
@@ -242,45 +254,46 @@ supplementary.
 
 ### Acceptance Criteria
 
-- [ ] CoordinationState unit tests pass (rate limiting, first-responder claims, violation tracking)
-- [ ] TagSchemaHook rejects untagged messages in coord channels, allows in casual channels
-- [ ] RateLimitHook allows under limit, rejects over limit
-- [ ] EngagementPolicyHook passes targeted messages, rejects untargeted
-- [ ] FirstResponderHook: first caller wins, second caller rejected
-- [ ] SecretEntropyHook detects high-entropy strings, allows normal text
-- [ ] Hooks are no-ops on non-coordination channels
-- [ ] `COORD_ENABLED=false` disables all coordination hooks (zero overhead)
+- [x] CoordinationState unit tests pass (rate limiting, first-responder claims, violation tracking)
+- [x] TagSchemaHook rejects untagged messages in coord channels, allows in casual channels
+- [x] RateLimitHook allows under limit, rejects over limit
+- [x] EngagementPolicyHook passes targeted messages, rejects untargeted
+- [x] FirstResponderHook: first caller wins, second caller rejected
+- [x] SecretEntropyHook detects high-entropy strings, allows normal text
+- [x] Hooks are no-ops on non-coordination channels
+- [x] `COORD_ENABLED=false` disables all coordination hooks (zero overhead)
 
 ---
 
 ## Phase 3: Three-Strike Enforcement Gate
 
-### New Files
+### Implemented Files
 
-| File | Purpose | Est. LOC |
-|------|---------|----------|
-| `ic/src/gate/violation_store.rs` | ViolationStore — persistent per-agent violation tracking | ~150 |
-| `ic/crates/lunarwing_engine/src/gate/coordination.rs` | CoordinationGate — ExecutionGate impl | ~80 |
-| `ic/crates/lunarwing_engine/src/gate/mod.rs` (modified) | Add `pub mod coordination;` | +1 |
-| `ic/src/gate/mod.rs` (modified) | Add `pub mod violation_store;` | +1 |
-| `ic/src/channels/web/handlers/coord.rs` (new) | Admin HTTP endpoints (localhost-only) | ~50 |
+| File | Purpose |
+|------|---------|
+| `ic/src/gate/violation_store.rs` | Bounded, asynchronously persisted per-agent violation tracking |
+| `ic/src/gate/coordination.rs` | Priority-5 `ExecutionGate` implementation |
+| `ic/src/channels/web/handlers/coord.rs` | Authenticated localhost-only admin server and tests |
+| `ic/src/main.rs` / `ic/src/agent/agent_loop.rs` / `ic/src/bridge/effect_adapter.rs` | Gate construction, dependency wiring, and pre-side-effect enforcement |
 
 ### Components
 
-1. **ViolationStore** — persistent per-agent violation tracking.
-   - File: `$LUNARWING_BASE_DIR/coordination-violations.json` (atomic write:
-     temp + rename, same pattern as `PendingGateStore`)
-   - Single `Mutex`, same pattern as existing gate stores
+1. **ViolationStore** — bounded persistent per-agent violation tracking.
+   - File: `$LUNARWING_BASE_DIR/coordination-violations.json`; a bounded,
+     debounced writer persists immutable snapshots via atomic temp + rename.
+   - In-memory state is protected by one mutex; the writer uses a capacity-one
+     notification channel and retries failed persistence without blocking hooks.
    - `ViolationStatus`: `Active(0)` → `Warning(1)` → `FinalWarning(2)` →
      `Disabled(3+, 24h)`
    - `ViolationRecord`: timestamp, reason, hook, channel
-   - Methods: `record_violation`, `get_status`, `clear_violations`,
-     `manual_disable`, `manual_enable`, `expire_check`
+   - Public operations: `record_violation`, `status`, `all_statuses`,
+     `is_disabled`, `clear`, `manual_disable`, and `manual_enable`
    - Violation decay: 7 days (configurable via `COORD_VIOLATION_DECAY`)
 
 2. **CoordinationGate** — `ExecutionGate` impl at priority 5 (above LeaseGate
-   at 10). Denies all tool execution when agent is auto-disabled. Auto-clears
-   when disable period expires.
+   at 10). The production Engine V2 effect adapter checks it before tool side
+   effects. Legacy tool-dispatch paths do not currently evaluate this gate.
+   Expired automatic disables clear when status is evaluated.
 
 3. **Admin HTTP endpoints** (localhost-only, bound to `127.0.0.1`):
    - `GET /coord/status` — all agents
@@ -289,29 +302,25 @@ supplementary.
    - `POST /coord/disable/:agent` — manual disable
    - `POST /coord/enable/:agent` — manual enable
 
-4. **Phase 2 integration** — `CoordinationState` gains
+4. **Phase 2 integration** — `CoordinationState` holds an optional shared
    `Arc<ViolationStore>`. Hooks call `record_violation` on detection.
    - Strike 1: silent halt (hook already rejects)
-   - Strike 2: ops alert via Gotify/DM (webhook hook or direct send)
-   - Strike 3: auto-disable set by store, CoordinationGate blocks all activity
+   - Strike 2: structured `tracing::warn!` ops alert for log-based alerting
+   - Strike 3: auto-disable set by store; `CoordinationGate` blocks Engine V2 tool side effects
 
-### Concern to Resolve Before Phase 3
+### Historical Concern and Resolution
 
-#### C4: GateDecision::Deny Silent Field
+#### C4: Silent Gate Denial
 
-**Problem:** Phase 3 wants silent denies for disabled agents (no channel
-message, no error surfaced). Current `GateDecision::Deny { reason: String }`
-has no `silent` field. Adding one touches every match arm.
+**Original problem:** Phase 3 needed disabled agents to stop without surfacing a
+reason to the model or channel, while `GateDecision::Deny` carried only a reason
+string.
 
-**Resolution for 2.0.4.0:** Use a convention prefix `"[SILENT] "` in the reason
-string. The gate pipeline and bridge already handle `Deny` by surfacing the
-reason — we add a check: if reason starts with `"[SILENT] "`, suppress the
-channel message and log at `debug` level only. This avoids an enum change that
-would touch all match sites.
-
-**Alternative (if clean enough):** Add `silent: bool` to `Deny` with a default
-of `false` via a constructor method. Audit all match sites (grep
-`GateDecision::Deny` in `ic/`). If the count is small (<20), this is cleaner.
+**Implemented resolution:** `CoordinationGate` prefixes its reason with
+`"[SILENT] "`. The Engine V2 effect adapter recognizes that marker before any
+tool side effect and returns typed `ExecutionStopped` control flow. Executor
+paths refund pre-execution lease use, emit no action failure, stop the thread,
+and log only at debug level.
 
 ### Configuration
 
@@ -324,65 +333,62 @@ of `false` via a constructor method. Audit all match sites (grep
 
 ### Acceptance Criteria
 
-- [ ] ViolationStore persists to disk and survives restarts
-- [ ] Three-strike escalation: 1st silent halt, 2nd ops alert, 3rd auto-disable
-- [ ] CoordinationGate denies all tool execution for disabled agents
-- [ ] Auto-disable expires after configurable duration
-- [ ] Admin HTTP endpoints work from localhost only
-- [ ] `COORD_PERMISSIVE=true` disables the gate for testing
+- [x] ViolationStore persists to disk and survives restarts
+- [x] Three-strike escalation: 1st silent halt, 2nd ops alert, 3rd auto-disable
+- [x] CoordinationGate denies Engine V2 tool execution for disabled agents before side effects
+- [x] Auto-disable expires after configurable duration
+- [x] Admin HTTP endpoints work from localhost only
+- [x] `COORD_PERMISSIVE=true` disables the gate for testing
 
 ---
 
-## Phase 4: Coalesce Window (Stretch)
+## Phase 4: Coalesce Window
 
-### New Files
+### Implemented Files
 
-| File | Purpose | Est. LOC |
-|------|---------|----------|
-| `ic/src/channels/coalesce.rs` | CoalesceBuffer + merge logic + timer | ~150 |
-| Channel adapter trait (modified) | Optional coalesce passthrough | ~20 |
-| XMPP adapter (modified) | Integration | ~15 |
-| WeeChat adapter (modified) | Integration | ~15 |
+| File | Purpose |
+|------|---------|
+| `ic/src/channels/coalesce.rs` | CoalesceBuffer, bounded delivery actor, merge logic, timer, shutdown barrier |
+| `ic/src/agent/agent_loop.rs` | Transport-independent placement after outbound hooks and before channel dispatch |
 
 ### Design
 
-**CoalesceBuffer** lives in the channel adapter layer — AFTER BeforeOutbound
-hooks, BEFORE `channel.send()`. It batches rapid-fire messages from the same
-agent in the same channel.
+**CoalesceBuffer** lives at the agent's outbound boundary — AFTER
+BeforeOutbound hooks, BEFORE `channel.send()`. It therefore applies uniformly
+to native and WASM channels rather than requiring adapter-specific wiring.
 
 - `pending: HashMap<ChannelKey, PendingMessage>`
-- `ChannelKey` = `(agent_id, channel_id, conversation_id)`
+- `ChannelKey` = `(agent_id, transport_id, channel_id, conversation_id)`
 - Window: 2.0 seconds (configurable via `COALESCE_WINDOW_SEC`)
 - Max merges: 3 (flush immediately if hit)
 
 ### Merge Strategy
 
 - Same tag prefix: concatenate with `" | "` separator
-- Different tags: preserve both, keep first message's tag
-- Merged content >420 chars: split into two messages, send sequentially
+- Different tags: preserve content under the first message's tag
+- Merged content >420 chars: flush the pending message, then buffer the new one
 - Exact duplicate content within merge: stripped
 
 ### Edge Cases
 
 - **ALERT messages:** bypass coalesce entirely (priority flush)
-- **Thread termination:** flush all pending for that thread before exit
-- **Engine shutdown:** flush all pending before graceful shutdown
-- **Timer drift:** use `tokio::Instant`, not `Duration` arithmetic
+- **Conversation isolation:** the key prevents cross-thread or cross-transport merging
+- **Agent shutdown:** `flush_all()` drains pending messages and waits for in-flight delivery
+- **Timer drift:** uses `tokio::Instant`, not wall-clock arithmetic
 
 ### What Phase 4 Depends On
 
-- Phase 1 (TagSchemaHook for post-merge validation)
-- Phase 2 (only coalesce messages that passed engagement check)
-- Does NOT depend on Phase 3 (coalesce runs before violation detection)
+- Phase 1/2 outbound policy hooks run before buffering
+- Does NOT depend on Phase 3 (coalescing occurs after violation-detecting hooks)
 
 ### Acceptance Criteria
 
-- [ ] Rapid-fire messages from same agent are merged
-- [ ] ALERT messages bypass coalesce
-- [ ] Thread termination flushes pending messages
-- [ ] Engine shutdown flushes pending messages
-- [ ] Merged content passes through BeforeOutbound hooks again
-- [ ] Non-coordination channels are unaffected (coalesce only on coord channels)
+- [x] Rapid-fire messages from same agent are merged
+- [x] ALERT messages bypass coalesce
+- [x] Buffer keys isolate conversations; final design uses one agent-owned buffer rather than a per-thread flush API
+- [x] Agent shutdown flushes pending messages and waits for in-flight delivery
+- [x] Each message passes hooks before buffering; merged delivery is not re-hooked, avoiding duplicate strikes and rate accounting
+- [x] Non-coordination channels are unaffected (coalesce only on coord channels)
 
 ---
 
@@ -390,10 +396,10 @@ agent in the same channel.
 
 | Dependency | Status | Notes |
 |-----------|--------|-------|
-| HookRegistry and Hook system | Ready | `ic/src/hooks/` — verified |
-| GatePipeline and ExecutionGate | Ready | `ic/crates/lunarwing_engine/src/gate/` — verified |
-| HookBundleConfig (workspace hooks) | Ready | `ic/src/hooks/bundled.rs`, `bootstrap.rs` — verified |
-| XMPP channel adapter | Ready | Needed for Phase 4 coalesce |
+| HookRegistry and Hook system | Shipped | `ic/src/hooks/` |
+| GatePipeline and ExecutionGate | Shipped | Engine trait in `ic/crates/lunarwing_engine/src/gate/`; application gate in `ic/src/gate/` |
+| HookBundleConfig (workspace hooks) | Shipped | `ic/src/hooks/bundled.rs`, `bootstrap.rs` |
+| Agent outbound boundary | Shipped | `ic/src/agent/agent_loop.rs` applies hooks then transport-independent coalescing |
 | Router thread-spawn integration | Deferred | Phase 2 uses Option B (non-invasive) |
 
 ---
@@ -412,7 +418,10 @@ agent in the same channel.
 
 ---
 
-## Implementation Order
+## Historical Implementation Order
+
+All steps below are complete; the list records sequencing rather than remaining
+work.
 
 1. **Phase 1 deploy + verify** — ship the declarative bundle, run verification
    tests. No Rust changes. Can be done immediately.
@@ -435,36 +444,32 @@ agent in the same channel.
    4. Phase 2 integration (hooks call `record_violation`)
    5. Admin HTTP endpoints (localhost-only)
 
-4. **Phase 4 — Coalesce window (stretch)** — implement if time permits:
-   1. `CoalesceBuffer` (buffer + merge + timer)
-   2. Channel adapter trait extension
-   3. XMPP adapter integration
-   4. WeeChat adapter integration
+4. **Phase 4 — Coalesce window:**
+   1. `CoalesceBuffer` (bounded delivery actor, buffer, merge, timer, shutdown)
+   2. Agent outbound-boundary integration after hooks
+   3. Transport/destination/conversation-aware keys for native and WASM parity
 
 ---
 
-## Open Questions
+## Resolved Decisions and Deferred Scope
 
-1. **Coordination channel identification:** How do we know which channels are
-   coordination MUCs? Config list of JIDs (`COORD_CHANNELS`)? Convention-based
-   naming (`coord@conference.*`)? **Current plan:** explicit config list.
-
-2. **Admin commands transport:** The framework mentions localhost-only HTTP.
-   Should this go through the existing web gateway router or a new dedicated
-   endpoint? **Current plan:** dedicated localhost-only endpoints in a new
-   handler module, not through the authenticated web gateway.
-
-3. **Violation persistence:** Should violations survive agent restarts?
-   **Current plan:** yes — persisted to `$LUNARWING_BASE_DIR/coordination-violations.json`
-   via atomic write.
-
-4. **Ops alert delivery (strike 2):** Gotify? DM? Webhook? **Current plan:**
-   webhook hook (existing OutboundWebhookHook system) for maximum flexibility.
-   Specific alert destination configured via existing webhook hook config.
-
-5. **GateDecision silent approach:** Convention prefix `"[SILENT] "` or
-   `silent: bool` field? **Current plan:** evaluate match site count; if <20,
-   add the field. Otherwise use the prefix convention.
+1. **Channel identification:** explicit, case-insensitive exact matches from
+   `COORD_CHANNELS`, evaluated against canonical `policy_scope` rather than the
+   transport adapter name.
+2. **Admin transport:** a dedicated bearer-authenticated server bound only to
+   `127.0.0.1`, separate from the web gateway. It stays down without
+   `COORD_ADMIN_TOKEN`.
+3. **Violation persistence:** bounded records survive restarts in
+   `$LUNARWING_BASE_DIR/coordination-violations.json`; writes use a debounced
+   background persistence worker and atomic replacement.
+4. **Strike-two alerting:** a structured `tracing::warn!` event. Operators must
+   route daemon warning logs into their alerting system; no Gotify/DM is sent by
+   this module.
+5. **Silent gate denial:** `CoordinationGate` uses the `"[SILENT] "` convention,
+   and callers translate it into typed execution-stop control flow without
+   surfacing the reason to the model or channel.
+6. **Deferred:** first-responder claims are process-local. A shared
+   compare-and-insert backend is required to deduplicate across tenant daemons.
 
 ---
 

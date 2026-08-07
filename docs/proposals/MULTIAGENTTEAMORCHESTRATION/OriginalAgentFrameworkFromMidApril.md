@@ -1,5 +1,10 @@
 # Agent Framework: Kageho & Baud
 
+**Status:** Historical source framework. LunarWing's adapted four-phase
+implementation shipped in v2.0.4.0; use [`DEPLOYMENT.md`](DEPLOYMENT.md) for
+current configuration, security boundaries, and known limitations. Names and
+configuration examples below describe the original cross-project design.
+
 A hook-based pipeline and policy framework for multi-agent coordination in a group chat environment (XMPP/OMEMO on Prosody, with IRC as a legacy reference point). Covers OpenClaw (IRC-facing) and IronClaw (TEE-focused) agent behavior.
 
 ---

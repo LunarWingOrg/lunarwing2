@@ -1,10 +1,19 @@
 # GitLab CI/CD Plan for LunarWing
 
-> **Current status (2026-07-23): PHASE 1 IMPLEMENTED - GitLab activation pending.**
-> This document completes item #12 in
+> **Current status (reverified 2026-08-04): PHASE 1 ACTIVE AND VERIFIED;
+> PHASE 2 PARTIAL.** This document completes item #12 in
 > `docs/ops/AGENT_GOALS_2.0.2.0.md`. Item #13 added the root pipeline and
-> `.gitlab/` implementation. Phases 2-4 remain gated by the prerequisites below.
-> GitLab project and runner activation instructions live in `.gitlab/README.md`.
+> `.gitlab/` implementation. Public GitLab evidence now proves activation:
+> default-branch pipeline [1093](https://git.lunarwing.org/lunarwing/lunarwing2/-/pipelines/1093)
+> passed on 2026-08-03 with every required job green, all four Rust check shapes,
+> libSQL tests, cargo-deny, Cavepony/WASM coverage, and all three manual worker
+> image builds; merge-request pipeline
+> [1118](https://git.lunarwing.org/lunarwing/lunarwing2/-/pipelines/1118) also
+> passed on 2026-08-04. Full Phase 2 exit criteria remain open: PostgreSQL
+> service tests, general browser tests consuming one prebuilt binary,
+> standalone-crate coverage, and measured coverage are absent. Package, release,
+> and deployment automation (Phases 3–4) also remain absent. Project and runner
+> configuration guidance lives in `.gitlab/README.md`.
 
 **Repository audited:** `lunarwing/lunarwing2`
 **Primary project:** `ic/`
@@ -44,13 +53,13 @@ not the artifact tested by CI.
 
 | Area | Current state | Consequence |
 |---|---|---|
-| Root GitLab pipeline | `.gitlab-ci.yml` composes local files under `.gitlab/ci/` | Phase 1 MR CI is implemented; authenticated GitLab CI Lint and runner proof remain. |
+| Root GitLab pipeline | `.gitlab-ci.yml` composes local files under `.gitlab/ci/` | Active on push and merge-request pipelines; green default-branch and MR evidence is linked above. |
 | Nested GitLab files | Generic Auto DevOps files exist under `lunarwing_weechat_wss/` and `git-lunarwing-unix-socket-client-repo/` | They do not govern the root project. |
-| Mirror workflow | `.forgejo/workflows/mirror.yaml` force-mirrors all refs to GitHub and puts `GH_PAT` in a remote URL | Keep separate from build CI; move credentials to safer protected automation. |
+| Mirror workflow | No `.forgejo/` or `.github/` workflow is present; the old Forgejo mirror was deleted | Mirror credentials are outside the current root CI surface. |
 | Local quality gate | `ic/scripts/ci/quality_gate.sh` anchors itself to `ic/` and bounds Cargo CPU/jobs/tests | Available for local hooks; GitLab uses smaller attributed jobs. |
-| Strict quality gate | `ic/scripts/ci/quality_gate_strict.sh` now anchors itself to `ic/` and applies resource limits | Available locally once cargo-deny is installed. |
+| Strict quality gate | `ic/scripts/ci/quality_gate_strict.sh` anchors itself to `ic/` and applies resource limits | Available locally once cargo-deny is installed. |
 | Version checks | `ic/scripts/check-version-bumps.sh` accepts `BASE_BRANCH`, `BASE_SHA`, and `CHANGE_LABELS` | GitLab wrapper supplies deterministic MR/push metadata; bypass requires a second maintainer-controlled variable. |
-| Boundary checks | `ic/scripts/check-boundaries.sh` exists | 2026-07-23 audit found current DB, PostgreSQL gating, silent-skip, and LLM boundary failures; baseline must be fixed before blocking. |
+| Boundary checks | `ic/scripts/check-boundaries.sh` passes its hard gates while reporting cleanup warnings | Still observational in CI; pipeline 1093 passed the job. |
 | Dependency policy | `ic/deny.toml` plus checksum-pinned cargo-deny 0.20.2 installer | Blocking phase 1 job passes after `spin` 0.9.8 was updated to 0.9.9. |
 | Coverage | `ic/scripts/coverage.sh` and `ic/codecov.yml` exist | Measure first; do not enforce unverified 80/90 thresholds on first pipeline. |
 | Release flow | `docs/ops/RELEASE_COMMANDS.md` describes manual tag, API, and package upload commands | It references stale repository paths and a nonexistent earlier release job. |
@@ -59,9 +68,9 @@ not the artifact tested by CI.
 ### 2.2 Build and test constraints
 
 - Core workspace is rooted at `ic/Cargo.toml`, uses Rust 2024, and declares
-  MSRV 1.92.
-- Core manifests, Docker builders, root README, and `ic/rust-toolchain.toml`
-  now use Rust 1.92/1.92.0. Historical release notes still record their
+  MSRV 1.96.1.
+- Core manifests, Docker builders, root README, `ic/rust-toolchain.toml`, and CI
+  images are reconciled on Rust 1.96.1. Historical release notes retain their
   original toolchain claims.
 - Every Cargo command must run with CPU affinity `taskset -c 0-5`; compile,
   test, and Clippy commands must use at most `-j6`, and tests must use at most
@@ -75,10 +84,13 @@ not the artifact tested by CI.
 - `ic/Cargo.toml` has explicit heavy targets behind the `integration` feature.
 - `ic/tests/workspace_integration.rs` currently gates PostgreSQL behavior only
   on `postgres`, conflicting with the intended `postgres + integration` rule.
-- `ic/scripts/build-wasm-extensions.sh` reports a missing source directory as
-  `SKIP` and still succeeds. CI needs strict manifest-to-source validation.
-- Browser fixtures can trigger their own full debug build. CI must accept one
-  prebuilt executable artifact instead of rebuilding inside each test job.
+- `ic/scripts/build-wasm-extensions.sh --strict` now fails on missing manifest
+  fields, capabilities, source directories, build failures, and expected output.
+  CI currently builds only the XMPP and WeeChat WASM test artifacts directly;
+  a full registry-driven strict build/reuse job remains Phase 2 work.
+- Legacy browser fixtures can still trigger their own full debug build. Engine V2
+  E2E already fails closed without an executable `LUNARWING_E2E_BINARY`; CI has
+  not yet added the one-build artifact job needed to run either browser suite.
 - Standalone Rust projects outside the core workspace need path-triggered jobs;
   the core lockfile does not validate them.
 - `.gitmodules` declares `pebble`, but current checkout does not contain a
@@ -341,10 +353,10 @@ with conservative triggers; optimize only after observing real runtimes.
 
 ### 8.6 WASM
 
-Before making WASM blocking:
+Before making the full registry-driven WASM suite blocking:
 
-1. Add strict mode to `ic/scripts/build-wasm-extensions.sh` so missing source,
-   missing manifest fields, missing output, or missing capability files fail.
+1. **Done:** `ic/scripts/build-wasm-extensions.sh --strict` fails on missing
+   source, manifest fields, output, capability files, and build failures.
 2. Pin `cargo-component`, `wasm-tools`, and `wasm32-wasip2` toolchain setup in
    the CI image.
 3. Limit child Cargo builds with inherited CPU affinity and
@@ -361,9 +373,11 @@ CARGO_BUILD_JOBS=6 taskset -c 0-5 ./scripts/build-wasm-extensions.sh --strict
 ### 8.7 Browser and worker integration
 
 Browser tests use Python 3.11+, Playwright Chromium, a temporary HOME, libSQL,
-and mock services. Change fixtures to require `LUNARWING_E2E_BINARY` (or one
-equivalent variable) and consume one prebuilt executable. Do not allow each
-test job to start an unbounded debug build.
+and mock services. The Engine V2 fixture already requires an explicit executable
+`LUNARWING_E2E_BINARY`; the legacy `lunarwing_binary` fixture still rebuilds a
+debug binary when stale. Add one bounded executable-build artifact job, migrate
+the legacy fixture to consume it, and reuse that same artifact across browser
+jobs.
 
 Split browser jobs into:
 
@@ -793,13 +807,13 @@ Required before blocking CI:
    and provision an isolated protected release cache/sccache namespace.
 4. Inventory native x86_64, native aarch64, systemd-user, OpenRC, and ephemeral
    Docker runners.
-5. Pin one supported Rust toolchain and reconcile 1.92 versus 1.96 docs/builds.
+5. **Done:** pin and reconcile Rust 1.96.1 across manifests, toolchain, CI images, and current docs.
 6. Fix `quality_gate_strict.sh` working directory and CPU limits.
 7. Make version checks forge-neutral and use `$CI_DEFAULT_BRANCH` mappings.
 8. Make architecture-boundary baseline green.
 9. Fix PostgreSQL feature gates and fail dedicated DB jobs on missing DB.
 10. Scope/fix ShellCheck and maintained Python syntax baselines.
-11. Add strict WASM registry/source/output validation.
+11. **Partially done:** strict registry/source/output validation exists in `build-wasm-extensions.sh`; full CI invocation and artifact reuse remain.
 12. Resolve stale `.gitmodules` behavior.
 13. Correct stale GitLab repository paths in release docs.
 

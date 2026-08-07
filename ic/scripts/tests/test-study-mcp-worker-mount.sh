@@ -194,13 +194,6 @@ if grep -q 'LW2STUDYMCP_ALLOW_WRITE' "$opencode_unit"; then
   exit 1
 fi
 
-render_worker_quadlet test nanocode 8443
-nanocode_unit="$(tenant_quadlet_dir test)/lunarwing-nanocode-test.container"
-if grep -q 'LW2STUDYMCP\|/opt/lw2studymcp\|/var/lib/lw2studymcp\|UserNS=keep-id' "$nanocode_unit"; then
-  printf 'Study Notes mount leaked into nanocode quadlet\n' >&2
-  exit 1
-fi
-
 # Disabling core writes retains latest state for worker reads.
 configure_study_mcp test "$study_home" false
 grep -Fqx "LW2STUDYMCP_STATE_HOME=$study_state" "$(tenant_env_dir test)/lunarwing.env"
@@ -271,8 +264,14 @@ fi
 # A rebuilt image must escape any StartLimitBurst lockout left by old failures.
 container_image_user="$OPENCODE_CONTAINER_UID:$OPENCODE_CONTAINER_GID"
 CONTAINER_RT="podman"
+# Override consumed by sourced worker startup.
+# shellcheck disable=SC2034
 MT_ROOTLESS="true"
-ensure_init_system() { INIT_SYSTEM="systemd"; }
+ensure_init_system() {
+  # Global consumed by sourced worker startup.
+  # shellcheck disable=SC2034
+  INIT_SYSTEM="systemd"
+}
 podman_supports_quadlet() { return 0; }
 _wait_user_manager() { :; }
 systemctl_calls=()
@@ -314,6 +313,8 @@ if grep -Eq -- 'image prune|--no-cache|--layers=false' "$build_calls"; then
 fi
 
 docker() { printf '%s\n' "$*" >>"$build_calls"; }
+# Override consumed by sourced worker builder.
+# shellcheck disable=SC2034
 CONTAINER_RT="docker"
 : >"$build_calls"
 build_opencode_worker true true
@@ -324,5 +325,17 @@ if grep -Eq -- 'image prune|--layers=false' "$build_calls"; then
 fi
 
 grep -Fq 'bun pm cache rm' "$dockerfile"
+grep -Fq 'COPY --from=builder /out/bin/opencode /usr/local/bin/opencode' "$dockerfile"
+grep -Fq 'COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk' "$dockerfile"
+if grep -Fq 'COPY --from=builder /build/opencode /app/opencode' "$dockerfile"; then
+  printf 'OpenCode runtime image copies full upstream build tree\n' >&2
+  exit 1
+fi
+
+entrypoint="$SCRIPT_DIR/../../opencode4lunarwing/entrypoint.sh"
+executor="$SCRIPT_DIR/../../opencode4lunarwing/scripts/opencode_task_executor.ts"
+grep -Fq 'OPENCODE_BIN="${OPENCODE_BIN:-/usr/local/bin/opencode}"' "$entrypoint"
+grep -Fq '"$OPENCODE_BIN" serve' "$entrypoint"
+grep -Fq 'from "@opencode-ai/sdk/v2/client"' "$executor"
 
 printf 'Study MCP worker mount tests passed\n'

@@ -38,9 +38,9 @@ impl Default for ThreadId {
 /// Thread lifecycle state.
 ///
 /// ```text
-/// Created → Running → Waiting → Running (resume)
-///                   → Suspended → Running (resume)
-///                   → Completed → Done
+/// Created → Running → Waiting → Running (resume) | Completed (external stop)
+///                   → Suspended → Running (resume) | Completed (external stop)
+///                   → Completed → Done | Failed
 ///                   → Failed
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,12 +76,15 @@ impl ThreadState {
             | (Self::Running, Self::Failed)
             // From Waiting
             | (Self::Waiting, Self::Running)
+            | (Self::Waiting, Self::Completed)
             | (Self::Waiting, Self::Failed)
             // From Suspended
             | (Self::Suspended, Self::Running)
+            | (Self::Suspended, Self::Completed)
             | (Self::Suspended, Self::Failed)
             // From Completed
             | (Self::Completed, Self::Done)
+            | (Self::Completed, Self::Failed)
         )
     }
 
@@ -137,6 +140,10 @@ pub struct ThreadConfig {
     /// Auto-expires after `supervised_timeout_secs` on no response.
     #[serde(default)]
     pub supervised_mode: bool,
+    /// Whether multiple channel actors share this conversation scope. Approval-
+    /// requiring effects must not use per-user grants in this context.
+    #[serde(default)]
+    pub shared_conversation: bool,
     /// Timeout in seconds for supervised mode approval prompts.
     /// After this duration with no human response, the action is
     /// auto-denied (fail-closed). Default: 300 (5 minutes).
@@ -185,6 +192,7 @@ impl Default for ThreadConfig {
             require_action_attempt: false,
             max_action_requirement_nudges: 2,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             max_tokens_total: None,
             max_consecutive_errors: None,
@@ -405,13 +413,28 @@ mod tests {
     }
 
     #[test]
+    fn waiting_can_complete_on_external_stop() {
+        assert!(ThreadState::Waiting.can_transition_to(ThreadState::Completed));
+    }
+
+    #[test]
     fn suspended_can_resume_to_running() {
         assert!(ThreadState::Suspended.can_transition_to(ThreadState::Running));
     }
 
     #[test]
+    fn suspended_can_complete_on_external_stop() {
+        assert!(ThreadState::Suspended.can_transition_to(ThreadState::Completed));
+    }
+
+    #[test]
     fn completed_can_transition_to_done() {
         assert!(ThreadState::Completed.can_transition_to(ThreadState::Done));
+    }
+
+    #[test]
+    fn completed_can_transition_to_failed_during_finalization() {
+        assert!(ThreadState::Completed.can_transition_to(ThreadState::Failed));
     }
 
     #[test]

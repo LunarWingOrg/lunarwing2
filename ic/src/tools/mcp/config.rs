@@ -42,6 +42,10 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         env: HashMap<String, String>,
+        /// Environment variable names mapped to owner-scoped secret names.
+        /// Secret values are resolved only when the process starts.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        env_secrets: HashMap<String, String>,
     },
     /// Unix domain socket transport.
     Unix { socket_path: String },
@@ -72,6 +76,11 @@ pub struct McpServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Automatic recovery stopped after repeated unstable restarts.
+    /// Explicit activation clears this marker.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub recovery_circuit_open: bool,
+
     /// Optional description for the server.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -79,13 +88,27 @@ pub struct McpServerConfig {
     /// Raw MCP tool names that always require explicit approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub always_require_approval: Vec<String>,
+
+    /// Package provenance record (identity, trust state, executable digest).
+    /// Absent means unverified legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::tools::mcp::provenance::McpPackageProvenance>,
 }
 
 fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl McpServerConfig {
+    /// Whether daemon startup may activate this server automatically.
+    pub fn should_auto_start(&self) -> bool {
+        self.enabled && !self.recovery_circuit_open
+    }
+
     /// Create a new MCP server configuration.
     pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
@@ -95,8 +118,10 @@ impl McpServerConfig {
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -107,6 +132,17 @@ impl McpServerConfig {
         args: Vec<String>,
         env: HashMap<String, String>,
     ) -> Self {
+        Self::new_stdio_with_secrets(name, command, args, env, HashMap::new())
+    }
+
+    /// Create a stdio MCP configuration with owner-scoped secret references.
+    pub fn new_stdio_with_secrets(
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
+        env_secrets: HashMap<String, String>,
+    ) -> Self {
         Self {
             name: name.into(),
             url: String::new(),
@@ -114,12 +150,15 @@ impl McpServerConfig {
                 command: command.into(),
                 args,
                 env,
+                env_secrets,
             }),
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -134,8 +173,10 @@ impl McpServerConfig {
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -166,13 +207,30 @@ impl McpServerConfig {
         self
     }
 
+    /// Set the package provenance record.
+    pub fn with_provenance(
+        mut self,
+        provenance: crate::tools::mcp::provenance::McpPackageProvenance,
+    ) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
+
     /// Get the effective transport type.
     pub fn effective_transport(&self) -> EffectiveTransport<'_> {
         match &self.transport {
             Some(McpTransportConfig::Http) | None => EffectiveTransport::Http,
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
-                EffectiveTransport::Stdio { command, args, env }
-            }
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }) => EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            },
             Some(McpTransportConfig::Unix { socket_path }) => {
                 EffectiveTransport::Unix { socket_path }
             }
@@ -203,7 +261,14 @@ impl McpServerConfig {
                     });
                 }
             }
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            } => {
+                let mut plain_env_names = std::collections::HashSet::new();
+                let mut secret_env_names = std::collections::HashSet::new();
                 if command.is_empty() {
                     return Err(ConfigError::InvalidConfig {
                         reason: "Stdio transport command cannot be empty".to_string(),
@@ -224,6 +289,40 @@ impl McpServerConfig {
                         return Err(ConfigError::InvalidConfig {
                             reason: format!(
                                 "Stdio environment variable '{name}' contains a NUL byte"
+                            ),
+                        });
+                    }
+                    if !plain_env_names.insert(canonical_env_name(name)) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Duplicate stdio environment variable name '{name}'"),
+                        });
+                    }
+                }
+                for (name, secret_name) in env_secrets {
+                    if name.is_empty() || name.contains(['=', '\0']) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Invalid stdio environment variable name '{name}'"),
+                        });
+                    }
+                    if secret_name.trim().is_empty() || secret_name.contains('\0') {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Invalid secret name for stdio environment variable '{name}'"
+                            ),
+                        });
+                    }
+                    let canonical_name = canonical_env_name(name);
+                    if plain_env_names.contains(&canonical_name) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Stdio environment variable '{name}' cannot use both a plain value and a secret reference"
+                            ),
+                        });
+                    }
+                    if !secret_env_names.insert(canonical_name) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "Duplicate stdio secret environment variable name '{name}'"
                             ),
                         });
                     }
@@ -287,6 +386,17 @@ impl McpServerConfig {
             });
         }
 
+        if let Some(provenance) = &self.provenance {
+            provenance.validate()?;
+            if provenance.command_sha256.is_some()
+                && !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. })
+            {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "provenance command digests only apply to stdio servers".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -336,6 +446,16 @@ impl McpServerConfig {
     pub fn client_id_secret_name(&self) -> String {
         format!("mcp_{}_client_id", self.name)
     }
+}
+
+#[cfg(windows)]
+fn canonical_env_name(name: &str) -> String {
+    name.to_ascii_uppercase()
+}
+
+#[cfg(not(windows))]
+fn canonical_env_name(name: &str) -> String {
+    name.to_string()
 }
 
 /// Parse the explicit Study Notes write opt-in.
@@ -583,6 +703,7 @@ fn apply_managed_study_notes_config(
             return None;
         }
         config.enabled = existing.enabled;
+        config.recovery_circuit_open = existing.recovery_circuit_open;
     }
     servers.upsert(config.clone());
     Some(config)
@@ -693,6 +814,23 @@ fn default_schema_version() -> u32 {
 }
 
 impl McpServersFile {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let mut names = std::collections::HashSet::new();
+        for server in &self.servers {
+            server
+                .validate()
+                .map_err(|error| ConfigError::InvalidConfig {
+                    reason: format!("Server '{}': {error}", server.name),
+                })?;
+            if !names.insert(&server.name) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Duplicate server name: '{}'", server.name),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Get a server by name.
     pub fn get(&self, name: &str) -> Option<&McpServerConfig> {
         self.servers.iter().find(|s| s.name == name)
@@ -803,12 +941,8 @@ pub async fn load_mcp_servers_from(path: impl AsRef<Path>) -> Result<McpServersF
     let content = fs::read_to_string(path).await?;
     let config: McpServersFile = serde_json::from_str(&content)?;
 
-    // Validate every server on load so corrupted configs are caught early
-    for server in &config.servers {
-        server.validate().map_err(|e| ConfigError::InvalidConfig {
-            reason: format!("Server '{}': {}", server.name, e),
-        })?;
-    }
+    // Validate every server and reject ambiguous runtime ownership.
+    config.validate()?;
 
     Ok(config)
 }
@@ -823,6 +957,7 @@ pub async fn save_mcp_servers_to(
     config: &McpServersFile,
     path: impl AsRef<Path>,
 ) -> Result<(), ConfigError> {
+    config.validate()?;
     let path = path.as_ref();
 
     // Ensure parent directory exists
@@ -895,6 +1030,9 @@ pub async fn set_mcp_server_enabled(
             name: name.to_string(),
         })?;
     server.enabled = enabled;
+    if enabled {
+        server.recovery_circuit_open = false;
+    }
     let server = server.clone();
     save_mcp_servers(&servers).await?;
     Ok(server)
@@ -910,6 +1048,9 @@ pub async fn toggle_mcp_server_enabled(name: &str) -> Result<McpServerConfig, Co
             name: name.to_string(),
         })?;
     server.enabled = !server.enabled;
+    if server.enabled {
+        server.recovery_circuit_open = false;
+    }
     let server = server.clone();
     save_mcp_servers(&servers).await?;
     Ok(server)
@@ -930,6 +1071,19 @@ pub async fn disable_mcp_server_if_unchanged(
     server.enabled = false;
     save_mcp_servers(&servers).await?;
     Ok(true)
+}
+
+/// Persist an open recovery circuit without disabling explicit activation.
+pub async fn mark_mcp_recovery_circuit_open(name: &str) -> Result<(), ConfigError> {
+    let _config_guard = acquire_mcp_config_write_guard().await?;
+    let mut servers = load_mcp_servers().await?;
+    let server = servers
+        .get_mut(name)
+        .ok_or_else(|| ConfigError::ServerNotFound {
+            name: name.to_string(),
+        })?;
+    server.recovery_circuit_open = true;
+    save_mcp_servers(&servers).await
 }
 
 /// Get a specific MCP server configuration.
@@ -989,6 +1143,7 @@ pub async fn save_mcp_servers_to_db(
     user_id: &str,
     config: &McpServersFile,
 ) -> Result<(), ConfigError> {
+    config.validate()?;
     let value = serde_json::to_value(config)?;
     store
         .set_setting(user_id, "mcp_servers", &value)
@@ -1058,6 +1213,9 @@ pub async fn set_mcp_server_enabled_db(
                 name: name.to_string(),
             })?;
         server.enabled = enabled;
+        if enabled {
+            server.recovery_circuit_open = false;
+        }
         Ok(server.clone())
     })
     .await
@@ -1076,6 +1234,9 @@ pub async fn toggle_mcp_server_enabled_db(
                 name: name.to_string(),
             })?;
         server.enabled = !server.enabled;
+        if server.enabled {
+            server.recovery_circuit_open = false;
+        }
         Ok(server.clone())
     })
     .await
@@ -1100,15 +1261,27 @@ pub async fn disable_mcp_server_if_unchanged_db(
     .await
 }
 
+/// Persist an open recovery circuit in owner-scoped configuration.
+pub async fn mark_mcp_recovery_circuit_open_db(
+    store: &dyn crate::db::Database,
+    user_id: &str,
+    name: &str,
+) -> Result<(), ConfigError> {
+    mutate_mcp_servers_db(store, user_id, |servers| {
+        let server = servers
+            .get_mut(name)
+            .ok_or_else(|| ConfigError::ServerNotFound {
+                name: name.to_string(),
+            })?;
+        server.recovery_circuit_open = true;
+        Ok(())
+    })
+    .await
+}
+
 fn parse_mcp_servers_value(value: serde_json::Value) -> Result<McpServersFile, ConfigError> {
     let config: McpServersFile = serde_json::from_value(value)?;
-    for server in &config.servers {
-        server
-            .validate()
-            .map_err(|error| ConfigError::InvalidConfig {
-                reason: format!("Server '{}': {error}", server.name),
-            })?;
-    }
+    config.validate()?;
     Ok(config)
 }
 
@@ -1167,6 +1340,7 @@ pub enum EffectiveTransport<'a> {
         command: &'a str,
         args: &'a [String],
         env: &'a HashMap<String, String>,
+        env_secrets: &'a HashMap<String, String>,
     },
     Unix {
         socket_path: &'a str,
@@ -1267,7 +1441,9 @@ mod tests {
         assert!(config.enabled);
         assert!(config.always_require_approval.is_empty());
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command, args, env, ..
+            } => {
                 assert_eq!(command, "python3");
                 assert!(args.iter().any(|arg| arg.ends_with("study_notes_mcp.py")));
                 assert!(args.iter().any(|arg| arg.ends_with("agent-notes.sqlite3")));
@@ -1375,7 +1551,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_study_notes_refresh_preserves_disabled_state() {
+    fn managed_study_notes_refresh_preserves_lifecycle_state() {
         let code = tempdir().unwrap();
         let state = tempdir().unwrap();
         create_study_notes_fixture(code.path());
@@ -1385,6 +1561,7 @@ mod tests {
         let mut existing = study_notes_server_from_home(code.path(), None, false).unwrap();
         existing.description = Some(LEGACY_STUDY_NOTES_DESCRIPTION.to_string());
         existing.enabled = false;
+        existing.recovery_circuit_open = true;
         let mut servers = McpServersFile::default();
         servers.upsert(existing);
         let generated =
@@ -1393,6 +1570,7 @@ mod tests {
         let replacement = apply_managed_study_notes_config(&mut servers, generated)
             .expect("managed config should refresh");
         assert!(!replacement.enabled);
+        assert!(replacement.recovery_circuit_open);
         assert!(
             replacement
                 .always_require_approval
@@ -1497,6 +1675,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn load_rejects_duplicate_server_names() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp-servers.json");
+        let duplicate = serde_json::json!({
+            "servers": [
+                {"name": "duplicate", "url": "https://one.example.com"},
+                {"name": "duplicate", "url": "https://two.example.com"}
+            ]
+        });
+        tokio::fs::write(&path, duplicate.to_string())
+            .await
+            .unwrap();
+
+        let error = load_mcp_servers_from(&path).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Duplicate server name: 'duplicate'")
+        );
+    }
+
+    #[test]
+    fn recovery_circuit_blocks_auto_start_until_explicit_enable() {
+        let mut config =
+            McpServerConfig::new_stdio("blocked", "server", Vec::new(), HashMap::new());
+        config.recovery_circuit_open = true;
+        assert!(!config.should_auto_start());
+
+        let mut servers = McpServersFile::default();
+        servers.upsert(config);
+        let server = servers.get_mut("blocked").unwrap();
+        server.enabled = true;
+        server.recovery_circuit_open = false;
+        assert!(server.should_auto_start());
+    }
+
     #[test]
     fn test_token_secret_names() {
         let config = McpServerConfig::new("notion", "https://mcp.notion.com");
@@ -1567,6 +1782,7 @@ mod tests {
                 command,
                 args,
                 env: e,
+                env_secrets,
             }) => {
                 assert_eq!(command, "npx");
                 assert_eq!(
@@ -1574,6 +1790,7 @@ mod tests {
                     &["-y".to_string(), "@modelcontextprotocol/server".to_string()]
                 );
                 assert_eq!(e, &env);
+                assert!(env_secrets.is_empty());
             }
             other => panic!("Expected Stdio transport, got {:?}", other),
         }
@@ -1633,6 +1850,50 @@ mod tests {
             HashMap::from([("GOOD_NAME".to_string(), "bad\0value".to_string())]),
         );
         assert!(invalid_value.validate().is_err());
+    }
+
+    #[test]
+    fn test_stdio_secret_environment_validation() {
+        let valid = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        );
+        assert!(valid.validate().is_ok());
+
+        let invalid_name = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("BAD=NAME".to_string(), "api_token".to_string())]),
+        );
+        assert!(invalid_name.validate().is_err());
+
+        let empty_secret = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "  ".to_string())]),
+        );
+        assert!(empty_secret.validate().is_err());
+
+        let overlap = McpServerConfig::new_stdio_with_secrets(
+            "server",
+            "npx",
+            vec![],
+            HashMap::from([("API_TOKEN".to_string(), "plain".to_string())]),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        );
+        let error = overlap.validate().expect_err("overlap must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("both a plain value and a secret")
+        );
     }
 
     #[test]
@@ -1815,6 +2076,7 @@ mod tests {
             command: "npx".to_string(),
             args: vec!["-y".to_string(), "server".to_string()],
             env: HashMap::from([("KEY".to_string(), "val".to_string())]),
+            env_secrets: HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
         };
         let json = serde_json::to_string(&transport).unwrap();
         assert!(json.contains("\"transport\":\"stdio\""));
@@ -1822,10 +2084,16 @@ mod tests {
 
         let parsed: McpTransportConfig = serde_json::from_str(&json).unwrap();
         match parsed {
-            McpTransportConfig::Stdio { command, args, env } => {
+            McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args, vec!["-y".to_string(), "server".to_string()]);
                 assert_eq!(env.get("KEY").unwrap(), "val");
+                assert_eq!(env_secrets.get("API_TOKEN").unwrap(), "api_token");
             }
             other => panic!("Expected Stdio, got {:?}", other),
         }
@@ -1888,10 +2156,16 @@ mod tests {
         assert_eq!(parsed.description.as_deref(), Some("A test server"));
 
         match &parsed.transport {
-            Some(McpTransportConfig::Stdio { command, args, env }) => {
+            Some(McpTransportConfig::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }) => {
                 assert_eq!(command, "node");
                 assert_eq!(args, &["server.js".to_string()]);
                 assert_eq!(env.get("NODE_ENV").unwrap(), "production");
+                assert!(env_secrets.is_empty());
             }
             other => panic!("Expected Stdio transport, got {:?}", other),
         }

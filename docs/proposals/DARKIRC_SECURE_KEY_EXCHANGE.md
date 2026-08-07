@@ -1,12 +1,25 @@
 # Secure Automated DarkIRC Key Exchange
 
-> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** No proposed
-> key-exchange commands, ledger, journal, or web surfaces exist. The Phase 0
-> prerequisite is also open: DarkIRC config regeneration can still replace the
-> whole TOML instead of preserving manually managed contacts.
+> **Current status (2026-08-04): Phase 0/1 and the Stage A command surface are
+> implemented; acceptance awaits dedicated live-host evidence.** Contact-preserving config regeneration, measured
+> compatibility attestation, stable tenant scopes, metadata-only adoption,
+> structured migration, bounded pending state, durable replay/expiry
+> tombstones, and public-only `prepare` / `respond` / deferred `complete` /
+> `cancel` commands are implemented through `lunarwing-mt-admin.sh` and the
+> typed Unix helper.
+>
+> The implemented boundary intentionally stops at `Installed`. Strict health is
+> diagnostic only. Activation, rollback, round-trip confirmation, rotation,
+> revocation, same-host pairing, QR/web delivery, and trusted-channel
+> automation remain disabled pending separate threat-model and recovery review.
+> Source-audit findings are closed, including atomic immutable release
+> publication, capability-relative diagnostics, and init-agnostic legacy
+> lifecycle cleanup. Real two-user `/proc`/output/log scans must still pass on
+> both systemd-user and OpenRC hosts.
+> See [DarkIRC Key Exchange Next Stages](DARKIRC_KEY_EXCHANGE_NEXT_STAGES.md).
 
-**Status:** Proposal only. None of the commands, state files, APIs, or web
-surfaces described here exist yet.
+**Status:** Phase 0/1 and Stage A implemented; Stage A live acceptance pending;
+Stage B and later deferred.
 
 **Scope:** LunarWing multi-tenant DarkIRC deployments managed through
 `ic/scripts/lunarwing-mt-admin.sh`.
@@ -25,10 +38,9 @@ This design is intentionally not a zero-click trust system. Automation should
 remove secret-handling and TOML-editing mistakes, not decide that an IRC
 nickname is a cryptographic identity.
 
-There is one prerequisite: LunarWing must first stop replacing the complete
-DarkIRC TOML during `patch-env`. Current rendering can erase manually managed
-`[contact]` sections. Key automation must not ship until all writers share a
-locked, semantic, journaled config-update path that preserves contacts.
+The original prerequisite is now satisfied: `patch-env` and provisioning route
+DarkIRC baseline changes through the shared locked, semantic, journaled updater.
+Existing `[contact]` sections and unknown operator-owned fields are preserved.
 
 The recommended migration sequence is:
 
@@ -102,48 +114,35 @@ required assignment in the current checked-in template. The peer public half
 and local private half are placed inline in the contact table. A separate YAML
 file is not daemon input.
 
-This is a source and template observation, not an attestation of every
-installed binary. Mt-admin can build from an existing DarkFi checkout and
-installs one shared `darkirc` binary. That checkout or binary can differ from
-the repo's default source revision. Before automation parses generator output
-or edits a live config, it must identify the actual binary by an approved
-compatibility profile and binary digest (and source revision when recorded).
+Mt-admin accepts only the pinned approved DarkFi revision and builds it from a
+root-owned clean checkout in a disposable unprivileged build tree. It stages an
+immutable release containing the daemon, helper, and an attestation that binds
+their digests, release ID, and LunarWing helper source revision, then durably
+switches one selector after syncing release and parent directories. Managed
+readers pin one complete release. The helper remeasures opened executable
+descriptors and executes the same daemon inode before committing pending state.
+Unknown release, digest, profile, key format, source revision, helper revision,
+generator output, or config schema fails closed. Managed start also rejects
+stale unit commands and systemd drop-in overrides.
 
-The repository documentation is inconsistent on these details:
+The helper source revision is an upgrade freshness gate, not a runtime ban on
+retained releases. Digest-valid immutable releases remain selectable for
+operator rollback; `ensure-darkirc-release` requires current helper source when
+an upgrade is being prepared.
 
-- [DarkIRC Multitenant Adapter](../guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md)
-  correctly says key material is inline and exchange is manual, but it also
-  describes `my_dm_chacha_public` as a third field and claims a placeholder
-  `darkirc_keypair.yaml` is generated.
-- [The June 23 session audit](SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md)
-  records the YAML claim as stale; the current generator does not create that
-  file.
-- The current template at
-  `ic/scripts/templates/darkirc_config.toml.template` defines only
-  `dm_chacha_public` and `my_dm_chacha_secret` in a contact table.
-- The operations runbook presents `LUNARWING_MT_DARKIRC_REV=master` as the
-  default, while current mt-admin source supplies a specific default revision.
-  An existing checkout can still be used as-is, so neither document nor script
-  default proves which binary is installed.
-- [The issue status report](../ops/ISSUE_STATUS_REPORT.md) confirms that no key
-  exchange automation currently exists.
+The checked-in template and current daemon contact schema contain only
+`dm_chacha_public` and `my_dm_chacha_secret`; no YAML keypair file or third
+`my_dm_chacha_public` field is generated or consumed.
 
-The later implementation must test its key-generator parser and TOML schema
-against the actual attested DarkIRC binary. It must fail closed on an unknown
-binary digest, CLI output, key format, or config schema instead of copying
-stale examples.
+### Contact-Preserving Config Ownership
 
-### Existing Config-Ownership Hazard
-
-`patch-env` currently calls `generate_darkirc_config()` for a DarkIRC-enabled
-tenant. `generate_darkirc_config()` renders the baseline template, and the
-shared `render_template()` function truncates the destination directly. As a
-result, a normal patch or upgrade can remove manually added contacts.
-
-This is not only a migration concern. A future contact helper and the current
-renderer would also be competing writers, creating lost-update and partial-file
-risks. The recommended design therefore makes contact-preserving config
-ownership a release prerequisite rather than a later cleanup.
+`patch-env`, repeated provisioning, migration import, adoption, and Stage A
+completion share the tenant lifecycle lock, root-side scope writer lock, and
+capability-relative helper lock. Baseline regeneration semantically preserves
+the complete `[contact]` subtree and unknown operator-owned fields. Every
+candidate is reparsed, fsynced, journaled, and committed ledger-first then
+config; recovery verifies recorded hashes before completing or refusing a
+partial transaction.
 
 ## Threat Model
 
@@ -464,63 +463,61 @@ A repeated operation with the same offer, fingerprint, and state is
 idempotent. A different key for an active nickname is a conflict, not an
 implicit update. The caller must use the rotation flow.
 
+`Installed` Stage A records remain protected maintenance state until deferred
+Stage B performs strict health-gated promotion. They do not consume active
+pending count or byte quota, but still block migration and remain available for
+idempotent replay. Separate retained-state bounds limit their disk footprint.
+
 ### CLI Flow
 
-The following syntax is a proposed contract, not an existing implementation:
+The implemented Stage A contract is:
 
 ```text
-lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact> --out <offer.json> [--expires <duration>] [--json]
-lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact> --in <offer.json> --out <response.json> --expect-peer-fingerprint <sha256> [--json]
-lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact> (--in <response.json> | --exchange-id <id>) --expect-peer-fingerprint <sha256> [--defer-apply] [--json]
-lunarwing-mt-admin.sh darkirc-contact apply <tenant> <contact> [--json]
-lunarwing-mt-admin.sh darkirc-contact confirm-roundtrip <tenant> <contact> --exchange-id <id> --expect-peer-fingerprint <sha256> [--json]
-lunarwing-mt-admin.sh darkirc-contact list <tenant> [--json]
-lunarwing-mt-admin.sh darkirc-contact status <tenant> <contact> [--json]
+lunarwing-mt-admin.sh darkirc-contact prepare <tenant> <contact> --out <offer.json|-> [--expires <seconds>] [--json]
+lunarwing-mt-admin.sh darkirc-contact respond <tenant> <contact> --in <offer.json|-> --out <response.json|-> --expect-peer-fingerprint <sha256> [--expires <seconds>] [--json]
+lunarwing-mt-admin.sh darkirc-contact complete <tenant> <contact> --in <peer-artifact.json|-> --exchange-id <id> --expect-peer-fingerprint <sha256> [--defer-apply] [--json]
+lunarwing-mt-admin.sh darkirc-contact list <tenant>
+lunarwing-mt-admin.sh darkirc-contact status <tenant> <contact>
+lunarwing-mt-admin.sh darkirc-contact exchanges <tenant>
 lunarwing-mt-admin.sh darkirc-contact cancel <tenant> --exchange-id <id> [--json]
-lunarwing-mt-admin.sh darkirc-contact doctor (<tenant> | --all) [--json]
+lunarwing-mt-admin.sh darkirc-contact doctor (<tenant> | --all)
+lunarwing-mt-admin.sh darkirc-contact adopt <tenant> --yes
+lunarwing-mt-admin.sh darkirc-contact recover <tenant>
 lunarwing-mt-admin.sh darkirc-health <tenant> --strict [--json]
 ```
 
-`prepare`, `respond`, `complete`, `list`, `status`, `cancel`, `doctor`, `apply`,
-`confirm-roundtrip`, and strict health verification are the first-release
-surface. Proposed later names are `darkirc-contact rotate`,
-`darkirc-contact revoke`, `darkirc-contact pair-local`,
-`darkirc-contact resolve-overdue`, and `restart-darkirc`.
+Mt-admin always forwards `--defer-apply`; callers cannot activate through
+`complete`. `apply`, `confirm-roundtrip`, `rotate`, `revoke`, `pair-local`,
+`resolve-overdue`, and `restart-darkirc` are rejected until later stages pass
+separate review.
 
 Human output contains contact, offer/transaction ID, state, fingerprints,
 expiry, and artifact path only. `--json` writes the same public/status fields as
 one structured stdout document; sanitized diagnostics go to stderr. Artifact
-files are created exclusively with mode `0600` and never overwritten. Repeating `respond` with
-the same initiator artifact returns the existing byte-identical response.
-Repeating `complete` or `apply` for the same committed transcript returns the
-current state successfully. A different key/transcript for an occupied contact
-returns a nonzero `conflict` result without changing files; expired, revoked,
-unknown-profile, and operator-action-required outcomes are also distinct
-nonzero result categories.
+files are created exclusively with mode `0600` and never overwritten. Repeating
+`prepare` for the same contact and semantics or `respond` for the same initiator
+artifact returns the existing byte-identical public artifact. Repeating
+`complete` for the same committed transcript returns `Installed`. A different
+key/transcript for an occupied contact returns a nonzero conflict without
+changing files.
 
 An operator flow is:
 
-1. The initiator runs `prepare`. The command writes protected pending state and
-   returns an initiator offer, public fingerprint, and expiry. It never
-   displays the private key.
-2. Send that offer over an authenticated out-of-band channel or show its QR.
-   The peer runs `respond`, which binds its public response to the initiator
-   offer, requires the independently obtained initiator fingerprint, and stores
-   its own protected pending secret.
-3. Each side runs `complete` using the paired artifacts by file or stdin. Raw
-   key material is not accepted as an argv value.
-4. Confirm the independently obtained peer fingerprint. Interactive mode
-   requires entering or scanning the full fingerprint; a generic yes/no prompt
-   and `--yes` are not accepted. Unattended mode requires
-   `--expect-peer-fingerprint` from a separate trust source. Transcript binding
-   is recomputed and checked internally from the two artifacts.
-5. The helper installs the contact transactionally. `apply` activates it
-   through mt-admin and reports `LocallyActivated` after service health. Only a
-   successful bidirectional encrypted DM check can mark it `PeerVerified`.
-6. After both operators observe a bidirectional encrypted DM round trip, each
-   records that fact with `confirm-roundtrip`. This is an explicit operator
-   attestation, not a claim inferred from service health. It advances
-   `PeerVerified` and triggers the applicable rollback cleanup.
+1. The initiator runs `prepare`. The command commits protected pending state
+   before delivering its public artifact, fingerprint, and expiry. It never
+   displays the private key. If output delivery fails, the sanitized error
+   reports the committed offer ID so the same semantic operation can be retried.
+2. Send the public artifact over an independently authenticated out-of-band
+   channel. QR and browser delivery are not implemented in Stage A.
+3. The peer runs `respond` with the full independently obtained initiator
+   fingerprint. The response is role-bound to the initiator offer and has its
+   own bounded lifetime.
+4. Each side runs `complete` using the paired public artifact plus the full
+   independently obtained peer fingerprint. Raw key material is not accepted in
+   argv or environment; a generic confirmation or `--yes` cannot authorize it.
+5. The helper recomputes the transcript, commits ledger then config through the
+   journal, and returns `Installed`. It does not restart, reload, health-gate,
+   activate, or claim peer verification.
 
 `pair-local` is a later optimization for two tenants on the same host. It must
 lock tenant names in a stable order, stage and validate both configs before
@@ -603,17 +600,16 @@ web process, or key helper may call bare `systemctl` or `rc-service`. A HUP path
 must not become the default until it is verified for the attested daemon and
 both init layouts.
 
-Current mt-admin start behavior is not a strict DarkIRC activation check: the
-main tenant can be healthy while an optional DarkIRC service failed. Before
-managed writes ship, mt-admin needs the proposed `darkirc-health <tenant>
---strict` contract. It must use the internal init abstraction to require both
+Mt-admin now provides `darkirc-health <tenant> --strict` through its internal
+init abstraction. Stage A uses it for diagnostics only; Stage B activation must
+use the same contract as a promotion gate. It requires both
 the tenant DarkIRC daemon and adapter service to be running, then call the
 authenticated adapter `/health` internally and require `status=ok` and
 `irc_connected=true`. It must never print the adapter bearer secret. The same
 contract and result categories apply on systemd user units and OpenRC, with a
 bounded reconnect wait and timeout rather than an unbounded poll.
 
-`apply` advances to `LocallyActivated` only after that strict check. This still
+Stage B `apply` advances to `LocallyActivated` only after that strict check. This still
 does not prove that the peer installed the matching keys. If activation fails,
 the transaction journal
 drives restoration of the protected previous TOML, advances the ledger to
@@ -687,6 +683,8 @@ easier to detect.
   service unit, shell variable printed under `set -x`, or HTTP request.
 - Do not print the raw key-generator output. Capture stdout and stderr; on
   failure, log the exit status and a sanitized category only.
+- Do not run the key generator without bounded output, a fixed deadline, and
+  kill/reap cleanup for its dedicated process group.
 - Do not write secrets to `/tmp`, a repo checkout, the LunarWing workspace, a
   world/group-readable file, a QR code, clipboard history, ticket, or chat.
 - Do not create, commit, or rely on `darkirc_keypair.yaml`. It is not the
@@ -729,14 +727,14 @@ identity invariants:
 6. Exercise `patch-env`, upgrade, export, import, and tenant rename against the
    adopted contacts before enabling write commands.
 
-The current generic tenant export includes nested DarkIRC state, and import can
-restore that state before target-specific DarkIRC enablement and ports are
-reconciled. With managed exchanges, that behavior could also capture pending
-secrets, candidates, journals, and rollback snapshots. Managed writes must not
-ship until migration either implements the contract below or fail-closes every
-export, import, and upgrade when managed key state exists.
+Generic tenant export now excludes the complete `state/darkirc` subtree, and
+import rejects an archive that contains it. Export fails closed before lifecycle
+mutation when pending secrets, candidates, journals, rollback state, interrupted
+manifest candidates, or unresolved ledger state exists. Import copies and
+decrypts credential material only under an owner-controlled non-`/tmp` staging
+root.
 
-The proposed `darkirc-contacts-v1` migration manifest contains the tenant scope
+The implemented `darkirc-contacts-v1` migration manifest contains the tenant scope
 ID, active contact tables, metadata ledger/tombstones, attested generator
 profile, and checksums. It is secret-bearing because active contact tables
 contain local private keys. The containing export must be owner-only and
@@ -748,11 +746,11 @@ verification decision exists.
 On import, mt-admin first reconciles the DarkIRC enablement flag and scope-ID
 uniqueness, renders a fresh target-specific baseline with target ports, and
 then structurally imports contacts and ledger metadata through the normal
-journal. It validates the target binary profile and strict health before start.
-A same-tenant move may preserve the scope ID only while the old host remains
-stopped. Importing or cloning keys into a different tenant scope is rejected
-until contacts complete a verified rotation. Keep the old host stopped but
-intact until both peers complete a DM round trip on the target.
+journal after validating the target binary profile. A same-tenant move may
+preserve the scope ID only while the old host remains stopped. Importing or
+cloning keys into a different tenant scope is rejected until contacts complete
+a future verified rotation. Import remains staged by default; when the operator
+explicitly starts it, strict DarkIRC health must pass or the target is stopped.
 
 ## Onboarding and Future Web UX
 
@@ -800,7 +798,7 @@ POST   /api/admin/darkirc/apply
 
 ## Rollout Plan
 
-### Phase 0: Confirm Compatibility and Config Ownership
+### Phase 0: Confirm Compatibility and Config Ownership — Complete
 
 - Record and attest the actual shared DarkIRC binary digest, source revision
   when known, and approved compatibility profile.
@@ -820,7 +818,7 @@ POST   /api/admin/darkirc/apply
 unresolved state cannot enter generic migration, and strict DarkIRC health is
 available without any key-exchange write command enabled.
 
-### Phase 1: Adoption and Migration Safety
+### Phase 1: Adoption and Migration Safety — Complete
 
 - Add `list`, `status`, and `doctor`.
 - Inventory existing contacts using fingerprints only.
@@ -835,41 +833,37 @@ available without any key-exchange write command enabled.
 unsafe state, and migrate a settled contact set without stale ports or
 transactional files before enabling exchange writes.
 
-### Phase 2: Managed Out-of-Band Exchange
+### Stage A: Managed Out-of-Band Installation — Implemented; Live Acceptance Pending
 
-- Add `prepare`, `respond`, `complete`, `cancel`, `apply`, and
-  `confirm-roundtrip`.
-- Freeze Public Exchange V1 canonicalization, role binding, and fingerprint
-  rules.
-- Support public offer files, stdin/stdout public-only mode, and optional QR.
-- Require explicit fingerprint confirmation and fail closed for unattended
-  calls without an expected fingerprint.
-- Activate through mt-admin and require the strict DarkIRC service plus adapter
-  health contract before local success.
+- Freeze Public Exchange V1 canonicalization, role binding, transcript order,
+  decoded-key fingerprints, compatibility fields, and bounded lifetimes.
+- Add public-only `prepare`, `respond`, deferred `complete`, and `cancel` through
+  mt-admin, plus inspection and recovery commands.
+- Require the full independently obtained peer fingerprint for `respond` and
+  `complete`; no generic confirmation bypass exists.
+- Bound pending count, per-record bytes, aggregate bytes, and expiry; reserve
+  expired, cancelled, and installed IDs durably in the ledger.
+- Commit `complete` only to `Installed`; no lifecycle or health transition runs.
 
-**Exit condition:** two test tenants can exchange role-bound artifacts,
-activate contacts, and complete encrypted DM round trips with private keys
-confined to the enumerated protected and transient locations.
+**Exit condition:** two isolated tenant fixtures exchange role-bound artifacts,
+install distinct contact keys transactionally, replay identical operations
+idempotently, reject conflicting or expired artifacts, and recover every Stage A
+journal/pending boundary without exposing private material. Code and fixture
+coverage pass; final acceptance additionally requires the dedicated H3 harness
+on real systemd-user and OpenRC hosts.
 
-### Phase 3: Lifecycle Completion
+### Stage B/C/D: Activation And Lifecycle — Deferred
 
-- Add rotation, revocation, same-host `pair-local`, and bounded history.
-- Add `restart-darkirc` inside mt-admin after systemd-user/OpenRC parity tests.
-- Exercise the defined rollback retention and compromise-specific no-rollback
-  behavior for rotation and revocation.
+Activation intent, init-agnostic restart/reload, strict health gating, rollback,
+peer round-trip confirmation, rotation, revocation, same-host pairing, and
+bounded rollback retention require separate threat-model and crash-recovery
+review. None of those commands is enabled by Stage A.
 
-**Exit condition:** rotation, revocation, rollback, and same-host partial-commit
-recovery are tested on both init systems with no cross-tenant key exposure.
+### Optional Delivery Surfaces — Deferred
 
-### Phase 4: Optional Delivery Surfaces
-
-- Add an onboarding wizard and web UI using the same commands and state machine.
-- Evaluate a mutual protocol over an existing authenticated channel.
-- Require a separate threat model and cryptographic review before allowing
-  protocol-driven confirmation or signing identities.
-
-**Exit condition:** the new surface changes only public-offer delivery; it does
-not create a second secret store or bypass fingerprint/identity policy.
+QR, browser, onboarding, and trusted-channel automation may transport public
+artifacts only and require separate authorization review. They must not create a
+second secret store or bypass full-fingerprint confirmation.
 
 Each phase is opt-in and reversible. Disabling new commands must leave valid
 active TOML contacts usable through the documented manual fallback.
@@ -991,17 +985,15 @@ tenant lock indefinitely.
 
 ## Implementation Acceptance Criteria
 
-This proposal is ready to be considered implemented only when all of the
-following are demonstrated:
+Phase 0/1 and Stage A are complete when the following are demonstrated:
 
-- Generated private keys appear only in generator/private-pipe/zeroized helper
-  memory and the enumerated `0600` pending, candidate, active, rollback, or
-  explicitly protected migration copies. They never appear in user-visible
-  process metadata, output, logs, public artifacts, or browser responses.
-- An unattended completion without an independently supplied expected
-  fingerprint fails closed.
-- Interactive completion requires full fingerprint entry or scan; a generic
-  confirmation and `--yes` cannot bypass it.
+- Generated private keys appear only in captured generator output, zeroized
+  helper memory, and the enumerated tenant-owned `0600` pending, candidate,
+  active, or explicitly protected migration copies. They never appear in argv,
+  environment variables, `/tmp`, user-visible output, logs, public artifacts,
+  repository files, or browser responses.
+- `respond` and `complete` fail closed without an independently supplied full
+  expected fingerprint. A generic confirmation or `--yes` cannot bypass it.
 - Unknown binary digests, compatibility profiles, key formats, artifact roles,
   offer bindings, and transcript hashes fail before state changes.
 - Replayed identical operations return the same public artifact or committed
@@ -1009,24 +1001,22 @@ following are demonstrated:
 - Existing manual contacts survive `patch-env`, upgrade, export/import, and
   adoption without forced rotation unless reuse or a tenant-scope conflict is
   detected.
-- Generic export/import cannot capture pending, candidate, journal, or rollback
-  files. Structured migration renders target ports, verifies scope identity,
-  and passes strict DarkIRC health before completion.
+- Generic export/import cannot capture the DarkIRC subtree. Structured
+  migration excludes pending/candidate/journal/rollback state, renders target
+  ports, verifies scope identity, and stages activation by default.
 - Config and ledger updates are structured, locked, validated, journaled in the
-  specified order, and recoverable at every crash point.
-- Cross-tenant path, symlink, nickname-injection, replay, and concurrent-update
-  tests pass.
-- Two tenants complete bidirectional encrypted DM tests with distinct
-  per-contact keys.
-- Local activation requires strict DarkIRC daemon/adapter status plus
-  authenticated adapter health with `irc_connected=true`; activation and
-  rollback pass through mt-admin on systemd user units and OpenRC, with no bare
-  init calls in wrappers.
-- Rollback storage obeys the one-per-contact count, 24-hour decision window,
-  seven-day extension cap, overdue mutation block, and peer-verification
-  cleanup rule.
-- Rotation and revocation require the current and proposed fingerprints, obey
-  the two-party cutover/tombstone ordering, recover same-host partial commits,
-  and never roll back a suspected-compromised key.
-- Documentation is updated to remove the stale YAML and third-field claims and
-  to describe the public-only exchange flow without claiming automatic trust.
+  specified order, and recoverable at every implemented crash boundary.
+- Cross-tenant path, symlink, hard-link, nickname-injection, replay, expiry,
+  capacity, output-failure, and concurrent-update tests pass.
+- Two isolated tenant fixtures exchange role-bound artifacts and install
+  distinct local-private/peer-public contact pairs, stopping at `Installed`.
+- Strict DarkIRC health checks systemd-user and OpenRC service state plus the
+  authenticated adapter result without exposing its bearer. It remains a
+  diagnostic in Stage A, and wrappers contain no bare init lifecycle path.
+- Documentation removes the stale YAML and third-field claims and describes the
+  public-only exchange flow without claiming automatic trust.
+
+Stage B-D acceptance remains open: live activation and rollback, bidirectional
+DM round-trip confirmation, rollback retention/overdue handling, rotation,
+revocation, same-host partial-commit recovery, and delivery surfaces must pass
+their own threat-model and parity reviews before those commands are enabled.

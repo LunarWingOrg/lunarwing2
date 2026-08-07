@@ -11,12 +11,12 @@
 # unit lands in /run/openrc/failed/.
 #
 # Usage:
-#   fault-inject-crash-loop.sh --tenant <name> [--container-type pg|nanocode|pebble|opencode]
+#   fault-inject-crash-loop.sh --tenant <name> [--container-type pg|pebble|opencode|kimi]
 #   fault-inject-crash-loop.sh --container <name> --user <os-user> [options]
 #
 # Options:
 #   --tenant <name>         Target tenant (derives container + user)
-#   --container-type <type> Container type: pg, nanocode, pebble, opencode (default: pg)
+#   --container-type <type> Container type: pg, pebble, opencode, kimi (default: pg)
 #   --container <name>      Explicit container name
 #   --user <os-user>        OS user owning the rootless container
 #   --respawn-max <n>       Override respawn_max to exhaust (default: read from unit or 10)
@@ -37,9 +37,10 @@
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 
 # ── Defaults ────────────────────────────────────────────────────────────────
 
@@ -109,13 +110,13 @@ while [[ $# -gt 0 ]]; do
         --yes|-y)            YES=true; shift ;;
         --verbose|-v)        VERBOSE=true; shift ;;
         --help|-h)
-            printf 'Usage: %s --tenant <name> [--container-type pg|nanocode|pebble|opencode] [options]\n' "$SCRIPT_NAME"
+            printf 'Usage: %s --tenant <name> [--container-type pg|pebble|opencode|kimi] [options]\n' "$SCRIPT_NAME"
             printf '       %s --container <name> --user <os-user> [options]\n\n' "$SCRIPT_NAME"
             printf 'Fault-injection test: exhausts supervise-daemon respawn budget,\n'
             printf 'then verifies self-heal backstop detects and handles the dead unit.\n\n'
             printf 'Options:\n'
             printf '  --tenant <name>           Target tenant name\n'
-            printf '  --container-type <type>   Container type (pg, nanocode, pebble, opencode; default: pg)\n'
+            printf '  --container-type <type>   Container type (pg, pebble, opencode, kimi; default: pg)\n'
             printf '  --container <name>        Explicit container name\n'
             printf '  --user <os-user>          OS user for rootless podman\n'
             printf '  --respawn-max <n>         Override respawn_max (default: read from unit or 10)\n'
@@ -137,10 +138,10 @@ done
 if [[ -n "$TENANT" ]]; then
     case "$CONTAINER_TYPE" in
         pg)       CONTAINER="lunarwing-pg-${TENANT}" ;;
-        nanocode) CONTAINER="lunarwing-nanocode-${TENANT}" ;;
         pebble)   CONTAINER="lunarwing-pebble-${TENANT}" ;;
         opencode) CONTAINER="lunarwing-opencode-${TENANT}" ;;
-        *) die "unknown container-type: $CONTAINER_TYPE (expected pg, nanocode, pebble, opencode)" ;;
+        kimi)     CONTAINER="lunarwing-kimi-${TENANT}" ;;
+        *) die "unknown container-type: $CONTAINER_TYPE (expected pg, pebble, opencode, kimi)" ;;
     esac
     USER="${USER:-$TENANT}"
 fi

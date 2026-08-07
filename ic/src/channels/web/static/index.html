@@ -14,16 +14,16 @@
   <script src="/i18n/en.js" defer></script>
   <script src="/i18n/zh-CN.js" defer></script>
 
+  <!-- DOMPurify and marked are vendored under /vendor/ (pinned + SRI) so the
+       UI works offline / in private-network installs with no CDN dependency. -->
   <script
-    src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.2.3/purify.min.js"
+    src="/vendor/purify.min.js"
     integrity="sha384-osZDKVu4ipZP703HmPOhWdyBajcFyjX2Psjk//TG1Rc0AdwEtuToaylrmcK3LdAl"
-    crossorigin="anonymous"
     defer
   ></script>
   <script
-    src="https://cdn.jsdelivr.net/npm/marked@17.0.2/lib/marked.umd.min.js"
+    src="/vendor/marked.umd.min.js"
     integrity="sha384-pN9zSKOnTZwXRtYZAu0PBPEgR2B7DOC1aeLxQ33oJ0oy5iN1we6gm57xldM2irDG"
-    crossorigin="anonymous"
     defer
   ></script>
   <script src="/theme-init.js"></script>
@@ -77,17 +77,27 @@
     <div class="restart-loader-overlay"></div>
     <div class="restart-loader-content">
       <img src="/favicon.svg" alt="LunarWing" class="restart-logo">
-      <div class="restart-spinner"></div>
-      <div class="restart-loader-text">
-        <p class="restart-title" data-i18n="restart.progressTitle">Restarting LunarWing</p>
-        <p class="restart-subtitle" data-i18n="restart.progressSubtitle">Please wait while the process restarts...</p>
+      <div id="restart-loader-progress">
+        <div class="restart-spinner"></div>
+        <div class="restart-loader-text">
+          <p class="restart-title" data-i18n="restart.progressTitle">Restarting LunarWing</p>
+          <p class="restart-subtitle" data-i18n="restart.progressSubtitle">Please wait while the process restarts...</p>
+        </div>
+        <div class="restart-progress-bar">
+          <div class="restart-progress-fill"></div>
+        </div>
+        <p class="restart-modal-info" data-i18n="restart.checkLogs">
+          Check the Logs tab for details after the restart completes.
+        </p>
       </div>
-      <div class="restart-progress-bar">
-        <div class="restart-progress-fill"></div>
+      <div class="restart-loader-error" id="restart-loader-error" style="display:none">
+        <p class="restart-title" data-i18n="restart.tooLong">Restart is taking longer than expected</p>
+        <p class="restart-subtitle" data-i18n="restart.tooLongDetail">The process may not have come back. Check the Logs tab, then reload the page.</p>
+        <div class="restart-modal-footer">
+          <button class="restart-modal-btn cancel" id="restart-dismiss-btn" data-i18n="restart.dismiss">Dismiss</button>
+          <button class="restart-modal-btn confirm" id="restart-reload-btn" data-i18n="restart.reload">Reload page</button>
+        </div>
       </div>
-      <p class="restart-modal-info" data-i18n="restart.checkLogs">
-        Check the Logs tab for details after the restart completes.
-      </p>
     </div>
   </div>
 
@@ -103,6 +113,21 @@
       <button data-tab="routines" data-i18n="tab.routines">Routines</button>
       <button data-tab="settings" data-i18n="tab.settings">Settings</button>
       <div class="spacer"></div>
+
+      <!-- Mobile "More" overflow (H2): on narrow screens the desktop
+           controls (Logs button, status text, language, theme) are hidden;
+           this exposes them. The dot mirrors the SSE connection state. -->
+      <button class="more-btn" id="more-btn" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="more-menu">
+        <span class="more-btn-label" data-i18n="tab.more">More</span>
+        <span class="mobile-status-dot" id="mobile-status-dot" aria-hidden="true"></span>
+      </button>
+      <div class="more-menu" id="more-menu" style="display:none">
+        <button type="button" class="more-menu-item" id="more-logs-btn" data-i18n="tab.logs">Logs</button>
+        <button type="button" class="more-menu-item" id="more-theme-btn" data-i18n="theme.menuLabel">Theme</button>
+        <div class="more-menu-divider" role="separator"></div>
+        <button type="button" class="more-menu-item" data-action="switch-language" data-lang="en">English</button>
+        <button type="button" class="more-menu-item" data-action="switch-language" data-lang="zh-CN">简体中文</button>
+      </div>
 
       <!-- Language Switcher -->
       <div class="language-switcher">
@@ -228,19 +253,20 @@
     <div class="tab-panel" id="tab-jobs">
       <div class="jobs-container">
         <div class="jobs-summary" id="jobs-summary"></div>
-        <table class="jobs-table" id="jobs-table">
-          <thead>
-            <tr>
-              <th data-i18n="jobs.id">ID</th>
-              <th data-i18n="jobs.title">Title</th>
-              <th data-i18n="jobs.source">Source</th>
-              <th data-i18n="jobs.status">Status</th>
-              <th data-i18n="jobs.created">Created</th>
-              <th data-i18n="jobs.actions">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="jobs-tbody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table class="jobs-table" id="jobs-table">
+            <thead>
+              <tr>
+                <th data-i18n="jobs.id">ID</th>
+                <th data-i18n="jobs.title">Title</th>
+                <th data-i18n="jobs.status">Status</th>
+                <th data-i18n="jobs.created">Created</th>
+                <th data-i18n="jobs.actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-tbody"></tbody>
+          </table>
+        </div>
         <div class="empty-state" id="jobs-empty" style="display:none" data-i18n="jobs.empty">No jobs found</div>
       </div>
     </div>
@@ -250,10 +276,10 @@
       <div class="logs-container">
         <div class="logs-toolbar">
           <select id="logs-server-level" title="Server-side log level (changes what the server emits)">
-            <option value="error">Server: ERROR</option>
-            <option value="warn">Server: WARN</option>
-            <option value="info" selected>Server: INFO</option>
-            <option value="debug">Server: DEBUG</option>
+            <option value="error" data-i18n="logs.serverLevel.error">Server: ERROR</option>
+            <option value="warn" data-i18n="logs.serverLevel.warn">Server: WARN</option>
+            <option value="info" data-i18n="logs.serverLevel.info" selected>Server: INFO</option>
+            <option value="debug" data-i18n="logs.serverLevel.debug">Server: DEBUG</option>
           </select>
           <select id="logs-level-filter">
             <option value="all" data-i18n="logs.allLevels">All Levels</option>
@@ -262,7 +288,7 @@
             <option value="INFO" data-i18n="logs.info">Info</option>
             <option value="DEBUG" data-i18n="logs.debug">Debug</option>
           </select>
-          <input type="text" id="logs-target-filter" placeholder="Filter by target...">
+          <input type="text" id="logs-target-filter" data-i18n-placeholder="logs.targetFilterPlaceholder" placeholder="Filter by target...">
           <label class="logs-checkbox"><input type="checkbox" id="logs-autoscroll" checked> <span data-i18n="logs.autoScroll">Auto-scroll</span></label>
           <button id="logs-pause-btn" data-i18n="logs.pause">Pause</button>
           <button id="logs-clear-btn" data-i18n="logs.clear">Clear</button>
@@ -275,21 +301,23 @@
     <div class="tab-panel" id="tab-routines">
       <div class="routines-container">
         <div class="routines-summary" id="routines-summary"></div>
-        <table class="routines-table" id="routines-table">
-          <thead>
-            <tr>
-              <th data-i18n="routines.name">Name</th>
-              <th data-i18n="routines.trigger">Trigger</th>
-              <th data-i18n="routines.action">Action</th>
-              <th data-i18n="routines.lastRun">Last Run</th>
-              <th data-i18n="routines.nextRun">Next Run</th>
-              <th data-i18n="routines.runs">Runs</th>
-              <th data-i18n="routines.status">Status</th>
-              <th data-i18n="routines.actions">Actions</th>
-            </tr>
-          </thead>
-          <tbody id="routines-tbody"></tbody>
-        </table>
+        <div class="table-scroll">
+          <table class="routines-table" id="routines-table">
+            <thead>
+              <tr>
+                <th data-i18n="routines.name">Name</th>
+                <th data-i18n="routines.trigger">Trigger</th>
+                <th data-i18n="routines.action">Action</th>
+                <th data-i18n="routines.lastRun">Last Run</th>
+                <th data-i18n="routines.nextRun">Next Run</th>
+                <th data-i18n="routines.runs">Runs</th>
+                <th data-i18n="routines.status">Status</th>
+                <th data-i18n="routines.actions">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="routines-tbody"></tbody>
+          </table>
+        </div>
         <div class="empty-state" id="routines-empty" style="display:none">
           <span data-i18n="routines.noConfigured">No routines configured. Ask the assistant to create one.</span>
         </div>
@@ -357,7 +385,7 @@
                 <h3 data-i18n="extensions.installWasm">Install Extension</h3>
                 <div class="ext-install-form">
                   <input type="text" id="wasm-install-name" data-i18n-placeholder="common.name" placeholder="Extension name">
-                  <input type="text" id="wasm-install-url" placeholder="URL to .tar.gz bundle">
+                  <input type="text" id="wasm-install-url" data-i18n-placeholder="ext.bundleUrlPlaceholder" placeholder="URL to .tar.gz bundle">
                   <button id="wasm-install-btn" data-i18n="extensions.install">Install</button>
                 </div>
               </div>
@@ -385,6 +413,8 @@
                     <textarea id="mcp-install-args" rows="3" data-i18n-placeholder="mcp.argsPlaceholder" placeholder="Arguments, one per line"></textarea>
                     <textarea id="mcp-install-env" rows="3" data-i18n-placeholder="mcp.envPlaceholder" placeholder="Non-secret environment, KEY=VALUE per line"></textarea>
                     <div class="mcp-env-note" data-i18n="mcp.envNonSecret">Environment values are stored as plain configuration. Do not enter secrets.</div>
+                    <textarea id="mcp-install-env-secrets" rows="3" data-i18n-placeholder="mcp.secretEnvPlaceholder" placeholder="Secret environment references, KEY=secret_name per line"></textarea>
+                    <div class="mcp-env-note" data-i18n="mcp.secretEnvWarning">Secret values are decrypted only at activation, then exposed to the unsandboxed MCP process. Install trusted code only.</div>
                   </div>
                   <button id="mcp-add-btn" data-i18n="mcp.add">Add</button>
                 </div>
@@ -440,7 +470,21 @@
     </div>
   </div>
 
-  <div id="toasts"></div>
+  <!-- Generic Prompt Modal (collects one or more text fields) -->
+  <div id="prompt-modal" class="modal-overlay" style="display:none" role="dialog" aria-modal="true" aria-labelledby="prompt-modal-title">
+    <div class="modal">
+      <h3 id="prompt-modal-title"></h3>
+      <div id="prompt-modal-fields"></div>
+      <div class="modal-actions">
+        <button id="prompt-modal-cancel-btn" class="btn-secondary" data-i18n="btn.cancel">Cancel</button>
+        <button id="prompt-modal-btn" class="btn-primary" data-i18n="btn.confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- M13: polite live region so toasts are announced to screen readers;
+       urgent error toasts additionally carry role="alert" (see showToast). -->
+  <div id="toasts" aria-live="polite"></div>
   <script src="/app.js" defer></script>
   <script src="/i18n-app.js" defer></script>
 </body>

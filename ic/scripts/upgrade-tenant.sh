@@ -24,8 +24,8 @@
 # Flow (rootless adopt):
 #   preflight GATE -> backup(DB+ports+env) & VERIFY -> stop(old) -> git update +
 #   build-tenant + install-wasm -> add-tenant --no-health (rootless prereqs +
-#   empty PG + render units, NO daemon) -> restore-tenant --yes -> start-tenant ->
-#   weechat-orphan cleanup -> verify. Rollback steps printed at the end.
+#   empty PG + render units, NO daemon) -> restore-tenant --yes ->
+#   weechat-orphan cleanup -> start-tenant -> verify. Rollback steps printed at the end.
 #
 # SAFETY: never proceeds past a failed/again-unverified backup; never starts the
 # daemon before the restore (so restore-tenant's "daemon stopped" gate holds);
@@ -36,7 +36,6 @@
 #   sudo ic/scripts/upgrade-tenant.sh <tenant> [options]
 #     --target <rev|tag>   git ref to upgrade the tenant clone to (default v1.1.4)
 #     --keep-rootful       Runbook B: stay rootful, reuse existing PG (no migrate)
-#     --with-nanocode      also (re)build the nanocode worker
 #     --with-pebble        also (re)build the pebble worker
 #     --skip-build         dry-run planning only; live upgrades require a fresh WASM build
 #     --prune-old-root     (standalone) delete the orphaned v1.1.0 root-store PG
@@ -48,7 +47,6 @@ set -euo pipefail
 
 TARGET_REF="v1.1.4"
 KEEP_ROOTFUL=false
-WITH_NANOCODE=false
 WITH_PEBBLE=false
 SKIP_BUILD=false
 DRY_RUN=false
@@ -56,12 +54,13 @@ AUTO_YES=false
 FORCE=false
 PRUNE_OLD_ROOT=false
 TENANT=""
+ORIGINAL_ARGS=("$@")
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)         TARGET_REF="$2"; shift 2 ;;
     --keep-rootful)   KEEP_ROOTFUL=true; shift ;;
-    --with-nanocode)  WITH_NANOCODE=true; shift ;;
+    --with-nanocode)  printf 'error: Nanocode worker is retired; remove --with-nanocode\n' >&2; exit 2 ;;
     --with-pebble)    WITH_PEBBLE=true; shift ;;
     --skip-build)     SKIP_BUILD=true; shift ;;
     --prune-old-root) PRUNE_OLD_ROOT=true; shift ;;
@@ -92,7 +91,7 @@ $SKIP_BUILD && ! $DRY_RUN && die "--skip-build is unsafe for live upgrades; fres
 command -v jq >/dev/null 2>&1 || die "jq required"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MT="$SCRIPT_DIR/lunarwing-mt-admin.sh"
+MT="${LUNARWING_MT_ADMIN:-$SCRIPT_DIR/lunarwing-mt-admin.sh}"
 PF="$SCRIPT_DIR/upgrade-preflight.sh"
 PORTS_REGISTRY="${LUNARWING_PORTS_REGISTRY:-/etc/lunarwing/ports.json}"
 BACKUP_DIR="${LUNARWING_MT_BACKUP_DIR:-/var/lib/lunarwing-backups}"
@@ -203,6 +202,13 @@ if $PRUNE_OLD_ROOT; then
   exit 0
 fi
 
+# Re-enter through mt-admin so one upgrade, lifecycle, and DarkIRC writer lock
+# spans backup, stop, rebuild, reprovision, restore, and final start.
+if [[ "${LUNARWING_MT_UPGRADE_BOUNDARY_TENANT:-}" != "$TENANT" ]]; then
+  exec "$MT" upgrade-wrapper-boundary "$TENANT" "${ORIGINAL_ARGS[@]}"
+fi
+"$MT" validate-upgrade-wrapper-boundary "$TENANT"
+
 MODE="rootless-adopt"; $KEEP_ROOTFUL && MODE="keep-rootful"
 # This tool backs up the root-store DB (step 1) and restores into the fresh
 # rootless DB (step 5), so the rootless flip is intended: acknowledge mt-admin's
@@ -266,7 +272,8 @@ note "prior clone rev recorded for rollback: $PRIOR_REV"
 
 # ---- 2. STOP the OLD model (daemon + old PG); old container/volume preserved --
 banner "2/8  Stop tenant (old model)"
-run mt_rootful stop-tenant "$TENANT"
+run mt_rootful stop-tenant-for-upgrade "$TENANT"
+run mt cleanup-legacy-weechat "$TENANT"
 
 # ---- 3. UPDATE the tenant clone + REBUILD (mt-admin does NOT auto-update) -----
 banner "3/8  Update clone + build"
@@ -280,11 +287,11 @@ else
   run sudo -u "$TENANT" git -C "$LWROOT" fetch --tags --prune
   run sudo -u "$TENANT" git -C "$LWROOT" checkout "$TARGET_REF"
   build_args=(build-tenant "$TENANT" --with-wasm --require-wasm)
-  $WITH_NANOCODE && build_args+=(--with-nanocode)
   $WITH_PEBBLE  && build_args+=(--with-pebble)
   run mt "${build_args[@]}"
   run mt install-wasm "$TENANT"
 fi
+run mt ensure-darkirc-release "$TENANT"
 
 # ---- 4. PROVISION rootless + render units + bring up EMPTY PG (NO daemon) -----
 banner "4/8  Provision + render (add-tenant --no-health, idempotent)"
@@ -332,21 +339,9 @@ fi
 banner "6/8  Start tenant"
 run mt start-tenant "$TENANT"
 
-# ---- 7. CLEAN UP the orphaned old WeeChat unit (rename left it) --------------
-banner "7/8  Orphan cleanup"
-OLD_WC="$HOME_T/.config/systemd/user/weechat-$TENANT.service"
-if [[ -f "$OLD_WC" ]]; then
-  run sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user disable --now "weechat-$TENANT.service"
-  run rm -f "$OLD_WC"
-  run sudo -u "$TENANT" env XDG_RUNTIME_DIR="/run/user/$UID_T" systemctl --user daemon-reload
-  note "removed orphaned weechat-$TENANT.service (replaced by lunarwing-weechat-$TENANT.service)"
-else
-  note "no orphaned weechat-$TENANT.service found"
-fi
-
-# ---- 8. VERIFY ---------------------------------------------------------------
-banner "8/8  Verify"
-run mt status-tenant "$TENANT"
+# ---- 7. VERIFY ---------------------------------------------------------------
+banner "7/8  Verify"
+run mt status "$TENANT"
 if [[ "$KEEP_ROOTFUL" == false ]] && ! $DRY_RUN; then
   vrows="$(rootless_data_rows "$TENANT")"   # row count, not table count (schema exists regardless of restore)
   if [[ "${vrows:-0}" -gt 0 ]]; then note "rootless DB holds $vrows conversation rows — restored data is present."

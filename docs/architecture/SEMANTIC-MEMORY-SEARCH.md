@@ -71,10 +71,10 @@ and profile data) with the shared safety `Sanitizer`. High-severity prompt
 injection patterns return `WorkspaceError::InjectionRejected`; the memory tool
 maps that to a not-authorized error.
 
-Layer-aware `write_to_layer()` and `append_to_layer()` currently apply layer
-permissions and privacy classification but do not call this system-prompt
-injection guard. Callers must not use a custom layer to bypass the default-scope
-write path for prompt-bearing files.
+Layer-aware `write_to_layer()` and `append_to_layer()` apply layer
+permissions and privacy classification, and run the same system-prompt
+injection guard as the default-scope path (appends to prompt-visible files
+re-validate the concatenated content).
 
 ### Step 2: Document Chunking
 
@@ -336,7 +336,7 @@ with another tenant's user ID; automatic scope namespacing is not implemented.
 ```rust
 SearchConfig {
     limit: 10,                          // max results returned
-    rrf_k: 60,                          // RRF constant (higher = favor top results more)
+    rrf_k: 60,                          // RRF constant (higher = flatter rank differences)
     use_fts: true,                      // enable full-text search
     use_vector: true,                   // enable vector search
     min_score: 0.0,                     // threshold [0, 1]

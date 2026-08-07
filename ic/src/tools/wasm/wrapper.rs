@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::{Stream, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
 use wasmtime::Store;
 use wasmtime::component::{Linker, ResourceTable};
@@ -113,7 +114,13 @@ impl ScopedBearerCredential {
         {
             return None;
         }
-        let host = url.host_str()?.to_ascii_lowercase();
+        // Normalize exactly like extract_host_from_url (lowercased, IPv6
+        // brackets stripped) so the stored host pattern matches the request
+        // host at injection time. Url::host_str() keeps IPv6 brackets
+        // ("[::1]") while extract_host_from_url strips them ("::1") — without
+        // this, an IPv6 loopback credential would never inject (fail-closed
+        // but broken).
+        let host = extract_host_from_url(service_url)?;
         let allowed_host = match url.host()? {
             url::Host::Domain(domain) => {
                 domain.eq_ignore_ascii_case("localhost")
@@ -154,6 +161,8 @@ fn url_matches_scoped_prefix(request_url: &str, allowed_prefix: &str) -> bool {
     request.origin() == allowed.origin() && request.path().starts_with(allowed.path())
 }
 
+const GITLAB_CONFIG_PATH: &str = "config/gitlab.json";
+
 /// Workspace reader backed by pre-loaded data.
 ///
 /// Loaded asynchronously before WASM execution so the sync host function
@@ -168,34 +177,45 @@ impl crate::tools::wasm::WorkspaceReader for PreloadedWorkspaceReader {
     }
 }
 
+fn uses_direct_gitlab_config_preload(tool_name: &str, prefixes: &[String]) -> bool {
+    matches!(tool_name, "gitlab" | "gitlab-tool")
+        && matches!(prefixes, [path] if path == GITLAB_CONFIG_PATH)
+}
+
 /// Pre-load workspace documents matching the given prefixes into a sync reader.
 async fn preload_workspace_reader(
     workspace: &crate::workspace::Workspace,
+    tool_name: &str,
     prefixes: &[String],
 ) -> PreloadedWorkspaceReader {
     let mut data = HashMap::new();
 
-    let paths = match workspace.list_all().await {
-        Ok(paths) => paths,
-        Err(e) => {
-            tracing::debug!("Failed to list workspace for WASM pre-load: {e}");
-            return PreloadedWorkspaceReader { data };
+    // GitLab reads one exact config file. Other grants retain prefix semantics.
+    let matching = if uses_direct_gitlab_config_preload(tool_name, prefixes) {
+        vec![GITLAB_CONFIG_PATH.to_string()]
+    } else {
+        let paths = match workspace.list_all().await {
+            Ok(paths) => paths,
+            Err(e) => {
+                tracing::debug!("Failed to list workspace for WASM pre-load: {e}");
+                return PreloadedWorkspaceReader { data };
+            }
+        };
+
+        if prefixes.is_empty() {
+            paths
+        } else {
+            paths
+                .into_iter()
+                .filter(|path| prefixes.iter().any(|prefix| path.starts_with(prefix)))
+                .collect()
         }
     };
 
-    let matching: Vec<&String> = if prefixes.is_empty() {
-        paths.iter().collect()
-    } else {
-        paths
-            .iter()
-            .filter(|p| prefixes.iter().any(|pfx| p.starts_with(pfx)))
-            .collect()
-    };
-
     for path in matching {
-        match workspace.read(path).await {
+        match workspace.read(&path).await {
             Ok(doc) => {
-                data.insert(path.clone(), doc.content);
+                data.insert(path, doc.content);
             }
             Err(e) => {
                 tracing::debug!(path = %path, "Failed to pre-load workspace doc for WASM: {e}");
@@ -377,6 +397,40 @@ impl WasiView for StoreData {
     }
 }
 
+fn enforce_response_size(size: u64, max_response_bytes: usize) -> Result<(), String> {
+    if size > max_response_bytes as u64 {
+        return Err(format!(
+            "Response body too large: {} bytes exceeds limit of {} bytes",
+            size, max_response_bytes
+        ));
+    }
+    Ok(())
+}
+
+async fn collect_capped_response_body<S, E>(
+    stream: S,
+    content_length: Option<u64>,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, String>
+where
+    S: Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+{
+    if let Some(content_length) = content_length {
+        enforce_response_size(content_length, max_response_bytes)?;
+    }
+
+    let mut body = Vec::new();
+    futures::pin_mut!(stream);
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("Failed to read response body: {e}"))?;
+        let new_size = (body.len() as u64).saturating_add(chunk.len() as u64);
+        enforce_response_size(new_size, max_response_bytes)?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 // Implement the generated Host trait from bindgen.
 //
 // This registers all 6 host functions under the `lunarwing:agent/host` namespace:
@@ -527,6 +581,8 @@ impl lunarwing::agent::host::Host for StoreData {
                 interceptor.before_request(&req).await
             });
             if let Some(resp) = intercepted {
+                let resp_body = resp.body.into_bytes();
+                enforce_response_size(resp_body.len() as u64, max_response_bytes)?;
                 let resp_headers: HashMap<String, String> = resp
                     .headers
                     .iter()
@@ -537,7 +593,7 @@ impl lunarwing::agent::host::Host for StoreData {
                 return Ok(lunarwing::agent::host::HttpResponse {
                     status: resp.status,
                     headers_json: resp_headers_json,
-                    body: resp.body.into_bytes(),
+                    body: resp_body,
                 });
             }
         }
@@ -613,30 +669,14 @@ impl lunarwing::agent::host::Host for StoreData {
                 .collect();
             let headers_json = serde_json::to_string(&response_headers).unwrap_or_default();
 
-            // Check Content-Length header for early rejection of oversized responses.
-            let max_response = max_response_bytes;
-            if let Some(cl) = response.content_length()
-                && cl as usize > max_response
-            {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    cl, max_response
-                ));
-            }
-
-            // Read body with a size cap to prevent memory exhaustion.
-            let body = response
-                .bytes()
-                .await
-                .map_err(|e| format!("Failed to read response body: {}", e))?;
-            if body.len() > max_response {
-                return Err(format!(
-                    "Response body too large: {} bytes exceeds limit of {} bytes",
-                    body.len(),
-                    max_response
-                ));
-            }
-            let body = body.to_vec();
+            // Stream body so absent or inaccurate Content-Length cannot bypass the cap.
+            let content_length = response.content_length();
+            let body = collect_capped_response_body(
+                response.bytes_stream(),
+                content_length,
+                max_response_bytes,
+            )
+            .await?;
 
             // Leak detection on response body
             if let Ok(body_str) = std::str::from_utf8(&body) {
@@ -1347,6 +1387,25 @@ pub(super) fn extract_wasm_metadata(
     Ok((description, schema))
 }
 
+fn approval_requirement_for(
+    capabilities: &Capabilities,
+) -> crate::tools::tool::ApprovalRequirement {
+    if capabilities.ssh.is_some() {
+        return crate::tools::tool::ApprovalRequirement::Always;
+    }
+    match capabilities.approval {
+        crate::tools::wasm::WasmApprovalPolicy::Never => {
+            crate::tools::tool::ApprovalRequirement::Never
+        }
+        crate::tools::wasm::WasmApprovalPolicy::UnlessAutoApproved => {
+            crate::tools::tool::ApprovalRequirement::UnlessAutoApproved
+        }
+        crate::tools::wasm::WasmApprovalPolicy::Always => {
+            crate::tools::tool::ApprovalRequirement::Always
+        }
+    }
+}
+
 #[async_trait]
 impl Tool for WasmToolWrapper {
     fn name(&self) -> &str {
@@ -1359,6 +1418,10 @@ impl Tool for WasmToolWrapper {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.schemas.advertised()
+    }
+
+    fn is_wasm_tool(&self) -> bool {
+        true
     }
 
     fn discovery_schema(&self) -> serde_json::Value {
@@ -1429,7 +1492,7 @@ impl Tool for WasmToolWrapper {
         let mut capabilities = self.capabilities.clone();
         if let (Some(ws), Some(ws_cap)) = (&self.workspace, &capabilities.workspace_read) {
             let prefixes = ws_cap.allowed_prefixes.clone();
-            let reader = preload_workspace_reader(ws, &prefixes).await;
+            let reader = preload_workspace_reader(ws, self.name(), &prefixes).await;
             if let Some(ref mut cap) = capabilities.workspace_read {
                 cap.reader = Some(Arc::new(reader));
             }
@@ -1503,11 +1566,13 @@ impl Tool for WasmToolWrapper {
         // A WASM tool granted the SSH capability can run remote commands — always
         // require explicit approval, matching the built-in ssh tool. Other WASM
         // tools keep the default (Never).
-        if self.capabilities.ssh.is_some() {
-            crate::tools::tool::ApprovalRequirement::Always
-        } else {
-            crate::tools::tool::ApprovalRequirement::Never
-        }
+        approval_requirement_for(&self.capabilities)
+    }
+
+    fn allows_autonomous_execution(&self) -> bool {
+        // A WASM tool granted the SSH capability can run remote commands —
+        // exclude it from autonomous jobs/routines, matching ssh/ssh_git.
+        self.capabilities.ssh.is_none()
     }
 
     fn requires_sanitization(&self) -> bool {
@@ -2116,9 +2181,72 @@ mod tests {
         TEST_GOOGLE_OAUTH_TOKEN, TEST_OAUTH_CLIENT_ID, TEST_OAUTH_CLIENT_SECRET,
         test_secrets_store,
     };
+    use crate::tools::tool::ApprovalRequirement;
     use crate::tools::tool::Tool;
-    use crate::tools::wasm::capabilities::Capabilities;
+    use crate::tools::wasm::capabilities::{Capabilities, WasmApprovalPolicy};
     use crate::tools::wasm::runtime::{WasmRuntimeConfig, WasmToolRuntime};
+
+    fn response_chunks(
+        sizes: &[usize],
+    ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + use<> {
+        futures::stream::iter(
+            sizes
+                .iter()
+                .map(|size| Ok(bytes::Bytes::from(vec![b'x'; *size])))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[tokio::test]
+    async fn response_without_content_length_cannot_exceed_cap() {
+        let error = super::collect_capped_response_body(response_chunks(&[4, 5]), None, 8)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Response body too large: 9 bytes exceeds limit of 8 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_with_underreported_content_length_cannot_exceed_cap() {
+        let error = super::collect_capped_response_body(response_chunks(&[4, 5]), Some(1), 8)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Response body too large: 9 bytes exceeds limit of 8 bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_at_cap_boundary_succeeds() {
+        let body = super::collect_capped_response_body(response_chunks(&[3, 5]), None, 8)
+            .await
+            .unwrap();
+
+        assert_eq!(body, b"xxxxxxxx");
+    }
+
+    #[test]
+    fn declarative_approval_policy_and_ssh_override_are_enforced() {
+        let mut capabilities = Capabilities {
+            approval: WasmApprovalPolicy::UnlessAutoApproved,
+            ..Capabilities::default()
+        };
+        assert_eq!(
+            super::approval_requirement_for(&capabilities),
+            ApprovalRequirement::UnlessAutoApproved
+        );
+
+        capabilities.ssh = Some(crate::tools::wasm::SshCapability::default());
+        assert_eq!(
+            super::approval_requirement_for(&capabilities),
+            ApprovalRequirement::Always
+        );
+    }
 
     /// Instantiation smoke test for the Option-3 `ssh` WASM guest.
     ///
@@ -2640,6 +2768,47 @@ mod tests {
             store_data.inject_host_credentials("localhost", &mut denied_headers, &mut denied_url);
             assert!(!denied_headers.contains_key("Authorization"));
         }
+    }
+
+    /// IPv6 loopback scoped credentials must actually inject: the credential
+    /// stores the host via the same normalization as `extract_host_from_url`
+    /// (bracket-stripped, lowercased). Regression coverage for the two forms
+    /// ("[::1]" vs "::1") silently mismatching.
+    #[test]
+    fn test_scoped_vision_credential_ipv6_loopback_injects() {
+        use crate::tools::wasm::wrapper::{
+            ScopedBearerCredential, StoreData, extract_host_from_url,
+        };
+        use secrecy::SecretString;
+        use std::collections::HashMap;
+
+        let credential = ScopedBearerCredential::new(
+            "http://[::1]:8088",
+            SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
+        )
+        .expect("valid IPv6 loopback vision credential")
+        .resolve();
+        let store_data = StoreData::new(
+            1024 * 1024,
+            Capabilities::default(),
+            HashMap::new(),
+            vec![credential],
+        );
+
+        let mut headers = HashMap::new();
+        let mut url = "http://[::1]:8088/v1/vision/analyze".to_string();
+        let host = extract_host_from_url(&url).expect("request host");
+        store_data.inject_host_credentials(&host, &mut headers, &mut url);
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&format!("Bearer {TEST_BEARER_TOKEN_123}"))
+        );
+
+        // A different origin still must not receive the token.
+        let mut denied_headers = HashMap::new();
+        let mut denied_url = "http://[::1]:8089/v1/vision/analyze".to_string();
+        store_data.inject_host_credentials(&host, &mut denied_headers, &mut denied_url);
+        assert!(!denied_headers.contains_key("Authorization"));
     }
 
     #[test]
@@ -3661,6 +3830,32 @@ mod tests {
             result.missing_required,
             vec!["google_oauth_token".to_string()]
         );
+    }
+
+    #[test]
+    fn test_gitlab_config_uses_direct_workspace_preload() {
+        let config_path = [super::GITLAB_CONFIG_PATH.to_string()];
+        assert!(super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &config_path
+        ));
+        assert!(super::uses_direct_gitlab_config_preload(
+            "gitlab-tool",
+            &config_path
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "another-tool",
+            &config_path
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &["config/".to_string()]
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload(
+            "gitlab",
+            &[super::GITLAB_CONFIG_PATH.to_string(), "notes/".to_string()]
+        ));
+        assert!(!super::uses_direct_gitlab_config_preload("gitlab", &[]));
     }
 
     #[test]

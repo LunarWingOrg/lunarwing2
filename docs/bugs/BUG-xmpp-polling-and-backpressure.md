@@ -1,11 +1,14 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-07-28).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-03).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
-> source-confirmed residual was not reproduced and is not automatically
-> recovered by the supervisor.
+> source-confirmed residual was not reproduced. The in-process supervisor does
+> not restart a merely-blocked poll task, but because the poll epoch only
+> advances after a successful dispatch, a queue-blocked poll trips the stall
+> detector and is visible to health reporting (and to the optional watchdog
+> deep check).
 
 This is the consolidated, current form of `BUG-daemon-stops-polling-xmpp-bridge.md`.
 
@@ -54,11 +57,11 @@ a failure criterion.
   poll loop with exponential backoff after an error or panic
   (`ic/src/channels/wasm/wrapper.rs:2284-2448`).
 - Poll callbacks are bounded by the configured callback timeout
-  (`ic/src/channels/wasm/wrapper.rs:2530-2562`).
+  (`ic/src/channels/wasm/wrapper.rs:2484-2513`).
 - `health_check()` detects a dead supervisor and a stale
-  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2906-2929`).
+  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2906-2948`).
 - Dedicated tests cover dead and stalled poll tasks
-  (`ic/src/channels/wasm/wrapper.rs:5641-5655`).
+  (`ic/src/channels/wasm/wrapper.rs:5641-5688`).
 - Channel health is aggregated by `ChannelManager`
   (`ic/src/channels/manager.rs:210-220`) and exposed by the gateway
   (`ic/src/channels/web/server.rs:2887-2961`).
@@ -72,18 +75,21 @@ to the polling block near line 2285 no longer match the current wrapper layout
 
 ## Residual backpressure path
 
-The channel's message queue is bounded. `dispatch_emitted_messages` awaits its
-`tx.reserve_many` and sends via permits (`ic/src/channels/wasm/wrapper.rs:2568-2650`;
-the queue is created with capacity 256 at `:969,2743`). If downstream consumption
-stalls, or sustained ingress exceeds the consumer's drain rate, this queue can
-fill; the dispatch path returns an error rather than blocking indefinitely. The
-poll task updates `last_poll_epoch_ms` before dispatch (within the poll loop at
-`wrapper.rs:2320-2330`).
+The channel's message queue is bounded (capacity 256, created at
+`ic/src/channels/wasm/wrapper.rs:969,2743`). `dispatch_emitted_messages`
+(`wrapper.rs:2568-2651`) awaits `tx.reserve_many` (`:2611-2617`) and sends via
+permits. If downstream consumption stalls, or sustained ingress exceeds the
+consumer's drain rate, this queue can fill and the `reserve_many` await blocks
+indefinitely; the dispatch path only errors for a closed queue, a missing
+sender, an oversized batch, or rate limiting. The poll task stores
+`last_poll_epoch_ms` only after a successful dispatch
+(`wrapper.rs:2382-2389`), so a queue-blocked poll stops refreshing the epoch
+and trips the stall detector once `max(3 x poll interval, 30s)` elapses.
 
 The earlier direct coupling to a synchronous worker turn is no longer current:
 the active-turn loop continues polling the merged channel stream, defers
 ordinary messages in a bounded FIFO, and rejects overflow explicitly
-(`ic/src/agent/agent_loop.rs:999-1074`, `ic/src/agent/dispatch.rs:6-51`). That
+(`ic/src/agent/agent_loop.rs:1056-1138`, `ic/src/agent/dispatch.rs:6-51`). That
 prevents `wait=true` by itself from halting downstream reads. The residual is
 the unbounded queue-send await under an independently stalled or overloaded
 consumer, not evidence that crash supervision is absent.
@@ -111,4 +117,7 @@ resolved.
 Status is based on current source, in-tree regression tests, and the watchdog
 scripts. No Cargo command, live bridge run, or full E2E run was performed in
 this documentation pass; the backpressure path is therefore a residual risk,
-not a reproduced current outage.
+not a reproduced current outage. Re-verified on 2026-08-03: the residual
+section was corrected — the poll epoch is stored only after a successful
+dispatch (`wrapper.rs:2382-2389`), so a queue-blocked poll is visible to the
+stall detector, and a full queue blocks `reserve_many` rather than erroring.

@@ -5,7 +5,8 @@
 # by restarting unhealthy services. Applies a grace period before the first
 # restart, exponential backoff with jitter (linear toggle available), a
 # flapping guard, post-restart verification via the component health checks,
-# multi-tenant remediation, state auto-prune, and escalation via notification.
+# multi-tenant remediation, state auto-prune, per-service escalation cooldown,
+# and escalation via notification.
 #
 # Usage:
 #   lunarwing-self-heal.sh [--report <path>] [--dry-run] [--max-retries N]
@@ -19,7 +20,7 @@
 
 set -euo pipefail
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -57,6 +58,23 @@ HISTORY_MAX="${SELF_HEAL_HISTORY_MAX:-20}"
 # coreutils `timeout` is unavailable (macOS/launchd hosts).
 ESCALATE_TIMEOUT="${SELF_HEAL_ESCALATE_TIMEOUT:-30}"
 
+# Per-service page cooldown. This state lives outside state.json so a
+# flap→recover→reflap cycle cannot erase it. Invalid values fail safely to the
+# default; 0/false/no/off disables the cooldown.
+ESCALATE_COOLDOWN="${SELF_HEAL_ESCALATE_COOLDOWN:-3600}"
+case "$ESCALATE_COOLDOWN" in
+    0|false|no|off) ESCALATE_COOLDOWN=0 ;;
+    *[!0-9]*|'')
+        printf 'WARNING: invalid SELF_HEAL_ESCALATE_COOLDOWN=%q; using 3600\n' "$ESCALATE_COOLDOWN" >&2
+        ESCALATE_COOLDOWN=3600
+        ;;
+esac
+
+# Tests and non-Gotify deployments can supply a notifier. Exit zero means a
+# custom notifier delivered the page; the bundled Gotify notifier additionally
+# requires GOTIFY_TOKEN to be non-empty before delivery is attempted.
+NOTIFY_SCRIPT="${SELF_HEAL_NOTIFY_SCRIPT:-$SCRIPT_DIR/send-notification.sh}"
+
 # Post-restart verification: re-run the component's health-*.sh and parse
 # .status (deeper than is-active). Set false to use is-active only.
 VERIFY_HEALTH="${SELF_HEAL_VERIFY_HEALTH:-true}"
@@ -71,6 +89,23 @@ STATE_PRUNE_TTL="${SELF_HEAL_STATE_PRUNE_TTL:-86400}"   # 24h
 # init units do. Set false to remediate ONLY the auto-discovered init sub-units
 # and avoid phantom restarts/escalations of nonexistent base services.
 REMEDY_LOGICAL="${SELF_HEAL_REMEDY_LOGICAL:-true}"
+
+# Base services may be system units (host-global MT pipeline) or user units
+# (single-node user timer). Tenant units still use their owner-specific user bus.
+SYSTEMD_SCOPE="${SELF_HEAL_SYSTEMD_SCOPE:-system}"
+case "$SYSTEMD_SCOPE" in
+    system|user) ;;
+    *)
+        printf 'WARNING: invalid SELF_HEAL_SYSTEMD_SCOPE=%q; using system\n' "$SYSTEMD_SCOPE" >&2
+        SYSTEMD_SCOPE=system
+        ;;
+esac
+
+# NetBird lifecycle is operator-owned. Health monitoring is independent; by
+# default self-heal escalates without restarting the host-global daemon. Set
+# true only when operators explicitly delegate daemon restart ownership.
+NETBIRD_REMEDIATE="${SELF_HEAL_NETBIRD_REMEDIATE:-false}"
+[[ "$NETBIRD_REMEDIATE" == true ]] || NETBIRD_REMEDIATE=false
 
 # Report staleness guard: refuse to act on a report older than this many seconds
 # (0 = disabled). Prevents remediating on stale data if the scheduler stalls.
@@ -95,7 +130,8 @@ REPORT_FILE=""
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 
 log_action() {
-    local line="$(timestamp) $*"
+    local line
+    line="$(timestamp) $*"
     mkdir -p "$(dirname "$SELF_HEAL_LOG")"
     printf '%s\n' "$line" >> "$SELF_HEAL_LOG"
     printf '%s\n' "$line" >&2
@@ -185,7 +221,9 @@ unit_tenant() {
         lunarwing-pg-*)              printf '%s' "${u#lunarwing-pg-}" ;;
         lunarwing-nanocode-*)        printf '%s' "${u#lunarwing-nanocode-}" ;;
         lunarwing-opencode-*)        printf '%s' "${u#lunarwing-opencode-}" ;;
+        lunarwing-kimi-*)            printf '%s' "${u#lunarwing-kimi-}" ;;
         lunarwing-pebble-*)          printf '%s' "${u#lunarwing-pebble-}" ;;
+        lunarwing-vision-*)          printf '%s' "${u#lunarwing-vision-}" ;;
         lunarwing-weechat-adapter-*) printf '%s' "${u#lunarwing-weechat-adapter-}" ;;
         lunarwing-weechat-*)         printf '%s' "${u#lunarwing-weechat-}" ;;
         xmpp-bridge-*)               printf '%s' "${u#xmpp-bridge-}" ;;
@@ -213,18 +251,40 @@ _resolve_systemd_tenant_user() {
 
 # ── Service restart helpers ──────────────────────────────────────────────────
 
-_systemd_active() { systemctl is-active --quiet "$1"; }
+_systemd_use_user_bus() {
+    local svc="$1"
+    # NetBird daemon is host-global even when LunarWing base units run under a
+    # single-node user manager.
+    [[ "$SYSTEMD_SCOPE" == user && "$svc" != "${NETBIRD_SERVICE:-netbird}" ]]
+}
+
+_systemd_active() {
+    if _systemd_use_user_bus "$1"; then
+        systemctl --user is-active --quiet "$1"
+    else
+        systemctl is-active --quiet "$1"
+    fi
+}
 _systemd_restart() {
     local svc="$1"
     if [[ "$DRY_RUN" == true ]]; then
-        log "[DRY-RUN] would run: systemctl restart $svc (after reset-failed)"
+        if _systemd_use_user_bus "$svc"; then
+            log "[DRY-RUN] would run: systemctl --user restart $svc (after reset-failed)"
+        else
+            log "[DRY-RUN] would run: systemctl restart $svc (after reset-failed)"
+        fi
         return 0
     fi
     # A start-limited unit (StartLimitBurst hit) sits in `failed` and refuses
     # `restart` until its failure counter is cleared. reset-failed is a no-op on
     # a healthy unit, so it is always safe to run first.
-    systemctl reset-failed "$svc" 2>/dev/null || true
-    systemctl restart "$svc"
+    if _systemd_use_user_bus "$svc"; then
+        systemctl --user reset-failed "$svc" 2>/dev/null || true
+        systemctl --user restart "$svc"
+    else
+        systemctl reset-failed "$svc" 2>/dev/null || true
+        systemctl restart "$svc"
+    fi
 }
 
 # Per-tenant systemd USER units: run as the tenant user against their bus.
@@ -326,7 +386,11 @@ service_substate() {
         [[ "$uid" == '?' ]] && return 0
         sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user show -p SubState --value "$svc" 2>/dev/null || true
     else
-        systemctl show -p SubState --value "$svc" 2>/dev/null || true
+        if _systemd_use_user_bus "$svc"; then
+            systemctl --user show -p SubState --value "$svc" 2>/dev/null || true
+        else
+            systemctl show -p SubState --value "$svc" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -338,6 +402,7 @@ declare -A SERVICE_MAP=(
     [tensorzero]="tensorzero-gateway"
     [clickhouse]="clickhouse-server"
     [lunarvision]="${LUNARVISION_SERVICE:-ocr-sidecar}"
+    [netbird]="${NETBIRD_SERVICE:-netbird}"
 )
 
 # Component → health-check script, for post-restart verification.
@@ -347,6 +412,7 @@ declare -A COMPONENT_CHECK_MAP=(
     [tensorzero]="health-tensorzero.sh"
     [clickhouse]="health-clickhouse.sh"
     [lunarvision]="health-lunarvision.sh"
+    [netbird]="health-netbird.sh"
 )
 
 # Components that represent features of another service, not their own service.
@@ -355,6 +421,13 @@ declare -A NO_REMEDY=(
     [ratelimit]=1
     [models]=1
 )
+
+# Components where detection is useful but automatic restart is unsafe. These
+# still enter the grace/escalation path instead of disappearing as NO_REMEDY.
+declare -A MONITOR_ONLY=()
+if [[ "$NETBIRD_REMEDIATE" != true ]]; then
+    MONITOR_ONLY[netbird]=1
+fi
 
 # ── Exponential backoff with jitter (kumogakure's compute_backoff) ───────────
 #
@@ -418,7 +491,7 @@ STATE_FILE="$SELF_HEAL_STATE_DIR/state.json"
 
 ensure_state_dir() {
     mkdir -p "$SELF_HEAL_STATE_DIR"
-    [[ -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
+    [[ "$DRY_RUN" == true || -f "$STATE_FILE" ]] || echo '{}' > "$STATE_FILE"
 }
 
 load_state() {
@@ -441,8 +514,12 @@ load_state() {
         # it overwrites last-wins and cannot accumulate unbounded across recurring
         # corruption. Then start fresh so escalated state can be rebuilt from the
         # next tick.
-        mv "$STATE_FILE" "$STATE_FILE.corrupt" 2>/dev/null || true
-        log "WARNING: state.json is corrupt — renamed to state.json.corrupt and starting fresh"
+        if [[ "$DRY_RUN" == true ]]; then
+            log "WARNING: state.json is corrupt — [DRY-RUN] would rename to state.json.corrupt and start fresh"
+        else
+            mv "$STATE_FILE" "$STATE_FILE.corrupt" 2>/dev/null || true
+            log "WARNING: state.json is corrupt — renamed to state.json.corrupt and starting fresh"
+        fi
         echo '{}'
     fi
 }
@@ -452,6 +529,14 @@ save_state() {
     tmp="$(mktemp "$STATE_FILE.tmp.XXXXXX")"
     printf '%s\n' "$state" > "$tmp"
     mv "$tmp" "$STATE_FILE"
+}
+
+persist_state() {
+    if [[ "$DRY_RUN" == true ]]; then
+        log "[DRY-RUN] state changes not persisted"
+        return 0
+    fi
+    save_state "$1"
 }
 
 state_get_num() {
@@ -483,8 +568,16 @@ mark_escalated() {
 }
 
 clear_service_state() {
-    local state="$1" svc="$2"
-    echo "$state" | jq --arg svc "$svc" 'del(.[$svc])'
+    local state="$1" svc="$2" since
+    since=$(( $(date +%s) - FLAP_WINDOW_SECS ))
+    echo "$state" | jq --arg svc "$svc" --argjson since "$since" '
+        .[$svc] as $old
+        | [($old.restart_history // [])[] | select(. >= $since)] as $history
+        | if ($history | length) > 0 then
+            .[$svc] = {restart_history: $history, last_attempt: (now | floor), escalated: false}
+          else
+            del(.[$svc])
+          end'
 }
 
 # Record an unhealthy observation: bump streak + first/last_unhealthy_at.
@@ -530,27 +623,97 @@ prune_state() {
 
 # ── Notification escalation ─────────────────────────────────────────────────
 
+_service_hash() {
+    local svc="$1" digest=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest="$(printf '%s' "$svc" | sha256sum)"; digest="${digest%% *}"
+    elif command -v shasum >/dev/null 2>&1; then
+        digest="$(printf '%s' "$svc" | shasum -a 256)"; digest="${digest%% *}"
+    elif command -v openssl >/dev/null 2>&1; then
+        digest="$(printf '%s' "$svc" | openssl dgst -sha256 2>/dev/null)"; digest="${digest##* }"
+    else
+        return 1
+    fi
+    [[ "$digest" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+    printf '%s' "${digest,,}"
+}
+
+_service_file_key() {
+    local svc="$1" safe digest
+    safe="$(printf '%s' "$svc" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-48)"
+    digest="$(_service_hash "$svc")" || return 1
+    printf '%s.%s' "$safe" "$digest"
+}
+
+# Include a readable prefix and a strong digest. Sanitization alone is unsafe:
+# distinct report-supplied names such as a/b and a?b would share one cooldown.
+_cooldown_file() {
+    local key
+    key="$(_service_file_key "$1")" || return 1
+    printf '%s/.last_escalation_page.%s' "$SELF_HEAL_STATE_DIR" "$key"
+}
+
 _send_notification() {
-    local status="$1" report_path="$2"
-    local notify_script="$SCRIPT_DIR/send-notification.sh"
+    local status="$1" report_path="$2" svc="${3:-}"
+    local notify_script="$NOTIFY_SCRIPT" cooldown_file="" now last age
+
+    if [[ -n "$svc" && "$ESCALATE_COOLDOWN" -gt 0 ]]; then
+        if cooldown_file="$(_cooldown_file "$svc")"; then
+            last="$(cat "$cooldown_file" 2>/dev/null || printf '0')"
+            [[ "$last" =~ ^[0-9]+$ ]] || last=0
+            now="$(date +%s)"
+            age=$((now - last))
+            if [[ "$last" -gt 0 && "$age" -ge 0 && "$age" -lt "$ESCALATE_COOLDOWN" ]]; then
+                log "COOLDOWN: page for $svc deferred (last page ${age}s ago < ${ESCALATE_COOLDOWN}s cooldown); will retry next tick"
+                log_action "ESCALATE_PAGE_SUPPRESSED target=$svc last_page_age=${age}s cooldown=${ESCALATE_COOLDOWN}s"
+                return 2
+            elif [[ "$last" -gt "$now" ]]; then
+                log "WARNING: future cooldown timestamp for $svc ignored"
+            fi
+        else
+            log "WARNING: no SHA-256 tool available; cooldown disabled for $svc"
+        fi
+    fi
+
+    local delivered=false
     if [[ -x "$notify_script" ]]; then
         # CRITICAL: redirect the notifier's stdout to stderr. escalate_service runs
         # inside remediate_component, whose STDOUT is captured as the returned state
         # JSON (state="$(remediate_component ...)"). Any stdout here corrupts that
-        # JSON, so the next prune_state jq aborts under `set -e` BEFORE save_state —
-        # silently losing escalated:true. Also tolerate a non-zero notify (e.g.
-        # Gotify non-200) so the escalated state still persists if the page fails.
+        # JSON, so the next prune_state jq aborts under `set -e` BEFORE save_state.
+        # A non-zero notifier result leaves escalation pending for the next tick.
         #
         # Guard with timeout so a hung Gotify endpoint can't stall the self-heal tick.
-        if command -v timeout >/dev/null 2>&1; then
-            timeout "${ESCALATE_TIMEOUT}" "$notify_script" "$status" "$report_path" >&2 || log "WARNING: escalation notification failed (page may not have been delivered)"
+        if [[ "$notify_script" == "$SCRIPT_DIR/send-notification.sh" && -z "${GOTIFY_TOKEN:-}" ]]; then
+            log "WARNING: GOTIFY_TOKEN is not set; escalation page was not delivered"
+        elif command -v timeout >/dev/null 2>&1; then
+            if timeout "${ESCALATE_TIMEOUT}" "$notify_script" "$status" "$report_path" >&2; then
+                delivered=true
+            else
+                log "WARNING: escalation notification failed (page may not have been delivered)"
+            fi
         else
             # Fallback for macOS/launchd hosts without GNU coreutils timeout.
-            "$notify_script" "$status" "$report_path" >&2 || log "WARNING: escalation notification failed (page may not have been delivered)"
+            if "$notify_script" "$status" "$report_path" >&2; then
+                delivered=true
+            else
+                log "WARNING: escalation notification failed (page may not have been delivered)"
+            fi
         fi
     else
         log "WARNING: send-notification.sh not found at $notify_script; cannot escalate"
     fi
+
+    if [[ "$delivered" == true && -n "$svc" && "$ESCALATE_COOLDOWN" -gt 0 && -n "$cooldown_file" ]]; then
+        local cooldown_tmp="${cooldown_file}.tmp.$$"
+        if (umask 077; date +%s > "$cooldown_tmp") && mv "$cooldown_tmp" "$cooldown_file"; then
+            :
+        else
+            rm -f "$cooldown_tmp"
+            log "WARNING: could not persist escalation cooldown for $svc"
+        fi
+    fi
+    [[ "$delivered" == true ]]
 }
 
 # escalate_service <svc> <retries> [reason]   (retries passed explicitly — no $STATE)
@@ -560,17 +723,37 @@ escalate_service() {
     log_action "ESCALATE target=$svc retries=$retries reason=$reason"
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] would send escalation notification for $svc"
-        return 0
+        return 2
     fi
 
-    local esc_report
-    esc_report="$SELF_HEAL_STATE_DIR/escalation-$(date +%Y%m%d%H%M%S)-$svc.json"
+    local esc_report esc_key
+    esc_key="$(_service_file_key "$svc")" || esc_key="unknown.$$"
+    esc_report="$(mktemp "$SELF_HEAL_STATE_DIR/escalation-$(date +%Y%m%d%H%M%S)-${esc_key}.json.XXXXXX")"
     jq -n --arg svc "$svc" --arg now "$(timestamp)" --arg reason "$reason" --argjson retries "$retries" \
         '{escalated: true, service: $svc, timestamp: $now, retries: $retries, reason: $reason, action: "manual_intervention_required"}' \
         > "$esc_report"
 
-    _send_notification "critical" "$esc_report"
+    local notify_rc
+    if _send_notification "critical" "$esc_report" "$svc"; then
+        notify_rc=0
+    else
+        notify_rc=$?
+    fi
     rm -f "$esc_report"
+    return "$notify_rc"
+}
+
+escalate_and_update_state() {
+    local state="$1" svc="$2" retries="$3" reason="$4"
+    if [[ "$DRY_RUN" == true ]]; then
+        escalate_service "$svc" "$retries" "$reason" || true
+    elif escalate_service "$svc" "$retries" "$reason"; then
+        state="$(mark_escalated "$state" "$svc")"
+    else
+        log "ESCALATION PENDING: page for $svc not delivered; will retry next tick"
+        log_action "ESCALATE_PENDING target=$svc retries=$retries reason=$reason"
+    fi
+    printf '%s' "$state"
 }
 
 # ── Post-restart verification ───────────────────────────────────────────────
@@ -630,15 +813,13 @@ remediate_component() {
         flaps="$(flap_count "$state" "$svc" "$flap_since")"
         if [[ "$flaps" -ge "$FLAP_MAX_RESTARTS" ]]; then
             log "FLAPPING: $svc restarted $flaps times in ${FLAP_WINDOW_SECS}s; escalating instead"
-            state="$(mark_escalated "$state" "$svc")"
-            escalate_service "$svc" "$retries" "flapping"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "flapping")"
             continue
         fi
 
         # Max retries reached → escalate.
         if [[ "$retries" -ge "$MAX_RETRIES" ]]; then
-            state="$(mark_escalated "$state" "$svc")"
-            escalate_service "$svc" "$retries" "max_retries"
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "max_retries")"
             continue
         fi
 
@@ -646,6 +827,11 @@ remediate_component() {
         if [[ "$obs" -lt "$GRACE_CHECKS" ]]; then
             log "GRACE: $svc unhealthy $obs/$GRACE_CHECKS observation(s); deferring restart"
             log_action "GRACE target=$svc obs=$obs/$GRACE_CHECKS"
+            continue
+        fi
+
+        if [[ "${MONITOR_ONLY[$comp]:-}" == "1" ]]; then
+            state="$(escalate_and_update_state "$state" "$svc" "$retries" "monitor_only")"
             continue
         fi
 
@@ -737,7 +923,7 @@ main() {
     log "=== Self-Healing Watchdog v$VERSION ==="
     log "report: $report"
     log "service manager: $SERVICE_MANAGER"
-    log "config: max-retries=$MAX_RETRIES settle=${BACKOFF_SECONDS}s backoff=$BACKOFF_STRATEGY base=${BACKOFF_BASE}s max=${BACKOFF_MAX}s grace=$GRACE_CHECKS flap=$FLAP_MAX_RESTARTS/${FLAP_WINDOW_SECS}s prune-ttl=${STATE_PRUNE_TTL}s verify=$VERIFY_HEALTH dry-run=$DRY_RUN"
+    log "config: max-retries=$MAX_RETRIES settle=${BACKOFF_SECONDS}s backoff=$BACKOFF_STRATEGY base=${BACKOFF_BASE}s max=${BACKOFF_MAX}s grace=$GRACE_CHECKS flap=$FLAP_MAX_RESTARTS/${FLAP_WINDOW_SECS}s prune-ttl=${STATE_PRUNE_TTL}s verify=$VERIFY_HEALTH escalate-cooldown=${ESCALATE_COOLDOWN}s systemd-scope=$SYSTEMD_SCOPE netbird-remediate=$NETBIRD_REMEDIATE dry-run=$DRY_RUN"
 
     jq . "$report" >/dev/null 2>&1 || die "report is not valid JSON: $report"
 
@@ -750,10 +936,14 @@ main() {
     local -A healthy=()
     local comp services svc
 
-    # 1) Standard logical components (skipped in MT mode — see SELF_HEAL_REMEDY_LOGICAL).
-    if [[ "$REMEDY_LOGICAL" == "true" ]]; then
+    # 1) Standard logical components. MT mode skips tenant-local logical
+    # mappings, but host-global NetBird monitoring remains active.
+    if [[ "$REMEDY_LOGICAL" != "true" ]]; then
+        log "MT mode: tenant-local logical-component remediation disabled (SELF_HEAL_REMEDY_LOGICAL=false); host-global monitoring remains active"
+    fi
     while IFS=$'\t' read -r comp cstatus; do
         [[ -n "$comp" ]] || continue
+        [[ "$REMEDY_LOGICAL" == "true" || "$comp" == netbird ]] || continue
         [[ "${NO_REMEDY[$comp]:-}" == "1" ]] && { [[ "$cstatus" != healthy ]] && log "SKIP: component '$comp' has no standalone service (feature/external)"; continue; }
         services="${SERVICE_MAP[$comp]:-}"
         [[ -n "$services" ]] || { [[ "$cstatus" != healthy ]] && log "WARNING: no service mapping for component '$comp'; skipping"; continue; }
@@ -767,9 +957,6 @@ main() {
             fi
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
-    else
-        log "MT mode: logical-component remediation disabled (SELF_HEAL_REMEDY_LOGICAL=false); only init sub-units will be remediated"
-    fi
 
     # 2) Init-system sub-units (systemd/openrc/launchd). Healthy ones populate
     #    `healthy`; unhealthy ones become targets.
@@ -810,7 +997,7 @@ main() {
 
     if [[ ${#targets[@]} -eq 0 ]]; then
         state="$(prune_state "$state" "$now_epoch")"
-        save_state "$state"
+        persist_state "$state"
         log "=== Self-Healing complete (nothing to do) ==="
         exit 0
     fi
@@ -824,7 +1011,7 @@ main() {
     done
 
     state="$(prune_state "$state" "$now_epoch" "${!seen[@]}")"
-    save_state "$state"
+    persist_state "$state"
 
     local summary
     summary="$(echo "$state" | jq -r 'to_entries | map({service: .key, retries: (.value.retries // 0), escalated: (.value.escalated // false)})')"

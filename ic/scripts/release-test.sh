@@ -30,10 +30,6 @@
 #     - full_job routines need Docker and a built worker image.
 #       Tested indirectly if Docker sandbox tests pass.
 #
-#   Nanocode external worker (line 47)
-#     - Requires the nanocode container running. Use lunarcode4lunarwing/
-#       smoke_test.ts for this (docker compose --profile smoke up agent-smoke).
-#
 #   Docker sandbox worker (line 48)
 #     - Requires Docker daemon and lunarwing-worker image built.
 #

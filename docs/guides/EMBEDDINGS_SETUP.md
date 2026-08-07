@@ -1,43 +1,53 @@
-# Embedded Memory Update
+# Configure Memory Embeddings
 
-## Configurable Embedding URL and OpenAI-Compatible Provider
+Embeddings are optional and disabled by default. When enabled, LunarWing uses them for vector-backed workspace memory search.
 
-Added support for the `openai_compatible` embedding provider, allowing LunarWing to use any OpenAI-compatible embedding endpoint (e.g., TensorZero, local models, third-party providers).
+## Configure in the Web UI
 
-### Changes
+The authenticated Configuration view exposes:
 
-- **`ic/src/config/embeddings.rs`** — Added `openai_compatible` provider branch that creates an `OpenAiEmbeddings` instance with a configurable base URL. Falls back to `EMBEDDING_BASE_URL` env var or the settings-level `base_url` field.
-- **`ic/src/settings.rs`** — Added `base_url: Option<String>` to `EmbeddingsSettings` for persisting the custom endpoint URL in `settings.json`.
-- **`ic/src/setup/wizard.rs`** — Added "OpenAI-compatible (custom URL)" as a provider choice in the onboarding wizard. Instructs the user to set the URL via the web UI or `EMBEDDING_BASE_URL` env var.
+- `embeddings.enabled`
+- `embeddings.provider`
+- `embeddings.model`
+- `embeddings.base_url` for `openai_compatible`
 
-### Configuration
+These values are database-backed settings. LunarWing no longer uses a standalone `settings.json` file for this configuration.
 
-Via environment:
+The web UI offers `openai`, `lunarwing_cloud`, and `openai_compatible`. The backend also supports `ollama` when configured through the environment.
+
+## Configure Through the Environment
+
+Environment values override database-backed settings:
+
 ```bash
 EMBEDDING_ENABLED=true
 EMBEDDING_PROVIDER=openai_compatible
 EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_BASE_URL=http://192.168.1.157:3002/openai/v1
-OPENAI_API_KEY=your-key
+EMBEDDING_BASE_URL=https://embeddings.example.com/openai
+OPENAI_API_KEY=<secret>
 ```
 
-Via settings.json:
-```json
-{
-  "embeddings": {
-    "enabled": true,
-    "provider": "openai_compatible",
-    "model": "text-embedding-3-small",
-    "base_url": "http://192.168.1.157:3002/openai/v1"
-  }
-}
-```
+`EMBEDDING_BASE_URL` is the service root **before** `/v1/embeddings`; LunarWing appends that path. Do not include a trailing `/v1` unless the provider's API intentionally requires a doubled path.
 
-### Supported Providers
+Additional controls:
 
-| Provider | Key | Base URL | Notes |
-|----------|-----|----------|-------|
-| `openai` | `OPENAI_API_KEY` | Default OpenAI API | Standard OpenAI embeddings |
-| `lunarwing_cloud` | LunarWing Cloud auth | — | Uses LunarWing Cloud infrastructure |
-| `ollama` | — | `OLLAMA_BASE_URL` | Local Ollama instance |
-| `openai_compatible` | `OPENAI_API_KEY` | `EMBEDDING_BASE_URL` or settings `base_url` | Any OpenAI-compatible endpoint |
+- `EMBEDDING_DIMENSION` overrides the dimension inferred from known model names.
+- `EMBEDDING_CACHE_SIZE` controls the in-memory LRU entry limit and must be at least `1`; the default is `10000`.
+- `OLLAMA_BASE_URL` selects the Ollama endpoint and defaults to `http://localhost:11434`.
+
+## Provider Requirements
+
+| Provider | Authentication | Endpoint configuration |
+| --- | --- | --- |
+| `lunarwing_cloud` | Active LunarWing Cloud session | LunarWing Cloud base URL |
+| `openai` | `OPENAI_API_KEY` | OpenAI by default; `EMBEDDING_BASE_URL` can override it |
+| `openai_compatible` | `OPENAI_API_KEY` | `EMBEDDING_BASE_URL`, or `https://api.openai.com` if omitted |
+| `ollama` | None | `OLLAMA_BASE_URL` |
+
+If an OpenAI-backed provider is enabled without `OPENAI_API_KEY`, LunarWing logs a warning and does not create the embedding provider.
+
+## Network Safety
+
+Embedding and Ollama base URLs pass the shared outbound URL validation. Remote plain HTTP, private ranges, link-local addresses, and cloud metadata targets are rejected by default; localhost HTTP is allowed. `ALLOW_PRIVATE_IPS=1` disables those private-address restrictions and should be used only in an intentionally isolated deployment, such as the committed private-network harness configuration.
+
+After changing startup environment values, restart the service through the appropriate service-management path. For multi-tenant installations, use `ic/scripts/lunarwing-mt-admin.sh` rather than direct tenant `systemctl` or `rc-service` commands.

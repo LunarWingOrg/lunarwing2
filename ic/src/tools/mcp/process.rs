@@ -1,11 +1,11 @@
 //! MCP stdio process manager.
 //!
 //! Manages the lifecycle of MCP servers running as child processes.
-//! Handles spawning, shutdown, and crash recovery with exponential backoff.
+//! Handles spawning, tracking, and shutdown.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::RwLock;
 
@@ -13,27 +13,27 @@ use crate::tools::mcp::stdio_transport::StdioMcpTransport;
 use crate::tools::mcp::transport::McpTransport;
 use crate::tools::tool::ToolError;
 
-/// Configuration for spawning a stdio MCP server.
-#[derive(Debug, Clone)]
-pub struct StdioSpawnConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub env: HashMap<String, String>,
+/// Current health of one managed stdio process.
+#[derive(Debug)]
+pub enum McpProcessState {
+    Running,
+    StdioClosed,
+    Exited(std::process::ExitStatus),
+    Missing,
 }
 
 /// Manages stdio MCP server processes.
 ///
-/// Handles spawning, tracking, and shutdown of child processes.
+/// Handles spawning, tracking, and shutdown of child processes. Higher-level
+/// recovery belongs to `ExtensionManager`, which also owns clients and tools.
 pub struct McpProcessManager {
     transports: RwLock<HashMap<String, Arc<StdioMcpTransport>>>,
-    configs: RwLock<HashMap<String, StdioSpawnConfig>>,
 }
 
 impl McpProcessManager {
     pub fn new() -> Self {
         Self {
             transports: RwLock::new(HashMap::new()),
-            configs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -43,28 +43,20 @@ impl McpProcessManager {
         name: impl Into<String>,
         command: impl Into<String>,
         args: Vec<String>,
-        env: HashMap<String, String>,
+        env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
+        suppress_stderr: bool,
     ) -> Result<Arc<StdioMcpTransport>, ToolError> {
         let name = name.into();
         let command = command.into();
-
-        let spawn_config = StdioSpawnConfig {
-            command: command.clone(),
-            args: args.clone(),
-            env: env.clone(),
-        };
-        let transport = Arc::new(StdioMcpTransport::spawn(&name, &command, args, env).await?);
-
-        // A failed spawn must not leave a restart configuration behind.
-        self.configs
-            .write()
-            .await
-            .insert(name.clone(), spawn_config);
-
-        self.transports
-            .write()
-            .await
-            .insert(name, Arc::clone(&transport));
+        let mut transports = self.transports.write().await;
+        if transports.contains_key(&name) {
+            return Err(ToolError::ExternalService(format!(
+                "MCP server process '{name}' is already managed"
+            )));
+        }
+        let transport =
+            Arc::new(StdioMcpTransport::spawn(&name, &command, args, env, suppress_stderr).await?);
+        transports.insert(name, Arc::clone(&transport));
 
         Ok(transport)
     }
@@ -74,6 +66,21 @@ impl McpProcessManager {
         self.transports.read().await.get(name).cloned()
     }
 
+    /// Query one managed process without waiting for it to exit.
+    pub async fn state(&self, name: &str) -> Result<McpProcessState, ToolError> {
+        let Some(transport) = self.get(name).await else {
+            return Ok(McpProcessState::Missing);
+        };
+        if let Some(status) = transport.exit_status().await? {
+            return Ok(McpProcessState::Exited(status));
+        }
+        Ok(if transport.reader_finished().await {
+            McpProcessState::StdioClosed
+        } else {
+            McpProcessState::Running
+        })
+    }
+
     /// Shut down all managed transports.
     pub async fn shutdown_all(&self) {
         let transports: Vec<(String, Arc<StdioMcpTransport>)> = {
@@ -81,11 +88,12 @@ impl McpProcessManager {
             map.drain().collect()
         };
 
-        for (name, transport) in transports {
+        futures::future::join_all(transports.into_iter().map(|(name, transport)| async move {
             if let Err(e) = transport.shutdown().await {
                 tracing::warn!("Failed to shut down MCP stdio server '{}': {}", name, e);
             }
-        }
+        }))
+        .await;
     }
 
     /// Shut down a specific transport by name.
@@ -96,79 +104,7 @@ impl McpProcessManager {
             transport.shutdown().await?;
         }
 
-        self.configs.write().await.remove(name);
         Ok(())
-    }
-
-    /// Attempt to restart a crashed transport with exponential backoff.
-    ///
-    /// Tries up to 5 times with delays of 1s, 2s, 4s, 8s, 16s (total: 31s max wait).
-    pub async fn try_restart(&self, name: &str) -> Result<Arc<StdioMcpTransport>, ToolError> {
-        let config = self
-            .configs
-            .read()
-            .await
-            .get(name)
-            .cloned()
-            .ok_or_else(|| {
-                ToolError::ExternalService(format!(
-                    "No spawn config for MCP server '{}', cannot restart",
-                    name
-                ))
-            })?;
-
-        // Shut down and remove old transport to avoid orphaning a wedged process.
-        if let Some(old_transport) = self.transports.write().await.remove(name) {
-            let _ = old_transport.shutdown().await;
-        }
-
-        let max_retries = 5;
-        let mut last_err = None;
-
-        for attempt in 0..max_retries {
-            let delay = Duration::from_secs(1 << attempt);
-            tokio::time::sleep(delay).await;
-
-            match StdioMcpTransport::spawn(
-                name,
-                &config.command,
-                config.args.clone(),
-                config.env.clone(),
-            )
-            .await
-            {
-                Ok(transport) => {
-                    let transport = Arc::new(transport);
-                    self.transports
-                        .write()
-                        .await
-                        .insert(name.to_string(), Arc::clone(&transport));
-                    tracing::info!(
-                        "MCP stdio server '{}' restarted after {} attempt(s)",
-                        name,
-                        attempt + 1
-                    );
-                    return Ok(transport);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Restart attempt {}/{} for MCP server '{}' failed: {}",
-                        attempt + 1,
-                        max_retries,
-                        name,
-                        e
-                    );
-                    last_err = Some(e);
-                }
-            }
-        }
-
-        Err(last_err.unwrap_or_else(|| {
-            ToolError::ExternalService(format!(
-                "Failed to restart MCP server '{}' after {} attempts",
-                name, max_retries
-            ))
-        }))
     }
 
     /// Get names of all managed transports.
@@ -197,6 +133,118 @@ mod tests {
         let manager = McpProcessManager::new();
         let servers = manager.managed_servers().await;
         assert!(servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_reports_missing_running_and_exited() {
+        let manager = McpProcessManager::new();
+        assert!(matches!(
+            manager.state("server").await.expect("missing state"),
+            McpProcessState::Missing
+        ));
+
+        manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn cat");
+        assert!(matches!(
+            manager.state("server").await.expect("running state"),
+            McpProcessState::Running
+        ));
+        manager.shutdown("server").await.expect("shutdown cat");
+
+        manager
+            .spawn_stdio(
+                "server",
+                "false",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn false");
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        assert!(matches!(
+            manager.state("server").await.expect("exited state"),
+            McpProcessState::Exited(_)
+        ));
+        manager.shutdown("server").await.expect("clean up false");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn state_reports_closed_stdio_for_live_child() {
+        let manager = McpProcessManager::new();
+        manager
+            .spawn_stdio(
+                "server",
+                "sh",
+                vec!["-c".to_string(), "exec 1>&-; sleep 10".to_string()],
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn live child with closed stdout");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    manager.state("server").await.expect("stdio state"),
+                    McpProcessState::StdioClosed
+                ) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("reader did not observe stdout closure");
+        manager.shutdown("server").await.expect("clean up child");
+    }
+
+    #[tokio::test]
+    async fn duplicate_process_name_preserves_existing_transport() {
+        let manager = McpProcessManager::new();
+        let first = manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+            .expect("spawn first process");
+        let error = match manager
+            .spawn_stdio(
+                "server",
+                "cat",
+                Vec::new(),
+                HashMap::<String, String>::new(),
+                false,
+            )
+            .await
+        {
+            Ok(_) => panic!("duplicate process must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("already managed"));
+        let registered = manager
+            .get("server")
+            .await
+            .expect("first transport retained");
+        assert!(Arc::ptr_eq(&first, &registered));
+        manager
+            .shutdown("server")
+            .await
+            .expect("clean up first process");
     }
 
     #[tokio::test]

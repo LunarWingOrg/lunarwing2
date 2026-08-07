@@ -356,6 +356,8 @@ CREATE TABLE IF NOT EXISTS wasm_channels (
 CREATE TABLE IF NOT EXISTS tool_capabilities (
     id TEXT PRIMARY KEY,
     wasm_tool_id TEXT NOT NULL REFERENCES wasm_tools(id) ON DELETE CASCADE,
+    approval_policy TEXT NOT NULL DEFAULT 'never'
+        CHECK (approval_policy IN ('never', 'unless_auto_approved', 'always')),
     http_allowlist TEXT NOT NULL DEFAULT '[]',
     allowed_secrets TEXT NOT NULL DEFAULT '[]',
     tool_aliases TEXT NOT NULL DEFAULT '{}',
@@ -968,6 +970,25 @@ WHERE key IN (
 );
 "#,
     ),
+    (
+        25,
+        "wasm_approval_policy",
+        r#"
+ALTER TABLE tool_capabilities ADD COLUMN approval_policy TEXT NOT NULL DEFAULT 'never'
+    CHECK (approval_policy IN ('never', 'unless_auto_approved', 'always'));
+"#,
+    ),
+    (
+        26,
+        "study_notes_knowledge",
+        // Partial index mirroring the PostgreSQL V26 migration: covers the
+        // metadata filters used by study-note topic/status scans.
+        r#"
+CREATE INDEX IF NOT EXISTS idx_memory_documents_study_notes
+    ON memory_documents (user_id, json_extract(metadata, '$.topic'))
+    WHERE json_extract(metadata, '$.provenance') = 'study-note';
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -978,6 +999,7 @@ const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] = &[
     (20, "reflex_patterns", "embedding"),
     (20, "reflex_patterns", "embedding_model"),
     (18, "routines", "retry_max_retries"),
+    (25, "tool_capabilities", "approval_policy"),
 ];
 
 /// Check whether `table` already contains `column` via `pragma_table_info`.

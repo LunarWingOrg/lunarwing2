@@ -34,9 +34,9 @@ console = Console()
 
 
 WORKER_LABELS = {
-    WorkerType.NANOCODE: "nanocode (NanoGPT)",
     WorkerType.PEBBLE: "pebble (Rust harness)",
     WorkerType.OPENCODE: "opencode (sst/opencode)",
+    WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
 }
 
 
@@ -361,9 +361,9 @@ def _configure_channels(config: TenantConfig) -> None:
 
 def _configure_workers(config: TenantConfig) -> None:
     labels = [
-        WORKER_LABELS[WorkerType.NANOCODE],
         WORKER_LABELS[WorkerType.PEBBLE],
         WORKER_LABELS[WorkerType.OPENCODE],
+        WORKER_LABELS[WorkerType.KIMI],
     ]
     selected = _q_checkbox("External workers (space to toggle, enter to confirm)", labels)
     config.workers = []
@@ -377,14 +377,6 @@ def _configure_workers(config: TenantConfig) -> None:
             "Include Rust/Go/C++ toolchains in workers? (increases image size ~5GB)",
             default=config.toolchains,
         )
-    if WorkerType.NANOCODE in config.workers:
-        config.nanocode_model = _q_text(
-            "Nanocode model override (optional)", default=config.nanocode_model
-        )
-        config.nanocode_base_url = _q_text(
-            "Nanocode base URL override (optional)",
-            default=config.nanocode_base_url,
-        )
     if WorkerType.OPENCODE in config.workers:
         config.opencode_model = _q_text(
             "OpenCode model override (optional)", default=config.opencode_model
@@ -393,6 +385,15 @@ def _configure_workers(config: TenantConfig) -> None:
             "OpenCode base URL override (optional)",
             default=config.opencode_base_url,
         )
+    if WorkerType.KIMI in config.workers:
+        config.kimi_model = _q_text(
+            "Kimi model override (optional)", default=config.kimi_model
+        )
+        config.kimi_base_url = _q_text(
+            "Kimi base URL override (optional)",
+            default=config.kimi_base_url,
+        )
+        config.kimi_api_key = _q_password("Kimi API key override (optional)")
 
 
 def _configure_llm(config: TenantConfig) -> None:

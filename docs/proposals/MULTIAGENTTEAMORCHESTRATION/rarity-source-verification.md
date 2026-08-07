@@ -4,6 +4,12 @@
 ## Reviewer: Rarity
 ## Subject: Coordination Pipeline Plan (by Captain Ruffles) — verified against v2.0.2.0 source
 
+**Status:** Historical pre-implementation feasibility review. All four phases
+subsequently shipped for v2.0.4.0, including a priority-5 `CoordinationGate`.
+The unresolved questions and recommendations below describe the v2.0.2.0
+baseline, not current gaps. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the current,
+source-verified implementation contract.
+
 ---
 
 ## Methodology

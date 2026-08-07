@@ -32,7 +32,7 @@ use lunarwing_safety::SafetyLayer;
 /// Wraps the existing tool pipeline to implement the engine's `EffectExecutor`.
 ///
 /// Enforces all v1 security controls at the adapter boundary:
-/// tool approval, output sanitization, hooks, rate limiting, and call limits.
+/// tool approval, output sanitization, hooks, and rate limiting.
 pub struct EffectBridgeAdapter {
     tools: Arc<ToolRegistry>,
     safety: Arc<SafetyLayer>,
@@ -41,14 +41,15 @@ pub struct EffectBridgeAdapter {
     auto_approved: RwLock<HashSet<(String, String)>>,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
-    /// Per-step tool call counter (reset externally between steps).
-    call_count: std::sync::atomic::AtomicU32,
     /// Per-user per-tool sliding window rate limiter.
     rate_limiter: RateLimiter,
     /// Mission manager for handling mission_* function calls.
     mission_manager: RwLock<Option<Arc<lunarwing_engine::MissionManager>>>,
     /// Centralized auth manager for pre-flight credential checks.
     auth_manager: RwLock<Option<Arc<AuthManager>>>,
+    /// Coordination gate: silently blocks all tool execution for agents
+    /// disabled by coordination violations (ISSUE-003).
+    coordination_gate: RwLock<Option<Arc<crate::gate::coordination::CoordinationGate>>>,
 }
 
 impl EffectBridgeAdapter {
@@ -63,10 +64,10 @@ impl EffectBridgeAdapter {
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
             settings_store: RwLock::new(None),
-            call_count: std::sync::atomic::AtomicU32::new(0),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
+            coordination_gate: RwLock::new(None),
         }
     }
 
@@ -110,6 +111,14 @@ impl EffectBridgeAdapter {
     /// Set the auth manager for pre-flight credential checks.
     pub async fn set_auth_manager(&self, mgr: Arc<AuthManager>) {
         *self.auth_manager.write().await = Some(mgr);
+    }
+
+    /// Set the coordination gate for pre-flight disabled-agent checks.
+    pub async fn set_coordination_gate(
+        &self,
+        gate: Arc<crate::gate::coordination::CoordinationGate>,
+    ) {
+        *self.coordination_gate.write().await = Some(gate);
     }
 
     /// Set the mission manager (called after engine init).
@@ -199,13 +208,12 @@ impl EffectBridgeAdapter {
                     }
                 }
             }
-        }
 
-        // Persisted settings are the source of truth and can revoke an earlier
-        // process-lifetime approval by changing it to AskEachTime or Disabled.
-        if persisted.is_some() {
+            // Configured settings storage is authoritative. A deleted grant
+            // revokes any process-lifetime cache entry immediately.
             return persisted;
         }
+
         if self
             .auto_approved
             .read()
@@ -214,7 +222,7 @@ impl EffectBridgeAdapter {
         {
             return Some(PermissionState::AlwaysAllow);
         }
-        persisted
+        None
     }
 
     fn coerce_to_u64(v: &serde_json::Value) -> Option<u64> {
@@ -472,12 +480,6 @@ impl EffectBridgeAdapter {
         })
     }
 
-    /// Reset the per-step call counter (called between threads/steps).
-    pub fn reset_call_count(&self) {
-        self.call_count
-            .store(0, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub async fn execute_resolved_pending_action(
         &self,
         action_name: &str,
@@ -506,22 +508,23 @@ impl EffectBridgeAdapter {
     ) -> Result<ActionResult, EngineError> {
         let start = Instant::now();
 
+        // ── Coordination gate (priority 5 — first check, before any side
+        // effect). A disabled agent must not execute tools at all. Return typed
+        // control flow so executors stop without putting policy text in model
+        // context or channel status (ISSUE-003).
+        if let Some(gate) = self.coordination_gate.read().await.as_ref()
+            && gate.deny_reason(&context.user_id).is_some()
+        {
+            tracing::debug!(
+                user = %context.user_id,
+                tool = %action_name,
+                "coordination gate: tool execution silently denied"
+            );
+            return Err(EngineError::ExecutionStopped);
+        }
+
         let resolved_name = self.tools.resolve_name(action_name).await;
         let lookup_name = resolved_name.as_deref().unwrap_or(action_name);
-
-        // ── Per-step call limit (prevent amplification loops) ──
-        const MAX_CALLS_PER_STEP: u32 = 50;
-        let count = self
-            .call_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count >= MAX_CALLS_PER_STEP {
-            return Err(EngineError::Effect {
-                reason: format!(
-                    "Tool call limit reached ({MAX_CALLS_PER_STEP} per code step). \
-                     Break your task into multiple steps."
-                ),
-            });
-        }
 
         if let Some(result) = self
             .handle_mission_call(action_name, &parameters, context)
@@ -570,19 +573,41 @@ impl EffectBridgeAdapter {
                 });
             }
 
+            let requirement = tool.requires_approval(&parameters);
+            if context.shared_conversation && requirement.is_required() {
+                return Err(Self::gate_paused(
+                    "approval",
+                    action_name,
+                    context.current_call_id.as_deref(),
+                    parameters,
+                    lunarwing_engine::ResumeKind::Approval {
+                        allow_always: false,
+                    },
+                    None,
+                ));
+            }
+            if context.thread_type != lunarwing_engine::ThreadType::Foreground
+                && requirement == ApprovalRequirement::Always
+            {
+                return Err(EngineError::LeaseDenied {
+                    reason: format!(
+                        "Tool '{}' requires explicit approval and cannot run autonomously.",
+                        action_name
+                    ),
+                });
+            }
+
             // ── Human delay / supervision mode ──
             // When supervised_mode is enabled on the thread, gate EVERY action
             // through human approval, regardless of the tool's tier.
             //
-            // Always-gated tools (ApprovalRequirement::Always) should not offer
-            // the "always approve" option in supervised mode either, so we set
-            // allow_always = false to be conservative.
+            // Supervision still gates every later action. Some constrained tools
+            // may nevertheless let the user persist a grant for normal mode.
             // A resolved pending action already has explicit approval for this
             // call. Later calls enter with `approval_already_granted = false`
             // and are gated again by supervision.
             if context.supervised_mode && !approval_already_granted {
-                let requirement = tool.requires_approval(&parameters);
-                let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+                let allow_always = tool.allows_always_approval(&parameters);
                 return Err(Self::gate_paused(
                     "approval",
                     action_name,
@@ -593,39 +618,22 @@ impl EffectBridgeAdapter {
                 ));
             }
 
-            let requirement = tool.requires_approval(&parameters);
-            match requirement {
-                ApprovalRequirement::Always => {
-                    if !approval_already_granted {
-                        return Err(Self::gate_paused(
-                            "approval",
-                            action_name,
-                            context.current_call_id.as_deref(),
-                            parameters,
-                            lunarwing_engine::ResumeKind::Approval {
-                                allow_always: false,
-                            },
-                            None,
-                        ));
-                    }
-                }
-                ApprovalRequirement::UnlessAutoApproved => {
-                    let is_approved = permission_state == Some(PermissionState::AlwaysAllow);
-                    if !is_approved && !approval_already_granted {
-                        // Credential presence alone does NOT bypass approval.
-                        // Credentials indicate the call *can* be authenticated,
-                        // not that the user has authorized this specific request.
-                        return Err(Self::gate_paused(
-                            "approval",
-                            action_name,
-                            context.current_call_id.as_deref(),
-                            parameters,
-                            lunarwing_engine::ResumeKind::Approval { allow_always: true },
-                            None,
-                        ));
-                    }
-                }
-                ApprovalRequirement::Never => {}
+            let allow_always = tool.allows_always_approval(&parameters);
+            let user_auto_approved = permission_state == Some(PermissionState::AlwaysAllow);
+            if !approval_already_granted
+                && requirement.needs_prompt_with_user_grant(false, user_auto_approved, allow_always)
+            {
+                // Credential presence alone does NOT bypass approval.
+                // Credentials indicate the call *can* be authenticated, not
+                // that the user authorized this specific request.
+                return Err(Self::gate_paused(
+                    "approval",
+                    action_name,
+                    context.current_call_id.as_deref(),
+                    parameters,
+                    lunarwing_engine::ResumeKind::Approval { allow_always },
+                    None,
+                ));
             }
         }
 
@@ -748,9 +756,15 @@ impl EffectBridgeAdapter {
         match result {
             Ok(output) => {
                 let sanitized = self.safety.sanitize_tool_output(lookup_name, &output);
-                let wrapped = self.safety.wrap_for_llm(lookup_name, &sanitized.content);
-                let output_value = serde_json::from_str::<serde_json::Value>(&output)
-                    .unwrap_or(serde_json::Value::String(wrapped));
+                // Parsing the original JSON here would bypass truncation and redaction.
+                drop(output);
+                let output_value = serde_json::from_str::<serde_json::Value>(&sanitized.content)
+                    .unwrap_or_else(|_| {
+                        serde_json::Value::String(
+                            self.safety.wrap_for_llm(lookup_name, &sanitized.content),
+                        )
+                    });
+                drop(sanitized);
 
                 if (lookup_name == "tool_activate" || lookup_name == "tool_auth")
                     && let Some(err) = Self::auth_gate_from_extension_result(
@@ -1107,7 +1121,7 @@ fn permission_setting_keys(tool_name: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::context::JobContext;
-    use crate::tools::{Tool, ToolError, ToolOutput};
+    use crate::tools::{ApprovalRequirement, Tool, ToolError, ToolOutput};
     use async_trait::async_trait;
     use std::collections::HashMap;
 
@@ -1202,35 +1216,6 @@ mod tests {
         }
     }
 
-    /// Verify that reset_call_count resets the counter to zero,
-    /// preventing the "call limit reached" error across threads.
-    #[test]
-    fn call_count_resets_between_threads() {
-        let adapter = make_adapter();
-
-        // Simulate 50 tool calls (the limit)
-        for _ in 0..50 {
-            adapter
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        assert_eq!(
-            adapter
-                .call_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            50
-        );
-
-        // Reset — simulates what handle_with_engine does before each thread
-        adapter.reset_call_count();
-        assert_eq!(
-            adapter
-                .call_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-    }
-
     /// Verify that auto_approve_tool adds entries and is queryable.
     #[tokio::test]
     async fn auto_approve_tracks_tools() {
@@ -1282,6 +1267,7 @@ mod tests {
             current_call_id: None,
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };
@@ -1299,6 +1285,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             &context,
             &[],
             &serde_json::json!({}),
+            None,
         )
         .await
         .expect("CodeAct execution should complete");
@@ -1369,6 +1356,42 @@ FINAL(echoed + "|" + http_result["error"])"#,
         }
     }
 
+    struct PersistableAlwaysApprovalTestTool;
+
+    #[async_trait]
+    impl Tool for PersistableAlwaysApprovalTestTool {
+        fn name(&self) -> &str {
+            "persistable_always_test"
+        }
+
+        fn description(&self) -> &str {
+            "Always-gated test tool with explicit persistent approval"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({"ok": true}),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+
+        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::Always
+        }
+
+        fn allows_always_approval(&self, _params: &serde_json::Value) -> bool {
+            true
+        }
+    }
+
     fn lease() -> lunarwing_engine::CapabilityLease {
         lunarwing_engine::CapabilityLease {
             id: lunarwing_engine::types::capability::LeaseId::new(),
@@ -1388,18 +1411,110 @@ FINAL(echoed + "|" + http_result["error"])"#,
         thread_id: lunarwing_engine::ThreadId,
         call_id: Option<&str>,
     ) -> lunarwing_engine::ThreadExecutionContext {
+        exec_ctx_for_type(
+            thread_id,
+            call_id,
+            lunarwing_engine::types::thread::ThreadType::Foreground,
+        )
+    }
+
+    fn exec_ctx_for_type(
+        thread_id: lunarwing_engine::ThreadId,
+        call_id: Option<&str>,
+        thread_type: lunarwing_engine::types::thread::ThreadType,
+    ) -> lunarwing_engine::ThreadExecutionContext {
         lunarwing_engine::ThreadExecutionContext {
             thread_id,
-            thread_type: lunarwing_engine::types::thread::ThreadType::Foreground,
+            thread_type,
             project_id: lunarwing_engine::ProjectId::new(),
             user_id: "test_user".to_string(),
             step_id: lunarwing_engine::StepId::new(),
             current_call_id: call_id.map(str::to_string),
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         }
+    }
+
+    struct PayloadTool;
+
+    #[async_trait]
+    impl Tool for PayloadTool {
+        fn name(&self) -> &str {
+            "payload"
+        }
+
+        fn description(&self) -> &str {
+            "Return a test payload"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "payload": { "type": "string" } },
+                "required": ["payload"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::success(
+                serde_json::json!({ "payload": params["payload"] }),
+                std::time::Duration::from_millis(1),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_output_honors_safety_size_limit_before_monty_conversion() {
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(PayloadTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&lunarwing_safety::SafetyConfig {
+                max_output_length: 128,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let thread_id = lunarwing_engine::ThreadId::new();
+
+        let small = adapter
+            .execute_action(
+                "payload",
+                serde_json::json!({ "payload": "small" }),
+                &lease(),
+                &exec_ctx(thread_id, Some("small")),
+            )
+            .await
+            .expect("small payload should execute");
+        assert_eq!(small.output["payload"], "small");
+
+        let oversized = adapter
+            .execute_action(
+                "payload",
+                serde_json::json!({ "payload": "x".repeat(4096) }),
+                &lease(),
+                &exec_ctx(thread_id, Some("oversized")),
+            )
+            .await
+            .expect("oversized payload should execute");
+        let bounded = oversized
+            .output
+            .as_str()
+            .expect("modified output should cross the engine boundary as bounded text");
+        assert!(bounded.contains("truncated: showing 128/"));
+        assert!(
+            bounded.len() < 512,
+            "bounded output was {} bytes",
+            bounded.len()
+        );
+        assert!(!bounded.contains(&"x".repeat(256)));
     }
 
     #[tokio::test]
@@ -1484,6 +1599,82 @@ FINAL(echoed + "|" + http_result["error"])"#,
             }
             other => panic!("expected GatePaused, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn coordination_gate_blocks_disabled_agent_tools() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        // Violation store with one disabled agent (max_violations = 1).
+        let dir = std::env::temp_dir().join(format!(
+            "coord-gate-adapter-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let store = Arc::new(crate::gate::violation_store::ViolationStore::new(
+            dir.join("violations.json"),
+            crate::gate::violation_store::ViolationStoreConfig {
+                max_violations: 1,
+                disable_duration_secs: 3600,
+                decay_secs: 600,
+            },
+        ));
+        store.record_violation("bad-agent", "r", "hook", "chan");
+        adapter
+            .set_coordination_gate(Arc::new(crate::gate::coordination::CoordinationGate::new(
+                Arc::clone(&store),
+                "good-agent".to_string(),
+            )))
+            .await;
+
+        // Disabled user: silent deny before any tool side effect.
+        let mut bad_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_bad"));
+        bad_ctx.user_id = "bad-agent".to_string();
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &bad_ctx,
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::ExecutionStopped)));
+
+        // Clean user still executes (auto-approved to skip the approval pause).
+        adapter
+            .auto_approve_tool("good-user", "approval_test")
+            .await;
+        let mut good_ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_good"));
+        good_ctx.user_id = "good-user".to_string();
+        let result = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &good_ctx,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1819,6 +2010,186 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
+    async fn explicit_always_grant_bypasses_opted_in_always_tool() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        let first = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_first")),
+            )
+            .await;
+        assert!(matches!(
+            first,
+            Err(EngineError::GatePaused {
+                resume_kind,
+                ..
+            }) if matches!(
+                *resume_kind,
+                lunarwing_engine::ResumeKind::Approval { allow_always: true }
+            )
+        ));
+
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let second = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_second")),
+            )
+            .await;
+        assert!(matches!(
+            second,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn always_tool_is_denied_in_autonomous_threads_despite_persisted_grant() {
+        use lunarwing_engine::ThreadType;
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        for thread_type in [ThreadType::Research, ThreadType::Mission] {
+            let context = exec_ctx_for_type(
+                lunarwing_engine::ThreadId::new(),
+                Some("call_autonomous"),
+                thread_type,
+            );
+            let result = adapter
+                .execute_action(
+                    "persistable_always_test",
+                    serde_json::json!({}),
+                    &lease(),
+                    &context,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::LeaseDenied { .. })),
+                "{thread_type:?} thread must deny Always tool, got: {result:?}"
+            );
+
+            let resolved = adapter
+                .execute_resolved_pending_action(
+                    "persistable_always_test",
+                    serde_json::json!({}),
+                    &lease(),
+                    &context,
+                    true,
+                )
+                .await;
+            assert!(
+                matches!(resolved, Err(EngineError::LeaseDenied { .. })),
+                "{thread_type:?} thread must reject resolved approval, got: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_conversation_ignores_persisted_always_grant() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+        let settings = Arc::new(TestSettingsStore::default());
+        settings
+            .set_setting(
+                "test_user",
+                "tool_permissions.persistable_always_test",
+                &serde_json::json!("always_allow"),
+            )
+            .await
+            .expect("persist setting");
+        adapter
+            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .await;
+
+        let mut context = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_shared"));
+        context.shared_conversation = true;
+        let result = adapter
+            .execute_action(
+                "persistable_always_test",
+                serde_json::json!({}),
+                &lease(),
+                &context,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::GatePaused { resume_kind, .. })
+                if matches!(
+                    *resume_kind,
+                    lunarwing_engine::ResumeKind::Approval { allow_always: false }
+                )
+        ));
+    }
+
+    #[tokio::test]
     async fn persisted_disabled_permission_denies_execution() {
         use lunarwing_safety::SafetyConfig;
 
@@ -1857,7 +2228,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
-    async fn persisted_ask_each_time_revokes_session_auto_approval() {
+    async fn persisted_revocation_overrides_session_auto_approval() {
         use lunarwing_safety::SafetyConfig;
 
         let tools = Arc::new(ToolRegistry::new());
@@ -1883,7 +2254,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             .await
             .expect("persist setting");
         adapter
-            .set_settings_store(settings as Arc<dyn SettingsStore + Send + Sync>)
+            .set_settings_store(settings.clone() as Arc<dyn SettingsStore + Send + Sync>)
             .await;
 
         let result = adapter
@@ -1898,6 +2269,23 @@ FINAL(echoed + "|" + http_result["error"])"#,
             )
             .await;
         assert!(matches!(result, Err(EngineError::GatePaused { .. })));
+
+        settings
+            .delete_setting("test_user", "tool_permissions.approval_test")
+            .await
+            .expect("delete persisted permission");
+        let after_delete = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &exec_ctx(
+                    lunarwing_engine::ThreadId::new(),
+                    Some("call_deleted_permission"),
+                ),
+            )
+            .await;
+        assert!(matches!(after_delete, Err(EngineError::GatePaused { .. })));
     }
 
     // ── extract_credential_name tests ──────────────────────────
@@ -2079,6 +2467,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             current_call_id: None,
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };
@@ -2173,6 +2562,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             current_call_id: Some("call_123".to_string()),
             source_channel: None,
             supervised_mode: false,
+            shared_conversation: false,
             supervised_timeout_secs: 300,
             prompt_context: Arc::from([]),
         };

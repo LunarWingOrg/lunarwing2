@@ -83,7 +83,7 @@ impl Agent {
         );
         let prompt_context = prompt_context_from_chat_messages(&initial_messages);
 
-        let system_prompt = if let Some(ws) = self.workspace() {
+        let mut system_prompt = if let Some(ws) = self.workspace() {
             match ws
                 .system_prompt_for_context_tz(is_group_chat, user_tz)
                 .await
@@ -98,6 +98,40 @@ impl Agent {
         } else {
             None
         };
+
+        // Inject activated lorebook reference text (untrusted data, not
+        // instructions) after identity files for this turn.
+        if let Some(workspace) = self.workspace() {
+            let activation_scope = thread_id.to_string();
+            if let Some(block) = crate::lorebook::build_active_block(
+                workspace,
+                &initial_messages,
+                &activation_scope,
+                is_group_chat,
+                &self.config.lorebook,
+            )
+            .await
+            {
+                system_prompt = Some(match system_prompt {
+                    Some(prompt) => format!("{prompt}\n\n{block}"),
+                    None => block,
+                });
+            }
+        }
+
+        let policy_scope = crate::channels::routing_target_from_metadata(&message.metadata)
+            .unwrap_or_else(|| message.channel.clone());
+        if let Some(instruction) = self
+            .deps
+            .coordination_prompt_policy
+            .as_ref()
+            .and_then(|policy| policy.instruction_for_scope(&policy_scope))
+        {
+            system_prompt = Some(match system_prompt {
+                Some(prompt) => format!("{prompt}\n\n{instruction}"),
+                None => instruction.to_string(),
+            });
+        }
 
         // Select and prepare active skills (if skills system is enabled).
         let cavepony_activation = self.resolve_cavepony_activation(message).await;
@@ -165,8 +199,9 @@ impl Agent {
 
         // Reflex fast-path: check for compiled patterns before invoking LLM
         if !cavepony_skill_active
-            && let Some(tool_name) = self.reflex_router.try_route(&message.content).await
+            && let Some(route) = self.reflex_router.try_route_match(&message.content).await
         {
+            let tool_name = route.tool_name;
             tracing::info!("Reflex fast-path: routing to compiled tool '{}'", tool_name);
             let mut job_ctx =
                 JobContext::with_user(&message.user_id, "reflex", "Reflex fast-path execution")
@@ -178,6 +213,19 @@ impl Agent {
             let params = serde_json::json!({"input": message.content});
             match self.execute_chat_tool(&tool_name, &params, &job_ctx).await {
                 Ok(output) => {
+                    // Record the canonical stored pattern (not the raw input)
+                    // so fuzzy/semantic/promoted hits update the right row.
+                    // This is a brief synchronous mutex operation: one worker
+                    // batches all database writes outside the request path.
+                    if !self
+                        .reflex_hits
+                        .record(self.owner_id(), &route.matched_pattern)
+                    {
+                        tracing::debug!(
+                            pattern = %route.matched_pattern,
+                            "Reflex hit accumulator is at its unique-key limit"
+                        );
+                    }
                     return Ok(AgenticLoopResult::Response(output));
                 }
                 Err(e) => {
@@ -510,6 +558,15 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 tool_calls.clone(),
             ));
 
+        let tool_names: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
+        if let Some(reasoning) = StatusUpdate::reasoning_for_tools(&tool_names) {
+            let _ = self
+                .agent
+                .channels
+                .send_status(&self.message.channel, reasoning, &self.message.metadata)
+                .await;
+        }
+
         // Execute tools and add results to context
         let _ = self
             .agent
@@ -622,47 +679,37 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             }
 
             // Check if tool requires approval
-            if !self.agent.config.auto_approve_tools
-                && let Some(tool) = tool_opt
-            {
-                use crate::tools::ApprovalRequirement;
+            if let Some(tool) = tool_opt {
                 let requirement = tool.requires_approval(&tc.arguments);
-                let needs_approval = match requirement {
-                    ApprovalRequirement::Never => false,
-                    ApprovalRequirement::UnlessAutoApproved => {
-                        let sess = self.session.lock().await;
-                        !sess.is_tool_auto_approved(&tc.name)
-                    }
-                    ApprovalRequirement::Always => true,
+                if requirement.is_required() && self.message.is_shared_conversation() {
+                    tracing::info!(
+                        tool = %tc.name,
+                        channel = %self.message.channel,
+                        "Auto-denying approval-requiring tool in shared channel"
+                    );
+                    let reject_msg = format!(
+                        "Tool '{}' requires approval and cannot run in shared channels. \
+                         Ask the user to message me directly (DM) to use this tool.",
+                        tc.name
+                    );
+                    preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
+                    continue;
+                }
+                let allow_always = tool.allows_always_approval(&tc.arguments);
+                let session_auto_approved = if allow_always {
+                    self.agent
+                        .has_tool_always_grant(&self.session, &tc.name)
+                        .await
+                } else {
+                    false
                 };
+                let needs_approval = requirement.needs_prompt_with_user_grant(
+                    self.agent.config.auto_approve_tools,
+                    session_auto_approved,
+                    allow_always,
+                );
 
                 if needs_approval {
-                    // In non-DM relay channels, auto-deny approval-
-                    // requiring tools to prevent stuck AwaitingApproval
-                    // state and prompt injection from other users.
-                    let is_relay = self.message.channel.ends_with("-relay");
-                    let is_dm = self
-                        .message
-                        .metadata
-                        .get("event_type")
-                        .and_then(|v| v.as_str())
-                        == Some("direct_message");
-                    if is_relay && !is_dm {
-                        tracing::info!(
-                            tool = %tc.name,
-                            channel = %self.message.channel,
-                            "Auto-denying approval-requiring tool in non-DM relay channel"
-                        );
-                        let reject_msg = format!(
-                            "Tool '{}' requires approval and cannot run in shared channels. \
-                             Ask the user to message me directly (DM) to use this tool.",
-                            tc.name
-                        );
-                        preflight.push((tc, PreflightOutcome::Rejected(reject_msg)));
-                        continue;
-                    }
-
-                    let allow_always = !matches!(requirement, ApprovalRequirement::Always);
                     approval_needed = Some((idx, tc, tool, allow_always));
                     break;
                 }
@@ -1342,6 +1389,9 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
+            coordination_prompt_policy: None,
+            coordination_coalesce: None,
         };
 
         Agent::new(
@@ -1364,6 +1414,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -1508,15 +1562,13 @@ mod tests {
         assert!(always_needs, "Always must always require approval");
     }
 
-    /// Regression test: `allow_always` must be `false` for `Always` and
-    /// `true` for `UnlessAutoApproved`, so the UI hides the "always" button
-    /// for tools that truly cannot be auto-approved.
+    /// Baseline policy: `Always` hides the button unless a concrete tool
+    /// overrides `Tool::allows_always_approval` (built-in SSH does).
     #[test]
-    fn test_allow_always_matches_approval_requirement() {
+    fn test_default_allow_always_matches_approval_requirement() {
         use crate::tools::ApprovalRequirement;
 
-        // Mirrors the expression used in dispatcher.rs and thread_ops.rs:
-        //   let allow_always = !matches!(requirement, ApprovalRequirement::Always);
+        // Mirrors the Tool trait's default policy.
 
         // UnlessAutoApproved → allow_always = true
         let req = ApprovalRequirement::UnlessAutoApproved;
@@ -2231,6 +2283,9 @@ mod tests {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
+            coordination_prompt_policy: None,
+            coordination_coalesce: None,
         };
 
         Agent::new(
@@ -2253,6 +2308,10 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                lorebook: crate::config::LorebookConfig {
+                    enabled: false,
+                    ..crate::config::LorebookConfig::default()
+                },
                 reflex: crate::config::ReflexConfig::default(),
             },
             deps,
@@ -2360,6 +2419,9 @@ mod tests {
                 sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
                 builder: None,
                 llm_backend: "lunarwing_cloud".to_string(),
+                coordination_gate: None,
+                coordination_prompt_policy: None,
+                coordination_coalesce: None,
             };
 
             Agent::new(
@@ -2382,6 +2444,10 @@ mod tests {
                     handle_message_timeout: Duration::from_secs(400),
                     self_repair_op_timeout: Duration::from_secs(60),
                     session_prune_timeout: Duration::from_secs(30),
+                    lorebook: crate::config::LorebookConfig {
+                        enabled: false,
+                        ..crate::config::LorebookConfig::default()
+                    },
                     reflex: crate::config::ReflexConfig::default(),
                 },
                 deps,
@@ -2596,18 +2662,16 @@ mod tests {
         // Case 1: relay channel + non-DM → should auto-deny
         let msg = IncomingMessage::new("xmpp-relay", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "message" }));
-        let is_relay = msg.channel.ends_with("-relay");
-        let is_dm =
-            msg.metadata.get("event_type").and_then(|v| v.as_str()) == Some("direct_message");
-        assert!(is_relay && !is_dm, "Should auto-deny in relay non-DM");
+        assert!(
+            msg.is_shared_conversation(),
+            "Should auto-deny in relay non-DM"
+        );
 
         // Case 2: relay channel + DM → should NOT auto-deny
         let msg_dm = IncomingMessage::new("xmpp-relay", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "direct_message" }));
-        let is_dm_2 =
-            msg_dm.metadata.get("event_type").and_then(|v| v.as_str()) == Some("direct_message");
         assert!(
-            !msg_dm.channel.ends_with("-relay") || is_dm_2,
+            !msg_dm.is_shared_conversation(),
             "Should NOT auto-deny in relay DM"
         );
 
@@ -2615,8 +2679,15 @@ mod tests {
         let msg_web = IncomingMessage::new("web", "u1", "hello")
             .with_metadata(serde_json::json!({ "event_type": "message" }));
         assert!(
-            !msg_web.channel.ends_with("-relay"),
+            !msg_web.is_shared_conversation(),
             "Non-relay channel should not trigger auto-deny"
+        );
+
+        let xmpp_room = IncomingMessage::new("xmpp", "room@example", "hello")
+            .with_metadata(serde_json::json!({ "xmpp_type": "groupchat" }));
+        assert!(
+            xmpp_room.is_shared_conversation(),
+            "XMPP rooms must auto-deny"
         );
     }
 

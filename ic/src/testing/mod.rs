@@ -583,6 +583,9 @@ impl TestHarnessBuilder {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "lunarwing_cloud".to_string(),
+            coordination_gate: None,
+            coordination_prompt_policy: None,
+            coordination_coalesce: None,
         };
 
         TestHarness {

@@ -2,6 +2,7 @@
 //!
 //! These tools let the LLM manage extensions entirely through conversation.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -10,6 +11,46 @@ use crate::context::JobContext;
 use crate::extensions::{ExtensionKind, ExtensionManager};
 use crate::tools::mcp::McpServerConfig;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
+
+fn string_map_param(
+    params: &serde_json::Value,
+    key: &str,
+    description: &str,
+) -> Result<Option<HashMap<String, String>>, ToolError> {
+    params
+        .get(key)
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| {
+            ToolError::InvalidParameters(format!(
+                "{description} must be an object of string values: {error}"
+            ))
+        })
+}
+
+fn string_vec_param(
+    params: &serde_json::Value,
+    key: &str,
+    description: &str,
+) -> Result<Option<Vec<String>>, ToolError> {
+    params
+        .get(key)
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| {
+            ToolError::InvalidParameters(format!(
+                "{description} must be an array of strings: {error}"
+            ))
+        })
+}
+
+fn requests_secret_environment(params: &serde_json::Value) -> bool {
+    params.get("env_secrets").is_some_and(|value| {
+        value
+            .as_object()
+            .is_none_or(|mappings| !mappings.is_empty())
+    })
+}
 
 // ── tool_search ──────────────────────────────────────────────────────────
 
@@ -112,27 +153,15 @@ impl ToolInstallTool {
                             "MCP server command is required for stdio transport".to_string(),
                         )
                     })?;
-                let args = params
-                    .get("args")
-                    .map(|value| serde_json::from_value(value.clone()))
-                    .transpose()
-                    .map_err(|e| {
-                        ToolError::InvalidParameters(format!(
-                            "MCP stdio args must be an array of strings: {e}"
-                        ))
-                    })?
-                    .unwrap_or_default();
-                let env = params
-                    .get("env")
-                    .map(|value| serde_json::from_value(value.clone()))
-                    .transpose()
-                    .map_err(|e| {
-                        ToolError::InvalidParameters(format!(
-                            "MCP stdio env must be an object of string values: {e}"
-                        ))
-                    })?
-                    .unwrap_or_default();
-                McpServerConfig::new_stdio(name, command, args, env)
+                let args = string_vec_param(params, "args", "MCP stdio args")?.unwrap_or_default();
+                let env = string_map_param(params, "env", "MCP stdio env")?.unwrap_or_default();
+                let env_secrets = string_map_param(
+                    params,
+                    "env_secrets",
+                    "MCP stdio secret environment references",
+                )?
+                .unwrap_or_default();
+                McpServerConfig::new_stdio_with_secrets(name, command, args, env, env_secrets)
             }
             Some("http") => {
                 if params.get("url").and_then(|v| v.as_str()).is_none() {
@@ -149,10 +178,11 @@ impl ToolInstallTool {
             }
             None if params.get("command").is_some()
                 || params.get("args").is_some()
-                || params.get("env").is_some() =>
+                || params.get("env").is_some()
+                || params.get("env_secrets").is_some() =>
             {
                 return Err(ToolError::InvalidParameters(
-                    "MCP transport must be 'stdio' when command, args, or env are provided"
+                    "MCP transport must be 'stdio' when command, args, env, or env_secrets are provided"
                         .to_string(),
                 ));
             }
@@ -209,6 +239,11 @@ impl Tool for ToolInstallTool {
                     "additionalProperties": {"type": "string"},
                     "description": "Non-secret environment variables for a stdio MCP server"
                 },
+                "env_secrets": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Environment variable names mapped to owner-scoped LunarWing secret names. Raw values are exposed to the unsandboxed stdio process."
+                },
                 "kind": {
                     "type": "string",
                     "enum": ["mcp_server", "wasm_tool", "wasm_channel"],
@@ -262,8 +297,12 @@ impl Tool for ToolInstallTool {
         Ok(ToolOutput::success(output, start.elapsed()))
     }
 
-    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+    fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
+        if requests_secret_environment(params) {
+            ApprovalRequirement::Always
+        } else {
+            ApprovalRequirement::UnlessAutoApproved
+        }
     }
 }
 
@@ -550,19 +589,20 @@ impl ToolUpdateTool {
                             "MCP server command is required for stdio transport".to_string(),
                         )
                     })?;
-                let args = params
-                    .get("args")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-                let env = params
-                    .get("env")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-                Ok(McpServerConfig::new_stdio(
+                let args = string_vec_param(params, "args", "MCP stdio args")?.unwrap_or_default();
+                let env = string_map_param(params, "env", "MCP stdio env")?.unwrap_or_default();
+                let env_secrets = string_map_param(
+                    params,
+                    "env_secrets",
+                    "MCP stdio secret environment references",
+                )?
+                .unwrap_or_default();
+                Ok(McpServerConfig::new_stdio_with_secrets(
                     &existing.name,
                     command,
                     args,
                     env,
+                    env_secrets,
                 ))
             }
             Some("http") => {
@@ -577,20 +617,33 @@ impl ToolUpdateTool {
                 "Unsupported MCP transport '{other}'"
             ))),
             None => match existing.effective_transport() {
-                EffectiveTransport::Stdio { command, args, env } => {
+                EffectiveTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    env_secrets,
+                } => {
                     let cmd = params
                         .get("command")
                         .and_then(|v| v.as_str())
                         .unwrap_or(command);
-                    let a = params
-                        .get("args")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    let a = string_vec_param(params, "args", "MCP stdio args")?
                         .unwrap_or_else(|| args.to_vec());
-                    let e = params
-                        .get("env")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    let e = string_map_param(params, "env", "MCP stdio env")?
                         .unwrap_or_else(|| env.clone());
-                    Ok(McpServerConfig::new_stdio(&existing.name, cmd, a, e))
+                    let secret_env = string_map_param(
+                        params,
+                        "env_secrets",
+                        "MCP stdio secret environment references",
+                    )?
+                    .unwrap_or_else(|| env_secrets.clone());
+                    Ok(McpServerConfig::new_stdio_with_secrets(
+                        &existing.name,
+                        cmd,
+                        a,
+                        e,
+                        secret_env,
+                    ))
                 }
                 EffectiveTransport::Http => {
                     let url = params
@@ -615,7 +668,7 @@ impl Tool for ToolUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Update an installed MCP server's configuration in-place (command, args, env, or url) \
+        "Update an installed MCP server's configuration in-place (command, args, env, env_secrets, or url) \
          without removing and reinstalling it. If the server is active, it is restarted with \
          the new configuration. Enabled state and credentials are preserved."
     }
@@ -650,6 +703,11 @@ impl Tool for ToolUpdateTool {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                     "description": "New non-secret environment variables (stdio transport)"
+                },
+                "env_secrets": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "New environment-variable-to-secret-name mappings (stdio transport)"
                 }
             },
             "required": ["name"]
@@ -688,7 +746,7 @@ impl Tool for ToolUpdateTool {
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
-        ApprovalRequirement::UnlessAutoApproved
+        ApprovalRequirement::Always
     }
 }
 
@@ -984,6 +1042,7 @@ mod tests {
         assert!(schema["properties"].get("command").is_some());
         assert!(schema["properties"].get("args").is_some());
         assert!(schema["properties"].get("env").is_some());
+        assert!(schema["properties"].get("env_secrets").is_some());
     }
 
     #[test]
@@ -996,20 +1055,30 @@ mod tests {
             "transport": "stdio",
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"],
-            "env": {"LOG_LEVEL": "warn"}
+            "env": {"LOG_LEVEL": "warn"},
+            "env_secrets": {"API_TOKEN": "api_token"}
         });
 
         let config = ToolInstallTool::mcp_config(&params, "local-files")
             .expect("valid request")
             .expect("MCP config");
         match config.effective_transport() {
-            EffectiveTransport::Stdio { command, args, env } => {
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(
                     args,
                     ["-y", "@modelcontextprotocol/server-filesystem", "/srv/data"]
                 );
                 assert_eq!(env.get("LOG_LEVEL").map(String::as_str), Some("warn"));
+                assert_eq!(
+                    env_secrets.get("API_TOKEN").map(String::as_str),
+                    Some("api_token")
+                );
             }
             other => panic!("expected stdio transport, got {other:?}"),
         }
@@ -1028,6 +1097,24 @@ mod tests {
         let err = ToolInstallTool::mcp_config(&params, "local-files")
             .expect_err("numeric env value must fail");
         assert!(err.to_string().contains("object of string values"));
+    }
+
+    #[test]
+    fn tool_install_secret_environment_always_requires_approval() {
+        use crate::tools::tool::ApprovalRequirement;
+
+        let tool = ToolInstallTool {
+            manager: test_manager_stub(),
+        };
+        let params = serde_json::json!({
+            "name": "local-files",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "command": "local-files-mcp",
+            "env_secrets": {"API_TOKEN": "api_token"}
+        });
+
+        assert_eq!(tool.requires_approval(&params), ApprovalRequirement::Always);
     }
 
     #[test]
@@ -1118,14 +1205,54 @@ mod tests {
         assert_eq!(tool.name(), "tool_update");
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
-            ApprovalRequirement::UnlessAutoApproved
+            ApprovalRequirement::Always
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("name").is_some());
         assert!(schema["properties"].get("transport").is_some());
         assert!(schema["properties"].get("command").is_some());
         assert!(schema["properties"].get("args").is_some());
+        assert!(schema["properties"].get("env_secrets").is_some());
         assert_eq!(schema["required"], serde_json::json!(["name"]));
+    }
+
+    #[test]
+    fn tool_update_preserves_unmentioned_secret_environment() {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let existing = McpServerConfig::new_stdio_with_secrets(
+            "local-files",
+            "old-command",
+            vec![],
+            HashMap::new(),
+            HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]),
+        );
+        let updated = ToolUpdateTool::build_config(
+            &serde_json::json!({"name": "local-files", "command": "new-command"}),
+            &existing,
+        )
+        .expect("build update");
+
+        assert!(matches!(
+            updated.effective_transport(),
+            EffectiveTransport::Stdio {
+                command,
+                env_secrets,
+                ..
+            } if command == "new-command"
+                && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
+        ));
+
+        let tool = ToolUpdateTool {
+            manager: test_manager_stub(),
+        };
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({
+                "name": "local-files",
+                "env_secrets": {"API_TOKEN": "api_token"}
+            })),
+            ApprovalRequirement::Always
+        );
     }
 
     #[test]

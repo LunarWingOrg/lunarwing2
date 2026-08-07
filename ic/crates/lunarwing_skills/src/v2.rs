@@ -162,6 +162,7 @@ impl V2SkillMetadata {
             && self.archived_at.is_none()
             && self.deprecated_at.is_none()
             && self.pending_patch.is_none()
+            && self.pending_prune.is_none()
             && self.metrics.usage_count >= min_usage
             && self.metrics.confidence() <= threshold
     }
@@ -673,6 +674,20 @@ mod tests {
     fn test_is_prune_candidate_too_few_uses_excluded() {
         // 0/5 = 0.0 confidence but only 5 uses → below prune min-usage (10).
         let m = extracted_trusted(0, 5, 5);
+        assert!(!m.is_prune_candidate(DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE));
+    }
+
+    #[test]
+    fn test_is_prune_candidate_with_pending_prune_excluded() {
+        let mut m = extracted_trusted(0, 10, 10);
+        m.pending_prune = Some(PendingSkillPrune {
+            reason: "already staged".to_string(),
+            confidence_at_staging: 0.0,
+            usage_count_at_staging: 10,
+            source_thread_id: None,
+            staged_at: Utc::now(),
+        });
+
         assert!(!m.is_prune_candidate(DEFAULT_PRUNE_CONFIDENCE, DEFAULT_PRUNE_MIN_USAGE));
     }
 

@@ -238,6 +238,7 @@ impl ConversationManager {
                         user_id,
                         history,
                         preferred_thread_id,
+                        None,
                     )
                     .await?;
 
@@ -271,6 +272,25 @@ impl ConversationManager {
         }
     }
 
+    /// Untrack a thread from every conversation's active set.
+    ///
+    /// Reconciliation paths (gate expiry/orphan finalization) finalize a
+    /// thread without a conversation id at hand; without this the thread
+    /// stays "active" in conversation state forever.
+    pub async fn untrack_thread_everywhere(&self, thread_id: ThreadId) {
+        let mut convs = self.conversations.write().await;
+        for conv in convs.values_mut() {
+            conv.untrack_thread(thread_id);
+        }
+    }
+
+    /// Untrack a thread from its known conversation without scanning others.
+    pub async fn untrack_thread(&self, conversation_id: ConversationId, thread_id: ThreadId) {
+        if let Some(conv) = self.conversations.write().await.get_mut(&conversation_id) {
+            conv.untrack_thread(thread_id);
+        }
+    }
+
     /// Record a thread's outcome in its conversation.
     pub async fn record_thread_outcome(
         &self,
@@ -282,7 +302,9 @@ impl ConversationManager {
         if let Some(conv) = convs.get_mut(&conversation_id) {
             match outcome {
                 ThreadOutcome::Completed { response } => {
-                    if let Some(text) = response {
+                    if let Some(text) = response
+                        && !text.is_empty()
+                    {
                         conv.add_entry(ConversationEntry::agent(thread_id, text));
                     }
                     conv.untrack_thread(thread_id);
@@ -297,11 +319,11 @@ impl ConversationManager {
                 ThreadOutcome::MaxIterations => {
                     conv.add_entry(ConversationEntry::system_for_thread(
                         thread_id,
-                        "Thread reached max iterations",
+                        "Thread reached max iterations after final recovery; retry with narrower scope or a higher iteration limit",
                     ));
                     conv.untrack_thread(thread_id);
                 }
-                ThreadOutcome::Failed { error } => {
+                ThreadOutcome::Failed { error, .. } => {
                     conv.add_entry(ConversationEntry::system_for_thread(
                         thread_id,
                         format!("Thread failed: {error}"),
@@ -882,6 +904,72 @@ mod tests {
             conv.entries[0].sender,
             EntrySender::Agent { thread_id } if thread_id == tid
         ));
+    }
+
+    #[tokio::test]
+    async fn record_outcome_skips_empty_response() {
+        let (_, cm) = make_conv_manager();
+        let conv_id = cm.get_or_create_conversation("cli", "user1").await.unwrap();
+        let tid = ThreadId::new();
+
+        cm.conversations
+            .write()
+            .await
+            .get_mut(&conv_id)
+            .unwrap()
+            .track_thread(tid);
+        cm.record_thread_outcome(
+            conv_id,
+            tid,
+            &ThreadOutcome::Completed {
+                response: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let conv = cm.get_conversation(conv_id).await.unwrap();
+        assert!(conv.active_threads.is_empty());
+        assert!(conv.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn untrack_thread_only_updates_named_conversation() {
+        let (_, cm) = make_conv_manager();
+        let first = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let second = cm
+            .get_or_create_conversation("xmpp", "user1")
+            .await
+            .unwrap();
+        let thread_id = ThreadId::new();
+        {
+            let mut conversations = cm.conversations.write().await;
+            conversations
+                .get_mut(&first)
+                .unwrap()
+                .track_thread(thread_id);
+            conversations
+                .get_mut(&second)
+                .unwrap()
+                .track_thread(thread_id);
+        }
+
+        cm.untrack_thread(first, thread_id).await;
+
+        assert!(
+            !cm.get_conversation(first)
+                .await
+                .unwrap()
+                .active_threads
+                .contains(&thread_id)
+        );
+        assert!(
+            cm.get_conversation(second)
+                .await
+                .unwrap()
+                .active_threads
+                .contains(&thread_id)
+        );
     }
 
     #[tokio::test]

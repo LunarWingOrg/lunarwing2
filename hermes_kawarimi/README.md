@@ -21,14 +21,15 @@ HermesAgentSnapshot            neutral in-memory IR
 MappedAgent                    owner-agnostic LunarWing rows
    │  loader.py    (--apply only)
    ▼
-mt-admin add/build/start → schema → stop → populate live DB + secrets
+mt-admin add/build/start → schema → stop → start-pg → populate live DB + secrets
 ```
 
 **Why start-then-stop for schema:** LunarWing creates its schema via the daemon's
 refinery runner at first boot (`ic/src/app.rs`), and `V1__initial.sql` uses bare
 `CREATE TABLE`, so hand-applying SQL would collide. The loader boots the tenant
-once to create the schema, stops the daemon (PostgreSQL stays up), then populates
-with no daemon racing.
+once to create the schema, stops the daemon, then re-ups PostgreSQL only
+(`mt-admin start-pg` — `stop-tenant` stops PG too) and populates with no daemon
+racing.
 
 **Owner-scope safety:** every row is written under the freshly-provisioned
 tenant's `LUNARWING_OWNER_ID`, so the `KAWARIMI-OWNER-SCOPE-CONTINUITY`
@@ -67,7 +68,8 @@ sudo python3 -m hermes_kawarimi import --source /path/to/hermes/home \
 
 `--source` defaults to `$HERMES_HOME`, then `~/.hermes` (matching Hermes' own
 resolution). Import flags: `--apply`, `--start`, `--force` (reuse an existing
-tenant name), `--with-nanocode/--with-pebble/--with-opencode`, `--docker-group`,
+tenant name), `--with-pebble/--with-opencode/--with-kimi`, `--with-toolchains`
+(build-tenant only), `--docker-group`,
 `--tensorzero-url`, `--llm-model`, `--save FILE` / `--resume FILE`.
 
 ## Module layout
@@ -81,21 +83,47 @@ hermes_kawarimi/
 ├── config.py       # ImportPlan (JSON save/resume)
 ├── cli.py          # `inspect` + `import`
 ├── model_tests.py / extract_tests.py / mapper_tests.py
+├── config_tests.py / loader_tests.py / loader_populate_tests.py
+├── cli_tests.py
 └── requirements.txt
 ```
 
 ## Testing
 
 ```bash
-# Unit tests (no root, no DB)
+# Unit tests (no root, no DB) — all seven modules
 python3 -m unittest hermes_kawarimi.model_tests \
-  hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests
+  hermes_kawarimi.extract_tests hermes_kawarimi.mapper_tests \
+  hermes_kawarimi.config_tests hermes_kawarimi.loader_tests \
+  hermes_kawarimi.loader_populate_tests hermes_kawarimi.cli_tests
 ```
+
+`loader_tests` / `loader_populate_tests` cover preflight, plan->argv wiring,
+and the populate SQL with fakes; only true live writes (real DB + mt-admin)
+are deferred to host rehearsal.
 
 The live `--apply` path is validated on a LunarWing host with root + container
 runtime (mirrors the KAWARIMI rehearsal): after import, rows exist under
 `LUNARWING_OWNER_ID` and a stored secret decrypts. Rollback:
 `sudo lunarwing-mt-admin.sh remove-tenant <tenant>`.
+
+`--apply` needs `psycopg2` + `cryptography` importable by **root's** python.
+Keep them out of the system interpreter: create an isolated venv and invoke it
+with sudo from the repo root (CWD puts both packages on `sys.path`):
+
+```bash
+python3 -m venv .venv-kawarimi
+.venv-kawarimi/bin/pip install -r hermes_kawarimi/requirements.txt
+sudo .venv-kawarimi/bin/python3 -m hermes_kawarimi import \
+  --source /path/to/hermes/home --tenant kageho --apply
+```
+
+## Tuning
+
+- `KAWARIMI_SCHEMA_WAIT_SECONDS` — how long `loader._wait_for_schema` polls
+  for the `memory_documents` sentinel table after the first tenant boot
+  (default 90s; raise it on slow hosts with cold first-boot migrations or
+  container pulls).
 
 ## Scope
 

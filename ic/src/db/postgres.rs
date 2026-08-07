@@ -16,9 +16,9 @@ use crate::agent::routine::{Routine, RoutineRun, RunStatus};
 use crate::config::DatabaseConfig;
 use crate::context::{ActionRecord, JobContext, JobState};
 use crate::db::{
-    ApiTokenRecord, ConversationStore, Database, IdentityStore, JobStore, ReflexPatternRecord,
-    ReflexStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore, UserIdentityRecord,
-    UserRecord, UserStore, WorkspaceStore,
+    ApiTokenRecord, ConversationStore, Database, IdentityStore, JobStore, ReflexPatternHit,
+    ReflexPatternRecord, ReflexStore, RoutineStore, SandboxStore, SettingsStore, ToolFailureStore,
+    UserIdentityRecord, UserRecord, UserStore, WorkspaceStore,
 };
 use crate::error::{DatabaseError, WorkspaceError};
 use crate::history::{
@@ -27,7 +27,7 @@ use crate::history::{
 };
 use crate::workspace::{
     DocumentVersion, MemoryChunk, MemoryDocument, Repository, SearchConfig, SearchResult,
-    VersionSummary, WorkspaceEntry,
+    VersionSummary, WorkspaceEntry, WorkspaceFileContent,
 };
 
 /// PostgreSQL database backend.
@@ -742,6 +742,33 @@ impl WorkspaceStore for PgBackend {
         self.repo.list_directory(user_id, agent_id, directory).await
     }
 
+    async fn list_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+        self.repo
+            .list_files_limited(user_id, agent_id, directory, suffix, limit)
+            .await
+    }
+
+    async fn get_files_limited(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        directory: &str,
+        suffix: &str,
+        limit: usize,
+        max_file_bytes: usize,
+    ) -> Result<Vec<WorkspaceFileContent>, WorkspaceError> {
+        self.repo
+            .get_files_limited(user_id, agent_id, directory, suffix, limit, max_file_bytes)
+            .await
+    }
+
     async fn list_all_paths(
         &self,
         user_id: &str,
@@ -895,6 +922,43 @@ impl WorkspaceStore for PgBackend {
         agent_id: Option<Uuid>,
     ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
         self.repo.find_config_documents(user_id, agent_id).await
+    }
+
+    // ==================== Study-Notes knowledge store ====================
+
+    async fn knowledge_search(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        query: &str,
+        filter: &crate::workspace::KnowledgeFilter,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeSearchHit>, WorkspaceError> {
+        self.repo
+            .knowledge_search(user_ids, agent_id, query, filter, limit)
+            .await
+    }
+
+    async fn knowledge_topic_versions(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        topic: &str,
+    ) -> Result<Vec<MemoryDocument>, WorkspaceError> {
+        self.repo
+            .knowledge_topic_versions(user_ids, agent_id, topic)
+            .await
+    }
+
+    async fn knowledge_list_notes(
+        &self,
+        user_ids: &[String],
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
+        self.repo
+            .knowledge_list_notes(user_ids, agent_id, limit)
+            .await
     }
 
     // ==================== Versioning ====================
@@ -1242,6 +1306,7 @@ impl IdentityStore for PgBackend {
 impl ReflexStore for PgBackend {
     async fn find_recurring_job_patterns(
         &self,
+        user_id: &str,
         min_count: i32,
         limit: i32,
     ) -> Result<Vec<String>, DatabaseError> {
@@ -1249,12 +1314,12 @@ impl ReflexStore for PgBackend {
         let rows = conn
             .query(
                 "SELECT description FROM agent_jobs \
-                 WHERE status = 'completed' AND success = true \
+                 WHERE status = 'completed' AND success = true AND user_id = $1 \
                  GROUP BY description \
-                 HAVING COUNT(*) >= $1 \
+                 HAVING COUNT(*) >= $2 \
                  ORDER BY COUNT(*) DESC \
-                 LIMIT $2",
-                &[&min_count, &limit],
+                 LIMIT $3",
+                &[&user_id, &min_count, &limit],
             )
             .await?;
         Ok(rows
@@ -1277,6 +1342,9 @@ impl ReflexStore for PgBackend {
              VALUES (gen_random_uuid(), $1, $2, $3, $4, 1, NOW(), NOW(), NOW(), 'active', 0) \
              ON CONFLICT (user_id, normalized_pattern) \
              DO UPDATE SET \
+                 tool_name = EXCLUDED.tool_name, \
+                 status = 'active', \
+                 compilation_attempts = 0, \
                  match_count = reflex_patterns.match_count + 1, \
                  last_matched_at = NOW(), \
                  updated_at = NOW()",
@@ -1340,12 +1408,85 @@ impl ReflexStore for PgBackend {
         user_id: &str,
         normalized_pattern: &str,
     ) -> Result<(), DatabaseError> {
+        let hit = ReflexPatternHit {
+            user_id: user_id.to_string(),
+            normalized_pattern: normalized_pattern.to_string(),
+            count: 1,
+        };
+        self.bump_reflex_pattern_matches(std::slice::from_ref(&hit))
+            .await
+    }
+
+    async fn bump_reflex_pattern_matches(
+        &self,
+        hits: &[ReflexPatternHit],
+    ) -> Result<(), DatabaseError> {
+        let mut merged = HashMap::<(String, String), u64>::new();
+        for hit in hits.iter().filter(|hit| hit.count > 0) {
+            let count = merged
+                .entry((hit.user_id.clone(), hit.normalized_pattern.clone()))
+                .or_default();
+            *count = count.checked_add(hit.count).ok_or_else(|| {
+                DatabaseError::Constraint("reflex pattern hit count overflow".to_string())
+            })?;
+        }
+        if merged.is_empty() {
+            return Ok(());
+        }
+
+        let mut user_ids = Vec::with_capacity(merged.len());
+        let mut patterns = Vec::with_capacity(merged.len());
+        let mut counts = Vec::with_capacity(merged.len());
+        for ((user_id, pattern), count) in merged {
+            user_ids.push(user_id);
+            patterns.push(pattern);
+            counts.push(count.min(i32::MAX as u64) as i64);
+        }
+
         let conn = self.store.pool().get().await?;
         conn.execute(
-            "UPDATE reflex_patterns \
-             SET match_count = match_count + 1, last_matched_at = NOW(), updated_at = NOW() \
-             WHERE user_id = $1 AND normalized_pattern = $2",
-            &[&user_id, &normalized_pattern],
+            "UPDATE reflex_patterns AS pattern \
+             SET match_count = LEAST(pattern.match_count::bigint + hit.count, 2147483647)::integer, \
+                 last_matched_at = NOW(), updated_at = NOW(), \
+                 status = CASE WHEN pattern.status = 'evicted' THEN 'active' ELSE pattern.status END \
+             FROM UNNEST($1::text[], $2::text[], $3::bigint[]) \
+                  AS hit(user_id, normalized_pattern, count) \
+             WHERE pattern.user_id = hit.user_id \
+               AND pattern.normalized_pattern = hit.normalized_pattern",
+            &[&user_ids, &patterns, &counts],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_reflex_compilation_failure(
+        &self,
+        user_id: &str,
+        normalized_pattern: &str,
+        original_pattern: &str,
+        tool_name: &str,
+        max_attempts: i32,
+    ) -> Result<(), DatabaseError> {
+        let conn = self.store.pool().get().await?;
+        conn.execute(
+            "INSERT INTO reflex_patterns
+             (id, user_id, normalized_pattern, original_pattern, tool_name, match_count, last_matched_at, created_at, updated_at, status, compilation_attempts)
+             VALUES (gen_random_uuid(), $1, $2, $3, $4, 0, NULL, NOW(), NOW(), 'failed', 1)
+             ON CONFLICT (user_id, normalized_pattern)
+             DO UPDATE SET
+                 compilation_attempts = reflex_patterns.compilation_attempts + 1,
+                 updated_at = NOW(),
+                 status = CASE
+                     WHEN reflex_patterns.compilation_attempts + 1 >= $5 THEN 'disabled'
+                     ELSE 'failed'
+                 END",
+            &[
+                &user_id,
+                &normalized_pattern,
+                &original_pattern,
+                &tool_name,
+                &max_attempts,
+            ],
         )
         .await?;
         Ok(())
@@ -1375,23 +1516,25 @@ impl ReflexStore for PgBackend {
         let mut stale: Vec<ReflexPatternRecord> = rows.iter().map(row_to_reflex_pattern).collect();
 
         if !dry_run && !stale.is_empty() {
-            let ids: Vec<String> = stale.iter().map(|r| r.id.to_string()).collect();
-            conn.execute(
-                "UPDATE reflex_patterns \
-                 SET status = 'evicted', updated_at = NOW() \
-                 WHERE id = ANY($1)",
-                &[&ids.as_slice()],
-            )
-            .await?;
-            // Refresh rows to reflect updated status
+            let ids: Vec<Uuid> = stale.iter().map(|record| record.id).collect();
             let rows = conn
                 .query(
-                    "SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
-                     match_count, last_matched_at, created_at, updated_at, status, compilation_attempts \
-                     FROM reflex_patterns \
-                     WHERE id = ANY($1) \
+                    "WITH evicted AS (\
+                         UPDATE reflex_patterns \
+                         SET status = 'evicted', updated_at = NOW() \
+                         WHERE id = ANY($1::uuid[]) \
+                           AND status = 'active' \
+                           AND COALESCE(last_matched_at, created_at) < $2 \
+                         RETURNING id, user_id, normalized_pattern, original_pattern, tool_name, \
+                                   match_count, last_matched_at, created_at, updated_at, status, \
+                                   compilation_attempts, embedding, embedding_model\
+                     ) \
+                     SELECT id, user_id, normalized_pattern, original_pattern, tool_name, \
+                            match_count, last_matched_at, created_at, updated_at, status, \
+                            compilation_attempts, embedding, embedding_model \
+                     FROM evicted \
                      ORDER BY COALESCE(last_matched_at, created_at) ASC",
-                    &[&ids.as_slice()],
+                    &[&ids.as_slice(), &cutoff],
                 )
                 .await?;
             stale = rows.iter().map(row_to_reflex_pattern).collect();

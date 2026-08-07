@@ -5,9 +5,12 @@ PostgreSQL stays up):
 
     1. add-tenant --no-health  + build-tenant + install-wasm   (empty tenant)
     2. start-tenant            -> daemon runs migrations + onboard = SCHEMA
-    3. stop-tenant             -> daemon down, PostgreSQL container stays up
+    3. stop-tenant             -> daemon down (mt-admin stop-tenant also stops
+       start-pg                PostgreSQL, so bring PG back up PG-only; the
+                                  daemon stays down)
     4. populate                -> INSERT rows + encrypt secrets, no daemon racing
-    5. start-tenant (if --start) else leave STAGED (stopped, data in place)
+    5. start-tenant (if --start) else leave STAGED (daemon stopped, data in
+       place; PG left running, mirroring import-tenant.sh's staged state)
 
 Why start-then-stop for the schema: LunarWing creates its schema via the
 daemon's refinery runner at first boot (``ic/src/app.rs`` run_migrations +
@@ -130,7 +133,11 @@ def run_import(
     if not phase([mt, "build-tenant", plan.tenant, "--with-wasm", *_worker_flags(plan), *_build_flags(plan)]):
         result.error = "build-tenant failed"
         return result
-    phase([mt, "install-wasm", plan.tenant])  # best-effort, mirrors import-tenant.sh
+    # Required, mirroring import-tenant.sh (set -e aborts there on failure):
+    # a tenant missing its WASM artifacts boots with silently absent channels.
+    if not phase([mt, "install-wasm", plan.tenant]):
+        result.error = "install-wasm failed"
+        return result
 
     # Env (DATABASE_URL / SECRETS_MASTER_KEY / LUNARWING_OWNER_ID) exists now.
     try:
@@ -165,25 +172,60 @@ def run_import(
     if not phase([mt, "stop-tenant", plan.tenant]):
         result.error = "stop-tenant failed (before populate)"
         return result
-
-    # 4. populate (daemon down, PostgreSQL still up)
-    try:
-        counts = _populate(db_url, owner_id, mapped)
-        _insert_secrets(db_url, master_key, owner_id, mapped, result)
-    except Exception as exc:  # psycopg2 / crypto errors
-        result.error = f"populate failed: {exc}"
+    # mt-admin's stop-tenant also stops PostgreSQL. Bring PG back up PG-only
+    # (daemon stays down) so populate can connect with nothing racing.
+    if not phase([mt, "start-pg", plan.tenant]):
+        result.error = "start-pg failed (populate needs PostgreSQL up, daemon down)"
         return result
-    result.counts = counts
 
-    # 5. cut over or stage
-    if plan.start:
-        if not phase([mt, "start-tenant", plan.tenant]):
-            result.error = "start-tenant failed (after populate)"
+    # This import owns the PG-only start until a successful result deliberately
+    # leaves the tenant staged or transfers control to start-tenant.
+    postgres_owned = True
+    try:
+        # 4. populate (daemon down, PostgreSQL still up)
+        try:
+            counts = _populate(db_url, owner_id, mapped)
+            result.counts = counts  # set before _insert_secrets adds counts["secrets"]
+            _insert_secrets(db_url, master_key, owner_id, mapped, result)
+        except Exception as exc:  # psycopg2 / crypto errors
+            result.error = f"populate failed: {exc}"
             return result
-        result.staged = False
-    else:
-        result.staged = True
-    return result
+
+        # 5. cut over or stage
+        if plan.start:
+            if not phase([mt, "start-tenant", plan.tenant]):
+                result.error = "start-tenant failed (after populate)"
+                return result
+            result.staged = False
+        else:
+            result.staged = True
+        postgres_owned = False
+        return result
+    finally:
+        if postgres_owned:
+            _stop_owned_postgres(mt, plan.tenant, result, on_output)
+
+
+def _stop_owned_postgres(
+    mt: str,
+    tenant: str,
+    result: ImportResult,
+    on_output=None,
+) -> None:
+    """Best-effort cleanup without replacing the original import failure."""
+    try:
+        cleanup = run_command([mt, "stop-pg", tenant], on_output=on_output)
+        result.phases.append(cleanup)
+        if not cleanup.ok:
+            result.warnings.append(
+                "stop-pg cleanup failed after import failure; "
+                "PostgreSQL may still be running"
+            )
+    except Exception as exc:
+        result.warnings.append(
+            f"stop-pg cleanup raised after import failure: {exc}; "
+            "PostgreSQL may still be running"
+        )
 
 
 def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:
@@ -200,12 +242,12 @@ def _add_tenant_args(mt: str, plan: ImportPlan) -> list[str]:
 
 def _worker_flags(plan: ImportPlan) -> list[str]:
     flags: list[str] = []
-    if plan.with_nanocode:
-        flags.append("--with-nanocode")
     if plan.with_pebble:
         flags.append("--with-pebble")
     if plan.with_opencode:
         flags.append("--with-opencode")
+    if plan.with_kimi:
+        flags.append("--with-kimi")
     return flags
 
 

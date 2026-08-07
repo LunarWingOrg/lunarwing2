@@ -13,9 +13,12 @@ ROOT_CONFIG = ROOT / ".gitlab-ci.yml"
 README = ROOT / ".gitlab" / "README.md"
 TOOLCHAIN = ROOT / "ic" / "rust-toolchain.toml"
 WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
+CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
+KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 EXPECTED_RUST_VERSION = "1.96.1"
+EXPECTED_NORMAL_DEBUG = "line-tables-only"
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -23,11 +26,13 @@ EXPECTED_INCLUDES = [
     "/.gitlab/ci/rust.yml",
     "/.gitlab/ci/integration.yml",
     "/.gitlab/ci/security.yml",
+    "/.gitlab/ci/containers.yml",
 ]
 IMAGE_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})")
 DIRECT_CARGO_PATTERN = re.compile(r"(?:^|[;&|]\s*|\s)cargo(?:\s|$)")
 RUST_IMAGE_RE = re.compile(r"rust:([^@]+)@sha256:([0-9a-f]{64})")
+VARIABLE_REF_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 
 
 def load_yaml(path: pathlib.Path) -> dict:
@@ -46,17 +51,72 @@ def image_name(image: object) -> str | None:
     return None
 
 
-def extract_rust_image(defaults: dict, job_name: str) -> tuple[str, str] | None:
+def collect_variables(configs: list[tuple[pathlib.Path, dict]]) -> dict[str, str]:
+    variables: dict[str, str] = {}
+    for _path, config in configs:
+        declared = config.get("variables")
+        if not isinstance(declared, dict):
+            continue
+        for key, value in declared.items():
+            if isinstance(value, str):
+                variables[key] = value
+    return variables
+
+
+def resolve_variables(value: str, variables: dict[str, str], depth: int = 5) -> str:
+    result = value
+    for _ in range(depth):
+        replaced = VARIABLE_REF_PATTERN.sub(
+            lambda match: variables.get(match.group(1) or match.group(2), match.group(0)),
+            result,
+        )
+        if replaced == result:
+            break
+        result = replaced
+    return result
+
+
+def extract_rust_image(
+    defaults: dict, job_name: str, variables: dict[str, str]
+) -> tuple[str, str] | None:
     rust_job = defaults.get(job_name, {})
     if not isinstance(rust_job, dict):
         return None
     image = image_name(rust_job.get("image"))
     if not image:
         return None
-    match = RUST_IMAGE_RE.search(image)
+    match = RUST_IMAGE_RE.search(resolve_variables(image, variables))
     if not match:
         return None
     return match.group(1), match.group(2)
+
+
+def validate_cargo_profiles(defaults: dict, errors: list[str]) -> None:
+    if not CARGO_CONFIG.is_file():
+        errors.append(".cargo/config.toml missing")
+        return
+
+    with CARGO_CONFIG.open("rb") as stream:
+        cargo_config = tomllib.load(stream)
+    profiles = cargo_config.get("profile", {})
+    for profile_name in ("dev", "test"):
+        debug = profiles.get(profile_name, {}).get("debug")
+        if debug != EXPECTED_NORMAL_DEBUG:
+            errors.append(
+                f".cargo/config.toml profile.{profile_name}.debug {debug!r} != "
+                f"expected {EXPECTED_NORMAL_DEBUG!r}"
+            )
+
+    full_debug = profiles.get("full-debug", {})
+    if full_debug.get("inherits") != "dev" or full_debug.get("debug") != "full":
+        errors.append(".cargo/config.toml profile.full-debug must inherit dev with full debug")
+
+    ci_test_debug = defaults.get("variables", {}).get("CARGO_PROFILE_TEST_DEBUG")
+    if ci_test_debug != EXPECTED_NORMAL_DEBUG:
+        errors.append(
+            f"defaults.yml CARGO_PROFILE_TEST_DEBUG {ci_test_debug!r} != "
+            f"expected {EXPECTED_NORMAL_DEBUG!r}"
+        )
 
 
 def main() -> int:
@@ -75,6 +135,7 @@ def main() -> int:
             configs.append(path)
 
     loaded_configs = [(path, load_yaml(path)) for path in configs]
+    merged_variables = collect_variables(loaded_configs)
     workflow = dict(loaded_configs[1][1].get("workflow", {}))
     workflow_rules = workflow.get("rules", [])
     conditions = "\n".join(str(rule.get("if", "")) for rule in workflow_rules)
@@ -86,8 +147,26 @@ def main() -> int:
             if not isinstance(value, dict):
                 continue
             image = image_name(value.get("image"))
-            if image and not IMAGE_PATTERN.search(image):
-                errors.append(f"{path.relative_to(ROOT)}:{name} uses unpinned image {image}")
+            if image:
+                resolved_image = resolve_variables(image, merged_variables)
+                if not IMAGE_PATTERN.search(resolved_image):
+                    errors.append(
+                        f"{path.relative_to(ROOT)}:{name} uses unpinned image "
+                        f"{image} (resolved: {resolved_image})"
+                    )
+
+            rules = value.get("rules", [])
+            if isinstance(rules, list):
+                for index, rule in enumerate(rules, start=1):
+                    if (
+                        isinstance(rule, dict)
+                        and rule.get("when") == "manual"
+                        and "allow_failure" not in rule
+                    ):
+                        errors.append(
+                            f"{path.relative_to(ROOT)}:{name} manual rule {index} must "
+                            "explicitly set allow_failure"
+                        )
 
             script = value.get("script", [])
             if isinstance(script, str):
@@ -104,8 +183,9 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
-    rust_image = extract_rust_image(defaults, ".rust-job")
-    msrv_image = extract_rust_image(defaults, ".rust-msrv-job")
+    validate_cargo_profiles(defaults, errors)
+    rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
+    msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:
         errors.append("could not extract Rust image tag/digest from defaults.yml .rust-job")
     if msrv_image is None:
@@ -134,6 +214,17 @@ def main() -> int:
             )
     else:
         errors.append("opencode4lunarwing/Dockerfile missing")
+
+    if KIMI_DOCKERFILE.is_file():
+        dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+        toolchain_match = re.search(r"--default-toolchain\s+([^\s\\]+)", dockerfile_text)
+        if toolchain_match and toolchain_match.group(1) != EXPECTED_RUST_VERSION:
+            errors.append(
+                "kimicode4lunarwing/Dockerfile Rust toolchain "
+                f"{toolchain_match.group(1)!r} != expected {EXPECTED_RUST_VERSION!r}"
+            )
+    else:
+        errors.append("kimicode4lunarwing/Dockerfile missing")
 
     if rust_image is not None:
         rust_tag, rust_digest = rust_image

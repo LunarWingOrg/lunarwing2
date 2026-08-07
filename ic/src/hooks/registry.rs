@@ -324,9 +324,11 @@ mod tests {
     fn test_event() -> HookEvent {
         HookEvent::Inbound {
             user_id: "user-1".into(),
+            sender_id: Some("user-1".into()),
             channel: "test".into(),
             content: "hello".into(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 

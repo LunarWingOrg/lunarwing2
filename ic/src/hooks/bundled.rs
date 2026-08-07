@@ -211,6 +211,12 @@ pub struct HookRuleConfig {
     /// Optional regex guard. If provided and no match, rule is a no-op.
     #[serde(default)]
     pub when_regex: Option<String>,
+    /// Optional channel/scope guard evaluated against the event's policy
+    /// scope (routing-metadata destination, falling back to the transport
+    /// channel name). If provided and no match, the rule is a no-op
+    /// (ISSUE-010: keeps coordination rules off unrelated channels).
+    #[serde(default)]
+    pub when_channel_regex: Option<String>,
     /// Optional immediate reject reason if guard matches.
     #[serde(default)]
     pub reject_reason: Option<String>,
@@ -346,6 +352,7 @@ struct RuleHook {
     failure_mode: HookFailureMode,
     timeout: Duration,
     when_regex: Option<Regex>,
+    when_channel_regex: Option<Regex>,
     reject_reason: Option<String>,
     replacements: Vec<CompiledReplacement>,
     prepend: Option<String>,
@@ -363,6 +370,19 @@ impl RuleHook {
         let timeout = timeout_from_ms(config.timeout_ms, &scoped_name)?;
 
         let when_regex = match config.when_regex {
+            Some(pattern) => {
+                Some(
+                    Regex::new(&pattern).map_err(|e| HookBundleError::InvalidRegex {
+                        hook: scoped_name.clone(),
+                        pattern,
+                        reason: e.to_string(),
+                    })?,
+                )
+            }
+            None => None,
+        };
+
+        let when_channel_regex = match config.when_channel_regex {
             Some(pattern) => {
                 Some(
                     Regex::new(&pattern).map_err(|e| HookBundleError::InvalidRegex {
@@ -408,6 +428,7 @@ impl RuleHook {
             failure_mode: config.failure_mode.unwrap_or(HookFailureMode::FailOpen),
             timeout,
             when_regex,
+            when_channel_regex,
             reject_reason: config.reject_reason,
             replacements,
             prepend: config.prepend,
@@ -441,6 +462,19 @@ impl Hook for RuleHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
+        // Channel/scope guard first (ISSUE-010): rules can be scoped to
+        // specific destinations so coordination policy stays off unrelated
+        // channels. Evaluated against the policy scope (routing-metadata
+        // destination), falling back to the transport channel name.
+        if let Some(ref channel_guard) = self.when_channel_regex {
+            let in_scope = event
+                .policy_scope()
+                .is_some_and(|scope| channel_guard.is_match(scope));
+            if !in_scope {
+                return Ok(HookOutcome::ok());
+            }
+        }
+
         let content = extract_primary_content(event);
 
         if let Some(ref guard) = self.when_regex
@@ -956,9 +990,11 @@ mod tests {
     fn inbound_event(content: &str) -> HookEvent {
         HookEvent::Inbound {
             user_id: "user-1".to_string(),
+            sender_id: Some("user-1".to_string()),
             channel: "test".to_string(),
             content: content.to_string(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 
@@ -968,6 +1004,7 @@ mod tests {
             channel: channel.to_string(),
             content: content.to_string(),
             thread_id: None,
+            policy_scope: None,
         }
     }
 
@@ -1050,6 +1087,7 @@ mod tests {
                 failure_mode: None,
                 timeout_ms: None,
                 when_regex: None,
+                when_channel_regex: None,
                 reject_reason: None,
                 replacements: vec![RegexReplacementConfig {
                     pattern: "secret".to_string(),
@@ -1080,6 +1118,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_rule_hook_channel_guard_scopes_enforcement() {
+        // ISSUE-010: a rule with when_channel_regex must only act on matching
+        // destinations (policy scope), leaving other channels untouched.
+        let registry = Arc::new(HookRegistry::new());
+
+        let bundle = HookBundleConfig {
+            rules: vec![HookRuleConfig {
+                name: "coord-only-block".to_string(),
+                points: vec![HookPoint::BeforeOutbound],
+                priority: None,
+                failure_mode: None,
+                timeout_ms: None,
+                when_regex: Some("forbidden".to_string()),
+                when_channel_regex: Some("conference\\.".to_string()),
+                reject_reason: Some("coord: forbidden".to_string()),
+                replacements: vec![],
+                prepend: None,
+                append: None,
+            }],
+            outbound_webhooks: vec![],
+        };
+
+        let summary = register_bundle(&registry, "workspace:hooks/hooks.json", bundle).await;
+        assert_eq!(summary.hooks, 1);
+        assert_eq!(summary.errors, 0);
+
+        // MUC destination (via policy scope): content guard enforced.
+        let mut muc_event = outbound_event("xmpp", "this is forbidden");
+        if let HookEvent::Outbound {
+            ref mut policy_scope,
+            ..
+        } = muc_event
+        {
+            *policy_scope = Some("coord@conference.example".to_string());
+        }
+        let result = registry.run(&muc_event).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            HookError::Rejected { reason } if reason == "coord: forbidden"
+        ));
+
+        // Same content on a non-coordination channel: rule is a no-op.
+        let web_result = registry
+            .run(&outbound_event("web", "this is forbidden"))
+            .await;
+        assert!(matches!(web_result, Ok(HookOutcome::Continue { .. })));
+    }
+
+    #[tokio::test]
     async fn test_rule_hook_rejects() {
         let registry = Arc::new(HookRegistry::new());
 
@@ -1091,6 +1178,7 @@ mod tests {
                 failure_mode: None,
                 timeout_ms: None,
                 when_regex: Some("forbidden".to_string()),
+                when_channel_regex: None,
                 reject_reason: Some("forbidden content".to_string()),
                 replacements: vec![],
                 prepend: None,
@@ -1156,6 +1244,7 @@ mod tests {
             failure_mode: None,
             timeout_ms: None,
             when_regex: None,
+            when_channel_regex: None,
             reject_reason: None,
             replacements: vec![],
             prepend: None,
@@ -1297,6 +1386,7 @@ mod tests {
                 failure_mode: None,
                 timeout_ms: None,
                 when_regex: Some("forbidden".to_string()),
+                when_channel_regex: None,
                 reject_reason: None,
                 replacements: vec![RegexReplacementConfig {
                     pattern: "hello".to_string(),
@@ -1325,6 +1415,7 @@ mod tests {
                 failure_mode: None,
                 timeout_ms: None,
                 when_regex: None,
+                when_channel_regex: None,
                 reject_reason: None,
                 replacements: vec![RegexReplacementConfig {
                     pattern: "secret".to_string(),

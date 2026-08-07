@@ -57,7 +57,6 @@ ENABLE_SSH=true                     # SSH harness (key pair, agent, config.toml)
 ENABLE_HEALTH=true                  # Host-global health/self-heal pipeline
 ENABLE_WEECHAT_BOOTSTRAP=true       # Generate relay.conf during add-tenants
 BUILD_WASM=true                     # Build + install WASM tools and channels
-BUILD_NANOCODE=true                 # Build nanocode worker Docker image
 BUILD_PEBBLE=true                   # Build pebble worker Docker image
 BUILD_DARKIRC=true                  # Build darkirc daemon binary
 BUILD_VISION=true                   # Build vision/OCR sidecar Docker image
@@ -90,8 +89,6 @@ BUILD_PROFILE="${LUNARWING_MT_PROFILE:-release}"  # release | debug
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
-LUNARWING_ROOT="$(cd -- "${REPO_ROOT}/.." && pwd)"
 MT_ADMIN="${SCRIPT_DIR}/lunarwing-mt-admin.sh"
 ENV_FILE="${HOME}/.lunarwing-mt.env"
 HEALTH_ENV="/etc/lunarwing/health.env"
@@ -184,6 +181,8 @@ EOF
 
 # Run mt-admin with all env vars preserved.
 mt() {
+  # Runtime-generated exports configure mt-admin; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
   sudo -E "$MT_ADMIN" "$@"
 }
@@ -193,6 +192,8 @@ mt() {
 mt_tmux() {
   local session="$1"; shift
   local log="${LOG_DIR}/${session}.log"
+  # Runtime-generated exports configure tmux commands; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
   tmux kill-session -t "$session" 2>/dev/null || true
   tmux new-session -d -s "$session" \
@@ -271,11 +272,12 @@ phase_1() {
 phase_2() {
   say "══ Phase 2: Build binaries, workers, darkirc, vision, WASM ══"
 
+  # Runtime-generated exports configure this phase; no static source path exists.
+  # shellcheck disable=SC1090
   source "$ENV_FILE"
 
   local -a build_flags=()
   [[ "$BUILD_WASM" == true ]]     && build_flags+=(--with-wasm)
-  [[ "$BUILD_NANOCODE" == true ]] && build_flags+=(--with-nanocode)
   [[ "$BUILD_PEBBLE" == true ]]   && build_flags+=(--with-pebble)
 
   if [[ ${#build_flags[@]} -gt 0 ]]; then
@@ -402,7 +404,6 @@ main() {
   say "  SSH:           $ENABLE_SSH"
   say "  Health:        $ENABLE_HEALTH"
   say "  Build WASM:    $BUILD_WASM"
-  say "  Nanocode:      $BUILD_NANOCODE"
   say "  Pebble:        $BUILD_PEBBLE"
   say "  DarkIRC build: $BUILD_DARKIRC"
   say "  Vision:        $BUILD_VISION"

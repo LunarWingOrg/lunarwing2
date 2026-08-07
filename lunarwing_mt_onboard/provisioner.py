@@ -138,7 +138,7 @@ def ensure_mt_admin() -> str:
 def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     """Construct the argv list for ``mt-admin add-tenant``.
 
-    Secret values (XMPP password, LLM API key) are intentionally NOT placed
+    Secret values (XMPP password, LLM/Kimi API keys) are intentionally NOT placed
     on the argv — they would be visible in ``/proc/<pid>/cmdline``. Instead,
     ``add-tenant`` auto-generates throwaway values, and the secrets module
     overwrites them in ``lunarwing.env`` before ``start-tenant`` runs.
@@ -162,14 +162,14 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
         args.extend(["--llm-base-url", config.llm_base_url])
     if config.llm_model:
         args.extend(["--llm-model", config.llm_model])
-    if config.nanocode_model:
-        args.extend(["--nanocode-model", config.nanocode_model])
-    if config.nanocode_base_url:
-        args.extend(["--nanocode-base-url", config.nanocode_base_url])
     if config.opencode_model:
         args.extend(["--opencode-model", config.opencode_model])
     if config.opencode_base_url:
         args.extend(["--opencode-base-url", config.opencode_base_url])
+    if config.kimi_model:
+        args.extend(["--kimi-model", config.kimi_model])
+    if config.kimi_base_url:
+        args.extend(["--kimi-base-url", config.kimi_base_url])
     if config.enable_darkirc:
         args.append("--enable-darkirc")
     # Persist the tenant's external-worker selection at add-tenant so
@@ -177,12 +177,12 @@ def build_add_tenant_args(config: "TenantConfig") -> list[str]:
     # the per-tenant registry flag). build-tenant gets the same flags to build
     # the shared images; add-tenant records the per-tenant choice. See
     # build_build_tenant_args and docs/proposals/PER_TENANT_WORKER_GATING.md.
-    if WorkerType.NANOCODE in config.workers:
-        args.append("--with-nanocode")
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.KIMI in config.workers:
+        args.append("--with-kimi")
     if config.no_ssh:
         args.append("--no-ssh")
     if config.no_health:
@@ -196,12 +196,12 @@ def build_build_tenant_args(config: "TenantConfig") -> list[str]:
     """Construct the argv list for ``mt-admin build-tenant``."""
     script = ensure_mt_admin()
     args: list[str] = [script, "build-tenant", config.name, "--with-wasm"]
-    if WorkerType.NANOCODE in config.workers:
-        args.append("--with-nanocode")
     if WorkerType.PEBBLE in config.workers:
         args.append("--with-pebble")
     if WorkerType.OPENCODE in config.workers:
         args.append("--with-opencode")
+    if WorkerType.KIMI in config.workers:
+        args.append("--with-kimi")
     if config.toolchains:
         args.append("--with-toolchains")
     return args
@@ -279,6 +279,8 @@ def _inject_secrets(config: "TenantConfig") -> None:
         secrets["XMPP_PASSWORD"] = config.xmpp_password
     if config.llm_api_key:
         secrets["LLM_API_KEY"] = config.llm_api_key
+    if config.kimi_api_key:
+        secrets["KIMI_API_KEY"] = config.kimi_api_key
     if config.secrets_master_key:
         secrets["SECRETS_MASTER_KEY"] = config.secrets_master_key
 
@@ -304,8 +306,10 @@ def _write_env_values(env_file: str, values: dict[str, str]) -> None:
         lines = f.readlines()
 
     def _fmt(key: str, val: str) -> str:
-        escaped = val.replace("\\", "\\\\").replace("'", "\\'")
-        return f"{key}='{escaped}'\n"
+        if any(character in val for character in ("\0", "\r", "\n")):
+            raise ValueError(f"{key} cannot contain NUL or newline characters")
+        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{key}="{escaped}"\n'
 
     seen = set()
     new_lines = []

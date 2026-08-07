@@ -21,21 +21,30 @@ For adapter architecture and QA scenarios, see [DarkIRC Multitenant Adapter](../
 - **DarkIRC must be explicitly enabled** when creating tenants by passing `--enable-darkirc` to `add-tenant` or `add-tenants`. Without this flag, no DarkIRC services, env files, or service units are created for the tenant. The flag state is persisted per-tenant in `/etc/lunarwing/ports.json` as `enable_darkirc: true/false`; existing tenants without the field default to disabled.
 - `jq` is installed for `/etc/lunarwing/ports.json` migrations and inspection.
 - Python 3 with `aiohttp` is available for `darkirc_adapter.py`.
-- `git` and a working Rust toolchain (`cargo` + `make`) are available **to the tenant / build user** — `build-darkirc` clones and compiles DarkFi as that user, never as root. (Root does not need a Rust toolchain.)
+- `git`, `cargo`, `make`, `taskset`, `setpriv`, and `tar` are available on the host. `build-darkirc` uses a dedicated locked `lunarwing-build` account with no supplementary groups and a sanitized environment.
 
-You do **not** need to clone DarkFi by hand: `build-darkirc` auto-clones it if the source is absent (see [Build DarkIRC](#build-darkirc)). The source is cloned and built outside the LunarWing repo (under the tenant's home by default) and is never vendored into the repository.
+You do **not** need to clone DarkFi by hand. `build-darkirc` maintains one fixed root-owned clean checkout (default `/var/cache/lunarwing/darkfi-source`), archives the approved revision into a disposable unprivileged build tree, and never vendors DarkFi into the LunarWing repository.
 
 ## Port Registry Requirements
 
-DarkIRC requires schema v7 in `/etc/lunarwing/ports.json`.
+DarkIRC's three port fields were introduced by schema v7. The current registry
+schema is **v14**: v13 dedicated `extended_ports.coord_admin`, and v14 assigns a
+stable, unique, non-secret `darkirc_scope_id` to every DarkIRC-enabled tenant.
+Normal `lunarwing-mt-admin.sh` mutating commands call `ports_registry_init()` and
+migrate older registries through every version to v14 before operating. Do not
+intentionally leave a production registry at an intermediate version.
 
-| Schema | Adds | Script |
-|--------|------|--------|
+| Historical schema | Adds | Standalone migration |
+|-------------------|------|----------------------|
 | v6 | `extended_range`, `extended_base`, `extended_ports.reserved_0..reserved_9` | `ic/scripts/migrate-ports-v6.sh` |
 | v6.1 | `extended_ports.darkirc_adapter` from `reserved_0` | `ic/scripts/migrate-ports-v6.1.sh` |
 | v7 | `extended_ports.darkirc_irc` and `extended_ports.darkirc_rpc` from `reserved_1` and `reserved_2` | `ic/scripts/migrate-ports-v7.sh` |
+| v14 | Unique `darkirc_scope_id` for each enabled tenant | Integrated into `lunarwing-mt-admin.sh`; no standalone migration |
 
-New tenants created after these changes already receive all three DarkIRC ports. Existing tenants need the migrations.
+New tenants already receive all three DarkIRC ports and their stable scope
+identity. Existing registries are migrated by the admin script; the standalone
+v6/v6.1/v7 scripts are retained for explicit recovery or rehearsal on old
+copies.
 
 ### Inspect Current Schema
 
@@ -63,23 +72,27 @@ The exact numbers depend on the tenant's base port. Existing primary ports are n
 
 ### Migrate a Live Registry
 
-Run migrations in order from the repo root:
+Use the admin script rather than stopping at the old DarkIRC-specific v7 step:
 
 ```bash
-sudo ic/scripts/migrate-ports-v6.sh
-sudo ic/scripts/migrate-ports-v6.1.sh
-sudo ic/scripts/migrate-ports-v7.sh
+sudo ic/scripts/lunarwing-mt-admin.sh list-tenants
+jq -e '.version == 14' /etc/lunarwing/ports.json
+jq -e '
+  [.tenants | to_entries[]
+   | select(.value.enable_darkirc == true)
+   | .value.darkirc_scope_id] as $ids
+  | all($ids[]; test("^[0-9a-f]{32}$") and . != "00000000000000000000000000000000")
+    and (($ids | unique | length) == ($ids | length))
+' /etc/lunarwing/ports.json
 ```
 
-Each script:
+`list-tenants` calls `ports_registry_init()`, which acquires the registry lock and
+runs the full v2 → v14 migration chain before printing tenants. Other normal
+admin operations that initialize the registry do the same. Migration fails
+closed if an existing DarkIRC scope ID is invalid or duplicated.
 
-- accepts `PORTS_REGISTRY=/path/to/copy.json` for dry runs on a copy;
-- requires root only when operating on `/etc/lunarwing/ports.json`;
-- writes a timestamped backup next to the registry;
-- validates port uniqueness before replacing the registry;
-- swaps the new registry into place atomically.
-
-Dry-run against a copy first:
+For a DarkIRC-only rehearsal on an old registry copy, the standalone v6,
+v6.1, and v7 scripts remain useful:
 
 ```bash
 cp -p /etc/lunarwing/ports.json /tmp/ports.darkirc-test.json
@@ -89,88 +102,108 @@ PORTS_REGISTRY=/tmp/ports.darkirc-test.json ic/scripts/migrate-ports-v7.sh
 jq '.tenants | to_entries[] | {tenant: .key, extended_ports: .value.extended_ports}' /tmp/ports.darkirc-test.json
 ```
 
-### Inline Migration via Admin Script
+Those standalone scripts establish the DarkIRC fields but intentionally do not
+advance the copy through later schemas. Do not use their final version as the
+expected version of a live production registry.
 
-`lunarwing-mt-admin.sh` also contains inline migration functions:
+## Trusted DarkIRC Source And Compatibility
 
-- `ports_migrate_v6`
-- `ports_migrate_v6_1`
-- `ports_migrate_v7`
+`build-darkirc` uses one host-controlled source path. The default is:
 
-The top-level `ports_migrate()` dispatcher runs them in order. This means normal admin-script flows can bring stale registries forward, while the standalone scripts remain available for explicit operator-controlled upgrades.
-
-## Configure the DarkIRC Source Path (optional)
-
-`build-darkirc` resolves the DarkFi source path in this order:
-
-1. per-tenant `/home/<TENANT>/lunarwing/env/lunarwing.env` value:
-   ```bash
-   DARKIRC_SOURCE=/path/to/darkfi
-   ```
-2. host environment value:
-   ```bash
-   export LUNARWING_MT_DARKIRC_SOURCE=/path/to/darkfi
-   ```
-3. default: `/home/<TENANT>/darkfi` (tenant-owned).
-
-If the resolved path does not exist yet, `build-darkirc` **clones DarkFi into it automatically** (as the tenant / build user). Setting a path explicitly is only needed for a shared or non-default checkout, or to pin different tenants to different revisions.
-
-The clone source and revision are configurable (defaults shown):
-
-```bash
-export LUNARWING_MT_DARKIRC_REPO=https://github.com/darkrenaissance/darkfi
-export LUNARWING_MT_DARKIRC_REV=master
+```text
+/var/cache/lunarwing/darkfi-source
 ```
 
-To point one tenant at an existing checkout instead of auto-cloning:
+The checkout and Git metadata must be root-owned, symlink-free, non-writable by
+group or other, clean (including untracked files), and exactly at the approved
+revision `a05956d412a091e8b54c1cd4f4264c33b941203d`. Per-tenant `DARKIRC_SOURCE`
+values are not trusted build inputs.
+
+The repository URL may be overridden for a controlled mirror, but the approved
+revision may not be changed for managed key exchange:
 
 ```bash
-sudo install -d -m 700 -o <TENANT> -g <TENANT> /home/<TENANT>/lunarwing/env
-sudo sh -c 'grep -q "^DARKIRC_SOURCE=" /home/<TENANT>/lunarwing/env/lunarwing.env || printf "\nDARKIRC_SOURCE=/path/to/darkfi\n" >> /home/<TENANT>/lunarwing/env/lunarwing.env'
-sudo chown <TENANT>:<TENANT> /home/<TENANT>/lunarwing/env/lunarwing.env
-sudo chmod 600 /home/<TENANT>/lunarwing/env/lunarwing.env
+sudo LUNARWING_MT_DARKIRC_REPO=https://mirror.example/darkfi \
+  ic/scripts/lunarwing-mt-admin.sh build-darkirc --tenant <TENANT>
 ```
+
+Publication creates an immutable root-owned release under
+`/usr/local/lib/lunarwing/darkirc/releases/<release-id>/`. Each release contains
+the daemon, typed helper, and a mode-`0444` compatibility attestation binding
+the release ID, approved profile/revision/key format, helper source revision,
+and both executable digests. Mt-admin publishes one `current` selector with
+same-directory atomic rename and directory fsync. Readers resolve that selector
+once, pin one release, and the helper executes the same daemon descriptor it
+measured. Publication retry re-syncs all release files and parent directories
+before selection. `start-tenant` rejects missing, symlinked, stale,
+multiply-defined, or systemd-drop-in-overridden DarkIRC daemon commands; run
+`render-units <TENANT>` after upgrading old units.
+
+Runtime validation accepts a retained immutable release when its attestation
+shape and executable digests remain valid, so an intentional selector rollback
+does not depend on the current repository `HEAD`. Upgrade wrappers call
+`ensure-darkirc-release`; that gate compares the selected helper source revision
+to current trusted source and publishes a new release when they differ.
+
+Legacy `LUNARWING_MT_DARKIRC_BIN`, `LUNARWING_MT_DARKIRC_COMPAT_FILE`, and
+`LUNARWING_MT_DARKIRC_KEY_HELPER` overrides now fail closed. Controlled
+installations may relocate the complete release root with
+`LUNARWING_MT_DARKIRC_RELEASE_ROOT`.
 
 ## Provision or Backfill a Tenant
 
-For new tenants, `add-tenant` allocates DarkIRC ports and renders the DarkIRC env/config files as part of the tenant setup flow. DarkIRC services must be explicitly opted in with `--enable-darkirc`:
+For new tenants, `add-tenant` allocates DarkIRC ports, creates a stable random
+`darkirc_scope_id`, and renders the DarkIRC env/config files. DarkIRC must be
+explicitly enabled:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <TENANT> --docker-group --enable-darkirc
 ```
 
-Tenants created without `--enable-darkirc` will not have DarkIRC services, env files, or service units. The `start-tenant`, `status`, and `patch-env` commands automatically respect the persisted flag — they skip DarkIRC operations for tenants where it is disabled.
+Tenants created without `--enable-darkirc` have no DarkIRC services, env files,
+or service units. `start-tenant`, `status`, and `patch-env` respect the persisted
+flag.
 
-For an existing tenant after migration, patch the env/config files:
+For an existing enabled tenant, regenerate missing baseline settings with:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh patch-env <TENANT>
 ```
 
-This backfills DarkIRC-related values in `lunarwing.env`, writes `darkirc-adapter.env`, and renders `darkirc_config.toml` from templates.
+The DarkIRC baseline writer is semantic, locked, journaled, and
+contact-preserving. Repeated provisioning and `patch-env` preserve existing
+`[contact]` tables and unknown operator-owned fields; they do not truncate the
+active TOML.
 
 ## Build DarkIRC
 
-Build and install the DarkIRC daemon for one tenant:
+Build and atomically select an immutable shared daemon/helper/attestation
+release:
 
 ```bash
 sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc --tenant <TENANT>
 ```
 
-`build-darkirc`:
+The tenant argument selects the unprivileged account used for the generator
+self-test; it does not select tenant-controlled source. Mt-admin:
 
-- resolves the DarkFi source path (see above) and **clones it as the tenant user** if absent;
-- runs DarkFi's `make darkirc` **as the tenant user**, using that user's Rust toolchain — it never builds as root, so there are no root-owned source or build artifacts;
-- installs the resulting binary to the shared `DARKIRC_BIN` (default `/usr/local/bin/darkirc`) — the only step that uses root.
+- clones or verifies the fixed root-owned checkout at the approved revision;
+- archives that revision into disposable build trees;
+- builds DarkIRC and the helper as the dedicated locked `lunarwing-build` user
+  under `setpriv --clear-groups --no-new-privs`, `env -i`, and bounded CPU/jobs;
+- validates artifact owner, mode, link count, and executable type;
+- self-tests the staged generator output and public/private relationship;
+- fsyncs every release file and directory before publication;
+- atomically switches one selector only after the complete release validates;
+- retains prior complete releases, so interruption leaves either the old or new
+  coherent generation selected.
 
-Without `--tenant`, the build runs as the invoking (`sudo`) user instead, into `DARKIRC_SOURCE` / `LUNARWING_MT_DARKIRC_SOURCE`:
+Upgrade wrappers call `ensure-darkirc-release <TENANT>` before rendering or
+starting DarkIRC units. `start-tenant` independently validates the selected
+release even when the tenant config already exists.
 
-```bash
-sudo LUNARWING_MT_DARKIRC_SOURCE=/path/to/darkfi \
-  ic/scripts/lunarwing-mt-admin.sh build-darkirc
-```
-
-The build runs from an external DarkFi checkout and does not copy DarkFi source into the LunarWing repo. (Note: DarkFi's `make darkirc` also compiles `zkas` + proof circuits, so the first build can take a while.)
+DarkFi's first build also compiles `zkas` and proof circuits, so run this
+long-lived operation inside `tmux`.
 
 ## Install WASM Channel Artifacts
 
@@ -196,11 +229,14 @@ For tenant `<TENANT>`, the admin script manages:
 
 | File | Purpose |
 |------|---------|
-| `/home/<TENANT>/lunarwing/env/lunarwing.env` | Main daemon env, including `DARKIRC_ADAPTER_URL`, `DARKIRC_ADAPTER_SECRET`, and optional `DARKIRC_SOURCE` |
-| `/home/<TENANT>/lunarwing/env/darkirc-adapter.env` | Adapter env rendered from `ic/scripts/templates/darkirc-adapter.env.template` |
-| `/home/<TENANT>/lunarwing/state/darkirc/darkirc_config.toml` | Daemon config rendered from `ic/scripts/templates/darkirc_config.toml.template` |
+| `/home/<TENANT>/lunarwing/env/lunarwing.env` | Main daemon env, including `DARKIRC_ADAPTER_URL` and `DARKIRC_ADAPTER_SECRET`; it is not a trusted DarkIRC build-source selector |
+| `/home/<TENANT>/lunarwing/env/darkirc-adapter.env` | Adapter env rendered atomically from `ic/scripts/templates/darkirc-adapter.env.template` |
+| `/home/<TENANT>/lunarwing/state/darkirc/darkirc_config.toml` | Tenant-owned `0600` active daemon config, updated semantically and journaled |
+| `/home/<TENANT>/lunarwing/state/darkirc/key-exchange/` | Tenant-owned `0700` Stage A pending, ledger, candidate, transaction, rollback-reserved, and lock subtree; files are exact `0600` single-link |
 | `/home/<TENANT>/lunarwing/state/channels/darkirc.capabilities.json` | WASM channel capabilities installed by `install-wasm` |
-| `/home/<TENANT>/lunarwing/logs/` | Tenant daemon, adapter, and service logs |
+| `/usr/local/lib/lunarwing/darkirc/releases/<release-id>/` | Immutable root-owned daemon, typed helper, and compatibility attestation generation |
+| `/usr/local/lib/lunarwing/darkirc/current` | Atomically replaced root-owned selector for the complete active generation |
+| `/home/<TENANT>/lunarwing/logs/` | Tenant daemon, adapter, and service logs; private/public raw exchange values are not logged |
 
 The template placeholders use `__UPPERCASE__` form, not shell `${VAR}` form. Secrets are generated at runtime and are not stored in templates.
 
@@ -291,26 +327,24 @@ sudo grep -E '^(DARKIRC_PORT|ADAPTER_PORT)=' /home/<TENANT>/lunarwing/env/darkir
 
 Do not print `ADAPTER_SECRET`.
 
-### 3. Check Adapter Health
+### 3. Check Strict DarkIRC Health
 
-`/health` requires the adapter's bearer secret (it returns `{"error": "unauthorized"}` without it):
+Use mt-admin so the bearer is read owner-scoped and sent to `curl` over header
+stdin rather than argv:
 
 ```bash
-adapter_port=$(jq -r '.tenants["<TENANT>"].extended_ports.darkirc_adapter' /etc/lunarwing/ports.json)
-secret=$(sudo grep -s '^ADAPTER_SECRET=' /home/<TENANT>/lunarwing/env/darkirc-adapter.env | cut -d= -f2-)
-curl -sf -H "Authorization: Bearer ${secret}" "http://127.0.0.1:${adapter_port}/health" | jq .
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-health <TENANT> --strict --json
 ```
 
-Do not print the secret in shared logs. Expected shape:
+This requires both DarkIRC services to be active through the host's systemd-user
+or OpenRC abstraction, then requires authenticated adapter JSON with
+`status="ok"` and `irc_connected=true`. Expected output:
 
 ```json
-{
-  "status": "ok",
-  "irc_connected": true,
-  "irc_nick": "<TENANT>-bridge",
-  "queue_size": 0
-}
+{"status":"ok","tenant":"<TENANT>","irc_connected":true}
 ```
+
+This is diagnostic only in Stage A; it does not activate an installed contact.
 
 ### 4. Check Gateway Channel Health
 
@@ -351,9 +385,76 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <TENANT>
 
 ### Contacts and DM Keypairs
 
-DarkIRC contact key material belongs inline under `[contact."nickname"]` sections in the TOML. The daemon does not consume a separate generated keypair file.
+DarkIRC contact key material belongs inline under `[contact."nickname"]` in the
+active TOML. Each contact contains exactly the peer's public key and this
+tenant's local private key:
 
-A contact section should include the contact's public key and the tenant's own keypair for that contact. Exchange public keys out of band before enabling private DMs.
+```toml
+[contact."nickname"]
+dm_chacha_public = "<peer public key>"
+my_dm_chacha_secret = "<local private key>"
+```
+
+There is no `my_dm_chacha_public` field and no generated YAML keypair file.
+
+For a managed Stage A exchange, both sides must independently obtain and compare
+the full `sha256:<64 lowercase hex>` public fingerprint. Nicknames, sender
+pairing, or receipt of a message do not authorize a key.
+
+Initiator:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact prepare \
+  <TENANT_A> <CONTACT_B> --out offer.json --json
+```
+
+Transport `offer.json` through an independently authenticated out-of-band
+channel. It contains public material only. The responder runs:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact respond \
+  <TENANT_B> <CONTACT_A> \
+  --in offer.json --out response.json \
+  --expect-peer-fingerprint 'sha256:<INITIATOR_FINGERPRINT>' --json
+```
+
+Transport `response.json` back. Each side completes with its own local exchange
+ID and the full independently obtained fingerprint of the peer:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete \
+  <TENANT_A> <CONTACT_B> \
+  --in response.json --exchange-id <INITIATOR_OFFER_ID> \
+  --expect-peer-fingerprint 'sha256:<RESPONDER_FINGERPRINT>' --defer-apply --json
+
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact complete \
+  <TENANT_B> <CONTACT_A> \
+  --in offer.json --exchange-id <RESPONDER_OFFER_ID> \
+  --expect-peer-fingerprint 'sha256:<INITIATOR_FINGERPRINT>' --defer-apply --json
+```
+
+Mt-admin enforces deferred completion even if `--defer-apply` is omitted. The
+terminal Stage A state is `Installed`; these commands do **not** reload,
+restart, health-gate, activate, roll back, or claim a successful encrypted DM.
+Do not manually restart a production tenant merely to activate Stage A state;
+Stage B activation is intentionally disabled pending separate recovery review.
+
+Inspection and recovery commands are:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact list <TENANT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact status <TENANT> <CONTACT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact exchanges <TENANT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact doctor <TENANT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact recover <TENANT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact cancel \
+  <TENANT> --exchange-id <EXCHANGE_ID> --json
+```
+
+If public artifact delivery fails after pending state commits, the sanitized
+error reports its `offer_id`. Repeat the same semantic `prepare` or `respond`;
+the helper returns the stored byte-identical public artifact rather than
+creating another private key.
 
 ## Tor / Hidden Service Options
 
@@ -376,27 +477,45 @@ Operational rules:
 
 ### `build-darkirc` fails
 
-With `--tenant`, the source is auto-cloned to `/home/<TENANT>/darkfi` and built as the tenant — no manual source path is required. Common causes if it still fails:
+Common failures are fail-closed compatibility or source-custody checks:
 
-- **No Rust toolchain for the build user.** `build-darkirc` builds as the tenant (or, without `--tenant`, the invoking `sudo` user), never as root. That user needs working `cargo` + `make`:
-  ```bash
-  sudo -u <TENANT> bash -lc 'cargo --version && make --version'
-  ```
-- **Refuses to build as root.** Run with `--tenant <TENANT>`, or invoke via `sudo` from a normal user that has a toolchain.
-- **Custom source path invalid / clone failed.** If `DARKIRC_SOURCE` / `LUNARWING_MT_DARKIRC_SOURCE` points at a non-DarkFi tree (no `Makefile`), fix or unset it to fall back to auto-clone. Override the clone target with `LUNARWING_MT_DARKIRC_REPO` / `LUNARWING_MT_DARKIRC_REV`.
+- **Build account invalid.** `lunarwing-build` must be locked, use `nologin`, have
+  no supplementary groups, and use the configured build home.
+- **Trusted checkout invalid.** The fixed checkout or its Git metadata is dirty,
+  symlinked, non-root-owned, writable by group/other, contains a gitlink, or is
+  not exactly at the approved revision. Repair custody rather than bypassing the
+  check.
+- **Toolchain unavailable.** Verify host `cargo`, `make`, `taskset`, `setpriv`,
+  and `tar`; the build runs with a sanitized environment rather than a tenant's
+  shell profile.
+- **Generator self-test failed.** Unknown output, stderr output, malformed or
+  mismatched X25519 keys, digest mismatch, or unsupported profile prevents
+  selector publication. The previous complete release remains selected.
+- **Controlled mirror unavailable.** If `LUNARWING_MT_DARKIRC_REPO` points to a
+  mirror, it must still provide the approved revision; changing
+  `LUNARWING_MT_DARKIRC_REV` is rejected.
 
 ### DarkIRC daemon fails to start with `permission denied` on its config
 
-The daemon runs as the tenant and must own its state directory. `add-tenant` / `patch-env` chown it automatically; if it was created or edited as root, re-render and fix ownership:
+The daemon and helper require the DarkIRC root and all managed subdirectories to
+be tenant-owned exact mode `0700`; managed files must be tenant-owned,
+single-link, non-symlink exact mode `0600`. Run diagnostics before repair:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh patch-env <TENANT>
-sudo chown -R <TENANT>:<TENANT> /home/<TENANT>/lunarwing/state/darkirc
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact doctor <TENANT>
+sudo ic/scripts/lunarwing-mt-admin.sh darkirc-contact recover <TENANT>
 ```
+
+Do not use recursive `chown` or `chmod` across pending/journal state: that can
+normalize an attacker-controlled link or obscure a partial transaction. Stop
+the tenant and inspect the exact failing inode. If no managed transaction state
+exists, `patch-env <TENANT>` can safely regenerate the baseline through the
+typed helper.
 
 ### Adapter `/health` returns `{"error": "unauthorized"}`
 
-`/health` requires the adapter bearer secret — pass `Authorization: Bearer <ADAPTER_SECRET>` (see [Check Adapter Health](#3-check-adapter-health)).
+`/health` requires the adapter bearer secret. Do not expose it manually; use
+mt-admin strict health diagnostics (see [Check Strict DarkIRC Health](#3-check-strict-darkirc-health)).
 
 ### `darkirc_irc` or `darkirc_rpc` is missing
 
@@ -503,11 +622,15 @@ sudo cp /etc/lunarwing/ports.json.bak.<TIMESTAMP> /etc/lunarwing/ports.json
 
 Restart affected tenants after rollback if services were already rendered or started with migrated ports.
 
-### Disable DarkIRC for One Tenant
+### Temporarily Stop DarkIRC for One Tenant
 
-Stop the DarkIRC services while leaving the main tenant stack intact.
+There is no supported `disable-darkirc` verb. The commands below are a temporary
+maintenance stop only: `enable_darkirc=true` remains in the registry,
+`start-tenant` will start the services again, and host health/self-heal still
+expects them. Coordinate the maintenance window with that health policy so an
+automatic repair does not undo the stop.
 
-Systemd:
+Systemd user manager:
 
 ```bash
 sudo -u <TENANT> XDG_RUNTIME_DIR=/run/user/$(id -u <TENANT>) \
@@ -521,23 +644,29 @@ sudo rc-service lunarwing-darkirc-adapter-<TENANT> stop
 sudo rc-service lunarwing-darkirc-<TENANT> stop
 ```
 
-If the WASM channel is installed but the adapter is down, channel health will report degraded/unhealthy until either the service is restored or the channel is removed from the tenant's installed channels.
+If the WASM channel remains installed while the adapter is down, channel health
+reports degraded/unhealthy. Restore the services after maintenance. Permanent
+removal requires an explicit teardown plan for channel activation, units and
+boot persistence, registry state, env/config, contacts, and key material; do not
+flip `enable_darkirc` manually and leave the other surfaces inconsistent.
 
 ## Operator Checklist
 
 For each production tenant:
 
-- [ ] `/etc/lunarwing/ports.json` is schema v7.
+- [ ] `/etc/lunarwing/ports.json` is current schema v14.
 - [ ] `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` exist under `.extended_ports`.
-- [ ] The tenant (build) user has a working Rust toolchain (`cargo` + `make`). DarkFi source is auto-cloned; set `DARKIRC_SOURCE` only for a custom checkout.
-- [ ] `build-darkirc --tenant <TENANT>` completed (clones + builds as the tenant).
-- [ ] `build-tenant <TENANT> --with-wasm` completed.
-- [ ] `install-wasm <TENANT>` completed.
-- [ ] `darkirc_config.toml` and `darkirc-adapter.env` exist and use tenant ports.
-- [ ] `DARKIRC_ADAPTER_URL` exists in `lunarwing.env`.
-- [ ] Adapter secret is present on both daemon env and adapter env sides without being exposed in logs.
+- [ ] The root-owned DarkFi checkout is clean, non-writable, symlink-free, and at the approved revision.
+- [ ] The locked `lunarwing-build` account and host `cargo`/`make`/`taskset`/`setpriv` toolchain are available.
+- [ ] `ensure-darkirc-release <TENANT>` reports one valid selected immutable release.
+- [ ] Selected daemon/helper files are root-owned mode `0555`, single-link, and match the release attestation digests.
+- [ ] The registry entry has unique `darkirc_scope_id` plus `darkirc_adapter`, `darkirc_irc`, and `darkirc_rpc` ports.
+- [ ] `build-tenant <TENANT> --with-wasm` and `install-wasm <TENANT>` completed.
+- [ ] `darkirc_config.toml`, `darkirc-adapter.env`, and the key-exchange subtree have exact tenant ownership and `0600`/`0700` modes.
+- [ ] `DARKIRC_ADAPTER_URL` exists in `lunarwing.env`; adapter secrets are synchronized without appearing in argv or logs.
 - [ ] `start-tenant <TENANT>` starts daemon, adapter, and main LunarWing service.
-- [ ] Adapter `/health` returns `status: ok` and `irc_connected: true`.
-- [ ] Gateway status reports DarkIRC channel health.
-- [ ] Automatic secret seeding succeeded for the tenant (no post-start 401 from WASM channel to adapter; rerun `start-tenant` to refresh if needed).
+- [ ] `darkirc-health <TENANT> --strict --json` reports `status=ok` and `irc_connected=true` on the host init system.
+- [ ] `darkirc-contact doctor <TENANT>` reports no unsafe reuse, ledger mismatch, or transactional-state issue before migration/exchange.
+- [ ] Operators understand Stage A stops at `Installed`; activation, rollback, rotation, revocation, same-host pairing, QR, and web delivery remain disabled.
+- [ ] Automatic secret seeding succeeded (no post-start 401 from WASM channel to adapter; rerun `start-tenant` to refresh if needed).
 - [ ] Tor/hidden-service plan is documented if onion connectivity is required.

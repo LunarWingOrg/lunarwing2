@@ -1,6 +1,7 @@
 # Test Scripts Status Report
 
 **Generated**: 2026-07-08 (v1.1.9 `Kiyome きよめ` pre-release, item #3)
+**Rechecked**: 2026-08-05 (paths, command interfaces, release-smoke checks, and current worker matrix)
 **Author**: Rarity
 
 This report catalogs every automated testing script in the LunarWing repo, its
@@ -14,11 +15,11 @@ current status, what was fixed, and what remains untested or broken.
 |-----|------|--------|
 | **Bug fix** | `tests/mock_orchestrator/server.py:81` | f-string syntax error (`{args.host}:args.port}` → `{args.host}:{args.port}`) — the mock orchestrator could not start at all |
 | **Missing dependency** | `tests/requirements.txt` | Added `websockets==12.0` (used by `hub.py` but was absent from requirements); removed stale bare `docker` package (runner.py shells out to `docker compose`, doesn't use the Python SDK) |
-| **Missing workers** | `tests/docker-compose.test.yml` | Added `opencode_worker` and `pebble_worker` services (both have Dockerfiles and health endpoints at 8443/9090, same as nanocode) |
+| **Worker matrix** | `tests/docker-compose.test.yml` | Covers supported OpenCode, Kimi Code, and Pebble services plus built-in/sandbox workers |
 | **Missing test matrix entries** | `tests/tests.yaml` | Added `opencode` and `pebble` worker entries with health/ready/ws_handshake scenarios |
 | **Stale content** | `tests/a.txt` | Removed (placeholder file containing only `# A`) |
 | **Documentation** | `tests/README.md` | Updated worker table to include opencode and pebble; updated docker-compose service table; updated requirements list |
-| **Documentation** | `docs/guides/TESTING_GUIDE.md` | Updated worker matrix references from 3 workers to 5 (nanocode, opencode, pebble, builtin, sandbox) |
+| **Documentation** | `docs/guides/TESTING_GUIDE.md` | Worker matrix reflects supported external, built-in, and sandbox workers |
 
 ---
 
@@ -31,7 +32,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Status** | ✅ Working (syntax valid, logic intact) |
 | **Language** | Python 3.10+ |
 | **Purpose** | Matrix-driven test suite for all worker types. Brings up Docker Compose services, runs health/WS/auth scenarios, reports pass/fail. |
-| **Tests** | nanocode (health, ready, ws_handshake), opencode (health, ready, ws_handshake), pebble (health, ws_handshake), builtin (orchestrator_health, worker_config), sandbox (orchestrator_health) |
+| **Tests** | opencode and kimi (health, ready, ws_handshake), pebble (health, ws_handshake), builtin (orchestrator_health, worker_config), sandbox (orchestrator_health) |
 | **Dependencies** | `requests`, `websocket-client`, `pyyaml` |
 | **Run** | `cd tests && python runner.py --mode smoke` |
 | **Notes** | No code changes needed. The runner correctly handles the new workers via `tests.yaml`. |
@@ -62,7 +63,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Status** | ✅ Working (bash syntax valid, no issues found) |
 | **Language** | Bash |
 | **Purpose** | Hits gateway API to verify core subsystems: health, settings, memory, routines, jobs, skills, extensions, chat, gotify, secrets, logging |
-| **Checks** | 16 authenticated checks + 2 unauthenticated |
+| **Checks** | 22 token-dependent outcomes + 2 unauthenticated connectivity/page checks |
 | **Run** | `GATEWAY_URL=http://localhost:9098 GATEWAY_AUTH_TOKEN=tok ./ic/scripts/release-test.sh` |
 | **Not automated** | XMPP, WeeChat, Docker/sandbox workers, GitHub integration, image tools, REPL v2, performance/load, rollback, post-release monitoring, documentation (all documented in script header) |
 
@@ -74,7 +75,7 @@ current status, what was fixed, and what remains untested or broken.
 | **Language** | Bash |
 | **Purpose** | 6 checks: direct DB driver usage outside `src/db/`, `.unwrap()`/`.expect()` in production code, direct `env::var` reads outside config, integration test feature gating, silent test-skip patterns, LLM module isolation |
 | **Run** | `cd ic && bash scripts/check-boundaries.sh` |
-| **Exit** | Non-zero if hard violations found (warnings don't fail) |
+| **Exit** | Non-zero for new hard violations relative to the MR/push/default-branch base; existing full-tree debt remains visible as warnings |
 
 ### 6. `ic/scripts/coverage.sh` — Coverage Report Generator
 
@@ -90,7 +91,7 @@ current status, what was fixed, and what remains untested or broken.
 
 | Field | Value |
 |-------|-------|
-| **Status** | ✅ Working (bash syntax valid, 2650 lines) |
+| **Status** | ✅ Working (bash syntax valid; command surface rechecked) |
 | **Language** | Bash |
 | **Purpose** | Full-stack test environment: PostgreSQL, TensorZero proxy, XMPP bridge, WASM channels/tools, and the LunarWing daemon |
 | **Commands** | `init`, `build`, `build-wasm`, `install-wasm`, `doctor`, `up`, `down`, `status`, `verify`, `start-postgres`, `start-proxy`, `start-bridge`, `start-lunarwing`, `repl`, etc. |
@@ -100,10 +101,10 @@ current status, what was fixed, and what remains untested or broken.
 
 | Field | Value |
 |-------|-------|
-| **Status** | ⚠️ Exists but not reviewed in this task (separate test tier) |
+| **Status** | ⚠️ Separate test tier; current scenarios and setup are documented in its README |
 | **Language** | Python (Playwright) |
 | **Purpose** | Browser-based E2E tests against a live instance with a mock LLM |
-| **Docs** | `ic/tests/e2e/CLAUDE.md` |
+| **Docs** | `ic/tests/e2e/README.md` |
 
 ---
 
@@ -111,7 +112,7 @@ current status, what was fixed, and what remains untested or broken.
 
 1. **Chaos scenarios not defined in tests.yaml** — The runner supports `chaos: true` scenarios (run only in `--mode full`), but no chaos scenarios are currently defined. Adding invalid-auth, timeout, and rate-limit chaos scenarios is a future improvement.
 
-2. **No automated CI integration** — The worker test harness (`tests/runner.py`) and release-test.sh are designed for CI but no CI pipeline configuration exists in the repo to run them automatically.
+2. **No automated GitLab CI integration** — The worker test harness (`tests/runner.py`) and `release-test.sh` are designed for CI, but the current `.gitlab/` pipeline does not run either one.
 
 3. **No performance/load testing** — Referenced in TESTING_GUIDE.md but no k6/locust scripts exist.
 
@@ -124,7 +125,7 @@ current status, what was fixed, and what remains untested or broken.
 ## Recommendations for Future Work
 
 - Add chaos scenarios (invalid auth, timeout, resource exhaustion) to `tests.yaml`
-- Set up CI (GitHub Actions) to run `python runner.py --mode smoke` on PRs
+- Add a GitLab CI job to run `python runner.py --mode smoke` on merge requests
 - Add performance/load test scripts (k6 or Locust)
 - Validate the worker harness end-to-end once Docker is available
 - Consider adding a `Makefile` target or `justfile` recipe that runs the full test suite (cargo test + runner.py + release-test.sh + check-boundaries.sh) in one command

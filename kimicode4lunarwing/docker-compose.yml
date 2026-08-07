@@ -1,0 +1,90 @@
+x-worker-base: &worker-base
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      WITH_TOOLCHAINS: ${WITH_TOOLCHAINS:-false}
+  image: lunarwing-worker-kimi:latest
+  working_dir: /workspace
+  group_add:
+    - "${HOST_GID:-1000}"
+  volumes:
+    - kimi-data:/home/kimi/.kimi-code:z
+    - ./workspace:/workspace:z
+    - ./logs:/var/log/lunarwing:z
+    - ./results:/app/results:z
+    - ${SSH_DIR:-./.ssh-placeholder}:/home/kimi/.host-ssh:ro
+    - ${GITCONFIG_FILE:-./.gitconfig-placeholder}:/home/kimi/.host-gitconfig:ro
+  env_file:
+    - path: ${EXTRA_ENV_FILE:-.env.secrets}
+      required: false
+  environment: &worker-env
+    # Required bridge bearer credential. KIMI_API_KEY remains optional.
+    AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
+    LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
+    KIMI_API_KEY: ${KIMI_API_KEY:-}
+    WORKSPACE_ROOT: /workspace
+    KIMI_CODE_HOME: /home/kimi/.kimi-code
+    FILE_UMASK: ${FILE_UMASK:-0002}
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+    GH_TOKEN: ${GH_TOKEN:-}
+    GIT_AUTHOR_NAME: ${GIT_AUTHOR_NAME:-}
+    GIT_AUTHOR_EMAIL: ${GIT_AUTHOR_EMAIL:-}
+    GIT_COMMITTER_NAME: ${GIT_COMMITTER_NAME:-}
+    GIT_COMMITTER_EMAIL: ${GIT_COMMITTER_EMAIL:-}
+    KIMI_PROGRESS_HEARTBEAT_MS: ${KIMI_PROGRESS_HEARTBEAT_MS:-60000}
+    KIMI_KILL_GRACE_MS: ${KIMI_KILL_GRACE_MS:-5000}
+
+services:
+  lunarwing-worker:
+    <<: *worker-base
+    command: ["--mode", "websocket"]
+    environment:
+      <<: *worker-env
+      KIMI_MODE: websocket
+      WS_ROLE: server
+      HEALTH_PORT: ${HEALTH_PORT:-8443}
+      WS_BIND_HOST: ${WS_BIND_HOST:-0.0.0.0}
+      WS_PORT: ${WS_PORT:-9090}
+      WS_PATH: ${WS_PATH:-/ws/agent}
+    ports:
+      # Loopback publication limits exposure; bridge still requires auth because
+      # browser clients can reach loopback services.
+      - "127.0.0.1:${HEALTH_PORT:-8443}:${HEALTH_PORT:-8443}"
+      - "127.0.0.1:${WS_PORT:-9090}:${WS_PORT:-9090}"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:${HEALTH_PORT:-8443}/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  agent-smoke:
+    <<: *worker-base
+    profiles: ["smoke"]
+    depends_on:
+      lunarwing-worker:
+        condition: service_healthy
+    entrypoint: ["node", "/app/scripts/smoke_test.js"]
+    command: []
+    environment:
+      <<: *worker-env
+      SMOKE_WS_HOST: lunarwing-worker
+      SMOKE_WS_PORT: ${WS_PORT:-9090}
+      SMOKE_HEALTH_PORT: ${HEALTH_PORT:-8443}
+    restart: "no"
+
+  kimi-cli:
+    <<: *worker-base
+    profiles: ["cli"]
+    command: ["--mode", "cli", "--", "${TASK_PROMPT:-Write a hello world Python script}"]
+    environment:
+      <<: *worker-env
+      KIMI_MODE: cli
+    stdin_open: true
+    tty: true
+    restart: "no"
+
+volumes:
+  kimi-data:

@@ -3,8 +3,8 @@
 ## Getting Started
 
 ```bash
-git clone https://github.com/LunarWingOrg/lunarwing.git
-cd lunarwing
+git clone https://git.lunarwing.org/lunarwing/lunarwing2.git
+cd lunarwing2
 ./scripts/dev-setup.sh
 ```
 

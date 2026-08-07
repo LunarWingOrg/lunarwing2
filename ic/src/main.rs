@@ -20,7 +20,11 @@ use lunarwing::{
         run_status_command, run_tool_command,
     },
     config::Config,
-    hooks::bootstrap_hooks,
+    gate::violation_store::{ViolationStore, ViolationStoreConfig},
+    hooks::{
+        CoordinationHookConfig, CoordinationPromptPolicy, bootstrap_hooks,
+        register_coordination_hooks,
+    },
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
     pairing::PairingStore,
@@ -66,7 +70,14 @@ fn main() -> anyhow::Result<()> {
     #[cfg(any(feature = "postgres", feature = "libsql"))]
     lunarwing::setup::maybe_seed_default_instance_assets();
 
+    let worker_threads =
+        lunarwing::bootstrap::tokio_worker_threads().map_err(anyhow::Error::msg)?;
+    let max_blocking_threads =
+        lunarwing::bootstrap::tokio_max_blocking_threads().map_err(anyhow::Error::msg)?;
     let result = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .max_blocking_threads(max_blocking_threads)
+        .thread_name("lunarwing-tokio")
         .enable_all()
         .build()?
         .block_on(async_main());
@@ -632,10 +643,12 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Register lifecycle hooks.
     let active_tool_names = components.tools.list().await;
+    let coordination_config = CoordinationHookConfig::from_env();
 
     let hook_bootstrap = bootstrap_hooks(
         &components.hooks,
         components.workspace.as_ref(),
+        &coordination_config,
         &config.wasm.tools_dir,
         &config.channels.wasm_channels_dir,
         &active_tool_names,
@@ -651,6 +664,68 @@ async fn async_main() -> anyhow::Result<()> {
         errors = hook_bootstrap.errors,
         "Lifecycle hooks initialized"
     );
+
+    // Multi-agent coordination hooks (Phase 2/3 of the coordination pipeline).
+    // Only active when COORD_ENABLED=true with COORD_AGENT_ID/COORD_CHANNELS set.
+    let coordination_store: Option<Arc<ViolationStore>> =
+        coordination_config.is_actionable().then(|| {
+            Arc::new(ViolationStore::with_default_path(
+                ViolationStoreConfig::from_env(),
+            ))
+        });
+    let coordination_prompt_policy = CoordinationPromptPolicy::from_config(&coordination_config);
+    // Phase 3: execution gate sharing the hooks' violation store, so a
+    // strike-three (or manual) disable actually blocks tool execution
+    // instead of only filtering channel traffic (ISSUE-003).
+    let coordination_gate: Option<Arc<lunarwing::gate::coordination::CoordinationGate>> =
+        coordination_store.clone().map(|store| {
+            Arc::new(lunarwing::gate::coordination::CoordinationGate::new(
+                store,
+                coordination_config.agent_id.clone(),
+            ))
+        });
+    // Phase 4: shared outbound coalesce buffer at the agent boundary, so the
+    // deployed installable (WASM) XMPP path coalesces exactly like the native
+    // channel did (ISSUE-002).
+    let coordination_coalesce = {
+        let coalesce_config = lunarwing::channels::coalesce::CoalesceConfig::from_env();
+        (coalesce_config.enabled && !coalesce_config.coordination_channels.is_empty())
+            .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
+    };
+    let coordination_summary = register_coordination_hooks(
+        &components.hooks,
+        coordination_config.clone(),
+        coordination_store.clone(),
+    )
+    .await;
+    if coordination_summary.hooks > 0 {
+        tracing::info!(
+            hooks = coordination_summary.hooks,
+            "Coordination hooks initialized"
+        );
+    }
+
+    // Phase 3: localhost-only admin endpoints for coordination violations.
+    // Requires COORD_ADMIN_TOKEN; without it the server stays down (fail
+    // closed) rather than exposing unauthenticated mutations (ISSUE-009).
+    if let Some(store) = coordination_store.clone() {
+        match lunarwing::channels::web::coord_admin_token_from_env() {
+            Some(token) => {
+                let port = lunarwing::channels::web::coord_admin_port_from_env();
+                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await {
+                    Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        port = port,
+                        "Coordination admin server failed to bind; continuing without it"
+                    ),
+                }
+            }
+            None => {
+                tracing::warn!("COORD_ADMIN_TOKEN is not set; coordination admin server disabled")
+            }
+        }
+    }
 
     // Reuse the shared agent session manager prepared by AppBuilder.
     let session_manager = Arc::clone(&components.agent_session_manager);
@@ -959,8 +1034,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
         })
         ;
-    // Clone context_manager for the reaper before it's moved into Agent::new()
+    // Clone runtime managers needed after their primary handles move into Agent::new().
     let reaper_context_manager = Arc::clone(&components.context_manager);
+    let extension_manager_for_shutdown = components.extension_manager.clone();
 
     // Capture db reference for SIGHUP handler before it's moved into AgentDeps (Unix only)
     #[cfg(unix)]
@@ -1006,6 +1082,9 @@ async fn async_main() -> anyhow::Result<()> {
         },
         builder: components.builder,
         llm_backend: config.llm.backend.clone(),
+        coordination_gate,
+        coordination_prompt_policy,
+        coordination_coalesce,
     };
 
     let channels_for_warnings = Arc::clone(&channels);
@@ -1019,6 +1098,7 @@ async fn async_main() -> anyhow::Result<()> {
         Some(components.context_manager),
         Some(session_manager),
     );
+    agent.set_knowledge_sweep_config(config.knowledge_sweep.clone());
 
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());
@@ -1240,18 +1320,23 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    Arc::new(agent).run().await?;
+    let agent_result = Arc::new(agent).run().await;
 
     // ── Shutdown ────────────────────────────────────────────────────────
 
     // Signal background tasks (SIGHUP handler, etc.) to gracefully shut down
     let _ = shutdown_tx.send(());
 
+    lunarwing::bridge::router::shutdown_engine().await;
+
     if let Some(ref mgr) = external_worker_manager {
         mgr.drain_pool().await;
     }
 
-    // Shut down all stdio MCP server child processes.
+    if let Some(manager) = extension_manager_for_shutdown {
+        manager.shutdown_mcp_supervisor().await;
+    }
+    // Shut down all stdio MCP server child processes after recovery has stopped.
     components.mcp_process_manager.shutdown_all().await;
 
     // Flush LLM trace recording if enabled
@@ -1283,6 +1368,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     tracing::debug!("Agent shutdown complete");
 
+    agent_result?;
     Ok(())
 }
 

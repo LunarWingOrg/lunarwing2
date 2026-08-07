@@ -1,6 +1,6 @@
 # XMPP File Transfer Methods — Quick Reference
 
-## Update 2026-07-25
+## Update 2026-08-05
 
 Inbound XMPP images now pass through automatic LunarVision OCR/VL enrichment
 when `VISION_SERVICE_URL` is configured. Enrichment uses the per-tenant
@@ -41,13 +41,13 @@ XMPP supports multiple file transfer methods, each with different tradeoffs in t
 | Size cap | ✅ Implemented | 20MB limit per file |
 | Unit tests | ✅ Implemented | `ic/src/channels/xmpp/mod.rs` |
 | Automatic LunarVision enrichment | ✅ Implemented | Host-side Bearer auth when configured; OCR/VL text plus original image |
+| Inbound download egress policy | ✅ Implemented | HTTPS by default; rejects credentials/private resolution, pins validated addresses, disables redirects and environment proxies |
 
 ### ⏳ Pending
 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | End-to-end validation | ⏳ Pending | Live testing with Conversations/Gajim |
-| Inbound download SSRF guard | ⏳ Deferred | Network boundary relied upon for now |
 
 ### ❌ Not Implemented
 
@@ -108,10 +108,12 @@ XMPP Client → XMPP Bridge → Agent
 - [ ] Verify HTTP Upload URL handling
 - [ ] Verify OOB URL handling
 
-### Phase 3: SSRF Hardening (⏳ Deferred)
-- [ ] Implement allowlist for download domains
-- [ ] Add network isolation for download workers
-- [ ] Document security tradeoffs
+### Phase 3: Inbound Egress Hardening (✅ Complete)
+- [x] Require HTTPS unless `ALLOW_PRIVATE_IPS=1` explicitly permits local HTTP
+- [x] Reject embedded URL credentials and non-public resolved addresses by default
+- [x] Pin validated addresses to prevent DNS rebinding
+- [x] Disable redirects and environment proxies
+- [x] Cover the policy with focused unit tests
 
 ---
 
@@ -132,23 +134,25 @@ Component "files.example.com" "http_upload"
 
 ## Related Documentation
 
-- `docs/architecture/XMPP_FILE_TRANSFERS.md` — Full implementation details
-- `docs/bugs/XMPP-OMEMO-BUG-TO-DO.md` — Bug tracking
-- `docs/ops/GOALS_1.1.5.md` — Release goals including XMPP polish
-- `ic/testing/lunarwing-xmpp/` — Test harness setup
+- [`../architecture/XMPP_FILE_TRANSFERS.md`](../architecture/XMPP_FILE_TRANSFERS.md) — full implementation details
+- [`../bugs/history/XMPP-OMEMO-BUG-TO-DO.md`](../bugs/history/XMPP-OMEMO-BUG-TO-DO.md) — archived OMEMO bug tracker
+- [`history/GOALS_1.1.5.md`](history/GOALS_1.1.5.md) — archived v1.1.5 goals that included XMPP polish
+- [`../../ic/testing/lunarwing-xmpp/README.md`](../../ic/testing/lunarwing-xmpp/README.md) — test harness setup
 
 ---
 
-## Release Notes for v1.1.5
+## Current Status
 
-**New Features:**
+**Implemented:**
 - Inbound file transfer support (OOB, AES-GCM, HTTP Upload URLs)
 - Bounded concurrency (4 downloads max)
-- 20MB file size cap
+- 20 MB streamed file-size cap
+- Inbound URL egress policy: HTTPS by default, public-address validation and
+  DNS pinning, no redirects or environment proxies; `ALLOW_PRIVATE_IPS=1` is
+  the explicit private-network opt-out
 
-**Known Issues:**
-- End-to-end testing pending
-- SSRF guard deferred (network boundary relied upon)
+**Remaining:**
+- Live end-to-end validation against a real XMPP server and client
 
 **Not Included:**
 - Jingle File Transfer (XEP-0234) — out of scope

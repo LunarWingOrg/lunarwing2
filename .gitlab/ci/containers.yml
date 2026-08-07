@@ -1,0 +1,77 @@
+# Container image builds for the external workers, published to this project's
+# GitLab container registry ($CI_REGISTRY_IMAGE). Requires the built-in registry
+# to be enabled on the GitLab server — see docs/ops/GITLAB_CONTAINER_REGISTRY.md
+# for the server-side setup and for how MT hosts/tenants pull these images.
+#
+# Images are built with Kaniko (unprivileged, works on any docker-executor
+# runner; produces docker-format images so the Dockerfiles' HEALTHCHECKs
+# survive). ALL image jobs are manual-only on every pipeline — multi-GB builds
+# never start automatically.
+#
+# If gcr.io is unreachable from the runners, mirror the executor image into
+# our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
+
+.container-job:
+  image:
+    name: "gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e"
+    entrypoint: [""]
+  tags:
+    - "$CI_LINT_RUNNER_TAG"
+  stage: containers
+  # Start immediately, independent of earlier stages — image builds don't
+  # consume test artifacts, and stage gating would block the manual trigger
+  # behind the full Rust suite.
+  needs: []
+  before_script:
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
+        "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" \
+        > /kaniko/.docker/config.json
+
+worker-pebble-image:
+  extends: .container-job
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR"
+      --dockerfile "$CI_PROJECT_DIR/pebble4lunarwing/Dockerfile"
+      --destination "$CI_REGISTRY_IMAGE/worker-pebble:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-pebble:latest"
+  rules:
+    - when: manual
+      allow_failure: true
+
+worker-opencode-image:
+  extends: .container-job
+  variables:
+    # Mirrors mt-admin's build_opencode_worker: slim by default; set
+    # WITH_TOOLCHAINS=true on a manual pipeline for the fat toolchain image.
+    WITH_TOOLCHAINS: "false"
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR/opencode4lunarwing"
+      --dockerfile "$CI_PROJECT_DIR/opencode4lunarwing/Dockerfile"
+      --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
+      --destination "$CI_REGISTRY_IMAGE/worker-opencode:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-opencode:latest"
+  rules:
+    - when: manual
+      allow_failure: true
+
+worker-kimi-image:
+  extends: .container-job
+  variables:
+    KIMI_CODE_VERSION: "0.30.0"
+    # Keep parity with OpenCode: slim default, opt-in toolchain image.
+    WITH_TOOLCHAINS: "false"
+  script:
+    - /kaniko/executor
+      --context "$CI_PROJECT_DIR/kimicode4lunarwing"
+      --dockerfile "$CI_PROJECT_DIR/kimicode4lunarwing/Dockerfile"
+      --build-arg "KIMI_CODE_VERSION=$KIMI_CODE_VERSION"
+      --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
+      --destination "$CI_REGISTRY_IMAGE/worker-kimi:$CI_COMMIT_SHORT_SHA"
+      --destination "$CI_REGISTRY_IMAGE/worker-kimi:latest"
+  rules:
+    - when: manual
+      allow_failure: true

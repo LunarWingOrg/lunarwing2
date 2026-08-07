@@ -35,6 +35,8 @@ pub struct ThreadExecutionContext {
     /// Human delay / supervision mode — when true, every action is gated
     /// through human approval regardless of tool tier.
     pub supervised_mode: bool,
+    /// Whether multiple channel actors share this conversation scope.
+    pub shared_conversation: bool,
     /// Timeout in seconds for supervised approval prompts.
     /// Default: 300 (5 minutes).
     pub supervised_timeout_secs: u64,

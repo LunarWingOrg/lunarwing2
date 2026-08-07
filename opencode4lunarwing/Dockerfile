@@ -17,7 +17,7 @@ RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       git python3 make g++ ca-certificates && \
@@ -30,14 +30,11 @@ RUN (bun install --frozen-lockfile || bun install) \
     && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
-# The bridge imports @opencode-ai/sdk/v2 from THIS build's output. Do not hide
+# The bridge imports @opencode-ai/sdk/v2/client from THIS build's output. Do not hide
 # its errors (no `2>/dev/null`); a build-time import assertion in the runtime
 # stage below turns a broken build into a failed image instead of a worker that
 # only dies on first boot.
 RUN bun run build || echo "WARNING: @opencode-ai/sdk build reported errors (import-verified in runtime stage)"
-
-WORKDIR /build/opencode/packages/app
-RUN bun run build 2>/dev/null || true
 
 WORKDIR /build/opencode/packages/opencode
 # Build only the native platform target. opencode's build.ts (script/build.ts)
@@ -47,16 +44,24 @@ WORKDIR /build/opencode/packages/opencode
 # baseline + musl variants), which is the only binary the worker ever loads —
 # the image is distributed same-host via podman save|load, never cross-arch.
 # See docs/proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md for full rationale.
-RUN bun run build -- --single 2>/dev/null || true
+RUN bun run build -- --single
+
+# Keep cross-stage artifacts small. Copying the full monorepo makes Kaniko retain
+# thousands of source and node_modules files, exhausting CI runner memory while
+# snapshotting the runtime stage. The compiled binary is standalone; the bridge
+# only needs the generated SDK client source.
+RUN set -e; \
+    set -- dist/opencode-*/bin/opencode; \
+    [ "$#" -eq 1 ] && [ -x "$1" ]; \
+    install -D -m 0755 "$1" /out/bin/opencode; \
+    install -d /out/sdk; \
+    cp /build/opencode/packages/sdk/js/package.json /out/sdk/package.json; \
+    cp -a /build/opencode/packages/sdk/js/src /out/sdk/src
 
 # ──────────────────────
 # Stage 2: runtime image
 # ──────────────────────
 FROM docker.io/oven/bun:debian AS runtime
-
-LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
-      org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
-      org.opencontainers.image.version="1.0.0"
 
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # The opencode binary is already built in the builder stage; these are only
@@ -66,12 +71,17 @@ LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
 # which are only needed to compile native dependencies at runtime.
 ARG WITH_TOOLCHAINS=false
 
+LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
+      org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
+
 # Runtime packages: always installed (needed by the worker itself).
 RUN set -e; \
     (apt-get update 2>/dev/null || { \
       echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
       sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+      apt-get update; \
     }) && \
     apt-get install -y --no-install-recommends \
       tini \
@@ -94,7 +104,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       (apt-get update 2>/dev/null || { \
         echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
         sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
+        apt-get update; \
       }) && \
       apt-get install -y --no-install-recommends \
         python3-dev \
@@ -108,6 +118,7 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         clang \
         lld \
         llvm \
+        libclang-dev \
         pkg-config \
         libssl-dev \
         zlib1g-dev \
@@ -122,6 +133,10 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         musl-tools \
         libcurl4-openssl-dev \
         libxml2-dev \
+        autoconf \
+        automake \
+        libtool \
+        meson \
         nodejs \
         npm \
       && rm -rf /var/lib/apt/lists/*; \
@@ -137,14 +152,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+r /usr/local/rustup /usr/local/cargo; \
+        | CARGO_HOME=/usr/local/cargo sh -s -- -y --default-toolchain 1.96.1 \
+      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────
@@ -155,7 +168,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/opencode/go \
-    PATH=/usr/local/go/bin:/home/opencode/go/bin:$PATH
+    CARGO_HOME=/home/opencode/.cargo \
+    PATH=/home/opencode/.cargo/bin:/usr/local/cargo/bin:/usr/local/go/bin:/home/opencode/go/bin:$PATH
 
 # ── non-root user ──────────────────────
 # Keep IDs synchronized with ic/scripts/lunarwing-mt-admin.sh. Rootless Podman
@@ -167,7 +181,8 @@ RUN groupadd --gid 10001 opencode \
 # ── app layout ─────────────────
 WORKDIR /app
 
-COPY --from=builder /build/opencode /app/opencode
+COPY --from=builder /out/bin/opencode /usr/local/bin/opencode
+COPY --from=builder /out/sdk /app/node_modules/@opencode-ai/sdk
 
 COPY --chown=opencode:opencode entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY --chown=opencode:opencode scripts/ ./scripts/
@@ -175,14 +190,12 @@ COPY --chown=opencode:opencode config/ ./config/
 
 RUN chmod +x /app/entrypoint.sh /app/health_server.py
 
-RUN ln -s /app/opencode/node_modules /app/node_modules
-
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
-# resolve — the `bun run build` steps above are best-effort, so verify the exact
+# resolve — the SDK build above is best-effort, so verify the exact
 # import the worker depends on. Without this a broken/renamed SDK passes
 # `docker build` and only surfaces as a module-resolution error when the bridge
 # starts inside the running container.
-RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2 resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2 —", e.message); process.exit(1) })'
+RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2/client").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2/client resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2/client —", e.message); process.exit(1) })'
 RUN cd /app \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \

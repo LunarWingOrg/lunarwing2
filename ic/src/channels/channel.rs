@@ -157,6 +157,26 @@ impl IncomingMessage {
         self
     }
 
+    /// Whether this message belongs to a room/group where multiple actors can
+    /// share one conversation scope.
+    pub fn is_shared_conversation(&self) -> bool {
+        self.metadata
+            .get("chat_type")
+            .and_then(|value| value.as_str())
+            == Some("group")
+            || self
+                .metadata
+                .get("xmpp_type")
+                .and_then(|value| value.as_str())
+                == Some("groupchat")
+            || (self.channel.ends_with("-relay")
+                && self
+                    .metadata
+                    .get("event_type")
+                    .and_then(|value| value.as_str())
+                    != Some("direct_message"))
+    }
+
     /// Set user name.
     pub fn with_user_name(mut self, name: impl Into<String>) -> Self {
         self.user_name = Some(name.into());
@@ -282,8 +302,31 @@ impl OutgoingResponse {
 pub struct ToolDecision {
     /// Tool name.
     pub tool_name: String,
-    /// Agent's reasoning for choosing this tool.
+    /// User-facing rationale for choosing this tool.
     pub rationale: String,
+}
+
+impl ToolDecision {
+    /// Build a bounded, user-facing rationale without exposing model internals.
+    pub fn for_tool_name(tool_name: &str) -> Self {
+        let rationale = match tool_name {
+            "web_search" | "web_fetch" | "http" | "http_request" => {
+                "Gather current external information relevant to the request."
+            }
+            "memory_search" | "memory_read" => "Retrieve relevant saved context.",
+            "file_read" | "read_file" => "Inspect relevant project files.",
+            "file_write" | "write_file" | "edit" | "apply_patch" => {
+                "Apply the requested project change."
+            }
+            "shell" => "Inspect or execute work in the environment and verify the result.",
+            "llm_context" | "llm_query" | "rlm_query" => "Analyze gathered context.",
+            _ => "Complete a required step for the request.",
+        };
+        Self {
+            tool_name: tool_name.to_string(),
+            rationale: rationale.to_string(),
+        }
+    }
 }
 
 /// Status update types for showing agent activity.
@@ -329,9 +372,8 @@ pub enum StatusUpdate {
         description: String,
         parameters: serde_json::Value,
         /// When `true`, the UI should offer an "always" option that auto-approves
-        /// future calls to this tool for the rest of the session.  When `false`
-        /// (i.e. `ApprovalRequirement::Always`), the tool must be approved every
-        /// time and the "always" button should be hidden.
+        /// future calls to this tool. Tools choose this independently from their
+        /// base approval requirement; most `Always` tools keep it disabled.
         allow_always: bool,
     },
     /// Extension needs user authentication (token or OAuth).
@@ -358,7 +400,7 @@ pub enum StatusUpdate {
     Suggestions { suggestions: Vec<String> },
     /// Skills activated for this conversation turn.
     SkillActivated { skill_names: Vec<String> },
-    /// Agent reasoning update (why it chose specific tools).
+    /// Safe reasoning summary for selected tools.
     ReasoningUpdate {
         /// Human-readable summary of the agent's decision.
         narrative: String,
@@ -374,6 +416,24 @@ pub enum StatusUpdate {
 }
 
 impl StatusUpdate {
+    /// Build a safe reasoning summary from selected tool names.
+    pub fn reasoning_for_tools(tool_names: &[String]) -> Option<Self> {
+        if tool_names.is_empty() {
+            return None;
+        }
+        let count = tool_names.len();
+        let tool_word = if count == 1 { "tool" } else { "tools" };
+        Some(Self::ReasoningUpdate {
+            narrative: format!(
+                "Selected {count} {tool_word} based on task requirements and available context."
+            ),
+            decisions: tool_names
+                .iter()
+                .map(|name| ToolDecision::for_tool_name(name))
+                .collect(),
+        })
+    }
+
     /// User-facing text for an external gate pause.
     pub fn external_waiting_message(gate_name: &str) -> String {
         format!("Waiting for external confirmation (gate: {gate_name})...")
@@ -505,6 +565,30 @@ mod tests {
     use super::*;
     use crate::testing::credentials::TEST_REDACT_SECRET_123;
 
+    #[test]
+    fn reasoning_for_tools_is_bounded_and_user_facing() {
+        let names = vec!["web_search".to_string(), "shell".to_string()];
+        let status = StatusUpdate::reasoning_for_tools(&names).expect("reasoning update");
+        let StatusUpdate::ReasoningUpdate {
+            narrative,
+            decisions,
+        } = status
+        else {
+            panic!("expected ReasoningUpdate");
+        };
+        assert_eq!(decisions.len(), 2);
+        assert!(narrative.contains("Selected 2 tools"));
+        assert_eq!(decisions[0].tool_name, "web_search");
+        assert!(decisions[0].rationale.contains("external information"));
+        assert_eq!(decisions[1].tool_name, "shell");
+        assert!(decisions[1].rationale.contains("environment"));
+    }
+
+    #[test]
+    fn reasoning_for_no_tools_is_absent() {
+        assert!(StatusUpdate::reasoning_for_tools(&[]).is_none());
+    }
+
     /// Stub tool that marks `"value"` as sensitive.
     struct SecretTool;
 
@@ -632,6 +716,26 @@ mod tests {
     fn test_incoming_message_with_timezone() {
         let msg = IncomingMessage::new("test", "user1", "hello").with_timezone("America/New_York");
         assert_eq!(msg.timezone.as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn shared_conversation_detects_groups_but_not_direct_messages() {
+        let xmpp_room = IncomingMessage::new("xmpp", "room@example", "hello")
+            .with_metadata(serde_json::json!({"xmpp_type": "groupchat"}));
+        let signal_group = IncomingMessage::new("signal", "group", "hello")
+            .with_metadata(serde_json::json!({"chat_type": "group"}));
+        let relay_room = IncomingMessage::new("darkirc-relay", "room", "hello")
+            .with_metadata(serde_json::json!({"event_type": "channel_message"}));
+        let relay_dm = IncomingMessage::new("darkirc-relay", "alice", "hello")
+            .with_metadata(serde_json::json!({"event_type": "direct_message"}));
+        let xmpp_dm = IncomingMessage::new("xmpp", "alice@example", "hello")
+            .with_metadata(serde_json::json!({"chat_type": "private", "xmpp_type": "chat"}));
+
+        assert!(xmpp_room.is_shared_conversation());
+        assert!(signal_group.is_shared_conversation());
+        assert!(relay_room.is_shared_conversation());
+        assert!(!relay_dm.is_shared_conversation());
+        assert!(!xmpp_dm.is_shared_conversation());
     }
 
     #[test]

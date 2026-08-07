@@ -1,7 +1,8 @@
 # Bug tracker
 
-Reconciled against current source on **2026-07-28** (prior pass against revision
-`51ae5a8` on 2026-07-20). All 38 Markdown documents in this tracker (36
+Reconciled against current source (revision `94dfd58`) on **2026-08-03** (prior
+passes on 2026-07-28 and against revision `51ae5a8` on 2026-07-20). All 38
+Markdown documents in this tracker (36
 report/pointer files plus two README files) were checked against current source,
 scripts, tests, and reachable Git history. Closely related reports remain
 grouped; their original filenames and technical evidence are named in the
@@ -19,15 +20,14 @@ Some superseded files remain as compatibility pointers, including pointers in
 
 | Document | Status | Current finding | Verification |
 |---|---|---|---|
-| [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
+| [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` (sandbox default; external workers default to `wait=false`) still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
 | [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; bootstrap E2E tests are now `#[ignore]`'d (harness race); clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
-| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | PARTIAL | Provisioning and in-memory token merges work; full TOML rewrites can still drop worker bearer tokens | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
-| [BUG-mt-nanocode-image-size.md](BUG-mt-nanocode-image-size.md) | OPEN | Large Nanocode image is copied per tenant with `save|load` | `lunarwing-mt-admin.sh:606-649,3709-3727`, Dockerfile |
-| [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:51-69,283-289`; fresh related flag harness |
+| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | FIXED* | Provisioning, in-memory merges, and `save_toml` token re-injection all work, with round-trip tests; *live daemon/worker auth re-check still pending | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
+| [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:85-105,1043`; related flag harness |
 | [BUG-ssh-git-ref-and-remote-head.md](BUG-ssh-git-ref-and-remote-head.md) | PARTIAL | Null-like refs fixed; bare remote HEAD mismatch still reports success for an empty checkout, with only raw Git stderr | `ssh_git.rs`, null-ref tests, local bare-Git reproduction |
 | [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2164-2172` |
-| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode/Nanocode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun unavailable for a fresh self-check run |
-| [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; an unbounded send await on a full downstream queue remains a residual risk | WASM wrapper, active-turn dispatcher, channel manager, watchdog, XMPP bridge source |
+| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun self-check re-run green on 2026-08-03 |
+| [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; an unbounded send await on a full downstream queue remains a residual risk, now visible to the stall detector/watchdog | WASM wrapper, active-turn dispatcher, channel manager, watchdog, XMPP bridge source |
 | [BUG-xmpp-omemo-warmup-and-processing.md](BUG-xmpp-omemo-warmup-and-processing.md) | UNVERIFIED | Historical MUC fallback-spam has no current live verification; generic stuck-`Processing` recovery is fixed | XMPP config/tests, release v1.0.7, agent timeout path; source-only |
 
 ## Open follow-ups
@@ -38,8 +38,7 @@ These are the unresolved pieces inside grouped reports:
 |---|---|
 | Concurrent ordinary-turn scheduling or an async/session registry for default `wait=true` calls | [agent/worker lifecycle](BUG-agent-worker-lifecycle.md#1-synchronous-worker-jobs-built-in-and-external) |
 | Clipboard test runtime behavior | [E2E test bugs](BUG-e2e-test-bugs.md#2-clipboard-copy-test) |
-| Preserve external-worker auth tokens across `Settings::save_toml` | [external-worker config](BUG-external-worker-config-persistence.md#2-auth-token-loss-on-settings-rewrites) |
-| Slim/share Nanocode image distribution | [MT image size](BUG-mt-nanocode-image-size.md) |
+| Run a live daemon/worker token-auth re-check, then archive the report | [external-worker config](BUG-external-worker-config-persistence.md#2-auth-token-loss-on-settings-rewrites) |
 | Detect bare remote HEAD mismatch after `ssh_git clone` | [SSH Git](BUG-ssh-git-ref-and-remote-head.md#2-bare-remote-head-mismatch) |
 | Implement or remove WeeChat `rand_check` | [WeeChat relay](BUG-weechat-relay-rand-check.md#open-latent-behavior-bug) |
 | Normalize prompt-generated worker paths and Pebble `project_dir` | [worker paths](BUG-worker-workspace-path-expansion.md#remaining-gaps) |
@@ -86,7 +85,8 @@ unverified historical symptoms alongside their fixed primary changes.
 | [BUG-ssh-git-null-ref-serialization.md](BUG-ssh-git-null-ref-serialization.md) | FIXED | [SSH Git](BUG-ssh-git-ref-and-remote-head.md#1-null-like-ref-values) |
 | [BUG-subagent-worker-hang.md](BUG-subagent-worker-hang.md) | FIXED/RETIRED | [worker lifecycle](BUG-agent-worker-lifecycle.md#2-fire-and-forget-worker-completion-race) |
 | [BUG-unbounded-mpsc-recv-in-spawned-tasks.md](BUG-unbounded-mpsc-recv-in-spawned-tasks.md) | FIXED/INVALIDATED | [worker lifecycle](BUG-agent-worker-lifecycle.md#3-notification-receiver-report) |
-| [MISSING-CONFIG-FOR-NANOCODE.md](MISSING-CONFIG-FOR-NANOCODE.md) | PARTIAL | [external-worker config](BUG-external-worker-config-persistence.md) |
+| [history/MISSING-CONFIG-FOR-NANOCODE.md](history/MISSING-CONFIG-FOR-NANOCODE.md) | RETIRED | Nanocode worker removed |
+| [history/BUG-mt-nanocode-image-size.md](history/BUG-mt-nanocode-image-size.md) | RETIRED | Nanocode image build and distribution removed |
 | [history/BUG-FIXED-LAPSE.md](history/BUG-FIXED-LAPSE.md) | FIXED | [LAPSE history](history/BUG-FIXED-LAPSE.md) |
 | [history/BUG-FIXED-WEECHAT-WARNINGS.md](history/BUG-FIXED-WEECHAT-WARNINGS.md) | PARTIAL | [WeeChat rand check](BUG-weechat-relay-rand-check.md) |
 | [history/BUG-FIXED-wasm-tools-not-found-on-build.md](history/BUG-FIXED-wasm-tools-not-found-on-build.md) | FIXED | [wasm-tools history](history/BUG-FIXED-wasm-tools-not-found-on-build.md) |
@@ -114,7 +114,7 @@ reports as follows:
 - `BUG-engine-crate-test-failures.md` and
   `BUG-rust-integration-test-harness-failures.md` -> archived engine/harness
 - `BUG-kawarimi-import-no-opencode.md` -> archived Kawarimi import
-- `MISSING-CONFIG-FOR-NANOCODE.md` -> external-worker config persistence
+- `history/MISSING-CONFIG-FOR-NANOCODE.md` -> closed by Nanocode retirement
 - `history/BUG-FIXED-WEECHAT-WARNINGS.md` -> active WeeChat `rand_check` report
 - `history/XMPP-OMEMO-BUG-TO-DO.md` -> active OMEMO fallback/processing report
 

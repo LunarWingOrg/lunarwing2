@@ -63,6 +63,8 @@ pub struct TurnInfo {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub tool_calls: Vec<ToolCallInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningSummary>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +76,12 @@ pub struct ToolCallInfo {
     pub result_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReasoningSummary {
+    pub narrative: String,
+    pub decisions: Vec<ToolDecisionDto>,
 }
 
 #[derive(Debug, Serialize)]
@@ -281,7 +289,7 @@ pub enum SseEvent {
         message: Option<String>,
     },
 
-    /// Agent reasoning update (why it chose specific tools).
+    /// Safe reasoning summary for selected tools.
     #[serde(rename = "reasoning_update")]
     ReasoningUpdate {
         narrative: String,
@@ -798,6 +806,9 @@ pub struct ExtensionInfo {
     pub command: Option<String>,
     pub authenticated: bool,
     pub active: bool,
+    /// MCP runtime is rebuilding or waiting for retry.
+    #[serde(default)]
+    pub recovering: bool,
     /// Desired startup state for MCP servers. Omitted for other extension kinds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -848,11 +859,13 @@ pub struct InstallExtensionRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub env_secrets: std::collections::HashMap<String, String>,
 }
 
 impl InstallExtensionRequest {
     pub fn mcp_config(&self) -> Result<Option<crate::tools::mcp::McpServerConfig>, String> {
-        if self.kind.as_deref() != Some("mcp_server") {
+        if self.kind.as_deref() != Some("mcp_server") && self.transport.is_none() {
             return Ok(None);
         }
         let config = match self.transport.as_deref() {
@@ -860,11 +873,12 @@ impl InstallExtensionRequest {
                 let command = self.command.as_deref().ok_or_else(|| {
                     "MCP server command is required for stdio transport".to_string()
                 })?;
-                crate::tools::mcp::McpServerConfig::new_stdio(
+                crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
                     &self.name,
                     command,
                     self.args.clone(),
                     self.env.clone(),
+                    self.env_secrets.clone(),
                 )
             }
             Some("http") => {
@@ -874,9 +888,13 @@ impl InstallExtensionRequest {
                 return Ok(None);
             }
             Some(other) => return Err(format!("Unsupported MCP transport '{other}'")),
-            None if self.command.is_some() || !self.args.is_empty() || !self.env.is_empty() => {
+            None if self.command.is_some()
+                || !self.args.is_empty()
+                || !self.env.is_empty()
+                || !self.env_secrets.is_empty() =>
+            {
                 return Err(
-                    "MCP transport must be 'stdio' when command, args, or env are provided"
+                    "MCP transport must be 'stdio' when command, args, env, or env_secrets are provided"
                         .to_string(),
                 );
             }
@@ -1669,7 +1687,8 @@ mod tests {
             "transport": "stdio",
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-            "env": {"NODE_ENV": "production"}
+            "env": {"NODE_ENV": "production"},
+            "env_secrets": {"API_TOKEN": "api_token"}
         }"#;
         let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
         let config: McpServerConfig = req
@@ -1679,10 +1698,16 @@ mod tests {
 
         assert!(matches!(
             config.effective_transport(),
-            EffectiveTransport::Stdio { command, args, env }
+            EffectiveTransport::Stdio {
+                command,
+                args,
+                env,
+                env_secrets,
+            }
                 if command == "npx"
                     && args == ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
+                    && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
         ));
     }
 

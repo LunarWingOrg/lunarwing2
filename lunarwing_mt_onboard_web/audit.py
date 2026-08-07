@@ -24,6 +24,7 @@ _HEX64_RE = re.compile(r"\b[0-9a-fA-F]{64}\b")
 _SECRET_FLAGS = {
     "--xmpp-password",
     "--llm-api-key",
+    "--kimi-api-key",
     "--secret",
     "--secretvalue",
     "--password",

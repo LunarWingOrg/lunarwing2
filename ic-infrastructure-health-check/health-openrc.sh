@@ -31,7 +31,7 @@ discover_services() {
 
   # Multi-tenant. The `lunarwing-*` glob already covers lunarwing-<t> AND every
   # per-service unit (lunarwing-proxy-<t>, lunarwing-pg-<t>, lunarwing-nanocode-<t>,
-  # lunarwing-pebble-<t>, lunarwing-opencode-<t>, lunarwing-weechat-<t>,
+  # lunarwing-pebble-<t>, lunarwing-opencode-<t>, lunarwing-kimi-<t>, lunarwing-weechat-<t>,
   # lunarwing-weechat-adapter-<t>), so a separate lunarwing-proxy-* glob would only
   # double-list it. Dedup via `seen`.
   for initscript in "$INITD_DIR"/lunarwing-* "$INITD_DIR"/xmpp-bridge-*; do
@@ -71,6 +71,13 @@ svc_json() {
 EOF
 }
 
+retired_nanocode_service() {
+  case "$1" in
+    lunarwing-nanocode-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Probe one unit, bounded by STATUS_TIMEOUT when `timeout` is available.
 # Sets globals STATUS_OUT (text) and STATUS_RC (the REAL exit code; 124/137 mean
 # the probe was killed for exceeding the timeout).
@@ -88,9 +95,15 @@ probe_status() {
 # can point at a fake runlevels tree without touching the host.
 RUNLEVELS_DIR="${RUNLEVELS_DIR:-/etc/runlevels}"
 
+# Multi-tenant registry (lunarwing-mt-admin.sh ports.json). Used for optional
+# WeeChat and worker intent gates. Absent/unreadable file => gates inert (fail
+# safe: no outage is masked).
+TENANTS_FILE="${SELF_HEAL_TENANTS_FILE:-${LUNARWING_TENANTS_FILE:-/etc/lunarwing/ports.json}}"
+
 # Extract the tenant name from a unit, or "" for single-instance / non-tenant
 # units. Known per-service roles are stripped so every unit maps to its tenant:
 #   lunarwing-acme -> acme   lunarwing-proxy-acme -> acme
+#   lunarwing-vision-acme -> acme
 #   lunarwing-weechat-adapter-acme -> acme   xmpp-bridge-acme -> acme
 #   lunarwing-darkirc-adapter-acme -> acme   lunarwing-darkirc-acme -> acme
 # (weechat-adapter MUST precede weechat in the case so the longer role wins.
@@ -106,8 +119,10 @@ unit_tenant() {
         proxy-*)             rest="${rest#proxy-}" ;;
         pg-*)                rest="${rest#pg-}" ;;
         nanocode-*)          rest="${rest#nanocode-}" ;;
-        opencode-*)          rest="${rest#opencode-}" ;;
-        pebble-*)            rest="${rest#pebble-}" ;;
+        opencode-*)          rest="${rest#opencode-}"; rest="${rest%-sup}" ;;
+        kimi-*)              rest="${rest#kimi-}"; rest="${rest%-sup}" ;;
+        pebble-*)            rest="${rest#pebble-}"; rest="${rest%-sup}" ;;
+        vision-*)            rest="${rest#vision-}" ;;
         weechat-adapter-*)   rest="${rest#weechat-adapter-}" ;;
         weechat-*)           rest="${rest#weechat-}" ;;
         darkirc-adapter-*)   rest="${rest#darkirc-adapter-}" ;;
@@ -136,9 +151,61 @@ tenant_started() {
   return 1
 }
 
+# Per-tenant WeeChat health-gate (RENDER_UNITS_SMALL_BUG follow-up). The
+# lunarwing-weechat-<t> / lunarwing-weechat-adapter-<t> units are OPTIONAL and
+# match the lunarwing-* discovery glob, so an intentionally unused weechat
+# backend that cannot start would otherwise read critical and self-heal would
+# restart-storm it (flap). `mt-admin disable-weechat <tenant>` records
+# enable_weechat=false in the registry; down weechat units for such a tenant
+# are then classified `skipped` (self-heal honours `skipped`).
+# Fail safe everywhere: non-weechat unit, empty tenant, missing jq, or an
+# unreadable registry all return 1 (NOT disabled => normal classification).
+weechat_unit_disabled() {
+  local svc="$1" tenant
+  case "$svc" in
+    lunarwing-weechat-*) ;;   # glob covers both backend and -adapter roles
+    *) return 1 ;;
+  esac
+  tenant="$(unit_tenant "$svc")"
+  [ -n "$tenant" ] || return 1
+  [ -r "$TENANTS_FILE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  # NOTE: jq's `//` treats false as empty, so the explicit `== false` test is
+  # required — `.enable_weechat // true` would read a disabled tenant as enabled.
+  [ "$(jq -r --arg t "$tenant" 'if .tenants[$t].enable_weechat == false then "false" else "true" end' "$TENANTS_FILE" 2>/dev/null)" = "false" ]
+}
+
+# Down worker units are expected when worker selection is disabled or an OpenRC
+# stop-worker/kill-worker persisted desired_running=false. Covers direct and
+# babysitter (-sup) units. Missing tenant/registry/jq fails safe as managed.
+worker_unit_intentionally_stopped() {
+  local svc="$1" worker tenant result
+  case "$svc" in
+    lunarwing-pebble-*)   worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
+    lunarwing-opencode-*) worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
+    lunarwing-kimi-*)     worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
+    *) return 1 ;;
+  esac
+  case "$tenant" in *-sup) tenant="${tenant%-sup}" ;; esac
+  [ -n "$tenant" ] || return 1
+  [ -r "$TENANTS_FILE" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  result="$(jq -r --arg t "$tenant" --arg w "$worker" '
+    if .tenants[$t] == null then "unknown"
+    elif .tenants[$t].workers[$w] != true then "stopped"
+    elif .tenants[$t].worker_runtime[$w].desired_running == false then "stopped"
+    else "running" end
+  ' "$TENANTS_FILE" 2>/dev/null)" || return 1
+  [ "$result" = "stopped" ]
+}
+
 for svc in "${SERVICES_ARR[@]}"; do
   # Init script must exist.
   if ! rc-service --exists "$svc" >/dev/null 2>&1; then
+    if retired_nanocode_service "$svc"; then
+      svc_results+=("$(svc_json "$svc" "missing" "skipped")")
+      continue
+    fi
     issues+=("service not found: $svc")
     svc_results+=("$(svc_json "$svc" "missing" "critical")")
     overall_status="critical"; overall_exit=2
@@ -170,9 +237,17 @@ for svc in "${SERVICES_ARR[@]}"; do
     state="stopped"   # non-keyword output AND non-zero exit → down/ambiguous
   fi
 
+  if retired_nanocode_service "$svc"; then
+    local_status="skipped"; local_exit=0
+  else
   case "$state" in
     stopped|crashed)
-      if tenant_started "$(unit_tenant "$svc")"; then
+      if weechat_unit_disabled "$svc" || worker_unit_intentionally_stopped "$svc"; then
+        # Optional WeeChat unit on a weechat-DISABLED tenant: down is the
+        # expected state, as is an unselected or operator-stopped worker.
+        # `skipped` keeps self-heal from overriding persisted intent.
+        local_status="skipped"; local_exit=0
+      elif tenant_started "$(unit_tenant "$svc")"; then
         local_status="critical"; local_exit=2
         issues+=("$svc not running: $state")
       else
@@ -195,6 +270,7 @@ for svc in "${SERVICES_ARR[@]}"; do
       issues+=("$svc in unexpected state: $state")
       ;;
   esac
+  fi
 
   if [ "$local_exit" -gt "$overall_exit" ]; then
     overall_exit=$local_exit

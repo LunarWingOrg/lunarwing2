@@ -58,6 +58,25 @@ mk_unit() { : >"$1/initd/$2"; chmod +x "$1/initd/$2"; }                  # <s> <
 # Mark a unit as enabled in the default runlevel — i.e. the tenant was start-ed
 # (start-tenant `rc-update add`s the primary daemon). <s> <name>
 enable_unit() { : >"$1/runlevels/default/$2"; }
+# Write a fake ports registry for the weechat health-gate. <s> <tenant> <true|false|absent>
+mk_registry() {
+  if [ "$3" = absent ]; then
+    jq -n --arg t "$2" '{tenants:{($t):{user:$t}}}' >"$1/ports.json"
+  else
+    jq -n --arg t "$2" --argjson w "$3" '{tenants:{($t):{user:$t, enable_weechat:$w}}}' >"$1/ports.json"
+  fi
+}
+# Write worker selection/runtime intent. <s> <tenant> <worker> <enabled> <desired|absent>
+mk_worker_registry() {
+  if [ "$5" = absent ]; then
+    jq -n --arg t "$2" --arg w "$3" --argjson enabled "$4" \
+      '{tenants:{($t):{workers:{($w):$enabled}}}}' >"$1/ports.json"
+  else
+    jq -n --arg t "$2" --arg w "$3" --argjson enabled "$4" --argjson desired "$5" \
+      '{tenants:{($t):{workers:{($w):$enabled},worker_runtime:{($w):{desired_running:$desired}}}}}' \
+      >"$1/ports.json"
+  fi
+}
 # <s> <svc> <status-text> <exit-code> [sleep-secs]
 fix_set() {
   printf '%s' "$3" >"$1/fix/$2.out"
@@ -168,6 +187,107 @@ assert_eq "$(svc_field "$OUT" lunarwing-proxy-live status)" "critical" "S8: star
 assert_eq "$(svc_field "$OUT" lunarwing-fresh status)"      "skipped"  "S8: not-started tenant's down unit → skipped"
 assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S8: overall critical (driven by the started tenant)"
 assert_eq "$RC" 2 "S8: exit 2"
+
+# ── S9: weechat-DISABLED tenant (enable_weechat=false) — down weechat units → skipped ──
+# The render-units footgun scenario: re-rendered optional weechat units that cannot
+# start must not read critical (and self-heal must not restart-storm them) when the
+# operator disabled weechat for the tenant.
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;                    fix_set "$s" lunarwing-acme                    " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-proxy-acme;              fix_set "$s" lunarwing-proxy-acme              " * status: stopped" 3
+mk_unit "$s" lunarwing-weechat-acme;            fix_set "$s" lunarwing-weechat-acme            " * status: stopped" 3
+mk_unit "$s" lunarwing-weechat-adapter-acme;    fix_set "$s" lunarwing-weechat-adapter-acme    " * status: stopped" 3
+mk_registry "$s" acme false
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)"         "skipped"  "S9: disabled tenant's down weechat → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-adapter-acme status)" "skipped"  "S9: disabled tenant's down weechat-adapter → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-proxy-acme status)"           "critical" "S9: non-weechat down unit still critical (gate is weechat-only)"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S9: overall critical (driven by proxy, not weechat)"
+assert_eq "$RC" 2 "S9: exit 2"
+
+# ── S10: disabled weechat is the ONLY thing down → host stays healthy (flap fixed) ──
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;                 fix_set "$s" lunarwing-acme                 " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-weechat-acme;         fix_set "$s" lunarwing-weechat-acme         " * status: stopped" 3
+mk_unit "$s" lunarwing-weechat-adapter-acme; fix_set "$s" lunarwing-weechat-adapter-acme " * status: crashed" 1
+mk_registry "$s" acme false
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)"         "skipped" "S10: stopped weechat on disabled tenant → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-adapter-acme status)" "skipped" "S10: crashed weechat-adapter on disabled tenant → skipped"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S10: overall healthy — the render-units footgun is closed"
+assert_eq "$RC" 0 "S10: exit 0"
+
+# ── S11: gate inert when flag absent/true or registry unreadable (fail safe) ──
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;         fix_set "$s" lunarwing-acme         " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-weechat-acme; fix_set "$s" lunarwing-weechat-acme " * status: stopped" 3
+mk_registry "$s" acme absent   # pre-flag tenant entry: no enable_weechat key
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)" "critical" "S11: flag absent → down weechat still critical (backward compat)"
+
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;         fix_set "$s" lunarwing-acme         " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-weechat-acme; fix_set "$s" lunarwing-weechat-acme " * status: stopped" 3
+mk_registry "$s" acme true
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)" "critical" "S11: flag true → down weechat still critical"
+
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;         fix_set "$s" lunarwing-acme         " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-weechat-acme; fix_set "$s" lunarwing-weechat-acme " * status: stopped" 3
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/nonexistent.json"
+assert_eq "$(svc_field "$OUT" lunarwing-weechat-acme status)" "critical" "S11: unreadable registry → down weechat still critical (never masks)"
+
+# ── S12: retired Nanocode services remain visible but never trigger healing ─
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;          fix_set "$s" lunarwing-acme          " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-nanocode-acme; fix_set "$s" lunarwing-nanocode-acme " * status: crashed" 1
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-acme status)" "skipped" "S12: retired Nanocode service → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-acme state)" "crashed" "S12: retired Nanocode state remains visible"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S12: retired Nanocode service cannot degrade host"
+assert_eq "$RC" 0 "S12: retired Nanocode service keeps exit 0"
+
+s="$(new_scenario)"
+run_hc "$s" SERVICES=lunarwing-nanocode-ghost
+assert_eq "$(svc_field "$OUT" lunarwing-nanocode-ghost status)" "skipped" "S12: missing retired Nanocode service → skipped"
+assert_eq "$RC" 0 "S12: missing retired Nanocode service keeps exit 0"
+
+# ── S13: Vision role maps to its running tenant, not tenant "vision-<name>" ─
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;        fix_set "$s" lunarwing-acme        " * status: started" 0
+mk_unit "$s" lunarwing-vision-acme; fix_set "$s" lunarwing-vision-acme " * status: stopped" 3
+enable_unit "$s" lunarwing-acme
+run_hc "$s"
+assert_eq "$(svc_field "$OUT" lunarwing-vision-acme status)" "critical" "S13: down Vision unit on started tenant is critical"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S13: Vision outage drives overall status"
+assert_eq "$RC" 2 "S13: Vision outage exits 2"
+
+# ── S14: operator-stopped worker and babysitter stay skipped ────────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;                 fix_set "$s" lunarwing-acme                 " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-opencode-acme;        fix_set "$s" lunarwing-opencode-acme        " * status: stopped" 3
+mk_unit "$s" lunarwing-opencode-acme-sup;    fix_set "$s" lunarwing-opencode-acme-sup    " * status: crashed" 1
+mk_worker_registry "$s" acme opencode true false
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode-acme status)"     "skipped" "S14: desired-running false worker → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode-acme-sup status)" "skipped" "S14: desired-running false babysitter → skipped"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S14: stopped worker cannot trigger remediation"
+assert_eq "$RC" 0 "S14: stopped worker keeps exit 0"
+
+# ── S15: selected worker defaults running; unselected worker stays skipped ──
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;          fix_set "$s" lunarwing-acme          " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-kimi-acme;     fix_set "$s" lunarwing-kimi-acme     " * status: stopped" 3
+mk_unit "$s" lunarwing-kimi-acme-sup; fix_set "$s" lunarwing-kimi-acme-sup " * status: crashed" 1
+mk_unit "$s" lunarwing-pebble-acme;   fix_set "$s" lunarwing-pebble-acme   " * status: stopped" 3
+mk_worker_registry "$s" acme kimi true absent
+jq '.tenants.acme.workers.pebble = false' "$s/ports.json" >"$s/ports.tmp" && mv "$s/ports.tmp" "$s/ports.json"
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-kimi-acme status)"   "critical" "S15: enabled worker with absent intent defaults running"
+assert_eq "$(svc_field "$OUT" lunarwing-kimi-acme-sup status)" "critical" "S15: enabled worker babysitter maps to started tenant"
+assert_eq "$(svc_field "$OUT" lunarwing-pebble-acme status)" "skipped"  "S15: unselected worker → skipped"
+assert_eq "$RC" 2 "S15: selected down worker exits 2"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

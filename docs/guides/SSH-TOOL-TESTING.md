@@ -1,114 +1,84 @@
-# SSH Tool Testing Guide
+# SSH Delivery Testing Guide
 
-Test prompts for validating the three SSH delivery mechanisms in LunarWing v1.1.8.
-See `docs/architecture/SSH_DELIVERY_MECHANISMS.md` for the full design.
+Use these checks to validate the SSH paths described in [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md). Setup and recovery procedures live in [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md).
+
+All SSH tools accept a host from the configured `[[ssh.hosts]]` allowlist. Replace `<ssh-host>` below with that exact configured host value; an arbitrary IP or hostname is rejected even when it is reachable.
 
 ## Prerequisites
 
-- Tenant deployed with SSH harness enabled (`--no-ssh` NOT passed to `add-tenant`)
-- `start-tenant` completed — SSH key uploaded, agent socket active
-- `[[ssh.hosts]]` configured in the tenant's `config.toml` pointing at `127.0.0.1`
-- Verify readiness: `curl -s http://127.0.0.1:<http_port>/agent/status | jq` — should show `"keys_loaded": 1`
+- The tenant was provisioned without `--no-ssh`, or the harness was configured manually.
+- `config.toml` contains at least one `[[ssh.hosts]]` entry.
+- The encrypted secrets store contains an Ed25519 or ECDSA private key for the host. RSA is not supported by the in-process client.
+- The daemon was restarted after a key upload so the signing agent loaded the key.
+- The configured host-key policy is satisfied. Prefer `Strict` with a pinned `known_host_key` for sensitive systems.
+- For a multi-tenant host, `sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>` reports the tenant healthy.
 
-## Test 1: Built-in `ssh` Tool (Option 2, Phase 1)
+If the SSH harness HTTP API is enabled, its `/agent/status` response should report `running: true` and at least one loaded key. Treat the response as operational metadata and do not publish it unchanged.
 
-In-process Rust tool. Connects through the per-tenant ssh-agent socket, runs a remote command, returns output.
+## 1. Built-in `ssh`
 
-**Prompt:**
-```
-Use the ssh tool to connect to 127.0.0.1 as user <tenant> and run "hostname && whoami && date". Show me the full output.
-```
+Request a harmless command:
 
-**Expected result:**
-- Hostname of the host machine
-- Tenant username
-- Current timestamp
-- Exit code 0, no stderr
-
-**Verify on the host:**
-```bash
-sudo grep -i 'sshd.*session' /var/log/auth.log | tail -5
+```text
+Use the ssh tool with host <ssh-host> to run "hostname && whoami && date". Show stdout, stderr, and the exit code.
 ```
 
-Look for a session opened and closed for the tenant user at the matching timestamp.
+Expected behavior:
 
-## Test 3: WASM `ssh` Tool (Option 3)
+- the first action requires approval and offers **Always**;
+- the reported host matches the configured allowlist entry;
+- the command exits successfully with bounded stdout and stderr;
+- the remote username and hostname match the configured target.
 
-Sandboxed SSH via host-function bridge. The private key never enters WASM linear memory — the host signs challenges on behalf of the guest.
+Selecting **Always** after reviewing a harmless command suppresses later
+built-in `ssh` prompts for that user, across all configured aliases. Verify a
+second harmless call runs without a prompt, restart LunarWing, then verify the
+grant still applies. Set `tool_permissions.ssh` back to `ask_each_time` and
+verify the next call prompts again. This grant does not apply to `ssh_git`,
+WASM SSH, autonomous jobs, or supervised mode.
 
-> **Note:** The WASM ssh tool may need to be activated in the web panel first: Settings → Extensions → enable `ssh`.
+The built-in tool runs the SSH client in the LunarWing process and verifies the server key through the configured host-key policy.
 
-**Prompt:**
-```
-Use the WASM ssh tool to connect to 127.0.0.1 as user <tenant> and run "uname -a && id". Show me the output.
-```
+## 2. Built-in `ssh_git`
 
-**Expected result:**
-- Kernel version, architecture, hostname
-- User ID, group ID, and groups for the tenant user
-- Exit code 0, no stderr
+Use a disposable repository that the configured SSH identity can read. Prefer a read-only clone test before testing writes:
 
-**Verify on the host:**
-```bash
-sudo grep -i 'sshd.*session' /var/log/auth.log | tail -5
-```
-
-## Test 2: `ssh_git` Tool (Option 2, Phase 2)
-
-Git-over-SSH through the harness agent. Clones, pushes, and pulls from a remote git repo authenticated by the ssh-agent socket. The private key never touches disk — the `GIT_SSH_COMMAND` uses `SSH_AUTH_SOCK` pointing at the harness agent.
-
-**Setup — create a test bare repo on the host:**
-
-```bash
-sudo -u <tenant> bash -c '
-  cd /home/<tenant>/lunarwing
-  git init --bare test-repo.git
-  git --git-dir=test-repo.git symbolic-ref HEAD refs/heads/main
-  cd /tmp && rm -rf test-seed && git clone /home/<tenant>/lunarwing/test-repo.git test-seed
-  cd test-seed
-  echo "# Test repo for SSH git tool" > README.md
-  git add . && git commit -m "initial"
-  git branch -M main
-  git push origin main
-'
+```text
+Use ssh_git with operation clone, host <ssh-host>, repo <repo-relative-to-ssh-home>, path ssh-test-clone, ref main, and depth 1. Report the result without modifying or pushing the repository.
 ```
 
-> **Important:** The `repo` parameter is relative to the SSH user's home directory (scp-form URL: `user@host:repo`). For a repo at `/home/<tenant>/lunarwing/test-repo.git`, use `repo: lunarwing/test-repo.git`. The tool strips leading `/` — do not pass an absolute path.
+Expected behavior:
 
-> **Important:** The `path` parameter is relative to the ssh-git sandbox (`<base_dir>/ssh-git/`), NOT `/workspace/` or an absolute path. The tool rejects absolute paths and `..` traversal.
+- the action requires approval;
+- `path` is resolved below `<base_dir>/ssh-git/`;
+- absolute paths, `..`, symlink escapes, and option-injection inputs are rejected;
+- authentication uses the harness agent socket and the clone completes without an interactive prompt.
 
-**Prompt:**
-```
-Use the ssh_git tool with these exact parameters:
-- operation: clone
-- host: 127.0.0.1
-- repo: lunarwing/test-repo.git
-- path: test-repo-clone
-- ref: main
+Only test `push` against an explicitly disposable remote. Force-push refs are rejected, and `pull` is fast-forward only.
 
-After the clone succeeds, create a file called ssh-git-test.txt with the content "ssh_git tool works" inside the cloned repo at the ssh-git sandbox path test-repo-clone. Then commit it and use the ssh_git tool again with:
-- operation: push
-- host: 127.0.0.1
-- path: test-repo-clone
-- ref: main
+## 3. WASM `ssh`
+
+Build and install the registry `ssh` extension, then confirm its capability sidecar allows `<ssh-host>`. MT admin patches the installed allowlist from the tenant's `[[ssh.hosts]]` entries.
+
+```text
+Use the WASM ssh tool with host <ssh-host> to run "uname -a && id". Show stdout, stderr, and the exit code.
 ```
 
-> **Note:** `ssh_git` only handles clone/fetch/pull/push. To create files and commit inside the cloned repo, the agent uses the built-in `ssh` tool to run `git add`, `git commit`, etc. inside the sandbox clone path. This is expected behavior.
+Expected behavior:
 
-**Expected result:**
-- Clone succeeds (exit_code 0)
-- File created and committed in the sandbox clone
-- Push succeeds (exit_code 0)
+- the action requires approval;
+- both the global SSH host allowlist and the WASM tool's `ssh.allowed_hosts` capability permit the host;
+- key material remains host-side;
+- the one-shot command succeeds without PTY or interactive input.
 
-**Verify on the host:**
-```bash
-sudo -u <tenant> bash -c 'cd /home/<tenant>/lunarwing/test-repo.git && git log --oneline'
-sudo -u <tenant> bash -c 'cd /home/<tenant>/lunarwing/test-repo.git && git show HEAD:ssh-git-test.txt'
-```
+The WASM guest is sandboxed, but the actual SSH operation runs in the host function inside the LunarWing process. Do not claim that WASM isolates the network operation itself.
 
-## Notes
+## 4. Worker SSH
 
-- All three tools authenticate through the same ssh-agent socket — they differ only in execution context (in-process vs sandboxed vs git subprocess).
-- The SSH harness is enabled by default for new tenants. Disable with `--no-ssh` on `add-tenant`.
-- `ssh_git` repo paths use scp-form (relative to SSH home). `path` is sandbox-relative. Always pass `ref` explicitly to avoid the `null` serialization issue (see `docs/bugs/BUG-ssh-git-null-ref-serialization.md`).
-- Seed bare repos with `git symbolic-ref HEAD refs/heads/main` so HEAD points at `main` from the start.
+Create a disposable Pebble, OpenCode, or Kimi worker job that runs a read-only SSH command using the injected `SSH_AUTH_SOCK`. Confirm the worker performs normal OpenSSH host-key verification; the in-process `HostKeyVerifier` is not used in this path.
+
+Use worker mode for multi-step jobs where container isolation matters. A successful built-in `ssh` test does not prove the worker container has a correct `known_hosts` configuration.
+
+## Cleanup and Evidence
+
+Remove disposable clones and repositories through the same tenant context that created them. Record the LunarWing commit, configured host alias, mechanism tested, approval result, exit status, and a short redacted log window. Authentication log locations vary by distribution and init system; use the host's supported journal or auth log instead of assuming `/var/log/auth.log` exists.

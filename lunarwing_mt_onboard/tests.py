@@ -36,7 +36,15 @@ class TestTenantNameValidation(unittest.TestCase):
         self.assertIsNotNone(err)
 
     def test_reserved_prefix_rejected(self):
-        for prefix in ("pg-", "proxy-", "nanocode-", "pebble-", "opencode-", "weechat-"):
+        for prefix in (
+            "pg-",
+            "proxy-",
+            "nanocode-",
+            "pebble-",
+            "opencode-",
+            "kimi-",
+            "weechat-",
+        ):
             with self.subTest(prefix=prefix):
                 err = TenantConfig.validate_name(f"{prefix}1")
                 self.assertIsNotNone(err)
@@ -49,7 +57,7 @@ class TestConfigSerialization(unittest.TestCase):
             gateway_host="0.0.0.0",
             xmpp_enabled=True,
             xmpp_jid="alpha@xmpp.localhost",
-            workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
+            workers=[WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
             secrets_master_key="ab" * 32,
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -59,17 +67,20 @@ class TestConfigSerialization(unittest.TestCase):
         self.assertEqual(loaded.name, "alpha")
         self.assertEqual(loaded.gateway_host, "0.0.0.0")
         self.assertTrue(loaded.xmpp_enabled)
-        self.assertEqual(loaded.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
+        self.assertEqual(
+            loaded.workers,
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
+        )
         self.assertEqual(loaded.secrets_master_key, "ab" * 32)
 
     def test_current_llm_and_worker_overrides_round_trip(self):
         config = TenantConfig(
             name="alpha",
             llm_base_url="http://127.0.0.1:4000/openai/v1",
-            nanocode_model="nano-model",
-            nanocode_base_url="http://nano.test/v1",
             opencode_model="open-model",
             opencode_base_url="http://open.test/v1",
+            kimi_model="kimi-model",
+            kimi_base_url="http://kimi.test/v1",
         )
         self.assertEqual(TenantConfig.from_dict(config.to_dict()), config)
 
@@ -81,13 +92,20 @@ class TestConfigSerialization(unittest.TestCase):
         data = config.to_dict()
         self.assertEqual(data["workers"], ["pebble"])
 
-    def test_from_dict_accepts_string_workers(self):
+    def test_from_dict_accepts_supported_string_workers(self):
         data = {
             "name": "gamma",
-            "workers": ["nanocode", "opencode"],
+            "workers": ["pebble", "opencode", "kimi"],
         }
         config = TenantConfig.from_dict(data)
-        self.assertEqual(config.workers, [WorkerType.NANOCODE, WorkerType.OPENCODE])
+        self.assertEqual(
+            config.workers,
+            [WorkerType.PEBBLE, WorkerType.OPENCODE, WorkerType.KIMI],
+        )
+
+    def test_from_dict_rejects_retired_nanocode_worker(self):
+        with self.assertRaisesRegex(ValueError, "Nanocode worker is retired"):
+            TenantConfig.from_dict({"name": "legacy", "workers": ["nanocode"]})
 
     def test_json_file_permissions(self):
         config = TenantConfig(name="perms")
@@ -235,10 +253,10 @@ class TestProvisionerArgs(unittest.TestCase):
                     TenantConfig(
                         name="alpha",
                         llm_base_url="http://llm.test/v1",
-                        nanocode_model="nano-model",
-                        nanocode_base_url="http://nano.test/v1",
                         opencode_model="open-model",
                         opencode_base_url="http://open.test/v1",
+                        kimi_model="kimi-model",
+                        kimi_base_url="http://kimi.test/v1",
                     )
                 )
             finally:
@@ -246,13 +264,39 @@ class TestProvisionerArgs(unittest.TestCase):
 
         for flag, value in (
             ("--llm-base-url", "http://llm.test/v1"),
-            ("--nanocode-model", "nano-model"),
-            ("--nanocode-base-url", "http://nano.test/v1"),
             ("--opencode-model", "open-model"),
             ("--opencode-base-url", "http://open.test/v1"),
+            ("--kimi-model", "kimi-model"),
+            ("--kimi-base-url", "http://kimi.test/v1"),
         ):
             self.assertIn(flag, args)
             self.assertIn(value, args)
+
+    def test_kimi_api_key_uses_secret_injection_not_argv(self):
+        secret = "kimi-secret-value"
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "lunarwing-mt-admin.sh")
+            with open(script, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(script, 0o700)
+            previous = provisioner.MT_ADMIN_SCRIPT
+            provisioner.MT_ADMIN_SCRIPT = script
+            try:
+                config = TenantConfig(name="alpha", kimi_api_key=secret)
+                args = provisioner.build_add_tenant_args(config)
+            finally:
+                provisioner.MT_ADMIN_SCRIPT = previous
+
+        self.assertNotIn("--kimi-api-key", args)
+        self.assertNotIn(secret, args)
+        with patch.object(provisioner.os.path, "isfile", return_value=True), patch.object(
+            provisioner, "_write_env_values"
+        ) as write_values:
+            provisioner._inject_secrets(config)
+        write_values.assert_called_once_with(
+            "/home/alpha/lunarwing/env/lunarwing.env",
+            {"KIMI_API_KEY": secret},
+        )
 
     def test_worker_selection_is_forwarded_to_add_tenant(self):
         # start-tenant gates workers on the per-tenant registry flag persisted at
@@ -269,7 +313,7 @@ class TestProvisionerArgs(unittest.TestCase):
             try:
                 config = TenantConfig(
                     name="alpha",
-                    workers=[WorkerType.NANOCODE, WorkerType.OPENCODE],
+                    workers=[WorkerType.OPENCODE, WorkerType.KIMI],
                 )
                 add_args = provisioner.build_add_tenant_args(config)
                 build_args = provisioner.build_build_tenant_args(config)
@@ -277,13 +321,13 @@ class TestProvisionerArgs(unittest.TestCase):
                 provisioner.MT_ADMIN_SCRIPT = previous
 
         # Selected workers appear on add-tenant (the persisted selection).
-        self.assertIn("--with-nanocode", add_args)
         self.assertIn("--with-opencode", add_args)
+        self.assertIn("--with-kimi", add_args)
         # Unselected worker is omitted from add-tenant.
         self.assertNotIn("--with-pebble", add_args)
         # build-tenant still gets the same selection (to build the images).
-        self.assertIn("--with-nanocode", build_args)
         self.assertIn("--with-opencode", build_args)
+        self.assertIn("--with-kimi", build_args)
         self.assertNotIn("--with-pebble", build_args)
 
     def test_no_workers_selected_emits_no_worker_flags(self):
@@ -301,7 +345,12 @@ class TestProvisionerArgs(unittest.TestCase):
             finally:
                 provisioner.MT_ADMIN_SCRIPT = previous
 
-        for flag in ("--with-nanocode", "--with-pebble", "--with-opencode"):
+        for flag in (
+            "--with-nanocode",
+            "--with-pebble",
+            "--with-opencode",
+            "--with-kimi",
+        ):
             self.assertNotIn(flag, add_args)
 
     def test_weechat_bootstrap_opt_out_is_forwarded(self):
@@ -344,6 +393,35 @@ class TestProvisionerArgs(unittest.TestCase):
                 ),
             ],
         )
+
+    def test_write_env_values_uses_systemd_safe_quotes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, "lunarwing.env")
+            with open(env_file, "w") as handle:
+                handle.write("UNCHANGED=value\nKIMI_API_KEY=old\n")
+
+            provisioner._write_env_values(
+                env_file,
+                {"KIMI_API_KEY": "key'with\\slashes"},
+            )
+
+            with open(env_file) as handle:
+                content = handle.read()
+            self.assertIn("UNCHANGED=value\n", content)
+            self.assertIn('KIMI_API_KEY="key\'with\\\\slashes"\n', content)
+            self.assertNotIn("KIMI_API_KEY='", content)
+
+    def test_write_env_values_rejects_multiline_secret(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = os.path.join(tmp, "lunarwing.env")
+            with open(env_file, "w") as handle:
+                handle.write("")
+
+            with self.assertRaisesRegex(ValueError, "cannot contain"):
+                provisioner._write_env_values(
+                    env_file,
+                    {"KIMI_API_KEY": "first\nsecond"},
+                )
 
     def test_skip_build_also_skips_start(self):
         phase = provisioner.PhaseResult(name="add-tenant", returncode=0)

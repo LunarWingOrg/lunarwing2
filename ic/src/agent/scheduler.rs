@@ -558,8 +558,8 @@ impl Scheduler {
 
         // Scheduler-specific approval check
         let requirement = tool.requires_approval(&normalized_params);
-        let blocked =
-            ApprovalContext::is_blocked_or_default(&approval_context, tool_name, requirement);
+        let blocked = !tool.allows_autonomous_execution()
+            || ApprovalContext::is_blocked_or_default(&approval_context, tool_name, requirement);
         if blocked {
             return Err(autonomous_unavailable_error(tool_name, &job_ctx.user_id).into());
         }
@@ -806,6 +806,10 @@ mod tests {
             handle_message_timeout: std::time::Duration::from_secs(300),
             self_repair_op_timeout: std::time::Duration::from_secs(60),
             session_prune_timeout: std::time::Duration::from_secs(30),
+            lorebook: crate::config::LorebookConfig {
+                enabled: false,
+                ..crate::config::LorebookConfig::default()
+            },
             reflex: crate::config::ReflexConfig::default(),
         };
         let cm = Arc::new(ContextManager::new(5));

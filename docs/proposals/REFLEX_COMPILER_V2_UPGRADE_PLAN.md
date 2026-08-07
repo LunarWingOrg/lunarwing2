@@ -1,5 +1,19 @@
 # Reflex Compiler & Software Builder — v2 Upgrade Plan
 
+> **Current status (2026-08-02): Phase 1–3 reflex wiring is implemented.**
+> The router receives the workspace embedding provider, but semantic matching
+> now requires the separate default-off `REFLEX_SEMANTIC_ENABLED=true` opt-in.
+> It checks the local pattern-embedding cache before contacting the provider and
+> only generates missing pattern embeddings while semantic matching is enabled.
+> Successful fast-path executions no longer await a database update. They record
+> owner-scoped canonical hits in a bounded in-memory accumulator; one worker
+> flushes every three seconds through `bump_reflex_pattern_matches`. PostgreSQL
+> uses one additive `UNNEST` update, while libSQL uses repeated prepared updates
+> in one transaction. Failed or cancelled flushes requeue deltas with exponential
+> backoff, and graceful shutdown attempts one bounded final flush. The remaining
+> Software Builder and later architectural phases in this document are separate
+> work; older problem statements and samples below describe the pre-fix state.
+
 **Date:** 2026-07-27
 **Author:** Volta 🦊⚡
 **Target Release:** v2.0.3.0 (Phases 1–4), v2.0.4.0 (Phase 5)
@@ -14,17 +28,11 @@
 
 ## Executive Summary
 
-The reflex compiler was well-architected in v1 but neglected during the v2 engine migration. SweetieBot's deep-dive analysis (July 23, 2026) identified **12 gaps in the reflex system** and **15 gaps in the Software Builder**. The core matching logic (exact → fuzzy → semantic) is sound and well-tested (30+ unit tests, 7 E2E tests), but critical wiring gaps prevent correct production behavior:
+The reflex compiler was well-architected in v1 but neglected during the v2 engine migration. SweetieBot's July 2026 analysis identified **12 gaps in the reflex system** and **15 gaps in the Software Builder**. The original Phase 1–3 gaps included an unwired embedding provider, missing route-hit telemetry, an unspawned evictor, and hardcoded owner scope.
 
-- Semantic matching (Tier 3) is fully implemented but **never activated** — the embedding provider is never connected to the router
-- Match tracking is **broken** — routing hits are never recorded back to the database, so active patterns will be incorrectly evicted
-- The evictor background task **exists but is never spawned** — stale patterns accumulate forever
-- Multi-tenant support was **never updated** — user_id is hardcoded to `"default"`
-- The Software Builder (reflex's compilation backend) has its own critical bugs including a serde naming mismatch that silently breaks LLM-generated build requirements
+Those reflex wiring gaps are now fixed. Exact and fuzzy routing work whenever the compiler is enabled. Semantic routing additionally requires `REFLEX_SEMANTIC_ENABLED=true`; this avoids silently adding embedding-provider network requests before the normal LLM path. Route-hit telemetry uses bounded write-behind batching instead of waiting for one database update per response. The Software Builder and later architectural phases remain separate work.
 
-The system is disabled by default (`REFLEX_COMPILER_ENABLED=false`), so these issues are latent. Enabling it today would produce a partially-functional system with broken staleness tracking, no semantic matching, and no stale-pattern cleanup.
-
-This plan sequences the fixes into five phases, ordered by severity and dependency.
+The compiler itself remains disabled by default (`REFLEX_COMPILER_ENABLED=false`), and semantic matching remains independently disabled by default.
 
 ---
 
@@ -49,7 +57,7 @@ User Input
 |------|--------|-----------|--------|
 | 1 | Exact match | O(1) hash lookup on normalized input | ✅ Working |
 | 2 | Fuzzy match | Jaro-Winkler + word-overlap pre-filter (threshold 0.85) | ✅ Working |
-| 3 | Semantic match | Embedding cosine similarity (threshold 0.75) | ❌ Dead in prod |
+| 3 | Semantic match | Opt-in embedding cosine similarity (threshold 0.75) | ✅ Working when `REFLEX_SEMANTIC_ENABLED=true` |
 
 **Key files:**
 | File | Lines | Purpose |
@@ -72,61 +80,30 @@ User Input
 
 These are the "it's broken in production" fixes. All three are small, well-understood changes with existing test coverage for the underlying methods.
 
-### 1a. Wire Embedding Provider to ReflexRouter
+### 1a. Wire Embedding Provider to ReflexRouter — Completed
 
-**Problem:** `agent_loop.rs:347` creates `ReflexRouter::new()` with `embedding_provider: None`. The `with_embedding_provider()` builder method exists and is tested (`reflex.rs:1578-1581`), but is never called in production. This means:
-- Tier 3 semantic matching is permanently disabled
-- `semantic_route()`, `pattern_embeddings` cache, `embed_missing_patterns()`, and the DB's `semantic_search_reflex_patterns()` + `update_reflex_pattern_embedding()` are all dead code in production
-- The workspace's `EmbeddingProvider` (used for workspace search) is not shared with the reflex router
+The workspace embedding provider is attached in `Agent::new()`, but provider availability no longer enables semantic matching by itself. `REFLEX_SEMANTIC_ENABLED` is a separate switch and defaults to `false`. This matters because a semantic miss can contact a remote embedding service before the normal LLM path.
 
-**Fix:** In `Agent::new()` (line 347) or `Agent::run()`, attach the workspace embedding provider:
-
-```rust
-// agent_loop.rs — replace line 347
-let mut router = crate::agent::reflex::ReflexRouter::new();
-if let Some(ws) = &deps.workspace {
-    if let Some(provider) = ws.embedding_provider() {
-        router = router.with_embedding_provider(provider);
-    }
-}
-reflex_router: Arc::new(router),
-```
+Before embedding a query, `semantic_route()` checks whether any pattern embeddings are cached. Cache refresh only generates missing pattern embeddings while semantic matching is enabled. Exact and fuzzy matching are unaffected.
 
 **Verification:**
-- Existing test `test_reflex_router_semantic_match` (`reflex.rs:1578+`) covers the routing logic
-- Add integration test: create router with mock embedding provider → verify `has_embedding_provider()` returns true
-- Manual: enable reflex compiler, create patterns, verify semantic tier activates in logs
+- Semantic configuration defaults off.
+- Disabled semantic routing does not call the provider even when vectors are cached.
+- Enabled semantic routing with an empty pattern-vector cache does not call the provider.
+- Existing semantic match and threshold tests still pass with explicit opt-in.
 
-### 1b. Call `bump_reflex_pattern_match()` in Dispatcher Hot Path
+### 1b. Record Match Telemetry Through Bounded Write-Behind — Completed
 
-**Problem:** `dispatcher.rs:166-190` routes to a compiled tool but **never records the match** back to the database. Consequences:
-- `match_count` and `last_matched_at` in `reflex_patterns` are never updated during routing
-- The eviction sweep's staleness check (`last_matched_at < cutoff`) will evict patterns that are actively being used
-- `match_count` only reflects compilation-time counts from `find_recurring_job_patterns`, not actual routing hits
+Successful reflex tool executions record the owner-scoped canonical pattern in `ReflexHitAccumulator`. `record()` only takes a synchronous mutex, merges a counter in `HashMap<(user_id, pattern), PendingHit>`, and returns; it performs no async work and creates no task.
 
-The `bump_reflex_pattern_match()` method exists in both DB backends and is tested (`reflex.rs:1336-1340`), but is never invoked from the dispatcher.
+One worker flushes every three seconds. It swaps out the pending map before database I/O, then calls the mandatory shared `bump_reflex_pattern_matches()` batch method. PostgreSQL coalesces duplicate keys and uses one additive `UPDATE ... FROM UNNEST(...)`; libSQL uses one transaction with a reset prepared update. Both saturate the persisted 32-bit telemetry counter rather than wrapping.
 
-**Fix:** After successful `execute_chat_tool()` in `dispatcher.rs` (line ~180):
-
-```rust
-// dispatcher.rs — after line 180 (Ok(output) match arm)
-Ok(output) => {
-    // Record the match for staleness tracking
-    if let Some(store) = self.store() {
-        let normalized = crate::agent::reflex::normalize_pattern(&message.content);
-        if let Err(e) = store.bump_reflex_pattern_match(&message.user_id, &normalized).await {
-            tracing::debug!("Failed to bump reflex pattern match: {}", e);
-        }
-    }
-    return Ok(AgenticLoopResult::Response(output));
-}
-```
-
-**Note:** Use `debug!` not `warn!` for the error case — this is telemetry, not a user-facing failure. The reflex still succeeded.
+Distinct pending and in-flight keys share a hard cap of 4,096. Failed or cancelled flushes merge their deltas back into the accumulator, and retries use exponential backoff capped at 60 seconds. Graceful shutdown requests one final flush with a two-second bound. A crash may lose only the most recent telemetry window; reflex routing correctness is unaffected.
 
 **Verification:**
-- Existing test `test_reflex_store_bump_match` covers the DB method
-- Add integration test: route a message → verify `match_count` incremented and `last_matched_at` updated in DB
+- Unit tests cover coalescing, hard-cap enforcement across in-flight batches, cancellation-safe requeue, and capped backoff.
+- libSQL integration coverage verifies empty batches, duplicate keys, additive counts, timestamps, periodic batching, and bounded final flush.
+- The dispatcher request path contains no database await or task spawn for match telemetry.
 
 ### 1c. Spawn ReflexEvictor
 
@@ -277,19 +254,20 @@ impl ReflexRouter {
 
 Or refactor constants into the struct and use `FuzzyConfig::default()` in `ReflexRouter::new()`.
 
-### 3b. Add Missing `ReflexConfig` Options
+### 3b. Add `ReflexConfig` Options — Completed
 
-**Problem:** `ReflexConfig` (`config/agent.rs:44-55`) is missing several options that the code supports:
+The implemented environment-backed options are:
 
-| Missing Option | Current Value | Env Var |
+| Option | Default | Env Var |
 |---|---|---|
-| `fuzzy_threshold` | Hardcoded 0.85 | `REFLEX_FUZZY_THRESHOLD` |
-| `semantic_threshold` | Hardcoded 0.75 | `REFLEX_SEMANTIC_THRESHOLD` |
-| `eviction_check_interval` | Hardcoded 24h | `REFLEX_EVICTION_INTERVAL_SECS` |
-| `eviction_stale_days` | Hardcoded 30 | `REFLEX_EVICTION_STALE_DAYS` |
-| `max_patterns_per_user` | Not implemented (proposal says 50) | `REFLEX_MAX_PATTERNS_PER_USER` |
+| `fuzzy_threshold` | 0.85 | `REFLEX_FUZZY_THRESHOLD` |
+| `semantic_enabled` | `false` | `REFLEX_SEMANTIC_ENABLED` |
+| `semantic_threshold` | 0.75 | `REFLEX_SEMANTIC_THRESHOLD` |
+| `eviction_check_interval` | 24h | `REFLEX_EVICTION_INTERVAL_SECS` |
+| `eviction_stale_days` | 30 | `REFLEX_EVICTION_STALE_DAYS` |
+| `max_patterns_per_user` | 50 | `REFLEX_MAX_PATTERNS_PER_USER` |
 
-**Fix:** Add fields to `ReflexConfig`, parse from env vars in `config/agent.rs:163-171`, thread through to router and evictor construction.
+These values are parsed in `config/agent.rs` and threaded into router, compiler, and evictor construction. Semantic enablement is intentionally separate from its similarity threshold.
 
 ### 3c. Fix PG Prune Re-Query Missing Embedding Columns
 
@@ -537,8 +515,9 @@ cd ic && taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples --al
 
 | Risk | Mitigation |
 |------|------------|
-| Embedding provider attachment changes router behavior | Tier 3 only activates when provider exists; existing tiers unaffected |
-| `bump_reflex_pattern_match` adds latency to hot path | Single indexed UPDATE; ~1ms on PG; fire-and-forget with debug logging |
+| Embedding provider attachment changes router behavior | Tier 3 requires the separate default-off semantic switch and a non-empty local vector cache before provider I/O |
+| Match telemetry adds latency or row-lock contention | Request path only merges into a bounded map; one worker performs additive backend batches every three seconds |
+| Failed telemetry flush loses counts | Cancellation-safe batch guard requeues deltas; retries back off exponentially; shutdown attempts one bounded final flush |
 | Multi-tenant refactor breaks single-user deployments | Default user_id remains `"default"`; multi-user is opt-in |
 | Builder serde fix changes LLM parsing behavior | Aliases are additive; existing `"type_script"` still works |
 | Template rewrite (FFI → WIT) breaks existing generated tools | Templates are unused in production build loop; no existing tools depend on them |
@@ -551,8 +530,12 @@ cd ic && taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples --al
 ### Phase 1
 | File | Change |
 |------|--------|
-| `ic/src/agent/agent_loop.rs` | Wire embedding provider to router; spawn evictor |
-| `ic/src/agent/dispatcher.rs` | Add `bump_reflex_pattern_match()` after successful route |
+| `ic/src/agent/agent_loop.rs` | Wire semantic opt-in, own the hit accumulator worker, spawn evictor, and perform bounded final flush |
+| `ic/src/agent/dispatcher.rs` | Record canonical successful-route hits without awaiting the database |
+| `ic/src/agent/reflex.rs` | Check vector cache before provider I/O; add bounded accumulator, retry backoff, and worker lifecycle |
+| `ic/src/db/mod.rs` | Add mandatory additive `bump_reflex_pattern_matches()` contract and `ReflexPatternHit` |
+| `ic/src/db/postgres.rs` | Batch unique pattern deltas with one `UNNEST` update |
+| `ic/src/db/libsql/reflex.rs` | Batch unique pattern deltas with one prepared transaction |
 
 ### Phase 2
 | File | Change |
@@ -590,9 +573,9 @@ cd ic && taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples --al
 
 The reflex compiler upgrade is complete when:
 
-1. ✅ `REFLEX_COMPILER_ENABLED=true` produces a fully functional system
-2. ✅ All three matching tiers activate in production (exact, fuzzy, semantic)
-3. ✅ Match counts and staleness tracking update correctly during routing
+1. ✅ `REFLEX_COMPILER_ENABLED=true` activates exact/fuzzy reflex routing and lifecycle tasks
+2. ✅ Semantic routing activates only with the separate `REFLEX_SEMANTIC_ENABLED=true` opt-in
+3. ✅ Match counts and staleness tracking update through bounded additive write-behind batches
 4. ✅ Stale patterns are automatically evicted by the background evictor
 5. ✅ Multi-user deployments compile and route patterns per-user
 6. ✅ Failed compilations are tracked and capped at 3 attempts

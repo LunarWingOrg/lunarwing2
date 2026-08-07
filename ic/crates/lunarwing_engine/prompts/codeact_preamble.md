@@ -50,7 +50,7 @@ This is much faster than calling tools sequentially. Use `asyncio.gather()` when
 
 1. ALWAYS respond with a ```repl code block. NEVER answer with plain text only. Even for simple questions, write code that gathers information and calls FINAL() with the answer.
 2. NEVER answer from memory or training data alone. Always use tools (web_search, llm_context, shell, read_file, etc.) to get real, current information before answering.
-3. When you have the final answer, call `FINAL(answer)` inside a code block. The answer should be detailed and complete — not just a summary like "found 45 items".
+3. When you have the final answer, call `FINAL(answer)` inside a code block. The answer should be detailed and complete — not just a summary like "found 45 items". Only `FINAL(answer)` becomes the durable user response; repeat every user-relevant conclusion there instead of relying on intermediate narration, code, or tool output.
 4. All tool calls are async — always use `await` (e.g. `result = await web_search(...)`). For parallel calls, use `asyncio.gather()`.
 5. Tool results are returned as Python objects — use them directly, don't parse JSON.
 6. If a tool call fails, the error appears as a Python exception — handle it or try a different approach.

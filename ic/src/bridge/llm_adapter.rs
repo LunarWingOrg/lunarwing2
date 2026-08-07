@@ -5,8 +5,8 @@ use std::sync::Arc;
 use base64::Engine;
 use futures::StreamExt;
 use lunarwing_engine::{
-    ActionDef, EngineError, LlmBackend, LlmCallConfig, LlmOutput, LlmResponse, ThreadMessage,
-    TokenUsage, TransientContentPart,
+    ActionDef, EngineError, LlmBackend, LlmCallConfig, LlmOutput, LlmResponse, ModelFailureKind,
+    ThreadMessage, TokenUsage, TransientContentPart,
 };
 
 use crate::llm::{
@@ -79,8 +79,41 @@ fn build_request(
 }
 
 fn map_provider_error(error: LlmError) -> EngineError {
+    let kind = classify_provider_error(&error);
     EngineError::Llm {
+        kind,
         reason: error.to_string(),
+    }
+}
+
+fn classify_provider_error(error: &LlmError) -> ModelFailureKind {
+    match error {
+        LlmError::RateLimited { .. } => ModelFailureKind::RateLimited,
+        LlmError::InvalidResponse { .. } | LlmError::Json(_) => ModelFailureKind::InvalidOutput,
+        LlmError::ContextLengthExceeded { .. } => ModelFailureKind::ContextOverflow,
+        LlmError::ModelNotAvailable { .. } => ModelFailureKind::Unavailable,
+        LlmError::AuthFailed { .. } | LlmError::SessionExpired { .. } => {
+            ModelFailureKind::Authentication
+        }
+        LlmError::SessionRenewalFailed { .. } => ModelFailureKind::Transient,
+        LlmError::RequestFailed { reason, .. }
+            if crate::llm::retry::is_oversized_request(reason) =>
+        {
+            ModelFailureKind::ContextOverflow
+        }
+        LlmError::RequestFailed { .. } | LlmError::Io(_) => ModelFailureKind::Transient,
+        LlmError::Http(error) => match error.status() {
+            Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN) => {
+                ModelFailureKind::Authentication
+            }
+            Some(reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE) => {
+                ModelFailureKind::Unavailable
+            }
+            Some(reqwest::StatusCode::PAYLOAD_TOO_LARGE) => ModelFailureKind::ContextOverflow,
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS) => ModelFailureKind::RateLimited,
+            Some(status) if status.is_client_error() => ModelFailureKind::RequestRejected,
+            Some(_) | None => ModelFailureKind::Transient,
+        },
     }
 }
 
@@ -485,7 +518,13 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(matches!(error, EngineError::Llm { reason } if reason.contains("setup failed")));
+        assert!(matches!(
+            error,
+            EngineError::Llm {
+                kind: ModelFailureKind::Transient,
+                reason,
+            } if reason.contains("setup failed")
+        ));
     }
 
     #[tokio::test]
@@ -508,8 +547,49 @@ mod tests {
 
         assert!(matches!(
             items.first(),
-            Some(Err(EngineError::Llm { reason })) if reason.contains("item failed")
+            Some(Err(EngineError::Llm {
+                kind: ModelFailureKind::Transient,
+                reason,
+            })) if reason.contains("item failed")
         ));
+    }
+
+    #[test]
+    fn provider_errors_map_to_safe_recovery_classes() {
+        assert_eq!(
+            classify_provider_error(&LlmError::RateLimited {
+                provider: "test".into(),
+                retry_after: None,
+            }),
+            ModelFailureKind::RateLimited
+        );
+        assert_eq!(
+            classify_provider_error(&LlmError::ContextLengthExceeded {
+                used: 200,
+                limit: 100,
+            }),
+            ModelFailureKind::ContextOverflow
+        );
+        assert_eq!(
+            classify_provider_error(&LlmError::RequestFailed {
+                provider: "test".into(),
+                reason: "maximum context length exceeded".into(),
+            }),
+            ModelFailureKind::ContextOverflow
+        );
+        assert_eq!(
+            classify_provider_error(&LlmError::AuthFailed {
+                provider: "test".into(),
+            }),
+            ModelFailureKind::Authentication
+        );
+        assert_eq!(
+            classify_provider_error(&LlmError::SessionRenewalFailed {
+                provider: "test".into(),
+                reason: "temporary outage".into(),
+            }),
+            ModelFailureKind::Transient
+        );
     }
 
     #[derive(Default)]

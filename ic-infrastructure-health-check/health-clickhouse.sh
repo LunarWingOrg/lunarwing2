@@ -22,14 +22,16 @@ issues=()
 
 # Check query response time
 check_query_time() {
-    local start=$(date +%s%N)
+    local start
+    start=$(date +%s%N)
     
     # Simple query to test responsiveness
     if command -v clickhouse-client &>/dev/null; then
         clickhouse-client -q "SELECT 1" &>/dev/null 2>&1 || true
     fi
     
-    local end=$(date +%s%N)
+    local end
+    end=$(date +%s%N)
     local elapsed=$(( (end - start) / 1000000 ))  # Convert to ms
     
     echo $elapsed

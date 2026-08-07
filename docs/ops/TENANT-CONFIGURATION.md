@@ -9,18 +9,24 @@ Each tenant's configuration lives under their home directory:
 ```
 /home/<tenant>/lunarwing/
 ├── env/
-│   ├── lunarwing.env       # Main daemon environment (LLM, DB, XMPP, gateway, WASM)
+│   ├── lunarwing.env       # Main daemon and worker settings (mode 0600)
+│   ├── pg.secret           # Stable PostgreSQL password (mode 0600)
 │   ├── xmpp-bridge.env     # XMPP bridge service environment
-│   ├── proxy.env           # TensorZero proxy environment
-│   ├── weechat.env         # WeeChat relay credential only (RELAY_PASSWORD, mode 0600)
+│   ├── weechat.env         # WeeChat relay credential only (mode 0600)
+│   ├── vision.env          # LunarVision sidecar environment
+│   ├── proxy.env           # Present only when --enable-proxy is selected
+│   ├── darkirc-adapter.env # Present only when --enable-darkirc is selected
+│   ├── pebble.env          # Present after configure-pebble
 │   └── gotify.json         # Gotify notification settings (optional)
 ├── state/
 │   ├── config.toml         # Daemon settings (auto-seeded on first start)
 │   ├── workspace-template/ # Identity files (SOUL.md, IDENTITY.md, etc.)
 │   ├── tools/              # Installed WASM tools
 │   ├── channels/           # Installed WASM channels
+│   ├── darkirc/            # DarkIRC state when enabled
 │   └── xmpp/               # OMEMO key store
-├── logs/                   # Service log output
+├── logs/                   # OpenRC service log output
+├── run/                    # Runtime sockets and PID files
 └── ic/                     # Repo clone (source + build artifacts)
 ```
 
@@ -30,7 +36,7 @@ After changing any env file, restart the affected service for changes to take ef
 
 ## LLM Provider Configuration
 
-The LLM backend is configured in `env/lunarwing.env`. By default, tenants route through a per-tenant TensorZero proxy, but you can point directly at any OpenAI-compatible endpoint.
+The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorZero proxy is opt-in; without `--enable-proxy`, provisioning points `LLM_BASE_URL` directly at `LUNARWING_MT_TENSORZERO_URL` (or an explicit `--llm-base-url`).
 
 ### Setting your API key
 
@@ -44,17 +50,19 @@ If using TensorZero as a proxy, the key is passed through to the upstream provid
 
 ### Switching LLM backends
 
-The default setup routes through a local TensorZero proxy:
+The default setup connects directly to the configured upstream TensorZero URL:
 
 ```bash
 LLM_BACKEND=openai_compatible
-LLM_BASE_URL=http://127.0.0.1:<proxy_port>/v1
+LLM_BASE_URL=http://192.168.1.157:3000/openai/v1
 LLM_MODEL=tensorzero::function_name::lunarwing
 ```
 
-> `LLM_BASE_URL` can be set at provisioning time with `add-tenant --llm-base-url <url>` (or
-> fleet-wide via `LUNARWING_MT_LLM_BASE_URL`) instead of hand-editing it here — useful for
-> pointing tenants straight at a gateway or upstream endpoint as the proxy is phased out.
+Set the upstream with `LUNARWING_MT_TENSORZERO_URL`, or set `LLM_BASE_URL`
+directly at provisioning time with `add-tenant --llm-base-url <url>` (fleet-wide:
+`LUNARWING_MT_LLM_BASE_URL`). When `--enable-proxy` is selected and no explicit
+LLM base URL is supplied, mt-admin instead writes
+`http://127.0.0.1:<proxy_port>/v1`.
 
 To point directly at OpenAI (bypassing TensorZero):
 
@@ -92,7 +100,11 @@ LLM_MODEL=your-model-name
 
 ### TensorZero proxy configuration
 
-Each tenant has a TensorZero proxy configured in `env/proxy.env`:
+The proxy is disabled by default. Provision it with
+`add-tenant <name> --enable-proxy` (the command is idempotent for an existing
+tenant). mt-admin then
+creates `env/proxy.env`, renders the init-specific proxy unit, and defaults the
+daemon to that loopback endpoint:
 
 ```bash
 PROXY_PORT=<allocated_port>
@@ -100,7 +112,9 @@ PROXY_BIND=127.0.0.1
 TENSORZERO_URL=http://192.168.1.157:3000/openai/v1
 ```
 
-`TENSORZERO_URL` is the upstream TensorZero instance that the per-tenant proxy forwards to. Change this if your TensorZero server is at a different address.
+`TENSORZERO_URL` is the upstream instance that the per-tenant proxy forwards to.
+Change it through `--tensorzero-url` or `LUNARWING_MT_TENSORZERO_URL`, then
+re-render/restart the tenant as appropriate.
 
 ## XMPP Configuration
 
@@ -147,6 +161,25 @@ XMPP_ALLOW_PLAINTEXT_FALLBACK=true      # Set to false to require encryption
 ```
 
 The XMPP bridge has its own env file (`xmpp-bridge.env`) that mirrors the JID, password, and bridge token. Both files must agree on `XMPP_BRIDGE_TOKEN`.
+
+## Multi-Agent Coordination
+
+Tenant provisioning writes coordination defaults to `env/lunarwing.env`:
+
+```bash
+COORD_ENABLED=false
+COORD_AGENT_ID=<tenant-name>
+COORD_CHANNELS=
+COORD_ADMIN_TOKEN=<generated-secret>
+COORD_ADMIN_PORT=<allocated-port>
+```
+
+Set `COORD_CHANNELS` to exact room JIDs, then set `COORD_ENABLED=true` and
+restart tenant. `add-tenant` preserves existing coordination values and token;
+`patch-env <tenant>` backfills missing keys without rotating or printing token.
+Agent IDs must be 1–128 ASCII characters using letters, digits, `@.-_/:+~`.
+Transient XMPP thinking, tool, and reasoning statuses are suppressed in those
+rooms by default. Set `COORD_XMPP_STATUS_UPDATES=true` only to show them.
 
 ## Gateway (Web UI)
 
@@ -244,7 +277,13 @@ CLI_ENABLED=false                        # Disable interactive CLI (daemon mode)
 HEARTBEAT_ENABLED=false                  # Disable periodic background execution
 ONBOARD_COMPLETED=true                   # Skip setup wizard
 RUST_LOG=lunarwing=info                  # Log verbosity
+LUNARWING_TOKIO_WORKER_THREADS=8         # Optional; default is min(host CPUs, 8)
+LUNARWING_TOKIO_MAX_BLOCKING_THREADS=4   # Optional; default is min(host CPUs, 4)
 ```
+
+Tokio's worker and blocking-pool caps keep idle memory stable on large hosts.
+Increase them only after measuring sustained runtime saturation; they do not
+limit Cargo or other subprocess parallelism.
 
 ### Enabling heartbeat
 
@@ -322,7 +361,7 @@ sudo lunarwing-mt-admin.sh restart-worker <tenant> opencode
 sudo lunarwing-mt-admin.sh kill-worker <tenant> opencode
 ```
 
-The same commands accept `nanocode` and `pebble`. Running `podman stop` as root
+The same commands accept `pebble` and `kimi`. Running `podman stop` as root
 targets root's unrelated store and runtime directory (`/run/user/0/libpod`), not
 the tenant container. Do not use raw root Podman for tenant workers.
 
@@ -346,9 +385,9 @@ lunarwing-proxy-<tenant>.service            # TensorZero proxy
 lunarwing-weechat-<tenant>.service          # weechat backend
 lunarwing-weechat-adapter-<tenant>.service  # weechat WS adapter
 lunarwing-pg-<tenant>.service               # Postgres (rootless Quadlet)
-lunarwing-nanocode-<tenant>.service         # nanocode worker (rootless Quadlet)
 lunarwing-pebble-<tenant>.service           # pebble worker (rootless Quadlet)
 lunarwing-opencode-<tenant>.service         # opencode worker (rootless Quadlet)
+lunarwing-kimi-<tenant>.service             # Kimi Code worker (rootless Quadlet)
 ```
 
 There is no per-tenant `.target`; restart units individually, or use
@@ -365,7 +404,7 @@ sudo rc-service lunarwing-proxy-<tenant> restart            # TensorZero proxy
 sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
-# workers (if provisioned): lunarwing-nanocode-<tenant>, lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>
+# workers (if provisioned): lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>, lunarwing-kimi-<tenant>
 # each worker also has a <unit>-sup babysitter; stop it before stopping a container manually
 ```
 
@@ -405,10 +444,34 @@ These environment variables change the defaults used by `lunarwing-mt-admin.sh` 
 | `LUNARWING_MT_GOTIFY_TITLE` | (empty) | Default Gotify notification title |
 | `LUNARWING_MT_SOURCE_REPO` | (auto-detected) | Source repo to clone from |
 | `LUNARWING_MT_PROFILE` | `release` | Cargo build profile |
+| `LUNARWING_MT_WORKLOAD_SLICE` | `lunarwing-workloads.slice` | Slice for agent-spawned shell/compile scopes (BUG-005) |
+| `LUNARWING_MT_WORKLOAD_MEMORY_HIGH` | `6G` | Workload slice throttling threshold |
+| `LUNARWING_MT_WORKLOAD_MEMORY_MAX` | `8G` | Workload slice hard memory cap |
+| `LUNARWING_MT_WORKLOAD_CPU_QUOTA` | `800%` | Workload slice CPU quota |
+| `LUNARWING_MT_WORKLOAD_TASKS_MAX` | `2048` | Workload slice task cap |
+| `LUNARWING_MT_BUILD_SLICE` | `lunarwing-build.slice` | Slice for operator-driven `build_tenant` cargo scopes |
+| `LUNARWING_MT_BUILD_JOBS` | `$(nproc)` | Explicit `-j` passed to tenant cargo builds |
+| `LUNARWING_MT_BUILD_MEMORY_HIGH` | `16G` | Build scope throttling threshold |
+| `LUNARWING_MT_BUILD_MEMORY_MAX` | `24G` | Build scope hard memory cap |
+| `LUNARWING_MT_DAEMON_MEMORY_HIGH` | `1536M` | Daemon unit throttling threshold |
+| `LUNARWING_MT_DAEMON_MEMORY_MAX` | `2G` | Daemon unit hard memory cap |
+| `LUNARWING_MT_DAEMON_TASKS_MAX` | `512` | Daemon unit task cap |
+
+The workload/daemon caps exist so agent-spawned compiles are accounted and
+bounded separately from the daemon (BUG-005). The daemon additionally reads
+`LUNARWING_WORKLOAD_ISOLATION` (`auto`|`none`), `LUNARWING_WORKLOAD_SLICE`,
+and `LUNARWING_WORKLOAD_MEMORY_MAX` from its own environment to control
+transient-scope spawning (see `ic/src/tools/process.rs`).
 
 ### Port allocation
 
-Each tenant gets a 10-port block from `/etc/lunarwing/ports.json` (range 10000-19999), plus a mirrored extended block in 20000-29999 (`extended_base = base_port + 10000`) holding worker health, DarkIRC, and vision sidecar ports:
+Each tenant gets a 10-port primary block from `/etc/lunarwing/ports.json`
+(range 10000-19999), a mirrored 10-port extended block in 20000-29999
+(`extended_base = base_port + 10000`), and a two-port Kimi block in
+30000-39999 (`kimi_base = base_port + 20000`). The current registry schema is
+v14. Schema v14 also gives every DarkIRC-enabled tenant a unique, stable,
+non-secret `darkirc_scope_id`; mt-admin creates or migrates that identity and
+rejects invalid or duplicate values.
 
 Primary block:
 
@@ -421,15 +484,28 @@ Primary block:
 | +4 | TensorZero proxy |
 | +5 | WeeChat |
 | +6 | Orchestrator |
-| +7 | Nanocode WSS |
+| +7 | Reserved legacy Nanocode WSS slot |
 | +8 | Pebble WSS |
 | +9 | WeeChat adapter |
 
-Extended block (registry v6+; opencode_wss/health added in v11):
+Extended block:
 
 | Offset | Service |
 |--------|---------|
-| ebase+3 | nanocode_health |
-| ebase+4 | pebble_health |
-| ebase+7 | opencode_wss |
-| ebase+8 | opencode_health |
+| ebase+0 | DarkIRC adapter |
+| ebase+1 | DarkIRC IRC |
+| ebase+2 | DarkIRC RPC |
+| ebase+3 | Reserved legacy Nanocode health slot |
+| ebase+4 | Pebble health |
+| ebase+5 | LunarVision service |
+| ebase+6 | LunarVision health |
+| ebase+7 | OpenCode WSS |
+| ebase+8 | OpenCode health |
+| ebase+9 | Coordination admin API |
+
+Kimi block:
+
+| Offset | Service |
+|--------|---------|
+| kbase+0 | Kimi WSS |
+| kbase+1 | Kimi health |
