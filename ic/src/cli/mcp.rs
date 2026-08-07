@@ -1644,6 +1644,113 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_mcp_pin_unpin_revoke_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "pin",
+            "local-files",
+            "--package",
+            "@example/local-files-mcp",
+            "--ecosystem",
+            "npm",
+            "--version",
+            "1.4.0",
+            "--publisher",
+            "example",
+        ])
+        .expect("parse pin flags");
+        match parsed.cmd {
+            McpCommand::Pin {
+                name,
+                package,
+                ecosystem,
+                version,
+                publisher,
+                ..
+            } => {
+                assert_eq!(name, "local-files");
+                assert_eq!(package.as_deref(), Some("@example/local-files-mcp"));
+                assert_eq!(ecosystem, "npm");
+                assert_eq!(version.as_deref(), Some("1.4.0"));
+                assert_eq!(publisher.as_deref(), Some("example"));
+            }
+            other => panic!("expected pin command, got {other:?}"),
+        }
+
+        let parsed =
+            TestCli::try_parse_from(["test", "unpin", "local-files"]).expect("parse unpin");
+        match parsed.cmd {
+            McpCommand::Unpin { name } => assert_eq!(name, "local-files"),
+            other => panic!("expected unpin command, got {other:?}"),
+        }
+
+        let parsed = TestCli::try_parse_from(["test", "revoke", "local-files", "--offline"])
+            .expect("parse revoke");
+        match parsed.cmd {
+            McpCommand::Revoke { name, offline, .. } => {
+                assert_eq!(name, "local-files");
+                assert!(offline);
+            }
+            other => panic!("expected revoke command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_update_retains_provenance_for_stdio() {
+        let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+            .expect("pin cat");
+        let existing = McpServerConfig::new_stdio("local-files", "cat", vec![], HashMap::new())
+            .with_provenance(pinned);
+
+        let args = McpUpdateArgs {
+            name: "local-files".to_string(),
+            url: None,
+            transport: None,
+            command: None,
+            cmd_args: None,
+            env: None,
+            secret_env: None,
+        };
+        let updated = build_update_config(&args, &existing).expect("build update config");
+        let provenance = updated.provenance.expect("provenance retained");
+        assert_eq!(provenance.trust, PackageTrust::Pinned);
+        assert!(provenance.command_sha256.is_some());
+    }
+
+    #[test]
+    fn test_build_update_drops_digest_when_leaving_stdio() {
+        let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+            .expect("pin cat");
+        let existing = McpServerConfig::new_stdio("local-files", "cat", vec![], HashMap::new())
+            .with_provenance(pinned);
+
+        let args = McpUpdateArgs {
+            name: "local-files".to_string(),
+            url: Some("https://mcp.example.com".to_string()),
+            transport: Some("http".to_string()),
+            command: None,
+            cmd_args: None,
+            env: None,
+            secret_env: None,
+        };
+        let updated = build_update_config(&args, &existing).expect("build update config");
+        updated
+            .validate()
+            .expect("demoted record validates for http");
+        let provenance = updated.provenance.as_ref().expect("identity retained");
+        assert_eq!(provenance.trust, PackageTrust::Unverified);
+        assert!(provenance.command_sha256.is_none());
+    }
+
     #[tokio::test]
     async fn test_apply_live_mcp_toggle_calls_authenticated_gateway() {
         use axum::extract::Path as AxumPath;

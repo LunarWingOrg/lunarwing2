@@ -230,13 +230,13 @@ impl McpPackageProvenance {
                 });
             }
         }
-        if let Some(resolved) = &self.resolved_command {
-            if resolved.is_empty() || resolved.contains('\0') {
-                return Err(ConfigError::InvalidConfig {
-                    reason: "provenance resolved_command cannot be empty or contain NUL bytes"
-                        .to_string(),
-                });
-            }
+        if let Some(resolved) = &self.resolved_command
+            && (resolved.is_empty() || resolved.contains('\0'))
+        {
+            return Err(ConfigError::InvalidConfig {
+                reason: "provenance resolved_command cannot be empty or contain NUL bytes"
+                    .to_string(),
+            });
         }
         if self.trust == PackageTrust::Pinned && self.command_sha256.is_none() {
             return Err(ConfigError::InvalidConfig {
