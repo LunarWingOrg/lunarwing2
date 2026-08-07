@@ -7915,6 +7915,7 @@ description="WeeChat IRC client ($name)"
 command="\${weechat_openrc_env_exec}"
 command_args="--env-file \${weechat_env_file} -- \${weechat_command} -L weechat-${name} new-session -d -s weechat '\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}'"
 command_user="\${weechat_user}:\${weechat_group}"
+pidfile="\${weechat_pidfile}"
 required_files="\${weechat_openrc_env_exec} \${weechat_command} \${weechat_binary} \${weechat_start_helper} \${weechat_env_file}"
 
 depend() {
@@ -7933,7 +7934,43 @@ start() {
         --env-file "\${weechat_env_file}" -- "\${weechat_command}" \\
         -L weechat-${name} new-session -d -s weechat \
         "\${weechat_start_helper} --weechat-bin \${weechat_binary} --weechat-home \${weechat_home}"
-    eend \$?
+    start_rc=\$?
+    if [ "\${start_rc}" -eq 0 ]; then
+        # tmux new-session -d returns immediately and the real work runs in the
+        # detached tmux server, leaving OpenRC with no process to track (which
+        # surfaces as "status: crashed"). Record the tmux server PID so the
+        # pidfile, status, and health checks see the real process.
+        tmux_pid=""
+        i=0
+        while [ "\$i" -lt 50 ]; do
+            tmux_pid="\$(start-stop-daemon --start \\
+                --chuid "\${weechat_user}:\${weechat_group}" \\
+                --exec "\${weechat_command}" -- \\
+                -L "weechat-${name}" display-message -p '#{pid}' 2>/dev/null)"
+            [ -n "\$tmux_pid" ] && break
+            i=\$((i + 1))
+            sleep 0.1
+        done
+        if [ -n "\$tmux_pid" ]; then
+            printf '%s\n' "\$tmux_pid" >"\${weechat_pidfile}"
+            chown "\${weechat_user}:\${weechat_group}" "\${weechat_pidfile}" 2>/dev/null || true
+        fi
+    fi
+    eend "\${start_rc}"
+}
+
+status() {
+    # Probe the real tmux session instead of only the OpenRC state file, so a
+    # live session never reports as crashed.
+    if start-stop-daemon --start \\
+        --chuid "\${weechat_user}:\${weechat_group}" \\
+        --exec "\${weechat_command}" -- \\
+        -L "weechat-${name}" has-session -t weechat 2>/dev/null; then
+        einfo "WeeChat ($name) session is up"
+        return 0
+    fi
+    einfo "WeeChat ($name) session is not running"
+    return 1
 }
 
 stop() {
@@ -7965,6 +8002,7 @@ stop() {
         ) >/dev/null 2>&1
         stop_rc=\$?
     fi
+    [ "\${stop_rc}" -eq 0 ] && rm -f "\${weechat_pidfile}"
     eend "\${stop_rc}"
     return "\${stop_rc}"
 }
