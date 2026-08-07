@@ -2657,6 +2657,7 @@ install_darkirc_key_helper() {
   # to break the link (same bytes, fresh inode) before checking ownership.
   local unlinked="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/.lunarwing-darkirc-key-helper.unlinked"
   cp -f "$artifact" "$unlinked" && mv -f "$unlinked" "$artifact"
+  chown "$DARKIRC_BUILD_USER:$DARKIRC_BUILD_GROUP" "$artifact"
   darkirc_validate_build_artifact "$artifact" \
     || die "DarkIRC key helper artifact failed ownership validation"
   DARKIRC_HELPER_ARTIFACT="$artifact"
