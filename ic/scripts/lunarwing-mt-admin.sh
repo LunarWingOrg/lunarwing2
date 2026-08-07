@@ -2652,6 +2652,11 @@ install_darkirc_key_helper() {
     || die "DarkIRC helper build changed trusted LunarWing checkout"
   rm -rf -- "$cargo_home"
   artifact="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/lunarwing-darkirc-key-helper"
+  # Cargo hard-links release/<bin> to deps/<bin>-<hash> on capable filesystems,
+  # so the artifact would have st_nlink=2 and fail validation. Copy over itself
+  # to break the link (same bytes, fresh inode) before checking ownership.
+  local unlinked="$DARKIRC_KEY_HELPER_BUILD_ROOT/release/.lunarwing-darkirc-key-helper.unlinked"
+  cp -f "$artifact" "$unlinked" && mv -f "$unlinked" "$artifact"
   darkirc_validate_build_artifact "$artifact" \
     || die "DarkIRC key helper artifact failed ownership validation"
   DARKIRC_HELPER_ARTIFACT="$artifact"
