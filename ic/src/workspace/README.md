@@ -123,6 +123,25 @@ Scopes: reads span the caller's private scope plus the shared herd scope
 `scope=all|private|shared`. Writes default to the private scope;
 `scope=shared` publishes herd knowledge.
 
+### Lifecycle (Phase 2)
+
+- **Provenance** — every submitted note records `submitted_by` (the real
+  caller scope) and `session_id` (conversation/job) from the job context, in
+  addition to the self-declared `agent` slug, so shared notes keep
+  attribution. Legacy notes without these fields still parse.
+- **Stale sweep** (`knowledge_sweep`) — a cadence-guarded background pass
+  (heartbeat-driven, same pattern as memory hygiene) marks `active` notes
+  `stale` once `studied_at` (falling back to the document update time) is
+  older than `KNOWLEDGE_STALE_AFTER_DAYS` (default 30). Cadence:
+  `KNOWLEDGE_SWEEP_CADENCE_HOURS` (default 24); the shared herd scope is
+  swept too unless `KNOWLEDGE_SWEEP_INCLUDE_SHARED=false`; the whole sweep
+  can be disabled with `KNOWLEDGE_SWEEP_ENABLED=false`.
+- **Kawarimi migration** — notes are ordinary `memory_documents` rows, so
+  they travel with the tenant `pg_dump -Fc` → `pg_restore` bundle and the
+  owner-scope rekey (see `docs/ops/MT-MACHINE-MIGRATION.md`).
+- **Skill** — the bundled `study-notes` skill (v3) directs agents through
+  these native tools; the external study-notes MCP is no longer required.
+
 libSQL backend: implemented with FTS5 (`memory_chunks_fts`) and per-scope
 merge; note that FTS5 rank values are not comparable across scopes, so merged
 results carry descending ordinal ranks.

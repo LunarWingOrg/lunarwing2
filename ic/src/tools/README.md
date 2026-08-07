@@ -314,6 +314,14 @@ contracts exist.
 
 #### LunarWing Study Notes
 
+> **v2.0.6.0+:** the native `knowledge_*` built-in tools
+> (`knowledge_search`, `knowledge_get_topic`, `knowledge_submit_note`,
+> `knowledge_list_stale`, `knowledge_stats` — see
+> `src/workspace/README.md` § Study-Notes Knowledge Store) are the primary
+> study-notes path and need no external server. The bundled `study-notes`
+> skill (v3) uses them directly. The external lw2studymcp setup below remains
+> for backward compatibility with existing deployments.
+
 LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
 checkout as a managed stdio server. Read-only mode is default. Clone it at an
 absolute, stable path, verify its database, then set `LW2STUDYMCP_HOME`:
@@ -326,8 +334,8 @@ export LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
 
 Startup validates the canonical layout and creates or refreshes its managed
 `study_notes` config. Refresh preserves a disabled managed config. A user-owned
-config with the same name wins. A bundled trusted skill activates only when
-`LW2STUDYMCP_HOME` and `python3` are available.
+config with the same name wins. (Before v2.0.6.0 the bundled skill was gated on
+`LW2STUDYMCP_HOME`; the v3 skill uses the native tools and is always available.)
 
 Write mode requires mutable state separate from executable code and skill content:
 
