@@ -17,10 +17,10 @@
 4. [ ] work on this issue: [BUG-013] Secret leak warnings in logs (noisy but no functional impact) - last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 5. [ ] MCP part 2 work: host sandboxing (see docs for info)
 6. [ ] work on this issue: [BUG-013] Secret leak warnings in logs (noisy but no functional impact) - last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
-7. [ ] implement mcp part 2 work: general runtime adapters, MCP-over-WASM, and dedicated/shared gateway architecture (see docs for info)
+7. [ ] implement all remaining mcp part 2 work: general runtime adapters, MCP-over-WASM, and dedicated/shared gateway architecture (see docs for info)
 8. [ ] [BUG-016] WeeChat buffer restore — OpenRC root-vs-tenant context mismatch - work on this issue:[BUG-016] WeeChat buffer restore — OpenRC root-vs-tenant context mismatch  Consolidated from Sunburst's open bug list, last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 9. [ ] Research the following and make a new doc in ops with findings and next steps for this ( referencing docs/ops/35d44998cadf3e6d.md ): LunarHub / IronHub / Extension Marketplace — Future Direction - What they did: IronHub deep link installs, custom MCP server registration from WebUI with OpenAPI-derived tool discovery bounded by manifest tool budget. Extension lifecycle with CAS-protected mutations, hash-pinned manifests, soft-removal tombstones, restart repair. - What LunarWing needs first: 1 Binary distribution (the identified blocker) — proper packaged releases for LunarWing binaries, 2 Manifest registry — could be hosted on git.lunarwing.org, 3 Install flow with provenance verification — MCP provenance pinning already landing in 2.0.6.0 - Status: Pieces are being built. Marketplace is post-2.0.7.0 at earliest
-10. [ ]  research wasm functionality expansion n make new doc in doc/proposals
+10. [ ] Research wasm functionality expansion n make new doc in doc/proposals
 11. [ ] mcp part 2 work worker-local placement (see docs for info)
 12. [ ] fix cicd issues
 13. [ ] Review and make fixes to MCP part two implementation (see mcp documents first) - address any gaps or problems
@@ -34,6 +34,7 @@
 21. [ ] update README.md in repo root (if necessary)
 22. [ ] review first draft of release notes from prev step and update any inconsistencies
 23. [ ] update readme from prev step and update any inconsistencies
-24. [ ] check cicd of master for failures
+24. [ ] Run cargo update and lockfile reconciliation before tag
+25. [ ] check cicd of master for failures
 
 ---
