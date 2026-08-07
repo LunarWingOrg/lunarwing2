@@ -116,9 +116,9 @@ pub async fn execute_action_calls(
                 let error_result = ActionResult {
                     call_id: call.id.clone(),
                     action_name: call.action_name.clone(),
-                    output: serde_json::json!({"error": format!(
-                        "no active lease covers action '{}'", call.action_name
-                    )}),
+                    output: serde_json::json!({
+                        "error": super::capability_unavailable_message(&call.action_name)
+                    }),
                     is_error: true,
                     duration: std::time::Duration::ZERO,
                 };
@@ -162,7 +162,9 @@ pub async fn execute_action_calls(
                     let error_result = ActionResult {
                         call_id: call.id.clone(),
                         action_name: call.action_name.clone(),
-                        output: serde_json::json!({"error": format!("denied: {reason}")}),
+                        output: serde_json::json!({
+                            "error": super::policy_denied_message(&reason)
+                        }),
                         is_error: true,
                         duration: std::time::Duration::ZERO,
                     };

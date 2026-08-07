@@ -126,6 +126,7 @@ async fn completed_records_one_success_and_clears_ids() {
 async fn failed_records_one_failure_and_clears_ids() {
     assert_feedback_case(
         ThreadOutcome::Failed {
+            kind: crate::runtime::messaging::ThreadFailureKind::Unknown,
             error: "boom".into(),
         },
         true,

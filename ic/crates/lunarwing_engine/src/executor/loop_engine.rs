@@ -13,7 +13,7 @@ use tracing::debug;
 
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
-use crate::runtime::messaging::{SignalReceiver, ThreadOutcome};
+use crate::runtime::messaging::{SignalReceiver, ThreadFailureKind, ThreadOutcome};
 use crate::traits::effect::EffectExecutor;
 use crate::traits::llm::LlmBackend;
 use crate::types::error::EngineError;
@@ -432,6 +432,7 @@ impl ExecutionLoop {
                 self.persist_runtime_state(None, &mut persisted_event_count)
                     .await?;
                 Ok(ThreadOutcome::Failed {
+                    kind: ThreadFailureKind::Orchestrator,
                     error: format!("Orchestrator error: {e}"),
                 })
             }
@@ -515,13 +516,19 @@ mod tests {
 
     struct MockLlm {
         responses: Mutex<Vec<LlmOutput>>,
+        requests: Mutex<Vec<Vec<ThreadMessage>>>,
     }
 
     impl MockLlm {
         fn new(responses: Vec<LlmOutput>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<Vec<ThreadMessage>> {
+            self.requests.lock().unwrap().clone()
         }
     }
 
@@ -529,10 +536,11 @@ mod tests {
     impl LlmBackend for MockLlm {
         async fn complete(
             &self,
-            _messages: &[ThreadMessage],
+            messages: &[ThreadMessage],
             _actions: &[ActionDef],
             _config: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
                 Ok(LlmOutput {
@@ -546,6 +554,41 @@ mod tests {
 
         fn model_name(&self) -> &str {
             "mock"
+        }
+    }
+
+    struct ResultMockLlm {
+        responses: Mutex<Vec<Result<LlmOutput, EngineError>>>,
+        requests: Mutex<Vec<Vec<ThreadMessage>>>,
+    }
+
+    impl ResultMockLlm {
+        fn new(responses: Vec<Result<LlmOutput, EngineError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<Vec<ThreadMessage>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for ResultMockLlm {
+        async fn complete(
+            &self,
+            messages: &[ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            self.requests.lock().unwrap().push(messages.to_vec());
+            self.responses.lock().unwrap().remove(0)
+        }
+
+        fn model_name(&self) -> &str {
+            "result-mock"
         }
     }
 
@@ -575,6 +618,7 @@ mod tests {
         ) -> Result<LlmOutput, EngineError> {
             self.blocking_calls.fetch_add(1, Ordering::Relaxed);
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".to_string(),
             })
         }
@@ -594,6 +638,7 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .pop_front()
                 .ok_or_else(|| EngineError::Llm {
+                    kind: crate::types::error::ModelFailureKind::Internal,
                     reason: "no scripted engine stream remains".to_string(),
                 })?;
             Ok(futures::stream::iter(items).boxed())
@@ -984,6 +1029,7 @@ mod tests {
         let llm = Arc::new(StreamingMockLlm::new(vec![vec![
             Ok(LlmStreamChunk::TextDelta("partial".to_string())),
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
                 reason: "mid-stream failure".to_string(),
             }),
         ]]));
@@ -1104,20 +1150,175 @@ mod tests {
             ..ThreadConfig::default()
         };
 
-        let (mut exec, _tx) = make_loop(many_actions, many_results, config).await;
+        let llm = Arc::new(MockLlm::new(many_actions));
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), many_results, config).await;
 
         let outcome = exec.run().await.unwrap();
-        // The last iteration forces text mode, and MockLlm returns action_response
-        // which gets treated as the 3rd iteration, then on the 3rd iteration force_text
-        // is set. But MockLlm ignores force_text. So we get MaxIterations after 3 iterations.
-        // Actually, max_iterations=3, and force_text is set when iteration >= max-1 = 2,
-        // so iteration 2 (0-indexed) has force_text. The MockLlm still returns action calls,
-        // so we loop 3 times and exit.
+        assert!(matches!(outcome, ThreadOutcome::MaxIterations));
+        assert_eq!(exec.thread.step_count, 4);
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("final recovery iteration")
+        }));
+    }
+
+    #[tokio::test]
+    async fn transient_model_failure_gets_one_safe_recovery_request() {
+        let diagnostic = "upstream diagnostic with private provider details";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
         assert!(matches!(
             outcome,
-            ThreadOutcome::MaxIterations | ThreadOutcome::Completed { .. }
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
         ));
-        assert!(exec.thread.step_count <= 3);
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("provider temporarily failed")
+        }));
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains(diagnostic))
+        );
+    }
+
+    #[tokio::test]
+    async fn context_overflow_recovery_uses_bounded_plain_text_context() {
+        let diagnostic = "context limit diagnostic with provider internals";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: diagnostic.into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::User
+                && message.content.contains("Context was reduced")
+        }));
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("context overflowed")
+        }));
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains(diagnostic))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_model_failure_returns_typed_safe_failure() {
+        let diagnostic = "private provider failure body";
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: diagnostic.into(),
+            }),
+        ]));
+        let (mut exec, _tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::Transient
+                ),
+                error,
+            } if !error.contains(diagnostic) && error.contains("after retries")
+        ));
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_action_batches_get_one_warning_turn() {
+        let responses = (0..4)
+            .map(|index| action_response("test_tool", &format!("call_{index}")))
+            .collect();
+        let results = (0..4)
+            .map(|index| {
+                Ok(ActionResult {
+                    call_id: format!("call_{index}"),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"error": "failed"}),
+                    is_error: true,
+                    duration: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let llm = Arc::new(MockLlm::new(responses));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), results, ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::NoProgress,
+                ..
+            }
+        ));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("no progress")
+        }));
+    }
+
+    #[tokio::test]
+    async fn no_progress_warning_can_recover_with_final_text() {
+        let mut responses = (0..3)
+            .map(|index| action_response("test_tool", &format!("call_{index}")))
+            .collect::<Vec<_>>();
+        responses.push(text_response("changed approach"));
+        let results = (0..3)
+            .map(|index| {
+                Ok(ActionResult {
+                    call_id: format!("call_{index}"),
+                    action_name: "test_tool".into(),
+                    output: serde_json::json!({"error": "failed"}),
+                    is_error: true,
+                    duration: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let (mut exec, _tx) = make_loop(responses, results, ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "changed approach"
+        ));
     }
 
     #[tokio::test]
@@ -1968,6 +2169,7 @@ mod tests {
             _config: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }

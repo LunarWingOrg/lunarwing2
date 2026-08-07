@@ -104,10 +104,11 @@ fn thread_outcome_response(outcome: &ThreadOutcome) -> Option<String> {
     match outcome {
         ThreadOutcome::Completed { response } => response.clone(),
         ThreadOutcome::Stopped => Some(String::new()),
-        ThreadOutcome::MaxIterations => {
-            Some("Reached maximum iterations without completing.".into())
-        }
-        ThreadOutcome::Failed { error } => Some(format!("Error: {error}")),
+        ThreadOutcome::MaxIterations => Some(
+            "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
+                .into(),
+        ),
+        ThreadOutcome::Failed { error, .. } => Some(format!("Error: {error}")),
         ThreadOutcome::GatePaused { .. } => None,
     }
 }
@@ -7189,10 +7190,14 @@ mod tests {
         // delivery now that the direct SSE Response is gone.
         assert_eq!(
             thread_outcome_response(&ThreadOutcome::MaxIterations),
-            Some("Reached maximum iterations without completing.".into())
+            Some(
+                "Reached maximum iterations after a final recovery attempt. Retry with narrower scope or a higher iteration limit."
+                    .into()
+            )
         );
         assert_eq!(
             thread_outcome_response(&ThreadOutcome::Failed {
+                kind: lunarwing_engine::ThreadFailureKind::Unknown,
                 error: "boom".into()
             }),
             Some("Error: boom".into())
@@ -7239,6 +7244,7 @@ mod tests {
             _: &lunarwing_engine::LlmCallConfig,
         ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
             Err(lunarwing_engine::EngineError::Llm {
+                kind: lunarwing_engine::ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }

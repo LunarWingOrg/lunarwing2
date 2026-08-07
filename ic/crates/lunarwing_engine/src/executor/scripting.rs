@@ -1275,6 +1275,7 @@ async fn preflight_action(
     let lease = match leases.find_lease_for_action(thread.id, action_name).await {
         Some(l) => l,
         None => {
+            let model_message = super::capability_unavailable_message(action_name);
             events.push(EventKind::ActionFailed {
                 step_id: context.step_id,
                 action_name: action_name.into(),
@@ -1284,7 +1285,7 @@ async fn preflight_action(
             });
             return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
                 ExcType::RuntimeError,
-                Some(format!("no lease for action '{action_name}'")),
+                Some(model_message),
             )));
         }
     };
@@ -1312,7 +1313,7 @@ async fn preflight_action(
                 });
                 return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
                     ExcType::RuntimeError,
-                    Some(format!("denied: {reason}")),
+                    Some(super::policy_denied_message(&reason)),
                 )));
             }
             PolicyDecision::RequireApproval { .. } => {
@@ -1341,9 +1342,10 @@ async fn preflight_action(
     }
 
     if let Err(e) = leases.consume_use(lease.id).await {
+        debug!(action = action_name, error = %e, "capability lease unavailable");
         return PreflightResult::Denied(ExtFunctionResult::Error(MontyException::new(
             ExcType::RuntimeError,
-            Some(format!("lease exhausted: {e}")),
+            Some(super::capability_lease_unavailable_message(action_name)),
         )));
     }
 
@@ -1405,7 +1407,7 @@ async fn handle_llm_query(
         }
         Err(e) => ExtFunctionResult::Error(MontyException::new(
             ExcType::RuntimeError,
-            Some(format!("llm_query failed: {e}")),
+            Some(super::safe_model_failure_message("LLM sub-call", &e)),
         )),
     }
 }
@@ -1495,7 +1497,10 @@ async fn handle_llm_query_batched(
                 };
                 results.push(MontyObject::String(text));
             }
-            Err(e) => results.push(MontyObject::String(format!("Error: {e}"))),
+            Err(e) => results.push(MontyObject::String(super::safe_model_failure_message(
+                "LLM sub-call",
+                &e,
+            ))),
         }
     }
 
@@ -1643,7 +1648,7 @@ async fn handle_rlm_query(
                 crate::runtime::messaging::ThreadOutcome::Completed { response } => {
                     response.unwrap_or_default()
                 }
-                crate::runtime::messaging::ThreadOutcome::Failed { error } => {
+                crate::runtime::messaging::ThreadOutcome::Failed { error, .. } => {
                     format!("rlm_query child failed: {error}")
                 }
                 crate::runtime::messaging::ThreadOutcome::MaxIterations => {

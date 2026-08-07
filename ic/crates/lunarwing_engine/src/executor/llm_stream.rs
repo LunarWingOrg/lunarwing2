@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use futures::StreamExt;
 
 use crate::traits::llm::{LlmOutput, LlmStream, LlmStreamChunk};
-use crate::types::error::EngineError;
+use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::step::{ActionCall, LlmResponse, TokenUsage};
 
 #[derive(Default)]
@@ -140,6 +140,7 @@ fn merge_identity(
 
 fn llm_error(reason: impl Into<String>) -> EngineError {
     EngineError::Llm {
+        kind: ModelFailureKind::InvalidOutput,
         reason: reason.into(),
     }
 }
@@ -231,7 +232,7 @@ mod tests {
     async fn rejects_eof_before_done() {
         let (result, _) = collect(vec![Ok(LlmStreamChunk::TextDelta("partial".into()))]).await;
         assert!(
-            matches!(result, Err(EngineError::Llm { reason }) if reason.contains("before Done"))
+            matches!(result, Err(EngineError::Llm { reason, .. }) if reason.contains("before Done"))
         );
     }
 
@@ -243,7 +244,7 @@ mod tests {
         ])
         .await;
         assert!(
-            matches!(result, Err(EngineError::Llm { reason }) if reason.contains("after Done"))
+            matches!(result, Err(EngineError::Llm { reason, .. }) if reason.contains("after Done"))
         );
     }
 
@@ -260,7 +261,7 @@ mod tests {
         ])
         .await;
         assert!(
-            matches!(result, Err(EngineError::Llm { reason }) if reason.contains("after Done"))
+            matches!(result, Err(EngineError::Llm { reason, .. }) if reason.contains("after Done"))
         );
     }
 
@@ -268,7 +269,7 @@ mod tests {
     async fn rejects_second_done() {
         let (result, _) = collect(vec![done(None), done(None)]).await;
         assert!(
-            matches!(result, Err(EngineError::Llm { reason }) if reason.contains("after Done"))
+            matches!(result, Err(EngineError::Llm { reason, .. }) if reason.contains("after Done"))
         );
     }
 
@@ -277,12 +278,15 @@ mod tests {
         let (result, deltas) = collect(vec![
             Ok(LlmStreamChunk::TextDelta("visible".into())),
             Err(EngineError::Llm {
+                kind: ModelFailureKind::Transient,
                 reason: "stream failed".into(),
             }),
         ])
         .await;
         assert_eq!(deltas, vec!["visible"]);
-        assert!(matches!(result, Err(EngineError::Llm { reason }) if reason == "stream failed"));
+        assert!(
+            matches!(result, Err(EngineError::Llm { reason, .. }) if reason == "stream failed")
+        );
     }
 
     #[tokio::test]
@@ -342,7 +346,7 @@ mod tests {
         ] {
             let (result, _) = collect(items).await;
             assert!(
-                matches!(result, Err(EngineError::Llm { reason }) if reason.contains("conflicting"))
+                matches!(result, Err(EngineError::Llm { reason, .. }) if reason.contains("conflicting"))
             );
         }
     }

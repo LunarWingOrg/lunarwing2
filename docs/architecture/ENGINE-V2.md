@@ -33,7 +33,7 @@ ic/crates/lunarwing_engine/src/
     provenance.rs         Provenance enum (User/System/ToolOutput/LlmGenerated/etc.)
     conversation.rs       ConversationSurface, ConversationEntry, EntrySender
     mission.rs            Mission, MissionId, MissionCadence, MissionStatus
-    error.rs              EngineError, ThreadError, StepError, CapabilityError
+    error.rs              EngineError, ModelFailureKind, ThreadError, StepError, CapabilityError
   traits/                 External dependency abstractions (host implements these)
     llm.rs                LlmBackend trait
     store.rs              Store trait (33 CRUD methods)
@@ -53,7 +53,7 @@ ic/crates/lunarwing_engine/src/
     conversation.rs       ConversationManager (routes UI messages to threads)
     mission.rs            MissionManager (long-running goals that spawn threads on cadence)
     tree.rs               ThreadTree (parent-child relationships)
-    messaging.rs          ThreadSignal, ThreadOutcome, signal channels
+    messaging.rs          ThreadSignal, ThreadOutcome, ThreadFailureKind, signal channels
     skill_feedback.rs     Skill usage feedback events (feature-gated)
   executor/               Step execution
     loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
@@ -105,7 +105,7 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 5. If ActionCalls (Tier 0): find lease -> check policy -> consume use -> execute -> record
 6. If Code (Tier 1): execute Python via Monty with context-as-variables
 7. Record Step, emit ThreadEvents
-8. Repeat until: accepted text response, stop signal, max iterations, or approval needed
+8. Repeat until: accepted text response, stop signal, recovered terminal limit, typed failure, or approval needed
 ```
 
 ### Two Execution Tiers
@@ -157,6 +157,34 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   bounded correction before terminal delivery through shared channels such as XMPP.
 - Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
+
+### Failure Recovery
+
+Engine V2 keeps provider retry, fallback-model selection, cooldown, and circuit
+breaking in the host LLM stack. When those paths return a final provider error,
+the bridge maps it to `ModelFailureKind`. The Python orchestrator receives only
+that safe class and fixed recovery text, never provider-supplied diagnostics.
+
+- Recoverable model failures get one extra model request. Context-overflow
+  recovery first replaces protocol history with a bounded plain-text view of
+  the original goal and recent context. A second failure becomes a typed
+  `ThreadFailureKind::Model` outcome with actionable user text.
+- Authentication and rejected-request failures skip model retry because an
+  unchanged request cannot repair credentials or compatibility. Their terminal
+  text names the operator action required.
+- Reaching `max_iterations` schedules one final tool-capable model request before
+  returning `ThreadOutcome::MaxIterations`.
+- Three consecutive code steps or structured action batches with no successful
+  work schedule one no-progress warning. Repeating failure on warning turn
+  returns `ThreadFailureKind::NoProgress`; successful work resets detector.
+- Missing/exhausted capability leases and policy denials return actionable model
+  observations naming allowed next steps instead of opaque denial strings.
+
+One-shot accounting lives in `state["_failure_recovery"]` with pending and active
+warning states. It is written before recovery request, consumed only after
+successful model response, and retained when approval/authentication resume
+discards rest of live checkpoint. Terminal cleanup removes it with normal
+runtime checkpoint state.
 
 ## Capability Leases
 

@@ -32,13 +32,13 @@ use tracing::debug;
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::PolicyEngine;
 use crate::memory::RetrievalEngine;
-use crate::runtime::messaging::{SignalReceiver, ThreadOutcome, ThreadSignal};
+use crate::runtime::messaging::{SignalReceiver, ThreadFailureKind, ThreadOutcome, ThreadSignal};
 use crate::traits::effect::{
     EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
 };
 use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
 use crate::traits::store::Store;
-use crate::types::error::EngineError;
+use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
 use crate::types::message::ThreadMessage;
 use crate::types::project::ProjectId;
@@ -54,6 +54,9 @@ use super::scripting::{
 
 /// The compiled-in default orchestrator (v0).
 pub(crate) const DEFAULT_ORCHESTRATOR: &str = include_str!("../../orchestrator/default.py");
+
+/// Persisted-state key for bounded model and terminal recovery accounting.
+pub(crate) const RECOVERY_STATE_KEY: &str = "_failure_recovery";
 
 /// Opaque in-memory lookup key carried through the Python transcript.
 const TRANSIENT_CONTENT_ID_FIELD: &str = "__transient_content_id";
@@ -800,10 +803,18 @@ fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFun
 }
 
 fn llm_error_result(error: EngineError) -> ExtFunctionResult {
-    ExtFunctionResult::Error(monty::MontyException::new(
-        monty::ExcType::RuntimeError,
-        Some(format!("LLM call failed: {error}")),
-    ))
+    let kind = match error {
+        EngineError::Llm { kind, .. } => kind,
+        _ => ModelFailureKind::Internal,
+    };
+    tracing::warn!(failure_kind = %kind, "model request failed after provider recovery");
+    ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
+        "type": "model_error",
+        "kind": kind.as_str(),
+        "recoverable": kind.is_recoverable(),
+        "instruction": kind.recovery_instruction(),
+        "terminal_message": kind.terminal_message(),
+    })))
 }
 
 /// Handle `__execute_code_step__(code, state)`.
@@ -1035,7 +1046,9 @@ async fn handle_execute_action(
         Some(l) => l,
         None => {
             let error = format!("No lease for action '{name}'");
-            let output = serde_json::json!({"error": &error});
+            let output = serde_json::json!({
+                "error": super::capability_unavailable_message(&name)
+            });
             emit_and_record(
                 thread,
                 event_tx,
@@ -1068,7 +1081,9 @@ async fn handle_execute_action(
     if let Some(ref ad) = action_def {
         match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
             crate::capability::policy::PolicyDecision::Deny { reason } => {
-                let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                let output = serde_json::json!({
+                    "error": super::policy_denied_message(&reason)
+                });
                 emit_and_record(
                     thread,
                     event_tx,
@@ -1127,7 +1142,9 @@ async fn handle_execute_action(
     // 3. Consume a lease use
     if let Err(e) = leases.consume_use(lease.id).await {
         let error = format!("lease unavailable: {e}");
-        let output = serde_json::json!({"error": &error});
+        let output = serde_json::json!({
+            "error": super::capability_lease_unavailable_message(&name)
+        });
         emit_and_record(
             thread,
             event_tx,
@@ -1370,7 +1387,9 @@ async fn handle_execute_actions_parallel(
             Some(l) => l,
             None => {
                 let error = format!("No lease for action '{}'", pc.name);
-                let output = serde_json::json!({"error": &error});
+                let output = serde_json::json!({
+                    "error": super::capability_unavailable_message(&pc.name)
+                });
                 let result_json = serde_json::json!({
                     "output": &output,
                     "is_error": true,
@@ -1401,7 +1420,9 @@ async fn handle_execute_actions_parallel(
         if let Some(ref ad) = action_def {
             match policy.evaluate_with_provenance(ad, &lease, &[], &Provenance::LlmGenerated) {
                 crate::capability::policy::PolicyDecision::Deny { reason } => {
-                    let output = serde_json::json!({"error": format!("Denied: {reason}")});
+                    let output = serde_json::json!({
+                        "error": super::policy_denied_message(&reason)
+                    });
                     let result_json = serde_json::json!({
                         "output": &output,
                         "is_error": true,
@@ -1487,7 +1508,9 @@ async fn handle_execute_actions_parallel(
         // Consume lease
         if let Err(e) = leases.consume_use(lease.id).await {
             let error = format!("lease unavailable: {e}");
-            let output = serde_json::json!({"error": &error});
+            let output = serde_json::json!({
+                "error": super::capability_lease_unavailable_message(&pc.name)
+            });
             preflight.push(Some(PfOutcome::Error {
                 result_json: serde_json::json!({
                     "output": &output,
@@ -2510,6 +2533,7 @@ fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
         "stopped" => ThreadOutcome::Stopped,
         "max_iterations" => ThreadOutcome::MaxIterations,
         "failed" => ThreadOutcome::Failed {
+            kind: parse_thread_failure_kind(result),
             error: result
                 .get("error")
                 .and_then(|v| v.as_str())
@@ -2551,6 +2575,27 @@ fn parse_outcome(result: &serde_json::Value) -> ThreadOutcome {
             }
         }
         _ => ThreadOutcome::Completed { response: None },
+    }
+}
+
+fn parse_thread_failure_kind(result: &serde_json::Value) -> ThreadFailureKind {
+    let Some(value) = result
+        .get("failure_kind")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return ThreadFailureKind::Unknown;
+    };
+    if let Some(model_kind) = value
+        .strip_prefix("model_")
+        .and_then(ModelFailureKind::parse)
+    {
+        return ThreadFailureKind::Model(model_kind);
+    }
+    match value {
+        "no_progress" => ThreadFailureKind::NoProgress,
+        "consecutive_errors" => ThreadFailureKind::ConsecutiveErrors,
+        "orchestrator" => ThreadFailureKind::Orchestrator,
+        _ => ThreadFailureKind::Unknown,
     }
 }
 
@@ -3257,9 +3302,19 @@ mod tests {
 
     #[test]
     fn parse_outcome_failed() {
-        let result = serde_json::json!({"outcome": "failed", "error": "boom"});
+        let result = serde_json::json!({
+            "outcome": "failed",
+            "failure_kind": "model_context_overflow",
+            "error": "boom"
+        });
         let outcome = parse_outcome(&result);
-        assert!(matches!(outcome, ThreadOutcome::Failed { error } if error == "boom"));
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(ModelFailureKind::ContextOverflow),
+                error,
+            } if error == "boom"
+        ));
     }
 
     #[test]
@@ -3332,6 +3387,7 @@ mod tests {
             _: &LlmCallConfig,
         ) -> Result<LlmOutput, EngineError> {
             Err(EngineError::Llm {
+                kind: ModelFailureKind::Internal,
                 reason: "blocking completion must not be called".into(),
             })
         }
