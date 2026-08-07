@@ -3188,6 +3188,12 @@ install_wasm_tenant() {
     installed=$((installed + 1))
   done
 
+  # Patch WeeChat channel caps with per-tenant ports from the registry.
+  # The source caps file has generic default ports (9001/6681) that are wrong
+  # for every multi-tenant host. This runs after every install-wasm so the
+  # tenant's allocated ports are always correct, even after a fresh copy.
+  patch_weechat_caps "$name"
+
   say "installing WASM tools to $tools_dir..."
   for dir in "$repo/tools-src"/*/; do
     [[ -d "$dir" ]] || continue
@@ -5148,6 +5154,46 @@ patch_ssh_tool_allowlist() {
 _probe_tcp() {
   local host="$1" port="$2"
   timeout 2 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
+}
+
+# Patch the WeeChat WASM channel capabilities with the tenant's allocated ports
+# from the registry. The source caps file (channels-src/weechat/*.capabilities.json)
+# has generic default ports (9001/6681) that are wrong for every multi-tenant host.
+# This is called after install-wasm and on tenant start so the ports are always
+# correct. Idempotent: always derived from the registry.
+patch_weechat_caps() {
+  local name="$1" caps_path weechat_port adapter_port tmp
+  caps_path="$(tenant_state_dir "$name")/channels/weechat.capabilities.json"
+
+  if [[ ! -f "$caps_path" ]]; then
+    say "  weechat caps: weechat channel not installed — nothing to patch"
+    return 0
+  fi
+
+  command -v jq >/dev/null 2>&1 \
+    || { say "WARNING: jq not installed; weechat caps left unchanged" >&2; return 0; }
+
+  weechat_port="$(ports_get "$name" weechat)" \
+    || { say "WARNING: could not read weechat port for $name; caps left unchanged" >&2; return 0; }
+  adapter_port="$(ports_get "$name" weechat_adapter)" \
+    || { say "WARNING: could not read weechat_adapter port for $name; caps left unchanged" >&2; return 0; }
+
+  local relay_url="http://127.0.0.1:${weechat_port}"
+  local adapter_url="http://127.0.0.1:${adapter_port}"
+
+  # Same-directory temp file so mv is atomic.
+  tmp="$(mktemp "${caps_path}.tmp.XXXXXX")" \
+    || { say "WARNING: mktemp failed; weechat caps left unchanged" >&2; return 0; }
+  if jq --arg relay "$relay_url" --arg adapter "$adapter_url" \
+       '.config.relay_url = $relay | .config.ws_adapter_url = $adapter' \
+       "$caps_path" >"$tmp" 2>/dev/null \
+    && mv "$tmp" "$caps_path" \
+    && chown "$name:$name" "$caps_path"; then
+    say "  weechat caps patched: relay=$relay_url adapter=$adapter_url"
+  else
+    rm -f "$tmp"
+    say "WARNING: failed to patch weechat caps at $caps_path" >&2
+  fi
 }
 
 # Warn (never fail) if the tenant's configured loopback SSH host has no sshd
@@ -9733,6 +9779,11 @@ start_tenant() {
   # a failed upload warns and continues; the WASM channel refreshes the credential
   # live from the store, so no daemon restart is required.
   upload_tenant_darkirc_secret "$name" || true
+
+  # Patch WeeChat channel caps with the tenant's allocated ports. This ensures
+  # the ports are correct even if install-wasm wasn't run or the caps were
+  # manually edited. Runs before workers start so the channel connects immediately.
+  patch_weechat_caps "$name"
 
   # Workers start AFTER the daemon (and after any SSH-key bounce) so the SSH
   # agent socket is already a real, current Unix socket when podman bind-mounts it.
