@@ -33,7 +33,7 @@ fn truecolor_enabled() -> bool {
 
 /// Emerald green accent — primary brand color.
 ///
-/// Uses true-color `#34d399` when supported, falls back to basic green.
+/// Uses true-color `#1d4ed8` when supported, falls back to basic green.
 pub fn accent() -> &'static str {
     if !colors_enabled() {
         return "";
