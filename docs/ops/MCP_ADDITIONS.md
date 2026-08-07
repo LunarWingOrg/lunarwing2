@@ -1,11 +1,14 @@
 # MCP Additions Status
 
-> **Current status (2026-08-03): PARTIAL.** HTTP/HTTPS plus host-local stdio and
+> **Current status (2026-08-07): PARTIAL.** HTTP/HTTPS plus host-local stdio and
 > Unix MCP; owner-scoped secret references; diagnostics; explicit lifecycle
-> operations; and safe whole-runtime stdio crash recovery are implemented.
-> Worker-local placement, automatic package installation, package provenance, OS
-> sandboxing for host-local stdio, a general runtime-adapter layer, MCP-over-WASM,
-> and a dedicated shared MCP gateway are not implemented.
+> operations; safe whole-runtime stdio crash recovery; and operator-pinned
+> package provenance (executable digest verification, trust state, revocation)
+> are implemented.
+> Worker-local placement, automatic package installation, publisher signatures
+> and dependency locking, OS sandboxing for host-local stdio, a general
+> runtime-adapter layer, MCP-over-WASM, and a dedicated shared MCP gateway are
+> not implemented.
 
 For the concise checkpoint, remaining-validation list, and deferred-work summary,
 see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
@@ -84,12 +87,37 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 - `mcp test --user` resolves secrets for the selected owner and explicitly cleans
   its temporary runtime.
 
+### Package provenance (operator-pinned)
+
+- `McpServerConfig` carries an optional provenance record: canonical package
+  identity, ecosystem (npm/PyPI/binary), immutable version, source, publisher,
+  resolved stdio executable path, executable SHA-256, trust state
+  (`unverified`/`pinned`/`revoked`), and a recorded timestamp.
+- `lunarwing mcp pin` resolves the configured stdio command the way activation
+  would (explicit path or `PATH` search), records its digest and any supplied
+  package identity, and marks the server pinned. `mcp unpin` removes the record;
+  `mcp revoke` records revoked trust and disables the server (persisted first,
+  then a live gateway disable unless `--offline`). `mcp list --verbose` shows
+  trust state, identity, and digest.
+- Activation fails closed: a revoked package is blocked for every transport, and
+  a pinned stdio server re-hashes the resolved executable before any child is
+  spawned — startup, manual activation, and crash recovery all verify because
+  they share the factory path. Digest mismatch or revocation blocks activation
+  with a provenance error.
+- Servers without a record keep legacy unverified behavior. `mcp update`
+  retains the record for stdio servers; switching transports drops the digest
+  and demotes pinned to unverified. Web/conversational updates do not carry
+  provenance and reset the record; re-pin after using them.
+- Not yet covered: publisher signatures, trusted signing keys, locked
+  dependency graphs, upgrade diffs, marketplace trust roots, and revocation
+  distribution for compromised publishers.
+
 ## Not Implemented
 
 | Feature | Current status and reason |
 |---------|---------------------------|
-| Automatic npm/pip installation | No production package installer exists. LunarWing runs an operator-installed command. Safe automation needs immutable package identity, digest/signature verification, dependency locking, capability review, sandboxing, audit, revocation, health checks, and rollback. |
-| MCP package provenance | WASM artifact checksums do not authenticate stdio commands or their npm/pip dependency trees. Publisher trust, signatures, lock data, upgrade diffs, and revocation remain design work. |
+| Automatic npm/pip installation | No production package installer exists. LunarWing runs an operator-installed command. Safe automation needs immutable package identity, digest/signature verification, dependency locking, capability review, sandboxing, audit, revocation, health checks, and rollback. Provenance pinning (below) covers the identity/digest/trust subset; the rest remains. |
+| MCP package provenance | Partially implemented: operator-pinned executable digests, package identity, trust state, and revocation for host-local stdio servers. Publisher signatures, signing-key trust roots, dependency lock data, upgrade diffs, and marketplace revocation remain design work. |
 | Host-local stdio OS sandbox | Environment inheritance is restricted, but the child still runs with LunarWing service-account privileges. Environment filtering is not filesystem, network, process, device, or resource isolation. |
 | Generic worker-local MCP | Core per-job workers do not load LunarWing MCP configs or register MCP wrappers. External workers may independently use MCP, but that is a separate integration, not placement of installed LunarWing MCP packages. |
 | Runtime adapter boundary | The safe stdio recovery path now centralizes client preparation and runtime replacement, but process, WASM, worker, remote, and gateway lifecycle remain separate concrete paths rather than one public runtime-neutral interface. |

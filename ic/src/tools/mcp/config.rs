@@ -88,6 +88,11 @@ pub struct McpServerConfig {
     /// Raw MCP tool names that always require explicit approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub always_require_approval: Vec<String>,
+
+    /// Package provenance record (identity, trust state, executable digest).
+    /// Absent means unverified legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<crate::tools::mcp::provenance::McpPackageProvenance>,
 }
 
 fn default_true() -> bool {
@@ -116,6 +121,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -152,6 +158,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -169,6 +176,7 @@ impl McpServerConfig {
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
+            provenance: None,
         }
     }
 
@@ -196,6 +204,15 @@ impl McpServerConfig {
         tools: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.always_require_approval = tools.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set the package provenance record.
+    pub fn with_provenance(
+        mut self,
+        provenance: crate::tools::mcp::provenance::McpPackageProvenance,
+    ) -> Self {
+        self.provenance = Some(provenance);
         self
     }
 
@@ -367,6 +384,17 @@ impl McpServerConfig {
                 reason: "Approval-required MCP tool names cannot be empty or contain NUL bytes"
                     .to_string(),
             });
+        }
+
+        if let Some(provenance) = &self.provenance {
+            provenance.validate()?;
+            if provenance.command_sha256.is_some()
+                && !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. })
+            {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "provenance command digests only apply to stdio servers".to_string(),
+                });
+            }
         }
 
         Ok(())
