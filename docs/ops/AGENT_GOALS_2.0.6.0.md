@@ -19,10 +19,11 @@
 6. [ ] disable lorebooks by default - the are computationally expensive and most users will not use them — DONE 100% (2026-08-07, branch `rarity/kimi-7-20260807-0606`): `LorebookConfig::default()` now sets `enabled: false` in `ic/src/config/agent.rs` (opt back in with `LOREBOOK_ENABLED=true`; env override and validation unchanged). Engine test helper and three workspace activation tests now enable lorebooks explicitly; scheduler/dispatcher test configs already pinned `enabled: false`. Docs updated (`docs/proposals/LOREBOOKS.md` env table default `true`→`false` plus opt-in note, root `README.md`, `ic/src/workspace/README.md`). Verified: `cargo check`, 40 lorebook unit tests + 5 `config::agent` tests, clippy `--all --benches --tests --examples -D warnings`, rustfmt.
 7. [ ] mcp part 2 work worker-local placement (see docs for info)
 8. [x] (S) Review implementation of item 5 from docs/ops/35d44998cadf3e6d.md - u may clone ironclaw gh repo for reference - do not cokmit ic repo - needs more testing and refinment for sure especially on low end LLMs
-9. [ ] FIX CI/CD ISSUES
-10. [ ] Review and make fixes to MCP part two implementation (see mcp documents first)
-11. [ ] come up with codename ideas for release. put into new doc
-12. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
-13. [ ] update README.md in repo root (if necessary)
+9. [ ] Review and make fixes to MCP part two implementation (see mcp documents first)
+10. [ ] FIX CI/CD ISSUES
+11. [ ] review previous mcp work for part two and fix anything if something is found out to be weird or broken
+12. [ ] come up with codename ideas for release. put into new doc
+13. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF`known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. The codename for this release is:`UNKNOWN` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
+14. [ ] update README.md in repo root (if necessary)
 
 ---
