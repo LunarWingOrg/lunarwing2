@@ -319,11 +319,11 @@ impl ConversationManager {
                 ThreadOutcome::MaxIterations => {
                     conv.add_entry(ConversationEntry::system_for_thread(
                         thread_id,
-                        "Thread reached max iterations",
+                        "Thread reached max iterations after final recovery; retry with narrower scope or a higher iteration limit",
                     ));
                     conv.untrack_thread(thread_id);
                 }
-                ThreadOutcome::Failed { error } => {
+                ThreadOutcome::Failed { error, .. } => {
                     conv.add_entry(ConversationEntry::system_for_thread(
                         thread_id,
                         format!("Thread failed: {error}"),

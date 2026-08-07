@@ -2050,7 +2050,7 @@ async fn process_mission_outcome_and_notify(
             }
         }
         ThreadOutcome::Completed { response: None } => {}
-        ThreadOutcome::Failed { error } => {
+        ThreadOutcome::Failed { error, .. } => {
             mission.approach_history.push(format!("FAILED: {error}"));
             notify_response = Some(format!("Mission failed: {error}"));
             is_error = true;
@@ -2058,8 +2058,11 @@ async fn process_mission_outcome_and_notify(
         ThreadOutcome::MaxIterations => {
             mission
                 .approach_history
-                .push("Hit max iterations without completing".into());
-            notify_response = Some("Mission thread hit max iterations without completing".into());
+                .push("Hit max iterations after final recovery".into());
+            notify_response = Some(
+                "Mission hit max iterations after final recovery; retry with narrower scope or a higher iteration limit"
+                    .into(),
+            );
             is_error = true;
         }
         _ => {}
