@@ -46,8 +46,8 @@ serde_json = "1"
 deadpool-postgres = { version = "0.14", optional = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4", "with-serde_json-1"], optional = true }
 postgres-types = { version = "0.2", features = ["with-serde_json-1"], optional = true }
-refinery = { version = "0.8", features = ["tokio-postgres"], optional = true }
-tokio-postgres-rustls = { version = "0.13", optional = true }
+refinery = { version = "0.9", features = ["tokio-postgres"], optional = true }
+tokio-postgres-rustls = { version = "0.14", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-native-certs = { version = "0.8", optional = true }
 
@@ -64,7 +64,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Configuration
 dotenvy = "0.15"
-toml = "0.8"
+toml = "1"
 
 # Core types
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
@@ -95,7 +95,7 @@ agent-client-protocol = "0.10"
 tokio-util = { version = "0.7", features = ["compat"] }
 
 # Cron scheduling for routines
-cron = "0.13"
+cron = "0.17"
 
 # Internal crates
 lunarwing_common = { path = "crates/lunarwing_common", version = "2.0.6" }
@@ -224,7 +224,7 @@ tracing-test = "0.2"
 tokio-tungstenite = "0.26"
 pretty_assertions = "1"
 insta = "1.46.3"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "safety_check"
