@@ -11,8 +11,8 @@
 
 ---
 
-1. [x] implement proposal defined here - docs/proposals/lunarvoice-onnx-proposal-2.0.6.0.md — Completed: local sherpa-onnx sidecar, existing transcription-provider integration, sandboxed WASM tool, verified model workflow, multi-tenant systemd/OpenRC lifecycle, registry-aware health monitoring, tests, and deployment docs.
-2. [ ] work on this issue: Bug Report (Sunburst BUG-003) Summary Mission thread goal pollution — mission-spec text leaking into insight extraction. Severity High Source Consolidated from Sunburst's open bug list, last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
+1. [ ] Add support for parakeet-tdt-0.6b-v2-int8 and parakeet-tdt-0.6b-v3-int8    (original issue: implement proposal defined here - docs/proposals/lunarvoice-onnx-proposal-2.0.6.0.md — Completed: local sherpa-onnx sidecar, existing transcription-provider integration, sandboxed WASM tool, verified model workflow, multi-tenant systemd/OpenRC lifecycle, registry-aware health monitoring, tests, and deployment docs.)
+2. [x] Fixed Sunburst BUG-003: conversation-insight payloads now exclude mission thread goals before applying the five-goal limit; mixed-thread regression coverage added. - work on this issue: Bug Report (Sunburst BUG-003) Summary Mission thread goal pollution — mission-spec text leaking into insight extraction. Severity High Source Consolidated from Sunburst's open bug list, last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 3. [ ] MAKE V2 ENGINE CHANNELS ON BY DEFAULT FOR ALL i.e.  ENGINE_V2_CHANNELS=xmpp,weechat,darkirc by default should be present in new tenant env - ensure never overwrite existing tenant's value upon upgrade or rebuild or re-render
 4. [ ] work on this issue: [BUG-013] Secret leak warnings in logs (noisy but no functional impact) - last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 5. [ ] MCP part 2 work: host sandboxing (see docs for info)
