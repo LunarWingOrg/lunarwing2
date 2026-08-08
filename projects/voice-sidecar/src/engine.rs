@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::audio::{AudioData, TARGET_SAMPLE_RATE};
 use crate::config::Config;
 
-const WHISPER_CHUNK_SECS: usize = 30;
+const STT_CHUNK_SECS: usize = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptSegment {
@@ -93,8 +93,14 @@ pub trait VoiceEngine: Send + Sync {
 }
 
 #[cfg(feature = "onnx")]
+pub enum SttRecognizer {
+    Whisper(sherpa_rs::whisper::WhisperRecognizer),
+    Transducer(sherpa_rs::transducer::TransducerRecognizer),
+}
+
+#[cfg(feature = "onnx")]
 pub struct SherpaVoiceEngine {
-    whisper: Option<Arc<Mutex<sherpa_rs::whisper::WhisperRecognizer>>>,
+    stt: Option<Arc<Mutex<SttRecognizer>>>,
     vad: Option<Arc<Mutex<sherpa_rs::silero_vad::SileroVad>>>,
     tts: Option<Arc<Mutex<sherpa_rs::tts::KokoroTts>>>,
     model_name: String,
@@ -107,28 +113,7 @@ pub struct SherpaVoiceEngine {
 #[cfg(feature = "onnx")]
 impl SherpaVoiceEngine {
     pub fn load(config: &Config) -> Result<Self, EngineError> {
-        let whisper_paths = [&config.stt_encoder, &config.stt_decoder, &config.stt_tokens];
-        let whisper = if all_exist(&whisper_paths) {
-            let recognizer =
-                sherpa_rs::whisper::WhisperRecognizer::new(sherpa_rs::whisper::WhisperConfig {
-                    encoder: display_path(&config.stt_encoder),
-                    decoder: display_path(&config.stt_decoder),
-                    tokens: display_path(&config.stt_tokens),
-                    language: config.stt_language.clone(),
-                    provider: Some("cpu".into()),
-                    num_threads: Some(config.num_threads),
-                    ..Default::default()
-                })
-                .map_err(|error| EngineError::Initialization {
-                    component: "STT",
-                    reason: error.to_string(),
-                })?;
-            Some(Arc::new(Mutex::new(recognizer)))
-        } else if config.require_stt {
-            return Err(first_missing(&whisper_paths));
-        } else {
-            None
-        };
+        let stt = load_stt(config)?;
 
         let vad = if config.enable_vad && config.vad_model.is_file() {
             let detector = sherpa_rs::silero_vad::SileroVad::new(
@@ -177,7 +162,7 @@ impl SherpaVoiceEngine {
         };
 
         Ok(Self {
-            whisper,
+            stt,
             vad,
             tts,
             model_name: config.model_name.clone(),
@@ -190,6 +175,63 @@ impl SherpaVoiceEngine {
 }
 
 #[cfg(feature = "onnx")]
+fn load_stt(config: &Config) -> Result<Option<Arc<Mutex<SttRecognizer>>>, EngineError> {
+    let mut required = vec![
+        &config.stt_encoder,
+        &config.stt_decoder,
+        &config.stt_tokens,
+    ];
+    if config.stt_engine == crate::config::SttEngineKind::Parakeet {
+        required.push(&config.stt_joiner);
+    }
+    if !all_exist(&required) {
+        return if config.require_stt {
+            Err(first_missing(&required))
+        } else {
+            Ok(None)
+        };
+    }
+    let recognizer = match config.stt_engine {
+        crate::config::SttEngineKind::Whisper => {
+            let recognizer =
+                sherpa_rs::whisper::WhisperRecognizer::new(sherpa_rs::whisper::WhisperConfig {
+                    encoder: display_path(&config.stt_encoder),
+                    decoder: display_path(&config.stt_decoder),
+                    tokens: display_path(&config.stt_tokens),
+                    language: config.stt_language.clone(),
+                    provider: Some("cpu".into()),
+                    num_threads: Some(config.num_threads),
+                    ..Default::default()
+                })
+                .map_err(|error| EngineError::Initialization {
+                    component: "STT",
+                    reason: error.to_string(),
+                })?;
+            SttRecognizer::Whisper(recognizer)
+        }
+        crate::config::SttEngineKind::Parakeet => {
+            let recognizer = sherpa_rs::transducer::TransducerRecognizer::new(
+                sherpa_rs::transducer::TransducerConfig {
+                    encoder: display_path(&config.stt_encoder),
+                    decoder: display_path(&config.stt_decoder),
+                    joiner: display_path(&config.stt_joiner),
+                    tokens: display_path(&config.stt_tokens),
+                    num_threads: config.num_threads,
+                    provider: Some("cpu".into()),
+                    ..Default::default()
+                },
+            )
+            .map_err(|error| EngineError::Initialization {
+                component: "STT",
+                reason: error.to_string(),
+            })?;
+            SttRecognizer::Transducer(recognizer)
+        }
+    };
+    Ok(Some(Arc::new(Mutex::new(recognizer))))
+}
+
+#[cfg(feature = "onnx")]
 #[async_trait]
 impl VoiceEngine for SherpaVoiceEngine {
     async fn transcribe(
@@ -198,8 +240,8 @@ impl VoiceEngine for SherpaVoiceEngine {
         language: &str,
         model: &str,
     ) -> Result<Transcription, EngineError> {
-        let whisper = self
-            .whisper
+        let stt = self
+            .stt
             .clone()
             .ok_or(EngineError::ModelUnavailable("STT"))?;
         if !model.is_empty() && model != self.model_name {
@@ -220,7 +262,7 @@ impl VoiceEngine for SherpaVoiceEngine {
             .map_err(|_| EngineError::Busy)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            transcribe_chunks(&whisper, &audio, &fallback_language)
+            transcribe_chunks(&stt, &audio, &fallback_language)
         })
         .await
         .map_err(|_| EngineError::Inference)?
@@ -288,7 +330,7 @@ impl VoiceEngine for SherpaVoiceEngine {
 
     fn readiness(&self) -> EngineReadiness {
         let mut models_loaded = Vec::new();
-        if self.whisper.is_some() {
+        if self.stt.is_some() {
             models_loaded.push("stt".to_string());
         }
         if self.vad.is_some() {
@@ -298,8 +340,8 @@ impl VoiceEngine for SherpaVoiceEngine {
             models_loaded.push("tts".to_string());
         }
         EngineReadiness {
-            ready: self.whisper.is_some(),
-            stt_engine: self.whisper.as_ref().map(|_| self.model_name.clone()),
+            ready: self.stt.is_some(),
+            stt_engine: self.stt.as_ref().map(|_| self.model_name.clone()),
             tts_engine: self.tts.as_ref().map(|_| "kokoro".to_string()),
             vad_engine: self.vad.as_ref().map(|_| "silero-v5".to_string()),
             models_loaded,
@@ -309,24 +351,34 @@ impl VoiceEngine for SherpaVoiceEngine {
 
 #[cfg(feature = "onnx")]
 fn transcribe_chunks(
-    whisper: &Mutex<sherpa_rs::whisper::WhisperRecognizer>,
+    stt: &Mutex<SttRecognizer>,
     audio: &AudioData,
     fallback_language: &str,
 ) -> Result<Transcription, EngineError> {
-    let mut recognizer = whisper.lock().map_err(|_| EngineError::State)?;
-    let chunk_samples = TARGET_SAMPLE_RATE as usize * WHISPER_CHUNK_SECS;
+    let mut recognizer = stt.lock().map_err(|_| EngineError::State)?;
+    let chunk_samples = TARGET_SAMPLE_RATE as usize * STT_CHUNK_SECS;
     let mut segments = Vec::new();
     let mut language = fallback_language.to_string();
     for (index, chunk) in audio.samples.chunks(chunk_samples).enumerate() {
-        let result = recognizer.transcribe(audio.sample_rate, chunk);
-        if !result.lang.is_empty() {
-            language = result.lang;
-        }
-        let text = result.text.trim().to_string();
+        // Whisper reports the detected language per chunk; parakeet-tdt
+        // returns text only, so the configured language is kept.
+        let text = match &mut *recognizer {
+            SttRecognizer::Whisper(whisper) => {
+                let result = whisper.transcribe(audio.sample_rate, chunk);
+                if !result.lang.is_empty() {
+                    language = result.lang;
+                }
+                result.text
+            }
+            SttRecognizer::Transducer(transducer) => {
+                transducer.transcribe(audio.sample_rate, chunk)
+            }
+        };
+        let text = text.trim().to_string();
         if text.is_empty() {
             continue;
         }
-        let start_ms = index as u64 * WHISPER_CHUNK_SECS as u64 * 1_000;
+        let start_ms = index as u64 * STT_CHUNK_SECS as u64 * 1_000;
         let duration_ms = chunk.len() as u64 * 1_000 / u64::from(audio.sample_rate);
         segments.push(TranscriptSegment {
             start_ms,
