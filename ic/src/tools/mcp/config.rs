@@ -1387,8 +1387,11 @@ mod tests {
             .with_sandbox(sandbox.clone());
         stdio.validate().expect("stdio server may carry a sandbox");
 
-        let http = McpServerConfig::new("remote", "https://mcp.example.com").with_sandbox(sandbox.clone());
-        let error = http.validate().expect_err("http server must reject a sandbox");
+        let http =
+            McpServerConfig::new("remote", "https://mcp.example.com").with_sandbox(sandbox.clone());
+        let error = http
+            .validate()
+            .expect_err("http server must reject a sandbox");
         assert!(error.to_string().contains("stdio"));
 
         let unix = McpServerConfig::new_unix("unix", "/tmp/mcp.sock").with_sandbox(sandbox);

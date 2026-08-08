@@ -4501,6 +4501,7 @@ dependencies = [
  "iana-time-zone",
  "insta",
  "json5",
+ "libc",
  "libsignal-protocol",
  "libsql",
  "lru 0.18.2",

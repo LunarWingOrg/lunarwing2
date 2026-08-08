@@ -106,10 +106,7 @@ impl McpSandboxConfig {
         for path in &self.writable_paths {
             if !path.is_absolute() {
                 return Err(ConfigError::InvalidConfig {
-                    reason: format!(
-                        "sandbox writable path must be absolute: {}",
-                        path.display()
-                    ),
+                    reason: format!("sandbox writable path must be absolute: {}", path.display()),
                 });
             }
             if path.as_os_str().as_encoded_bytes().contains(&0) {
@@ -126,10 +123,7 @@ impl McpSandboxConfig {
 
     /// Whether any enabled restriction is only enforceable on Linux.
     pub fn requires_linux(&self) -> bool {
-        self.no_new_privileges
-            || self.deny_ptrace
-            || self.read_only_root
-            || self.network_isolated
+        self.no_new_privileges || self.deny_ptrace || self.read_only_root || self.network_isolated
     }
 
     /// Short human-readable summary for CLI and doctor output.
@@ -163,7 +157,10 @@ impl McpSandboxConfig {
             parts.push("ptrace-denied".to_string());
         }
         if self.read_only_root {
-            parts.push(format!("read-only-root(+{} writable)", self.writable_paths.len()));
+            parts.push(format!(
+                "read-only-root(+{} writable)",
+                self.writable_paths.len()
+            ));
         }
         if self.network_isolated {
             parts.push("network-isolated".to_string());
@@ -337,11 +334,7 @@ mod unix_impl {
         const MIB: u64 = 1024 * 1024;
         let mut specs: Vec<(Resource, &'static str, u64)> = Vec::new();
         if let Some(mb) = sandbox.max_memory_mb {
-            specs.push((
-                Resource::RLIMIT_AS,
-                "max_memory_mb",
-                mb.saturating_mul(MIB),
-            ));
+            specs.push((Resource::RLIMIT_AS, "max_memory_mb", mb.saturating_mul(MIB)));
         }
         if let Some(secs) = sandbox.max_cpu_seconds {
             specs.push((Resource::RLIMIT_CPU, "max_cpu_seconds", secs));
@@ -497,8 +490,8 @@ mod unix_impl {
         /// child cannot inspect or inject into sibling processes. Requires
         /// no_new_privileges to already be set.
         pub(super) fn deny_process_vm_syscalls() -> io::Result<()> {
-            const DENY: u32 = libc::SECCOMP_RET_ERRNO
-                | (libc::EPERM as u32 & libc::SECCOMP_RET_DATA);
+            const DENY: u32 =
+                libc::SECCOMP_RET_ERRNO | (libc::EPERM as u32 & libc::SECCOMP_RET_DATA);
             const ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
             const fn load_nr() -> libc::sock_filter {
                 libc::sock_filter {
@@ -540,8 +533,7 @@ mod unix_impl {
             };
             // SAFETY: filter outlives the call; prog points at a valid
             // classic-BPF program of exactly `len` instructions.
-            if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) } != 0
-            {
+            if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) } != 0 {
                 return Err(last_os_error());
             }
             Ok(())
@@ -616,10 +608,7 @@ mod unix_impl {
         }
 
         impl PreparedLandlock {
-            pub(super) fn new(
-                abi: u32,
-                writable_paths: &[PathBuf],
-            ) -> Result<Self, SandboxError> {
+            pub(super) fn new(abi: u32, writable_paths: &[PathBuf]) -> Result<Self, SandboxError> {
                 let to_cstring = |path: &std::path::Path| {
                     CString::new(path.as_os_str().as_bytes()).map_err(|_| SandboxError::Setup {
                         step: "landlock".to_string(),

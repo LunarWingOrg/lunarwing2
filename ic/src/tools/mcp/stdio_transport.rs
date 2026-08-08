@@ -347,10 +347,16 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_and_shutdown() {
         let env: HashMap<String, String> = HashMap::new();
-        let transport =
-            StdioMcpTransport::spawn("test-cat", "cat", std::iter::empty::<&str>(), &env, false, None)
-                .await
-                .expect("cat should be available");
+        let transport = StdioMcpTransport::spawn(
+            "test-cat",
+            "cat",
+            std::iter::empty::<&str>(),
+            &env,
+            false,
+            None,
+        )
+        .await
+        .expect("cat should be available");
 
         // Verify shutdown completes without error.
         transport.shutdown().await.expect("shutdown should succeed");
@@ -389,10 +395,16 @@ mod tests {
         // reader and we should hit the timeout. We use a short-lived test so
         // we override the 30s timeout expectation by just checking the error type.
         let env: HashMap<String, String> = HashMap::new();
-        let transport =
-            StdioMcpTransport::spawn("test-echo", "cat", std::iter::empty::<&str>(), &env, false, None)
-                .await
-                .expect("cat should be available");
+        let transport = StdioMcpTransport::spawn(
+            "test-echo",
+            "cat",
+            std::iter::empty::<&str>(),
+            &env,
+            false,
+            None,
+        )
+        .await
+        .expect("cat should be available");
 
         let request = McpRequest::list_tools(999);
         let headers = HashMap::new();
@@ -460,8 +472,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn sandbox_preserves_configured_core_dumps() {
-        let (soft, _hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
-            .expect("read daemon core limit");
+        let (soft, _hard) =
+            nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+                .expect("read daemon core limit");
         let expected = if soft == u64::MAX {
             "unlimited".to_string()
         } else {
@@ -536,9 +549,7 @@ mod tests {
         let status_text =
             std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read child status");
         assert!(
-            status_text
-                .lines()
-                .any(|line| line == "NoNewPrivs:\t1"),
+            status_text.lines().any(|line| line == "NoNewPrivs:\t1"),
             "child must keep no_new_privs across exec: {status_text}"
         );
 
