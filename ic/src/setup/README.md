@@ -793,7 +793,8 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 
 `enable-voice` sets `TRANSCRIPTION_PROVIDER=lunarvoice`, enables existing audio
 transcription middleware, and uses tenant registry `voice_service` port. It
-fails closed when verified Whisper files are absent. `disable-voice` stops
+fails closed when verified STT model files are absent (Whisper or
+Parakeet-TDT, selected by `VOICE_STT_ENGINE` in `voice.env`). `disable-voice` stops
 sidecar and disables transcription only when current provider remains
 `lunarvoice`; operator-selected cloud transcription config is preserved.
 Per-tenant model name and `/models/...` paths live in protected `voice.env`;
