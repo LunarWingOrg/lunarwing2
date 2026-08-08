@@ -5,9 +5,11 @@
 //! on incoming messages and replaces them with transcribed text.
 
 mod chat_completions;
+mod lunarvoice;
 mod openai;
 
 pub use self::chat_completions::ChatCompletionsTranscriptionProvider;
+pub use self::lunarvoice::{LunarVoiceConfigError, LunarVoiceTranscriptionProvider};
 pub use self::openai::OpenAiWhisperProvider;
 
 use async_trait::async_trait;

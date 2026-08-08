@@ -1,0 +1,26 @@
+[package]
+name = "voice-transcribe-tool"
+version = "0.1.0"
+edition = "2024"
+description = "LunarVoice transcription WASM tool for LunarWing"
+publish = false
+authors = ["LunarWing Team"]
+license = "AGPL-3.0-or-later"
+homepage = "https://lunarwing.org"
+repository = "https://git.lunarwing.org/lunarwing/lunarwing2"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wit-bindgen = "0.41"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+
+[workspace]

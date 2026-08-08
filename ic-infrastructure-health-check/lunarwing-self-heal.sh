@@ -402,6 +402,7 @@ declare -A SERVICE_MAP=(
     [tensorzero]="tensorzero-gateway"
     [clickhouse]="clickhouse-server"
     [lunarvision]="${LUNARVISION_SERVICE:-ocr-sidecar}"
+    [lunarvoice]="${LUNARVOICE_SERVICE:-voice-sidecar}"
     [netbird]="${NETBIRD_SERVICE:-netbird}"
 )
 
@@ -412,6 +413,7 @@ declare -A COMPONENT_CHECK_MAP=(
     [tensorzero]="health-tensorzero.sh"
     [clickhouse]="health-clickhouse.sh"
     [lunarvision]="health-lunarvision.sh"
+    [lunarvoice]="health-lunarvoice.sh"
     [netbird]="health-netbird.sh"
 )
 
@@ -425,6 +427,7 @@ declare -A NO_REMEDY=(
 # Components where detection is useful but automatic restart is unsafe. These
 # still enter the grace/escalation path instead of disappearing as NO_REMEDY.
 declare -A MONITOR_ONLY=()
+MONITOR_ONLY[lunarvoice]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
@@ -937,13 +940,13 @@ main() {
     local comp services svc
 
     # 1) Standard logical components. MT mode skips tenant-local logical
-    # mappings, but host-global NetBird monitoring remains active.
+    # mappings, but host-global monitor-only components remain visible.
     if [[ "$REMEDY_LOGICAL" != "true" ]]; then
         log "MT mode: tenant-local logical-component remediation disabled (SELF_HEAL_REMEDY_LOGICAL=false); host-global monitoring remains active"
     fi
     while IFS=$'\t' read -r comp cstatus; do
         [[ -n "$comp" ]] || continue
-        [[ "$REMEDY_LOGICAL" == "true" || "$comp" == netbird ]] || continue
+        [[ "$REMEDY_LOGICAL" == "true" || "${MONITOR_ONLY[$comp]:-}" == "1" ]] || continue
         [[ "${NO_REMEDY[$comp]:-}" == "1" ]] && { [[ "$cstatus" != healthy ]] && log "SKIP: component '$comp' has no standalone service (feature/external)"; continue; }
         services="${SERVICE_MAP[$comp]:-}"
         [[ -n "$services" ]] || { [[ "$cstatus" != healthy ]] && log "WARNING: no service mapping for component '$comp'; skipping"; continue; }

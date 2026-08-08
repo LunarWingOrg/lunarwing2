@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+
+description="LunarVoice ONNX sidecar"
+command="/opt/lunarvoice/lunarwing-voice-sidecar"
+command_user="${VOICE_USER:-lunarvoice}:${VOICE_GROUP:-lunarvoice}"
+command_background=true
+pidfile="/run/lunarvoice/voice-sidecar.pid"
+output_log="/var/log/lunarvoice.log"
+error_log="/var/log/lunarvoice.err"
+start_stop_daemon_args="--env LD_LIBRARY_PATH=/opt/lunarvoice/lib"
+
+depend() {
+    need net localmount
+    after firewall
+}
+
+start_pre() {
+    checkpath -d -m 0750 -o "$command_user" /run/lunarvoice
+    [ -f /etc/lunarwing/voice-sidecar.env ] || {
+        eerror "missing /etc/lunarwing/voice-sidecar.env"
+        return 1
+    }
+    set -a
+    . /etc/lunarwing/voice-sidecar.env
+    set +a
+}

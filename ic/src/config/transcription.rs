@@ -9,7 +9,7 @@ use crate::settings::Settings;
 pub struct TranscriptionConfig {
     /// Whether audio transcription is enabled.
     pub enabled: bool,
-    /// Provider: "openai" (default) or "chat_completions".
+    /// Provider: "openai" (default), "chat_completions", or "lunarvoice".
     pub provider: String,
     /// OpenAI API key (reuses OPENAI_API_KEY).
     pub openai_api_key: Option<SecretString>,
@@ -21,6 +21,10 @@ pub struct TranscriptionConfig {
     pub model: String,
     /// Base URL override for the transcription API.
     pub base_url: Option<String>,
+    /// Loopback LunarVoice sidecar URL.
+    pub voice_service_url: Option<String>,
+    /// LunarVoice bearer token.
+    pub voice_auth_token: Option<SecretString>,
 }
 
 impl Default for TranscriptionConfig {
@@ -33,6 +37,8 @@ impl Default for TranscriptionConfig {
             llm_api_key: None,
             model: "whisper-1".to_string(),
             base_url: None,
+            voice_service_url: None,
+            voice_auth_token: None,
         }
     }
 }
@@ -50,15 +56,18 @@ impl TranscriptionConfig {
         let openai_api_key = optional_env("OPENAI_API_KEY")?.map(SecretString::from);
         let api_key = optional_env("TRANSCRIPTION_API_KEY")?.map(SecretString::from);
         let llm_api_key = optional_env("LLM_API_KEY")?.map(SecretString::from);
+        let voice_auth_token = optional_env("VOICE_AUTH_TOKEN")?.map(SecretString::from);
 
         let default_model = match provider.as_str() {
             "chat_completions" => "google/gemini-2.0-flash-001",
+            "lunarvoice" => "whisper-tiny",
             _ => "whisper-1",
         };
         let model =
             optional_env("TRANSCRIPTION_MODEL")?.unwrap_or_else(|| default_model.to_string());
 
         let base_url = optional_env("TRANSCRIPTION_BASE_URL")?;
+        let voice_service_url = optional_env("VOICE_SERVICE_URL")?;
 
         // Validate base URL to prevent SSRF (#1103).
         if let Some(ref url) = base_url {
@@ -73,13 +82,19 @@ impl TranscriptionConfig {
             llm_api_key,
             model,
             base_url,
+            voice_service_url,
+            voice_auth_token,
         })
     }
 
     /// Resolve the API key for the configured provider.
     ///
-    /// Priority: `TRANSCRIPTION_API_KEY` > provider-specific key.
+    /// Priority: `TRANSCRIPTION_API_KEY` > provider-specific key. LunarVoice is
+    /// intentionally exempt and accepts only its dedicated loopback token.
     fn resolve_api_key(&self) -> Option<&SecretString> {
+        if self.provider == "lunarvoice" {
+            return self.voice_auth_token.as_ref();
+        }
         self.api_key
             .as_ref()
             .or_else(|| match self.provider.as_str() {
@@ -99,6 +114,28 @@ impl TranscriptionConfig {
         let api_key = self.resolve_api_key()?;
 
         match self.provider.as_str() {
+            "lunarvoice" => {
+                let service_url = self
+                    .voice_service_url
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:8090");
+                match crate::llm::transcription::LunarVoiceTranscriptionProvider::new(
+                    service_url,
+                    api_key.clone(),
+                ) {
+                    Ok(provider) => {
+                        tracing::info!(
+                            model = %self.model,
+                            "Audio transcription enabled via local LunarVoice"
+                        );
+                        Some(Box::new(provider.with_model(&self.model)))
+                    }
+                    Err(error) => {
+                        tracing::error!(error = %error, "Invalid LunarVoice configuration");
+                        None
+                    }
+                }
+            }
             "chat_completions" => {
                 tracing::info!(
                     model = %self.model,
