@@ -101,6 +101,9 @@ pub struct StdioMcpTransport {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     stderr_handle: Mutex<Option<JoinHandle<()>>>,
     child: Arc<Mutex<Child>>,
+    /// Shutdown SIGKILLs the child's whole process group (sandboxed servers
+    /// run as group leaders so grandchildren cannot outlive the server).
+    kill_process_group: bool,
 }
 
 impl StdioMcpTransport {
@@ -113,12 +116,16 @@ impl StdioMcpTransport {
     /// * `args` - Command-line arguments.
     /// * `env` - Additional environment variables to set.
     /// * `suppress_stderr` - Hide raw stderr when credentials were injected.
+    /// * `sandbox` - Optional host OS sandbox policy for the child. A policy
+    ///   that cannot be enforced fails the spawn before any process starts.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         name: impl Into<String>,
         command: &str,
         args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
         env: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
         suppress_stderr: bool,
+        sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
     ) -> Result<Self, ToolError> {
         let server_name = name.into();
 
@@ -131,6 +138,15 @@ impl StdioMcpTransport {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        if let Some(sandbox) = sandbox {
+            crate::tools::mcp::sandbox::install(&mut cmd, sandbox).map_err(|error| {
+                ToolError::ExternalService(format!(
+                    "[{}] Failed to prepare sandbox for MCP server '{}': {}",
+                    server_name, command, error
+                ))
+            })?;
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             ToolError::ExternalService(format!(
@@ -201,6 +217,7 @@ impl StdioMcpTransport {
             reader_handle: Mutex::new(Some(reader_handle)),
             stderr_handle: Mutex::new(Some(stderr_handle)),
             child: Arc::new(Mutex::new(child)),
+            kill_process_group: crate::tools::mcp::sandbox::kills_process_group(sandbox),
         })
     }
 
@@ -244,6 +261,18 @@ impl McpTransport for StdioMcpTransport {
     async fn shutdown(&self) -> Result<(), ToolError> {
         let kill_timed_out = tokio::time::timeout(MCP_CHILD_SHUTDOWN_TIMEOUT, async {
             let mut child = self.child.lock().await;
+            #[cfg(unix)]
+            if self.kill_process_group {
+                // The sandbox made the child a process-group leader; kill the
+                // whole group so spawned grandchildren cannot linger. ESRCH
+                // (group already gone) is expected and ignored.
+                if let Some(pid) = child.id() {
+                    let _ = nix::sys::signal::killpg(
+                        nix::unistd::Pid::from_raw(pid as i32),
+                        nix::sys::signal::Signal::SIGKILL,
+                    );
+                }
+            }
             let _ = child.kill().await;
         })
         .await
@@ -294,6 +323,7 @@ mod tests {
             std::iter::empty::<&str>(),
             &env,
             false,
+            None,
         )
         .await;
 
@@ -318,7 +348,7 @@ mod tests {
     async fn test_spawn_and_shutdown() {
         let env: HashMap<String, String> = HashMap::new();
         let transport =
-            StdioMcpTransport::spawn("test-cat", "cat", std::iter::empty::<&str>(), &env, false)
+            StdioMcpTransport::spawn("test-cat", "cat", std::iter::empty::<&str>(), &env, false, None)
                 .await
                 .expect("cat should be available");
 
@@ -336,6 +366,7 @@ mod tests {
             ["-c", "test \"$MCP_TEST_TOKEN\" = expected"],
             &env,
             true,
+            None,
         )
         .await
         .expect("spawn shell");
@@ -359,7 +390,7 @@ mod tests {
         // we override the 30s timeout expectation by just checking the error type.
         let env: HashMap<String, String> = HashMap::new();
         let transport =
-            StdioMcpTransport::spawn("test-echo", "cat", std::iter::empty::<&str>(), &env, false)
+            StdioMcpTransport::spawn("test-echo", "cat", std::iter::empty::<&str>(), &env, false, None)
                 .await
                 .expect("cat should be available");
 
@@ -381,5 +412,232 @@ mod tests {
         // Verify send after shutdown fails (stdin is closed).
         let result = transport.send(&request, &headers).await;
         assert!(result.is_err());
+    }
+
+    /// Spawn `sh -c ...` under a sandbox policy and return its exit status.
+    #[cfg(unix)]
+    async fn spawn_sandboxed_shell(
+        name: &str,
+        script: &str,
+        script_args: &[&str],
+        sandbox: &crate::tools::mcp::sandbox::McpSandboxConfig,
+    ) -> std::process::ExitStatus {
+        let env: HashMap<String, String> = HashMap::new();
+        let mut args = vec!["-c", script, "sandbox-test"];
+        args.extend_from_slice(script_args);
+        let transport = StdioMcpTransport::spawn(name, "sh", args, &env, false, Some(sandbox))
+            .await
+            .expect("sandboxed shell should spawn");
+        let status = transport
+            .child
+            .lock()
+            .await
+            .wait()
+            .await
+            .expect("wait for sandboxed shell");
+        transport.shutdown().await.expect("shutdown should succeed");
+        status
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_applies_memory_and_core_dump_limits() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            max_memory_mb: Some(64),
+            ..Default::default()
+        };
+        // ulimit -v reports KiB; 64 MiB == 65536. Core dumps default to 0.
+        let status = spawn_sandboxed_shell(
+            "sandbox-limits",
+            "test \"$(ulimit -v)\" = 65536 && test \"$(ulimit -c)\" = 0",
+            &[],
+            &sandbox,
+        )
+        .await;
+        assert!(status.success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_preserves_configured_core_dumps() {
+        let (soft, _hard) = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+            .expect("read daemon core limit");
+        let expected = if soft == u64::MAX {
+            "unlimited".to_string()
+        } else {
+            soft.to_string()
+        };
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            allow_core_dumps: true,
+            ..Default::default()
+        };
+        // /proc/self/limits reports the soft limit in bytes as the 5th field.
+        // Save the expected value before `set --` replaces positional params.
+        let status = spawn_sandboxed_shell(
+            "sandbox-cores",
+            "expected=$1; set -- $(grep '^Max core file size' /proc/self/limits) \
+                && test \"$5\" = \"$expected\"",
+            &[&expected],
+            &sandbox,
+        )
+        .await;
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sandbox_rejects_limit_above_daemon_hard_limit() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            max_file_descriptors: Some(u64::MAX),
+            ..Default::default()
+        };
+        let env: HashMap<String, String> = HashMap::new();
+        let result = StdioMcpTransport::spawn(
+            "sandbox-hard-limit",
+            "cat",
+            std::iter::empty::<&str>(),
+            &env,
+            false,
+            Some(&sandbox),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("limit above the hard limit must fail"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("hard limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_sets_no_new_privileges_and_process_group() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            no_new_privileges: true,
+            isolate_process_group: true,
+            ..Default::default()
+        };
+        let env: HashMap<String, String> = HashMap::new();
+        let transport = StdioMcpTransport::spawn(
+            "sandbox-prctl",
+            "cat",
+            std::iter::empty::<&str>(),
+            &env,
+            false,
+            Some(&sandbox),
+        )
+        .await
+        .expect("spawn sandboxed cat");
+        let pid = transport.child.lock().await.id().expect("child pid");
+
+        // /proc/<pid>/status carries the surviving no_new_privs flag.
+        let status_text =
+            std::fs::read_to_string(format!("/proc/{pid}/status")).expect("read child status");
+        assert!(
+            status_text
+                .lines()
+                .any(|line| line == "NoNewPrivs:\t1"),
+            "child must keep no_new_privs across exec: {status_text}"
+        );
+
+        // /proc/<pid>/stat: pid (comm) state ppid pgrp — the pgrp field of a
+        // process-group leader equals its own pid.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("read child stat");
+        let after_comm = stat.rsplit_once(") ").expect("stat comm boundary").1;
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let pgrp: u32 = fields[2].parse().expect("parse pgrp");
+        assert_eq!(pgrp, pid, "child must lead its own process group");
+
+        transport.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_deny_ptrace_installs_seccomp_filter() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            deny_ptrace: true,
+            ..Default::default()
+        };
+        // Seccomp mode 2 is "filter"; the field survives exec.
+        let status = spawn_sandboxed_shell(
+            "sandbox-seccomp",
+            "grep -q '^Seccomp:.2' /proc/self/status",
+            &[],
+            &sandbox,
+        )
+        .await;
+        assert!(status.success(), "seccomp filter must be active");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_read_only_root_keeps_only_writable_paths() {
+        if crate::tools::mcp::sandbox::landlock_abi_version().is_none() {
+            eprintln!("skipping: kernel lacks Landlock support");
+            return;
+        }
+        let writable = tempfile::tempdir().expect("writable tempdir");
+        let denied = tempfile::tempdir().expect("denied tempdir");
+        let writable_arg = writable.path().to_str().expect("utf-8 tempdir").to_string();
+        let denied_arg = denied.path().to_str().expect("utf-8 tempdir").to_string();
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            read_only_root: true,
+            writable_paths: vec![writable.path().to_path_buf()],
+            ..Default::default()
+        };
+        let status = spawn_sandboxed_shell(
+            "sandbox-landlock",
+            "touch \"$1/ok\" && ! touch \"$2/denied\"",
+            &[&writable_arg, &denied_arg],
+            &sandbox,
+        )
+        .await;
+        assert!(
+            status.success(),
+            "writable path must stay writable, ungranted path must be denied"
+        );
+        assert!(writable.path().join("ok").is_file());
+        assert!(!denied.path().join("denied").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn sandbox_network_isolated_leaves_only_loopback() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            network_isolated: true,
+            ..Default::default()
+        };
+        let env: HashMap<String, String> = HashMap::new();
+        let result = StdioMcpTransport::spawn(
+            "sandbox-netns",
+            "sh",
+            ["-c", "test \"$(wc -l < /proc/net/dev)\" = 3"],
+            &env,
+            false,
+            Some(&sandbox),
+        )
+        .await;
+        let transport = match result {
+            Ok(transport) => transport,
+            Err(error) if error.to_string().contains("Operation not permitted") => {
+                eprintln!("skipping: unprivileged user namespaces unavailable");
+                return;
+            }
+            Err(error) => panic!("unexpected sandbox spawn failure: {error}"),
+        };
+        let status = transport
+            .child
+            .lock()
+            .await
+            .wait()
+            .await
+            .expect("wait for namespaced shell");
+        transport.shutdown().await.expect("shutdown should succeed");
+        assert!(
+            status.success(),
+            "isolated network namespace must contain only loopback"
+        );
     }
 }

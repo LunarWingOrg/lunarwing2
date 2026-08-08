@@ -21,8 +21,11 @@
 //! platforms):
 //! - `no_new_privileges`: `PR_SET_NO_NEW_PRIVS` blocks setuid and
 //!   file-capability privilege escalation.
-//! - `protect_from_ptrace`: dumpable flag cleared so same-UID processes
-//!   cannot attach with ptrace or read `/proc/<pid>/mem`.
+//! - `deny_ptrace`: a seccomp filter rejects the `ptrace`,
+//!   `process_vm_readv`, and `process_vm_writev` syscalls so a compromised
+//!   server cannot inspect or inject into sibling processes. Note this cannot
+//!   cover same-UID `/proc/<pid>/mem` reads, which the kernel authorizes by
+//!   credential checks rather than by syscall.
 //! - `read_only_root` + `writable_paths`: Landlock restricts the filesystem
 //!   to read/execute except beneath explicitly writable paths.
 //! - `network_isolated`: the child enters a fresh user and network namespace
@@ -71,10 +74,12 @@ pub struct McpSandboxConfig {
     /// Block setuid/file-capability privilege escalation (Linux).
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_new_privileges: bool,
-    /// Clear the dumpable flag so same-UID processes cannot ptrace the child
-    /// or read its memory through /proc (Linux).
+    /// Reject the ptrace and process_vm_* syscalls from the child via
+    /// seccomp (Linux), so a compromised server cannot inspect or inject
+    /// into sibling processes. Same-UID /proc/<pid>/mem reads are a kernel
+    /// credential check and cannot be filtered by seccomp.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub protect_from_ptrace: bool,
+    pub deny_ptrace: bool,
     /// Landlock read/execute-only filesystem root. Only `writable_paths`
     /// remain writable (Linux, kernel >= 5.13 with Landlock enabled).
     #[serde(default, skip_serializing_if = "is_false")]
@@ -122,7 +127,7 @@ impl McpSandboxConfig {
     /// Whether any enabled restriction is only enforceable on Linux.
     pub fn requires_linux(&self) -> bool {
         self.no_new_privileges
-            || self.protect_from_ptrace
+            || self.deny_ptrace
             || self.read_only_root
             || self.network_isolated
     }
@@ -154,8 +159,8 @@ impl McpSandboxConfig {
         if self.no_new_privileges {
             parts.push("no-new-privileges".to_string());
         }
-        if self.protect_from_ptrace {
-            parts.push("ptrace-protected".to_string());
+        if self.deny_ptrace {
+            parts.push("ptrace-denied".to_string());
         }
         if self.read_only_root {
             parts.push(format!("read-only-root(+{} writable)", self.writable_paths.len()));
@@ -259,7 +264,7 @@ mod unix_impl {
         #[cfg(target_os = "linux")]
         no_new_privileges: bool,
         #[cfg(target_os = "linux")]
-        protect_from_ptrace: bool,
+        deny_ptrace: bool,
         #[cfg(target_os = "linux")]
         landlock: Option<linux::PreparedLandlock>,
     }
@@ -271,12 +276,12 @@ mod unix_impl {
             {
                 let landlock = prepare_landlock(sandbox)?;
                 let no_new_privileges =
-                    sandbox.no_new_privileges || sandbox.protect_from_ptrace || landlock.is_some();
+                    sandbox.no_new_privileges || sandbox.deny_ptrace || landlock.is_some();
                 Ok(Some(Self {
                     rlimits,
                     network_isolated: sandbox.network_isolated,
                     no_new_privileges,
-                    protect_from_ptrace: sandbox.protect_from_ptrace,
+                    deny_ptrace: sandbox.deny_ptrace,
                     landlock,
                 }))
             }
@@ -311,11 +316,13 @@ mod unix_impl {
                 if self.no_new_privileges {
                     linux::deny_new_privileges()?;
                 }
-                if self.protect_from_ptrace {
-                    linux::clear_dumpable()?;
-                }
                 if let Some(landlock) = &self.landlock {
                     landlock.apply()?;
+                }
+                // Seccomp goes last so the filter cannot interfere with the
+                // sandbox setup itself.
+                if self.deny_ptrace {
+                    linux::deny_process_vm_syscalls()?;
                 }
             }
             Ok(())
@@ -460,15 +467,17 @@ mod unix_impl {
         /// Move the child into a fresh user+network namespace whose only
         /// interface is a down loopback.
         pub(super) fn enter_isolated_netns() -> io::Result<()> {
+            // Capture the identity before unshare: inside a mapless user
+            // namespace the uid reads back as the overflow uid (65534).
+            // SAFETY: getuid/getgid cannot fail.
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
             // SAFETY: creates namespaces for the calling (about to exec)
             // process only; no buffers are involved.
             if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNET) } != 0 {
                 return Err(last_os_error());
             }
             write_proc_self(c"/proc/self/setgroups", b"deny")?;
-            // SAFETY: getuid/getgid cannot fail.
-            let uid = unsafe { libc::getuid() };
-            let gid = unsafe { libc::getgid() };
             let mut buffer = [0_u8; 48];
             write_proc_self(c"/proc/self/uid_map", format_id_map(&mut buffer, uid))?;
             write_proc_self(c"/proc/self/gid_map", format_id_map(&mut buffer, gid))?;
@@ -484,10 +493,55 @@ mod unix_impl {
             Ok(())
         }
 
-        /// PR_SET_DUMPABLE 0: block same-UID ptrace and /proc memory reads.
-        pub(super) fn clear_dumpable() -> io::Result<()> {
-            // SAFETY: scalar-only prctl; applies to the calling process.
-            if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        /// Seccomp filter rejecting ptrace and process_vm_* syscalls so the
+        /// child cannot inspect or inject into sibling processes. Requires
+        /// no_new_privileges to already be set.
+        pub(super) fn deny_process_vm_syscalls() -> io::Result<()> {
+            const DENY: u32 = libc::SECCOMP_RET_ERRNO
+                | (libc::EPERM as u32 & libc::SECCOMP_RET_DATA);
+            const ALLOW: u32 = libc::SECCOMP_RET_ALLOW;
+            const fn load_nr() -> libc::sock_filter {
+                libc::sock_filter {
+                    code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+                    jt: 0,
+                    jf: 0,
+                    k: 0, // offsetof(seccomp_data, nr)
+                }
+            }
+            const fn jump_if_eq(syscall: u32, jt: u8, jf: u8) -> libc::sock_filter {
+                libc::sock_filter {
+                    code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+                    jt,
+                    jf,
+                    k: syscall,
+                }
+            }
+            const fn ret(value: u32) -> libc::sock_filter {
+                libc::sock_filter {
+                    code: (libc::BPF_RET | libc::BPF_K) as u16,
+                    jt: 0,
+                    jf: 0,
+                    k: value,
+                }
+            }
+            let mut filter = [
+                load_nr(),
+                jump_if_eq(libc::SYS_ptrace as u32, 0, 1),
+                ret(DENY),
+                jump_if_eq(libc::SYS_process_vm_readv as u32, 0, 1),
+                ret(DENY),
+                jump_if_eq(libc::SYS_process_vm_writev as u32, 0, 1),
+                ret(DENY),
+                ret(ALLOW),
+            ];
+            let prog = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            // SAFETY: filter outlives the call; prog points at a valid
+            // classic-BPF program of exactly `len` instructions.
+            if unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &prog) } != 0
+            {
                 return Err(last_os_error());
             }
             Ok(())
