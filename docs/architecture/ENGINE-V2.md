@@ -5,7 +5,10 @@ The V2 engine is a unified thread-capability-CodeAct execution model that lives 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
-present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching).
+present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching). Multi-tenant
+provisioning (`ic/scripts/lunarwing-mt-admin.sh`) writes `ENGINE_V2=true` and
+`ENGINE_V2_CHANNELS=xmpp,weechat,darkirc` into new tenant envs by default and
+preserves existing tenant values across upgrade/rebuild/re-render.
 
 ## Five Primitives
 
@@ -521,10 +524,14 @@ This enables:
 ## Configuration
 
 ```bash
-ENGINE_V2=true                 # Enable Engine V2 (default: false)
-ENGINE_V2_CHANNELS=            # Gateway only (default)
+ENGINE_V2=true                 # Enable Engine V2 (runtime default: false;
+                               # multi-tenant provisioning writes true)
+ENGINE_V2_CHANNELS=            # Gateway only (runtime default)
 ENGINE_V2_CHANNELS=xmpp        # Add XMPP
 ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
+# Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
+# (existing tenant values preserved on re-render; ENGINE_V2=false or
+#  ENGINE_V2_CHANNELS=none opts out durably)
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle
 ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
 ```
