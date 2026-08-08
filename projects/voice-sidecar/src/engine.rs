@@ -176,11 +176,7 @@ impl SherpaVoiceEngine {
 
 #[cfg(feature = "onnx")]
 fn load_stt(config: &Config) -> Result<Option<Arc<Mutex<SttRecognizer>>>, EngineError> {
-    let mut required = vec![
-        &config.stt_encoder,
-        &config.stt_decoder,
-        &config.stt_tokens,
-    ];
+    let mut required = vec![&config.stt_encoder, &config.stt_decoder, &config.stt_tokens];
     if config.stt_engine == crate::config::SttEngineKind::Parakeet {
         required.push(&config.stt_joiner);
     }

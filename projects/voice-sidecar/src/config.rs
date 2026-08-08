@@ -265,3 +265,47 @@ fn parse_voice_map() -> Result<HashMap<String, i32>, ConfigError> {
     };
     serde_json::from_str(&value).map_err(|_| ConfigError::InvalidVoiceMap)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stt_engine_env_parsing() {
+        // One test keeps env mutation sequential; parallel tests must not
+        // observe a partially-updated VOICE_STT_ENGINE.
+        unsafe { env::remove_var("VOICE_STT_ENGINE") };
+        assert_eq!(env_stt_engine().ok(), Some(SttEngineKind::Whisper));
+        for value in ["parakeet", "parakeet-tdt", "transducer", "PARAKEET"] {
+            unsafe { env::set_var("VOICE_STT_ENGINE", value) };
+            assert_eq!(env_stt_engine().ok(), Some(SttEngineKind::Parakeet));
+        }
+        unsafe { env::set_var("VOICE_STT_ENGINE", "sensevoice") };
+        assert!(env_stt_engine().is_err());
+        unsafe { env::remove_var("VOICE_STT_ENGINE") };
+    }
+
+    #[test]
+    fn parakeet_defaults_follow_model_name() {
+        let paths = SttPathDefaults::new("parakeet-tdt-0.6b-v3-int8", SttEngineKind::Parakeet);
+        let root = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+        assert_eq!(paths.encoder, format!("{root}/encoder.int8.onnx"));
+        assert_eq!(paths.decoder, format!("{root}/decoder.int8.onnx"));
+        assert_eq!(paths.joiner, format!("{root}/joiner.int8.onnx"));
+        assert_eq!(paths.tokens, format!("{root}/tokens.txt"));
+    }
+
+    #[test]
+    fn whisper_defaults_keep_historical_layout() {
+        let paths = SttPathDefaults::new("whisper-tiny", SttEngineKind::Whisper);
+        assert_eq!(
+            paths.encoder,
+            "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx"
+        );
+        assert_eq!(
+            paths.decoder,
+            "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx"
+        );
+        assert_eq!(paths.tokens, "sherpa-onnx-whisper-tiny/tiny-tokens.txt");
+    }
+}
