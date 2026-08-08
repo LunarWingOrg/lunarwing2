@@ -13,8 +13,8 @@ ic/src/bridge/ssh_secrets.rs:private-key:224
 ic/src/bridge/ssh_secrets.rs:private-key:239
 ic/src/bridge/ssh_secrets.rs:private-key:320
 ic/src/bridge/ssh_secrets.rs:private-key:365
-ic/crates/lunarwing_safety/src/leak_detector.rs:generic-api-key:541
-ic/crates/lunarwing_safety/src/leak_detector.rs:stripe-access-token:996
+ic/crates/lunarwing_safety/src/leak_detector.rs:generic-api-key:564
+ic/crates/lunarwing_safety/src/leak_detector.rs:stripe-access-token:1053
 ic/scripts/tests/test-weechat-relay-bootstrap.sh:generic-api-key:108
 ic/src/context/fallback.rs:generic-api-key:233
 ic/src/channels/wasm/router.rs:generic-api-key:907
