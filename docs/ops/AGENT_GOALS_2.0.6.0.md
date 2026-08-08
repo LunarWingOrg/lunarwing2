@@ -11,7 +11,7 @@
 
 ---
 
-1. [ ] implement proposal defined here - docs/proposals/lunarvoice-onnx-proposal-2.0.6.0.md
+1. [x] implement proposal defined here - docs/proposals/lunarvoice-onnx-proposal-2.0.6.0.md — Completed: local sherpa-onnx sidecar, existing transcription-provider integration, sandboxed WASM tool, verified model workflow, multi-tenant systemd/OpenRC lifecycle, registry-aware health monitoring, tests, and deployment docs.
 2. [ ] work on this issue: Bug Report (Sunburst BUG-003) Summary Mission thread goal pollution — mission-spec text leaking into insight extraction. Severity High Source Consolidated from Sunburst's open bug list, last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)
 3. [ ] MAKE V2 ENGINE CHANNELS ON BY DEFAULT FOR ALL i.e.  ENGINE_V2_CHANNELS=xmpp,weechat,darkirc by default should be present in new tenant env - ensure never overwrite existing tenant's value upon upgrade or rebuild or re-render
 4. [ ] work on this issue: [BUG-013] Secret leak warnings in logs (noisy but no functional impact) - last updated 2026-08-01 on build 2.0.3.0 (might already be fixed - in that case, confirm)

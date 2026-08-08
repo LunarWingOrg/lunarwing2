@@ -114,6 +114,7 @@ run_check "health-clickhouse.sh" "clickhouse" > "$WORKDIR/check-clickhouse.tmp" 
 run_check "health-tensorzero.sh" "tensorzero" > "$WORKDIR/check-tensorzero.tmp" 2> "$WORKDIR/log-tensorzero.tmp" &
 run_check "health-models.sh" "models" > "$WORKDIR/check-models.tmp" 2> "$WORKDIR/log-models.tmp" &
 run_check "health-lunarvision.sh" "lunarvision" > "$WORKDIR/check-lunarvision.tmp" 2> "$WORKDIR/log-lunarvision.tmp" &
+run_check "health-lunarvoice.sh" "lunarvoice" > "$WORKDIR/check-lunarvoice.tmp" 2> "$WORKDIR/log-lunarvoice.tmp" &
 run_check "health-netbird.sh" "netbird" > "$WORKDIR/check-netbird.tmp" 2> "$WORKDIR/log-netbird.tmp" &
 case "$SERVICE_MANAGER" in
   systemd) run_check "health-systemd.sh" "systemd" > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
@@ -126,7 +127,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models lunarvision netbird svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models lunarvision lunarvoice netbird svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -139,6 +140,7 @@ check_clickhouse=$(cat "$WORKDIR/check-clickhouse.tmp" 2>/dev/null || echo)
 check_tensorzero=$(cat "$WORKDIR/check-tensorzero.tmp" 2>/dev/null || echo)
 check_models=$(cat "$WORKDIR/check-models.tmp" 2>/dev/null || echo)
 check_lunarvision=$(cat "$WORKDIR/check-lunarvision.tmp" 2>/dev/null || echo)
+check_lunarvoice=$(cat "$WORKDIR/check-lunarvoice.tmp" 2>/dev/null || echo)
 check_netbird=$(cat "$WORKDIR/check-netbird.tmp" 2>/dev/null || echo)
 check_svcmgr=$(cat "$WORKDIR/check-svcmgr.tmp" 2>/dev/null || echo)
 
@@ -155,6 +157,7 @@ components=(
     "$check_tensorzero"
     "$check_models"
     "$check_lunarvision"
+    "$check_lunarvoice"
     "$check_netbird"
     "${check_svcmgr:-}"
 )
@@ -195,7 +198,7 @@ components_json=""
 for comp in "$check_gateway" "$check_xmpp" \
     "${check_omemo:-}" "${check_ratelimit:-}" \
     "$check_clickhouse" "$check_tensorzero" \
-    "$check_models" "$check_lunarvision" "$check_netbird" \
+    "$check_models" "$check_lunarvision" "$check_lunarvoice" "$check_netbird" \
     "${check_svcmgr:-}"; do
     if [ -n "$comp" ] && echo "$comp" | jq . >/dev/null 2>&1; then
         if [ -n "$components_json" ]; then

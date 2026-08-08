@@ -1,9 +1,9 @@
 # LunarWing Infrastructure Health Check System
 
-_Last updated: 2026-08-03 — self-heal watchdog v2.1.0; NetBird readiness added._
+_Last updated: 2026-08-08 — LunarVoice readiness monitoring added._
 
 Automated health monitoring and self-healing for LunarWing infrastructure.
-Ten parallel component checks aggregate into a JSON report; a separate
+Eleven parallel component checks aggregate into a JSON report; a separate
 watchdog reads that report and auto-remediates unhealthy services with a grace
 period, exponential backoff, a flapping guard, post-restart verification, and
 multi-tenant awareness.
@@ -21,6 +21,7 @@ cron-wrapper.sh
   │     ├── health-tensorzero.sh       (proxy p50/p95, error rate, queue, GPU)
   │     ├── health-models.sh           (LLM provider APIs)
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
+  │     ├── health-lunarvoice.sh       (enabled local voice sidecars: health + STT readiness)
   │     ├── health-netbird.sh          (opt-in host tunnel readiness)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
@@ -113,6 +114,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | per-provider `status`, `latency_ms`, `last_error` |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
+| lunarvoice | health-lunarvoice.sh | Enabled LunarVoice `/health`, `/ready`, and `/metrics` endpoints | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
@@ -152,6 +154,10 @@ checks can instead be **disabled** so they report `healthy` with
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
 | `HEALTH_LUNARVISION_LATENCY_DEGRADED_MS` | health-lunarvision.sh | `2000` | Health-endpoint latency threshold for `degraded` |
 | `HEALTH_LUNARVISION_LATENCY_CRITICAL_MS` | health-lunarvision.sh | `5000` | Health-endpoint latency threshold for `critical` |
+| `HEALTH_LUNARVOICE_ENABLED` | health-lunarvoice.sh | `auto` | Auto-probes enabled registry tenants or explicit URL; `true` forces single-node 8091 fallback; other values disable |
+| `HEALTH_LUNARVOICE_URL` | health-lunarvoice.sh | _(unset)_ → enabled registry `voice_health` ports, else `http://127.0.0.1:8091` | Optional single-node override; leave unset on multi-tenant hosts |
+| `HEALTH_LUNARVOICE_TIMEOUT` | health-lunarvoice.sh | `5` | curl timeout for health/readiness/metrics probes |
+| `HEALTH_LUNARVOICE_FETCH_METRICS` | health-lunarvoice.sh | `true` | Fetch bounded operational counters from `/metrics` |
 | `HEALTH_NETBIRD_ENABLED` | health-netbird.sh | `false` | Opt in to host NetBird readiness monitoring |
 | `HEALTH_NETBIRD_TIMEOUT` | health-netbird.sh | `5` | Readiness probe timeout (seconds) |
 | `NETBIRD_BINARY` | health-netbird.sh | `netbird` | NetBird CLI name or path |
@@ -259,6 +265,7 @@ wedge it.
 | tensorzero | `tensorzero-gateway` | health-tensorzero.sh |
 | clickhouse | `clickhouse-server` | health-clickhouse.sh |
 | lunarvision | `ocr-sidecar` | health-lunarvision.sh |
+| lunarvoice | `voice-sidecar` (monitor-only) | health-lunarvoice.sh |
 | netbird | `netbird` (monitor-only unless explicitly delegated) | health-netbird.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
 
@@ -416,16 +423,18 @@ bash tests/test-self-heal-matrix.sh         # synthetic report matrix (sections 
 bash tests/chaos-harness.sh                 # end-to-end fault-injection (13 scenarios: CH1–CH6, CH9–CH15)
 bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S13)
 bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
+bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness scenarios
 ```
 
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (149 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (151 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
 | `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
