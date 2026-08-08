@@ -571,7 +571,7 @@ mod unix_impl {
 
         /// Format "<id> <id> 1\n" into a stack buffer without allocating;
         /// allocation is not async-signal-safe in the fork/exec window.
-        fn format_id_map<'a>(buffer: &'a mut [u8; 48], id: libc::uid_t) -> &'a [u8] {
+        fn format_id_map(buffer: &mut [u8; 48], id: libc::uid_t) -> &[u8] {
             let mut pos = write_u32(buffer, id);
             buffer[pos] = b' ';
             pos += 1;
