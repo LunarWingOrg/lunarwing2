@@ -21,6 +21,23 @@ pub enum ConfigError {
     PortConflict,
     #[error("VOICE_TTS_VOICES_JSON must be a JSON object mapping names to integer speaker IDs")]
     InvalidVoiceMap,
+    #[error("VOICE_STT_ENGINE must be one of: whisper, parakeet")]
+    InvalidSttEngine,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttEngineKind {
+    Whisper,
+    Parakeet,
+}
+
+impl SttEngineKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Whisper => "whisper",
+            Self::Parakeet => "parakeet",
+        }
+    }
 }
 
 pub struct Config {
@@ -39,8 +56,10 @@ pub struct Config {
     pub cache_max_entries: usize,
     pub ffmpeg_path: PathBuf,
     pub model_name: String,
+    pub stt_engine: SttEngineKind,
     pub stt_encoder: PathBuf,
     pub stt_decoder: PathBuf,
+    pub stt_joiner: PathBuf,
     pub stt_tokens: PathBuf,
     pub stt_language: String,
     pub vad_model: PathBuf,
@@ -80,6 +99,9 @@ impl Config {
         }
 
         let tts_voice_ids = parse_voice_map()?;
+        let model_name = env_string("VOICE_STT_MODEL", "whisper-tiny");
+        let stt_engine = env_stt_engine()?;
+        let stt_paths = SttPathDefaults::new(&model_name, stt_engine);
         Ok(Self {
             bind_host,
             port,
@@ -95,22 +117,12 @@ impl Config {
             cache_ttl_secs: env_number("VOICE_CACHE_TTL_SECS", 600u64)?,
             cache_max_entries: env_number("VOICE_CACHE_MAX_ENTRIES", 5_000usize)?.max(1),
             ffmpeg_path: env_path("VOICE_FFMPEG_PATH", "ffmpeg"),
-            model_name: env_string("VOICE_STT_MODEL", "whisper-tiny"),
-            stt_encoder: env_path_or_join(
-                "VOICE_STT_ENCODER",
-                &model_dir,
-                "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx",
-            ),
-            stt_decoder: env_path_or_join(
-                "VOICE_STT_DECODER",
-                &model_dir,
-                "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx",
-            ),
-            stt_tokens: env_path_or_join(
-                "VOICE_STT_TOKENS",
-                &model_dir,
-                "sherpa-onnx-whisper-tiny/tiny-tokens.txt",
-            ),
+            model_name,
+            stt_engine,
+            stt_encoder: env_path_or_join("VOICE_STT_ENCODER", &model_dir, &stt_paths.encoder),
+            stt_decoder: env_path_or_join("VOICE_STT_DECODER", &model_dir, &stt_paths.decoder),
+            stt_joiner: env_path_or_join("VOICE_STT_JOINER", &model_dir, &stt_paths.joiner),
+            stt_tokens: env_path_or_join("VOICE_STT_TOKENS", &model_dir, &stt_paths.tokens),
             stt_language: env_string("VOICE_STT_LANGUAGE", "auto"),
             vad_model: env_path_or_join("VOICE_VAD_MODEL", &model_dir, "silero_vad.onnx"),
             tts_model: env_path_or_join(
@@ -203,10 +215,97 @@ where
     }
 }
 
+fn env_stt_engine() -> Result<SttEngineKind, ConfigError> {
+    match env::var("VOICE_STT_ENGINE") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "whisper" => Ok(SttEngineKind::Whisper),
+            "parakeet" | "parakeet-tdt" | "transducer" => Ok(SttEngineKind::Parakeet),
+            _ => Err(ConfigError::InvalidSttEngine),
+        },
+        Err(_) => Ok(SttEngineKind::Whisper),
+    }
+}
+
+/// Model-relative default artifact paths for the selected STT engine.
+/// Parakeet archives ship as `sherpa-onnx-nemo-<model>/` with uniform file
+/// names; Whisper keeps its historical per-size names and has no joiner.
+struct SttPathDefaults {
+    encoder: String,
+    decoder: String,
+    joiner: String,
+    tokens: String,
+}
+
+impl SttPathDefaults {
+    fn new(model_name: &str, engine: SttEngineKind) -> Self {
+        match engine {
+            SttEngineKind::Whisper => Self {
+                encoder: "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx".into(),
+                decoder: "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx".into(),
+                joiner: "sherpa-onnx-whisper-tiny/tiny-tokens.txt".into(),
+                tokens: "sherpa-onnx-whisper-tiny/tiny-tokens.txt".into(),
+            },
+            SttEngineKind::Parakeet => {
+                let root = format!("sherpa-onnx-nemo-{model_name}");
+                Self {
+                    encoder: format!("{root}/encoder.int8.onnx"),
+                    decoder: format!("{root}/decoder.int8.onnx"),
+                    joiner: format!("{root}/joiner.int8.onnx"),
+                    tokens: format!("{root}/tokens.txt"),
+                }
+            }
+        }
+    }
+}
+
 fn parse_voice_map() -> Result<HashMap<String, i32>, ConfigError> {
     let default = HashMap::from([("af_heart".to_string(), 0)]);
     let Ok(value) = env::var("VOICE_TTS_VOICES_JSON") else {
         return Ok(default);
     };
     serde_json::from_str(&value).map_err(|_| ConfigError::InvalidVoiceMap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stt_engine_env_parsing() {
+        // One test keeps env mutation sequential; parallel tests must not
+        // observe a partially-updated VOICE_STT_ENGINE.
+        unsafe { env::remove_var("VOICE_STT_ENGINE") };
+        assert_eq!(env_stt_engine().ok(), Some(SttEngineKind::Whisper));
+        for value in ["parakeet", "parakeet-tdt", "transducer", "PARAKEET"] {
+            unsafe { env::set_var("VOICE_STT_ENGINE", value) };
+            assert_eq!(env_stt_engine().ok(), Some(SttEngineKind::Parakeet));
+        }
+        unsafe { env::set_var("VOICE_STT_ENGINE", "sensevoice") };
+        assert!(env_stt_engine().is_err());
+        unsafe { env::remove_var("VOICE_STT_ENGINE") };
+    }
+
+    #[test]
+    fn parakeet_defaults_follow_model_name() {
+        let paths = SttPathDefaults::new("parakeet-tdt-0.6b-v3-int8", SttEngineKind::Parakeet);
+        let root = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+        assert_eq!(paths.encoder, format!("{root}/encoder.int8.onnx"));
+        assert_eq!(paths.decoder, format!("{root}/decoder.int8.onnx"));
+        assert_eq!(paths.joiner, format!("{root}/joiner.int8.onnx"));
+        assert_eq!(paths.tokens, format!("{root}/tokens.txt"));
+    }
+
+    #[test]
+    fn whisper_defaults_keep_historical_layout() {
+        let paths = SttPathDefaults::new("whisper-tiny", SttEngineKind::Whisper);
+        assert_eq!(
+            paths.encoder,
+            "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx"
+        );
+        assert_eq!(
+            paths.decoder,
+            "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx"
+        );
+        assert_eq!(paths.tokens, "sherpa-onnx-whisper-tiny/tiny-tokens.txt");
+    }
 }

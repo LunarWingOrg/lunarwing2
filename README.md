@@ -39,7 +39,7 @@ The v2 line combines a channel-neutral execution engine, an interactive browser 
 
 Engine V2 provides the channel-neutral thread, capability, and CodeAct execution path used by the v2 gateway. It supports streamed events, interrupts, stop handling, approval gates, and rich tool results. New multi-tenant configurations enable Engine V2 by default; direct single-instance configurations must opt in.
 
-The gateway receives the full interactive experience. XMPP, DarkIRC, and WeeChat can opt in through `ENGINE_V2_CHANNELS`; other channels remain on the legacy path. Opted-in WASM channels currently receive terminal responses and status updates rather than live token edits. Validate channel-specific behavior before enabling Engine V2 for group channels.
+The gateway receives the full interactive experience. Multi-tenant deployments route XMPP, DarkIRC, and WeeChat through Engine V2 by default (`ENGINE_V2_CHANNELS=xmpp,weechat,darkirc`, with operator overrides preserved across re-renders); single-instance configurations opt in through `ENGINE_V2_CHANNELS`. Other channels remain on the legacy path. WASM channels on Engine V2 currently receive terminal responses and status updates rather than live token edits. Validate channel-specific behavior before enabling Engine V2 for additional group channels.
 
 Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 

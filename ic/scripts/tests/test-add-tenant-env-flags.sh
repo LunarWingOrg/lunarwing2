@@ -120,6 +120,8 @@ assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-te
 assert_eq "coordination admin token generated" \
   "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
+assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
+assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
 
 # Case 2: all three flags on first write
 out="$(run_writer fixture-tenant \
@@ -141,6 +143,8 @@ sed -i \
   -e 's/^COORD_AGENT_ID=.*/COORD_AGENT_ID=custom-agent/' \
   -e 's/^COORD_CHANNELS=.*/COORD_CHANNELS=ops@conference.example/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
+  -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
+  -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
   "$MT_FIXTURE/env/lunarwing.env"
 cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
@@ -164,6 +168,19 @@ assert_eq "rerun preserves LW2STUDYMCP_STATE_HOME" \
   "$(envval LW2STUDYMCP_STATE_HOME)" "/srv/lunarwing/study-state"
 assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
   "$(envval LW2STUDYMCP_ALLOW_WRITE)" "1"
+assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
+assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
+
+# Case 3b: upgrade path — an env written by an older version (no ENGINE_V2
+# keys at all) gains the on-by-default values on re-render.
+sed -i \
+  -e '/^ENGINE_V2=/d' \
+  -e '/^ENGINE_V2_CHANNELS=/d' \
+  "$MT_FIXTURE/env/lunarwing.env"
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "upgrade adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
+assert_eq "upgrade adds ENGINE_V2_CHANNELS default" \
+  "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
 
 # Case 4: a DarkIRC-enabled re-render must preserve the existing adapter secret.
 DARKIRC_FIXTURE_ENABLED=true

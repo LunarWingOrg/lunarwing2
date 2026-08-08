@@ -38,6 +38,7 @@ impl McpProcessManager {
     }
 
     /// Spawn a new stdio MCP server process.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn_stdio(
         &self,
         name: impl Into<String>,
@@ -45,6 +46,7 @@ impl McpProcessManager {
         args: Vec<String>,
         env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
         suppress_stderr: bool,
+        sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
     ) -> Result<Arc<StdioMcpTransport>, ToolError> {
         let name = name.into();
         let command = command.into();
@@ -54,8 +56,9 @@ impl McpProcessManager {
                 "MCP server process '{name}' is already managed"
             )));
         }
-        let transport =
-            Arc::new(StdioMcpTransport::spawn(&name, &command, args, env, suppress_stderr).await?);
+        let transport = Arc::new(
+            StdioMcpTransport::spawn(&name, &command, args, env, suppress_stderr, sandbox).await?,
+        );
         transports.insert(name, Arc::clone(&transport));
 
         Ok(transport)
@@ -150,6 +153,7 @@ mod tests {
                 Vec::new(),
                 HashMap::<String, String>::new(),
                 false,
+                None,
             )
             .await
             .expect("spawn cat");
@@ -166,6 +170,7 @@ mod tests {
                 Vec::new(),
                 HashMap::<String, String>::new(),
                 false,
+                None,
             )
             .await
             .expect("spawn false");
@@ -188,6 +193,7 @@ mod tests {
                 vec!["-c".to_string(), "exec 1>&-; sleep 10".to_string()],
                 HashMap::<String, String>::new(),
                 false,
+                None,
             )
             .await
             .expect("spawn live child with closed stdout");
@@ -218,6 +224,7 @@ mod tests {
                 Vec::new(),
                 HashMap::<String, String>::new(),
                 false,
+                None,
             )
             .await
             .expect("spawn first process");
@@ -228,6 +235,7 @@ mod tests {
                 Vec::new(),
                 HashMap::<String, String>::new(),
                 false,
+                None,
             )
             .await
         {

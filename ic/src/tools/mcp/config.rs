@@ -93,6 +93,11 @@ pub struct McpServerConfig {
     /// Absent means unverified legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<crate::tools::mcp::provenance::McpPackageProvenance>,
+
+    /// Host OS sandbox policy for a stdio server child process.
+    /// Absent means legacy unsandboxed execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<crate::tools::mcp::sandbox::McpSandboxConfig>,
 }
 
 fn default_true() -> bool {
@@ -122,6 +127,7 @@ impl McpServerConfig {
             description: None,
             always_require_approval: Vec::new(),
             provenance: None,
+            sandbox: None,
         }
     }
 
@@ -159,6 +165,7 @@ impl McpServerConfig {
             description: None,
             always_require_approval: Vec::new(),
             provenance: None,
+            sandbox: None,
         }
     }
 
@@ -177,6 +184,7 @@ impl McpServerConfig {
             description: None,
             always_require_approval: Vec::new(),
             provenance: None,
+            sandbox: None,
         }
     }
 
@@ -213,6 +221,12 @@ impl McpServerConfig {
         provenance: crate::tools::mcp::provenance::McpPackageProvenance,
     ) -> Self {
         self.provenance = Some(provenance);
+        self
+    }
+
+    /// Set the host OS sandbox policy (stdio servers only).
+    pub fn with_sandbox(mut self, sandbox: crate::tools::mcp::sandbox::McpSandboxConfig) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 
@@ -393,6 +407,15 @@ impl McpServerConfig {
             {
                 return Err(ConfigError::InvalidConfig {
                     reason: "provenance command digests only apply to stdio servers".to_string(),
+                });
+            }
+        }
+
+        if let Some(sandbox) = &self.sandbox {
+            sandbox.validate()?;
+            if !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. }) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "sandbox policies only apply to stdio servers".to_string(),
                 });
             }
         }
@@ -1351,6 +1374,44 @@ pub enum EffectiveTransport<'a> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn sandbox_policy_only_applies_to_stdio() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            max_memory_mb: Some(256),
+            isolate_process_group: true,
+            ..Default::default()
+        };
+
+        let stdio = McpServerConfig::new_stdio("local", "cat", Vec::new(), HashMap::new())
+            .with_sandbox(sandbox.clone());
+        stdio.validate().expect("stdio server may carry a sandbox");
+
+        let http =
+            McpServerConfig::new("remote", "https://mcp.example.com").with_sandbox(sandbox.clone());
+        let error = http
+            .validate()
+            .expect_err("http server must reject a sandbox");
+        assert!(error.to_string().contains("stdio"));
+
+        let unix = McpServerConfig::new_unix("unix", "/tmp/mcp.sock").with_sandbox(sandbox);
+        assert!(unix.validate().is_err());
+    }
+
+    #[test]
+    fn sandbox_policy_survives_serde_roundtrip() {
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            read_only_root: true,
+            writable_paths: vec![PathBuf::from("/var/lib/mcp")],
+            network_isolated: true,
+            ..Default::default()
+        };
+        let config = McpServerConfig::new_stdio("local", "cat", Vec::new(), HashMap::new())
+            .with_sandbox(sandbox);
+        let json = serde_json::to_value(&config).expect("serialize");
+        let parsed: McpServerConfig = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.sandbox, config.sandbox);
+    }
 
     #[test]
     fn test_is_localhost_url() {
