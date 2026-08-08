@@ -27,6 +27,7 @@ assert_eq "$(jq -r '.tenants.alpha.voice_ports.voice_service' "$registry")" 4000
 
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$SCRIPTS_DIR/lunarwing-mt-admin.sh"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 PORTS_REGISTRY="$registry"
 env_dir="$ROOT/env"
 mkdir -p "$env_dir"
@@ -64,6 +65,7 @@ assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_ENABLED)" fals
 tenant_quadlet_dir() { printf '%s' "$ROOT/quadlets"; }
 tenant_home() { printf '%s' "$ROOT/home"; }
 OPENRC_INITD_DIR="$ROOT/init.d"
+# shellcheck disable=SC2034  # Mock container runtime consumed by sourced mt-admin functions.
 CONTAINER_RT=true
 mkdir -p "$OPENRC_INITD_DIR"
 ports_set_voice alpha true

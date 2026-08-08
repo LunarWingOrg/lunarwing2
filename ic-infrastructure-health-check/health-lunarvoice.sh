@@ -152,7 +152,7 @@ probe() {
 overall=healthy
 exit_code=0
 instances='[]'
-issues='[]'
+all_issues='[]'
 for target in "${targets[@]}"; do
   tenant="${target%%|*}"
   base="${target#*|}"
@@ -162,13 +162,13 @@ for target in "${targets[@]}"; do
     overall="$instance_status"
   fi
   instances="$(jq -c --argjson instance "$instance" '. + [$instance]' <<<"$instances")"
-  issues="$(jq -c --argjson more "$(jq '.issues' <<<"$instance")" '. + $more' <<<"$issues")"
+  all_issues="$(jq -c --argjson more "$(jq '.issues' <<<"$instance")" '. + $more' <<<"$all_issues")"
 done
 case "$overall" in critical) exit_code=2 ;; degraded) exit_code=1 ;; esac
 
 jq -n \
   --arg timestamp "$TIMESTAMP" --arg status "$overall" --arg discovery "$discovery" \
-  --argjson instances "$instances" --argjson issues "$issues" \
+  --argjson instances "$instances" --argjson issues "$all_issues" \
   '{component:"lunarvoice",status:$status,timestamp:$timestamp,
     metrics:{enabled:true,discovery:$discovery,target_count:($instances|length),instances:$instances},issues:$issues}'
 exit "$exit_code"

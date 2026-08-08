@@ -372,16 +372,6 @@ Workflow:
 EOF
 }
 
-[[ $# -eq 0 ]] && { usage; exit 0; }
-
-case "$1" in
-  snapshot)  shift; do_snapshot "$@" ;;
-  run)      shift; do_run "$@" ;;
-  results)  do_results ;;
-  clean)    do_clean ;;
-  *)        usage; exit 1 ;;
-esac
-
 # ── Run loop ─────────────────────────────────────────────────────────────────
 
 do_run() {
@@ -424,3 +414,13 @@ do_run() {
   banner "All branches tested"
   do_results
 }
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+case "$1" in
+  snapshot)  shift; do_snapshot "$@" ;;
+  run)      shift; do_run "$@" ;;
+  results)  do_results ;;
+  clean)    do_clean ;;
+  *)        usage; exit 1 ;;
+esac
