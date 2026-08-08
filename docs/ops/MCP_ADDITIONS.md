@@ -1,14 +1,16 @@
 # MCP Additions Status
 
-> **Current status (2026-08-07): PARTIAL.** HTTP/HTTPS plus host-local stdio and
+> **Current status (2026-08-08): PARTIAL.** HTTP/HTTPS plus host-local stdio and
 > Unix MCP; owner-scoped secret references; diagnostics; explicit lifecycle
-> operations; safe whole-runtime stdio crash recovery; and operator-pinned
-> package provenance (executable digest verification, trust state, revocation)
-> are implemented.
+> operations; safe whole-runtime stdio crash recovery; operator-pinned
+> package provenance (executable digest verification, trust state, revocation);
+> and opt-in host OS sandboxing for stdio children (resource limits,
+> process-group isolation, seccomp ptrace denial, Landlock read-only root,
+> network namespace isolation) are implemented.
 > Worker-local placement, automatic package installation, publisher signatures
-> and dependency locking, OS sandboxing for host-local stdio, a general
-> runtime-adapter layer, MCP-over-WASM, and a dedicated shared MCP gateway are
-> not implemented.
+> and dependency locking, device-level sandboxing and mandatory default sandbox
+> profiles, a general runtime-adapter layer, MCP-over-WASM, and a dedicated
+> shared MCP gateway are not implemented.
 
 For the concise checkpoint, remaining-validation list, and deferred-work summary,
 see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
@@ -112,13 +114,41 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   dependency graphs, upgrade diffs, marketplace trust roots, and revocation
   distribution for compromised publishers.
 
+### Host OS sandboxing for stdio children
+
+- `McpServerConfig` carries an optional `sandbox` policy (stdio-only, like the
+  provenance digest rule). `lunarwing mcp add --sandbox` enables the baseline;
+  granular `--sandbox-*` flags set individual restrictions.
+- Portable (any unix): setrlimit caps for memory, CPU seconds, file
+  descriptors, process count, and file size; core dumps disabled unless
+  explicitly allowed; a request above the daemon's hard limit fails activation
+  instead of clamping; process-group isolation makes the child a group leader
+  so shutdown SIGKILLs the whole group and cannot orphan grandchildren.
+- Linux-only, failing closed when requested elsewhere: `no_new_privileges`
+  (PR_SET_NO_NEW_PRIVS), a seccomp filter denying `ptrace`/
+  `process_vm_readv`/`process_vm_writev`, Landlock read-only root with explicit
+  writable paths (kernel >= 5.13), and network isolation via a fresh
+  user+network namespace with a down loopback.
+- Enforcement runs in the fork/exec window from state prepared before the
+  fork, and every spawn path (startup, manual activation, crash recovery)
+  shares the factory, so the policy is always re-applied. A policy that cannot
+  be honored fails activation before any child starts.
+- `mcp list --verbose` shows the policy; `lunarwing doctor` warns when the
+  host cannot honor it. `mcp update` retains it for stdio servers and drops it
+  on transport switch; web/conversational updates reset it, like provenance.
+- Limits: the seccomp filter blocks the memory-inspection syscalls but not
+  same-UID `/proc/<pid>/mem` reads (a kernel credential check, not a syscall);
+  `PR_SET_DUMPABLE` does not survive `execve`, so inbound memory-read
+  protection cannot be applied from the spawn path. Device isolation and
+  mandatory default sandbox profiles remain future work.
+
 ## Not Implemented
 
 | Feature | Current status and reason |
 |---------|---------------------------|
 | Automatic npm/pip installation | No production package installer exists. LunarWing runs an operator-installed command. Safe automation needs immutable package identity, digest/signature verification, dependency locking, capability review, sandboxing, audit, revocation, health checks, and rollback. Provenance pinning (below) covers the identity/digest/trust subset; the rest remains. |
 | MCP package provenance | Partially implemented: operator-pinned executable digests, package identity, trust state, and revocation for host-local stdio servers. Publisher signatures, signing-key trust roots, dependency lock data, upgrade diffs, and marketplace revocation remain design work. |
-| Host-local stdio OS sandbox | Environment inheritance is restricted, but the child still runs with LunarWing service-account privileges. Environment filtering is not filesystem, network, process, device, or resource isolation. |
+| Host-local stdio OS sandbox | Partially implemented: opt-in per-server policy covering resource limits, core-dump control, process-group isolation and group teardown (all unix), plus Linux-only no_new_privileges, seccomp ptrace/process_vm denial, Landlock read-only root with writable paths, and user+network namespace network isolation. Remaining: device isolation, mandatory default profiles, and same-UID `/proc/<pid>/mem` inbound reads (kernel credential check, not syscall-filterable). |
 | Generic worker-local MCP | Core per-job workers do not load LunarWing MCP configs or register MCP wrappers. External workers may independently use MCP, but that is a separate integration, not placement of installed LunarWing MCP packages. |
 | Runtime adapter boundary | The safe stdio recovery path now centralizes client preparation and runtime replacement, but process, WASM, worker, remote, and gateway lifecycle remain separate concrete paths rather than one public runtime-neutral interface. |
 | MCP-over-WASM | Existing WASM tool ABI is invocation-scoped and does not implement MCP server sessions, resources, prompts, notifications, or subscriptions. |
@@ -235,3 +265,7 @@ resolved secret values are never retained as restart configuration.
   full client initialization, atomic tool replacement, per-server cancellable tasks,
   bounded jittered retry, crash-loop circuit breaking, generation checks, accurate
   status, and deadline-bounded shutdown ordering that prevents resurrection.
+- 2026-08-08: opt-in host OS sandboxing for stdio children added — rlimits and
+  process-group isolation on unix; no_new_privileges, seccomp ptrace/process_vm
+  denial, Landlock read-only root with writable paths, and user+network namespace
+  network isolation on Linux; fail-closed activation, CLI and doctor surfaces.

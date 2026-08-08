@@ -85,6 +85,7 @@ pub async fn create_client_from_config(
                         .iter()
                         .map(|(name, value)| (name.as_str(), value.expose_secret())),
                     !env_secrets.is_empty(),
+                    server.sandbox.as_ref(),
                 )
                 .await
                 .map_err(|e| McpFactoryError::StdioSpawn {
@@ -429,6 +430,88 @@ mod tests {
             .shutdown("pinned-server")
             .await
             .expect("clean up pinned process");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_activation_applies_sandbox_policy() {
+        use crate::tools::mcp::sandbox::McpSandboxConfig;
+
+        let session_manager = Arc::new(McpSessionManager::new());
+        let process_manager = Arc::new(McpProcessManager::new());
+
+        // A limit above the daemon's hard limit fails before any child spawns.
+        let config = McpServerConfig::new_stdio(
+            "over-limited",
+            "cat",
+            Vec::new(),
+            std::collections::HashMap::new(),
+        )
+        .with_sandbox(McpSandboxConfig {
+            max_file_descriptors: Some(u64::MAX),
+            ..McpSandboxConfig::default()
+        });
+        let error = match create_client_from_config(
+            config,
+            &session_manager,
+            &process_manager,
+            None,
+            "test-user",
+        )
+        .await
+        {
+            Ok(_) => panic!("impossible sandbox limit must not activate"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, McpFactoryError::StdioSpawn { .. }));
+        assert!(
+            process_manager.managed_servers().await.is_empty(),
+            "failed sandbox preparation must not spawn a child"
+        );
+
+        // A sane policy activates and the child observes the limit.
+        let config = McpServerConfig::new_stdio(
+            "sandboxed",
+            "sh",
+            vec![
+                "-c".to_string(),
+                "test \"$(ulimit -v)\" = 65536".to_string(),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .with_sandbox(McpSandboxConfig {
+            max_memory_mb: Some(64),
+            ..McpSandboxConfig::default()
+        });
+        let client = create_client_from_config(
+            config,
+            &session_manager,
+            &process_manager,
+            None,
+            "test-user",
+        )
+        .await
+        .expect("sandboxed server activates");
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(crate::tools::mcp::McpProcessState::Exited(status)) =
+                    process_manager.state("sandboxed").await
+                {
+                    assert!(status.success(), "child must observe the memory limit");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("sandboxed child did not exit in time");
+
+        client.shutdown().await.expect("shutdown sandboxed client");
+        process_manager
+            .shutdown("sandboxed")
+            .await
+            .expect("clean up sandboxed process");
     }
 
     #[tokio::test]

@@ -130,8 +130,9 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
   exposes MCP tools only; it does not expose resources, prompts, subscriptions, or
   a WebSocket MCP transport
 - Cost: host-local stdio is an external process with LunarWing service-account
-  privileges, not an OS sandbox; raw credentials given to that process can be read
-  or leaked by it
+  privileges; an opt-in per-server OS sandbox (below) can limit its filesystem,
+  network, process, and resource reach, but raw credentials given to that
+  process can still be read or leaked by it
 
 #### Current MCP support
 
@@ -141,7 +142,8 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 | Activate/deactivate | `ExtensionManager` initializes clients, discovers tools, tracks exact tool ownership, and tears down transport/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated gateway when available, falls back to persisted state when unavailable, and accepts `--offline` to request persisted-only behavior explicitly. |
 | Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, but unchanged persisted intent is disabled until explicit activation. Inspect returned message and active status. |
 | Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default. Persisted removal happens before active tool/runtime cleanup so a crash cannot restore stale intent; `--offline` is explicit persisted-only cleanup. |
-| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, and stdio command availability. |
+| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, and sandbox policy enforceability. |
+| Host sandboxing | Opt-in per stdio server: resource limits, core-dump control, process-group isolation with group teardown, plus Linux-only `no_new_privileges`, seccomp denial of ptrace/process_vm syscalls, Landlock read-only root with explicit writable paths, and user+network namespace network isolation. Enforcement fails closed at activation. |
 | Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
 | Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
 | Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Recovery uses isolated cancellable tasks, five-attempt circuit breaking, a 30-second stability window, jittered bounded backoff, all-or-none tool registration, and internal cleanup deadlines. Configurable per-server lifecycle timeout controls are not implemented. |
@@ -176,8 +178,9 @@ conversational `tool_install` tool:
 ```
 
 Installation persists configuration only. Activation starts the child process,
-negotiates MCP, and registers its tools. Treat the executable as trusted installed
-code: stdio servers are not sandboxed. Values in `env` are plain configuration.
+negotiates MCP, and registers its tools. Treat the executable as installed code:
+stdio servers run unsandboxed unless a per-server sandbox policy is configured
+(see "Host sandboxing for stdio MCP servers" below). Values in `env` are plain configuration.
 `env_secrets` maps environment variable names to owner-scoped LunarWing secret
 names. Only names are persisted; values are decrypted at activation, zeroized from
 resolver-owned memory after spawn, and exposed to the child process. No resolved
@@ -237,6 +240,54 @@ After stopping LunarWing, `lunarwing mcp remove local-files --offline` performs 
 explicit persisted-only removal. As with toggle, custom `--url` requires explicit
 `--token`.
 
+#### Host sandboxing for stdio MCP servers
+
+A host-local stdio server can carry an opt-in OS sandbox policy, persisted on
+the server configuration and enforced on every spawn — startup, manual
+activation, and crash recovery share one factory path, so the policy is always
+re-applied. A policy that cannot be honored fails activation before any process
+starts; a configured policy never silently runs unsandboxed.
+
+```bash
+lunarwing mcp add local-files \
+  --transport stdio --command local-files-mcp \
+  --sandbox --sandbox-max-memory-mb 512 \
+  --sandbox-read-only-root --sandbox-writable-path /var/lib/local-files
+```
+
+`--sandbox` enables the baseline: the child leads its own process group (so
+shutdown kills the whole group, including grandchildren), `no_new_privileges`
+blocks setuid and file-capability escalation, and a seccomp filter denies the
+`ptrace`, `process_vm_readv`, and `process_vm_writev` syscalls. Granular flags
+used without `--sandbox` apply only themselves: resource caps
+(`--sandbox-max-memory-mb`, `--sandbox-max-cpu-seconds`, `--sandbox-max-fds`,
+`--sandbox-max-processes`, `--sandbox-max-file-size-mb`). Core dumps are
+disabled whenever a policy is present unless `--sandbox-allow-core-dumps` is
+given.
+
+Two stronger isolations are available on Linux:
+
+- `--sandbox-read-only-root` uses Landlock (kernel >= 5.13) to make the entire
+  filesystem read/execute-only except `--sandbox-writable-path` directories.
+- `--sandbox-network-isolated` moves the child into a fresh user and network
+  namespace whose only interface is a down loopback, removing all network
+  access. It needs unprivileged user namespaces (`unshare -Urn true` succeeds).
+
+Limits above the daemon's own hard ulimits are rejected at activation instead of
+being silently clamped. `mcp list --verbose` shows the policy and `lunarwing
+doctor` warns when a configured policy cannot be honored on this host.
+`mcp update` retains the policy for stdio servers and drops it on a transport
+switch; web and conversational updates reset it, like provenance.
+
+Scope notes: resource limits, process-group isolation, and core-dump control
+work on any unix; the remaining options are Linux-only and fail closed
+elsewhere. The seccomp filter blocks the memory-inspection syscalls but cannot
+filter same-UID `/proc/<pid>/mem` reads, which the kernel authorizes by
+credential checks rather than syscalls — treat raw secrets handed to a child as
+visible to the daemon account regardless. The sandbox does not virtualize
+devices and does not replace package provenance: provenance answers what code
+runs, sandboxing answers what it can damage.
+
 #### Automatic npm/pip installation, provenance, and sandboxing
 
 Automatic npm/pip MCP installation is **not implemented**. LunarWing runs the
@@ -294,7 +345,10 @@ Before automatic installation, package provenance must cover:
 Provenance answers **what code is this and who supplied it**. It does not prove code
 is safe. Installation and runtime still need containment: non-root execution,
 isolated writable paths, controlled network egress, bounded CPU/memory/processes,
-no implicit host devices or daemon credentials, and reliable teardown. Sandboxing
+no implicit host devices or daemon credentials, and reliable teardown. The opt-in
+host sandbox above covers the resource, filesystem, network, and process subsets
+for stdio servers; device isolation and mandatory default sandbox profiles remain
+open. Sandboxing
 answers **what can this code damage if it is malicious or compromised**. Neither
 control replaces the other.
 

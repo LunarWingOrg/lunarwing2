@@ -58,7 +58,11 @@ These are validation and coverage tasks, not known production-code defects.
   diffs, and marketplace revocation distribution. (Operator-pinned executable
   digests, package identity, trust state, and revocation for host-local stdio
   servers are implemented as of 2026-08-07.)
-- Host-process filesystem, network, process, device, and resource sandboxing.
+- Device-level sandboxing and mandatory default sandbox profiles. (Opt-in
+  host sandboxing for stdio servers — resource limits, core-dump control,
+  process-group isolation, no_new_privileges, seccomp ptrace/process_vm
+  denial, Landlock read-only root, and network namespace isolation — is
+  implemented as of 2026-08-08.)
 - A generic runtime-adapter boundary.
 - MCP-over-WASM session/runtime support.
 - A dedicated or shared MCP gateway.

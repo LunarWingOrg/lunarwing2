@@ -556,6 +556,20 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
         }
     }
 
+    if let Some(sandbox) = &server.sandbox {
+        detail.push_str(&format!(" — sandbox: {}", sandbox.describe()));
+        #[cfg(target_os = "linux")]
+        if sandbox.read_only_root && crate::tools::mcp::sandbox::landlock_abi_version().is_none() {
+            missing = true;
+            detail.push_str(" (kernel lacks Landlock; activation will fail)");
+        }
+        #[cfg(not(target_os = "linux"))]
+        if sandbox.requires_linux() {
+            missing = true;
+            detail.push_str(" (requires Linux; activation will fail)");
+        }
+    }
+
     McpPreflight {
         detail,
         invalid,

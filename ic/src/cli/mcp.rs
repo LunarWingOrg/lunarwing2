@@ -18,7 +18,47 @@ use crate::tools::mcp::{
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
     provenance::{McpPackageProvenance, PackageEcosystem, PackageTrust, ProvenanceIdentity},
+    sandbox::McpSandboxConfig,
 };
+
+/// Build the sandbox policy from `mcp add` flags.
+///
+/// `--sandbox` enables the baseline (process-group isolation plus Linux
+/// no-new-privileges and ptrace denial); any `--sandbox-*` option implies a
+/// sandbox is present without enabling the whole baseline.
+fn build_sandbox_from_add_args(args: &McpAddArgs) -> anyhow::Result<Option<McpSandboxConfig>> {
+    let detailed = args.sandbox_max_memory_mb.is_some()
+        || args.sandbox_max_cpu_seconds.is_some()
+        || args.sandbox_max_fds.is_some()
+        || args.sandbox_max_processes.is_some()
+        || args.sandbox_max_file_size_mb.is_some()
+        || args.sandbox_allow_core_dumps
+        || args.sandbox_read_only_root
+        || !args.sandbox_writable_paths.is_empty()
+        || args.sandbox_network_isolated;
+    if !args.sandbox && !detailed {
+        return Ok(None);
+    }
+    let baseline = args.sandbox;
+    let sandbox = McpSandboxConfig {
+        max_memory_mb: args.sandbox_max_memory_mb,
+        max_cpu_seconds: args.sandbox_max_cpu_seconds,
+        max_file_descriptors: args.sandbox_max_fds,
+        max_processes: args.sandbox_max_processes,
+        max_file_size_mb: args.sandbox_max_file_size_mb,
+        allow_core_dumps: args.sandbox_allow_core_dumps,
+        isolate_process_group: baseline,
+        no_new_privileges: baseline,
+        deny_ptrace: baseline,
+        read_only_root: args.sandbox_read_only_root,
+        writable_paths: args.sandbox_writable_paths.clone(),
+        network_isolated: args.sandbox_network_isolated,
+    };
+    sandbox
+        .validate()
+        .map_err(|error| anyhow::anyhow!("invalid sandbox configuration: {error}"))?;
+    Ok(Some(sandbox))
+}
 
 /// Arguments for the `mcp add` subcommand.
 #[derive(Args, Debug, Clone)]
@@ -76,6 +116,52 @@ pub struct McpAddArgs {
     /// Server description
     #[arg(long)]
     pub description: Option<String>,
+
+    /// Enable the baseline host OS sandbox (stdio transport): the child runs
+    /// as an isolated process-group leader with no_new_privileges and a
+    /// seccomp filter denying ptrace/process_vm_* syscalls (Linux)
+    #[arg(long)]
+    pub sandbox: bool,
+
+    /// Sandbox: cap the child's virtual memory in MiB (stdio transport)
+    #[arg(long, value_name = "MIB")]
+    pub sandbox_max_memory_mb: Option<u64>,
+
+    /// Sandbox: cap the child's CPU time in seconds (stdio transport)
+    #[arg(long, value_name = "SECONDS")]
+    pub sandbox_max_cpu_seconds: Option<u64>,
+
+    /// Sandbox: cap the child's open file descriptors (stdio transport)
+    #[arg(long, value_name = "COUNT")]
+    pub sandbox_max_fds: Option<u64>,
+
+    /// Sandbox: cap the child's process/thread count, counted per daemon UID
+    /// (stdio transport)
+    #[arg(long, value_name = "COUNT")]
+    pub sandbox_max_processes: Option<u64>,
+
+    /// Sandbox: cap the size of files the child can write, in MiB (stdio transport)
+    #[arg(long, value_name = "MIB")]
+    pub sandbox_max_file_size_mb: Option<u64>,
+
+    /// Sandbox: keep core dumps enabled (they are disabled when sandboxed)
+    #[arg(long)]
+    pub sandbox_allow_core_dumps: bool,
+
+    /// Sandbox: Landlock read/execute-only filesystem root; grant exceptions
+    /// with --sandbox-writable-path (stdio transport, Linux)
+    #[arg(long)]
+    pub sandbox_read_only_root: bool,
+
+    /// Sandbox: absolute path that stays writable under
+    /// --sandbox-read-only-root (can be repeated)
+    #[arg(long = "sandbox-writable-path", value_name = "PATH")]
+    pub sandbox_writable_paths: Vec<std::path::PathBuf>,
+
+    /// Sandbox: remove all network access by moving the child into a fresh
+    /// network namespace (stdio transport, Linux)
+    #[arg(long)]
+    pub sandbox_network_isolated: bool,
 }
 
 /// Arguments for the `mcp update` subcommand.
@@ -341,6 +427,8 @@ async fn add_server(
     config_path: Option<&Path>,
     no_db: bool,
 ) -> anyhow::Result<()> {
+    let sandbox_policy = build_sandbox_from_add_args(&args)?;
+
     let McpAddArgs {
         name,
         url,
@@ -356,11 +444,15 @@ async fn add_server(
         token_url,
         scopes,
         description,
+        ..
     } = args;
 
     let transport_lower = transport.to_lowercase();
     if transport_lower != "stdio" && !secret_env.is_empty() {
         anyhow::bail!("--secret-env is only supported with stdio transport");
+    }
+    if sandbox_policy.is_some() && transport_lower != "stdio" {
+        anyhow::bail!("sandbox options are only supported with stdio transport");
     }
 
     let mut config = match transport_lower.as_str() {
@@ -408,8 +500,17 @@ async fn add_server(
         config = config.with_description(desc);
     }
 
+    if let Some(sandbox) = sandbox_policy {
+        config = config.with_sandbox(sandbox);
+    }
+
     // Track if auth is required
     let requires_auth = client_id.is_some();
+
+    let sandbox_summary = config
+        .sandbox
+        .as_ref()
+        .map(crate::tools::mcp::sandbox::McpSandboxConfig::describe);
 
     // Set up OAuth if client_id is provided (HTTP transport only)
     if let Some(client_id) = client_id {
@@ -445,6 +546,9 @@ async fn add_server(
                 "    Transport: stdio (command: {})",
                 command.as_deref().unwrap_or("")
             );
+            if let Some(ref summary) = sandbox_summary {
+                println!("    Sandbox: {summary}");
+            }
         }
         "unix" => {
             println!(
@@ -613,6 +717,9 @@ async fn list_servers(
                 if let Some(ref digest) = provenance.command_sha256 {
                     println!("      Command SHA-256: {}", digest);
                 }
+            }
+            if let Some(ref sandbox) = server.sandbox {
+                println!("      Sandbox: {}", sandbox.describe());
             }
             if let Some(ref oauth) = server.oauth {
                 println!("      OAuth Client ID: {}", oauth.client_id);
@@ -1003,6 +1110,16 @@ fn build_update_config(
         }
         provenance
     });
+    // Sandbox policy follows the same retention rule as provenance: kept
+    // while the server stays on stdio, dropped when the transport changes.
+    config.sandbox = if matches!(
+        config.effective_transport(),
+        EffectiveTransport::Stdio { .. }
+    ) {
+        existing.sandbox.clone()
+    } else {
+        None
+    };
     Ok(config)
 }
 
@@ -1642,6 +1759,140 @@ mod tests {
             } if command == "new-command"
                 && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
         ));
+    }
+
+    #[test]
+    fn test_mcp_sandbox_flags_parse_and_build() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "local-files",
+            "--transport",
+            "stdio",
+            "--command",
+            "local-files-mcp",
+            "--sandbox",
+            "--sandbox-max-memory-mb",
+            "512",
+            "--sandbox-read-only-root",
+            "--sandbox-writable-path",
+            "/var/lib/local-files",
+            "--sandbox-network-isolated",
+        ])
+        .expect("parse sandbox flags");
+        let McpCommand::Add(args) = parsed.cmd else {
+            panic!("expected add command");
+        };
+        let sandbox = build_sandbox_from_add_args(&args)
+            .expect("sandbox builds")
+            .expect("sandbox present");
+        assert!(sandbox.isolate_process_group);
+        assert!(sandbox.no_new_privileges);
+        assert!(sandbox.deny_ptrace);
+        assert_eq!(sandbox.max_memory_mb, Some(512));
+        assert!(sandbox.read_only_root);
+        assert_eq!(
+            sandbox.writable_paths,
+            vec![std::path::PathBuf::from("/var/lib/local-files")]
+        );
+        assert!(sandbox.network_isolated);
+
+        // Detail flags without --sandbox build a sandbox without the baseline.
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "limited",
+            "--transport",
+            "stdio",
+            "--command",
+            "limited-mcp",
+            "--sandbox-max-fds",
+            "64",
+        ])
+        .expect("parse limit-only flags");
+        let McpCommand::Add(args) = parsed.cmd else {
+            panic!("expected add command");
+        };
+        let sandbox = build_sandbox_from_add_args(&args)
+            .expect("sandbox builds")
+            .expect("sandbox present");
+        assert_eq!(sandbox.max_file_descriptors, Some(64));
+        assert!(!sandbox.isolate_process_group);
+        assert!(!sandbox.no_new_privileges);
+
+        // No sandbox flags at all means no sandbox.
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "plain",
+            "--transport",
+            "stdio",
+            "--command",
+            "plain-mcp",
+        ])
+        .expect("parse plain add");
+        let McpCommand::Add(args) = parsed.cmd else {
+            panic!("expected add command");
+        };
+        assert!(
+            build_sandbox_from_add_args(&args)
+                .expect("no sandbox")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_build_update_retains_sandbox_for_stdio() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let sandbox = McpSandboxConfig {
+            max_memory_mb: Some(256),
+            isolate_process_group: true,
+            ..McpSandboxConfig::default()
+        };
+        let existing = McpServerConfig::new_stdio("local-files", "cat", vec![], HashMap::new())
+            .with_sandbox(sandbox);
+
+        let parsed =
+            TestCli::try_parse_from(["test", "update", "local-files", "--command", "new-command"])
+                .expect("parse update");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+        let updated = build_update_config(&args, &existing).expect("build update config");
+        let retained = updated.sandbox.expect("sandbox retained for stdio");
+        assert_eq!(retained.max_memory_mb, Some(256));
+        assert!(retained.isolate_process_group);
+
+        // Switching transports drops the now-meaningless policy.
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "update",
+            "local-files",
+            "https://mcp.example.com",
+            "--transport",
+            "http",
+        ])
+        .expect("parse transport switch");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+        let updated = build_update_config(&args, &existing).expect("build update config");
+        assert!(updated.sandbox.is_none());
     }
 
     #[test]
