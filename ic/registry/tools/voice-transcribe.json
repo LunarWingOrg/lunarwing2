@@ -1,0 +1,28 @@
+{
+  "name": "voice-transcribe",
+  "display_name": "Voice Transcribe",
+  "kind": "tool",
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "description": "Transcribe base64 audio locally through the LunarVoice ONNX sidecar.",
+  "keywords": ["voice", "audio", "transcription", "speech-to-text", "lunarvoice"],
+  "source": {
+    "dir": "tools-src/voice-transcribe",
+    "capabilities": "voice-transcribe-tool.capabilities.json",
+    "crate_name": "voice-transcribe-tool"
+  },
+  "artifacts": {
+    "wasm32-wasip2": {
+      "url": null,
+      "sha256": null
+    }
+  },
+  "auth_summary": {
+    "method": "none",
+    "provider": null,
+    "secrets": [],
+    "shared_auth": null,
+    "setup_url": null
+  },
+  "tags": ["lunarwing", "voice", "local-ai"]
+}

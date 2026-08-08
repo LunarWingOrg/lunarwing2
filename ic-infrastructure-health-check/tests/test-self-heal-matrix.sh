@@ -103,6 +103,11 @@ b12="$(sb)"; report "$b12" '{components:[{component:"netbird",status:"critical",
 oB12="$(run_dry "$b12" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_REMEDY_LOGICAL=false)"
 assert_contains "$oB12" "ESCALATING: netbird (monitor_only" "B12: MT logical disable retains host NetBird monitoring"
 
+b13="$(sb)"; report "$b13" '{components:[{component:"lunarvoice",status:"critical",metrics:{}}]}'
+oB13="$(run_dry "$b13" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB13" "ESCALATING: voice-sidecar (monitor_only" "B13: LunarVoice is monitor-only"
+assert_absent "$oB13" "restart voice-sidecar" "B13: LunarVoice is never auto-restarted"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},

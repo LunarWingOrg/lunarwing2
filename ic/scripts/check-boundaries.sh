@@ -169,7 +169,7 @@ if [ -n "$raw_results" ]; then
     echo
     # Show per-file counts, sorted by count descending, top 15
     file_counts=$(echo "$raw_results" | cut -d: -f1 | sort | uniq -c | sort -rn)
-    echo "$file_counts" | head -15
+    sed -n '1,15p' <<< "$file_counts"
     fc_total=$(echo "$file_counts" | wc -l | tr -d ' ')
     if [ "$fc_total" -gt 15 ]; then
         echo "    ... and $((fc_total - 15)) more files"

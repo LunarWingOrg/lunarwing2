@@ -29,7 +29,7 @@ use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadType};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -45,6 +45,16 @@ const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
     "expected_behavior",
     "skill_maintenance",
 ];
+
+fn recent_conversation_thread_goals(threads: &[Thread], limit: usize) -> Vec<String> {
+    threads
+        .iter()
+        .rev()
+        .filter(|thread| thread.thread_type != ThreadType::Mission)
+        .take(limit)
+        .map(|thread| thread.goal.clone())
+        .collect()
+}
 
 fn is_recurring_learning_mission(mission: &Mission) -> bool {
     mission
@@ -1278,12 +1288,10 @@ impl MissionManager {
                                 .list_threads(thread.project_id, &thread.user_id)
                                 .await
                             {
-                                Ok(threads) => threads
-                                    .iter()
-                                    .rev()
-                                    .take(CONVERSATION_INSIGHTS_INTERVAL as usize)
-                                    .map(|t| t.goal.clone())
-                                    .collect(),
+                                Ok(threads) => recent_conversation_thread_goals(
+                                    &threads,
+                                    CONVERSATION_INSIGHTS_INTERVAL as usize,
+                                ),
                                 Err(_) => vec![thread.goal.clone()],
                             };
 
@@ -2610,6 +2618,41 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn conversation_insight_goals_exclude_mission_threads() {
+        let project_id = ProjectId::new();
+        let make_thread = |goal: &str, thread_type| {
+            Thread::new(
+                goal,
+                thread_type,
+                project_id,
+                "test-user",
+                ThreadConfig::default(),
+            )
+        };
+        let threads = vec![
+            make_thread("conversation 0", ThreadType::Foreground),
+            make_thread("conversation 1", ThreadType::Foreground),
+            make_thread("mission specification 0", ThreadType::Mission),
+            make_thread("conversation 2", ThreadType::Foreground),
+            make_thread("mission specification 1", ThreadType::Mission),
+            make_thread("research 0", ThreadType::Research),
+            make_thread("conversation 3", ThreadType::Foreground),
+            make_thread("conversation 4", ThreadType::Foreground),
+        ];
+
+        assert_eq!(
+            recent_conversation_thread_goals(&threads, 5),
+            [
+                "conversation 4",
+                "conversation 3",
+                "research 0",
+                "conversation 2",
+                "conversation 1",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn create_mission_persists() {
