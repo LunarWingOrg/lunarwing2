@@ -1,0 +1,39 @@
+{
+  "version": "0.1.0",
+  "wit_version": "0.3.0",
+  "description": "Transcribe audio with a loopback LunarVoice sidecar. Host injects the tenant URL and a scoped bearer credential.",
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        {
+          "host": "127.0.0.1",
+          "path_prefix": "/v1/voice/",
+          "methods": ["POST"]
+        },
+        {
+          "host": "localhost",
+          "path_prefix": "/v1/voice/",
+          "methods": ["POST"]
+        },
+        {
+          "host": "host.containers.internal",
+          "path_prefix": "/v1/voice/",
+          "methods": ["POST"]
+        },
+        {
+          "host": "::1",
+          "path_prefix": "/v1/voice/",
+          "methods": ["POST"]
+        }
+      ],
+      "rate_limit": {
+        "requests_per_minute": 30,
+        "requests_per_hour": 300
+      }
+    }
+  },
+  "setup": {
+    "required_secrets": [],
+    "env_vars": []
+  }
+}

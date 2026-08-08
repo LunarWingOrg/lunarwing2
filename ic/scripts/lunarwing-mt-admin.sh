@@ -82,6 +82,7 @@ DEFAULT_VL_URL="${LUNARWING_MT_VL_URL:-http://host.containers.internal:8080/v1/c
 DEFAULT_LLM_BASE_URL="${LUNARWING_MT_LLM_BASE_URL:-}"
 DEFAULT_GOTIFY_URL="${LUNARWING_MT_GOTIFY_URL:-}"
 DEFAULT_GOTIFY_TITLE="${LUNARWING_MT_GOTIFY_TITLE:-}"
+VOICE_MODELS_DIR="${LUNARWING_MT_VOICE_MODELS_DIR:-/var/lib/lunarwing/voice-models}"
 DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS="${LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS:-3600000}"
 LEGACY_EXTERNAL_WORKER_TIMEOUT_MS=300000
 MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS="${LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS:-true}"
@@ -571,6 +572,10 @@ Commands:
     --kimi-code-version <version>  Override kimi-code package version
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
+  build-voice-sidecar              Build the LunarVoice ONNX sidecar container image
+  enable-voice <name>              Configure/start local voice; restart tenant to apply
+                                   (verified models required)
+  disable-voice <name>             Disable/stop local voice; restart tenant to apply
 
   build-darkirc                   Build darkirc daemon from external source
   ensure-darkirc-release <name>   Build the atomic release set when required
@@ -1202,7 +1207,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "14" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "15" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -1445,6 +1450,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 12 ]]; then ports_migrate_v12; fi
   if [[ "$current_version" -lt 13 ]]; then ports_migrate_v13; fi
   if [[ "$current_version" -lt 14 ]]; then ports_migrate_v14; fi
+  if [[ "$current_version" -lt 15 ]]; then ports_migrate_v15; fi
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -1664,6 +1670,36 @@ ports_migrate_v14() {
   say "port registry migrated to v14 (stable DarkIRC scope IDs)"
 }
 
+# v14 -> v15: add an isolated two-port range for LunarVoice. Existing base and
+# extended ranges are full; a separate range keeps every live tenant port stable.
+ports_migrate_v15() {
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 15
+    | .voice_range = ((.voice_range) // {"start": 40000, "end": 49999})
+    | .voice_block_size = ((.voice_block_size) // 2)
+    | ( .range.start // 10000 ) as $rstart
+    | ( .voice_range.start ) as $vstart
+    | .tenants |= with_entries(
+        .value |= (
+          if .base_port then
+            ( .base_port - $rstart + $vstart ) as $vbase
+            | .enable_voice = ((.enable_voice) // false)
+            | .voice_base = ((.voice_base) // $vbase)
+            | .voice_ports = ((.voice_ports) // {
+                voice_service: ($vbase + 0),
+                voice_health: ($vbase + 1)
+              })
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v15 (LunarVoice service + health ports)"
+}
+
 ports_allocate() {
   local name="$1"
   local enable_darkirc="${2:-false}"
@@ -1760,8 +1796,10 @@ ports_allocate() {
     | ( .extended_range.start // 20000 ) as $estart
     | ( .extended_block_size // 10 ) as $ebs
     | ( .kimi_range.start // 30000 ) as $kstart
+    | ( .voice_range.start // 40000 ) as $vstart
     | ( $base - $rstart + $estart ) as $ebase
     | ( $base - $rstart + $kstart ) as $kbase
+    | ( $base - $rstart + $vstart ) as $vbase
     | .tenants[$name] = {
         base_port: $base,
         user: $name,
@@ -1769,6 +1807,7 @@ ports_allocate() {
         enable_darkirc: $darkirc,
         darkirc_scope_id: (if $darkirc then $scope else null end),
         enable_proxy: $proxy,
+        enable_voice: false,
         enable_weechat: true,
         workers: $workers,
         ports: {
@@ -1803,6 +1842,11 @@ ports_allocate() {
         kimi_ports: {
           kimi_wss: ($kbase + 0),
           kimi_health: ($kbase + 1)
+        },
+        voice_base: $vbase,
+        voice_ports: {
+          voice_service: ($vbase + 0),
+          voice_health: ($vbase + 1)
         }
       }
   ' "$PORTS_REGISTRY" >"$tmp"
@@ -1887,6 +1931,27 @@ ports_enable_proxy() {
   mv "$tmp" "$PORTS_REGISTRY"
   [[ "$had_lock" == "true" ]] || release_ports_lock
   say "proxy for tenant '$name': disabled -> enabled" >&2
+}
+
+ports_set_voice() {
+  local name="$1" enabled="$2" tmp
+  require_cmd jq
+  case "$enabled" in true|false) ;; *) die "ports_set_voice: enabled must be true or false" ;; esac
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --argjson enabled "$enabled" \
+      '.tenants[$name].enable_voice = $enabled' "$PORTS_REGISTRY" >"$tmp"; then
+    rm -f "$tmp"
+    release_ports_lock
+    die "failed to set LunarVoice flag for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
 }
 
 # Set the per-tenant WeeChat health-gate flag in the registry (bidirectional).
@@ -2075,6 +2140,11 @@ ports_get() {
     printf '%s' "$port"
     return 0
   fi
+  port="$(jq -r ".tenants[\"$name\"].voice_ports.$port_name // empty" "$PORTS_REGISTRY")"
+  if [[ -n "$port" ]]; then
+    printf '%s' "$port"
+    return 0
+  fi
   # Back-compat: pre-v9 registries had `reserved_5` where `vision_service` now
   # lives. Read either name; new tenants only ever carry `vision_service`.
   if [[ "$port_name" == "vision_service" ]]; then
@@ -2108,8 +2178,8 @@ ports_list() {
     say "no port registry found; run add-tenant first"
     return 0
   fi
-  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")"' "$PORTS_REGISTRY" \
-    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH"
+  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")\t\(.value.voice_ports.voice_service // "-")\t\(.value.voice_ports.voice_health // "-")"' "$PORTS_REGISTRY" \
+    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH,VOICE_SVC,VOICE_HLTH"
 }
 
 tenant_exists_in_registry() {
@@ -3282,6 +3352,22 @@ _env_existing() {  # <env_file> <KEY>
   _read_env_value "$1" "$2"
 }
 
+_env_set() {  # <env_file> <KEY> <VALUE>
+  local path="$1" key="$2" value="$3" tmp
+  [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || die "invalid environment key: $key"
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "environment value for $key contains a newline"
+  [[ -f "$path" && ! -L "$path" ]] || die "environment file missing or unsafe: $path"
+  tmp="$(mktemp "$(dirname "$path")/.env-set.XXXXXX")"
+  awk -v prefix="$key=" -v replacement="$key=$value" '
+    index($0, prefix) != 1 { print }
+    END { print replacement }
+  ' "$path" >"$tmp"
+  chmod --reference="$path" "$tmp"
+  chown --reference="$path" "$tmp"
+  mv -T -- "$tmp" "$path"
+}
+
 validate_study_notes_path() {  # <absolute path> <label>
   [[ "$1" =~ ^/[A-Za-z0-9._/-]+$ ]] \
     || die "$2 must be an absolute path without whitespace or shell metacharacters"
@@ -3803,6 +3889,15 @@ write_tenant_lunarwing_env() {
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
+  local transcription_enabled transcription_provider transcription_model voice_enabled
+  voice_enabled="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_ENABLED)"
+  voice_enabled="${voice_enabled:-false}"
+  transcription_enabled="$(_env_existing "$path" TRANSCRIPTION_ENABLED)"
+  transcription_enabled="${transcription_enabled:-$voice_enabled}"
+  transcription_provider="$(_env_existing "$path" TRANSCRIPTION_PROVIDER)"
+  transcription_provider="${transcription_provider:-lunarvoice}"
+  transcription_model="$(_env_existing "$path" TRANSCRIPTION_MODEL)"
+  transcription_model="${transcription_model:-whisper-tiny}"
   # LLM circuit breaker: fleet defaults (open after 7 fully-retried failures,
   # probe again after 45s). These are tunables, so preserve an operator's
   # per-tenant override across re-provision rather than clobbering it.
@@ -3968,6 +4063,18 @@ ENVEOF
     vision_token="${vision_token:-$(generate_token)}"
     printf '\nVISION_SERVICE_URL=http://127.0.0.1:%s\nVISION_AUTH_TOKEN=%s\n' \
       "$vision_port" "$vision_token" >> "$path"
+  fi
+  # LunarVoice is provisioned but disabled until explicitly enabled. Preserve
+  # any operator-selected cloud transcription provider on re-render.
+  local voice_port voice_token
+  voice_port="$(ports_get "$name" voice_service)" || true
+  if [[ -n "$voice_port" ]]; then
+    voice_token="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_AUTH_TOKEN)"
+    voice_token="${voice_token:-$(generate_token)}"
+    printf '\nVOICE_SERVICE_URL=http://127.0.0.1:%s\nVOICE_AUTH_TOKEN=%s\n' \
+      "$voice_port" "$voice_token" >> "$path"
+    printf 'TRANSCRIPTION_ENABLED=%s\nTRANSCRIPTION_PROVIDER=%s\nTRANSCRIPTION_MODEL=%s\n' \
+      "$transcription_enabled" "$transcription_provider" "$transcription_model" >> "$path"
   fi
   [[ -n "$opencode_model" ]]    && printf '\nOPENCODE_MODEL=%s\n'    "$opencode_model"     >> "$path"
   [[ -n "$opencode_base_url" ]] && printf 'OPENCODE_BASE_URL=%s\n' "$opencode_base_url" >> "$path"
@@ -6736,6 +6843,75 @@ ENVEOF
   printf '%s' "$token"
 }
 
+write_tenant_voice_env() {
+  local name="$1"
+  local env_dir env_path token enabled stt_model stt_language enable_vad enable_tts
+  env_dir="$(tenant_env_dir "$name")"
+  env_path="$env_dir/voice.env"
+  token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
+  token="${token:-$(generate_token)}"
+  enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
+  [[ "$enabled" == true ]] || enabled=false
+  stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"; stt_model="${stt_model:-whisper-tiny}"
+  stt_language="$(_env_existing "$env_path" VOICE_STT_LANGUAGE)"; stt_language="${stt_language:-auto}"
+  enable_vad="$(_env_existing "$env_path" VOICE_ENABLE_VAD)"; enable_vad="${enable_vad:-true}"
+  enable_tts="$(_env_existing "$env_path" VOICE_ENABLE_TTS)"; enable_tts="${enable_tts:-true}"
+  mkdir -p "$env_dir"
+  (
+    umask 077
+    cat >"$env_path" <<ENVEOF
+VOICE_ENABLED=$enabled
+VOICE_AUTH_TOKEN=$token
+VOICE_BIND_HOST=0.0.0.0
+VOICE_PORT=8090
+VOICE_HEALTH_PORT=8091
+VOICE_MODEL_DIR=/models
+VOICE_STT_MODEL=$stt_model
+VOICE_STT_LANGUAGE=$stt_language
+VOICE_ENABLE_VAD=$enable_vad
+VOICE_ENABLE_TTS=$enable_tts
+VOICE_REQUIRE_STT=true
+VOICE_MAX_AUDIO_SECS=300
+VOICE_MAX_AUDIO_BYTES=52428800
+VOICE_MAX_TTS_AUDIO_SECS=300
+VOICE_REQUEST_TIMEOUT_SECS=120
+VOICE_MAX_CONCURRENT_INFERENCE=2
+VOICE_RATE_LIMIT_PER_SEC=5
+VOICE_CACHE_TTL_SECS=600
+VOICE_CACHE_MAX_ENTRIES=5000
+ORT_NUM_THREADS=4
+ENVEOF
+  )
+  chown "$name:$name" "$env_path"
+  printf '%s' "$token"
+}
+
+tenant_voice_enabled() {
+  [[ "$(jq -r --arg name "$1" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)" == "true" ]]
+}
+
+voice_models_ready() {
+  local name="$1" env_path key value default_path host_path stt_model marker_hash
+  env_path="$(tenant_env_dir "$name")/voice.env"
+  stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"
+  stt_model="${stt_model:-whisper-tiny}"
+  [[ "$stt_model" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ -f "$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256" ]] || return 1
+  marker_hash="$(tr -d '\r\n' <"$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256")"
+  [[ "$marker_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  while IFS='|' read -r key default_path; do
+    value="$(_env_existing "$env_path" "$key")"
+    value="${value:-$default_path}"
+    [[ "$value" == /models/* ]] || return 1
+    host_path="$VOICE_MODELS_DIR/${value#/models/}"
+    [[ -f "$host_path" && -r "$host_path" ]] || return 1
+  done <<'MODEL_PATHS'
+VOICE_STT_ENCODER|/models/sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx
+VOICE_STT_DECODER|/models/sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx
+VOICE_STT_TOKENS|/models/sherpa-onnx-whisper-tiny/tiny-tokens.txt
+MODEL_PATHS
+}
+
 start_tenant_vision() {
   local name="$1"
   ensure_container_runtime
@@ -6960,6 +7136,226 @@ RestartSec=10
 WantedBy=default.target
 EOF
   } > "$qdir/lunarwing-vision-${name}.container"
+}
+
+# ── LunarVoice ONNX sidecar ──────────────────────────────────────────────────
+
+VOICE_SIDECAR_IMAGE=lunarwing/voice-service:latest
+VOICE_SIDECAR_INTERNAL_PORT=8090
+VOICE_SIDECAR_HEALTH_PORT=8091
+
+build_voice_sidecar_image() {
+  ensure_container_runtime
+  local sidecar_dir="$SOURCE_REPO/projects/voice-sidecar"
+  [[ -f "$sidecar_dir/Dockerfile" ]] \
+    || { say "WARNING: LunarVoice Dockerfile missing: $sidecar_dir"; return 1; }
+  "$CONTAINER_RT" build --network=host --format docker \
+    -t "$VOICE_SIDECAR_IMAGE" -f "$sidecar_dir/Dockerfile" "$sidecar_dir" >/dev/null \
+    || { say "WARNING: LunarVoice image build failed"; return 1; }
+  say "LunarVoice sidecar image built: $VOICE_SIDECAR_IMAGE"
+}
+
+start_tenant_voice() {
+  local name="$1"
+  tenant_voice_enabled "$name" || { say "LunarVoice disabled for $name (skipping)"; return 0; }
+  voice_models_ready "$name" \
+    || { say "ERROR: verified Whisper models missing under $VOICE_MODELS_DIR" >&2; return 1; }
+  ensure_container_runtime
+
+  local voice_port voice_health_port container_name env_path
+  voice_port="$(ports_get "$name" voice_service)" || true
+  voice_health_port="$(ports_get "$name" voice_health)" || true
+  [[ -n "$voice_port" && -n "$voice_health_port" ]] \
+    || { say "ERROR: LunarVoice ports missing for $name" >&2; return 1; }
+  if ! _ensure_tenant_image "$name" "$VOICE_SIDECAR_IMAGE"; then
+    say "ERROR: LunarVoice image unavailable; run 'build-voice-sidecar' first" >&2
+    return 1
+  fi
+  container_name="lunarwing-voice-$name"
+  env_path="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$env_path" ]] || write_tenant_voice_env "$name" >/dev/null
+
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    _wait_user_manager "$name"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
+    render_voice_quadlet "$name"
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if _container_config_changed "$name" "$container_name" "$quadlet_file"; then
+      _recreate_quadlet_container "$name" "${container_name}.service" "$container_name"
+    fi
+    if _systemctl_user "$name" start "${container_name}.service" >/dev/null 2>&1; then
+      _store_container_hash "$name" "$container_name" "$quadlet_file"
+      say "LunarVoice ready via quadlet (${container_name}.service, port $voice_port)"
+    else
+      say "WARNING: ${container_name}.service failed to start" >&2
+      _systemctl_user "$name" status "${container_name}.service" --no-pager >&2 || true
+      return 1
+    fi
+    return 0
+  fi
+
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" start "$container_name" >/dev/null 2>&1 || true
+  else
+    local -a restart_arg=()
+    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+    _ctr "$name" run -d \
+      --name "$container_name" \
+      --env-file "$env_path" \
+      -p "127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}" \
+      -p "127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}" \
+      -v "$VOICE_MODELS_DIR:/models:ro,z" \
+      --security-opt=no-new-privileges \
+      "${restart_arg[@]}" \
+      "$VOICE_SIDECAR_IMAGE" >/dev/null
+  fi
+  say "LunarVoice ready ($container_name, port $voice_port)"
+
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    render_voice_openrc_unit "$name"
+    rc-update add "$container_name" default >/dev/null 2>&1 || true
+    rc-service "$container_name" start >/dev/null 2>&1 \
+      || { say "ERROR: rc-service $container_name start failed" >&2; return 1; }
+  fi
+}
+
+stop_tenant_voice() {
+  local name="$1" container_name="lunarwing-voice-$1"
+  ensure_container_runtime
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
+    rc-service "$container_name" stop >/dev/null 2>&1 || true
+  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+  fi
+  say "LunarVoice stopped ($container_name)"
+}
+
+render_voice_quadlet() {
+  local name="$1" qdir voice_port voice_health_port env_path
+  qdir="$(tenant_quadlet_dir "$name")"
+  voice_port="$(ports_get "$name" voice_service)"
+  voice_health_port="$(ports_get "$name" voice_health)"
+  env_path="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$env_path" ]] || write_tenant_voice_env "$name" >/dev/null
+  mkdir -p "$qdir"
+  cat >"$qdir/lunarwing-voice-${name}.container" <<EOF
+[Unit]
+Description=LunarVoice ONNX sidecar ($name)
+After=network-online.target
+Wants=network-online.target
+Before=lunarwing-${name}.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Container]
+ContainerName=lunarwing-voice-${name}
+Image=${VOICE_SIDECAR_IMAGE}
+PublishPort=127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}
+PublishPort=127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}
+EnvironmentFile=${env_path}
+Volume=${VOICE_MODELS_DIR}:/models:ro,z
+SecurityLabelDisable=false
+
+[Service]
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+render_voice_openrc_unit() {
+  local name="$1" runtime_bin container uid home voice_health_port
+  container="lunarwing-voice-${name}"
+  uid="$(id -u "$name" 2>/dev/null || echo "")"
+  home="$(tenant_home "$name")"
+  voice_health_port="$(ports_get "$name" voice_health)"
+  [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
+  cat >"$OPENRC_INITD_DIR/${container}" <<INITEOF
+#!/sbin/openrc-run
+description="LunarVoice sidecar ($name)"
+: "\${voice_runtime:=$runtime_bin}"
+: "\${voice_container:=$container}"
+: "\${voice_rootless:=$MT_ROOTLESS}"
+: "\${voice_user:=$name}"
+: "\${voice_home:=$home}"
+: "\${voice_uid:=$uid}"
+: "\${voice_health_port:=$voice_health_port}"
+
+depend() { need net localmount; after firewall; before lunarwing-${name}; }
+_voice() {
+    if [ "\${voice_rootless}" = "true" ]; then
+        sudo -u "\${voice_user}" env HOME="\${voice_home}" XDG_RUNTIME_DIR="/run/user/\${voice_uid}" "\${voice_runtime}" "\$@"
+    else
+        "\${voice_runtime}" "\$@"
+    fi
+}
+_healthy() {
+    [ "\$(_voice inspect -f '{{.State.Running}}' "\${voice_container}" 2>/dev/null)" = "true" ] || return 1
+    curl -fsS --max-time 3 "http://127.0.0.1:\${voice_health_port}/health" >/dev/null 2>&1
+}
+start() {
+    ebegin "Starting LunarVoice (\${voice_container})"
+    _voice start "\${voice_container}" >/dev/null 2>&1 || { eend 1; return 1; }
+    _wait=0
+    while ! _healthy; do
+        _wait=\$((_wait + 1)); [ "\$_wait" -lt 60 ] || { eend 1 "not healthy"; return 1; }
+        sleep 1
+    done
+    eend 0
+}
+stop() {
+    ebegin "Stopping LunarVoice (\${voice_container})"
+    _voice stop --time 30 "\${voice_container}" >/dev/null 2>&1
+    eend \$?
+}
+status() { _healthy && { einfo "\${voice_container}: started"; return 0; }; einfo "\${voice_container}: stopped"; return 3; }
+INITEOF
+  chmod 0755 "$OPENRC_INITD_DIR/${container}"
+}
+
+configure_voice() {
+  local name="$1" enabled="$2" voice_env lunarwing_env token voice_port stt_model
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$voice_env" ]] || write_tenant_voice_env "$name" >/dev/null
+  [[ -f "$lunarwing_env" ]] || die "tenant LunarWing environment missing"
+  if [[ "$enabled" == "true" ]]; then
+    voice_models_ready "$name" || die "verified Whisper models missing under $VOICE_MODELS_DIR"
+  fi
+  token="$(_env_existing "$voice_env" VOICE_AUTH_TOKEN)"
+  stt_model="$(_env_existing "$voice_env" VOICE_STT_MODEL)"
+  stt_model="${stt_model:-whisper-tiny}"
+  voice_port="$(ports_get "$name" voice_service)"
+  _env_set "$voice_env" VOICE_ENABLED "$enabled"
+  _env_set "$lunarwing_env" VOICE_SERVICE_URL "http://127.0.0.1:${voice_port}"
+  _env_set "$lunarwing_env" VOICE_AUTH_TOKEN "$token"
+  if [[ "$enabled" == true ]]; then
+    _env_set "$lunarwing_env" TRANSCRIPTION_PROVIDER lunarvoice
+    _env_set "$lunarwing_env" TRANSCRIPTION_MODEL "$stt_model"
+    _env_set "$lunarwing_env" TRANSCRIPTION_ENABLED true
+  elif [[ "$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)" == lunarvoice ]]; then
+    _env_set "$lunarwing_env" TRANSCRIPTION_ENABLED false
+  fi
+  ports_set_voice "$name" "$enabled"
+  say "LunarVoice enabled=$enabled for $name; restart tenant to apply daemon transcription settings"
+}
+
+remove_tenant_voice_unit() {
+  local name="$1" container_name="lunarwing-voice-$1"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    rm -f "$(tenant_quadlet_dir "$name")/${container_name}.container"
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+  else
+    rc-update del "$container_name" default >/dev/null 2>&1 || true
+    rm -f "$OPENRC_INITD_DIR/$container_name"
+  fi
 }
 
 # ── PostgreSQL container ─────────────────────────────────────────────────────
@@ -9319,6 +9715,11 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
 
+# LunarVoice: leave HEALTH_LUNARVOICE_URL unset. The check discovers only
+# tenants explicitly enabled in the registry and reports healthy/disabled when
+# none are enabled, so provisioned-but-disabled sidecars never false-page.
+# HEALTH_LUNARVOICE_URL=
+
 # NetBird is operator-owned and disabled by default. To monitor readiness, set
 # HEALTH_NETBIRD_ENABLED=true. Automatic daemon restart also requires explicit
 # SELF_HEAL_NETBIRD_REMEDIATE=true; otherwise failures only escalate.
@@ -9487,6 +9888,7 @@ add_tenant() {
 
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
+  write_tenant_voice_env "$name" >/dev/null
   write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
@@ -9670,8 +10072,19 @@ _render_tenant_units_locked() {
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    if tenant_voice_enabled "$name"; then
+      render_voice_quadlet "$name"
+    else
+      rm -f "$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
+    fi
     render_tenant_systemd_units "$name"
   else
+    if tenant_voice_enabled "$name"; then
+      render_voice_openrc_unit "$name"
+    else
+      rc-update del "lunarwing-voice-${name}" default >/dev/null 2>&1 || true
+      rm -f "$OPENRC_INITD_DIR/lunarwing-voice-${name}"
+    fi
     render_tenant_openrc_units "$name"
   fi
   say "units re-rendered for '$name' (services NOT restarted)."
@@ -9797,6 +10210,7 @@ start_tenant() {
   # <run_dir>/ssh-agent.sock, which the workers bind-mount.
   start_tenant_postgres "$name"
   start_tenant_vision "$name"
+  start_tenant_voice "$name"
 
   with_tenant_lifecycle_lock "$name" _start_tenant_init_services "$name" \
     || die "failed to start init services for tenant '$name'"
@@ -9874,6 +10288,7 @@ stop_tenant() {
   fi
 
   stop_tenant_vision "$name"
+  stop_tenant_voice "$name"
   stop_tenant_pebble "$name"
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
@@ -10411,6 +10826,8 @@ status_tenant() {
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
+  say "  voice_service:    $(ports_get "$name" voice_service)"
+  say "  voice_health:     $(ports_get "$name" voice_health)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say ""
 
@@ -10458,6 +10875,15 @@ status_tenant() {
     say "Kimi worker: not created"
   fi
 
+  local voice_container="lunarwing-voice-$name"
+  if _ctr "$name" inspect -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
+    say "LunarVoice: running ($voice_container, API port $(ports_get "$name" voice_service))"
+  elif _ctr "$name" inspect "$voice_container" &>/dev/null; then
+    say "LunarVoice: stopped ($voice_container)"
+  else
+    say "LunarVoice: not created (enabled=$(tenant_voice_enabled "$name" && echo true || echo false))"
+  fi
+
   ensure_init_system
   say ""
   say "Services ($INIT_SYSTEM):"
@@ -10471,6 +10897,7 @@ status_tenant() {
     # they run as plain containers (shown above), not systemd units.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
       svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
+      tenant_voice_enabled "$name" && svcs+=("lunarwing-voice-${name}")
     fi
     local svc state
     for svc in "${svcs[@]}"; do
@@ -10486,6 +10913,7 @@ status_tenant() {
     rc_svcs+=("lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
               "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
               "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup")
+    tenant_voice_enabled "$name" && rc_svcs+=("lunarwing-voice-${name}")
     local svc state
     for svc in "${rc_svcs[@]}"; do
       state="$(rc-service "$svc" status 2>/dev/null | grep -oE 'started|stopped|crashed' || echo "unknown")"
@@ -10936,6 +11364,25 @@ main() {
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
+      ;;
+
+    build-voice-sidecar)
+      require_root
+      build_voice_sidecar_image
+      ;;
+
+    enable-voice|disable-voice)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: $command_name <name>"
+      _voice_name="$(sanitize_name "$1")"
+      if [[ "$command_name" == "enable-voice" ]]; then
+        configure_voice "$_voice_name" true
+        start_tenant_voice "$_voice_name"
+      else
+        configure_voice "$_voice_name" false
+        stop_tenant_voice "$_voice_name"
+        remove_tenant_voice_unit "$_voice_name"
+      fi
       ;;
 
     install-wasm)

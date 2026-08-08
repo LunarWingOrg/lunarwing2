@@ -2,7 +2,28 @@
 
 ## Target Release: v2.0.6.0
 
-## Status: PROPOSAL — for discussion
+## Status: IMPLEMENTED for v2.0.6.0
+
+## Implementation Notes
+
+Implementation preserves proposal goals but corrects assumptions found during source review:
+
+- LunarWing already had cloud audio transcription through
+  `ic/src/llm/transcription/`. LunarVoice implements that existing
+  `TranscriptionProvider` contract instead of adding parallel enrichment middleware.
+- Sidecar uses Axum plus `sherpa-rs` 0.6.8 (sherpa-onnx) for Whisper, Silero VAD,
+  and Kokoro. This avoids duplicating model-specific preprocessing with direct `ort`.
+- API and health listeners use separate defaults: `8090` and `8091`. Proposed
+  `8089` conflicted with LunarVision health deployment.
+- Multi-tenant host ports come from registry v15 `voice_service` and
+  `voice_health` fields in isolated range `40000-49999`.
+- Voice is provisioned disabled. `lunarwing-mt-admin.sh enable-voice <tenant>`
+  requires verified Whisper artifacts before enabling local transcription.
+- Model downloads are opt-in and require operator-supplied exact SHA-256 values.
+  No unverified first-run download occurs.
+- Health discovery probes only tenants with `enable_voice=true`; LunarVoice is
+  monitor-only in self-heal because restarting optional model workloads
+  automatically is unsafe.
 
 ## Motivation
 
@@ -19,10 +40,14 @@ LunarVision (exists):
   Uses: Tesseract + optional PaddleOCR + external VL model API
   Deploy: systemd/OpenRC service or rootless Podman container
 
-LunarVoice (does not exist):
-  No audio processing anywhere in the codebase
-  No ONNX runtime dependency
-  No speech-to-text, text-to-speech, or VAD
+Audio transcription (exists):
+  ic/src/llm/transcription/       → provider trait + inbound middleware
+  Cloud providers                → OpenAI Whisper and Chat Completions
+
+LunarVoice (implemented here):
+  projects/voice-sidecar/        → local STT, TTS, and VAD
+  ic/src/llm/transcription/lunarvoice.rs → loopback provider
+  ic/tools-src/voice-transcribe/ → sandboxed WASM tool
 ```
 
 ## Proposed Architecture
@@ -31,7 +56,7 @@ Follow the proven LunarVision sidecar pattern — separate process, HTTP API, he
 
 ```
 LunarVoice Sidecar (new):
-  projects/voice-sidecar/          → Rust HTTP server (warp/axum), port 8089
+  projects/voice-sidecar/          → Rust HTTP server (Axum), API 8090, health 8091
   ├── STT endpoint: POST /v1/voice/transcribe
   ├── TTS endpoint: POST /v1/voice/synthesize
   ├── VAD endpoint: POST /v1/voice/detect
@@ -45,14 +70,19 @@ LunarVoice Sidecar (new):
   └── TTS engine (configurable, see below)
 
 Daemon Integration:
-  ic/src/voice_enrichment.rs       → inbound audio message transcription
-  ic/src/tools/wasm/wrapper.rs     → inject voice sidecar URL (like OCR at 8088)
+  ic/src/llm/transcription/lunarvoice.rs → existing transcription pipeline provider
+  ic/src/tools/wasm/wrapper.rs     → inject scoped sidecar URL and bearer token
   Health checks: lunarwing-voice-<t> units (same pattern as vision)
 ```
 
 ## ONNX Runtime Integration
 
-### Crate: `ort` (pyke.io)
+### Runtime: sherpa-rs / sherpa-onnx
+
+Final implementation uses `sherpa-rs` with downloaded, checksum-pinned
+sherpa-onnx runtime binaries. Direct `ort` integration below records original
+design research but is not shipped because sherpa-rs owns required audio/model
+preprocessing and exposes all three engines behind one API.
 
 - v2.0.0-rc.13, wraps ONNX Runtime 1.28
 - 14.5M downloads, actively maintained (updated Jul 28 2026)
@@ -182,8 +212,8 @@ GET /ready  → { "ready": true, "stt_engine": "whisper-tiny", "tts_engine": "ko
 
 ```env
 # Voice sidecar config
-VOICE_PORT=8089
-VOICE_HEALTH_PORT=8089
+VOICE_PORT=8090
+VOICE_HEALTH_PORT=8091
 VOICE_AUTH_TOKEN=<bearer token>
 
 # Model selection
@@ -254,7 +284,9 @@ podman run -d \
   ghcr.io/lunarwing/voice-sidecar:latest
 ```
 
-Container includes ONNX Runtime + default models. First-run downloads models to mounted volume.
+Container includes sherpa-onnx runtime libraries but no models. Operators mount
+verified models; optional first-run installation requires HTTPS plus exact
+SHA-256 values in `VOICE_MODEL_MANIFEST`.
 
 ### Bare metal (Gentoo/OpenRC)
 
@@ -296,22 +328,22 @@ VAD is negligible on all platforms (~2MB model, <10ms/frame).
 
 ### Phase 1: Core Sidecar (2.0.6.0)
 
-- [ ] `projects/voice-sidecar/` scaffold (warp HTTP server, config, auth)
-- [ ] ort integration with `load-dynamic`
-- [ ] Silero VAD endpoint
-- [ ] Whisper STT endpoint (sherpa-onnx)
-- [ ] Kokoro TTS endpoint (sherpa-onnx)
-- [ ] Model download on first run
-- [ ] Health/ready endpoints
-- [ ] systemd + OpenRC service templates
-- [ ] Podman deployment docs
+- [x] `projects/voice-sidecar/` Axum server, config, auth, limits, and cache
+- [x] sherpa-rs/sherpa-onnx runtime integration
+- [x] Silero VAD endpoint
+- [x] Whisper STT endpoint
+- [x] Kokoro TTS endpoint
+- [x] Opt-in SHA-256-verified model installer
+- [x] Separate health/ready/metrics listener
+- [x] systemd + OpenRC service templates
+- [x] Podman deployment docs
 
 ### Phase 2: Daemon Integration (2.0.6.0)
 
-- [ ] `ic/src/voice_enrichment.rs` — inbound audio transcription
-- [ ] WASM tool `voice-transcribe` (same pattern as vision-analyze)
-- [ ] Health check integration (mt-admin, self-heal)
-- [ ] Per-tenant voice config (enable/disable, model selection)
+- [x] Existing transcription middleware integration through local provider
+- [x] WASM tool `voice-transcribe` with host-scoped bearer injection
+- [x] Registry-aware health check, mt-admin lifecycle, monitor-only self-heal
+- [x] Per-tenant enable/disable and model configuration
 
 ### Phase 3: Advanced Features (2.0.8.0+)
 
@@ -335,7 +367,7 @@ VAD is negligible on all platforms (~2MB model, <10ms/frame).
 - **sherpa-onnx C++ dependency** — build complexity (mitigated: pre-built binaries, container)
 - **Model size** — 154MB default footprint (mitigated: int8 quantization, model selection)
 - **CPU load during inference** — STT is compute-heavy (mitigated: rate limiting, caching, VAD pre-filter)
-- **ort version churn** — still rc releases (mitigated: load-dynamic, pin version)
+- **sherpa runtime churn** — native ABI/build changes (mitigated: pinned crate and container)
 - **sherpa-onnx Rust bindings maturity** — docs.rs exists but API surface is large (mitigated: wrap behind clean interface)
 
 ## References

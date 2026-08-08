@@ -1097,17 +1097,22 @@ impl WasmToolWrapper {
         prepared: Arc<PreparedModule>,
         capabilities: Capabilities,
     ) -> Self {
-        let scoped_bearer_credential = if matches!(
-            prepared.name.as_str(),
-            "vision-analyze" | "vision-analyze-tool"
-        ) {
-            crate::config::env_or_override("VISION_AUTH_TOKEN").and_then(|token| {
-                let service_url = crate::config::env_or_override("VISION_SERVICE_URL")
-                    .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
-                ScopedBearerCredential::new(&service_url, SecretString::from(token))
-            })
-        } else {
-            None
+        let scoped_bearer_credential = match prepared.name.as_str() {
+            "vision-analyze" | "vision-analyze-tool" => {
+                crate::config::env_or_override("VISION_AUTH_TOKEN").and_then(|token| {
+                    let service_url = crate::config::env_or_override("VISION_SERVICE_URL")
+                        .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
+                    ScopedBearerCredential::new(&service_url, SecretString::from(token))
+                })
+            }
+            "voice-transcribe" | "voice-transcribe-tool" => {
+                crate::config::env_or_override("VOICE_AUTH_TOKEN").and_then(|token| {
+                    let service_url = crate::config::env_or_override("VOICE_SERVICE_URL")
+                        .unwrap_or_else(|| "http://127.0.0.1:8090".to_string());
+                    ScopedBearerCredential::new(&service_url, SecretString::from(token))
+                })
+            }
+            _ => None,
         };
 
         Self {
@@ -1482,8 +1487,24 @@ impl Tool for WasmToolWrapper {
             host_credentials.push(credential.resolve());
         }
 
-        // Serialize context for WASM
-        let context_json = serde_json::to_string(ctx).ok();
+        // Serialize context for WASM. LunarVoice is an optional per-tenant
+        // sidecar; inject its host-owned URL without widening every JobContext
+        // constructor or allowing the model-provided parameter to win.
+        let context_json = if matches!(
+            self.prepared.name.as_str(),
+            "voice-transcribe" | "voice-transcribe-tool"
+        ) {
+            serde_json::to_value(ctx).ok().and_then(|mut value| {
+                if let Some(url) = crate::config::env_or_override("VOICE_SERVICE_URL")
+                    && let Some(context) = value.as_object_mut()
+                {
+                    context.insert("voice_service_url".into(), serde_json::Value::String(url));
+                }
+                serde_json::to_string(&value).ok()
+            })
+        } else {
+            serde_json::to_string(ctx).ok()
+        };
 
         // Pre-load workspace data (async, before blocking task).
         // WASM tools run in a sync context (spawn_blocking), so we load
