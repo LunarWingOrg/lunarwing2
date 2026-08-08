@@ -61,6 +61,30 @@ LunarVoice expects sherpa-onnx model layouts:
   lexicon-zh.txt
 ```
 
+### STT engines
+
+`VOICE_STT_ENGINE` selects the speech-to-text engine:
+
+- `whisper` (default) — Whisper via sherpa-onnx, multilingual, reports the
+  detected language per chunk. Default model `whisper-tiny`.
+- `parakeet` — NVIDIA Parakeet-TDT via the sherpa-onnx transducer
+  recognizer. Supported models: `parakeet-tdt-0.6b-v2-int8` (English) and
+  `parakeet-tdt-0.6b-v3-int8` (multilingual). Set `VOICE_STT_MODEL` to one of
+  those names; the expected layout is:
+
+```text
+/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/
+  encoder.int8.onnx
+  decoder.int8.onnx
+  joiner.int8.onnx
+  tokens.txt
+```
+
+Parakeet does not detect the spoken language; the response language is the
+configured `VOICE_STT_LANGUAGE` (set it explicitly, e.g. `en` for the v2
+model). Explicit `VOICE_STT_ENCODER`/`VOICE_STT_DECODER`/`VOICE_STT_JOINER`/
+`VOICE_STT_TOKENS` paths override the derived locations for either engine.
+
 Models are not committed or silently downloaded. Copy
 `model-manifest.example.json`, replace each placeholder with a SHA-256 obtained
 through a trusted release channel, mount it, then set:
