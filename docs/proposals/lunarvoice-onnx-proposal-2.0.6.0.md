@@ -24,6 +24,10 @@ Implementation preserves proposal goals but corrects assumptions found during so
 - Health discovery probes only tenants with `enable_voice=true`; LunarVoice is
   monitor-only in self-heal because restarting optional model workloads
   automatically is unsafe.
+- STT engine is selectable via `VOICE_STT_ENGINE`: `whisper` (default) or
+  `parakeet`. Parakeet supports `parakeet-tdt-0.6b-v2-int8` and
+  `parakeet-tdt-0.6b-v3-int8` through the sherpa-onnx transducer recognizer,
+  with the same SHA-256-verified install and mt-admin lifecycle as Whisper.
 
 ## Motivation
 

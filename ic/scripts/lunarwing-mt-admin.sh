@@ -6845,13 +6845,14 @@ ENVEOF
 
 write_tenant_voice_env() {
   local name="$1"
-  local env_dir env_path token enabled stt_model stt_language enable_vad enable_tts
+  local env_dir env_path token enabled stt_engine stt_model stt_language enable_vad enable_tts
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/voice.env"
   token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
   token="${token:-$(generate_token)}"
   enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$enabled" == true ]] || enabled=false
+  stt_engine="$(_env_existing "$env_path" VOICE_STT_ENGINE)"; stt_engine="${stt_engine:-whisper}"
   stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"; stt_model="${stt_model:-whisper-tiny}"
   stt_language="$(_env_existing "$env_path" VOICE_STT_LANGUAGE)"; stt_language="${stt_language:-auto}"
   enable_vad="$(_env_existing "$env_path" VOICE_ENABLE_VAD)"; enable_vad="${enable_vad:-true}"
@@ -6866,6 +6867,7 @@ VOICE_BIND_HOST=0.0.0.0
 VOICE_PORT=8090
 VOICE_HEALTH_PORT=8091
 VOICE_MODEL_DIR=/models
+VOICE_STT_ENGINE=$stt_engine
 VOICE_STT_MODEL=$stt_model
 VOICE_STT_LANGUAGE=$stt_language
 VOICE_ENABLE_VAD=$enable_vad
@@ -6891,25 +6893,34 @@ tenant_voice_enabled() {
 }
 
 voice_models_ready() {
-  local name="$1" env_path key value default_path host_path stt_model marker_hash
+  local name="$1" env_path key value default_path host_path stt_model stt_engine marker_hash
   env_path="$(tenant_env_dir "$name")/voice.env"
   stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"
   stt_model="${stt_model:-whisper-tiny}"
+  stt_engine="$(_env_existing "$env_path" VOICE_STT_ENGINE)"
+  stt_engine="${stt_engine:-whisper}"
   [[ "$stt_model" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
   [[ -f "$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256" ]] || return 1
   marker_hash="$(tr -d '\r\n' <"$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256")"
   [[ "$marker_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  local model_paths
+  if [[ "$stt_engine" == parakeet* ]]; then
+    model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-nemo-${stt_model}/encoder.int8.onnx
+VOICE_STT_DECODER|/models/sherpa-onnx-nemo-${stt_model}/decoder.int8.onnx
+VOICE_STT_JOINER|/models/sherpa-onnx-nemo-${stt_model}/joiner.int8.onnx
+VOICE_STT_TOKENS|/models/sherpa-onnx-nemo-${stt_model}/tokens.txt"
+  else
+    model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx
+VOICE_STT_DECODER|/models/sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx
+VOICE_STT_TOKENS|/models/sherpa-onnx-whisper-tiny/tiny-tokens.txt"
+  fi
   while IFS='|' read -r key default_path; do
     value="$(_env_existing "$env_path" "$key")"
     value="${value:-$default_path}"
     [[ "$value" == /models/* ]] || return 1
     host_path="$VOICE_MODELS_DIR/${value#/models/}"
     [[ -f "$host_path" && -r "$host_path" ]] || return 1
-  done <<'MODEL_PATHS'
-VOICE_STT_ENCODER|/models/sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx
-VOICE_STT_DECODER|/models/sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx
-VOICE_STT_TOKENS|/models/sherpa-onnx-whisper-tiny/tiny-tokens.txt
-MODEL_PATHS
+  done <<<"$model_paths"
 }
 
 start_tenant_vision() {
@@ -7159,7 +7170,7 @@ start_tenant_voice() {
   local name="$1"
   tenant_voice_enabled "$name" || { say "LunarVoice disabled for $name (skipping)"; return 0; }
   voice_models_ready "$name" \
-    || { say "ERROR: verified Whisper models missing under $VOICE_MODELS_DIR" >&2; return 1; }
+    || { say "ERROR: verified STT models missing under $VOICE_MODELS_DIR" >&2; return 1; }
   ensure_container_runtime
 
   # SELinux: the shared model store must carry a container-readable label or
@@ -7333,7 +7344,7 @@ configure_voice() {
   [[ -f "$voice_env" ]] || write_tenant_voice_env "$name" >/dev/null
   [[ -f "$lunarwing_env" ]] || die "tenant LunarWing environment missing"
   if [[ "$enabled" == "true" ]]; then
-    voice_models_ready "$name" || die "verified Whisper models missing under $VOICE_MODELS_DIR"
+    voice_models_ready "$name" || die "verified STT models missing under $VOICE_MODELS_DIR"
   fi
   token="$(_env_existing "$voice_env" VOICE_AUTH_TOKEN)"
   stt_model="$(_env_existing "$voice_env" VOICE_STT_MODEL)"
