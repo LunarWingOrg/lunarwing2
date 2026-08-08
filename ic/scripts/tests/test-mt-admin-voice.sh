@@ -42,7 +42,57 @@ TRANSCRIPTION_MODEL=whisper-1
 PRESERVE_ME=yes
 ENV
 chmod 0600 "$env_dir/voice.env" "$env_dir/lunarwing.env"
-tenant_env_dir() { printf '%s' "$env_dir"; }
+# Distinct name: mt-admin locals named env_dir would shadow the test global
+# under bash dynamic scoping when the mock runs inside a command substitution.
+TENANT_ENV_DIR_MOCK="$env_dir"
+tenant_env_dir() { printf '%s' "$TENANT_ENV_DIR_MOCK"; }
+
+# --- STT engine selection: whisper default, parakeet-tdt support ---
+VOICE_MODELS_DIR="$ROOT/models"
+mkdir -p "$VOICE_MODELS_DIR"
+hash64=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+chown() { :; }  # No root in the test harness; tenant users do not exist.
+
+write_tenant_voice_env alpha >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_ENGINE)" whisper "voice env defaults to whisper engine"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_MODEL)" whisper-tiny "voice env defaults to whisper model"
+
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" no "whisper readiness fails without verified models"
+mkdir -p "$VOICE_MODELS_DIR/sherpa-onnx-whisper-tiny"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-tiny/tiny-tokens.txt"
+printf '%s\n' "$hash64" >"$VOICE_MODELS_DIR/.lunarvoice-whisper-tiny.sha256"
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" yes "whisper readiness passes with verified models"
+
+_env_set "$env_dir/voice.env" VOICE_STT_ENGINE parakeet
+_env_set "$env_dir/voice.env" VOICE_STT_MODEL parakeet-tdt-0.6b-v3-int8
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" no "parakeet readiness fails without verified models"
+mkdir -p "$VOICE_MODELS_DIR/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/encoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/decoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/tokens.txt"
+printf '%s\n' "$hash64" >"$VOICE_MODELS_DIR/.lunarvoice-parakeet-tdt-0.6b-v3-int8.sha256"
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" no "parakeet readiness requires the joiner artifact"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/joiner.int8.onnx"
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" yes "parakeet readiness passes with verified models"
+
+write_tenant_voice_env alpha >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_ENGINE)" parakeet "voice env rewrite preserves parakeet engine"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_MODEL)" parakeet-tdt-0.6b-v3-int8 "voice env rewrite preserves parakeet model"
+unset -f chown
+
+# Restore the original whisper fixture state for the configure_voice checks.
+cat >"$env_dir/voice.env" <<'ENV'
+VOICE_ENABLED=false
+VOICE_AUTH_TOKEN=stable-token
+ENV
+
 voice_models_ready() { return 0; }
 
 configure_voice alpha false >/dev/null
