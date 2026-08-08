@@ -1258,6 +1258,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transient_failures_get_second_recovery_attempt_when_configured() {
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: "flaky upstream".into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::Transient,
+                reason: "flaky upstream".into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 2,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        assert_eq!(llm.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_failure_goes_terminal_without_engine_attempt() {
+        let llm = Arc::new(ResultMockLlm::new(vec![Err(EngineError::Llm {
+            kind: crate::types::error::ModelFailureKind::RateLimited,
+            reason: "quota exhausted".into(),
+        })]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(crate::types::error::ModelFailureKind::RateLimited),
+                ..
+            }
+        ));
+        // The provider layer owns rate-limit waiting; no engine retry.
+        assert_eq!(llm.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn total_recovery_attempt_cap_forces_terminal() {
+        // Lifetime cap of zero: even a recoverable first failure goes terminal.
+        let llm = Arc::new(ResultMockLlm::new(vec![Err(EngineError::Llm {
+            kind: crate::types::error::ModelFailureKind::Transient,
+            reason: "flaky upstream".into(),
+        })]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 2,
+            model_recovery_total_attempts: 0,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(crate::types::error::ModelFailureKind::Transient),
+                ..
+            }
+        ));
+        assert_eq!(llm.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_second_attempt_shrinks_context_harder() {
+        let llm = Arc::new(ResultMockLlm::new(vec![
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Err(EngineError::Llm {
+                kind: crate::types::error::ModelFailureKind::ContextOverflow,
+                reason: "window exceeded".into(),
+            }),
+            Ok(text_response("recovered")),
+        ]));
+        let config = ThreadConfig {
+            model_recovery_max_attempts: 2,
+            ..ThreadConfig::default()
+        };
+        let (mut exec, _tx) = make_loop_with_llm(llm.clone(), Vec::new(), config).await;
+
+        let outcome = exec.run().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "recovered"
+        ));
+        // Two engine recovery attempts happened (three provider calls total).
+        assert_eq!(llm.requests().len(), 3);
+    }
+
+    #[tokio::test]
     async fn repeated_failed_action_batches_get_one_warning_turn() {
         let responses = (0..4)
             .map(|index| action_response("test_tool", &format!("call_{index}")))
