@@ -16,7 +16,9 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bzip2 ca-certificates curl ffmpeg jq libstdc++6 util-linux \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home /app --shell /usr/sbin/nologin voice \
+    && (getent group voice >/dev/null || groupadd --system voice) \
+    && (getent passwd voice >/dev/null \
+        || useradd --system -g voice --home /app --shell /usr/sbin/nologin voice) \
     && install -d -o voice -g voice /app /app/lib /models
 
 WORKDIR /app

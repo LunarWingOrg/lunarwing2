@@ -7162,6 +7162,13 @@ start_tenant_voice() {
     || { say "ERROR: verified Whisper models missing under $VOICE_MODELS_DIR" >&2; return 1; }
   ensure_container_runtime
 
+  # SELinux: the shared model store must carry a container-readable label or
+  # the sidecar gets EACCES on /models. chcon (not :z) because the dir is
+  # root-owned and shared across tenants — a per-tenant relabel would fight.
+  if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
+    chcon -Rt container_file_t "$VOICE_MODELS_DIR" 2>/dev/null || true
+  fi
+
   local voice_port voice_health_port container_name env_path
   voice_port="$(ports_get "$name" voice_service)" || true
   voice_health_port="$(ports_get "$name" voice_health)" || true
@@ -7206,7 +7213,7 @@ start_tenant_voice() {
       --env-file "$env_path" \
       -p "127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}" \
       -p "127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}" \
-      -v "$VOICE_MODELS_DIR:/models:ro,z" \
+      -v "$VOICE_MODELS_DIR:/models:ro" \
       --security-opt=no-new-privileges \
       "${restart_arg[@]}" \
       "$VOICE_SIDECAR_IMAGE" >/dev/null
@@ -7256,7 +7263,7 @@ Image=${VOICE_SIDECAR_IMAGE}
 PublishPort=127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}
 PublishPort=127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}
 EnvironmentFile=${env_path}
-Volume=${VOICE_MODELS_DIR}:/models:ro,z
+Volume=${VOICE_MODELS_DIR}:/models:ro
 SecurityLabelDisable=false
 
 [Service]
