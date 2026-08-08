@@ -3944,6 +3944,15 @@ write_tenant_lunarwing_env() {
     xmpp_allow_from_effective="${xmpp_allow_from_effective:-$xmpp_jid}"
   fi
 
+  # Engine V2 rollout (v2.0.6.0): V2 engine channels ON by default for all
+  # tenants. An existing ENGINE_V2 / ENGINE_V2_CHANNELS value is preserved
+  # across upgrade/rebuild/re-render — never clobber an operator's setting;
+  # only a first write (or an absent key) falls back to the defaults.
+  local engine_v2 engine_v2_channels
+  engine_v2="$(_env_existing "$path" ENGINE_V2)"; engine_v2="${engine_v2:-true}"
+  engine_v2_channels="$(_env_existing "$path" ENGINE_V2_CHANNELS)"
+  engine_v2_channels="${engine_v2_channels:-xmpp,weechat,darkirc}"
+
   (
     umask 077
     cat >"$path" <<ENVEOF
@@ -4037,8 +4046,13 @@ ADAPTER_PORT=$weechat_adapter_port
 WEECHAT_ADAPTER_PORT=$weechat_adapter_port
 WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 
-# Engine V2 (parallel execution path with streaming, gates, missions)
-ENGINE_V2=true
+# Engine V2 (parallel execution path with streaming, gates, missions).
+# ENGINE_V2_CHANNELS is the comma-separated allowlist of non-gateway channels
+# routed through Engine V2 (eligible: xmpp, weechat, darkirc) — on by default
+# for all tenants; an existing value is preserved on re-render. Set
+# ENGINE_V2=false or ENGINE_V2_CHANNELS=none to opt out durably.
+ENGINE_V2=$engine_v2
+ENGINE_V2_CHANNELS=$engine_v2_channels
 
 # Daemon mode
 CLI_ENABLED=false

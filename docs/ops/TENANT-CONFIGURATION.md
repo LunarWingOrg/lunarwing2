@@ -204,21 +204,29 @@ grep GATEWAY_AUTH_TOKEN /home/<tenant>/lunarwing/env/lunarwing.env
 
 ## Engine V2 Channel Rollout
 
-Engine V2 is disabled unless `ENGINE_V2=true`. When enabled, the gateway uses
-Engine V2 by default and other channels remain on the legacy engine unless they
-are explicitly allowlisted:
+As of v2.0.6.0, multi-tenant provisioning writes Engine V2 into every
+tenant's `lunarwing.env` with all eligible channels on by default:
 
 ```bash
 ENGINE_V2=true
-ENGINE_V2_CHANNELS=                 # gateway only
-ENGINE_V2_CHANNELS=xmpp             # gateway plus XMPP
-ENGINE_V2_CHANNELS=xmpp,weechat     # gateway plus XMPP and WeeChat
+ENGINE_V2_CHANNELS=xmpp,weechat,darkirc   # default for new tenants
 ```
 
-The only eligible non-gateway names are `xmpp`, `darkirc`, and `weechat`.
-Entries are comma-separated, trimmed, lowercased, and matched exactly; empty or
-unknown entries do nothing. `ENGINE_V2=false` disables Engine V2 for every
-channel regardless of the allowlist.
+Existing tenants whose env lacks these keys gain the defaults on the next
+upgrade/rebuild/re-render. An operator-set value is never overwritten:
+`write_tenant_lunarwing_env` preserves both `ENGINE_V2` and
+`ENGINE_V2_CHANNELS` across re-runs. An empty `ENGINE_V2_CHANNELS=` counts as
+unset (the default returns on re-render); use `ENGINE_V2_CHANNELS=none` or
+`ENGINE_V2=false` for a durable opt-out.
+
+The gateway always uses Engine V2 when `ENGINE_V2=true`; other channels stay
+on the legacy engine unless explicitly allowlisted. The only eligible
+non-gateway names are `xmpp`, `darkirc`, and `weechat`. Entries are
+comma-separated, trimmed, lowercased, and matched exactly; empty or unknown
+entries do nothing. Listing `darkirc` is harmless for tenants without a
+DarkIRC adapter — the allowlist only permits routing, it does not spawn
+channels. `ENGINE_V2=false` disables Engine V2 for every channel regardless
+of the allowlist.
 
 Gateway responses stream incrementally. Current WASM channels ignore provider
 chunks and receive one final response through their existing `on_respond`
@@ -226,10 +234,11 @@ contract, preserving the original JID/room, nick, or buffer metadata. No WIT
 migration or WASM reinstall is required for this rollout.
 
 Enable one configured channel at a time and restart through
-`lunarwing-mt-admin.sh`. To roll back a channel, remove only its allowlist entry
-and restart the tenant. Setting `ENGINE_V2_CHANNELS=` immediately restores the
-gateway-only default without a database migration or state restore. Back up the
-tenant env file before introducing the key; do not replace the rest of `env/` or
+`lunarwing-mt-admin.sh`. To roll back a channel, remove only its allowlist
+entry and restart the tenant — the edited allowlist survives subsequent
+re-renders. Setting `ENGINE_V2=false` immediately restores the legacy engine
+for every channel without a database migration or state restore. Back up the
+tenant env file before editing it; do not replace the rest of `env/` or
 anything under `state/`.
 
 ## WASM Extensions
