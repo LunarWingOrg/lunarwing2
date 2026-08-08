@@ -1,0 +1,17 @@
+services:
+  lunarvoice:
+    build: .
+    image: lunarwing/voice-service:latest
+    container_name: lunarwing-voice-sidecar
+    env_file: .env
+    environment:
+      VOICE_BIND_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:8090:8090"
+      - "127.0.0.1:8091:8091"
+    volumes:
+      - voice_models:/models
+    restart: unless-stopped
+
+volumes:
+  voice_models:

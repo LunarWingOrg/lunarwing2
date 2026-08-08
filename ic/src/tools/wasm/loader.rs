@@ -55,6 +55,7 @@ const LEGACY_RENAMED_TOOL_STEMS: &[&str] = &[
     "multica-bridge",
     "ssh",
     "vision-analyze",
+    "voice-transcribe",
     "web-search",
 ];
 

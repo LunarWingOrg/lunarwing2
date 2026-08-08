@@ -1,0 +1,27 @@
+{
+  "artifacts": [
+    {
+      "name": "whisper-tiny",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-whisper-tiny.tar.bz2",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_A_TRUSTED_SOURCE",
+      "kind": "tar.bz2",
+      "archive_root": "sherpa-onnx-whisper-tiny",
+      "destination": "sherpa-onnx-whisper-tiny"
+    },
+    {
+      "name": "silero-vad",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_A_TRUSTED_SOURCE",
+      "kind": "file",
+      "destination": "silero_vad.onnx"
+    },
+    {
+      "name": "kokoro-multilang-v1",
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/kokoro-multi-lang-v1_0.tar.bz2",
+      "sha256": "REPLACE_WITH_64_HEX_CHARACTERS_FROM_A_TRUSTED_SOURCE",
+      "kind": "tar.bz2",
+      "archive_root": "kokoro-multi-lang-v1_0",
+      "destination": "kokoro-multi-lang-v1_0"
+    }
+  ]
+}

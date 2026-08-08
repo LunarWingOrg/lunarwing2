@@ -779,6 +779,38 @@ and falls back to `http://127.0.0.1:{OAUTH_CALLBACK_PORT}`.
 
 ---
 
+## Optional Local Audio Transcription
+
+Interactive setup does not enable LunarVoice. Multi-tenant provisioning writes
+sidecar settings and credentials with `VOICE_ENABLED=false`; verified models and
+an explicit operator action are required:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh build-voice-sidecar
+sudo ic/scripts/lunarwing-mt-admin.sh enable-voice <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+```
+
+`enable-voice` sets `TRANSCRIPTION_PROVIDER=lunarvoice`, enables existing audio
+transcription middleware, and uses tenant registry `voice_service` port. It
+fails closed when verified Whisper files are absent. `disable-voice` stops
+sidecar and disables transcription only when current provider remains
+`lunarvoice`; operator-selected cloud transcription config is preserved.
+Per-tenant model name and `/models/...` paths live in protected `voice.env`;
+enablement requires matching readable host files plus downloader SHA marker.
+
+Relevant bootstrap environment:
+
+| Variable | Purpose |
+|----------|---------|
+| `TRANSCRIPTION_ENABLED` | Enables existing inbound audio middleware |
+| `TRANSCRIPTION_PROVIDER` | Set to `lunarvoice` for local sidecar |
+| `TRANSCRIPTION_MODEL` | Loaded sidecar model name, default `whisper-tiny` |
+| `VOICE_SERVICE_URL` | Loopback API URL; multi-tenant value comes from ports registry |
+| `VOICE_AUTH_TOKEN` | Per-tenant bearer token; never log or expose it |
+
+---
+
 ## Testing
 
 Tests live in `mod tests {}` at the bottom of each file.

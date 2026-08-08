@@ -107,6 +107,23 @@
 #HEALTH_LUNARVISION_LATENCY_CRITICAL_MS=5000
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Component: lunarvoice (local ONNX STT/TTS/VAD)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# `auto` probes enabled registry tenants or an explicit URL and otherwise
+# reports healthy/not-configured. Set true to force single-node 8091 fallback;
+# set false to disable entirely.
+#HEALTH_LUNARVOICE_ENABLED=auto
+
+# Single-node health-listener override. Leave unset on multi-tenant hosts so
+# enabled tenants are discovered from voice_health in ports registry. When
+# registry exists but no tenant enables voice, check reports healthy/disabled.
+#HEALTH_LUNARVOICE_URL="http://127.0.0.1:8091"
+
+#HEALTH_LUNARVOICE_TIMEOUT=5
+#HEALTH_LUNARVOICE_FETCH_METRICS=true
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Component: netbird (host tunnel peer readiness)
 # ═════════════════════════════════════════════════════════════════════════════
 
