@@ -1,16 +1,14 @@
 # MCP Additions Status
 
-> **Current status (2026-08-08): PARTIAL.** HTTP/HTTPS plus host-local stdio and
-> Unix MCP; owner-scoped secret references; diagnostics; explicit lifecycle
-> operations; safe whole-runtime stdio crash recovery; operator-pinned
-> package provenance (executable digest verification, trust state, revocation);
-> and opt-in host OS sandboxing for stdio children (resource limits,
-> process-group isolation, seccomp ptrace denial, Landlock read-only root,
-> network namespace isolation) are implemented.
+> **Current status (2026-08-09): PARTIAL.** HTTP/HTTPS, host-local stdio, Unix,
+> stateful MCP-over-WASM, and dedicated/shared gateway adapters are implemented
+> behind one runtime-neutral activation registry. Owner-scoped secret references,
+> diagnostics, explicit lifecycle operations, safe stdio crash recovery,
+> operator-pinned package provenance, and opt-in host OS sandboxing are also
+> implemented.
 > Worker-local placement, automatic package installation, publisher signatures
-> and dependency locking, device-level sandboxing and mandatory default sandbox
-> profiles, a general runtime-adapter layer, MCP-over-WASM, and a dedicated
-> shared MCP gateway are not implemented.
+> and dependency locking, device-level sandboxing, mandatory default sandbox
+> profiles, and a bundled shared gateway service remain unimplemented.
 
 For the concise checkpoint, remaining-validation list, and deferred-work summary,
 see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
@@ -25,9 +23,10 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   web API, and browser MCP form accept structured MCP configuration.
 - Installation persists configuration only. Activation initializes MCP, discovers
   tools, and registers owner-scoped wrappers.
-- HTTP/HTTPS, stdio, and Unix domain socket transports are supported. Current MCP
-  integration exposes tools, not resources, prompts, subscriptions, or WebSocket
-  transport.
+- HTTP/HTTPS, stdio, Unix domain socket, stateful WASM component, and gateway
+  transports are supported. The agent registry currently exposes MCP tools; the
+  raw WASM actor ABI preserves resources, prompts, notifications, subscriptions,
+  and future JSON-RPC methods for clients that invoke those methods.
 
 ### Lifecycle and diagnostics
 
@@ -142,6 +141,42 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   protection cannot be applied from the spawn path. Device isolation and
   mandatory default sandbox profiles remain future work.
 
+### Runtime adapters, MCP-over-WASM, and gateways
+
+- `ic/src/tools/mcp/runtime.rs` defines the public `McpRuntimeAdapter` boundary,
+  activation context/request types, stable runtime kinds, typed activation errors,
+  and an extensible registry. The factory validates persisted intent and provenance
+  once, then dispatches HTTP, stdio, Unix, WASM, or gateway activation through the
+  registry. Every adapter returns the same `McpClient`, preserving discovery,
+  wrapper ownership, approval, update, deactivation, and shutdown behavior.
+- `ic/wit/mcp-server.wit` defines a stateful actor ABI carrying complete JSON-RPC
+  envelopes. One component instance is retained for an active server and requests
+  are serialized through it, so initialization state and subscriptions can persist.
+  Guest code receives minimal WASI with no inherited environment, filesystem,
+  network, standard streams, or credentials. Activation requires a canonical,
+  non-symlink regular component path and enforces a 64 MiB artifact cap. Per-message
+  limits cover memory, replenished fuel, epoch interruption, a 1-300 second timeout,
+  and 4 MiB request/response envelopes. A trap permanently stops that actor rather
+  than reusing possibly-corrupt state.
+- Gateway config explicitly distinguishes `dedicated` and `shared` modes. Both use
+  Streamable HTTP and retain normal session/OAuth behavior. The transport owns
+  `X-LunarWing-MCP-Gateway-Mode`; shared mode additionally requires and injects
+  `X-LunarWing-MCP-Route`. User headers cannot override either routing header.
+  A gateway service may therefore dedicate an endpoint to one server or route many
+  servers while LunarWing uses the same client lifecycle. The service itself remains
+  independently deployed; LunarWing does not concentrate gateway credentials or
+  cross-tenant policy inside the daemon.
+- `lunarwing mcp add/list/test`, `lunarwing doctor`, startup activation,
+  `ExtensionManager`, and the authenticated web install API understand the new
+  runtimes. Example installs:
+
+  ```bash
+  lunarwing mcp add portable --transport wasm \
+    --component /opt/lunarwing/mcp/portable.wasm
+  lunarwing mcp add shared-tools https://gateway.example.com/mcp \
+    --transport gateway --gateway-mode shared --gateway-route project-tools
+  ```
+
 ## Not Implemented
 
 | Feature | Current status and reason |
@@ -150,15 +185,14 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 | MCP package provenance | Partially implemented: operator-pinned executable digests, package identity, trust state, and revocation for host-local stdio servers. Publisher signatures, signing-key trust roots, dependency lock data, upgrade diffs, and marketplace revocation remain design work. |
 | Host-local stdio OS sandbox | Partially implemented: opt-in per-server policy covering resource limits, core-dump control, process-group isolation and group teardown (all unix), plus Linux-only no_new_privileges, seccomp ptrace/process_vm denial, Landlock read-only root with writable paths, and user+network namespace network isolation. Remaining: device isolation, mandatory default profiles, and same-UID `/proc/<pid>/mem` inbound reads (kernel credential check, not syscall-filterable). |
 | Generic worker-local MCP | Core per-job workers do not load LunarWing MCP configs or register MCP wrappers. External workers may independently use MCP, but that is a separate integration, not placement of installed LunarWing MCP packages. |
-| Runtime adapter boundary | The safe stdio recovery path now centralizes client preparation and runtime replacement, but process, WASM, worker, remote, and gateway lifecycle remain separate concrete paths rather than one public runtime-neutral interface. |
-| MCP-over-WASM | Existing WASM tool ABI is invocation-scoped and does not implement MCP server sessions, resources, prompts, notifications, or subscriptions. |
-| Dedicated MCP gateway | Browser/CLI lifecycle routes use the LunarWing gateway, but no separate shared MCP control plane provides cross-daemon sessions, package placement, or centralized policy. |
-| Per-server lifecycle timeouts | Configurable startup, request, and shutdown timeout controls remain deferred. |
+| Bundled gateway service | LunarWing implements dedicated/shared gateway client placement and a protected routing contract, but does not bundle or operate the external gateway control-plane service. Cross-daemon HA, centralized package policy, and cross-tenant credential ownership belong to that deployment. |
+| Per-server lifecycle timeouts | WASM message deadlines are configurable. General startup, request, and shutdown timeout controls for every transport remain deferred. |
 
-## v2.0.4 Release Boundary and Assumptions
+## Historical v2.0.4 Release Boundary and Assumptions
 
-Item 14 closes the v2.0.4 **host-local lifecycle** scope. It does not relabel the
-larger V2 architecture as implemented:
+At the v2.0.4 boundary, item 14 closed only the **host-local lifecycle** scope.
+The following bullets record that historical boundary; the runtime adapter,
+MCP-over-WASM, and gateway-adapter deferrals were completed on 2026-08-09:
 
 - **Host-local recovery only:** supervision applies to an already activated stdio
   runtime owned by this `ExtensionManager`. HTTP and Unix transports keep their
@@ -191,11 +225,9 @@ larger V2 architecture as implemented:
   multi-tenant placement, centralized package policy, shared credentials, routing,
   and gateway high-availability semantics remain future architecture work.
 
-These deferrals are security and ownership boundaries, not hidden partial
-implementations. The roadmap places runtime/package vocabulary, the adapter boundary,
-and a verified-package worker prototype in MCP Overhaul Part 2; provenance-backed
-package installation and dedicated-gateway evaluation follow only after that
-foundation.
+The public adapter registry, stateful WASM actor, and gateway routing contract now
+supersede the last two historical bullets. Worker-local placement and safe automatic
+package installation remain separate security and ownership boundaries.
 
 ## Why Package Provenance and Sandboxing Matter
 
@@ -269,3 +301,6 @@ resolved secret values are never retained as restart configuration.
   process-group isolation on unix; no_new_privileges, seccomp ptrace/process_vm
   denial, Landlock read-only root with writable paths, and user+network namespace
   network isolation on Linux; fail-closed activation, CLI and doctor surfaces.
+- 2026-08-09: public runtime adapter registry, stateful MCP-over-WASM actor ABI,
+  and dedicated/shared gateway routing contract added with CLI, web API,
+  diagnostics, startup, lifecycle, and focused test coverage.
