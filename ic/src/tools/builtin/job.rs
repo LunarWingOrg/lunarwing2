@@ -26,7 +26,7 @@ use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
-use crate::orchestrator::auth::CredentialGrant;
+use crate::orchestrator::auth::{CredentialGrant, SandboxJobGrants};
 use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
 use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
 use crate::secrets::SecretsStore;
@@ -212,6 +212,14 @@ struct ExternalExecutionOptions {
     credential_grants: Vec<CredentialGrant>,
 }
 
+struct SandboxExecutionOptions {
+    project_dir: Option<PathBuf>,
+    wait: bool,
+    grants: SandboxJobGrants,
+    worker_mcp_servers: Vec<crate::tools::mcp::worker::WorkerMcpServerDescriptor>,
+    max_iterations: u32,
+}
+
 fn external_prompt_context(
     ctx: &JobContext,
     scope: ExternalContextScope,
@@ -389,6 +397,60 @@ impl CreateJobTool {
         Ok(grants)
     }
 
+    fn parse_worker_mcp_names(params: &serde_json::Value) -> Result<Vec<String>, ToolError> {
+        let Some(value) = params.get("mcp_servers") else {
+            return Ok(Vec::new());
+        };
+        let values = value.as_array().ok_or_else(|| {
+            ToolError::InvalidParameters("mcp_servers must be an array of server names".to_string())
+        })?;
+        if values.len() > crate::tools::mcp::worker::MAX_WORKER_MCP_SERVERS {
+            return Err(ToolError::InvalidParameters(format!(
+                "too many worker MCP servers ({}, max {})",
+                values.len(),
+                crate::tools::mcp::worker::MAX_WORKER_MCP_SERVERS
+            )));
+        }
+        values
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    ToolError::InvalidParameters(
+                        "every mcp_servers entry must be a string".to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    async fn resolve_worker_mcp_servers(
+        &self,
+        grants: &SandboxJobGrants,
+        user_id: &str,
+    ) -> Result<Vec<crate::tools::mcp::worker::WorkerMcpServerDescriptor>, ToolError> {
+        if grants.worker_mcp_servers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let servers = match &self.store {
+            Some(store) => {
+                crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), user_id).await
+            }
+            None => crate::tools::mcp::config::load_mcp_servers().await,
+        }
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to load MCP server config: {error}"))
+        })?;
+        let credential_map = grants
+            .credential_map()
+            .map_err(ToolError::InvalidParameters)?;
+        crate::tools::mcp::worker::select_worker_mcp_servers(
+            &grants.worker_mcp_servers,
+            &servers,
+            &credential_map,
+        )
+        .map_err(|error| ToolError::InvalidParameters(error.to_string()))
+    }
+
     /// Persist a sandbox job record (fire-and-forget).
     fn persist_job(&self, record: SandboxJobRecord) {
         if let Some(store) = self.store.clone() {
@@ -547,10 +609,7 @@ impl CreateJobTool {
     async fn execute_sandbox(
         &self,
         task: &str,
-        explicit_dir: Option<PathBuf>,
-        wait: bool,
-        credential_grants: Vec<CredentialGrant>,
-        max_iterations: u32,
+        options: SandboxExecutionOptions,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
@@ -559,24 +618,24 @@ impl CreateJobTool {
                 "Sandbox execution requires a configured job manager (container runtime not available)".to_string(),
             )
         })?;
+        let SandboxExecutionOptions {
+            project_dir: explicit_dir,
+            wait,
+            grants,
+            worker_mcp_servers,
+            max_iterations,
+        } = options;
 
         let job_id = Uuid::new_v4();
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
 
-        // Serialize credential grants so restarts can reload them.
-        let credential_grants_json = match serde_json::to_string(&credential_grants) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to serialize credential grants for job {}: {}. \
-                     Grants will not survive a restart.",
-                    job_id,
-                    e
-                );
-                String::from("[]")
-            }
-        };
+        // Persist names and secret references only; values remain in the secrets store.
+        let job_grants_json = serde_json::to_string(&grants).map_err(|error| {
+            ToolError::ExecutionFailed(format!(
+                "failed to serialize job grants for restart: {error}"
+            ))
+        })?;
 
         // Register in ContextManager so query tools (list_jobs, job_status,
         // job_events, cancel_job) can find sandbox jobs. Without this, sandbox
@@ -606,7 +665,7 @@ impl CreateJobTool {
             created_at: Utc::now(),
             started_at: None,
             completed_at: None,
-            credential_grants_json,
+            credential_grants_json: job_grants_json,
         });
 
         // Subscribe to the broadcast channel BEFORE starting the container.
@@ -625,7 +684,8 @@ impl CreateJobTool {
                 task,
                 Some(project_dir),
                 JobMode::Worker,
-                credential_grants,
+                grants.credentials,
+                worker_mcp_servers,
                 max_iterations,
             )
             .await
@@ -1337,6 +1397,17 @@ impl Tool for CreateJobTool {
                 });
             }
 
+            if self.sandbox_enabled() {
+                props["mcp_servers"] = serde_json::json!({
+                    "type": "array",
+                    "description": "Installed MCP server names explicitly approved for job-worker placement. Servers must be enabled stdio configs with placement=job-worker and direct preinstalled entrypoints. Any env_secrets must also be supplied through this job's credentials map using the exact environment variable name.",
+                    "items": { "type": "string" },
+                    "maxItems": crate::tools::mcp::worker::MAX_WORKER_MCP_SERVERS,
+                    "uniqueItems": true,
+                    "default": []
+                });
+            }
+
             if self.has_external_workers() {
                 let mut names = self
                     .external_worker_manager
@@ -1497,17 +1568,26 @@ impl Tool for CreateJobTool {
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from);
 
-            // Parse and validate credential grants
-            let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
+            let credentials = self.parse_credentials(&params, &ctx.user_id).await?;
+            let grants = SandboxJobGrants {
+                credentials,
+                worker_mcp_servers: Self::parse_worker_mcp_names(&params)?,
+            };
+            let worker_mcp_servers = self
+                .resolve_worker_mcp_servers(&grants, &ctx.user_id)
+                .await?;
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
             self.execute_sandbox(
                 &task,
-                explicit_dir,
-                wait,
-                credential_grants,
-                max_iterations,
+                SandboxExecutionOptions {
+                    project_dir: explicit_dir,
+                    wait,
+                    grants,
+                    worker_mcp_servers,
+                    max_iterations,
+                },
                 ctx,
             )
             .await
@@ -2509,6 +2589,42 @@ mod tests {
     }
 
     #[test]
+    fn worker_mcp_name_parser_handles_boundaries() {
+        assert!(
+            CreateJobTool::parse_worker_mcp_names(&serde_json::json!({}))
+                .expect("missing selection")
+                .is_empty()
+        );
+        assert!(
+            CreateJobTool::parse_worker_mcp_names(&serde_json::json!({"mcp_servers": []}))
+                .expect("empty selection")
+                .is_empty()
+        );
+        assert_eq!(
+            CreateJobTool::parse_worker_mcp_names(
+                &serde_json::json!({"mcp_servers": ["repo", "search"]})
+            )
+            .expect("valid selection"),
+            ["repo", "search"]
+        );
+        assert!(
+            CreateJobTool::parse_worker_mcp_names(&serde_json::json!({"mcp_servers": "repo"}))
+                .is_err()
+        );
+        assert!(
+            CreateJobTool::parse_worker_mcp_names(&serde_json::json!({"mcp_servers": ["repo", 7]}))
+                .is_err()
+        );
+        let too_many: Vec<_> = (0..=crate::tools::mcp::worker::MAX_WORKER_MCP_SERVERS)
+            .map(|index| serde_json::Value::String(format!("server-{index}")))
+            .collect();
+        assert!(
+            CreateJobTool::parse_worker_mcp_names(&serde_json::json!({"mcp_servers": too_many}))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_execution_timeout_sandbox() {
         let manager = Arc::new(ContextManager::new(5));
 
@@ -2527,10 +2643,13 @@ mod tests {
         let result = tool
             .execute_sandbox(
                 "test task",
-                None,
-                false,
-                vec![],
-                DEFAULT_WORKER_ITERATIONS,
+                SandboxExecutionOptions {
+                    project_dir: None,
+                    wait: false,
+                    grants: SandboxJobGrants::default(),
+                    worker_mcp_servers: Vec::new(),
+                    max_iterations: DEFAULT_WORKER_ITERATIONS,
+                },
                 &JobContext::default(),
             )
             .await;
