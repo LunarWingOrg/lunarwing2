@@ -33,6 +33,29 @@ pub struct CredentialGrant {
     pub env_var: String,
 }
 
+/// Persisted, secret-free grants required to restart a sandbox job.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SandboxJobGrants {
+    #[serde(default)]
+    pub credentials: Vec<CredentialGrant>,
+    /// Installed server names to re-resolve against current owner config on restart.
+    #[serde(default)]
+    pub worker_mcp_servers: Vec<String>,
+}
+
+impl SandboxJobGrants {
+    /// Decode the current object envelope or the legacy credential-array shape.
+    pub fn from_json(value: &str) -> Result<Self, serde_json::Error> {
+        if value.trim_start().starts_with('[') {
+            return serde_json::from_str(value).map(|credentials| Self {
+                credentials,
+                worker_mcp_servers: Vec::new(),
+            });
+        }
+        serde_json::from_str(value)
+    }
+}
+
 /// In-memory store for per-job authentication tokens, grants, and worker runtimes.
 #[derive(Clone)]
 pub struct TokenStore {
@@ -196,6 +219,24 @@ fn extract_job_id_from_path(path: &str) -> Option<Uuid> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_job_grants_decode_current_and_legacy_shapes() {
+        let legacy = r#"[{"secret_name":"token","env_var":"TOKEN"}]"#;
+        let decoded = SandboxJobGrants::from_json(legacy).expect("legacy grants");
+        assert_eq!(decoded.credentials.len(), 1);
+        assert!(decoded.worker_mcp_servers.is_empty());
+
+        let current = SandboxJobGrants {
+            credentials: decoded.credentials,
+            worker_mcp_servers: vec!["repo".to_string()],
+        };
+        let json = serde_json::to_string(&current).expect("serialize current grants");
+        let decoded = SandboxJobGrants::from_json(&json).expect("current grants");
+        assert_eq!(decoded.credentials.len(), 1);
+        assert_eq!(decoded.worker_mcp_servers, ["repo"]);
+        assert!(SandboxJobGrants::from_json("not-json").is_err());
+    }
 
     #[tokio::test]
     async fn test_token_create_and_validate() {
