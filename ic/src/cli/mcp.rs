@@ -2,7 +2,6 @@
 //!
 //! Commands for adding, removing, authenticating, and testing MCP servers.
 
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
