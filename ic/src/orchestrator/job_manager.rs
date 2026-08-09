@@ -18,6 +18,7 @@ use crate::bootstrap::lunarwing_base_dir;
 use crate::error::OrchestratorError;
 use crate::orchestrator::auth::{CredentialGrant, TokenStore};
 use crate::sandbox::connect_docker;
+use crate::tools::mcp::worker::WorkerMcpServerDescriptor;
 
 /// Which mode a sandbox container runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,8 +288,8 @@ impl ContainerJobManager {
     /// Create and start a new container for a job.
     ///
     /// The caller provides the `job_id` so it can be persisted to the database
-    /// before the container is created. Credential grants are stored in the
-    /// TokenStore and served on-demand via the `/credentials` endpoint.
+    /// before the container is created. Credential and MCP runtime grants are
+    /// stored in the TokenStore and served on demand to the authenticated worker.
     /// Returns the auth token for the worker.
     pub async fn create_job(
         &self,
@@ -297,15 +298,24 @@ impl ContainerJobManager {
         project_dir: Option<PathBuf>,
         mode: JobMode,
         credential_grants: Vec<CredentialGrant>,
+        worker_mcp_servers: Vec<WorkerMcpServerDescriptor>,
         max_iterations: u32,
     ) -> Result<String, OrchestratorError> {
         // Generate auth token (stored in TokenStore, never logged)
         let token = self.token_store.create_token(job_id).await;
 
-        // Store credential grants (revoked automatically when the token is revoked)
+        // Store job-scoped grants (revoked automatically with the token).
         self.token_store
             .store_grants(job_id, credential_grants)
             .await;
+        if let Err(reason) = self
+            .token_store
+            .store_worker_mcp_servers(job_id, worker_mcp_servers)
+            .await
+        {
+            self.token_store.revoke(job_id).await;
+            return Err(OrchestratorError::ContainerCreationFailed { job_id, reason });
+        }
 
         // Record the handle
         let handle = ContainerHandle {
