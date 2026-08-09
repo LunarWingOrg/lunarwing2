@@ -45,6 +45,7 @@ pub(crate) mod transport;
 #[cfg(unix)]
 pub(crate) mod unix_transport;
 pub(crate) mod wasm_transport;
+pub mod worker;
 
 pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
