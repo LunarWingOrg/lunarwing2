@@ -2,7 +2,8 @@
 //!
 //! Records what package backs an MCP server and who supplied it: canonical
 //! package identity, ecosystem, immutable version, publisher, and — for
-//! host-local stdio servers — a SHA-256 digest of the resolved executable.
+//! host-local stdio and WASM servers — a SHA-256 digest of the executable or
+//! component artifact.
 //!
 //! Provenance answers **what code is this and who supplied it**. It does not
 //! prove that code is safe; containment (sandboxing) is a separate control.
@@ -12,10 +13,11 @@
 //!
 //! Trust states:
 //! - `Unverified` (default): no provenance requirements; legacy behavior.
-//! - `Pinned`: activation re-hashes the resolved executable and fails closed
-//!   when it no longer matches the recorded digest.
+//! - `Pinned`: activation re-hashes the selected runtime artifact and fails
+//!   closed when it no longer matches the recorded digest.
 //! - `Revoked`: activation is blocked for every transport.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -23,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::tools::mcp::config::ConfigError;
+
+const MAX_MCP_WASM_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Package ecosystem a server package came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,11 +108,17 @@ pub enum ProvenanceError {
         expected: String,
         actual: String,
     },
-    #[error("pinned package has no recorded executable digest")]
+    #[error("pinned package has no recorded runtime artifact digest")]
     MissingPin,
-    #[error("cannot resolve command '{command}': {reason}")]
+    #[error("component digest mismatch for '{path}': expected sha256 {expected}, got {actual}")]
+    ComponentDigestMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("cannot resolve runtime artifact '{command}': {reason}")]
     Resolve { command: String, reason: String },
-    #[error("cannot hash executable '{path}': {reason}")]
+    #[error("cannot hash runtime artifact '{path}': {reason}")]
     Hash { path: String, reason: String },
 }
 
@@ -158,6 +168,14 @@ pub struct McpPackageProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_command: Option<String>,
 
+    /// Lowercase hex SHA-256 of the MCP-over-WASM component at pin time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub component_sha256: Option<String>,
+
+    /// Canonical component path the digest was recorded for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_component: Option<String>,
+
     /// Trust state.
     #[serde(default)]
     pub trust: PackageTrust,
@@ -178,6 +196,8 @@ impl McpPackageProvenance {
             publisher: None,
             command_sha256: None,
             resolved_command: None,
+            component_sha256: None,
+            resolved_component: None,
             trust,
             recorded_at: Utc::now(),
         }
@@ -200,6 +220,35 @@ impl McpPackageProvenance {
             publisher: identity.publisher,
             command_sha256: Some(digest),
             resolved_command: Some(resolved.to_string_lossy().into_owned()),
+            component_sha256: None,
+            resolved_component: None,
+            trust: PackageTrust::Pinned,
+            recorded_at: Utc::now(),
+        })
+    }
+
+    /// Pin a stateful MCP-over-WASM component by its current file digest.
+    pub fn pin_for_component(
+        component_path: &Path,
+        identity: ProvenanceIdentity,
+    ) -> Result<Self, ProvenanceError> {
+        let digest = sha256_component_file(component_path)?;
+        let resolved = component_path
+            .canonicalize()
+            .map_err(|error| ProvenanceError::Resolve {
+                command: component_path.to_string_lossy().into_owned(),
+                reason: error.to_string(),
+            })?;
+        Ok(Self {
+            package_id: identity.package_id,
+            ecosystem: identity.ecosystem,
+            version: identity.version,
+            source: identity.source,
+            publisher: identity.publisher,
+            command_sha256: None,
+            resolved_command: None,
+            component_sha256: Some(digest),
+            resolved_component: Some(resolved.to_string_lossy().into_owned()),
             trust: PackageTrust::Pinned,
             recorded_at: Utc::now(),
         })
@@ -217,7 +266,11 @@ impl McpPackageProvenance {
                 validate_metadata_field(field, value)?;
             }
         }
-        if let Some(digest) = &self.command_sha256 {
+        for (field, digest) in [
+            ("command_sha256", &self.command_sha256),
+            ("component_sha256", &self.component_sha256),
+        ] {
+            let Some(digest) = digest else { continue };
             let valid = digest.len() == 64
                 && digest
                     .bytes()
@@ -225,22 +278,29 @@ impl McpPackageProvenance {
             if !valid {
                 return Err(ConfigError::InvalidConfig {
                     reason: format!(
-                        "provenance command_sha256 must be 64 lowercase hex characters (got '{digest}')"
+                        "provenance {field} must be 64 lowercase hex characters (got '{digest}')"
                     ),
                 });
             }
         }
-        if let Some(resolved) = &self.resolved_command
-            && (resolved.is_empty() || resolved.contains('\0'))
-        {
-            return Err(ConfigError::InvalidConfig {
-                reason: "provenance resolved_command cannot be empty or contain NUL bytes"
-                    .to_string(),
-            });
+        for (field, resolved) in [
+            ("resolved_command", &self.resolved_command),
+            ("resolved_component", &self.resolved_component),
+        ] {
+            if let Some(resolved) = resolved
+                && (resolved.is_empty() || resolved.contains('\0'))
+            {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("provenance {field} cannot be empty or contain NUL bytes"),
+                });
+            }
         }
-        if self.trust == PackageTrust::Pinned && self.command_sha256.is_none() {
+        let pin_count = usize::from(self.command_sha256.is_some())
+            + usize::from(self.component_sha256.is_some());
+        if self.trust == PackageTrust::Pinned && pin_count != 1 {
             return Err(ConfigError::InvalidConfig {
-                reason: "pinned provenance requires a recorded command_sha256 digest".to_string(),
+                reason: "pinned provenance requires exactly one runtime artifact digest"
+                    .to_string(),
             });
         }
         Ok(())
@@ -290,6 +350,75 @@ impl McpPackageProvenance {
         }
         Ok(())
     }
+
+    /// Verify the WASM component that activation is about to instantiate.
+    pub fn verify_wasm_component(&self, component_path: &Path) -> Result<(), ProvenanceError> {
+        self.verify_not_revoked()?;
+        if self.trust != PackageTrust::Pinned {
+            return Ok(());
+        }
+        let expected = self
+            .component_sha256
+            .as_deref()
+            .ok_or(ProvenanceError::MissingPin)?;
+        let actual = sha256_component_file(component_path)?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ProvenanceError::ComponentDigestMismatch {
+                path: component_path.to_string_lossy().into_owned(),
+                expected: expected.to_string(),
+                actual,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn sha256_component_file(path: &Path) -> Result<String, ProvenanceError> {
+    let metadata = path
+        .symlink_metadata()
+        .map_err(|error| ProvenanceError::Resolve {
+            command: path.to_string_lossy().into_owned(),
+            reason: error.to_string(),
+        })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > MAX_MCP_WASM_COMPONENT_BYTES
+    {
+        return Err(ProvenanceError::Resolve {
+            command: path.to_string_lossy().into_owned(),
+            reason: format!(
+                "component must be a regular, non-symlink file no larger than {MAX_MCP_WASM_COMPONENT_BYTES} bytes"
+            ),
+        });
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|error| ProvenanceError::Hash {
+        path: path.to_string_lossy().into_owned(),
+        reason: error.to_string(),
+    })?;
+    let mut hasher = Sha256::new();
+    let copied = std::io::copy(
+        &mut file.take(MAX_MCP_WASM_COMPONENT_BYTES + 1),
+        &mut hasher,
+    )
+    .map_err(|error| ProvenanceError::Hash {
+        path: path.to_string_lossy().into_owned(),
+        reason: error.to_string(),
+    })?;
+    if copied > MAX_MCP_WASM_COMPONENT_BYTES {
+        return Err(ProvenanceError::Hash {
+            path: path.to_string_lossy().into_owned(),
+            reason: "component grew beyond the size limit while hashing".to_string(),
+        });
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn validate_metadata_field(field: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -442,6 +571,8 @@ mod tests {
             publisher: None,
             command_sha256: None,
             resolved_command: None,
+            component_sha256: None,
+            resolved_component: None,
             trust: PackageTrust::Unverified,
             recorded_at: Utc::now(),
         };
@@ -510,6 +641,47 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"lunarwing provenance test");
         assert_eq!(digest, format!("{:x}", hasher.finalize()));
+    }
+
+    #[test]
+    fn pinned_component_verifies_and_detects_replacement() {
+        let temp = tempfile::NamedTempFile::new().expect("temp component");
+        std::fs::write(temp.path(), b"component-v1").expect("write component");
+        let provenance = McpPackageProvenance::pin_for_component(temp.path(), identity())
+            .expect("pin component");
+        provenance
+            .verify_wasm_component(temp.path())
+            .expect("unchanged component verifies");
+
+        std::fs::write(temp.path(), b"component-v2").expect("replace component");
+        assert!(matches!(
+            provenance
+                .verify_wasm_component(temp.path())
+                .expect_err("replacement must fail closed"),
+            ProvenanceError::ComponentDigestMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn component_pin_rejects_oversized_artifact() {
+        let temp = tempfile::NamedTempFile::new().expect("temp component");
+        temp.as_file()
+            .set_len(MAX_MCP_WASM_COMPONENT_BYTES + 1)
+            .expect("size sparse component");
+        assert!(McpPackageProvenance::pin_for_component(temp.path(), identity()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn component_pin_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let component = temp.path().join("component.wasm");
+        let link = temp.path().join("component-link.wasm");
+        std::fs::write(&component, b"component").expect("write component");
+        symlink(&component, &link).expect("create symlink");
+        assert!(McpPackageProvenance::pin_for_component(&link, identity()).is_err());
     }
 
     #[test]

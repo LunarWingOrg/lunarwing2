@@ -526,6 +526,8 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
         EffectiveTransport::Http => "http",
         EffectiveTransport::Stdio { .. } => "stdio",
         EffectiveTransport::Unix { .. } => "unix",
+        EffectiveTransport::Wasm { .. } => "wasm",
+        EffectiveTransport::Gateway { .. } => "gateway",
     };
     let state = if server.enabled {
         "enabled"
@@ -552,6 +554,21 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
             None => {
                 missing = true;
                 detail.push_str(&format!(" — command '{command}' not found in PATH"));
+            }
+        }
+    }
+    if let EffectiveTransport::Wasm { component_path, .. } = server.effective_transport() {
+        match component_path.canonicalize() {
+            Ok(canonical) if canonical == component_path => {
+                detail.push_str(&format!(" — component {}", canonical.display()));
+            }
+            Ok(_) => {
+                missing = true;
+                detail.push_str(" — component path is not canonical or is a symlink");
+            }
+            Err(error) => {
+                missing = true;
+                detail.push_str(&format!(" — component unavailable: {error}"));
             }
         }
     }
