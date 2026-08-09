@@ -19,6 +19,8 @@ use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::tools::mcp::worker::{MAX_WORKER_MCP_SERVERS, WorkerMcpServerDescriptor};
+
 /// A credential grant that maps a secret (stored in SecretsStore) to an
 /// environment variable name the container worker expects.
 ///
@@ -31,13 +33,15 @@ pub struct CredentialGrant {
     pub env_var: String,
 }
 
-/// In-memory store for per-job authentication tokens and credential grants.
+/// In-memory store for per-job authentication tokens, grants, and worker runtimes.
 #[derive(Clone)]
 pub struct TokenStore {
     /// Maps job_id -> bearer token. Never logged or persisted.
     tokens: Arc<RwLock<HashMap<Uuid, String>>>,
     /// Maps job_id -> granted credentials. Revoked alongside the token.
     credential_grants: Arc<RwLock<HashMap<Uuid, Vec<CredentialGrant>>>>,
+    /// Secret-free MCP descriptors approved for exactly one job.
+    worker_mcp_servers: Arc<RwLock<HashMap<Uuid, Vec<WorkerMcpServerDescriptor>>>>,
 }
 
 impl TokenStore {
@@ -45,6 +49,7 @@ impl TokenStore {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             credential_grants: Arc::new(RwLock::new(HashMap::new())),
+            worker_mcp_servers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -65,10 +70,11 @@ impl TokenStore {
             .unwrap_or(false)
     }
 
-    /// Remove a token and its credential grants (on container cleanup).
+    /// Remove a token and all job-scoped grants (on container cleanup).
     pub async fn revoke(&self, job_id: Uuid) {
         self.tokens.write().await.remove(&job_id);
         self.credential_grants.write().await.remove(&job_id);
+        self.worker_mcp_servers.write().await.remove(&job_id);
     }
 
     /// Get the number of active tokens (for diagnostics).
@@ -86,6 +92,46 @@ impl TokenStore {
     /// Retrieve credential grants for a job.
     pub async fn get_grants(&self, job_id: Uuid) -> Option<Vec<CredentialGrant>> {
         self.credential_grants.read().await.get(&job_id).cloned()
+    }
+
+    /// Store validated MCP descriptors approved for one job.
+    pub async fn store_worker_mcp_servers(
+        &self,
+        job_id: Uuid,
+        descriptors: Vec<WorkerMcpServerDescriptor>,
+    ) -> Result<(), String> {
+        if descriptors.len() > MAX_WORKER_MCP_SERVERS {
+            return Err(format!(
+                "too many worker MCP servers (max {MAX_WORKER_MCP_SERVERS})"
+            ));
+        }
+        let mut names = std::collections::HashSet::new();
+        for descriptor in &descriptors {
+            descriptor.validate().map_err(|error| error.to_string())?;
+            if !names.insert(descriptor.name.as_str()) {
+                return Err(format!(
+                    "duplicate worker MCP server name '{}'",
+                    descriptor.name
+                ));
+            }
+        }
+        if !descriptors.is_empty() {
+            self.worker_mcp_servers
+                .write()
+                .await
+                .insert(job_id, descriptors);
+        }
+        Ok(())
+    }
+
+    /// Retrieve the job-scoped MCP descriptors.
+    pub async fn get_worker_mcp_servers(&self, job_id: Uuid) -> Vec<WorkerMcpServerDescriptor> {
+        self.worker_mcp_servers
+            .read()
+            .await
+            .get(&job_id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -289,5 +335,59 @@ mod tests {
         let grants_b = store.get_grants(job_b).await.unwrap();
         assert_eq!(grants_b.len(), 1);
         assert_eq!(grants_b[0].secret_name, "secret_b");
+    }
+
+    fn worker_descriptor(name: &str) -> WorkerMcpServerDescriptor {
+        WorkerMcpServerDescriptor {
+            name: name.to_string(),
+            command: "/usr/local/bin/repo-mcp".to_string(),
+            args: vec!["/workspace".to_string()],
+            env: HashMap::new(),
+            credential_env: Vec::new(),
+            always_require_approval: Vec::new(),
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_descriptors_are_job_scoped_and_revoked() {
+        let store = TokenStore::new();
+        let job_a = Uuid::new_v4();
+        let job_b = Uuid::new_v4();
+        store
+            .store_worker_mcp_servers(job_a, vec![worker_descriptor("repo")])
+            .await
+            .expect("store worker descriptor");
+
+        assert_eq!(store.get_worker_mcp_servers(job_a).await.len(), 1);
+        assert!(store.get_worker_mcp_servers(job_b).await.is_empty());
+
+        store.revoke(job_a).await;
+        assert!(store.get_worker_mcp_servers(job_a).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_descriptors_reject_duplicates_and_excess() {
+        let store = TokenStore::new();
+        let job_id = Uuid::new_v4();
+        assert!(
+            store
+                .store_worker_mcp_servers(
+                    job_id,
+                    vec![worker_descriptor("repo"), worker_descriptor("repo")]
+                )
+                .await
+                .is_err()
+        );
+
+        let too_many = (0..=MAX_WORKER_MCP_SERVERS)
+            .map(|index| worker_descriptor(&format!("repo-{index}")))
+            .collect();
+        assert!(
+            store
+                .store_worker_mcp_servers(job_id, too_many)
+                .await
+                .is_err()
+        );
     }
 }
