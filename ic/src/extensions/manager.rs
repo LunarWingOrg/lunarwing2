@@ -1348,7 +1348,8 @@ impl ExtensionManager {
                             display_name,
                             description: server.description.clone(),
                             url: match server.effective_transport() {
-                                crate::tools::mcp::config::EffectiveTransport::Http => {
+                                crate::tools::mcp::config::EffectiveTransport::Http
+                                | crate::tools::mcp::config::EffectiveTransport::Gateway { .. } => {
                                     Some(server.url.clone())
                                 }
                                 _ => None,
@@ -1362,6 +1363,12 @@ impl ExtensionManager {
                                     crate::tools::mcp::config::EffectiveTransport::Unix {
                                         ..
                                     } => "unix",
+                                    crate::tools::mcp::config::EffectiveTransport::Wasm {
+                                        ..
+                                    } => "wasm",
+                                    crate::tools::mcp::config::EffectiveTransport::Gateway {
+                                        ..
+                                    } => "gateway",
                                 }
                                 .to_string(),
                             ),
@@ -1375,6 +1382,7 @@ impl ExtensionManager {
                             authenticated: !matches!(
                                 server.effective_transport(),
                                 crate::tools::mcp::config::EffectiveTransport::Http
+                                    | crate::tools::mcp::config::EffectiveTransport::Gateway { .. }
                             ) || authenticated,
                             active,
                             recovering,
@@ -2692,6 +2700,8 @@ impl ExtensionManager {
             crate::tools::mcp::config::EffectiveTransport::Http => "HTTP",
             crate::tools::mcp::config::EffectiveTransport::Stdio { .. } => "stdio",
             crate::tools::mcp::config::EffectiveTransport::Unix { .. } => "Unix socket",
+            crate::tools::mcp::config::EffectiveTransport::Wasm { .. } => "WASM actor",
+            crate::tools::mcp::config::EffectiveTransport::Gateway { .. } => "gateway",
         };
 
         self.add_mcp_server(config, user_id)
@@ -3184,6 +3194,7 @@ impl ExtensionManager {
         if !matches!(
             server.effective_transport(),
             crate::tools::mcp::config::EffectiveTransport::Http
+                | crate::tools::mcp::config::EffectiveTransport::Gateway { .. }
         ) {
             return Ok(AuthResult::no_auth_required(name, ExtensionKind::McpServer));
         }
