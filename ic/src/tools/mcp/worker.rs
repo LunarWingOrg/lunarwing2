@@ -45,6 +45,40 @@ pub struct WorkerMcpServerDescriptor {
     pub provenance: Option<McpPackageProvenance>,
 }
 
+/// Resolve an ordered, explicit list of installed worker-local MCP servers.
+pub fn select_worker_mcp_servers(
+    names: &[String],
+    servers: &crate::tools::mcp::McpServersFile,
+    granted_secrets: &HashMap<String, String>,
+) -> Result<Vec<WorkerMcpServerDescriptor>, ConfigError> {
+    if names.len() > MAX_WORKER_MCP_SERVERS {
+        return Err(invalid(format!(
+            "too many worker MCP servers requested (max {MAX_WORKER_MCP_SERVERS})"
+        )));
+    }
+
+    let mut seen = HashSet::new();
+    let mut descriptors = Vec::with_capacity(names.len());
+    for name in names {
+        validate_text("server name", name, MAX_DESCRIPTOR_NAME_BYTES)?;
+        if !seen.insert(name.as_str()) {
+            return Err(invalid(format!(
+                "worker MCP server '{name}' was requested more than once"
+            )));
+        }
+        let config = servers.get(name).ok_or_else(|| {
+            invalid(format!(
+                "worker MCP server '{name}' is not installed for this owner"
+            ))
+        })?;
+        descriptors.push(WorkerMcpServerDescriptor::from_config(
+            config,
+            granted_secrets,
+        )?);
+    }
+    Ok(descriptors)
+}
+
 impl WorkerMcpServerDescriptor {
     /// Resolve an installed worker-local config against explicit per-job grants.
     ///
@@ -346,6 +380,51 @@ mod tests {
         )
         .with_placement(McpPlacement::JobWorker)
         .with_always_require_approval(["write"])
+    }
+
+    #[test]
+    fn selector_preserves_order_and_handles_empty_selection() {
+        let mut servers = crate::tools::mcp::McpServersFile::default();
+        let mut second = worker_config();
+        second.name = "second".to_string();
+        servers.upsert(worker_config());
+        servers.upsert(second);
+        let grants = HashMap::from([("API_TOKEN".to_string(), "repo_token".to_string())]);
+
+        let selected = select_worker_mcp_servers(
+            &["second".to_string(), "repo".to_string()],
+            &servers,
+            &grants,
+        )
+        .expect("ordered selection");
+        assert_eq!(
+            selected
+                .iter()
+                .map(|descriptor| descriptor.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "repo"]
+        );
+        assert!(
+            select_worker_mcp_servers(&[], &servers, &grants)
+                .expect("empty selection")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn selector_rejects_missing_duplicates_and_excess() {
+        let mut servers = crate::tools::mcp::McpServersFile::default();
+        servers.upsert(worker_config());
+        let grants = HashMap::from([("API_TOKEN".to_string(), "repo_token".to_string())]);
+        assert!(select_worker_mcp_servers(&["missing".to_string()], &servers, &grants).is_err());
+        assert!(
+            select_worker_mcp_servers(&["repo".to_string(), "repo".to_string()], &servers, &grants)
+                .is_err()
+        );
+        let excess = (0..=MAX_WORKER_MCP_SERVERS)
+            .map(|index| format!("server-{index}"))
+            .collect::<Vec<_>>();
+        assert!(select_worker_mcp_servers(&excess, &servers, &grants).is_err());
     }
 
     #[test]
