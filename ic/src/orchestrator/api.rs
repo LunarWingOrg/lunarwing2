@@ -79,6 +79,10 @@ impl OrchestratorApi {
             .route("/worker/{job_id}/event", post(job_event_handler))
             .route("/worker/{job_id}/prompt", get(get_prompt_handler))
             .route("/worker/{job_id}/credentials", get(get_credentials_handler))
+            .route(
+                "/worker/{job_id}/mcp-servers",
+                get(get_worker_mcp_servers_handler),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 state.token_store.clone(),
                 worker_auth_middleware,
@@ -586,6 +590,22 @@ async fn get_credentials_handler(
     ))
 }
 
+/// Serve the secret-free MCP runtime descriptors approved for one job.
+async fn get_worker_mcp_servers_handler(
+    State(state): State<OrchestratorState>,
+    Path(job_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let descriptors = state.token_store.get_worker_mcp_servers(job_id).await;
+    if descriptors.is_empty() {
+        return Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null)));
+    }
+    let body = serde_json::to_value(descriptors).map_err(|error| {
+        tracing::error!(job_id = %job_id, %error, "Failed to serialize worker MCP descriptors");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    Ok((StatusCode::OK, Json(body)))
+}
+
 fn format_finish_reason(reason: crate::llm::FinishReason) -> String {
     match reason {
         crate::llm::FinishReason::Stop => "stop".to_string(),
@@ -710,6 +730,74 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_endpoint_is_job_scoped_and_secret_free() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let other_job = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        state
+            .token_store
+            .store_worker_mcp_servers(
+                job_id,
+                vec![crate::tools::mcp::worker::WorkerMcpServerDescriptor {
+                    name: "repo".to_string(),
+                    command: "/usr/local/bin/repo-mcp".to_string(),
+                    args: vec!["/workspace".to_string()],
+                    env: HashMap::new(),
+                    credential_env: vec!["API_TOKEN".to_string()],
+                    always_require_approval: Vec::new(),
+                    provenance: None,
+                }],
+            )
+            .await
+            .expect("store descriptor");
+
+        let router = OrchestratorApi::router(state);
+        let wrong_job = Request::builder()
+            .uri(format!("/worker/{other_job}/mcp-servers"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.clone().oneshot(wrong_job).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let request = Request::builder()
+            .uri(format!("/worker/{job_id}/mcp-servers"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("repo-mcp"));
+        assert!(text.contains("API_TOKEN"));
+        assert!(!text.contains("secret_name"));
+        assert!(!text.contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_endpoint_returns_no_content_without_selection() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        let router = OrchestratorApi::router(state);
+        let request = Request::builder()
+            .uri(format!("/worker/{job_id}/mcp-servers"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     // -- Prompt queue tests --
