@@ -517,3 +517,20 @@ EOF
   chmod 0600 "$qdir/lunarwing-${worker}-${name}.container"
   chown -R "$name:$name" "$(tenant_home "$name")/.config/containers"
 }
+require_worker_name() {
+  case "${1:-}" in
+    nanocode) die "Nanocode worker is retired" ;;
+    pebble|opencode|kimi) ;;
+    *) die "unknown worker '${1:-}'; expected pebble, opencode, or kimi" ;;
+  esac
+}
+
+prepare_worker_lifecycle() {
+  local name worker
+  name="$(sanitize_name "$1")"
+  worker="$2"
+  require_worker_name "$worker"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  printf '%s %s\n' "$name" "$worker"
+}
+

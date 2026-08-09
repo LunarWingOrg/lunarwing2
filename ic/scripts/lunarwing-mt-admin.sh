@@ -5983,23 +5983,8 @@ restart_tenant() {
   start_tenant "$name"
 }
 
-require_worker_name() {
-  case "${1:-}" in
-    nanocode) die "Nanocode worker is retired" ;;
-    pebble|opencode|kimi) ;;
-    *) die "unknown worker '${1:-}'; expected pebble, opencode, or kimi" ;;
-  esac
-}
-
-prepare_worker_lifecycle() {
-  local name worker
-  name="$(sanitize_name "$1")"
-  worker="$2"
-  require_worker_name "$worker"
-  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
-  printf '%s %s\n' "$name" "$worker"
-}
-
+# (require_worker_name moved to mt-admin-lib/09-worker-config.sh)
+# (prepare_worker_lifecycle moved to mt-admin-lib/09-worker-config.sh)
 openrc_service_remove_runlevels() {
   local svc="$1" link runlevel
   for link in "$OPENRC_RUNLEVELS_DIR"/*/"$svc"; do
