@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use crate::tools::mcp::protocol::{McpRequest, McpResponse};
 use crate::tools::mcp::transport::McpTransport;
 use crate::tools::tool::ToolError;
-use crate::tools::wasm::{ResourceLimits, WasmResourceLimiter, WasmRuntimeConfig, WasmToolRuntime};
+use crate::tools::wasm::{WasmResourceLimiter, WasmRuntimeConfig, WasmToolRuntime};
 
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
@@ -101,17 +101,7 @@ impl WasmMcpTransport {
         let memory_bytes = memory_mb.checked_mul(1024 * 1024).ok_or_else(|| {
             ToolError::InvalidParameters("MCP-over-WASM memory limit overflow".to_string())
         })?;
-        let limits = ResourceLimits::default()
-            .with_memory(memory_bytes)
-            .with_fuel(fuel)
-            .with_timeout(Duration::from_secs(timeout_seconds));
-        let runtime = Arc::new(
-            WasmToolRuntime::new(WasmRuntimeConfig {
-                default_limits: limits,
-                ..WasmRuntimeConfig::default()
-            })
-            .map_err(|error| ToolError::ExternalService(error.to_string()))?,
-        );
+        let runtime = shared_wasm_runtime()?;
         let component = compile_component(Arc::clone(&runtime), wasm_bytes).await?;
         let actor = instantiate_actor(&runtime, &component, memory_bytes, fuel, timeout_seconds)?;
 
@@ -201,6 +191,21 @@ impl McpTransport for WasmMcpTransport {
             ToolError::ExternalService(format!("MCP-over-WASM shutdown task failed: {error}"))
         })?
     }
+}
+
+fn shared_wasm_runtime() -> Result<Arc<WasmToolRuntime>, ToolError> {
+    static RUNTIME: OnceLock<Result<Arc<WasmToolRuntime>, String>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            WasmToolRuntime::new(WasmRuntimeConfig::default())
+                .map(Arc::new)
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .map(Arc::clone)
+        .map_err(|error| {
+            ToolError::ExternalService(format!("Failed to initialize MCP WASM runtime: {error}"))
+        })
 }
 
 async fn compile_component(
@@ -311,9 +316,15 @@ mod tests {
     }
 
     #[test]
+    fn runtime_engine_is_shared_across_servers() {
+        let first = shared_wasm_runtime().expect("first runtime");
+        let second = shared_wasm_runtime().expect("second runtime");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn epoch_deadline_rounds_up() {
-        let runtime =
-            Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::for_testing()).expect("test runtime"));
+        let runtime = shared_wasm_runtime().expect("test runtime");
         let transport = WasmMcpTransport {
             server_name: "test".to_string(),
             actor: Arc::new(Mutex::new(None)),
