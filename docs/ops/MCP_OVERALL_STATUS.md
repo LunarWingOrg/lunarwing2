@@ -1,9 +1,9 @@
 # MCP Overall Status
 
 **Status as of 2026-08-09:** MCP work is partial overall. Part 1 host-local
-lifecycle, the public runtime-adapter boundary, stateful MCP-over-WASM, and
-client placement behind dedicated/shared gateways are implemented. Worker-local
-placement and the remaining package, marketplace, and sandbox hardening stay open.
+lifecycle, the public runtime-adapter boundary, stateful MCP-over-WASM,
+dedicated/shared gateway client placement, and core Docker job-worker placement
+are implemented. Package, marketplace, and remaining sandbox hardening stay open.
 
 ## Part 1 Status
 
@@ -44,6 +44,20 @@ Implemented on 2026-08-09:
   new runtime types.
 - LunarWing provides the gateway client/routing contract, not a bundled gateway
   control-plane service; operators may deploy and scale that service separately.
+- Explicit `host` and `job_worker` placement separates daemon and job activation.
+  Legacy configs default to `host`; worker placement accepts stdio only.
+- Job creation takes an immutable owner-scoped snapshot of enabled worker configs.
+  Secret names become separate job-scoped grants, and values are fetched through a
+  dedicated authenticated worker route instead of entering normal shell credentials.
+- Core Docker workers activate only preinstalled commands, verify pinned provenance
+  inside the worker, register the complete discovered tool set atomically, and tear
+  it down before job completion. Startup, grant coverage, tool conflicts, approval
+  requirements, or cleanup failures fail the job closed.
+- Worker placement requires a mounted `/workspace`, is limited to eight servers and
+  32 credential grants per job, and is not available to persistent external workers.
+  Each server is limited to 256 discovered tools, 2 MiB of tool descriptors, and
+  4 MiB stream frames. Existing worker images fail closed when the orchestrator
+  requires MCP support.
 
 Part 2 verification on 2026-08-09:
 
@@ -82,7 +96,6 @@ These are validation and coverage tasks, not known production-code defects.
 
 ## Deferred MCP Work
 
-- Worker-local MCP placement.
 - Automatic npm/pip package installation.
 - Publisher signatures, trusted signing keys, dependency locking, upgrade
   diffs, and marketplace revocation distribution. (Operator-pinned stdio executable
@@ -98,6 +111,9 @@ These are validation and coverage tasks, not known production-code defects.
   placement contract is implemented.
 - Configurable startup and request timeouts for every transport. MCP-over-WASM
   per-message deadlines and bounded transport/process shutdown are implemented.
+- Post-start worker MCP crash supervision and restart. Worker startup/discovery and
+  teardown are bounded, tool-call failures remain visible, and container termination
+  remains the final isolation boundary for this per-job prototype.
 
 Automatic npm/pip installation must remain blocked until provenance, dependency
 locking, containment, audit, revocation, health, and rollback policies exist.

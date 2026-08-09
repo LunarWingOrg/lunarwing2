@@ -444,6 +444,18 @@ pub async fn jobs_restart_handler(
 
             let new_job_id = Uuid::new_v4();
             let now = chrono::Utc::now();
+            let (mcp_servers, mcp_credential_grants) = crate::orchestrator::snapshot_worker_mcp(
+                Some(store.as_ref()),
+                state.secrets_store.as_deref(),
+                &old_job.user_id,
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to snapshot worker MCP config: {e}"),
+                )
+            })?;
 
             let record = crate::history::SandboxJobRecord {
                 id: new_job_id,
@@ -478,14 +490,17 @@ pub async fn jobs_restart_handler(
 
             let project_dir = std::path::PathBuf::from(&old_job.project_dir);
             let _token = jm
-                .create_job(
-                    new_job_id,
-                    &task,
-                    Some(project_dir),
+                .create_job(crate::orchestrator::ContainerJobRequest {
+                    job_id: new_job_id,
+                    task,
+                    project_dir: Some(project_dir),
                     mode,
+                    owner_id: old_job.user_id.clone(),
                     credential_grants,
-                    lunarwing_common::DEFAULT_WORKER_ITERATIONS,
-                )
+                    mcp_servers,
+                    mcp_credential_grants,
+                    max_iterations: lunarwing_common::DEFAULT_WORKER_ITERATIONS,
+                })
                 .await
                 .map_err(|e| {
                     (

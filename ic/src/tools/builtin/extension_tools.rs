@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::context::JobContext;
-use crate::extensions::{ExtensionKind, ExtensionManager};
-use crate::tools::mcp::{McpGatewayMode, McpServerConfig};
+use crate::extensions::{ExtensionError, ExtensionKind, ExtensionManager};
+use crate::tools::mcp::{McpGatewayMode, McpPlacement, McpServerConfig};
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
 fn string_map_param(
@@ -121,6 +121,22 @@ fn requests_secret_environment(params: &serde_json::Value) -> bool {
     })
 }
 
+fn placement_param(params: &serde_json::Value) -> Result<Option<McpPlacement>, ToolError> {
+    let Some(value) = params.get("placement") else {
+        return Ok(None);
+    };
+    let placement = value.as_str().ok_or_else(|| {
+        ToolError::InvalidParameters("MCP placement must be a string".to_string())
+    })?;
+    match placement {
+        "host" => Ok(Some(McpPlacement::Host)),
+        "job_worker" | "job-worker" => Ok(Some(McpPlacement::JobWorker)),
+        other => Err(ToolError::InvalidParameters(format!(
+            "Unsupported MCP placement '{other}'"
+        ))),
+    }
+}
+
 // ── tool_search ──────────────────────────────────────────────────────────
 
 pub struct ToolSearchTool {
@@ -209,8 +225,15 @@ impl ToolInstallTool {
     ) -> Result<Option<McpServerConfig>, ToolError> {
         let kind = params.get("kind").and_then(|v| v.as_str());
         let transport = params.get("transport").and_then(|v| v.as_str());
+        let placement = placement_param(params)?.unwrap_or_default();
         if kind != Some("mcp_server") && transport.is_none() {
-            return Ok(None);
+            return if placement == McpPlacement::JobWorker {
+                Err(ToolError::InvalidParameters(
+                    "Job-worker placement requires an explicit stdio MCP server".to_string(),
+                ))
+            } else {
+                Ok(None)
+            };
         }
         let config = match transport {
             Some("stdio") => {
@@ -238,6 +261,11 @@ impl ToolInstallTool {
                         "MCP server URL is required for HTTP transport".to_string(),
                     ));
                 }
+                if placement == McpPlacement::JobWorker {
+                    return Err(ToolError::InvalidParameters(
+                        "Job-worker MCP servers only support stdio transport".to_string(),
+                    ));
+                }
                 return Ok(None);
             }
             Some("wasm") => wasm_mcp_config(params, name)?,
@@ -257,9 +285,17 @@ impl ToolInstallTool {
                         .to_string(),
                 ));
             }
-            None => return Ok(None),
+            None => {
+                if placement == McpPlacement::JobWorker {
+                    return Err(ToolError::InvalidParameters(
+                        "Job-worker MCP installation requires explicit stdio transport".to_string(),
+                    ));
+                }
+                return Ok(None);
+            }
         };
 
+        let config = config.with_placement(placement);
         config
             .validate()
             .map_err(|e| ToolError::InvalidParameters(e.to_string()))?;
@@ -276,7 +312,8 @@ impl Tool for ToolInstallTool {
     fn description(&self) -> &str {
         "Install an extension (channel, tool, or MCP server). \
          Use the name from tool_search results, provide an explicit URL, or configure \
-         a host-local stdio/WASM MCP server or dedicated/shared MCP gateway."
+         a host-local stdio/WASM MCP server, dedicated/shared MCP gateway, or job-worker \
+         stdio server whose command already exists in worker image."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -296,9 +333,14 @@ impl Tool for ToolInstallTool {
                     "enum": ["http", "stdio", "wasm", "gateway"],
                     "description": "MCP transport. Defaults to http when url is provided."
                 },
+                "placement": {
+                    "type": "string",
+                    "enum": ["host", "job_worker"],
+                    "description": "MCP runtime placement. host starts a daemon-host process; job_worker makes a stdio server eligible inside future jobs. Defaults to host."
+                },
                 "command": {
                     "type": "string",
-                    "description": "Executable command for a host-local stdio MCP server"
+                    "description": "Executable command for a stdio MCP server. For job_worker placement, command must exist in worker image."
                 },
                 "args": {
                     "type": "array",
@@ -313,7 +355,7 @@ impl Tool for ToolInstallTool {
                 "env_secrets": {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
-                    "description": "Environment variable names mapped to owner-scoped LunarWing secret names. Raw values are exposed to the unsandboxed stdio process."
+                    "description": "Environment variable names mapped to owner-scoped LunarWing secret names. Raw values are exposed only to selected host or job-local stdio MCP process."
                 },
                 "component_path": {
                     "type": "string",
@@ -512,7 +554,7 @@ impl Tool for ToolActivateTool {
     }
 
     fn description(&self) -> &str {
-        "Activate an installed extension — starts channels, loads tools, or connects to MCP servers."
+        "Activate an installed extension. Host MCP placement starts a host process; job_worker placement enables eligibility for future jobs without changing running job snapshots."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -545,11 +587,7 @@ impl Tool for ToolActivateTool {
             }
             Err(activate_err) => {
                 let err_str = activate_err.to_string();
-                let err_lower = err_str.to_ascii_lowercase();
-                let needs_auth = err_lower.contains("authentication")
-                    || err_lower.contains("401")
-                    || err_lower.contains("unauthorized")
-                    || err_lower.contains("not authenticated");
+                let needs_auth = matches!(activate_err, ExtensionError::AuthRequired);
 
                 if !needs_auth {
                     return Err(ToolError::ExecutionFailed(err_str));
@@ -607,7 +645,7 @@ impl Tool for ToolDeactivateTool {
     }
 
     fn description(&self) -> &str {
-        "Deactivate an MCP server without uninstalling it. This unloads its tools and stops its host-local process while preserving configuration and credentials."
+        "Deactivate an MCP server without uninstalling it. Host placement unloads tools and stops its process; job_worker placement removes future-job eligibility. Configuration and credentials remain."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -665,7 +703,7 @@ impl ToolUpdateTool {
         use crate::tools::mcp::config::EffectiveTransport;
 
         let transport = params.get("transport").and_then(|v| v.as_str());
-        match transport {
+        let mut config = match transport {
             Some("stdio") => {
                 let command = params
                     .get("command")
@@ -779,7 +817,12 @@ impl ToolUpdateTool {
                     Ok(updated)
                 }
             },
-        }
+        }?;
+        config.placement = placement_param(params)?.unwrap_or(existing.placement);
+        config
+            .validate()
+            .map_err(|error| ToolError::InvalidParameters(error.to_string()))?;
+        Ok(config)
     }
 }
 
@@ -792,7 +835,8 @@ impl Tool for ToolUpdateTool {
     fn description(&self) -> &str {
         "Update an installed MCP server's configuration in-place (command, args, env, env_secrets, or url) \
          without removing and reinstalling it. If the server is active, it is restarted with \
-         the new configuration. Enabled state and credentials are preserved."
+         the new configuration. Placement defaults to existing placement; explicit host/job_worker \
+         switches runtime location. Worker updates affect future jobs, not running snapshots. Enabled state and credentials are preserved."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -807,6 +851,11 @@ impl Tool for ToolUpdateTool {
                     "type": "string",
                     "enum": ["http", "stdio", "wasm", "gateway"],
                     "description": "New transport type. WASM and gateway values preserve their existing runtime-specific settings."
+                },
+                "placement": {
+                    "type": "string",
+                    "enum": ["host", "job_worker"],
+                    "description": "New MCP runtime placement. Omit to preserve existing placement. job_worker requires stdio and command availability in worker image."
                 },
                 "url": {
                     "type": "string",
@@ -1161,6 +1210,10 @@ mod tests {
         assert!(schema["properties"].get("name").is_some());
         assert!(schema["properties"].get("url").is_some());
         assert!(schema["properties"].get("transport").is_some());
+        assert_eq!(
+            schema["properties"]["placement"]["enum"],
+            serde_json::json!(["host", "job_worker"])
+        );
         assert!(schema["properties"].get("command").is_some());
         assert!(schema["properties"].get("args").is_some());
         assert!(schema["properties"].get("env").is_some());
@@ -1206,6 +1259,45 @@ mod tests {
                 );
             }
             other => panic!("expected stdio transport, got {other:?}"),
+        }
+        assert_eq!(config.placement, McpPlacement::Host);
+    }
+
+    #[test]
+    fn test_tool_install_builds_job_worker_stdio_config() {
+        let params = serde_json::json!({
+            "name": "worker-files",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "command": "worker-files-mcp",
+            "placement": "job_worker"
+        });
+        let config = ToolInstallTool::mcp_config(&params, "worker-files")
+            .expect("valid worker config")
+            .expect("explicit MCP config");
+
+        assert_eq!(config.placement, McpPlacement::JobWorker);
+    }
+
+    #[test]
+    fn test_tool_install_rejects_job_worker_non_stdio_paths() {
+        for params in [
+            serde_json::json!({
+                "name": "remote",
+                "kind": "mcp_server",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+                "placement": "job_worker"
+            }),
+            serde_json::json!({
+                "name": "catalog",
+                "kind": "mcp_server",
+                "placement": "job_worker"
+            }),
+        ] {
+            let error = ToolInstallTool::mcp_config(&params, "worker")
+                .expect_err("worker non-stdio must fail");
+            assert!(error.to_string().contains("Job-worker MCP"));
         }
     }
 
@@ -1308,6 +1400,18 @@ mod tests {
         });
 
         assert_eq!(tool.requires_approval(&params), ApprovalRequirement::Always);
+        let worker_params = serde_json::json!({
+            "name": "worker-files",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "command": "worker-files-mcp",
+            "placement": "job_worker",
+            "env_secrets": {"API_TOKEN": "api_token"}
+        });
+        assert_eq!(
+            tool.requires_approval(&worker_params),
+            ApprovalRequirement::Always
+        );
     }
 
     #[test]
@@ -1406,6 +1510,10 @@ mod tests {
         assert!(schema["properties"].get("command").is_some());
         assert!(schema["properties"].get("args").is_some());
         assert!(schema["properties"].get("env_secrets").is_some());
+        assert_eq!(
+            schema["properties"]["placement"]["enum"],
+            serde_json::json!(["host", "job_worker"])
+        );
         assert_eq!(schema["required"], serde_json::json!(["name"]));
     }
 
@@ -1446,6 +1554,37 @@ mod tests {
             })),
             ApprovalRequirement::Always
         );
+    }
+
+    #[test]
+    fn tool_update_preserves_or_explicitly_switches_placement() {
+        let existing = McpServerConfig::new_stdio("worker", "old", vec![], HashMap::new())
+            .with_placement(McpPlacement::JobWorker);
+        let preserved = ToolUpdateTool::build_config(
+            &serde_json::json!({"name": "worker", "command": "new"}),
+            &existing,
+        )
+        .expect("preserved config");
+        assert_eq!(preserved.placement, McpPlacement::JobWorker);
+
+        let switched = ToolUpdateTool::build_config(
+            &serde_json::json!({
+                "name": "worker",
+                "transport": "stdio",
+                "command": "new",
+                "placement": "host"
+            }),
+            &existing,
+        )
+        .expect("switched config");
+        assert_eq!(switched.placement, McpPlacement::Host);
+
+        let error = ToolUpdateTool::build_config(
+            &serde_json::json!({"transport": "http", "placement": "job_worker"}),
+            &existing,
+        )
+        .expect_err("HTTP worker update must fail");
+        assert!(error.to_string().contains("only support stdio"));
     }
 
     #[test]

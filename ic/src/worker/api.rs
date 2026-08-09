@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
+use crate::tools::mcp::config::McpServerConfig;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -40,6 +41,11 @@ pub struct JobDescription {
     pub title: String,
     pub description: String,
     pub project_dir: Option<String>,
+    #[serde(default)]
+    pub owner_id: String,
+    /// Immutable, sanitized MCP configuration snapshot for this job.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 /// Completion result from the orchestrator (proxied from the real LLM).
@@ -120,6 +126,14 @@ pub struct CredentialResponse {
     pub value: String,
 }
 
+/// MCP-only credential delivered through the dedicated worker endpoint.
+#[derive(Serialize, Deserialize)]
+pub struct McpCredentialResponse {
+    pub server_name: String,
+    pub env_var: String,
+    pub value: String,
+}
+
 impl WorkerHttpClient {
     /// Create a new client from environment.
     ///
@@ -129,6 +143,7 @@ impl WorkerHttpClient {
         let token = std::env::var("LUNARWING_WORKER_TOKEN")
             .or_else(|_| std::env::var("IRONCLAW_WORKER_TOKEN"))
             .map_err(|_| WorkerError::MissingToken)?;
+        protect_worker_credentials()?;
 
         Ok(Self {
             client: Self::build_client(),
@@ -415,6 +430,38 @@ impl WorkerHttpClient {
             })
     }
 
+    /// Fetch only MCP process credentials granted to this job.
+    pub async fn fetch_mcp_credentials(&self) -> Result<Vec<McpCredentialResponse>, WorkerError> {
+        let resp = self
+            .client
+            .get(self.url("mcp/credentials"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| WorkerError::ConnectionFailed {
+                url: self.orchestrator_url.clone(),
+                reason: e.to_string(),
+            })?;
+
+        if resp.status() == reqwest::StatusCode::NO_CONTENT
+            || resp.status() == reqwest::StatusCode::NOT_FOUND
+        {
+            return Ok(Vec::new());
+        }
+        if !resp.status().is_success() {
+            return Err(WorkerError::SecretResolveFailed {
+                secret_name: "(mcp)".to_string(),
+                reason: format!("MCP credentials endpoint returned {}", resp.status()),
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| WorkerError::SecretResolveFailed {
+                secret_name: "(mcp)".to_string(),
+                reason: format!("failed to parse MCP credentials response: {e}"),
+            })
+    }
+
     /// Signal job completion to the orchestrator.
     pub async fn report_complete(&self, report: &CompletionReport) -> Result<(), WorkerError> {
         let _: serde_json::Value = self
@@ -422,6 +469,28 @@ impl WorkerHttpClient {
             .await?;
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn protect_worker_credentials() -> Result<(), WorkerError> {
+    // Worker children run under the same UID. Keep bearer tokens and resolved
+    // credentials in this trusted parent unreadable through /proc or ptrace.
+    let result = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(WorkerError::ExecutionFailed {
+            reason: format!(
+                "failed to protect worker credentials: {}",
+                std::io::Error::last_os_error()
+            ),
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn protect_worker_credentials() -> Result<(), WorkerError> {
+    Ok(())
 }
 
 fn parse_finish_reason(s: &str) -> FinishReason {
@@ -487,5 +556,23 @@ mod tests {
         assert_eq!(job.title, "Test");
         assert_eq!(job.description, "desc");
         assert!(job.project_dir.is_none());
+        assert!(job.owner_id.is_empty());
+        assert!(job.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn test_mcp_credentials_url_construction() {
+        let client = WorkerHttpClient::new(
+            "http://host.docker.internal:50051".to_string(),
+            Uuid::nil(),
+            TEST_BEARER_TOKEN.to_string(),
+        );
+        assert_eq!(
+            client.url("mcp/credentials"),
+            format!(
+                "http://host.docker.internal:50051/worker/{}/mcp/credentials",
+                Uuid::nil()
+            )
+        );
     }
 }

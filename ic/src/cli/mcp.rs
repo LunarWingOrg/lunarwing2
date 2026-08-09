@@ -12,7 +12,8 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpGatewayMode, McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
+    McpGatewayMode, McpPlacement, McpProcessManager, McpServerConfig, McpSessionManager,
+    OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
@@ -71,6 +72,10 @@ pub struct McpAddArgs {
     /// Transport type: http (default), stdio, unix, wasm, gateway
     #[arg(long, default_value = "http")]
     pub transport: String,
+
+    /// Runtime placement: host (default) or job-worker. Worker commands must be preinstalled.
+    #[arg(long, default_value = "host", value_parser = parse_mcp_placement)]
+    pub placement: McpPlacement,
 
     /// Command to run (stdio transport)
     #[arg(long)]
@@ -200,6 +205,10 @@ pub struct McpUpdateArgs {
     #[arg(long)]
     pub transport: Option<String>,
 
+    /// New runtime placement: host or job-worker. Omission keeps existing placement.
+    #[arg(long, value_parser = parse_mcp_placement)]
+    pub placement: Option<McpPlacement>,
+
     /// New command to run (stdio transport)
     #[arg(long)]
     pub command: Option<String>,
@@ -296,7 +305,7 @@ pub enum McpCommand {
     /// Update an MCP server's configuration in-place
     Update(Box<McpUpdateArgs>),
 
-    /// Pin package provenance for a host-local stdio or WASM MCP server.
+    /// Pin package provenance for a host-placed stdio or WASM MCP server.
     ///
     /// Resolves the configured runtime artifact, records its SHA-256 digest
     /// and supplied package identity, and marks the package pinned.
@@ -373,6 +382,23 @@ fn parse_secret_env_ref(s: &str) -> Result<(String, String), String> {
         ));
     }
     Ok((name, secret_name))
+}
+
+fn parse_mcp_placement(value: &str) -> Result<McpPlacement, String> {
+    match value {
+        "host" => Ok(McpPlacement::Host),
+        "job-worker" => Ok(McpPlacement::JobWorker),
+        _ => Err(format!(
+            "invalid placement '{value}'; expected host or job-worker"
+        )),
+    }
+}
+
+fn placement_label(placement: McpPlacement) -> &'static str {
+    match placement {
+        McpPlacement::Host => "host",
+        McpPlacement::JobWorker => "job-worker",
+    }
 }
 
 /// Run an MCP command.
@@ -559,6 +585,7 @@ fn apply_add_metadata(
     args: &McpAddArgs,
     sandbox: Option<McpSandboxConfig>,
 ) -> anyhow::Result<McpServerConfig> {
+    config.placement = args.placement;
     if !args.headers.is_empty() {
         config = config.with_headers(args.headers.iter().cloned().collect());
     }
@@ -585,6 +612,7 @@ fn apply_add_metadata(
 fn print_add_summary(args: &McpAddArgs, sandbox_summary: Option<&str>) {
     println!();
     println!("  ✓ Added MCP server '{}'", args.name);
+    println!("    Placement: {}", placement_label(args.placement));
     match args.transport.to_ascii_lowercase().as_str() {
         "stdio" => {
             println!(
@@ -614,6 +642,11 @@ fn print_add_summary(args: &McpAddArgs, sandbox_summary: Option<&str>) {
         println!(
             "\n  Run 'lunarwing mcp auth {}' to authenticate.",
             args.name
+        );
+    }
+    if args.placement == McpPlacement::JobWorker {
+        println!(
+            "    Command must be preinstalled in worker image; LunarWing does not download it."
         );
     }
     println!();
@@ -723,6 +756,7 @@ async fn list_servers(
 
         if verbose {
             println!("  {} {}{}", status, server.name, auth_status);
+            println!("      Placement: {}", placement_label(server.placement));
             println!("      Transport: {}", transport_label);
             match &effective {
                 EffectiveTransport::Http => {
@@ -820,8 +854,13 @@ async fn list_servers(
                 }
             };
             println!(
-                "  {} {} - {} [{}]{}",
-                status, server.name, display, transport_label, auth_status
+                "  {} {} - {} [{}; {}]{}",
+                status,
+                server.name,
+                display,
+                transport_label,
+                placement_label(server.placement),
+                auth_status
             );
         }
     }
@@ -850,6 +889,8 @@ async fn auth_server(
         .get(&name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    require_host_cli_operation(&server, "OAuth authentication")?;
 
     // Initialize secrets store
     let secrets = get_secrets_store().await?;
@@ -928,6 +969,8 @@ async fn test_server(
         .get(&name)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
+
+    require_host_cli_operation(&server, "connection testing")?;
 
     println!();
     println!("  Testing connection to '{}'...", name);
@@ -1047,6 +1090,7 @@ async fn update_server(
 
     let new_config = build_update_config(&args, &existing)?;
     new_config.validate()?;
+    let placement = new_config.placement;
 
     if let Some(db) = db.as_ref() {
         crate::tools::mcp::config::persist_mcp_server_db(
@@ -1063,11 +1107,15 @@ async fn update_server(
     println!();
     println!("  ✓ Updated MCP server '{}'", args.name);
     println!();
-    println!("    The change will take effect when LunarWing next starts.");
-    println!(
-        "    Use 'lunarwing mcp toggle {} --disable && lunarwing mcp toggle {} --enable' to restart it live.",
-        args.name, args.name
-    );
+    if placement == McpPlacement::JobWorker {
+        println!("    Future Docker jobs use this configuration; running jobs keep snapshots.");
+    } else {
+        println!("    The change will take effect when LunarWing next starts.");
+        println!(
+            "    Use 'lunarwing mcp toggle {} --disable && lunarwing mcp toggle {} --enable' to restart it live.",
+            args.name, args.name
+        );
+    }
     println!();
 
     Ok(())
@@ -1185,6 +1233,8 @@ fn build_update_config(
     };
 
     config.enabled = existing.enabled;
+    config.recovery_circuit_open = existing.recovery_circuit_open;
+    config.placement = args.placement.unwrap_or(existing.placement);
     config.oauth = existing.oauth.clone();
     config.headers = existing.headers.clone();
     config.description = existing.description.clone();
@@ -1241,7 +1291,17 @@ async fn persist_updated_server(
     Ok(())
 }
 
-/// Pin package provenance for a host-local MCP server.
+fn require_host_cli_operation(server: &McpServerConfig, operation: &str) -> anyhow::Result<()> {
+    if server.placement == McpPlacement::Host {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Cannot perform {operation} for job-worker MCP server '{}': worker image is authority",
+        server.name
+    )
+}
+
+/// Pin package provenance for a host-placed MCP server.
 #[allow(clippy::too_many_arguments)] // CLI flag plumbing mirrors the clap surface
 async fn pin_server(
     name: String,
@@ -1260,6 +1320,8 @@ async fn pin_server(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", name))?;
 
+    require_host_cli_operation(&server, "package pinning")?;
+
     enum PinArtifact {
         Command(String),
         Component(std::path::PathBuf),
@@ -1270,7 +1332,7 @@ async fn pin_server(
             PinArtifact::Component(component_path.to_path_buf())
         }
         _ => anyhow::bail!(
-            "Server '{name}' is not host-local; pinning applies to stdio and WASM transports"
+            "Server '{name}' is not host-placed; pinning applies to stdio and WASM transports"
         ),
     };
 
@@ -2143,6 +2205,7 @@ mod tests {
             name: "local-files".to_string(),
             url: None,
             transport: None,
+            placement: None,
             command: None,
             cmd_args: None,
             env: None,
@@ -2165,6 +2228,7 @@ mod tests {
             name: "local-files".to_string(),
             url: Some("https://mcp.example.com".to_string()),
             transport: Some("http".to_string()),
+            placement: None,
             command: None,
             cmd_args: None,
             env: None,
@@ -2177,6 +2241,147 @@ mod tests {
         let provenance = updated.provenance.as_ref().expect("identity retained");
         assert_eq!(provenance.trust, PackageTrust::Unverified);
         assert!(provenance.command_sha256.is_none());
+    }
+
+    #[test]
+    fn test_mcp_placement_add_parsing_default_explicit_and_invalid() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let default = TestCli::try_parse_from([
+            "test",
+            "add",
+            "hosted",
+            "--transport",
+            "stdio",
+            "--command",
+            "hosted-mcp",
+        ])
+        .expect("default placement parses");
+        let McpCommand::Add(default) = default.cmd else {
+            panic!("expected add command");
+        };
+        assert_eq!(default.placement, McpPlacement::Host);
+
+        let worker = TestCli::try_parse_from([
+            "test",
+            "add",
+            "worker-tools",
+            "--transport",
+            "stdio",
+            "--command",
+            "worker-mcp",
+            "--placement",
+            "job-worker",
+        ])
+        .expect("job-worker placement parses");
+        let McpCommand::Add(worker) = worker.cmd else {
+            panic!("expected add command");
+        };
+        assert_eq!(worker.placement, McpPlacement::JobWorker);
+        let config = apply_add_metadata(
+            build_add_transport(&worker).expect("stdio transport"),
+            &worker,
+            None,
+        )
+        .expect("valid worker config");
+        assert_eq!(config.placement, McpPlacement::JobWorker);
+
+        assert!(TestCli::try_parse_from(["test", "add", "bad", "--placement", "worker"]).is_err());
+    }
+
+    #[test]
+    fn test_build_update_preserves_and_switches_placement_and_metadata() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let mut existing = McpServerConfig::new_stdio(
+            "worker-tools",
+            "worker-mcp",
+            vec!["--stdio".to_string()],
+            HashMap::new(),
+        )
+        .with_placement(McpPlacement::JobWorker)
+        .with_description("worker tools")
+        .with_always_require_approval(["write"]);
+        existing.enabled = false;
+        existing.recovery_circuit_open = true;
+
+        let parsed = TestCli::try_parse_from(["test", "update", "worker-tools"])
+            .expect("update without placement");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+        let preserved = build_update_config(&args, &existing).expect("preserved update");
+        assert_eq!(preserved.placement, McpPlacement::JobWorker);
+        assert!(!preserved.enabled);
+        assert!(preserved.recovery_circuit_open);
+        assert_eq!(preserved.description.as_deref(), Some("worker tools"));
+        assert_eq!(preserved.always_require_approval, vec!["write"]);
+
+        let parsed =
+            TestCli::try_parse_from(["test", "update", "worker-tools", "--placement", "host"])
+                .expect("explicit host placement");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+        let switched = build_update_config(&args, &existing).expect("placement switch");
+        switched.validate().expect("host stdio remains valid");
+        assert_eq!(switched.placement, McpPlacement::Host);
+    }
+
+    #[test]
+    fn test_build_update_rejects_incompatible_worker_transition() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let existing = McpServerConfig::new("remote", "https://example.invalid/mcp");
+        let parsed =
+            TestCli::try_parse_from(["test", "update", "remote", "--placement", "job-worker"])
+                .expect("placement parses");
+        let McpCommand::Update(args) = parsed.cmd else {
+            panic!("expected update command");
+        };
+        let updated = build_update_config(&args, &existing).expect("update reconstructs");
+        assert!(updated.validate().is_err());
+    }
+
+    #[test]
+    fn test_list_placement_labels_and_worker_host_only_rejection() {
+        assert_eq!(placement_label(McpPlacement::Host), "host");
+        assert_eq!(placement_label(McpPlacement::JobWorker), "job-worker");
+
+        let worker = McpServerConfig::new_stdio(
+            "worker-tools",
+            "__must_not_resolve_or_hash_on_host__",
+            vec![],
+            HashMap::new(),
+        )
+        .with_placement(McpPlacement::JobWorker);
+        for operation in [
+            "connection testing",
+            "OAuth authentication",
+            "package pinning",
+        ] {
+            let error = require_host_cli_operation(&worker, operation)
+                .expect_err("worker operation must be rejected");
+            assert!(error.to_string().contains("worker image is authority"));
+        }
     }
 
     #[tokio::test]

@@ -3444,10 +3444,17 @@ function renderMcpServerCard(entry, installedExt) {
   header.appendChild(kind);
 
   if (installedExt) {
-    var authDot = document.createElement('span');
-    authDot.className = 'ext-auth-dot ' + (installedExt.authenticated ? 'authed' : 'unauthed');
-    authDot.title = installedExt.authenticated ? 'Authenticated' : 'Not authenticated';
-    header.appendChild(authDot);
+    if (installedExt.placement !== 'job_worker') {
+      var authDot = document.createElement('span');
+      authDot.className = 'ext-auth-dot ' + (installedExt.authenticated ? 'authed' : 'unauthed');
+      authDot.title = installedExt.authenticated ? 'Authenticated' : 'Not authenticated';
+      header.appendChild(authDot);
+    }
+
+    var placement = document.createElement('span');
+    placement.className = 'ext-kind';
+    placement.textContent = installedExt.placement === 'job_worker' ? 'Job worker' : 'Host';
+    header.appendChild(placement);
   }
 
   card.appendChild(header);
@@ -3477,7 +3484,24 @@ function renderMcpServerCard(entry, installedExt) {
   actions.className = 'ext-actions';
 
   if (installedExt) {
-    if (installedExt.recovering) {
+    if (installedExt.placement === 'job_worker') {
+      var workerLabel = document.createElement('span');
+      workerLabel.className = 'ext-active-label' + (installedExt.enabled === false ? ' inactive' : '');
+      workerLabel.textContent = installedExt.enabled === false
+        ? 'Not eligible for jobs'
+        : 'Eligible for future jobs';
+      actions.appendChild(workerLabel);
+      var workerToggleBtn = document.createElement('button');
+      workerToggleBtn.className = installedExt.enabled === false ? 'btn-ext activate' : 'btn-ext deactivate';
+      workerToggleBtn.textContent = installedExt.enabled === false
+        ? I18n.t('common.activate')
+        : I18n.t('common.deactivate');
+      workerToggleBtn.addEventListener('click', function() {
+        if (installedExt.enabled === false) activateExtension(installedExt.name);
+        else deactivateExtension(installedExt.name);
+      });
+      actions.appendChild(workerToggleBtn);
+    } else if (installedExt.recovering) {
       var recoveringLabel = document.createElement('span');
       recoveringLabel.className = 'ext-active-label inactive';
       recoveringLabel.textContent = I18n.t('ext.recovering');
@@ -5262,7 +5286,8 @@ function addMcpServer() {
 
   var activeTransport = document.querySelector('.mcp-transport-option.active');
   var transport = activeTransport ? activeTransport.dataset.mcpTransport : 'http';
-  var body = { name: name, kind: 'mcp_server', transport: transport };
+  var placement = document.getElementById('mcp-install-placement').value;
+  var body = { name: name, kind: 'mcp_server', transport: transport, placement: placement };
 
   if (transport === 'http') {
     var url = document.getElementById('mcp-install-url').value.trim();
@@ -5344,6 +5369,8 @@ function addMcpServer() {
 }
 
 function setMcpInstallTransport(transport) {
+  var placement = document.getElementById('mcp-install-placement').value;
+  if (placement === 'job_worker') transport = 'stdio';
   document.querySelectorAll('.mcp-transport-option').forEach(function(button) {
     var selected = button.dataset.mcpTransport === transport;
     button.classList.toggle('active', selected);
@@ -5353,9 +5380,22 @@ function setMcpInstallTransport(transport) {
   document.getElementById('mcp-stdio-fields').hidden = transport !== 'stdio';
 }
 
+function setMcpInstallPlacement(placement) {
+  var worker = placement === 'job_worker';
+  var httpButton = document.querySelector('[data-mcp-transport="http"]');
+  httpButton.disabled = worker;
+  document.getElementById('mcp-worker-placement-warning').hidden = !worker;
+  document.getElementById('mcp-secret-env-warning').textContent = worker
+    ? 'Secret values are decrypted for each job and exposed only to its job-local MCP process. Install trusted code only.'
+    : I18n.t('mcp.secretEnvWarning');
+  if (worker) setMcpInstallTransport('stdio');
+}
+
 function resetMcpInstallForm() {
   ['mcp-install-name', 'mcp-install-url', 'mcp-install-command', 'mcp-install-args', 'mcp-install-env', 'mcp-install-env-secrets']
     .forEach(function(id) { document.getElementById(id).value = ''; });
+  document.getElementById('mcp-install-placement').value = 'host';
+  setMcpInstallPlacement('host');
   setMcpInstallTransport('http');
 }
 
@@ -6953,6 +6993,9 @@ document.getElementById('logs-pause-btn').addEventListener('click', () => toggle
 document.getElementById('logs-clear-btn').addEventListener('click', () => clearLogs());
 document.getElementById('wasm-install-btn').addEventListener('click', () => installWasmExtension());
 document.getElementById('mcp-add-btn').addEventListener('click', () => addMcpServer());
+document.getElementById('mcp-install-placement').addEventListener('change', function(event) {
+  setMcpInstallPlacement(event.target.value);
+});
 document.querySelectorAll('.mcp-transport-option').forEach(function(button) {
   button.addEventListener('click', function() {
     setMcpInstallTransport(button.dataset.mcpTransport);

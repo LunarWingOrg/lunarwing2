@@ -146,7 +146,7 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 | Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, WASM component canonicality/availability, and sandbox policy enforceability. |
 | Host sandboxing | Stdio supports an opt-in OS policy. MCP-over-WASM exposes no WASI or host imports and bounds artifact/message sizes, memory, replenished fuel, and epoch deadlines. |
 | Protocol surface | Tool discovery and tool calls are registered with the agent. The raw MCP-over-WASM ABI carries full JSON-RPC methods, including resources, prompts, notifications, cancellation messages, and subscriptions. WebSocket transport is not implemented. |
-| Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, and external dedicated/shared gateway placement are implemented. Generic worker-local MCP and a bundled gateway control-plane service are not implemented. |
+| Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, external dedicated/shared gateway, and core Docker job-worker placement are implemented. A bundled gateway control-plane service is not implemented. |
 | Reliability | Explicit lifecycle cleanup and whole-runtime stdio/WASM crash recovery are implemented. WASM traps stop and discard the actor before manager reconstruction; per-message deadlines and shutdown bounds are enforced. General configurable startup/request timeouts remain open. |
 
 #### MCP-over-WASM servers
@@ -416,15 +416,56 @@ not be the default.
 
 #### Worker-local MCP
 
-Generic worker-local MCP is **not implemented**. The core per-job worker creates its
-own tool registry but does not receive LunarWing MCP configs, construct MCP clients,
-or register MCP tool wrappers. Some external workers can independently configure
-their own MCP integrations; that is not generic LunarWing placement of an installed
-MCP package into a job worker.
+Core Docker job workers support explicit `job_worker` placement for stdio MCP
+servers. Existing configs remain `host` by default. Configure a preinstalled command:
 
-Worker-local placement would start an approved MCP server inside the job container.
-Potential benefits depend on enforced mounts, network policy, grants, resource
-limits, and teardown:
+```bash
+lunarwing mcp add project-tools \
+  --transport stdio --placement job-worker \
+  --command project-tools-mcp \
+  --arg /workspace \
+  --secret-env API_TOKEN=project_tools_token
+```
+
+Activation marks this server eligible for future core Docker jobs; it does not
+start a host process. Each job snapshots all enabled worker servers for its owner.
+The snapshot is immutable for that job, requires a mounted `/workspace`, and is
+limited to eight servers and 32 secret grants. Persistent external workers do not
+receive this placement.
+
+Only stdio is accepted. Command and arguments execute without a shell, and the
+command must already exist in the worker image. Pinned provenance is checked against
+the executable visible inside that image before spawn. Automatic npm/pip installation
+does not occur. Host-only OAuth, request headers, Unix/WASM/gateway transports, and
+host sandbox policy are rejected for worker placement.
+
+Secret names are removed from the descriptor and retained as separate job-scoped
+grants. The worker fetches values through a dedicated job-token-authenticated route;
+descriptor and value coverage must match exactly. MCP credentials do not enter the
+normal worker shell environment, but the MCP child receives its explicit values and
+can read or leak them.
+
+Worker startup initializes every client and discovers every tool before atomically
+registering wrappers in the per-job registry. Any startup error, tool-name conflict,
+approval requirement, autonomous-execution denial, or partial failure rejects the
+whole MCP snapshot and cleans up started runtimes. Stdio JSON-RPC frames are capped
+at 4 MiB; each server may expose at most 256 tools and 2 MiB of serialized tool
+descriptors. Older worker images receive
+`--require-worker-mcp` and fail rather than silently ignoring requested placement.
+
+MCP children receive a scrubbed environment without the worker bearer token. On
+Linux, the trusted worker parent also marks itself non-dumpable before any untrusted
+child starts, blocking same-UID reads of its token and credential memory through
+`/proc`, ptrace, and process-memory APIs. Failure to install this protection prevents
+worker startup.
+
+Before job completion, the worker unregisters exact wrappers, closes clients and
+sessions, and stops child processes with bounded waits. Cleanup failure makes the
+job fail. This prototype does not restart an MCP child that dies after successful
+activation; tool errors expose that failure, and job/container termination provides
+the final cleanup boundary.
+
+Benefits:
 
 - Direct access to that job's `/workspace` and installed language toolchains.
 - Isolation of arbitrary server code from the LunarWing daemon and host filesystem.
@@ -443,14 +484,10 @@ HTTP MCP endpoint, or a durable heavyweight service better placed in a dedicated
 worker or gateway.
 
 Costs include per-job startup, image/package availability, descriptor and grant
-delivery, separate MCP-versus-worker health reporting, credential exposure inside
-the worker when raw secrets are required, and reliable cancellation/teardown.
-Worker isolation limits blast radius but does not remove package-provenance needs.
-
-Recommended order: define package/policy vocabulary, run worker-local MCP only from
-preinstalled or verified packages, then add automatic package installation after
-provenance, capability review, sandbox, audit, revocation, upgrade, and rollback
-contracts exist.
+delivery, credential exposure inside the MCP child, and no post-start MCP restart
+supervisor. Worker isolation limits blast radius but does not remove package
+provenance needs. Add automatic package installation only after provenance,
+capability review, sandbox, audit, revocation, upgrade, and rollback contracts exist.
 
 #### LunarWing Study Notes
 

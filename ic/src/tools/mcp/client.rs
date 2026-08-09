@@ -22,6 +22,9 @@ use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::McpTransport;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
+const MAX_WORKER_MCP_TOOLS: usize = 256;
+const MAX_WORKER_MCP_TOOL_BYTES: usize = 2 * 1024 * 1024;
+
 /// MCP client for communicating with MCP servers.
 ///
 /// Supports multiple transport types:
@@ -570,8 +573,19 @@ impl McpClient {
     /// Create Tool implementations for all MCP tools.
     pub async fn create_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let mcp_tools = self.list_tools().await?;
+        Ok(self.wrap_tools(mcp_tools))
+    }
+
+    /// Create tools for an untrusted per-job worker runtime with bounded discovery.
+    pub(crate) async fn create_worker_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+        let mcp_tools = self.list_tools().await?;
+        validate_worker_tools(&mcp_tools)?;
+        Ok(self.wrap_tools(mcp_tools))
+    }
+
+    fn wrap_tools(&self, mcp_tools: Vec<McpTool>) -> Vec<Arc<dyn Tool>> {
         let client = Arc::new(self.clone());
-        Ok(mcp_tools
+        mcp_tools
             .into_iter()
             .map(|t| {
                 let prefixed_name = format!("{}_{}", self.server_name, t.name);
@@ -581,7 +595,7 @@ impl McpClient {
                     client: client.clone(),
                 }) as Arc<dyn Tool>
             })
-            .collect())
+            .collect()
     }
 
     /// Test the connection to the MCP server.
@@ -590,6 +604,24 @@ impl McpClient {
         self.list_tools().await?;
         Ok(())
     }
+}
+
+fn validate_worker_tools(tools: &[McpTool]) -> Result<(), ToolError> {
+    if tools.len() > MAX_WORKER_MCP_TOOLS {
+        return Err(ToolError::ExternalService(format!(
+            "worker MCP tool limit exceeded ({} discovered, max {MAX_WORKER_MCP_TOOLS})",
+            tools.len()
+        )));
+    }
+    let encoded = serde_json::to_vec(tools).map_err(|error| {
+        ToolError::ExternalService(format!("failed to measure worker MCP tools: {error}"))
+    })?;
+    if encoded.len() > MAX_WORKER_MCP_TOOL_BYTES {
+        return Err(ToolError::ExternalService(format!(
+            "worker MCP tool descriptors exceed {MAX_WORKER_MCP_TOOL_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Clone the client, resetting the tools cache and initialization state.
@@ -716,6 +748,30 @@ fn strip_top_level_nulls(value: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_tool(name: &str, schema: serde_json::Value) -> McpTool {
+        McpTool {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: schema,
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn worker_tool_discovery_enforces_count_and_size_limits() {
+        let too_many = (0..=MAX_WORKER_MCP_TOOLS)
+            .map(|index| worker_tool(&format!("tool-{index}"), serde_json::json!({})))
+            .collect::<Vec<_>>();
+        assert!(validate_worker_tools(&too_many).is_err());
+
+        let oversized = vec![worker_tool(
+            "large",
+            serde_json::json!({"description": "x".repeat(MAX_WORKER_MCP_TOOL_BYTES)}),
+        )];
+        assert!(validate_worker_tools(&oversized).is_err());
+        assert!(validate_worker_tools(&[worker_tool("small", serde_json::json!({}))]).is_ok());
+    }
 
     #[test]
     fn test_mcp_request_list_tools() {

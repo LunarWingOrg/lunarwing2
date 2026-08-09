@@ -508,6 +508,9 @@ pub struct InstalledExtension {
     /// Host-local stdio executable. Arguments and environment are intentionally omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// MCP runtime placement (`host` or `job_worker`). `None` for other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::tools::mcp::McpPlacement>,
     pub authenticated: bool,
     pub active: bool,
     /// MCP runtime is rebuilding or waiting for an automatic retry.
@@ -963,6 +966,7 @@ mod tests {
         assert!(ext.url.is_none());
         assert!(ext.transport.is_none());
         assert!(ext.command.is_none());
+        assert!(ext.placement.is_none());
         assert!(ext.activation_error.is_none());
     }
 
@@ -976,6 +980,7 @@ mod tests {
             url: Some("https://gmail.example.com".to_string()),
             transport: None,
             command: None,
+            placement: None,
             authenticated: true,
             active: true,
             recovering: false,
@@ -1001,6 +1006,26 @@ mod tests {
         assert!(back.needs_setup);
         assert!(!back.installed);
         assert_eq!(back.activation_error.as_deref(), Some("token expired"));
+    }
+
+    #[test]
+    fn installed_extension_serializes_mcp_placement() {
+        let json = serde_json::json!({
+            "name": "worker-files",
+            "kind": "mcp_server",
+            "placement": "job_worker",
+            "authenticated": true,
+            "active": false,
+        });
+        let extension: InstalledExtension = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            extension.placement,
+            Some(crate::tools::mcp::McpPlacement::JobWorker)
+        );
+        assert_eq!(
+            serde_json::to_value(extension).unwrap()["placement"],
+            "job_worker"
+        );
     }
 
     // ── ExtensionError Display ───────────────────────────────────────

@@ -4,6 +4,7 @@
 //! - Connects to the orchestrator over HTTP
 //! - Uses a `ProxyLlmProvider` that routes LLM calls through the orchestrator
 //! - Runs container-safe tools (shell, file ops, patch)
+//! - Activates immutable per-job MCP snapshots through dedicated credentials
 //! - Reports status and completion back to the orchestrator
 //!
 //! ```text
@@ -19,6 +20,9 @@
 //! │    │   ├─ write_file            │
 //! │    │   ├─ list_dir              │
 //! │    │   └─ apply_patch           │
+//! │    ├─ per-job MCP clients       │
+//! │    │   └─ stdio child processes │
+//! │    ├─ MCP credentials ──────────┼──▶ Orchestrator /worker/{id}/mcp/credentials
 //! │    └─ WorkerHttpClient ─────────┼──▶ Orchestrator /worker/{id}/status
 //! │                                 │
 //! └────────────────────────────────┘
@@ -28,6 +32,7 @@ pub mod acp_bridge;
 pub mod api;
 pub mod container;
 pub mod job;
+pub mod mcp;
 pub mod proxy_llm;
 
 pub use acp_bridge::AcpBridgeRuntime;
@@ -93,6 +98,7 @@ pub async fn run_worker(
     job_id: uuid::Uuid,
     orchestrator_url: &str,
     max_iterations: u32,
+    require_worker_mcp: bool,
 ) -> anyhow::Result<()> {
     tracing::info!(
         "Starting worker for job {} (orchestrator: {})",
@@ -105,6 +111,7 @@ pub async fn run_worker(
         orchestrator_url: orchestrator_url.to_string(),
         max_iterations: max_iterations.clamp(1, lunarwing_common::MAX_WORKER_ITERATIONS),
         timeout: std::time::Duration::from_secs(600),
+        require_worker_mcp,
     };
 
     let rt =

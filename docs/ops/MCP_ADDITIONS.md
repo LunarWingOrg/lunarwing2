@@ -5,8 +5,10 @@
 > behind one runtime-neutral activation registry. Owner-scoped secret references,
 > diagnostics, explicit lifecycle operations, safe stdio/WASM crash recovery,
 > operator-pinned package provenance, and opt-in host OS sandboxing are also
-> implemented.
-> Worker-local placement, automatic package installation, publisher signatures
+> implemented. Core Docker jobs support explicit worker-local stdio placement with
+> immutable owner-scoped snapshots, separate credential grants, provenance checks,
+> atomic tool registration, and bounded teardown.
+> Automatic package installation, publisher signatures
 > and dependency locking, device-level sandboxing, mandatory default sandbox
 > profiles, and a bundled shared gateway service remain unimplemented.
 
@@ -182,6 +184,43 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
     --transport gateway --gateway-mode shared --gateway-route project-tools
   ```
 
+### Core Docker job-worker placement
+
+- `McpServerConfig.placement` explicitly selects `host` (the backward-compatible
+  default) or `job_worker`. Worker placement accepts stdio only; HTTP, Unix, WASM,
+  gateway, OAuth/header configuration, and host sandbox policy are rejected.
+- CLI uses `--placement job-worker`; conversational, authenticated web API, and
+  browser install surfaces use `job_worker`. Enabling a worker server makes it
+  eligible for future core Docker jobs and never starts it in the daemon.
+- Job creation snapshots all enabled worker servers for the owner. The immutable
+  snapshot is limited to eight servers, requires a mounted `/workspace`, and is not
+  sent to persistent external workers. Running jobs do not observe later config
+  updates, disables, or removals.
+- Secret names are stripped from worker descriptors and stored as separate
+  job-scoped grants. Up to 32 values are resolved through a dedicated bearer-token
+  worker route. Descriptor keys and delivered values must match exactly; MCP values
+  never enter the worker's normal shell `extra_env` map.
+- Worker startup verifies pinned command provenance against the executable visible
+  inside the image, starts only preinstalled commands, initializes each client, and
+  discovers tools with bounded time. No npm/pip download or package install occurs.
+- The full MCP tool set registers atomically into the per-job registry. Name
+  conflicts, partial startup, tools requiring approval, or tools disallowing
+  autonomous execution reject activation and clean up all partial runtime state.
+  Stdio JSON-RPC frames are capped at 4 MiB; discovery is capped at 256 tools and
+  2 MiB of serialized descriptors per server.
+- Worker cleanup unregisters exact wrappers, closes clients and sessions, and stops
+  all MCP child processes before reporting job completion. Cleanup failure changes
+  the job result to failure. Older worker images reject MCP-required jobs through
+  the `--require-worker-mcp` command contract instead of silently running without
+  requested tools.
+- On Linux, the trusted worker parent sets itself non-dumpable before launching
+  untrusted children. Combined with scrubbed child environments, this prevents an
+  MCP or shell child running under the worker UID from reading bearer tokens and
+  resolved credential state through `/proc`, ptrace, or process-memory APIs.
+- Prototype limit: initial activation and teardown are bounded, but there is no
+  in-job MCP child restart supervisor. A later child failure surfaces through tool
+  errors; job/container cancellation remains the final cleanup boundary.
+
 ## Not Implemented
 
 | Feature | Current status and reason |
@@ -189,7 +228,6 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 | Automatic npm/pip installation | No production package installer exists. LunarWing runs an operator-installed command. Safe automation needs immutable package identity, digest/signature verification, dependency locking, capability review, sandboxing, audit, revocation, health checks, and rollback. Provenance pinning (below) covers the identity/digest/trust subset; the rest remains. |
 | MCP package provenance | Partially implemented: operator-pinned stdio executable and WASM component digests, package identity, trust state, and revocation. Publisher signatures, signing-key trust roots, dependency lock data, upgrade diffs, and marketplace revocation remain design work. |
 | Host-local stdio OS sandbox | Partially implemented: opt-in per-server policy covering resource limits, core-dump control, process-group isolation and group teardown (all unix), plus Linux-only no_new_privileges, seccomp ptrace/process_vm denial, Landlock read-only root with writable paths, and user+network namespace network isolation. Remaining: device isolation, mandatory default profiles, and same-UID `/proc/<pid>/mem` inbound reads (kernel credential check, not syscall-filterable). |
-| Generic worker-local MCP | Core per-job workers do not load LunarWing MCP configs or register MCP wrappers. External workers may independently use MCP, but that is a separate integration, not placement of installed LunarWing MCP packages. |
 | Bundled gateway service | LunarWing implements dedicated/shared gateway client placement and a protected routing contract, but does not bundle or operate the external gateway control-plane service. Cross-daemon HA, centralized package policy, and cross-tenant credential ownership belong to that deployment. |
 | Per-server lifecycle timeouts | WASM message deadlines are configurable and transport/process shutdown is bounded. Configurable startup and request timeout controls for every transport remain deferred. |
 
@@ -230,9 +268,10 @@ MCP-over-WASM, and gateway-adapter deferrals were completed on 2026-08-09:
   multi-tenant placement, centralized package policy, shared credentials, routing,
   and gateway high-availability semantics remain future architecture work.
 
-The public adapter registry, stateful WASM actor, and gateway routing contract now
-supersede the last two historical bullets. Worker-local placement and safe automatic
-package installation remain separate security and ownership boundaries.
+The public adapter registry, stateful WASM actor, gateway routing contract, and core
+Docker worker-local prototype now supersede the last three historical runtime
+bullets. Safe automatic package installation remains a separate security and
+ownership boundary.
 
 ## Why Package Provenance and Sandboxing Matter
 
@@ -257,20 +296,20 @@ for operator-facing details.
 
 ## Why Worker-Local MCP Matters
 
-Worker-local placement would run an approved server beside a job's `/workspace` and
-toolchain. With enforced mounts, network policy, grants, limits, and teardown, it
-can isolate arbitrary code from the daemon host, scope files and raw credentials to
-one job, permit conflicting package versions, and bind runtime lifetime to the job.
-It best fits repository inspection, code generation, testing, native dependencies,
-and other workspace-coupled tools.
+Worker-local placement runs approved stdio servers beside a core Docker job's
+`/workspace` and toolchain. Owner-scoped immutable descriptors, exact credential
+grants, limits, and teardown isolate server code from the daemon host, scope files
+and raw credentials to one job, permit image-specific package versions, and bind
+runtime lifetime to the job. It best fits repository inspection, code generation,
+testing, native dependencies, and other workspace-coupled tools.
 
 It is not needed for trusted operator-installed host processes, hosted HTTP MCP, or
 durable heavyweight services better placed in dedicated workers. Costs include
 per-job startup, package/image availability, descriptor and grant delivery,
 separate worker/MCP health, credential exposure inside the worker, and teardown
 reliability. Worker isolation reduces blast radius but does not remove provenance
-requirements. First prototype should use preinstalled or verified packages, not
-arbitrary package-manager downloads during jobs.
+requirements. The implemented prototype uses preinstalled commands with optional
+worker-visible digest verification, not arbitrary package-manager downloads.
 
 ## Rejected Reference Implementation
 
@@ -312,3 +351,7 @@ resolved secret values are never retained as restart configuration.
   hardening removed WASI imports, pinned exact component bytes, moved guest work off
   Tokio workers, added terminal-trap recovery and whole-runtime daemon shutdown, and
   verified gateway routing headers on wire.
+- 2026-08-09: explicit core Docker job-worker placement added with owner-scoped
+  immutable snapshots, separate exact-cover credential grants, preinstalled/pinned
+  stdio activation, atomic autonomous-tool registration, compatibility guard for old
+  worker images, and bounded fail-closed teardown.

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
@@ -44,6 +45,7 @@ pub struct McpRuntimeContext<'a> {
     session_manager: &'a Arc<McpSessionManager>,
     process_manager: &'a Arc<McpProcessManager>,
     secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    worker_secret_env: Option<HashMap<String, SecretString>>,
     user_id: &'a str,
 }
 
@@ -58,8 +60,18 @@ impl<'a> McpRuntimeContext<'a> {
             session_manager,
             process_manager,
             secrets,
+            worker_secret_env: None,
             user_id,
         }
+    }
+
+    /// Supply already job-scoped secret environment values to a worker runtime.
+    pub(crate) fn with_worker_secret_env(
+        mut self,
+        worker_secret_env: HashMap<String, SecretString>,
+    ) -> Self {
+        self.worker_secret_env = Some(worker_secret_env);
+        self
     }
 
     pub fn session_manager(&self) -> &Arc<McpSessionManager> {
@@ -72,6 +84,10 @@ impl<'a> McpRuntimeContext<'a> {
 
     pub fn secrets(&self) -> Option<Arc<dyn SecretsStore + Send + Sync>> {
         self.secrets.clone()
+    }
+
+    pub(crate) fn worker_secret_env(&self) -> Option<&HashMap<String, SecretString>> {
+        self.worker_secret_env.as_ref()
     }
 
     pub fn user_id(&self) -> &str {

@@ -3,7 +3,7 @@
 //! Extends the existing `SandboxManager` infrastructure to support persistent
 //! containers with their own agent loops (as opposed to ephemeral per-command containers).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -15,9 +15,16 @@ use uuid::Uuid;
 use futures::StreamExt;
 
 use crate::bootstrap::lunarwing_base_dir;
+use crate::db::Database;
 use crate::error::OrchestratorError;
-use crate::orchestrator::auth::{CredentialGrant, TokenStore};
+use crate::orchestrator::auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 use crate::sandbox::connect_docker;
+use crate::secrets::SecretsStore;
+use crate::tools::mcp::config::{McpServerConfig, McpServersFile, McpTransportConfig};
+
+const MAX_WORKER_MCP_SERVERS: usize = 8;
+const MAX_WORKER_MCP_CREDENTIALS: usize = 32;
+const MCP_SECRET_MARKER: &str = "worker-grant";
 
 /// Which mode a sandbox container runs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +125,9 @@ pub struct ContainerHandle {
     pub container_id: String,
     pub state: ContainerState,
     pub mode: JobMode,
+    pub owner_id: String,
+    /// Immutable, sanitized MCP configuration snapshot sent to worker.
+    pub mcp_servers: Vec<McpServerConfig>,
     pub created_at: DateTime<Utc>,
     pub project_dir: Option<PathBuf>,
     pub task_description: String,
@@ -129,6 +139,106 @@ pub struct ContainerHandle {
     pub completion_result: Option<CompletionResult>,
     // NOTE: auth_token is intentionally NOT in this struct.
     // It lives only in the TokenStore (never logged, serialized, or persisted).
+}
+
+/// Fully bound request for one core Docker worker container.
+pub struct ContainerJobRequest {
+    pub job_id: Uuid,
+    pub task: String,
+    pub project_dir: Option<PathBuf>,
+    pub mode: JobMode,
+    pub owner_id: String,
+    pub credential_grants: Vec<CredentialGrant>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub mcp_credential_grants: Vec<McpCredentialGrant>,
+    pub max_iterations: u32,
+}
+
+/// Load and sanitize job-worker MCP configuration for one owner.
+///
+/// Secret values remain encrypted. Secret names move into separate grants and
+/// descriptor references become opaque markers preserving required env keys.
+pub async fn snapshot_worker_mcp(
+    store: Option<&dyn Database>,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    owner_id: &str,
+) -> Result<(Vec<McpServerConfig>, Vec<McpCredentialGrant>), OrchestratorError> {
+    let configured = if let Some(store) = store {
+        crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate(store, owner_id).await
+    } else {
+        crate::tools::mcp::config::load_mcp_servers().await
+    }
+    .map_err(|error| OrchestratorError::ApiError {
+        reason: format!("failed to load worker MCP configuration: {error}"),
+    })?;
+    prepare_worker_mcp(configured, secrets, owner_id).await
+}
+
+async fn prepare_worker_mcp(
+    configured: McpServersFile,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    owner_id: &str,
+) -> Result<(Vec<McpServerConfig>, Vec<McpCredentialGrant>), OrchestratorError> {
+    let mut servers = configured.job_worker_servers().cloned().collect::<Vec<_>>();
+    if servers.len() > MAX_WORKER_MCP_SERVERS {
+        return Err(OrchestratorError::ApiError {
+            reason: format!(
+                "worker MCP server limit exceeded ({} configured, max {MAX_WORKER_MCP_SERVERS})",
+                servers.len()
+            ),
+        });
+    }
+
+    let mut grants = Vec::new();
+    for server in &mut servers {
+        let Some(McpTransportConfig::Stdio { env_secrets, .. }) = &mut server.transport else {
+            return Err(OrchestratorError::ApiError {
+                reason: "worker MCP snapshot contained non-stdio transport".to_string(),
+            });
+        };
+        if !env_secrets.is_empty() && secrets.is_none() {
+            return Err(OrchestratorError::ApiError {
+                reason: "worker MCP secret references require configured secrets store".to_string(),
+            });
+        }
+        for (env_var, secret_name) in env_secrets.iter_mut() {
+            let secret_store = secrets.ok_or_else(|| OrchestratorError::ApiError {
+                reason: "worker MCP secret references require configured secrets store".to_string(),
+            })?;
+            let exists = secret_store
+                .exists(owner_id, secret_name)
+                .await
+                .map_err(|_| OrchestratorError::ApiError {
+                    reason: format!(
+                        "failed to validate worker MCP credential for server '{}' env '{}'",
+                        server.name, env_var
+                    ),
+                })?;
+            if !exists {
+                return Err(OrchestratorError::ApiError {
+                    reason: format!(
+                        "missing worker MCP credential for server '{}' env '{}'",
+                        server.name, env_var
+                    ),
+                });
+            }
+            grants.push(McpCredentialGrant {
+                server_name: server.name.clone(),
+                secret_name: secret_name.clone(),
+                env_var: env_var.clone(),
+            });
+            *secret_name = MCP_SECRET_MARKER.to_string();
+        }
+    }
+    if grants.len() > MAX_WORKER_MCP_CREDENTIALS {
+        return Err(OrchestratorError::ApiError {
+            reason: format!(
+                "worker MCP credential limit exceeded ({} configured, max {MAX_WORKER_MCP_CREDENTIALS})",
+                grants.len()
+            ),
+        });
+    }
+    Ok((servers, grants))
 }
 
 /// Result reported by a worker on completion.
@@ -212,9 +322,14 @@ fn validate_bind_mount_path(
     Ok(canonical)
 }
 
-fn worker_command(job_id: Uuid, orchestrator_url: &str, max_iterations: u32) -> Vec<String> {
+fn worker_command(
+    job_id: Uuid,
+    orchestrator_url: &str,
+    max_iterations: u32,
+    require_worker_mcp: bool,
+) -> Vec<String> {
     let max_iterations = max_iterations.clamp(1, MAX_WORKER_ITERATIONS);
-    vec![
+    let mut command = vec![
         "worker".to_string(),
         "--job-id".to_string(),
         job_id.to_string(),
@@ -222,7 +337,96 @@ fn worker_command(job_id: Uuid, orchestrator_url: &str, max_iterations: u32) -> 
         orchestrator_url.to_string(),
         "--max-iterations".to_string(),
         max_iterations.to_string(),
-    ]
+    ];
+    if require_worker_mcp {
+        command.push("--require-worker-mcp".to_string());
+    }
+    command
+}
+
+fn validate_worker_mcp_request(
+    job_id: Uuid,
+    mode: &JobMode,
+    project_dir: Option<&std::path::Path>,
+    servers: &[McpServerConfig],
+    grants: &[McpCredentialGrant],
+) -> Result<(), OrchestratorError> {
+    let invalid = |reason| OrchestratorError::ContainerCreationFailed { job_id, reason };
+    if servers.is_empty() && grants.is_empty() {
+        return Ok(());
+    }
+    if mode != &JobMode::Worker {
+        return Err(invalid(
+            "MCP snapshots are supported only by core Docker workers".to_string(),
+        ));
+    }
+    if project_dir.is_none() {
+        return Err(invalid(
+            "Worker-local MCP requires a job workspace mount".to_string(),
+        ));
+    }
+    if servers.len() > MAX_WORKER_MCP_SERVERS {
+        return Err(invalid(format!(
+            "worker MCP server limit exceeded ({} configured, max {MAX_WORKER_MCP_SERVERS})",
+            servers.len()
+        )));
+    }
+    if grants.len() > MAX_WORKER_MCP_CREDENTIALS {
+        return Err(invalid(format!(
+            "worker MCP credential limit exceeded ({} configured, max {MAX_WORKER_MCP_CREDENTIALS})",
+            grants.len()
+        )));
+    }
+
+    let mut server_names = HashSet::new();
+    let mut expected_grants = HashSet::new();
+    for server in servers {
+        server.validate().map_err(|error| {
+            invalid(format!(
+                "invalid worker MCP server '{}': {error}",
+                server.name
+            ))
+        })?;
+        if !server.should_run_in_job() || !server_names.insert(server.name.as_str()) {
+            return Err(invalid(format!(
+                "invalid or duplicate worker MCP server '{}'",
+                server.name
+            )));
+        }
+        let Some(McpTransportConfig::Stdio { env_secrets, .. }) = server.transport.as_ref() else {
+            return Err(invalid(format!(
+                "worker MCP server '{}' must use explicit stdio transport",
+                server.name
+            )));
+        };
+        for (env_var, marker) in env_secrets {
+            if marker != MCP_SECRET_MARKER
+                || !expected_grants.insert((server.name.as_str(), env_var.as_str()))
+            {
+                return Err(invalid(format!(
+                    "invalid worker MCP credential descriptor for server '{}'",
+                    server.name
+                )));
+            }
+        }
+    }
+
+    let mut actual_grants = HashSet::new();
+    for grant in grants {
+        if grant.secret_name.trim().is_empty()
+            || !actual_grants.insert((grant.server_name.as_str(), grant.env_var.as_str()))
+        {
+            return Err(invalid(
+                "invalid or duplicate worker MCP credential grant".to_string(),
+            ));
+        }
+    }
+    if actual_grants != expected_grants {
+        return Err(invalid(
+            "worker MCP grants do not exactly cover descriptor secret environment".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Manages the lifecycle of Docker containers for sandboxed job execution.
@@ -292,19 +496,37 @@ impl ContainerJobManager {
     /// Returns the auth token for the worker.
     pub async fn create_job(
         &self,
-        job_id: Uuid,
-        task: &str,
-        project_dir: Option<PathBuf>,
-        mode: JobMode,
-        credential_grants: Vec<CredentialGrant>,
-        max_iterations: u32,
+        request: ContainerJobRequest,
     ) -> Result<String, OrchestratorError> {
+        let ContainerJobRequest {
+            job_id,
+            task,
+            project_dir,
+            mode,
+            owner_id,
+            credential_grants,
+            mcp_servers,
+            mcp_credential_grants,
+            max_iterations,
+        } = request;
+        let watcher_owner_id = owner_id.clone();
+        validate_worker_mcp_request(
+            job_id,
+            &mode,
+            project_dir.as_deref(),
+            &mcp_servers,
+            &mcp_credential_grants,
+        )?;
+        let require_worker_mcp = !mcp_servers.is_empty();
         // Generate auth token (stored in TokenStore, never logged)
         let token = self.token_store.create_token(job_id).await;
 
         // Store credential grants (revoked automatically when the token is revoked)
         self.token_store
             .store_grants(job_id, credential_grants)
+            .await;
+        self.token_store
+            .store_mcp_grants(job_id, mcp_credential_grants)
             .await;
 
         // Record the handle
@@ -313,9 +535,11 @@ impl ContainerJobManager {
             container_id: String::new(), // set after container creation
             state: ContainerState::Creating,
             mode: mode.clone(),
+            owner_id,
+            mcp_servers,
             created_at: Utc::now(),
             project_dir: project_dir.clone(),
-            task_description: task.to_string(),
+            task_description: task,
             last_worker_status: None,
             worker_iteration: 0,
             completion_result: None,
@@ -325,7 +549,14 @@ impl ContainerJobManager {
         // Run the actual container creation. On any failure, revoke the token
         // and remove the handle so we don't leak resources.
         match self
-            .create_job_inner(job_id, &token, project_dir, mode, max_iterations)
+            .create_job_inner(
+                job_id,
+                &token,
+                project_dir,
+                max_iterations,
+                require_worker_mcp,
+                watcher_owner_id,
+            )
             .await
         {
             Ok(()) => Ok(token),
@@ -343,8 +574,9 @@ impl ContainerJobManager {
         job_id: Uuid,
         token: &str,
         project_dir: Option<PathBuf>,
-        _mode: JobMode,
         max_iterations: u32,
+        require_worker_mcp: bool,
+        watcher_owner_id: String,
     ) -> Result<(), OrchestratorError> {
         // Connect to Docker (reuses cached connection)
         let docker = self.docker().await?;
@@ -406,7 +638,12 @@ impl ContainerJobManager {
             ..Default::default()
         };
 
-        let cmd = worker_command(job_id, &orchestrator_url, max_iterations);
+        let cmd = worker_command(
+            job_id,
+            &orchestrator_url,
+            max_iterations,
+            require_worker_mcp,
+        );
 
         // Add Docker labels for reaper identification and orphan detection
         let mut labels = std::collections::HashMap::new();
@@ -564,7 +801,7 @@ impl ContainerJobManager {
             if let Some(ref tx) = watcher_event_tx {
                 let _ = tx.send((
                     job_id,
-                    "default".to_string(),
+                    watcher_owner_id,
                     crate::channels::web::types::SseEvent::JobResult {
                         job_id: job_id.to_string(),
                         status: "failed".to_string(),
@@ -731,6 +968,7 @@ impl ContainerJobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::mcp::config::{EffectiveTransport, McpPlacement, McpServerConfig};
 
     #[test]
     fn test_container_job_config_default() {
@@ -748,13 +986,18 @@ mod tests {
     #[test]
     fn worker_command_propagates_and_clamps_iteration_limit() {
         let job_id = Uuid::new_v4();
-        let command = worker_command(job_id, "http://orchestrator", 300);
+        let command = worker_command(job_id, "http://orchestrator", 300, false);
         assert_eq!(command.last().map(String::as_str), Some("300"));
 
-        let clamped = worker_command(job_id, "http://orchestrator", u32::MAX);
+        let clamped = worker_command(job_id, "http://orchestrator", u32::MAX, true);
+        assert!(
+            clamped
+                .iter()
+                .any(|value| value == &MAX_WORKER_ITERATIONS.to_string())
+        );
         assert_eq!(
-            clamped.last().and_then(|value| value.parse::<u32>().ok()),
-            Some(MAX_WORKER_ITERATIONS)
+            clamped.last().map(String::as_str),
+            Some("--require-worker-mcp")
         );
     }
 
@@ -818,6 +1061,8 @@ mod tests {
                     container_id: "test".to_string(),
                     state: ContainerState::Running,
                     mode: JobMode::Worker,
+                    owner_id: "owner".to_string(),
+                    mcp_servers: Vec::new(),
                     created_at: chrono::Utc::now(),
                     project_dir: None,
                     task_description: "test job".to_string(),
@@ -834,5 +1079,93 @@ mod tests {
         let handle = mgr.get_handle(job_id).await.unwrap();
         assert_eq!(handle.worker_iteration, 3);
         assert_eq!(handle.last_worker_status.as_deref(), Some("Iteration 3"));
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_snapshot_filters_sanitizes_and_validates_owner() {
+        use crate::testing::credentials::test_secrets_store;
+        use secrecy::SecretString;
+
+        let secrets = test_secrets_store();
+        secrets
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams {
+                    name: "real-secret-name".to_string(),
+                    value: SecretString::from("value".to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let host = McpServerConfig::new_stdio("host", "cat", Vec::new(), HashMap::new());
+        let worker = McpServerConfig::new_stdio_with_secrets(
+            "worker",
+            "cat",
+            Vec::new(),
+            HashMap::new(),
+            HashMap::from([("TOKEN".to_string(), "real-secret-name".to_string())]),
+        )
+        .with_placement(McpPlacement::JobWorker);
+        let mut disabled = worker.clone();
+        disabled.name = "disabled".to_string();
+        disabled.enabled = false;
+        let configured = McpServersFile {
+            servers: vec![host, worker, disabled],
+            ..Default::default()
+        };
+
+        let (snapshot, grants) = prepare_worker_mcp(configured.clone(), Some(&secrets), "owner-a")
+            .await
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].secret_name, "real-secret-name");
+        let EffectiveTransport::Stdio { env_secrets, .. } = snapshot[0].effective_transport()
+        else {
+            panic!("worker snapshot must remain stdio");
+        };
+        assert_eq!(
+            env_secrets.get("TOKEN").map(String::as_str),
+            Some(MCP_SECRET_MARKER)
+        );
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("real-secret-name")
+        );
+
+        assert!(
+            prepare_worker_mcp(configured, Some(&secrets), "owner-b")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_mcp_snapshot_rejects_overflow() {
+        let servers = (0..=MAX_WORKER_MCP_SERVERS)
+            .map(|index| {
+                McpServerConfig::new_stdio(
+                    format!("worker-{index}"),
+                    "cat",
+                    Vec::new(),
+                    HashMap::new(),
+                )
+                .with_placement(McpPlacement::JobWorker)
+            })
+            .collect();
+        let error = prepare_worker_mcp(
+            McpServersFile {
+                servers,
+                ..Default::default()
+            },
+            None,
+            "owner",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("limit exceeded"));
     }
 }

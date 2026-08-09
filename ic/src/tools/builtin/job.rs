@@ -28,7 +28,9 @@ use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
 use crate::orchestrator::auth::CredentialGrant;
 use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
-use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
+use crate::orchestrator::job_manager::{
+    ContainerJobManager, ContainerJobRequest, JobMode, snapshot_worker_mcp,
+};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
@@ -560,6 +562,16 @@ impl CreateJobTool {
             )
         })?;
 
+        let (mcp_servers, mcp_credential_grants) = snapshot_worker_mcp(
+            self.store.as_deref(),
+            self.secrets_store.as_deref(),
+            &ctx.user_id,
+        )
+        .await
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to snapshot worker MCP config: {error}"))
+        })?;
+
         let job_id = Uuid::new_v4();
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
@@ -620,14 +632,17 @@ impl CreateJobTool {
 
         // Create the container job with the pre-determined job_id.
         let _token = jm
-            .create_job(
+            .create_job(ContainerJobRequest {
                 job_id,
-                task,
-                Some(project_dir),
-                JobMode::Worker,
+                task: task.to_string(),
+                project_dir: Some(project_dir),
+                mode: JobMode::Worker,
+                owner_id: ctx.user_id.clone(),
                 credential_grants,
+                mcp_servers,
+                mcp_credential_grants,
                 max_iterations,
-            )
+            })
             .await
             .map_err(|e| {
                 self.update_status(
