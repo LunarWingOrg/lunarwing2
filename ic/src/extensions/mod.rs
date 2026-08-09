@@ -502,10 +502,13 @@ pub struct InstalledExtension {
     /// Server or source URL (e.g. MCP server endpoint).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// MCP transport for installed MCP servers (`http`, `stdio`, or `unix`).
+    /// MCP transport for installed MCP servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
-    /// Host-local stdio executable. Arguments and environment are intentionally omitted.
+    /// MCP execution placement (`orchestrator` or `job-worker`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    /// Stdio executable. Arguments and environment are intentionally omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     pub authenticated: bool,

@@ -1299,6 +1299,14 @@ impl ExtensionManager {
         .map_err(|error| ExtensionError::Config(error.to_string()))?;
 
         if server.enabled {
+            if server.placement == crate::tools::mcp::McpPlacement::JobWorker {
+                let message = format!(
+                    "Enabled MCP server '{name}' for explicit selection by sandbox worker jobs"
+                );
+                self.broadcast_extension_status(user_id, name, "configured", Some(&message))
+                    .await;
+                return Ok(message);
+            }
             if let Err(error) = self.ensure_mcp_owner_available(name, user_id).await {
                 return Err(self
                     .rollback_failed_mcp_activation(user_id, &server, error)
@@ -2754,6 +2762,7 @@ impl ExtensionManager {
             .validate()
             .map_err(|e| ExtensionError::Config(e.to_string()))?;
         let name = config.name.clone();
+        let placement = config.placement;
         let transport = match config.effective_transport() {
             crate::tools::mcp::config::EffectiveTransport::Http => "HTTP",
             crate::tools::mcp::config::EffectiveTransport::Stdio { .. } => "stdio",
@@ -2766,13 +2775,19 @@ impl ExtensionManager {
             .await
             .map_err(|e| ExtensionError::Config(e.to_string()))?;
 
-        tracing::info!(server = %name, transport, "Installed MCP server");
+        tracing::info!(server = %name, transport, ?placement, "Installed MCP server");
+        let message = match placement {
+            crate::tools::mcp::McpPlacement::Orchestrator => format!(
+                "MCP server '{name}' installed with {transport} transport. Run activate to connect."
+            ),
+            crate::tools::mcp::McpPlacement::JobWorker => format!(
+                "MCP server '{name}' installed with {transport} transport for explicit selection by sandbox worker jobs."
+            ),
+        };
         Ok(InstallResult {
             name: name.clone(),
             kind: ExtensionKind::McpServer,
-            message: format!(
-                "MCP server '{name}' installed with {transport} transport. Run activate to connect."
-            ),
+            message,
         })
     }
 
@@ -2842,7 +2857,17 @@ impl ExtensionManager {
             self.stop_mcp_runtime(name, user_id).await;
         }
 
-        let (message, status) = if was_active && new_config.enabled {
+        let (message, status) = if was_active
+            && new_config.enabled
+            && new_config.placement == crate::tools::mcp::McpPlacement::JobWorker
+        {
+            (
+                format!(
+                    "Updated MCP server '{name}' for explicit selection by sandbox worker jobs; host runtime stopped"
+                ),
+                "configured",
+            )
+        } else if was_active && new_config.enabled {
             match self
                 .activate_mcp_locked(name, user_id, new_config.clone())
                 .await
@@ -4312,6 +4337,19 @@ impl ExtensionManager {
         let _lifecycle_guard = self.lock_mcp_lifecycle_for_manual(name).await;
         self.ensure_mcp_owner_available(name, user_id).await?;
         let server = self.set_mcp_enabled(name, user_id, true).await?;
+        if server.placement == crate::tools::mcp::McpPlacement::JobWorker {
+            let message = format!(
+                "Enabled MCP server '{name}' for explicit selection by sandbox worker jobs"
+            );
+            self.broadcast_extension_status(user_id, name, "configured", Some(&message))
+                .await;
+            return Ok(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                tools_loaded: Vec::new(),
+                message,
+            });
+        }
         match self
             .activate_mcp_locked(name, user_id, server.clone())
             .await
@@ -4335,6 +4373,9 @@ impl ExtensionManager {
             .await
             .map_err(|error| ExtensionError::NotInstalled(error.to_string()))?;
         if !server.enabled {
+            return Ok(None);
+        }
+        if server.placement == crate::tools::mcp::McpPlacement::JobWorker {
             return Ok(None);
         }
         self.activate_mcp_locked(name, user_id, server)
