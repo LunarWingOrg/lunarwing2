@@ -853,6 +853,9 @@ pub struct InstallExtensionRequest {
     pub kind: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
+    /// MCP execution placement: orchestrator (default) or job-worker.
+    #[serde(default)]
+    pub placement: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
     #[serde(default)]
@@ -877,9 +880,24 @@ pub struct InstallExtensionRequest {
 
 impl InstallExtensionRequest {
     pub fn mcp_config(&self) -> Result<Option<crate::tools::mcp::McpServerConfig>, String> {
-        if self.kind.as_deref() != Some("mcp_server") && self.transport.is_none() {
+        if self.kind.as_deref() != Some("mcp_server")
+            && self.transport.is_none()
+            && self.placement.is_none()
+        {
             return Ok(None);
         }
+        let placement = match self
+            .placement
+            .as_deref()
+            .unwrap_or("orchestrator")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "orchestrator" => crate::tools::mcp::McpPlacement::Orchestrator,
+            "job-worker" | "job_worker" => crate::tools::mcp::McpPlacement::JobWorker,
+            other => return Err(format!("Unsupported MCP placement '{other}'")),
+        };
         let config = match self.transport.as_deref() {
             Some("stdio") => {
                 let command = self.command.as_deref().ok_or_else(|| {
@@ -894,10 +912,14 @@ impl InstallExtensionRequest {
                 )
             }
             Some("http") => {
-                if self.url.is_none() {
-                    return Err("MCP server URL is required for HTTP transport".to_string());
+                let url = self
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| "MCP server URL is required for HTTP transport".to_string())?;
+                if placement == crate::tools::mcp::McpPlacement::Orchestrator {
+                    return Ok(None);
                 }
-                return Ok(None);
+                crate::tools::mcp::McpServerConfig::new(&self.name, url)
             }
             Some("wasm") => {
                 let component = self.component.clone().ok_or_else(|| {
@@ -937,7 +959,8 @@ impl InstallExtensionRequest {
                 )
             }
             Some(other) => return Err(format!("Unsupported MCP transport '{other}'")),
-            None if self.command.is_some()
+            None if self.placement.is_some()
+                || self.command.is_some()
                 || !self.args.is_empty()
                 || !self.env.is_empty()
                 || !self.env_secrets.is_empty()
@@ -953,6 +976,7 @@ impl InstallExtensionRequest {
             None => return Ok(None),
         };
 
+        let config = config.with_placement(placement);
         config.validate().map_err(|e| e.to_string())?;
         Ok(Some(config))
     }
@@ -1761,6 +1785,36 @@ mod tests {
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
                     && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
         ));
+        assert_eq!(
+            config.placement,
+            crate::tools::mcp::McpPlacement::Orchestrator
+        );
+    }
+
+    #[test]
+    fn test_install_extension_request_builds_worker_mcp_config() {
+        let json = r#"{
+            "name": "repo",
+            "kind": "mcp_server",
+            "transport": "stdio",
+            "placement": "job-worker",
+            "command": "/usr/local/bin/repo-mcp"
+        }"#;
+        let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+        let config = req
+            .mcp_config()
+            .expect("valid worker request")
+            .expect("explicit MCP config");
+        assert_eq!(config.placement, crate::tools::mcp::McpPlacement::JobWorker);
+
+        for invalid in [
+            r#"{"name":"remote","kind":"mcp_server","transport":"http","placement":"job-worker","url":"https://example.com/mcp"}"#,
+            r#"{"name":"missing","kind":"mcp_server","placement":"job-worker"}"#,
+            r#"{"name":"bad","kind":"mcp_server","transport":"stdio","placement":"remote","command":"repo-mcp"}"#,
+        ] {
+            let req: InstallExtensionRequest = serde_json::from_str(invalid).expect("request");
+            assert!(req.mcp_config().is_err());
+        }
     }
 
     #[test]
