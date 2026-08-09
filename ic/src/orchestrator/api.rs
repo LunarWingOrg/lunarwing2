@@ -238,6 +238,12 @@ async fn report_complete(
     Path(job_id): Path<Uuid>,
     Json(report): Json<CompletionReport>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let owner_id = state
+        .job_manager
+        .get_handle(job_id)
+        .await
+        .map(|handle| handle.owner_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
     if report.success {
         tracing::info!(
             job_id = %job_id,
@@ -285,16 +291,9 @@ async fn report_complete(
     // event_rx.recv() would block indefinitely when the worker reports
     // completion via /complete instead of /event.
     if let Some(ref tx) = state.job_event_tx {
-        let owner_uid = state
-            .job_owner_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_else(|| state.user_id.clone());
         let _ = tx.send((
             job_id,
-            owner_uid,
+            owner_id,
             SseEvent::JobResult {
                 job_id: job_id.to_string(),
                 status: status.to_string(),
@@ -689,7 +688,7 @@ mod tests {
             job_id,
             crate::orchestrator::job_manager::ContainerHandle {
                 job_id,
-                container_id: "test-container".to_string(),
+                container_id: String::new(),
                 state: crate::orchestrator::job_manager::ContainerState::Running,
                 mode: crate::orchestrator::job_manager::JobMode::Worker,
                 owner_id: owner_id.to_string(),
@@ -786,6 +785,41 @@ mod tests {
 
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn completion_broadcast_uses_handle_owner_without_cache() {
+        let mut state = test_state();
+        state.user_id = "wrong-default".to_string();
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        state.job_event_tx = Some(event_tx);
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "owner-a").await;
+        let router = OrchestratorApi::router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/complete"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "success": true,
+                    "message": "done",
+                    "iterations": 1
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (reported_job, owner_id, event) = event_rx.recv().await.unwrap();
+        assert_eq!(reported_job, job_id);
+        assert_eq!(owner_id, "owner-a");
+        assert!(matches!(event, SseEvent::JobResult { .. }));
     }
 
     // -- Prompt queue tests --

@@ -122,11 +122,15 @@ discovers tools, and atomically adds autonomous wrappers to its fresh `ToolRegis
 It unregisters wrappers and stops all MCP runtime state before job completion.
 
 This path requires a mounted `/workspace`, accepts only preinstalled stdio commands,
-and allows at most eight servers and 32 grants per job. Secret values travel through
-a dedicated job-token-authenticated route and never enter normal shell credentials.
+and allows at most eight servers and 32 grants per job. Across those servers, tool
+discovery is capped at 256 tools and 2 MiB of descriptors; stream frames are capped
+at 4 MiB. Secret values travel through a dedicated job-token-authenticated route and
+never enter normal shell credentials.
 Startup, exact grant coverage, provenance, conflicts, approval requirements, and
 cleanup fail closed. Initial activation and teardown are bounded; post-start MCP
-child restart supervision remains outside this prototype.
+child restart supervision remains outside this prototype. Linux worker activation
+also requires Yama `kernel.yama.ptrace_scope >= 1` so same-UID MCP and shell sibling
+processes cannot inspect each other's credential environments after `execve`.
 
 Some persistent external workers can independently configure their own MCP clients
 or servers. They do not receive this core Docker job-worker placement contract.

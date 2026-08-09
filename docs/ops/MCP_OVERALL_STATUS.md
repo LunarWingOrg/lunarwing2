@@ -55,18 +55,24 @@ Implemented on 2026-08-09:
   requirements, or cleanup failures fail the job closed.
 - Worker placement requires a mounted `/workspace`, is limited to eight servers and
   32 credential grants per job, and is not available to persistent external workers.
-  Each server is limited to 256 discovered tools, 2 MiB of tool descriptors, and
-  4 MiB stream frames. Existing worker images fail closed when the orchestrator
+  Each job is limited to 256 discovered tools and 2 MiB of tool descriptors; stream
+  frames are capped at 4 MiB. Existing worker images fail closed when the orchestrator
   requires MCP support.
+- Worker children receive scrubbed environments. The Linux worker parent is
+  non-dumpable, and MCP activation requires Yama `kernel.yama.ptrace_scope >= 1`
+  so same-UID MCP and shell siblings cannot inspect each other's credential state.
+  Completion and unexpected-exit events route through authoritative job ownership.
 
 Part 2 verification on 2026-08-09:
 
 - `taskset -c 0-5 cargo test -j6 --lib --all-features mcp -- --test-threads=6`:
-  333 passed.
+  358 passed.
+- Direct completion-owner routing regression: passed.
 - `taskset -c 0-5 cargo check -j6 --all-features`: passed.
 - `taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples
   --all-features -- -D warnings`: passed.
 - `taskset -c 0-5 cargo fmt --all -- --check`: passed.
+- `node --check src/channels/web/static/app.js`: passed.
 - `git diff HEAD --check`: passed.
 
 Completed verification for the host-local lifecycle checkpoint:

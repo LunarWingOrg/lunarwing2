@@ -22,8 +22,8 @@ use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::McpTransport;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
-const MAX_WORKER_MCP_TOOLS: usize = 256;
-const MAX_WORKER_MCP_TOOL_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_WORKER_MCP_TOOLS: usize = 256;
+pub(crate) const MAX_WORKER_MCP_TOOL_BYTES: usize = 2 * 1024 * 1024;
 
 /// MCP client for communicating with MCP servers.
 ///
@@ -577,10 +577,12 @@ impl McpClient {
     }
 
     /// Create tools for an untrusted per-job worker runtime with bounded discovery.
-    pub(crate) async fn create_worker_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
+    pub(crate) async fn create_worker_tools(
+        &self,
+    ) -> Result<(Vec<Arc<dyn Tool>>, usize), ToolError> {
         let mcp_tools = self.list_tools().await?;
-        validate_worker_tools(&mcp_tools)?;
-        Ok(self.wrap_tools(mcp_tools))
+        let descriptor_bytes = validate_worker_tools(&mcp_tools)?;
+        Ok((self.wrap_tools(mcp_tools), descriptor_bytes))
     }
 
     fn wrap_tools(&self, mcp_tools: Vec<McpTool>) -> Vec<Arc<dyn Tool>> {
@@ -606,7 +608,7 @@ impl McpClient {
     }
 }
 
-fn validate_worker_tools(tools: &[McpTool]) -> Result<(), ToolError> {
+fn validate_worker_tools(tools: &[McpTool]) -> Result<usize, ToolError> {
     if tools.len() > MAX_WORKER_MCP_TOOLS {
         return Err(ToolError::ExternalService(format!(
             "worker MCP tool limit exceeded ({} discovered, max {MAX_WORKER_MCP_TOOLS})",
@@ -621,7 +623,7 @@ fn validate_worker_tools(tools: &[McpTool]) -> Result<(), ToolError> {
             "worker MCP tool descriptors exceed {MAX_WORKER_MCP_TOOL_BYTES} bytes"
         )));
     }
-    Ok(())
+    Ok(encoded.len())
 }
 
 /// Clone the client, resetting the tools cache and initialization state.

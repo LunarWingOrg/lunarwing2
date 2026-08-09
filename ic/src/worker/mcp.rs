@@ -8,7 +8,10 @@ use secrecy::SecretString;
 
 use crate::error::WorkerError;
 use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
-use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager};
+use crate::tools::mcp::{
+    MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS, McpClient, McpProcessManager,
+    McpSessionManager,
+};
 use crate::tools::{ApprovalRequirement, Tool, ToolRegistry};
 use crate::worker::api::McpCredentialResponse;
 
@@ -32,6 +35,9 @@ impl WorkerMcpRuntime {
         credentials: Vec<McpCredentialResponse>,
         owner_id: &str,
     ) -> Result<Self, WorkerError> {
+        if !servers.is_empty() {
+            require_sibling_process_isolation().await?;
+        }
         let mut credential_env = group_credentials(&servers, credentials)?;
         let sessions = Arc::new(McpSessionManager::new());
         let processes = Arc::new(McpProcessManager::new());
@@ -42,6 +48,7 @@ impl WorkerMcpRuntime {
             clients: Vec::new(),
             wrappers: Vec::new(),
         };
+        let mut descriptor_bytes = 0;
 
         for server in servers {
             let server_name = server.name.clone();
@@ -80,8 +87,8 @@ impl WorkerMcpRuntime {
                     });
                 }
             };
-            let wrappers = match discovery {
-                Ok(Ok(wrappers)) => wrappers,
+            let (wrappers, discovered_bytes) = match discovery {
+                Ok(Ok(discovery)) => discovery,
                 Ok(Err(error)) => {
                     let reason =
                         format!("worker MCP tool discovery failed for '{server_name}': {error}");
@@ -90,6 +97,17 @@ impl WorkerMcpRuntime {
                 Err(_) => {
                     let reason = format!("worker MCP startup timed out for '{server_name}'");
                     return Err(runtime.activation_failure(reason).await);
+                }
+            };
+            descriptor_bytes = match validate_aggregate_discovery(
+                runtime.wrappers.len(),
+                descriptor_bytes,
+                wrappers.len(),
+                discovered_bytes,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return Err(runtime.activation_failure(error).await);
                 }
             };
             if let Some(tool) = wrappers.iter().find(|tool| {
@@ -181,6 +199,57 @@ impl WorkerMcpRuntime {
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn require_sibling_process_isolation() -> Result<(), WorkerError> {
+    let scope = tokio::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
+        .await
+        .map_err(|error| WorkerError::ExecutionFailed {
+            reason: format!("worker-local MCP requires Linux Yama sibling isolation: {error}"),
+        })?;
+    if ptrace_scope_isolates_siblings(&scope) {
+        Ok(())
+    } else {
+        Err(WorkerError::ExecutionFailed {
+            reason: "worker-local MCP requires kernel.yama.ptrace_scope >= 1".to_string(),
+        })
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn require_sibling_process_isolation() -> Result<(), WorkerError> {
+    Err(WorkerError::ExecutionFailed {
+        reason: "worker-local MCP requires Linux Yama sibling isolation".to_string(),
+    })
+}
+
+fn ptrace_scope_isolates_siblings(value: &str) -> bool {
+    value.trim().parse::<u8>().is_ok_and(|scope| scope >= 1)
+}
+
+fn validate_aggregate_discovery(
+    current_tools: usize,
+    current_bytes: usize,
+    discovered_tools: usize,
+    discovered_bytes: usize,
+) -> Result<usize, String> {
+    let total_tools = current_tools
+        .checked_add(discovered_tools)
+        .filter(|total| *total <= MAX_WORKER_MCP_TOOLS)
+        .ok_or_else(|| {
+            format!("worker MCP aggregate tool limit exceeded (max {MAX_WORKER_MCP_TOOLS})")
+        })?;
+    let total_bytes = current_bytes
+        .checked_add(discovered_bytes)
+        .filter(|total| *total <= MAX_WORKER_MCP_TOOL_BYTES)
+        .ok_or_else(|| {
+            format!(
+                "worker MCP aggregate tool descriptors exceed {MAX_WORKER_MCP_TOOL_BYTES} bytes"
+            )
+        })?;
+    debug_assert!(total_tools <= MAX_WORKER_MCP_TOOLS);
+    Ok(total_bytes)
+}
+
 fn group_credentials(
     servers: &[McpServerConfig],
     credentials: Vec<McpCredentialResponse>,
@@ -270,6 +339,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(grouped["example"].len(), 1);
+    }
+
+    #[test]
+    fn aggregate_discovery_limits_span_all_servers() {
+        let bytes = validate_aggregate_discovery(128, 1024, 128, 1024).unwrap();
+        assert_eq!(bytes, 2048);
+        assert!(validate_aggregate_discovery(128, 0, 129, 0).is_err());
+        assert!(validate_aggregate_discovery(0, MAX_WORKER_MCP_TOOL_BYTES, 0, 1,).is_err());
+    }
+
+    #[test]
+    fn yama_scope_must_block_same_uid_siblings() {
+        assert!(!ptrace_scope_isolates_siblings("0\n"));
+        assert!(ptrace_scope_isolates_siblings("1\n"));
+        assert!(ptrace_scope_isolates_siblings("3"));
+        assert!(!ptrace_scope_isolates_siblings("unknown"));
     }
 
     #[tokio::test]

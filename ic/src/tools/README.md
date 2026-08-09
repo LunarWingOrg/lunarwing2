@@ -449,15 +449,16 @@ Worker startup initializes every client and discovers every tool before atomical
 registering wrappers in the per-job registry. Any startup error, tool-name conflict,
 approval requirement, autonomous-execution denial, or partial failure rejects the
 whole MCP snapshot and cleans up started runtimes. Stdio JSON-RPC frames are capped
-at 4 MiB; each server may expose at most 256 tools and 2 MiB of serialized tool
-descriptors. Older worker images receive
+at 4 MiB; the full job snapshot may expose at most 256 tools and 2 MiB of serialized
+tool descriptors. Older worker images receive
 `--require-worker-mcp` and fail rather than silently ignoring requested placement.
 
 MCP children receive a scrubbed environment without the worker bearer token. On
-Linux, the trusted worker parent also marks itself non-dumpable before any untrusted
-child starts, blocking same-UID reads of its token and credential memory through
-`/proc`, ptrace, and process-memory APIs. Failure to install this protection prevents
-worker startup.
+Linux, the trusted worker parent marks itself non-dumpable before any untrusted child
+starts. Worker MCP activation additionally requires Yama
+`kernel.yama.ptrace_scope >= 1`, blocking same-UID sibling MCP and shell processes
+from reading each other's environments or memory after `execve`. Failure to install
+parent protection or verify sibling isolation prevents worker startup.
 
 Before job completion, the worker unregisters exact wrappers, closes clients and
 sessions, and stops child processes with bounded waits. Cleanup failure makes the

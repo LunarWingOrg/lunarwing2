@@ -207,16 +207,17 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   conflicts, partial startup, tools requiring approval, or tools disallowing
   autonomous execution reject activation and clean up all partial runtime state.
   Stdio JSON-RPC frames are capped at 4 MiB; discovery is capped at 256 tools and
-  2 MiB of serialized descriptors per server.
+  2 MiB of serialized descriptors across the whole job snapshot.
 - Worker cleanup unregisters exact wrappers, closes clients and sessions, and stops
   all MCP child processes before reporting job completion. Cleanup failure changes
   the job result to failure. Older worker images reject MCP-required jobs through
   the `--require-worker-mcp` command contract instead of silently running without
   requested tools.
 - On Linux, the trusted worker parent sets itself non-dumpable before launching
-  untrusted children. Combined with scrubbed child environments, this prevents an
-  MCP or shell child running under the worker UID from reading bearer tokens and
-  resolved credential state through `/proc`, ptrace, or process-memory APIs.
+  untrusted children. Worker MCP activation also fails unless Yama
+  `kernel.yama.ptrace_scope >= 1`, which blocks same-UID sibling MCP and shell
+  processes from inspecting each other's environments or memory after `execve`.
+  Child environments remain scrubbed of the worker bearer token.
 - Prototype limit: initial activation and teardown are bounded, but there is no
   in-job MCP child restart supervisor. A later child failure surfaces through tool
   errors; job/container cancellation remains the final cleanup boundary.
@@ -354,4 +355,5 @@ resolved secret values are never retained as restart configuration.
 - 2026-08-09: explicit core Docker job-worker placement added with owner-scoped
   immutable snapshots, separate exact-cover credential grants, preinstalled/pinned
   stdio activation, atomic autonomous-tool registration, compatibility guard for old
-  worker images, and bounded fail-closed teardown.
+  worker images, bounded fail-closed teardown, authoritative completion/exit owner
+  routing, non-dumpable parent credentials, and required Yama sibling isolation.
