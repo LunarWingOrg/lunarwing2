@@ -1,12 +1,12 @@
-# AI Code Contribution Policy
+# LunarWing AI Code Contribution Policy
 
-## Effective August 15th, 2026, the following policy will be enforced for all contributions to this repository:
+## Effective September 15th, 2026, the following policy will be enforced for all contributions to this repository:
 
-### Last edited on Jul 26th 2026 to add one exception and extension.
+### Last edited on Aug 9th 2026 to add one exception, extension, and further clarifying details
 
 * Code produced by proprietary, closed-weight models — including but not limited to those accessed exclusively via vendor APIs where the model weights are not publicly available — will no longer be accepted. This includes code generated through services that do not provide downloadable, inspectable model weights.
 
-* Code produced by open-weight models (e.g., Qwen, DeepSeek, GLM, GPT-OSS, and similar models whose trained parameters are publicly released) will continue to be accepted. Contributions that disclose the model used are appreciated but not required.
+* Code produced by open-weight models - e.g., Qwen (3.5, 3.6, 3.8), DeepSeek, GLM, GPT-OSS, moonshot kimi (2.5, 2.6, and 3) llama variants, and similar models whose trained parameters are publicly released - will all continue to be accepted. Contributions that disclose the model used are appreciated but not required.
 
 * Contributors are responsible for ensuring their submissions comply with this policy. Maintainers may reject pull requests that are known to originate from closed-weight model output. When in doubt, ask before you submit.
 

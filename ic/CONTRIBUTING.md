@@ -21,23 +21,11 @@ cargo test --features integration                            # + PostgreSQL test
 
 ## Code Style
 
-- Zero clippy warnings policy
+- Zero clippy warnings policy (except for clearly defined exemptions)
 - No `.unwrap()` or `.expect()` in production code (tests are fine)
 - Use `thiserror` for error types, map errors with context
 - Prefer `crate::` for cross-module imports
 - Comments for non-obvious logic only
-
-See `CLAUDE.md` for full style guidelines.
-
-## Feature Parity Requirement
-
-When your change affects a tracked capability, update `FEATURE_PARITY.md` in the same branch.
-
-### Required before opening a PR
-
-1. Review the relevant parity rows in `FEATURE_PARITY.md`.
-2. Update status/notes if behavior changed.
-3. Include the `FEATURE_PARITY.md` diff in your commit when applicable.
 
 ## Review Tracks
 
@@ -51,10 +39,10 @@ All PRs follow a risk-based review process:
 
 Select the appropriate track in the PR template based on what your changes touch.
 
-## Database Changes
-
-LunarWing uses dual-backend persistence (PostgreSQL + libSQL). All new persistence features must support both backends. See `src/db/CLAUDE.md`.
-
 ## Adding Dependencies
 
 Run `cargo deny check` before adding new dependencies to verify license compatibility and check for known advisories.
+
+## AI code guidelines
+
+* See: `docs/guides/AI-CODE-CONTRIBUTION-POLICY.md` for details
