@@ -2746,22 +2746,6 @@ configure_gotify_capabilities() {
 
 # ── Pebble worker configuration ──────────────────────────────────────────────
 
-stop_tenant_kimi() {
-  local name="$1"
-  ensure_container_runtime
-
-  local container_name="lunarwing-kimi-$name"
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    _deregister_babysitter "$container_name"
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    say "kimi worker stopped ($container_name)"
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-    say "kimi worker stopped ($container_name)"
-  fi
-}
-
 # ── Pebble worker container ──────────────────────────────────────────────────
 
 # ── LunarVision OCR/vision sidecar ──────────────────────────────────────────
@@ -5573,106 +5557,6 @@ openrc_service_remove_runlevels() {
 
 # Stop both worker units and remove every boot path. Init scripts stay rendered
 # so an explicit start-worker can re-enable them without reprovisioning.
-openrc_worker_stop_disable() {
-  local name="$1" worker="$2" container svc
-  container="lunarwing-${worker}-${name}"
-  for svc in "${container}-sup" "$container"; do
-    if [[ -x "$OPENRC_INITD_DIR/$svc" ]]; then
-      rc-service "$svc" stop >/dev/null 2>&1 \
-        || { say "failed to stop OpenRC service $svc" >&2; return 1; }
-    fi
-    openrc_service_remove_runlevels "$svc" || return 1
-  done
-}
-
-start_worker() {
-  local prepared name worker
-  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
-  read -r name worker <<<"$prepared"
-  tenant_worker_enabled "$name" "$worker" \
-    || die "worker '$worker' is not enabled for tenant '$name'"
-  ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    ports_set_worker_desired_running "$name" "$worker" true
-  fi
-  "start_tenant_${worker}" "$name"
-}
-
-stop_worker() {
-  local prepared name worker container service
-  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
-  read -r name worker <<<"$prepared"
-  container="lunarwing-${worker}-${name}"
-  service="${container}.service"
-  ensure_container_runtime
-  ensure_init_system
-
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
-      && podman_supports_quadlet; then
-    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 \
-      || _ctr "$name" stop "$container" >/dev/null 2>&1 \
-      || die "failed to stop $service"
-  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    ports_set_worker_desired_running "$name" "$worker" false
-    openrc_worker_stop_disable "$name" "$worker" \
-      || die "failed to stop and disable OpenRC worker $worker for tenant '$name'"
-    if [[ ! -x "$OPENRC_INITD_DIR/$container" ]] \
-        && _ctr "$name" inspect "$container" &>/dev/null; then
-      _ctr "$name" stop "$container" >/dev/null 2>&1 \
-        || die "failed to stop container $container"
-    fi
-  elif _ctr "$name" inspect "$container" &>/dev/null; then
-    _ctr "$name" stop "$container" >/dev/null 2>&1 \
-      || die "failed to stop container $container"
-  fi
-  say "$worker worker stopped for $name"
-}
-
-kill_worker() {
-  local prepared name worker container service
-  prepared="$(prepare_worker_lifecycle "$1" "$2")" || return
-  read -r name worker <<<"$prepared"
-  container="lunarwing-${worker}-${name}"
-  service="${container}.service"
-  ensure_container_runtime
-  ensure_init_system
-
-  # Stop supervision before the zero-grace container stop. Otherwise
-  # Restart=on-failure/supervise-daemon can resurrect the worker immediately.
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
-      && podman_supports_quadlet; then
-    _systemctl_user "$name" stop --no-block "$service" >/dev/null 2>&1 || true
-  elif [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    ports_set_worker_desired_running "$name" "$worker" false
-    rc-service "${container}-sup" stop >/dev/null 2>&1 || true
-    openrc_service_remove_runlevels "${container}-sup" \
-      || die "failed to disable OpenRC supervisor ${container}-sup"
-    openrc_service_remove_runlevels "$container" \
-      || die "failed to disable OpenRC service $container"
-  fi
-
-  if _ctr "$name" inspect "$container" &>/dev/null; then
-    _ctr "$name" stop --time 0 "$container" >/dev/null 2>&1 \
-      || die "failed to kill container $container"
-  fi
-
-  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
-      && podman_supports_quadlet; then
-    _systemctl_user "$name" stop "$service" >/dev/null 2>&1 || true
-  elif [[ "$INIT_SYSTEM" == "openrc" && -x "$OPENRC_INITD_DIR/${container}" ]]; then
-    rc-service "$container" stop >/dev/null 2>&1 || true
-  fi
-  say "$worker worker killed and left stopped for $name"
-}
-
-restart_worker() {
-  stop_worker "$1" "$2"
-  start_worker "$1" "$2"
-}
-
-# Cargo builds can refresh tracked lockfiles in nested standalone crates. Restore
-# them only when they are the sole tracked changes; otherwise preserve everything
-# and fail. Untracked tenant runtime directories do not block checkout.
 prepare_tenant_checkout() {
   local name="$1" lw_root="$2" target_ref="$3"
   local tgit=(sudo -u "$name" git -c safe.directory="$lw_root" -C "$lw_root")
