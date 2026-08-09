@@ -125,10 +125,11 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 
 - Growing ecosystem of pre-built servers (GitHub, Notion, Postgres, etc.)
 - Any language (TypeScript/Python most common)
-- LunarWing transports: HTTP/HTTPS, stdio, and Unix domain sockets
-- Servers may maintain their own state or background work, but LunarWing currently
-  exposes MCP tools only; it does not expose resources, prompts, subscriptions, or
-  a WebSocket MCP transport
+- LunarWing transports: HTTP/HTTPS, stdio, Unix domain sockets, persistent WASM
+  components, and dedicated/shared gateways
+- The agent registry exposes MCP tools. The raw MCP-over-WASM actor ABI preserves
+  resources, prompts, notifications, cancellation messages, and subscriptions for
+  clients that invoke those methods; WebSocket transport is not implemented
 - Cost: host-local stdio is an external process with LunarWing service-account
   privileges; an opt-in per-server OS sandbox (below) can limit its filesystem,
   network, process, and resource reach, but raw credentials given to that
@@ -138,15 +139,67 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 
 | Area | Current behavior |
 |------|------------------|
-| Install | Registry CLI, `lunarwing mcp add`, conversational `tool_install`, authenticated web API, and browser MCP install form accept validated HTTP or structured stdio config. Install persists config but does not activate it. |
-| Activate/deactivate | `ExtensionManager` initializes clients, discovers tools, tracks exact tool ownership, and tears down transport/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated gateway when available, falls back to persisted state when unavailable, and accepts `--offline` to request persisted-only behavior explicitly. |
-| Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, but unchanged persisted intent is disabled until explicit activation. Inspect returned message and active status. |
-| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default. Persisted removal happens before active tool/runtime cleanup so a crash cannot restore stale intent; `--offline` is explicit persisted-only cleanup. |
-| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, and sandbox policy enforceability. |
-| Host sandboxing | Opt-in per stdio server: resource limits, core-dump control, process-group isolation with group teardown, plus Linux-only `no_new_privileges`, seccomp denial of ptrace/process_vm syscalls, Landlock read-only root with explicit writable paths, and user+network namespace network isolation. Enforcement fails closed at activation. |
-| Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
-| Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
-| Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Recovery uses isolated cancellable tasks, five-attempt circuit breaking, a 30-second stability window, jittered bounded backoff, all-or-none tool registration, and internal cleanup deadlines. Configurable per-server lifecycle timeout controls are not implemented. |
+| Install | `lunarwing mcp add` and the authenticated web API accept validated HTTP, stdio, Unix, WASM, and gateway config. Registry/conversational surfaces retain their manifest schemas; the browser form currently exposes HTTP and stdio. Install persists config but does not activate it. |
+| Activate/deactivate | `ExtensionManager` initializes clients through the runtime adapter registry, discovers tools, tracks exact ownership, and tears down runtime/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated LunarWing web gateway when available and accepts `--offline` for persisted-only behavior. |
+| Update | CLI `lunarwing mcp update` changes persisted config only and preserves existing WASM/gateway runtime-specific fields. Conversational and authenticated API updates attempt to restart an active server. Browser MCP panel has no update editor. |
+| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated LunarWing web gateway by default. Persisted removal happens before active cleanup; `--offline` is explicit persisted-only cleanup. |
+| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, WASM component canonicality/availability, and sandbox policy enforceability. |
+| Host sandboxing | Stdio supports an opt-in OS policy. MCP-over-WASM always uses minimal WASI with bounded artifact/message sizes, memory, replenished fuel, and epoch deadlines. |
+| Protocol surface | Tool discovery and tool calls are registered with the agent. The raw MCP-over-WASM ABI carries full JSON-RPC methods, including resources, prompts, notifications, cancellation messages, and subscriptions. WebSocket transport is not implemented. |
+| Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, and external dedicated/shared gateway placement are implemented. Generic worker-local MCP and a bundled gateway control-plane service are not implemented. |
+| Reliability | Explicit lifecycle cleanup and whole-runtime stdio crash recovery are implemented. WASM traps stop and discard the actor; per-message deadlines are configurable. General per-server startup/request/shutdown timeouts remain open. |
+
+#### MCP-over-WASM servers
+
+An MCP component exports `lunarwing:mcp/server@0.1.0` from
+`wit/mcp-server.wit`. LunarWing keeps one component instance for the active
+server and sends complete JSON-RPC envelopes to its `handle` export. The
+component receives no inherited environment, filesystem, network, standard
+streams, or credentials.
+
+The component path must be absolute, canonical, and not a symlink. Activation
+also requires a regular file no larger than 64 MiB. Defaults are 64 MiB memory,
+500 million fuel per message, a 60-second message deadline, and 4 MiB request
+and response envelopes:
+
+```bash
+lunarwing mcp add portable --transport wasm \
+  --component /opt/lunarwing/mcp/portable.wasm \
+  --wasm-memory-mb 96 \
+  --wasm-fuel 500000000 \
+  --wasm-timeout-seconds 30
+```
+
+The authenticated web install API accepts equivalent `component`, `memory_mb`,
+`fuel`, and `timeout_seconds` fields. A guest-reported MCP error preserves the
+actor; a Wasmtime trap discards it and requires explicit reactivation. Use the
+native invocation-scoped WASM tool ABI instead when an extension only needs one
+narrow tool.
+
+#### Dedicated and shared MCP gateways
+
+Gateway placement expects a separately deployed Streamable HTTP MCP gateway.
+Dedicated mode maps one endpoint to one server:
+
+```bash
+lunarwing mcp add hosted-tools https://gateway.example.com/mcp \
+  --transport gateway --gateway-mode dedicated
+```
+
+Shared mode requires a route selected by the gateway:
+
+```bash
+lunarwing mcp add project-tools https://gateway.example.com/mcp \
+  --transport gateway --gateway-mode shared \
+  --gateway-route project-tools
+```
+
+LunarWing owns `X-LunarWing-MCP-Gateway-Mode` and
+`X-LunarWing-MCP-Route`; configured headers cannot override them. OAuth,
+custom authorization headers, Streamable HTTP session IDs, retries, and session
+termination otherwise follow direct HTTP behavior. LunarWing supplies this
+routing contract but does not bundle the gateway service or its cross-daemon HA,
+tenant policy, and credential store.
 
 #### Host-local stdio MCP servers
 
