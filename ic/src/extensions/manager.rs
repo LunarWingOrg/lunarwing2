@@ -109,6 +109,7 @@ struct ActiveMcpServer {
     client: Arc<McpClient>,
     tools: Vec<Arc<dyn Tool>>,
     managed_stdio: bool,
+    managed_wasm: bool,
     generation: u64,
     health: McpRuntimeHealth,
     restart_attempts: u32,
@@ -495,12 +496,42 @@ impl ExtensionManager {
         }
     }
 
+    /// Stop supervision, unregister every MCP wrapper, and close all live runtimes.
+    pub async fn shutdown_mcp_runtimes(&self) {
+        self.shutdown_mcp_supervisor().await;
+        let runtimes = self
+            .active_mcp_servers
+            .write()
+            .await
+            .drain()
+            .collect::<Vec<_>>();
+        for (_, runtime) in &runtimes {
+            for tool in &runtime.tools {
+                self.tool_registry
+                    .unregister_if_same(tool.name(), tool)
+                    .await;
+            }
+        }
+        let shutdowns = runtimes.iter().map(|(name, runtime)| async move {
+            (
+                name,
+                self.shutdown_mcp_runtime(name, Some(runtime.client.as_ref()))
+                    .await,
+            )
+        });
+        for (name, result) in futures::future::join_all(shutdowns).await {
+            if let Err(error) = result {
+                tracing::warn!(server = %name, %error, "MCP runtime shutdown was incomplete");
+            }
+        }
+    }
+
     async fn supervise_mcp_runtimes_once(self: &Arc<Self>) {
         let candidates = {
             let runtimes = self.active_mcp_servers.read().await;
             runtimes
                 .iter()
-                .filter(|(_, runtime)| runtime.managed_stdio)
+                .filter(|(_, runtime)| runtime.managed_stdio || runtime.managed_wasm)
                 .map(|(name, runtime)| McpRecoveryCandidate {
                     name: name.clone(),
                     owner_id: runtime.owner_id.clone(),
@@ -803,6 +834,7 @@ impl ExtensionManager {
             return;
         }
         let managed_stdio = self.mcp_process_manager.get(&name).await.is_some();
+        let managed_wasm = !managed_stdio && client.runtime_is_wasm();
         let generation = self.next_mcp_runtime_generation();
         self.active_mcp_servers.write().await.insert(
             name,
@@ -811,6 +843,7 @@ impl ExtensionManager {
                 client,
                 tools,
                 managed_stdio,
+                managed_wasm,
                 generation,
                 health: McpRuntimeHealth::Healthy,
                 restart_attempts: 0,
@@ -1348,7 +1381,8 @@ impl ExtensionManager {
                             display_name,
                             description: server.description.clone(),
                             url: match server.effective_transport() {
-                                crate::tools::mcp::config::EffectiveTransport::Http => {
+                                crate::tools::mcp::config::EffectiveTransport::Http
+                                | crate::tools::mcp::config::EffectiveTransport::Gateway { .. } => {
                                     Some(server.url.clone())
                                 }
                                 _ => None,
@@ -1362,6 +1396,12 @@ impl ExtensionManager {
                                     crate::tools::mcp::config::EffectiveTransport::Unix {
                                         ..
                                     } => "unix",
+                                    crate::tools::mcp::config::EffectiveTransport::Wasm {
+                                        ..
+                                    } => "wasm",
+                                    crate::tools::mcp::config::EffectiveTransport::Gateway {
+                                        ..
+                                    } => "gateway",
                                 }
                                 .to_string(),
                             ),
@@ -1375,6 +1415,7 @@ impl ExtensionManager {
                             authenticated: !matches!(
                                 server.effective_transport(),
                                 crate::tools::mcp::config::EffectiveTransport::Http
+                                    | crate::tools::mcp::config::EffectiveTransport::Gateway { .. }
                             ) || authenticated,
                             active,
                             recovering,
@@ -2120,6 +2161,7 @@ impl ExtensionManager {
                     && matches!(
                         server.effective_transport(),
                         crate::tools::mcp::config::EffectiveTransport::Stdio { .. }
+                            | crate::tools::mcp::config::EffectiveTransport::Wasm { .. }
                     ) =>
             {
                 server
@@ -2145,7 +2187,7 @@ impl ExtensionManager {
             let Some(runtime) = runtimes.get(&candidate.name).filter(|runtime| {
                 runtime.owner_id == candidate.owner_id
                     && runtime.generation == candidate.generation
-                    && runtime.managed_stdio
+                    && (runtime.managed_stdio || runtime.managed_wasm)
             }) else {
                 return McpRecoveryClaim::Skip;
             };
@@ -2162,19 +2204,8 @@ impl ExtensionManager {
                 }
             }
             McpRuntimeHealth::Healthy => {
-                match self.mcp_process_manager.state(&candidate.name).await {
-                    Ok(crate::tools::mcp::McpProcessState::Running) => {
-                        return McpRecoveryClaim::Skip;
-                    }
-                    Ok(crate::tools::mcp::McpProcessState::StdioClosed) => {
-                        tracing::warn!(server = %candidate.name, "Host-local MCP server stdio closed unexpectedly");
-                    }
-                    Ok(crate::tools::mcp::McpProcessState::Exited(status)) => {
-                        tracing::warn!(server = %candidate.name, %status, "Host-local MCP server exited unexpectedly");
-                    }
-                    Ok(crate::tools::mcp::McpProcessState::Missing) | Err(_) => {
-                        tracing::warn!(server = %candidate.name, "Host-local MCP server runtime is missing");
-                    }
+                if !self.mcp_runtime_needs_recovery(candidate).await {
+                    return McpRecoveryClaim::Skip;
                 }
             }
         }
@@ -2213,6 +2244,41 @@ impl ExtensionManager {
         runtime.restart_attempts = attempts;
         runtime.health = McpRuntimeHealth::Recovering;
         McpRecoveryClaim::Recover(dead_tools)
+    }
+
+    async fn mcp_runtime_needs_recovery(&self, candidate: &McpRecoveryCandidate) -> bool {
+        let (managed_stdio, client) = {
+            let runtimes = self.active_mcp_servers.read().await;
+            let Some(runtime) = runtimes.get(&candidate.name).filter(|runtime| {
+                runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+            }) else {
+                return false;
+            };
+            (runtime.managed_stdio, Arc::clone(&runtime.client))
+        };
+        if !managed_stdio {
+            let failed = !client.runtime_is_healthy();
+            if failed {
+                tracing::warn!(server = %candidate.name, "Host-local WASM MCP runtime trapped");
+            }
+            return failed;
+        }
+
+        match self.mcp_process_manager.state(&candidate.name).await {
+            Ok(crate::tools::mcp::McpProcessState::Running) => false,
+            Ok(crate::tools::mcp::McpProcessState::StdioClosed) => {
+                tracing::warn!(server = %candidate.name, "Host-local MCP server stdio closed unexpectedly");
+                true
+            }
+            Ok(crate::tools::mcp::McpProcessState::Exited(status)) => {
+                tracing::warn!(server = %candidate.name, %status, "Host-local MCP server exited unexpectedly");
+                true
+            }
+            Ok(crate::tools::mcp::McpProcessState::Missing) | Err(_) => {
+                tracing::warn!(server = %candidate.name, "Host-local MCP server runtime is missing");
+                true
+            }
+        }
     }
 
     async fn apply_mcp_recovery_claim(&self, candidate: &McpRecoveryCandidate) -> bool {
@@ -2692,6 +2758,8 @@ impl ExtensionManager {
             crate::tools::mcp::config::EffectiveTransport::Http => "HTTP",
             crate::tools::mcp::config::EffectiveTransport::Stdio { .. } => "stdio",
             crate::tools::mcp::config::EffectiveTransport::Unix { .. } => "Unix socket",
+            crate::tools::mcp::config::EffectiveTransport::Wasm { .. } => "WASM actor",
+            crate::tools::mcp::config::EffectiveTransport::Gateway { .. } => "gateway",
         };
 
         self.add_mcp_server(config, user_id)
@@ -3184,6 +3252,7 @@ impl ExtensionManager {
         if !matches!(
             server.effective_transport(),
             crate::tools::mcp::config::EffectiveTransport::Http
+                | crate::tools::mcp::config::EffectiveTransport::Gateway { .. }
         ) {
             return Ok(AuthResult::no_auth_required(name, ExtensionKind::McpServer));
         }
@@ -4360,6 +4429,10 @@ impl ExtensionManager {
             server.effective_transport(),
             crate::tools::mcp::config::EffectiveTransport::Stdio { .. }
         );
+        let managed_wasm = matches!(
+            server.effective_transport(),
+            crate::tools::mcp::config::EffectiveTransport::Wasm { .. }
+        );
         let prepared = self.prepare_mcp_runtime(name, user_id, server).await?;
         if let Err(conflicts) = self
             .tool_registry
@@ -4387,6 +4460,7 @@ impl ExtensionManager {
                 client: prepared.client,
                 tools: prepared.tools,
                 managed_stdio,
+                managed_wasm,
                 generation,
                 health: McpRuntimeHealth::Healthy,
                 restart_attempts: 0,
@@ -6005,6 +6079,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
@@ -6012,12 +6087,51 @@ mod tests {
     use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
     use crate::extensions::manager::{
-        FallbackDecision, McpRuntimeHealth, build_wasm_channel_runtime_config_updates,
-        combine_install_errors, fallback_decision, infer_kind_from_url, join_or_abort_tasks,
-        normalize_hosted_callback_url,
+        ActiveMcpServer, FallbackDecision, McpRecoveryCandidate, McpRecoveryClaim,
+        McpRuntimeHealth, build_wasm_channel_runtime_config_updates, combine_install_errors,
+        fallback_decision, infer_kind_from_url, join_or_abort_tasks, normalize_hosted_callback_url,
     };
     use crate::extensions::{ExtensionError, ExtensionKind, ExtensionSource, InstallResult};
     use crate::tools::{Tool, ToolError, ToolOutput};
+
+    struct UnhealthyMcpTransport;
+
+    #[async_trait]
+    impl crate::tools::mcp::McpTransport for UnhealthyMcpTransport {
+        async fn send(
+            &self,
+            _request: &crate::tools::mcp::McpRequest,
+            _headers: &HashMap<String, String>,
+        ) -> Result<crate::tools::mcp::McpResponse, ToolError> {
+            Err(ToolError::ExternalService("runtime trapped".to_string()))
+        }
+
+        async fn shutdown(&self) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn is_healthy(&self) -> bool {
+            false
+        }
+    }
+
+    struct ShutdownTrackingMcpTransport(Arc<AtomicBool>);
+
+    #[async_trait]
+    impl crate::tools::mcp::McpTransport for ShutdownTrackingMcpTransport {
+        async fn send(
+            &self,
+            _request: &crate::tools::mcp::McpRequest,
+            _headers: &HashMap<String, String>,
+        ) -> Result<crate::tools::mcp::McpResponse, ToolError> {
+            Err(ToolError::ExternalService("not used".to_string()))
+        }
+
+        async fn shutdown(&self) -> Result<(), ToolError> {
+            self.0.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
 
     struct NamedTestTool {
         name: String,
@@ -6442,6 +6556,88 @@ done
         tools_dir: std::path::PathBuf,
     ) -> crate::extensions::manager::ExtensionManager {
         make_test_manager_with_dirs(wasm_runtime, tools_dir.clone(), tools_dir, None)
+    }
+
+    #[tokio::test]
+    async fn trapped_wasm_mcp_runtime_is_claimed_for_recovery() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manager = make_test_manager(None, dir.path().to_path_buf());
+        let config = crate::tools::mcp::McpServerConfig::new_wasm(
+            "portable",
+            "/opt/lunarwing/portable.wasm",
+        );
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "portable",
+            Arc::new(UnhealthyMcpTransport),
+            None,
+            None,
+            "test",
+            Some(config),
+        ));
+        let generation = manager.next_mcp_runtime_generation();
+        manager.active_mcp_servers.write().await.insert(
+            "portable".to_string(),
+            ActiveMcpServer {
+                owner_id: "test".to_string(),
+                client,
+                tools: vec![],
+                managed_stdio: false,
+                managed_wasm: true,
+                generation,
+                health: McpRuntimeHealth::Healthy,
+                restart_attempts: 0,
+                healthy_since: Instant::now(),
+                retry_after: None,
+            },
+        );
+        let claim = manager
+            .claim_mcp_recovery(&McpRecoveryCandidate {
+                name: "portable".to_string(),
+                owner_id: "test".to_string(),
+                generation,
+            })
+            .await;
+
+        assert!(matches!(claim, McpRecoveryClaim::Recover(_)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_and_removes_active_wasm_mcp_runtime() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let manager = make_test_manager(None, dir.path().to_path_buf());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let config = crate::tools::mcp::McpServerConfig::new_wasm(
+            "portable",
+            "/opt/lunarwing/portable.wasm",
+        );
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "portable",
+            Arc::new(ShutdownTrackingMcpTransport(Arc::clone(&stopped))),
+            None,
+            None,
+            "test",
+            Some(config),
+        ));
+        manager.active_mcp_servers.write().await.insert(
+            "portable".to_string(),
+            ActiveMcpServer {
+                owner_id: "test".to_string(),
+                client,
+                tools: vec![],
+                managed_stdio: false,
+                managed_wasm: true,
+                generation: manager.next_mcp_runtime_generation(),
+                health: McpRuntimeHealth::Healthy,
+                restart_attempts: 0,
+                healthy_since: Instant::now(),
+                retry_after: None,
+            },
+        );
+
+        manager.shutdown_mcp_runtimes().await;
+
+        assert!(stopped.load(Ordering::Acquire));
+        assert!(manager.active_mcp_servers.read().await.is_empty());
     }
 
     fn write_test_tool(

@@ -252,6 +252,21 @@ impl McpClient {
         self.session_manager.is_some()
     }
 
+    /// Whether the underlying persistent runtime can still accept requests.
+    pub(crate) fn runtime_is_healthy(&self) -> bool {
+        self.transport.is_healthy()
+    }
+
+    /// Whether this client owns an in-process MCP-over-WASM actor.
+    pub(crate) fn runtime_is_wasm(&self) -> bool {
+        self.server_config.as_ref().is_some_and(|config| {
+            matches!(
+                config.effective_transport(),
+                crate::tools::mcp::config::EffectiveTransport::Wasm { .. }
+            )
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn owner_user_id(&self) -> &str {
         &self.user_id

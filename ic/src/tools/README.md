@@ -125,10 +125,11 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 
 - Growing ecosystem of pre-built servers (GitHub, Notion, Postgres, etc.)
 - Any language (TypeScript/Python most common)
-- LunarWing transports: HTTP/HTTPS, stdio, and Unix domain sockets
-- Servers may maintain their own state or background work, but LunarWing currently
-  exposes MCP tools only; it does not expose resources, prompts, subscriptions, or
-  a WebSocket MCP transport
+- LunarWing transports: HTTP/HTTPS, stdio, Unix domain sockets, persistent WASM
+  components, and dedicated/shared gateways
+- The agent registry exposes MCP tools. The raw MCP-over-WASM actor ABI preserves
+  resources, prompts, notifications, cancellation messages, and subscriptions for
+  clients that invoke those methods; WebSocket transport is not implemented
 - Cost: host-local stdio is an external process with LunarWing service-account
   privileges; an opt-in per-server OS sandbox (below) can limit its filesystem,
   network, process, and resource reach, but raw credentials given to that
@@ -138,15 +139,69 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 
 | Area | Current behavior |
 |------|------------------|
-| Install | Registry CLI, `lunarwing mcp add`, conversational `tool_install`, authenticated web API, and browser MCP install form accept validated HTTP or structured stdio config. Install persists config but does not activate it. |
-| Activate/deactivate | `ExtensionManager` initializes clients, discovers tools, tracks exact tool ownership, and tears down transport/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated gateway when available, falls back to persisted state when unavailable, and accepts `--offline` to request persisted-only behavior explicitly. |
-| Update | CLI `lunarwing mcp update` changes persisted config only. Conversational `tool_update` always requires approval and attempts to restart an active server. Authenticated `POST /api/extensions/{name}/update` also attempts the restart immediately; browser MCP panel has no update editor. Config remains updated if reactivation fails, but unchanged persisted intent is disabled until explicit activation. Inspect returned message and active status. |
-| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated gateway by default. Persisted removal happens before active tool/runtime cleanup so a crash cannot restore stale intent; `--offline` is explicit persisted-only cleanup. |
-| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, and sandbox policy enforceability. |
-| Host sandboxing | Opt-in per stdio server: resource limits, core-dump control, process-group isolation with group teardown, plus Linux-only `no_new_privileges`, seccomp denial of ptrace/process_vm syscalls, Landlock read-only root with explicit writable paths, and user+network namespace network isolation. Enforcement fails closed at activation. |
-| Protocol surface | Tool discovery and tool calls are implemented. General MCP resources, prompts, subscriptions, sampling, elicitation, and WebSocket transport are not implemented. |
-| Runtime placement | Host-local and remote MCP are implemented. Generic worker-local MCP, MCP-over-WASM, and a dedicated shared MCP gateway are not implemented. |
-| Reliability | Explicit activate/deactivate/update/remove cleanup and whole-runtime host-local stdio crash recovery are implemented. Recovery uses isolated cancellable tasks, five-attempt circuit breaking, a 30-second stability window, jittered bounded backoff, all-or-none tool registration, and internal cleanup deadlines. Configurable per-server lifecycle timeout controls are not implemented. |
+| Install | `lunarwing mcp add`, conversational `tool_install`, and the authenticated web API accept validated HTTP, stdio, WASM, and gateway config; CLI/web also retain Unix support. Registry manifests retain their existing schema; the browser form currently exposes HTTP and stdio. Install persists config but does not activate it. |
+| Activate/deactivate | `ExtensionManager` initializes clients through the runtime adapter registry, discovers tools, tracks exact ownership, and tears down runtime/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated LunarWing web gateway when available and accepts `--offline` for persisted-only behavior. |
+| Update | CLI `lunarwing mcp update` changes persisted config only and preserves existing WASM/gateway runtime-specific fields. Conversational and authenticated API updates attempt to restart an active server. Browser MCP panel has no update editor. |
+| Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated LunarWing web gateway by default. Persisted removal happens before active cleanup; `--offline` is explicit persisted-only cleanup. |
+| Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, WASM component canonicality/availability, and sandbox policy enforceability. |
+| Host sandboxing | Stdio supports an opt-in OS policy. MCP-over-WASM exposes no WASI or host imports and bounds artifact/message sizes, memory, replenished fuel, and epoch deadlines. |
+| Protocol surface | Tool discovery and tool calls are registered with the agent. The raw MCP-over-WASM ABI carries full JSON-RPC methods, including resources, prompts, notifications, cancellation messages, and subscriptions. WebSocket transport is not implemented. |
+| Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, and external dedicated/shared gateway placement are implemented. Generic worker-local MCP and a bundled gateway control-plane service are not implemented. |
+| Reliability | Explicit lifecycle cleanup and whole-runtime stdio/WASM crash recovery are implemented. WASM traps stop and discard the actor before manager reconstruction; per-message deadlines and shutdown bounds are enforced. General configurable startup/request timeouts remain open. |
+
+#### MCP-over-WASM servers
+
+An MCP component exports `lunarwing:mcp/server@0.1.0` from
+`wit/mcp-server.wit`. LunarWing keeps one component instance for the active
+server and sends complete JSON-RPC envelopes to its `handle` export. The
+component receives no inherited environment, filesystem, network, standard
+streams, or credentials.
+
+The component path must be absolute and its final entry cannot be a symlink.
+Activation uses one bounded file handle and requires a regular file no larger than
+64 MiB. Defaults are 64 MiB memory,
+500 million fuel per message, a 60-second message deadline, and 4 MiB request
+and response envelopes:
+
+```bash
+lunarwing mcp add portable --transport wasm \
+  --component /opt/lunarwing/mcp/portable.wasm \
+  --wasm-memory-mb 96 \
+  --wasm-fuel 500000000 \
+  --wasm-timeout-seconds 30
+```
+
+The authenticated web install API accepts equivalent `component`, `memory_mb`,
+`fuel`, and `timeout_seconds` fields. A guest-reported MCP error preserves the
+actor; a Wasmtime trap discards it, removes dead wrappers, and triggers bounded
+manager recovery from current persisted intent. Use the
+native invocation-scoped WASM tool ABI instead when an extension only needs one
+narrow tool.
+
+#### Dedicated and shared MCP gateways
+
+Gateway placement expects a separately deployed Streamable HTTP MCP gateway.
+Dedicated mode maps one endpoint to one server:
+
+```bash
+lunarwing mcp add hosted-tools https://gateway.example.com/mcp \
+  --transport gateway --gateway-mode dedicated
+```
+
+Shared mode requires a route selected by the gateway:
+
+```bash
+lunarwing mcp add project-tools https://gateway.example.com/mcp \
+  --transport gateway --gateway-mode shared \
+  --gateway-route project-tools
+```
+
+LunarWing owns `X-LunarWing-MCP-Gateway-Mode` and
+`X-LunarWing-MCP-Route`; configured headers cannot override them. OAuth,
+custom authorization headers, Streamable HTTP session IDs, retries, and session
+termination otherwise follow direct HTTP behavior. LunarWing supplies this
+routing contract but does not bundle the gateway service or its cross-daemon HA,
+tenant policy, and credential store.
 
 #### Host-local stdio MCP servers
 
@@ -197,15 +252,17 @@ the same OS privileges; use WASM tools when host-side credential injection is
 required. When `env_secrets` is non-empty, LunarWing suppresses raw MCP child
 stderr content to avoid copying an accidentally printed secret into daemon logs.
 
-If an active managed stdio child exits unexpectedly, `ExtensionManager` removes its
-dead wrappers, re-reads the owner's enabled config, resolves secret references again,
+If an active managed stdio child exits or an MCP-over-WASM actor traps,
+`ExtensionManager` removes its dead wrappers, re-reads the owner's enabled config,
 starts and initializes a fresh client, rediscovers tools, and atomically registers the
-replacement wrappers. Each server recovers in its own cancellable task. Five unstable
+replacement wrappers. Stdio secret references resolve again. Each server recovers in
+its own cancellable task. Five unstable
 restart attempts use jittered exponential backoff; 30 healthy seconds reset the
 attempt window. Further failure opens a visible circuit and requires explicit
 activation instead of restart-storming. Disable, update, remove, and application
 shutdown cancel and serialize with recovery so they cannot resurrect the old runtime.
-Recovery and child cleanup have internal deadlines. This supervision does not install
+Daemon shutdown drains every active MCP client/actor and managed child. Recovery and
+runtime cleanup have internal deadlines. This supervision does not install
 missing commands or packages; initial activation still fails explicitly when the
 configured executable or required secret is unavailable.
 
@@ -295,7 +352,7 @@ configured stdio command directly and assumes an operator already installed it.
 The MCP registry records command, arguments, and environment configuration; it
 does not download, sign, upgrade, or roll back Node/Python packages.
 
-Package provenance **is implemented** for host-local stdio servers as an
+Package provenance **is implemented** for host-local stdio and WASM servers as an
 operator-driven pinning flow:
 
 ```bash
@@ -307,24 +364,23 @@ lunarwing mcp revoke local-files # block activation + disable
 lunarwing mcp unpin local-files  # back to unverified legacy behavior
 ```
 
-`mcp pin` resolves the configured command exactly as activation would (explicit
-path or `PATH` search), records its SHA-256 digest plus the optional package
+`mcp pin` resolves the configured command (explicit path or `PATH` search) or WASM
+component, records its SHA-256 digest plus the optional package
 identity (canonical id, ecosystem, immutable version, source, publisher), and
 marks the server `pinned`. Every later activation — startup, manual activation,
-and crash recovery alike — re-hashes the resolved executable and **fails
-closed** on mismatch, so a silently replaced or upgraded binary cannot start
+and crash recovery alike — re-hashes the selected artifact and **fails closed** on
+mismatch, so silently replaced or upgraded code cannot start
 until the operator re-pins. `mcp revoke` records `revoked` trust (blocking
 activation for any transport) and disables the server; a revoked server stays
 blocked until it is re-pinned or unpinned. Servers without a provenance record
-keep the legacy unverified behavior. `mcp update` retains the record for stdio
-servers; switching transports drops the digest. Web and conversational update
+keep the legacy unverified behavior. `mcp update` retains the matching record for
+stdio and WASM servers; switching runtime types drops the digest. Web and conversational update
 requests do not carry provenance and reset the record — re-pin after using
 them.
 
 What this does not yet cover: publisher signatures and trusted signing keys,
 locked dependency graphs, upgrade diffs, marketplace trust roots, and
-compromised-publisher revocation distribution. WASM artifact checksums remain
-separate from stdio executable digests.
+compromised-publisher revocation distribution.
 
 Safe automatic installation would improve usability: one-command installs, exact
 version selection, reproducible tenants, and managed upgrades/rollback. It also
