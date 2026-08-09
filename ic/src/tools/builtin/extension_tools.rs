@@ -613,8 +613,32 @@ impl ToolUpdateTool {
                     .unwrap_or(&existing.url);
                 Ok(McpServerConfig::new(&existing.name, url))
             }
+            Some("wasm")
+                if matches!(
+                    existing.effective_transport(),
+                    EffectiveTransport::Wasm { .. }
+                ) =>
+            {
+                Ok(existing.clone())
+            }
+            Some("gateway")
+                if matches!(
+                    existing.effective_transport(),
+                    EffectiveTransport::Gateway { .. }
+                ) =>
+            {
+                let mut updated = existing.clone();
+                if let Some(url) = params
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                {
+                    updated.url = url.to_string();
+                }
+                Ok(updated)
+            }
             Some(other) => Err(ToolError::InvalidParameters(format!(
-                "Unsupported MCP transport '{other}'"
+                "Unsupported or incomplete MCP transport '{other}'"
             ))),
             None => match existing.effective_transport() {
                 EffectiveTransport::Stdio {
@@ -656,6 +680,18 @@ impl ToolUpdateTool {
                 EffectiveTransport::Unix { socket_path } => {
                     Ok(McpServerConfig::new_unix(&existing.name, socket_path))
                 }
+                EffectiveTransport::Wasm { .. } => Ok(existing.clone()),
+                EffectiveTransport::Gateway { .. } => {
+                    let mut updated = existing.clone();
+                    if let Some(url) = params
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                    {
+                        updated.url = url.to_string();
+                    }
+                    Ok(updated)
+                }
             },
         }
     }
@@ -683,12 +719,12 @@ impl Tool for ToolUpdateTool {
                 },
                 "transport": {
                     "type": "string",
-                    "enum": ["http", "stdio"],
-                    "description": "New transport type. If omitted, keeps the existing transport."
+                    "enum": ["http", "stdio", "wasm", "gateway"],
+                    "description": "New transport type. WASM and gateway values preserve their existing runtime-specific settings."
                 },
                 "url": {
                     "type": "string",
-                    "description": "New URL (http transport)"
+                    "description": "New URL (HTTP or gateway transport)"
                 },
                 "command": {
                     "type": "string",
