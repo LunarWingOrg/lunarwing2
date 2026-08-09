@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
+    McpGatewayMode, McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
@@ -69,7 +69,7 @@ pub struct McpAddArgs {
     /// Server URL (e.g., "https://mcp.notion.com") -- required for http transport
     pub url: Option<String>,
 
-    /// Transport type: http (default), stdio, unix
+    /// Transport type: http (default), stdio, unix, wasm, gateway
     #[arg(long, default_value = "http")]
     pub transport: String,
 
@@ -92,6 +92,30 @@ pub struct McpAddArgs {
     /// Unix socket path (unix transport)
     #[arg(long)]
     pub socket: Option<String>,
+
+    /// Absolute component path (wasm transport)
+    #[arg(long, value_name = "PATH")]
+    pub component: Option<std::path::PathBuf>,
+
+    /// WASM actor memory limit in MiB
+    #[arg(long, value_name = "MIB")]
+    pub wasm_memory_mb: Option<u64>,
+
+    /// WASM actor fuel replenished for every MCP message
+    #[arg(long, value_name = "COUNT")]
+    pub wasm_fuel: Option<u64>,
+
+    /// WASM actor wall-clock deadline per MCP message
+    #[arg(long, value_name = "SECONDS")]
+    pub wasm_timeout_seconds: Option<u64>,
+
+    /// Gateway deployment mode: dedicated or shared
+    #[arg(long, value_name = "MODE")]
+    pub gateway_mode: Option<String>,
+
+    /// Upstream route name (required for a shared gateway)
+    #[arg(long, value_name = "ROUTE")]
+    pub gateway_route: Option<String>,
 
     /// Custom HTTP headers (KEY:VALUE format, can be repeated)
     #[arg(long = "header", value_parser = parse_header)]
@@ -170,10 +194,10 @@ pub struct McpUpdateArgs {
     /// Server name to update
     pub name: String,
 
-    /// New server URL (http transport)
+    /// New server URL (HTTP or gateway transport)
     pub url: Option<String>,
 
-    /// Transport type: http, stdio. If omitted, keeps existing transport.
+    /// Transport type. If omitted, keeps the existing transport.
     #[arg(long)]
     pub transport: Option<String>,
 
@@ -427,148 +451,164 @@ async fn add_server(
     config_path: Option<&Path>,
     no_db: bool,
 ) -> anyhow::Result<()> {
-    let sandbox_policy = build_sandbox_from_add_args(&args)?;
-
-    let McpAddArgs {
-        name,
-        url,
-        transport,
-        command,
-        cmd_args,
-        env,
-        secret_env,
-        socket,
-        headers,
-        client_id,
-        auth_url,
-        token_url,
-        scopes,
-        description,
-        ..
-    } = args;
-
-    let transport_lower = transport.to_lowercase();
-    if transport_lower != "stdio" && !secret_env.is_empty() {
-        anyhow::bail!("--secret-env is only supported with stdio transport");
-    }
-    if sandbox_policy.is_some() && transport_lower != "stdio" {
-        anyhow::bail!("sandbox options are only supported with stdio transport");
-    }
-
-    let mut config = match transport_lower.as_str() {
-        "stdio" => {
-            let cmd = command
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--command is required for stdio transport"))?;
-            let env_map: HashMap<String, String> = env.into_iter().collect();
-            let secret_env_map: HashMap<String, String> = secret_env.into_iter().collect();
-            McpServerConfig::new_stdio_with_secrets(
-                &name,
-                &cmd,
-                cmd_args.clone(),
-                env_map,
-                secret_env_map,
-            )
-        }
-        "unix" => {
-            let socket_path = socket
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--socket is required for unix transport"))?;
-            McpServerConfig::new_unix(&name, &socket_path)
-        }
-        "http" => {
-            let url_val = url
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("URL is required for http transport"))?;
-            McpServerConfig::new(&name, url_val)
-        }
-        other => {
-            anyhow::bail!(
-                "Unknown transport type '{}'. Supported: http, stdio, unix",
-                other
-            );
-        }
-    };
-
-    // Apply headers if any
-    if !headers.is_empty() {
-        let headers_map: HashMap<String, String> = headers.into_iter().collect();
-        config = config.with_headers(headers_map);
-    }
-
-    if let Some(desc) = description {
-        config = config.with_description(desc);
-    }
-
-    if let Some(sandbox) = sandbox_policy {
-        config = config.with_sandbox(sandbox);
-    }
-
-    // Track if auth is required
-    let requires_auth = client_id.is_some();
-
+    let sandbox = build_sandbox_from_add_args(&args)?;
+    validate_add_runtime_options(&args, sandbox.as_ref())?;
+    let config = apply_add_metadata(build_add_transport(&args)?, &args, sandbox)?;
     let sandbox_summary = config
         .sandbox
         .as_ref()
         .map(crate::tools::mcp::sandbox::McpSandboxConfig::describe);
+    persist_server_with_path(config, true, config_path, no_db).await?;
+    print_add_summary(&args, sandbox_summary.as_deref());
+    Ok(())
+}
 
-    // Set up OAuth if client_id is provided (HTTP transport only)
-    if let Some(client_id) = client_id {
-        if transport_lower != "http" {
-            anyhow::bail!("OAuth authentication is only supported with http transport");
+fn validate_add_runtime_options(
+    args: &McpAddArgs,
+    sandbox: Option<&McpSandboxConfig>,
+) -> anyhow::Result<()> {
+    let transport = args.transport.to_ascii_lowercase();
+    if transport != "stdio" && !args.secret_env.is_empty() {
+        anyhow::bail!("--secret-env is only supported with stdio transport");
+    }
+    if sandbox.is_some() && transport != "stdio" {
+        anyhow::bail!("sandbox options are only supported with stdio transport");
+    }
+    if args.client_id.is_some() && !matches!(transport.as_str(), "http" | "gateway") {
+        anyhow::bail!("OAuth authentication is only supported with http or gateway transport");
+    }
+    Ok(())
+}
+
+fn build_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
+    match args.transport.to_ascii_lowercase().as_str() {
+        "stdio" => {
+            let command = args
+                .command
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--command is required for stdio transport"))?;
+            Ok(McpServerConfig::new_stdio_with_secrets(
+                &args.name,
+                command,
+                args.cmd_args.clone(),
+                args.env.iter().cloned().collect(),
+                args.secret_env.iter().cloned().collect(),
+            ))
         }
+        "unix" => args
+            .socket
+            .as_deref()
+            .map(|socket| McpServerConfig::new_unix(&args.name, socket))
+            .ok_or_else(|| anyhow::anyhow!("--socket is required for unix transport")),
+        "http" => args
+            .url
+            .as_deref()
+            .map(|url| McpServerConfig::new(&args.name, url))
+            .ok_or_else(|| anyhow::anyhow!("URL is required for http transport")),
+        "wasm" => build_wasm_add_transport(args),
+        "gateway" => build_gateway_add_transport(args),
+        other => anyhow::bail!(
+            "Unknown transport type '{other}'. Supported: http, stdio, unix, wasm, gateway"
+        ),
+    }
+}
 
+fn build_wasm_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
+    let path = args
+        .component
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--component is required for wasm transport"))?;
+    Ok(
+        McpServerConfig::new_wasm(&args.name, path).with_wasm_limits(
+            args.wasm_memory_mb.unwrap_or(64),
+            args.wasm_fuel
+                .unwrap_or(crate::tools::wasm::DEFAULT_FUEL_LIMIT),
+            args.wasm_timeout_seconds.unwrap_or(60),
+        ),
+    )
+}
+
+fn build_gateway_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
+    let endpoint = args
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("URL is required for gateway transport"))?;
+    let mode = match args.gateway_mode.as_deref().unwrap_or("dedicated") {
+        "dedicated" => McpGatewayMode::Dedicated,
+        "shared" => McpGatewayMode::Shared,
+        other => anyhow::bail!("Unknown gateway mode '{other}'. Supported: dedicated, shared"),
+    };
+    Ok(McpServerConfig::new_gateway(
+        &args.name,
+        endpoint,
+        mode,
+        args.gateway_route.clone(),
+    ))
+}
+
+fn apply_add_metadata(
+    mut config: McpServerConfig,
+    args: &McpAddArgs,
+    sandbox: Option<McpSandboxConfig>,
+) -> anyhow::Result<McpServerConfig> {
+    if !args.headers.is_empty() {
+        config = config.with_headers(args.headers.iter().cloned().collect());
+    }
+    if let Some(description) = &args.description {
+        config = config.with_description(description);
+    }
+    if let Some(sandbox) = sandbox {
+        config = config.with_sandbox(sandbox);
+    }
+    if let Some(client_id) = &args.client_id {
         let mut oauth = OAuthConfig::new(client_id);
-
-        if let (Some(auth), Some(token)) = (auth_url, token_url) {
+        if let (Some(auth), Some(token)) = (&args.auth_url, &args.token_url) {
             oauth = oauth.with_endpoints(auth, token);
         }
-
-        if let Some(scopes_str) = scopes {
-            let scope_list: Vec<String> = scopes_str
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            oauth = oauth.with_scopes(scope_list);
+        if let Some(scopes) = &args.scopes {
+            oauth = oauth.with_scopes(scopes.split(',').map(|s| s.trim().to_string()).collect());
         }
-
         config = config.with_oauth(oauth);
     }
+    config.validate().map_err(anyhow::Error::from)?;
+    Ok(config)
+}
 
-    persist_server_with_path(config, true, config_path, no_db).await?;
-
+fn print_add_summary(args: &McpAddArgs, sandbox_summary: Option<&str>) {
     println!();
-    println!("  ✓ Added MCP server '{}'", name);
-
-    match transport_lower.as_str() {
+    println!("  ✓ Added MCP server '{}'", args.name);
+    match args.transport.to_ascii_lowercase().as_str() {
         "stdio" => {
             println!(
                 "    Transport: stdio (command: {})",
-                command.as_deref().unwrap_or("")
+                args.command.as_deref().unwrap_or("")
             );
-            if let Some(ref summary) = sandbox_summary {
+            if let Some(summary) = sandbox_summary {
                 println!("    Sandbox: {summary}");
             }
         }
-        "unix" => {
-            println!(
-                "    Transport: unix (socket: {})",
-                socket.as_deref().unwrap_or("")
-            );
-        }
-        _ => {
-            println!("    URL: {}", url.as_deref().unwrap_or(""));
-        }
+        "unix" => println!(
+            "    Transport: unix (socket: {})",
+            args.socket.as_deref().unwrap_or("")
+        ),
+        "wasm" => println!(
+            "    Transport: wasm (component: {})",
+            args.component.as_deref().unwrap_or(Path::new("")).display()
+        ),
+        "gateway" => println!(
+            "    Transport: gateway ({}) at {}",
+            args.gateway_mode.as_deref().unwrap_or("dedicated"),
+            args.url.as_deref().unwrap_or("")
+        ),
+        _ => println!("    URL: {}", args.url.as_deref().unwrap_or("")),
     }
-
-    if requires_auth {
-        println!();
-        println!("  Run 'lunarwing mcp auth {}' to authenticate.", name);
+    if args.client_id.is_some() {
+        println!(
+            "\n  Run 'lunarwing mcp auth {}' to authenticate.",
+            args.name
+        );
     }
-
     println!();
-
-    Ok(())
 }
 
 /// Remove an MCP server.
@@ -669,6 +709,8 @@ async fn list_servers(
             EffectiveTransport::Unix { socket_path } => {
                 format!("unix ({})", socket_path)
             }
+            EffectiveTransport::Wasm { .. } => "wasm".to_string(),
+            EffectiveTransport::Gateway { mode, .. } => format!("gateway ({mode:?})"),
         };
 
         if verbose {
@@ -704,6 +746,24 @@ async fn list_servers(
                 }
                 EffectiveTransport::Unix { socket_path } => {
                     println!("      Socket: {}", socket_path);
+                }
+                EffectiveTransport::Wasm {
+                    component_path,
+                    memory_mb,
+                    fuel,
+                    timeout_seconds,
+                } => {
+                    println!("      Component: {}", component_path.display());
+                    println!("      Memory: {memory_mb} MiB");
+                    println!("      Fuel/message: {fuel}");
+                    println!("      Timeout: {timeout_seconds}s");
+                }
+                EffectiveTransport::Gateway { mode, route } => {
+                    println!("      URL: {}", server.url);
+                    println!("      Gateway mode: {mode:?}");
+                    if let Some(route) = route {
+                        println!("      Route: {route}");
+                    }
                 }
             }
             if let Some(ref desc) = server.description {
@@ -741,9 +801,12 @@ async fn list_servers(
             println!();
         } else {
             let display = match &effective {
-                EffectiveTransport::Http => server.url.clone(),
+                EffectiveTransport::Http | EffectiveTransport::Gateway { .. } => server.url.clone(),
                 EffectiveTransport::Stdio { command, .. } => command.to_string(),
                 EffectiveTransport::Unix { socket_path } => socket_path.to_string(),
+                EffectiveTransport::Wasm { component_path, .. } => {
+                    component_path.display().to_string()
+                }
             };
             println!(
                 "  {} {} - {} [{}]{}",
@@ -1011,6 +1074,8 @@ fn build_update_config(
             EffectiveTransport::Http => Some("http".to_string()),
             EffectiveTransport::Stdio { .. } => Some("stdio".to_string()),
             EffectiveTransport::Unix { .. } => Some("unix".to_string()),
+            EffectiveTransport::Wasm { .. } => Some("wasm".to_string()),
+            EffectiveTransport::Gateway { .. } => Some("gateway".to_string()),
         });
 
     if transport.as_deref() != Some("stdio") && args.secret_env.is_some() {
@@ -1080,9 +1145,29 @@ fn build_update_config(
             };
             McpServerConfig::new_unix(&existing.name, &socket_path)
         }
+        Some("wasm")
+            if matches!(
+                existing.effective_transport(),
+                EffectiveTransport::Wasm { .. }
+            ) =>
+        {
+            existing.clone()
+        }
+        Some("gateway")
+            if matches!(
+                existing.effective_transport(),
+                EffectiveTransport::Gateway { .. }
+            ) =>
+        {
+            let mut updated = existing.clone();
+            if let Some(url) = args.url.as_deref().filter(|value| !value.is_empty()) {
+                updated.url = url.to_string();
+            }
+            updated
+        }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "Unknown transport type '{other}'. Supported: http, stdio, unix"
+                "Unknown or incomplete transport type '{other}'. Supported: http, stdio, unix, wasm, gateway"
             ));
         }
         None => return Err(anyhow::anyhow!("Could not determine transport type")),
