@@ -26,9 +26,11 @@ use crate::context::{ContextManager, JobContext, JobState};
 use crate::db::Database;
 use crate::history::SandboxJobRecord;
 use crate::orchestrator::ExternalWorkerManager;
-use crate::orchestrator::auth::CredentialGrant;
+use crate::orchestrator::auth::{CredentialGrant, SandboxJobGrants};
 use crate::orchestrator::external_worker::{ExternalTaskStatus, build_task_context};
-use crate::orchestrator::job_manager::{ContainerJobManager, JobMode};
+use crate::orchestrator::job_manager::{
+    ContainerJobManager, ContainerJobRequest, JobMode, MAX_WORKER_MCP_SERVERS, snapshot_worker_mcp,
+};
 use crate::secrets::SecretsStore;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
@@ -210,6 +212,14 @@ struct ExternalExecutionOptions {
     context_scope: ExternalContextScope,
     project_dir: Option<String>,
     credential_grants: Vec<CredentialGrant>,
+}
+
+struct SandboxExecutionOptions {
+    explicit_dir: Option<PathBuf>,
+    wait: bool,
+    credential_grants: Vec<CredentialGrant>,
+    mcp_servers: Vec<String>,
+    max_iterations: u32,
 }
 
 fn external_prompt_context(
@@ -547,12 +557,16 @@ impl CreateJobTool {
     async fn execute_sandbox(
         &self,
         task: &str,
-        explicit_dir: Option<PathBuf>,
-        wait: bool,
-        credential_grants: Vec<CredentialGrant>,
-        max_iterations: u32,
+        options: SandboxExecutionOptions,
         ctx: &JobContext,
     ) -> Result<ToolOutput, ToolError> {
+        let SandboxExecutionOptions {
+            explicit_dir,
+            wait,
+            credential_grants,
+            mcp_servers: selected_mcp_servers,
+            max_iterations,
+        } = options;
         let start = std::time::Instant::now();
         let jm = self.job_manager.as_ref().ok_or_else(|| {
             ToolError::ExecutionFailed(
@@ -560,23 +574,28 @@ impl CreateJobTool {
             )
         })?;
 
+        let (mcp_servers, mcp_credential_grants) = snapshot_worker_mcp(
+            self.store.as_deref(),
+            self.secrets_store.as_deref(),
+            &ctx.user_id,
+            &selected_mcp_servers,
+        )
+        .await
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to snapshot worker MCP config: {error}"))
+        })?;
+
         let job_id = Uuid::new_v4();
         let (project_dir, browse_id) = resolve_project_dir(explicit_dir, job_id)?;
         let project_dir_str = project_dir.display().to_string();
 
-        // Serialize credential grants so restarts can reload them.
-        let credential_grants_json = match serde_json::to_string(&credential_grants) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to serialize credential grants for job {}: {}. \
-                     Grants will not survive a restart.",
-                    job_id,
-                    e
-                );
-                String::from("[]")
-            }
-        };
+        let credential_grants_json = serde_json::to_string(&SandboxJobGrants {
+            credentials: credential_grants.clone(),
+            mcp_servers: selected_mcp_servers,
+        })
+        .map_err(|error| {
+            ToolError::ExecutionFailed(format!("failed to serialize sandbox job grants: {error}"))
+        })?;
 
         // Register in ContextManager so query tools (list_jobs, job_status,
         // job_events, cancel_job) can find sandbox jobs. Without this, sandbox
@@ -620,14 +639,17 @@ impl CreateJobTool {
 
         // Create the container job with the pre-determined job_id.
         let _token = jm
-            .create_job(
+            .create_job(ContainerJobRequest {
                 job_id,
-                task,
-                Some(project_dir),
-                JobMode::Worker,
+                task: task.to_string(),
+                project_dir: Some(project_dir),
+                mode: JobMode::Worker,
+                owner_id: ctx.user_id.clone(),
                 credential_grants,
+                mcp_servers,
+                mcp_credential_grants,
                 max_iterations,
-            )
+            })
             .await
             .map_err(|e| {
                 self.update_status(
@@ -1337,6 +1359,17 @@ impl Tool for CreateJobTool {
                 });
             }
 
+            if self.sandbox_enabled() {
+                props["mcp_servers"] = serde_json::json!({
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "maxItems": MAX_WORKER_MCP_SERVERS,
+                    "uniqueItems": true,
+                    "default": [],
+                    "description": "Exact enabled job-worker MCP server names to grant this Docker job. Omit or use [] to grant none."
+                });
+            }
+
             if self.has_external_workers() {
                 let mut names = self
                     .external_worker_manager
@@ -1440,6 +1473,11 @@ impl Tool for CreateJobTool {
 
         // Route to external worker if requested and available
         if mode_str != "worker" {
+            if params.get("mcp_servers").is_some() {
+                return Err(ToolError::InvalidParameters(
+                    "mcp_servers is supported only by the Docker worker".to_string(),
+                ));
+            }
             if let Some(ref ewm) = self.external_worker_manager
                 && ewm.get_worker(mode_str).is_some()
             {
@@ -1499,19 +1537,38 @@ impl Tool for CreateJobTool {
 
             // Parse and validate credential grants
             let credential_grants = self.parse_credentials(&params, &ctx.user_id).await?;
+            let selected_mcp_servers = params
+                .get("mcp_servers")
+                .cloned()
+                .map(serde_json::from_value::<Vec<String>>)
+                .transpose()
+                .map_err(|_| {
+                    ToolError::InvalidParameters(
+                        "mcp_servers must be an array of server names".to_string(),
+                    )
+                })?
+                .unwrap_or_default();
 
             // Combine title and description into the task prompt for the sub-agent.
             let task = format!("{}\n\n{}", title, description);
             self.execute_sandbox(
                 &task,
-                explicit_dir,
-                wait,
-                credential_grants,
-                max_iterations,
+                SandboxExecutionOptions {
+                    explicit_dir,
+                    wait,
+                    credential_grants,
+                    mcp_servers: selected_mcp_servers,
+                    max_iterations,
+                },
                 ctx,
             )
             .await
         } else {
+            if params.get("mcp_servers").is_some() {
+                return Err(ToolError::InvalidParameters(
+                    "mcp_servers requires the Docker sandbox".to_string(),
+                ));
+            }
             let max_iterations = worker_max_iterations(&params)?;
             self.execute_local(title, description, max_iterations, ctx)
                 .await
@@ -2527,10 +2584,13 @@ mod tests {
         let result = tool
             .execute_sandbox(
                 "test task",
-                None,
-                false,
-                vec![],
-                DEFAULT_WORKER_ITERATIONS,
+                SandboxExecutionOptions {
+                    explicit_dir: None,
+                    wait: false,
+                    credential_grants: vec![],
+                    mcp_servers: vec![],
+                    max_iterations: DEFAULT_WORKER_ITERATIONS,
+                },
                 &JobContext::default(),
             )
             .await;
@@ -3014,6 +3074,27 @@ mod tests {
             /* safety: test */
             props.contains_key("credentials"),
             "sandbox schema must expose credentials"
+        );
+    }
+
+    #[test]
+    fn sandbox_schema_defaults_worker_mcp_to_none() {
+        let manager = Arc::new(ContextManager::new(5));
+        let jm = Arc::new(ContainerJobManager::new(
+            crate::orchestrator::job_manager::ContainerJobConfig::default(),
+            crate::orchestrator::TokenStore::new(),
+        ));
+        let schema = CreateJobTool::new(manager)
+            .with_sandbox(jm, None)
+            .parameters_schema();
+
+        assert_eq!(
+            schema["properties"]["mcp_servers"]["default"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            schema["properties"]["mcp_servers"]["maxItems"],
+            MAX_WORKER_MCP_SERVERS
         );
     }
 

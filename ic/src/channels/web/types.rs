@@ -804,6 +804,8 @@ pub struct ExtensionInfo {
     pub transport: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::tools::mcp::McpPlacement>,
     pub authenticated: bool,
     pub active: bool,
     /// MCP runtime is rebuilding or waiting for retry.
@@ -873,12 +875,38 @@ pub struct InstallExtensionRequest {
     pub gateway_mode: Option<String>,
     #[serde(default)]
     pub gateway_route: Option<String>,
+    #[serde(default)]
+    pub placement: Option<WebMcpPlacement>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebMcpPlacement {
+    Host,
+    #[serde(alias = "job-worker")]
+    JobWorker,
+}
+
+impl From<WebMcpPlacement> for crate::tools::mcp::McpPlacement {
+    fn from(value: WebMcpPlacement) -> Self {
+        match value {
+            WebMcpPlacement::Host => Self::Host,
+            WebMcpPlacement::JobWorker => Self::JobWorker,
+        }
+    }
 }
 
 impl InstallExtensionRequest {
     pub fn mcp_config(&self) -> Result<Option<crate::tools::mcp::McpServerConfig>, String> {
+        use crate::tools::mcp::McpPlacement;
+
+        let placement = self.placement.map(Into::into).unwrap_or_default();
         if self.kind.as_deref() != Some("mcp_server") && self.transport.is_none() {
-            return Ok(None);
+            return if placement == McpPlacement::JobWorker {
+                Err("Job-worker placement requires an explicit stdio MCP server".to_string())
+            } else {
+                Ok(None)
+            };
         }
         let config = match self.transport.as_deref() {
             Some("stdio") => {
@@ -896,6 +924,9 @@ impl InstallExtensionRequest {
             Some("http") => {
                 if self.url.is_none() {
                     return Err("MCP server URL is required for HTTP transport".to_string());
+                }
+                if placement == McpPlacement::JobWorker {
+                    return Err("Job-worker MCP servers only support stdio transport".to_string());
                 }
                 return Ok(None);
             }
@@ -950,11 +981,97 @@ impl InstallExtensionRequest {
                         .to_string(),
                 );
             }
-            None => return Ok(None),
+            None => {
+                if placement == McpPlacement::JobWorker {
+                    return Err(
+                        "Job-worker MCP installation requires explicit stdio transport".to_string(),
+                    );
+                }
+                return Ok(None);
+            }
         };
 
+        let config = config.with_placement(placement);
         config.validate().map_err(|e| e.to_string())?;
         Ok(Some(config))
+    }
+
+    pub fn mcp_update_config(
+        &self,
+        name: &str,
+        existing: &crate::tools::mcp::McpServerConfig,
+    ) -> Result<crate::tools::mcp::McpServerConfig, String> {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let mut config = match self.transport.as_deref() {
+            Some("stdio") => {
+                let command = self.command.as_deref().ok_or_else(|| {
+                    "MCP server command is required for stdio transport".to_string()
+                })?;
+                crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
+                    name,
+                    command,
+                    self.args.clone(),
+                    self.env.clone(),
+                    self.env_secrets.clone(),
+                )
+            }
+            Some("http") => crate::tools::mcp::McpServerConfig::new(
+                name,
+                self.url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                    .unwrap_or(&existing.url),
+            ),
+            Some(other) => return Err(format!("Unsupported MCP update transport '{other}'")),
+            None => match existing.effective_transport() {
+                EffectiveTransport::Stdio {
+                    command,
+                    args,
+                    env,
+                    env_secrets,
+                } => crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
+                    name,
+                    self.command.as_deref().unwrap_or(command),
+                    if self.args.is_empty() {
+                        args.to_vec()
+                    } else {
+                        self.args.clone()
+                    },
+                    if self.env.is_empty() {
+                        env.clone()
+                    } else {
+                        self.env.clone()
+                    },
+                    if self.env_secrets.is_empty() {
+                        env_secrets.clone()
+                    } else {
+                        self.env_secrets.clone()
+                    },
+                ),
+                EffectiveTransport::Unix { .. } | EffectiveTransport::Wasm { .. } => {
+                    existing.clone()
+                }
+                EffectiveTransport::Gateway { .. } => {
+                    let mut current = existing.clone();
+                    if let Some(url) = self.url.as_deref().filter(|url| !url.is_empty()) {
+                        current.url = url.to_string();
+                    }
+                    current
+                }
+                EffectiveTransport::Http => {
+                    let mut current = existing.clone();
+                    if let Some(url) = self.url.as_deref().filter(|url| !url.is_empty()) {
+                        current.url = url.to_string();
+                    }
+                    current
+                }
+            },
+        };
+
+        config.placement = self.placement.map(Into::into).unwrap_or(existing.placement);
+        config.validate().map_err(|error| error.to_string())?;
+        Ok(config)
     }
 }
 
@@ -1761,6 +1878,75 @@ mod tests {
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
                     && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
         ));
+        assert_eq!(config.placement, crate::tools::mcp::McpPlacement::Host);
+    }
+
+    #[test]
+    fn test_install_extension_request_applies_job_worker_placement() {
+        let req: InstallExtensionRequest = serde_json::from_str(
+            r#"{
+                "name":"worker-files",
+                "kind":"mcp_server",
+                "transport":"stdio",
+                "command":"worker-files-mcp",
+                "placement":"job-worker"
+            }"#,
+        )
+        .expect("request");
+        let config = req
+            .mcp_config()
+            .expect("valid worker request")
+            .expect("explicit MCP config");
+
+        assert_eq!(config.placement, crate::tools::mcp::McpPlacement::JobWorker);
+    }
+
+    #[test]
+    fn test_install_extension_request_rejects_job_worker_http_and_registry() {
+        for json in [
+            r#"{"name":"remote","kind":"mcp_server","transport":"http","url":"https://example.com/mcp","placement":"job_worker"}"#,
+            r#"{"name":"catalog","kind":"mcp_server","placement":"job_worker"}"#,
+        ] {
+            let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+            let error = req.mcp_config().expect_err("worker non-stdio must fail");
+            assert!(error.contains("Job-worker MCP"));
+        }
+    }
+
+    #[test]
+    fn test_update_extension_request_preserves_and_switches_placement() {
+        use crate::tools::mcp::{McpPlacement, McpServerConfig};
+
+        let existing = McpServerConfig::new_stdio("worker", "old", vec![], Default::default())
+            .with_placement(McpPlacement::JobWorker);
+        let preserve: InstallExtensionRequest =
+            serde_json::from_str(r#"{"name":"worker"}"#).expect("request");
+        assert_eq!(
+            preserve
+                .mcp_update_config("worker", &existing)
+                .expect("preserved config")
+                .placement,
+            McpPlacement::JobWorker
+        );
+        assert!(matches!(
+            preserve
+                .mcp_update_config("worker", &existing)
+                .expect("updated config")
+                .effective_transport(),
+            crate::tools::mcp::config::EffectiveTransport::Stdio { command: "old", .. }
+        ));
+
+        let switch: InstallExtensionRequest = serde_json::from_str(
+            r#"{"name":"worker","transport":"stdio","command":"new","placement":"host"}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            switch
+                .mcp_update_config("worker", &existing)
+                .expect("switched config")
+                .placement,
+            McpPlacement::Host
+        );
     }
 
     #[test]

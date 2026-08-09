@@ -48,8 +48,9 @@ pub(crate) mod wasm_transport;
 
 pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
+pub(crate) use client::{MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS};
 pub use config::{
-    McpGatewayMode, McpServerConfig, McpServersFile, McpTransportConfig, OAuthConfig,
+    McpGatewayMode, McpPlacement, McpServerConfig, McpServersFile, McpTransportConfig, OAuthConfig,
 };
 pub use factory::{McpFactoryError, create_client_from_config};
 pub use process::{McpProcessManager, McpProcessState};

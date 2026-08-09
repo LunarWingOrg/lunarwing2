@@ -520,7 +520,7 @@ struct McpPreflight {
 }
 
 fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> McpPreflight {
-    use crate::tools::mcp::config::EffectiveTransport;
+    use crate::tools::mcp::config::{EffectiveTransport, McpPlacement};
 
     let transport = match server.effective_transport() {
         EffectiveTransport::Http => "http",
@@ -534,13 +534,26 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
     } else {
         "disabled"
     };
-    let mut detail = format!("{} [{} {}]", server.name, transport, state);
+    let placement = match server.placement {
+        McpPlacement::Host => "host",
+        McpPlacement::JobWorker => "job-worker",
+    };
+    let mut detail = format!("{} [{} {} {}]", server.name, transport, placement, state);
     let mut invalid = false;
     let mut missing = false;
 
     if let Err(e) = server.validate() {
         invalid = true;
         detail.push_str(&format!(" — invalid: {e}"));
+        return McpPreflight {
+            detail,
+            invalid,
+            missing,
+        };
+    }
+
+    if server.placement == McpPlacement::JobWorker {
+        detail.push_str(" — command availability must be checked in worker image");
         return McpPreflight {
             detail,
             invalid,
@@ -1258,6 +1271,25 @@ mod tests {
             "expected 'disabled' in detail, got: {}",
             pf.detail
         );
+    }
+
+    #[test]
+    fn preflight_worker_stdio_requires_worker_image_check_without_host_path_failure() {
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+        let server = McpServerConfig::new_stdio(
+            "worker-tools",
+            "__lunarwing_missing_only_on_host__",
+            vec![],
+            std::collections::HashMap::new(),
+        )
+        .with_placement(McpPlacement::JobWorker);
+        let pf = preflight_mcp_server(&server);
+        assert!(!pf.invalid);
+        assert!(!pf.missing);
+        assert!(pf.detail.contains("job-worker"));
+        assert!(pf.detail.contains("checked in worker image"));
+        assert!(!pf.detail.contains("not found in PATH"));
     }
 
     fn format_result(r: &CheckResult) -> String {

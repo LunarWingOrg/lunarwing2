@@ -59,6 +59,7 @@ pub async fn extensions_list_handler(
                 url: ext.url,
                 transport: ext.transport,
                 command: ext.command,
+                placement: ext.placement,
                 authenticated: ext.authenticated,
                 active: ext.active,
                 recovering: ext.recovering,
@@ -102,6 +103,10 @@ pub async fn extensions_install_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<InstallExtensionRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let mcp_config = match req.mcp_config() {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(ActionResponse::fail(error))),
+    };
     let ext_mgr = state.extension_manager.as_ref().ok_or((
         StatusCode::NOT_IMPLEMENTED,
         "Extension manager not available (secrets store required)".to_string(),
@@ -122,14 +127,13 @@ pub async fn extensions_install_handler(
                 .map(|_| crate::extensions::ExtensionKind::McpServer)
         });
 
-    let install_result = match req.mcp_config() {
-        Ok(Some(config)) => ext_mgr.install_mcp_config(config, &user.user_id).await,
-        Ok(None) => {
+    let install_result = match mcp_config {
+        Some(config) => ext_mgr.install_mcp_config(config, &user.user_id).await,
+        None => {
             ext_mgr
                 .install(&req.name, req.url.as_deref(), kind_hint, &user.user_id)
                 .await
         }
-        Err(e) => return Ok(Json(ActionResponse::fail(e))),
     };
 
     match install_result {

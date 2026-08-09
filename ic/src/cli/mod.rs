@@ -204,11 +204,11 @@ pub enum Command {
     )]
     Routines(RoutinesCommand),
 
-    /// Manage MCP servers (hosted tool providers)
+    /// Manage MCP servers (host or job-worker tool providers)
     #[command(
         subcommand,
         about = "Manage MCP servers",
-        long_about = "Add, auth, list, or test MCP servers.\nExample: lunarwing mcp add notion https://mcp.notion.com"
+        long_about = "Add, update, list, auth, or test host and job-worker MCP servers.\nExample: lunarwing mcp add notion https://mcp.notion.com"
     )]
     Mcp(Box<McpCommand>),
 
@@ -329,6 +329,11 @@ pub enum Command {
         /// Maximum iterations before stopping.
         #[arg(long, default_value_t = lunarwing_common::DEFAULT_WORKER_ITERATIONS)]
         max_iterations: u32,
+
+        /// Require worker-local MCP support for this job. New orchestrators use
+        /// this flag so older worker images fail closed instead of ignoring MCP.
+        #[arg(long, default_value_t = false)]
+        require_worker_mcp: bool,
     },
 
     /// Manage ACP (Agent Client Protocol) agents

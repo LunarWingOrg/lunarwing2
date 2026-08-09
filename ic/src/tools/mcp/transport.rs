@@ -15,6 +15,8 @@ use tokio::task::JoinHandle;
 use crate::tools::mcp::protocol::{McpRequest, McpResponse};
 use crate::tools::tool::ToolError;
 
+const MAX_JSONRPC_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 /// Trait for sending JSON-RPC requests to an MCP server and receiving responses.
 ///
 /// Implementations handle the underlying transport (HTTP, stdio, unix socket, etc.).
@@ -93,13 +95,25 @@ pub fn spawn_jsonrpc_reader<R: AsyncBufRead + Unpin + Send + 'static>(
     server_name: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut lines = reader.lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let response = match serde_json::from_str::<McpResponse>(&line) {
+        let mut reader = reader;
+        loop {
+            let line = match read_bounded_jsonrpc_line(&mut reader).await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        "[{}] Stopping JSON-RPC reader after invalid frame: {}",
+                        server_name,
+                        error
+                    );
+                    break;
+                }
+            };
+            let response = match serde_json::from_slice::<McpResponse>(&line) {
                 Ok(resp) => resp,
                 Err(e) => {
                     // Truncate logged line to avoid leaking sensitive data in large payloads.
-                    let preview: String = line.chars().take(200).collect();
+                    let preview = String::from_utf8_lossy(&line[..line.len().min(200)]);
                     tracing::debug!(
                         "[{}] Failed to parse JSON-RPC response: {} — line: {}{}",
                         server_name,
@@ -131,8 +145,35 @@ pub fn spawn_jsonrpc_reader<R: AsyncBufRead + Unpin + Send + 'static>(
             }
         }
 
+        pending.lock().await.clear();
         tracing::debug!("[{}] JSON-RPC reader finished", server_name);
     })
+}
+
+async fn read_bounded_jsonrpc_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk_len = newline.unwrap_or(available.len());
+        if line.len().saturating_add(chunk_len) > MAX_JSONRPC_LINE_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("JSON-RPC line exceeds {MAX_JSONRPC_LINE_BYTES} bytes"),
+            ));
+        }
+        line.extend_from_slice(&available[..chunk_len]);
+        let consumed = chunk_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+    }
 }
 
 /// Send a JSON-RPC request over a stream-based transport (stdio / unix socket).
@@ -282,6 +323,21 @@ mod tests {
         assert_eq!(resp.id, Some(7));
 
         handle.await.expect("reader task should finish");
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_reader_rejects_oversized_line_and_drops_pending_requests() {
+        let reader = std::io::Cursor::new(vec![b'x'; MAX_JSONRPC_LINE_BYTES + 1]);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(1, tx);
+
+        let handle = spawn_jsonrpc_reader(reader, Arc::clone(&pending), "test".into());
+        handle.await.expect("reader task should finish");
+
+        assert!(rx.await.is_err());
+        assert!(pending.lock().await.is_empty());
     }
 
     /// Issue 9 regression: a JSON-RPC notification (no id) must not resolve

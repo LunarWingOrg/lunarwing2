@@ -14,7 +14,7 @@
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.6.0 |
 | Native MCP tools, PostgreSQL-backed, per-tenant + shared scopes | v2.0.6.0 |
 | Kawarimi migration, self-improving skills integration, stale detection | v2.0.6.0 |
-| MCP Overhaul Part 2 - See [MCP status](MCP_OVERALL_STATUS.md) — runtime adapter boundary, MCP-over-WASM, and dedicated/shared gateway client placement implemented; worker-local prototype using preinstalled or verified packages remains item #11 | v2.0.6.0 |
+| MCP Overhaul Part 2 - See [MCP status](MCP_OVERALL_STATUS.md) — runtime adapter boundary, MCP-over-WASM, dedicated/shared gateway client placement, and core Docker worker-local stdio placement implemented | v2.0.6.0 |
 | Additional Opencode External Worker Polishing, including update of opencode version | v2.0.7.0 |
 | Reflex Compiler polishing and improvements | v2.0.7.0 |
 | LunarVoice Two Way Voice Communication | v2.0.8.0 |

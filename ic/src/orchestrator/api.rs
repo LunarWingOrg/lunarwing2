@@ -23,8 +23,9 @@ use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::secrets::SecretsStore;
 use crate::worker::api::JobEventPayload;
 use crate::worker::api::{
-    CompletionReport, CredentialResponse, JobDescription, ProxyCompletionRequest,
-    ProxyCompletionResponse, ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
+    CompletionReport, CredentialResponse, JobDescription, McpCredentialResponse,
+    ProxyCompletionRequest, ProxyCompletionResponse, ProxyToolCompletionRequest,
+    ProxyToolCompletionResponse, StatusUpdate,
 };
 
 /// A follow-up prompt queued for a Claude Code bridge.
@@ -49,7 +50,7 @@ pub struct OrchestratorState {
     pub store: Option<Arc<dyn Database>>,
     /// Encrypted secrets store for credential injection into containers.
     pub secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
-    /// User ID for secret lookups (single-tenant, typically "default").
+    /// Legacy fallback owner for completion event routing.
     pub user_id: String,
     /// In-memory cache of job_id → user_id for SSE scoping. Populated when
     /// sandbox jobs are created, avoiding a DB round-trip on every job event.
@@ -79,6 +80,10 @@ impl OrchestratorApi {
             .route("/worker/{job_id}/event", post(job_event_handler))
             .route("/worker/{job_id}/prompt", get(get_prompt_handler))
             .route("/worker/{job_id}/credentials", get(get_credentials_handler))
+            .route(
+                "/worker/{job_id}/mcp/credentials",
+                get(get_mcp_credentials_handler),
+            )
             .route_layer(axum::middleware::from_fn_with_state(
                 state.token_store.clone(),
                 worker_auth_middleware,
@@ -142,6 +147,8 @@ async fn get_job(
         title: format!("Job {}", job_id),
         description: handle.task_description,
         project_dir: handle.project_dir.map(|p| p.display().to_string()),
+        owner_id: handle.owner_id,
+        mcp_servers: handle.mcp_servers,
     }))
 }
 
@@ -231,6 +238,12 @@ async fn report_complete(
     Path(job_id): Path<Uuid>,
     Json(report): Json<CompletionReport>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    let owner_id = state
+        .job_manager
+        .get_handle(job_id)
+        .await
+        .map(|handle| handle.owner_id)
+        .ok_or(StatusCode::NOT_FOUND)?;
     if report.success {
         tracing::info!(
             job_id = %job_id,
@@ -278,16 +291,9 @@ async fn report_complete(
     // event_rx.recv() would block indefinitely when the worker reports
     // completion via /complete instead of /event.
     if let Some(ref tx) = state.job_event_tx {
-        let owner_uid = state
-            .job_owner_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_else(|| state.user_id.clone());
         let _ = tx.send((
             job_id,
-            owner_uid,
+            owner_id,
             SseEvent::JobResult {
                 job_id: job_id.to_string(),
                 status: status.to_string(),
@@ -534,6 +540,11 @@ async fn get_credentials_handler(
     State(state): State<OrchestratorState>,
     Path(job_id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let handle = state
+        .job_manager
+        .get_handle(job_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
     let grants = match state.token_store.get_grants(job_id).await {
         Some(g) if !g.is_empty() => g,
         _ => return Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null))),
@@ -548,18 +559,18 @@ async fn get_credentials_handler(
 
     for grant in &grants {
         let decrypted = secrets
-            .get_decrypted(&state.user_id, &grant.secret_name)
+            .get_decrypted(&handle.owner_id, &grant.secret_name)
             .await
-            .map_err(|e| {
+            .map_err(|_| {
                 tracing::error!(
                     job_id = %job_id,
-                    "Failed to decrypt secret for credential grant: {}", e
+                    "Failed to decrypt credential grant"
                 );
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
         // Record usage for audit trail
-        if let Ok(secret) = secrets.get(&state.user_id, &grant.secret_name).await
+        if let Ok(secret) = secrets.get(&handle.owner_id, &grant.secret_name).await
             && let Err(e) = secrets.record_usage(secret.id).await
         {
             tracing::warn!(
@@ -583,6 +594,50 @@ async fn get_credentials_handler(
     Ok((
         StatusCode::OK,
         Json(serde_json::to_value(&credentials).unwrap_or(serde_json::Value::Null)),
+    ))
+}
+
+/// Serve owner-scoped MCP credentials without exposing them to generic workers.
+async fn get_mcp_credentials_handler(
+    State(state): State<OrchestratorState>,
+    Path(job_id): Path<Uuid>,
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
+    let handle = state
+        .job_manager
+        .get_handle(job_id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let grants = match state.token_store.get_mcp_grants(job_id).await {
+        Some(grants) if !grants.is_empty() => grants,
+        _ => return Ok((StatusCode::NO_CONTENT, Json(serde_json::Value::Null))),
+    };
+    let secrets = state.secrets_store.as_ref().ok_or_else(|| {
+        tracing::error!(job_id = %job_id, "MCP credentials requested without secrets store");
+        StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let mut credentials = Vec::with_capacity(grants.len());
+    for grant in grants {
+        let decrypted = secrets
+            .get_decrypted(&handle.owner_id, &grant.secret_name)
+            .await
+            .map_err(|_| {
+                tracing::error!(job_id = %job_id, "Failed to decrypt MCP credential grant");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+        if let Ok(secret) = secrets.get(&handle.owner_id, &grant.secret_name).await
+            && let Err(error) = secrets.record_usage(secret.id).await
+        {
+            tracing::warn!(job_id = %job_id, "Failed to record MCP credential usage: {error}");
+        }
+        credentials.push(McpCredentialResponse {
+            server_name: grant.server_name,
+            env_var: grant.env_var,
+            value: decrypted.expose().to_string(),
+        });
+    }
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::to_value(credentials).unwrap_or(serde_json::Value::Null)),
     ))
 }
 
@@ -626,6 +681,26 @@ mod tests {
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             context_manager: None,
         }
+    }
+
+    async fn insert_test_handle(state: &OrchestratorState, job_id: Uuid, owner_id: &str) {
+        state.job_manager.containers.write().await.insert(
+            job_id,
+            crate::orchestrator::job_manager::ContainerHandle {
+                job_id,
+                container_id: String::new(),
+                state: crate::orchestrator::job_manager::ContainerState::Running,
+                mode: crate::orchestrator::job_manager::JobMode::Worker,
+                owner_id: owner_id.to_string(),
+                mcp_servers: Vec::new(),
+                created_at: chrono::Utc::now(),
+                project_dir: None,
+                task_description: "test".to_string(),
+                last_worker_status: None,
+                worker_iteration: 0,
+                completion_result: None,
+            },
+        );
     }
 
     #[tokio::test]
@@ -712,6 +787,41 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
+    #[tokio::test]
+    async fn completion_broadcast_uses_handle_owner_without_cache() {
+        let mut state = test_state();
+        state.user_id = "wrong-default".to_string();
+        let (event_tx, mut event_rx) = broadcast::channel(4);
+        state.job_event_tx = Some(event_tx);
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "owner-a").await;
+        let router = OrchestratorApi::router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{job_id}/complete"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "success": true,
+                    "message": "done",
+                    "iterations": 1
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            router.oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let (reported_job, owner_id, event) = event_rx.recv().await.unwrap();
+        assert_eq!(reported_job, job_id);
+        assert_eq!(owner_id, "owner-a");
+        assert!(matches!(event, SseEvent::JobResult { .. }));
+    }
+
     // -- Prompt queue tests --
 
     #[tokio::test]
@@ -769,6 +879,7 @@ mod tests {
         let state = test_state();
         let job_id = Uuid::new_v4();
         let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "default").await;
         let router = OrchestratorApi::router(state);
 
         let req = Request::builder()
@@ -786,6 +897,7 @@ mod tests {
         let state = test_state();
         let job_id = Uuid::new_v4();
         let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "default").await;
 
         // Store grants so we get past the 204 check
         state
@@ -820,7 +932,7 @@ mod tests {
         // Create a secret
         secrets_store
             .create(
-                "default",
+                "owner-a",
                 crate::secrets::CreateSecretParams {
                     name: "test_secret".to_string(),
                     value: SecretString::from("supersecretvalue".to_string()),
@@ -857,6 +969,7 @@ mod tests {
             job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
             context_manager: None,
         };
+        insert_test_handle(&state, job_id, "owner-a").await;
 
         let router = OrchestratorApi::router(state);
         let req = Request::builder()
@@ -873,6 +986,113 @@ mod tests {
         assert_eq!(json.len(), 1);
         assert_eq!(json[0]["env_var"], "MY_SECRET");
         assert_eq!(json[0]["value"], "supersecretvalue");
+    }
+
+    #[tokio::test]
+    async fn mcp_credentials_return_204_without_grants() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        insert_test_handle(&state, job_id, "default").await;
+        let router = OrchestratorApi::router(state);
+        let req = Request::builder()
+            .uri(format!("/worker/{job_id}/mcp/credentials"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_credentials_return_503_without_secrets_store() {
+        let state = test_state();
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        state
+            .token_store
+            .store_mcp_grants(
+                job_id,
+                vec![crate::orchestrator::auth::McpCredentialGrant {
+                    server_name: "example".into(),
+                    secret_name: "secret".into(),
+                    env_var: "TOKEN".into(),
+                }],
+            )
+            .await;
+        insert_test_handle(&state, job_id, "owner").await;
+        let router = OrchestratorApi::router(state);
+        let req = Request::builder()
+            .uri(format!("/worker/{job_id}/mcp/credentials"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            router.oneshot(req).await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_credentials_use_handle_owner() {
+        use crate::testing::credentials::test_secrets_store;
+        use secrecy::SecretString;
+
+        let secrets_store = Arc::new(test_secrets_store());
+        secrets_store
+            .create(
+                "owner-a",
+                crate::secrets::CreateSecretParams {
+                    name: "shared_name".to_string(),
+                    value: SecretString::from("owner-a-value".to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        secrets_store
+            .create(
+                "default",
+                crate::secrets::CreateSecretParams {
+                    name: "shared_name".to_string(),
+                    value: SecretString::from("wrong-default-value".to_string()),
+                    provider: None,
+                    expires_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        let mut state = test_state();
+        state.secrets_store = Some(secrets_store);
+        let job_id = Uuid::new_v4();
+        let token = state.token_store.create_token(job_id).await;
+        state
+            .token_store
+            .store_mcp_grants(
+                job_id,
+                vec![crate::orchestrator::auth::McpCredentialGrant {
+                    server_name: "example".to_string(),
+                    secret_name: "shared_name".to_string(),
+                    env_var: "TOKEN".to_string(),
+                }],
+            )
+            .await;
+        insert_test_handle(&state, job_id, "owner-a").await;
+        let router = OrchestratorApi::router(state);
+        let req = Request::builder()
+            .uri(format!("/worker/{job_id}/mcp/credentials"))
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let values: Vec<McpCredentialResponse> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(values[0].server_name, "example");
+        assert_eq!(values[0].value, "owner-a-value");
     }
 
     // -- Job event handler tests --
@@ -1047,6 +1267,8 @@ mod tests {
                     container_id: "test-container".to_string(),
                     state: crate::orchestrator::job_manager::ContainerState::Running,
                     mode: crate::orchestrator::job_manager::JobMode::Worker,
+                    owner_id: "default".to_string(),
+                    mcp_servers: Vec::new(),
                     created_at: chrono::Utc::now(),
                     project_dir: None,
                     task_description: "test".to_string(),

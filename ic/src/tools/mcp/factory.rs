@@ -1,5 +1,6 @@
 //! Factory for creating MCP clients through runtime-neutral adapters.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -8,7 +9,7 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::secrets::SecretsStore;
 use crate::tools::ToolError;
 use crate::tools::mcp::config::{
-    EffectiveTransport, McpServerConfig, validate_managed_study_notes_runtime,
+    EffectiveTransport, McpPlacement, McpServerConfig, validate_managed_study_notes_runtime,
 };
 use crate::tools::mcp::runtime::{
     McpRuntimeAdapter, McpRuntimeContext, McpRuntimeRegistry, McpRuntimeRequest,
@@ -25,6 +26,7 @@ pub async fn create_client_from_config(
     secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
     user_id: &str,
 ) -> Result<McpClient, McpFactoryError> {
+    require_host_placement(&server)?;
     let registry = default_runtime_registry();
     create_client_with_runtime_registry(
         server,
@@ -37,6 +39,26 @@ pub async fn create_client_from_config(
     .await
 }
 
+/// Create a job-worker MCP client from already scoped secret environment values.
+///
+/// Caller must invoke this inside worker process or image so provenance resolves
+/// and hashes worker-visible executable before spawning it.
+pub(crate) async fn create_worker_client_from_config(
+    server: McpServerConfig,
+    session_manager: &Arc<McpSessionManager>,
+    process_manager: &Arc<McpProcessManager>,
+    worker_secret_env: HashMap<String, SecretString>,
+    user_id: &str,
+) -> Result<McpClient, McpFactoryError> {
+    require_worker_stdio_placement(&server)?;
+    validate_activation_config(&server)?;
+    let context = McpRuntimeContext::new(session_manager, process_manager, None, user_id)
+        .with_worker_secret_env(worker_secret_env);
+    default_runtime_registry()
+        .connect(McpRuntimeRequest::new(server, context))
+        .await
+}
+
 /// Create a client through an explicit adapter registry.
 pub async fn create_client_with_runtime_registry(
     server: McpServerConfig,
@@ -46,11 +68,41 @@ pub async fn create_client_with_runtime_registry(
     user_id: &str,
     registry: &McpRuntimeRegistry,
 ) -> Result<McpClient, McpFactoryError> {
+    require_host_placement(&server)?;
     validate_activation_config(&server)?;
     let context = McpRuntimeContext::new(session_manager, process_manager, secrets, user_id);
     registry
         .connect(McpRuntimeRequest::new(server, context))
         .await
+}
+
+fn require_host_placement(server: &McpServerConfig) -> Result<(), McpFactoryError> {
+    if server.placement == McpPlacement::Host {
+        return Ok(());
+    }
+    Err(McpFactoryError::InvalidConfig {
+        name: server.name.clone(),
+        reason: "host factory cannot activate a job-worker MCP server".to_string(),
+    })
+}
+
+fn require_worker_stdio_placement(server: &McpServerConfig) -> Result<(), McpFactoryError> {
+    if server.placement != McpPlacement::JobWorker {
+        return Err(McpFactoryError::InvalidConfig {
+            name: server.name.clone(),
+            reason: "worker factory requires job_worker placement".to_string(),
+        });
+    }
+    if !matches!(
+        server.effective_transport(),
+        EffectiveTransport::Stdio { .. }
+    ) {
+        return Err(McpFactoryError::InvalidConfig {
+            name: server.name.clone(),
+            reason: "worker factory only supports stdio MCP servers".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_activation_config(server: &McpServerConfig) -> Result<(), McpFactoryError> {
@@ -147,17 +199,37 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
         else {
             return Err(runtime_mismatch(&server_name));
         };
+        let worker_secret_env = match (server.placement, context.worker_secret_env()) {
+            (McpPlacement::Host, None) => None,
+            (McpPlacement::JobWorker, Some(worker_secret_env)) => Some(worker_secret_env),
+            (McpPlacement::Host, Some(_)) => {
+                return Err(McpFactoryError::InvalidConfig {
+                    name: server_name,
+                    reason: "host MCP runtime cannot receive worker secret environment".to_string(),
+                });
+            }
+            (McpPlacement::JobWorker, None) => {
+                return Err(McpFactoryError::InvalidConfig {
+                    name: server_name,
+                    reason: "job-worker MCP runtime requires worker-scoped environment".to_string(),
+                });
+            }
+        };
         if let Some(provenance) = server.provenance.clone() {
             verify_stdio_provenance(&server_name, provenance, command).await?;
         }
-        let resolved_env = resolve_stdio_env(
-            &server_name,
-            env,
-            env_secrets,
-            secrets.as_deref(),
-            context.user_id(),
-        )
-        .await?;
+        let resolved_env = if let Some(worker_secret_env) = worker_secret_env {
+            resolve_worker_stdio_env(&server_name, env, env_secrets, worker_secret_env)?
+        } else {
+            resolve_stdio_env(
+                &server_name,
+                env,
+                env_secrets,
+                secrets.as_deref(),
+                context.user_id(),
+            )
+            .await?
+        };
         let transport = context
             .process_manager()
             .spawn_stdio(
@@ -416,6 +488,36 @@ async fn resolve_stdio_env(
     Ok(resolved)
 }
 
+fn resolve_worker_stdio_env(
+    server_name: &str,
+    env: &HashMap<String, String>,
+    env_secrets: &HashMap<String, String>,
+    worker_secret_env: &HashMap<String, SecretString>,
+) -> Result<Vec<(String, SecretString)>, McpFactoryError> {
+    let exact_coverage = env_secrets.len() == worker_secret_env.len()
+        && env_secrets
+            .keys()
+            .all(|name| worker_secret_env.contains_key(name));
+    if !exact_coverage {
+        return Err(McpFactoryError::InvalidConfig {
+            name: server_name.to_string(),
+            reason: "worker secret environment must exactly cover configured env_secrets names"
+                .to_string(),
+        });
+    }
+
+    let mut resolved = env
+        .iter()
+        .map(|(name, value)| (name.clone(), SecretString::from(value.clone())))
+        .collect::<Vec<_>>();
+    resolved.extend(
+        worker_secret_env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone())),
+    );
+    Ok(resolved)
+}
+
 /// Release all runtime state associated with an MCP client.
 pub(crate) async fn shutdown_client_runtime(
     server_name: &str,
@@ -469,6 +571,112 @@ mod tests {
         let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
         let crypto = Arc::new(crate::secrets::SecretsCrypto::new(key).expect("test crypto"));
         Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
+    }
+
+    #[tokio::test]
+    async fn host_factory_rejects_job_worker_before_spawn() {
+        use crate::tools::mcp::provenance::{McpPackageProvenance, PackageTrust};
+
+        let sessions = Arc::new(McpSessionManager::new());
+        let processes = Arc::new(McpProcessManager::new());
+        let server = McpServerConfig::new_stdio("worker", "cat", Vec::new(), HashMap::new())
+            .with_provenance(McpPackageProvenance::with_trust(PackageTrust::Revoked))
+            .with_placement(McpPlacement::JobWorker);
+
+        let error =
+            match create_client_from_config(server, &sessions, &processes, None, "owner").await {
+                Ok(_) => panic!("host factory must reject worker placement"),
+                Err(error) => error,
+            };
+
+        assert!(error.to_string().contains("host factory"));
+        assert!(processes.managed_servers().await.is_empty());
+
+        let host = McpServerConfig::new_stdio("host", "cat", Vec::new(), HashMap::new());
+        let error = match create_worker_client_from_config(
+            host,
+            &sessions,
+            &processes,
+            HashMap::new(),
+            "owner",
+        )
+        .await
+        {
+            Ok(_) => panic!("worker factory must reject host placement"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("job_worker placement"));
+        assert!(processes.managed_servers().await.is_empty());
+    }
+
+    #[test]
+    fn worker_secret_environment_requires_exact_coverage() {
+        let plain = HashMap::from([("LOG_LEVEL".to_string(), "info".to_string())]);
+        let refs = HashMap::from([("API_TOKEN".to_string(), "api_token".to_string())]);
+
+        let missing = resolve_worker_stdio_env("worker", &plain, &refs, &HashMap::new())
+            .expect_err("missing worker secret must fail");
+        assert!(missing.to_string().contains("exactly cover"));
+
+        let extra_values = HashMap::from([
+            (
+                "API_TOKEN".to_string(),
+                SecretString::from("secret".to_string()),
+            ),
+            (
+                "EXTRA".to_string(),
+                SecretString::from("secret".to_string()),
+            ),
+        ]);
+        let extra = resolve_worker_stdio_env("worker", &plain, &refs, &extra_values)
+            .expect_err("extra worker secret must fail");
+        assert!(extra.to_string().contains("exactly cover"));
+
+        let values = HashMap::from([(
+            "API_TOKEN".to_string(),
+            SecretString::from("secret".to_string()),
+        )]);
+        let resolved = resolve_worker_stdio_env("worker", &plain, &refs, &values)
+            .expect("exact worker secret coverage");
+        let names = resolved
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            names,
+            std::collections::HashSet::from(["LOG_LEVEL", "API_TOKEN"])
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_factory_verifies_worker_visible_provenance_before_spawn() {
+        use crate::tools::mcp::provenance::{McpPackageProvenance, ProvenanceIdentity};
+
+        let sessions = Arc::new(McpSessionManager::new());
+        let processes = Arc::new(McpProcessManager::new());
+        let mut provenance =
+            McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
+                .expect("pin cat");
+        provenance.command_sha256 = Some("0".repeat(64));
+        let server = McpServerConfig::new_stdio("worker", "cat", Vec::new(), HashMap::new())
+            .with_provenance(provenance)
+            .with_placement(McpPlacement::JobWorker);
+
+        let error = match create_worker_client_from_config(
+            server,
+            &sessions,
+            &processes,
+            HashMap::new(),
+            "owner",
+        )
+        .await
+        {
+            Ok(_) => panic!("worker-visible digest mismatch must fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, McpFactoryError::Provenance { .. }));
+        assert!(processes.managed_servers().await.is_empty());
     }
 
     #[tokio::test]

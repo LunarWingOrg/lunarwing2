@@ -2136,6 +2136,7 @@ async fn extensions_list_handler(
                 url: ext.url,
                 transport: ext.transport,
                 command: ext.command,
+                placement: ext.placement,
                 authenticated: ext.authenticated,
                 active: ext.active,
                 recovering: ext.recovering,
@@ -2179,6 +2180,10 @@ async fn extensions_install_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<InstallExtensionRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let mcp_config = match req.mcp_config() {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(ActionResponse::fail(error))),
+    };
     // When extension manager isn't available, check registry entries for a helpful message
     let Some(ext_mgr) = state.extension_manager.as_ref() else {
         // Look up the entry in the catalog to give a specific error
@@ -2219,14 +2224,13 @@ async fn extensions_install_handler(
                 .map(|_| crate::extensions::ExtensionKind::McpServer)
         });
 
-    let install_result = match req.mcp_config() {
-        Ok(Some(config)) => ext_mgr.install_mcp_config(config, &user.user_id).await,
-        Ok(None) => {
+    let install_result = match mcp_config {
+        Some(config) => ext_mgr.install_mcp_config(config, &user.user_id).await,
+        None => {
             ext_mgr
                 .install(&req.name, req.url.as_deref(), kind_hint, &user.user_id)
                 .await
         }
-        Err(e) => return Ok(Json(ActionResponse::fail(e))),
     };
 
     match install_result {
@@ -2271,6 +2275,10 @@ async fn extensions_activate_handler(
         StatusCode::NOT_IMPLEMENTED,
         "Extension manager not available (secrets store required)".to_string(),
     ))?;
+    let is_job_worker = ext_mgr
+        .get_mcp_server_pub(&name, &user.user_id)
+        .await
+        .is_ok_and(|config| config.placement == crate::tools::mcp::McpPlacement::JobWorker);
 
     match ext_mgr.activate(&name, &user.user_id).await {
         Ok(result) => {
@@ -2279,7 +2287,8 @@ async fn extensions_activate_handler(
             // already has a token but missing the documents scope).
             // Initial OAuth setup is triggered via configure.
             let mut resp = ActionResponse::ok(result.message);
-            if let Ok(auth_result) = ext_mgr.auth(&name, &user.user_id).await
+            if !is_job_worker
+                && let Ok(auth_result) = ext_mgr.auth(&name, &user.user_id).await
                 && auth_result.auth_url().is_some()
             {
                 resp.auth_url = auth_result.auth_url().map(String::from);
@@ -2293,6 +2302,9 @@ async fn extensions_activate_handler(
             );
 
             if !needs_auth {
+                return Ok(Json(ActionResponse::fail(activate_err.to_string())));
+            }
+            if is_job_worker {
                 return Ok(Json(ActionResponse::fail(activate_err.to_string())));
             }
 
@@ -2414,35 +2426,10 @@ async fn extensions_update_handler(
         .await
         .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
 
-    let new_config = match req.transport.as_deref() {
-        Some("stdio") => {
-            let command = req.command.as_deref().ok_or_else(|| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "command is required for stdio transport".to_string(),
-                )
-            })?;
-            crate::tools::mcp::McpServerConfig::new_stdio_with_secrets(
-                &name,
-                command,
-                req.args.clone(),
-                req.env.clone(),
-                req.env_secrets.clone(),
-            )
-        }
-        _ => {
-            let url = req
-                .url
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&existing.url);
-            crate::tools::mcp::McpServerConfig::new(&name, url)
-        }
+    let new_config = match req.mcp_update_config(&name, &existing) {
+        Ok(config) => config,
+        Err(error) => return Ok(Json(ActionResponse::fail(error))),
     };
-
-    if let Err(e) = new_config.validate() {
-        return Ok(Json(ActionResponse::fail(e.to_string())));
-    }
 
     match ext_mgr.update_mcp(&name, new_config, &user.user_id).await {
         Ok(message) => Ok(Json(ActionResponse::ok(message))),
@@ -3162,6 +3149,7 @@ mod tests {
             url: None,
             transport: None,
             command: None,
+            placement: None,
             authenticated: true,
             active: true,
             recovering: false,

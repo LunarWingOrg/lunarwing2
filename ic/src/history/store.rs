@@ -491,7 +491,8 @@ pub struct SandboxJobRecord {
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
-    /// Serialized JSON of `Vec<CredentialGrant>` for restart support.
+    /// Serialized `SandboxJobGrants` envelope for restart support. Legacy rows
+    /// may contain a bare `Vec<CredentialGrant>`.
     /// Stored in the `description` column of `agent_jobs` (unused for sandbox jobs).
     pub credential_grants_json: String,
 }

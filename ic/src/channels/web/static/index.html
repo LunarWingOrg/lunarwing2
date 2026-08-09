@@ -401,6 +401,14 @@
                 <h4 data-i18n="mcp.addCustom">Add Custom MCP Server</h4>
                 <div class="ext-install-form mcp-install-form">
                   <input type="text" id="mcp-install-name" data-i18n-placeholder="common.name" placeholder="Server name">
+                  <label for="mcp-install-placement">Runtime placement</label>
+                  <select id="mcp-install-placement">
+                    <option value="host">Host</option>
+                    <option value="job_worker">Job worker</option>
+                  </select>
+                  <div class="mcp-env-note" id="mcp-worker-placement-warning" hidden>
+                    Command must exist in worker image. Credentials are exposed only to job-local MCP process. Updates affect future jobs; running job snapshots stay unchanged.
+                  </div>
                   <div class="mcp-transport-control" role="group" data-i18n="mcp.transport" data-i18n-attr="aria-label" aria-label="MCP transport">
                     <button type="button" class="mcp-transport-option active" data-mcp-transport="http" aria-pressed="true" data-i18n="mcp.http">HTTP</button>
                     <button type="button" class="mcp-transport-option" data-mcp-transport="stdio" aria-pressed="false" data-i18n="mcp.stdio">stdio</button>
@@ -414,7 +422,7 @@
                     <textarea id="mcp-install-env" rows="3" data-i18n-placeholder="mcp.envPlaceholder" placeholder="Non-secret environment, KEY=VALUE per line"></textarea>
                     <div class="mcp-env-note" data-i18n="mcp.envNonSecret">Environment values are stored as plain configuration. Do not enter secrets.</div>
                     <textarea id="mcp-install-env-secrets" rows="3" data-i18n-placeholder="mcp.secretEnvPlaceholder" placeholder="Secret environment references, KEY=secret_name per line"></textarea>
-                    <div class="mcp-env-note" data-i18n="mcp.secretEnvWarning">Secret values are decrypted only at activation, then exposed to the unsandboxed MCP process. Install trusted code only.</div>
+                    <div class="mcp-env-note" id="mcp-secret-env-warning" data-i18n="mcp.secretEnvWarning">Secret values are decrypted only at activation, then exposed to the unsandboxed MCP process. Install trusted code only.</div>
                   </div>
                   <button id="mcp-add-btn" data-i18n="mcp.add">Add</button>
                 </div>

@@ -670,11 +670,7 @@ impl AppBuilder {
                                 "Suppressed managed Study Notes write mode without live opt-in"
                             );
                         }
-                        let enabled: Vec<_> = servers
-                            .enabled_servers()
-                            .filter(|server| server.should_auto_start())
-                            .cloned()
-                            .collect();
+                        let enabled: Vec<_> = servers.host_auto_start_servers().cloned().collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
                                 "Loading {} configured MCP server(s)...",
