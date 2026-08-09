@@ -40,6 +40,21 @@ pub enum McpGatewayMode {
     Shared,
 }
 
+/// Execution placement for an MCP server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpPlacement {
+    /// Activate in or adjacent to the LunarWing daemon.
+    #[default]
+    Orchestrator,
+    /// Activate inside an isolated per-job worker container.
+    JobWorker,
+}
+
+fn is_orchestrator_placement(placement: &McpPlacement) -> bool {
+    *placement == McpPlacement::Orchestrator
+}
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -116,6 +131,10 @@ pub struct McpServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
+    /// Runtime placement. Legacy configurations default to daemon-local execution.
+    #[serde(default, skip_serializing_if = "is_orchestrator_placement")]
+    pub placement: McpPlacement,
+
     /// Automatic recovery stopped after repeated unstable restarts.
     /// Explicit activation clears this marker.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -151,24 +170,36 @@ fn is_false(value: &bool) -> bool {
 impl McpServerConfig {
     /// Whether daemon startup may activate this server automatically.
     pub fn should_auto_start(&self) -> bool {
-        self.enabled && !self.recovery_circuit_open
+        self.enabled && !self.recovery_circuit_open && self.placement == McpPlacement::Orchestrator
     }
 
-    /// Create a new MCP server configuration.
-    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+    /// Whether this server may be delivered to a per-job worker.
+    pub fn is_worker_local(&self) -> bool {
+        self.enabled && !self.recovery_circuit_open && self.placement == McpPlacement::JobWorker
+    }
+
+    fn base(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            url: url.into(),
+            url: String::new(),
             transport: None,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
+            placement: McpPlacement::Orchestrator,
             recovery_circuit_open: false,
             description: None,
             always_require_approval: Vec::new(),
             provenance: None,
             sandbox: None,
         }
+    }
+
+    /// Create a new MCP server configuration.
+    pub fn new(name: impl Into<String>, url: impl Into<String>) -> Self {
+        let mut config = Self::base(name);
+        config.url = url.into();
+        config
     }
 
     /// Create a new stdio transport MCP server configuration.
@@ -189,65 +220,35 @@ impl McpServerConfig {
         env: HashMap<String, String>,
         env_secrets: HashMap<String, String>,
     ) -> Self {
-        Self {
-            name: name.into(),
-            url: String::new(),
-            transport: Some(McpTransportConfig::Stdio {
-                command: command.into(),
-                args,
-                env,
-                env_secrets,
-            }),
-            headers: HashMap::new(),
-            oauth: None,
-            enabled: true,
-            recovery_circuit_open: false,
-            description: None,
-            always_require_approval: Vec::new(),
-            provenance: None,
-            sandbox: None,
-        }
+        let mut config = Self::base(name);
+        config.transport = Some(McpTransportConfig::Stdio {
+            command: command.into(),
+            args,
+            env,
+            env_secrets,
+        });
+        config
     }
 
     /// Create a new Unix socket transport MCP server configuration.
     pub fn new_unix(name: impl Into<String>, socket_path: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            url: String::new(),
-            transport: Some(McpTransportConfig::Unix {
-                socket_path: socket_path.into(),
-            }),
-            headers: HashMap::new(),
-            oauth: None,
-            enabled: true,
-            recovery_circuit_open: false,
-            description: None,
-            always_require_approval: Vec::new(),
-            provenance: None,
-            sandbox: None,
-        }
+        let mut config = Self::base(name);
+        config.transport = Some(McpTransportConfig::Unix {
+            socket_path: socket_path.into(),
+        });
+        config
     }
 
     /// Create a stateful MCP-over-WASM server configuration.
     pub fn new_wasm(name: impl Into<String>, component_path: impl Into<PathBuf>) -> Self {
-        Self {
-            name: name.into(),
-            url: String::new(),
-            transport: Some(McpTransportConfig::Wasm {
-                component_path: component_path.into(),
-                memory_mb: default_wasm_memory_mb(),
-                fuel: default_wasm_fuel(),
-                timeout_seconds: default_wasm_timeout_seconds(),
-            }),
-            headers: HashMap::new(),
-            oauth: None,
-            enabled: true,
-            recovery_circuit_open: false,
-            description: None,
-            always_require_approval: Vec::new(),
-            provenance: None,
-            sandbox: None,
-        }
+        let mut config = Self::base(name);
+        config.transport = Some(McpTransportConfig::Wasm {
+            component_path: component_path.into(),
+            memory_mb: default_wasm_memory_mb(),
+            fuel: default_wasm_fuel(),
+            timeout_seconds: default_wasm_timeout_seconds(),
+        });
+        config
     }
 
     /// Create an MCP server hosted behind a dedicated or shared gateway.
@@ -314,6 +315,12 @@ impl McpServerConfig {
         self
     }
 
+    /// Select where this server is activated.
+    pub fn with_placement(mut self, placement: McpPlacement) -> Self {
+        self.placement = placement;
+        self
+    }
+
     /// Set the host OS sandbox policy (stdio servers only).
     pub fn with_sandbox(mut self, sandbox: crate::tools::mcp::sandbox::McpSandboxConfig) -> Self {
         self.sandbox = Some(sandbox);
@@ -361,6 +368,20 @@ impl McpServerConfig {
         if self.name.is_empty() {
             return Err(ConfigError::InvalidConfig {
                 reason: "Server name cannot be empty".to_string(),
+            });
+        }
+        if self.placement == McpPlacement::JobWorker
+            && !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. })
+        {
+            return Err(ConfigError::InvalidConfig {
+                reason: "job-worker placement currently supports only stdio MCP servers"
+                    .to_string(),
+            });
+        }
+        if self.placement == McpPlacement::JobWorker && self.sandbox.is_some() {
+            return Err(ConfigError::InvalidConfig {
+                reason: "job-worker MCP servers use container isolation and cannot declare a host sandbox policy"
+                    .to_string(),
             });
         }
 
@@ -1603,6 +1624,44 @@ mod tests {
         let json = serde_json::to_value(&config).expect("serialize");
         let parsed: McpServerConfig = serde_json::from_value(json).expect("deserialize");
         assert_eq!(parsed.sandbox, config.sandbox);
+    }
+
+    #[test]
+    fn placement_defaults_to_orchestrator_and_roundtrips() {
+        let legacy = serde_json::json!({
+            "name": "legacy",
+            "url": "https://mcp.example.com",
+            "enabled": true
+        });
+        let parsed: McpServerConfig = serde_json::from_value(legacy).expect("legacy config");
+        assert_eq!(parsed.placement, McpPlacement::Orchestrator);
+        assert!(parsed.should_auto_start());
+        assert!(!parsed.is_worker_local());
+
+        let worker = McpServerConfig::new_stdio("repo", "repo-mcp", Vec::new(), HashMap::new())
+            .with_placement(McpPlacement::JobWorker);
+        let json = serde_json::to_value(&worker).expect("serialize worker placement");
+        assert_eq!(json["placement"], "job-worker");
+        let roundtrip: McpServerConfig = serde_json::from_value(json).expect("worker config");
+        assert!(roundtrip.is_worker_local());
+        assert!(!roundtrip.should_auto_start());
+        roundtrip.validate().expect("valid worker placement");
+    }
+
+    #[test]
+    fn job_worker_placement_rejects_unsupported_runtime_policy() {
+        let remote = McpServerConfig::new("remote", "https://mcp.example.com")
+            .with_placement(McpPlacement::JobWorker);
+        assert!(remote.validate().is_err());
+
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig::default();
+        let nested_sandbox = McpServerConfig::new_stdio("local", "cat", Vec::new(), HashMap::new())
+            .with_placement(McpPlacement::JobWorker)
+            .with_sandbox(sandbox);
+        let error = nested_sandbox
+            .validate()
+            .expect_err("worker container owns isolation policy");
+        assert!(error.to_string().contains("container isolation"));
     }
 
     #[test]
