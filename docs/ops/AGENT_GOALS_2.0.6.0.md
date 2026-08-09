@@ -1,7 +1,5 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.0.6.0
 
-## Codename: UNDECIDED
-
 **Open TODOs (v2.0.6.0) — To be done before release**
 
 ### Rares = odd (1, 3, 5, 7, ...)
