@@ -39,6 +39,51 @@ pub struct McpCredentialGrant {
     pub env_var: String,
 }
 
+/// Restart metadata for sandbox job capabilities.
+///
+/// New records use this object envelope. Deserialization also accepts the
+/// legacy bare credential array, which grants no worker-local MCP servers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SandboxJobGrants {
+    pub credentials: Vec<CredentialGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SandboxJobGrantsWire {
+    Current(SandboxJobGrantsFields),
+    Legacy(Vec<CredentialGrant>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxJobGrantsFields {
+    #[serde(default)]
+    credentials: Vec<CredentialGrant>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for SandboxJobGrants {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match SandboxJobGrantsWire::deserialize(deserializer)? {
+            SandboxJobGrantsWire::Current(fields) => Ok(Self {
+                credentials: fields.credentials,
+                mcp_servers: fields.mcp_servers,
+            }),
+            SandboxJobGrantsWire::Legacy(credentials) => Ok(Self {
+                credentials,
+                mcp_servers: Vec::new(),
+            }),
+        }
+    }
+}
+
 /// In-memory store for per-job authentication tokens and credential grants.
 #[derive(Clone)]
 pub struct TokenStore {
@@ -248,6 +293,33 @@ mod tests {
         assert_eq!(retrieved[0].secret_name, "github_token");
         assert_eq!(retrieved[0].env_var, "GITHUB_TOKEN");
         assert_eq!(retrieved[1].secret_name, "npm_token");
+    }
+
+    #[test]
+    fn sandbox_job_grants_decode_legacy_array_without_mcp_access() {
+        let grants: SandboxJobGrants =
+            serde_json::from_str(r#"[{"secret_name":"github_token","env_var":"GITHUB_TOKEN"}]"#)
+                .unwrap();
+
+        assert_eq!(grants.credentials.len(), 1);
+        assert!(grants.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn sandbox_job_grants_round_trip_explicit_mcp_selection() {
+        let grants = SandboxJobGrants {
+            credentials: Vec::new(),
+            mcp_servers: vec!["project-tools".to_string()],
+        };
+        let json = serde_json::to_string(&grants).unwrap();
+        let decoded: SandboxJobGrants = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.mcp_servers, ["project-tools"]);
+    }
+
+    #[test]
+    fn sandbox_job_grants_reject_unknown_fields() {
+        assert!(serde_json::from_str::<SandboxJobGrants>(r#"{"mcp_server":["typo"]}"#).is_err());
     }
 
     #[tokio::test]

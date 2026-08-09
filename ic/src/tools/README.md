@@ -428,10 +428,19 @@ lunarwing mcp add project-tools \
 ```
 
 Activation marks this server eligible for future core Docker jobs; it does not
-start a host process. Each job snapshots all enabled worker servers for its owner.
-The snapshot is immutable for that job, requires a mounted `/workspace`, and is
-limited to eight servers and 32 secret grants. Persistent external workers do not
-receive this placement.
+start a host process. `create_job` grants none by default. Pass exact enabled
+worker server names through `mcp_servers`, for example
+`{"mcp_servers":["project-tools"]}`. Each job snapshots only that ordered
+selection for its owner. Duplicate, missing, disabled, host-placed, or
+circuit-open selections fail closed. The snapshot is immutable for that job,
+requires a mounted `/workspace`, and is limited to eight servers and 32 secret
+grants. Persistent external workers do not receive this placement.
+
+Restart metadata persists selected server names, not secret values or mutable
+server descriptors. Restart reloads owner configuration and re-resolves those
+same names; removed, disabled, or moved servers reject restart with a conflict
+instead of silently broadening or dropping capability. Legacy jobs stored before
+explicit selection restart with no worker MCP access.
 
 Only stdio is accepted. Command and arguments execute without a shell, and the
 command must already exist in the worker image. Pinned provenance is checked against

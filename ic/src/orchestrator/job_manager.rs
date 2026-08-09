@@ -22,7 +22,7 @@ use crate::sandbox::connect_docker;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::config::{McpServerConfig, McpServersFile, McpTransportConfig};
 
-const MAX_WORKER_MCP_SERVERS: usize = 8;
+pub const MAX_WORKER_MCP_SERVERS: usize = 8;
 const MAX_WORKER_MCP_CREDENTIALS: usize = 32;
 const MCP_SECRET_MARKER: &str = "worker-grant";
 
@@ -162,7 +162,12 @@ pub async fn snapshot_worker_mcp(
     store: Option<&dyn Database>,
     secrets: Option<&(dyn SecretsStore + Send + Sync)>,
     owner_id: &str,
+    selected_names: &[String],
 ) -> Result<(Vec<McpServerConfig>, Vec<McpCredentialGrant>), OrchestratorError> {
+    validate_worker_mcp_selection(selected_names)?;
+    if selected_names.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
     let configured = if let Some(store) = store {
         crate::tools::mcp::config::load_mcp_servers_from_db_or_migrate(store, owner_id).await
     } else {
@@ -171,23 +176,76 @@ pub async fn snapshot_worker_mcp(
     .map_err(|error| OrchestratorError::ApiError {
         reason: format!("failed to load worker MCP configuration: {error}"),
     })?;
-    prepare_worker_mcp(configured, secrets, owner_id).await
+    prepare_worker_mcp(configured, selected_names, secrets, owner_id).await
+}
+
+fn validate_worker_mcp_selection(selected_names: &[String]) -> Result<(), OrchestratorError> {
+    if selected_names.len() > MAX_WORKER_MCP_SERVERS {
+        return Err(OrchestratorError::ApiError {
+            reason: format!(
+                "worker MCP server limit exceeded ({} selected, max {MAX_WORKER_MCP_SERVERS})",
+                selected_names.len()
+            ),
+        });
+    }
+    let mut unique = HashSet::new();
+    for name in selected_names {
+        if name.is_empty() {
+            return Err(OrchestratorError::ApiError {
+                reason: "worker MCP server names cannot be empty".to_string(),
+            });
+        }
+        if !unique.insert(name) {
+            return Err(OrchestratorError::ApiError {
+                reason: format!("duplicate worker MCP server selection '{name}'"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn select_worker_mcp_servers(
+    configured: &McpServersFile,
+    selected_names: &[String],
+) -> Result<Vec<McpServerConfig>, OrchestratorError> {
+    validate_worker_mcp_selection(selected_names)?;
+    selected_names
+        .iter()
+        .map(|name| {
+            let server = configured
+                .get(name)
+                .ok_or_else(|| OrchestratorError::ApiError {
+                    reason: format!("selected worker MCP server '{name}' is not configured"),
+                })?;
+            if !server.enabled {
+                return Err(OrchestratorError::ApiError {
+                    reason: format!("selected worker MCP server '{name}' is disabled"),
+                });
+            }
+            if server.recovery_circuit_open {
+                return Err(OrchestratorError::ApiError {
+                    reason: format!(
+                        "selected worker MCP server '{name}' has an open recovery circuit"
+                    ),
+                });
+            }
+            if server.placement != crate::tools::mcp::config::McpPlacement::JobWorker {
+                return Err(OrchestratorError::ApiError {
+                    reason: format!("selected MCP server '{name}' is not placed in a job worker"),
+                });
+            }
+            Ok(server.clone())
+        })
+        .collect()
 }
 
 async fn prepare_worker_mcp(
     configured: McpServersFile,
+    selected_names: &[String],
     secrets: Option<&(dyn SecretsStore + Send + Sync)>,
     owner_id: &str,
 ) -> Result<(Vec<McpServerConfig>, Vec<McpCredentialGrant>), OrchestratorError> {
-    let mut servers = configured.job_worker_servers().cloned().collect::<Vec<_>>();
-    if servers.len() > MAX_WORKER_MCP_SERVERS {
-        return Err(OrchestratorError::ApiError {
-            reason: format!(
-                "worker MCP server limit exceeded ({} configured, max {MAX_WORKER_MCP_SERVERS})",
-                servers.len()
-            ),
-        });
-    }
+    let mut servers = select_worker_mcp_servers(&configured, selected_names)?;
 
     let mut grants = Vec::new();
     for server in &mut servers {
@@ -1116,9 +1174,11 @@ mod tests {
             ..Default::default()
         };
 
-        let (snapshot, grants) = prepare_worker_mcp(configured.clone(), Some(&secrets), "owner-a")
-            .await
-            .unwrap();
+        let selected = vec!["worker".to_string()];
+        let (snapshot, grants) =
+            prepare_worker_mcp(configured.clone(), &selected, Some(&secrets), "owner-a")
+                .await
+                .unwrap();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].secret_name, "real-secret-name");
@@ -1137,7 +1197,7 @@ mod tests {
         );
 
         assert!(
-            prepare_worker_mcp(configured, Some(&secrets), "owner-b")
+            prepare_worker_mcp(configured, &selected, Some(&secrets), "owner-b")
                 .await
                 .is_err()
         );
@@ -1145,7 +1205,7 @@ mod tests {
 
     #[tokio::test]
     async fn worker_mcp_snapshot_rejects_overflow() {
-        let servers = (0..=MAX_WORKER_MCP_SERVERS)
+        let servers: Vec<_> = (0..=MAX_WORKER_MCP_SERVERS)
             .map(|index| {
                 McpServerConfig::new_stdio(
                     format!("worker-{index}"),
@@ -1156,16 +1216,97 @@ mod tests {
                 .with_placement(McpPlacement::JobWorker)
             })
             .collect();
+        let selected = servers
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
         let error = prepare_worker_mcp(
             McpServersFile {
                 servers,
                 ..Default::default()
             },
+            &selected,
             None,
             "owner",
         )
         .await
         .unwrap_err();
         assert!(error.to_string().contains("limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn empty_worker_mcp_selection_grants_none_without_loading_config() {
+        let (servers, grants) = snapshot_worker_mcp(None, None, "owner", &[]).await.unwrap();
+
+        assert!(servers.is_empty());
+        assert!(grants.is_empty());
+    }
+
+    #[test]
+    fn worker_mcp_selection_is_explicit_ordered_and_fail_closed() {
+        let worker = |name: &str| {
+            McpServerConfig::new_stdio(name, "cat", Vec::new(), HashMap::new())
+                .with_placement(McpPlacement::JobWorker)
+        };
+        let mut disabled = worker("disabled");
+        disabled.enabled = false;
+        let mut circuit_open = worker("circuit-open");
+        circuit_open.recovery_circuit_open = true;
+        let host = McpServerConfig::new_stdio("host", "cat", Vec::new(), HashMap::new());
+        let configured = McpServersFile {
+            servers: vec![
+                worker("first"),
+                worker("second"),
+                disabled,
+                circuit_open,
+                host,
+            ],
+            ..Default::default()
+        };
+
+        let selected = vec!["second".to_string(), "first".to_string()];
+        let servers = select_worker_mcp_servers(&configured, &selected).unwrap();
+        assert_eq!(
+            servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["second", "first"]
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &["missing".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("not configured")
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &["disabled".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &["host".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("not placed")
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &["circuit-open".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("open recovery circuit")
+        );
+        assert!(
+            select_worker_mcp_servers(&configured, &["first".to_string(), "first".to_string()])
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
     }
 }

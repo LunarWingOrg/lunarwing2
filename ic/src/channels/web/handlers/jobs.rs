@@ -444,16 +444,30 @@ pub async fn jobs_restart_handler(
 
             let new_job_id = Uuid::new_v4();
             let now = chrono::Utc::now();
+            let grants: crate::orchestrator::auth::SandboxJobGrants =
+                serde_json::from_str(&old_job.credential_grants_json).map_err(|error| {
+                    (
+                        StatusCode::CONFLICT,
+                        format!("Cannot restart job with invalid saved grants: {error}"),
+                    )
+                })?;
             let (mcp_servers, mcp_credential_grants) = crate::orchestrator::snapshot_worker_mcp(
                 Some(store.as_ref()),
                 state.secrets_store.as_deref(),
                 &old_job.user_id,
+                &grants.mcp_servers,
             )
             .await
             .map_err(|e| {
                 (
+                    StatusCode::CONFLICT,
+                    format!("Cannot restart job with saved MCP selection: {e}"),
+                )
+            })?;
+            let grants_json = serde_json::to_string(&grants).map_err(|error| {
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to snapshot worker MCP config: {e}"),
+                    format!("Failed to persist restarted job grants: {error}"),
                 )
             })?;
 
@@ -468,7 +482,7 @@ pub async fn jobs_restart_handler(
                 created_at: now,
                 started_at: None,
                 completed_at: None,
-                credential_grants_json: old_job.credential_grants_json.clone(),
+                credential_grants_json: grants_json,
             };
             store
                 .save_sandbox_job(&record)
@@ -476,17 +490,6 @@ pub async fn jobs_restart_handler(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
             let mode = crate::orchestrator::job_manager::JobMode::Worker;
-
-            let credential_grants: Vec<crate::orchestrator::auth::CredentialGrant> =
-                serde_json::from_str(&old_job.credential_grants_json).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        job_id = %old_job.id,
-                        "Failed to deserialize credential grants from stored job: {}. \
-                         Restarted job will have no credentials.",
-                        e
-                    );
-                    vec![]
-                });
 
             let project_dir = std::path::PathBuf::from(&old_job.project_dir);
             let _token = jm
@@ -496,7 +499,7 @@ pub async fn jobs_restart_handler(
                     project_dir: Some(project_dir),
                     mode,
                     owner_id: old_job.user_id.clone(),
-                    credential_grants,
+                    credential_grants: grants.credentials,
                     mcp_servers,
                     mcp_credential_grants,
                     max_iterations: lunarwing_common::DEFAULT_WORKER_ITERATIONS,
