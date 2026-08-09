@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 use crate::error::WorkerError;
 use crate::tools::mcp::config::{EffectiveTransport, McpServerConfig};
 use crate::tools::mcp::{
-    MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS, McpClient, McpProcessManager,
-    McpProcessState, McpSessionManager,
+    MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS, McpClient, McpProcessManager, McpProcessState,
+    McpSessionManager,
 };
 use crate::tools::{ApprovalRequirement, Tool, ToolRegistry};
 use crate::worker::api::McpCredentialResponse;
@@ -141,7 +141,9 @@ impl WorkerMcpRuntime {
         {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
-                return Err(format!("worker MCP activation failed for '{name}': {error}"));
+                return Err(format!(
+                    "worker MCP activation failed for '{name}': {error}"
+                ));
             }
             Err(_) => return Err(format!("worker MCP startup timed out for '{name}'")),
         };
@@ -476,7 +478,15 @@ async fn rebuild_worker_mcp_server(
             RebuildDiscovery::Retry => return true,
             RebuildDiscovery::Stop => return false,
         };
-    finish_worker_mcp_rebuild(shared, name, client, old_wrappers, wrappers, descriptor_bytes).await
+    finish_worker_mcp_rebuild(
+        shared,
+        name,
+        client,
+        old_wrappers,
+        wrappers,
+        descriptor_bytes,
+    )
+    .await
 }
 
 /// Discovery result for one restart attempt.
@@ -523,7 +533,10 @@ async fn rebuild_discover_tools(
             .iter()
             .filter(|(other, _)| other.as_str() != name)
             .fold((0, 0), |(tools, bytes), (_, server)| {
-                (tools + server.wrappers.len(), bytes + server.descriptor_bytes)
+                (
+                    tools + server.wrappers.len(),
+                    bytes + server.descriptor_bytes,
+                )
             })
     };
     if let Err(reason) =
