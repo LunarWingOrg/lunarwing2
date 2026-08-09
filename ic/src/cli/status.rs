@@ -173,11 +173,7 @@ pub async fn run_status_command() -> anyhow::Result<()> {
 
     // MCP servers
     let mcp_value = match crate::tools::mcp::config::load_mcp_servers().await {
-        Ok(servers) => {
-            let enabled = servers.servers.iter().filter(|s| s.enabled).count();
-            let total = servers.servers.len();
-            format!("{} enabled / {} configured", enabled, total)
-        }
+        Ok(servers) => summarize_mcp_servers(&servers),
         Err(_) => "none configured".to_string(),
     };
     println!("{}", fmt::kv_line("MCP Servers", &mcp_value, 12));
@@ -194,6 +190,27 @@ pub async fn run_status_command() -> anyhow::Result<()> {
     );
 
     Ok(())
+}
+
+fn summarize_mcp_servers(servers: &crate::tools::mcp::config::McpServersFile) -> String {
+    use crate::tools::mcp::config::McpPlacement;
+
+    let host_enabled = servers
+        .servers
+        .iter()
+        .filter(|server| server.enabled && server.placement == McpPlacement::Host)
+        .count();
+    let worker_enabled = servers
+        .servers
+        .iter()
+        .filter(|server| server.enabled && server.placement == McpPlacement::JobWorker)
+        .count();
+    format!(
+        "{} host enabled, {} worker enabled / {} configured",
+        host_enabled,
+        worker_enabled,
+        servers.servers.len()
+    )
 }
 
 #[cfg(feature = "postgres")]
@@ -247,7 +264,7 @@ fn default_channels_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::load_settings_from;
+    use super::{load_settings_from, summarize_mcp_servers};
 
     /// Regression test for #354: load_settings_from must read config.toml.
     #[test]
@@ -338,5 +355,31 @@ mod tests {
         // Should fall back to JSON values, not crash
         assert!(settings.heartbeat.enabled);
         assert_eq!(settings.heartbeat.interval_secs, 500);
+    }
+
+    #[test]
+    fn mcp_status_distinguishes_host_and_worker_enabled_counts() {
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig, McpServersFile};
+
+        let host = McpServerConfig::new("remote", "https://example.invalid/mcp");
+        let worker = McpServerConfig::new_stdio(
+            "worker-tools",
+            "worker-mcp",
+            vec![],
+            std::collections::HashMap::new(),
+        )
+        .with_placement(McpPlacement::JobWorker);
+        let mut disabled_worker = worker.clone();
+        disabled_worker.name = "disabled-worker".to_string();
+        disabled_worker.enabled = false;
+        let servers = McpServersFile {
+            servers: vec![host, worker, disabled_worker],
+            ..McpServersFile::default()
+        };
+
+        assert_eq!(
+            summarize_mcp_servers(&servers),
+            "1 host enabled, 1 worker enabled / 3 configured"
+        );
     }
 }

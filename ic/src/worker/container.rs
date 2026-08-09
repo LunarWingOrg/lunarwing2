@@ -27,6 +27,7 @@ use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::tools::execute::{execute_tool_simple, process_tool_result};
 use crate::worker::api::{CompletionReport, JobEventPayload, StatusUpdate, WorkerHttpClient};
+use crate::worker::mcp::WorkerMcpRuntime;
 use crate::worker::proxy_llm::ProxyLlmProvider;
 
 /// Configuration for the worker runtime.
@@ -35,6 +36,7 @@ pub struct WorkerConfig {
     pub orchestrator_url: String,
     pub max_iterations: u32,
     pub timeout: Duration,
+    pub require_worker_mcp: bool,
 }
 
 impl Default for WorkerConfig {
@@ -44,6 +46,7 @@ impl Default for WorkerConfig {
             orchestrator_url: String::new(),
             max_iterations: DEFAULT_WORKER_ITERATIONS,
             timeout: Duration::from_secs(600),
+            require_worker_mcp: false,
         }
     }
 }
@@ -107,6 +110,12 @@ impl WorkerRuntime {
 
         // Fetch job description from orchestrator
         let job = self.client.get_job().await?;
+        if self.config.require_worker_mcp && job.mcp_servers.is_empty() {
+            return Err(WorkerError::ExecutionFailed {
+                reason: "orchestrator required worker-local MCP but supplied no runtime descriptor"
+                    .to_string(),
+            });
+        }
 
         tracing::info!(
             "Received job: {} - {}",
@@ -131,14 +140,62 @@ impl WorkerRuntime {
             );
         }
 
+        let owner_id = if job.owner_id.is_empty() {
+            "default".to_string()
+        } else {
+            job.owner_id.clone()
+        };
+        let mcp_credentials = self.client.fetch_mcp_credentials().await?;
+        let mut mcp_runtime = match WorkerMcpRuntime::activate(
+            Arc::clone(&self.tools),
+            job.mcp_servers.clone(),
+            mcp_credentials,
+            &owner_id,
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let message = format!("Worker MCP activation failed: {error}");
+                self.post_event(
+                    "result",
+                    serde_json::json!({
+                        "status": "error",
+                        "success": false,
+                        "message": message,
+                    }),
+                )
+                .await;
+                self.client
+                    .report_complete(&CompletionReport {
+                        success: false,
+                        message: Some(message),
+                        iterations: 0,
+                    })
+                    .await?;
+                return Ok(());
+            }
+        };
+
         // Report that we're starting
-        self.client
+        if let Err(status_error) = self
+            .client
             .report_status(&StatusUpdate {
                 state: "in_progress".to_string(),
                 message: Some("Worker started, beginning execution".to_string()),
                 iteration: 0,
             })
-            .await?;
+            .await
+        {
+            return match mcp_runtime.shutdown().await {
+                Ok(()) => Err(status_error),
+                Err(cleanup_error) => Err(WorkerError::ExecutionFailed {
+                    reason: format!(
+                        "worker status failed: {status_error}; MCP cleanup failed: {cleanup_error}"
+                    ),
+                }),
+            };
+        }
 
         // Create reasoning engine
         let reasoning = Reasoning::new(self.llm.clone());
@@ -170,6 +227,7 @@ Work independently to complete this job. Report when done."#,
                 safety: self.safety.clone(),
                 tools: self.tools.clone(),
                 extra_env: self.extra_env.clone(),
+                owner_id,
                 last_output: Mutex::new(String::new()),
                 iteration_tracker: iteration_tracker.clone(),
                 consecutive_text_only: Mutex::new(0),
@@ -194,126 +252,91 @@ Work independently to complete this job. Report when done."#,
 
         let iterations = *iteration_tracker.lock().await;
 
-        match result {
+        let mut report = match result {
             Ok(Ok(LoopOutcome::Response(output))) => {
                 tracing::info!("Worker completed job {} successfully", self.config.job_id);
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "completed",
-                        "success": true,
-                        "message": truncate_for_preview(&output, 2000),
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: true,
-                        message: Some(output),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: true,
+                    message: Some(output),
+                    iterations,
+                }
             }
             Ok(Ok(LoopOutcome::MaxIterations)) => {
                 let msg = format!("max iterations ({}) exceeded", self.config.max_iterations);
                 tracing::warn!("Worker failed for job {}: {}", self.config.job_id, msg);
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "error",
-                        "success": false,
-                        "message": format!("Execution failed: {}", msg),
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: false,
-                        message: Some(format!("Execution failed: {}", msg)),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: false,
+                    message: Some(format!("Execution failed: {msg}")),
+                    iterations,
+                }
             }
             Ok(Ok(LoopOutcome::Stopped)) => {
                 tracing::info!("Worker for job {} stopped", self.config.job_id);
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "error",
-                        "success": false,
-                        "message": "Execution stopped",
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: false,
-                        message: Some("Execution stopped".to_string()),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: false,
+                    message: Some("Execution stopped".to_string()),
+                    iterations,
+                }
             }
             Ok(Ok(LoopOutcome::NeedApproval(_))) => {
                 tracing::info!(
                     "Worker for job {} requires approval before it can continue",
                     self.config.job_id
                 );
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "stuck",
-                        "success": false,
-                        "message": "Awaiting approval",
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: false,
-                        message: Some("Awaiting approval".to_string()),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: false,
+                    message: Some("Awaiting approval".to_string()),
+                    iterations,
+                }
             }
             Ok(Err(e)) => {
                 tracing::error!("Worker failed for job {}: {}", self.config.job_id, e);
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "error",
-                        "success": false,
-                        "message": format!("Execution failed: {}", e),
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: false,
-                        message: Some(format!("Execution failed: {}", e)),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: false,
+                    message: Some(format!("Execution failed: {e}")),
+                    iterations,
+                }
             }
             Err(_) => {
                 tracing::warn!("Worker timed out for job {}", self.config.job_id);
-                self.post_event(
-                    "result",
-                    serde_json::json!({
-                        "status": "error",
-                        "success": false,
-                        "message": "Execution timed out",
-                    }),
-                )
-                .await;
-                self.client
-                    .report_complete(&CompletionReport {
-                        success: false,
-                        message: Some("Execution timed out".to_string()),
-                        iterations,
-                    })
-                    .await?;
+                CompletionReport {
+                    success: false,
+                    message: Some("Execution timed out".to_string()),
+                    iterations,
+                }
             }
+        };
+
+        if let Err(cleanup_error) = mcp_runtime.shutdown().await {
+            tracing::warn!(
+                job_id = %self.config.job_id,
+                "Worker MCP cleanup failed"
+            );
+            report.success = false;
+            let cleanup_message = format!("MCP cleanup failed: {cleanup_error}");
+            report.message = Some(match report.message {
+                Some(message) => format!("{message}; {cleanup_message}"),
+                None => cleanup_message,
+            });
         }
+
+        let status = if report.success {
+            "completed"
+        } else if report.message.as_deref() == Some("Awaiting approval") {
+            "stuck"
+        } else {
+            "error"
+        };
+        self.post_event(
+            "result",
+            serde_json::json!({
+                "status": status,
+                "success": report.success,
+                "message": report.message.as_deref().map(|message| truncate_for_preview(message, 2000)),
+            }),
+        )
+        .await;
+        self.client.report_complete(&report).await?;
 
         Ok(())
     }
@@ -338,6 +361,7 @@ struct ContainerDelegate {
     safety: Arc<SafetyLayer>,
     tools: Arc<ToolRegistry>,
     extra_env: Arc<HashMap<String, String>>,
+    owner_id: String,
     /// Tracks the last successful tool output for the final response.
     last_output: Mutex<String>,
     /// Tracks the current iteration — shared with the outer `run` method so
@@ -532,6 +556,7 @@ impl LoopDelegate for ContainerDelegate {
             .await;
 
             let job_ctx = JobContext {
+                user_id: self.owner_id.clone(),
                 extra_env: self.extra_env.clone(),
                 ..Default::default()
             };

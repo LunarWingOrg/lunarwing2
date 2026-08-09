@@ -31,6 +31,59 @@ pub struct CredentialGrant {
     pub env_var: String,
 }
 
+/// Owner-scoped secret grant for one MCP server process environment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpCredentialGrant {
+    pub server_name: String,
+    pub secret_name: String,
+    pub env_var: String,
+}
+
+/// Restart metadata for sandbox job capabilities.
+///
+/// New records use this object envelope. Deserialization also accepts the
+/// legacy bare credential array, which grants no worker-local MCP servers.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SandboxJobGrants {
+    pub credentials: Vec<CredentialGrant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SandboxJobGrantsWire {
+    Current(SandboxJobGrantsFields),
+    Legacy(Vec<CredentialGrant>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SandboxJobGrantsFields {
+    #[serde(default)]
+    credentials: Vec<CredentialGrant>,
+    #[serde(default)]
+    mcp_servers: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for SandboxJobGrants {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        match SandboxJobGrantsWire::deserialize(deserializer)? {
+            SandboxJobGrantsWire::Current(fields) => Ok(Self {
+                credentials: fields.credentials,
+                mcp_servers: fields.mcp_servers,
+            }),
+            SandboxJobGrantsWire::Legacy(credentials) => Ok(Self {
+                credentials,
+                mcp_servers: Vec::new(),
+            }),
+        }
+    }
+}
+
 /// In-memory store for per-job authentication tokens and credential grants.
 #[derive(Clone)]
 pub struct TokenStore {
@@ -38,6 +91,8 @@ pub struct TokenStore {
     tokens: Arc<RwLock<HashMap<Uuid, String>>>,
     /// Maps job_id -> granted credentials. Revoked alongside the token.
     credential_grants: Arc<RwLock<HashMap<Uuid, Vec<CredentialGrant>>>>,
+    /// MCP grants stay isolated from generic shell/child-process credentials.
+    mcp_credential_grants: Arc<RwLock<HashMap<Uuid, Vec<McpCredentialGrant>>>>,
 }
 
 impl TokenStore {
@@ -45,6 +100,7 @@ impl TokenStore {
         Self {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             credential_grants: Arc::new(RwLock::new(HashMap::new())),
+            mcp_credential_grants: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -69,6 +125,7 @@ impl TokenStore {
     pub async fn revoke(&self, job_id: Uuid) {
         self.tokens.write().await.remove(&job_id);
         self.credential_grants.write().await.remove(&job_id);
+        self.mcp_credential_grants.write().await.remove(&job_id);
     }
 
     /// Get the number of active tokens (for diagnostics).
@@ -86,6 +143,23 @@ impl TokenStore {
     /// Retrieve credential grants for a job.
     pub async fn get_grants(&self, job_id: Uuid) -> Option<Vec<CredentialGrant>> {
         self.credential_grants.read().await.get(&job_id).cloned()
+    }
+
+    pub async fn store_mcp_grants(&self, job_id: Uuid, grants: Vec<McpCredentialGrant>) {
+        let mut stored = self.mcp_credential_grants.write().await;
+        if grants.is_empty() {
+            stored.remove(&job_id);
+        } else {
+            stored.insert(job_id, grants);
+        }
+    }
+
+    pub async fn get_mcp_grants(&self, job_id: Uuid) -> Option<Vec<McpCredentialGrant>> {
+        self.mcp_credential_grants
+            .read()
+            .await
+            .get(&job_id)
+            .cloned()
     }
 }
 
@@ -221,6 +295,33 @@ mod tests {
         assert_eq!(retrieved[1].secret_name, "npm_token");
     }
 
+    #[test]
+    fn sandbox_job_grants_decode_legacy_array_without_mcp_access() {
+        let grants: SandboxJobGrants =
+            serde_json::from_str(r#"[{"secret_name":"github_token","env_var":"GITHUB_TOKEN"}]"#)
+                .unwrap();
+
+        assert_eq!(grants.credentials.len(), 1);
+        assert!(grants.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn sandbox_job_grants_round_trip_explicit_mcp_selection() {
+        let grants = SandboxJobGrants {
+            credentials: Vec::new(),
+            mcp_servers: vec!["project-tools".to_string()],
+        };
+        let json = serde_json::to_string(&grants).unwrap();
+        let decoded: SandboxJobGrants = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.mcp_servers, ["project-tools"]);
+    }
+
+    #[test]
+    fn sandbox_job_grants_reject_unknown_fields() {
+        assert!(serde_json::from_str::<SandboxJobGrants>(r#"{"mcp_server":["typo"]}"#).is_err());
+    }
+
     #[tokio::test]
     async fn test_revoke_clears_grants() {
         let store = TokenStore::new();
@@ -289,5 +390,29 @@ mod tests {
         let grants_b = store.get_grants(job_b).await.unwrap();
         assert_eq!(grants_b.len(), 1);
         assert_eq!(grants_b[0].secret_name, "secret_b");
+    }
+
+    #[tokio::test]
+    async fn mcp_grants_are_isolated_and_revoked() {
+        let store = TokenStore::new();
+        let job_a = Uuid::new_v4();
+        let job_b = Uuid::new_v4();
+        store
+            .store_mcp_grants(
+                job_a,
+                vec![McpCredentialGrant {
+                    server_name: "alpha".into(),
+                    secret_name: "token_a".into(),
+                    env_var: "TOKEN".into(),
+                }],
+            )
+            .await;
+        assert!(store.get_mcp_grants(job_b).await.is_none());
+        assert_eq!(
+            store.get_mcp_grants(job_a).await.unwrap()[0].server_name,
+            "alpha"
+        );
+        store.revoke(job_a).await;
+        assert!(store.get_mcp_grants(job_a).await.is_none());
     }
 }

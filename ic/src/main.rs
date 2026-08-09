@@ -245,9 +245,16 @@ async fn async_main() -> anyhow::Result<()> {
             job_id,
             orchestrator_url,
             max_iterations,
+            require_worker_mcp,
         }) => {
             init_worker_tracing();
-            return lunarwing::worker::run_worker(*job_id, orchestrator_url, *max_iterations).await;
+            return lunarwing::worker::run_worker(
+                *job_id,
+                orchestrator_url,
+                *max_iterations,
+                *require_worker_mcp,
+            )
+            .await;
         }
         Some(Command::Login) => {
             init_cli_tracing();

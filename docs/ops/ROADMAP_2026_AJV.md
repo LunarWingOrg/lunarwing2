@@ -42,7 +42,7 @@ Add
 | Human Delay Mode Phase 2 | v2.0.6 | `docs/proposals/human-delay-mode-phase2-plan.md` |
 | Input-validation security improvements | v2.0.6 | |
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.6 | |
-| MCP Overhaul Part 2 — runtime adapter boundary, MCP-over-WASM, and dedicated/shared gateway client placement implemented; worker-local prototype remains | v2.0.6 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
+| MCP Overhaul Part 2 — runtime adapter boundary, MCP-over-WASM, dedicated/shared gateway client placement, and core Docker worker-local stdio placement implemented | v2.0.6 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
 | IronClaw port backlog — top 2 priority additions | v2.0.6 | `docs/proposals/IRONCLAW_TOP2_PRIORITY_PLAN.md` |
 | Routine engine improvements — remaining items 4-8 | v2.0.6 | `docs/proposals/ROUTINE_ENGINE_IMPROVEMENTS.md` |
 | DarkIRC decentralized peering — Tor transport for onion seeds and expanded clearnet seed availability | v2.0.6 | `docs/proposals/DARKIRC_THINGS_TO_ADD.md` |

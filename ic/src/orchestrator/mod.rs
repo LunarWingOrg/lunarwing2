@@ -14,6 +14,7 @@
 //! │    POST /worker/{id}/llm/complete_with_tools    │
 //! │    GET  /worker/{id}/job                        │
 //! │    GET  /worker/{id}/credentials                │
+//! │    GET  /worker/{id}/mcp/credentials            │
 //! │    POST /worker/{id}/status                     │
 //! │    POST /worker/{id}/complete                   │
 //! │                                                 │
@@ -35,10 +36,11 @@ pub mod job_manager;
 pub mod reaper;
 
 pub use api::OrchestratorApi;
-pub use auth::{CredentialGrant, TokenStore};
+pub use auth::{CredentialGrant, McpCredentialGrant, TokenStore};
 pub use external_worker::{ExternalTaskResult, ExternalWorkerManager};
 pub use job_manager::{
-    CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager, JobMode,
+    CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
+    ContainerJobRequest, JobMode, snapshot_worker_mcp,
 };
 pub use reaper::{ReaperConfig, SandboxReaper};
 

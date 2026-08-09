@@ -40,6 +40,17 @@ pub enum McpGatewayMode {
     Shared,
 }
 
+/// Runtime placement responsible for activating an MCP server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpPlacement {
+    /// Run in the LunarWing daemon host runtime.
+    #[default]
+    Host,
+    /// Run inside an isolated job worker.
+    JobWorker,
+}
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -104,6 +115,10 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<McpTransportConfig>,
 
+    /// Runtime placement responsible for activating this server.
+    #[serde(default)]
+    pub placement: McpPlacement,
+
     /// Custom headers to include in every HTTP request.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
@@ -149,9 +164,19 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl McpServerConfig {
-    /// Whether daemon startup may activate this server automatically.
+    /// Whether daemon startup may activate this host server automatically.
+    pub fn should_host_auto_start(&self) -> bool {
+        self.enabled && !self.recovery_circuit_open && self.placement == McpPlacement::Host
+    }
+
+    /// Whether a job worker may activate this server.
+    pub fn should_run_in_job(&self) -> bool {
+        self.enabled && !self.recovery_circuit_open && self.placement == McpPlacement::JobWorker
+    }
+
+    /// Backward-compatible alias for host daemon startup.
     pub fn should_auto_start(&self) -> bool {
-        self.enabled && !self.recovery_circuit_open
+        self.should_host_auto_start()
     }
 
     /// Create a new MCP server configuration.
@@ -160,6 +185,7 @@ impl McpServerConfig {
             name: name.into(),
             url: url.into(),
             transport: None,
+            placement: McpPlacement::Host,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -198,6 +224,7 @@ impl McpServerConfig {
                 env,
                 env_secrets,
             }),
+            placement: McpPlacement::Host,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -217,6 +244,7 @@ impl McpServerConfig {
             transport: Some(McpTransportConfig::Unix {
                 socket_path: socket_path.into(),
             }),
+            placement: McpPlacement::Host,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -239,6 +267,7 @@ impl McpServerConfig {
                 fuel: default_wasm_fuel(),
                 timeout_seconds: default_wasm_timeout_seconds(),
             }),
+            placement: McpPlacement::Host,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -275,6 +304,12 @@ impl McpServerConfig {
             *configured_fuel = fuel;
             *configured_timeout = timeout_seconds;
         }
+        self
+    }
+
+    /// Set runtime placement.
+    pub fn with_placement(mut self, placement: McpPlacement) -> Self {
+        self.placement = placement;
         self
     }
 
@@ -362,6 +397,29 @@ impl McpServerConfig {
             return Err(ConfigError::InvalidConfig {
                 reason: "Server name cannot be empty".to_string(),
             });
+        }
+
+        if self.placement == McpPlacement::JobWorker {
+            if !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. }) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Job-worker MCP servers only support stdio transport".to_string(),
+                });
+            }
+            if self.sandbox.is_some() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Job-worker MCP servers cannot use host sandbox policies".to_string(),
+                });
+            }
+            if self.oauth.is_some() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Job-worker MCP servers cannot use OAuth".to_string(),
+                });
+            }
+            if !self.headers.is_empty() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "Job-worker MCP servers cannot use custom headers".to_string(),
+                });
+            }
         }
 
         match self.effective_transport() {
@@ -1065,6 +1123,20 @@ impl McpServersFile {
     /// Get all enabled servers.
     pub fn enabled_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
         self.servers.iter().filter(|s| s.enabled)
+    }
+
+    /// Get host servers eligible for daemon startup.
+    pub fn host_auto_start_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        self.servers
+            .iter()
+            .filter(|server| server.should_host_auto_start())
+    }
+
+    /// Get job-worker servers eligible for job activation.
+    pub fn job_worker_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        self.servers
+            .iter()
+            .filter(|server| server.should_run_in_job())
     }
 }
 
@@ -1955,14 +2027,80 @@ mod tests {
         let mut config =
             McpServerConfig::new_stdio("blocked", "server", Vec::new(), HashMap::new());
         config.recovery_circuit_open = true;
-        assert!(!config.should_auto_start());
+        assert!(!config.should_host_auto_start());
 
         let mut servers = McpServersFile::default();
         servers.upsert(config);
         let server = servers.get_mut("blocked").unwrap();
         server.enabled = true;
         server.recovery_circuit_open = false;
-        assert!(server.should_auto_start());
+        assert!(server.should_host_auto_start());
+    }
+
+    #[test]
+    fn legacy_config_defaults_to_host_placement() {
+        let config: McpServerConfig = serde_json::from_str(
+            r#"{"name":"legacy","url":"https://mcp.example.com","enabled":true}"#,
+        )
+        .expect("deserialize legacy config");
+
+        assert_eq!(config.placement, McpPlacement::Host);
+        assert!(config.should_host_auto_start());
+        assert!(!config.should_run_in_job());
+
+        let invalid = r#"{
+            "name":"invalid",
+            "url":"https://mcp.example.com",
+            "placement":"elsewhere"
+        }"#;
+        assert!(serde_json::from_str::<McpServerConfig>(invalid).is_err());
+    }
+
+    #[test]
+    fn job_worker_placement_survives_serde_roundtrip() {
+        let config = McpServerConfig::new_stdio("worker", "server", Vec::new(), HashMap::new())
+            .with_placement(McpPlacement::JobWorker);
+        let json = serde_json::to_string(&config).expect("serialize worker config");
+        let parsed: McpServerConfig =
+            serde_json::from_str(&json).expect("deserialize worker config");
+
+        assert_eq!(parsed.placement, McpPlacement::JobWorker);
+        assert!(parsed.should_run_in_job());
+        assert!(!parsed.should_host_auto_start());
+    }
+
+    #[test]
+    fn job_worker_validation_rejects_host_only_features() {
+        let http = McpServerConfig::new("worker", "https://mcp.example.com")
+            .with_placement(McpPlacement::JobWorker);
+        assert!(http.validate().unwrap_err().to_string().contains("stdio"));
+
+        let sandboxed = McpServerConfig::new_stdio("worker", "server", Vec::new(), HashMap::new())
+            .with_sandbox(crate::tools::mcp::sandbox::McpSandboxConfig::default())
+            .with_placement(McpPlacement::JobWorker);
+        assert!(
+            sandboxed
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sandbox")
+        );
+
+        let oauth = McpServerConfig::new_stdio("worker", "server", Vec::new(), HashMap::new())
+            .with_oauth(OAuthConfig::new("client"))
+            .with_placement(McpPlacement::JobWorker);
+        assert!(oauth.validate().unwrap_err().to_string().contains("OAuth"));
+
+        let headers = McpServerConfig::new_stdio("worker", "server", Vec::new(), HashMap::new())
+            .with_headers(HashMap::from([("X-Test".to_string(), "value".to_string())]))
+            .with_placement(McpPlacement::JobWorker);
+        assert!(
+            headers
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("headers")
+        );
     }
 
     #[test]

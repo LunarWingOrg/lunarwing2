@@ -2,8 +2,10 @@
 
 > **Current status (2026-08-09): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
 > stdio lifecycle, a public runtime-adapter registry, stateful MCP-over-WASM, and
-> dedicated/shared gateway client placement are implemented. The runtime-neutral
-> package model, generic worker-local MCP, marketplace signatures/dependency locks,
+> dedicated/shared gateway client placement are implemented. Core Docker job workers
+> also support explicit worker-local stdio placement with immutable owner snapshots,
+> separate credential grants, and bounded lifecycle. The runtime-neutral
+> package model, persistent-worker MCP placement, marketplace signatures/dependency locks,
 > automatic package installation, and a bundled gateway control-plane service
 > remain open.
 
@@ -110,24 +112,28 @@ MCP config or retained as restart data. Child processes receive an allowlisted O
 environment rather than inheriting daemon credentials. This is raw credential
 exposure to trusted, unsandboxed code, not host-bound credential injection.
 
-### Core per-job workers do not load LunarWing MCP configs
+### Core per-job workers support explicit MCP placement
 
-The standard container worker creates a fresh `ToolRegistry` and calls
-`register_container_tools()`. That path currently registers shell and file-editing
-tools, but it does not load MCP configuration, construct MCP clients, or register
-MCP tool wrappers.
+`McpServerConfig.placement` distinguishes backward-compatible `host` activation
+from `job_worker`. On core Docker job creation, LunarWing takes an immutable
+owner-scoped snapshot of enabled worker stdio configs and separate secret grants.
+The worker verifies any pinned executable against its own image, initializes MCP,
+discovers tools, and atomically adds autonomous wrappers to its fresh `ToolRegistry`.
+It unregisters wrappers and stops all MCP runtime state before job completion.
 
-The worker image already contains Node.js/npm, Python/pip, Rust, Git, and common
-build dependencies. Many stdio MCP servers could physically run in the image, but
-the worker runtime has no supported manifest/configuration path for them today.
-
-Adding worker-local MCP therefore requires lifecycle and policy plumbing, not only
-installing a package in the image.
+This path requires a mounted `/workspace`, accepts only preinstalled stdio commands,
+and allows at most eight servers and 32 grants per job. Across those servers, tool
+discovery is capped at 256 tools and 2 MiB of descriptors; stream frames are capped
+at 4 MiB. Secret values travel through a dedicated job-token-authenticated route and
+never enter normal shell credentials.
+Startup, exact grant coverage, provenance, conflicts, approval requirements, and
+cleanup fail closed. Initial activation and teardown are bounded; post-start MCP
+child restart supervision remains outside this prototype. Linux worker activation
+also requires Yama `kernel.yama.ptrace_scope >= 1` so same-UID MCP and shell sibling
+processes cannot inspect each other's credential environments after `execve`.
 
 Some persistent external workers can independently configure their own MCP clients
-or servers. That is not generic LunarWing worker-local placement: the orchestrator
-does not send an installed MCP package descriptor and evaluated grants to the core
-job worker, and worker-local MCP tools are not registered from LunarWing MCP config.
+or servers. They do not receive this core Docker job-worker placement contract.
 
 ### The native WASM tool ABI remains invocation-scoped; MCP uses an actor ABI
 
@@ -376,9 +382,9 @@ same container and registers their tools in the worker's local tool registry.
 
 **Assessment**
 
-Useful as explicit `job-worker` placement for workspace-coupled MCP servers. Prefer
-prebuilt worker images or verified extension bundles over installing arbitrary npm
-or Python packages during a job.
+Implemented as explicit `job_worker` placement for workspace-coupled stdio MCP
+servers in core Docker jobs. Commands must be preinstalled; optional pinned
+provenance is checked in the worker. Runtime package installation remains blocked.
 
 ### 5. MCP inside a persistent external worker
 
@@ -608,8 +614,10 @@ The implemented MCP runtime registry delegates these resources:
 - Gateway adapter: dedicated/shared placement, protected route selection, sessions,
   OAuth, and independent gateway-service ownership.
 
-The worker adapter remains open for item #11: image/package availability, descriptor
-and grant delivery, task routing, health, and cancellation are not yet wired.
+The core Docker worker adapter now owns immutable descriptor/grant delivery,
+worker-image provenance checks, bounded startup, atomic tool registration, and
+pre-completion teardown. Post-start MCP process restart, package delivery, and
+persistent external-worker placement remain open.
 
 ## Suggested Exploration Sequence
 
@@ -649,7 +657,7 @@ This phase can be designed without implementing new runtimes.
   credential, leak-detection, rate-limit, and audit primitives remain Phase 1/package
   policy work rather than MCP activation blockers.
 
-### Phase 3: Worker-local MCP prototype
+### Phase 3: Worker-local MCP prototype (completed 2026-08-09)
 
 - Pass an allowlisted, resolved MCP runtime descriptor to a job worker.
 - Start only preinstalled or verified server packages.
@@ -657,7 +665,9 @@ This phase can be designed without implementing new runtimes.
 - Scope workspace and credentials to the job.
 - Measure startup time, failure isolation, and teardown reliability.
 
-This is likely the fastest prototype for validating placement-aware extensions.
+Implemented for core Docker jobs with stdio-only placement, immutable owner-scoped
+snapshots, exact separate credential grants, server/grant limits, old-worker
+compatibility guard, autonomous-tool checks, and fail-closed bounded cleanup.
 
 ### Phase 4: Marketplace provenance
 
@@ -700,8 +710,9 @@ Native WASM tools remain the better implementation for ordinary narrow tool call
    its declared allowed placements?
 5. Which MCP primitives beyond tools are real LunarWing V2 requirements: resources,
    prompts, subscriptions, sampling, elicitation, or all of them?
-6. Should worker-local MCP servers be available only to the worker agent, or can the
-   orchestrator proxy selected tools into the primary agent session?
+6. Should worker-local MCP remain available only to the worker agent, as in the
+   prototype, or can the orchestrator safely proxy selected tools into the primary
+   agent session?
 7. How should package-defined tools retain stable identity across runtime changes and
    upgrades?
 8. What state API should invocation-scoped WASM tools and persistent WASM actors use?
@@ -732,12 +743,12 @@ Use native WASM tools for small integrations, worker placement for workspace-loc
 or native servers, dedicated workers for stateful/heavy services, and gateways for
 shared remote control-plane concerns.
 
-The host-local stdio installation, explicit lifecycle, and safe whole-runtime crash
-recovery work is complete. Worker-local MCP is the next placement option to evaluate
-when a concrete
-workspace-coupled server justifies additional lifecycle and credential-policy
-plumbing. Start with preinstalled or verified packages; do not combine the first
-placement prototype with arbitrary npm/pip installation.
+The host-local stdio installation, explicit lifecycle, safe whole-runtime crash
+recovery, and core Docker worker-local prototype are complete. Worker placement is
+limited to preinstalled or worker-verified stdio commands and job-scoped credentials;
+do not combine it with arbitrary npm/pip installation. Next evidence should measure
+representative startup, post-start failure, and cancellation behavior before adding
+restart supervision or broader worker types.
 
 The optional MCP-over-WASM actor/session ABI and dedicated/shared gateway client
 placement are now available without changing native WASM tool defaults. Continue to
@@ -760,6 +771,9 @@ coupling to the daemon is intentional.
 - `ic/src/channels/web/server.rs`
 - `ic/src/app.rs`
 - `ic/src/worker/container.rs`
+- `ic/src/worker/mcp.rs`
+- `ic/src/orchestrator/job_manager.rs`
+- `ic/src/orchestrator/api.rs`
 - `ic/src/tools/registry.rs`
 - `ic/Dockerfile.worker`
 - `ic/src/tools/wasm/runtime.rs`

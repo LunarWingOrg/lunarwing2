@@ -34,7 +34,7 @@ use crate::tools::mcp::auth::{
     authorize_mcp_server, canonical_resource_uri, discover_full_oauth_metadata,
     find_available_port, is_authenticated, register_client,
 };
-use crate::tools::mcp::config::McpServerConfig;
+use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::wasm::{WasmToolLoader, WasmToolRuntime, discover_tools};
 use crate::tools::{Tool, ToolRegistry};
@@ -833,6 +833,25 @@ impl ExtensionManager {
             );
             return;
         }
+        let host_config = self
+            .get_mcp_server(&name, &self.user_id)
+            .await
+            .is_ok_and(|server| server.placement == McpPlacement::Host);
+        if !host_config {
+            for tool in &tools {
+                self.tool_registry
+                    .unregister_if_same(tool.name(), tool)
+                    .await;
+            }
+            if let Err(error) = self
+                .shutdown_mcp_runtime(&name, Some(client.as_ref()))
+                .await
+            {
+                tracing::warn!(server = %name, %error, "Rejected non-host MCP startup injection; cleanup incomplete");
+            }
+            tracing::warn!(server = %name, "Rejected MCP startup injection without current host placement");
+            return;
+        }
         let managed_stdio = self.mcp_process_manager.get(&name).await.is_some();
         let managed_wasm = !managed_stdio && client.runtime_is_wasm();
         let generation = self.next_mcp_runtime_generation();
@@ -1263,13 +1282,20 @@ impl ExtensionManager {
         }
 
         let _lifecycle_guard = self.lock_mcp_lifecycle_for_manual(name).await;
-        self.set_mcp_enabled(name, user_id, false).await?;
+        let server = self.set_mcp_enabled(name, user_id, false).await?;
         self.clear_pending_extension_auth(name, user_id).await;
         let stopped = self.stop_mcp_runtime(name, user_id).await;
-        let mut message = format!(
-            "Deactivated MCP server '{name}' and unloaded {} tool(s); configuration preserved",
-            stopped.tool_names.len()
-        );
+        let mut message = if server.placement == McpPlacement::JobWorker {
+            format!(
+                "Disabled job-worker MCP server '{name}' for future Docker jobs; running jobs retain immutable MCP snapshots; cleaned up {} stale host tool(s)",
+                stopped.tool_names.len()
+            )
+        } else {
+            format!(
+                "Deactivated host MCP server '{name}' and unloaded {} tool(s); configuration preserved",
+                stopped.tool_names.len()
+            )
+        };
         if let Some(warning) = stopped.cleanup_warning {
             message.push_str(&format!(". Runtime cleanup warning: {warning}"));
         }
@@ -1297,6 +1323,37 @@ impl ExtensionManager {
             crate::tools::mcp::config::toggle_mcp_server_enabled(name).await
         }
         .map_err(|error| ExtensionError::Config(error.to_string()))?;
+
+        if server.placement == McpPlacement::JobWorker {
+            self.clear_pending_extension_auth(name, user_id).await;
+            let stopped = self.stop_mcp_runtime(name, user_id).await;
+            let mut message = if server.enabled {
+                format!(
+                    "Enabled job-worker MCP server '{name}' for future Docker jobs; running jobs retain immutable MCP snapshots"
+                )
+            } else {
+                format!(
+                    "Disabled job-worker MCP server '{name}' for future Docker jobs; running jobs retain immutable MCP snapshots"
+                )
+            };
+            if !stopped.tool_names.is_empty() {
+                message.push_str(&format!(
+                    "; cleaned up {} stale host tool(s)",
+                    stopped.tool_names.len()
+                ));
+            }
+            if let Some(warning) = stopped.cleanup_warning {
+                message.push_str(&format!(". Runtime cleanup warning: {warning}"));
+            }
+            let status = if server.enabled {
+                "enabled"
+            } else {
+                "inactive"
+            };
+            self.broadcast_extension_status(user_id, name, status, Some(&message))
+                .await;
+            return Ok(message);
+        }
 
         if server.enabled {
             if let Err(error) = self.ensure_mcp_owner_available(name, user_id).await {
@@ -1347,7 +1404,10 @@ impl ExtensionManager {
                 Ok(servers) => {
                     for server in &servers.servers {
                         let authenticated = is_authenticated(server, &self.secrets, user_id).await;
-                        let (health, tools) = {
+                        let worker_placement = server.placement == McpPlacement::JobWorker;
+                        let (health, tools) = if worker_placement {
+                            (None, Vec::new())
+                        } else {
                             let active_servers = self.active_mcp_servers.read().await;
                             let runtime = active_servers
                                 .get(&server.name)
@@ -1412,6 +1472,7 @@ impl ExtensionManager {
                                 } => Some(command.to_string()),
                                 _ => None,
                             },
+                            placement: Some(server.placement),
                             authenticated: !matches!(
                                 server.effective_transport(),
                                 crate::tools::mcp::config::EffectiveTransport::Http
@@ -1419,7 +1480,11 @@ impl ExtensionManager {
                             ) || authenticated,
                             active,
                             recovering,
-                            enabled: Some(server.enabled),
+                            enabled: Some(if worker_placement {
+                                server.should_run_in_job()
+                            } else {
+                                server.enabled
+                            }),
                             tools,
                             needs_setup: false,
                             has_auth: false,
@@ -1427,8 +1492,13 @@ impl ExtensionManager {
                             activation_error: (health == Some(McpRuntimeHealth::CircuitOpen)
                                 || server.recovery_circuit_open)
                                 .then(|| {
-                                    "Automatic recovery stopped after repeated crashes; activate manually to retry"
-                                        .to_string()
+                                    if worker_placement {
+                                        "Automatic recovery stopped; job-worker MCP is ineligible for future Docker jobs until explicitly activated"
+                                            .to_string()
+                                    } else {
+                                        "Automatic recovery stopped after repeated host MCP crashes; activate manually to retry"
+                                            .to_string()
+                                    }
                                 }),
                             version: None,
                         });
@@ -1476,6 +1546,7 @@ impl ExtensionManager {
                             url: None,
                             transport: None,
                             command: None,
+                            placement: None,
                             authenticated: auth_state == ToolAuthState::Ready,
                             active,
                             recovering: false,
@@ -1536,6 +1607,7 @@ impl ExtensionManager {
                             url: None,
                             transport: None,
                             command: None,
+                            placement: None,
                             authenticated: auth_state == ToolAuthState::Ready,
                             active,
                             recovering: false,
@@ -1579,6 +1651,7 @@ impl ExtensionManager {
                     url: None,
                     transport: None,
                     command: None,
+                    placement: None,
                     authenticated: false,
                     active: false,
                     recovering: false,
@@ -1608,17 +1681,29 @@ impl ExtensionManager {
         match kind {
             ExtensionKind::McpServer => {
                 let _lifecycle_guard = self.lock_mcp_lifecycle_for_manual(name).await;
+                let placement = self
+                    .get_mcp_server(name, user_id)
+                    .await
+                    .map_err(|error| ExtensionError::Config(error.to_string()))?
+                    .placement;
                 self.remove_mcp_server(name, user_id)
                     .await
                     .map_err(|e| ExtensionError::Config(e.to_string()))?;
                 self.clear_pending_extension_auth(name, user_id).await;
                 let stopped = self.stop_mcp_runtime(name, user_id).await;
 
-                let mut message = format!(
-                    "Removed MCP server '{}' and {} tool(s)",
-                    name,
-                    stopped.tool_names.len()
-                );
+                let mut message = if placement == McpPlacement::JobWorker {
+                    format!(
+                        "Removed job-worker MCP server '{name}' from future Docker jobs; running jobs retain immutable MCP snapshots; cleaned up {} stale host tool(s)",
+                        stopped.tool_names.len()
+                    )
+                } else {
+                    format!(
+                        "Removed host MCP server '{}' and {} tool(s)",
+                        name,
+                        stopped.tool_names.len()
+                    )
+                };
                 if let Some(warning) = stopped.cleanup_warning {
                     message.push_str(&format!(". Runtime cleanup warning: {warning}"));
                 }
@@ -1981,6 +2066,11 @@ impl ExtensionManager {
                 Ok(info)
             }
             ExtensionKind::McpServer => {
+                let server = self
+                    .get_mcp_server(name, user_id)
+                    .await
+                    .map_err(|error| ExtensionError::Config(error.to_string()))?;
+                let worker_placement = server.placement == McpPlacement::JobWorker;
                 let health = self
                     .active_mcp_servers
                     .read()
@@ -1991,12 +2081,15 @@ impl ExtensionManager {
                 let info = serde_json::json!({
                     "name": name,
                     "kind": "mcp_server",
-                    "connected": health == Some(McpRuntimeHealth::Healthy),
-                    "recovering": matches!(
+                    "placement": server.placement,
+                    "worker_eligible": server.should_run_in_job(),
+                    "connected": !worker_placement && health == Some(McpRuntimeHealth::Healthy),
+                    "recovering": !worker_placement && matches!(
                         health,
                         Some(McpRuntimeHealth::Recovering | McpRuntimeHealth::RetryPending)
                     ),
-                    "recovery_failed": health == Some(McpRuntimeHealth::CircuitOpen),
+                    "recovery_failed": !worker_placement
+                        && health == Some(McpRuntimeHealth::CircuitOpen),
                 });
                 Ok(info)
             }
@@ -2158,6 +2251,7 @@ impl ExtensionManager {
             }
             Ok(Ok(server))
                 if server.enabled
+                    && server.placement == McpPlacement::Host
                     && matches!(
                         server.effective_transport(),
                         crate::tools::mcp::config::EffectiveTransport::Stdio { .. }
@@ -2754,6 +2848,7 @@ impl ExtensionManager {
             .validate()
             .map_err(|e| ExtensionError::Config(e.to_string()))?;
         let name = config.name.clone();
+        let placement = config.placement;
         let transport = match config.effective_transport() {
             crate::tools::mcp::config::EffectiveTransport::Http => "HTTP",
             crate::tools::mcp::config::EffectiveTransport::Stdio { .. } => "stdio",
@@ -2766,13 +2861,20 @@ impl ExtensionManager {
             .await
             .map_err(|e| ExtensionError::Config(e.to_string()))?;
 
-        tracing::info!(server = %name, transport, "Installed MCP server");
+        tracing::info!(server = %name, transport, placement = ?placement, "Installed MCP server");
+        let message = if placement == McpPlacement::JobWorker {
+            format!(
+                "MCP server '{name}' installed with {transport} transport and job_worker placement. Command must exist in worker image; activation and enabled changes apply to future Docker jobs only."
+            )
+        } else {
+            format!(
+                "MCP server '{name}' installed with {transport} transport and host placement. Run activate to connect."
+            )
+        };
         Ok(InstallResult {
             name: name.clone(),
             kind: ExtensionKind::McpServer,
-            message: format!(
-                "MCP server '{name}' installed with {transport} transport. Run activate to connect."
-            ),
+            message,
         })
     }
 
@@ -2789,9 +2891,9 @@ impl ExtensionManager {
 
     /// Update an installed MCP server's configuration in-place.
     ///
-    /// Preserves enabled state, credentials, headers, description, and approval
-    /// policy from the existing config. If the server is currently active, it is
-    /// stopped and restarted with the new configuration.
+    /// Preserves enabled state, description, approval policy, and package provenance.
+    /// Host credentials and sandbox policy remain host-only. Active host runtimes
+    /// restart only for host-to-host updates.
     pub async fn update_mcp(
         &self,
         name: &str,
@@ -2814,16 +2916,22 @@ impl ExtensionManager {
             .map_err(|e| ExtensionError::Config(e.to_string()))?;
         new_config.name = existing.name.clone();
         new_config.enabled = existing.enabled;
-        if new_config.oauth.is_none() {
+        if new_config.oauth.is_none() && new_config.placement == McpPlacement::Host {
             new_config.oauth = existing.oauth.clone();
         }
-        if new_config.headers.is_empty() {
+        if new_config.headers.is_empty() && new_config.placement == McpPlacement::Host {
             new_config.headers = existing.headers.clone();
         }
         if new_config.description.is_none() {
             new_config.description = existing.description.clone();
         }
         new_config.always_require_approval = existing.always_require_approval.clone();
+        if new_config.provenance.is_none() {
+            new_config.provenance = existing.provenance.clone();
+        }
+        if new_config.sandbox.is_none() && new_config.placement == McpPlacement::Host {
+            new_config.sandbox = existing.sandbox.clone();
+        }
 
         new_config
             .validate()
@@ -2838,11 +2946,19 @@ impl ExtensionManager {
 
         self.persist_mcp_config(new_config.clone(), user_id).await?;
 
+        if new_config.placement == McpPlacement::JobWorker {
+            self.clear_pending_extension_auth(name, user_id).await;
+        }
+
         if was_active {
             self.stop_mcp_runtime(name, user_id).await;
         }
 
-        let (message, status) = if was_active && new_config.enabled {
+        let reactivate_host = was_active
+            && existing.placement == McpPlacement::Host
+            && new_config.placement == McpPlacement::Host
+            && new_config.enabled;
+        let (message, status) = if reactivate_host {
             match self
                 .activate_mcp_locked(name, user_id, new_config.clone())
                 .await
@@ -2872,6 +2988,20 @@ impl ExtensionManager {
                     )
                 }
             }
+        } else if new_config.placement == McpPlacement::JobWorker {
+            (
+                format!(
+                    "Updated MCP server '{name}' for job_worker placement; future Docker jobs use new config, running jobs retain immutable snapshots"
+                ),
+                "updated",
+            )
+        } else if existing.placement == McpPlacement::JobWorker {
+            (
+                format!(
+                    "Updated MCP server '{name}' to host placement; explicit activation required"
+                ),
+                "updated",
+            )
         } else {
             (
                 format!("Updated MCP server '{name}' configuration"),
@@ -3249,6 +3379,12 @@ impl ExtensionManager {
             .await
             .map_err(|e| ExtensionError::NotInstalled(e.to_string()))?;
 
+        if server.placement == McpPlacement::JobWorker {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Job-worker MCP server '{name}' cannot use host OAuth; configure worker-scoped env_secrets instead"
+            )));
+        }
+
         if !matches!(
             server.effective_transport(),
             crate::tools::mcp::config::EffectiveTransport::Http
@@ -3332,6 +3468,11 @@ impl ExtensionManager {
         server: &McpServerConfig,
         user_id: &str,
     ) -> Result<AuthResult, ExtensionError> {
+        if server.placement != McpPlacement::Host {
+            return Err(ExtensionError::AuthNotSupported(format!(
+                "Job-worker MCP server '{name}' cannot use host OAuth"
+            )));
+        }
         // Try to discover OAuth metadata and build a URL the user can open manually
         let metadata = discover_full_oauth_metadata(&server.url)
             .await
@@ -4310,8 +4451,29 @@ impl ExtensionManager {
         user_id: &str,
     ) -> Result<ActivateResult, ExtensionError> {
         let _lifecycle_guard = self.lock_mcp_lifecycle_for_manual(name).await;
-        self.ensure_mcp_owner_available(name, user_id).await?;
+        let current = self
+            .get_mcp_server(name, user_id)
+            .await
+            .map_err(|error| ExtensionError::NotInstalled(error.to_string()))?;
+        if current.placement == McpPlacement::Host {
+            self.ensure_mcp_owner_available(name, user_id).await?;
+        }
         let server = self.set_mcp_enabled(name, user_id, true).await?;
+        if server.placement == McpPlacement::JobWorker {
+            self.clear_pending_extension_auth(name, user_id).await;
+            self.stop_mcp_runtime(name, user_id).await;
+            let message = format!(
+                "Enabled job-worker MCP server '{name}' for future Docker jobs; command must exist in worker image; running jobs retain immutable MCP snapshots"
+            );
+            self.broadcast_extension_status(user_id, name, "enabled", Some(&message))
+                .await;
+            return Ok(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                tools_loaded: Vec::new(),
+                message,
+            });
+        }
         match self
             .activate_mcp_locked(name, user_id, server.clone())
             .await
@@ -4329,7 +4491,6 @@ impl ExtensionManager {
         user_id: &str,
     ) -> Result<Option<ActivateResult>, ExtensionError> {
         let _lifecycle_guard = self.lock_mcp_lifecycle_for_manual(name).await;
-        self.ensure_mcp_owner_available(name, user_id).await?;
         let server = self
             .get_mcp_server(name, user_id)
             .await
@@ -4337,6 +4498,18 @@ impl ExtensionManager {
         if !server.enabled {
             return Ok(None);
         }
+        if server.placement == McpPlacement::JobWorker {
+            self.stop_mcp_runtime(name, user_id).await;
+            return Ok(Some(ActivateResult {
+                name: name.to_string(),
+                kind: ExtensionKind::McpServer,
+                tools_loaded: Vec::new(),
+                message: format!(
+                    "Job-worker MCP server '{name}' remains enabled for future Docker jobs; running jobs retain immutable MCP snapshots"
+                ),
+            }));
+        }
+        self.ensure_mcp_owner_available(name, user_id).await?;
         self.activate_mcp_locked(name, user_id, server)
             .await
             .map(Some)
@@ -4367,6 +4540,11 @@ impl ExtensionManager {
         user_id: &str,
         server: McpServerConfig,
     ) -> Result<PreparedMcpRuntime, ExtensionError> {
+        if server.placement != McpPlacement::Host {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "Host runtime cannot prepare job-worker MCP server '{name}'"
+            )));
+        }
         let client = Arc::new(
             crate::tools::mcp::create_client_from_config(
                 server,
@@ -4400,6 +4578,11 @@ impl ExtensionManager {
         user_id: &str,
         server: McpServerConfig,
     ) -> Result<ActivateResult, ExtensionError> {
+        if server.placement != McpPlacement::Host {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "Host runtime cannot activate job-worker MCP server '{name}'"
+            )));
+        }
         let active_tools = self
             .active_mcp_servers
             .read()
@@ -6083,6 +6266,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
+    use tokio_util::sync::CancellationToken;
 
     use crate::context::JobContext;
     use crate::extensions::ExtensionManager;
@@ -6765,6 +6949,266 @@ done
             .await
             .expect("reload MCP config");
         assert!(stored.get("filesystem").is_none());
+    }
+
+    #[tokio::test]
+    async fn job_worker_install_list_activate_and_toggle_never_start_host_runtime() {
+        use crate::extensions::ExtensionError;
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let mut config =
+            McpServerConfig::new_stdio("worker-files", "worker-mcp", Vec::new(), HashMap::new())
+                .with_placement(McpPlacement::JobWorker);
+        config.enabled = false;
+
+        let installed = manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install worker MCP");
+        assert!(installed.message.contains("job_worker placement"));
+        assert!(installed.message.contains("worker image"));
+
+        let listed = manager
+            .list(Some(ExtensionKind::McpServer), false, "test")
+            .await
+            .expect("list worker MCP");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].placement, Some(McpPlacement::JobWorker));
+        assert_eq!(listed[0].enabled, Some(false));
+        assert!(!listed[0].active);
+        assert!(!listed[0].recovering);
+        assert!(listed[0].tools.is_empty());
+
+        let auth = manager
+            .auth("worker-files", "test")
+            .await
+            .expect_err("worker MCP must not start host OAuth");
+        assert!(matches!(auth, ExtensionError::AuthNotSupported(_)));
+
+        let activated = manager
+            .activate("worker-files", "test")
+            .await
+            .expect("enable worker MCP");
+        assert!(activated.tools_loaded.is_empty());
+        assert!(activated.message.contains("future Docker jobs"));
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+
+        let info = manager
+            .extension_info("worker-files", "test")
+            .await
+            .expect("worker MCP info");
+        assert_eq!(info["placement"], "job_worker");
+        assert_eq!(info["worker_eligible"], true);
+        assert_eq!(info["connected"], false);
+
+        let disabled = manager
+            .toggle_mcp("worker-files", "test")
+            .await
+            .expect("disable future worker jobs");
+        assert!(disabled.contains("Disabled job-worker"));
+        let enabled = manager
+            .toggle_mcp("worker-files", "test")
+            .await
+            .expect("enable future worker jobs");
+        assert!(enabled.contains("Enabled job-worker"));
+        assert!(enabled.contains("immutable MCP snapshots"));
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_injection_rejects_worker_config_and_unregisters_tools() {
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let config =
+            McpServerConfig::new_stdio("worker-injected", "worker-mcp", Vec::new(), HashMap::new())
+                .with_placement(McpPlacement::JobWorker);
+        manager
+            .install_mcp_config(config.clone(), "test")
+            .await
+            .expect("install worker MCP");
+
+        let tool: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "worker_injected_ping".to_string(),
+        });
+        manager.tool_registry.register(Arc::clone(&tool)).await;
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "worker-injected",
+            Arc::new(UnhealthyMcpTransport),
+            None,
+            None,
+            "test",
+            Some(config),
+        ));
+
+        manager
+            .inject_mcp_client("worker-injected".to_string(), client, vec![tool])
+            .await;
+
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        assert!(!manager.tool_registry.has("worker_injected_ping").await);
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_to_worker_update_unloads_host_runtime_without_reactivation() {
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(Arc::clone(&store)),
+        );
+        let host = McpServerConfig::new_stdio("moving", "host-mcp", Vec::new(), HashMap::new());
+        manager
+            .install_mcp_config(host.clone(), "test")
+            .await
+            .expect("install host MCP");
+
+        let tool: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "moving_ping".to_string(),
+        });
+        manager.tool_registry.register(Arc::clone(&tool)).await;
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "moving",
+            Arc::new(UnhealthyMcpTransport),
+            None,
+            None,
+            "test",
+            Some(host),
+        ));
+        manager.active_mcp_servers.write().await.insert(
+            "moving".to_string(),
+            ActiveMcpServer {
+                owner_id: "test".to_string(),
+                client,
+                tools: vec![tool],
+                managed_stdio: false,
+                managed_wasm: false,
+                generation: manager.next_mcp_runtime_generation(),
+                health: McpRuntimeHealth::Healthy,
+                restart_attempts: 0,
+                healthy_since: Instant::now(),
+                retry_after: None,
+            },
+        );
+
+        let worker = McpServerConfig::new_stdio("moving", "worker-mcp", Vec::new(), HashMap::new())
+            .with_placement(McpPlacement::JobWorker);
+        let message = manager
+            .update_mcp("moving", worker, "test")
+            .await
+            .expect("move MCP to worker");
+
+        assert!(message.contains("job_worker placement"));
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        assert!(!manager.tool_registry.has("moving_ping").await);
+        let stored = crate::tools::mcp::config::load_mcp_servers_from_db(store.as_ref(), "test")
+            .await
+            .expect("load moved config");
+        assert_eq!(
+            stored.get("moving").expect("moved config").placement,
+            McpPlacement::JobWorker
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_reread_rejects_worker_placement_and_removes_stale_runtime() {
+        use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+        let (store, dir) = make_test_store().await;
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let config =
+            McpServerConfig::new_stdio("worker-recovery", "worker-mcp", Vec::new(), HashMap::new())
+                .with_placement(McpPlacement::JobWorker);
+        manager
+            .install_mcp_config(config.clone(), "test")
+            .await
+            .expect("install worker MCP");
+        let generation = manager.next_mcp_runtime_generation();
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "worker-recovery",
+            Arc::new(UnhealthyMcpTransport),
+            None,
+            None,
+            "test",
+            Some(config),
+        ));
+        manager.active_mcp_servers.write().await.insert(
+            "worker-recovery".to_string(),
+            ActiveMcpServer {
+                owner_id: "test".to_string(),
+                client,
+                tools: Vec::new(),
+                managed_stdio: false,
+                managed_wasm: true,
+                generation,
+                health: McpRuntimeHealth::Healthy,
+                restart_attempts: 0,
+                healthy_since: Instant::now(),
+                retry_after: None,
+            },
+        );
+
+        manager
+            .recover_mcp_runtime_if_needed(
+                McpRecoveryCandidate {
+                    name: "worker-recovery".to_string(),
+                    owner_id: "test".to_string(),
+                    generation,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(manager.active_mcp_servers.read().await.is_empty());
+        assert!(
+            manager
+                .mcp_process_manager
+                .managed_servers()
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]

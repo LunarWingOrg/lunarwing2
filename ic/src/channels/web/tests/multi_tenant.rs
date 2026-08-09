@@ -463,6 +463,48 @@ mod jobs_isolation {
     }
 
     #[tokio::test]
+    async fn test_jobs_restart_rejects_stale_worker_mcp_selection() {
+        let (db, _dir) = test_db().await;
+        crate::tools::mcp::config::save_mcp_servers_to_db(
+            db.as_ref(),
+            "alice",
+            &crate::tools::mcp::config::McpServersFile::default(),
+        )
+        .await
+        .unwrap();
+
+        let mut alice_job = make_sandbox_job("alice", "stale MCP selection");
+        alice_job.status = "failed".to_string();
+        alice_job.success = Some(false);
+        alice_job.credential_grants_json =
+            serde_json::to_string(&crate::orchestrator::auth::SandboxJobGrants {
+                credentials: Vec::new(),
+                mcp_servers: vec!["removed-server".to_string()],
+            })
+            .unwrap();
+        db.save_sandbox_job(&alice_job).await.unwrap();
+
+        let mut state = build_state(Some(db), None);
+        Arc::get_mut(&mut state).unwrap().job_manager =
+            Some(Arc::new(crate::orchestrator::ContainerJobManager::new(
+                crate::orchestrator::job_manager::ContainerJobConfig::default(),
+                crate::orchestrator::TokenStore::new(),
+            )));
+        let app = jobs_router(state, two_user_auth());
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/jobs/{}/restart", alice_job.id))
+            .header("Authorization", "Bearer tok-alice")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("removed-server"));
+    }
+
+    #[tokio::test]
     async fn test_jobs_prompt_rejects_sandbox_jobs() {
         let (db, _dir) = test_db().await;
 
