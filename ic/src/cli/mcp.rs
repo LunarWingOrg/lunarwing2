@@ -12,7 +12,8 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpGatewayMode, McpProcessManager, McpServerConfig, McpSessionManager, OAuthConfig,
+    McpGatewayMode, McpPlacement, McpProcessManager, McpServerConfig, McpSessionManager,
+    OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config,
@@ -71,6 +72,10 @@ pub struct McpAddArgs {
     /// Transport type: http (default), stdio, unix, wasm, gateway
     #[arg(long, default_value = "http")]
     pub transport: String,
+
+    /// Execution placement: orchestrator (default) or job-worker
+    #[arg(long, default_value = "orchestrator")]
+    pub placement: String,
 
     /// Command to run (stdio transport)
     #[arg(long)]
@@ -199,6 +204,10 @@ pub struct McpUpdateArgs {
     /// Transport type. If omitted, keeps the existing transport.
     #[arg(long)]
     pub transport: Option<String>,
+
+    /// Execution placement. If omitted, keeps the existing placement.
+    #[arg(long)]
+    pub placement: Option<String>,
 
     /// New command to run (stdio transport)
     #[arg(long)]
@@ -461,6 +470,16 @@ async fn add_server(
     Ok(())
 }
 
+fn parse_placement(value: &str) -> anyhow::Result<McpPlacement> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "orchestrator" => Ok(McpPlacement::Orchestrator),
+        "job-worker" | "job_worker" => Ok(McpPlacement::JobWorker),
+        other => {
+            anyhow::bail!("Unknown MCP placement '{other}'. Supported: orchestrator, job-worker")
+        }
+    }
+}
+
 fn validate_add_runtime_options(
     args: &McpAddArgs,
     sandbox: Option<&McpSandboxConfig>,
@@ -565,6 +584,7 @@ fn apply_add_metadata(
     if let Some(description) = &args.description {
         config = config.with_description(description);
     }
+    config = config.with_placement(parse_placement(&args.placement)?);
     if let Some(sandbox) = sandbox {
         config = config.with_sandbox(sandbox);
     }
@@ -610,6 +630,7 @@ fn print_add_summary(args: &McpAddArgs, sandbox_summary: Option<&str>) {
         ),
         _ => println!("    URL: {}", args.url.as_deref().unwrap_or("")),
     }
+    println!("    Placement: {}", args.placement);
     if args.client_id.is_some() {
         println!(
             "\n  Run 'lunarwing mcp auth {}' to authenticate.",
@@ -724,6 +745,7 @@ async fn list_servers(
         if verbose {
             println!("  {} {}{}", status, server.name, auth_status);
             println!("      Transport: {}", transport_label);
+            println!("      Placement: {:?}", server.placement);
             match &effective {
                 EffectiveTransport::Http => {
                     println!("      URL: {}", server.url);
@@ -820,8 +842,8 @@ async fn list_servers(
                 }
             };
             println!(
-                "  {} {} - {} [{}]{}",
-                status, server.name, display, transport_label, auth_status
+                "  {} {} - {} [{}; {:?}]{}",
+                status, server.name, display, transport_label, server.placement, auth_status
             );
         }
     }
@@ -1189,6 +1211,10 @@ fn build_update_config(
     config.headers = existing.headers.clone();
     config.description = existing.description.clone();
     config.always_require_approval = existing.always_require_approval.clone();
+    config.placement = match args.placement.as_deref() {
+        Some(value) => parse_placement(value)?,
+        None => existing.placement,
+    };
     // Retain only the pin associated with the selected local runtime.
     config.provenance = existing.provenance.clone().map(|mut provenance| {
         match config.effective_transport() {
@@ -1789,6 +1815,66 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_placement_add_and_validation() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let parsed = TestCli::try_parse_from([
+            "test",
+            "add",
+            "repo",
+            "--transport",
+            "stdio",
+            "--command",
+            "/usr/local/bin/repo-mcp",
+            "--placement",
+            "job-worker",
+        ])
+        .expect("worker placement flags");
+        let McpCommand::Add(args) = parsed.cmd else {
+            panic!("expected add command");
+        };
+        let config = apply_add_metadata(
+            build_add_transport(&args).expect("stdio config"),
+            &args,
+            None,
+        )
+        .expect("valid worker config");
+        assert_eq!(config.placement, McpPlacement::JobWorker);
+        assert_eq!(
+            parse_placement("job_worker").unwrap(),
+            McpPlacement::JobWorker
+        );
+        assert!(parse_placement("remote").is_err());
+
+        let invalid = TestCli::try_parse_from([
+            "test",
+            "add",
+            "remote",
+            "https://mcp.example.com",
+            "--placement",
+            "job-worker",
+        ])
+        .expect("parse invalid combination");
+        let McpCommand::Add(invalid) = invalid.cmd else {
+            panic!("expected add command");
+        };
+        assert!(
+            apply_add_metadata(
+                build_add_transport(&invalid).expect("http config"),
+                &invalid,
+                None
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_mcp_toggle_live_control_flags_parse() {
         use clap::Parser;
 
@@ -2137,18 +2223,21 @@ mod tests {
         let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
             .expect("pin cat");
         let existing = McpServerConfig::new_stdio("local-files", "cat", vec![], HashMap::new())
-            .with_provenance(pinned);
+            .with_provenance(pinned)
+            .with_placement(McpPlacement::JobWorker);
 
         let args = McpUpdateArgs {
             name: "local-files".to_string(),
             url: None,
             transport: None,
+            placement: None,
             command: None,
             cmd_args: None,
             env: None,
             secret_env: None,
         };
         let updated = build_update_config(&args, &existing).expect("build update config");
+        assert_eq!(updated.placement, McpPlacement::JobWorker);
         let provenance = updated.provenance.expect("provenance retained");
         assert_eq!(provenance.trust, PackageTrust::Pinned);
         assert!(provenance.command_sha256.is_some());
@@ -2165,6 +2254,7 @@ mod tests {
             name: "local-files".to_string(),
             url: Some("https://mcp.example.com".to_string()),
             transport: Some("http".to_string()),
+            placement: None,
             command: None,
             cmd_args: None,
             env: None,
