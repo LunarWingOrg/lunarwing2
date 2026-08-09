@@ -442,9 +442,52 @@ pub async fn jobs_restart_handler(
                 old_job.task.clone()
             };
 
+            let grants = crate::orchestrator::auth::SandboxJobGrants::from_json(
+                &old_job.credential_grants_json,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Stored job grants are invalid: {error}"),
+                )
+            })?;
+            let credential_map = grants.credential_map().map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Stored job credential grants are invalid: {error}"),
+                )
+            })?;
+            let mcp_servers = crate::tools::mcp::config::load_mcp_servers_from_db(
+                store.as_ref(),
+                &old_job.user_id,
+            )
+            .await
+            .map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to reload MCP configuration: {error}"),
+                )
+            })?;
+            let worker_mcp_servers = crate::tools::mcp::worker::select_worker_mcp_servers(
+                &grants.worker_mcp_servers,
+                &mcp_servers,
+                &credential_map,
+            )
+            .map_err(|error| {
+                (
+                    StatusCode::CONFLICT,
+                    format!("Worker MCP selection is no longer valid: {error}"),
+                )
+            })?;
+            let grants_json = serde_json::to_string(&grants).map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to serialize job grants: {error}"),
+                )
+            })?;
+
             let new_job_id = Uuid::new_v4();
             let now = chrono::Utc::now();
-
             let record = crate::history::SandboxJobRecord {
                 id: new_job_id,
                 task: task.clone(),
@@ -456,25 +499,12 @@ pub async fn jobs_restart_handler(
                 created_at: now,
                 started_at: None,
                 completed_at: None,
-                credential_grants_json: old_job.credential_grants_json.clone(),
+                credential_grants_json: grants_json,
             };
             store
                 .save_sandbox_job(&record)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-            let mode = crate::orchestrator::job_manager::JobMode::Worker;
-
-            let credential_grants: Vec<crate::orchestrator::auth::CredentialGrant> =
-                serde_json::from_str(&old_job.credential_grants_json).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        job_id = %old_job.id,
-                        "Failed to deserialize credential grants from stored job: {}. \
-                         Restarted job will have no credentials.",
-                        e
-                    );
-                    vec![]
-                });
 
             let project_dir = std::path::PathBuf::from(&old_job.project_dir);
             let _token = jm
@@ -482,8 +512,9 @@ pub async fn jobs_restart_handler(
                     new_job_id,
                     &task,
                     Some(project_dir),
-                    mode,
-                    credential_grants,
+                    crate::orchestrator::job_manager::JobMode::Worker,
+                    grants.credentials,
+                    worker_mcp_servers,
                     lunarwing_common::DEFAULT_WORKER_ITERATIONS,
                 )
                 .await
