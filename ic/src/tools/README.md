@@ -452,7 +452,10 @@ Secret names are removed from the descriptor and retained as separate job-scoped
 grants. The worker fetches values through a dedicated job-token-authenticated route;
 descriptor and value coverage must match exactly. MCP credentials do not enter the
 normal worker shell environment, but the MCP child receives its explicit values and
-can read or leak them.
+can read or leak them. Resolved values are retained as `SecretString` in trusted
+worker memory for the job lifetime so post-start restart supervision can re-spawn a
+crashed child without re-fetching grants; they are zeroized when the runtime drops
+at job end.
 
 Worker startup initializes every client and discovers every tool before atomically
 registering wrappers in the per-job registry. Any startup error, tool-name conflict,
@@ -469,11 +472,25 @@ starts. Worker MCP activation additionally requires Yama
 from reading each other's environments or memory after `execve`. Failure to install
 parent protection or verify sibling isolation prevents worker startup.
 
-Before job completion, the worker unregisters exact wrappers, closes clients and
-sessions, and stops child processes with bounded waits. Cleanup failure makes the
-job fail. This prototype does not restart an MCP child that dies after successful
-activation; tool errors expose that failure, and job/container termination provides
-the final cleanup boundary.
+After activation, one supervisor task per server watches its managed stdio
+child. An unexpected exit, closed stdio, or missing runtime restarts the server
+from the job's immutable snapshot: the dead runtime is cleaned up with bounded
+waits, a fresh client is initialized, tools are rediscovered and revalidated
+against the same autonomous-execution and aggregate limits, and replacement
+wrappers are atomically swapped into the registry. Old wrappers stay registered
+until the replacement is ready, so in-flight calls fail against the dead client
+instead of disappearing mid-job. Five unstable restart attempts use jittered
+exponential backoff (1s base, 30s cap); 30 healthy seconds reset the attempt
+window. Further failure stops supervision for that server — the circuit leaves
+it down for the rest of the job and tool calls keep surfacing the transport
+error. Supervision never reloads owner configuration or re-fetches grants; the
+job snapshot stays immutable.
+
+Before job completion, the worker cancels supervision first so a restart cannot
+resurrect a runtime mid-teardown, then unregisters exact wrappers, closes
+clients and sessions, and stops child processes with bounded waits. Cleanup
+failure makes the job fail. Job/container termination provides the final
+cleanup boundary.
 
 Benefits:
 
@@ -494,8 +511,9 @@ HTTP MCP endpoint, or a durable heavyweight service better placed in a dedicated
 worker or gateway.
 
 Costs include per-job startup, image/package availability, descriptor and grant
-delivery, credential exposure inside the MCP child, and no post-start MCP restart
-supervisor. Worker isolation limits blast radius but does not remove package
+delivery, credential exposure inside the MCP child, and resolved secret values
+retained in worker memory for the job lifetime to support restart supervision.
+Worker isolation limits blast radius but does not remove package
 provenance needs. Add automatic package installation only after provenance,
 capability review, sandbox, audit, revocation, upgrade, and rollback contracts exist.
 
