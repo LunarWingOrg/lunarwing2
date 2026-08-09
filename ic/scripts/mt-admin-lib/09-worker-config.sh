@@ -534,3 +534,199 @@ prepare_worker_lifecycle() {
   printf '%s %s\n' "$name" "$worker"
 }
 
+configure_pebble() {
+  local name="$1"
+  local nanogpt_api_key="$2"
+  local model="$3"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+
+  local env_dir env_path
+  env_dir="$(tenant_env_dir "$name")"
+  env_path="$env_dir/pebble.env"
+
+  mkdir -p "$env_dir"
+
+  : >"$env_path"
+
+  if [[ -n "$nanogpt_api_key" ]]; then
+    printf 'NANOGPT_API_KEY=%s\n' "$nanogpt_api_key" >>"$env_path"
+  fi
+
+  if [[ -n "$model" ]]; then
+    printf 'PEBBLE_MODEL=%s\n' "$model" >>"$env_path"
+  fi
+
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+  say "pebble configured for tenant '$name' at $env_path"
+
+  local container_name="lunarwing-pebble-$name"
+  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+    say "note: restart the pebble worker to pick up new config:"
+    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
+  fi
+}
+
+# ── OpenCode worker container ──────────────────────────────────────────────────
+
+snapshot_sqlite_database() {  # <source> <destination>
+  require_cmd python3
+  python3 - "$1" "$2" <<'PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+source_path = Path(sys.argv[1]).resolve(strict=True)
+destination_path = Path(sys.argv[2])
+source = sqlite3.connect(f"{source_path.as_uri()}?mode=ro", uri=True)
+destination = sqlite3.connect(destination_path)
+try:
+    source.backup(destination)
+    result = destination.execute("PRAGMA quick_check").fetchall()
+    if result != [("ok",)]:
+        raise RuntimeError(f"SQLite quick_check failed: {result}")
+finally:
+    destination.close()
+    source.close()
+PY
+}
+
+initialize_study_notes_state() {  # <tenant> <code home> <state home>
+  local name="$1" home="$2" state_home="$3"
+  validate_study_notes_path "$state_home" "Study Notes state home"
+
+  local home_real state_real
+  home_real="$(readlink -f -- "$home")"
+  state_real="$(readlink -m -- "$state_home")"
+  [[ "$state_real" != "$home_real" && "$state_real" != "$home_real/"* \
+      && "$home_real" != "$state_real/"* ]] \
+    || die "Study Notes code and state directories must not overlap"
+
+  if [[ -e "$state_home" ]]; then
+    [[ -d "$state_home" ]] || die "Study Notes state home is not a directory: $state_home"
+    if [[ -e "$state_home/agent-notes.sqlite3" \
+        || -e "$state_home/agent-notes-by-agent" ]]; then
+      validate_study_notes_state_home "$state_home"
+      return 0
+    fi
+    [[ -z "$(find "$state_home" -mindepth 1 -maxdepth 1 -print -quit)" ]] \
+      || die "Study Notes state home is non-empty but uninitialized: $state_home"
+  fi
+
+  local state_parent staged
+  state_parent="$(dirname -- "$state_home")"
+  mkdir -p "$state_parent"
+  staged="$(mktemp -d "$state_parent/.study-notes-state.XXXXXX")"
+  if ! snapshot_sqlite_database \
+      "$home/agent-notes.sqlite3" "$staged/agent-notes.sqlite3" \
+      || ! chmod u+rw,go-rwx "$staged/agent-notes.sqlite3" \
+      || ! cp -a "$home/agent-notes-by-agent" "$staged/agent-notes-by-agent" \
+      || ! chown -R "$name:$name" "$staged" \
+      || ! chmod u+rwx "$staged" \
+      || ! find "$staged/agent-notes-by-agent" -type d -exec chmod u+rwx {} +; then
+    rm -rf -- "$staged"
+    die "failed to seed Study Notes state: $state_home"
+  fi
+  validate_study_notes_state_home "$staged"
+  if [[ -d "$state_home" ]] && ! rmdir -- "$state_home"; then
+    rm -rf -- "$staged"
+    die "Study Notes state home changed while seeding: $state_home"
+  fi
+  if ! mv -T -- "$staged" "$state_home"; then
+    rm -rf -- "$staged"
+    die "failed to install seeded Study Notes state: $state_home"
+  fi
+}
+
+validate_study_notes_tenant_access() {  # <tenant> <code home> [state home] <write bool>
+  local name="$1" home="$2" state_home="$3" allow_write="$4"
+  local required
+  for required in \
+    "$home/study_notes_mcp.py" \
+    "$home/memorydb.py" \
+    "$home/agent-notes.sqlite3" \
+    "$home/skills/study-notes/SKILL.md"; do
+    sudo -u "$name" test -r "$required" \
+      || die "tenant '$name' cannot read Study Notes file: $required"
+  done
+  sudo -u "$name" test -x "$home/agent-notes-by-agent" \
+    || die "tenant '$name' cannot traverse Study Notes directory: $home/agent-notes-by-agent"
+
+  [[ -n "$state_home" ]] || return 0
+  sudo -u "$name" test -r "$state_home/agent-notes.sqlite3" \
+    || die "tenant '$name' cannot read Study Notes state database"
+  sudo -u "$name" test -x "$state_home/agent-notes-by-agent" \
+    || die "tenant '$name' cannot traverse Study Notes state notes"
+  [[ "$allow_write" == "true" ]] || return 0
+  sudo -u "$name" test -w "$state_home" \
+    || die "tenant '$name' cannot write Study Notes state home: $state_home"
+  local unwritable
+  unwritable="$(sudo -u "$name" find "$state_home/agent-notes-by-agent" \
+    -type d ! -writable -print -quit)"
+  [[ -z "$unwritable" ]] \
+    || die "tenant '$name' cannot write Study Notes state directory: $unwritable"
+  if [[ -e "$state_home/agent-notes-by-agent/.study-notes.lock" ]]; then
+    sudo -u "$name" test -w "$state_home/agent-notes-by-agent/.study-notes.lock" \
+      || die "tenant '$name' cannot write Study Notes lock file"
+  fi
+}
+
+configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
+  local name="$1" home="$2" allow_write_raw="$3" state_home="${4:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  validate_study_notes_home "$home"
+
+  local allow_write=false
+  if study_notes_write_enabled "$allow_write_raw"; then
+    allow_write=true
+  fi
+  if [[ -z "$state_home" ]]; then
+    state_home="$(tenant_study_notes_state_home "$name")"
+  fi
+  if [[ "$allow_write" == "true" && -z "$state_home" ]]; then
+    state_home="$(tenant_state_dir "$name")/study-notes"
+  fi
+  if [[ -n "$state_home" ]]; then
+    initialize_study_notes_state "$name" "$home" "$state_home"
+  fi
+  validate_study_notes_tenant_access "$name" "$home" "$state_home" "$allow_write"
+
+  # Rootless Podman cannot relabel a root-owned shared checkout itself.
+  if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+    require_cmd chcon
+    chcon -R -t container_file_t -- "$home" \
+      || die "failed to label Study Notes checkout for container access: $home"
+    if [[ -n "$state_home" ]]; then
+      chcon -R -t container_file_t -- "$state_home" \
+        || die "failed to label Study Notes state for container access: $state_home"
+    fi
+  fi
+
+  local env_path tmp
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+  tmp="$(mktemp)"
+  grep -vE '^(# Shared .*Study Notes MCP|LW2STUDYMCP_(HOME|STATE_HOME|ALLOW_WRITE)=)' \
+    "$env_path" > "$tmp" || true
+  printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
+    "$home" >> "$tmp"
+  [[ -z "$state_home" ]] \
+    || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$state_home" >> "$tmp"
+  [[ "$allow_write" != "true" ]] \
+    || printf 'LW2STUDYMCP_ALLOW_WRITE=1\n' >> "$tmp"
+  cat "$tmp" > "$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+
+  say "Study Notes MCP configured for tenant '$name' from $home (write=$allow_write)"
+  say "restart tenant to seed core MCP config and recreate opencode worker mount:"
+  say "  sudo $0 restart-tenant $name"
+}
+
+# ── Kimi Code worker container ────────────────────────────────────────────────
+
