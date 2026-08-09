@@ -32,6 +32,7 @@ pub mod auth;
 mod client;
 pub mod config;
 pub mod factory;
+pub(crate) mod gateway_transport;
 pub(crate) mod http_transport;
 pub(crate) mod process;
 mod protocol;
@@ -43,6 +44,7 @@ pub(crate) mod stdio_transport;
 pub(crate) mod transport;
 #[cfg(unix)]
 pub(crate) mod unix_transport;
+pub(crate) mod wasm_transport;
 
 pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
