@@ -861,6 +861,18 @@ pub struct InstallExtensionRequest {
     pub env: std::collections::HashMap<String, String>,
     #[serde(default)]
     pub env_secrets: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub component: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub memory_mb: Option<u64>,
+    #[serde(default)]
+    pub fuel: Option<u64>,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub gateway_mode: Option<String>,
+    #[serde(default)]
+    pub gateway_route: Option<String>,
 }
 
 impl InstallExtensionRequest {
@@ -887,14 +899,44 @@ impl InstallExtensionRequest {
                 }
                 return Ok(None);
             }
+            Some("wasm") => {
+                let component = self.component.clone().ok_or_else(|| {
+                    "MCP component path is required for WASM transport".to_string()
+                })?;
+                crate::tools::mcp::McpServerConfig::new_wasm(&self.name, component)
+                    .with_wasm_limits(
+                        self.memory_mb.unwrap_or(64),
+                        self.fuel.unwrap_or(crate::tools::wasm::DEFAULT_FUEL_LIMIT),
+                        self.timeout_seconds.unwrap_or(60),
+                    )
+            }
+            Some("gateway") => {
+                let endpoint = self.url.as_deref().ok_or_else(|| {
+                    "MCP gateway endpoint URL is required for gateway transport".to_string()
+                })?;
+                let mode = match self.gateway_mode.as_deref().unwrap_or("dedicated") {
+                    "dedicated" => crate::tools::mcp::McpGatewayMode::Dedicated,
+                    "shared" => crate::tools::mcp::McpGatewayMode::Shared,
+                    other => return Err(format!("Unsupported MCP gateway mode '{other}'")),
+                };
+                crate::tools::mcp::McpServerConfig::new_gateway(
+                    &self.name,
+                    endpoint,
+                    mode,
+                    self.gateway_route.clone(),
+                )
+            }
             Some(other) => return Err(format!("Unsupported MCP transport '{other}'")),
             None if self.command.is_some()
                 || !self.args.is_empty()
                 || !self.env.is_empty()
-                || !self.env_secrets.is_empty() =>
+                || !self.env_secrets.is_empty()
+                || self.component.is_some()
+                || self.gateway_mode.is_some()
+                || self.gateway_route.is_some() =>
             {
                 return Err(
-                    "MCP transport must be 'stdio' when command, args, env, or env_secrets are provided"
+                    "MCP transport is required when runtime-specific fields are provided"
                         .to_string(),
                 );
             }
@@ -1708,6 +1750,63 @@ mod tests {
                     && args == ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
                     && env.get("NODE_ENV").map(String::as_str) == Some("production")
                     && env_secrets.get("API_TOKEN").map(String::as_str) == Some("api_token")
+        ));
+    }
+
+    #[test]
+    fn test_install_extension_request_builds_wasm_mcp_config() {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let json = r#"{
+            "name": "portable",
+            "kind": "mcp_server",
+            "transport": "wasm",
+            "component": "/opt/lunarwing/mcp/portable.wasm",
+            "memory_mb": 96,
+            "fuel": 123456,
+            "timeout_seconds": 12
+        }"#;
+        let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+        let config = req
+            .mcp_config()
+            .expect("valid WASM request")
+            .expect("explicit MCP config");
+
+        assert!(matches!(
+            config.effective_transport(),
+            EffectiveTransport::Wasm {
+                memory_mb: 96,
+                fuel: 123456,
+                timeout_seconds: 12,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_install_extension_request_builds_shared_gateway_config() {
+        use crate::tools::mcp::config::{EffectiveTransport, McpGatewayMode};
+
+        let json = r#"{
+            "name": "shared-tools",
+            "kind": "mcp_server",
+            "transport": "gateway",
+            "url": "https://gateway.example.com/mcp",
+            "gateway_mode": "shared",
+            "gateway_route": "project-tools"
+        }"#;
+        let req: InstallExtensionRequest = serde_json::from_str(json).expect("request");
+        let config = req
+            .mcp_config()
+            .expect("valid gateway request")
+            .expect("explicit MCP config");
+
+        assert!(matches!(
+            config.effective_transport(),
+            EffectiveTransport::Gateway {
+                mode: McpGatewayMode::Shared,
+                route: Some("project-tools")
+            }
         ));
     }
 
