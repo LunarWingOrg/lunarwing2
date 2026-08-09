@@ -4400,6 +4400,12 @@ impl ExtensionManager {
         user_id: &str,
         server: McpServerConfig,
     ) -> Result<ActivateResult, ExtensionError> {
+        if server.placement == crate::tools::mcp::McpPlacement::JobWorker {
+            return Err(ExtensionError::ActivationFailed(format!(
+                "MCP server '{name}' is configured for job-worker placement and activates only inside sandbox jobs"
+            )));
+        }
+
         let active_tools = self
             .active_mcp_servers
             .read()
