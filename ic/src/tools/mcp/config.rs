@@ -29,6 +29,17 @@ const STUDY_NOTES_MANAGED_DESCRIPTION_PREFIX: &str = "Managed Study Notes MCP";
 const LEGACY_STUDY_NOTES_DESCRIPTION: &str =
     "Shared read-only LunarWing codebase study notes (managed by LW2STUDYMCP_HOME)";
 
+/// Deployment shape for an MCP gateway endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpGatewayMode {
+    /// One gateway endpoint is dedicated to this MCP server.
+    #[default]
+    Dedicated,
+    /// One gateway endpoint routes multiple MCP servers by route name.
+    Shared,
+}
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -49,6 +60,35 @@ pub enum McpTransportConfig {
     },
     /// Unix domain socket transport.
     Unix { socket_path: String },
+    /// Stateful MCP server implemented as a WASM component.
+    Wasm {
+        component_path: PathBuf,
+        #[serde(default = "default_wasm_memory_mb")]
+        memory_mb: u64,
+        #[serde(default = "default_wasm_fuel")]
+        fuel: u64,
+        #[serde(default = "default_wasm_timeout_seconds")]
+        timeout_seconds: u64,
+    },
+    /// MCP endpoint hosted behind a dedicated or shared gateway.
+    Gateway {
+        #[serde(default)]
+        mode: McpGatewayMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
+    },
+}
+
+const fn default_wasm_memory_mb() -> u64 {
+    64
+}
+
+const fn default_wasm_fuel() -> u64 {
+    crate::tools::wasm::DEFAULT_FUEL_LIMIT
+}
+
+const fn default_wasm_timeout_seconds() -> u64 {
+    60
 }
 
 /// Configuration for connecting to a remote MCP server.
@@ -188,6 +228,56 @@ impl McpServerConfig {
         }
     }
 
+    /// Create a stateful MCP-over-WASM server configuration.
+    pub fn new_wasm(name: impl Into<String>, component_path: impl Into<PathBuf>) -> Self {
+        Self {
+            name: name.into(),
+            url: String::new(),
+            transport: Some(McpTransportConfig::Wasm {
+                component_path: component_path.into(),
+                memory_mb: default_wasm_memory_mb(),
+                fuel: default_wasm_fuel(),
+                timeout_seconds: default_wasm_timeout_seconds(),
+            }),
+            headers: HashMap::new(),
+            oauth: None,
+            enabled: true,
+            recovery_circuit_open: false,
+            description: None,
+            always_require_approval: Vec::new(),
+            provenance: None,
+            sandbox: None,
+        }
+    }
+
+    /// Create an MCP server hosted behind a dedicated or shared gateway.
+    pub fn new_gateway(
+        name: impl Into<String>,
+        endpoint: impl Into<String>,
+        mode: McpGatewayMode,
+        route: Option<String>,
+    ) -> Self {
+        let mut config = Self::new(name, endpoint);
+        config.transport = Some(McpTransportConfig::Gateway { mode, route });
+        config
+    }
+
+    /// Override resource limits for an MCP-over-WASM server.
+    pub fn with_wasm_limits(mut self, memory_mb: u64, fuel: u64, timeout_seconds: u64) -> Self {
+        if let Some(McpTransportConfig::Wasm {
+            memory_mb: configured_memory,
+            fuel: configured_fuel,
+            timeout_seconds: configured_timeout,
+            ..
+        }) = &mut self.transport
+        {
+            *configured_memory = memory_mb;
+            *configured_fuel = fuel;
+            *configured_timeout = timeout_seconds;
+        }
+        self
+    }
+
     /// Set OAuth configuration.
     pub fn with_oauth(mut self, oauth: OAuthConfig) -> Self {
         self.oauth = Some(oauth);
@@ -248,6 +338,21 @@ impl McpServerConfig {
             Some(McpTransportConfig::Unix { socket_path }) => {
                 EffectiveTransport::Unix { socket_path }
             }
+            Some(McpTransportConfig::Wasm {
+                component_path,
+                memory_mb,
+                fuel,
+                timeout_seconds,
+            }) => EffectiveTransport::Wasm {
+                component_path,
+                memory_mb: *memory_mb,
+                fuel: *fuel,
+                timeout_seconds: *timeout_seconds,
+            },
+            Some(McpTransportConfig::Gateway { mode, route }) => EffectiveTransport::Gateway {
+                mode: *mode,
+                route: route.as_deref(),
+            },
         }
     }
 
@@ -349,6 +454,68 @@ impl McpServerConfig {
                     });
                 }
             }
+            EffectiveTransport::Wasm {
+                component_path,
+                memory_mb,
+                fuel,
+                timeout_seconds,
+            } => {
+                if !component_path.is_absolute() || component_path.as_os_str().is_empty() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "MCP-over-WASM component_path must be an absolute path".to_string(),
+                    });
+                }
+                if !(1..=1024).contains(&memory_mb) {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "MCP-over-WASM memory_mb must be between 1 and 1024".to_string(),
+                    });
+                }
+                if fuel == 0 {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "MCP-over-WASM fuel must be greater than zero".to_string(),
+                    });
+                }
+                if !(1..=300).contains(&timeout_seconds) {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "MCP-over-WASM timeout_seconds must be between 1 and 300"
+                            .to_string(),
+                    });
+                }
+            }
+            EffectiveTransport::Gateway { mode, route } => {
+                let parsed =
+                    url::Url::parse(&self.url).map_err(|error| ConfigError::InvalidConfig {
+                        reason: format!("Invalid MCP gateway endpoint: {error}"),
+                    })?;
+                let secure = parsed.scheme() == "https";
+                let local = parsed.scheme() == "http" && is_localhost_url(&self.url);
+                if !secure && !local {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "MCP gateway endpoints must use HTTPS (HTTP loopback is allowed)"
+                            .to_string(),
+                    });
+                }
+                match (mode, route) {
+                    (McpGatewayMode::Dedicated, None) => {}
+                    (McpGatewayMode::Dedicated, Some(_)) => {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: "Dedicated MCP gateways cannot declare a shared route"
+                                .to_string(),
+                        });
+                    }
+                    (McpGatewayMode::Shared, Some(route))
+                        if !route.is_empty()
+                            && route.len() <= 128
+                            && reqwest::header::HeaderValue::from_str(route).is_ok() => {}
+                    (McpGatewayMode::Shared, _) => {
+                        return Err(ConfigError::InvalidConfig {
+                            reason:
+                                "Shared MCP gateways require a valid route of at most 128 bytes"
+                                    .to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         // Validate custom header names and values using the http crate's RFC 9110
@@ -381,7 +548,11 @@ impl McpServerConfig {
             }
             if matches!(
                 normalized.as_str(),
-                "mcp-session-id" | "content-type" | "accept"
+                "mcp-session-id"
+                    | "content-type"
+                    | "accept"
+                    | "x-lunarwing-mcp-gateway-mode"
+                    | "x-lunarwing-mcp-route"
             ) {
                 return Err(ConfigError::InvalidConfig {
                     reason: format!("Header '{name}' is managed by the MCP client"),
@@ -438,10 +609,13 @@ impl McpServerConfig {
     /// Returns true if OAuth is pre-configured OR if this is a remote HTTPS server
     /// (which likely supports Dynamic Client Registration even without pre-configured OAuth).
     ///
-    /// Non-HTTP transports (stdio, unix) never require auth.
+    /// Non-network transports (stdio, unix, WASM) never require auth.
     pub fn requires_auth(&self) -> bool {
-        // Non-HTTP transports don't use HTTP auth
-        if !matches!(self.effective_transport(), EffectiveTransport::Http) {
+        // Only direct HTTP and gateway transports use HTTP authentication.
+        if !matches!(
+            self.effective_transport(),
+            EffectiveTransport::Http | EffectiveTransport::Gateway { .. }
+        ) {
             return false;
         }
 
@@ -1368,6 +1542,16 @@ pub enum EffectiveTransport<'a> {
     Unix {
         socket_path: &'a str,
     },
+    Wasm {
+        component_path: &'a Path,
+        memory_mb: u64,
+        fuel: u64,
+        timeout_seconds: u64,
+    },
+    Gateway {
+        mode: McpGatewayMode,
+        route: Option<&'a str>,
+    },
 }
 
 #[cfg(test)]
@@ -2283,5 +2467,60 @@ mod tests {
     fn test_is_localhost_url_rejects_remote() {
         assert!(!is_localhost_url("https://mcp.example.com"));
         assert!(!is_localhost_url("http://192.168.1.1:8080"));
+    }
+
+    #[test]
+    fn wasm_transport_roundtrip_and_limits() {
+        let config = McpServerConfig::new_wasm("portable", "/opt/mcp/server.wasm")
+            .with_wasm_limits(128, 42_000_000, 15);
+        config.validate().expect("valid WASM MCP config");
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let parsed: McpServerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            parsed.effective_transport(),
+            EffectiveTransport::Wasm {
+                component_path,
+                memory_mb: 128,
+                fuel: 42_000_000,
+                timeout_seconds: 15,
+            } if component_path == Path::new("/opt/mcp/server.wasm")
+        ));
+    }
+
+    #[test]
+    fn gateway_modes_enforce_routing_contract() {
+        let dedicated = McpServerConfig::new_gateway(
+            "dedicated",
+            "https://gateway.example.com/mcp",
+            McpGatewayMode::Dedicated,
+            None,
+        );
+        dedicated.validate().expect("valid dedicated gateway");
+
+        let shared = McpServerConfig::new_gateway(
+            "shared",
+            "https://gateway.example.com/mcp",
+            McpGatewayMode::Shared,
+            Some("tenant-tools".to_string()),
+        );
+        shared.validate().expect("valid shared gateway");
+        assert!(shared.requires_auth());
+
+        let missing_route = McpServerConfig::new_gateway(
+            "bad",
+            "https://gateway.example.com/mcp",
+            McpGatewayMode::Shared,
+            None,
+        );
+        assert!(missing_route.validate().is_err());
+
+        let insecure = McpServerConfig::new_gateway(
+            "bad",
+            "http://gateway.example.com/mcp",
+            McpGatewayMode::Dedicated,
+            None,
+        );
+        assert!(insecure.validate().is_err());
     }
 }
