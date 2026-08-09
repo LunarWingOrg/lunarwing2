@@ -26,6 +26,7 @@ use crate::llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext};
 use crate::safety::SafetyLayer;
 use crate::tools::ToolRegistry;
 use crate::tools::execute::{execute_tool_simple, process_tool_result};
+use crate::tools::mcp::worker::WorkerMcpRuntimeSet;
 use crate::worker::api::{CompletionReport, JobEventPayload, StatusUpdate, WorkerHttpClient};
 use crate::worker::proxy_llm::ProxyLlmProvider;
 
@@ -114,31 +115,63 @@ impl WorkerRuntime {
             truncate_for_preview(&job.description, 100)
         );
 
-        // Fetch credentials and store them for injection into child processes
-        // via Command::envs() (avoids unsafe std::env::set_var in multi-threaded runtime).
+        // Fetch credentials and keep them job-local for shell/MCP child injection.
         let credentials = self.client.fetch_credentials().await?;
-        {
-            let mut env_map = HashMap::new();
-            for cred in &credentials {
-                env_map.insert(cred.env_var.clone(), cred.value.clone());
+        let mut env_map = HashMap::with_capacity(credentials.len());
+        for credential in credentials {
+            if env_map
+                .insert(credential.env_var.clone(), credential.value)
+                .is_some()
+            {
+                return Err(WorkerError::ExecutionFailed {
+                    reason: format!(
+                        "credential environment variable '{}' was delivered more than once",
+                        credential.env_var
+                    ),
+                });
             }
-            self.extra_env = Arc::new(env_map);
         }
-        if !credentials.is_empty() {
+        self.extra_env = Arc::new(env_map);
+        if !self.extra_env.is_empty() {
             tracing::info!(
                 "Fetched {} credential(s) for child process injection",
-                credentials.len()
+                self.extra_env.len()
             );
         }
 
-        // Report that we're starting
-        self.client
+        let descriptors = self.client.fetch_worker_mcp_servers().await?;
+        let worker_user_id = format!("worker:{}", self.config.job_id);
+        let mut mcp_runtimes = WorkerMcpRuntimeSet::activate(
+            &descriptors,
+            self.extra_env.as_ref(),
+            &self.tools,
+            &worker_user_id,
+        )
+        .await
+        .map_err(|error| WorkerError::ExecutionFailed {
+            reason: format!("failed to activate worker-local MCP: {error}"),
+        })?;
+        let startup_message = if mcp_runtimes.server_count() == 0 {
+            "Worker started, beginning execution".to_string()
+        } else {
+            format!(
+                "Worker started with {} MCP server(s) and {} MCP tool(s)",
+                mcp_runtimes.server_count(),
+                mcp_runtimes.tool_count()
+            )
+        };
+        if let Err(error) = self
+            .client
             .report_status(&StatusUpdate {
                 state: "in_progress".to_string(),
-                message: Some("Worker started, beginning execution".to_string()),
+                message: Some(startup_message),
                 iteration: 0,
             })
-            .await?;
+            .await
+        {
+            mcp_runtimes.shutdown(&self.tools).await;
+            return Err(error);
+        }
 
         // Create reasoning engine
         let reasoning = Reasoning::new(self.llm.clone());
@@ -157,8 +190,8 @@ Work independently to complete this job. Report when done."#,
             job.title, job.description
         )));
 
-        // Load tool definitions
-        reason_ctx.available_tools = self.tools.tool_definitions().await;
+        // Load only tools visible to this job-scoped worker identity.
+        reason_ctx.available_tools = self.tools.tool_definitions_for_user(&worker_user_id).await;
 
         // Shared iteration tracker — read after the loop to report accurate counts.
         let iteration_tracker = Arc::new(Mutex::new(0u32));
@@ -170,6 +203,7 @@ Work independently to complete this job. Report when done."#,
                 safety: self.safety.clone(),
                 tools: self.tools.clone(),
                 extra_env: self.extra_env.clone(),
+                worker_user_id: worker_user_id.clone(),
                 last_output: Mutex::new(String::new()),
                 iteration_tracker: iteration_tracker.clone(),
                 consecutive_text_only: Mutex::new(0),
@@ -193,6 +227,8 @@ Work independently to complete this job. Report when done."#,
         .await;
 
         let iterations = *iteration_tracker.lock().await;
+        // Runtime lifetime is exactly the job loop, including timeout/error paths.
+        mcp_runtimes.shutdown(&self.tools).await;
 
         match result {
             Ok(Ok(LoopOutcome::Response(output))) => {
@@ -338,6 +374,7 @@ struct ContainerDelegate {
     safety: Arc<SafetyLayer>,
     tools: Arc<ToolRegistry>,
     extra_env: Arc<HashMap<String, String>>,
+    worker_user_id: String,
     /// Tracks the last successful tool output for the final response.
     last_output: Mutex<String>,
     /// Tracks the current iteration — shared with the outer `run` method so
@@ -431,8 +468,11 @@ impl LoopDelegate for ContainerDelegate {
         // Poll for follow-up prompts from the user
         self.poll_and_inject_prompt(reason_ctx).await;
 
-        // Refresh tools (in case WASM tools were built)
-        reason_ctx.available_tools = self.tools.tool_definitions().await;
+        // Refresh only tools visible to this exact job worker.
+        reason_ctx.available_tools = self
+            .tools
+            .tool_definitions_for_user(&self.worker_user_id)
+            .await;
 
         None
     }
@@ -532,18 +572,31 @@ impl LoopDelegate for ContainerDelegate {
             .await;
 
             let job_ctx = JobContext {
+                user_id: self.worker_user_id.clone(),
                 extra_env: self.extra_env.clone(),
                 ..Default::default()
             };
 
-            let result = execute_tool_simple(
-                &self.tools,
-                &self.safety,
-                &tc.name,
-                tc.arguments.clone(),
-                &job_ctx,
-            )
-            .await;
+            let result = match self
+                .tools
+                .get_resolved_for_user(&tc.name, &self.worker_user_id)
+                .await
+            {
+                Some((resolved, _)) => {
+                    execute_tool_simple(
+                        &self.tools,
+                        &self.safety,
+                        &resolved,
+                        tc.arguments.clone(),
+                        &job_ctx,
+                    )
+                    .await
+                }
+                None => Err(format!(
+                    "Tool '{}' is not available to this worker job",
+                    tc.name
+                )),
+            };
 
             self.post_event(
                 "tool_result",
