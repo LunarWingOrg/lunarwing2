@@ -13,10 +13,11 @@ use std::sync::Arc;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
+use crate::tools::ToolRegistry;
 use crate::tools::mcp::config::{ConfigError, EffectiveTransport, McpPlacement, McpServerConfig};
 use crate::tools::mcp::provenance::McpPackageProvenance;
 use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager, McpTransport};
-use crate::tools::tool::ToolError;
+use crate::tools::tool::{ApprovalRequirement, Tool, ToolError};
 
 /// Maximum MCP runtimes a single sandbox job may request.
 pub const MAX_WORKER_MCP_SERVERS: usize = 16;
@@ -193,6 +194,128 @@ impl WorkerMcpServerDescriptor {
         .with_always_require_approval(self.always_require_approval.clone());
         config.provenance = self.provenance.clone();
         config
+    }
+}
+
+const WORKER_MCP_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// MCP clients, processes, and exact tool registrations owned by one job worker.
+pub struct WorkerMcpRuntimeSet {
+    clients: Vec<McpClient>,
+    tools: Vec<Arc<dyn Tool>>,
+    session_manager: Arc<McpSessionManager>,
+    process_manager: Arc<McpProcessManager>,
+}
+
+impl WorkerMcpRuntimeSet {
+    /// Activate all descriptors and register their tools atomically.
+    pub async fn activate(
+        descriptors: &[WorkerMcpServerDescriptor],
+        credentials: &HashMap<String, String>,
+        registry: &Arc<ToolRegistry>,
+        user_id: &str,
+    ) -> Result<Self, ToolError> {
+        let session_manager = Arc::new(McpSessionManager::new());
+        let process_manager = Arc::new(McpProcessManager::new());
+        let mut runtime = Self {
+            clients: Vec::with_capacity(descriptors.len()),
+            tools: Vec::new(),
+            session_manager,
+            process_manager,
+        };
+        for descriptor in descriptors {
+            if let Err(error) = runtime
+                .prepare_descriptor(descriptor, credentials, user_id)
+                .await
+            {
+                runtime.shutdown(registry).await;
+                return Err(error);
+            }
+        }
+        if let Err(conflicts) = registry
+            .replace_runtime_tools(&[], runtime.tools.clone())
+            .await
+        {
+            runtime.shutdown(registry).await;
+            return Err(ToolError::ExternalService(format!(
+                "worker MCP tool registration conflicts: {}",
+                conflicts.join(", ")
+            )));
+        }
+        Ok(runtime)
+    }
+
+    async fn prepare_descriptor(
+        &mut self,
+        descriptor: &WorkerMcpServerDescriptor,
+        credentials: &HashMap<String, String>,
+        user_id: &str,
+    ) -> Result<(), ToolError> {
+        let client = create_worker_mcp_client(
+            descriptor,
+            credentials,
+            &self.session_manager,
+            &self.process_manager,
+            user_id,
+        )
+        .await?;
+        let tools =
+            match tokio::time::timeout(WORKER_MCP_STARTUP_TIMEOUT, client.create_tools()).await {
+                Ok(Ok(tools)) => tools,
+                Ok(Err(error)) => {
+                    let _ = client.shutdown().await;
+                    let _ = self.process_manager.shutdown(&descriptor.name).await;
+                    return Err(error);
+                }
+                Err(_) => {
+                    let _ = client.shutdown().await;
+                    let _ = self.process_manager.shutdown(&descriptor.name).await;
+                    return Err(ToolError::Timeout(WORKER_MCP_STARTUP_TIMEOUT));
+                }
+            };
+        let (interactive_only, autonomous_tools): (Vec<_>, Vec<_>) =
+            tools.into_iter().partition(|tool| {
+                matches!(
+                    tool.requires_approval(&serde_json::Value::Null),
+                    ApprovalRequirement::Always
+                )
+            });
+        for tool in interactive_only {
+            tracing::warn!(
+                server = %descriptor.name,
+                tool = %tool.name(),
+                "Excluding worker MCP tool that always requires interactive approval"
+            );
+        }
+        self.tools.extend(autonomous_tools);
+        self.clients.push(client);
+        Ok(())
+    }
+
+    /// Remove exact registrations and stop every child/session owned by this job.
+    pub async fn shutdown(&mut self, registry: &ToolRegistry) {
+        for tool in self.tools.drain(..) {
+            registry.unregister_if_same(tool.name(), &tool).await;
+        }
+        for client in self.clients.drain(..) {
+            let name = client.server_name().to_string();
+            if let Err(error) = client.shutdown().await {
+                tracing::warn!(server = %name, %error, "Failed to stop worker MCP client");
+            }
+            if let Err(error) = self.process_manager.shutdown(&name).await {
+                tracing::warn!(server = %name, %error, "Failed to stop worker MCP process");
+            }
+            self.session_manager.terminate(&name).await;
+        }
+        self.process_manager.shutdown_all().await;
+    }
+
+    pub fn server_count(&self) -> usize {
+        self.clients.len()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
     }
 }
 
@@ -480,5 +603,103 @@ mod tests {
         config.placement = McpPlacement::JobWorker;
         config.enabled = false;
         assert!(WorkerMcpServerDescriptor::from_config(&config, &grants).is_err());
+    }
+
+    #[cfg(unix)]
+    fn write_worker_mcp_fixture(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.path().join("worker-mcp-fixture.py");
+        std::fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import sys
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    if request_id is None:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"worker-fixture","version":"1"}}
+    elif method == "tools/list":
+        result = {"tools":[
+            {"name":"ping","description":"Ping","inputSchema":{"type":"object"}},
+            {"name":"write","description":"Write","inputSchema":{"type":"object"}}
+        ]}
+    elif method == "tools/call":
+        result = {"content":[{"type":"text","text":"token=" + os.environ.get("API_TOKEN", "missing")}],"isError":False}
+    else:
+        print(json.dumps({"jsonrpc":"2.0","id":request_id,"error":{"code":-32601,"message":"unknown"}}), flush=True)
+        continue
+    print(json.dumps({"jsonrpc":"2.0","id":request_id,"result":result}), flush=True)
+"#,
+        )
+        .expect("write worker MCP fixture");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("fixture permissions");
+        path
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_set_registers_scopes_invokes_and_tears_down() {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let descriptor = WorkerMcpServerDescriptor {
+            name: "fixture".to_string(),
+            command: write_worker_mcp_fixture(&dir)
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            credential_env: vec!["API_TOKEN".to_string()],
+            always_require_approval: vec!["write".to_string()],
+            provenance: None,
+        };
+        let credentials = HashMap::from([("API_TOKEN".to_string(), "scoped-token".to_string())]);
+        let registry = Arc::new(ToolRegistry::new());
+        let mut runtime = WorkerMcpRuntimeSet::activate(
+            &[descriptor],
+            &credentials,
+            &registry,
+            "worker:test-job",
+        )
+        .await
+        .expect("activate worker MCP");
+
+        assert_eq!(runtime.server_count(), 1);
+        assert_eq!(runtime.tool_count(), 1);
+        assert!(registry.has("fixture_ping").await);
+        assert!(!registry.has("fixture_write").await);
+        assert!(
+            registry
+                .get_for_user("fixture_ping", "other-worker")
+                .await
+                .is_none()
+        );
+        let tool = registry
+            .get_for_user("fixture_ping", "worker:test-job")
+            .await
+            .expect("job-owned MCP tool");
+        let output = tool
+            .execute(
+                serde_json::json!({}),
+                &crate::context::JobContext {
+                    user_id: "worker:test-job".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("invoke worker MCP tool");
+        assert_eq!(output.result, serde_json::json!("token=scoped-token"));
+
+        runtime.shutdown(&registry).await;
+        assert!(!registry.has("fixture_ping").await);
+        assert!(runtime.process_manager.managed_servers().await.is_empty());
     }
 }
