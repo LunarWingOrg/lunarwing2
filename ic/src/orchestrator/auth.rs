@@ -54,6 +54,23 @@ impl SandboxJobGrants {
         }
         serde_json::from_str(value)
     }
+
+    /// Resolve granted environment names to secret names, rejecting ambiguity.
+    pub fn credential_map(&self) -> Result<HashMap<String, String>, String> {
+        let mut mapped = HashMap::with_capacity(self.credentials.len());
+        for grant in &self.credentials {
+            if mapped
+                .insert(grant.env_var.clone(), grant.secret_name.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "credential environment variable '{}' is granted more than once",
+                    grant.env_var
+                ));
+            }
+        }
+        Ok(mapped)
+    }
 }
 
 /// In-memory store for per-job authentication tokens, grants, and worker runtimes.
@@ -235,7 +252,30 @@ mod tests {
         let decoded = SandboxJobGrants::from_json(&json).expect("current grants");
         assert_eq!(decoded.credentials.len(), 1);
         assert_eq!(decoded.worker_mcp_servers, ["repo"]);
+        assert_eq!(
+            decoded
+                .credential_map()
+                .expect("unique credential mapping")
+                .get("TOKEN")
+                .map(String::as_str),
+            Some("token")
+        );
         assert!(SandboxJobGrants::from_json("not-json").is_err());
+
+        let duplicate = SandboxJobGrants {
+            credentials: vec![
+                CredentialGrant {
+                    secret_name: "one".to_string(),
+                    env_var: "TOKEN".to_string(),
+                },
+                CredentialGrant {
+                    secret_name: "two".to_string(),
+                    env_var: "TOKEN".to_string(),
+                },
+            ],
+            worker_mcp_servers: Vec::new(),
+        };
+        assert!(duplicate.credential_map().is_err());
     }
 
     #[tokio::test]
