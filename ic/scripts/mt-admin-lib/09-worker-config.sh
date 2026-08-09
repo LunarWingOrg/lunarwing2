@@ -730,3 +730,230 @@ configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
 
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
+prepare_worker_workspace() {
+  local name="$1" worker="$2" workspace_dir container_uid container_gid
+  workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
+  mkdir -p "$workspace_dir"
+
+  case "$worker" in
+    opencode)
+      container_uid="$OPENCODE_CONTAINER_UID"
+      container_gid="$OPENCODE_CONTAINER_GID"
+      ;;
+    kimi)
+      container_uid="$KIMI_CONTAINER_UID"
+      container_gid="$KIMI_CONTAINER_GID"
+      ;;
+    *) die "unsupported private worker workspace: $worker" ;;
+  esac
+
+  if [[ "$MT_ROOTLESS" != "true" ]]; then
+    # Rootful runtimes do not apply keep-id, so bind mounts must use image IDs.
+    chown -R "$container_uid:$container_gid" "$workspace_dir"
+  else
+    chown -R "$name:$name" "$workspace_dir"
+  fi
+  chmod 2770 "$workspace_dir"
+  printf '%s\n' "$workspace_dir"
+}
+
+write_kimi_runtime_env() {
+  local name="$1" source_path target_path temporary key value
+  source_path="$(tenant_env_dir "$name")/lunarwing.env"
+  target_path="$(tenant_env_dir "$name")/kimi-runtime.env"
+  temporary="$(mktemp "${target_path}.tmp.XXXXXX")"
+  chmod 600 "$temporary"
+
+  for key in KIMI_MODEL KIMI_BASE_URL KIMI_API_KEY; do
+    value="$(_read_env_value "$source_path" "$key")"
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+      || { rm -f "$temporary"; die "$key cannot contain a newline"; }
+    [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value" >>"$temporary"
+  done
+
+  value="$(_read_env_value "$source_path" GATEWAY_AUTH_TOKEN)"
+  [[ -n "$value" ]] \
+    || { rm -f "$temporary"; die "Kimi worker requires GATEWAY_AUTH_TOKEN"; }
+  # Worker bridge expects AGENT_AUTH_TOKEN, not daemon's gateway variable name.
+  printf 'AGENT_AUTH_TOKEN=%s\n' "$value" >>"$temporary"
+  chown "$name:$name" "$temporary"
+  chmod 600 "$temporary"
+  mv -f "$temporary" "$target_path"
+  printf '%s\n' "$target_path"
+}
+
+configure_kimi() {
+  local name="$1"
+  local model="${2:-}"
+  local base_url="${3:-}"
+  local api_key="${4:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  [[ -n "$model" || -n "$base_url" || -n "$api_key" ]] \
+    || die "configure-kimi: pass --model <model>, --base-url <url>, or --api-key-file <path>"
+
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+
+  local tmp existing_model existing_base_url existing_api_key
+  existing_model="$(_read_env_value "$env_path" KIMI_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" KIMI_BASE_URL)"
+  existing_api_key="$(_read_env_value "$env_path" KIMI_API_KEY)"
+  [[ -n "$model" ]] || model="$existing_model"
+  [[ -n "$base_url" ]] || base_url="$existing_base_url"
+  [[ -n "$api_key" ]] || api_key="$existing_api_key"
+  tmp="$(mktemp)"
+  grep -v -e '^KIMI_MODEL=' -e '^KIMI_BASE_URL=' -e '^KIMI_API_KEY=' "$env_path" >"$tmp" || true
+  [[ -n "$model" ]]    && printf 'KIMI_MODEL=%s\n'    "$model"    >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'KIMI_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  [[ -n "$api_key" ]] \
+    && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$api_key")" >>"$tmp"
+  cat "$tmp" >"$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+  say "kimi LLM overrides written to $env_path for tenant '$name'"
+
+  local container_name="lunarwing-kimi-$name"
+  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+    say "note: restart the kimi worker to pick up the new config:"
+    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
+  fi
+}
+
+start_tenant_kimi() {
+  local name="$1"
+  ensure_container_runtime
+
+  local kimi_launch_contract=""
+  local -a kimi_userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    kimi_launch_contract="$KIMI_ROOTLESS_LAUNCH_CONTRACT"
+    kimi_userns_args=(--userns "$KIMI_USERNS")
+  fi
+
+  local wss_port container_name kimi_dir
+  wss_port="$(ports_get "$name" kimi_wss)" || true
+  container_name="lunarwing-kimi-$name"
+  kimi_dir="${LUNARWING_ROOT}/kimicode4lunarwing"
+
+  if [[ -z "$wss_port" ]]; then
+    say "no kimi_wss port allocated for $name (skipping kimi worker)"
+    return 0
+  fi
+
+  if ! _ensure_tenant_image "$name" lunarwing-worker-kimi:latest; then
+    say "kimi worker image not available; run 'build-kimi-worker' first (skipping)"
+    return 0
+  fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-kimi:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$KIMI_CONTAINER_UID"|"$KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID") ;;
+    *)
+      die "kimi worker image has user '${image_user:-unset}', expected $KIMI_CONTAINER_UID:$KIMI_CONTAINER_GID; rebuild it"
+      ;;
+  esac
+
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    _wait_user_manager "$name"
+    local kimi_service="lunarwing-kimi-${name}.service"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-kimi-${name}.container"
+    render_worker_quadlet "$name" kimi 8443
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if _container_config_changed "$name" "lunarwing-kimi-${name}" "$quadlet_file"; then
+      _recreate_quadlet_container "$name" "$kimi_service" "lunarwing-kimi-${name}"
+    fi
+    _systemctl_user "$name" reset-failed "$kimi_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$kimi_service" >/dev/null 2>&1; then
+      _store_container_hash "$name" "lunarwing-kimi-${name}" "$quadlet_file"
+      say "kimi worker ready via quadlet ($kimi_service, WSS port $wss_port)"
+    else
+      say "WARNING: $kimi_service failed to start" >&2
+      _systemctl_user "$name" status "$kimi_service" --no-pager --full >&2 || true
+    fi
+    return 0
+  fi
+
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    local env_file_for_hash
+    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"; then
+      say "config changed for $container_name; force-recreating"
+      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
+    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+      say "kimi worker already running ($container_name, WSS port $wss_port)"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      return 0
+    else
+      say "starting existing kimi worker container $container_name"
+      _ctr "$name" start "$container_name" >/dev/null
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$kimi_launch_contract"
+      _register_worker_unit "$name" kimi
+      say "kimi worker ready ($container_name, WSS port $wss_port)"
+      return 0
+    fi
+  fi
+
+  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+    say "creating kimi worker container $container_name on WSS port $wss_port"
+
+    local kimi_env_path
+    kimi_env_path="$(tenant_env_dir "$name")/kimi.env"
+
+    local runtime_env_path
+    runtime_env_path="$(write_kimi_runtime_env "$name")"
+    local env_flags=(--env-file "$runtime_env_path")
+
+    if [[ -f "$kimi_env_path" ]]; then
+      env_flags+=(--env-file "$kimi_env_path")
+    fi
+
+    local workspace_dir
+    workspace_dir="$(prepare_worker_workspace "$name" kimi)"
+
+    local -a restart_arg=()
+    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+    local -a health_publish=()
+    local host_health_port
+    host_health_port="$(ports_get "$name" kimi_health)" || true
+    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    _ctr "$name" run -d \
+      --name "$container_name" \
+      "${kimi_userns_args[@]}" \
+      -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
+      -e WS_PORT="$wss_port" \
+      -e HEALTH_PORT="8443" \
+      -e KIMI_MODE=websocket \
+      -e WS_ROLE=server \
+      -e WS_BIND_HOST=0.0.0.0 \
+      -e WS_PATH=/ws/agent \
+      "${env_flags[@]}" \
+      "${ssh_mount[@]}" \
+      -p "127.0.0.1:${wss_port}:${wss_port}" \
+      "${health_publish[@]}" \
+      -v "$workspace_dir:/workspace:z" \
+      "${restart_arg[@]}" \
+      lunarwing-worker-kimi:latest \
+      --mode websocket >/dev/null
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$kimi_launch_contract"
+  fi
+
+  _register_worker_unit "$name" kimi
+  say "kimi worker ready ($container_name, WSS port $wss_port)"
+}
