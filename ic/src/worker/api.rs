@@ -10,9 +10,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::WorkerError;
+use crate::tools::mcp::worker::{MAX_WORKER_MCP_SERVERS, WorkerMcpServerDescriptor};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_WORKER_MCP_RESPONSE_BYTES: usize = 1024 * 1024;
 use crate::llm::{
     ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
@@ -415,6 +417,45 @@ impl WorkerHttpClient {
             })
     }
 
+    /// Fetch secret-free MCP descriptors approved for this job.
+    ///
+    /// A 404 is treated as an empty selection for compatibility with older
+    /// orchestrators during rolling upgrades.
+    pub async fn fetch_worker_mcp_servers(
+        &self,
+    ) -> Result<Vec<WorkerMcpServerDescriptor>, WorkerError> {
+        let response = self
+            .client
+            .get(self.url("mcp-servers"))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|error| WorkerError::ConnectionFailed {
+                url: self.orchestrator_url.clone(),
+                reason: error.to_string(),
+            })?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NO_CONTENT | reqwest::StatusCode::NOT_FOUND
+        ) {
+            return Ok(Vec::new());
+        }
+        if !response.status().is_success() {
+            return Err(WorkerError::OrchestratorRejected {
+                job_id: self.job_id,
+                reason: format!("MCP descriptor endpoint returned {}", response.status()),
+            });
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| WorkerError::OrchestratorRejected {
+                job_id: self.job_id,
+                reason: format!("failed to read MCP descriptor response: {error}"),
+            })?;
+        parse_worker_mcp_descriptors(&body)
+    }
+
     /// Signal job completion to the orchestrator.
     pub async fn report_complete(&self, report: &CompletionReport) -> Result<(), WorkerError> {
         let _: serde_json::Value = self
@@ -422,6 +463,35 @@ impl WorkerHttpClient {
             .await?;
         Ok(())
     }
+}
+
+fn parse_worker_mcp_descriptors(
+    body: &[u8],
+) -> Result<Vec<WorkerMcpServerDescriptor>, WorkerError> {
+    if body.len() > MAX_WORKER_MCP_RESPONSE_BYTES {
+        return Err(WorkerError::ExecutionFailed {
+            reason: format!(
+                "MCP descriptor response exceeds {MAX_WORKER_MCP_RESPONSE_BYTES} bytes"
+            ),
+        });
+    }
+    let descriptors: Vec<WorkerMcpServerDescriptor> =
+        serde_json::from_slice(body).map_err(|error| WorkerError::ExecutionFailed {
+            reason: format!("failed to parse MCP descriptor response: {error}"),
+        })?;
+    if descriptors.len() > MAX_WORKER_MCP_SERVERS {
+        return Err(WorkerError::ExecutionFailed {
+            reason: format!("too many worker MCP descriptors (max {MAX_WORKER_MCP_SERVERS})"),
+        });
+    }
+    for descriptor in &descriptors {
+        descriptor
+            .validate()
+            .map_err(|error| WorkerError::ExecutionFailed {
+                reason: format!("invalid worker MCP descriptor: {error}"),
+            })?;
+    }
+    Ok(descriptors)
 }
 
 fn parse_finish_reason(s: &str) -> FinishReason {
@@ -477,6 +547,41 @@ mod tests {
                 "http://host.docker.internal:50051/worker/{}/credentials",
                 Uuid::nil()
             )
+        );
+    }
+
+    fn test_descriptor(name: &str) -> WorkerMcpServerDescriptor {
+        WorkerMcpServerDescriptor {
+            name: name.to_string(),
+            command: "/usr/local/bin/repo-mcp".to_string(),
+            args: vec!["/workspace".to_string()],
+            env: std::collections::HashMap::new(),
+            credential_env: Vec::new(),
+            always_require_approval: Vec::new(),
+            provenance: None,
+        }
+    }
+
+    #[test]
+    fn worker_mcp_descriptor_decoder_enforces_wire_bounds() {
+        let valid = serde_json::to_vec(&vec![test_descriptor("repo")]).unwrap();
+        let decoded = parse_worker_mcp_descriptors(&valid).expect("valid descriptor");
+        assert_eq!(decoded.len(), 1);
+        assert!(parse_worker_mcp_descriptors(b"[]").unwrap().is_empty());
+        assert!(parse_worker_mcp_descriptors(b"not-json").is_err());
+
+        let mut invalid = test_descriptor("repo");
+        invalid.command = "npx".to_string();
+        assert!(
+            parse_worker_mcp_descriptors(&serde_json::to_vec(&vec![invalid]).unwrap()).is_err()
+        );
+
+        let too_many = (0..=MAX_WORKER_MCP_SERVERS)
+            .map(|index| test_descriptor(&format!("server-{index}")))
+            .collect::<Vec<_>>();
+        assert!(parse_worker_mcp_descriptors(&serde_json::to_vec(&too_many).unwrap()).is_err());
+        assert!(
+            parse_worker_mcp_descriptors(&vec![b' '; MAX_WORKER_MCP_RESPONSE_BYTES + 1]).is_err()
         );
     }
 
