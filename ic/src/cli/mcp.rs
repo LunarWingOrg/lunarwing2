@@ -1698,6 +1698,54 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_wasm_and_gateway_add_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let wasm = TestCli::try_parse_from([
+            "test",
+            "add",
+            "portable",
+            "--transport",
+            "wasm",
+            "--component",
+            "/opt/lunarwing/mcp/portable.wasm",
+            "--wasm-memory-mb",
+            "96",
+        ])
+        .expect("WASM add flags");
+        let McpCommand::Add(wasm) = wasm.cmd else {
+            panic!("expected add command");
+        };
+        assert_eq!(wasm.transport, "wasm");
+        assert_eq!(wasm.wasm_memory_mb, Some(96));
+
+        let gateway = TestCli::try_parse_from([
+            "test",
+            "add",
+            "shared-tools",
+            "https://gateway.example.com/mcp",
+            "--transport",
+            "gateway",
+            "--gateway-mode",
+            "shared",
+            "--gateway-route",
+            "project-tools",
+        ])
+        .expect("gateway add flags");
+        let McpCommand::Add(gateway) = gateway.cmd else {
+            panic!("expected add command");
+        };
+        assert_eq!(gateway.gateway_mode.as_deref(), Some("shared"));
+        assert_eq!(gateway.gateway_route.as_deref(), Some("project-tools"));
+    }
+
+    #[test]
     fn test_mcp_toggle_live_control_flags_parse() {
         use clap::Parser;
 
