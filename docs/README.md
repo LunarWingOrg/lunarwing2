@@ -116,6 +116,7 @@ Deployment, operations, multitenancy, and production guides.
 | [`UI_FIX_SUGGESTIONS.md`](ops/UI_FIX_SUGGESTIONS.md) | Web gateway UI fix suggestions: source-verified findings with priorities and implementation order |
 | [`KUMOGAKURE_RECENT_REV_T.md`](ops/KUMOGAKURE_RECENT_REV_T.md) | v2 branch sentinel with Hermes adapter and mt-admin decomposition review notes |
 | [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Current MCP implementation matrix, host-local lifecycle and secret handling, deferred package/worker/runtime work, and security rationale |
+| [`LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`](ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md) | Source-pinned IronHub/IronClaw marketplace review, LunarWing readiness gaps, security requirements, and phased LunarHub roadmap |
 | [`MEMORY_IMPL.md`](ops/MEMORY_IMPL.md) | Planning stub for importing or integrating memory cleanup, de-duplication, and correction routines |
 | [`meta5.md`](ops/meta5.md) | `sun/meta5/v2.0.0.0` branch pointer |
 | [`NEAR_REMOVAL_COMPLETION_AUDIT.md`](ops/NEAR_REMOVAL_COMPLETION_AUDIT.md) | Completion audit of the Near/IronClaw naming migration and its unresolved compatibility work |
