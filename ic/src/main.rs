@@ -1334,7 +1334,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     if let Some(manager) = extension_manager_for_shutdown {
-        manager.shutdown_mcp_supervisor().await;
+        manager.shutdown_mcp_runtimes().await;
     }
     // Shut down all stdio MCP server child processes after recovery has stopped.
     components.mcp_process_manager.shutdown_all().await;

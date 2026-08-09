@@ -45,6 +45,12 @@ pub trait McpTransport: Send + Sync {
     fn supports_http_features(&self) -> bool {
         false
     }
+
+    /// Whether a persistent in-process runtime can still accept requests.
+    /// Other transports keep their existing lifecycle-specific health checks.
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 /// Serialize an [`McpRequest`] as a single JSON line and write it to `writer`.

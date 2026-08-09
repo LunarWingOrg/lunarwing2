@@ -42,7 +42,7 @@ Add
 | Human Delay Mode Phase 2 | v2.0.6 | `docs/proposals/human-delay-mode-phase2-plan.md` |
 | Input-validation security improvements | v2.0.6 | |
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.6 | |
-| MCP Overhaul Part 2 — runtime-neutral package/policy vocabulary, runtime adapter boundary, and worker-local prototype using preinstalled or verified packages | v2.0.6 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
+| MCP Overhaul Part 2 — runtime adapter boundary, MCP-over-WASM, and dedicated/shared gateway client placement implemented; worker-local prototype remains | v2.0.6 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
 | IronClaw port backlog — top 2 priority additions | v2.0.6 | `docs/proposals/IRONCLAW_TOP2_PRIORITY_PLAN.md` |
 | Routine engine improvements — remaining items 4-8 | v2.0.6 | `docs/proposals/ROUTINE_ENGINE_IMPROVEMENTS.md` |
 | DarkIRC decentralized peering — Tor transport for onion seeds and expanded clearnet seed availability | v2.0.6 | `docs/proposals/DARKIRC_THINGS_TO_ADD.md` |
@@ -51,7 +51,7 @@ Add
 | Additional Opencode External Worker Polishing | v2.0.7 | |
 | Reflex Compiler polishing and improvements | v2.0.7 | `docs/proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md` |
 | LunarVoice Two Way Voice Communication | v2.0.8 | |
-| MCP Overhaul Part 3 — marketplace provenance/signatures/revocation, safe package-install policy, dedicated gateway evaluation, and MCP-over-WASM feasibility | v2.0.8 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
+| MCP Overhaul Part 3 — marketplace provenance/signatures/revocation, safe package-install policy, and optional bundled gateway control-plane/HA evaluation | v2.0.8 | `docs/proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md` |
 | App Builder (enhanced) direction | v2.0.8 | `docs/proposals/APP_BUILDER_DIRECTION.md` |
 | Git WASM tool (Gitoxide-based) | v2.0.8 | `docs/proposals/GITWASM/` |
 | Multica integration plan — remaining phases | v2.0.8 | `docs/proposals/MULTICA_INTEGRATION_PLAN.md` |

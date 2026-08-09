@@ -14,13 +14,13 @@
 | ONNX Runtime speech to text model support necessary for LunarVoice | v2.0.6.0 |
 | Native MCP tools, PostgreSQL-backed, per-tenant + shared scopes | v2.0.6.0 |
 | Kawarimi migration, self-improving skills integration, stale detection | v2.0.6.0 |
-| MCP Overhaul Part 2 - See [MCP Overhaul Part 1](MCP_OVERALL_STATUS.md) for details — runtime-neutral package/policy vocabulary, runtime adapter boundary, and worker-local prototype using preinstalled or verified packages | v2.0.6.0 |
+| MCP Overhaul Part 2 - See [MCP status](MCP_OVERALL_STATUS.md) — runtime adapter boundary, MCP-over-WASM, and dedicated/shared gateway client placement implemented; worker-local prototype using preinstalled or verified packages remains item #11 | v2.0.6.0 |
 | Additional Opencode External Worker Polishing, including update of opencode version | v2.0.7.0 |
 | Reflex Compiler polishing and improvements | v2.0.7.0 |
 | LunarVoice Two Way Voice Communication | v2.0.8.0 |
 | Cross-tenant knowledge sharing via coordination pipeline | v2.0.8.0 |
 | Vector embeddings hybrid ranking | v2.0.8.0 |
-| MCP Overhaul Part 3 — marketplace provenance/signatures/revocation, safe package-install policy, dedicated gateway evaluation, and MCP-over-WASM feasibility | v2.0.8.0 |
+| MCP Overhaul Part 3 — marketplace provenance/signatures/revocation, safe package-install policy, and optional bundled gateway control-plane/HA evaluation | v2.0.8.0 |
 | Lunartica improvements | v2.0.9.0 |
 | Additional LunarVoice polishing | v2.0.9.0 |
 | A surprise | v2.1.0.0 |
