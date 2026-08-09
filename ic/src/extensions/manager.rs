@@ -1358,7 +1358,7 @@ impl ExtensionManager {
         if server.enabled {
             if let Err(error) = self.ensure_mcp_owner_available(name, user_id).await {
                 return Err(self
-                    .rollback_failed_mcp_activation(user_id, &server, error)
+                    .rollback_mcp_activation_unless_auth_required(user_id, &server, error)
                     .await);
             }
             return match self
@@ -1367,7 +1367,7 @@ impl ExtensionManager {
             {
                 Ok(result) => Ok(result.message),
                 Err(error) => Err(self
-                    .rollback_failed_mcp_activation(user_id, &server, error)
+                    .rollback_mcp_activation_unless_auth_required(user_id, &server, error)
                     .await),
             };
         }
@@ -2222,6 +2222,24 @@ impl ExtensionManager {
                 "{error}; failed to roll back enabled state: {rollback_error}"
             )),
         }
+    }
+
+    /// Roll back the enabled flag after a failed activation, except when the
+    /// failure is [`ExtensionError::AuthRequired`]. Authentication is a
+    /// waypoint, not a failure: the caller continues into the OAuth flow, and
+    /// the post-callback `activate_after_auth` path only completes activation
+    /// and resumes paused engine gates while the server stays enabled.
+    async fn rollback_mcp_activation_unless_auth_required(
+        &self,
+        user_id: &str,
+        server: &McpServerConfig,
+        error: ExtensionError,
+    ) -> ExtensionError {
+        if matches!(error, ExtensionError::AuthRequired) {
+            return error;
+        }
+        self.rollback_failed_mcp_activation(user_id, server, error)
+            .await
     }
 
     async fn recover_mcp_runtime_if_needed(
@@ -4480,7 +4498,7 @@ impl ExtensionManager {
         {
             Ok(result) => Ok(result),
             Err(error) => Err(self
-                .rollback_failed_mcp_activation(user_id, &server, error)
+                .rollback_mcp_activation_unless_auth_required(user_id, &server, error)
                 .await),
         }
     }

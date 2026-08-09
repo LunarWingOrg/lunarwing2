@@ -7,9 +7,18 @@ async fn engine_v2_mcp_transport_executes_real_mock_tool_once() {
     let server = start_mock_mcp_server(vec![mock_tool_response("mock-result")]).await;
     server.require_token(false);
     let sessions = Arc::new(McpSessionManager::new());
-    let client = McpClient::new_with_config(McpServerConfig::new(SERVER_NAME, server.mcp_url()))
-        .expect("mock MCP config should be valid")
-        .with_session_manager(sessions);
+    let processes = Arc::new(McpProcessManager::new());
+    // The MCP tool wrapper enforces owner-scoped execution, so the client must
+    // be created for the same user that sends the gateway message.
+    let client = lunarwing::tools::mcp::factory::create_client_from_config(
+        McpServerConfig::new(SERVER_NAME, server.mcp_url()),
+        &sessions,
+        &processes,
+        None,
+        "user-transport",
+    )
+    .await
+    .expect("mock MCP client should build");
     let mcp_tools = client
         .create_tools()
         .await
