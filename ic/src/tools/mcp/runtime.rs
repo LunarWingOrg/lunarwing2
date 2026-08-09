@@ -216,10 +216,10 @@ mod tests {
             context,
         );
         let registry = McpRuntimeRegistry::new(Vec::new());
-        let error = registry
-            .connect(request)
-            .await
-            .expect_err("missing adapter must fail");
+        let error = match registry.connect(request).await {
+            Ok(_) => panic!("missing adapter must fail"),
+            Err(error) => error,
+        };
 
         assert!(matches!(
             error,
