@@ -110,7 +110,10 @@ Stdio configs can map child environment variable names to owner-scoped LunarWing
 secret names. Values are resolved only during activation and are not persisted in
 MCP config or retained as restart data. Child processes receive an allowlisted OS
 environment rather than inheriting daemon credentials. This is raw credential
-exposure to trusted, unsandboxed code, not host-bound credential injection.
+exposure to trusted, unsandboxed code, not host-bound credential injection. The
+job-worker placement is the one exception to retention: resolved grant values stay
+in trusted worker memory for the job lifetime so post-start restart supervision
+can re-spawn a crashed child without re-fetching grants.
 
 ### Core per-job workers support explicit MCP placement
 
@@ -127,8 +130,14 @@ discovery is capped at 256 tools and 2 MiB of descriptors; stream frames are cap
 at 4 MiB. Secret values travel through a dedicated job-token-authenticated route and
 never enter normal shell credentials.
 Startup, exact grant coverage, provenance, conflicts, approval requirements, and
-cleanup fail closed. Initial activation and teardown are bounded; post-start MCP
-child restart supervision remains outside this prototype. Linux worker activation
+cleanup fail closed. Initial activation and teardown are bounded. Post-start MCP
+child restart supervision is implemented: one supervisor task per server watches
+its stdio child and rebuilds it from the immutable job snapshot after an
+unexpected exit, with bounded cleanup, rediscovery revalidation, atomic tool
+swap, jittered exponential backoff, a stability-window reset, and a five-attempt
+circuit that leaves the server down for the rest of the job. Resolved secret
+values stay in trusted worker memory for the job lifetime so restarts do not
+re-fetch grants. Linux worker activation
 also requires Yama `kernel.yama.ptrace_scope >= 1` so same-UID MCP and shell sibling
 processes cannot inspect each other's credential environments after `execve`.
 
@@ -746,9 +755,11 @@ shared remote control-plane concerns.
 The host-local stdio installation, explicit lifecycle, safe whole-runtime crash
 recovery, and core Docker worker-local prototype are complete. Worker placement is
 limited to preinstalled or worker-verified stdio commands and job-scoped credentials;
-do not combine it with arbitrary npm/pip installation. Next evidence should measure
+do not combine it with arbitrary npm/pip installation. Post-start worker MCP restart
+supervision is now implemented with bounded per-server rebuilds from the immutable
+job snapshot, backoff, and a per-job circuit. Next evidence should measure
 representative startup, post-start failure, and cancellation behavior before adding
-restart supervision or broader worker types.
+broader worker types.
 
 The optional MCP-over-WASM actor/session ABI and dedicated/shared gateway client
 placement are now available without changing native WASM tool defaults. Continue to
