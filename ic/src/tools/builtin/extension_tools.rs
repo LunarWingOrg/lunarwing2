@@ -9,7 +9,7 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::extensions::{ExtensionKind, ExtensionManager};
-use crate::tools::mcp::McpServerConfig;
+use crate::tools::mcp::{McpGatewayMode, McpServerConfig};
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
 
 fn string_map_param(
@@ -42,6 +42,75 @@ fn string_vec_param(
                 "{description} must be an array of strings: {error}"
             ))
         })
+}
+
+fn u64_param(
+    params: &serde_json::Value,
+    key: &str,
+    description: &str,
+) -> Result<Option<u64>, ToolError> {
+    params
+        .get(key)
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| {
+            ToolError::InvalidParameters(format!(
+                "{description} must be a non-negative integer: {error}"
+            ))
+        })
+}
+
+fn wasm_mcp_config(params: &serde_json::Value, name: &str) -> Result<McpServerConfig, ToolError> {
+    let component = params
+        .get("component_path")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            ToolError::InvalidParameters(
+                "MCP component_path is required for WASM transport".to_string(),
+            )
+        })?;
+    Ok(McpServerConfig::new_wasm(name, component).with_wasm_limits(
+        u64_param(params, "memory_mb", "MCP WASM memory_mb")?.unwrap_or(64),
+        u64_param(params, "fuel", "MCP WASM fuel")?
+            .unwrap_or(crate::tools::wasm::DEFAULT_FUEL_LIMIT),
+        u64_param(params, "timeout_seconds", "MCP WASM timeout_seconds")?.unwrap_or(60),
+    ))
+}
+
+fn gateway_mcp_config(
+    params: &serde_json::Value,
+    name: &str,
+) -> Result<McpServerConfig, ToolError> {
+    let endpoint = params
+        .get("url")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| {
+            ToolError::InvalidParameters(
+                "MCP server URL is required for gateway transport".to_string(),
+            )
+        })?;
+    let normalized_mode = params
+        .get("gateway_mode")
+        .and_then(|value| value.as_str())
+        .unwrap_or("dedicated")
+        .trim()
+        .to_ascii_lowercase();
+    let mode = match normalized_mode.as_str() {
+        "dedicated" => McpGatewayMode::Dedicated,
+        "shared" => McpGatewayMode::Shared,
+        other => {
+            return Err(ToolError::InvalidParameters(format!(
+                "Unsupported MCP gateway mode '{other}'"
+            )));
+        }
+    };
+    let route = params
+        .get("gateway_route")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|route| !route.is_empty())
+        .map(str::to_string);
+    Ok(McpServerConfig::new_gateway(name, endpoint, mode, route))
 }
 
 fn requests_secret_environment(params: &serde_json::Value) -> bool {
@@ -171,6 +240,8 @@ impl ToolInstallTool {
                 }
                 return Ok(None);
             }
+            Some("wasm") => wasm_mcp_config(params, name)?,
+            Some("gateway") => gateway_mcp_config(params, name)?,
             Some(other) => {
                 return Err(ToolError::InvalidParameters(format!(
                     "Unsupported MCP transport '{other}'"
@@ -205,7 +276,7 @@ impl Tool for ToolInstallTool {
     fn description(&self) -> &str {
         "Install an extension (channel, tool, or MCP server). \
          Use the name from tool_search results, provide an explicit URL, or configure \
-         a host-local stdio MCP server with a command and structured arguments."
+         a host-local stdio/WASM MCP server or dedicated/shared MCP gateway."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -222,7 +293,7 @@ impl Tool for ToolInstallTool {
                 },
                 "transport": {
                     "type": "string",
-                    "enum": ["http", "stdio"],
+                    "enum": ["http", "stdio", "wasm", "gateway"],
                     "description": "MCP transport. Defaults to http when url is provided."
                 },
                 "command": {
@@ -243,6 +314,21 @@ impl Tool for ToolInstallTool {
                     "type": "object",
                     "additionalProperties": {"type": "string"},
                     "description": "Environment variable names mapped to owner-scoped LunarWing secret names. Raw values are exposed to the unsandboxed stdio process."
+                },
+                "component_path": {
+                    "type": "string",
+                    "description": "Absolute component path for MCP-over-WASM"
+                },
+                "memory_mb": {"type": "integer", "minimum": 1, "maximum": 1024},
+                "fuel": {"type": "integer", "minimum": 1},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+                "gateway_mode": {
+                    "type": "string",
+                    "enum": ["dedicated", "shared"]
+                },
+                "gateway_route": {
+                    "type": "string",
+                    "description": "Required routing key for shared gateways"
                 },
                 "kind": {
                     "type": "string",
@@ -613,8 +699,32 @@ impl ToolUpdateTool {
                     .unwrap_or(&existing.url);
                 Ok(McpServerConfig::new(&existing.name, url))
             }
+            Some("wasm")
+                if matches!(
+                    existing.effective_transport(),
+                    EffectiveTransport::Wasm { .. }
+                ) =>
+            {
+                Ok(existing.clone())
+            }
+            Some("gateway")
+                if matches!(
+                    existing.effective_transport(),
+                    EffectiveTransport::Gateway { .. }
+                ) =>
+            {
+                let mut updated = existing.clone();
+                if let Some(url) = params
+                    .get("url")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                {
+                    updated.url = url.to_string();
+                }
+                Ok(updated)
+            }
             Some(other) => Err(ToolError::InvalidParameters(format!(
-                "Unsupported MCP transport '{other}'"
+                "Unsupported or incomplete MCP transport '{other}'"
             ))),
             None => match existing.effective_transport() {
                 EffectiveTransport::Stdio {
@@ -656,6 +766,18 @@ impl ToolUpdateTool {
                 EffectiveTransport::Unix { socket_path } => {
                     Ok(McpServerConfig::new_unix(&existing.name, socket_path))
                 }
+                EffectiveTransport::Wasm { .. } => Ok(existing.clone()),
+                EffectiveTransport::Gateway { .. } => {
+                    let mut updated = existing.clone();
+                    if let Some(url) = params
+                        .get("url")
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.is_empty())
+                    {
+                        updated.url = url.to_string();
+                    }
+                    Ok(updated)
+                }
             },
         }
     }
@@ -683,12 +805,12 @@ impl Tool for ToolUpdateTool {
                 },
                 "transport": {
                     "type": "string",
-                    "enum": ["http", "stdio"],
-                    "description": "New transport type. If omitted, keeps the existing transport."
+                    "enum": ["http", "stdio", "wasm", "gateway"],
+                    "description": "New transport type. WASM and gateway values preserve their existing runtime-specific settings."
                 },
                 "url": {
                     "type": "string",
-                    "description": "New URL (http transport)"
+                    "description": "New URL (HTTP or gateway transport)"
                 },
                 "command": {
                     "type": "string",
@@ -1043,6 +1165,9 @@ mod tests {
         assert!(schema["properties"].get("args").is_some());
         assert!(schema["properties"].get("env").is_some());
         assert!(schema["properties"].get("env_secrets").is_some());
+        assert!(schema["properties"].get("component_path").is_some());
+        assert!(schema["properties"].get("gateway_mode").is_some());
+        assert!(schema["properties"].get("gateway_route").is_some());
     }
 
     #[test]
@@ -1097,6 +1222,74 @@ mod tests {
         let err = ToolInstallTool::mcp_config(&params, "local-files")
             .expect_err("numeric env value must fail");
         assert!(err.to_string().contains("object of string values"));
+    }
+
+    #[test]
+    fn test_tool_install_builds_wasm_mcp_config() {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let config = ToolInstallTool::mcp_config(
+            &serde_json::json!({
+                "kind": "mcp_server",
+                "transport": "wasm",
+                "component_path": "/opt/lunarwing/tools.wasm",
+                "memory_mb": 128,
+                "fuel": 12345,
+                "timeout_seconds": 15
+            }),
+            "portable",
+        )
+        .expect("valid request")
+        .expect("MCP config");
+        assert!(matches!(
+            config.effective_transport(),
+            EffectiveTransport::Wasm {
+                memory_mb: 128,
+                fuel: 12345,
+                timeout_seconds: 15,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_tool_install_rejects_non_numeric_wasm_limits() {
+        let error = ToolInstallTool::mcp_config(
+            &serde_json::json!({
+                "kind": "mcp_server",
+                "transport": "wasm",
+                "component_path": "/opt/lunarwing/tools.wasm",
+                "memory_mb": "128"
+            }),
+            "portable",
+        )
+        .expect_err("string memory limit must fail");
+        assert!(error.to_string().contains("non-negative integer"));
+    }
+
+    #[test]
+    fn test_tool_install_builds_shared_gateway_config() {
+        use crate::tools::mcp::config::EffectiveTransport;
+
+        let config = ToolInstallTool::mcp_config(
+            &serde_json::json!({
+                "kind": "mcp_server",
+                "transport": "gateway",
+                "url": "https://gateway.example.com/mcp",
+                "gateway_mode": " SHARED ",
+                "gateway_route": " project-tools "
+            }),
+            "shared-tools",
+        )
+        .expect("valid request")
+        .expect("MCP config");
+        assert!(matches!(
+            config.effective_transport(),
+            EffectiveTransport::Gateway {
+                mode: McpGatewayMode::Shared,
+                route: Some("project-tools")
+            }
+        ));
     }
 
     #[test]

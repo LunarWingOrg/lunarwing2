@@ -1,16 +1,15 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-08-03): PARTIAL / EXPLORATORY.** Host-local stdio
-> installation, owner-scoped secret environment references, diagnostics, explicit
-> activate/deactivate/update/remove lifecycle, and safe whole-runtime stdio crash
-> recovery are implemented. The runtime-neutral package model, general adapter
-> boundary, generic worker-local MCP, marketplace provenance, automatic package
-> installation, dedicated MCP gateway, and MCP-over-WASM phases remain
-> unimplemented design work.
+> **Current status (2026-08-09): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
+> stdio lifecycle, a public runtime-adapter registry, stateful MCP-over-WASM, and
+> dedicated/shared gateway client placement are implemented. The runtime-neutral
+> package model, generic worker-local MCP, marketplace signatures/dependency locks,
+> automatic package installation, and a bundled gateway control-plane service
+> remain open.
 
-**Status:** Exploratory V2 architecture; host-local stdio installation landed on
-2026-07-09 and lifecycle, secret, and crash-recovery hardening is reflected through
-2026-08-03.
+**Status:** Exploratory V2 architecture with implemented runtime slices; host-local
+stdio landed on 2026-07-09, lifecycle/recovery hardening landed through 2026-08-03,
+and the adapter/WASM/gateway runtime work landed on 2026-08-09.
 **Date:** 2026-07-09  
 **Scope:** Possible V2 extension packaging, MCP compatibility, execution placement,
 and tenant policy
@@ -130,23 +129,24 @@ or servers. That is not generic LunarWing worker-local placement: the orchestrat
 does not send an installed MCP package descriptor and evaluated grants to the core
 job worker, and worker-local MCP tools are not registered from LunarWing MCP config.
 
-### The current WASM tool ABI is intentionally invocation-scoped
+### The native WASM tool ABI remains invocation-scoped; MCP uses an actor ABI
 
-The WASM tool runtime compiles components once and instantiates a fresh component
-for each execution. Its WIT world exports one tool interface with schema,
+The native WASM tool runtime still compiles components once and instantiates a fresh
+component for each execution. Its WIT world exports one tool interface with schema,
 description, and execute functions. Host capabilities cover HTTP, workspace reads,
 tool invocation, secret existence checks, and related controlled operations.
 
-This is a strong model for small tools, but it is not a general MCP server runtime.
-MCP initialization, capability negotiation, resources, prompts, notifications,
-cancellation, subscriptions, and session behavior would require a new server or
-actor ABI.
+MCP-over-WASM is implemented separately in `ic/wit/mcp-server.wit` and
+`ic/src/tools/mcp/wasm_transport.rs`. Each active server retains one component
+instance and receives complete JSON-RPC envelopes through a serialized `handle`
+export. This preserves initialization, resources, prompts, notifications,
+cancellation messages, subscriptions, and future protocol methods without expanding
+the WIT ABI for every MCP revision. The linker supplies no WASI or host imports and
+bounds artifact size, message size, memory, fuel, and wall time; a trap stops the
+actor and manager supervision reconstructs it from persisted intent.
 
-The current implementation choice does not mean WASM is fundamentally incapable
-of persistent behavior. The WASM channel subsystem already manages lifecycle
-callbacks, polling tasks, runtime configuration, and persistent host-side state.
-A stateful WASM MCP runtime is possible, but it would be a new runtime design rather
-than a minor extension of `WasmToolWrapper`.
+The separate actor does not change the preferred format for small tools: native WASM
+tools keep their narrower capability-scoped ABI and fresh-instance isolation.
 
 ### Package integrity exists, but publisher authenticity is incomplete
 
@@ -430,9 +430,13 @@ servers and presents one controlled endpoint to LunarWing.
 
 **Assessment**
 
-Retain this as a deployment and control-plane option. It is particularly strong for
-hosted HTTP MCP and shared authentication, but should not be the mandatory path for
-workspace-local or dedicated-worker capabilities.
+Client placement for this option is implemented. `McpGatewayMode` distinguishes a
+dedicated endpoint from a shared endpoint; shared mode requires a validated route,
+and the gateway transport injects host-owned mode/route headers while retaining
+Streamable HTTP session and OAuth behavior. LunarWing does not bundle the gateway
+service itself, so cross-daemon sessions, HA, centralized policy, and credential
+ownership remain responsibilities of the separately deployed gateway. Gateway
+placement is not mandatory for workspace-local or dedicated-worker capabilities.
 
 ### 7. Signed extension marketplace
 
@@ -591,20 +595,21 @@ The package lifecycle should remain consistent even when runtime behavior differ
 10. Upgrade with artifact and capability diff review.
 11. Deactivate, revoke grants, stop runtime resources, and remove.
 
-Runtime adapters would own their specific resources:
+The implemented MCP runtime registry delegates these resources:
 
-- Process adapter: child lifecycle, stdio framing, and shutdown. The current MCP
-  lifecycle now performs correct whole-runtime stdio recovery: it revalidates
-  owner-scoped persisted intent, recreates and initializes the client, rediscovers
-  tools, atomically replaces registered wrappers, and uses generation checks to
-  prevent resurrection. Per-server cancellable tasks isolate failures; five attempts,
-  jittered capped backoff, a 30-second stability window, and circuit-open state bound
-  crash loops. Recovery and child teardown have internal deadlines. Restarting only
-  the child remains invalid.
-- WASM adapter: compile cache, instances/actors, fuel, memory, and host functions.
-- Worker adapter: image/package availability, task routing, health, and cancellation.
-- Remote adapter: sessions, OAuth, HTTP policy, and retries.
-- Gateway adapter: endpoint registration, tenant routing, and shared session policy.
+- Process adapter: child lifecycle, stdio framing, sandboxing, provenance, and
+  shutdown. Whole-runtime recovery still recreates the client and wrappers rather
+  than restarting only the child.
+- WASM adapter: component compilation, one persistent actor, no host imports,
+  artifact digest pinning, fuel, memory, epoch deadlines, message bounds, and
+  terminal-trap recovery.
+- Unix adapter: connection ownership and stream shutdown.
+- Remote adapter: Streamable HTTP sessions, OAuth, HTTP policy, and retries.
+- Gateway adapter: dedicated/shared placement, protected route selection, sessions,
+  OAuth, and independent gateway-service ownership.
+
+The worker adapter remains open for item #11: image/package availability, descriptor
+and grant delivery, task routing, health, and cancellation are not yet wired.
 
 ## Suggested Exploration Sequence
 
@@ -635,12 +640,14 @@ If broader V2 work proceeds, the least-regret order is:
 
 This phase can be designed without implementing new runtimes.
 
-### Phase 2: Runtime adapter boundary
+### Phase 2: MCP runtime adapter boundary (completed 2026-08-09)
 
-- Extract a common extension-runtime lifecycle interface.
-- Preserve current WASM, MCP, and extension behavior behind adapters.
-- Unify common network, credentials, leak detection, rate limiting, and audit
-  primitives used by WASM tools and channels.
+- `McpRuntimeAdapter` and `McpRuntimeRegistry` provide the common MCP activation
+  interface and preserve existing client/tool lifecycle behavior across runtimes.
+- HTTP, stdio, Unix, stateful WASM, and gateway adapters ship in the default registry.
+- Broader package-level adapter vocabulary and common WASM tool/channel network,
+  credential, leak-detection, rate-limit, and audit primitives remain Phase 1/package
+  policy work rather than MCP activation blockers.
 
 ### Phase 3: Worker-local MCP prototype
 
@@ -659,20 +666,17 @@ This is likely the fastest prototype for validating placement-aware extensions.
 - Add revocation and compromised publisher handling.
 - Extend artifacts beyond the current WASM-only package shape.
 
-### Phase 5: MCP-over-WASM feasibility prototype
+### Phase 5: MCP-over-WASM runtime (implemented 2026-08-09)
 
-Only begin this phase with concrete target servers or protocol features. The
-prototype should test:
+The stateful actor and host transport are implemented. Raw JSON-RPC preserves MCP
+initialization, capability negotiation, multiple tools, resources, prompts,
+notifications, cancellation messages, and subscriptions without a version-specific
+WIT expansion. The host owns persistent session state and enforces long-running
+operation limits with fuel and epoch deadlines.
 
-- MCP initialization and capability negotiation.
-- Multiple tools plus resources or prompts.
-- Notifications and cancellation.
-- Session state ownership.
-- Long-running operation limits.
-- Compatibility with a non-LunarWing MCP client.
-
-If the prototype only reproduces ordinary tool calls, native WASM tools remain the
-better implementation.
+Representative guest interoperability and serving the same component to a
+non-LunarWing client remain release validation, not missing runtime architecture.
+Native WASM tools remain the better implementation for ordinary narrow tool calls.
 
 ## Non-Goals
 
@@ -682,7 +686,7 @@ better implementation.
 - Allowing arbitrary runtime package installation during a job by default.
 - Treating package signatures as proof of safety.
 - Designing the final V2 manifest schema in this exploratory note.
-- Committing to a gateway, worker, or WASM runtime before workload evidence exists.
+- Making gateway, worker, or MCP-over-WASM placement mandatory for every extension.
 
 ## Open Questions
 
@@ -735,16 +739,21 @@ workspace-coupled server justifies additional lifecycle and credential-policy
 plumbing. Start with preinstalled or verified packages; do not combine the first
 placement prototype with arbitrary npm/pip installation.
 
-Defer MCP-over-WASM until a concrete server or required MCP primitive justifies the
-new actor/session ABI. Defer general embedded extensions indefinitely; reserve them
-for first-party capabilities whose coupling to the daemon is intentional.
+The optional MCP-over-WASM actor/session ABI and dedicated/shared gateway client
+placement are now available without changing native WASM tool defaults. Continue to
+defer general embedded extensions; reserve them for first-party capabilities whose
+coupling to the daemon is intentional.
 
 ## Relevant Source and Proposal References
 
 - `ic/src/tools/mcp/config.rs`
 - `ic/src/tools/mcp/factory.rs`
+- `ic/src/tools/mcp/runtime.rs`
+- `ic/src/tools/mcp/wasm_transport.rs`
+- `ic/src/tools/mcp/gateway_transport.rs`
 - `ic/src/tools/mcp/process.rs`
 - `ic/src/tools/mcp/stdio_transport.rs`
+- `ic/wit/mcp-server.wit`
 - `ic/src/extensions/manager.rs`
 - `ic/src/cli/mcp.rs`
 - `ic/src/tools/builtin/extension_tools.rs`

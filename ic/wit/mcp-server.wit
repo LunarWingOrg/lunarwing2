@@ -1,0 +1,27 @@
+package lunarwing:mcp@0.1.0;
+
+// Stateful MCP server component interface.
+//
+// The host instantiates one component actor for each active MCP server and
+// serializes JSON-RPC messages through that actor. Keeping the MCP envelope as
+// JSON preserves protocol compatibility for tools, resources, prompts,
+// notifications, subscriptions, and future protocol methods without expanding
+// the component ABI for every MCP revision.
+
+/// MCP server actor implemented by the guest component.
+interface server {
+    /// Handle one complete MCP JSON-RPC request or notification.
+    ///
+    /// Requests with an id must return a complete JSON-RPC response. For a
+    /// notification the guest may return an empty string; the host treats it as
+    /// successful fire-and-forget delivery.
+    handle: func(request-json: string) -> result<string, string>;
+}
+
+/// Persistent MCP server world.
+///
+/// Components receive only a minimal WASI context: no inherited environment,
+/// network, filesystem, standard streams, or host credentials.
+world mcp-server {
+    export server;
+}
