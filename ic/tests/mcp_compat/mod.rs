@@ -14,7 +14,7 @@ use lunarwing::llm::{
     Role, TokenUsage, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
 use lunarwing::secrets::SecretsStore;
-use lunarwing::tools::mcp::McpClient;
+use lunarwing::tools::mcp::McpProcessManager;
 use lunarwing::tools::mcp::config::McpServerConfig;
 use lunarwing::tools::mcp::session::McpSessionManager;
 
