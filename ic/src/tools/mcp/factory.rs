@@ -1,10 +1,8 @@
-//! Factory for creating MCP clients from server configuration.
-//!
-//! Encapsulates the transport dispatch logic (stdio, Unix socket, HTTP)
-//! so that callers don't need to match on `EffectiveTransport` themselves.
+//! Factory for creating MCP clients through runtime-neutral adapters.
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::secrets::SecretsStore;
@@ -12,25 +10,14 @@ use crate::tools::ToolError;
 use crate::tools::mcp::config::{
     EffectiveTransport, McpServerConfig, validate_managed_study_notes_runtime,
 };
+use crate::tools::mcp::runtime::{
+    McpRuntimeAdapter, McpRuntimeContext, McpRuntimeRegistry, McpRuntimeRequest,
+};
 use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager, McpTransport};
 
-/// Error returned when MCP client creation fails.
-#[derive(Debug, thiserror::Error)]
-pub enum McpFactoryError {
-    #[error("Failed to spawn stdio MCP server '{name}': {reason}")]
-    StdioSpawn { name: String, reason: String },
-    #[error("Failed to connect to Unix MCP server '{name}': {reason}")]
-    UnixConnect { name: String, reason: String },
-    #[error("Unix socket transport is not supported on this platform (server '{name}')")]
-    UnixNotSupported { name: String },
-    #[error("Invalid configuration for MCP server '{name}': {reason}")]
-    InvalidConfig { name: String, reason: String },
-    #[error("Package provenance check failed for MCP server '{name}': {reason}")]
-    Provenance { name: String, reason: String },
-}
+pub use crate::tools::mcp::runtime::McpRuntimeError as McpFactoryError;
 
-/// Create an `McpClient` from a server configuration, dispatching on the
-/// effective transport type.
+/// Create an `McpClient` with the built-in runtime adapters.
 pub async fn create_client_from_config(
     server: McpServerConfig,
     session_manager: &Arc<McpSessionManager>,
@@ -38,6 +25,35 @@ pub async fn create_client_from_config(
     secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
     user_id: &str,
 ) -> Result<McpClient, McpFactoryError> {
+    let registry = default_runtime_registry();
+    create_client_with_runtime_registry(
+        server,
+        session_manager,
+        process_manager,
+        secrets,
+        user_id,
+        &registry,
+    )
+    .await
+}
+
+/// Create a client through an explicit adapter registry.
+pub async fn create_client_with_runtime_registry(
+    server: McpServerConfig,
+    session_manager: &Arc<McpSessionManager>,
+    process_manager: &Arc<McpProcessManager>,
+    secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    user_id: &str,
+    registry: &McpRuntimeRegistry,
+) -> Result<McpClient, McpFactoryError> {
+    validate_activation_config(&server)?;
+    let context = McpRuntimeContext::new(session_manager, process_manager, secrets, user_id);
+    registry
+        .connect(McpRuntimeRequest::new(server, context))
+        .await
+}
+
+fn validate_activation_config(server: &McpServerConfig) -> Result<(), McpFactoryError> {
     let server_name = server.name.clone();
     server
         .validate()
@@ -45,123 +61,253 @@ pub async fn create_client_from_config(
             name: server_name.clone(),
             reason: error.to_string(),
         })?;
-    validate_managed_study_notes_runtime(&server).map_err(|error| {
+    validate_managed_study_notes_runtime(server).map_err(|error| {
         McpFactoryError::InvalidConfig {
             name: server_name.clone(),
             reason: error.to_string(),
         }
     })?;
-
-    // Revocation applies to every transport; digest pinning is enforced for
-    // stdio before the child is spawned.
     if let Some(provenance) = &server.provenance {
         provenance
             .verify_not_revoked()
             .map_err(|error| McpFactoryError::Provenance {
-                name: server_name.clone(),
+                name: server_name,
                 reason: error.to_string(),
             })?;
     }
+    Ok(())
+}
 
-    match server.effective_transport() {
-        EffectiveTransport::Stdio {
+fn default_runtime_registry() -> McpRuntimeRegistry {
+    let adapters: Vec<Arc<dyn McpRuntimeAdapter>> = vec![
+        Arc::new(HttpRuntimeAdapter),
+        Arc::new(StdioRuntimeAdapter),
+        Arc::new(UnixRuntimeAdapter),
+        Arc::new(WasmRuntimeAdapter),
+        Arc::new(GatewayRuntimeAdapter),
+    ];
+    McpRuntimeRegistry::new(adapters)
+}
+
+struct HttpRuntimeAdapter;
+struct StdioRuntimeAdapter;
+struct UnixRuntimeAdapter;
+struct WasmRuntimeAdapter;
+struct GatewayRuntimeAdapter;
+
+#[async_trait]
+impl McpRuntimeAdapter for HttpRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::Http
+    }
+
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        if let Some(secrets) = context.secrets() {
+            let has_tokens =
+                crate::tools::mcp::is_authenticated(&server, &secrets, context.user_id()).await;
+            if has_tokens || server.requires_auth() {
+                return Ok(McpClient::new_authenticated(
+                    server,
+                    Arc::clone(context.session_manager()),
+                    secrets,
+                    context.user_id(),
+                ));
+            }
+        }
+        McpClient::new_with_config_and_session_manager(
+            server,
+            Arc::clone(context.session_manager()),
+            context.user_id(),
+        )
+        .map_err(|error| McpFactoryError::InvalidConfig {
+            name: server_name,
+            reason: error.to_string(),
+        })
+    }
+}
+
+#[async_trait]
+impl McpRuntimeAdapter for StdioRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::Stdio
+    }
+
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        let secrets = context.secrets();
+        let EffectiveTransport::Stdio {
             command,
             args,
             env,
             env_secrets,
-        } => {
-            if let Some(provenance) = server.provenance.clone() {
-                verify_stdio_provenance(&server_name, provenance, command).await?;
-            }
-            let resolved_env =
-                resolve_stdio_env(&server_name, env, env_secrets, secrets.as_deref(), user_id)
-                    .await?;
-            let transport = process_manager
-                .spawn_stdio(
-                    &server_name,
-                    command,
-                    args.to_vec(),
-                    resolved_env
-                        .iter()
-                        .map(|(name, value)| (name.as_str(), value.expose_secret())),
-                    !env_secrets.is_empty(),
-                    server.sandbox.as_ref(),
-                )
-                .await
-                .map_err(|e| McpFactoryError::StdioSpawn {
-                    name: server_name.clone(),
-                    reason: e.to_string(),
-                })?;
-
-            Ok(McpClient::new_with_transport(
-                &server_name,
-                transport as Arc<dyn McpTransport>,
-                None,
-                secrets,
-                user_id,
-                Some(server),
-            ))
+        } = server.effective_transport()
+        else {
+            return Err(runtime_mismatch(&server_name));
+        };
+        if let Some(provenance) = server.provenance.clone() {
+            verify_stdio_provenance(&server_name, provenance, command).await?;
         }
+        let resolved_env = resolve_stdio_env(
+            &server_name,
+            env,
+            env_secrets,
+            secrets.as_deref(),
+            context.user_id(),
+        )
+        .await?;
+        let transport = context
+            .process_manager()
+            .spawn_stdio(
+                &server_name,
+                command,
+                args.to_vec(),
+                resolved_env
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.expose_secret())),
+                !env_secrets.is_empty(),
+                server.sandbox.as_ref(),
+            )
+            .await
+            .map_err(|error| McpFactoryError::StdioSpawn {
+                name: server_name.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(McpClient::new_with_transport(
+            &server_name,
+            transport as Arc<dyn McpTransport>,
+            None,
+            secrets,
+            context.user_id(),
+            Some(server),
+        ))
+    }
+}
+
+#[async_trait]
+impl McpRuntimeAdapter for UnixRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::Unix
+    }
+
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        let EffectiveTransport::Unix { socket_path } = server.effective_transport() else {
+            return Err(runtime_mismatch(&server_name));
+        };
         #[cfg(unix)]
-        EffectiveTransport::Unix { socket_path } => {
+        {
             let transport = crate::tools::mcp::unix_transport::UnixMcpTransport::connect(
                 &server_name,
                 socket_path,
             )
             .await
-            .map_err(|e| McpFactoryError::UnixConnect {
+            .map_err(|error| McpFactoryError::UnixConnect {
                 name: server_name.clone(),
-                reason: e.to_string(),
+                reason: error.to_string(),
             })?;
-
             Ok(McpClient::new_with_transport(
                 &server_name,
                 Arc::new(transport) as Arc<dyn McpTransport>,
                 None,
-                secrets,
-                user_id,
+                context.secrets(),
+                context.user_id(),
                 Some(server),
             ))
         }
         #[cfg(not(unix))]
-        EffectiveTransport::Unix { .. } => {
+        {
+            let _ = socket_path;
             Err(McpFactoryError::UnixNotSupported { name: server_name })
         }
-        EffectiveTransport::Http => {
-            if let Some(ref secrets) = secrets {
-                let has_tokens =
-                    crate::tools::mcp::is_authenticated(&server, secrets, user_id).await;
+    }
+}
 
-                if has_tokens || server.requires_auth() {
-                    Ok(McpClient::new_authenticated(
-                        server,
-                        Arc::clone(session_manager),
-                        Arc::clone(secrets),
-                        user_id,
-                    ))
-                } else {
-                    Ok(McpClient::new_with_config_and_session_manager(
-                        server,
-                        Arc::clone(session_manager),
-                        user_id,
-                    )
-                    .map_err(|e| McpFactoryError::InvalidConfig {
-                        name: server_name.clone(),
-                        reason: e.to_string(),
-                    })?)
-                }
-            } else {
-                Ok(McpClient::new_with_config_and_session_manager(
-                    server,
-                    Arc::clone(session_manager),
-                    user_id,
-                )
-                .map_err(|e| McpFactoryError::InvalidConfig {
-                    name: server_name,
-                    reason: e.to_string(),
-                })?)
-            }
-        }
+#[async_trait]
+impl McpRuntimeAdapter for WasmRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::Wasm
+    }
+
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        let (component_path, memory_mb, fuel, timeout_seconds) = match server.effective_transport()
+        {
+            EffectiveTransport::Wasm {
+                component_path,
+                memory_mb,
+                fuel,
+                timeout_seconds,
+            } => (
+                component_path.to_path_buf(),
+                memory_mb,
+                fuel,
+                timeout_seconds,
+            ),
+            _ => return Err(runtime_mismatch(&server_name)),
+        };
+        let transport = crate::tools::mcp::wasm_transport::WasmMcpTransport::load(
+            &server_name,
+            &component_path,
+            memory_mb,
+            fuel,
+            timeout_seconds,
+        )
+        .await
+        .map_err(|error| McpFactoryError::WasmLoad {
+            name: server_name.clone(),
+            reason: error.to_string(),
+        })?;
+        Ok(McpClient::new_with_transport(
+            &server_name,
+            Arc::new(transport),
+            None,
+            context.secrets(),
+            context.user_id(),
+            Some(server),
+        ))
+    }
+}
+
+#[async_trait]
+impl McpRuntimeAdapter for GatewayRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::Gateway
+    }
+
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        let (mode, route) = match server.effective_transport() {
+            EffectiveTransport::Gateway { mode, route } => (mode, route.map(str::to_string)),
+            _ => return Err(runtime_mismatch(&server_name)),
+        };
+        let transport = crate::tools::mcp::gateway_transport::GatewayMcpTransport::new(
+            server.url.clone(),
+            &server_name,
+            mode,
+            route,
+            Arc::clone(context.session_manager()),
+        );
+        Ok(McpClient::new_with_transport(
+            &server_name,
+            Arc::new(transport),
+            Some(Arc::clone(context.session_manager())),
+            context.secrets(),
+            context.user_id(),
+            Some(server),
+        ))
+    }
+}
+
+fn runtime_mismatch(name: &str) -> McpFactoryError {
+    McpFactoryError::InvalidConfig {
+        name: name.to_string(),
+        reason: "runtime adapter received a mismatched transport".to_string(),
     }
 }
 
