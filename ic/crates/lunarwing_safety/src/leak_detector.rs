@@ -134,12 +134,16 @@ pub struct LeakDetector {
     /// For fast prefix matching of known patterns
     prefix_matcher: Option<AhoCorasick>,
     known_prefixes: Vec<(String, usize)>, // (prefix, pattern_index)
+    /// Demote the broad built-in 64-hex heuristic to debug logging.
+    quiet_high_entropy_hex_warning: bool,
 }
 
 impl LeakDetector {
     /// Create a new detector with default patterns.
     pub fn new() -> Self {
-        Self::with_patterns(default_patterns())
+        let mut detector = Self::with_patterns(default_patterns());
+        detector.quiet_high_entropy_hex_warning = true;
+        detector
     }
 
     /// Create a detector with custom patterns.
@@ -168,6 +172,7 @@ impl LeakDetector {
             patterns,
             prefix_matcher,
             known_prefixes: prefixes,
+            quiet_high_entropy_hex_warning: false,
         }
     }
 
@@ -273,14 +278,24 @@ impl LeakDetector {
             });
         }
 
-        // Log warnings
-        for m in &result.matches {
-            if m.action == LeakAction::Warn {
+        for leak_match in &result.matches {
+            if leak_match.action != LeakAction::Warn {
+                continue;
+            }
+
+            if self.should_emit_warning(leak_match) {
                 tracing::warn!(
-                    pattern = %m.pattern_name,
-                    severity = %m.severity,
-                    preview = %m.masked_preview,
+                    pattern = %leak_match.pattern_name,
+                    severity = %leak_match.severity,
+                    preview = %leak_match.masked_preview,
                     "Potential secret leak detected (warning only)"
+                );
+            } else {
+                tracing::debug!(
+                    pattern = %leak_match.pattern_name,
+                    severity = %leak_match.severity,
+                    preview = %leak_match.masked_preview,
+                    "Potential secret-like value detected (heuristic only)"
                 );
             }
         }
@@ -289,6 +304,10 @@ impl LeakDetector {
         Ok(result
             .redacted_content
             .unwrap_or_else(|| content.to_string()))
+    }
+
+    fn should_emit_warning(&self, leak_match: &LeakMatch) -> bool {
+        !self.quiet_high_entropy_hex_warning || leak_match.pattern_name != "high_entropy_hex"
     }
 
     /// Scan an outbound HTTP request for potential secret leakage.
@@ -1334,5 +1353,38 @@ mod tests {
                  scan_http_request operates on raw URL, not decoded form"
             );
         }
+    }
+
+    #[test]
+    fn default_high_entropy_hex_is_detected_without_warning_classification() {
+        let detector = LeakDetector::new();
+        let content = format!("sha256={}", "a1".repeat(32));
+        let result = detector.scan(&content);
+        let leak_match = result
+            .matches
+            .iter()
+            .find(|leak_match| leak_match.pattern_name == "high_entropy_hex")
+            .expect("64-character hash should remain detectable");
+
+        assert!(!detector.should_emit_warning(leak_match));
+        assert_eq!(detector.scan_and_clean(&content).unwrap(), content);
+    }
+
+    #[test]
+    fn custom_high_entropy_hex_pattern_keeps_warning_classification() {
+        use regex::Regex;
+
+        use crate::leak_detector::{LeakAction, LeakPattern};
+
+        let detector = LeakDetector::with_patterns(vec![LeakPattern {
+            name: "high_entropy_hex".to_string(),
+            regex: Regex::new(r"\b[a-fA-F0-9]{64}\b").unwrap(),
+            severity: LeakSeverity::Medium,
+            action: LeakAction::Warn,
+        }]);
+        let result = detector.scan(&"a1".repeat(32));
+        let leak_match = result.matches.first().expect("custom pattern should match");
+
+        assert!(detector.should_emit_warning(leak_match));
     }
 }
