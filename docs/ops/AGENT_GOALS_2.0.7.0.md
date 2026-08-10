@@ -14,19 +14,18 @@
 by CI source-version policy. CI/CD contains no hardcoded LunarWing package-version pin and derives versions from Cargo manifests; verify GitLab config validation passes if possible - cargo update and all that good stuff as usual
 3. [x] investigate cause of agent occasionally getting "stuck" after certain tool calls or approval mechanisms and fix if possible - you may spin up test tenant(s) to live debug — DONE (2026-08-10): verified that mission-only `__save_memory_doc__` access is an intentional trust boundary, not a Reflex dependency; fixed its real failure mode by raising explicit errors instead of returning silent `False`. Fixed orchestrator v0 dropping null/missing/interrupted structured results, made denied approvals resolve the original call with an `ActionResult`, and corrected `missing_tool_output` analysis to pair call IDs in the authoritative inference transcript. Added embedded-Monty regressions plus approval/auth matrix coverage. Verified `493/493` engine tests, `engine_v2_channel_delivery_matrix`, formatting, `cargo check`, and zero-warning clippy for both touched crates
 4. [x] improve coordination protocol - any negative things preventing full capability should be addressed — DONE (2026-08-10): removed activation and execution parity blockers (derived safe aliases, Engine V2 prompt contract, uniform legacy/Engine auto-disable, complete master switch); added deterministic cross-daemon responder election with explicit-routing and replay safety plus tenant roster persistence; auto-loaded the managed seven-rule protocol bundle; reconciled strike-aware explicit/entropy secret detection and coalescer config safety; refreshed operator/design docs. Verified coordination/bootstrap/gate/coalescer/boundary/Engine tests, tenant shell harness, JSON parity, rustfmt, all-feature cargo check, and all-feature lib clippy
-5. [ ] find gaps/issues with mcp part 2 implementations if any. document findings in new document in docs/ops - feel free to use existing documentation for reference
-6. [ ] Additional Opencode External Worker Polishing, including update of opencode version (latest is 1.18.9 )
-7. [ ] LunarVision polishing, improving stability across both systemd/gentoo setups
-8. [ ] LunarVoice polishing, improving stability across both systemd/gentoo setups
-9. [ ] come up with codename ideas for release. put into new doc in docs/ops - base the name on all changes made since 2.0.6.0
-10. [ ] go over items in work items ( hint: can use gitlab api to access work items without auth ). make note/document of any that are already confirmed fix and should be closed - put note/doc in docs/ops - check when done - you may use existing documentation for reference
-11. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.7.0 explaining all relevant changes since v2.0.6.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `UNKNOWN` — The file you write will be `RELEASE-v2.0.7.0.md` and should be written to the ROOT of the repo
-12. [ ] update any outdated documents in docs/proposals
-13. [ ] update any outdated documents in docs/guides
-14. [ ] update README.md in repo root (if necessary)
-15. [ ] review first draft of release notes from prev step and update any inconsistencies
-16. [ ] update readme from prev step and update any inconsistencies
-17. [ ] Run cargo update and lockfile reconciliation before tag if necessary
-18. [ ] check cicd of master for failures before beginning release process (after testing phase completed)
-
+5. [ ] fix cicd.  secret detection is failing now
+6. [ ] find gaps/issues with mcp part 2 implementations if any. document findings in new document in docs/ops - feel free to use existing documentation for reference
+7. [ ] Additional Opencode External Worker Polishing, including update of opencode version (latest is 1.18.9 )
+8. [ ] LunarVision polishing, improving stability across both systemd/gentoo setups
+9. [ ] LunarVoice polishing, improving stability across both systemd/gentoo setups
+10. [ ] come up with codename ideas for release. put into new doc in docs/ops - base the name on all changes made since 2.0.6.0
+11. [ ] go over items in work items ( hint: can use gitlab api to access work items without auth ). make note/document of any that are already confirmed fix and should be closed - put note/doc in docs/ops - check when done - you may use existing documentation for reference
+12. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.7.0 explaining all relevant changes since v2.0.6.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `UNKNOWN` — The file you write will be `RELEASE-v2.0.7.0.md` and should be written to the ROOT of the repo
+13. [ ] update any outdated documents in docs/proposals
+14. [ ] update any outdated documents in docs/guides
+15. [ ] update README.md in repo root (if necessary)
+16. [ ] review first draft of release notes from prev step and update any inconsistencies
+17. [ ] update readme from prev step and update any inconsistencies
+18. [ ] Run cargo update and lockfile reconciliation before tag if necessary
 ---
