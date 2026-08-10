@@ -1,13 +1,15 @@
 # Coordination Pipeline — Phase 1 Declarative Hooks
 
 **Status:** Implemented for v2.0.4.0; retained as a Phase 1 capability record.
-The shipped bundle is `ic/config/hooks/coordination.hook.json`, whose rules are
-scoped at startup to exact `COORD_CHANNELS` matches. The adjacent
+The shipped bundle is `ic/config/hooks/coordination.hook.json`, compiled into the
+daemon and scoped at startup to exact `COORD_CHANNELS` matches. The adjacent
 `coordination-phase1-bundle.json` is synchronized with that guarded source
-artifact. See [`DEPLOYMENT.md`](DEPLOYMENT.md) for current guidance.
+artifact. A legacy workspace copy is ignored to prevent duplicate enforcement.
+See [`DEPLOYMENT.md`](DEPLOYMENT.md) for current guidance.
 
-Phase 1 uses ONLY the existing declarative hook system (HookBundleConfig).
-Workspace hook files are loaded from `hooks/hooks.json` or `hooks/*.hook.json`.
+Phase 1 uses the existing declarative hook system (`HookBundleConfig`). Generic
+workspace hook files still load from `hooks/hooks.json` or `hooks/*.hook.json`;
+the coordination bundle is managed directly by `bootstrap_hooks()`.
 
 ## Hook System Capabilities (verified from source)
 
