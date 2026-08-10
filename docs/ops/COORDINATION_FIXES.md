@@ -83,3 +83,24 @@ a disabled local agent before any execution path while allowing trusted internal
 notifications through. Engine V2 retains its effect-time defense in depth.
 Coalescer creation now additionally requires actionable coordination config, so
 `COORD_ENABLED` is the real master switch.
+
+## Issue #6: Phase 1 rules were not deployed automatically
+
+The canonical secret/newline/length bundle lived under `ic/config/hooks/`, but
+startup loaded only workspace hook files. No provisioning path copied it into a
+tenant workspace, so an enabled coordination deployment could silently lack all
+eight Phase 1 rules. The Rust entropy hook is supplementary and intentionally
+allowlists URLs/paths/SHAs, making the missing bundle a real security gap.
+
+Fix: `bootstrap_hooks()` now embeds, scopes, and registers the canonical bundle
+whenever coordination config is actionable. Legacy workspace copies are ignored
+to avoid duplicate enforcement. Tests verify disabled no-op, eight-rule
+registration, in-scope secret rejection, and out-of-scope pass-through.
+
+## Issue #7: malformed coalescer settings could crash or disable behavior
+
+`COALESCE_WINDOW_SEC=NaN`/infinity/overflow reached
+`Duration::from_secs_f64`, which panics, while `COALESCE_MAX_MERGES=0` produced
+nonsensical immediate-flush semantics. The parser now accepts only finite,
+representable windows (minimum 100 ms) and positive merge counts, otherwise
+retaining safe defaults.
