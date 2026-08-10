@@ -34,3 +34,52 @@ curl -fsS -X POST \
 ```
 
 Then test with valid input such as `QUERY: @derpy report status`.
+
+## Issue #2: empty aliases silently disabled engagement
+
+Tenant provisioning wrote an empty `COORD_AGENT_ALIASES`. Once coordination was
+turned on, valid messages addressed with the configured `COORD_AGENT_ID` still
+failed engagement unless an operator separately populated aliases.
+
+Fix: the runtime now derives lowercase full-ID, `@ID`, and JID local-part aliases
+from every valid `COORD_AGENT_ID`, while preserving and deduplicating explicit
+aliases. Matching observes identifier boundaries, so a short alias such as `aj`
+no longer triggers on words such as `adjust`.
+
+## Issue #3: Engine V2 lacked the response contract
+
+The legacy dispatcher injected the room-scoped tagged-output instruction, but
+Engine V2 only received generic channel budgets. Its untagged final output was
+then rejected by the shared transform and could auto-disable the local agent.
+
+Fix: Engine V2 composes the same coordination instruction into its per-thread
+channel context without replacing transport budgets.
+
+## Issue #4: first-responder behavior did not coordinate daemons
+
+The original claim map was process-local, used an implementation-defined hash,
+and accepted repeat claims by the same daemon. Normal multi-tenant deployment
+could therefore emit duplicate responses, while transport replay could wake one
+daemon repeatedly.
+
+Fix:
+
+- `COORD_RESPONDER_ROSTER` enables rendezvous-hash election for unaddressed
+  `QUERY:` messages; identical rosters independently choose exactly one daemon;
+- stable SHA-256 correlation covers normalized room, sender, and content;
+- explicit mentions retain direct routing;
+- a process-local TTL claim suppresses repeated delivery to the elected daemon,
+  including same-agent replay;
+- mt-admin provisioning and upgrade backfill preserve the roster setting.
+
+## Issue #5: auto-disable and master switch were incomplete
+
+Three-strike enforcement stopped Engine V2 effects, but legacy chat, reflex, and
+approval-resume paths could still execute. Separately, configuring
+`COORD_CHANNELS` could activate the coalescer while `COORD_ENABLED=false`.
+
+Fix: the common inbound boundary now silently suppresses external activity from
+a disabled local agent before any execution path while allowing trusted internal
+notifications through. Engine V2 retains its effect-time defense in depth.
+Coalescer creation now additionally requires actionable coordination config, so
+`COORD_ENABLED` is the real master switch.
