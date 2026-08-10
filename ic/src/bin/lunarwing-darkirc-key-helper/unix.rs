@@ -785,25 +785,8 @@ fn parse_generator_output(
         }
         let text =
             std::str::from_utf8(stdout).map_err(|_| KeyManagerError::InvalidCompatibility)?;
-        let mut public_key = None;
-        let mut secret_key: Option<Zeroizing<String>> = None;
-        for line in text.lines() {
-            if let Some(value) = line.strip_prefix("Public:") {
-                let value = value.trim();
-                if value.is_empty() || public_key.replace(value.to_owned()).is_some() {
-                    return Err(KeyManagerError::InvalidCompatibility);
-                }
-            } else if let Some(value) = line.strip_prefix("Secret:") {
-                let value = Zeroizing::new(value.trim().to_owned());
-                if value.is_empty() || secret_key.replace(value).is_some() {
-                    return Err(KeyManagerError::InvalidCompatibility);
-                }
-            } else {
-                return Err(KeyManagerError::InvalidCompatibility);
-            }
-        }
-        let public_key = public_key.ok_or(KeyManagerError::InvalidCompatibility)?;
-        let secret_key = secret_key.ok_or(KeyManagerError::InvalidCompatibility)?;
+        let (public_key, secret_key) =
+            parse_strict_key_lines(text).or_else(|_| parse_toml_keypair_lines(text))?;
         validate_generated_pair(&public_key, &secret_key)?;
         Ok(KeypairOutput {
             public_key,
@@ -813,6 +796,64 @@ fn parse_generator_output(
     stdout.zeroize();
     stderr.zeroize();
     parsed
+}
+
+/// Strict two-line `Public:` / `Secret:` generator output (legacy format).
+fn parse_strict_key_lines(text: &str) -> Result<(String, Zeroizing<String>)> {
+    let mut public_key = None;
+    let mut secret_key: Option<Zeroizing<String>> = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("Public:") {
+            let value = value.trim();
+            if value.is_empty() || public_key.replace(value.to_owned()).is_some() {
+                return Err(KeyManagerError::InvalidCompatibility);
+            }
+        } else if let Some(value) = line.strip_prefix("Secret:") {
+            let value = Zeroizing::new(value.trim().to_owned());
+            if value.is_empty() || secret_key.replace(value).is_some() {
+                return Err(KeyManagerError::InvalidCompatibility);
+            }
+        } else {
+            return Err(KeyManagerError::InvalidCompatibility);
+        }
+    }
+    let public_key = public_key.ok_or(KeyManagerError::InvalidCompatibility)?;
+    let secret_key = secret_key.ok_or(KeyManagerError::InvalidCompatibility)?;
+    Ok((public_key, secret_key))
+}
+
+/// darkirc's TOML-snippet generator output: the pinned daemon prints a config
+/// block with `my_dm_chacha_secret = "..."` and a commented-out
+/// `#my_dm_chacha_public = "..."` line. The uncommented
+/// `dm_chacha_public = "YOUR_CONTACT_PUBLIC_KEY"` placeholder is
+/// documentation, not a key, and is ignored.
+fn parse_toml_keypair_lines(text: &str) -> Result<(String, Zeroizing<String>)> {
+    let mut public_key = None;
+    let mut secret_key: Option<Zeroizing<String>> = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().trim_start_matches('#').trim();
+        let value = value.trim().trim_matches('"').trim();
+        match key {
+            "my_dm_chacha_public" => {
+                if value.is_empty() || public_key.replace(value.to_owned()).is_some() {
+                    return Err(KeyManagerError::InvalidCompatibility);
+                }
+            }
+            "my_dm_chacha_secret" => {
+                let value = Zeroizing::new(value.to_owned());
+                if value.is_empty() || secret_key.replace(value).is_some() {
+                    return Err(KeyManagerError::InvalidCompatibility);
+                }
+            }
+            _ => {}
+        }
+    }
+    let public_key = public_key.ok_or(KeyManagerError::InvalidCompatibility)?;
+    let secret_key = secret_key.ok_or(KeyManagerError::InvalidCompatibility)?;
+    Ok((public_key, secret_key))
 }
 
 fn decode_generator_key(value: &str) -> Result<Zeroizing<[u8; 32]>> {
@@ -1450,6 +1491,34 @@ mod tests {
             .expect("parse captured generator output");
 
         assert_eq!(output.public_key, public);
+    }
+
+    #[test]
+    fn parse_generator_output_accepts_darkirc_toml_snippet() {
+        // The pinned darkirc daemon prints a config block, not Public:/Secret:
+        // lines; the helper must extract the real keys and ignore the
+        // YOUR_CONTACT_PUBLIC_KEY placeholder.
+        let (public, secret) = generator_pair();
+        let mut stdout = format!(
+            "Place this in your config file under your contact, you can reuse this keypair for multiple contacts\n\n[contact.\"satoshi\"]\ndm_chacha_public = \"YOUR_CONTACT_PUBLIC_KEY\"\nmy_dm_chacha_secret = \"{secret}\"\n#my_dm_chacha_public = \"{public}\"\n"
+        )
+        .into_bytes();
+        let mut stderr = Vec::new();
+
+        let output = parse_generator_output(&mut stdout, &mut stderr, true)
+            .expect("darkirc TOML snippet parses");
+
+        assert_eq!(output.public_key, public);
+    }
+
+    #[test]
+    fn parse_generator_output_rejects_toml_snippet_without_public() {
+        let (_public, secret) = generator_pair();
+        let mut stdout =
+            format!("[contact.\"satoshi\"]\nmy_dm_chacha_secret = \"{secret}\"\n").into_bytes();
+        let mut stderr = Vec::new();
+
+        assert!(parse_generator_output(&mut stdout, &mut stderr, true).is_err());
     }
 
     #[test]
