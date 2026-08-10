@@ -1583,6 +1583,19 @@ impl Agent {
             return Ok(Some(message.content.clone()));
         }
 
+        // Enforce coordination auto-disable before every external execution
+        // path. Engine V2 also checks immediately before each effect, but this
+        // shared boundary closes legacy chat, reflex fast-path, and approval-
+        // resume bypasses without exposing the silent deny reason.
+        if coordination_activity_is_denied(self.deps.coordination_gate.as_deref(), message) {
+            tracing::debug!(
+                channel = %message.channel,
+                sender = %message.sender_id,
+                "Coordination-disabled activity silently suppressed"
+            );
+            return Ok(Some(String::new()));
+        }
+
         // Set message tool context for this turn (current channel and target)
         // For Signal, use signal_target from metadata (group:ID or phone number),
         // otherwise fall back to user_id
@@ -2075,6 +2088,13 @@ impl Agent {
     }
 }
 
+fn coordination_activity_is_denied(
+    gate: Option<&crate::gate::coordination::CoordinationGate>,
+    message: &IncomingMessage,
+) -> bool {
+    !message.is_internal && gate.is_some_and(|gate| gate.deny_reason(&message.sender_id).is_some())
+}
+
 fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
     IncomingMessage {
         id: message.id,
@@ -2105,8 +2125,8 @@ mod tests {
     use super::Agent;
     use super::{
         abort_and_wait, chat_tool_execution_metadata, coalesced_reply_context,
-        resolve_routine_notification_user, should_fallback_routine_notification,
-        truncate_for_preview,
+        coordination_activity_is_denied, resolve_routine_notification_user,
+        should_fallback_routine_notification, truncate_for_preview,
     };
     #[cfg(feature = "libsql")]
     use crate::channels::ChannelManager;
@@ -2143,6 +2163,29 @@ mod tests {
         assert_eq!(context.metadata, message.metadata);
         assert!(context.content.is_empty());
         assert!(context.attachments.is_empty());
+    }
+
+    #[test]
+    fn coordination_gate_suppresses_external_activity_but_not_internal_delivery() {
+        let dir = tempfile::tempdir().expect("temporary coordination gate directory");
+        let store = Arc::new(crate::gate::violation_store::ViolationStore::new(
+            dir.path().join("violations.json"),
+            crate::gate::violation_store::ViolationStoreConfig {
+                max_violations: 1,
+                disable_duration_secs: 60,
+                decay_secs: 600,
+            },
+        ));
+        store.record_violation("local-agent", "test", "hook", "coord");
+        let gate =
+            crate::gate::coordination::CoordinationGate::new(store, "local-agent".to_string());
+        let external =
+            IncomingMessage::new("xmpp", "owner", "QUERY: status").with_sender_id("operator");
+        assert!(coordination_activity_is_denied(Some(&gate), &external));
+
+        let internal = external.clone().into_internal();
+        assert!(!coordination_activity_is_denied(Some(&gate), &internal));
+        assert!(!coordination_activity_is_denied(None, &external));
     }
 
     #[cfg(feature = "libsql")]
