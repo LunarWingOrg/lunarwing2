@@ -2802,7 +2802,10 @@ darkirc_validate_release_directory() {
   mode="$(stat -c '%a' "$release_dir" 2>/dev/null || true)"
   owner="$(stat -c '%u' "$release_dir" 2>/dev/null || true)"
   links="$(stat -c '%h' "$release_dir" 2>/dev/null || true)"
-  [[ "$mode" == 555 && "$owner" == 0 && "$links" == 2 ]] || return 1
+  [[ "$mode" == 555 && "$owner" == 0 ]] || return 1
+  # Directory st_nlink is filesystem-dependent: 2 on ext4/tmpfs (leaf dirs),
+  # 1 on btrfs and overlayfs. The exact-contents check below carries integrity.
+  [[ "$links" == 1 || "$links" == 2 ]] || return 1
   darkirc_validate_root_executable "$release_dir/darkirc" || return 1
   darkirc_validate_root_executable "$release_dir/lunarwing-darkirc-key-helper" || return 1
   [[ "$(stat -c '%u:%a:%h' "$release_dir/darkirc" 2>/dev/null)" == "0:555:1" ]] || return 1
