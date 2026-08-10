@@ -3882,7 +3882,7 @@ write_tenant_lunarwing_env() {
   # tokens would break live clients/workers; minting a fresh XMPP_PASSWORD would
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
-  local coord_enabled coord_agent_id coord_agent_aliases coord_channels coord_admin_users coord_admin_token coord_admin_port
+  local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
   local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
@@ -3892,6 +3892,7 @@ write_tenant_lunarwing_env() {
   coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
   coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
   coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
+  coord_responder_roster="$(_env_existing "$path" COORD_RESPONDER_ROSTER)"
   coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
   coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
   coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
@@ -4013,6 +4014,7 @@ SECRETS_MASTER_KEY=$secrets_key
 COORD_ENABLED=$coord_enabled
 COORD_AGENT_ID=$coord_agent_id
 COORD_AGENT_ALIASES=$coord_agent_aliases
+COORD_RESPONDER_ROSTER=$coord_responder_roster
 COORD_CHANNELS=$coord_channels
 COORD_ADMIN_USERS=$coord_admin_users
 COORD_ADMIN_TOKEN=$coord_admin_token
@@ -5547,6 +5549,10 @@ patch_tenant_coordination_env() {
   if ! grep -q '^COORD_AGENT_ALIASES=' "$env_path"; then
     printf 'COORD_AGENT_ALIASES=\n' >>"$env_path"
     say "added COORD_AGENT_ALIASES to $env_path"
+  fi
+  if ! grep -q '^COORD_RESPONDER_ROSTER=' "$env_path"; then
+    printf 'COORD_RESPONDER_ROSTER=\n' >>"$env_path"
+    say "added COORD_RESPONDER_ROSTER to $env_path"
   fi
   if ! grep -q '^COORD_ADMIN_USERS=' "$env_path"; then
     printf 'COORD_ADMIN_USERS=\n' >>"$env_path"
