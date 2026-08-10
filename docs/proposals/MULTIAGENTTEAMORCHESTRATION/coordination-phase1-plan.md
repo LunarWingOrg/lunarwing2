@@ -48,11 +48,14 @@ Our coordination hooks use priorities 10-80 for layered enforcement.
 
 ## What Phase 1 Enforces
 
-### 1. Secret Detection (priority 10-13, fail_closed)
+### 1. Explicit Secret Detection (priority 10-12, fail_closed)
 - API keys, tokens, passwords (regex pattern matching)
 - Private key material (PEM headers)
 - JWT tokens (eyJ... format)
-- High-entropy base64 strings (40+ chars)
+
+The original priority-13 blanket base64 rule was removed in v2.0.7 because it
+rejected exact git SHAs and other valid identifiers. Strike-aware entropy
+checking now lives in the stateful Rust hook, with precise safe-token handling.
 
 ### 2. Inbound Newline Stripping (priority 50, fail_open)
 - Replaces `\r\n`, `\r`, `\n` with spaces
