@@ -9,8 +9,8 @@
 
 ---
 
-1. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference
-2. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.6. we need bump to 2.0.7 - ensure CI/CD is also updated for the new crate versions — lockfiles must be refreshed - all channel registry patch versions must be also be bumped to comply with CI/CD
+1. [x] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference — DONE (2026-08-10): [`CRATE_SECURITY_AUDIT_v2.0.7.0.md`](CRATE_SECURITY_AUDIT_v2.0.7.0.md) records the live 32-root RustSec audit. No newly fixable security bump was found; the seven accepted shipped-graph advisories remain blocked by libSQL's legacy TLS stack, unpatched RSA via russh, or the vendored Signal wrapper.
+2. [x] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.6. we need bump to 2.0.7 - ensure CI/CD is also updated for the new crate versions — lockfiles must be refreshed - all channel registry patch versions must be also be bumped to comply with CI/CD
 by CI source-version policy. CI/CD contains no hardcoded LunarWing package-version pin and derives versions from Cargo manifests; verify GitLab config validation passes if possible - cargo update and all that good stuff as usual
 3. [ ] investigate cause of agent occasionally getting "stuck" after certain tool calls or approval mechanisms and fix if possible - you may spin up test tenant(s) to live debug
 4. [ ] improve coordination protocol
