@@ -91,6 +91,13 @@ impl Default for CoalesceConfig {
     }
 }
 
+fn parse_window_duration(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.max(0.1)).ok()
+}
+
 impl CoalesceConfig {
     /// Load from environment variables.
     pub fn from_env() -> Self {
@@ -98,15 +105,17 @@ impl CoalesceConfig {
         if let Ok(v) = std::env::var("COALESCE_ENABLED") {
             config.enabled = v.eq_ignore_ascii_case("true") || v == "1";
         }
-        if let Some(secs) = std::env::var("COALESCE_WINDOW_SEC")
+        if let Some(window) = std::env::var("COALESCE_WINDOW_SEC")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
+            .and_then(parse_window_duration)
         {
-            config.window = Duration::from_secs_f64(secs.max(0.1));
+            config.window = window;
         }
         if let Some(n) = std::env::var("COALESCE_MAX_MERGES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
         {
             config.max_merges = n;
         }
@@ -516,6 +525,22 @@ mod tests {
             })
         });
         (flush, sent)
+    }
+
+    #[test]
+    fn coalesce_window_parser_rejects_non_finite_and_overflow_values() {
+        assert_eq!(parse_window_duration(0.0), Some(Duration::from_millis(100)));
+        assert_eq!(
+            parse_window_duration(0.05),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            parse_window_duration(2.5),
+            Some(Duration::from_millis(2500))
+        );
+        assert_eq!(parse_window_duration(f64::NAN), None);
+        assert_eq!(parse_window_duration(f64::INFINITY), None);
+        assert_eq!(parse_window_duration(f64::MAX), None);
     }
 
     #[test]

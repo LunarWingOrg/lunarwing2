@@ -141,6 +141,7 @@ write_tenant_lunarwing_env fixture-tenant \
 sed -i \
   -e 's/^COORD_ENABLED=.*/COORD_ENABLED=true/' \
   -e 's/^COORD_AGENT_ID=.*/COORD_AGENT_ID=custom-agent/' \
+  -e 's/^COORD_RESPONDER_ROSTER=.*/COORD_RESPONDER_ROSTER=custom-agent,peer-agent/' \
   -e 's/^COORD_CHANNELS=.*/COORD_CHANNELS=ops@conference.example/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
@@ -160,6 +161,8 @@ assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
 assert_eq "rerun preserves XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost,admin@xmpp.org"
 assert_eq "rerun preserves COORD_ENABLED" "$(envval COORD_ENABLED)" "true"
 assert_eq "rerun preserves COORD_AGENT_ID" "$(envval COORD_AGENT_ID)" "custom-agent"
+assert_eq "rerun preserves COORD_RESPONDER_ROSTER" \
+  "$(envval COORD_RESPONDER_ROSTER)" "custom-agent,peer-agent"
 assert_eq "rerun preserves COORD_CHANNELS" "$(envval COORD_CHANNELS)" "ops@conference.example"
 assert_eq "rerun preserves COORD_ADMIN_TOKEN" "$(envval COORD_ADMIN_TOKEN)" "preserved-coord-token"
 assert_eq "rerun preserves LW2STUDYMCP_HOME" \
@@ -199,6 +202,7 @@ assert_eq "backfill coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "backfill coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
 assert_eq "backfill coordination channels" "$(envval COORD_CHANNELS)" ""
 assert_eq "backfill coordination aliases" "$(envval COORD_AGENT_ALIASES)" ""
+assert_eq "backfill coordination responder roster" "$(envval COORD_RESPONDER_ROSTER)" ""
 assert_eq "backfill coordination admin users" "$(envval COORD_ADMIN_USERS)" ""
 assert_eq "backfill coordination token" \
   "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

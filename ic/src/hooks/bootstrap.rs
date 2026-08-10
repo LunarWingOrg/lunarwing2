@@ -35,7 +35,9 @@ impl HookBootstrapSummary {
     }
 }
 
-/// Register bundled hooks, then load plugin and workspace hook bundles.
+const MANAGED_COORDINATION_BUNDLE: &str = include_str!("../../config/hooks/coordination.hook.json");
+
+/// Register bundled hooks, then load managed, plugin, and workspace hook bundles.
 #[allow(clippy::too_many_arguments)]
 pub async fn bootstrap_hooks(
     registry: &Arc<HookRegistry>,
@@ -53,6 +55,11 @@ pub async fn bootstrap_hooks(
     summary.bundled_hooks += bundled.hooks;
     summary.outbound_webhooks += bundled.outbound_webhooks;
     summary.errors += bundled.errors;
+
+    let managed = register_managed_coordination_bundle(registry, coordination_config).await;
+    summary.bundled_hooks += managed.hooks;
+    summary.outbound_webhooks += managed.outbound_webhooks;
+    summary.errors += managed.errors;
 
     let plugin = register_plugin_bundles(
         registry,
@@ -76,6 +83,39 @@ pub async fn bootstrap_hooks(
     }
 
     summary
+}
+
+async fn register_managed_coordination_bundle(
+    registry: &Arc<HookRegistry>,
+    config: &CoordinationHookConfig,
+) -> HookRegistrationSummary {
+    if !config.is_actionable() {
+        return HookRegistrationSummary::default();
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(MANAGED_COORDINATION_BUNDLE) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            tracing::error!(%error, "Managed coordination hook bundle is invalid JSON");
+            return HookRegistrationSummary {
+                hooks: 0,
+                outbound_webhooks: 0,
+                errors: 1,
+            };
+        }
+    };
+    let mut bundle = match parse_workspace_bundle(&parsed) {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            tracing::error!(%error, "Managed coordination hook bundle is invalid");
+            return HookRegistrationSummary {
+                hooks: 0,
+                outbound_webhooks: 0,
+                errors: 1,
+            };
+        }
+    };
+    scope_coordination_bundle(&mut bundle, config);
+    register_bundle(registry, "managed.coordination", bundle).await
 }
 
 async fn register_plugin_bundles(
@@ -278,8 +318,12 @@ async fn register_workspace_bundles(
     hook_paths.sort();
 
     for path in hook_paths {
-        if path == "hooks/coordination.hook.json" && !coordination_config.is_actionable() {
-            tracing::debug!(path = %path, "Skipping disabled coordination hook bundle");
+        if path == "hooks/coordination.hook.json" {
+            tracing::debug!(
+                path = %path,
+                enabled = coordination_config.is_actionable(),
+                "Ignoring legacy workspace coordination bundle; managed bundle owns these rules"
+            );
             continue;
         }
         let doc = match workspace.read(&path).await {
@@ -300,7 +344,7 @@ async fn register_workspace_bundles(
             }
         };
 
-        let mut bundle = match parse_workspace_bundle(&parsed) {
+        let bundle = match parse_workspace_bundle(&parsed) {
             Ok(bundle) => bundle,
             Err(err) => {
                 summary.errors += 1;
@@ -308,10 +352,6 @@ async fn register_workspace_bundles(
                 continue;
             }
         };
-
-        if path == "hooks/coordination.hook.json" {
-            scope_coordination_bundle(&mut bundle, coordination_config);
-        }
 
         let source = format!("workspace:{}", path);
         let registered = register_bundle(registry, &source, bundle).await;
@@ -415,6 +455,59 @@ mod tests {
         assert!(guard.is_match("ä-team@conference.example"));
         assert!(!guard.is_match("other@conference.example"));
         assert!(!guard.is_match("xops+one@conference.example"));
+    }
+
+    #[tokio::test]
+    async fn managed_coordination_bundle_registers_only_when_actionable() {
+        let registry = Arc::new(HookRegistry::new());
+        let disabled =
+            register_managed_coordination_bundle(&registry, &CoordinationHookConfig::default())
+                .await;
+        assert_eq!(disabled.hooks, 0);
+        assert!(registry.list().await.is_empty());
+
+        let config = CoordinationHookConfig {
+            enabled: true,
+            agent_id: "agent-1".into(),
+            coordination_channels: vec!["coord@conference.example".into()],
+            ..CoordinationHookConfig::default()
+        };
+        let enabled = register_managed_coordination_bundle(&registry, &config).await;
+        assert_eq!(enabled.hooks, 7);
+        assert_eq!(enabled.errors, 0);
+        assert_eq!(registry.list().await.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn managed_coordination_rules_are_exactly_room_scoped() {
+        let registry = Arc::new(HookRegistry::new());
+        let config = CoordinationHookConfig {
+            enabled: true,
+            agent_id: "agent-1".into(),
+            coordination_channels: vec!["coord@conference.example".into()],
+            ..CoordinationHookConfig::default()
+        };
+        register_managed_coordination_bundle(&registry, &config).await;
+        let event = |scope: &str| crate::hooks::HookEvent::Inbound {
+            user_id: "remote".into(),
+            sender_id: Some("remote".into()),
+            channel: "xmpp".into(),
+            content: "STATUS: token=abcdefghijklmnop".into(),
+            thread_id: None,
+            policy_scope: Some(scope.into()),
+        };
+        assert!(
+            registry
+                .run(&event("coord@conference.example"))
+                .await
+                .is_err()
+        );
+        assert!(
+            registry
+                .run(&event("casual@conference.example"))
+                .await
+                .is_ok()
+        );
     }
 
     #[test]

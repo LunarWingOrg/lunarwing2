@@ -6,13 +6,14 @@
 **Source material:** `docs/proposals/MULTIAGENTTEAMORCHESTRATION/` (6 files)
 
 All four phases shipped on 2026-07-30, with ISSUE-001…014 review fixes applied
-on 2026-07-31. Use
-[`MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`](MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md)
+on 2026-07-31. A v2.0.7 hardening pass added derived identity aliases,
+deterministic cross-daemon responder election, replay suppression, Engine V2
+prompt parity, uniform auto-disable enforcement, and a complete master switch.
+Use [`MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`](MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md)
 for the current configuration and operational contract. Important final design
 differences are recorded alongside the acceptance criteria below: tag validation
 runs once at `transformResponse`, the gate is owned by `ic/src/gate/`, coalescing
-is transport-independent, strike-two alerting is a structured warning log, and
-first-responder claims remain process-local.
+is transport-independent, and strike-two alerting is a structured warning log.
 
 ---
 
@@ -45,11 +46,12 @@ designated coordination channels:
 - **Rate limiting:** 2 messages per agent per configured window by default
   (`COORD_RATE_WINDOW_SECS=3600`).
 - **Engagement policy:** within configured coordination scopes, messages pass
-  when sent by the local agent/admin or when their text contains a configured
-  `COORD_AGENT_ALIASES` value. Direct-reply metadata is not inspected; DMs are
+  when sent by the local agent/admin or when their text addresses an exact
+  configured/derived alias. Direct-reply metadata is not inspected; DMs are
   unaffected unless explicitly listed in `COORD_CHANNELS`.
-- **First-responder correlation:** opportunistically suppresses duplicate claims
-  among hooks sharing one daemon; separate tenant daemons can still both respond.
+- **First-responder correlation:** an optional shared roster makes independent
+  daemons elect the same responder for unaddressed queries; process-local TTL
+  claims suppress replay at the selected daemon.
 - **Three-strike enforcement:** repeated violations auto-disable an agent for
   24 hours.
 - **Coalesce window:** a 2-second pre-send buffer by default
@@ -106,9 +108,10 @@ covering native and installable channels uniformly.
 
 ### What Does NOT Ship in 2.0.4.0
 
-- **Shared first-responder store** (host-local broker/file CAS or remote broker):
-  current claims are process-local, so separate tenant daemons on the same host
-  or different hosts can both respond. Shared coordination is deferred.
+- **Shared first-responder store** (host-local broker/file CAS or remote broker)
+  did not ship in 2.0.4.0. v2.0.7 instead added deterministic roster-based
+  election, which prevents duplicate responses without shared storage but is not
+  a liveness/failover oracle.
 - **Router-level engagement gating** (Option A from verification doc): the
   router refactor to respect BeforeInbound rejections for thread spawning is
   invasive and deferred. 2.0.4.0 uses Option B (thread spawns but agent
@@ -122,10 +125,10 @@ covering native and installable channels uniformly.
 
 ### Deliverables
 
-1. Ship `coordination-phase1-bundle.json` as a workspace hook bundle
-2. Document deployment: place as `hooks/coordination.hook.json` in workspace,
-   restart daemon, hooks auto-load via `register_workspace_bundles()`
-3. Verification: 7 test cases from `coordination-phase1-plan.md` §Verification
+1. Ship `ic/config/hooks/coordination.hook.json` as the canonical rule bundle
+2. Compile, scope, and register its seven rules automatically when coordination
+   is actionable; ignore legacy workspace copies to prevent duplicate enforcement
+3. Verify activation/no-op behavior and exact destination scoping in bootstrap tests
 
 ### What Phase 1 Enforces
 
@@ -135,7 +138,6 @@ covering native and installable channels uniformly.
 | API key/token detection (outbound) | 10 | beforeOutbound, transformResponse | fail_closed |
 | Private key material detection | 11 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
 | JWT token detection | 12 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
-| High-entropy base64 detection | 13 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
 | Newline strip (inbound) | 50 | beforeInbound | fail_open |
 | Newline reject (outbound) | 50 | beforeOutbound, transformResponse | fail_closed |
 | Max length 420 chars (outbound) | 51 | beforeOutbound, transformResponse | fail_closed |
@@ -175,18 +177,20 @@ covering native and installable channels uniformly.
    limit windows, first-responder claims, violation counts, disabled agents,
    coordination channel list.
 
-2. **SecretEntropyHook** (priority 5, BeforeInbound + BeforeOutbound) — Shannon
-   entropy detection beyond Phase 1 regex. Threshold: 4.8 bits/char (adjusted
-   from 4.5 per Rarity's false-positive concern). Min token length: 32.
+2. **SecretEntropyHook** (priority 5, BeforeInbound + BeforeOutbound +
+   TransformResponse) — strike-aware explicit credential/private-key/JWT and
+   Shannon-entropy detection. Threshold: 4.8 bits/char, minimum token length 32;
+   exact git SHAs, explicit paths, and HTTP(S) URLs bypass entropy only.
 
 3. **EngagementPolicyHook** (priority 15, BeforeInbound) — rejects non-targeted
-   messages in coordination channels. Uses agent aliases for @mention
-   detection. FailOpen (non-coordination channels unaffected).
+   messages in coordination channels. Uses identifier-boundary alias matching
+   and optional deterministic roster election. FailOpen outside coordination
+   channels.
 
-4. **FirstResponderHook** (priority 16, BeforeInbound) — prevents duplicate
-   responses via a deterministic correlation ID. Claims are process-local and
-   expire after the configured 2-second TTL by default; they do not coordinate
-   separate tenant daemons.
+4. **FirstResponderHook** (priority 16, BeforeInbound) — suppresses replayed
+   deliveries with a stable sender/room/content correlation ID. Claims are
+   process-local and expire after the configured 2-second TTL; cross-daemon
+   selection is handled deterministically by the engagement hook.
 
 5. **TagSchemaHook** (priority 14, BeforeInbound + TransformResponse) — rejects
    messages in coordination channels not starting with an allowed tag. Inbound
@@ -203,9 +207,10 @@ Environment variables (loaded by `CoordinationHookConfig::from_env()`):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COORD_ENABLED` | `false` | Enable coordination hooks |
+| `COORD_ENABLED` | `false` | Master switch for all coordination runtime components |
 | `COORD_AGENT_ID` | (required) | This agent's unique identifier |
-| `COORD_AGENT_ALIASES` | (empty) | Comma-separated @mentions targeting this agent |
+| `COORD_AGENT_ALIASES` | (derived from agent ID) | Optional additional exact mention aliases |
+| `COORD_RESPONDER_ROSTER` | (empty) | Shared team roster for deterministic unaddressed-query election |
 | `COORD_CHANNELS` | (required) | Comma-separated coordination policy scopes |
 | `COORD_MAX_MESSAGES` | `2` | Max messages per rate window per agent |
 | `COORD_RATE_WINDOW_SECS` | `3600` | Sliding rate-window duration |
@@ -222,13 +227,11 @@ Environment variables (loaded by `CoordinationHookConfig::from_env()`):
 but does NOT prevent the router from spawning a thread. The agent gets woken up
 and consumes tokens even though the hook rejected the message.
 
-**Resolution for 2.0.4.0:** Option B — let the thread spawn but have the agent
-return immediately without generating a response. The EngagementPolicyHook
-reject prevents the message from reaching the conversation, so the agent's loop
-exits with no output. Token waste is minimal (system prompt load only).
-
-**Future (2.0.5.0+):** Option A — modify the router to respect BeforeInbound
-rejections for thread spawning decisions.
+**Resolution:** Option B — the supervised outer message task starts, then the
+BeforeInbound hook rejects before session/thread resolution, model generation,
+or tool execution. The agent returns typed empty suppression with no output. A
+router/channel refactor that avoids creating the short-lived Tokio task remains
+unnecessary for capability or token correctness.
 
 #### C2: ResponseTransform Originally Had No Destination Scope
 
@@ -466,10 +469,12 @@ work.
    route daemon warning logs into their alerting system; no Gotify/DM is sent by
    this module.
 5. **Silent gate denial:** `CoordinationGate` uses the `"[SILENT] "` convention,
-   and callers translate it into typed execution-stop control flow without
-   surfacing the reason to the model or channel.
-6. **Deferred:** first-responder claims are process-local. A shared
-   compare-and-insert backend is required to deduplicate across tenant daemons.
+   and the shared inbound boundary plus Engine V2 effect adapter stop execution
+   without surfacing the reason to the model or channel.
+6. **First responder:** a stable roster-based rendezvous election coordinates
+   independent daemons for unaddressed queries; process-local TTL claims suppress
+   replay. The trade-off is no automatic failover when the elected daemon is
+   offline.
 
 ---
 
