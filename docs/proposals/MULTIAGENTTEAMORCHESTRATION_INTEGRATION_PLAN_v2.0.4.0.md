@@ -126,7 +126,7 @@ covering native and installable channels uniformly.
 ### Deliverables
 
 1. Ship `ic/config/hooks/coordination.hook.json` as the canonical rule bundle
-2. Compile, scope, and register its eight rules automatically when coordination
+2. Compile, scope, and register its seven rules automatically when coordination
    is actionable; ignore legacy workspace copies to prevent duplicate enforcement
 3. Verify activation/no-op behavior and exact destination scoping in bootstrap tests
 
@@ -138,7 +138,6 @@ covering native and installable channels uniformly.
 | API key/token detection (outbound) | 10 | beforeOutbound, transformResponse | fail_closed |
 | Private key material detection | 11 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
 | JWT token detection | 12 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
-| High-entropy base64 detection | 13 | beforeInbound, beforeOutbound, transformResponse | fail_closed |
 | Newline strip (inbound) | 50 | beforeInbound | fail_open |
 | Newline reject (outbound) | 50 | beforeOutbound, transformResponse | fail_closed |
 | Max length 420 chars (outbound) | 51 | beforeOutbound, transformResponse | fail_closed |
@@ -178,9 +177,10 @@ covering native and installable channels uniformly.
    limit windows, first-responder claims, violation counts, disabled agents,
    coordination channel list.
 
-2. **SecretEntropyHook** (priority 5, BeforeInbound + BeforeOutbound) — Shannon
-   entropy detection beyond Phase 1 regex. Threshold: 4.8 bits/char (adjusted
-   from 4.5 per Rarity's false-positive concern). Min token length: 32.
+2. **SecretEntropyHook** (priority 5, BeforeInbound + BeforeOutbound +
+   TransformResponse) — strike-aware explicit credential/private-key/JWT and
+   Shannon-entropy detection. Threshold: 4.8 bits/char, minimum token length 32;
+   exact git SHAs, explicit paths, and HTTP(S) URLs bypass entropy only.
 
 3. **EngagementPolicyHook** (priority 15, BeforeInbound) — rejects non-targeted
    messages in coordination channels. Uses identifier-boundary alias matching
