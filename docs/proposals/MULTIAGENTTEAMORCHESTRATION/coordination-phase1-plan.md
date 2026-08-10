@@ -3,20 +3,21 @@
 ## Status: IMPLEMENTED FOR v2.0.4.0 — HISTORICAL DESIGN RECORD
 ## Date: 2026-07-24
 
-Phase 1 shipped as `ic/config/hooks/coordination.hook.json`. The current,
-source-verified deployment contract is documented in [`DEPLOYMENT.md`](DEPLOYMENT.md);
-this plan preserves the pre-implementation design and should not be used as an
-operator runbook.
+Phase 1 shipped as `ic/config/hooks/coordination.hook.json`. Since v2.0.7 it is
+compiled in and registered automatically when coordination is actionable; the
+manual workspace-copy steps below are historical. The current, source-verified
+deployment contract is documented in [`DEPLOYMENT.md`](DEPLOYMENT.md); this plan
+preserves the pre-implementation design and should not be used as an operator
+runbook.
 
 ---
 
 ## Overview
 
-Phase 1 implements coordination enforcement using ONLY the existing declarative
-hook system (HookBundleConfig). No Rust code changes required.
-
-The hook bundle JSON file is placed in the workspace at `hooks/` and is
-automatically loaded by `bootstrap_hooks()` via `register_workspace_bundles()`.
+Phase 1 implements coordination enforcement using the declarative hook system
+(`HookBundleConfig`). The original deployment placed the bundle in workspace
+`hooks/`; current startup embeds, scopes, and registers it directly, while
+ignoring legacy workspace copies to avoid duplicate rules.
 
 ## Architecture (verified from source)
 
@@ -83,7 +84,7 @@ then newline stripping. This is correct — we want to catch secrets before tran
 
 ---
 
-## Deployment
+## Historical deployment (superseded by managed startup registration)
 
 1. Place `coordination-phase1-bundle.json` as `hooks/coordination.hook.json` in workspace
 2. Restart daemon — hooks auto-load via `register_workspace_bundles()`
