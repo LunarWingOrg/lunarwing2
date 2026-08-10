@@ -1,10 +1,10 @@
 # Release Notes for LunarWing v2.0.6.0: Codename `Kairo (回路)`
 
-**Release Date:** TBD
+**Release Date:** 2026-08-10
 
-> **First-draft pre-release notes.** *Kairo* (回路) means "circuit." LunarWing
-> v2.0.6.0 connects more execution paths through bounded MCP runtimes, native
-> shared knowledge, local voice processing, and Engine V2 channel routing.
+> *Kairo* (回路) means "circuit." LunarWing v2.0.6.0 connects more execution paths
+> through bounded MCP runtimes, native shared knowledge, local voice processing, and
+> Engine V2 channel routing.
 
 ## Overview
 
@@ -177,7 +177,7 @@ lower-priority follow-ups.
 
 ### Security, Runtime, and Release Limitations
 
-- DarkIRC Stages B-D and automated QR/web/trusted-channel delivery remain
+- DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel delivery remain
   disabled; Stage A live-host release acceptance remains a release/deployment
   gate rather than proof of activated contact security.
 - MCP does not automatically install npm/pip packages. Publisher signatures,
@@ -200,9 +200,3 @@ lower-priority follow-ups.
   checkout/import.
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
-
-### Draft Release Gates
-
-- Final `cargo update`/lockfile reconciliation and the second release-note
-  consistency review are not complete at the time of this first draft.
-- Replace the `TBD` release date and rerun final release validation before tag.
