@@ -1866,10 +1866,11 @@ async fn settle_completion_after_stop(
 
 /// Handle `__save_memory_doc__(title, content, doc_type, tags=None, metadata=None, shared=False)`.
 ///
-/// Creates a MemoryDoc (e.g. an extracted Skill, a fix-pattern update, an
-/// orchestrator version) from a **Mission thread** and returns the new doc id
-/// string. Refused (returns `False`) for non-mission threads: ordinary threads
-/// must not be able to mint `trust: "trusted"` skill docs.
+/// Creates a MemoryDoc (e.g. an extracted Skill, a fix-pattern update, or an
+/// orchestrator version) from a **Mission thread** and returns the new doc id.
+/// Refusal and persistence failures raise an exception instead of returning a
+/// falsey value that mission code could silently mistake for success. Ordinary
+/// threads remain unable to mint `trust: "trusted"` skill docs.
 ///
 /// With `shared=True` the doc is written under the shared owner — required for
 /// docs the engine loads from the shared space (prompt overlay, orchestrator
@@ -1883,11 +1884,17 @@ async fn handle_save_memory_doc(
 ) -> ExtFunctionResult {
     if thread.thread_type != crate::types::thread::ThreadType::Mission {
         debug!("__save_memory_doc__: refused for non-mission thread");
-        return ExtFunctionResult::Return(MontyObject::Bool(false));
+        return memory_doc_error(
+            ExcType::RuntimeError,
+            "memory document persistence is only available to mission threads",
+        );
     }
     let Some(store) = store else {
         debug!("__save_memory_doc__: no store available");
-        return ExtFunctionResult::Return(MontyObject::Bool(false));
+        return memory_doc_error(
+            ExcType::RuntimeError,
+            "memory document store is unavailable",
+        );
     };
 
     // Every parameter accepts a keyword form: the mission prompts call this with
@@ -1900,7 +1907,10 @@ async fn handle_save_memory_doc(
     let doc_type_str = extract_string_arg(args, kwargs, "doc_type", 2).unwrap_or_default();
     if title.is_empty() || content.is_empty() {
         debug!("__save_memory_doc__: title and content are required");
-        return ExtFunctionResult::Return(MontyObject::Bool(false));
+        return memory_doc_error(
+            ExcType::TypeError,
+            "__save_memory_doc__ requires non-empty title and content",
+        );
     }
 
     use crate::types::memory::DocType;
@@ -1914,7 +1924,10 @@ async fn handle_save_memory_doc(
         "plan" => DocType::Plan,
         other => {
             debug!("__save_memory_doc__: unknown doc_type: {other}");
-            return ExtFunctionResult::Return(MontyObject::Bool(false));
+            return memory_doc_error(
+                ExcType::ValueError,
+                format!("unsupported memory document type: {other}"),
+            );
         }
     };
 
@@ -1941,12 +1954,16 @@ async fn handle_save_memory_doc(
     doc.metadata = metadata;
 
     let doc_id = doc.id.0.to_string();
-    if let Err(e) = store.save_memory_doc(&doc).await {
-        debug!("__save_memory_doc__: failed to save: {e}");
-        return ExtFunctionResult::Return(MontyObject::Bool(false));
+    if let Err(error) = store.save_memory_doc(&doc).await {
+        debug!(%error, "__save_memory_doc__: failed to save");
+        return memory_doc_error(ExcType::RuntimeError, "failed to persist memory document");
     }
 
     ExtFunctionResult::Return(MontyObject::String(doc_id))
+}
+
+fn memory_doc_error(error_type: ExcType, message: impl Into<String>) -> ExtFunctionResult {
+    ExtFunctionResult::Error(MontyException::new(error_type, Some(message.into())))
 }
 
 /// Resolve one argument by keyword first, then by position.
@@ -2605,6 +2622,88 @@ FINAL(doc_id)
                 .unwrap()
                 .is_empty(),
             "non-mission thread must not create memory docs"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_missing_store_is_an_explicit_error() {
+        let thread = Thread::new(
+            "extract a skill",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let result = execute_code(
+            r#"doc_id = __save_memory_doc__("skill:x", "body", "skill", [], {})
+FINAL(doc_id)"#,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.had_error);
+        assert!(
+            result
+                .stdout
+                .contains("memory document store is unavailable")
+        );
+        assert!(result.final_answer.is_none());
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_invalid_type_is_an_explicit_error() {
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "extract a skill",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let result = execute_code(
+            r#"doc_id = __save_memory_doc__("skill:x", "body", "unknown", [], {})
+FINAL(doc_id)"#,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.had_error);
+        assert!(result.stdout.contains("unsupported memory document type"));
+        assert!(result.final_answer.is_none());
+        assert!(
+            store
+                .list_memory_docs(thread.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

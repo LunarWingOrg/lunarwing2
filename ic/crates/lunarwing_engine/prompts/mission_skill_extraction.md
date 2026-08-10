@@ -18,7 +18,7 @@ Save the skill by calling the host function (available in your code blocks):
 doc_id = __save_memory_doc__(title, content, doc_type, tags, metadata)
 ```
 
-It returns the new doc id string, or `False` on refusal/error. Use:
+It returns the new doc id string. Refusal or persistence failure raises an error; never report the skill as created unless a doc id was returned. Use:
 - title: `"skill:<short-name>"` (e.g., "skill:github-issue-triage")
 - content: the skill prompt (step-by-step instructions)
 - doc_type: `"skill"`

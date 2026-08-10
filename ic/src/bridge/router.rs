@@ -249,6 +249,23 @@ fn resumed_action_result_message(
     )
 }
 
+fn denied_action_result_message(
+    call_id: &str,
+    action_name: &str,
+    reason: Option<&str>,
+) -> lunarwing_engine::ThreadMessage {
+    let reason = reason
+        .map(|value| format!(" Reason: {value}"))
+        .unwrap_or_default();
+    lunarwing_engine::ThreadMessage::action_result(
+        call_id,
+        action_name,
+        format!(
+            "User denied this action. It was not executed; choose an alternative approach.{reason}"
+        ),
+    )
+}
+
 async fn insert_and_notify_pending_gate(
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     state: &EngineState,
@@ -2118,14 +2135,11 @@ pub async fn resolve_gate(
                 )
                 .await;
 
-            let deny_msg = lunarwing_engine::ThreadMessage::user(format!(
-                "User denied action '{}'. Do not execute it; choose an alternative approach.{}",
-                pending.action_name,
-                reason
-                    .as_deref()
-                    .map(|r| format!(" Reason: {r}"))
-                    .unwrap_or_default()
-            ));
+            let deny_result = denied_action_result_message(
+                &pending.call_id,
+                &pending.action_name,
+                reason.as_deref(),
+            );
 
             let event_rx = state.thread_manager.subscribe_events();
             state
@@ -2133,9 +2147,9 @@ pub async fn resolve_gate(
                 .resume_thread(
                     pending.thread_id,
                     message.user_id.clone(),
-                    Some(deny_msg),
+                    Some(deny_result),
                     Some((pending.call_id.clone(), false)),
-                    None,
+                    Some(pending.call_id.clone()),
                 )
                 .await
                 .map_err(|e| engine_err("resume error", e))?;
@@ -6214,6 +6228,22 @@ mod tests {
         let result = find_most_recent_thread(&state, &Some(conv), "alice").await;
         assert!(result.is_some(), "should find thread via entry fallback");
         assert_eq!(result.unwrap().id, tid);
+    }
+
+    // --- gate result message tests ---
+
+    #[test]
+    fn denied_action_result_resolves_the_original_call() {
+        let message = denied_action_result_message("call-1", "shell", Some("too risky"));
+
+        assert_eq!(
+            message.role,
+            lunarwing_engine::types::message::MessageRole::ActionResult
+        );
+        assert_eq!(message.action_call_id.as_deref(), Some("call-1"));
+        assert_eq!(message.action_name.as_deref(), Some("shell"));
+        assert!(message.content.contains("was not executed"));
+        assert!(message.content.contains("too risky"));
     }
 
     // --- clamp_always_to_resume_kind tests ---
