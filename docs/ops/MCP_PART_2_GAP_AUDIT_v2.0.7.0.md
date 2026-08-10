@@ -1,7 +1,9 @@
 # MCP Part 2 Gap Audit for LunarWing v2.0.7.0
 
-**Audit date:** 2026-08-10  
-**Audited commit:** `06753dec743edbf97c90f0b023be4edbdfe8ef50`  
+**Audit date:** 2026-08-10
+
+**Audited commit:** `06753dec743edbf97c90f0b023be4edbdfe8ef50`
+
 **Result:** Part 2's principal runtime slices exist, but the implementation is not a
 complete MCP compatibility layer. This review found three high-priority correctness or
 integrity gaps, five medium-priority protocol, validation, or architecture gaps, and
