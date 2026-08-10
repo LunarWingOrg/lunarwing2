@@ -1,8 +1,11 @@
 # Crate Security Audit - v2.0.7.0
 
-**Date:** 2026-08-10  
-**Source commit:** `c157a53374fa`  
-**Scope:** all 19 tracked Cargo lockfiles plus 12 excluded/lockless Cargo roots  
+**Date:** 2026-08-10
+
+**Source commit:** `c157a53374fa`
+
+**Scope:** all 19 tracked Cargo lockfiles plus 12 excluded/lockless Cargo roots
+
 **Reference:** `CRATE_AUDIT_v2.0.5.0.md`
 
 ## Conclusion
