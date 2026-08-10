@@ -696,8 +696,10 @@ async fn async_main() -> anyhow::Result<()> {
     // channel did (ISSUE-002).
     let coordination_coalesce = {
         let coalesce_config = lunarwing::channels::coalesce::CoalesceConfig::from_env();
-        (coalesce_config.enabled && !coalesce_config.coordination_channels.is_empty())
-            .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
+        (coordination_config.is_actionable()
+            && coalesce_config.enabled
+            && !coalesce_config.coordination_channels.is_empty())
+        .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
     };
     let coordination_summary = register_coordination_hooks(
         &components.hooks,
