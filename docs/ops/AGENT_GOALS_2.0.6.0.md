@@ -29,7 +29,7 @@
 18. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.6.0 explaining all relevant changes since v2.0.5.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `Kairo (回路)` — The file you write will be`RELEASE-v2.0.6.0.md` and should be written to the ROOT of the repo
 19. [x] update any outdated documents in docs/proposals
 20. [x] update any outdated documents in docs/guides
-21. [ ] update README.md in repo root (if necessary)
+21. [x] update README.md in repo root (if necessary) — DONE 2026-08-10 (rarity/kimi-21-20260810-0002): refreshed the capability summary for v2.0.6.0 with MCP runtime placements, artifact pinning and sandbox/recovery boundaries, worker-scoped grants, local LunarVoice ONNX processing (Whisper/Parakeet-TDT STT, Kokoro TTS, Silero VAD), and the native Study-Notes knowledge store. Verified links, `git diff --check`, and `taskset -c 0-17 cargo check -j18`.
 22. [ ] review first draft of release notes from prev step and update any inconsistencies
 23. [x] update readme from prev step and update any inconsistencies
 24. [ ] Run cargo update and lockfile reconciliation before tag if necessary
