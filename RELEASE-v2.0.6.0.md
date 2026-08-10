@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.6.0: Codename `Kairo (回路)`
 
-**Release Date:** 2026-08-09
+**Release Date:** 2026-08-10
 
 > *Kairo* (回路) means "circuit." LunarWing v2.0.6.0 connects more execution paths
 > through bounded MCP runtimes, native shared knowledge, local voice processing, and
