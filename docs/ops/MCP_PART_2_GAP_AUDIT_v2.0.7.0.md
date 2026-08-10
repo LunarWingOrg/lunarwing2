@@ -223,7 +223,7 @@ not provide the compatibility or safety behavior it appears to promise.
 camelCase fields with explicit aliases and add wire-format tests. Preserve explicit
 operator policy as authoritative and never allow an annotation to weaken it.
 
-### P2 — Status documents contradict current source
+### Documentation — Status documents contradict current source
 
 Current source contains worker restart supervision, and the v2.0.6.0 release notes and
 top of the V2 proposal say it shipped. However:
