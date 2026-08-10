@@ -24,7 +24,7 @@ For each issue in the trigger payload:
    Level 1 (PROMPT — low risk, apply directly):
    - Read the current prompt overlay: `memory_search("prompt:codeact_preamble")`
    - Write an updated overlay with a new rule appended
-   - Save with `__save_memory_doc__("prompt:codeact_preamble", updated_overlay, "note", ["prompt_overlay"], {}, shared=True)` (returns the doc id, or `False` on error)
+   - Save with `__save_memory_doc__("prompt:codeact_preamble", updated_overlay, "note", ["prompt_overlay"], {}, shared=True)` (returns the doc id; persistence failure raises an error and must not be reported as success)
    - The rule should be specific and actionable (e.g. "Never call web_fetch — use http() instead")
 
    Level 2 (CONFIG — medium risk):
@@ -62,7 +62,7 @@ The execution loop itself is Python code that you can modify. This is the orches
 To modify the orchestrator:
 1. Read current version: `memory_search("orchestrator:main")`
 2. Make your change (keep it minimal — one fix at a time)
-3. Save the new version: `__save_memory_doc__("orchestrator:main", new_code, "note", ["orchestrator_code"], {"version": N+1, "parent_version": N}, shared=True)` (returns the doc id, or `False` on error)
+3. Save the new version: `__save_memory_doc__("orchestrator:main", new_code, "note", ["orchestrator_code"], {"version": N+1, "parent_version": N}, shared=True)` (returns the doc id; persistence failure raises an error and must not be reported as activation)
 4. The next thread will use your updated orchestrator
 
 If your change causes 3 consecutive failures, the system auto-rolls back to the previous version. So be conservative — test your logic mentally before saving.
