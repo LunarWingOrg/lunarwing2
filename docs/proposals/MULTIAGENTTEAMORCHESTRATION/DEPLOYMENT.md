@@ -37,20 +37,16 @@ in coordination rooms; XMPP DMs and unrelated rooms are always unaffected.
 
 ## Phase 1 — Declarative hook bundle (no Rust needed)
 
-Ships as `ic/config/hooks/coordination.hook.json`.
-
-Deploy: copy it into the agent workspace as `hooks/coordination.hook.json` and
-restart the daemon. `register_workspace_bundles()` auto-loads
-`hooks/*.hook.json` at startup.
+Ships as `ic/config/hooks/coordination.hook.json` and is compiled into the daemon.
+No workspace copy is required. When coordination config is actionable, startup
+registers all eight managed rules and replaces each inert shipped guard with one
+exact, case-insensitive regex generated from escaped `COORD_CHANNELS` values.
+A legacy `hooks/coordination.hook.json` workspace copy is ignored to prevent
+duplicate enforcement; generic workspace hooks still load normally.
 
 Enforces: API-key/PEM/JWT/high-entropy secret rejection (inbound + outbound),
-inbound newline stripping, outbound single-line and 420-char caps.
-
-The managed workspace path follows `COORD_ENABLED` (ISSUE-010). When enabled,
-startup replaces every rule's inert shipped guard with one exact,
-case-insensitive regex generated from escaped `COORD_CHANNELS` values. Other
-MUCs, CLI, web, and DMs remain unaffected; no hand-editing is required.
-Generic workspace hook files keep their configured guards unchanged.
+inbound newline stripping, outbound single-line and 420-char caps. Other MUCs,
+CLI, web, and DMs remain unaffected.
 
 ## Phase 2 — Stateful Rust hooks
 
