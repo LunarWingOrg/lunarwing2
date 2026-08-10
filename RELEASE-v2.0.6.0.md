@@ -78,7 +78,7 @@ previous compatibility baseline.
   `no_new_privileges`, syscall restrictions, Landlock, and network isolation.
 - Operator-pinned package identity, executable/component digests, trust state,
   revocation, and CLI management now protect activation from artifact drift.
-- Core Docker jobs can activate owner-approved stdio MCP servers from immutable
+- Core podman jobs can activate owner-approved stdio MCP servers from immutable
   snapshots. Job-scoped credential grants, worker-image provenance checks,
   bounded discovery, atomic registration, and fail-closed startup/cleanup keep
   the server inside the job boundary.
@@ -127,7 +127,7 @@ previous compatibility baseline.
 - Ambiguous standalone 64-character hex values remain detected and masked, but
   the default heuristic logs them at `DEBUG` instead of `WARN`; block/redact and
   custom warning policies are unchanged.
-- Multica capability allowlists can match an API subtree beneath an arbitrary
+- Multica/Lunartica capability allowlists can match an API subtree beneath an arbitrary
   deployment base path without allowing traversal.
 - Multi-tenant WeeChat capability files receive allocated relay/adapter ports;
   OpenRC tracks the real tmux process and reports live sessions correctly.
@@ -158,23 +158,6 @@ previous compatibility baseline.
 
 ## Known Issues
 
-### Active Bug Tracker
-
-| Area | Status | Current limitation |
-|---|---|---|
-| Agent/worker lifecycle | Partial | Default `wait=true` sandbox jobs still occupy the originating turn; ordinary messages wait in a bounded FIFO |
-| External-worker config | Fixed, live check pending | Persistence and token re-injection are covered, but live daemon/worker authentication re-check remains pending |
-| Kawarimi import flags | Open | Explicit `--with-wasm` is rejected even though import adds the flag internally |
-| SSH Git | Partial | A bare remote whose `HEAD` points to a missing branch can still report a successful empty checkout |
-| WeeChat relay | Partial | `rand_check` remains disabled and always returns false |
-| Worker paths | Partial | Structured OpenCode paths expand `~`; prompt-generated paths and Pebble `project_dir` remain unnormalized |
-| XMPP/WASM delivery | Partial | Supervision detects polling stalls, but downstream queue backpressure can still leave delivery awaiting capacity |
-| E2E coverage | Partial/unverified | Bootstrap greeting scenarios remain ignored because of a harness race; clipboard behavior remains environment-dependent and unverified |
-| XMPP OMEMO | Unverified | Historical MUC fallback-spam has no current live reproduction; stuck-processing recovery is fixed |
-
-See the [canonical bug tracker](docs/bugs/README.md) for detailed evidence and
-lower-priority follow-ups.
-
 ### Security, Runtime, and Release Limitations
 
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel delivery remain
@@ -196,7 +179,6 @@ lower-priority follow-ups.
   only for trusted private networks.
 - Engine output safety still truncates oversized prefixes before later
   redaction/policy transforms and does not re-cap every later transformation.
-- Kawarimi remains PostgreSQL-only and has no automatic rollback after a failed
-  checkout/import.
+- Kawarimi remains PostgreSQL-only
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
