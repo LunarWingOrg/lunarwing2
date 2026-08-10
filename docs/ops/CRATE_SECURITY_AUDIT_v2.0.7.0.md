@@ -4,7 +4,8 @@
 
 **Source commit:** `c157a53374fa`
 
-**Scope:** all 19 tracked Cargo lockfiles plus 12 excluded/lockless Cargo roots
+**Scope:** all 19 tracked Cargo lockfiles, 12 excluded/lockless Cargo roots,
+and the ignored local GitLab tool lockfile
 
 **Reference:** `CRATE_AUDIT_v2.0.5.0.md`
 
@@ -12,9 +13,10 @@
 
 No crate has a newly available security upgrade that should be applied as a
 simple v2.0.7.0 release bump. A live RustSec scan found the same seven accepted
-advisories in the shipped LunarWing graph that are already listed in
-`ic/deny.toml`; no unlisted advisory was found. The other active lockfile roots
-are clean.
+advisories in the main shipped LunarWing graph that are already listed in
+`ic/deny.toml`; no unlisted advisory ID was found in any root. The standalone
+XMPP bridge reproduces five of those IDs through its LunarWing path dependency;
+the other active lockfile roots are clean.
 
 The seven shipped-graph findings are not solved by a compatible lockfile update:
 
@@ -42,10 +44,11 @@ advisories ok
 Because that result honors `ic/deny.toml`, every tracked lockfile was also
 scanned with `--all-features` against an empty advisory ignore list. Excluded
 Cargo roots without committed lockfiles were resolved and scanned separately;
-temporary lockfiles were removed afterward. This covered 31 Cargo roots in
-all. The stale standalone XMPP bridge lock could not be read with `--locked`
-after its path dependency changed, so its currently resolved graph was scanned
-without `--locked` and its lockfile was restored byte-for-byte.
+temporary lockfiles were removed afterward. Including the ignored local
+GitLab tool lockfile, this covered 32 Cargo roots. The stale standalone XMPP
+bridge lock could not be read with `--locked` after its path dependency changed,
+so its currently resolved graph was scanned without `--locked` and its lockfile
+was restored byte-for-byte.
 
 A `cargo update --dry-run --verbose` of the main graph was also reviewed. It
 found compatible maintenance updates, but none affects the advisory set. Those
