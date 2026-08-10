@@ -473,9 +473,9 @@ mod tests {
             ..CoordinationHookConfig::default()
         };
         let enabled = register_managed_coordination_bundle(&registry, &config).await;
-        assert_eq!(enabled.hooks, 8);
+        assert_eq!(enabled.hooks, 7);
         assert_eq!(enabled.errors, 0);
-        assert_eq!(registry.list().await.len(), 8);
+        assert_eq!(registry.list().await.len(), 7);
     }
 
     #[tokio::test]
