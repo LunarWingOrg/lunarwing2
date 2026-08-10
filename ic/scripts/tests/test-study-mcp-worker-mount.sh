@@ -164,6 +164,7 @@ grep -Fq -- "-e LW2STUDYMCP_HOME=/opt/lw2studymcp" "$ctr_calls"
 grep -Fq -- "-v $study_state:/var/lib/lw2studymcp:ro,z" "$ctr_calls"
 grep -Fq -- "-e LW2STUDYMCP_STATE_HOME=/var/lib/lw2studymcp" "$ctr_calls"
 grep -Fq -- "--userns $OPENCODE_USERNS" "$ctr_calls"
+grep -Fq -- "--no-healthcheck" "$ctr_calls"
 grep -Fq -- "-e OPENCODE_MODEL=final-model" "$ctr_calls"
 grep -Fq -- "-e OPENCODE_BASE_URL=http://final.example" "$ctr_calls"
 if grep -Eq -- 'stale-model|stale\.example' "$ctr_calls"; then

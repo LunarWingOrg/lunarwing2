@@ -912,6 +912,28 @@ _ctr() {
   fi
 }
 
+# Podman delegates periodic healthcheck scheduling to systemd timers. On OpenRC,
+# image-defined healthchecks therefore remain "starting" forever even while the
+# generated OpenRC units' active endpoint probes report healthy. Disable only
+# Podman's unscheduled copy; OpenRC remains the health authority.
+_openrc_podman_uses_init_health() {
+  [[ "${INIT_SYSTEM:-}" == "openrc" && "${CONTAINER_RT:-}" == "podman" ]]
+}
+
+# Remove a pre-fix container once so its inherited image healthcheck can be
+# replaced by --no-healthcheck on the following run command.
+_reconcile_openrc_podman_healthcheck() {  # <tenant> <container>
+  local name="$1" container="$2" healthcheck
+  _openrc_podman_uses_init_health || return 0
+  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  case "$healthcheck" in
+    ""|null|*'"NONE"'*) return 0 ;;
+  esac
+  say "OpenRC owns health for $container; recreating without unsupported Podman timer healthcheck"
+  _ctr "$name" stop "$container" >/dev/null 2>&1 || true
+  _ctr "$name" rm -f "$container" >/dev/null 2>&1 || true
+}
+
 # Ensure a worker image is available to whoever will run the tenant's container.
 # Rootful (docker): the shared root store already has it — just verify presence.
 # Rootless (podman): the image lives in the tenant's OWN store; if absent, copy it
@@ -6277,6 +6299,12 @@ start_tenant_opencode() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -6370,6 +6398,7 @@ start_tenant_opencode() {
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       "${opencode_userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-opencode-${name}" \
       -e WS_PORT="$wss_port" \
@@ -6564,6 +6593,12 @@ start_tenant_kimi() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -6617,6 +6652,7 @@ start_tenant_kimi() {
     local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
@@ -6700,6 +6736,12 @@ start_tenant_pebble() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     local env_file_for_hash
     env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
@@ -6765,6 +6807,7 @@ start_tenant_pebble() {
     ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       -e LUNARWING_WORKER_ID="worker-pebble-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -6975,6 +7018,12 @@ start_tenant_vision() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     if _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "vision sidecar already running ($container_name, port $vision_port)"
@@ -7001,6 +7050,7 @@ start_tenant_vision() {
     say "creating vision sidecar container $container_name on port $vision_port"
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       --env-file "$vision_env_path" \
       -p "127.0.0.1:${vision_port}:${VISION_SIDECAR_INTERNAL_PORT}" \
       "${health_publish[@]}" \
@@ -7228,6 +7278,12 @@ start_tenant_voice() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" start "$container_name" >/dev/null 2>&1 || true
   else
@@ -7235,6 +7291,7 @@ start_tenant_voice() {
     [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
     _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       --env-file "$env_path" \
       -p "127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}" \
       -p "127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}" \
@@ -7481,6 +7538,12 @@ start_tenant_postgres() {
     return 0
   fi
 
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
   if _ctr "$name" inspect "$container_name" &>/dev/null; then
     if _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
       say "PostgreSQL already running ($container_name, port $pg_port)"
@@ -7514,6 +7577,7 @@ start_tenant_postgres() {
     # installed). add-tenant is resumable (F4): fix the cause and re-run.
     if ! _ctr "$name" run -d \
       --name "$container_name" \
+      "${healthcheck_args[@]}" \
       -e POSTGRES_USER=lunarwing \
       --env-file "$pg_init_env" \
       -e POSTGRES_DB=lunarwing \

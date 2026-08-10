@@ -302,6 +302,43 @@ fi
 assert_before "stop-openrc:alice" "retire-nanocode:alice"
 assert_before "stop-postgres:alice" "retire-nanocode:alice"
 
+# Podman cannot schedule image healthchecks without systemd. OpenRC-managed
+# containers carrying a pre-fix healthcheck must be recreated once; other init
+# systems and Docker keep their runtime-native healthchecks.
+_ctr() {
+  CALLS+=("ctr:$*")
+  if [[ "$2" == "inspect" ]]; then
+    printf '%s\n' "$HEALTHCHECK_JSON"
+  fi
+}
+INIT_SYSTEM="openrc"
+CONTAINER_RT="podman"
+HEALTHCHECK_JSON='{"Test":["CMD-SHELL","curl -f /health"]}'
+CALLS=()
+_reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
+assert_call "ctr:alice stop lunarwing-opencode-alice"
+assert_call "ctr:alice rm -f lunarwing-opencode-alice"
+
+HEALTHCHECK_JSON='{"Test":["NONE"]}'
+CALLS=()
+_reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
+assert_no_call "ctr:alice stop lunarwing-opencode-alice"
+assert_no_call "ctr:alice rm -f lunarwing-opencode-alice"
+
+INIT_SYSTEM="systemd"
+CALLS=()
+_reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
+assert_no_call "ctr:alice inspect -f {{json .Config.Healthcheck}} lunarwing-opencode-alice"
+
+# Globals consumed by the sourced reconciliation helper.
+# shellcheck disable=SC2034
+INIT_SYSTEM="openrc"
+# shellcheck disable=SC2034
+CONTAINER_RT="docker"
+CALLS=()
+_reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
+assert_no_call "ctr:alice inspect -f {{json .Config.Healthcheck}} lunarwing-opencode-alice"
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1
