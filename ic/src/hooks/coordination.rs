@@ -6,8 +6,8 @@
 //! designated coordination channels (XMPP MUC, IRC):
 //!
 //! - [`SecretEntropyHook`] (priority 5) — Shannon-entropy secret detection
-//! - [`EngagementPolicyHook`] (priority 15) — only respond when targeted
-//! - [`FirstResponderHook`] (priority 16) — one agent claims a message
+//! - [`EngagementPolicyHook`] (priority 15) — target/elect one responder
+//! - [`FirstResponderHook`] (priority 16) — suppress replayed deliveries
 //! - [`TagSchemaHook`] (priority 14) — messages must start with an allowed tag
 //! - [`RateLimitHook`] (priority 25) — 2 messages/hour per agent
 //!
@@ -121,6 +121,21 @@ fn contains_addressed_alias(content: &str, aliases: &[String]) -> bool {
             before.is_none_or(|character| !is_agent_id_char(character))
                 && after.is_none_or(|character| !is_agent_id_char(character))
         })
+    })
+}
+
+fn addresses_roster_member(content: &str, roster: &[String]) -> bool {
+    roster.iter().any(|agent| {
+        contains_addressed_alias(content, &normalized_agent_aliases(agent, Vec::new()))
+    })
+}
+
+fn has_explicit_mention(content: &str) -> bool {
+    content.match_indices('@').any(|(start, _)| {
+        let before = content[..start].chars().next_back();
+        let after = content[start + 1..].chars().next();
+        before.is_none_or(|character| !is_agent_id_char(character))
+            && after.is_some_and(is_agent_id_char)
     })
 }
 
@@ -656,6 +671,12 @@ impl Hook for EngagementPolicyHook {
         if self.is_targeted(content) {
             return Ok(HookOutcome::ok());
         }
+        if addresses_roster_member(content, &self.responder_roster) || has_explicit_mention(content)
+        {
+            return Ok(HookOutcome::reject(
+                "coord: query explicitly targets another agent",
+            ));
+        }
         if is_coordination_query(content)
             && let Some(elected) = elected_responder(
                 &correlation_id(scope, actor, content),
@@ -757,10 +778,10 @@ impl Hook for FirstResponderHook {
                 tracing::debug!(
                     agent = %self.agent_id,
                     claimed_by = %other,
-                    "coordination: message already claimed by another agent"
+                    "coordination: replayed message already processed"
                 );
                 Ok(HookOutcome::reject(
-                    "coord: another agent already claimed this message",
+                    "coord: replayed message already processed",
                 ))
             }
         }
@@ -1135,6 +1156,9 @@ mod tests {
             "QUERY: @applejack2 status",
             &aliases
         ));
+        assert!(has_explicit_mention("QUERY: @unknown status"));
+        assert!(!has_explicit_mention("QUERY: mail me@example.test"));
+        assert!(!has_explicit_mention("QUERY: status"));
     }
 
     #[test]
@@ -1529,6 +1553,26 @@ mod tests {
         .filter(|result| matches!(result, Ok(HookOutcome::Continue { .. })))
         .count();
         assert_eq!(accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_mention_never_falls_through_to_roster_election() {
+        let hook = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-1".into(),
+            vec!["@agent1".into()],
+            vec!["agent-1".into(), "agent-2".into()],
+        );
+        for content in ["QUERY: @agent2 status", "QUERY: @unknown status"] {
+            assert!(matches!(
+                hook.execute(
+                    &inbound("operator", "coord@conference.example", content),
+                    &ctx()
+                )
+                .await,
+                Ok(HookOutcome::Reject { .. })
+            ));
+        }
     }
 
     #[tokio::test]
