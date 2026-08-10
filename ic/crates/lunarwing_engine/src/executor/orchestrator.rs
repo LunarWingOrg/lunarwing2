@@ -2690,9 +2690,9 @@ mod tests {
     // evaluates `signals_tool_intent(text)` directly, mirroring the V1
     // Rust unit test suite in src/llm/reasoning.rs.
 
-    /// Run a Python expression that returns a bool by prepending the
-    /// orchestrator helper definitions and wrapping in `FINAL(expr)`.
-    fn eval_python_bool(expr: &str) -> bool {
+    /// Run a Python expression by prepending the orchestrator helper definitions
+    /// and wrapping it in `FINAL(expr)`.
+    fn eval_python_value(expr: &str) -> MontyObject {
         // Extract only the helper functions (everything before run_loop)
         let helpers_end = DEFAULT_ORCHESTRATOR
             .find("\ndef run_loop(")
@@ -2713,24 +2713,15 @@ mod tests {
         // Drive the VM — handle the FINAL() host call
         loop {
             match progress {
-                RunProgress::Complete(obj) => {
-                    return match obj {
-                        MontyObject::Bool(v) => v,
-                        other => panic!("Expected bool, got: {other:?}"),
-                    };
-                }
+                RunProgress::Complete(obj) => return obj,
                 RunProgress::FunctionCall(call) => {
                     if call.function_name == "FINAL" {
-                        let val = call.args.first().cloned().unwrap_or(MontyObject::None);
-                        // Resume and discard — we already have the value
+                        let value = call.args.first().cloned().unwrap_or(MontyObject::None);
                         let _ = call.resume(
                             ExtFunctionResult::Return(MontyObject::None),
                             PrintWriter::Collect(&mut stdout),
                         );
-                        return match val {
-                            MontyObject::Bool(v) => v,
-                            other => panic!("FINAL() received non-bool: {other:?}"),
-                        };
+                        return value;
                     }
                     // Unknown host function — return None and continue
                     progress = call
@@ -2750,6 +2741,13 @@ mod tests {
                 }
                 _ => panic!("Unexpected RunProgress variant in test"),
             }
+        }
+    }
+
+    fn eval_python_bool(expr: &str) -> bool {
+        match eval_python_value(expr) {
+            MontyObject::Bool(value) => value,
+            other => panic!("Expected bool, got: {other:?}"),
         }
     }
 
@@ -2805,6 +2803,28 @@ mod tests {
         ));
         assert!(eval_python_bool(
             r#"sanitize_action_results([{"role": "User", "content": "x" * 9000}])[0]["content"] == "x" * 9000"#
+        ));
+    }
+
+    #[test]
+    fn structured_action_result_normalizer_runs_in_monty() {
+        assert!(eval_python_bool(
+            r#"is_gate_result({"action_name": "null", "output": None}) == False"#
+        ));
+        let value = eval_python_value(
+            r#"append_structured_action_results([], [{"name": "null", "call_id": "c1"}], [{"action_name": "null", "output": None}])"#,
+        );
+        assert_eq!(
+            monty_to_json(&value),
+            serde_json::json!([{
+                "role": "ActionResult",
+                "content": "None",
+                "action_name": "null",
+                "action_call_id": "c1"
+            }])
+        );
+        assert!(eval_python_bool(
+            r#"append_structured_action_results([], [{"name": "skip", "call_id": "c1"}, {"name": "gate", "call_id": "c2"}], [None, {"gate_paused": True}])[0]["action_call_id"] == "c1""#
         ));
     }
 
