@@ -67,11 +67,12 @@ Generic workspace hook files keep their configured guards unchanged.
 
 Notes:
 
-- Engagement policy uses Option B from the plan: the thread may spawn but the
-  agent exits without responding when the message isn't targeted at it.
-  Inbound hook rejections now produce **typed suppression** (empty response,
-  logged at debug) instead of synthetic `[Message rejected: …]` channel text
-  that re-entered outbound hooks and mis-scored the local agent (ISSUE-004).
+- Engagement policy uses Option B from the plan: the outer message task may
+  spawn, but the agent exits before session/thread resolution, model generation,
+  or tool execution when a message is not targeted. Inbound hook rejections
+  produce **typed suppression** (empty response, logged at debug) instead of
+  synthetic `[Message rejected: …]` channel text that re-entered outbound hooks
+  and mis-scored the local agent (ISSUE-004).
 - `TagSchemaHook` rejects malformed inbound room traffic before model execution
   and attributes that violation to the channel sender, not the local agent or
   conversation owner. Outbound enforcement remains `transformResponse` only:
@@ -79,10 +80,10 @@ Notes:
   pass it exactly once, so one malformed response costs one strike. Rejection is
   typed suppression: no synthetic policy text is persisted, re-hooked,
   rate-limited, or delivered.
-- The agent receives a host-authored, coordination-scoped system instruction
-  requiring one-line tagged final output. It overrides persona/style formatting
-  for configured destinations without affecting DMs, casual rooms, or other
-  channels.
+- Both legacy and Engine V2 receive a host-authored, coordination-scoped system
+  instruction requiring one-line tagged final output. It overrides persona/style
+  formatting for configured destinations without affecting DMs, casual rooms,
+  or other channels.
 - The XMPP bridge contract carries `sender_id` separately from the room/storage
   target. Older payloads remain accepted; installable XMPP now preserves the
   actual MUC actor for engagement and violation attribution.
@@ -90,10 +91,12 @@ Notes:
   secrets strike the remote sender; outbound secrets strike the configured
   local agent (`COORD_AGENT_ID`). The event's `user_id` is the conversation
   peer and is never used for outbound attribution.
-- First-responder claims are **process-local** (ISSUE-013): each daemon keeps
-  its own in-memory claim map, so separate tenant daemons watching the same
-  MUC can both claim and both respond. Treat it as opportunistic
-  self-deduplication; a shared compare-and-insert backend is deferred (below).
+- Set the same `COORD_RESPONDER_ROSTER` on every daemon watching a coordination
+  room to enable team-wide first-responder behavior for unaddressed `QUERY:`
+  messages. Each daemon computes the same rendezvous-hash winner from the stable
+  sender/room/content correlation ID, so exactly one listed agent engages without
+  a shared service. Explicit mentions still route directly. A process-local TTL
+  claim then suppresses transport replays at the elected daemon.
 - Entropy detection is supplementary to the Phase 1 regexes. Allowlisted:
   40-char hex git SHAs, file paths, URLs.
 
@@ -107,12 +110,13 @@ Notes:
   "re-arm on new violation", not on stale strikes alone.
 - `ic/src/gate/coordination.rs` — `CoordinationGate` (`ExecutionGate`,
   priority 5) is **registered in production** (ISSUE-003): `main.rs` builds it
-  from the same `Arc<ViolationStore>` as the hooks, `AgentDeps` carries it,
-  and the Engine V2 effect adapter checks it first in
-  `execute_action_internal` — before any tool side effect. Denials become typed
-  `ExecutionStopped` control flow: executors refund pre-execution lease use,
-  emit no action failure, stop the thread, and expose no reason to model or
-  channel. `COORD_PERMISSIVE=true` disables it for testing.
+  from the same `Arc<ViolationStore>` as the hooks and `AgentDeps` carries it.
+  The shared agent boundary silently suppresses external activity before legacy
+  chat, reflex, approval-resume, or Engine V2 routing; internal notifications
+  remain deliverable. Engine V2 also checks the gate immediately before every
+  effect and returns typed `ExecutionStopped` control flow, so no side effect or
+  policy reason reaches model/channel. `COORD_PERMISSIVE=true` disables it for
+  testing.
 - Admin endpoints (`ic/src/channels/web/handlers/coord.rs`): dedicated axum
   server bound to `127.0.0.1` only — **not** routed through the authenticated
   web gateway. All routes require `Authorization: Bearer $COORD_ADMIN_TOKEN`
@@ -160,9 +164,10 @@ channel, native and installable WASM XMPP channels coalesce identically.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `COORD_ENABLED` | `false` | Master switch for coordination hooks + admin server |
+| `COORD_ENABLED` | `false` | Master switch for hooks, gate, prompt policy, coalescer, and admin server |
 | `COORD_AGENT_ID` | (required) | Unique 1–128-byte ASCII ID using letters, digits, `@.-_/:+~` |
-| `COORD_AGENT_ALIASES` | (required for engagement) | Comma-separated @mentions targeting this agent |
+| `COORD_AGENT_ALIASES` | (derived from agent ID) | Optional comma-separated mention aliases; exact identifier boundaries are enforced |
+| `COORD_RESPONDER_ROSTER` | (empty) | Same comma-separated agent ID set on each daemon; enables deterministic team-wide election for unaddressed `QUERY:` messages |
 | `COORD_CHANNELS` | (required) | Comma-separated coordination destinations (policy scope: room JIDs/names) |
 | `COORD_MAX_MESSAGES` | `2` | Max messages per rate window per agent |
 | `COORD_RATE_WINDOW_SECS` | `3600` | Rate limit window |
@@ -192,9 +197,16 @@ channel, native and installable WASM XMPP channels coalesce identically.
 
 Both apply to coordination traffic; the stricter one wins.
 
-## Deferred to 2.0.5.0+
+## Operational boundaries
 
-- Shared first-responder backend (host-local store or broker compare-and-insert
-  keyed by correlation id). Current behavior is process-local (ISSUE-013).
-- Router-level engagement gating (Option A: suppress thread spawning on
-  BeforeInbound rejections).
+- Every participating daemon must use the same `COORD_RESPONDER_ROSTER`, and each
+  entry must exactly match that daemon's `COORD_AGENT_ID` (comparison is
+  case-insensitive). Invalid IDs disable election rather than creating divergent
+  winners. Membership changes require updating/restarting the team.
+- Deterministic election prevents duplicate cross-daemon responses without a
+  shared service, but it is not a liveness oracle: if the elected daemon is
+  offline, another daemon does not take over that already-delivered query.
+  Explicitly address a live agent when failover is required.
+- BeforeInbound rejection happens inside the supervised outer message task. It
+  prevents session/thread resolution, model generation, and tool execution, but
+  does not avoid creating that short-lived Tokio task.
