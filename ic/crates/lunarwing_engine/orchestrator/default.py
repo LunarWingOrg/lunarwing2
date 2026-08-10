@@ -306,32 +306,49 @@ def sanitize_action_results(messages):
     return messages
 
 
-def append_structured_action_results(messages, calls, results):
-    """Record one result per non-gated call, including null or missing outputs."""
-    interrupted = any(
-        isinstance(result, dict) and (
-            result.get("gate_paused")
-            or result.get("need_authentication")
-            or result.get("need_approval"))
-        for result in results
+def is_gate_result(result):
+    """Return whether a structured host result interrupts for a gate."""
+    return isinstance(result, dict) and (
+        result.get("gate_paused")
+        or result.get("need_authentication")
+        or result.get("need_approval")
     )
+
+
+def append_structured_action_results(messages, calls, results):
+    """Record one result per call except the first pending gate."""
+    pending_gate_index = None
+    for idx in range(len(results)):
+        if is_gate_result(results[idx]):
+            pending_gate_index = idx
+            break
+
     for idx in range(len(calls)):
         call = calls[idx] if isinstance(calls[idx], dict) else {}
         result = results[idx] if idx < len(results) else None
-        if isinstance(result, dict) and (
-                result.get("gate_paused")
-                or result.get("need_authentication")
-                or result.get("need_approval")):
+        if idx == pending_gate_index:
             continue
 
         action_name = call.get("name", "")
-        if isinstance(result, dict):
+        if is_gate_result(result):
+            action_name = result.get("action_name", action_name)
+            resume_output = result.get("resume_output")
+            if resume_output is None:
+                output = {
+                    "error": "tool was not executed because another call paused the batch"
+                }
+            else:
+                output = {
+                    "status": "tool executed; additional gate deferred",
+                    "output": resume_output,
+                }
+        elif isinstance(result, dict):
             action_name = result.get("action_name", action_name)
             if "output" in result:
                 output = result["output"]
             else:
                 output = {"error": "tool result missing from host response"}
-        elif interrupted:
+        elif pending_gate_index is not None:
             output = {"error": "tool was not executed because another call paused the batch"}
         else:
             output = {"error": "tool result missing from host response"}
