@@ -306,6 +306,45 @@ def sanitize_action_results(messages):
     return messages
 
 
+def append_structured_action_results(messages, calls, results):
+    """Record one result per non-gated call, including null or missing outputs."""
+    interrupted = any(
+        isinstance(result, dict) and (
+            result.get("gate_paused")
+            or result.get("need_authentication")
+            or result.get("need_approval"))
+        for result in results
+    )
+    for idx in range(len(calls)):
+        call = calls[idx] if isinstance(calls[idx], dict) else {}
+        result = results[idx] if idx < len(results) else None
+        if isinstance(result, dict) and (
+                result.get("gate_paused")
+                or result.get("need_authentication")
+                or result.get("need_approval")):
+            continue
+
+        action_name = call.get("name", "")
+        if isinstance(result, dict):
+            action_name = result.get("action_name", action_name)
+            if "output" in result:
+                output = result["output"]
+            else:
+                output = {"error": "tool result missing from host response"}
+        elif interrupted:
+            output = {"error": "tool was not executed because another call paused the batch"}
+        else:
+            output = {"error": "tool result missing from host response"}
+
+        append_message(
+            messages,
+            "ActionResult",
+            str(output),
+            action_name=action_name,
+            action_call_id=call.get("call_id", ""),
+        )
+
+
 def format_docs(docs):
     """Format memory docs for context injection."""
     parts = ["## Prior Knowledge (from completed threads)\n"]
@@ -1241,22 +1280,7 @@ def run_loop(context, goal, actions, state, config):
             # Rust handles preflight (lease/policy), parallel execution via
             # JoinSet, and event emission in call order.
             results = __execute_actions_parallel__(calls)
-            for idx in range(len(results)):
-                r = results[idx]
-                if r is None:
-                    continue
-                call = calls[idx] if idx < len(calls) else {}
-                call_id = call.get("call_id", "")
-                action_name = r.get("action_name", call.get("name", ""))
-                output = r.get("output")
-                if output is not None:
-                    append_message(
-                        working_messages,
-                        "ActionResult",
-                        str(output),
-                        action_name=action_name,
-                        action_call_id=call_id,
-                    )
+            append_structured_action_results(working_messages, calls, results)
 
             # Check results for auth/approval interrupts
             for r_idx, r in enumerate(results):
