@@ -58,6 +58,53 @@ pub(crate) fn coordination_channel_guard(channels: &[String]) -> String {
     format!("(?i)^(?:{alternatives})$")
 }
 
+fn push_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim().to_lowercase();
+    if !alias.is_empty() && !aliases.iter().any(|existing| existing == &alias) {
+        aliases.push(alias);
+    }
+}
+
+fn normalized_agent_aliases(agent_id: &str, configured: Vec<String>) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for alias in configured {
+        push_alias(&mut aliases, &alias);
+    }
+    if valid_coordination_agent_id(agent_id) {
+        push_alias(&mut aliases, agent_id);
+        if !agent_id.contains('@') && !agent_id.contains('/') {
+            push_alias(&mut aliases, &format!("@{agent_id}"));
+        }
+        if let Some(local_name) = agent_id.split(['@', '/']).next() {
+            push_alias(&mut aliases, local_name);
+            push_alias(&mut aliases, &format!("@{local_name}"));
+        }
+    }
+    aliases
+}
+
+fn normalized_responder_roster(configured: Vec<String>) -> Vec<String> {
+    if configured
+        .iter()
+        .any(|agent| !valid_coordination_agent_id(agent))
+    {
+        tracing::warn!(
+            "COORD_RESPONDER_ROSTER contains an invalid agent ID; deterministic election disabled"
+        );
+        return Vec::new();
+    }
+    let mut roster = Vec::new();
+    for agent in configured {
+        if !roster
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&agent))
+        {
+            roster.push(agent);
+        }
+    }
+    roster
+}
+
 /// Configuration for the coordination hooks, loaded from environment.
 #[derive(Debug, Clone)]
 pub struct CoordinationHookConfig {
@@ -67,6 +114,8 @@ pub struct CoordinationHookConfig {
     pub agent_id: String,
     /// Lowercase @mention aliases that target this agent (`COORD_AGENT_ALIASES`).
     pub agent_aliases: Vec<String>,
+    /// Agents eligible for deterministic QUERY election (`COORD_RESPONDER_ROSTER`).
+    pub responder_roster: Vec<String>,
     /// Coordination channel JIDs/names (`COORD_CHANNELS`).
     pub coordination_channels: Vec<String>,
     /// Max messages per rate window per agent (`COORD_MAX_MESSAGES`, default 2).
@@ -93,6 +142,7 @@ impl Default for CoordinationHookConfig {
             enabled: false,
             agent_id: String::new(),
             agent_aliases: Vec::new(),
+            responder_roster: Vec::new(),
             coordination_channels: Vec::new(),
             max_messages: 2,
             rate_window: Duration::from_secs(3600),
@@ -116,25 +166,26 @@ impl CoordinationHookConfig {
         if let Ok(v) = std::env::var("COORD_AGENT_ID") {
             config.agent_id = v.trim().to_string();
         }
-        config.agent_aliases = env_list("COORD_AGENT_ALIASES")
-            .into_iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        config.agent_aliases =
+            normalized_agent_aliases(&config.agent_id, env_list("COORD_AGENT_ALIASES"));
+        config.responder_roster = normalized_responder_roster(env_list("COORD_RESPONDER_ROSTER"));
         config.coordination_channels = env_list("COORD_CHANNELS");
         config.admin_users = env_list("COORD_ADMIN_USERS");
-        if let Some(v) = env_parse::<usize>("COORD_MAX_MESSAGES") {
+        if let Some(v) = env_parse::<usize>("COORD_MAX_MESSAGES").filter(|value| *value > 0) {
             config.max_messages = v;
         }
-        if let Some(v) = env_parse::<u64>("COORD_RATE_WINDOW_SECS") {
+        if let Some(v) = env_parse::<u64>("COORD_RATE_WINDOW_SECS").filter(|value| *value > 0) {
             config.rate_window = Duration::from_secs(v);
         }
-        if let Some(v) = env_parse::<u64>("COORD_COALESCE_MS") {
+        if let Some(v) = env_parse::<u64>("COORD_COALESCE_MS").filter(|value| *value > 0) {
             config.coalesce_window = Duration::from_millis(v);
         }
-        if let Some(v) = env_parse::<f64>("COORD_ENTROPY_THRESHOLD") {
+        if let Some(v) = env_parse::<f64>("COORD_ENTROPY_THRESHOLD")
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 8.0)
+        {
             config.entropy_threshold = v;
         }
-        if let Some(v) = env_parse::<usize>("COORD_MIN_SECRET_LENGTH") {
+        if let Some(v) = env_parse::<usize>("COORD_MIN_SECRET_LENGTH").filter(|value| *value > 0) {
             config.min_secret_length = v;
         }
         config
@@ -966,11 +1017,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_id_supplies_safe_default_engagement_aliases() {
+        assert_eq!(
+            normalized_agent_aliases("Applejack", Vec::new()),
+            vec!["applejack", "@applejack"]
+        );
+        assert_eq!(
+            normalized_agent_aliases(
+                "Applejack@example.test/resource",
+                vec!["@AJ".to_string(), "@aj".to_string()]
+            ),
+            vec![
+                "@aj",
+                "applejack@example.test/resource",
+                "applejack",
+                "@applejack"
+            ]
+        );
+    }
+
+    #[test]
+    fn responder_roster_is_case_insensitive_and_fails_closed_on_invalid_ids() {
+        assert_eq!(
+            normalized_responder_roster(vec![
+                "Applejack".to_string(),
+                "applejack".to_string(),
+                "Rarity".to_string()
+            ]),
+            vec!["Applejack", "Rarity"]
+        );
+        assert!(
+            normalized_responder_roster(vec!["Applejack".to_string(), "bad id".to_string()])
+                .is_empty()
+        );
+    }
+
     fn test_config() -> CoordinationHookConfig {
         CoordinationHookConfig {
             enabled: true,
             agent_id: "agent-1".to_string(),
             agent_aliases: vec!["@agent1".to_string(), "agent1".to_string()],
+            responder_roster: Vec::new(),
             coordination_channels: vec!["coord@conference.example".to_string()],
             max_messages: 2,
             rate_window: Duration::from_secs(3600),
