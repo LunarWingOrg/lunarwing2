@@ -15,7 +15,7 @@
 //! nothing is registered unless `COORD_ENABLED=true`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -481,23 +481,70 @@ pub fn shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
-/// Known-safe token shapes that should not trip entropy detection:
-/// git SHAs (40 hex chars), file paths, and URLs.
+static EXPLICIT_SECRET_PATTERNS: LazyLock<Result<Vec<(&'static str, regex::Regex)>, String>> =
+    LazyLock::new(|| {
+        [
+            (
+                "credential assignment",
+                r#"(?i)(api[_-]?key|secret|token|password|bearer|authorization)\s*[:=]\s*['"]?[A-Za-z0-9+/=_-]{16,}"#,
+            ),
+            (
+                "private key material",
+                r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE KEY-----",
+            ),
+            (
+                "JWT token",
+                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, pattern)| {
+            regex::Regex::new(pattern)
+                .map(|compiled| (kind, compiled))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+    });
+
+fn explicit_secret_kind(content: &str) -> Result<Option<&'static str>, HookError> {
+    let patterns =
+        EXPLICIT_SECRET_PATTERNS
+            .as_ref()
+            .map_err(|error| HookError::ExecutionFailed {
+                reason: format!("invalid built-in secret pattern: {error}"),
+            })?;
+    Ok(patterns
+        .iter()
+        .find_map(|(kind, pattern)| pattern.is_match(content).then_some(*kind)))
+}
+
+/// Known-safe token shapes that should not trip entropy detection: exact git
+/// SHAs, explicit file paths, and absolute HTTP(S) URLs.
 fn is_allowlisted_token(token: &str) -> bool {
-    if token.contains('/') || token.contains('\\') {
-        return true;
-    }
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+        )
+    });
     if token.len() == 40 && token.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
     }
-    false
+    if token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+    {
+        return true;
+    }
+    url::Url::parse(token).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-/// Extract (user_id, policy scope, content, is_outbound) from
-/// inbound/outbound events. The scope is the canonical destination from
-/// routing metadata when present (e.g. the XMPP room JID), falling back to
-/// the transport channel name (ISSUE-001).
-fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
+/// Extract (actor, policy scope, content, is_local_output) from scoped events.
+fn event_content<'a>(
+    event: &'a HookEvent,
+    local_agent: &'a str,
+) -> Option<(&'a str, &'a str, &'a str, bool)> {
     let scope = event.policy_scope()?;
     match event {
         HookEvent::Inbound {
@@ -511,14 +558,13 @@ fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
             content,
             false,
         )),
-        HookEvent::Outbound {
-            user_id, content, ..
-        } => Some((user_id, scope, content, true)),
+        HookEvent::Outbound { content, .. } => Some((local_agent, scope, content, true)),
+        HookEvent::ResponseTransform { response, .. } => Some((local_agent, scope, response, true)),
         _ => None,
     }
 }
 
-/// Priority 5 — high-entropy secret detection beyond the Phase 1 regexes.
+/// Priority 5 — strike-aware explicit and high-entropy secret detection.
 pub struct SecretEntropyHook {
     state: CoordinationState,
     /// This agent's own identifier (`COORD_AGENT_ID`). Outbound violations
@@ -553,7 +599,11 @@ impl Hook for SecretEntropyHook {
     }
 
     fn hook_points(&self) -> &[HookPoint] {
-        &[HookPoint::BeforeInbound, HookPoint::BeforeOutbound]
+        &[
+            HookPoint::BeforeInbound,
+            HookPoint::BeforeOutbound,
+            HookPoint::TransformResponse,
+        ]
     }
 
     fn failure_mode(&self) -> HookFailureMode {
@@ -565,24 +615,24 @@ impl Hook for SecretEntropyHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let Some((user_id, scope, content, is_outbound)) = event_content(event) else {
+        let Some((actor, scope, content, _is_local_output)) = event_content(event, &self.agent_id)
+        else {
             return Ok(HookOutcome::ok());
         };
         if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
+        }
+        if let Some(kind) = explicit_secret_kind(content)? {
+            self.state
+                .record_violation(actor, kind, self.name(), scope)
+                .await;
+            return Ok(HookOutcome::reject(format!("coord: {kind} detected")));
         }
         for token in content.split_whitespace() {
             if token.len() >= self.min_length
                 && !is_allowlisted_token(token)
                 && shannon_entropy(token) >= self.entropy_threshold
             {
-                // Inbound secrets belong to the remote sender; outbound
-                // secrets are emitted by the local agent (ISSUE-004).
-                let actor = if is_outbound {
-                    self.agent_id.as_str()
-                } else {
-                    user_id
-                };
                 self.state
                     .record_violation(actor, "high-entropy token", self.name(), scope)
                     .await;
@@ -1244,10 +1294,34 @@ mod tests {
     #[test]
     fn test_allowlisted_tokens() {
         assert!(is_allowlisted_token("/usr/local/bin/some-long-path-token"));
+        assert!(is_allowlisted_token("../relative/file-name"));
+        assert!(is_allowlisted_token(
+            "https://example.test/releases/long-artifact-name"
+        ));
         assert!(is_allowlisted_token(
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         ));
+        assert!(!is_allowlisted_token(
+            "prefix/A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0"
+        ));
         assert!(!is_allowlisted_token("A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0"));
+    }
+
+    #[test]
+    fn explicit_secret_patterns_cover_credentials_keys_and_jwts() {
+        assert_eq!(
+            explicit_secret_kind("STATUS: api_key=abcdefghijklmnop").unwrap(),
+            Some("credential assignment")
+        );
+        assert_eq!(
+            explicit_secret_kind("-----BEGIN PRIVATE KEY-----").unwrap(),
+            Some("private key material")
+        );
+        assert_eq!(
+            explicit_secret_kind("STATUS: eyJaaaaaaaaaa.eyJbbbbbbbbbb.cccccccccccc").unwrap(),
+            Some("JWT token")
+        );
+        assert_eq!(explicit_secret_kind("STATUS: safe").unwrap(), None);
     }
 
     #[tokio::test]
@@ -1377,15 +1451,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secret_entropy_allows_normal_text() {
+    async fn test_secret_entropy_allows_normal_text_and_known_safe_tokens() {
         let hook = SecretEntropyHook::new(test_state(), "agent-1".to_string(), 4.8, 32);
-        let event = inbound(
-            "agent-2",
-            "coord@conference.example",
+        for content in [
             "STATUS: deployment finished successfully on all hosts",
-        );
-        let outcome = hook.execute(&event, &ctx()).await;
-        assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
+            "STATUS: commit da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "STATUS: artifact /usr/local/bin/some-long-path-token",
+            "STATUS: docs https://example.test/releases/long-artifact-name",
+        ] {
+            let event = inbound("agent-2", "coord@conference.example", content);
+            let outcome = hook.execute(&event, &ctx()).await;
+            assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
+        }
     }
 
     #[tokio::test]
@@ -1437,19 +1514,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secret_entropy_outbound_strikes_local_agent() {
-        // ISSUE-004 regression: an outbound secret must be attributed to the
-        // local emitting agent, not the conversation peer named by the event.
-        let dir = std::env::temp_dir().join(format!(
-            "coord-entropy-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+    async fn secret_detection_strikes_sender_and_local_transform_once_each() {
+        let dir = tempfile::tempdir().expect("temporary secret violation directory");
         let store = Arc::new(ViolationStore::new(
-            dir.join("violations.json"),
+            dir.path().join("violations.json"),
             crate::gate::violation_store::ViolationStoreConfig {
                 max_violations: 3,
                 disable_duration_secs: 3600,
@@ -1463,22 +1531,28 @@ mod tests {
             Some(Arc::clone(&store)),
         );
         let hook = SecretEntropyHook::new(state, config.agent_id, 4.8, 32);
-        let event = outbound(
+        let inbound_secret = inbound(
             "remote-peer",
             "coord@conference.example",
-            "STATUS: key A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0x2 done",
+            "STATUS: api_key=abcdefghijklmnop",
         );
         assert!(matches!(
-            hook.execute(&event, &ctx()).await,
+            hook.execute(&inbound_secret, &ctx()).await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+        let transformed_secret =
+            transformed("coord@conference.example", "STATUS: token=qrstuvwxyzabcdef");
+        assert!(matches!(
+            hook.execute(&transformed_secret, &ctx()).await,
             Ok(HookOutcome::Reject { .. })
         ));
         assert_eq!(
-            store.status("agent-1"),
+            store.status("remote-peer"),
             crate::gate::violation_store::ViolationStatus::Warning
         );
         assert_eq!(
-            store.status("remote-peer"),
-            crate::gate::violation_store::ViolationStatus::Active
+            store.status("agent-1"),
+            crate::gate::violation_store::ViolationStatus::Warning
         );
     }
 
