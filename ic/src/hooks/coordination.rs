@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::gate::violation_store::{ViolationStatus, ViolationStore};
@@ -102,7 +103,45 @@ fn normalized_responder_roster(configured: Vec<String>) -> Vec<String> {
             roster.push(agent);
         }
     }
+    roster.sort_by_key(|agent| agent.to_ascii_lowercase());
     roster
+}
+
+fn is_agent_id_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '@' | '.' | '-' | '_' | '/' | ':' | '+' | '~')
+}
+
+fn contains_addressed_alias(content: &str, aliases: &[String]) -> bool {
+    let content = content.to_lowercase();
+    aliases.iter().any(|alias| {
+        content.match_indices(alias).any(|(start, matched)| {
+            let before = content[..start].chars().next_back();
+            let after = content[start + matched.len()..].chars().next();
+            before.is_none_or(|character| !is_agent_id_char(character))
+                && after.is_none_or(|character| !is_agent_id_char(character))
+        })
+    })
+}
+
+fn is_coordination_query(content: &str) -> bool {
+    content
+        .trim_start()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("QUERY:"))
+}
+
+fn elected_responder<'a>(correlation_id: &str, roster: &'a [String]) -> Option<&'a str> {
+    roster
+        .iter()
+        .max_by_key(|agent| {
+            let mut hasher = Sha256::new();
+            hasher.update(correlation_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(agent.to_ascii_lowercase().as_bytes());
+            hasher.finalize().to_vec()
+        })
+        .map(String::as_str)
 }
 
 /// Configuration for the coordination hooks, loaded from environment.
@@ -356,10 +395,7 @@ impl CoordinationState {
             .responder_claims
             .retain(|_, (_, at)| now.duration_since(*at) < ttl);
         match guard.responder_claims.get(correlation_id) {
-            Some((claimer, _)) if claimer != agent_id => {
-                ClaimResult::AlreadyClaimed(claimer.clone())
-            }
-            Some(_) => ClaimResult::Claimed,
+            Some((claimer, _)) => ClaimResult::AlreadyClaimed(claimer.clone()),
             None => {
                 guard
                     .responder_claims
@@ -549,21 +585,32 @@ pub struct EngagementPolicyHook {
     state: CoordinationState,
     agent_id: String,
     agent_aliases: Vec<String>,
+    responder_roster: Vec<String>,
 }
 
 impl EngagementPolicyHook {
     /// Create with shared state, this agent's id, and its mention aliases.
     pub fn new(state: CoordinationState, agent_id: String, agent_aliases: Vec<String>) -> Self {
+        Self::new_with_roster(state, agent_id, agent_aliases, Vec::new())
+    }
+
+    /// Create with a team roster for deterministic unaddressed QUERY election.
+    pub fn new_with_roster(
+        state: CoordinationState,
+        agent_id: String,
+        agent_aliases: Vec<String>,
+        responder_roster: Vec<String>,
+    ) -> Self {
         Self {
             state,
             agent_id,
             agent_aliases,
+            responder_roster,
         }
     }
 
     fn is_targeted(&self, content: &str) -> bool {
-        let lower = content.to_lowercase();
-        self.agent_aliases.iter().any(|alias| lower.contains(alias))
+        contains_addressed_alias(content, &self.agent_aliases)
     }
 }
 
@@ -606,24 +653,36 @@ impl Hook for EngagementPolicyHook {
         if actor == self.agent_id || self.state.is_admin(actor) {
             return Ok(HookOutcome::ok());
         }
-        if !self.is_targeted(content) {
-            // Silent pass: message wasn't directed at this agent. The reject
-            // keeps it out of the conversation so the agent loop exits without
-            // generating a response (Option B from the integration plan).
-            return Ok(HookOutcome::reject("coord: not targeted at this agent"));
+        if self.is_targeted(content) {
+            return Ok(HookOutcome::ok());
         }
-        Ok(HookOutcome::ok())
+        if is_coordination_query(content)
+            && let Some(elected) = elected_responder(
+                &correlation_id(scope, actor, content),
+                &self.responder_roster,
+            )
+        {
+            return if elected.eq_ignore_ascii_case(&self.agent_id) {
+                Ok(HookOutcome::ok())
+            } else {
+                Ok(HookOutcome::reject(
+                    "coord: another agent elected for query",
+                ))
+            };
+        }
+        // Silent pass: message wasn't directed at this agent. The reject keeps
+        // it out of the conversation so the agent loop exits without generating
+        // a response (Option B from the integration plan).
+        Ok(HookOutcome::reject("coord: not targeted at this agent"))
     }
 }
 
-/// Priority 16 — first responder wins; duplicates are rejected.
+/// Priority 16 — suppresses replayed inbound deliveries inside one daemon.
 ///
-/// Scope note (ISSUE-013): claims live in this process's in-memory
-/// `CoordinationState`, so deduplication is **process-local** — it covers
-/// hooks sharing one daemon's state, NOT separate tenant daemons watching
-/// the same MUC. Two independent agents can both claim and both respond.
-/// A shared compare-and-insert backend (host-local store or broker op) is
-/// deferred; treat this as opportunistic self-deduplication only.
+/// Cross-daemon first-responder selection for unaddressed `QUERY:` traffic is
+/// deterministic in [`EngagementPolicyHook`] when `COORD_RESPONDER_ROSTER` is
+/// configured. This hook is the second layer: it prevents one selected daemon
+/// from processing the same inbound delivery more than once during the TTL.
 pub struct FirstResponderHook {
     state: CoordinationState,
     agent_id: String,
@@ -641,13 +700,15 @@ impl FirstResponderHook {
     }
 }
 
-/// Correlation id from channel + content (FNV-style via DefaultHasher).
-fn correlation_id(channel: &str, content: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    channel.hash(&mut hasher);
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// Stable correlation ID shared by independent daemon builds and processes.
+fn correlation_id(channel: &str, sender: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(channel.to_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(sender.to_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(content.trim().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[async_trait]
@@ -669,7 +730,13 @@ impl Hook for FirstResponderHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let HookEvent::Inbound { content, .. } = event else {
+        let HookEvent::Inbound {
+            user_id,
+            sender_id,
+            content,
+            ..
+        } = event
+        else {
             return Ok(HookOutcome::ok());
         };
         let Some(scope) = event.policy_scope() else {
@@ -678,7 +745,8 @@ impl Hook for FirstResponderHook {
         if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
-        let id = correlation_id(scope, content);
+        let sender = sender_id.as_deref().unwrap_or(user_id);
+        let id = correlation_id(scope, sender, content);
         match self
             .state
             .try_claim(&id, &self.agent_id, self.claim_ttl)
@@ -948,10 +1016,11 @@ pub async fn register_coordination_hooks(
             5,
         ),
         (
-            Arc::new(EngagementPolicyHook::new(
+            Arc::new(EngagementPolicyHook::new_with_roster(
                 state.clone(),
                 config.agent_id.clone(),
                 config.agent_aliases.clone(),
+                config.responder_roster.clone(),
             )),
             15,
         ),
@@ -1041,9 +1110,9 @@ mod tests {
     fn responder_roster_is_case_insensitive_and_fails_closed_on_invalid_ids() {
         assert_eq!(
             normalized_responder_roster(vec![
+                "Rarity".to_string(),
                 "Applejack".to_string(),
-                "applejack".to_string(),
-                "Rarity".to_string()
+                "applejack".to_string()
             ]),
             vec!["Applejack", "Rarity"]
         );
@@ -1051,6 +1120,36 @@ mod tests {
             normalized_responder_roster(vec!["Applejack".to_string(), "bad id".to_string()])
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn engagement_aliases_match_identifiers_not_substrings() {
+        let aliases = vec!["aj".to_string(), "@applejack".to_string()];
+        assert!(contains_addressed_alias("QUERY: aj status", &aliases));
+        assert!(contains_addressed_alias(
+            "QUERY: @Applejack status",
+            &aliases
+        ));
+        assert!(!contains_addressed_alias("QUERY: adjust status", &aliases));
+        assert!(!contains_addressed_alias(
+            "QUERY: @applejack2 status",
+            &aliases
+        ));
+    }
+
+    #[test]
+    fn independent_daemons_elect_the_same_responder() {
+        let roster_a = normalized_responder_roster(vec!["Rarity".into(), "Applejack".into()]);
+        let roster_b = normalized_responder_roster(vec!["applejack".into(), "rarity".into()]);
+        let id = correlation_id(
+            "COORD@conference.example",
+            "operator@example.test",
+            "QUERY: report status",
+        );
+        let elected_a = elected_responder(&id, &roster_a).map(str::to_ascii_lowercase);
+        let elected_b = elected_responder(&id, &roster_b).map(str::to_ascii_lowercase);
+        assert_eq!(elected_a, elected_b);
+        assert!(matches!(elected_a.as_deref(), Some("applejack" | "rarity")));
     }
 
     fn test_config() -> CoordinationHookConfig {
@@ -1223,20 +1322,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_first_responder_second_caller_rejected() {
+    async fn test_first_responder_suppresses_cross_agent_and_replayed_claims() {
         let state = test_state();
         state
             .try_claim("corr-2", "agent-1", Duration::from_secs(2))
             .await;
-        let r2 = state
+        let cross_agent = state
             .try_claim("corr-2", "agent-2", Duration::from_secs(2))
             .await;
-        assert_eq!(r2, ClaimResult::AlreadyClaimed("agent-1".to_string()));
-        // Same agent re-claiming is fine (idempotent).
-        let r3 = state
+        assert_eq!(
+            cross_agent,
+            ClaimResult::AlreadyClaimed("agent-1".to_string())
+        );
+        let replay = state
             .try_claim("corr-2", "agent-1", Duration::from_secs(2))
             .await;
-        assert_eq!(r3, ClaimResult::Claimed);
+        assert_eq!(replay, ClaimResult::AlreadyClaimed("agent-1".to_string()));
     }
 
     #[tokio::test]
@@ -1398,6 +1499,36 @@ mod tests {
         );
         let outcome = hook.execute(&event, &ctx()).await;
         assert!(matches!(outcome, Ok(HookOutcome::Reject { .. })));
+    }
+
+    #[tokio::test]
+    async fn team_roster_elects_exactly_one_daemon_for_unaddressed_query() {
+        let roster = vec!["agent-1".to_string(), "agent-2".to_string()];
+        let hook_a = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-1".into(),
+            vec!["@agent1".into()],
+            roster.clone(),
+        );
+        let hook_b = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-2".into(),
+            vec!["@agent2".into()],
+            roster,
+        );
+        let event = inbound(
+            "operator",
+            "coord@conference.example",
+            "QUERY: report deployment status",
+        );
+        let accepted = [
+            hook_a.execute(&event, &ctx()).await,
+            hook_b.execute(&event, &ctx()).await,
+        ]
+        .into_iter()
+        .filter(|result| matches!(result, Ok(HookOutcome::Continue { .. })))
+        .count();
+        assert_eq!(accepted, 1);
     }
 
     #[tokio::test]
