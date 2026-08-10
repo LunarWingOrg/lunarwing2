@@ -308,29 +308,30 @@ def sanitize_action_results(messages):
 
 def is_gate_result(result):
     """Return whether a structured host result interrupts for a gate."""
-    return isinstance(result, dict) and (
-        result.get("gate_paused")
-        or result.get("need_authentication")
-        or result.get("need_approval")
-    )
+    if not isinstance(result, dict):
+        return False
+    if result.get("gate_paused") == True:
+        return True
+    if result.get("need_authentication") == True:
+        return True
+    if result.get("need_approval") == True:
+        return True
+    return False
 
 
 def append_structured_action_results(messages, calls, results):
     """Record one result per call except the first pending gate."""
-    pending_gate_index = None
-    for idx in range(len(results)):
-        if is_gate_result(results[idx]):
-            pending_gate_index = idx
-            break
-
+    gate_seen = False
     for idx in range(len(calls)):
         call = calls[idx] if isinstance(calls[idx], dict) else {}
         result = results[idx] if idx < len(results) else None
-        if idx == pending_gate_index:
+        gate_result = is_gate_result(result)
+        if gate_result and not gate_seen:
+            gate_seen = True
             continue
 
         action_name = call.get("name", "")
-        if is_gate_result(result):
+        if gate_result:
             action_name = result.get("action_name", action_name)
             resume_output = result.get("resume_output")
             if resume_output is None:
@@ -348,18 +349,18 @@ def append_structured_action_results(messages, calls, results):
                 output = result["output"]
             else:
                 output = {"error": "tool result missing from host response"}
-        elif pending_gate_index is not None:
+        elif gate_seen:
             output = {"error": "tool was not executed because another call paused the batch"}
         else:
             output = {"error": "tool result missing from host response"}
 
-        append_message(
-            messages,
-            "ActionResult",
-            str(output),
-            action_name=action_name,
-            action_call_id=call.get("call_id", ""),
-        )
+        messages.append({
+            "role": "ActionResult",
+            "content": format_action_output(str(output)),
+            "action_name": action_name,
+            "action_call_id": call.get("call_id", ""),
+        })
+    return messages
 
 
 def format_docs(docs):
