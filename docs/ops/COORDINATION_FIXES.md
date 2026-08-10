@@ -89,12 +89,12 @@ Coalescer creation now additionally requires actionable coordination config, so
 The canonical secret/newline/length bundle lived under `ic/config/hooks/`, but
 startup loaded only workspace hook files. No provisioning path copied it into a
 tenant workspace, so an enabled coordination deployment could silently lack all
-eight Phase 1 rules. The Rust entropy hook is supplementary and intentionally
-allowlists URLs/paths/SHAs, making the missing bundle a real security gap.
+seven Phase 1 rules. The Rust entropy hook was supplementary, making the missing
+bundle a real security gap.
 
 Fix: `bootstrap_hooks()` now embeds, scopes, and registers the canonical bundle
 whenever coordination config is actionable. Legacy workspace copies are ignored
-to avoid duplicate enforcement. Tests verify disabled no-op, eight-rule
+to avoid duplicate enforcement. Tests verify disabled no-op, seven-rule
 registration, in-scope secret rejection, and out-of-scope pass-through.
 
 ## Issue #7: malformed coalescer settings could crash or disable behavior
@@ -104,3 +104,19 @@ registration, in-scope secret rejection, and out-of-scope pass-through.
 nonsensical immediate-flush semantics. The parser now accepts only finite,
 representable windows (minimum 100 ms) and positive merge counts, otherwise
 retaining safe defaults.
+
+## Issue #8: secret filters disagreed on valid tokens and strike accounting
+
+The declarative priority-13 regex rejected every 40-character alphanumeric token,
+including exact git SHAs that the Rust entropy hook explicitly allowed.
+Conversely, the Rust helper treated any slash-containing token as a path, so a
+high-entropy secret with an embedded slash bypassed entropy. Declarative secret
+rejections also did not update the three-strike store.
+
+Fix: the stateful priority-5 hook is now the strike-aware authority for explicit
+credential assignments, private-key markers, JWTs, and entropy across inbound,
+outbound, and transform events. Inbound detections strike the remote sender;
+local output strikes `COORD_AGENT_ID` once. Entropy allowlisting is limited to
+exact 40-hex SHAs, explicit path prefixes, and absolute HTTP(S) URLs. The
+conflicting blanket base64 rule was removed from both canonical and reference
+bundles.
