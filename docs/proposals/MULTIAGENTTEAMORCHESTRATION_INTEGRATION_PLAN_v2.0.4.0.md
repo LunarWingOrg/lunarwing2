@@ -125,10 +125,10 @@ covering native and installable channels uniformly.
 
 ### Deliverables
 
-1. Ship `coordination-phase1-bundle.json` as a workspace hook bundle
-2. Document deployment: place as `hooks/coordination.hook.json` in workspace,
-   restart daemon, hooks auto-load via `register_workspace_bundles()`
-3. Verification: 7 test cases from `coordination-phase1-plan.md` §Verification
+1. Ship `ic/config/hooks/coordination.hook.json` as the canonical rule bundle
+2. Compile, scope, and register its eight rules automatically when coordination
+   is actionable; ignore legacy workspace copies to prevent duplicate enforcement
+3. Verify activation/no-op behavior and exact destination scoping in bootstrap tests
 
 ### What Phase 1 Enforces
 
