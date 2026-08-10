@@ -39,14 +39,16 @@ in coordination rooms; XMPP DMs and unrelated rooms are always unaffected.
 
 Ships as `ic/config/hooks/coordination.hook.json` and is compiled into the daemon.
 No workspace copy is required. When coordination config is actionable, startup
-registers all eight managed rules and replaces each inert shipped guard with one
+registers all seven managed rules and replaces each inert shipped guard with one
 exact, case-insensitive regex generated from escaped `COORD_CHANNELS` values.
 A legacy `hooks/coordination.hook.json` workspace copy is ignored to prevent
 duplicate enforcement; generic workspace hooks still load normally.
 
-Enforces: API-key/PEM/JWT/high-entropy secret rejection (inbound + outbound),
-inbound newline stripping, outbound single-line and 420-char caps. Other MUCs,
-CLI, web, and DMs remain unaffected.
+Enforces: API-key/PEM/JWT rejection (inbound + outbound), inbound newline
+stripping, and outbound single-line/420-character caps. High-entropy detection is
+owned by the strike-aware Rust hook below so exact SHAs, paths, and HTTP(S) URLs
+can pass without the old blanket base64 false positives. Other MUCs, CLI, web,
+and DMs remain unaffected.
 
 ## Phase 2 — Stateful Rust hooks
 
@@ -55,7 +57,7 @@ CLI, web, and DMs remain unaffected.
 
 | Hook | Priority | Point | Mode |
 |------|----------|-------|------|
-| `coordination.secret_entropy` | 5 | beforeInbound, beforeOutbound | fail-closed |
+| `coordination.secret_entropy` | 5 | beforeInbound, beforeOutbound, transformResponse | fail-closed |
 | `coordination.engagement_policy` | 15 | beforeInbound | fail-open |
 | `coordination.first_responder` | 16 | beforeInbound | fail-open |
 | `coordination.tag_schema` | 14 | beforeInbound, transformResponse | fail-closed |
@@ -83,18 +85,17 @@ Notes:
 - The XMPP bridge contract carries `sender_id` separately from the room/storage
   target. Older payloads remain accepted; installable XMPP now preserves the
   actual MUC actor for engagement and violation attribution.
-- `SecretEntropyHook` attributes violations by direction (ISSUE-004): inbound
-  secrets strike the remote sender; outbound secrets strike the configured
-  local agent (`COORD_AGENT_ID`). The event's `user_id` is the conversation
-  peer and is never used for outbound attribution.
+- `SecretEntropyHook` is the strike-aware authority for credential assignments,
+  private-key markers, JWTs, and high-entropy tokens. Inbound detections strike
+  the remote sender; outbound/transform detections strike the configured local
+  agent (`COORD_AGENT_ID`) exactly once. Exact 40-hex SHAs, explicit paths, and
+  absolute HTTP(S) URLs bypass entropy only; explicit secret patterns still win.
 - Set the same `COORD_RESPONDER_ROSTER` on every daemon watching a coordination
   room to enable team-wide first-responder behavior for unaddressed `QUERY:`
   messages. Each daemon computes the same rendezvous-hash winner from the stable
   sender/room/content correlation ID, so exactly one listed agent engages without
   a shared service. Explicit mentions still route directly. A process-local TTL
   claim then suppresses transport replays at the elected daemon.
-- Entropy detection is supplementary to the Phase 1 regexes. Allowlisted:
-  40-char hex git SHAs, file paths, URLs.
 
 ## Phase 3 — Three-strike enforcement + admin endpoints
 
