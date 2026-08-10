@@ -49,7 +49,9 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - XMPP file attachments via XEP-0363 HTTP File Upload
 - WeeChat buffer restoration across service restarts and clean reboots
-- HTTP/HTTPS plus host-local stdio and Unix MCP with validated lifecycle controls, safe stdio crash recovery, live updates and removal, diagnostics, and owner-scoped secrets
+- MCP runtimes for HTTP/HTTPS, Unix sockets, host-local stdio, persistent WASM components, separately deployed dedicated/shared gateways, and explicitly selected core Docker job workers
+- MCP artifact pinning for host stdio/WASM, optional OS sandboxing for host stdio, bounded stdio/WASM crash recovery, and owner- or job-scoped credential grants
+- Optional [LunarVoice](projects/voice-sidecar/README.md) local ONNX speech processing with Whisper or Parakeet-TDT STT, Kokoro TTS, and Silero VAD
 - Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
 - Persistent Pebble, OpenCode, and Kimi Code worker containers
 
@@ -58,6 +60,8 @@ DarkIRC is opt-in. It is not rendered or built for a new tenant unless the opera
 ### Memory, lorebooks, and learning
 
 LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
+
+The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) gives agents provenance-aware tools to search, compare, submit, and identify stale source-verified findings. Per-agent versions remain distinct, lifecycle metadata is preserved, and notes migrate with the tenant workspace.
 
 Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Lorebooks are disabled by default (`LOREBOOK_ENABLED=true` opts in) because activation scanning is computationally expensive. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
 
