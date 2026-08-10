@@ -32,7 +32,7 @@ You investigate why LunarWing did not behave as the user expected. The user used
 
    WRONG_TOOL_CHOICE or PROMPT_GAP:
    - Apply a Level 1 (prompt overlay) fix — add a rule that guides the agent in this scenario
-   - Save with `__save_memory_doc__("prompt:codeact_preamble", updated_overlay, "note", ["prompt_overlay"], {}, shared=True)` (returns the doc id, or `False` on error)
+   - Save with `__save_memory_doc__("prompt:codeact_preamble", updated_overlay, "note", ["prompt_overlay"], {}, shared=True)` (returns the doc id; persistence failure raises an error and must not be reported as success)
    - The rule must be specific and actionable
 
    CONFIG_ISSUE:
