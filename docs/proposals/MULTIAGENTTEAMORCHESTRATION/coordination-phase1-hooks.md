@@ -42,7 +42,7 @@ Tag enforcement needs Phase 2 (Rust hooks) for this reason.
 
 What Phase 1 CAN enforce:
 1. ✅ Exact coordination-scope guards derived from `COORD_CHANNELS`
-2. ✅ Secret detection + rejection (inbound + outbound)
+2. ✅ Explicit API-key/private-key/JWT rejection (inbound + outbound); stateful entropy detection is Phase 2
 3. ✅ Newline stripping on inbound (regex replacement)
 4. ✅ Newline rejection on outbound
 5. ✅ 420-char limit rejection on outbound
