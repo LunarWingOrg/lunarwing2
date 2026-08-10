@@ -30,7 +30,7 @@
 19. [x] update any outdated documents in docs/proposals
 20. [x] update any outdated documents in docs/guides
 21. [x] update README.md in repo root (if necessary) — DONE 2026-08-10 (rarity/kimi-21-20260810-0002): refreshed the capability summary for v2.0.6.0 with MCP runtime placements, artifact pinning and sandbox/recovery boundaries, worker-scoped grants, local LunarVoice ONNX processing (Whisper/Parakeet-TDT STT, Kokoro TTS, Silero VAD), and the native Study-Notes knowledge store. Verified links, `git diff --check`, and `taskset -c 0-17 cargo check -j18`.
-22. [ ] review first draft of release notes from prev step and update any inconsistencies
+22. [x] review first draft of release notes from prev step and update any inconsistencies
 23. [x] update readme from prev step and update any inconsistencies
 24. [ ] Run cargo update and lockfile reconciliation before tag if necessary
 25. [x] check cicd of master for failures before beginning release process (after testing phase completed)
