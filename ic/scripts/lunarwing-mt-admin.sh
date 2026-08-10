@@ -9247,7 +9247,17 @@ darkirc_service_uses_release_selector() {
       "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
     drop_ins="$(_systemctl_user "$name" show --value -p DropInPaths \
       "lunarwing-darkirc-${name}.service" 2>/dev/null)" || return 1
-    [[ "$fragment" == "$service_path" && -z "$drop_ins" ]]
+    # Ignore global admin drop-ins (/usr/lib/systemd/user/service.d/*.conf),
+    # which apply to every user service on the host; only tenant/unit-specific
+    # drop-ins make the unit stale or unsafe.
+    local drop_in
+    for drop_in in $drop_ins; do
+      case "$drop_in" in
+        /usr/lib/systemd/user/service.d/*.conf) ;;
+        *) return 1 ;;
+      esac
+    done
+    [[ "$fragment" == "$service_path" ]]
   fi
 }
 
