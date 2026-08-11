@@ -439,8 +439,13 @@ manager. `loginctl enable-linger` keeps them running after logout.
 | `lunarwing-weechat-<name>.service` and `lunarwing-weechat-adapter-<name>.service` | WeeChat enabled (the default) |
 | `lunarwing-proxy-<name>.service` | `--enable-proxy` selected |
 | `lunarwing-darkirc-<name>.service` and `lunarwing-darkirc-adapter-<name>.service` | `--enable-darkirc` selected |
-| `lunarwing-pg-<name>.service`, LunarVision, and selected worker units | Rootless Podman Quadlets after their containers are provisioned |
+| `lunarwing-pg-<name>.service`, `lunarwing-vision-<name>.service`, and selected worker units | Rootless Podman Quadlets after their containers are provisioned; LunarVision uses a managed `podman wait` user-unit fallback when the installed Podman is too old for the emitted Quadlet contract |
 | `lunarwing-workloads.slice` and `lunarwing-build.slice` | Always; resource bounds for agent and operator workloads |
+
+LunarVision publishes the registry `vision_service` and `vision_health` ports to
+its internal `8088` API and `8089` operational listeners. `start-tenant` requires
+the internal `/health` probe to pass and force-recreates a stale container when
+its image, environment, ports, runtime, or init contract changes.
 
 The main unit pulls in only sidecars that are enabled. Admin tooling always
 addresses tenant units through that user's bus:
@@ -462,8 +467,11 @@ OpenRC scripts live in `/etc/init.d/`; the baseline is
 `lunarwing-<name>`, `xmpp-bridge-<name>`, and `lunarwing-pg-<name>`.
 WeeChat and its adapter are present by default. Proxy and DarkIRC scripts are
 rendered only when selected, while LunarVision and selected Pebble/OpenCode/Kimi
-workers get container services when provisioned. Rootless Podman PostgreSQL and
-worker containers also get `<container>-sup` babysitter services.
+workers get container services when provisioned. Rootless Podman PostgreSQL,
+LunarVision, and worker containers also get `<container>-sup` babysitter
+services. For LunarVision, `lunarwing-vision-<name>` provides health-aware status
+and `lunarwing-vision-<name>-sup` restarts a crashed container within seconds;
+the host self-heal pipeline remains the bounded backstop.
 
 The process services use `supervise-daemon` with the tenant identity. Dependency
 wiring starts PostgreSQL and enabled sidecars before the main daemon. The main
@@ -654,8 +662,9 @@ Registry feature flags keep intentionally disabled WeeChat, proxy, DarkIRC, and
 worker services classified as `skipped`; retired Nanocode units remain visible
 but cannot degrade host health. LunarVision health ports are discovered per
 tenant from `vision_health` in `/etc/lunarwing/ports.json`, so multi-tenant hosts
-must not force the single-node `127.0.0.1:8088` default. `SERVICES="svc1 svc2"`
-remains an intentional OpenRC override.
+must not force any single-node target. Without registry targets the dedicated
+single-node operational listener is `127.0.0.1:8089`; `8088` is the API listener.
+`SERVICES="svc1 svc2"` remains an intentional OpenRC override.
 
 Force init detection only when necessary with
 `LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.

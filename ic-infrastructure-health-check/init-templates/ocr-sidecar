@@ -1,48 +1,77 @@
 #!/sbin/openrc-run
-# OpenRC init script for LunarWing Vision OCR Sidecar (Podman rootless)
-#
-# Install:
-#   sudo cp ocr-sidecar /etc/init.d/ocr-sidecar
-#   sudo chmod +x /etc/init.d/ocr-sidecar
-#   sudo rc-update add ocr-sidecar default
-#
-# For rootless Podman, run as the user who owns the containers:
-#   sudo usermod -aG podman <username>
-#
-# Config: /etc/lunarwing/ocr-sidecar.env (sourced if present)
+# Standalone OpenRC service for LunarVision on rootless Podman.
+# Multi-tenant hosts should use lunarwing-mt-admin.sh instead.
 
 name="ocr-sidecar"
-description="LunarWing Vision OCR Sidecar (Podman rootless)"
+description="LunarWing Vision OCR Sidecar (rootless Podman)"
 
+: "${ocr_user:=lunarwing}"
+: "${ocr_home:=/home/${ocr_user}}"
+: "${ocr_env_file:=${ocr_home}/.config/lunarwing/ocr-sidecar.env}"
+: "${directory:=/opt/lunarwing/projects/ocr-sidecar}"
+: "${ocr_wait:=120}"
+: "${output_log:=/var/log/lunarwing/ocr-sidecar.log}"
+: "${error_log:=/var/log/lunarwing/ocr-sidecar.err}"
+
+supervisor="supervise-daemon"
 command="/usr/bin/podman"
-command_args="compose up --build"
-command_background=true
-pidfile="/run/ocr-sidecar.pid"
-output_log="/var/log/lunarwing/ocr-sidecar.log"
-error_log="/var/log/lunarwing/ocr-sidecar.err"
+command_args="compose --env-file ${ocr_env_file} up --build --remove-orphans"
+command_user="${ocr_user}:${ocr_user}"
+respawn_delay=5
+respawn_max=5
+respawn_period=300
 
-# Adjust this if your compose file lives elsewhere
-directory="${OCR_SIDECAR_COMPOSE_DIR:-/opt/lunarwing/projects/ocr-sidecar}"
-
-# Source env file if present
-if [ -f /etc/lunarwing/ocr-sidecar.env ]; then
-    . /etc/lunarwing/ocr-sidecar.env
-fi
+_ocr() {
+    sudo -n -u "${ocr_user}" env HOME="${ocr_home}" \
+        XDG_RUNTIME_DIR="/run/user/${ocr_uid}" /usr/bin/podman "$@"
+}
 
 depend() {
-    need podman
-    after net
+    need net localmount
+    after firewall
 }
 
 start_pre() {
-    checkpath --directory --owner root:root --mode 0755 /var/log/lunarwing
-    ebegin "Pulling and building OCR sidecar"
-    cd "$directory" && podman compose build >/dev/null 2>&1
-    eend $?
+    command -v sudo >/dev/null 2>&1 || { eerror "sudo is required for rootless Podman"; return 1; }
+    [ -x "${command}" ] || { eerror "Podman not found at ${command}"; return 1; }
+    id "${ocr_user}" >/dev/null 2>&1 || { eerror "service user not found: ${ocr_user}"; return 1; }
+    ocr_uid="$(id -u "${ocr_user}")" || return 1
+    [ -d "${directory}" ] || { eerror "compose directory not found: ${directory}"; return 1; }
+    [ -f "${ocr_env_file}" ] && [ ! -L "${ocr_env_file}" ] \
+        || { eerror "regular environment file required: ${ocr_env_file}"; return 1; }
+    [ "$(stat -c %u "${ocr_env_file}" 2>/dev/null)" = "${ocr_uid}" ] \
+        || { eerror "environment file must be owned by ${ocr_user}"; return 1; }
+    [ "$(stat -c %a "${ocr_env_file}" 2>/dev/null)" = "600" ] \
+        || { eerror "environment file must have mode 0600"; return 1; }
+
+    checkpath -d -m 0700 -o "${ocr_user}:${ocr_user}" "/run/user/${ocr_uid}" || return 1
+    checkpath -d -m 0750 -o "${ocr_user}:${ocr_user}" /var/log/lunarwing || return 1
+    checkpath -f -m 0640 -o "${ocr_user}:${ocr_user}" "${output_log}" || return 1
+    checkpath -f -m 0640 -o "${ocr_user}:${ocr_user}" "${error_log}" || return 1
+
+    export HOME="${ocr_home}" XDG_RUNTIME_DIR="/run/user/${ocr_uid}"
+    (cd "${directory}" && _ocr compose --env-file "${ocr_env_file}" \
+        down --remove-orphans >/dev/null 2>&1) || true
 }
 
-stop() {
-    ebegin "Stopping OCR sidecar"
-    cd "$directory" && podman compose down
+start_post() {
+    local waited=0
+    ebegin "Waiting for LunarVision health endpoint"
+    while ! _ocr exec lunarwing-ocr-sidecar curl --fail --silent --output /dev/null \
+        --max-time 3 http://127.0.0.1:8089/health 2>/dev/null; do
+        waited=$((waited + 1))
+        if [ "${waited}" -ge "${ocr_wait}" ]; then
+            eend 1 "not healthy after ${ocr_wait}s"
+            return 1
+        fi
+        sleep 1
+    done
+    eend 0
+}
+
+stop_post() {
+    ocr_uid="$(id -u "${ocr_user}" 2>/dev/null)" || return 0
+    ebegin "Removing LunarVision compose resources"
+    (cd "${directory}" && _ocr compose --env-file "${ocr_env_file}" down)
     eend $?
 }

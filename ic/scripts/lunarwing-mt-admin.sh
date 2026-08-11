@@ -2173,6 +2173,12 @@ ports_get() {
     port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_5 // empty" "$PORTS_REGISTRY")"
     [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
   fi
+  # Back-compat: pre-v10 registries had `reserved_6` where `vision_health` now
+  # lives. The migration normally renames it, but direct callers must remain safe.
+  if [[ "$port_name" == "vision_health" ]]; then
+    port="$(jq -r ".tenants[\"$name\"].extended_ports.reserved_6 // empty" "$PORTS_REGISTRY")"
+    [[ -n "$port" ]] && { printf '%s' "$port"; return 0; }
+  fi
   # Back-compat: pre-v11 registries had `reserved_7`/`reserved_8` where
   # `opencode_wss`/`opencode_health` now live (renamed by ports_migrate_v11).
   # Read either name so an unmigrated tenant's opencode worker still resolves
@@ -6989,121 +6995,308 @@ VOICE_STT_TOKENS|/models/sherpa-onnx-whisper-tiny/tiny-tokens.txt"
   done <<<"$model_paths"
 }
 
+_vision_port_valid() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port > 0 && 10#$port <= 65535 ))
+}
+
+_vision_launch_contract() {
+  local name="$1" vision_port="$2" health_port="$3" env_path="$4" image_id env_hash
+  image_id="$(_ctr "$name" image inspect -f '{{.Id}}' "$VISION_SIDECAR_IMAGE" 2>/dev/null)" || return 1
+  env_hash="$(_container_config_hash "$env_path")" || return 1
+  [[ -n "$image_id" && -n "$env_hash" ]] || return 1
+  printf 'image=%s;env=%s;api=%s:%s;health=%s:%s;runtime=%s;rootless=%s;init=%s;no_new_privileges=true' \
+    "$image_id" "$env_hash" "$vision_port" "$VISION_SIDECAR_INTERNAL_PORT" \
+    "$health_port" "$VISION_SIDECAR_HEALTH_PORT" "$CONTAINER_RT" \
+    "$MT_ROOTLESS" "$INIT_SYSTEM"
+}
+
+_vision_container_healthy() {
+  local name="$1" container="$2" running
+  running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+  [[ "$running" == "true" ]] || return 1
+  _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
+    "http://127.0.0.1:${VISION_SIDECAR_HEALTH_PORT}/health" 2>/dev/null
+}
+
+_wait_tenant_vision_healthy() {
+  local name="$1" container="$2" attempts="${3:-30}" attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    _vision_container_healthy "$name" "$container" && return 0
+    (( attempt < attempts )) && sleep 1
+  done
+  return 1
+}
+
+_stop_vision_openrc_supervisor() {
+  local container="$1" supervisor="${1}-sup"
+  [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$supervisor" ]] || return 0
+  rc-service "$supervisor" stop >/dev/null 2>&1 && return 0
+  rc-service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
+}
+
+_create_vision_container() {
+  local name="$1" container="$2" env_path="$3" vision_port="$4" health_port="$5"
+  local -a healthcheck_args=() restart_arg=()
+  _openrc_podman_uses_init_health && healthcheck_args=(--no-healthcheck)
+  [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+  say "creating vision sidecar container $container on ports $vision_port/$health_port"
+  _ctr "$name" run -d \
+    --name "$container" \
+    "${healthcheck_args[@]}" \
+    --env-file "$env_path" \
+    -p "127.0.0.1:${vision_port}:${VISION_SIDECAR_INTERNAL_PORT}" \
+    -p "127.0.0.1:${health_port}:${VISION_SIDECAR_HEALTH_PORT}" \
+    --security-opt=no-new-privileges \
+    "${restart_arg[@]}" \
+    "$VISION_SIDECAR_IMAGE" >/dev/null
+}
+
+_vision_has_unsupported_openrc_healthcheck() {
+  local name="$1" container="$2" healthcheck
+  _openrc_podman_uses_init_health || return 1
+  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  case "$healthcheck" in
+    ""|null|*'"NONE"'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+_stop_vision_supervision() {
+  local name="$1" container="$2" path
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _stop_vision_openrc_supervisor "$container"
+    return
+  fi
+  [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+    && "$CONTAINER_RT" == "podman" ]] || return 0
+  path="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  if [[ ! -f "$path" || -L "$path" ]] \
+      || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVision fallback$' "$path"; then
+    say "ERROR: refusing to stop unmanaged systemd unit $path" >&2
+    return 1
+  fi
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1
+}
+
+_reconcile_vision_container() {
+  local name="$1" container="$2" env_path="$3" contract="$4" recreate=false
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    if _vision_has_unsupported_openrc_healthcheck "$name" "$container" \
+        || _container_config_changed "$name" "$container" "$env_path" "$contract"; then
+      recreate=true
+    fi
+  fi
+
+  if [[ "$recreate" == "true" ]]; then
+    say "config, image, or health ownership changed for $container; force-recreating"
+    _stop_vision_supervision "$name" "$container" || return 1
+    if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$container" ]]; then
+      rc-service "$container" stop >/dev/null 2>&1 || true
+    fi
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    _ctr "$name" rm -f "$container" >/dev/null || return 1
+  fi
+
+  if ! _ctr "$name" inspect "$container" &>/dev/null; then
+    _create_vision_container "$name" "$container" "$env_path" \
+      "$(ports_get "$name" vision_service)" "$(ports_get "$name" vision_health)" || return 1
+  elif ! _vision_container_healthy "$name" "$container"; then
+    _stop_vision_supervision "$name" "$container" || return 1
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    _ctr "$name" start "$container" >/dev/null || return 1
+  fi
+
+  if ! _wait_tenant_vision_healthy "$name" "$container"; then
+    say "ERROR: vision sidecar $container did not become healthy" >&2
+    return 1
+  fi
+  _store_container_hash "$name" "$container" "$env_path" "$contract"
+}
+
+_remove_vision_systemd_fallback() {
+  local name="$1" service="lunarwing-vision-${1}.service" path
+  path="$(tenant_home "$name")/.config/systemd/user/$service"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  if [[ ! -f "$path" || -L "$path" ]] \
+      || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVision fallback$' "$path"; then
+    say "ERROR: refusing to remove unmanaged systemd unit $path" >&2
+    return 1
+  fi
+  _systemctl_user "$name" disable --now "$service" >/dev/null 2>&1 || true
+  rm -f -- "$path"
+}
+
+render_vision_systemd_fallback_unit() {
+  local name="$1" container="lunarwing-vision-${1}" unit_dir path tmp runtime_bin babysitter home uid
+  unit_dir="$(tenant_home "$name")/.config/systemd/user"
+  path="$unit_dir/${container}.service"
+  runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
+  babysitter="${LUNARWING_MT_BABYSITTER_HELPER:-/usr/local/sbin/lunarwing-ctr-babysit}"
+  home="$(tenant_home "$name")"
+  uid="$(id -u "$name" 2>/dev/null || true)"
+  [[ "$CONTAINER_RT" == "podman" && -n "$runtime_bin" && -n "$uid" ]] || return 1
+  ensure_babysitter_helper
+  [[ -x "$babysitter" ]] || return 1
+  if [[ -e "$path" || -L "$path" ]]; then
+    if [[ ! -f "$path" || -L "$path" ]] \
+        || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVision fallback$' "$path"; then
+      say "ERROR: refusing to overwrite unmanaged systemd unit $path" >&2
+      return 1
+    fi
+  fi
+  mkdir -p "$unit_dir"
+  tmp="$(mktemp "$unit_dir/.${container}.service.XXXXXX")" || return 1
+  cat >"$tmp" <<EOF
+# Managed by lunarwing-mt-admin: LunarVision fallback
+[Unit]
+Description=LunarWing vision sidecar ($name)
+After=network-online.target
+Wants=network-online.target
+Before=lunarwing-${name}.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Environment=HOME=${home}
+Environment=XDG_RUNTIME_DIR=/run/user/${uid}
+ExecStart=${babysitter} ${container}
+ExecStop=${runtime_bin} stop --time 30 ${container}
+Restart=always
+RestartSec=2
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+EOF
+  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path"
+}
+
+_prepare_vision_systemd_fallback() {
+  local name="$1" container="lunarwing-vision-${1}" qfile
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  [[ ! -e "$qfile" && ! -L "$qfile" ]] && return 0
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
+  rm -f -- "$qfile"
+  _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+}
+
+_register_vision_systemd_fallback() {
+  local name="$1" container="lunarwing-vision-${1}"
+  render_vision_systemd_fallback_unit "$name" || return 1
+  _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+  _systemctl_user "$name" reset-failed "${container}.service" >/dev/null 2>&1 || true
+  _systemctl_user "$name" enable --now "${container}.service" >/dev/null 2>&1 || return 1
+  _wait_tenant_vision_healthy "$name" "$container"
+}
+
+_register_vision_openrc() {
+  local name="$1" container="lunarwing-vision-${1}" uid home
+  render_vision_openrc_unit "$name" || return 1
+  rc-update add "$container" default >/dev/null 2>&1 || return 1
+  rc-service "$container" start >/dev/null 2>&1 || return 1
+  [[ "$MT_ROOTLESS" == "true" ]] || return 0
+  uid="$(id -u "$name")" || return 1
+  home="$(tenant_home "$name")"
+  render_container_babysitter_unit "$name" vision "$container" "$uid" "$home" || return 1
+  rc-update add "${container}-sup" default >/dev/null 2>&1 || return 1
+  rc-service "${container}-sup" start >/dev/null 2>&1 || return 1
+}
+
 start_tenant_vision() {
-  local name="$1"
+  local name="$1" vision_port health_port env_path container contract quadlet_file
   ensure_container_runtime
-
-  local vision_port
-  vision_port="$(ports_get "$name" vision_service)" || true
-  if [[ -z "$vision_port" ]]; then
-    say "no vision_service port allocated for $name (skipping vision sidecar)"
-    return 0
-  fi
-
-  if ! _ensure_tenant_image "$name" "$VISION_SIDECAR_IMAGE"; then
-    say "vision sidecar image not available; run 'build-vision-sidecar' first (skipping)"
-    return 0
-  fi
-
-  local container_name="lunarwing-vision-$name"
-
   ensure_init_system
+  vision_port="$(ports_get "$name" vision_service)" || true
+  health_port="$(ports_get "$name" vision_health)" || true
+  if ! _vision_port_valid "$vision_port" || ! _vision_port_valid "$health_port" \
+      || [[ "$vision_port" == "$health_port" ]]; then
+    say "ERROR: distinct valid vision_service and vision_health ports are required for $name" >&2
+    return 1
+  fi
+  if ! _ensure_tenant_image "$name" "$VISION_SIDECAR_IMAGE"; then
+    say "ERROR: vision sidecar image unavailable; run 'build-vision-sidecar'" >&2
+    return 1
+  fi
+  env_path="$(tenant_env_dir "$name")/vision.env"
+  [[ -f "$env_path" ]] || write_tenant_vision_env "$name" >/dev/null
+  container="lunarwing-vision-$name"
+  contract="$(_vision_launch_contract "$name" "$vision_port" "$health_port" "$env_path")" || return 1
+
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file
-    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-vision-${name}.container"
-    render_vision_quadlet "$name"
-    _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "lunarwing-vision-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-vision-${name}.service" "lunarwing-vision-${name}"
+    _remove_vision_systemd_fallback "$name" || return 1
+    quadlet_file="$(tenant_quadlet_dir "$name")/${container}.container"
+    render_vision_quadlet "$name" || return 1
+    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+    if _container_config_changed "$name" "$container" "$quadlet_file" "$contract"; then
+      _recreate_quadlet_container "$name" "${container}.service" "$container"
     fi
-    if _systemctl_user "$name" start "lunarwing-vision-${name}.service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "lunarwing-vision-${name}" "$quadlet_file"
-      say "vision sidecar ready via quadlet (lunarwing-vision-${name}.service, port $vision_port)"
-    else
-      say "WARNING: lunarwing-vision-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-vision-${name}.service" --no-pager >&2 || true
+    _systemctl_user "$name" reset-failed "${container}.service" >/dev/null 2>&1 || true
+    if ! _systemctl_user "$name" start "${container}.service" >/dev/null 2>&1 \
+        || ! _wait_tenant_vision_healthy "$name" "$container"; then
+      say "ERROR: ${container}.service failed to become healthy" >&2
+      _systemctl_user "$name" status "${container}.service" --no-pager --full >&2 || true
+      return 1
     fi
+    _store_container_hash "$name" "$container" "$quadlet_file" "$contract"
+    say "vision sidecar ready via Quadlet ($container, ports $vision_port/$health_port)"
     return 0
   fi
 
-  local -a healthcheck_args=()
-  if _openrc_podman_uses_init_health; then
-    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
-    healthcheck_args=(--no-healthcheck)
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+      && "$CONTAINER_RT" == "podman" ]]; then
+    _prepare_vision_systemd_fallback "$name" || return 1
   fi
-
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    if _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
-      say "vision sidecar already running ($container_name, port $vision_port)"
-    else
-      _ctr "$name" start "$container_name" >/dev/null
-      say "vision sidecar restarted ($container_name, port $vision_port)"
-    fi
-  else
-    local vision_env_path
-    vision_env_path="$(tenant_env_dir "$name")/vision.env"
-    [[ -f "$vision_env_path" ]] || write_tenant_vision_env "$name" >/dev/null
-
-    local -a restart_arg=()
-    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
-
-    # v10: also publish the tenant's dedicated vision_health port -> container
-    # 8089, so the host self-heal pipeline can probe /health directly (mirrors
-    # the external-worker health_publish pattern).
-    local -a health_publish=()
-    local host_health_port
-    host_health_port="$(ports_get "$name" vision_health)" || true
-    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:${VISION_SIDECAR_HEALTH_PORT}")
-
-    say "creating vision sidecar container $container_name on port $vision_port"
-    _ctr "$name" run -d \
-      --name "$container_name" \
-      "${healthcheck_args[@]}" \
-      --env-file "$vision_env_path" \
-      -p "127.0.0.1:${vision_port}:${VISION_SIDECAR_INTERNAL_PORT}" \
-      "${health_publish[@]}" \
-      "${restart_arg[@]}" \
-      "$VISION_SIDECAR_IMAGE" >/dev/null
-    say "vision sidecar ready ($container_name, port $vision_port)"
-  fi
-
-  ensure_init_system
+  _reconcile_vision_container "$name" "$container" "$env_path" "$contract" || return 1
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    render_vision_openrc_unit "$name"
-    rc-update add "$container_name" default >/dev/null 2>&1 || true
-    rc-service "$container_name" start >/dev/null 2>&1 || \
-      say "WARNING: rc-service $container_name start returned non-zero (container may already be up)"
+    _register_vision_openrc "$name" || return 1
+  elif [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
+    _register_vision_systemd_fallback "$name" || return 1
   fi
+  say "vision sidecar ready ($container, ports $vision_port/$health_port)"
 }
 
 stop_tenant_vision() {
-  local name="$1"
+  local name="$1" container="lunarwing-vision-${1}" running
   ensure_container_runtime
-
-  local container_name="lunarwing-vision-$name"
   ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-    say "vision sidecar stopped ($container_name)"
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
-    say "vision sidecar stopped ($container_name)"
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _stop_vision_openrc_supervisor "$container" || return 1
+    if [[ -f "$OPENRC_INITD_DIR/$container" ]]; then
+      rc-service "$container" stop >/dev/null 2>&1 || true
+    fi
+  else
+    _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
   fi
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null || true)"
+    if [[ "$running" == "true" ]]; then
+      say "ERROR: vision sidecar remained running after stop ($container)" >&2
+      return 1
+    fi
+  fi
+  say "vision sidecar stopped ($container)"
 }
 
 render_vision_openrc_unit() {
-  local name="$1"
+  local name="$1" vision_port runtime_bin="" container uid home unit_path
   ensure_container_runtime
-  local vision_port runtime_bin container uid home
-  vision_port="$(ports_get "$name" vision_service)"
-  [[ -n "$vision_port" ]] || return 0
+  vision_port="$(ports_get "$name" vision_service)" || return 1
+  _vision_port_valid "$vision_port" || return 1
   [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
   container="lunarwing-vision-${name}"
-  uid="$(id -u "$name" 2>/dev/null || echo "")"
+  uid="$(id -u "$name" 2>/dev/null || true)"
   home="$(tenant_home "$name")"
+  unit_path="$OPENRC_INITD_DIR/$container"
+  mkdir -p "$OPENRC_INITD_DIR"
 
-  cat >"/etc/init.d/${container}" <<INITEOF
+  cat >"$unit_path" <<INITEOF
 #!/sbin/openrc-run
 
 description="LunarWing vision sidecar ($name)"
@@ -7114,16 +7307,13 @@ description="LunarWing vision sidecar ($name)"
 : "\${vis_user:=$name}"
 : "\${vis_home:=$home}"
 : "\${vis_uid:=$uid}"
-: "\${vis_port:=$vision_port}"
-: "\${vis_internal_port:=$VISION_SIDECAR_INTERNAL_PORT}"
 : "\${vis_health_internal_port:=$VISION_SIDECAR_HEALTH_PORT}"
-: "\${vis_image:=$VISION_SIDECAR_IMAGE}"
-: "\${vis_env_file:=$(tenant_env_dir "$name")/vision.env}"
 : "\${vis_wait:=30}"
 
 depend() {
     need net localmount
-    after firewall lunarwing-${name}
+    after firewall
+    before lunarwing-${name}
 }
 
 _vis() {
@@ -7140,9 +7330,10 @@ _vis_healthy() {
 }
 
 start() {
-    [ -n "\${vis_runtime}" ] && [ -x "\${vis_runtime}" ] || { ewarn "no container runtime; skipping vision for $name"; return 0; }
+    [ -n "\${vis_runtime}" ] && [ -x "\${vis_runtime}" ] || { eend 1 "container runtime unavailable"; return 1; }
     ebegin "Starting vision sidecar (\${vis_container})"
     if [ "\${vis_rootless}" = "true" ]; then
+        [ -n "\${vis_uid}" ] || { eend 1 "tenant uid unavailable"; return 1; }
         checkpath -d -m 0700 -o "\${vis_user}:\${vis_user}" "/run/user/\${vis_uid}"
     fi
     _vis start "\${vis_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
@@ -7159,7 +7350,7 @@ stop() {
     [ -n "\${vis_runtime}" ] && [ -x "\${vis_runtime}" ] || return 0
     ebegin "Stopping vision sidecar (\${vis_container})"
     _vis stop --time 30 "\${vis_container}" >/dev/null 2>&1
-    eend 0
+    eend \$?
 }
 
 status() {
@@ -7169,28 +7360,32 @@ status() {
     einfo "\${vis_container}: stopped"; return 3
 }
 INITEOF
-  chmod 0755 "/etc/init.d/${container}"
+  chmod 0755 "$unit_path"
 }
 
 render_vision_quadlet() {
-  local name="$1"
-  local qdir vision_port vision_health_port env_path token
+  local name="$1" qdir vision_port vision_health_port env_path path tmp
   qdir="$(tenant_quadlet_dir "$name")"
-  vision_port="$(ports_get "$name" vision_service)"
-  [[ -n "$vision_port" ]] || return 0
-  vision_health_port="$(ports_get "$name" vision_health)" || true
+  vision_port="$(ports_get "$name" vision_service)" || return 1
+  vision_health_port="$(ports_get "$name" vision_health)" || return 1
+  _vision_port_valid "$vision_port" && _vision_port_valid "$vision_health_port" || return 1
   env_path="$(tenant_env_dir "$name")/vision.env"
-  [[ -f "$env_path" ]] || write_tenant_vision_env "$name" >/dev/null
-  token="$(_read_env_value "$env_path" LUNARWING_AUTH_TOKEN)"
-  token="${token//%/%%}"
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || { say "ERROR: regular LunarVision env file required: $env_path" >&2; return 1; }
   mkdir -p "$qdir"
+  path="$qdir/lunarwing-vision-${name}.container"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] \
+      || { say "ERROR: refusing to overwrite unsafe Quadlet path $path" >&2; return 1; }
+  fi
+  tmp="$(mktemp "$qdir/.lunarwing-vision-${name}.container.XXXXXX")" || return 1
 
-  {
-    cat <<EOF
+  cat >"$tmp" <<EOF
 [Unit]
 Description=LunarWing vision sidecar ($name)
 After=network-online.target
 Wants=network-online.target
+Before=lunarwing-${name}.service
 StartLimitIntervalSec=300
 StartLimitBurst=5
 
@@ -7198,28 +7393,68 @@ StartLimitBurst=5
 ContainerName=lunarwing-vision-${name}
 Image=${VISION_SIDECAR_IMAGE}
 PublishPort=127.0.0.1:${vision_port}:${VISION_SIDECAR_INTERNAL_PORT}
-Environment=OCR_PORT=${VISION_SIDECAR_INTERNAL_PORT}
-Environment=OCR_HEALTH_PORT=${VISION_SIDECAR_HEALTH_PORT}
-Environment=LUNARWING_AUTH_TOKEN=${token}
-EOF
-    # Publish the per-tenant dedicated vision health port (v10) -> container's
-    # 8089, so the host self-heal pipeline can probe /health independently of
-    # OCR traffic. The sidecar listens on OCR_HEALTH_PORT=8089 internally.
-    [[ -n "$vision_health_port" ]] && printf 'PublishPort=127.0.0.1:%s:%s\n' "$vision_health_port" "$VISION_SIDECAR_HEALTH_PORT"
-    if [[ -f "$env_path" ]]; then
-      printf 'EnvironmentFile=%s\n' "$env_path"
-    fi
-
-    cat <<EOF
+PublishPort=127.0.0.1:${vision_health_port}:${VISION_SIDECAR_HEALTH_PORT}
+EnvironmentFile=${env_path}
+HealthCmd=curl -sf http://127.0.0.1:${VISION_SIDECAR_HEALTH_PORT}/health || exit 1
+HealthInterval=15s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=30s
+PodmanArgs=--security-opt=no-new-privileges
+SecurityLabelDisable=false
 
 [Service]
 Restart=on-failure
-RestartSec=10
+RestartSec=5
+TimeoutStartSec=120
 
 [Install]
 WantedBy=default.target
 EOF
-  } > "$qdir/lunarwing-vision-${name}.container"
+  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path"
+}
+
+render_vision_systemd_assets() {
+  local name="$1" container qfile fallback has_quadlet=false has_fallback=false
+  ensure_container_runtime
+  [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] || return 0
+  container="lunarwing-vision-${name}"
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  fallback="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  [[ -e "$qfile" || -L "$qfile" ]] && has_quadlet=true
+  [[ -e "$fallback" || -L "$fallback" ]] && has_fallback=true
+  if [[ "$has_quadlet" == "true" && "$has_fallback" == "true" ]]; then
+    say "ERROR: conflicting LunarVision Quadlet and fallback unit for $name" >&2
+    return 1
+  fi
+  if [[ "$has_fallback" == "true" ]]; then
+    render_vision_systemd_fallback_unit "$name"
+  elif [[ "$has_quadlet" == "true" ]]; then
+    render_vision_quadlet "$name"
+  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  elif podman_supports_quadlet; then
+    render_vision_quadlet "$name"
+  else
+    render_vision_systemd_fallback_unit "$name"
+  fi
+}
+
+render_vision_openrc_assets() {
+  local name="$1" uid home container="lunarwing-vision-${1}" direct supervisor
+  direct="$OPENRC_INITD_DIR/$container"
+  supervisor="$OPENRC_INITD_DIR/${container}-sup"
+  if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
+      && ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  fi
+  render_vision_openrc_unit "$name" || return 1
+  [[ "$MT_ROOTLESS" == "true" ]] || return 0
+  uid="$(id -u "$name")" || return 1
+  home="$(tenant_home "$name")"
+  render_container_babysitter_unit "$name" vision "$container" "$uid" "$home"
 }
 
 # ── LunarVoice ONNX sidecar ──────────────────────────────────────────────────
@@ -8272,11 +8507,10 @@ MemoryHigh=$BUILD_MEMORY_HIGH
 MemoryMax=$BUILD_MEMORY_MAX
 EOF
 
-  # The pg + worker Quadlet .container units are rendered by the start functions
-  # (start_tenant_postgres / start_tenant_<worker>), NOT here: those guard on
-  # image availability, so a not-yet-built worker image never produces a unit
-  # that would crash-loop at boot (Restart=always). The daemon's Requires= above
-  # still resolves because start_tenant_postgres renders + starts pg first.
+  # Refresh LunarVision's existing supervision shape without starting it. PG and
+  # worker Quadlets remain owned by their start functions because selection and
+  # image availability determine whether those units should exist.
+  render_vision_systemd_assets "$name" || return 1
 
   chown -R "$name:$name" "$user_unit_dir"
   say "rendered systemd units for $name in $user_unit_dir"
@@ -8311,13 +8545,8 @@ start_tenant_systemd() {
       || die "effective DarkIRC systemd unit is stale or overridden; run render-units $name"
   fi
   # Quadlet-generated units (pg, supported workers, vision) are NOT in the
-  # enable_list: `systemctl enable` fails on generated/transient units with
-  # "Failed to enable unit: ... is transient or generated", and under
-  # `set -euo pipefail` that non-zero exit aborts the entire enable batch —
-  # leaving every regular service disabled. Each Quadlet unit is already
-  # started by its own start_tenant_* function (which renders the quadlet,
-  # reloads the daemon, and starts the unit). The imperative `start` below
-  # is belt-and-suspenders for the vision unit (harmless if already running).
+  # enable_list: `systemctl enable` fails on generated/transient units. Each is
+  # rendered, started, and health-gated by its owning start_tenant_* function.
   local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service")
   # WeeChat units join the enable list only when the tenant's registry flag
   # allows them (ISSUE-006): a disabled tenant must not be re-enabled for
@@ -8336,7 +8565,6 @@ start_tenant_systemd() {
     _systemctl_user "$name" start "lunarwing-darkirc-${name}.service"
     sleep 2
   fi
-  _systemctl_user "$name" start "lunarwing-vision-${name}.service" 2>/dev/null || true
   _systemctl_user "$name" start "lunarwing-${name}.service"
   sleep 2
   if _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service"; then
@@ -8369,6 +8597,8 @@ uninstall_tenant_systemd() {
   for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service"; do
     rm -f "$user_unit_dir/$svc"
   done
+  _remove_vision_systemd_fallback "$name" || return 1
+  rm -f "$(_hash_dir "$name")/lunarwing-vision-${name}.hash"
 
   # Quadlet .container units (rootless pg + workers + vision sidecar). Remove the
   # worker containers (their workspace data is bind-mounted in the home); the pg
@@ -9092,6 +9322,7 @@ CONFD
 CONFD
   fi
 
+  render_vision_openrc_assets "$name" || return 1
   say "rendered OpenRC init scripts and conf.d for $name"
 }
 
@@ -9144,7 +9375,7 @@ start_tenant_openrc() {
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
   if tenant_weechat_enabled "$name"; then
     boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
   fi
@@ -9182,8 +9413,8 @@ stop_tenant_openrc() {
       || rc-service "lunarwing-darkirc-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
       || die "failed to stop OpenRC service lunarwing-darkirc-${name}"
   fi
-  # Worker babysitters: stop the supervisors so they don't respawn the stopped containers.
-  for worker in nanocode pebble opencode kimi; do
+  # Container babysitters must stop before their containers or they immediately respawn them.
+  for worker in nanocode pebble opencode kimi vision; do
     rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
   done
   rc-service "lunarwing-vision-${name}" stop 2>/dev/null || true
@@ -9486,6 +9717,7 @@ tenant_writer_services() {
   if tenant_darkirc_enabled "$name"; then
     printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
   fi
+  [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-vision-${name}-sup"
   printf '%s\n' "lunarwing-vision-${name}"
   local worker
   for worker in pebble opencode kimi; do
@@ -9667,7 +9899,7 @@ darkirc_health_strict() {
 
 uninstall_tenant_openrc() {
   local name="$1"
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup"; do
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
     rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
@@ -9826,7 +10058,7 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 
 # LunarVision: leave HEALTH_LUNARVISION_URL unset so health-lunarvision.sh
 # auto-discovers every tenant's vision_health port from the ports registry
-# (single-node still falls back to http://127.0.0.1:8088). Only set the URL
+# (single-node still falls back to http://127.0.0.1:8089). Only set the URL
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
 
@@ -10169,10 +10401,10 @@ remove_tenant() {
 
 # Re-render a tenant's service units from the current generator WITHOUT touching
 # secrets/env or restarting anything — for applying a generator change (e.g. an
-# updated init-script status()) to an already-provisioned tenant. The systemd
-# renderer daemon-reloads internally; OpenRC reads the script per invocation. A
-# status()/health change takes effect immediately; a change to the run command
-# needs a restart.
+# updated init-script status()) to an already-provisioned tenant. The command
+# daemon-reloads once after all systemd assets are written; OpenRC reads scripts
+# per invocation. A status()/health change takes effect immediately; a change to
+# the run command needs a restart.
 render_tenant_units() {
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -10192,7 +10424,8 @@ _render_tenant_units_locked() {
     else
       rm -f "$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
     fi
-    render_tenant_systemd_units "$name"
+    render_tenant_systemd_units "$name" || return 1
+    _systemctl_user "$name" daemon-reload >/dev/null || return 1
   else
     if tenant_voice_enabled "$name"; then
       render_voice_openrc_unit "$name"
@@ -10941,6 +11174,8 @@ status_tenant() {
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
+  say "  vision_service:   $(ports_get "$name" vision_service)"
+  say "  vision_health:    $(ports_get "$name" vision_health)"
   say "  voice_service:    $(ports_get "$name" voice_service)"
   say "  voice_health:     $(ports_get "$name" voice_health)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
@@ -10990,6 +11225,17 @@ status_tenant() {
     say "Kimi worker: not created"
   fi
 
+  local vision_container="lunarwing-vision-$name"
+  if _vision_container_healthy "$name" "$vision_container"; then
+    say "LunarVision: healthy ($vision_container, API/health ports $(ports_get "$name" vision_service)/$(ports_get "$name" vision_health))"
+  elif _ctr "$name" inspect -f '{{.State.Running}}' "$vision_container" 2>/dev/null | grep -q true; then
+    say "LunarVision: running but unhealthy ($vision_container)"
+  elif _ctr "$name" inspect "$vision_container" &>/dev/null; then
+    say "LunarVision: stopped ($vision_container)"
+  else
+    say "LunarVision: not created"
+  fi
+
   local voice_container="lunarwing-voice-$name"
   if _ctr "$name" inspect -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
     say "LunarVoice: running ($voice_container, API port $(ports_get "$name" voice_service))"
@@ -11008,8 +11254,12 @@ status_tenant() {
     if tenant_darkirc_enabled "$name"; then
       svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi
-    # pg + workers are Quadlet units only on rootless podman; on rootful docker
-    # they run as plain containers (shown above), not systemd units.
+    # LunarVision is supervised for every rootless Podman systemd deployment:
+    # Quadlet where supported, otherwise the managed podman-wait fallback unit.
+    if [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
+      svcs+=("lunarwing-vision-${name}")
+    fi
+    # PostgreSQL and workers use Quadlet only when the Podman version supports it.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
       svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
       tenant_voice_enabled "$name" && svcs+=("lunarwing-voice-${name}")
@@ -11021,7 +11271,8 @@ status_tenant() {
     done
   else
     local rc_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" \
-                   "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
+                   "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" \
+                   "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
     if tenant_darkirc_enabled "$name"; then
       rc_svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi

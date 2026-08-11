@@ -19,14 +19,14 @@ The podman wait babysitter provides docker-parity crash recovery for rootless Po
    - Runs as tenant user with proper rootless environment (HOME, XDG_RUNTIME_DIR)
 
 2. **Babysitter OpenRC Units** (`/etc/init.d/lunarwing-<type>-<tenant>-sup`)
-   - One per container type: pg, pebble, opencode, kimi
+   - One per container type: pg, vision, pebble, opencode, kimi
    - Uses `supervisor="supervise-daemon"`
    - Foreground command: `lunarwing-ctr-babysit <container-name>`
    - Runs as tenant user via `command_user`
    - Respawn policy: `respawn_delay=2 respawn_max=10 respawn_period=120`
 
 3. **Container Units** (existing, unchanged)
-   - `lunarwing-pg-<t>`, `lunarwing-pebble-<t>`, `lunarwing-opencode-<t>`, `lunarwing-kimi-<t>`
+   - `lunarwing-pg-<t>`, `lunarwing-vision-<t>`, `lunarwing-pebble-<t>`, `lunarwing-opencode-<t>`, `lunarwing-kimi-<t>`
    - Continue to provide health-aware `status()` for health-openrc.sh
    - Started/stopped by tenant lifecycle, not by babysitter
 
@@ -35,6 +35,7 @@ The podman wait babysitter provides docker-parity crash recovery for rootless Po
 | Container Unit | Babysitter Unit |
 |----------------|-----------------|
 | `lunarwing-pg-<tenant>` | `lunarwing-pg-<tenant>-sup` |
+| `lunarwing-vision-<tenant>` | `lunarwing-vision-<tenant>-sup` |
 | `lunarwing-pebble-<tenant>` | `lunarwing-pebble-<tenant>-sup` |
 | `lunarwing-opencode-<tenant>` | `lunarwing-opencode-<tenant>-sup` |
 | `lunarwing-kimi-<tenant>` | `lunarwing-kimi-<tenant>-sup` |
@@ -62,9 +63,12 @@ stopping stale units and removing stale runlevel links. Health reports those
 down units as `skipped`, so periodic remediation cannot override operator
 intent.
 
-### Worker Registration
+### Registration
 
-`_register_worker_unit()` renders/registers babysitters for Pebble, OpenCode, and Kimi Code.
+`_register_worker_unit()` renders/registers babysitters for Pebble, OpenCode, and
+Kimi Code. `_register_vision_openrc()` does the same for LunarVision after its
+container passes the dedicated `8089/health` probe. Its direct unit retains
+endpoint-aware `status()`, while the supervisor supplies fast crash recovery.
 
 ## PG Status() Fix
 
@@ -116,10 +120,15 @@ start_pre() {
 
 Fault injection test:
 ```sh
-# Tenant-scoped fault injection (supports pg, pebble, opencode, kimi)
+# Named container types currently cover pg, pebble, opencode, and kimi.
 ic/scripts/fault-inject-respawn.sh --tenant <tenant> --container-type opencode
-# Watch: rc-service lunarwing-pg-<tenant>-sup status → restarts within seconds
-# Self-heal sweep no longer needed for container crashes
+
+# LunarVision uses the explicit-container form.
+ic/scripts/fault-inject-respawn.sh \
+  --container lunarwing-vision-<tenant> --user <tenant>
+
+# Watch the matching -sup service; it should restart within seconds.
+# The periodic self-heal sweep remains the bounded backstop.
 ```
 
 ## Files Modified

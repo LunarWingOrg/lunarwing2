@@ -1,18 +1,35 @@
 [Unit]
-Description=LunarWing OCR Sidecar
-After=network.target
+Description=LunarWing Vision OCR Sidecar
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2/-/tree/master/projects/ocr-sidecar
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
-WorkingDirectory=/opt/lunarwing-ocr-sidecar
-Environment="OCR_PORT=8088"
-Environment="OCR_HEALTH_PORT=8089"
-Environment="LUNARWING_AUTH_TOKEN=change-me-in-production"
+DynamicUser=yes
+StateDirectory=lunarwing-ocr-sidecar
+CacheDirectory=lunarwing-ocr-sidecar
+WorkingDirectory=/var/lib/lunarwing-ocr-sidecar
+EnvironmentFile=/etc/lunarwing/ocr-sidecar.env
+Environment=OCR_PORT=8088
+Environment=OCR_HEALTH_PORT=8089
+Environment=CACHE_DIR=/var/cache/lunarwing-ocr-sidecar
 ExecStart=/usr/local/bin/lunarwing-ocr-sidecar
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

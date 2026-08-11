@@ -31,7 +31,7 @@ tracing = "0.1"
 
 # Optional (catalog feature)
 futures = { version = "0.3", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-native-roots"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "query", "rustls"], optional = true }
 urlencoding = { version = "2", optional = true }
 # Leak detection for the B-3 publish path (defense-in-depth before sending skill
 # bodies to the registry). Sibling workspace crate.

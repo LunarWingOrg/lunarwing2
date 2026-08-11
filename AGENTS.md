@@ -198,11 +198,12 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 ### Required
 
 - Tenant lifecycle, status, and health checks go through **`lunarwing-mt-admin.sh`** (override path with `LUNARWING_MT_ADMIN` if needed). Prefer `status <tenant>`, start/stop/build, etc.
+- LunarVision managed tenants publish distinct API/health ports, health-gate starts, and recreate stale containers when image/env/port contracts change. systemd uses user Quadlet or the managed older-Podman fallback; OpenRC pairs its health unit with a `-sup` crash supervisor.
 - Wrappers (`lunarwing_mt_onboard`, `lunarwing_mt_onboard_web`, other orchestration) are **thin drivers** of mt-admin. They must not invent parallel init logic.
 - If you must parse status text, handle **both** init shapes (e.g. systemd `lunarwing-<t>.service: active` and OpenRC `lunarwing-<t>: started`), or better: use mt-admin exit codes / structured contracts when available.
 - Init-specific code belongs **inside** `ic/scripts/lunarwing-mt-admin.sh` (and related infra-health tooling), behind helpers like `_systemctl_user` — not scattered through onboard/web/verify layers.
 - **Both systemd and OpenRC are first-class.** launchd is a distant third. Never treat OpenRC/Gentoo as an edge case.
-- Host health pipeline (`ic-infrastructure-health-check/`, installed via mt-admin) must stay ports-registry-aware; do not reintroduce sole-default 8088 lunarvision probes on MT fleets.
+- Host health pipeline (`ic-infrastructure-health-check/`, installed via mt-admin) must stay ports-registry-aware. Empty registry uses the dedicated single-node operational listener on `8089`; never restore `8088` as the default health target.
 
 ### Why this is non-negotiable
 
