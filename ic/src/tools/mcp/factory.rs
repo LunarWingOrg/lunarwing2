@@ -59,7 +59,10 @@ pub(crate) async fn create_worker_client_from_config(
         .await
 }
 
-/// Create a client through an explicit adapter registry.
+/// Create a client through an explicit built-in adapter registry.
+///
+/// Production composition uses the closed default registry; explicit injection keeps
+/// dispatch testable but is not a runtime-plugin contract.
 pub async fn create_client_with_runtime_registry(
     server: McpServerConfig,
     session_manager: &Arc<McpSessionManager>,
@@ -215,9 +218,11 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
                 });
             }
         };
-        if let Some(provenance) = server.provenance.clone() {
-            verify_stdio_provenance(&server_name, provenance, command).await?;
-        }
+        let verified_executable = if let Some(provenance) = server.provenance.clone() {
+            verify_stdio_provenance(&server_name, provenance, command).await?
+        } else {
+            None
+        };
         let resolved_env = if let Some(worker_secret_env) = worker_secret_env {
             resolve_worker_stdio_env(&server_name, env, env_secrets, worker_secret_env)?
         } else {
@@ -230,23 +235,39 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
             )
             .await?
         };
-        let transport = context
-            .process_manager()
-            .spawn_stdio(
-                &server_name,
-                command,
-                args.to_vec(),
-                resolved_env
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.expose_secret())),
-                !env_secrets.is_empty(),
-                server.sandbox.as_ref(),
-            )
-            .await
-            .map_err(|error| McpFactoryError::StdioSpawn {
-                name: server_name.clone(),
-                reason: error.to_string(),
-            })?;
+        let env_values = resolved_env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.expose_secret()));
+        let transport = if let Some(executable) = verified_executable {
+            context
+                .process_manager()
+                .spawn_verified_stdio(
+                    &server_name,
+                    command,
+                    args.to_vec(),
+                    env_values,
+                    !env_secrets.is_empty(),
+                    server.sandbox.as_ref(),
+                    executable,
+                )
+                .await
+        } else {
+            context
+                .process_manager()
+                .spawn_stdio(
+                    &server_name,
+                    command,
+                    args.to_vec(),
+                    env_values,
+                    !env_secrets.is_empty(),
+                    server.sandbox.as_ref(),
+                )
+                .await
+        }
+        .map_err(|error| McpFactoryError::StdioSpawn {
+            name: server_name.clone(),
+            reason: error.to_string(),
+        })?;
         Ok(McpClient::new_with_transport(
             &server_name,
             transport as Arc<dyn McpTransport>,
@@ -402,28 +423,31 @@ async fn verify_stdio_provenance(
     server_name: &str,
     provenance: crate::tools::mcp::provenance::McpPackageProvenance,
     command: &str,
-) -> Result<(), McpFactoryError> {
+) -> Result<Option<crate::tools::mcp::provenance::VerifiedStdioExecutable>, McpFactoryError> {
     let command = command.to_string();
     let name = server_name.to_string();
-    let result = tokio::task::spawn_blocking(move || provenance.verify_stdio_command(&command))
+    let result = tokio::task::spawn_blocking(move || provenance.prepare_stdio_command(&command))
         .await
         .map_err(|error| McpFactoryError::Provenance {
             name: name.clone(),
             reason: format!("provenance verification task failed: {error}"),
         })?;
-    if let Err(error) = result {
-        tracing::warn!(
-            server = %name,
-            error = %error,
-            "MCP package provenance verification failed; activation blocked"
-        );
-        return Err(McpFactoryError::Provenance {
-            name,
-            reason: error.to_string(),
-        });
-    }
+    let executable = match result {
+        Ok(executable) => executable,
+        Err(error) => {
+            tracing::warn!(
+                server = %name,
+                error = %error,
+                "MCP package provenance verification failed; activation blocked"
+            );
+            return Err(McpFactoryError::Provenance {
+                name,
+                reason: error.to_string(),
+            });
+        }
+    };
     tracing::debug!(server = %name, "MCP package provenance verified");
-    Ok(())
+    Ok(executable)
 }
 
 /// Verify a pinned component digest off the async executor before instantiation.
@@ -648,6 +672,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn worker_factory_verifies_worker_visible_provenance_before_spawn() {
         use crate::tools::mcp::provenance::{McpPackageProvenance, ProvenanceIdentity};
@@ -740,6 +765,7 @@ mod tests {
         assert!(wrong_owner.to_string().contains("api_token"));
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn stdio_activation_enforces_package_provenance() {
         use crate::tools::mcp::provenance::{

@@ -49,8 +49,28 @@ struct WorkerMcpServer {
     client: McpClient,
     wrappers: Vec<Arc<dyn Tool>>,
     descriptor_bytes: usize,
-    restart_attempts: u32,
-    healthy_since: Instant,
+    tools_generation: u64,
+    restart_state: WorkerMcpRestartState,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WorkerMcpRestartState {
+    /// Runtime is live. Attempts remain charged until this child survives the
+    /// full stability window without interruption.
+    Healthy { since: Instant, prior_attempts: u32 },
+    /// Runtime failed and no replacement has completed yet.
+    Unstable { attempts: u32 },
+    /// Retry budget is exhausted. Wrappers have been removed permanently.
+    CircuitOpen { attempts: u32 },
+}
+
+impl WorkerMcpRestartState {
+    fn attempts(self) -> u32 {
+        match self {
+            Self::Healthy { prior_attempts, .. } => prior_attempts,
+            Self::Unstable { attempts } | Self::CircuitOpen { attempts } => attempts,
+        }
+    }
 }
 
 /// Runtime state shared with the per-server supervisor tasks.
@@ -155,21 +175,28 @@ impl WorkerMcpRuntime {
                 client: client.clone(),
                 wrappers: Vec::new(),
                 descriptor_bytes: 0,
-                restart_attempts: 0,
-                healthy_since: Instant::now(),
+                tools_generation: client.tools_generation(),
+                restart_state: WorkerMcpRestartState::Healthy {
+                    since: Instant::now(),
+                    prior_attempts: 0,
+                },
             },
         );
-        let discovery =
-            match tokio::time::timeout(MCP_STARTUP_TIMEOUT, client.create_worker_tools()).await {
-                Ok(Ok(discovery)) => discovery,
-                Ok(Err(error)) => {
-                    return Err(format!(
-                        "worker MCP tool discovery failed for '{name}': {error}"
-                    ));
-                }
-                Err(_) => return Err(format!("worker MCP startup timed out for '{name}'")),
-            };
-        let (wrappers, discovered_bytes) = discovery;
+        let discovery = match tokio::time::timeout(
+            MCP_STARTUP_TIMEOUT,
+            client.create_worker_tools_with_generation(),
+        )
+        .await
+        {
+            Ok(Ok(discovery)) => discovery,
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "worker MCP tool discovery failed for '{name}': {error}"
+                ));
+            }
+            Err(_) => return Err(format!("worker MCP startup timed out for '{name}'")),
+        };
+        let (wrappers, discovered_bytes, discovery_generation) = discovery;
         let (current_tools, current_bytes) = {
             let servers = self.shared.servers.lock().await;
             aggregate_totals(&servers)
@@ -189,6 +216,7 @@ impl WorkerMcpRuntime {
         };
         server.wrappers = wrappers.clone();
         server.descriptor_bytes = discovered_bytes;
+        server.tools_generation = discovery_generation;
         Ok(wrappers)
     }
 
@@ -310,7 +338,7 @@ impl WorkerMcpRuntime {
             .lock()
             .await
             .get(name)
-            .map(|server| server.restart_attempts)
+            .map(|server| server.restart_state.attempts())
     }
 }
 
@@ -337,7 +365,13 @@ async fn supervise_worker_mcp_server(
             () = tokio::time::sleep(MCP_SUPERVISOR_INTERVAL) => {}
         }
         let needs_restart = match shared.processes.state(&name).await {
-            Ok(McpProcessState::Running) => false,
+            Ok(McpProcessState::Running) => {
+                mark_worker_mcp_running(&shared, &name).await;
+                if !refresh_worker_mcp_tools(&shared, &name, &cancel).await {
+                    break;
+                }
+                false
+            }
             Ok(McpProcessState::StdioClosed) => {
                 tracing::warn!(server = %name, "Worker MCP server stdio closed unexpectedly");
                 true
@@ -372,12 +406,16 @@ async fn restart_worker_mcp_server(
             Some(server) => match claim_worker_mcp_restart(server) {
                 Some(attempts) => attempts,
                 None => {
+                    let attempts = server.restart_state.attempts();
+                    server.restart_state = WorkerMcpRestartState::CircuitOpen { attempts };
                     tracing::error!(
                         server = %name,
-                        attempts = server.restart_attempts,
+                        attempts,
                         "Worker MCP restart supervision stopped after repeated crashes; \
                          server stays down for the rest of this job"
                     );
+                    drop(servers);
+                    unregister_dead_worker_mcp_wrappers(shared, name).await;
                     return false;
                 }
             },
@@ -472,7 +510,7 @@ async fn rebuild_worker_mcp_server(
         }
     };
 
-    let (wrappers, descriptor_bytes) =
+    let (wrappers, descriptor_bytes, discovery_generation) =
         match rebuild_discover_tools(shared, name, &client, cancel).await {
             RebuildDiscovery::Discovered(discovery) => discovery,
             RebuildDiscovery::Retry => return true,
@@ -485,13 +523,14 @@ async fn rebuild_worker_mcp_server(
         old_wrappers,
         wrappers,
         descriptor_bytes,
+        discovery_generation,
     )
     .await
 }
 
 /// Discovery result for one restart attempt.
 enum RebuildDiscovery {
-    Discovered((Vec<Arc<dyn Tool>>, usize)),
+    Discovered((Vec<Arc<dyn Tool>>, usize, u64)),
     /// Discovery failed or was rejected; keep supervising and retry later.
     Retry,
     /// Shutdown was requested; stop supervising.
@@ -504,24 +543,29 @@ async fn rebuild_discover_tools(
     client: &McpClient,
     cancel: &CancellationToken,
 ) -> RebuildDiscovery {
-    let (wrappers, descriptor_bytes) =
-        match cancelable_step(cancel, MCP_STARTUP_TIMEOUT, client.create_worker_tools()).await {
-            Ok(Ok(discovery)) => discovery,
-            Ok(Err(error)) => {
-                tracing::warn!(server = %name, %error, "Worker MCP restart tool discovery failed");
-                cleanup_partial_restart(shared, name, Some(client)).await;
-                return RebuildDiscovery::Retry;
-            }
-            Err(WorkerMcpStepAbort::Cancelled) => {
-                cleanup_partial_restart(shared, name, Some(client)).await;
-                return RebuildDiscovery::Stop;
-            }
-            Err(WorkerMcpStepAbort::TimedOut) => {
-                tracing::warn!(server = %name, "Worker MCP restart tool discovery timed out");
-                cleanup_partial_restart(shared, name, Some(client)).await;
-                return RebuildDiscovery::Retry;
-            }
-        };
+    let (wrappers, descriptor_bytes, discovery_generation) = match cancelable_step(
+        cancel,
+        MCP_STARTUP_TIMEOUT,
+        client.create_worker_tools_with_generation(),
+    )
+    .await
+    {
+        Ok(Ok(discovery)) => discovery,
+        Ok(Err(error)) => {
+            tracing::warn!(server = %name, %error, "Worker MCP restart tool discovery failed");
+            cleanup_partial_restart(shared, name, Some(client)).await;
+            return RebuildDiscovery::Retry;
+        }
+        Err(WorkerMcpStepAbort::Cancelled) => {
+            cleanup_partial_restart(shared, name, Some(client)).await;
+            return RebuildDiscovery::Stop;
+        }
+        Err(WorkerMcpStepAbort::TimedOut) => {
+            tracing::warn!(server = %name, "Worker MCP restart tool discovery timed out");
+            cleanup_partial_restart(shared, name, Some(client)).await;
+            return RebuildDiscovery::Retry;
+        }
+    };
     if let Some(reason) = autonomous_tool_violation(&wrappers) {
         tracing::warn!(server = %name, %reason, "Worker MCP restart rejected discovered tools");
         cleanup_partial_restart(shared, name, Some(client)).await;
@@ -546,7 +590,102 @@ async fn rebuild_discover_tools(
         cleanup_partial_restart(shared, name, Some(client)).await;
         return RebuildDiscovery::Retry;
     }
-    RebuildDiscovery::Discovered((wrappers, descriptor_bytes))
+    RebuildDiscovery::Discovered((wrappers, descriptor_bytes, discovery_generation))
+}
+
+/// Refresh wrappers in place after negotiated tools/list change notification.
+/// Failed refresh keeps prior immutable registration and retries next supervisor tick.
+async fn refresh_worker_mcp_tools(
+    shared: &Arc<WorkerMcpShared>,
+    name: &str,
+    cancel: &CancellationToken,
+) -> bool {
+    refresh_worker_mcp_tools_after_discovery(shared, name, cancel, || {}).await
+}
+
+async fn refresh_worker_mcp_tools_after_discovery(
+    shared: &Arc<WorkerMcpShared>,
+    name: &str,
+    cancel: &CancellationToken,
+    after_discovery: impl FnOnce(),
+) -> bool {
+    if cancel.is_cancelled() {
+        return false;
+    }
+    let (client, old_wrappers) = {
+        let servers = shared.servers.lock().await;
+        let Some(server) = servers.get(name) else {
+            return false;
+        };
+        if server.client.tools_generation() == server.tools_generation {
+            return true;
+        }
+        (server.client.clone(), server.wrappers.clone())
+    };
+    let (wrappers, descriptor_bytes, discovery_generation) = match cancelable_step(
+        cancel,
+        MCP_STARTUP_TIMEOUT,
+        client.create_worker_tools_with_generation(),
+    )
+    .await
+    {
+        Ok(Ok(discovery)) => discovery,
+        Ok(Err(error)) => {
+            tracing::warn!(server = %name, %error, "Worker MCP tools/list refresh failed; retaining prior tools");
+            return true;
+        }
+        Err(WorkerMcpStepAbort::TimedOut) => {
+            tracing::warn!(server = %name, "Worker MCP tools/list refresh timed out; retaining prior tools");
+            return true;
+        }
+        Err(WorkerMcpStepAbort::Cancelled) => return false,
+    };
+    after_discovery();
+    if let Some(reason) = autonomous_tool_violation(&wrappers) {
+        tracing::warn!(server = %name, %reason, "Worker MCP tools/list refresh rejected; retaining prior tools");
+        return true;
+    }
+    let (other_tools, other_bytes) = {
+        let servers = shared.servers.lock().await;
+        servers
+            .iter()
+            .filter(|(other, _)| other.as_str() != name)
+            .fold((0, 0), |(tools, bytes), (_, server)| {
+                (
+                    tools + server.wrappers.len(),
+                    bytes + server.descriptor_bytes,
+                )
+            })
+    };
+    if let Err(reason) =
+        validate_aggregate_discovery(other_tools, other_bytes, wrappers.len(), descriptor_bytes)
+    {
+        tracing::warn!(server = %name, %reason, "Worker MCP tools/list refresh exceeded aggregate limits; retaining prior tools");
+        return true;
+    }
+    if let Err(conflicts) = shared
+        .registry
+        .replace_runtime_tools(&old_wrappers, wrappers.clone())
+        .await
+    {
+        tracing::warn!(server = %name, tools = ?conflicts, "Worker MCP tools/list refresh conflicted; retaining prior tools");
+        return true;
+    }
+
+    let mut servers = shared.servers.lock().await;
+    let Some(server) = servers.get_mut(name) else {
+        drop(servers);
+        let _ = shared
+            .registry
+            .replace_runtime_tools(&wrappers, old_wrappers)
+            .await;
+        return false;
+    };
+    server.wrappers = wrappers;
+    server.descriptor_bytes = descriptor_bytes;
+    server.tools_generation = discovery_generation;
+    tracing::info!(server = %name, tools = server.wrappers.len(), "Refreshed worker MCP tools after list change notification");
+    true
 }
 
 /// Atomically swap the rebuilt tools into the registry and track the new
@@ -558,6 +697,7 @@ async fn finish_worker_mcp_rebuild(
     old_wrappers: Vec<Arc<dyn Tool>>,
     wrappers: Vec<Arc<dyn Tool>>,
     descriptor_bytes: usize,
+    discovery_generation: u64,
 ) -> bool {
     if let Err(conflicts) = shared
         .registry
@@ -579,7 +719,8 @@ async fn finish_worker_mcp_rebuild(
             server.client = client;
             server.wrappers = wrappers;
             server.descriptor_bytes = descriptor_bytes;
-            server.healthy_since = Instant::now();
+            server.tools_generation = discovery_generation;
+            mark_worker_mcp_rebuilt(server);
         }
         None => {
             // Teardown drained the servers concurrently; undo the swap.
@@ -642,17 +783,75 @@ async fn cancelable_step<T>(
     }
 }
 
-/// Claim one restart attempt. A server that stayed healthy for the stability
-/// window resets its attempt window; `None` means the circuit is open.
+/// Claim one restart attempt and suspend the current healthy interval. Attempt
+/// reset happens only while the supervisor has observed the child running.
 fn claim_worker_mcp_restart(server: &mut WorkerMcpServer) -> Option<u32> {
-    if server.healthy_since.elapsed() >= MCP_RESTART_STABILITY_WINDOW {
-        server.restart_attempts = 0;
-    }
-    if server.restart_attempts >= MCP_RESTART_MAX_ATTEMPTS {
+    let attempts = match server.restart_state {
+        WorkerMcpRestartState::Healthy { prior_attempts, .. } => prior_attempts.saturating_add(1),
+        WorkerMcpRestartState::Unstable { attempts } => attempts.saturating_add(1),
+        WorkerMcpRestartState::CircuitOpen { .. } => return None,
+    };
+    if attempts > MCP_RESTART_MAX_ATTEMPTS {
         return None;
     }
-    server.restart_attempts += 1;
-    Some(server.restart_attempts)
+    server.restart_state = WorkerMcpRestartState::Unstable { attempts };
+    Some(attempts)
+}
+
+fn mark_worker_mcp_rebuilt(server: &mut WorkerMcpServer) {
+    server.restart_state = WorkerMcpRestartState::Healthy {
+        since: Instant::now(),
+        prior_attempts: server.restart_state.attempts(),
+    };
+}
+
+fn mark_worker_mcp_running_state(server: &mut WorkerMcpServer) {
+    if let WorkerMcpRestartState::Healthy {
+        since,
+        prior_attempts,
+    } = &mut server.restart_state
+        && *prior_attempts != 0
+        && since.elapsed() >= MCP_RESTART_STABILITY_WINDOW
+    {
+        *prior_attempts = 0;
+    }
+}
+
+/// Clear charged attempts only after the current rebuilt child has remained
+/// continuously healthy for the full stability window.
+async fn mark_worker_mcp_running(shared: &WorkerMcpShared, name: &str) {
+    let mut servers = shared.servers.lock().await;
+    let Some(server) = servers.get_mut(name) else {
+        return;
+    };
+    mark_worker_mcp_running_state(server);
+}
+
+/// Remove only this dead runtime's exact registrations. Keep terminal server
+/// state so normal job shutdown can still clean clients, sessions, and secrets.
+async fn unregister_dead_worker_mcp_wrappers(shared: &WorkerMcpShared, name: &str) {
+    let mut servers = shared.servers.lock().await;
+    let Some(server) = servers.get_mut(name) else {
+        return;
+    };
+    let wrappers = server.wrappers.clone();
+    if wrappers.is_empty() {
+        return;
+    }
+    if let Err(conflicts) = shared
+        .registry
+        .replace_runtime_tools(&wrappers, Vec::new())
+        .await
+    {
+        tracing::error!(
+            server = %name,
+            tools = ?conflicts,
+            "Failed to unregister dead worker MCP tools after restart circuit opened"
+        );
+        return;
+    }
+    server.wrappers.clear();
+    server.descriptor_bytes = 0;
 }
 
 fn worker_mcp_restart_backoff(attempt: u32) -> Duration {
@@ -795,7 +994,83 @@ fn credential_coverage_error() -> WorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use crate::tools::mcp::config::{McpPlacement, McpServerConfig};
+
+    struct ChangingWorkerTransport {
+        responses: std::sync::Mutex<std::collections::VecDeque<crate::tools::mcp::McpResponse>>,
+        enabled: std::sync::atomic::AtomicBool,
+        generation: AtomicU64,
+    }
+
+    impl ChangingWorkerTransport {
+        fn new(responses: Vec<crate::tools::mcp::McpResponse>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                enabled: std::sync::atomic::AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+            }
+        }
+
+        fn notify(&self) {
+            if self.enabled.load(Ordering::Acquire) {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::mcp::McpTransport for ChangingWorkerTransport {
+        async fn send(
+            &self,
+            _request: &crate::tools::mcp::McpRequest,
+            _headers: &HashMap<String, String>,
+        ) -> Result<crate::tools::mcp::McpResponse, crate::tools::ToolError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| crate::tools::ToolError::ExternalService("missing response".into()))
+        }
+
+        async fn shutdown(&self) -> Result<(), crate::tools::ToolError> {
+            Ok(())
+        }
+
+        fn set_tools_list_changed(&self, enabled: bool) {
+            self.enabled.store(enabled, Ordering::Release);
+        }
+
+        fn tools_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
+        }
+    }
+
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "worker MCP restart test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            unreachable!()
+        }
+    }
 
     fn server() -> McpServerConfig {
         McpServerConfig::new_stdio_with_secrets(
@@ -829,9 +1104,157 @@ mod tests {
             client: McpClient::new("http://127.0.0.1:9"),
             wrappers: Vec::new(),
             descriptor_bytes: 0,
-            restart_attempts,
-            healthy_since,
+            tools_generation: 0,
+            restart_state: WorkerMcpRestartState::Healthy {
+                since: healthy_since,
+                prior_attempts: restart_attempts,
+            },
         }
+    }
+
+    fn worker_response(result: serde_json::Value) -> crate::tools::mcp::McpResponse {
+        crate::tools::mcp::McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_list_change_retains_old_wrappers_on_limit_and_honors_cancellation() {
+        let too_many = (0..=MAX_WORKER_MCP_TOOLS)
+            .map(|index| serde_json::json!({"name": format!("tool-{index}"), "inputSchema": {}}))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(ChangingWorkerTransport::new(vec![
+            worker_response(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "example", "version": "1"}
+            })),
+            crate::tools::mcp::McpResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: None,
+            },
+            worker_response(serde_json::json!({"tools": [{"name": "old", "inputSchema": {}}]})),
+            worker_response(serde_json::json!({"tools": too_many})),
+        ]));
+        let client = McpClient::new_with_transport(
+            "example",
+            transport.clone(),
+            None,
+            None,
+            "owner",
+            Some(server()),
+        );
+        let (old_wrappers, descriptor_bytes, _) =
+            client.create_worker_tools_with_generation().await.unwrap();
+        let runtime = empty_runtime();
+        runtime
+            .shared
+            .registry
+            .replace_runtime_tools(&[], old_wrappers.clone())
+            .await
+            .unwrap();
+        runtime.shared.servers.lock().await.insert(
+            "example".to_string(),
+            WorkerMcpServer {
+                config: server(),
+                secret_env: HashMap::new(),
+                client,
+                wrappers: old_wrappers.clone(),
+                descriptor_bytes,
+                tools_generation: 0,
+                restart_state: WorkerMcpRestartState::Healthy {
+                    since: Instant::now(),
+                    prior_attempts: 0,
+                },
+            },
+        );
+
+        transport.notify();
+        assert!(
+            refresh_worker_mcp_tools(&runtime.shared, "example", &CancellationToken::new()).await
+        );
+        assert!(runtime.shared.registry.get("example_old").await.is_some());
+        assert_eq!(
+            runtime.shared.servers.lock().await["example"].tools_generation,
+            0
+        );
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(!refresh_worker_mcp_tools(&runtime.shared, "example", &cancel).await);
+        assert!(runtime.shared.registry.get("example_old").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn notification_after_discovery_is_not_acknowledged_as_current() {
+        let transport = Arc::new(ChangingWorkerTransport::new(vec![
+            worker_response(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "example", "version": "1"}
+            })),
+            crate::tools::mcp::McpResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: None,
+            },
+            worker_response(serde_json::json!({"tools": [{"name": "old", "inputSchema": {}}]})),
+            worker_response(serde_json::json!({"tools": [{"name": "new", "inputSchema": {}}]})),
+        ]));
+        let client = McpClient::new_with_transport(
+            "example",
+            transport.clone(),
+            None,
+            None,
+            "owner",
+            Some(server()),
+        );
+        let (old_wrappers, descriptor_bytes, _) =
+            client.create_worker_tools_with_generation().await.unwrap();
+        let runtime = empty_runtime();
+        runtime
+            .shared
+            .registry
+            .replace_runtime_tools(&[], old_wrappers.clone())
+            .await
+            .unwrap();
+        runtime.shared.servers.lock().await.insert(
+            "example".to_string(),
+            WorkerMcpServer {
+                config: server(),
+                secret_env: HashMap::new(),
+                client,
+                wrappers: old_wrappers,
+                descriptor_bytes,
+                tools_generation: 0,
+                restart_state: WorkerMcpRestartState::Healthy {
+                    since: Instant::now(),
+                    prior_attempts: 0,
+                },
+            },
+        );
+
+        transport.notify();
+        assert!(
+            refresh_worker_mcp_tools_after_discovery(
+                &runtime.shared,
+                "example",
+                &CancellationToken::new(),
+                || transport.notify(),
+            )
+            .await
+        );
+
+        assert!(runtime.shared.registry.get("example_new").await.is_some());
+        let server = &runtime.shared.servers.lock().await["example"];
+        assert_eq!(server.tools_generation, 1);
+        assert_eq!(server.client.tools_generation(), 2);
     }
 
     #[test]
@@ -877,20 +1300,118 @@ mod tests {
     }
 
     #[test]
-    fn restart_claim_opens_circuit_after_max_attempts() {
-        let mut state = fake_server_state(Instant::now(), 0);
+    fn stable_runtime_failed_rebuilds_open_bounded_circuit() {
+        let mut state = fake_server_state(Instant::now() - MCP_RESTART_STABILITY_WINDOW, 3);
+        mark_worker_mcp_running_state(&mut state);
+        assert_eq!(state.restart_state.attempts(), 0);
         for expected in 1..=MCP_RESTART_MAX_ATTEMPTS {
             assert_eq!(claim_worker_mcp_restart(&mut state), Some(expected));
         }
         assert_eq!(claim_worker_mcp_restart(&mut state), None);
-        assert_eq!(state.restart_attempts, MCP_RESTART_MAX_ATTEMPTS);
+        assert_eq!(state.restart_state.attempts(), MCP_RESTART_MAX_ATTEMPTS);
         assert_eq!(claim_worker_mcp_restart(&mut state), None);
     }
 
     #[test]
-    fn restart_claim_resets_after_stability_window() {
-        let mut state = fake_server_state(Instant::now() - MCP_RESTART_STABILITY_WINDOW, 3);
+    fn rebuilt_runtime_must_complete_new_stability_window_before_reset() {
+        let mut state = fake_server_state(Instant::now(), 3);
+        state.restart_state = WorkerMcpRestartState::Unstable { attempts: 3 };
+        mark_worker_mcp_rebuilt(&mut state);
+        assert_eq!(claim_worker_mcp_restart(&mut state), Some(4));
+
+        state.restart_state = WorkerMcpRestartState::Unstable { attempts: 3 };
+        mark_worker_mcp_rebuilt(&mut state);
+        let WorkerMcpRestartState::Healthy { since, .. } = &mut state.restart_state else {
+            panic!("rebuilt runtime must enter healthy probation");
+        };
+        *since = Instant::now() - MCP_RESTART_STABILITY_WINDOW;
+        mark_worker_mcp_running_state(&mut state);
+        assert_eq!(state.restart_state.attempts(), 0);
         assert_eq!(claim_worker_mcp_restart(&mut state), Some(1));
+    }
+
+    #[tokio::test]
+    async fn circuit_open_unregisters_exact_dead_wrappers_even_when_cancelled() {
+        let mut runtime = empty_runtime();
+        let dead: Arc<dyn Tool> = Arc::new(NamedTool("dead"));
+        let unrelated: Arc<dyn Tool> = Arc::new(NamedTool("unrelated"));
+        runtime.shared.registry.register(Arc::clone(&dead)).await;
+        runtime
+            .shared
+            .registry
+            .register(Arc::clone(&unrelated))
+            .await;
+        let mut server = fake_server_state(Instant::now(), 0);
+        server.restart_state = WorkerMcpRestartState::Unstable {
+            attempts: MCP_RESTART_MAX_ATTEMPTS,
+        };
+        server.wrappers = vec![Arc::clone(&dead)];
+        server.descriptor_bytes = 42;
+        runtime
+            .shared
+            .servers
+            .lock()
+            .await
+            .insert("example".to_string(), server);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        assert!(!restart_worker_mcp_server(&runtime.shared, "example", &cancel).await);
+        assert!(runtime.shared.registry.get("dead").await.is_none());
+        assert!(
+            runtime
+                .shared
+                .registry
+                .get("unrelated")
+                .await
+                .is_some_and(|tool| Arc::ptr_eq(&tool, &unrelated))
+        );
+        let servers = runtime.shared.servers.lock().await;
+        let server = &servers["example"];
+        assert!(matches!(
+            server.restart_state,
+            WorkerMcpRestartState::CircuitOpen {
+                attempts: MCP_RESTART_MAX_ATTEMPTS
+            }
+        ));
+        assert!(server.wrappers.is_empty());
+        assert_eq!(server.descriptor_bytes, 0);
+        drop(servers);
+        runtime.shutdown().await.expect("terminal shutdown");
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_backoff_stops_without_opening_circuit() {
+        let mut runtime = empty_runtime();
+        let wrapper: Arc<dyn Tool> = Arc::new(NamedTool("still-owned"));
+        runtime.shared.registry.register(Arc::clone(&wrapper)).await;
+        let mut server = fake_server_state(Instant::now(), 0);
+        server.restart_state = WorkerMcpRestartState::Unstable { attempts: 1 };
+        server.wrappers = vec![Arc::clone(&wrapper)];
+        runtime
+            .shared
+            .servers
+            .lock()
+            .await
+            .insert("example".to_string(), server);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        assert!(!restart_worker_mcp_server(&runtime.shared, "example", &cancel).await);
+        assert!(
+            runtime
+                .shared
+                .registry
+                .get("still-owned")
+                .await
+                .is_some_and(|tool| Arc::ptr_eq(&tool, &wrapper))
+        );
+        assert!(matches!(
+            runtime.shared.servers.lock().await["example"].restart_state,
+            WorkerMcpRestartState::Unstable { attempts: 2 }
+        ));
+        runtime.shutdown().await.expect("cancelled shutdown");
+        assert!(runtime.shared.registry.get("still-owned").await.is_none());
     }
 
     #[test]
@@ -922,6 +1443,10 @@ echo spawn >> "$SPAWN_LOG"
 ( sleep "$DIE_AFTER"; kill "$$" ) &
 while IFS= read -r line; do
   case "$line" in
+    *'"method":"initialize"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"fake","version":"1"}}}\n' "$id"
+      ;;
     *tools/list*)
       id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
       printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"

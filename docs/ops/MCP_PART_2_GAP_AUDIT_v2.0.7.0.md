@@ -10,6 +10,45 @@ integrity gaps, five medium-priority protocol, validation, or architecture gaps,
 contradictory status documentation. No evidence supports enabling automatic npm/PyPI
 installation or removing the documented sandbox and marketplace deferrals.
 
+## Remediation Status (2026-08-11)
+
+The audited commit and findings below remain the historical review result. Remediation
+in this branch addresses all three P1 and five P2 findings:
+
+- **P1 client capabilities:** initialization now advertises empty client capabilities,
+  and inbound JSON-RPC envelopes are classified strictly so server requests cannot be
+  mistaken for responses.
+- **P1 worker recovery:** failed rebuilds no longer reset the stability window. The
+  bounded circuit persists terminal state and atomically removes dead wrappers.
+- **P1 stdio provenance:** pinned Linux stdio activation executes the same verified,
+  sealed native bytes through `memfd` plus `execveat`. Reads have a 128 MiB metadata
+  precheck and streaming limit; shebang scripts and non-Linux pinning fail closed.
+  Unpinned legacy stdio remains available.
+- **P2 discovery/events:** `tools/list` follows bounded pagination with repeated-cursor,
+  page, tool-count, byte, and time limits. Negotiated `tools.listChanged` signals flow
+  through stream transports and one bounded persistent HTTP GET/SSE listener, including
+  gateway transport, into generation-safe host and worker atomic wrapper refresh.
+- **P2 version negotiation:** initialization accepts exactly `2024-11-05`; missing or
+  different negotiated versions fail before session activation.
+- **P2 MCP-over-WASM:** scope is now explicit: one synchronous client-to-server tool
+  actor, with no LunarWing client surface for unsolicited server events,
+  server-to-client requests, resources, prompts, or subscriptions. A real source WAT
+  fixture validates envelopes, persistent state, pagination, calls, memory and fuel
+  limits, timeout, terminal traps, and manager wrapper replacement.
+- **P2 runtime registry:** decision is explicit: registry is an `INTERNAL` closed
+  built-in dispatch boundary, not a production plugin API. Generic external runtime
+  descriptors remain deferred.
+- **P2 annotations:** canonical later-revision fields and defaults deserialize correctly,
+  but remain untrusted advisory input. Negotiated version stays `2024-11-05`; no claim
+  is made that annotations belong to that revision, and operator approval policy remains
+  authoritative.
+
+Remediation verification passed 4,715 all-feature serialized library tests (4 ignored),
+all 3 Engine V2 MCP compatibility tests, rustfmt, all-feature/PostgreSQL/libSQL checks,
+and zero-warning all-feature clippy. Full release aggregation remains blocked outside
+this MCP diff by unavailable real channel WASM artifacts and existing
+skill-selection/TensorZero streaming expectations.
+
 ## Scope and Method
 
 This audit treated the following as the Part 2 delivery contract:
@@ -35,7 +74,7 @@ Relevant MCP specification references:
 - [2024-11-05 tool discovery, pagination, and list-change notification](https://modelcontextprotocol.io/specification/2024-11-05/server/tools)
 - [2024-11-05 canonical TypeScript schema](https://raw.githubusercontent.com/modelcontextprotocol/specification/main/schema/2024-11-05/schema.ts)
 
-## Requirement Matrix
+## Requirement Matrix at Audited Commit
 
 | Part 2 slice | Current evidence | Audit status |
 |---|---|---|

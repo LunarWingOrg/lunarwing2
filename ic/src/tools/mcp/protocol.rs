@@ -2,6 +2,64 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Strict classification for inbound JSON-RPC envelopes.
+#[derive(Debug)]
+pub(crate) enum InboundJsonRpc {
+    Response(McpResponse),
+    Request { id: u64, method: String },
+    Notification { method: String },
+}
+
+pub(crate) fn classify_inbound_jsonrpc(bytes: &[u8]) -> Result<InboundJsonRpc, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    classify_inbound_value(value)
+}
+
+pub(crate) fn classify_inbound_value(
+    value: serde_json::Value,
+) -> Result<InboundJsonRpc, serde_json::Error> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| jsonrpc_error("envelope must be an object"))?;
+    if object.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err(jsonrpc_error("unsupported JSON-RPC version"));
+    }
+
+    if let Some(method) = object.get("method") {
+        let method = method
+            .as_str()
+            .ok_or_else(|| jsonrpc_error("JSON-RPC method must be a string"))?
+            .to_string();
+        return match object.get("id").and_then(flexible_id) {
+            Some(id) => Ok(InboundJsonRpc::Request { id, method }),
+            None => Ok(InboundJsonRpc::Notification { method }),
+        };
+    }
+
+    let id = object
+        .get("id")
+        .and_then(flexible_id)
+        .ok_or_else(|| jsonrpc_error("JSON-RPC response requires an id"))?;
+    if object.contains_key("result") == object.contains_key("error") {
+        return Err(jsonrpc_error(
+            "JSON-RPC response must contain exactly one of result or error",
+        ));
+    }
+    let mut response: McpResponse = serde_json::from_value(value)?;
+    response.id = Some(id);
+    Ok(InboundJsonRpc::Response(response))
+}
+
+fn flexible_id(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|id| id.parse().ok()))
+}
+
+fn jsonrpc_error(message: &'static str) -> serde_json::Error {
+    <serde_json::Error as serde::de::Error>::custom(message)
+}
+
 /// Flexibly deserialize a JSON-RPC id that may be a number, string, or null.
 fn deserialize_flexible_id<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
@@ -17,6 +75,9 @@ where
 
 /// MCP protocol version.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// MCP protocol versions this client can negotiate.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
 
 /// An MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,25 +106,65 @@ fn default_input_schema() -> serde_json::Value {
     serde_json::json!({"type": "object", "properties": {}})
 }
 
-/// Annotations for an MCP tool that provide hints about its behavior.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Annotations for an MCP tool that provide untrusted behavioral hints.
+/// Operator policy remains authoritative; servers cannot use hints as authorization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpToolAnnotations {
-    /// Hint that this tool performs destructive operations that cannot be undone.
-    /// Tools with this hint set to true should require user approval before execution.
+    /// Human-readable display title.
     #[serde(default)]
-    pub destructive_hint: bool,
-
-    /// Hint that this tool may have side effects beyond its return value.
-    #[serde(default)]
-    pub side_effects_hint: bool,
+    pub title: Option<String>,
 
     /// Hint that this tool performs read-only operations.
-    #[serde(default)]
+    #[serde(default, rename = "readOnlyHint", alias = "read_only_hint")]
     pub read_only_hint: bool,
 
-    /// Hint about the expected execution time category.
-    #[serde(default)]
+    /// Hint that this tool performs destructive operations that cannot be undone.
+    /// Per MCP schema, omission defaults to true.
+    #[serde(
+        default = "default_true",
+        rename = "destructiveHint",
+        alias = "destructive_hint"
+    )]
+    pub destructive_hint: bool,
+
+    /// Hint that repeated calls with identical arguments have no additional effect.
+    #[serde(default, rename = "idempotentHint", alias = "idempotent_hint")]
+    pub idempotent_hint: bool,
+
+    /// Hint that this tool may interact with external, open-world entities.
+    /// Per MCP schema, omission defaults to true.
+    #[serde(
+        default = "default_true",
+        rename = "openWorldHint",
+        alias = "open_world_hint"
+    )]
+    pub open_world_hint: bool,
+
+    /// Legacy LunarWing extension; not part of standard ToolAnnotations.
+    #[serde(default, rename = "sideEffectsHint", alias = "side_effects_hint")]
+    pub side_effects_hint: bool,
+
+    /// Legacy LunarWing extension; not part of standard ToolAnnotations.
+    #[serde(default, rename = "executionTimeHint", alias = "execution_time_hint")]
     pub execution_time_hint: Option<ExecutionTimeHint>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for McpToolAnnotations {
+    fn default() -> Self {
+        Self {
+            title: None,
+            read_only_hint: false,
+            destructive_hint: true,
+            idempotent_hint: false,
+            open_world_hint: true,
+            side_effects_hint: false,
+            execution_time_hint: None,
+        }
+    }
 }
 
 /// Hint about how long a tool typically takes to execute.
@@ -121,10 +222,7 @@ impl McpRequest {
             "initialize",
             Some(serde_json::json!({
                 "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {
-                    "roots": { "listChanged": false },
-                    "sampling": {}
-                },
+                "capabilities": {},
                 "clientInfo": {
                     "name": "lunarwing",
                     "version": env!("CARGO_PKG_VERSION")
@@ -146,7 +244,13 @@ impl McpRequest {
 
     /// Create a tools/list request.
     pub fn list_tools(id: u64) -> Self {
-        Self::new(id, "tools/list", None)
+        Self::list_tools_page(id, None)
+    }
+
+    /// Create a tools/list request for an optional pagination cursor.
+    pub fn list_tools_page(id: u64, cursor: Option<&str>) -> Self {
+        let params = cursor.map(|cursor| serde_json::json!({ "cursor": cursor }));
+        Self::new(id, "tools/list", params)
     }
 
     /// Create a tools/call request.
@@ -191,19 +295,18 @@ pub struct McpError {
 }
 
 /// Result of the initialize handshake.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeResult {
     /// Protocol version supported by the server.
     #[serde(rename = "protocolVersion")]
-    pub protocol_version: Option<String>,
+    pub protocol_version: String,
 
     /// Server capabilities.
-    #[serde(default)]
     pub capabilities: ServerCapabilities,
 
     /// Server information.
     #[serde(rename = "serverInfo")]
-    pub server_info: Option<ServerInfo>,
+    pub server_info: ServerInfo,
 
     /// Instructions for using this server.
     pub instructions: Option<String>,
@@ -264,13 +367,15 @@ pub struct ServerInfo {
     pub name: String,
 
     /// Server version.
-    pub version: Option<String>,
+    pub version: String,
 }
 
 /// Result of listing tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListToolsResult {
     pub tools: Vec<McpTool>,
+    #[serde(default, rename = "nextCursor", alias = "next_cursor")]
+    pub next_cursor: Option<String>,
 }
 
 /// Result of calling a tool.
@@ -377,11 +482,23 @@ mod tests {
 
         let params = req.params.expect("initialize must have params");
         assert_eq!(params["protocolVersion"], PROTOCOL_VERSION);
-        assert!(params["capabilities"].is_object());
-        assert!(params["capabilities"]["roots"].is_object());
-        assert!(params["capabilities"]["sampling"].is_object());
+        assert_eq!(params["capabilities"], serde_json::json!({}));
         assert_eq!(params["clientInfo"]["name"], "lunarwing");
         assert!(params["clientInfo"]["version"].is_string());
+    }
+
+    #[test]
+    fn test_initialize_serialization_advertises_no_client_capabilities() {
+        let json = serde_json::to_value(McpRequest::initialize(1)).expect("serialize initialize");
+        assert_eq!(json["params"]["capabilities"], serde_json::json!({}));
+        assert!(json["params"]["capabilities"].get("roots").is_none());
+        assert!(json["params"]["capabilities"].get("sampling").is_none());
+    }
+
+    #[test]
+    fn test_list_tools_request_with_cursor() {
+        let req = McpRequest::list_tools_page(7, Some("next-page"));
+        assert_eq!(req.params, Some(serde_json::json!({"cursor": "next-page"})));
     }
 
     #[test]
@@ -466,7 +583,7 @@ mod tests {
             "instructions": "Use this server for testing."
         });
         let result: InitializeResult = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(result.protocol_version.as_deref(), Some("2024-11-05"));
+        assert_eq!(result.protocol_version, "2024-11-05");
 
         let tools_cap = result.capabilities.tools.expect("has tools capability");
         assert!(tools_cap.list_changed);
@@ -483,12 +600,81 @@ mod tests {
 
         assert!(result.capabilities.logging.is_some());
 
-        let info = result.server_info.expect("has server info");
+        let info = result.server_info;
         assert_eq!(info.name, "test-server");
-        assert_eq!(info.version.as_deref(), Some("1.2.3"));
+        assert_eq!(info.version, "1.2.3");
         assert_eq!(
             result.instructions.as_deref(),
             Some("Use this server for testing.")
+        );
+    }
+
+    #[test]
+    fn test_initialize_result_requires_schema_fields() {
+        for missing in ["protocolVersion", "capabilities", "serverInfo"] {
+            let mut json = serde_json::json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "serverInfo": {"name": "test", "version": "1.0"}
+            });
+            json.as_object_mut().expect("object").remove(missing);
+            assert!(
+                serde_json::from_value::<InitializeResult>(json).is_err(),
+                "missing {missing} must fail"
+            );
+        }
+
+        for missing in ["name", "version"] {
+            let mut json = serde_json::json!({"name": "test", "version": "1.0"});
+            json.as_object_mut().expect("object").remove(missing);
+            assert!(
+                serde_json::from_value::<ServerInfo>(json).is_err(),
+                "missing serverInfo.{missing} must fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_annotations_use_canonical_camel_case() {
+        let annotations = McpToolAnnotations {
+            title: Some("Danger".to_string()),
+            read_only_hint: false,
+            destructive_hint: true,
+            idempotent_hint: true,
+            open_world_hint: false,
+            side_effects_hint: true,
+            execution_time_hint: Some(ExecutionTimeHint::Slow),
+        };
+        let json = serde_json::to_value(&annotations).expect("serialize annotations");
+        assert_eq!(json["title"], "Danger");
+        assert_eq!(json["readOnlyHint"], false);
+        assert_eq!(json["destructiveHint"], true);
+        assert_eq!(json["idempotentHint"], true);
+        assert_eq!(json["openWorldHint"], false);
+        assert_eq!(json["sideEffectsHint"], true);
+        assert_eq!(json["executionTimeHint"], "slow");
+        assert!(json.get("destructive_hint").is_none());
+    }
+
+    #[test]
+    fn test_tool_annotations_accept_snake_case_aliases() {
+        let annotations: McpToolAnnotations = serde_json::from_value(serde_json::json!({
+            "destructive_hint": true,
+            "idempotent_hint": true,
+            "open_world_hint": false,
+            "side_effects_hint": true,
+            "read_only_hint": true,
+            "execution_time_hint": "fast"
+        }))
+        .expect("deserialize snake_case annotations");
+        assert!(annotations.destructive_hint);
+        assert!(annotations.idempotent_hint);
+        assert!(!annotations.open_world_hint);
+        assert!(annotations.side_effects_hint);
+        assert!(annotations.read_only_hint);
+        assert_eq!(
+            annotations.execution_time_hint,
+            Some(ExecutionTimeHint::Fast)
         );
     }
 
@@ -610,11 +796,36 @@ mod tests {
 
     #[test]
     fn test_mcp_tool_annotations_defaults() {
-        let annotations = McpToolAnnotations::default();
-        assert!(!annotations.destructive_hint);
+        let annotations: McpToolAnnotations =
+            serde_json::from_value(serde_json::json!({})).expect("empty annotations");
+        assert!(annotations.destructive_hint);
+        assert!(annotations.open_world_hint);
+        assert!(!annotations.idempotent_hint);
         assert!(!annotations.side_effects_hint);
         assert!(!annotations.read_only_hint);
         assert!(annotations.execution_time_hint.is_none());
+    }
+
+    #[test]
+    fn empty_annotations_require_default_approval() {
+        let tool: McpTool = serde_json::from_value(serde_json::json!({
+            "name": "unspecified",
+            "inputSchema": {},
+            "annotations": {}
+        }))
+        .expect("tool with empty annotations");
+        assert!(tool.requires_approval());
+    }
+
+    #[test]
+    fn contradictory_read_only_hint_cannot_weaken_destructive_approval() {
+        let tool: McpTool = serde_json::from_value(serde_json::json!({
+            "name": "read",
+            "inputSchema": {},
+            "annotations": {"readOnlyHint": true, "destructiveHint": true}
+        }))
+        .expect("contradictory annotations");
+        assert!(tool.requires_approval());
     }
 
     #[test]

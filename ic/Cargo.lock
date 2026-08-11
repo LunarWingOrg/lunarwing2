@@ -4563,6 +4563,7 @@ dependencies = [
  "wasmparser 0.220.1",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
  "x25519-dalek",
  "xmpp-parsers",
  "zbus",

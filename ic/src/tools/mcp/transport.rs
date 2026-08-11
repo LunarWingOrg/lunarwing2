@@ -6,16 +6,60 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::tools::mcp::protocol::{McpRequest, McpResponse};
+use crate::tools::mcp::protocol::{
+    InboundJsonRpc, McpRequest, McpResponse, classify_inbound_jsonrpc,
+};
 use crate::tools::tool::ToolError;
 
 const MAX_JSONRPC_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Default)]
+pub(crate) struct McpNotificationState {
+    tools_list_changed_enabled: AtomicBool,
+    tools_generation: AtomicU64,
+}
+
+impl McpNotificationState {
+    pub(crate) fn set_tools_list_changed(&self, enabled: bool) {
+        self.tools_list_changed_enabled
+            .store(enabled, Ordering::Release);
+    }
+
+    pub(crate) fn tools_generation(&self) -> u64 {
+        self.tools_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn tools_list_changed_enabled(&self) -> bool {
+        self.tools_list_changed_enabled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn advance_tools_generation(&self) {
+        if self.tools_list_changed_enabled.load(Ordering::Acquire) {
+            let _ = self.tools_generation.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |generation| Some(generation.saturating_add(1)),
+            );
+        }
+    }
+
+    pub(crate) fn handle_notification(&self, method: &str) -> bool {
+        if method != "notifications/tools/list_changed"
+            || !self.tools_list_changed_enabled.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        self.advance_tools_generation();
+        true
+    }
+}
 
 /// Trait for sending JSON-RPC requests to an MCP server and receiving responses.
 ///
@@ -52,6 +96,21 @@ pub trait McpTransport: Send + Sync {
     /// Other transports keep their existing lifecycle-specific health checks.
     fn is_healthy(&self) -> bool {
         true
+    }
+
+    /// Configure and inspect bounded tools/list change signaling.
+    fn set_tools_list_changed(&self, _enabled: bool) {}
+
+    fn tools_generation(&self) -> u64 {
+        0
+    }
+
+    /// Start transport-specific delivery of server-originated notifications.
+    async fn start_notifications(
+        &self,
+        _headers: &HashMap<String, String>,
+    ) -> Result<(), ToolError> {
+        Ok(())
     }
 }
 
@@ -92,6 +151,7 @@ pub async fn write_jsonrpc_line(
 pub fn spawn_jsonrpc_reader<R: AsyncBufRead + Unpin + Send + 'static>(
     reader: R,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>>,
+    notifications: Arc<McpNotificationState>,
     server_name: String,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -109,8 +169,18 @@ pub fn spawn_jsonrpc_reader<R: AsyncBufRead + Unpin + Send + 'static>(
                     break;
                 }
             };
-            let response = match serde_json::from_slice::<McpResponse>(&line) {
-                Ok(resp) => resp,
+            let response = match classify_inbound_jsonrpc(&line) {
+                Ok(InboundJsonRpc::Response(response)) => response,
+                Ok(InboundJsonRpc::Notification { method }) => {
+                    if !notifications.handle_notification(&method) {
+                        tracing::debug!(server = %server_name, %method, "Ignoring unsupported MCP notification");
+                    }
+                    continue;
+                }
+                Ok(InboundJsonRpc::Request { id, method }) => {
+                    tracing::warn!(server = %server_name, id, %method, "Ignoring unsupported server-originated MCP request");
+                    continue;
+                }
                 Err(e) => {
                     // Truncate logged line to avoid leaking sensitive data in large payloads.
                     let preview = String::from_utf8_lossy(&line[..line.len().min(200)]);
@@ -125,13 +195,7 @@ pub fn spawn_jsonrpc_reader<R: AsyncBufRead + Unpin + Send + 'static>(
                 }
             };
 
-            let Some(id) = response.id else {
-                tracing::debug!(
-                    "[{}] Received JSON-RPC notification (no id), skipping dispatch",
-                    server_name
-                );
-                continue;
-            };
+            let Some(id) = response.id else { continue };
             let mut map = pending.lock().await;
             if let Some(tx) = map.remove(&id) {
                 // Ignore send error — the receiver may have been dropped (timeout).
@@ -293,7 +357,8 @@ mod tests {
             map.insert(42, tx);
         }
 
-        let handle = spawn_jsonrpc_reader(reader, pending.clone(), "test".into());
+        let handle =
+            spawn_jsonrpc_reader(reader, pending.clone(), notification_state(), "test".into());
 
         let resp = rx.await.expect("should receive response");
         assert_eq!(resp.id, Some(42));
@@ -315,7 +380,8 @@ mod tests {
             map.insert(7, tx);
         }
 
-        let handle = spawn_jsonrpc_reader(reader, pending.clone(), "test".into());
+        let handle =
+            spawn_jsonrpc_reader(reader, pending.clone(), notification_state(), "test".into());
 
         let resp = rx
             .await
@@ -333,7 +399,12 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(1, tx);
 
-        let handle = spawn_jsonrpc_reader(reader, Arc::clone(&pending), "test".into());
+        let handle = spawn_jsonrpc_reader(
+            reader,
+            Arc::clone(&pending),
+            notification_state(),
+            "test".into(),
+        );
         handle.await.expect("reader task should finish");
 
         assert!(rx.await.is_err());
@@ -359,12 +430,68 @@ mod tests {
             map.insert(0, tx);
         }
 
-        let handle = spawn_jsonrpc_reader(reader, pending.clone(), "test".into());
+        let handle =
+            spawn_jsonrpc_reader(reader, pending.clone(), notification_state(), "test".into());
 
         let resp = rx.await.expect("should receive the real id=0 response");
         assert_eq!(resp.id, Some(0));
         assert!(resp.result.is_some());
 
         handle.await.expect("reader task should finish");
+    }
+
+    #[tokio::test]
+    async fn colliding_server_request_does_not_resolve_pending_response() {
+        let request = r#"{"jsonrpc":"2.0","id":7,"method":"sampling/createMessage","params":{}}"#;
+        let response = r#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+        let reader = std::io::Cursor::new(format!("{request}\n{response}\n").into_bytes());
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        pending.lock().await.insert(7, tx);
+
+        let handle = spawn_jsonrpc_reader(
+            reader,
+            Arc::clone(&pending),
+            notification_state(),
+            "test".into(),
+        );
+        let received = rx
+            .await
+            .expect("actual response must satisfy pending request");
+        assert_eq!(received.result, Some(serde_json::json!({"ok": true})));
+        handle.await.expect("reader finishes");
+    }
+
+    #[tokio::test]
+    async fn list_changed_signal_requires_exact_method_and_capability() {
+        let state = notification_state();
+        let input = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed_extra\"}\n",
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n",
+        );
+        spawn_jsonrpc_reader(
+            std::io::Cursor::new(input.as_bytes().to_vec()),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::clone(&state),
+            "test".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.tools_generation(), 0);
+
+        state.set_tools_list_changed(true);
+        spawn_jsonrpc_reader(
+            std::io::Cursor::new(input.as_bytes().to_vec()),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::clone(&state),
+            "test".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(state.tools_generation(), 1);
+    }
+
+    fn notification_state() -> Arc<McpNotificationState> {
+        Arc::new(McpNotificationState::default())
     }
 }

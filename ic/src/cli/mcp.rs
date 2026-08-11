@@ -309,6 +309,7 @@ pub enum McpCommand {
     ///
     /// Resolves the configured runtime artifact, records its SHA-256 digest
     /// and supplied package identity, and marks the package pinned.
+    /// Atomic stdio pins require a native Linux executable; scripts need a native launcher.
     Pin {
         /// Server name to pin
         name: String,
@@ -2194,6 +2195,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_build_update_retains_provenance_for_stdio() {
         let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
@@ -2217,6 +2219,7 @@ mod tests {
         assert!(provenance.command_sha256.is_some());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_build_update_drops_digest_when_leaving_stdio() {
         let pinned = McpPackageProvenance::pin_for_command("cat", ProvenanceIdentity::default())
