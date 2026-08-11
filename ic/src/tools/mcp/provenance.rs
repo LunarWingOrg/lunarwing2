@@ -20,6 +20,9 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
+use std::io::{Seek, Write};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -27,6 +30,8 @@ use sha2::{Digest, Sha256};
 use crate::tools::mcp::config::ConfigError;
 
 const MAX_MCP_WASM_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum bytes accepted for an atomic pinned stdio executable snapshot.
+pub const MAX_PINNED_STDIO_EXECUTABLE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Package ecosystem a server package came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +125,26 @@ pub enum ProvenanceError {
     Resolve { command: String, reason: String },
     #[error("cannot hash runtime artifact '{path}': {reason}")]
     Hash { path: String, reason: String },
+    #[error("atomic execution of pinned stdio commands is unsupported on this platform")]
+    AtomicExecutionUnsupported,
+    #[error(
+        "pinned stdio command '{path}' is a shebang script; use a pinned native launcher that authenticates its interpreter and dependencies, or unpin the command"
+    )]
+    PinnedScriptUnsupported { path: String },
+}
+
+/// Immutable executable snapshot whose descriptor must be used for exec.
+pub(crate) struct VerifiedStdioExecutable {
+    #[cfg(target_os = "linux")]
+    file: std::fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl VerifiedStdioExecutable {
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.file.as_raw_fd()
+    }
 }
 
 /// Optional package identity fields supplied when pinning a server.
@@ -164,7 +189,8 @@ pub struct McpPackageProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_sha256: Option<String>,
 
-    /// Absolute path of the executable the digest was recorded for.
+    /// Informational path reported by the opened executable descriptor. Runtime
+    /// identity comes only from the digest and retained descriptor, not this path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_command: Option<String>,
 
@@ -209,22 +235,30 @@ impl McpPackageProvenance {
         command: &str,
         identity: ProvenanceIdentity,
     ) -> Result<Self, ProvenanceError> {
-        let path = resolve_command_path(command)?;
-        let digest = sha256_file(&path)?;
-        let resolved = path.canonicalize().unwrap_or(path);
-        Ok(Self {
-            package_id: identity.package_id,
-            ecosystem: identity.ecosystem,
-            version: identity.version,
-            source: identity.source,
-            publisher: identity.publisher,
-            command_sha256: Some(digest),
-            resolved_command: Some(resolved.to_string_lossy().into_owned()),
-            component_sha256: None,
-            resolved_component: None,
-            trust: PackageTrust::Pinned,
-            recorded_at: Utc::now(),
-        })
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (command, identity);
+            Err(ProvenanceError::AtomicExecutionUnsupported)
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let path = resolve_command_path(command)?;
+            let (_, digest, resolved) = open_and_hash_executable(command, &path)?;
+            Ok(Self {
+                package_id: identity.package_id,
+                ecosystem: identity.ecosystem,
+                version: identity.version,
+                source: identity.source,
+                publisher: identity.publisher,
+                command_sha256: Some(digest),
+                resolved_command: Some(resolved),
+                component_sha256: None,
+                resolved_component: None,
+                trust: PackageTrust::Pinned,
+                recorded_at: Utc::now(),
+            })
+        }
     }
 
     /// Pin a stateful MCP-over-WASM component by its current file digest.
@@ -328,27 +362,41 @@ impl McpPackageProvenance {
     /// record. Unverified records pass; pinned records re-hash the resolved
     /// executable and fail closed on mismatch; revoked records always fail.
     pub fn verify_stdio_command(&self, command: &str) -> Result<(), ProvenanceError> {
+        self.prepare_stdio_command(command).map(drop)
+    }
+
+    /// Verify and retain pinned executable object for atomic descriptor exec.
+    pub(crate) fn prepare_stdio_command(
+        &self,
+        command: &str,
+    ) -> Result<Option<VerifiedStdioExecutable>, ProvenanceError> {
         self.verify_not_revoked()?;
         if self.trust != PackageTrust::Pinned {
-            return Ok(());
+            return Ok(None);
         }
-        let expected = self
-            .command_sha256
-            .as_deref()
-            .ok_or(ProvenanceError::MissingPin)?;
-        let path = resolve_command_path(command)?;
-        let actual = sha256_file(&path)?;
-        // Local digest comparison is not exposed to timing oracles; a plain
-        // case-insensitive string compare is sufficient here.
-        if !actual.eq_ignore_ascii_case(expected) {
-            return Err(ProvenanceError::DigestMismatch {
-                command: command.to_string(),
-                path: path.to_string_lossy().into_owned(),
-                expected: expected.to_string(),
-                actual,
-            });
+        #[cfg(not(target_os = "linux"))]
+        return Err(ProvenanceError::AtomicExecutionUnsupported);
+
+        #[cfg(target_os = "linux")]
+        {
+            let expected = self
+                .command_sha256
+                .as_deref()
+                .ok_or(ProvenanceError::MissingPin)?;
+            let path = resolve_command_path(command)?;
+            let (file, actual, _) = open_and_hash_executable(command, &path)?;
+            // Local digest comparison is not exposed to timing oracles; a plain
+            // case-insensitive string compare is sufficient here.
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(ProvenanceError::DigestMismatch {
+                    command: command.to_string(),
+                    path: path.to_string_lossy().into_owned(),
+                    expected: expected.to_string(),
+                    actual,
+                });
+            }
+            Ok(Some(VerifiedStdioExecutable { file }))
         }
-        Ok(())
     }
 
     /// Verify the WASM component that activation is about to instantiate.
@@ -487,6 +535,223 @@ pub fn sha256_file(path: &Path) -> Result<String, ProvenanceError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[cfg(target_os = "linux")]
+fn open_and_hash_executable(
+    command: &str,
+    path: &Path,
+) -> Result<(std::fs::File, String, String), ProvenanceError> {
+    let resolve_error = |reason: String| ProvenanceError::Resolve {
+        command: command.to_string(),
+        reason,
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        resolve_error(format!(
+            "cannot open executable without following symlinks: {error}"
+        ))
+    })?;
+    let before = file
+        .metadata()
+        .map_err(|error| resolve_error(format!("cannot inspect executable: {error}")))?;
+    if !before.is_file() {
+        return Err(resolve_error(
+            "runtime artifact is not a regular file".to_string(),
+        ));
+    }
+    if before.len() > MAX_PINNED_STDIO_EXECUTABLE_BYTES {
+        return Err(resolve_error(format!(
+            "runtime artifact is {} bytes; pinned stdio executables cannot exceed {MAX_PINNED_STDIO_EXECUTABLE_BYTES} bytes",
+            before.len()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if before.permissions().mode() & 0o111 == 0 {
+            return Err(resolve_error(
+                "runtime artifact is not executable".to_string(),
+            ));
+        }
+    }
+
+    let mut verified_file = create_sealable_executable(command)?;
+    let digest = copy_and_hash_executable(
+        &mut file,
+        &mut verified_file,
+        path,
+        MAX_PINNED_STDIO_EXECUTABLE_BYTES,
+    )?;
+    let after = file
+        .metadata()
+        .map_err(|error| resolve_error(format!("cannot re-inspect executable: {error}")))?;
+    if !same_file_version(&before, &after) {
+        return Err(resolve_error(
+            "runtime artifact changed while being verified".to_string(),
+        ));
+    }
+    seal_executable(&mut verified_file, path)?;
+    let resolved = opened_descriptor_path(&file, path);
+    Ok((verified_file, digest, resolved))
+}
+
+#[cfg(target_os = "linux")]
+fn copy_and_hash_executable(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    path: &Path,
+    limit: u64,
+) -> Result<String, ProvenanceError> {
+    let hash_error = |reason: String| ProvenanceError::Hash {
+        path: path.to_string_lossy().into_owned(),
+        reason,
+    };
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    let mut prefix = [0_u8; 2];
+    let mut prefix_len = 0;
+    loop {
+        let remaining = limit - total;
+        let read_limit = buffer.len().min((remaining + 1) as usize);
+        let bytes = reader
+            .read(&mut buffer[..read_limit])
+            .map_err(|error| hash_error(error.to_string()))?;
+        if bytes == 0 {
+            break;
+        }
+        let prefix_bytes = (prefix.len() - prefix_len).min(bytes);
+        prefix[prefix_len..prefix_len + prefix_bytes].copy_from_slice(&buffer[..prefix_bytes]);
+        prefix_len += prefix_bytes;
+        if prefix_len == prefix.len() && prefix == *b"#!" {
+            return Err(ProvenanceError::PinnedScriptUnsupported {
+                path: path.to_string_lossy().into_owned(),
+            });
+        }
+        total += bytes as u64;
+        if total > limit {
+            return Err(hash_error(format!(
+                "runtime artifact grew beyond {limit} byte limit while hashing"
+            )));
+        }
+        hasher.update(&buffer[..bytes]);
+        writer
+            .write_all(&buffer[..bytes])
+            .map_err(|error| hash_error(format!("cannot snapshot verified executable: {error}")))?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(target_os = "linux")]
+fn opened_descriptor_path(file: &std::fs::File, fallback: &Path) -> String {
+    use std::os::fd::AsRawFd;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .unwrap_or_else(|_| fallback.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn create_sealable_executable(command: &str) -> Result<std::fs::File, ProvenanceError> {
+    use std::os::fd::FromRawFd;
+
+    let name = c"lunarwing-mcp-pinned";
+    let fd = create_executable_memfd(|flags| {
+        let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
+        if fd == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(fd)
+        }
+    })
+    .map_err(|error| ProvenanceError::Resolve {
+        command: command.to_string(),
+        reason: executable_memfd_error(&error),
+    })?;
+    let fd = duplicate_descriptor_above_stdio(fd).map_err(|error| ProvenanceError::Resolve {
+        command: command.to_string(),
+        reason: format!("cannot secure executable snapshot descriptor: {error}"),
+    })?;
+    // SAFETY: helper returned a new owned descriptor and closed original.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(target_os = "linux")]
+fn create_executable_memfd(
+    mut create: impl FnMut(libc::c_uint) -> std::io::Result<std::os::fd::RawFd>,
+) -> std::io::Result<std::os::fd::RawFd> {
+    let base_flags = libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING;
+    // Never retry without MFD_EXEC: EINVAL can also represent a policy or LSM denial.
+    create(base_flags | libc::MFD_EXEC)
+}
+
+#[cfg(target_os = "linux")]
+fn executable_memfd_error(error: &std::io::Error) -> String {
+    format!(
+        "cannot create executable sealed snapshot: required MFD_EXEC is unsupported by the running kernel or denied by vm.memfd_noexec, security policy, or LSM: {error}"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn duplicate_descriptor_above_stdio(fd: std::os::fd::RawFd) -> std::io::Result<std::os::fd::RawFd> {
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    let duplicate_error = std::io::Error::last_os_error();
+    unsafe { libc::close(fd) };
+    if duplicated == -1 {
+        Err(duplicate_error)
+    } else {
+        Ok(duplicated)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn seal_executable(file: &mut std::fs::File, path: &Path) -> Result<(), ProvenanceError> {
+    use std::os::fd::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    if unsafe { libc::fchmod(fd, 0o500) } == -1 {
+        return Err(ProvenanceError::Hash {
+            path: path.to_string_lossy().into_owned(),
+            reason: format!(
+                "cannot mark verified snapshot executable: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    let seals = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) } == -1 {
+        return Err(ProvenanceError::Hash {
+            path: path.to_string_lossy().into_owned(),
+            reason: format!(
+                "cannot seal verified executable snapshot: {}",
+                std::io::Error::last_os_error()
+            ),
+        });
+    }
+    file.rewind().map_err(|error| ProvenanceError::Hash {
+        path: path.to_string_lossy().into_owned(),
+        reason: format!("cannot rewind verified executable snapshot: {error}"),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn same_file_version(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +780,7 @@ mod tests {
         assert!("maven".parse::<PackageEcosystem>().is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pin_records_digest_and_identity() {
         let provenance =
@@ -530,6 +796,7 @@ mod tests {
         assert!(resolved.contains("cat"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn pinned_record_verifies_unchanged_command() {
         let provenance = McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");
@@ -538,6 +805,7 @@ mod tests {
             .expect("unchanged executable verifies");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn digest_mismatch_fails_closed() {
         let mut provenance =
@@ -549,6 +817,7 @@ mod tests {
         assert!(matches!(error, ProvenanceError::DigestMismatch { .. }));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn revoked_record_blocks_any_transport() {
         let mut provenance =
@@ -582,6 +851,7 @@ mod tests {
         provenance.validate().expect("unverified record is valid");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn validate_rejects_bad_digest_and_pin_without_digest() {
         let mut provenance =
@@ -608,6 +878,7 @@ mod tests {
             .expect("unverified without digest is valid");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn validate_rejects_empty_metadata() {
         let mut provenance =
@@ -641,6 +912,199 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(b"lunarwing provenance test");
         assert_eq!(digest, format!("{:x}", hasher.finalize()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_pin_rejects_symlink_and_non_executable_file() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let executable = temp.path().join("server");
+        let link = temp.path().join("server-link");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").expect("write executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+        symlink(&executable, &link).expect("create symlink");
+
+        assert!(
+            McpPackageProvenance::pin_for_command(link.to_str().expect("utf-8 path"), identity(),)
+                .is_err()
+        );
+
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))
+            .expect("remove execute bits");
+        assert!(
+            McpPackageProvenance::pin_for_command(
+                executable.to_str().expect("utf-8 path"),
+                identity(),
+            )
+            .is_err()
+        );
+        assert!(
+            McpPackageProvenance::pin_for_command(
+                temp.path().to_str().expect("utf-8 path"),
+                identity(),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_pin_rejects_shebang_script_with_actionable_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::NamedTempFile::new().expect("temp script");
+        std::fs::write(temp.path(), b"#!/bin/sh\nexit 0\n").expect("write script");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod script");
+
+        let error = McpPackageProvenance::pin_for_command(
+            temp.path().to_str().expect("utf-8 path"),
+            identity(),
+        )
+        .expect_err("pinned scripts must fail closed");
+        assert!(matches!(
+            error,
+            ProvenanceError::PinnedScriptUnsupported { .. }
+        ));
+        let message = error.to_string();
+        assert!(message.contains("native launcher"));
+        assert!(message.contains("unpin"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn command_pin_rejects_oversized_executable_before_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::NamedTempFile::new().expect("temp executable");
+        temp.as_file()
+            .set_len(MAX_PINNED_STDIO_EXECUTABLE_BYTES + 1)
+            .expect("size sparse executable");
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod executable");
+
+        let error = McpPackageProvenance::pin_for_command(
+            temp.path().to_str().expect("utf-8 path"),
+            identity(),
+        )
+        .expect_err("oversized executable must fail before snapshot");
+        assert!(error.to_string().contains("cannot exceed"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_stream_rejects_limit_plus_one_without_copying_extra_byte() {
+        let mut input = std::io::Cursor::new(b"123456789");
+        let mut snapshot = Vec::new();
+        let error = copy_and_hash_executable(
+            &mut input,
+            &mut snapshot,
+            Path::new("growing-executable"),
+            8,
+        )
+        .expect_err("limit plus one must fail closed");
+
+        assert!(error.to_string().contains("grew beyond 8 byte limit"));
+        assert!(snapshot.len() <= 8);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_stream_detects_shebang_across_one_byte_reads() {
+        struct OneByteReader(std::io::Cursor<Vec<u8>>);
+
+        impl Read for OneByteReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read_limit = buffer.len().min(1);
+                self.0.read(&mut buffer[..read_limit])
+            }
+        }
+
+        let mut input = OneByteReader(std::io::Cursor::new(b"#!/bin/sh\n".to_vec()));
+        let mut snapshot = Vec::new();
+        let error = copy_and_hash_executable(
+            &mut input,
+            &mut snapshot,
+            Path::new("fragmented-script"),
+            64,
+        )
+        .expect_err("fragmented shebang must fail closed");
+
+        assert!(matches!(
+            error,
+            ProvenanceError::PinnedScriptUnsupported { .. }
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_memfd_does_not_retry_without_exec_on_einval() {
+        let mut calls = Vec::new();
+        let error = create_executable_memfd(|flags| {
+            calls.push(flags);
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .expect_err("unsupported or denied MFD_EXEC must fail closed");
+
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(calls.len(), 1);
+        assert_ne!(calls[0] & libc::MFD_EXEC, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_memfd_does_not_retry_policy_denial() {
+        let mut calls = 0;
+        let error = create_executable_memfd(|_| {
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EACCES))
+        })
+        .expect_err("policy denial must fail closed");
+
+        assert_eq!(calls, 1);
+        let message = executable_memfd_error(&error);
+        assert!(message.contains("vm.memfd_noexec, security policy, or LSM"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_memfd_error_explains_old_kernel_or_policy_for_any_failure() {
+        for errno in [libc::EINVAL, libc::EPERM, libc::EACCES, libc::ENOMEM] {
+            let message = executable_memfd_error(&std::io::Error::from_raw_os_error(errno));
+            assert!(message.contains("required MFD_EXEC is unsupported by the running kernel"));
+            assert!(message.contains("security policy, or LSM"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn executable_snapshot_descriptor_is_above_stdio_and_cloexec() {
+        use std::os::fd::FromRawFd;
+
+        let original =
+            unsafe { libc::memfd_create(c"descriptor-test".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(original >= 0, "memfd_create failed");
+        let duplicated = duplicate_descriptor_above_stdio(original).expect("duplicate descriptor");
+        assert!(duplicated >= 3);
+        assert_eq!(unsafe { libc::fcntl(original, libc::F_GETFD) }, -1);
+        assert_ne!(
+            unsafe { libc::fcntl(duplicated, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        // SAFETY: helper returned owned duplicated descriptor.
+        drop(unsafe { std::fs::File::from_raw_fd(duplicated) });
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn command_pin_rejects_unsupported_platform_before_resolution() {
+        let error =
+            McpPackageProvenance::pin_for_command("definitely-not-a-real-command-lw", identity())
+                .expect_err("non-Linux pin must fail before persistence");
+        assert!(matches!(error, ProvenanceError::AtomicExecutionUnsupported));
     }
 
     #[test]
@@ -684,6 +1148,7 @@ mod tests {
         assert!(McpPackageProvenance::pin_for_component(&link, identity()).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn provenance_serde_roundtrip() {
         let provenance = McpPackageProvenance::pin_for_command("cat", identity()).expect("pin cat");

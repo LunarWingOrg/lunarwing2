@@ -127,9 +127,10 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 - Any language (TypeScript/Python most common)
 - LunarWing transports: HTTP/HTTPS, stdio, Unix domain sockets, persistent WASM
   components, and dedicated/shared gateways
-- The agent registry exposes MCP tools. The raw MCP-over-WASM actor ABI preserves
-  resources, prompts, notifications, cancellation messages, and subscriptions for
-  clients that invoke those methods; WebSocket transport is not implemented
+- The agent registry exposes MCP tools. MCP-over-WASM is a synchronous
+  client-to-server actor; LunarWing does not expose unsolicited server events,
+  server-to-client requests, resources, prompts, or subscriptions through it.
+  WebSocket transport is not implemented
 - Cost: host-local stdio is an external process with LunarWing service-account
   privileges; an opt-in per-server OS sandbox (below) can limit its filesystem,
   network, process, and resource reach, but raw credentials given to that
@@ -140,12 +141,12 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 | Area | Current behavior |
 |------|------------------|
 | Install | `lunarwing mcp add`, conversational `tool_install`, and the authenticated web API accept validated HTTP, stdio, WASM, and gateway config; CLI/web also retain Unix support. Registry manifests retain their existing schema; the browser form currently exposes HTTP and stdio. Install persists config but does not activate it. |
-| Activate/deactivate | `ExtensionManager` initializes clients through the runtime adapter registry, discovers tools, tracks exact ownership, and tears down runtime/session/process state. Desired `enabled` state persists. CLI toggle uses the authenticated LunarWing web gateway when available and accepts `--offline` for persisted-only behavior. |
+| Activate/deactivate | `ExtensionManager` initializes clients through the internal closed built-in runtime registry, discovers tools, tracks exact ownership, and tears down runtime/session/process state. This registry is not a production plugin API. Desired `enabled` state persists. CLI toggle uses the authenticated LunarWing web gateway when available and accepts `--offline` for persisted-only behavior. |
 | Update | CLI `lunarwing mcp update` changes persisted config only and preserves existing WASM/gateway runtime-specific fields. Conversational and authenticated API updates attempt to restart an active server. Browser MCP panel has no update editor. |
 | Remove | Web and conversational removal use `ExtensionManager`. CLI removal uses the authenticated LunarWing web gateway by default. Persisted removal happens before active cleanup; `--offline` is explicit persisted-only cleanup. |
 | Diagnostics | `lunarwing doctor` validates config and reports transport, enabled state, stdio command availability, WASM component canonicality/availability, and sandbox policy enforceability. |
 | Host sandboxing | Stdio supports an opt-in OS policy. MCP-over-WASM exposes no WASI or host imports and bounds artifact/message sizes, memory, replenished fuel, and epoch deadlines. |
-| Protocol surface | Tool discovery and tool calls are registered with the agent. The raw MCP-over-WASM ABI carries full JSON-RPC methods, including resources, prompts, notifications, cancellation messages, and subscriptions. WebSocket transport is not implemented. |
+| Protocol surface | Client capabilities are empty; inbound envelopes are strictly classified; negotiation accepts exactly `2024-11-05`; `tools/list` pagination is bounded. Negotiated `tools.listChanged` signals trigger generation-safe atomic wrapper refresh through streams and persistent HTTP GET/SSE, including gateways. Later-revision annotations deserialize canonically but remain untrusted hints, not `2024-11-05` claims. LunarWing exposes tools only. WebSocket transport is not implemented. |
 | Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, external dedicated/shared gateway, and core Docker job-worker placement are implemented. A bundled gateway control-plane service is not implemented. |
 | Reliability | Explicit lifecycle cleanup and whole-runtime stdio/WASM crash recovery are implemented. WASM traps stop and discard the actor before manager reconstruction; per-message deadlines and shutdown bounds are enforced. General configurable startup/request timeouts remain open. |
 
@@ -155,7 +156,8 @@ An MCP component exports `lunarwing:mcp/server@0.1.0` from
 `wit/mcp-server.wit`. LunarWing keeps one component instance for the active
 server and sends complete JSON-RPC envelopes to its `handle` export. The
 component receives no inherited environment, filesystem, network, standard
-streams, or credentials.
+streams, or credentials. Its synchronous ABI carries client requests and notifications
+only; no server event/outbox exists.
 
 The component path must be absolute and its final entry cannot be a symlink.
 Activation uses one bounded file handle and requires a regular file no larger than
@@ -170,6 +172,10 @@ lunarwing mcp add portable --transport wasm \
   --wasm-fuel 500000000 \
   --wasm-timeout-seconds 30
 ```
+
+Committed source WAT coverage validates initialize/initialized envelopes, persistent
+actor state, paginated discovery, calls, memory and fuel enforcement, timeout, terminal
+traps, and manager replacement of registry-resolved wrappers.
 
 The authenticated web install API accepts equivalent `component`, `memory_mb`,
 `fuel`, and `timeout_seconds` fields. A guest-reported MCP error preserves the
@@ -368,7 +374,7 @@ lunarwing mcp unpin local-files  # back to unverified legacy behavior
 component, records its SHA-256 digest plus the optional package
 identity (canonical id, ecosystem, immutable version, source, publisher), and
 marks the server `pinned`. Every later activation — startup, manual activation,
-and crash recovery alike — re-hashes the selected artifact and **fails closed** on
+and crash recovery alike — verifies the selected artifact and **fails closed** on
 mismatch, so silently replaced or upgraded code cannot start
 until the operator re-pins. `mcp revoke` records `revoked` trust (blocking
 activation for any transport) and disables the server; a revoked server stays
@@ -377,6 +383,14 @@ keep the legacy unverified behavior. `mcp update` retains the matching record fo
 stdio and WASM servers; switching runtime types drops the digest. Web and conversational update
 requests do not carry provenance and reset the record — re-pin after using
 them.
+
+Atomic stdio pinning is Linux-only and accepts native executables up to 128 MiB, enforced
+by metadata precheck and streaming limit. Activation executes the same verified sealed
+bytes through `memfd` plus `execveat`; stored resolved path is informational only.
+Shebang scripts are rejected because authenticating script bytes alone does not
+authenticate their interpreter or dependency closure. Use a pinned native
+launcher that owns those dependencies, or leave the script command unpinned. Pinning
+on non-Linux fails before persistence; unpinned legacy stdio remains available.
 
 What this does not yet cover: publisher signatures and trusted signing keys,
 locked dependency graphs, upgrade diffs, marketplace trust roots, and
@@ -458,7 +472,8 @@ crashed child without re-fetching grants; they are zeroized when the runtime dro
 at job end.
 
 Worker startup initializes every client and discovers every tool before atomically
-registering wrappers in the per-job registry. Any startup error, tool-name conflict,
+registering wrappers in the per-job registry. Paginated discovery is bounded across
+all pages. Any startup error, tool-name conflict,
 approval requirement, autonomous-execution denial, or partial failure rejects the
 whole MCP snapshot and cleans up started runtimes. Stdio JSON-RPC frames are capped
 at 4 MiB; the full job snapshot may expose at most 256 tools and 2 MiB of serialized
@@ -477,13 +492,13 @@ child. An unexpected exit, closed stdio, or missing runtime restarts the server
 from the job's immutable snapshot: the dead runtime is cleaned up with bounded
 waits, a fresh client is initialized, tools are rediscovered and revalidated
 against the same autonomous-execution and aggregate limits, and replacement
-wrappers are atomically swapped into the registry. Old wrappers stay registered
-until the replacement is ready, so in-flight calls fail against the dead client
-instead of disappearing mid-job. Five unstable restart attempts use jittered
-exponential backoff (1s base, 30s cap); 30 healthy seconds reset the attempt
-window. Further failure stops supervision for that server — the circuit leaves
-it down for the rest of the job and tool calls keep surfacing the transport
-error. Supervision never reloads owner configuration or re-fetches grants; the
+wrappers are atomically swapped into the registry. Old wrappers remain registered
+until replacement is ready, so calls during recovery fail against the dead client
+rather than exposing a partial registry. Discovery captures exact notification generation,
+so a concurrent `tools.listChanged` remains pending instead of being lost. Five unstable
+restart attempts use jittered exponential backoff (1s base, 30s cap); 30 healthy seconds reset the attempt
+window. Further failure persists terminal circuit state, removes dead wrappers, and
+stops supervision for that server. Supervision never reloads owner configuration or re-fetches grants; the
 job snapshot stays immutable.
 
 Before job completion, the worker cancels supervision first so a restart cannot

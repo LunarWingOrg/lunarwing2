@@ -13,7 +13,7 @@ You extract user preferences, patterns, and domain knowledge from a batch of rec
 1. Analyze the thread goals and user messages for patterns
 2. Search existing insights: `memory_search(query="user preferences")` and `memory_search(query="domain knowledge")`
 3. Extract NEW insights not already recorded in memory
-4. Write each insight with `__save_memory_doc__("insight:<category>:<topic>", insight_text, "lesson", ["insight"], {})` (returns the doc id, or `False` on error)
+4. Write each insight with `__save_memory_doc__("insight:<category>:<topic>", insight_text, "lesson", ["insight"], {})` (returns the doc id; persistence failure raises an error, and only returned doc ids count as extracted insights)
 
 ## Categories to look for
 

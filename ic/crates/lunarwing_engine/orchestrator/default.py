@@ -306,6 +306,63 @@ def sanitize_action_results(messages):
     return messages
 
 
+def is_gate_result(result):
+    """Return whether a structured host result interrupts for a gate."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("gate_paused") == True:
+        return True
+    if result.get("need_authentication") == True:
+        return True
+    if result.get("need_approval") == True:
+        return True
+    return False
+
+
+def append_structured_action_results(messages, calls, results):
+    """Record one result per call except the first pending gate."""
+    gate_seen = False
+    for idx in range(len(calls)):
+        call = calls[idx] if isinstance(calls[idx], dict) else {}
+        result = results[idx] if idx < len(results) else None
+        gate_result = is_gate_result(result)
+        if gate_result and not gate_seen:
+            gate_seen = True
+            continue
+
+        action_name = call.get("name", "")
+        if gate_result:
+            action_name = result.get("action_name", action_name)
+            resume_output = result.get("resume_output")
+            if resume_output is None:
+                output = {
+                    "error": "tool was not executed because another call paused the batch"
+                }
+            else:
+                output = {
+                    "status": "tool executed; additional gate deferred",
+                    "output": resume_output,
+                }
+        elif isinstance(result, dict):
+            action_name = result.get("action_name", action_name)
+            if "output" in result:
+                output = result["output"]
+            else:
+                output = {"error": "tool result missing from host response"}
+        elif gate_seen:
+            output = {"error": "tool was not executed because another call paused the batch"}
+        else:
+            output = {"error": "tool result missing from host response"}
+
+        messages.append({
+            "role": "ActionResult",
+            "content": format_action_output(str(output)),
+            "action_name": action_name,
+            "action_call_id": call.get("call_id", ""),
+        })
+    return messages
+
+
 def format_docs(docs):
     """Format memory docs for context injection."""
     parts = ["## Prior Knowledge (from completed threads)\n"]
@@ -1241,22 +1298,7 @@ def run_loop(context, goal, actions, state, config):
             # Rust handles preflight (lease/policy), parallel execution via
             # JoinSet, and event emission in call order.
             results = __execute_actions_parallel__(calls)
-            for idx in range(len(results)):
-                r = results[idx]
-                if r is None:
-                    continue
-                call = calls[idx] if idx < len(calls) else {}
-                call_id = call.get("call_id", "")
-                action_name = r.get("action_name", call.get("name", ""))
-                output = r.get("output")
-                if output is not None:
-                    append_message(
-                        working_messages,
-                        "ActionResult",
-                        str(output),
-                        action_name=action_name,
-                        action_call_id=call_id,
-                    )
+            append_structured_action_results(working_messages, calls, results)
 
             # Check results for auth/approval interrupts
             for r_idx, r in enumerate(results):

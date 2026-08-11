@@ -15,7 +15,9 @@ use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::tools::mcp::protocol::{McpRequest, McpResponse};
-use crate::tools::mcp::transport::{McpTransport, spawn_jsonrpc_reader, stream_transport_send};
+use crate::tools::mcp::transport::{
+    McpNotificationState, McpTransport, spawn_jsonrpc_reader, stream_transport_send,
+};
 use crate::tools::tool::ToolError;
 
 /// MCP transport that communicates over a Unix domain socket.
@@ -28,6 +30,7 @@ pub struct UnixMcpTransport {
     server_name: String,
     writer: Arc<Mutex<tokio::io::WriteHalf<UnixStream>>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>>,
+    notifications: Arc<McpNotificationState>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -58,15 +61,22 @@ impl UnixMcpTransport {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let notifications = Arc::new(McpNotificationState::default());
 
         let reader = BufReader::new(read_half);
-        let reader_handle = spawn_jsonrpc_reader(reader, pending.clone(), server_name.clone());
+        let reader_handle = spawn_jsonrpc_reader(
+            reader,
+            pending.clone(),
+            Arc::clone(&notifications),
+            server_name.clone(),
+        );
 
         Ok(Self {
             socket_path,
             server_name,
             writer: Arc::new(Mutex::new(write_half)),
             pending,
+            notifications,
             reader_handle: Mutex::new(Some(reader_handle)),
         })
     }
@@ -124,6 +134,14 @@ impl McpTransport for UnixMcpTransport {
 
     fn supports_http_features(&self) -> bool {
         false
+    }
+
+    fn set_tools_list_changed(&self, enabled: bool) {
+        self.notifications.set_tools_list_changed(enabled);
+    }
+
+    fn tools_generation(&self) -> u64 {
+        self.notifications.tools_generation()
     }
 }
 

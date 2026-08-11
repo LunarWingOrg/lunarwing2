@@ -64,6 +64,42 @@ impl McpProcessManager {
         Ok(transport)
     }
 
+    /// Spawn a pinned server using its already verified executable descriptor.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_verified_stdio(
+        &self,
+        name: impl Into<String>,
+        command: impl Into<String>,
+        args: Vec<String>,
+        env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
+        suppress_stderr: bool,
+        sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
+        executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+    ) -> Result<Arc<StdioMcpTransport>, ToolError> {
+        let name = name.into();
+        let command = command.into();
+        let mut transports = self.transports.write().await;
+        if transports.contains_key(&name) {
+            return Err(ToolError::ExternalService(format!(
+                "MCP server process '{name}' is already managed"
+            )));
+        }
+        let transport = Arc::new(
+            StdioMcpTransport::spawn_verified(
+                &name,
+                &command,
+                args,
+                env,
+                suppress_stderr,
+                sandbox,
+                executable,
+            )
+            .await?,
+        );
+        transports.insert(name, Arc::clone(&transport));
+        Ok(transport)
+    }
+
     /// Get a transport by server name.
     pub async fn get(&self, name: &str) -> Option<Arc<StdioMcpTransport>> {
         self.transports.read().await.get(name).cloned()

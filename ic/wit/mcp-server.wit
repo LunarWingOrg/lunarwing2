@@ -4,9 +4,9 @@ package lunarwing:mcp@0.1.0;
 //
 // The host instantiates one component actor for each active MCP server and
 // serializes JSON-RPC messages through that actor. Keeping the MCP envelope as
-// JSON preserves protocol compatibility for tools, resources, prompts,
-// notifications, subscriptions, and future protocol methods without expanding
-// the component ABI for every MCP revision.
+// JSON preserves request/response protocol compatibility without expanding the
+// component ABI for every MCP revision. This synchronous interface cannot carry
+// unsolicited server requests or notifications back to the host.
 
 /// MCP server actor implemented by the guest component.
 interface server {
@@ -20,8 +20,8 @@ interface server {
 
 /// Persistent MCP server world.
 ///
-/// Components receive only a minimal WASI context: no inherited environment,
-/// network, filesystem, standard streams, or host credentials.
+/// Components receive no host imports: no inherited environment, network,
+/// filesystem, standard streams, clocks, randomness, or host credentials.
 world mcp-server {
     export server;
 }

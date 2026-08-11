@@ -6,8 +6,8 @@
 //! designated coordination channels (XMPP MUC, IRC):
 //!
 //! - [`SecretEntropyHook`] (priority 5) — Shannon-entropy secret detection
-//! - [`EngagementPolicyHook`] (priority 15) — only respond when targeted
-//! - [`FirstResponderHook`] (priority 16) — one agent claims a message
+//! - [`EngagementPolicyHook`] (priority 15) — target/elect one responder
+//! - [`FirstResponderHook`] (priority 16) — suppress replayed deliveries
 //! - [`TagSchemaHook`] (priority 14) — messages must start with an allowed tag
 //! - [`RateLimitHook`] (priority 25) — 2 messages/hour per agent
 //!
@@ -15,10 +15,11 @@
 //! nothing is registered unless `COORD_ENABLED=true`.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::gate::violation_store::{ViolationStatus, ViolationStore};
@@ -58,6 +59,106 @@ pub(crate) fn coordination_channel_guard(channels: &[String]) -> String {
     format!("(?i)^(?:{alternatives})$")
 }
 
+fn push_alias(aliases: &mut Vec<String>, alias: &str) {
+    let alias = alias.trim().to_lowercase();
+    if !alias.is_empty() && !aliases.iter().any(|existing| existing == &alias) {
+        aliases.push(alias);
+    }
+}
+
+fn normalized_agent_aliases(agent_id: &str, configured: Vec<String>) -> Vec<String> {
+    let mut aliases = Vec::new();
+    for alias in configured {
+        push_alias(&mut aliases, &alias);
+    }
+    if valid_coordination_agent_id(agent_id) {
+        push_alias(&mut aliases, agent_id);
+        if !agent_id.contains('@') && !agent_id.contains('/') {
+            push_alias(&mut aliases, &format!("@{agent_id}"));
+        }
+        if let Some(local_name) = agent_id.split(['@', '/']).next() {
+            push_alias(&mut aliases, local_name);
+            push_alias(&mut aliases, &format!("@{local_name}"));
+        }
+    }
+    aliases
+}
+
+fn normalized_responder_roster(configured: Vec<String>) -> Vec<String> {
+    if configured
+        .iter()
+        .any(|agent| !valid_coordination_agent_id(agent))
+    {
+        tracing::warn!(
+            "COORD_RESPONDER_ROSTER contains an invalid agent ID; deterministic election disabled"
+        );
+        return Vec::new();
+    }
+    let mut roster = Vec::new();
+    for agent in configured {
+        if !roster
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(&agent))
+        {
+            roster.push(agent);
+        }
+    }
+    roster.sort_by_key(|agent| agent.to_ascii_lowercase());
+    roster
+}
+
+fn is_agent_id_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '@' | '.' | '-' | '_' | '/' | ':' | '+' | '~')
+}
+
+fn contains_addressed_alias(content: &str, aliases: &[String]) -> bool {
+    let content = content.to_lowercase();
+    aliases.iter().any(|alias| {
+        content.match_indices(alias).any(|(start, matched)| {
+            let before = content[..start].chars().next_back();
+            let after = content[start + matched.len()..].chars().next();
+            before.is_none_or(|character| !is_agent_id_char(character))
+                && after.is_none_or(|character| !is_agent_id_char(character))
+        })
+    })
+}
+
+fn addresses_roster_member(content: &str, roster: &[String]) -> bool {
+    roster.iter().any(|agent| {
+        contains_addressed_alias(content, &normalized_agent_aliases(agent, Vec::new()))
+    })
+}
+
+fn has_explicit_mention(content: &str) -> bool {
+    content.match_indices('@').any(|(start, _)| {
+        let before = content[..start].chars().next_back();
+        let after = content[start + 1..].chars().next();
+        before.is_none_or(|character| !is_agent_id_char(character))
+            && after.is_some_and(is_agent_id_char)
+    })
+}
+
+fn is_coordination_query(content: &str) -> bool {
+    content
+        .trim_start()
+        .get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("QUERY:"))
+}
+
+fn elected_responder<'a>(correlation_id: &str, roster: &'a [String]) -> Option<&'a str> {
+    roster
+        .iter()
+        .max_by_key(|agent| {
+            let mut hasher = Sha256::new();
+            hasher.update(correlation_id.as_bytes());
+            hasher.update([0]);
+            hasher.update(agent.to_ascii_lowercase().as_bytes());
+            hasher.finalize().to_vec()
+        })
+        .map(String::as_str)
+}
+
 /// Configuration for the coordination hooks, loaded from environment.
 #[derive(Debug, Clone)]
 pub struct CoordinationHookConfig {
@@ -67,6 +168,8 @@ pub struct CoordinationHookConfig {
     pub agent_id: String,
     /// Lowercase @mention aliases that target this agent (`COORD_AGENT_ALIASES`).
     pub agent_aliases: Vec<String>,
+    /// Agents eligible for deterministic QUERY election (`COORD_RESPONDER_ROSTER`).
+    pub responder_roster: Vec<String>,
     /// Coordination channel JIDs/names (`COORD_CHANNELS`).
     pub coordination_channels: Vec<String>,
     /// Max messages per rate window per agent (`COORD_MAX_MESSAGES`, default 2).
@@ -93,6 +196,7 @@ impl Default for CoordinationHookConfig {
             enabled: false,
             agent_id: String::new(),
             agent_aliases: Vec::new(),
+            responder_roster: Vec::new(),
             coordination_channels: Vec::new(),
             max_messages: 2,
             rate_window: Duration::from_secs(3600),
@@ -116,25 +220,26 @@ impl CoordinationHookConfig {
         if let Ok(v) = std::env::var("COORD_AGENT_ID") {
             config.agent_id = v.trim().to_string();
         }
-        config.agent_aliases = env_list("COORD_AGENT_ALIASES")
-            .into_iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        config.agent_aliases =
+            normalized_agent_aliases(&config.agent_id, env_list("COORD_AGENT_ALIASES"));
+        config.responder_roster = normalized_responder_roster(env_list("COORD_RESPONDER_ROSTER"));
         config.coordination_channels = env_list("COORD_CHANNELS");
         config.admin_users = env_list("COORD_ADMIN_USERS");
-        if let Some(v) = env_parse::<usize>("COORD_MAX_MESSAGES") {
+        if let Some(v) = env_parse::<usize>("COORD_MAX_MESSAGES").filter(|value| *value > 0) {
             config.max_messages = v;
         }
-        if let Some(v) = env_parse::<u64>("COORD_RATE_WINDOW_SECS") {
+        if let Some(v) = env_parse::<u64>("COORD_RATE_WINDOW_SECS").filter(|value| *value > 0) {
             config.rate_window = Duration::from_secs(v);
         }
-        if let Some(v) = env_parse::<u64>("COORD_COALESCE_MS") {
+        if let Some(v) = env_parse::<u64>("COORD_COALESCE_MS").filter(|value| *value > 0) {
             config.coalesce_window = Duration::from_millis(v);
         }
-        if let Some(v) = env_parse::<f64>("COORD_ENTROPY_THRESHOLD") {
+        if let Some(v) = env_parse::<f64>("COORD_ENTROPY_THRESHOLD")
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 8.0)
+        {
             config.entropy_threshold = v;
         }
-        if let Some(v) = env_parse::<usize>("COORD_MIN_SECRET_LENGTH") {
+        if let Some(v) = env_parse::<usize>("COORD_MIN_SECRET_LENGTH").filter(|value| *value > 0) {
             config.min_secret_length = v;
         }
         config
@@ -305,10 +410,7 @@ impl CoordinationState {
             .responder_claims
             .retain(|_, (_, at)| now.duration_since(*at) < ttl);
         match guard.responder_claims.get(correlation_id) {
-            Some((claimer, _)) if claimer != agent_id => {
-                ClaimResult::AlreadyClaimed(claimer.clone())
-            }
-            Some(_) => ClaimResult::Claimed,
+            Some((claimer, _)) => ClaimResult::AlreadyClaimed(claimer.clone()),
             None => {
                 guard
                     .responder_claims
@@ -379,23 +481,70 @@ pub fn shannon_entropy(s: &str) -> f64 {
     entropy
 }
 
-/// Known-safe token shapes that should not trip entropy detection:
-/// git SHAs (40 hex chars), file paths, and URLs.
+static EXPLICIT_SECRET_PATTERNS: LazyLock<Result<Vec<(&'static str, regex::Regex)>, String>> =
+    LazyLock::new(|| {
+        [
+            (
+                "credential assignment",
+                r#"(?i)(api[_-]?key|secret|token|password|bearer|authorization)\s*[:=]\s*['"]?[A-Za-z0-9+/=_-]{16,}"#,
+            ),
+            (
+                "private key material",
+                r"-----BEGIN\s+(RSA\s+|EC\s+|OPENSSH\s+|PGP\s+)?PRIVATE KEY-----",
+            ),
+            (
+                "JWT token",
+                r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+            ),
+        ]
+        .into_iter()
+        .map(|(kind, pattern)| {
+            regex::Regex::new(pattern)
+                .map(|compiled| (kind, compiled))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+    });
+
+fn explicit_secret_kind(content: &str) -> Result<Option<&'static str>, HookError> {
+    let patterns =
+        EXPLICIT_SECRET_PATTERNS
+            .as_ref()
+            .map_err(|error| HookError::ExecutionFailed {
+                reason: format!("invalid built-in secret pattern: {error}"),
+            })?;
+    Ok(patterns
+        .iter()
+        .find_map(|(kind, pattern)| pattern.is_match(content).then_some(*kind)))
+}
+
+/// Known-safe token shapes that should not trip entropy detection: exact git
+/// SHAs, explicit file paths, and absolute HTTP(S) URLs.
 fn is_allowlisted_token(token: &str) -> bool {
-    if token.contains('/') || token.contains('\\') {
-        return true;
-    }
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+        )
+    });
     if token.len() == 40 && token.chars().all(|c| c.is_ascii_hexdigit()) {
         return true;
     }
-    false
+    if token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+    {
+        return true;
+    }
+    url::Url::parse(token).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
 }
 
-/// Extract (user_id, policy scope, content, is_outbound) from
-/// inbound/outbound events. The scope is the canonical destination from
-/// routing metadata when present (e.g. the XMPP room JID), falling back to
-/// the transport channel name (ISSUE-001).
-fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
+/// Extract (actor, policy scope, content, is_local_output) from scoped events.
+fn event_content<'a>(
+    event: &'a HookEvent,
+    local_agent: &'a str,
+) -> Option<(&'a str, &'a str, &'a str, bool)> {
     let scope = event.policy_scope()?;
     match event {
         HookEvent::Inbound {
@@ -409,14 +558,13 @@ fn event_content(event: &HookEvent) -> Option<(&str, &str, &str, bool)> {
             content,
             false,
         )),
-        HookEvent::Outbound {
-            user_id, content, ..
-        } => Some((user_id, scope, content, true)),
+        HookEvent::Outbound { content, .. } => Some((local_agent, scope, content, true)),
+        HookEvent::ResponseTransform { response, .. } => Some((local_agent, scope, response, true)),
         _ => None,
     }
 }
 
-/// Priority 5 — high-entropy secret detection beyond the Phase 1 regexes.
+/// Priority 5 — strike-aware explicit and high-entropy secret detection.
 pub struct SecretEntropyHook {
     state: CoordinationState,
     /// This agent's own identifier (`COORD_AGENT_ID`). Outbound violations
@@ -451,7 +599,11 @@ impl Hook for SecretEntropyHook {
     }
 
     fn hook_points(&self) -> &[HookPoint] {
-        &[HookPoint::BeforeInbound, HookPoint::BeforeOutbound]
+        &[
+            HookPoint::BeforeInbound,
+            HookPoint::BeforeOutbound,
+            HookPoint::TransformResponse,
+        ]
     }
 
     fn failure_mode(&self) -> HookFailureMode {
@@ -463,24 +615,24 @@ impl Hook for SecretEntropyHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let Some((user_id, scope, content, is_outbound)) = event_content(event) else {
+        let Some((actor, scope, content, _is_local_output)) = event_content(event, &self.agent_id)
+        else {
             return Ok(HookOutcome::ok());
         };
         if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
+        }
+        if let Some(kind) = explicit_secret_kind(content)? {
+            self.state
+                .record_violation(actor, kind, self.name(), scope)
+                .await;
+            return Ok(HookOutcome::reject(format!("coord: {kind} detected")));
         }
         for token in content.split_whitespace() {
             if token.len() >= self.min_length
                 && !is_allowlisted_token(token)
                 && shannon_entropy(token) >= self.entropy_threshold
             {
-                // Inbound secrets belong to the remote sender; outbound
-                // secrets are emitted by the local agent (ISSUE-004).
-                let actor = if is_outbound {
-                    self.agent_id.as_str()
-                } else {
-                    user_id
-                };
                 self.state
                     .record_violation(actor, "high-entropy token", self.name(), scope)
                     .await;
@@ -498,21 +650,32 @@ pub struct EngagementPolicyHook {
     state: CoordinationState,
     agent_id: String,
     agent_aliases: Vec<String>,
+    responder_roster: Vec<String>,
 }
 
 impl EngagementPolicyHook {
     /// Create with shared state, this agent's id, and its mention aliases.
     pub fn new(state: CoordinationState, agent_id: String, agent_aliases: Vec<String>) -> Self {
+        Self::new_with_roster(state, agent_id, agent_aliases, Vec::new())
+    }
+
+    /// Create with a team roster for deterministic unaddressed QUERY election.
+    pub fn new_with_roster(
+        state: CoordinationState,
+        agent_id: String,
+        agent_aliases: Vec<String>,
+        responder_roster: Vec<String>,
+    ) -> Self {
         Self {
             state,
             agent_id,
             agent_aliases,
+            responder_roster,
         }
     }
 
     fn is_targeted(&self, content: &str) -> bool {
-        let lower = content.to_lowercase();
-        self.agent_aliases.iter().any(|alias| lower.contains(alias))
+        contains_addressed_alias(content, &self.agent_aliases)
     }
 }
 
@@ -555,24 +718,42 @@ impl Hook for EngagementPolicyHook {
         if actor == self.agent_id || self.state.is_admin(actor) {
             return Ok(HookOutcome::ok());
         }
-        if !self.is_targeted(content) {
-            // Silent pass: message wasn't directed at this agent. The reject
-            // keeps it out of the conversation so the agent loop exits without
-            // generating a response (Option B from the integration plan).
-            return Ok(HookOutcome::reject("coord: not targeted at this agent"));
+        if self.is_targeted(content) {
+            return Ok(HookOutcome::ok());
         }
-        Ok(HookOutcome::ok())
+        if addresses_roster_member(content, &self.responder_roster) || has_explicit_mention(content)
+        {
+            return Ok(HookOutcome::reject(
+                "coord: query explicitly targets another agent",
+            ));
+        }
+        if is_coordination_query(content)
+            && let Some(elected) = elected_responder(
+                &correlation_id(scope, actor, content),
+                &self.responder_roster,
+            )
+        {
+            return if elected.eq_ignore_ascii_case(&self.agent_id) {
+                Ok(HookOutcome::ok())
+            } else {
+                Ok(HookOutcome::reject(
+                    "coord: another agent elected for query",
+                ))
+            };
+        }
+        // Silent pass: message wasn't directed at this agent. The reject keeps
+        // it out of the conversation so the agent loop exits without generating
+        // a response (Option B from the integration plan).
+        Ok(HookOutcome::reject("coord: not targeted at this agent"))
     }
 }
 
-/// Priority 16 — first responder wins; duplicates are rejected.
+/// Priority 16 — suppresses replayed inbound deliveries inside one daemon.
 ///
-/// Scope note (ISSUE-013): claims live in this process's in-memory
-/// `CoordinationState`, so deduplication is **process-local** — it covers
-/// hooks sharing one daemon's state, NOT separate tenant daemons watching
-/// the same MUC. Two independent agents can both claim and both respond.
-/// A shared compare-and-insert backend (host-local store or broker op) is
-/// deferred; treat this as opportunistic self-deduplication only.
+/// Cross-daemon first-responder selection for unaddressed `QUERY:` traffic is
+/// deterministic in [`EngagementPolicyHook`] when `COORD_RESPONDER_ROSTER` is
+/// configured. This hook is the second layer: it prevents one selected daemon
+/// from processing the same inbound delivery more than once during the TTL.
 pub struct FirstResponderHook {
     state: CoordinationState,
     agent_id: String,
@@ -590,13 +771,15 @@ impl FirstResponderHook {
     }
 }
 
-/// Correlation id from channel + content (FNV-style via DefaultHasher).
-fn correlation_id(channel: &str, content: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    channel.hash(&mut hasher);
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// Stable correlation ID shared by independent daemon builds and processes.
+fn correlation_id(channel: &str, sender: &str, content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(channel.to_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(sender.to_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(content.trim().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[async_trait]
@@ -618,7 +801,13 @@ impl Hook for FirstResponderHook {
         event: &HookEvent,
         _ctx: &HookContext,
     ) -> Result<HookOutcome, HookError> {
-        let HookEvent::Inbound { content, .. } = event else {
+        let HookEvent::Inbound {
+            user_id,
+            sender_id,
+            content,
+            ..
+        } = event
+        else {
             return Ok(HookOutcome::ok());
         };
         let Some(scope) = event.policy_scope() else {
@@ -627,7 +816,8 @@ impl Hook for FirstResponderHook {
         if !self.state.is_coordination_channel(scope).await {
             return Ok(HookOutcome::ok());
         }
-        let id = correlation_id(scope, content);
+        let sender = sender_id.as_deref().unwrap_or(user_id);
+        let id = correlation_id(scope, sender, content);
         match self
             .state
             .try_claim(&id, &self.agent_id, self.claim_ttl)
@@ -638,10 +828,10 @@ impl Hook for FirstResponderHook {
                 tracing::debug!(
                     agent = %self.agent_id,
                     claimed_by = %other,
-                    "coordination: message already claimed by another agent"
+                    "coordination: replayed message already processed"
                 );
                 Ok(HookOutcome::reject(
-                    "coord: another agent already claimed this message",
+                    "coord: replayed message already processed",
                 ))
             }
         }
@@ -897,10 +1087,11 @@ pub async fn register_coordination_hooks(
             5,
         ),
         (
-            Arc::new(EngagementPolicyHook::new(
+            Arc::new(EngagementPolicyHook::new_with_roster(
                 state.clone(),
                 config.agent_id.clone(),
                 config.agent_aliases.clone(),
+                config.responder_roster.clone(),
             )),
             15,
         ),
@@ -966,11 +1157,81 @@ mod tests {
         }
     }
 
+    #[test]
+    fn agent_id_supplies_safe_default_engagement_aliases() {
+        assert_eq!(
+            normalized_agent_aliases("Applejack", Vec::new()),
+            vec!["applejack", "@applejack"]
+        );
+        assert_eq!(
+            normalized_agent_aliases(
+                "Applejack@example.test/resource",
+                vec!["@AJ".to_string(), "@aj".to_string()]
+            ),
+            vec![
+                "@aj",
+                "applejack@example.test/resource",
+                "applejack",
+                "@applejack"
+            ]
+        );
+    }
+
+    #[test]
+    fn responder_roster_is_case_insensitive_and_fails_closed_on_invalid_ids() {
+        assert_eq!(
+            normalized_responder_roster(vec![
+                "Rarity".to_string(),
+                "Applejack".to_string(),
+                "applejack".to_string()
+            ]),
+            vec!["Applejack", "Rarity"]
+        );
+        assert!(
+            normalized_responder_roster(vec!["Applejack".to_string(), "bad id".to_string()])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn engagement_aliases_match_identifiers_not_substrings() {
+        let aliases = vec!["aj".to_string(), "@applejack".to_string()];
+        assert!(contains_addressed_alias("QUERY: aj status", &aliases));
+        assert!(contains_addressed_alias(
+            "QUERY: @Applejack status",
+            &aliases
+        ));
+        assert!(!contains_addressed_alias("QUERY: adjust status", &aliases));
+        assert!(!contains_addressed_alias(
+            "QUERY: @applejack2 status",
+            &aliases
+        ));
+        assert!(has_explicit_mention("QUERY: @unknown status"));
+        assert!(!has_explicit_mention("QUERY: mail me@example.test"));
+        assert!(!has_explicit_mention("QUERY: status"));
+    }
+
+    #[test]
+    fn independent_daemons_elect_the_same_responder() {
+        let roster_a = normalized_responder_roster(vec!["Rarity".into(), "Applejack".into()]);
+        let roster_b = normalized_responder_roster(vec!["applejack".into(), "rarity".into()]);
+        let id = correlation_id(
+            "COORD@conference.example",
+            "operator@example.test",
+            "QUERY: report status",
+        );
+        let elected_a = elected_responder(&id, &roster_a).map(str::to_ascii_lowercase);
+        let elected_b = elected_responder(&id, &roster_b).map(str::to_ascii_lowercase);
+        assert_eq!(elected_a, elected_b);
+        assert!(matches!(elected_a.as_deref(), Some("applejack" | "rarity")));
+    }
+
     fn test_config() -> CoordinationHookConfig {
         CoordinationHookConfig {
             enabled: true,
             agent_id: "agent-1".to_string(),
             agent_aliases: vec!["@agent1".to_string(), "agent1".to_string()],
+            responder_roster: Vec::new(),
             coordination_channels: vec!["coord@conference.example".to_string()],
             max_messages: 2,
             rate_window: Duration::from_secs(3600),
@@ -1033,10 +1294,34 @@ mod tests {
     #[test]
     fn test_allowlisted_tokens() {
         assert!(is_allowlisted_token("/usr/local/bin/some-long-path-token"));
+        assert!(is_allowlisted_token("../relative/file-name"));
+        assert!(is_allowlisted_token(
+            "https://example.test/releases/long-artifact-name"
+        ));
         assert!(is_allowlisted_token(
             "da39a3ee5e6b4b0d3255bfef95601890afd80709"
         ));
+        assert!(!is_allowlisted_token(
+            "prefix/A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0"
+        ));
         assert!(!is_allowlisted_token("A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0"));
+    }
+
+    #[test]
+    fn explicit_secret_patterns_cover_credentials_keys_and_jwts() {
+        assert_eq!(
+            explicit_secret_kind("STATUS: api_key=abcdefghijklmnop").unwrap(),
+            Some("credential assignment")
+        );
+        assert_eq!(
+            explicit_secret_kind("-----BEGIN PRIVATE KEY-----").unwrap(),
+            Some("private key material")
+        );
+        assert_eq!(
+            explicit_secret_kind("STATUS: eyJaaaaaaaaaa.eyJbbbbbbbbbb.cccccccccccc").unwrap(),
+            Some("JWT token")
+        );
+        assert_eq!(explicit_secret_kind("STATUS: safe").unwrap(), None);
     }
 
     #[tokio::test]
@@ -1135,20 +1420,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_first_responder_second_caller_rejected() {
+    async fn test_first_responder_suppresses_cross_agent_and_replayed_claims() {
         let state = test_state();
         state
             .try_claim("corr-2", "agent-1", Duration::from_secs(2))
             .await;
-        let r2 = state
+        let cross_agent = state
             .try_claim("corr-2", "agent-2", Duration::from_secs(2))
             .await;
-        assert_eq!(r2, ClaimResult::AlreadyClaimed("agent-1".to_string()));
-        // Same agent re-claiming is fine (idempotent).
-        let r3 = state
+        assert_eq!(
+            cross_agent,
+            ClaimResult::AlreadyClaimed("agent-1".to_string())
+        );
+        let replay = state
             .try_claim("corr-2", "agent-1", Duration::from_secs(2))
             .await;
-        assert_eq!(r3, ClaimResult::Claimed);
+        assert_eq!(replay, ClaimResult::AlreadyClaimed("agent-1".to_string()));
     }
 
     #[tokio::test]
@@ -1164,15 +1451,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secret_entropy_allows_normal_text() {
+    async fn test_secret_entropy_allows_normal_text_and_known_safe_tokens() {
         let hook = SecretEntropyHook::new(test_state(), "agent-1".to_string(), 4.8, 32);
-        let event = inbound(
-            "agent-2",
-            "coord@conference.example",
+        for content in [
             "STATUS: deployment finished successfully on all hosts",
-        );
-        let outcome = hook.execute(&event, &ctx()).await;
-        assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
+            "STATUS: commit da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "STATUS: artifact /usr/local/bin/some-long-path-token",
+            "STATUS: docs https://example.test/releases/long-artifact-name",
+        ] {
+            let event = inbound("agent-2", "coord@conference.example", content);
+            let outcome = hook.execute(&event, &ctx()).await;
+            assert!(matches!(outcome, Ok(HookOutcome::Continue { .. })));
+        }
     }
 
     #[tokio::test]
@@ -1224,19 +1514,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secret_entropy_outbound_strikes_local_agent() {
-        // ISSUE-004 regression: an outbound secret must be attributed to the
-        // local emitting agent, not the conversation peer named by the event.
-        let dir = std::env::temp_dir().join(format!(
-            "coord-entropy-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+    async fn secret_detection_strikes_sender_and_local_transform_once_each() {
+        let dir = tempfile::tempdir().expect("temporary secret violation directory");
         let store = Arc::new(ViolationStore::new(
-            dir.join("violations.json"),
+            dir.path().join("violations.json"),
             crate::gate::violation_store::ViolationStoreConfig {
                 max_violations: 3,
                 disable_duration_secs: 3600,
@@ -1250,22 +1531,28 @@ mod tests {
             Some(Arc::clone(&store)),
         );
         let hook = SecretEntropyHook::new(state, config.agent_id, 4.8, 32);
-        let event = outbound(
+        let inbound_secret = inbound(
             "remote-peer",
             "coord@conference.example",
-            "STATUS: key A9f3Kx82LmQpZ7wT1vBnR4yUeC6sGhJ0x2 done",
+            "STATUS: api_key=abcdefghijklmnop",
         );
         assert!(matches!(
-            hook.execute(&event, &ctx()).await,
+            hook.execute(&inbound_secret, &ctx()).await,
+            Ok(HookOutcome::Reject { .. })
+        ));
+        let transformed_secret =
+            transformed("coord@conference.example", "STATUS: token=qrstuvwxyzabcdef");
+        assert!(matches!(
+            hook.execute(&transformed_secret, &ctx()).await,
             Ok(HookOutcome::Reject { .. })
         ));
         assert_eq!(
-            store.status("agent-1"),
+            store.status("remote-peer"),
             crate::gate::violation_store::ViolationStatus::Warning
         );
         assert_eq!(
-            store.status("remote-peer"),
-            crate::gate::violation_store::ViolationStatus::Active
+            store.status("agent-1"),
+            crate::gate::violation_store::ViolationStatus::Warning
         );
     }
 
@@ -1310,6 +1597,56 @@ mod tests {
         );
         let outcome = hook.execute(&event, &ctx()).await;
         assert!(matches!(outcome, Ok(HookOutcome::Reject { .. })));
+    }
+
+    #[tokio::test]
+    async fn team_roster_elects_exactly_one_daemon_for_unaddressed_query() {
+        let roster = vec!["agent-1".to_string(), "agent-2".to_string()];
+        let hook_a = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-1".into(),
+            vec!["@agent1".into()],
+            roster.clone(),
+        );
+        let hook_b = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-2".into(),
+            vec!["@agent2".into()],
+            roster,
+        );
+        let event = inbound(
+            "operator",
+            "coord@conference.example",
+            "QUERY: report deployment status",
+        );
+        let accepted = [
+            hook_a.execute(&event, &ctx()).await,
+            hook_b.execute(&event, &ctx()).await,
+        ]
+        .into_iter()
+        .filter(|result| matches!(result, Ok(HookOutcome::Continue { .. })))
+        .count();
+        assert_eq!(accepted, 1);
+    }
+
+    #[tokio::test]
+    async fn explicit_peer_mention_never_falls_through_to_roster_election() {
+        let hook = EngagementPolicyHook::new_with_roster(
+            test_state(),
+            "agent-1".into(),
+            vec!["@agent1".into()],
+            vec!["agent-1".into(), "agent-2".into()],
+        );
+        for content in ["QUERY: @agent2 status", "QUERY: @unknown status"] {
+            assert!(matches!(
+                hook.execute(
+                    &inbound("operator", "coord@conference.example", content),
+                    &ctx()
+                )
+                .await,
+                Ok(HookOutcome::Reject { .. })
+            ));
+        }
     }
 
     #[tokio::test]

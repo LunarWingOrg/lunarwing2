@@ -5,7 +5,7 @@
 **Initial report commit:** `271d2b8`
 **Overall status:** Not release-ready (at review time)
 
-**Verification pass (2026-07-31, branch aj/kimi-2-20260731-0001):** all 14 issues independently verified against the code; every one was confirmed real. ISSUE-001 through ISSUE-012 and ISSUE-014 are fixed in the commits noted per issue below; ISSUE-013 is addressed via the doc-accuracy path the recommended fix allows (shared backend deferred). Each fix carries regression tests; suites: hooks 83/83, coordination+gate+coalesce green, xmpp 76/76, agent 459/459, health-systemd 34/34, health-openrc 43/43.
+**Verification pass (2026-07-31, branch aj/kimi-2-20260731-0001):** all 14 issues independently verified against the code; every one was confirmed real. ISSUE-001 through ISSUE-012 and ISSUE-014 were fixed in the commits noted per issue below; ISSUE-013 initially took the allowed doc-accuracy path and was functionally resolved in v2.0.7 with deterministic roster election plus replay suppression. Each fix carries regression tests; suites: hooks 83/83, coordination+gate+coalesce green, xmpp 76/76, agent 459/459, health-systemd 34/34, health-openrc 43/43.
 
 **Residual-fix verification (2026-07-31, branch `lotofissueswithorch`, head `d0d0a04`):** six follow-up fixes verified with passing suites. (1) Coalesce delivery-barrier read guard is now moved INTO the detached flush task — previously dropped at `spawn_flush` return, letting `flush_all` complete mid-delivery (`test_flush_all_waits_for_early_flush_callback` was failing). (2) `bootstrap_hooks` clippy signature (`too_many_arguments`). (3) AlwaysAllow now persists only when the approved action genuinely succeeded — tool-level failures arrive as `Ok(is_error: true)` and no longer earn auto-approval. (4) Gate expiry/orphan finalization is routed through `ThreadManager::finalize_waiting_thread_as_failed` + `ConversationManager::untrack_thread_everywhere` — previously direct store writes leaked no-TTL leases and stale conversation tracking. (5) The approval resolving window (inline action execution between gate removal and resume) is interrupt-visible and cancellable via a per-thread `CancellationToken`; regression test `interrupt_cancels_resolving_window_and_finalizes_waiting_thread`. (6) `engine_v2_channel_delivery_matrix` transform-reject case fixed — test-side race: it waited for thread `Done`, which the finisher sets BEFORE the handler runs the transform hook; it now waits for the hook itself. Suites this pass: `lunarwing_engine` lib 435/435; root focused suites 42/42 (coordination_ 7, mission_notification_ 3, coalesce 19, interrupt_ 6, expired_gate 5, resolving_window 1, coordination_gate 1); `engine_v2_channel_delivery_matrix` 1/1 (`--features="libsql integration"`); health-systemd 49/49; health-openrc 43/43; mt-admin shell harnesses pass; `cargo check --all-features`, `cargo clippy --all --benches --tests --examples --all-features -- -D warnings`, `cargo fmt --all -- --check` all clean.
 
@@ -552,10 +552,8 @@ file ownership, mode, and unrelated operator settings.
 ### ISSUE-013: First-responder claims are process-local, not host-wide or team-wide
 
 **Severity:** Medium
-**Status:** Confirmed real (limitation) — addressed in `7a5495f`: feature re-documented as process-local; shared compare-and-insert claim backend explicitly deferred (doc-accuracy path per the recommended fix)
-**Affected code:** `ic/src/hooks/coordination.rs:155-180`,
-`ic/src/hooks/coordination.rs:472-545`,
-`ic/src/hooks/coordination.rs:738-763`
+**Status:** Confirmed real — FIXED in v2.0.7 (`3f351dde`): stable roster-based rendezvous election coordinates independent daemons; process-local claims now suppress replay
+**Affected code:** `ic/src/hooks/coordination.rs`
 
 #### Observed behavior
 
@@ -579,11 +577,17 @@ teams. Claim must be one compare-and-insert operation keyed by stable message or
 correlation ID. If this is deferred, describe the feature as process-local and
 remove claims of deployed multi-agent deduplication.
 
-#### Required validation
+#### Implemented resolution and validation
 
-- Start two independent agent processes against one shared claim backend.
-- Deliver the same message concurrently and assert exactly one claim succeeds.
-- Verify TTL expiry, process crash recovery, and unrelated correlation IDs.
+v2.0.7 avoids a shared backend by requiring the same normalized
+`COORD_RESPONDER_ROSTER` on all participating daemons. A stable SHA-256
+room/sender/content correlation ID and rendezvous hash makes every process elect
+one identical winner for unaddressed `QUERY:` messages; explicit mentions keep
+direct routing. The elected process records a TTL claim and rejects both
+cross-agent and same-agent replay. Tests verify roster-order/case independence,
+exactly one accepted independent hook instance, stable correlation behavior, and
+replay suppression. This resolves duplicate-response capability; unlike a live
+broker, it intentionally cannot fail over when the elected daemon is offline.
 
 ## Test Reliability
 
@@ -634,9 +638,9 @@ shared `.tmp` rename target.
 
 ## Release Recommendation
 
-Superseded by the 2026-07-31 verification pass: ISSUE-001 through ISSUE-007
-(and 008-012, 014) are fixed and tested; ISSUE-013 is documented as
-process-local with the shared backend deferred. Remaining pre-release work
-from this review: runtime end-to-end coverage that starts the same channel,
-hook, gate, init, and health paths used in production — component-only tests
-and a clean compile cannot validate these integration boundaries.
+Superseded by the 2026-07-31 verification pass and v2.0.7 coordination
+hardening: ISSUE-001 through ISSUE-014 are now fixed and tested. Remaining
+pre-release work from the original review is runtime end-to-end coverage that
+starts the same channel, hook, gate, init, and health paths used in production —
+component-only tests and a clean compile cannot validate every integration
+boundary.

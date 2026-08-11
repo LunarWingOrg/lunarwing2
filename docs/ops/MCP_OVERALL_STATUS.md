@@ -1,7 +1,7 @@
 # MCP Overall Status
 
-**Status as of 2026-08-09:** MCP work is partial overall. Part 1 host-local
-lifecycle, the public runtime-adapter boundary, stateful MCP-over-WASM,
+**Status as of 2026-08-11:** MCP work is partial overall. Part 1 host-local
+lifecycle, the internal built-in runtime-dispatch boundary, stateful MCP-over-WASM,
 dedicated/shared gateway client placement, and core Docker job-worker placement
 are implemented. Package, marketplace, and remaining sandbox hardening stay open.
 
@@ -28,14 +28,26 @@ Implemented scope includes:
 
 ## Part 2 Runtime Status
 
-Implemented on 2026-08-09:
+Implemented through 2026-08-11:
 
-- `McpRuntimeAdapter` plus an extensible registry dispatch HTTP, stdio, Unix,
-  stateful WASM, and gateway activation through one validated factory path.
+- `McpRuntimeAdapter` plus an internal closed registry dispatch HTTP, stdio, Unix,
+  stateful WASM, and gateway activation through one validated factory path. This is
+  not a production plugin API; generic external runtime descriptors remain deferred.
 - MCP-over-WASM uses one persistent component actor per active server, a raw
   JSON-RPC WIT boundary, no WASI/host imports, single-open artifact loading,
   optional operator-pinned digest verification, terminal-trap recovery, and bounded
   memory, fuel, wall time, and message sizes.
+- MCP-over-WASM is synchronous client-to-server tool transport only. LunarWing does
+  not expose unsolicited server events, server-to-client requests, resources, prompts,
+  or subscriptions through its MCP client surface. Source WAT coverage validates
+  protocol envelopes, state, pagination, calls, limits, timeout, traps, and replacement.
+- Client initialization advertises empty capabilities, strictly classifies inbound
+  envelopes, and negotiates exactly `2024-11-05`. Discovery follows bounded pagination.
+  Negotiated `tools.listChanged` signals flow through stream and persistent HTTP GET/SSE
+  transports, including gateways, into generation-safe atomic wrapper refresh.
+- Later-revision canonical tool annotations deserialize with spec defaults but remain
+  untrusted hints under operator approval policy; they are not claimed as part of the
+  negotiated `2024-11-05` revision.
 - Gateway placement distinguishes dedicated and shared deployments. Shared
   endpoints require a validated route; mode and route headers are host-owned and
   cannot be overridden by configured request headers.
@@ -46,7 +58,8 @@ Implemented on 2026-08-09:
   control-plane service; operators may deploy and scale that service separately.
 - Explicit `host` and `job_worker` placement separates daemon and job activation.
   Legacy configs default to `host`; worker placement accepts stdio only.
-- Job creation takes an immutable owner-scoped snapshot of enabled worker configs.
+- Job creation takes an immutable owner-scoped snapshot of explicitly selected enabled
+  worker names; none are selected by default. Restart state stores those exact names.
   Secret names become separate job-scoped grants, and values are fetched through a
   dedicated authenticated worker route instead of entering normal shell credentials.
 - Core Docker workers activate only preinstalled commands, verify pinned provenance
@@ -62,8 +75,14 @@ Implemented on 2026-08-09:
   non-dumpable, and MCP activation requires Yama `kernel.yama.ptrace_scope >= 1`
   so same-UID MCP and shell siblings cannot inspect each other's credential state.
   Completion and unexpected-exit events route through authoritative job ownership.
+- Per-server worker supervisors rebuild failed stdio runtimes from immutable snapshots
+  with generation-safe discovery and atomic replacement. Bounded retries persist terminal
+  circuit state and remove dead wrappers.
+- Pinned stdio execution is atomic on Linux: verified sealed native bytes execute through
+  `memfd` plus `execveat`, with a 128 MiB cap. Scripts and non-Linux pinning fail closed;
+  unpinned legacy stdio remains available.
 
-Part 2 verification on 2026-08-09:
+Historical Part 2 verification on 2026-08-09:
 
 - `taskset -c 0-5 cargo test -j6 --lib --all-features mcp -- --test-threads=6`:
   358 passed.
@@ -74,6 +93,16 @@ Part 2 verification on 2026-08-09:
 - `taskset -c 0-5 cargo fmt --all -- --check`: passed.
 - `node --check src/channels/web/static/app.js`: passed.
 - `git diff HEAD --check`: passed.
+
+Remediation verification on 2026-08-11:
+
+- All-feature serialized library suite: 4,715 passed, 4 ignored.
+- Engine V2 MCP compatibility: 3 passed.
+- Rustfmt, all-feature/PostgreSQL/libSQL checks, and zero-warning all-feature clippy:
+  passed with six-core affinity.
+- Full release aggregation remains blocked outside the MCP diff: six real channel WASM
+  tests need artifacts that could not be built because `rustup`/`wasm32-wasip2` are
+  unavailable; existing skill-selection and TensorZero streaming expectations also fail.
 
 Completed verification for the host-local lifecycle checkpoint:
 
@@ -117,9 +146,8 @@ These are validation and coverage tasks, not known production-code defects.
   placement contract is implemented.
 - Configurable startup and request timeouts for every transport. MCP-over-WASM
   per-message deadlines and bounded transport/process shutdown are implemented.
-- Post-start worker MCP crash supervision and restart. Worker startup/discovery and
-  teardown are bounded, tool-call failures remain visible, and container termination
-  remains the final isolation boundary for this per-job prototype.
+- Generic external runtime descriptors and production adapter-plugin composition. Current
+  runtime registry intentionally remains an internal closed built-in dispatch boundary.
 
 Automatic npm/pip installation must remain blocked until provenance, dependency
 locking, containment, audit, revocation, health, and rollback policies exist.

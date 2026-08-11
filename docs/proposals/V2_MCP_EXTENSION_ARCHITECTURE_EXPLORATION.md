@@ -1,8 +1,8 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-08-09): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
-> stdio lifecycle, a public runtime-adapter registry, stateful MCP-over-WASM, and
-> dedicated/shared gateway client placement are implemented. Core Docker job workers
+> **Current status (2026-08-11): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
+> stdio lifecycle, an internal built-in runtime-dispatch registry, stateful
+> MCP-over-WASM, and dedicated/shared gateway client placement are implemented. Core Docker job workers
 > also support explicit worker-local stdio placement with immutable owner snapshots,
 > separate credential grants, and bounded lifecycle. The runtime-neutral
 > package model, persistent-worker MCP placement, marketplace signatures/dependency locks,
@@ -43,9 +43,9 @@ Under this model:
   execution is acceptable.
 - Worker-hosted MCP becomes an explicit placement for project-local, native,
   stateful, or computationally heavy servers.
-- MCP-over-WASM becomes a compatibility runtime for portable MCP servers and for
-  servers that need the broader MCP surface, not the default way to write a small
-  LunarWing tool.
+- MCP-over-WASM becomes a compatibility runtime for portable synchronous MCP tool
+  servers, not the default way to write a small LunarWing tool. Broader server events,
+  requests, resources, prompts, and subscriptions need a future host event ABI.
 - Native WASM tools remain the preferred shape for narrow, capability-scoped tool
   integrations.
 - Embedded modules remain exceptional and first-party.
@@ -118,8 +118,9 @@ can re-spawn a crashed child without re-fetching grants.
 ### Core per-job workers support explicit MCP placement
 
 `McpServerConfig.placement` distinguishes backward-compatible `host` activation
-from `job_worker`. On core Docker job creation, LunarWing takes an immutable
-owner-scoped snapshot of enabled worker stdio configs and separate secret grants.
+from `job_worker`. Core Docker job creation selects exact enabled server names, with
+none selected by default, then takes an immutable owner-scoped snapshot and separate
+secret grants. Restart state stores and resolves those same names.
 The worker verifies any pinned executable against its own image, initializes MCP,
 discovers tools, and atomically adds autonomous wrappers to its fresh `ToolRegistry`.
 It unregisters wrappers and stops all MCP runtime state before job completion.
@@ -154,11 +155,27 @@ tool invocation, secret existence checks, and related controlled operations.
 MCP-over-WASM is implemented separately in `ic/wit/mcp-server.wit` and
 `ic/src/tools/mcp/wasm_transport.rs`. Each active server retains one component
 instance and receives complete JSON-RPC envelopes through a serialized `handle`
-export. This preserves initialization, resources, prompts, notifications,
-cancellation messages, subscriptions, and future protocol methods without expanding
-the WIT ABI for every MCP revision. The linker supplies no WASI or host imports and
-bounds artifact size, message size, memory, fuel, and wall time; a trap stops the
-actor and manager supervision reconstructs it from persisted intent.
+export. This supports synchronous client-to-server initialization, initialized
+notification, tool discovery, and tool calls while preserving guest state. It has no
+event/outbox path for unsolicited server events or server-to-client requests, and
+LunarWing exposes no resources, prompts, or subscriptions through this client surface.
+The linker supplies no WASI or host imports and bounds artifact size, message size,
+memory, fuel, and wall time; a trap stops the actor and manager supervision reconstructs
+it from persisted intent. A source WAT fixture validates protocol envelopes, state,
+pagination, calls, memory and fuel enforcement, timeout, traps, and wrapper replacement.
+
+### Current MCP protocol scope is conservative and bounded
+
+The client advertises empty capabilities and strictly separates inbound JSON-RPC
+responses, errors, requests, and notifications. Initialization negotiates exactly
+`2024-11-05`. Tool discovery follows bounded pagination and rejects repeated cursors.
+When negotiated, `tools.listChanged` signals flow through stream transports and one
+bounded persistent Streamable HTTP GET/SSE listener, including gateway placement, into
+generation-safe host and worker atomic wrapper refresh.
+
+Canonical annotation fields from later MCP revisions deserialize with their specified
+defaults but remain untrusted advisory input under operator policy. This does not claim
+annotation support in negotiated revision `2024-11-05`.
 
 The separate actor does not change the preferred format for small tools: native WASM
 tools keep their narrower capability-scoped ABI and fresh-instance isolation.
@@ -176,10 +193,12 @@ addition to checksums.
 
 ### Automatic npm/pip MCP installation is not implemented
 
-Current stdio manifests describe a command, arguments, and environment. The MCP
-path does not download or manage npm/PyPI packages, and WASM artifact checksums do
-not verify the executable or dependency tree behind a stdio command. Operators are
-responsible for installing and pinning that command.
+Current stdio manifests describe a command, arguments, and environment. The MCP path
+does not download or manage npm/PyPI packages. Operator pinning verifies and executes
+the same sealed native bytes on Linux through `memfd` plus `execveat`, with a 128 MiB
+cap; scripts and non-Linux pinning fail closed while unpinned legacy stdio remains.
+This still does not verify an npm/PyPI dependency tree. Operators remain responsible
+for installation.
 
 Automatic installation could provide one-command setup, exact version selection,
 reproducible tenant provisioning, and managed upgrade/rollback. It would also run
@@ -362,9 +381,10 @@ native WASM tool ABI while also inheriting MCP lifecycle complexity.
 
 **Assessment**
 
-Treat MCP-over-WASM as an optional compatibility runtime. Build it only when
-specific extensions need resources, prompts, notifications, portable MCP reuse, or
-cross-client serving. Do not require simple WASM tools to implement MCP.
+Treat shipped MCP-over-WASM as an optional synchronous tool compatibility runtime.
+Portable MCP reuse beyond that surface, including resources, prompts, notifications,
+server requests, and cross-client serving, needs more ABI and client work. Do not
+require simple WASM tools to implement MCP.
 
 ### 4. MCP inside a per-job worker container
 
@@ -551,7 +571,7 @@ package must not automatically grant all tenants or all execution placements acc
 | Native dependencies or language runtime | Job worker or dedicated worker |
 | Durable state or long-lived subscriptions | Dedicated worker or gateway |
 | GPU or heavy compute | Dedicated worker |
-| Full MCP resources/prompts/notifications in portable sandbox | MCP-over-WASM |
+| Stateful synchronous MCP tools in portable sandbox | MCP-over-WASM |
 | Core first-party runtime integration | Embedded Rust module |
 
 This table should guide defaults, not impose hard prohibitions. Manifests and policy
@@ -610,7 +630,9 @@ The package lifecycle should remain consistent even when runtime behavior differ
 10. Upgrade with artifact and capability diff review.
 11. Deactivate, revoke grants, stop runtime resources, and remove.
 
-The implemented MCP runtime registry delegates these resources:
+The implemented MCP runtime registry is an `INTERNAL` closed built-in dispatch boundary,
+not a production plugin API. Generic external runtime descriptors remain deferred. It
+delegates these resources:
 
 - Process adapter: child lifecycle, stdio framing, sandboxing, provenance, and
   shutdown. Whole-runtime recovery still recreates the client and wrappers rather
@@ -625,8 +647,9 @@ The implemented MCP runtime registry delegates these resources:
 
 The core Docker worker adapter now owns immutable descriptor/grant delivery,
 worker-image provenance checks, bounded startup, atomic tool registration, and
-pre-completion teardown. Post-start MCP process restart, package delivery, and
-persistent external-worker placement remain open.
+pre-completion teardown. Post-start MCP process restart ships with generation-safe
+atomic refresh, bounded retry, persistent circuit state, and dead-wrapper removal.
+Package delivery and persistent external-worker placement remain open.
 
 ## Suggested Exploration Sequence
 
@@ -662,6 +685,8 @@ This phase can be designed without implementing new runtimes.
 - `McpRuntimeAdapter` and `McpRuntimeRegistry` provide the common MCP activation
   interface and preserve existing client/tool lifecycle behavior across runtimes.
 - HTTP, stdio, Unix, stateful WASM, and gateway adapters ship in the default registry.
+- Registry remains internal closed built-in dispatch. Production plugin composition and
+  generic external runtime descriptors remain deferred package/runtime design work.
 - Broader package-level adapter vocabulary and common WASM tool/channel network,
   credential, leak-detection, rate-limit, and audit primitives remain Phase 1/package
   policy work rather than MCP activation blockers.
@@ -688,13 +713,15 @@ compatibility guard, autonomous-tool checks, and fail-closed bounded cleanup.
 ### Phase 5: MCP-over-WASM runtime (implemented 2026-08-09)
 
 The stateful actor and host transport are implemented. Raw JSON-RPC preserves MCP
-initialization, capability negotiation, multiple tools, resources, prompts,
-notifications, cancellation messages, and subscriptions without a version-specific
-WIT expansion. The host owns persistent session state and enforces long-running
-operation limits with fuel and epoch deadlines.
+client requests and client notifications without version-specific WIT expansion. Current
+LunarWing use is synchronous initialization, paginated tool discovery, and tool calls;
+there is no unsolicited server-event or server-request path and no LunarWing resources,
+prompts, or subscriptions surface. Host owns persistent actor state and enforces memory,
+fuel, epoch-deadline, timeout, and envelope limits.
 
-Representative guest interoperability and serving the same component to a
-non-LunarWing client remain release validation, not missing runtime architecture.
+Source WAT interoperability now covers protocol framing, state, pagination, calls,
+resource limits, timeout, traps, and manager wrapper replacement. Serving same component
+to a non-LunarWing client remains release validation.
 Native WASM tools remain the better implementation for ordinary narrow tool calls.
 
 ## Non-Goals

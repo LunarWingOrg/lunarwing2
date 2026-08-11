@@ -91,6 +91,23 @@ impl McpTransport for GatewayMcpTransport {
     fn supports_http_features(&self) -> bool {
         true
     }
+
+    fn set_tools_list_changed(&self, enabled: bool) {
+        self.inner.set_tools_list_changed(enabled);
+    }
+
+    fn tools_generation(&self) -> u64 {
+        self.inner.tools_generation()
+    }
+
+    async fn start_notifications(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<(), ToolError> {
+        self.inner
+            .start_notifications(&self.managed_headers(headers))
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -227,5 +244,24 @@ mod tests {
 
         assert_eq!(headers["x-lunarwing-mcp-gateway-mode"], "dedicated");
         assert!(headers.get("x-lunarwing-mcp-route").is_none());
+    }
+
+    #[test]
+    fn gateway_delegates_tools_generation() {
+        let transport = GatewayMcpTransport::new(
+            "http://localhost:1234/mcp",
+            "test",
+            McpGatewayMode::Dedicated,
+            None,
+            Arc::new(McpSessionManager::new()),
+        );
+        transport.set_tools_list_changed(true);
+        assert!(
+            transport
+                .inner
+                .notifications_for_test()
+                .handle_notification("notifications/tools/list_changed")
+        );
+        assert_eq!(transport.tools_generation(), 1);
     }
 }

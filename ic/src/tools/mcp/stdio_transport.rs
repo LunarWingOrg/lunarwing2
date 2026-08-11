@@ -40,6 +40,124 @@ const SAFE_INHERITED_ENV: &[&str] = &[
 ];
 const MCP_CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[cfg(target_os = "linux")]
+struct PreparedDescriptorExec {
+    // Keep CString buffers alive; pointer arrays below address these buffers.
+    _argv_strings: Vec<std::ffi::CString>,
+    argv: Box<[*mut libc::c_char]>,
+    _env_strings: Vec<std::ffi::CString>,
+    env: Box<[*mut libc::c_char]>,
+    executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+}
+
+// SAFETY: pointers address immutable CString heap buffers owned by same struct.
+// libc models exec argv/env entries as mutable, but kernel only reads them.
+// Moving struct between threads does not move those buffers.
+#[cfg(target_os = "linux")]
+unsafe impl Send for PreparedDescriptorExec {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for PreparedDescriptorExec {}
+
+#[cfg(target_os = "linux")]
+impl PreparedDescriptorExec {
+    fn exec(&self) -> std::io::Result<()> {
+        let fd = self.executable.raw_fd();
+        let empty_path = c"";
+        let result = unsafe {
+            libc::execveat(
+                fd,
+                empty_path.as_ptr(),
+                self.argv.as_ptr(),
+                self.env.as_ptr(),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        debug_assert_eq!(result, -1);
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_verified_exec(
+    command: &mut Command,
+    executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+    command_name: &str,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+) -> Result<(), ToolError> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+
+    let mut argv_strings = Vec::with_capacity(args.len() + 1);
+    argv_strings.push(
+        std::ffi::CString::new(command_name.as_bytes()).map_err(|_| {
+            ToolError::ExternalService("Pinned MCP command contains a NUL byte".to_string())
+        })?,
+    );
+    for arg in args {
+        argv_strings.push(std::ffi::CString::new(arg.as_bytes()).map_err(|_| {
+            ToolError::ExternalService(
+                "Pinned MCP command argument contains a NUL byte".to_string(),
+            )
+        })?);
+    }
+    let env_strings = env
+        .iter()
+        .map(|(name, value)| {
+            if name.as_bytes().contains(&b'=') {
+                return Err(ToolError::ExternalService(
+                    "Pinned MCP environment name contains '='".to_string(),
+                ));
+            }
+            let mut entry = Vec::with_capacity(name.len() + value.len() + 1);
+            entry.extend_from_slice(name.as_bytes());
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_bytes());
+            std::ffi::CString::new(entry).map_err(|_| {
+                ToolError::ExternalService("Pinned MCP environment contains a NUL byte".to_string())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let argv = argv_strings
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let env = env_strings
+        .iter()
+        .map(|value| value.as_ptr().cast_mut())
+        .chain(std::iter::once(std::ptr::null_mut()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let prepared = PreparedDescriptorExec {
+        _argv_strings: argv_strings,
+        argv,
+        _env_strings: env_strings,
+        env,
+        executable,
+    };
+    // SAFETY: sandbox hooks were installed first. This final hook only calls
+    // execveat using immutable storage prepared before fork.
+    unsafe {
+        command.as_std_mut().pre_exec(move || prepared.exec());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_verified_exec(
+    _command: &mut Command,
+    _executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+    _command_name: &str,
+    _args: &[OsString],
+    _env: &[(OsString, OsString)],
+) -> Result<(), ToolError> {
+    Err(ToolError::ExternalService(
+        "Atomic execution of pinned MCP commands is unsupported on this platform".to_string(),
+    ))
+}
+
 #[cfg(windows)]
 const SAFE_INHERITED_ENV_WINDOWS: &[&str] = &[
     "APPDATA",
@@ -98,6 +216,7 @@ pub struct StdioMcpTransport {
     server_name: String,
     stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>>,
+    notifications: Arc<crate::tools::mcp::transport::McpNotificationState>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     stderr_handle: Mutex<Option<JoinHandle<()>>>,
     child: Arc<Mutex<Child>>,
@@ -127,13 +246,61 @@ impl StdioMcpTransport {
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
     ) -> Result<Self, ToolError> {
+        Self::spawn_inner(name, command, args, env, suppress_stderr, sandbox, None).await
+    }
+
+    /// Spawn using descriptor retained by pinned provenance verification.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_verified(
+        name: impl Into<String>,
+        command: &str,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+        env: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
+        suppress_stderr: bool,
+        sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
+        executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+    ) -> Result<Self, ToolError> {
+        Self::spawn_inner(
+            name,
+            command,
+            args,
+            env,
+            suppress_stderr,
+            sandbox,
+            Some(executable),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_inner(
+        name: impl Into<String>,
+        command: &str,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+        env: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
+        suppress_stderr: bool,
+        sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
+        executable: Option<crate::tools::mcp::provenance::VerifiedStdioExecutable>,
+    ) -> Result<Self, ToolError> {
         let server_name = name.into();
+        let args = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_os_string())
+            .collect::<Vec<_>>();
+        let explicit_env = env
+            .into_iter()
+            .map(|(name, value)| (name.as_ref().to_os_string(), value.as_ref().to_os_string()))
+            .collect::<Vec<_>>();
+        let mut child_env = safe_process_environment();
+        for (name, value) in &explicit_env {
+            child_env.retain(|(inherited, _)| inherited != name);
+            child_env.push((name.clone(), value.clone()));
+        }
 
         let mut cmd = Command::new(command);
-        cmd.args(args)
+        cmd.args(&args)
             .env_clear()
-            .envs(safe_process_environment())
-            .envs(env)
+            .envs(child_env.iter().map(|(name, value)| (name, value)))
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -146,6 +313,10 @@ impl StdioMcpTransport {
                     server_name, command, error
                 ))
             })?;
+        }
+
+        if let Some(executable) = executable {
+            install_verified_exec(&mut cmd, executable, command, &args, &child_env)?;
         }
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -178,9 +349,15 @@ impl StdioMcpTransport {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let notifications = Arc::new(crate::tools::mcp::transport::McpNotificationState::default());
 
         let reader = BufReader::new(stdout);
-        let reader_handle = spawn_jsonrpc_reader(reader, pending.clone(), server_name.clone());
+        let reader_handle = spawn_jsonrpc_reader(
+            reader,
+            pending.clone(),
+            Arc::clone(&notifications),
+            server_name.clone(),
+        );
 
         let stderr_name = server_name.clone();
         let stderr_handle = tokio::spawn(async move {
@@ -214,6 +391,7 @@ impl StdioMcpTransport {
             server_name,
             stdin: Arc::new(Mutex::new(stdin)),
             pending,
+            notifications,
             reader_handle: Mutex::new(Some(reader_handle)),
             stderr_handle: Mutex::new(Some(stderr_handle)),
             child: Arc::new(Mutex::new(child)),
@@ -308,6 +486,14 @@ impl McpTransport for StdioMcpTransport {
     fn supports_http_features(&self) -> bool {
         false
     }
+
+    fn set_tools_list_changed(&self, enabled: bool) {
+        self.notifications.set_tools_list_changed(enabled);
+    }
+
+    fn tools_generation(&self) -> u64 {
+        self.notifications.tools_generation()
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +572,63 @@ mod tests {
 
         assert!(status.success());
         transport.shutdown().await.expect("shutdown should succeed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pinned_spawn_executes_verified_descriptor_after_path_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let command = temp.path().join("server");
+        let replacement = temp.path().join("server-replacement");
+        let native_true = crate::tools::mcp::provenance::resolve_command_path("true")
+            .expect("resolve native true");
+        let native_false = crate::tools::mcp::provenance::resolve_command_path("false")
+            .expect("resolve native false");
+        std::fs::copy(native_true, &command).expect("copy verified native executable");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod verified executable");
+        let provenance = crate::tools::mcp::provenance::McpPackageProvenance::pin_for_command(
+            command.to_str().expect("utf-8 command"),
+            crate::tools::mcp::provenance::ProvenanceIdentity::default(),
+        )
+        .expect("pin executable");
+        let executable = provenance
+            .prepare_stdio_command(command.to_str().expect("utf-8 command"))
+            .expect("verify executable")
+            .expect("pinned descriptor");
+
+        std::fs::copy(native_false, &replacement).expect("copy replacement native executable");
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement executable");
+        std::fs::rename(&replacement, &command).expect("replace executable path");
+        let sandbox = crate::tools::mcp::sandbox::McpSandboxConfig {
+            no_new_privileges: true,
+            ..Default::default()
+        };
+
+        let transport = StdioMcpTransport::spawn_verified(
+            "pinned-race",
+            command.to_str().expect("utf-8 command"),
+            std::iter::empty::<&str>(),
+            std::iter::empty::<(&str, &str)>(),
+            false,
+            Some(&sandbox),
+            executable,
+        )
+        .await
+        .expect("spawn verified descriptor");
+        let status =
+            tokio::time::timeout(Duration::from_secs(2), transport.child.lock().await.wait())
+                .await
+                .expect("verified executable did not exit")
+                .expect("wait for verified executable");
+        assert!(
+            status.success(),
+            "snapshot must execute original native true binary"
+        );
+        transport.shutdown().await.expect("shutdown transport");
     }
 
     #[tokio::test]

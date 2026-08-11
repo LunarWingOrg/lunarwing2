@@ -3,20 +3,21 @@
 ## Status: IMPLEMENTED FOR v2.0.4.0 — HISTORICAL DESIGN RECORD
 ## Date: 2026-07-24
 
-Phase 1 shipped as `ic/config/hooks/coordination.hook.json`. The current,
-source-verified deployment contract is documented in [`DEPLOYMENT.md`](DEPLOYMENT.md);
-this plan preserves the pre-implementation design and should not be used as an
-operator runbook.
+Phase 1 shipped as `ic/config/hooks/coordination.hook.json`. Since v2.0.7 it is
+compiled in and registered automatically when coordination is actionable; the
+manual workspace-copy steps below are historical. The current, source-verified
+deployment contract is documented in [`DEPLOYMENT.md`](DEPLOYMENT.md); this plan
+preserves the pre-implementation design and should not be used as an operator
+runbook.
 
 ---
 
 ## Overview
 
-Phase 1 implements coordination enforcement using ONLY the existing declarative
-hook system (HookBundleConfig). No Rust code changes required.
-
-The hook bundle JSON file is placed in the workspace at `hooks/` and is
-automatically loaded by `bootstrap_hooks()` via `register_workspace_bundles()`.
+Phase 1 implements coordination enforcement using the declarative hook system
+(`HookBundleConfig`). The original deployment placed the bundle in workspace
+`hooks/`; current startup embeds, scopes, and registers it directly, while
+ignoring legacy workspace copies to avoid duplicate rules.
 
 ## Architecture (verified from source)
 
@@ -47,11 +48,14 @@ Our coordination hooks use priorities 10-80 for layered enforcement.
 
 ## What Phase 1 Enforces
 
-### 1. Secret Detection (priority 10-13, fail_closed)
+### 1. Explicit Secret Detection (priority 10-12, fail_closed)
 - API keys, tokens, passwords (regex pattern matching)
 - Private key material (PEM headers)
 - JWT tokens (eyJ... format)
-- High-entropy base64 strings (40+ chars)
+
+The original priority-13 blanket base64 rule was removed in v2.0.7 because it
+rejected exact git SHAs and other valid identifiers. Strike-aware entropy
+checking now lives in the stateful Rust hook, with precise safe-token handling.
 
 ### 2. Inbound Newline Stripping (priority 50, fail_open)
 - Replaces `\r\n`, `\r`, `\n` with spaces
@@ -83,7 +87,7 @@ then newline stripping. This is correct — we want to catch secrets before tran
 
 ---
 
-## Deployment
+## Historical deployment (superseded by managed startup registration)
 
 1. Place `coordination-phase1-bundle.json` as `hooks/coordination.hook.json` in workspace
 2. Restart daemon — hooks auto-load via `register_workspace_bundles()`

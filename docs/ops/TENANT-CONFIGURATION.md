@@ -169,13 +169,19 @@ Tenant provisioning writes coordination defaults to `env/lunarwing.env`:
 ```bash
 COORD_ENABLED=false
 COORD_AGENT_ID=<tenant-name>
+COORD_AGENT_ALIASES=
+COORD_RESPONDER_ROSTER=
 COORD_CHANNELS=
 COORD_ADMIN_TOKEN=<generated-secret>
 COORD_ADMIN_PORT=<allocated-port>
 ```
 
 Set `COORD_CHANNELS` to exact room JIDs, then set `COORD_ENABLED=true` and
-restart tenant. `add-tenant` preserves existing coordination values and token;
+restart tenant. Agent-ID aliases are derived automatically; add
+`COORD_AGENT_ALIASES` only for extra names. To let an unaddressed `QUERY:` select
+one responder across daemons, set the same comma-separated
+`COORD_RESPONDER_ROSTER` on every participant, using each participant's exact
+`COORD_AGENT_ID`. `add-tenant` preserves existing coordination values and token;
 `patch-env <tenant>` backfills missing keys without rotating or printing token.
 Agent IDs must be 1–128 ASCII characters using letters, digits, `@.-_/:+~`.
 Transient XMPP thinking, tool, and reasoning statuses are suppressed in those

@@ -2,9 +2,10 @@
 //!
 //! Transports describe how JSON-RPC messages move. Runtime adapters additionally
 //! own activation concerns such as process spawning, WASM actor creation, remote
-//! authentication, and gateway routing. Keeping this boundary above
-//! [`McpTransport`](crate::tools::mcp::McpTransport) allows new placements to reuse
-//! the same client, discovery, lifecycle, and tool-wrapper logic.
+//! authentication, and gateway routing. Keeping this internal built-in boundary above
+//! [`McpTransport`](crate::tools::mcp::McpTransport) lets supported placements reuse the
+//! same client, discovery, lifecycle, and tool-wrapper logic. It is not a production
+//! plugin registry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,7 +149,7 @@ pub trait McpRuntimeAdapter: Send + Sync {
     async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpRuntimeError>;
 }
 
-/// Extensible runtime adapter registry used by the MCP client factory.
+/// Closed built-in runtime dispatch registry used by the MCP client factory.
 pub struct McpRuntimeRegistry {
     adapters: HashMap<McpRuntimeKind, Arc<dyn McpRuntimeAdapter>>,
 }

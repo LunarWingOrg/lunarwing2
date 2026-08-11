@@ -249,6 +249,23 @@ fn resumed_action_result_message(
     )
 }
 
+fn denied_action_result_message(
+    call_id: &str,
+    action_name: &str,
+    reason: Option<&str>,
+) -> lunarwing_engine::ThreadMessage {
+    let reason = reason
+        .map(|value| format!(" Reason: {value}"))
+        .unwrap_or_default();
+    lunarwing_engine::ThreadMessage::action_result(
+        call_id,
+        action_name,
+        format!(
+            "User denied this action. It was not executed; choose an alternative approach.{reason}"
+        ),
+    )
+}
+
 async fn insert_and_notify_pending_gate(
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
     state: &EngineState,
@@ -2118,14 +2135,11 @@ pub async fn resolve_gate(
                 )
                 .await;
 
-            let deny_msg = lunarwing_engine::ThreadMessage::user(format!(
-                "User denied action '{}'. Do not execute it; choose an alternative approach.{}",
-                pending.action_name,
-                reason
-                    .as_deref()
-                    .map(|r| format!(" Reason: {r}"))
-                    .unwrap_or_default()
-            ));
+            let deny_result = denied_action_result_message(
+                &pending.call_id,
+                &pending.action_name,
+                reason.as_deref(),
+            );
 
             let event_rx = state.thread_manager.subscribe_events();
             state
@@ -2133,9 +2147,9 @@ pub async fn resolve_gate(
                 .resume_thread(
                     pending.thread_id,
                     message.user_id.clone(),
-                    Some(deny_msg),
+                    Some(deny_result),
                     Some((pending.call_id.clone(), false)),
-                    None,
+                    Some(pending.call_id.clone()),
                 )
                 .await
                 .map_err(|e| engine_err("resume error", e))?;
@@ -2766,6 +2780,16 @@ pub async fn handle_with_engine(
 /// Maximum depth for auth-retry recursion (credential stored → retry original message).
 const MAX_AUTH_RETRY_DEPTH: u8 = 2;
 
+fn append_channel_constraint(context: &mut Option<String>, constraint: &str) {
+    if constraint.trim().is_empty() {
+        return;
+    }
+    *context = Some(match context.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{constraint}"),
+        _ => constraint.to_string(),
+    });
+}
+
 async fn handle_with_engine_inner(
     agent: &Agent,
     message: &IncomingMessage,
@@ -2924,7 +2948,21 @@ async fn handle_with_engine_inner(
         // into the engine system prompt so replies fit the transport. The
         // engine crate is channel-neutral; the budget lives host-side.
         if let Some(budget) = crate::channels::budget::budget_for_channel(&message.channel) {
-            config.channel_context = Some(budget.prompt_guidance());
+            append_channel_constraint(&mut config.channel_context, &budget.prompt_guidance());
+        }
+        // Match legacy dispatch: configured coordination destinations must
+        // receive the host-authored schema contract before generation. Without
+        // this Engine V2 model output is commonly untagged and the fail-closed
+        // transform suppresses it while assigning a strike to the local agent.
+        let policy_scope = crate::channels::routing_target_from_metadata(&message.metadata)
+            .unwrap_or_else(|| message.channel.clone());
+        if let Some(instruction) = agent
+            .deps
+            .coordination_prompt_policy
+            .as_ref()
+            .and_then(|policy| policy.instruction_for_scope(&policy_scope))
+        {
+            append_channel_constraint(&mut config.channel_context, instruction);
         }
         // Supervised mode: opt-in via env (set by --supervised CLI flag or
         // explicit config). Forces every tool action through human approval
@@ -5269,6 +5307,20 @@ mod tests {
 
     static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
+    #[test]
+    fn channel_constraints_compose_without_empty_sections() {
+        let mut context = None;
+        append_channel_constraint(&mut context, "  ");
+        assert!(context.is_none());
+
+        append_channel_constraint(&mut context, "transport limit");
+        append_channel_constraint(&mut context, "coordination schema");
+        assert_eq!(
+            context.as_deref(),
+            Some("transport limit\n\ncoordination schema")
+        );
+    }
+
     struct TestStore {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
@@ -6214,6 +6266,22 @@ mod tests {
         let result = find_most_recent_thread(&state, &Some(conv), "alice").await;
         assert!(result.is_some(), "should find thread via entry fallback");
         assert_eq!(result.unwrap().id, tid);
+    }
+
+    // --- gate result message tests ---
+
+    #[test]
+    fn denied_action_result_resolves_the_original_call() {
+        let message = denied_action_result_message("call-1", "shell", Some("too risky"));
+
+        assert_eq!(
+            message.role,
+            lunarwing_engine::types::message::MessageRole::ActionResult
+        );
+        assert_eq!(message.action_call_id.as_deref(), Some("call-1"));
+        assert_eq!(message.action_name.as_deref(), Some("shell"));
+        assert!(message.content.contains("was not executed"));
+        assert!(message.content.contains("too risky"));
     }
 
     // --- clamp_always_to_resume_kind tests ---

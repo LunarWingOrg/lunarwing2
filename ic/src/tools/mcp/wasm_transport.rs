@@ -206,7 +206,7 @@ async fn compile_component(
 ) -> Result<Component, ToolError> {
     tokio::task::spawn_blocking(move || {
         Component::new(runtime.engine(), bytes).map_err(|error| {
-            ToolError::ExternalService(format!("Failed to compile MCP WASM component: {error}"))
+            ToolError::ExternalService(format!("Failed to compile MCP WASM component: {error:#}"))
         })
     })
     .await
@@ -339,24 +339,20 @@ fn validate_response(
             "MCP-over-WASM server '{server_name}' returned a response to a notification"
         )));
     }
-    let response: McpResponse = serde_json::from_str(response_json).map_err(|error| {
-        ToolError::ExternalService(format!(
-            "MCP-over-WASM server '{server_name}' returned invalid JSON-RPC: {error}"
-        ))
-    })?;
-    if response.jsonrpc != "2.0" {
+    let envelope = crate::tools::mcp::protocol::classify_inbound_jsonrpc(response_json.as_bytes())
+        .map_err(|error| {
+            ToolError::ExternalService(format!(
+                "MCP-over-WASM server '{server_name}' returned invalid JSON-RPC: {error}"
+            ))
+        })?;
+    let crate::tools::mcp::protocol::InboundJsonRpc::Response(response) = envelope else {
         return Err(ToolError::ExternalService(format!(
-            "MCP-over-WASM server '{server_name}' returned unsupported JSON-RPC version"
+            "MCP-over-WASM server '{server_name}' returned non-response JSON-RPC envelope"
         )));
-    }
+    };
     if response.id != request.id {
         return Err(ToolError::ExternalService(format!(
             "MCP-over-WASM server '{server_name}' returned a mismatched response id"
-        )));
-    }
-    if response.result.is_some() == response.error.is_some() {
-        return Err(ToolError::ExternalService(format!(
-            "MCP-over-WASM server '{server_name}' must return exactly one of result or error"
         )));
     }
     Ok(response)
@@ -395,7 +391,7 @@ fn call_actor(
         Err(error) => {
             *guard = None;
             Err(ToolError::ExternalService(format!(
-                "MCP-over-WASM server '{server_name}' trapped and was stopped: {error}"
+                "MCP-over-WASM server '{server_name}' trapped and was stopped: {error:#}"
             )))
         }
     }
@@ -419,6 +415,79 @@ fn empty_notification_response() -> McpResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mcp-wasm/stateful-server.wat"
+    );
+
+    async fn load_fixture(timeout_seconds: u64) -> Arc<WasmMcpTransport> {
+        load_fixture_with_limits(64, timeout_seconds, crate::tools::wasm::DEFAULT_FUEL_LIMIT).await
+    }
+
+    async fn load_fixture_with_fuel(timeout_seconds: u64, fuel: u64) -> Arc<WasmMcpTransport> {
+        load_fixture_with_limits(64, timeout_seconds, fuel).await
+    }
+
+    async fn load_fixture_with_limits(
+        memory_mb: u64,
+        timeout_seconds: u64,
+        fuel: u64,
+    ) -> Arc<WasmMcpTransport> {
+        let component = wat::parse_file(FIXTURE).expect("parse MCP component fixture source");
+        let temp = tempfile::tempdir().expect("fixture temp dir");
+        let component_path = temp.path().join("stateful-server.wasm");
+        std::fs::write(&component_path, component).expect("materialize MCP component fixture");
+        Arc::new(
+            WasmMcpTransport::load(
+                "fixture",
+                &component_path,
+                memory_mb,
+                fuel,
+                timeout_seconds,
+                None,
+            )
+            .await
+            .expect("load real MCP component fixture"),
+        )
+    }
+
+    async fn exercise_fixture(transport: Arc<WasmMcpTransport>) {
+        use crate::tools::mcp::McpClient;
+        use crate::tools::mcp::protocol::ContentBlock;
+
+        let client = McpClient::new_with_transport("fixture", transport, None, None, "test", None);
+        let initialized = client.initialize().await.expect("initialize fixture");
+        assert_eq!(initialized.protocol_version, "2024-11-05");
+        assert_eq!(initialized.server_info.name, "fixture");
+
+        let tools = client.list_tools().await.expect("paginated tools/list");
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+
+        let result = client
+            .call_tool("alpha", serde_json::json!({"value": 1}))
+            .await
+            .expect("tools/call");
+        assert!(matches!(
+            result.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "actor-state-retained"
+        ));
+    }
+
+    fn fixture_request(id: u64, method: &str) -> McpRequest {
+        McpRequest {
+            jsonrpc: "2.0".to_string(),
+            id: Some(id),
+            method: method.to_string(),
+            params: None,
+        }
+    }
 
     fn request(id: Option<u64>) -> McpRequest {
         McpRequest {
@@ -482,6 +551,8 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":8,"result":{}}"#,
             r#"{"jsonrpc":"2.0","id":7,"result":{},"error":{"code":-1,"message":"bad"}}"#,
             r#"{"jsonrpc":"2.0","id":7}"#,
+            r#"{"jsonrpc":"2.0","id":7,"method":"sampling/createMessage","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#,
         ] {
             assert!(validate_response("test", &rpc_request, invalid).is_err());
         }
@@ -493,6 +564,91 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn real_component_negotiates_paginates_calls_and_retains_actor_state() {
+        let transport = load_fixture(1).await;
+        exercise_fixture(Arc::clone(&transport)).await;
+        assert!(transport.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn real_component_traps_on_malformed_host_envelope() {
+        let transport = load_fixture(1).await;
+        let error = transport
+            .send(&fixture_request(1, "tools/list"), &HashMap::new())
+            .await
+            .expect_err("fixture must validate first initialize envelope");
+        assert!(error.to_string().contains("trapped and was stopped"));
+        assert!(!transport.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn real_component_enforces_low_guest_memory_limit() {
+        let transport =
+            load_fixture_with_limits(1, 1, crate::tools::wasm::DEFAULT_FUEL_LIMIT).await;
+        exercise_fixture(Arc::clone(&transport)).await;
+
+        let error = transport
+            .send(&fixture_request(90, "fixture/memory"), &HashMap::new())
+            .await
+            .expect_err("guest memory growth beyond one MiB must fail");
+        assert!(error.to_string().contains("trapped and was stopped"));
+        assert!(!transport.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn real_component_timeout_is_terminal_and_fresh_load_recovers() {
+        let transport = load_fixture_with_fuel(1, 100_000_000_000).await;
+        exercise_fixture(Arc::clone(&transport)).await;
+
+        let started = std::time::Instant::now();
+        let error = transport
+            .send(&fixture_request(90, "fixture/timeout"), &HashMap::new())
+            .await
+            .expect_err("infinite guest execution must time out");
+        assert!(started.elapsed() >= Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(error.to_string().contains("trapped and was stopped"));
+        assert!(!transport.is_healthy());
+
+        let replacement = load_fixture(1).await;
+        exercise_fixture(Arc::clone(&replacement)).await;
+        assert!(replacement.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn real_component_fuel_exhaustion_is_terminal() {
+        let transport = load_fixture(1).await;
+        exercise_fixture(Arc::clone(&transport)).await;
+
+        let error = transport
+            .send(&fixture_request(90, "fixture/timeout"), &HashMap::new())
+            .await
+            .expect_err("infinite guest execution must exhaust bounded fuel");
+        assert!(error.to_string().contains("trapped and was stopped"));
+        assert!(error.to_string().contains("fuel"));
+        assert!(!transport.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn real_component_trap_stops_actor_and_future_calls_fail_closed() {
+        let transport = load_fixture(1).await;
+        exercise_fixture(Arc::clone(&transport)).await;
+
+        let error = transport
+            .send(&fixture_request(90, "fixture/trap"), &HashMap::new())
+            .await
+            .expect_err("guest trap must fail");
+        assert!(error.to_string().contains("trapped and was stopped"));
+        assert!(!transport.is_healthy());
+
+        let error = transport
+            .send(&fixture_request(91, "tools/list"), &HashMap::new())
+            .await
+            .expect_err("terminal actor must reject future calls");
+        assert!(error.to_string().contains("is shut down"));
     }
 
     #[test]

@@ -3,9 +3,10 @@
 //! Supports both local (unauthenticated) and hosted (OAuth-authenticated) servers.
 //! Uses pluggable transports (HTTP, stdio, Unix) via the `McpTransport` trait.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::RwLock;
@@ -17,6 +18,7 @@ use crate::tools::mcp::config::McpServerConfig;
 use crate::tools::mcp::http_transport::HttpMcpTransport;
 use crate::tools::mcp::protocol::{
     CallToolResult, InitializeResult, ListToolsResult, McpRequest, McpResponse, McpTool,
+    SUPPORTED_PROTOCOL_VERSIONS,
 };
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::McpTransport;
@@ -24,6 +26,12 @@ use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput};
 
 pub(crate) const MAX_WORKER_MCP_TOOLS: usize = 256;
 pub(crate) const MAX_WORKER_MCP_TOOL_BYTES: usize = 2 * 1024 * 1024;
+
+/// Discovery bounds prevent malicious servers from extending pagination indefinitely.
+const MAX_TOOLS_LIST_PAGES: usize = 100;
+const MAX_TOOLS_LIST_COUNT: usize = 4_096;
+const MAX_TOOLS_LIST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_TOOLS_LIST_DURATION: Duration = Duration::from_secs(30);
 
 /// MCP client for communicating with MCP servers.
 ///
@@ -44,7 +52,7 @@ pub struct McpClient {
     next_id: AtomicU64,
 
     /// Cached tools.
-    tools_cache: RwLock<Option<Vec<McpTool>>>,
+    tools_cache: RwLock<Option<(u64, Vec<McpTool>)>>,
 
     /// Session manager (shared across clients).
     session_manager: Option<Arc<McpSessionManager>>,
@@ -363,19 +371,30 @@ impl McpClient {
         }
 
         let request = McpRequest::initialize(self.next_request_id());
-        let response = self
-            .transport
-            .send(&request, &self.build_request_headers().await?)
-            .await?;
+        let headers = match self.build_request_headers().await {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.cleanup_failed_initialization().await;
+                return Err(error);
+            }
+        };
+        let response = match self.transport.send(&request, &headers).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.cleanup_failed_initialization().await;
+                return Err(error);
+            }
+        };
 
         if let Some(error) = response.error {
+            self.cleanup_failed_initialization().await;
             return Err(ToolError::ExternalService(format!(
                 "MCP initialization error: {} (code {})",
                 error.message, error.code
             )));
         }
 
-        let init_result: InitializeResult = response
+        let init_result: InitializeResult = match response
             .result
             .ok_or_else(|| {
                 ToolError::ExternalService("No result in initialize response".to_string())
@@ -384,18 +403,50 @@ impl McpClient {
                 serde_json::from_value(r).map_err(|e| {
                     ToolError::ExternalService(format!("Invalid initialize result: {}", e))
                 })
-            })?;
+            }) {
+            Ok(result) => result,
+            Err(error) => {
+                self.cleanup_failed_initialization().await;
+                return Err(error);
+            }
+        };
 
-        if let Some(ref session_manager) = self.session_manager {
-            session_manager.mark_initialized(&self.server_name).await;
+        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&init_result.protocol_version.as_str()) {
+            let protocol_version = init_result.protocol_version.clone();
+            self.cleanup_failed_initialization().await;
+            return Err(ToolError::ExternalService(format!(
+                "Unsupported MCP protocol version '{protocol_version}'"
+            )));
+        }
+
+        let list_changed = init_result
+            .capabilities
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.list_changed);
+        self.transport.set_tools_list_changed(list_changed);
+
+        let headers = match self.build_request_headers().await {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.cleanup_failed_initialization().await;
+                return Err(error);
+            }
+        };
+
+        // Streamable HTTP permits opening GET after initialize establishes its
+        // session. Wait only for response headers: some servers defer them until
+        // initialized, so bounded readiness must never block that notification.
+        if list_changed && let Err(error) = self.transport.start_notifications(&headers).await {
+            tracing::debug!(
+                server = %self.server_name,
+                %error,
+                "Failed to start MCP notification stream"
+            );
         }
 
         let notification = McpRequest::initialized_notification();
-        if let Err(e) = self
-            .transport
-            .send(&notification, &self.build_request_headers().await?)
-            .await
-        {
+        if let Err(e) = self.transport.send(&notification, &headers).await {
             tracing::debug!(
                 "Failed to send initialized notification to '{}': {}",
                 self.server_name,
@@ -403,7 +454,26 @@ impl McpClient {
             );
         }
 
+        if let Some(ref session_manager) = self.session_manager {
+            session_manager.mark_initialized(&self.server_name).await;
+        }
+
         Ok(init_result)
+    }
+
+    async fn cleanup_failed_initialization(&self) {
+        let headers = self.build_request_headers().await.unwrap_or_default();
+        if let Err(error) = self.transport.shutdown_with_headers(&headers).await {
+            tracing::debug!(
+                server = %self.server_name,
+                %error,
+                "Failed to close transport after MCP initialization failure"
+            );
+        }
+        if let Some(ref session_manager) = self.session_manager {
+            session_manager.terminate(&self.server_name).await;
+        }
+        self.clear_cache().await;
     }
 
     /// Return true when the error looks like a recoverable MCP session expiry.
@@ -496,14 +566,7 @@ impl McpClient {
     pub async fn initialize(&self) -> Result<InitializeResult, ToolError> {
         let result = self
             .initialized
-            .get_or_try_init(|| async {
-                if let Some(ref session_manager) = self.session_manager
-                    && session_manager.is_initialized(&self.server_name).await
-                {
-                    return Ok(InitializeResult::default());
-                }
-                self.reinitialize_session().await
-            })
+            .get_or_try_init(|| async { self.reinitialize_session().await })
             .await?;
 
         Ok(result.clone())
@@ -511,31 +574,112 @@ impl McpClient {
 
     /// List available tools from the MCP server.
     pub async fn list_tools(&self) -> Result<Vec<McpTool>, ToolError> {
-        if let Some(tools) = self.tools_cache.read().await.as_ref() {
-            return Ok(tools.clone());
-        }
+        self.list_tools_with_generation(MAX_TOOLS_LIST_DURATION)
+            .await
+            .map(|(tools, _)| tools)
+    }
+
+    async fn list_tools_with_generation(
+        &self,
+        operation_timeout: Duration,
+    ) -> Result<(Vec<McpTool>, u64), ToolError> {
+        let tools = tokio::time::timeout(operation_timeout, async {
+            loop {
+                let generation = self.tools_generation();
+                if let Some((cached_generation, tools)) = self.tools_cache.read().await.as_ref()
+                    && *cached_generation == generation
+                {
+                    return Ok::<(Vec<McpTool>, u64), ToolError>((tools.clone(), generation));
+                }
+                let tools = self.list_all_tools().await?;
+                if self.tools_generation() == generation {
+                    *self.tools_cache.write().await = Some((generation, tools.clone()));
+                    return Ok::<(Vec<McpTool>, u64), ToolError>((tools, generation));
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            ToolError::ExternalService(format!(
+                "MCP tools/list exceeded {} second operation limit",
+                operation_timeout.as_secs_f64()
+            ))
+        })??;
+        Ok(tools)
+    }
+
+    #[cfg(test)]
+    async fn list_tools_with_timeout(
+        &self,
+        operation_timeout: Duration,
+    ) -> Result<Vec<McpTool>, ToolError> {
+        self.list_tools_with_generation(operation_timeout)
+            .await
+            .map(|(tools, _)| tools)
+    }
+
+    async fn list_all_tools(&self) -> Result<Vec<McpTool>, ToolError> {
         self.initialize().await?;
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        let mut serialized_bytes = 0usize;
 
-        let request = McpRequest::list_tools(self.next_request_id());
-        let response = self.send_request(request).await?;
+        for page in 1..=MAX_TOOLS_LIST_PAGES {
+            let request = McpRequest::list_tools_page(self.next_request_id(), cursor.as_deref());
+            let response = self.send_request(request).await?;
+            if let Some(error) = response.error {
+                return Err(ToolError::ExternalService(format!(
+                    "MCP error: {} (code {})",
+                    error.message, error.code
+                )));
+            }
 
-        if let Some(error) = response.error {
-            return Err(ToolError::ExternalService(format!(
-                "MCP error: {} (code {})",
-                error.message, error.code
-            )));
+            let value = response.result.ok_or_else(|| {
+                ToolError::ExternalService("No result in MCP response".to_string())
+            })?;
+            let page_bytes = serde_json::to_vec(&value).map_err(|error| {
+                ToolError::ExternalService(format!("Invalid tools list: {error}"))
+            })?;
+            serialized_bytes = serialized_bytes
+                .checked_add(page_bytes.len())
+                .ok_or_else(|| {
+                    ToolError::ExternalService("MCP tools/list byte count overflow".to_string())
+                })?;
+            if serialized_bytes > MAX_TOOLS_LIST_BYTES {
+                return Err(ToolError::ExternalService(format!(
+                    "MCP tools/list exceeded {MAX_TOOLS_LIST_BYTES} serialized bytes"
+                )));
+            }
+
+            let result: ListToolsResult = serde_json::from_value(value).map_err(|error| {
+                ToolError::ExternalService(format!("Invalid tools list: {error}"))
+            })?;
+            if tools.len().saturating_add(result.tools.len()) > MAX_TOOLS_LIST_COUNT {
+                return Err(ToolError::ExternalService(format!(
+                    "MCP tools/list exceeded {MAX_TOOLS_LIST_COUNT} tools"
+                )));
+            }
+            tools.extend(result.tools);
+
+            let Some(next_cursor) = result.next_cursor else {
+                return Ok(tools);
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                return Err(ToolError::ExternalService(format!(
+                    "MCP tools/list repeated cursor '{next_cursor}'"
+                )));
+            }
+            cursor = Some(next_cursor);
+
+            if page == MAX_TOOLS_LIST_PAGES {
+                return Err(ToolError::ExternalService(format!(
+                    "MCP tools/list exceeded {MAX_TOOLS_LIST_PAGES} pages"
+                )));
+            }
         }
 
-        let result: ListToolsResult = response
-            .result
-            .ok_or_else(|| ToolError::ExternalService("No result in MCP response".to_string()))
-            .and_then(|r| {
-                serde_json::from_value(r)
-                    .map_err(|e| ToolError::ExternalService(format!("Invalid tools list: {}", e)))
-            })?;
-
-        *self.tools_cache.write().await = Some(result.tools.clone());
-        Ok(result.tools)
+        unreachable!("tools/list page loop always returns")
     }
 
     /// Call a tool on the MCP server.
@@ -570,19 +714,26 @@ impl McpClient {
         *self.tools_cache.write().await = None;
     }
 
+    /// Monotonic generation advanced by negotiated tools/list change notifications.
+    pub(crate) fn tools_generation(&self) -> u64 {
+        self.transport.tools_generation()
+    }
+
     /// Create Tool implementations for all MCP tools.
     pub async fn create_tools(&self) -> Result<Vec<Arc<dyn Tool>>, ToolError> {
         let mcp_tools = self.list_tools().await?;
         Ok(self.wrap_tools(mcp_tools))
     }
 
-    /// Create tools for an untrusted per-job worker runtime with bounded discovery.
-    pub(crate) async fn create_worker_tools(
+    /// Create tools for an untrusted worker, retaining exact discovery generation.
+    pub(crate) async fn create_worker_tools_with_generation(
         &self,
-    ) -> Result<(Vec<Arc<dyn Tool>>, usize), ToolError> {
-        let mcp_tools = self.list_tools().await?;
+    ) -> Result<(Vec<Arc<dyn Tool>>, usize, u64), ToolError> {
+        let (mcp_tools, generation) = self
+            .list_tools_with_generation(MAX_TOOLS_LIST_DURATION)
+            .await?;
         let descriptor_bytes = validate_worker_tools(&mcp_tools)?;
-        Ok((self.wrap_tools(mcp_tools), descriptor_bytes))
+        Ok((self.wrap_tools(mcp_tools), descriptor_bytes, generation))
     }
 
     fn wrap_tools(&self, mcp_tools: Vec<McpTool>) -> Vec<Arc<dyn Tool>> {
@@ -626,13 +777,14 @@ fn validate_worker_tools(tools: &[McpTool]) -> Result<usize, ToolError> {
     Ok(encoded.len())
 }
 
-/// Clone the client, resetting the tools cache and initialization state.
-/// The cloned client shares the same transport and session manager, so
-/// re-initialization will short-circuit via the session manager check if
-/// the source was already initialized. The `next_id` counter is copied
-/// so that cloned clients continue with monotonically increasing IDs.
+/// Clone the client, resetting the tools cache and preserving completed initialization state.
+/// The `next_id` counter is copied so cloned clients continue with monotonically increasing IDs.
 impl Clone for McpClient {
     fn clone(&self) -> Self {
+        let initialized = tokio::sync::OnceCell::new();
+        if let Some(result) = self.initialized.get() {
+            let _ = initialized.set(result.clone());
+        }
         Self {
             transport: self.transport.clone(),
             server_url: self.server_url.clone(),
@@ -644,7 +796,7 @@ impl Clone for McpClient {
             user_id: self.user_id.clone(),
             server_config: self.server_config.clone(),
             custom_headers: self.custom_headers.clone(),
-            initialized: tokio::sync::OnceCell::new(),
+            initialized,
         }
     }
 }
@@ -958,6 +1110,7 @@ mod tests {
                 side_effects_hint: false,
                 read_only_hint: false,
                 execution_time_hint: None,
+                ..Default::default()
             }),
         };
         assert!(tool.requires_approval());
@@ -975,6 +1128,7 @@ mod tests {
                 side_effects_hint: true,
                 read_only_hint: false,
                 execution_time_hint: None,
+                ..Default::default()
             }),
         };
         assert!(!tool.requires_approval());
@@ -996,8 +1150,12 @@ mod tests {
     struct MockTransport {
         supports_http: bool,
         responses: std::sync::Mutex<Vec<McpResponse>>,
+        recorded_requests: std::sync::Mutex<Vec<McpRequest>>,
         recorded_headers: std::sync::Mutex<Vec<HashMap<String, String>>>,
         shutdown_called: std::sync::atomic::AtomicBool,
+        send_delay: Duration,
+        list_changed_enabled: std::sync::atomic::AtomicBool,
+        tools_generation: AtomicU64,
     }
 
     impl MockTransport {
@@ -1005,16 +1163,37 @@ mod tests {
             Self {
                 supports_http,
                 responses: std::sync::Mutex::new(responses),
+                recorded_requests: std::sync::Mutex::new(Vec::new()),
                 recorded_headers: std::sync::Mutex::new(Vec::new()),
                 shutdown_called: std::sync::atomic::AtomicBool::new(false),
+                send_delay: Duration::ZERO,
+                list_changed_enabled: std::sync::atomic::AtomicBool::new(false),
+                tools_generation: AtomicU64::new(0),
+            }
+        }
+
+        fn new_delayed(responses: Vec<McpResponse>, send_delay: Duration) -> Self {
+            Self {
+                send_delay,
+                ..Self::new(false, responses)
             }
         }
         fn recorded_headers(&self) -> Vec<HashMap<String, String>> {
             self.recorded_headers.lock().unwrap().clone()
         }
 
+        fn recorded_requests(&self) -> Vec<McpRequest> {
+            self.recorded_requests.lock().unwrap().clone()
+        }
+
         fn shutdown_called(&self) -> bool {
             self.shutdown_called.load(Ordering::SeqCst)
+        }
+
+        fn notify_tools_changed(&self) {
+            if self.list_changed_enabled.load(Ordering::Acquire) {
+                self.tools_generation.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -1022,9 +1201,11 @@ mod tests {
     impl McpTransport for MockTransport {
         async fn send(
             &self,
-            _request: &McpRequest,
+            request: &McpRequest,
             headers: &HashMap<String, String>,
         ) -> Result<McpResponse, ToolError> {
+            tokio::time::sleep(self.send_delay).await;
+            self.recorded_requests.lock().unwrap().push(request.clone());
             self.recorded_headers.lock().unwrap().push(headers.clone());
             let mut responses = self.responses.lock().unwrap();
             if responses.is_empty() {
@@ -1040,6 +1221,12 @@ mod tests {
         }
         fn supports_http_features(&self) -> bool {
             self.supports_http
+        }
+        fn set_tools_list_changed(&self, enabled: bool) {
+            self.list_changed_enabled.store(enabled, Ordering::Release);
+        }
+        fn tools_generation(&self) -> u64 {
+            self.tools_generation.load(Ordering::Acquire)
         }
     }
 
@@ -1213,6 +1400,255 @@ mod tests {
         assert_eq!(transport.recorded_headers().len(), 2); // no additional sends
     }
 
+    fn successful_initialize_response() -> McpResponse {
+        McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            result: Some(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "test", "version": "1.0"}
+            })),
+            error: None,
+        }
+    }
+
+    fn notification_ack() -> McpResponse {
+        McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: None,
+            result: None,
+            error: None,
+        }
+    }
+
+    fn tools_page(tools: serde_json::Value, next_cursor: Option<&str>) -> McpResponse {
+        let mut result = serde_json::json!({"tools": tools});
+        if let Some(cursor) = next_cursor {
+            result["nextCursor"] = serde_json::json!(cursor);
+        }
+        McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(2),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn test_client(transport: Arc<MockTransport>) -> McpClient {
+        McpClient::new_with_transport("test", transport, None, None, "default", None)
+    }
+
+    #[tokio::test]
+    async fn test_initialize_rejects_unsupported_version_before_notification() {
+        let mut response = successful_initialize_response();
+        response.result.as_mut().expect("result")["protocolVersion"] =
+            serde_json::json!("2025-03-26");
+        let transport = Arc::new(MockTransport::new(false, vec![response]));
+        let client = test_client(transport.clone());
+
+        let error = client.initialize().await.expect_err("version must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported MCP protocol version")
+        );
+        let requests = transport.recorded_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "initialize");
+        assert!(transport.shutdown_called());
+        assert!(client.initialized.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_follows_pages_in_order() {
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                tools_page(
+                    serde_json::json!([{"name": "first", "inputSchema": {}}]),
+                    Some("page-2"),
+                ),
+                tools_page(
+                    serde_json::json!([{"name": "second", "inputSchema": {}}]),
+                    None,
+                ),
+            ],
+        ));
+        let client = test_client(transport.clone());
+
+        let tools = client.list_tools().await.expect("list all pages");
+
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        let requests = transport.recorded_requests();
+        assert!(requests[2].params.is_none());
+        assert_eq!(
+            requests[3].params,
+            Some(serde_json::json!({"cursor": "page-2"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn list_changed_generation_invalidates_tools_cache() {
+        let mut initialize = successful_initialize_response();
+        initialize.result.as_mut().expect("initialize result")["capabilities"] =
+            serde_json::json!({"tools": {"listChanged": true}});
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                initialize,
+                notification_ack(),
+                tools_page(
+                    serde_json::json!([{"name": "old", "inputSchema": {}}]),
+                    None,
+                ),
+                tools_page(
+                    serde_json::json!([{"name": "new", "inputSchema": {}}]),
+                    None,
+                ),
+            ],
+        ));
+        let client = test_client(Arc::clone(&transport));
+
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "old");
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "old");
+        transport.notify_tools_changed();
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "new");
+        assert_eq!(client.tools_generation(), 1);
+        assert_eq!(transport.recorded_requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_worker_tool_limit_sees_all_paginated_tools() {
+        let first_page = (0..200)
+            .map(|index| serde_json::json!({"name": format!("tool-{index}"), "inputSchema": {}}))
+            .collect::<Vec<_>>();
+        let second_page = (200..257)
+            .map(|index| serde_json::json!({"name": format!("tool-{index}"), "inputSchema": {}}))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                tools_page(serde_json::json!(first_page), Some("page-2")),
+                tools_page(serde_json::json!(second_page), None),
+            ],
+        ));
+
+        let error = test_client(transport)
+            .create_worker_tools_with_generation()
+            .await
+            .err()
+            .expect("aggregate worker limit must fail");
+        assert!(error.to_string().contains("257 discovered, max 256"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_rejects_repeated_cursor() {
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                tools_page(serde_json::json!([]), Some("repeat")),
+                tools_page(serde_json::json!([]), Some("repeat")),
+            ],
+        ));
+        let client = test_client(transport);
+
+        let error = client
+            .list_tools()
+            .await
+            .expect_err("cursor loop must fail");
+        assert!(error.to_string().contains("repeated cursor 'repeat'"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_enforces_count_bound() {
+        let tools = (0..=MAX_TOOLS_LIST_COUNT)
+            .map(|index| serde_json::json!({"name": format!("tool-{index}"), "inputSchema": {}}))
+            .collect::<Vec<_>>();
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                tools_page(serde_json::json!(tools), None),
+            ],
+        ));
+
+        let error = test_client(transport)
+            .list_tools()
+            .await
+            .expect_err("count limit must fail");
+        assert!(error.to_string().contains("exceeded 4096 tools"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_enforces_serialized_byte_bound() {
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![
+                successful_initialize_response(),
+                notification_ack(),
+                tools_page(
+                    serde_json::json!([{
+                        "name": "oversized",
+                        "description": "x".repeat(MAX_TOOLS_LIST_BYTES),
+                        "inputSchema": {}
+                    }]),
+                    None,
+                ),
+            ],
+        ));
+
+        let error = test_client(transport)
+            .list_tools()
+            .await
+            .expect_err("byte limit must fail");
+        assert!(error.to_string().contains("serialized bytes"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_enforces_page_bound() {
+        let mut responses = vec![successful_initialize_response(), notification_ack()];
+        responses.extend(
+            (0..MAX_TOOLS_LIST_PAGES)
+                .map(|page| tools_page(serde_json::json!([]), Some(&format!("page-{page}")))),
+        );
+        let transport = Arc::new(MockTransport::new(false, responses));
+
+        let error = test_client(transport)
+            .list_tools()
+            .await
+            .expect_err("page limit must fail");
+        assert!(error.to_string().contains("exceeded 100 pages"));
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_enforces_whole_operation_timeout() {
+        let transport = Arc::new(MockTransport::new_delayed(
+            vec![successful_initialize_response()],
+            Duration::from_millis(50),
+        ));
+
+        let error = test_client(transport)
+            .list_tools_with_timeout(Duration::from_millis(1))
+            .await
+            .expect_err("operation timeout must fail");
+        assert!(error.to_string().contains("operation limit"));
+    }
+
     #[tokio::test]
     async fn test_http_session_error_triggers_reinitialize_and_retry() {
         let init_response = McpResponse {
@@ -1367,6 +1803,7 @@ mod tests {
                     side_effects_hint: false,
                     read_only_hint: false,
                     execution_time_hint: None,
+                    ..Default::default()
                 })
             } else {
                 None

@@ -108,6 +108,7 @@ struct ActiveMcpServer {
     owner_id: String,
     client: Arc<McpClient>,
     tools: Vec<Arc<dyn Tool>>,
+    tools_generation: u64,
     managed_stdio: bool,
     managed_wasm: bool,
     generation: u64,
@@ -531,7 +532,11 @@ impl ExtensionManager {
             let runtimes = self.active_mcp_servers.read().await;
             runtimes
                 .iter()
-                .filter(|(_, runtime)| runtime.managed_stdio || runtime.managed_wasm)
+                .filter(|(_, runtime)| {
+                    runtime.managed_stdio
+                        || runtime.managed_wasm
+                        || runtime.client.tools_generation() != runtime.tools_generation
+                })
                 .map(|(name, runtime)| McpRecoveryCandidate {
                     name: name.clone(),
                     owner_id: runtime.owner_id.clone(),
@@ -855,12 +860,14 @@ impl ExtensionManager {
         let managed_stdio = self.mcp_process_manager.get(&name).await.is_some();
         let managed_wasm = !managed_stdio && client.runtime_is_wasm();
         let generation = self.next_mcp_runtime_generation();
+        let tools_generation = client.tools_generation();
         self.active_mcp_servers.write().await.insert(
             name,
             ActiveMcpServer {
                 owner_id: self.user_id.clone(),
                 client,
                 tools,
+                tools_generation,
                 managed_stdio,
                 managed_wasm,
                 generation,
@@ -2251,6 +2258,7 @@ impl ExtensionManager {
             _ = cancel.cancelled() => return,
             guard = self.lock_mcp_lifecycle(&candidate.name) => guard,
         };
+        self.refresh_mcp_tools_if_needed(&candidate, &cancel).await;
         if !self.apply_mcp_recovery_claim(&candidate).await {
             return;
         }
@@ -2291,6 +2299,65 @@ impl ExtensionManager {
         };
 
         self.rebuild_mcp_runtime(candidate, server, &cancel).await;
+    }
+
+    async fn refresh_mcp_tools_if_needed(
+        &self,
+        candidate: &McpRecoveryCandidate,
+        cancel: &CancellationToken,
+    ) {
+        let (client, old_tools, observed_generation) = {
+            let runtimes = self.active_mcp_servers.read().await;
+            let Some(runtime) = runtimes.get(&candidate.name).filter(|runtime| {
+                runtime.owner_id == candidate.owner_id
+                    && runtime.generation == candidate.generation
+                    && runtime.health == McpRuntimeHealth::Healthy
+                    && runtime.client.tools_generation() != runtime.tools_generation
+            }) else {
+                return;
+            };
+            (
+                Arc::clone(&runtime.client),
+                runtime.tools.clone(),
+                runtime.client.tools_generation(),
+            )
+        };
+
+        let replacement = match await_mcp_recovery_step(cancel, client.create_tools()).await {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(error)) => {
+                tracing::warn!(server = %candidate.name, %error, "MCP tools/list refresh failed; retaining prior tools");
+                return;
+            }
+            Err(McpRecoveryAbort::TimedOut) => {
+                tracing::warn!(server = %candidate.name, "MCP tools/list refresh timed out; retaining prior tools");
+                return;
+            }
+            Err(McpRecoveryAbort::Cancelled) => return,
+        };
+        if let Err(conflicts) = self
+            .tool_registry
+            .replace_runtime_tools(&old_tools, replacement.clone())
+            .await
+        {
+            tracing::warn!(server = %candidate.name, tools = ?conflicts, "MCP tools/list refresh conflicted; retaining prior tools");
+            return;
+        }
+
+        let mut runtimes = self.active_mcp_servers.write().await;
+        let Some(runtime) = runtimes.get_mut(&candidate.name).filter(|runtime| {
+            runtime.owner_id == candidate.owner_id && runtime.generation == candidate.generation
+        }) else {
+            drop(runtimes);
+            let _ = self
+                .tool_registry
+                .replace_runtime_tools(&replacement, old_tools)
+                .await;
+            return;
+        };
+        runtime.tools = replacement;
+        runtime.tools_generation = observed_generation;
+        tracing::info!(server = %candidate.name, tools = runtime.tools.len(), "Refreshed MCP tools after list change notification");
     }
 
     async fn claim_mcp_recovery(&self, candidate: &McpRecoveryCandidate) -> McpRecoveryClaim {
@@ -2540,6 +2607,7 @@ impl ExtensionManager {
         };
         runtime.client = prepared.client;
         runtime.tools = prepared.tools;
+        runtime.tools_generation = runtime.client.tools_generation();
         runtime.generation = generation;
         runtime.health = McpRuntimeHealth::Healthy;
         runtime.healthy_since = Instant::now();
@@ -4653,6 +4721,7 @@ impl ExtensionManager {
             .map(|tool| tool.name().to_string())
             .collect::<Vec<_>>();
         let generation = self.next_mcp_runtime_generation();
+        let tools_generation = prepared.client.tools_generation();
 
         self.active_mcp_servers.write().await.insert(
             name.to_string(),
@@ -4660,6 +4729,7 @@ impl ExtensionManager {
                 owner_id: user_id.to_string(),
                 client: prepared.client,
                 tools: prepared.tools,
+                tools_generation,
                 managed_stdio,
                 managed_wasm,
                 generation,
@@ -6280,7 +6350,7 @@ mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use async_trait::async_trait;
@@ -6332,6 +6402,55 @@ mod tests {
         async fn shutdown(&self) -> Result<(), ToolError> {
             self.0.store(true, Ordering::Release);
             Ok(())
+        }
+    }
+
+    struct ChangingToolsTransport {
+        responses: std::sync::Mutex<std::collections::VecDeque<crate::tools::mcp::McpResponse>>,
+        enabled: AtomicBool,
+        generation: AtomicU64,
+    }
+
+    impl ChangingToolsTransport {
+        fn new(responses: Vec<crate::tools::mcp::McpResponse>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into()),
+                enabled: AtomicBool::new(false),
+                generation: AtomicU64::new(0),
+            }
+        }
+
+        fn notify(&self) {
+            if self.enabled.load(Ordering::Acquire) {
+                self.generation.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::tools::mcp::McpTransport for ChangingToolsTransport {
+        async fn send(
+            &self,
+            _request: &crate::tools::mcp::McpRequest,
+            _headers: &HashMap<String, String>,
+        ) -> Result<crate::tools::mcp::McpResponse, ToolError> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| ToolError::ExternalService("missing test response".to_string()))
+        }
+
+        async fn shutdown(&self) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        fn set_tools_list_changed(&self, enabled: bool) {
+            self.enabled.store(enabled, Ordering::Release);
+        }
+
+        fn tools_generation(&self) -> u64 {
+            self.generation.load(Ordering::Acquire)
         }
     }
 
@@ -6760,6 +6879,17 @@ done
         make_test_manager_with_dirs(wasm_runtime, tools_dir.clone(), tools_dir, None)
     }
 
+    fn materialize_mcp_wasm_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mcp-wasm/stateful-server.wat"
+        );
+        let component = wat::parse_file(source).expect("parse MCP component fixture source");
+        let path = dir.join("stateful-server.wasm");
+        std::fs::write(&path, component).expect("materialize MCP component fixture");
+        path
+    }
+
     #[tokio::test]
     async fn trapped_wasm_mcp_runtime_is_claimed_for_recovery() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -6783,6 +6913,7 @@ done
                 owner_id: "test".to_string(),
                 client,
                 tools: vec![],
+                tools_generation: 0,
                 managed_stdio: false,
                 managed_wasm: true,
                 generation,
@@ -6801,6 +6932,84 @@ done
             .await;
 
         assert!(matches!(claim, McpRecoveryClaim::Recover(_)));
+    }
+
+    #[tokio::test]
+    async fn trapped_real_wasm_mcp_runtime_is_replaced_by_manager() {
+        let (store, dir) = make_test_store().await;
+        let component = materialize_mcp_wasm_fixture(dir.path());
+        let manager = make_test_manager_with_dirs(
+            None,
+            dir.path().join("tools"),
+            dir.path().join("channels"),
+            Some(store),
+        );
+        let config = crate::tools::mcp::McpServerConfig::new_wasm("fixture", component)
+            .with_wasm_limits(64, crate::tools::wasm::DEFAULT_FUEL_LIMIT, 1);
+        manager
+            .install_mcp_config(config, "test")
+            .await
+            .expect("install real WASM MCP fixture");
+        let activated = manager
+            .activate("fixture", "test")
+            .await
+            .expect("activate real WASM MCP fixture");
+        assert_eq!(activated.tools_loaded, ["fixture_alpha", "fixture_beta"]);
+        let original_wrapper = manager
+            .tool_registry
+            .get("fixture_alpha")
+            .await
+            .expect("original registry wrapper");
+
+        let (generation, client) = {
+            let runtimes = manager.active_mcp_servers.read().await;
+            let runtime = &runtimes["fixture"];
+            (runtime.generation, Arc::clone(&runtime.client))
+        };
+        client
+            .call_tool("alpha", serde_json::json!({"value": 1}))
+            .await
+            .expect("persistent actor handles first tool call");
+        client
+            .call_tool("alpha", serde_json::json!({"value": 2}))
+            .await
+            .expect_err("fixture trap must stop actor");
+        assert!(!client.runtime_is_healthy());
+
+        manager
+            .recover_mcp_runtime_if_needed(
+                McpRecoveryCandidate {
+                    name: "fixture".to_string(),
+                    owner_id: "test".to_string(),
+                    generation,
+                },
+                CancellationToken::new(),
+            )
+            .await;
+
+        let replacement = {
+            let runtimes = manager.active_mcp_servers.read().await;
+            let runtime = &runtimes["fixture"];
+            assert_ne!(runtime.generation, generation);
+            assert_eq!(runtime.health, McpRuntimeHealth::Healthy);
+            assert!(runtime.client.runtime_is_healthy());
+            Arc::clone(&runtime.client)
+        };
+        let replacement_wrapper = manager
+            .tool_registry
+            .get("fixture_alpha")
+            .await
+            .expect("replacement registry wrapper");
+        assert!(!Arc::ptr_eq(&original_wrapper, &replacement_wrapper));
+        assert!(manager.tool_registry.get("fixture_beta").await.is_some());
+        assert!(replacement.runtime_is_healthy());
+        replacement_wrapper
+            .execute(
+                serde_json::json!({"value": 1}),
+                &crate::context::JobContext::with_user("test", "test", "test"),
+            )
+            .await
+            .expect("registry-resolved replacement wrapper executes on fresh actor");
     }
 
     #[tokio::test]
@@ -6826,6 +7035,7 @@ done
                 owner_id: "test".to_string(),
                 client,
                 tools: vec![],
+                tools_generation: 0,
                 managed_stdio: false,
                 managed_wasm: true,
                 generation: manager.next_mcp_runtime_generation(),
@@ -6840,6 +7050,107 @@ done
 
         assert!(stopped.load(Ordering::Acquire));
         assert!(manager.active_mcp_servers.read().await.is_empty());
+    }
+
+    fn changing_tools_response(result: serde_json::Value) -> crate::tools::mcp::McpResponse {
+        crate::tools::mcp::McpResponse {
+            jsonrpc: "2.0".to_string(),
+            id: Some(1),
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn host_list_change_swaps_exact_wrappers_and_retains_them_on_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = make_test_manager(None, dir.path().to_path_buf());
+        let transport = Arc::new(ChangingToolsTransport::new(vec![
+            changing_tools_response(serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "changing", "version": "1"}
+            })),
+            crate::tools::mcp::McpResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: None,
+            },
+            changing_tools_response(
+                serde_json::json!({"tools": [{"name": "old", "inputSchema": {}}]}),
+            ),
+            changing_tools_response(
+                serde_json::json!({"tools": [{"name": "new", "inputSchema": {}}]}),
+            ),
+            changing_tools_response(
+                serde_json::json!({"tools": [{"name": "conflict", "inputSchema": {}}]}),
+            ),
+        ]));
+        let client = Arc::new(crate::tools::mcp::McpClient::new_with_transport(
+            "changing",
+            transport.clone(),
+            None,
+            None,
+            "test",
+            None,
+        ));
+        let old_tools = client.create_tools().await.unwrap();
+        manager
+            .tool_registry
+            .replace_runtime_tools(&[], old_tools.clone())
+            .await
+            .unwrap();
+        let generation = manager.next_mcp_runtime_generation();
+        manager.active_mcp_servers.write().await.insert(
+            "changing".to_string(),
+            ActiveMcpServer {
+                owner_id: "test".to_string(),
+                client,
+                tools: old_tools.clone(),
+                tools_generation: 0,
+                managed_stdio: true,
+                managed_wasm: false,
+                generation,
+                health: McpRuntimeHealth::Healthy,
+                restart_attempts: 0,
+                healthy_since: Instant::now(),
+                retry_after: None,
+            },
+        );
+        let candidate = McpRecoveryCandidate {
+            name: "changing".to_string(),
+            owner_id: "test".to_string(),
+            generation,
+        };
+
+        transport.notify();
+        manager
+            .refresh_mcp_tools_if_needed(&candidate, &CancellationToken::new())
+            .await;
+        assert!(manager.tool_registry.get("changing_old").await.is_none());
+        assert!(manager.tool_registry.get("changing_new").await.is_some());
+
+        let conflict: Arc<dyn Tool> = Arc::new(NamedTestTool {
+            name: "changing_conflict".to_string(),
+        });
+        manager.tool_registry.register(Arc::clone(&conflict)).await;
+        transport.notify();
+        manager
+            .refresh_mcp_tools_if_needed(&candidate, &CancellationToken::new())
+            .await;
+        assert!(manager.tool_registry.get("changing_new").await.is_some());
+        assert!(
+            manager
+                .tool_registry
+                .get("changing_conflict")
+                .await
+                .is_some_and(|tool| Arc::ptr_eq(&tool, &conflict))
+        );
+        assert_eq!(
+            manager.active_mcp_servers.read().await["changing"].tools[0].name(),
+            "changing_new"
+        );
     }
 
     fn write_test_tool(
@@ -7136,6 +7447,7 @@ done
                 owner_id: "test".to_string(),
                 client,
                 tools: vec![tool],
+                tools_generation: 0,
                 managed_stdio: false,
                 managed_wasm: false,
                 generation: manager.next_mcp_runtime_generation(),
@@ -7198,6 +7510,7 @@ done
                 owner_id: "test".to_string(),
                 client,
                 tools: Vec::new(),
+                tools_generation: 0,
                 managed_stdio: false,
                 managed_wasm: true,
                 generation,

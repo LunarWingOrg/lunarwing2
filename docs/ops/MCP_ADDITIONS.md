@@ -1,8 +1,8 @@
 # MCP Additions Status
 
-> **Current status (2026-08-09): PARTIAL.** HTTP/HTTPS, host-local stdio, Unix,
+> **Current status (2026-08-11): PARTIAL.** HTTP/HTTPS, host-local stdio, Unix,
 > stateful MCP-over-WASM, and dedicated/shared gateway adapters are implemented
-> behind one runtime-neutral activation registry. Owner-scoped secret references,
+> behind one internal closed built-in dispatch registry. Owner-scoped secret references,
 > diagnostics, explicit lifecycle operations, safe stdio/WASM crash recovery,
 > operator-pinned package provenance, and opt-in host OS sandboxing are also
 > implemented. Core Docker jobs support explicit worker-local stdio placement with
@@ -27,8 +27,9 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   tools, and registers owner-scoped wrappers.
 - HTTP/HTTPS, stdio, Unix domain socket, stateful WASM component, and gateway
   transports are supported. The agent registry currently exposes MCP tools; the
-  raw WASM actor ABI preserves resources, prompts, notifications, subscriptions,
-  and future JSON-RPC methods for clients that invoke those methods.
+  WASM actor is a synchronous client-to-server tool transport. LunarWing does not
+  expose unsolicited server events, server-to-client requests, resources, prompts,
+  or subscriptions through this client surface.
 
 ### Lifecycle and diagnostics
 
@@ -106,8 +107,11 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   then a live gateway disable unless `--offline`). `mcp list --verbose` shows
   trust state, identity, and digest.
 - Activation fails closed: a revoked package is blocked for every transport. Pinned
-  stdio executables are verified before spawn; pinned WASM bytes are verified both
-  before and during bounded artifact loading, closing the path-swap window. Startup,
+  Linux stdio uses the same verified sealed native bytes for spawn through `memfd`
+  plus `execveat`; pinned WASM bytes are verified both before and during bounded
+  artifact loading. Both close path-swap windows. Pinned stdio reads use metadata and
+  streaming enforcement of a 128 MiB cap; shebang scripts and non-Linux pinning fail
+  closed while unpinned legacy stdio remains available. Startup,
   manual activation, and recovery share this factory path. Digest mismatch or
   revocation blocks activation with a provenance error.
 - Servers without a record keep legacy unverified behavior. `mcp update`
@@ -148,15 +152,18 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 
 ### Runtime adapters, MCP-over-WASM, and gateways
 
-- `ic/src/tools/mcp/runtime.rs` defines the public `McpRuntimeAdapter` boundary,
+- `ic/src/tools/mcp/runtime.rs` defines the internal `McpRuntimeAdapter` boundary,
   activation context/request types, stable runtime kinds, typed activation errors,
-  and an extensible registry. The factory validates persisted intent and provenance
-  once, then dispatches HTTP, stdio, Unix, WASM, or gateway activation through the
-  registry. Every adapter returns the same `McpClient`, preserving discovery,
-  wrapper ownership, approval, update, deactivation, and shutdown behavior.
-- `ic/wit/mcp-server.wit` defines a stateful actor ABI carrying complete JSON-RPC
-  envelopes. One component instance is retained for an active server and requests
-  are serialized through it, so initialization state and subscriptions can persist.
+  and a closed registry for built-in dispatch. It is not a production plugin API;
+  generic external runtime descriptors remain deferred. The factory validates
+  persisted intent and provenance once, then dispatches HTTP, stdio, Unix, WASM, or
+  gateway activation through the registry. Every adapter returns the same `McpClient`,
+  preserving discovery, wrapper ownership, approval, update, deactivation, and
+  shutdown behavior.
+- `ic/wit/mcp-server.wit` defines a stateful synchronous actor ABI carrying JSON-RPC
+  client requests and notifications. One component instance is retained for an active
+  server and calls are serialized through it, so initialization and guest state persist.
+  It has no event/outbox path for unsolicited server events or server-to-client requests.
   The linker exposes no WASI or other host imports, so guest code receives no
   environment, filesystem, network, standard streams, or credentials. Activation
   requires a bounded, single-open, non-symlink regular component artifact and
@@ -165,6 +172,17 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   and 4 MiB request/response envelopes. A trap permanently stops that actor rather
   than reusing possibly-corrupt state; manager supervision removes dead wrappers and
   reconstructs a fresh actor from current persisted intent.
+- The committed source WAT fixture validates initialize/initialized envelopes, exact
+  IDs and capabilities, paginated tool discovery, tool calls and arguments, persistent
+  actor state, memory and fuel limits, timeout, terminal traps, and manager replacement
+  of the registry-resolved wrapper.
+- Initialization advertises empty client capabilities, strictly classifies inbound
+  envelopes, and negotiates exactly MCP `2024-11-05`. Tool discovery follows bounded
+  pagination. When `tools.listChanged` is negotiated, stream transports and one bounded
+  persistent HTTP GET/SSE listener (also through gateway transport) signal a
+  generation-safe rediscovery and atomic wrapper refresh. Canonical annotation fields
+  from later revisions deserialize with their spec defaults but remain untrusted hints;
+  operator approval policy is authoritative.
 - Gateway config explicitly distinguishes `dedicated` and `shared` modes. Both use
   Streamable HTTP and retain normal session/OAuth behavior. The transport owns
   `X-LunarWing-MCP-Gateway-Mode`; shared mode additionally requires and injects
@@ -192,7 +210,8 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 - CLI uses `--placement job-worker`; conversational, authenticated web API, and
   browser install surfaces use `job_worker`. Enabling a worker server makes it
   eligible for future core Docker jobs and never starts it in the daemon.
-- Job creation snapshots all enabled worker servers for the owner. The immutable
+- Job creation snapshots only explicitly selected enabled worker server names for the
+  owner; no worker MCP servers are selected by default. The immutable
   snapshot is limited to eight servers, requires a mounted `/workspace`, and is not
   sent to persistent external workers. Running jobs do not observe later config
   updates, disables, or removals.
@@ -218,9 +237,12 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   `kernel.yama.ptrace_scope >= 1`, which blocks same-UID sibling MCP and shell
   processes from inspecting each other's environments or memory after `execve`.
   Child environments remain scrubbed of the worker bearer token.
-- Prototype limit: initial activation and teardown are bounded, but there is no
-  in-job MCP child restart supervisor. A later child failure surfaces through tool
-  errors; job/container cancellation remains the final cleanup boundary.
+- One supervisor per selected server rebuilds unexpected stdio failures from the
+  immutable job snapshot. Discovery-generation capture makes notification races
+  deterministic: stale refreshes cannot overwrite newer tool sets. Rebuilds use bounded
+  cleanup, jittered backoff, a stability window, and a five-attempt circuit. Terminal
+  circuit state removes dead wrappers; job/container cancellation remains the final
+  cleanup boundary.
 
 ## Not Implemented
 
@@ -346,7 +368,7 @@ resolved secret values are never retained as restart configuration.
   process-group isolation on unix; no_new_privileges, seccomp ptrace/process_vm
   denial, Landlock read-only root with writable paths, and user+network namespace
   network isolation on Linux; fail-closed activation, CLI and doctor surfaces.
-- 2026-08-09: public runtime adapter registry, stateful MCP-over-WASM actor ABI,
+- 2026-08-09: internal built-in runtime adapter registry, stateful MCP-over-WASM actor ABI,
   and dedicated/shared gateway routing contract added with CLI, conversational and
   web API, diagnostics, startup, lifecycle, and focused test coverage. Review
   hardening removed WASI imports, pinned exact component bytes, moved guest work off

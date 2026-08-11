@@ -78,10 +78,17 @@ impl IssueSeverity {
     }
 }
 
+fn inference_messages(thread: &Thread) -> &[crate::types::message::ThreadMessage] {
+    if thread.internal_messages.is_empty() {
+        &thread.messages
+    } else {
+        &thread.internal_messages
+    }
+}
+
 /// Build a trace from a completed thread.
 pub fn build_trace(thread: &Thread) -> ExecutionTrace {
-    let messages: Vec<MessageRecord> = thread
-        .messages
+    let messages: Vec<MessageRecord> = inference_messages(thread)
         .iter()
         .map(|m| {
             let preview: String = m.content.chars().take(300).collect();
@@ -181,6 +188,7 @@ pub fn log_trace_summary(trace: &ExecutionTrace) {
 /// Analyze a completed thread for common issues.
 fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
     let mut issues = Vec::new();
+    let inference_messages = inference_messages(thread);
 
     // 1. Check if the thread failed
     if thread.state == ThreadState::Failed {
@@ -239,7 +247,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         "TypeError",
         "NotImplementedError",
     ];
-    for (i, msg) in thread.messages.iter().enumerate() {
+    for (i, msg) in inference_messages.iter().enumerate() {
         let is_code_output = msg.role == crate::types::message::MessageRole::User
             && (msg.content.starts_with("[stdout]")
                 || msg.content.starts_with("[stderr]")
@@ -257,7 +265,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
     }
 
     // 5. Check for empty call_id on ActionResult messages (causes LLM API rejection).
-    for (i, msg) in thread.messages.iter().enumerate() {
+    for (i, msg) in inference_messages.iter().enumerate() {
         if msg.role == crate::types::message::MessageRole::ActionResult {
             let call_id_empty = msg.action_call_id.as_ref().is_none_or(|id| id.is_empty());
             if call_id_empty {
@@ -274,26 +282,64 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         }
     }
 
-    // 6. Check for model ignoring tool results (hallucination risk).
-    // In Tier 0 (structured), results appear as ActionResult messages.
-    // In Tier 1 (CodeAct), results appear as User messages with "[tool result]" prefixes.
-    let has_tool_results = thread
-        .messages
+    // 6. Check structured calls against the transcript used for inference.
+    // An ActionResult is itself provider-visible tool output; requiring a second
+    // User-role rendering falsely flagged every healthy structured call. Pair by
+    // call ID instead. A waiting thread may omit the one request that has neither
+    // an ApprovalReceived event nor a result yet.
+    let result_ids: std::collections::HashSet<&str> = inference_messages
         .iter()
-        .any(|m| m.role == crate::types::message::MessageRole::ActionResult);
-    let has_tool_output_in_context = thread.messages.iter().any(|m| {
-        m.role == crate::types::message::MessageRole::User
-            && (m.content.contains(" result]") || m.content.contains(" error]"))
-    });
-    if has_tool_results && !has_tool_output_in_context {
-        issues.push(TraceIssue {
-            severity: IssueSeverity::Warning,
-            category: "missing_tool_output".into(),
-            description:
-                "Tool results exist but no tool output in messages — model may not see tool results"
-                    .into(),
-            step: None,
-        });
+        .filter(|message| message.role == crate::types::message::MessageRole::ActionResult)
+        .filter_map(|message| message.action_call_id.as_deref())
+        .filter(|call_id| !call_id.is_empty())
+        .collect();
+    let resolved_gate_ids: std::collections::HashSet<&str> = thread
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            crate::types::event::EventKind::ApprovalReceived { call_id, .. } => {
+                Some(call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let pending_gate_id = (thread.state == ThreadState::Waiting)
+        .then(|| {
+            thread.events.iter().find_map(|event| match &event.kind {
+                crate::types::event::EventKind::ApprovalRequested { call_id, .. }
+                    if !result_ids.contains(call_id.as_str())
+                        && !resolved_gate_ids.contains(call_id.as_str()) =>
+                {
+                    Some(call_id.as_str())
+                }
+                _ => None,
+            })
+        })
+        .flatten();
+    let mut reported_ids = std::collections::HashSet::new();
+
+    for (message_index, message) in inference_messages.iter().enumerate() {
+        let Some(calls) = message.action_calls.as_ref() else {
+            continue;
+        };
+        for call in calls {
+            if call.id.is_empty()
+                || result_ids.contains(call.id.as_str())
+                || pending_gate_id == Some(call.id.as_str())
+                || !reported_ids.insert(call.id.as_str())
+            {
+                continue;
+            }
+            issues.push(TraceIssue {
+                severity: IssueSeverity::Warning,
+                category: "missing_tool_output".into(),
+                description: format!(
+                    "Tool call '{}' ({}) in inference message {} has no matching ActionResult",
+                    call.action_name, call.id, message_index
+                ),
+                step: None,
+            });
+        }
     }
 
     // 7. Check for excessive iterations
@@ -331,8 +377,7 @@ fn analyze_trace(thread: &Thread) -> Vec<TraceIssue> {
         .iter()
         .filter(|e| matches!(e.kind, crate::types::event::EventKind::StepStarted { .. }))
         .count();
-    let text_responses_without_code = thread
-        .messages
+    let text_responses_without_code = inference_messages
         .iter()
         .filter(|m| {
             m.role == crate::types::message::MessageRole::Assistant
@@ -519,7 +564,7 @@ mod tests {
     use crate::types::event::EventKind;
     use crate::types::message::ThreadMessage;
     use crate::types::project::ProjectId;
-    use crate::types::step::StepId;
+    use crate::types::step::{ActionCall, StepId};
     use crate::types::thread::{ThreadConfig, ThreadType};
 
     fn make_thread() -> Thread {
@@ -529,6 +574,17 @@ mod tests {
             ProjectId::new(),
             "test-user",
             ThreadConfig::default(),
+        )
+    }
+
+    fn assistant_action(call_id: &str, action_name: &str) -> ThreadMessage {
+        ThreadMessage::assistant_with_actions(
+            None,
+            vec![ActionCall {
+                id: call_id.to_string(),
+                action_name: action_name.to_string(),
+                parameters: serde_json::json!({}),
+            }],
         )
     }
 
@@ -554,6 +610,143 @@ mod tests {
         assert!(!issue.severity.is_actionable());
     }
 
+    // ── missing_tool_output detection ─────────────────────────
+
+    #[test]
+    fn structured_action_result_is_provider_visible_output() {
+        let mut thread = make_thread();
+        thread.add_message(assistant_action("call-1", "search"));
+        thread.add_message(ThreadMessage::action_result("call-1", "search", "found"));
+
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.category == "missing_tool_output")
+        );
+    }
+
+    #[test]
+    fn detects_structured_call_without_matching_result() {
+        let mut thread = make_thread();
+        thread.add_message(assistant_action("call-missing", "search"));
+
+        let issues = analyze_trace(&thread);
+        let missing: Vec<_> = issues
+            .iter()
+            .filter(|issue| issue.category == "missing_tool_output")
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].description.contains("call-missing"));
+        assert!(missing[0].description.contains("search"));
+    }
+
+    #[test]
+    fn missing_result_uses_authoritative_internal_transcript() {
+        let mut thread = make_thread();
+        thread.add_message(assistant_action("visible-stale", "old_tool"));
+        thread
+            .internal_messages
+            .push(assistant_action("call-1", "search"));
+        thread
+            .internal_messages
+            .push(ThreadMessage::action_result("call-1", "search", "found"));
+
+        let issues = analyze_trace(&thread);
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.category == "missing_tool_output")
+        );
+    }
+
+    #[test]
+    fn duplicate_missing_call_id_is_reported_once() {
+        let mut thread = make_thread();
+        thread.add_message(assistant_action("call-1", "search"));
+        thread.add_message(assistant_action("call-1", "search"));
+
+        let missing_count = analyze_trace(&thread)
+            .iter()
+            .filter(|issue| issue.category == "missing_tool_output")
+            .count();
+        assert_eq!(missing_count, 1);
+    }
+
+    #[test]
+    fn waiting_gate_exempts_only_the_pending_call() {
+        let mut thread = make_thread();
+        thread.state = ThreadState::Waiting;
+        thread.add_message(assistant_action("call-gated", "shell"));
+        thread.add_message(assistant_action("call-missing", "search"));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ApprovalRequested {
+                action_name: "shell".into(),
+                call_id: "call-gated".into(),
+                parameters: Some(serde_json::json!({})),
+                description: None,
+                allow_always: Some(true),
+                gate_name: Some("approval".into()),
+                params_summary: None,
+            },
+        ));
+
+        let missing: Vec<_> = analyze_trace(&thread)
+            .into_iter()
+            .filter(|issue| issue.category == "missing_tool_output")
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].description.contains("call-missing"));
+    }
+
+    #[test]
+    fn waiting_gate_ignores_historical_resolved_request() {
+        let mut thread = make_thread();
+        thread.state = ThreadState::Waiting;
+        thread.add_message(assistant_action("call-old", "old_tool"));
+        thread.add_message(assistant_action("call-current", "shell"));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ApprovalRequested {
+                action_name: "old_tool".into(),
+                call_id: "call-old".into(),
+                parameters: None,
+                description: None,
+                allow_always: Some(true),
+                gate_name: Some("approval".into()),
+                params_summary: None,
+            },
+        ));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ApprovalReceived {
+                call_id: "call-old".into(),
+                approved: true,
+            },
+        ));
+        thread.events.push(ThreadEvent::new(
+            thread.id,
+            EventKind::ApprovalRequested {
+                action_name: "shell".into(),
+                call_id: "call-current".into(),
+                parameters: None,
+                description: None,
+                allow_always: Some(true),
+                gate_name: Some("approval".into()),
+                params_summary: None,
+            },
+        ));
+
+        let missing: Vec<_> = analyze_trace(&thread)
+            .into_iter()
+            .filter(|issue| issue.category == "missing_tool_output")
+            .collect();
+        assert_eq!(missing.len(), 1);
+        assert!(missing[0].description.contains("call-old"));
+        assert!(!missing[0].description.contains("call-current"));
+    }
+
     // ── empty_call_id detection (OpenAI / Codex rejection) ───
 
     /// OpenAI and Codex reject ActionResult messages with empty call_id.
@@ -575,6 +768,26 @@ mod tests {
         assert_eq!(empty_id_issues.len(), 1);
         assert_eq!(empty_id_issues[0].severity, IssueSeverity::Error);
         assert!(empty_id_issues[0].description.contains("web_search"));
+    }
+
+    #[test]
+    fn detects_empty_call_id_in_internal_inference_transcript() {
+        let mut thread = make_thread();
+        thread.add_message(ThreadMessage::assistant("visible response"));
+        thread
+            .internal_messages
+            .push(ThreadMessage::action_result("", "shell", "result"));
+
+        let trace = build_trace(&thread);
+        assert!(
+            trace
+                .issues
+                .iter()
+                .any(|issue| issue.category == "empty_call_id")
+        );
+        assert_eq!(trace.messages.len(), 1);
+        assert_eq!(trace.messages[0].role, "ActionResult");
+        assert_eq!(trace.messages[0].action_call_id.as_deref(), Some(""));
     }
 
     /// ActionResult with None call_id should also be flagged.
