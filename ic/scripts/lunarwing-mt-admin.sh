@@ -10424,7 +10424,8 @@ _render_tenant_units_locked() {
     else
       rm -f "$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
     fi
-    render_tenant_systemd_units "$name"
+    render_tenant_systemd_units "$name" || return 1
+    _systemctl_user "$name" daemon-reload >/dev/null || return 1
   else
     if tenant_voice_enabled "$name"; then
       render_voice_openrc_unit "$name"
