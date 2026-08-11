@@ -197,8 +197,8 @@ registry `vision_health` ports (e.g. lunarium → `20006`). Leave the URL unset 
 set `SELF_HEAL_TENANTS_FILE` (mt-admin writes `/etc/lunarwing/ports.json`) so
 `health-lunarvision.sh` discovers every tenant. Without registry targets, the
 single-node fallback is `http://127.0.0.1:8089`; port `8088` is the API listener
-and no longer serves `/health`. Only set `HEALTH_LUNARVISION_URL` when you
-intentionally force one override.
+and retains `/health` only as a pre-v10 compatibility alias. Only set
+`HEALTH_LUNARVISION_URL` when you intentionally force one override.
 
 Put these in a shared env file (e.g. `/etc/lunarwing/health.env`) loaded by the
 timer/cron unit so every run picks them up.
