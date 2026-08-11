@@ -7364,16 +7364,23 @@ INITEOF
 }
 
 render_vision_quadlet() {
-  local name="$1" qdir vision_port vision_health_port env_path
+  local name="$1" qdir vision_port vision_health_port env_path path tmp
   qdir="$(tenant_quadlet_dir "$name")"
   vision_port="$(ports_get "$name" vision_service)" || return 1
   vision_health_port="$(ports_get "$name" vision_health)" || return 1
   _vision_port_valid "$vision_port" && _vision_port_valid "$vision_health_port" || return 1
   env_path="$(tenant_env_dir "$name")/vision.env"
-  [[ -f "$env_path" ]] || write_tenant_vision_env "$name" >/dev/null
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || { say "ERROR: regular LunarVision env file required: $env_path" >&2; return 1; }
   mkdir -p "$qdir"
+  path="$qdir/lunarwing-vision-${name}.container"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] \
+      || { say "ERROR: refusing to overwrite unsafe Quadlet path $path" >&2; return 1; }
+  fi
+  tmp="$(mktemp "$qdir/.lunarwing-vision-${name}.container.XXXXXX")" || return 1
 
-  cat >"$qdir/lunarwing-vision-${name}.container" <<EOF
+  cat >"$tmp" <<EOF
 [Unit]
 Description=LunarWing vision sidecar ($name)
 After=network-online.target
@@ -7404,6 +7411,50 @@ TimeoutStartSec=120
 [Install]
 WantedBy=default.target
 EOF
+  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path"
+}
+
+render_vision_systemd_assets() {
+  local name="$1" container qfile fallback has_quadlet=false has_fallback=false
+  ensure_container_runtime
+  [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] || return 0
+  container="lunarwing-vision-${name}"
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  fallback="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  [[ -e "$qfile" || -L "$qfile" ]] && has_quadlet=true
+  [[ -e "$fallback" || -L "$fallback" ]] && has_fallback=true
+  if [[ "$has_quadlet" == "true" && "$has_fallback" == "true" ]]; then
+    say "ERROR: conflicting LunarVision Quadlet and fallback unit for $name" >&2
+    return 1
+  fi
+  if [[ "$has_fallback" == "true" ]]; then
+    render_vision_systemd_fallback_unit "$name"
+  elif [[ "$has_quadlet" == "true" ]]; then
+    render_vision_quadlet "$name"
+  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  elif podman_supports_quadlet; then
+    render_vision_quadlet "$name"
+  else
+    render_vision_systemd_fallback_unit "$name"
+  fi
+}
+
+render_vision_openrc_assets() {
+  local name="$1" uid home container="lunarwing-vision-${1}" direct supervisor
+  direct="$OPENRC_INITD_DIR/$container"
+  supervisor="$OPENRC_INITD_DIR/${container}-sup"
+  if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
+      && ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  fi
+  render_vision_openrc_unit "$name" || return 1
+  [[ "$MT_ROOTLESS" == "true" ]] || return 0
+  uid="$(id -u "$name")" || return 1
+  home="$(tenant_home "$name")"
+  render_container_babysitter_unit "$name" vision "$container" "$uid" "$home"
 }
 
 # ── LunarVoice ONNX sidecar ──────────────────────────────────────────────────
@@ -8456,11 +8507,10 @@ MemoryHigh=$BUILD_MEMORY_HIGH
 MemoryMax=$BUILD_MEMORY_MAX
 EOF
 
-  # The pg + worker Quadlet .container units are rendered by the start functions
-  # (start_tenant_postgres / start_tenant_<worker>), NOT here: those guard on
-  # image availability, so a not-yet-built worker image never produces a unit
-  # that would crash-loop at boot (Restart=always). The daemon's Requires= above
-  # still resolves because start_tenant_postgres renders + starts pg first.
+  # Refresh LunarVision's existing supervision shape without starting it. PG and
+  # worker Quadlets remain owned by their start functions because selection and
+  # image availability determine whether those units should exist.
+  render_vision_systemd_assets "$name" || return 1
 
   chown -R "$name:$name" "$user_unit_dir"
   say "rendered systemd units for $name in $user_unit_dir"
@@ -9272,6 +9322,7 @@ CONFD
 CONFD
   fi
 
+  render_vision_openrc_assets "$name" || return 1
   say "rendered OpenRC init scripts and conf.d for $name"
 }
 
