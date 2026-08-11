@@ -93,7 +93,10 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-pebble luna1 --nanogpt-api-key <
 ## 3. Start + enable services (OpenRC)
 
 `start-tenant` runs the sequence itself: it starts PostgreSQL and LunarVision,
-then the core OpenRC services and enabled sidecars under their dependency graph.
+requires LunarVision's internal `8089/health` probe to pass, then starts the core
+OpenRC services and enabled sidecars under their dependency graph. LunarVision's
+`lunarwing-vision-<tenant>` unit provides endpoint-aware status and its
+`lunarwing-vision-<tenant>-sup` companion restarts a crashed rootless container.
 The proxy and DarkIRC start only when selected; WeeChat starts when enabled.
 After the daemon and SSH agent are ready, mt-admin starts each worker only when
 it is selected for this tenant and its shared image exists. Services that start
@@ -121,6 +124,12 @@ sudo ic/scripts/lunarwing-mt-admin.sh tokens luna1        # gateway auth token f
 
 rc-service lunarwing-luna1 status
 rc-service lunarwing-pg-luna1 status
+rc-service lunarwing-vision-luna1 status
+rc-service lunarwing-vision-luna1-sup status
+
+# Probe the dedicated LunarVision health publication from the registry.
+vision_health_port="$(jq -r '.tenants.luna1.extended_ports.vision_health' /etc/lunarwing/ports.json)"
+curl --fail "http://127.0.0.1:${vision_health_port}/health"
 
 # First tenant on an empty registry => gateway port 10000, but read the real value from status/list-tenants
 curl -sS -o /dev/null -w 'gateway HTTP %{http_code}\n' http://127.0.0.1:10000/
@@ -143,6 +152,6 @@ tail -f /home/luna1/lunarwing/logs/lunarwing.log
 - **Base dir / layout** for `luna1`: home `/home/luna1`; LunarWing root `/home/luna1/lunarwing`; repo clone `/home/luna1/lunarwing/ic`; env dir `/home/luna1/lunarwing/env` (holds `lunarwing.env`, `pg.secret`, and `pebble.env` if configured); **state dir = `LUNARWING_BASE_DIR` = `/home/luna1/lunarwing/state`**; logs `/home/luna1/lunarwing/logs`; run/pids `/home/luna1/lunarwing/run`.
 - **Init-system / runtime selection** — no `--init-system` flag. Selection is the env override `LUNARWING_SERVICE_MANAGER=openrc|systemd` (else autodetected: `/run/openrc/softlevel` ⇒ openrc) and `LUNARWING_CONTAINER_RUNTIME=podman|docker` (else autodetected). Exporting both, as in step 0, makes the run deterministic. With podman the script sets `MT_ROOTLESS=true`: all per-tenant pg/worker containers run as the tenant user against their own rootless store (override with `LUNARWING_MT_ROOTLESS` if ever needed). Per-tenant image cleanup later lives in `/home/luna1/.local/share/containers`, **not** root's store.
 - **OpenRC vs systemd caveat** — on OpenRC the units are **system-level** init scripts in `/etc/init.d/` using `supervise-daemon` with `command_user=<tenant>`; logs go to `/home/luna1/lunarwing/logs/lunarwing.log` (tail it, there is no `journalctl --user`). Boot persistence is `rc-update add lunarwing-luna1 default` (already done by `start-tenant`). The systemd-only concepts in the docs — `~/.config/systemd/user/` units, `loginctl enable-linger`, podman Quadlet `.container` files — do **not** apply here. One overlap: `add-tenant` still calls `loginctl enable-linger luna1`, which works under elogind to keep the rootless runtime dir across reboots (not a systemd dependency).
-- **TensorZero proxy** is opt-in with `--enable-proxy` and is **not** a container under OpenRC — when selected, it runs as a tenant-owned `python3` process under `supervise-daemon` from the tenant's own `tensorzero-proxy-configurations/lunarwing-proxy.py`. PostgreSQL, LunarVision, and selected workers are Podman containers.
+- **TensorZero proxy** is opt-in with `--enable-proxy` and is **not** a container under OpenRC — when selected, it runs as a tenant-owned `python3` process under `supervise-daemon` from the tenant's own `tensorzero-proxy-configurations/lunarwing-proxy.py`. PostgreSQL, LunarVision, and selected workers are rootless Podman containers with matching `-sup` crash supervisors.
 - **WeeChat / weechat-adapter** are optional; `start-tenant` skips them non-fatally if their deps are missing, and the main daemon does not depend on them.
 - **`doctor`** returns non-zero if any check fails and includes a "root" assertion — run it via `sudo` so that check passes, and clear every `[FAIL]` before step 1.
