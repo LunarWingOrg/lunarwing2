@@ -31,10 +31,8 @@ cd projects/ocr-sidecar
 install -m 0600 /dev/null "$HOME/.config/lunarwing/ocr-sidecar.env"
 printf 'LUNARWING_AUTH_TOKEN=%s\n' 'replace-with-a-random-token' \
   >"$HOME/.config/lunarwing/ocr-sidecar.env"
-set -a
-. "$HOME/.config/lunarwing/ocr-sidecar.env"
-set +a
-podman compose up --build -d
+podman compose --env-file "$HOME/.config/lunarwing/ocr-sidecar.env" \
+  up --build -d
 
 curl --fail http://127.0.0.1:8089/health
 curl --fail http://127.0.0.1:8089/vision/metrics
