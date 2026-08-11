@@ -484,7 +484,7 @@ async fn handle_rejection(err: Rejection) -> Result<impl Reply, Infallible> {
                 code: 404,
             },
         )
-    } else if let Some(_) = err.find::<warp::reject::PayloadTooLarge>() {
+    } else if err.find::<warp::reject::PayloadTooLarge>().is_some() {
         (
             StatusCode::PAYLOAD_TOO_LARGE,
             ErrorResponse {
@@ -973,10 +973,7 @@ async fn run_vl(
     config: &Config,
     max_tokens: u32,
 ) -> Result<(VisionResult, Option<u32>), AppError> {
-    let vl_url = config
-        .vl_url
-        .as_ref()
-        .ok_or_else(|| AppError::InternalError)?;
+    let vl_url = config.vl_url.as_ref().ok_or(AppError::InternalError)?;
 
     let timeout = Duration::from_secs(config.vl_timeout_secs);
     let client = reqwest::Client::builder()
@@ -1820,10 +1817,12 @@ async fn main() {
         .map(|v| v == "1" || v == "true")
         .unwrap_or(false);
     let cache_dir = std::env::var("CACHE_DIR").ok().map(PathBuf::from);
-    let rate_limit_per_second = std::env::var("RATE_LIMIT_PER_SECOND")
+    let default_rate_limit = std::num::NonZeroU32::new(10).unwrap_or(std::num::NonZeroU32::MIN);
+    let rate_limit = std::env::var("RATE_LIMIT_PER_SECOND")
         .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(10);
+        .and_then(|p| p.parse::<std::num::NonZeroU32>().ok())
+        .unwrap_or(default_rate_limit);
+    let rate_limit_per_second = rate_limit.get();
 
     let config = Config {
         auth_token,
@@ -1841,10 +1840,7 @@ async fn main() {
         rate_limit_per_second,
     };
 
-    let quota = Quota::per_second(
-        std::num::NonZeroU32::new(rate_limit_per_second)
-            .unwrap_or(std::num::NonZeroU32::new(10).unwrap()),
-    );
+    let quota = Quota::per_second(rate_limit);
     let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
     let start_time = Instant::now();
@@ -1944,25 +1940,32 @@ async fn main() {
         .and(with_state(state.clone()))
         .and_then(prometheus_metrics_handler);
 
+    // Keep an API-port alias for pre-v10 deployments whose registry has no
+    // dedicated health publication. Managed and single-node health checks use
+    // OCR_HEALTH_PORT so inference saturation cannot starve normal probes.
+    let compatibility_health_route = warp::path("health")
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(health_handler);
     let health_route = warp::path("health")
         .and(warp::get())
         .and(with_state(state.clone()))
         .and_then(health_handler);
+    let health_metrics_route = warp::path("vision")
+        .and(warp::path("metrics"))
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(metrics_handler);
+    let health_routes = health_route
+        .or(health_metrics_route)
+        .recover(handle_rejection);
 
-    // The health route runs on a SEPARATE port (OCR_HEALTH_PORT, default 8089)
-    // so that a saturated or panicked OCR/vision handler cannot prevent the
-    // host self-heal pipeline from probing /health. This mirrors the
-    // external-worker pattern (WSS + dedicated 8443 health port).
-    let health_state = state.clone();
+    // Operational routes run on a separate port so a saturated OCR/vision
+    // handler cannot starve health checks or metrics collection. Keep both
+    // listeners in this task: if either unexpectedly stops, exit non-zero and
+    // let systemd, OpenRC, or the container restart policy recover the service.
     let health_port = config.health_port;
-    tokio::spawn(async move {
-        tracing::info!("Health endpoint listening on port {}", health_port);
-        warp::serve(health_route)
-            .run(([0, 0, 0, 0], health_port))
-            .await;
-    });
-
-    // Main API routes — everything except /health, served on OCR_PORT.
+    let api_port = config.port;
     let routes = legacy_ocr_route
         .or(legacy_vision_route)
         .or(legacy_metrics_route)
@@ -1971,9 +1974,11 @@ async fn main() {
         .or(metrics_route)
         .or(openapi_route)
         .or(prometheus_route)
+        .or(compatibility_health_route)
         .recover(handle_rejection);
 
-    tracing::info!("Starting Vision Service on port {}", config.port);
+    tracing::info!("Starting Vision Service on port {}", api_port);
+    tracing::info!("Health and metrics listening on port {}", health_port);
     tracing::info!(
         "PaddleOCR fallback: {}, Cache: {}, Rate limit: {}/s",
         config.enable_paddleocr,
@@ -1981,8 +1986,14 @@ async fn main() {
         config.rate_limit_per_second
     );
 
-    let _ = health_state; // keep alive for the duration of main
-    warp::serve(routes).run(([0, 0, 0, 0], config.port)).await;
+    let api_server = warp::serve(routes).run(([0, 0, 0, 0], api_port));
+    let health_server = warp::serve(health_routes).run(([0, 0, 0, 0], health_port));
+    let stopped_listener = tokio::select! {
+        _ = api_server => "API",
+        _ = health_server => "health",
+    };
+    tracing::error!(listener = stopped_listener, "listener stopped unexpectedly");
+    std::process::exit(1);
 }
 
 #[cfg(test)]

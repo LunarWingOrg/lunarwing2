@@ -33,13 +33,12 @@ fn test_image_format_validation() {
 }
 
 fn validate_image_format(body: &[u8]) -> Result<(), String> {
-    if body.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Ok(())
-    } else if body.starts_with(b"\xff\xd8\xff") {
-        Ok(())
-    } else if body.len() > 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP" {
-        Ok(())
-    } else if body.starts_with(b"II\x2a\x00") || body.starts_with(b"MM\x00\x2a") {
+    let supported = body.starts_with(b"\x89PNG\r\n\x1a\n")
+        || body.starts_with(b"\xff\xd8\xff")
+        || (body.len() > 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP")
+        || body.starts_with(b"II\x2a\x00")
+        || body.starts_with(b"MM\x00\x2a");
+    if supported {
         Ok(())
     } else {
         Err("Unsupported media type".to_string())

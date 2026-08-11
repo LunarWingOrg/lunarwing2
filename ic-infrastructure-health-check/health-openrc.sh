@@ -122,7 +122,7 @@ unit_tenant() {
         opencode-*)          rest="${rest#opencode-}"; rest="${rest%-sup}" ;;
         kimi-*)              rest="${rest#kimi-}"; rest="${rest%-sup}" ;;
         pebble-*)            rest="${rest#pebble-}"; rest="${rest%-sup}" ;;
-        vision-*)            rest="${rest#vision-}" ;;
+        vision-*)            rest="${rest#vision-}"; rest="${rest%-sup}" ;;
         weechat-adapter-*)   rest="${rest#weechat-adapter-}" ;;
         weechat-*)           rest="${rest#weechat-}" ;;
         darkirc-adapter-*)   rest="${rest#darkirc-adapter-}" ;;

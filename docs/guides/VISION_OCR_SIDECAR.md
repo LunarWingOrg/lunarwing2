@@ -30,8 +30,19 @@ A single-node default deployment exposes the main API on `OCR_PORT=8088` and the
 | `GET /v1/vision/metrics` | main API | JSON usage metrics |
 | `GET /metrics` | main API | Prometheus metrics |
 | `GET /openapi.json` | main API | OpenAPI document |
-| `GET /health` | dedicated health port | Health check; no bearer token required |
+| `GET /health` | dedicated operational port | Health check; no bearer token required |
+| `GET /vision/metrics` | dedicated operational port | JSON metrics for the host health pipeline |
 
-Unversioned `/ocr`, `/vision/analyze`, and `/vision/metrics` routes remain compatibility aliases, but new integrations should use `/v1/...`.
+Unversioned `/ocr`, `/vision/analyze`, and `/vision/metrics` routes remain compatibility aliases, but new API integrations should use `/v1/...`. The dedicated operational listener intentionally exposes only `/health` and unversioned `/vision/metrics`.
 
-Set `LUNARWING_AUTH_TOKEN` on the sidecar to require bearer authentication for protected API endpoints, and set the matching `VISION_AUTH_TOKEN` at the LunarWing host boundary. Never embed the token in WASM capabilities or client-visible configuration.
+Set `LUNARWING_AUTH_TOKEN` on the sidecar to require bearer authentication for OCR and vision-analysis POST endpoints, and set the matching `VISION_AUTH_TOKEN` at the LunarWing host boundary. Never embed the token in WASM capabilities or client-visible configuration. Operational and metadata endpoints are unauthenticated, so publish them only on trusted interfaces.
+
+## Managed Lifecycle
+
+Use `ic/scripts/lunarwing-mt-admin.sh` for multi-tenant deployments. It publishes
+distinct registry `vision_service` and `vision_health` ports, recreates a
+container when its image, environment, port, runtime, or init contract changes,
+and reports startup success only after the internal `8089/health` probe passes.
+systemd hosts use tenant user Quadlets, with a managed `podman wait` user-unit
+fallback on older Podman. OpenRC hosts use a health-aware direct unit plus a
+`lunarwing-vision-<tenant>-sup` crash supervisor.

@@ -216,8 +216,9 @@ assert_eq "$(src_fn -- unit_tenant lunarwing-proxy-acme.service)" "acme"   "D: u
 assert_eq "$(src_fn -- unit_tenant ironclaw-proxy-acme.service)"  "acme"   "D: unit_tenant ironclaw-proxy-<t>"
 assert_eq "$(src_fn -- unit_tenant xmpp-bridge-globex.service)"   "globex" "D: unit_tenant xmpp-bridge-<t>"
 assert_eq "$(src_fn -- unit_tenant lunarwing-acme.service)"       "acme"   "D: unit_tenant lunarwing-<t>"
-assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme.service)" "acme"   "D: unit_tenant lunarwing-vision-<t>"
-assert_eq "$(src_fn -- unit_tenant lunarwing.service)"            ""       "D: unit_tenant base unit → no tenant"
+assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme.service)"     "acme" "D: unit_tenant lunarwing-vision-<t>"
+assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme-sup.service)" "acme" "D: unit_tenant LunarVision supervisor"
+assert_eq "$(src_fn -- unit_tenant lunarwing.service)"                ""     "D: unit_tenant base unit → no tenant"
 assert_eq "$(src_fn -- unit_tenant clickhouse-server.service)"    ""       "D: unit_tenant foreign unit → no tenant"
 
 d5="$(sb)"; report "$d5" "$GW"

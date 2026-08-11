@@ -124,7 +124,8 @@ This is **not** a lowest-common-denominator product. Multi-tenant LunarWing runs
 
 - Tenant lifecycle / status / operator health → **`scripts/lunarwing-mt-admin.sh`** (`status <tenant>`, start/stop/build, doctor, health pipeline install). Override path with `LUNARWING_MT_ADMIN` if needed.
 - Host-global pipeline lives under `../ic-infrastructure-health-check/` (installed to `/usr/local/lib/lunarwing-health/` via mt-admin). It must stay **init-agnostic** and **ports-registry-aware**.
-- `health-lunarvision.sh`: leave **`HEALTH_LUNARVISION_URL` unset** on MT hosts so it auto-discovers every tenant's `vision_health` (fallback `vision_service`) from `SELF_HEAL_TENANTS_FILE` / `/etc/lunarwing/ports.json`. Explicit URL is only for intentional single-target override; empty registry falls back to single-node `8088`.
+- `health-lunarvision.sh`: leave **`HEALTH_LUNARVISION_URL` unset** on MT hosts so it auto-discovers every tenant's `vision_health` (legacy `reserved_6`, then `vision_service`) from `SELF_HEAL_TENANTS_FILE` / `/etc/lunarwing/ports.json`. Explicit URL is only for intentional single-target override; empty registry falls back to the dedicated single-node operational listener on `8089`.
+- LunarVision tenant lifecycle belongs in mt-admin: publish distinct API/health ports, recreate containers when env/image/port contracts change, require `/health` before reporting success, use systemd user Quadlet (or its managed older-Podman fallback), and pair the OpenRC health unit with a `-sup` crash supervisor.
 - Wrappers (`lunarwing_mt_onboard*`) are **thin drivers** of mt-admin — no parallel init or port logic.
 - Parse both init status shapes when reading mt-admin output (`….service: active` and OpenRC `…: started`), or use exit codes / structured contracts.
 - **Both systemd and OpenRC are first-class.** Never treat Gentoo/OpenRC as an edge case.
@@ -142,9 +143,8 @@ That class of bug must not reappear.
 # Must not appear in onboard/web/verify wrappers:
 rg -n 'systemctl is-active|systemctl status|rc-service' ../lunarwing_mt_onboard ../lunarwing_mt_onboard_web
 
-# LunarVision must not reintroduce hard-only 8088 without registry discovery:
-rg -n '127\.0\.0\.1:8088' ../ic-infrastructure-health-check/health-lunarvision.sh
-# (8088 as single-node *fallback after* ports-registry discovery is OK; sole/default-without-registry path must stay documented.)
+# LunarVision must not reintroduce the API listener as its health default:
+rg -n 'DEFAULT_SINGLE_NODE_URL=.*8088|HEALTH_LUNARVISION_URL=.*8088' ../ic-infrastructure-health-check
 ```
 
 Exceptions: comments/docs forbidding the pattern; init helpers **inside** `scripts/lunarwing-mt-admin.sh` (e.g. `_systemctl_user`); infrastructure-health tooling that already abstracts user units / OpenRC / ports.json correctly.

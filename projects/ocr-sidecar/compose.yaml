@@ -6,8 +6,10 @@ services:
     image: lunarwing/vision-service
     container_name: lunarwing-ocr-sidecar
     ports:
-      - "8088:8088"
-      - "8089:8089"
+      - "127.0.0.1:8088:8088"
+      - "127.0.0.1:8089:8089"
+    security_opt:
+      - no-new-privileges:true
     environment:
       - LUNARWING_AUTH_TOKEN=${LUNARWING_AUTH_TOKEN:?Set LUNARWING_AUTH_TOKEN}
       - OCR_PORT=8088

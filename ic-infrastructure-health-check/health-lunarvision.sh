@@ -7,11 +7,11 @@
 # Env vars:
 #   HEALTH_LUNARVISION_ENABLED       (default: true)   — false disables
 #   HEALTH_LUNARVISION_URL           (optional)        — single base URL override
-#                                                        (e.g. http://127.0.0.1:8088).
+#                                                        (e.g. http://127.0.0.1:8089).
 #                                                        When unset, multi-tenant hosts
 #                                                        auto-discover vision_health ports
 #                                                        from the ports registry; single-node
-#                                                        falls back to http://127.0.0.1:8088.
+#                                                        falls back to http://127.0.0.1:8089.
 #   SELF_HEAL_TENANTS_FILE / LUNARWING_TENANTS_FILE    — ports registry path
 #                                                        (default: /etc/lunarwing/ports.json)
 #   HEALTH_LUNARVISION_TIMEOUT       (default: 5)      — curl timeout in seconds
@@ -29,7 +29,7 @@ FETCH_METRICS="${HEALTH_LUNARVISION_FETCH_METRICS:-true}"
 REQUIRE_VL="${HEALTH_LUNARVISION_REQUIRE_VL:-false}"
 LATENCY_DEGRADED_MS="${HEALTH_LUNARVISION_LATENCY_DEGRADED_MS:-2000}"
 LATENCY_CRITICAL_MS="${HEALTH_LUNARVISION_LATENCY_CRITICAL_MS:-5000}"
-DEFAULT_SINGLE_NODE_URL="http://127.0.0.1:8088"
+DEFAULT_SINGLE_NODE_URL="http://127.0.0.1:8089"
 
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -44,8 +44,8 @@ fi
 # ── Target resolution (MT-aware) ─────────────────────────────────────────────
 # Explicit HEALTH_LUNARVISION_URL always wins (operator override).
 # Otherwise discover every tenant's vision_health port from the ports registry
-# so multi-tenant hosts never false-fail against the single-node 8088 default.
-# If no registry / no vision ports, fall back to single-node 8088.
+# so multi-tenant hosts never false-fail against the single-node 8089 default.
+# If no registry / no vision ports, fall back to single-node 8089.
 
 _resolve_tenants_file() {
     if [ -n "${SELF_HEAL_TENANTS_FILE:-}" ] && [ -f "${SELF_HEAL_TENANTS_FILE}" ]; then
@@ -76,7 +76,8 @@ else
     tenants_file=""
     if tenants_file="$(_resolve_tenants_file)"; then
         if command -v jq >/dev/null 2>&1; then
-            # Prefer dedicated vision_health; fall back to vision_service if older registry.
+            # Prefer the dedicated field, then its pre-v10 reserved name. The
+            # API-port fallback supports truly old registries without slot 6.
             while IFS=$'\t' read -r tname port; do
                 [ -n "$tname" ] && [ -n "$port" ] && [ "$port" != "null" ] || continue
                 TARGETS+=("${tname}|http://127.0.0.1:${port}")
@@ -86,6 +87,7 @@ else
                 | . as $e
                 | (
                     $e.value.extended_ports.vision_health
+                    // $e.value.extended_ports.reserved_6
                     // $e.value.extended_ports.vision_service
                     // empty
                   ) as $p

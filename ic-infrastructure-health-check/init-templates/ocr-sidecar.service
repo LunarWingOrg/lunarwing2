@@ -1,24 +1,27 @@
 [Unit]
-Description=LunarWing Vision OCR Sidecar (Podman rootless)
+Description=LunarWing Vision OCR Sidecar (rootless Podman)
 Documentation=https://git.lunarwing.org/lunarwing/lunarwing2/-/tree/master/projects/ocr-sidecar
-After=podman.service
-Requires=podman.service
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=/opt/lunarwing/projects/ocr-sidecar
-Environment=LUNARWING_AUTH_TOKEN=${LUNARWING_AUTH_TOKEN}
-Environment=OCR_PORT=8088
-EnvironmentFile=-/etc/lunarwing/ocr-sidecar.env
-ExecStartPre=/usr/bin/podman compose down --remove-orphans || true
-ExecStart=/usr/bin/podman compose up --build
+EnvironmentFile=%h/.config/lunarwing/ocr-sidecar.env
+ExecStartPre=-/usr/bin/podman compose down --remove-orphans
+ExecStart=/usr/bin/podman compose up --build --remove-orphans
+ExecStartPost=/usr/bin/timeout 120 /bin/sh -ec 'until /usr/bin/podman exec lunarwing-ocr-sidecar curl --fail --silent --output /dev/null --max-time 3 http://127.0.0.1:8089/health; do sleep 1; done'
 ExecStop=/usr/bin/podman compose down
 Restart=on-failure
-RestartSec=10
-TimeoutStartSec=120
+RestartSec=5
+TimeoutStartSec=180
+TimeoutStopSec=60
+UMask=0077
 
-# Rootless Podman: this unit runs as the user, not root
-# Install to: ~/.config/systemd/user/ocr-sidecar.service
+# Install as the user who owns the rootless Podman store:
+#   ~/.config/systemd/user/ocr-sidecar.service
 # Enable with: systemctl --user enable --now ocr-sidecar.service
 
 [Install]

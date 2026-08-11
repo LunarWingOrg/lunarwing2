@@ -98,7 +98,10 @@ Unified vision analysis endpoint with smart routing (Phase 2).
 4. Keyword heuristics: OCR-primary `["read", "say", "text", "extract"]`, VL-primary `["describe", "compare", "which", "looks", "color"]`
 
 ### GET /health
-Health check endpoint (no auth required).
+Health check endpoint on the dedicated operational listener (default
+`http://127.0.0.1:8089/health`; no auth required). Keeping this listener
+separate from the OCR API prevents saturated inference traffic from starving
+health probes.
 
 **Response:**
 ```json
@@ -113,7 +116,8 @@ Health check endpoint (no auth required).
 `vl_available` is `true` when `VL_URL` is configured.
 
 ### GET /metrics
-Prometheus metrics endpoint (no auth required). Emits text/plain Prometheus format.
+Prometheus metrics endpoint on the API listener (default port `8088`; no auth
+required). Emits `text/plain` Prometheus format.
 
 **Enabled by default.** Disable with `ENABLE_PROMETHEUS=false`.
 
@@ -129,7 +133,9 @@ scrape_configs:
 ```
 
 ### GET /vision/metrics
-Metrics endpoint (no auth required, Phase 3).
+JSON operational metrics endpoint (no auth required). It is available on both
+the API listener (`8088`) and dedicated operational listener (`8089`), so the
+host health pipeline needs only the published `vision_health` port.
 
 **Response:**
 ```json
@@ -147,16 +153,20 @@ Metrics endpoint (no auth required, Phase 3).
 
 ## Authentication
 
-Set `LUNARWING_AUTH_TOKEN` environment variable to enable bearer token auth:
+Set `LUNARWING_AUTH_TOKEN` to require bearer authentication on the OCR and
+vision-analysis POST APIs:
 
 ```bash
 export LUNARWING_AUTH_TOKEN="your-secret-token"
 ```
 
-All endpoints except `/health` require:
+Authenticated requests use:
 ```
 Authorization: Bearer <token>
 ```
+
+Operational (`/health`, `/vision/metrics`, `/metrics`) and OpenAPI endpoints
+remain unauthenticated; bind or publish them only on trusted interfaces.
 
 ## CLI Wrapper
 
@@ -183,9 +193,9 @@ OCR_PORT=8088 ./ic-ocr /tmp/screenshot.png
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OCR_PORT` | `8088` | HTTP server port (OCR + vision API) |
-| `OCR_HEALTH_PORT` | `8089` | Dedicated health endpoint port (`/health` only) |
-| `LUNARWING_AUTH_TOKEN` | none | Bearer token for auth |
+| `OCR_PORT` | `8088` | HTTP server port (OCR + vision API, Prometheus and JSON metrics) |
+| `OCR_HEALTH_PORT` | `8089` | Dedicated operational port (`/health` and `/vision/metrics`) |
+| `LUNARWING_AUTH_TOKEN` | none | Bearer token for OCR and vision-analysis POST APIs |
 | `VL_URL` | none | Vision-Language backend URL (e.g., llama.cpp OpenAI-compatible endpoint) |
 | `VL_API_KEY` | none | API key for VL backend (optional) |
 | `VL_MODEL` | `qwen3-vl` | VL model name |
@@ -229,24 +239,32 @@ Common error codes:
 ### Docker
 ```bash
 docker build -t lunarwing/ocr-sidecar .
-docker run -p 8088:8088 -e LUNARWING_AUTH_TOKEN=secret lunarwing/ocr-sidecar
+docker run -p 127.0.0.1:8088:8088 -p 127.0.0.1:8089:8089 \
+  -e LUNARWING_AUTH_TOKEN=secret lunarwing/ocr-sidecar
 ```
 
 ### Podman
 ```bash
 podman build -t lunarwing/ocr-sidecar .
-podman run -p 8088:8088 -e LUNARWING_AUTH_TOKEN=secret lunarwing/ocr-sidecar
+podman run -p 127.0.0.1:8088:8088 -p 127.0.0.1:8089:8089 \
+  -e LUNARWING_AUTH_TOKEN=secret lunarwing/ocr-sidecar
 ```
 
-### Systemd
-See `systemd/ocr-sidecar.service` for a systemd unit file template.
+### systemd and OpenRC
+
+For production multi-tenant deployments, use `ic/scripts/lunarwing-mt-admin.sh`.
+It renders systemd user Quadlets (with a supervised fallback on older Podman)
+or OpenRC health and crash-supervisor units, publishes registry-assigned API and
+health ports, recreates stale containers when image/env/port contracts change,
+and refuses a start that never becomes healthy. See `PODMAN_DEPLOYMENT.md` for
+the standalone service templates.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────┐
 │         Vision Service (Rust/warp)              │
-│         Docker container, port 8088             │
+│         API 8088 · operations 8089              │
 │                                                 │
 │  Phase 1:                                       │
 │  ┌──────────────────┐                           │

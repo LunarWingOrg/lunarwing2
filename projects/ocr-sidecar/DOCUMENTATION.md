@@ -500,78 +500,46 @@ Metrics endpoint (no auth required).
 
 ## Deployment Guide
 
-### Docker Deployment
+### Container Deployment
 
 ```bash
-# Build image
 cd projects/ocr-sidecar
 docker build -t lunarwing/vision-service .
-
-# Run container
 docker run -d \
-  -p 8088:8088 \
-  -e LUNARWING_AUTH_TOKEN=your-secret-token \
-  -e VL_URL=http://your-llama-server:8080/v1/chat/completions \
-  -e ENABLE_PADDLEOCR=true \
-  -e ENABLE_CACHE=true \
-  -e RATE_LIMIT_PER_SECOND=10 \
-  --name vision-service \
+  --name lunarwing-ocr-sidecar \
+  --env-file "$HOME/.config/lunarwing/ocr-sidecar.env" \
+  --security-opt=no-new-privileges \
+  -p 127.0.0.1:8088:8088 \
+  -p 127.0.0.1:8089:8089 \
+  -v ocr_cache:/app/cache \
   lunarwing/vision-service
 ```
 
-### Docker Compose
+The API listener is `8088`; the dedicated operational listener is `8089` and
+serves `/health` plus `/vision/metrics`. Publish both on loopback unless an
+explicit authenticated network boundary protects them.
 
-```yaml
-version: '3.8'
+### Compose
 
-services:
-  vision-service:
-    build: .
-    container_name: lunarwing-vision-service
-    ports:
-      - "8088:8088"
-    environment:
-      - OCR_PORT=8088
-      - LUNARWING_AUTH_TOKEN=${LUNARWING_AUTH_TOKEN}
-      - VL_URL=${VL_URL}
-      - VL_API_KEY=${VL_API_KEY}
-      - VL_MODEL=qwen3-vl
-      - ENABLE_PADDLEOCR=false
-      - ENABLE_CACHE=true
-      - RATE_LIMIT_PER_SECOND=10
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 5s
-    restart: unless-stopped
+The committed `compose.yaml` carries the same dual-port, loopback-only contract,
+uses the dedicated health listener, and requires `LUNARWING_AUTH_TOKEN` from the
+invoking environment:
+
+```bash
+podman compose up --build -d
+curl --fail http://127.0.0.1:8089/health
+curl --fail http://127.0.0.1:8089/vision/metrics
 ```
 
-### Systemd Service
+### systemd and OpenRC
 
-```ini
-[Unit]
-Description=LunarWing Vision Service
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-Group=nogroup
-WorkingDirectory=/opt/lunarwing-vision-service
-Environment="OCR_PORT=8088"
-Environment="LUNARWING_AUTH_TOKEN=change-me-in-production"
-Environment="VL_URL=http://192.168.1.157:8080/v1/chat/completions"
-Environment="ENABLE_CACHE=true"
-Environment="RATE_LIMIT_PER_SECOND=10"
-ExecStart=/usr/local/bin/lunarwing-ocr-sidecar
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+Use the hardened standalone templates in
+`ic-infrastructure-health-check/init-templates/` or, for multi-tenant hosts,
+`ic/scripts/lunarwing-mt-admin.sh`. Managed tenants receive registry-assigned
+API/health ports, image/env/port reconciliation, health-gated startup, systemd
+user Quadlet (with an older-Podman fallback), or OpenRC health plus `-sup` crash
+supervision. Keep secret-bearing environment files mode `0600`; do not embed
+bearer tokens in unit files.
 
 ### Local Development
 
@@ -596,9 +564,9 @@ LUNARWING_AUTH_TOKEN=secret VL_URL=http://localhost:8080/v1/chat/completions car
 
 | Variable | Default | Phase | Description |
 |----------|---------|-------|-------------|
-| `OCR_PORT` | `8088` | 1 | HTTP server port (OCR + vision API) |
-| `OCR_HEALTH_PORT` | `8089` | 1 | Dedicated health endpoint port (`/health` only) |
-| `LUNARWING_AUTH_TOKEN` | none | 1 | Bearer token for auth |
+| `OCR_PORT` | `8088` | 1 | API listener (OCR + vision API, Prometheus and JSON metrics) |
+| `OCR_HEALTH_PORT` | `8089` | 1 | Dedicated operational listener (`/health` and `/vision/metrics`) |
+| `LUNARWING_AUTH_TOKEN` | none | 1 | Bearer token for OCR and vision-analysis POST APIs |
 | `VL_URL` | none | 2 | Vision-Language backend URL |
 | `VL_API_KEY` | none | 2 | API key for VL backend |
 | `VL_MODEL` | `qwen3-vl` | 2 | VL model name |

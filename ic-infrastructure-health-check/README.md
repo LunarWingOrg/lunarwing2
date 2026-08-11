@@ -148,7 +148,7 @@ checks can instead be **disabled** so they report `healthy` with
 | `RATELIMIT_DIR` | health-ratelimit.sh | `$BASE/ratelimit` | Rate-limit state directory |
 | `HEALTH_MODELS_ENABLED` | health-models.sh | `true` | Non-`true` disables (reports healthy/disabled) |
 | `HEALTH_LUNARVISION_ENABLED` | health-lunarvision.sh | `true` | Non-`true` disables (reports healthy/disabled) |
-| `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | _(unset)_ → registry `vision_health` ports, else `http://127.0.0.1:8088` | Optional single-URL override. On multi-tenant hosts leave unset so every tenant `vision_health` port from the ports registry is probed. |
+| `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | _(unset)_ → registry `vision_health` ports, else `http://127.0.0.1:8089` | Optional single-URL override targeting a listener that serves `/health` and `/vision/metrics`. On multi-tenant hosts leave unset so every tenant `vision_health` port from the ports registry is probed. |
 | `HEALTH_LUNARVISION_TIMEOUT` | health-lunarvision.sh | `5` | curl timeout (seconds) for `/health` and `/vision/metrics` |
 | `HEALTH_LUNARVISION_FETCH_METRICS` | health-lunarvision.sh | `true` | Also probe `/vision/metrics` for request counts, cache stats, rate limiting |
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
@@ -191,12 +191,14 @@ HEALTH_NETBIRD_ENABLED=false      # default; opt in only on NetBird hosts
 HEALTHCHECK_NOTIFY=false     # don't page on every per-run degrade (let self-heal escalations page instead)
 ```
 
-**Multi-tenant LunarVision:** do **not** hardcode `HEALTH_LUNARVISION_URL=http://127.0.0.1:8088`
-on MT hosts. That is the single-node default and will false-critical while
-per-tenant sidecars listen on registry `vision_health` ports (e.g. lunarium →
-`20006`). Leave the URL unset and set `SELF_HEAL_TENANTS_FILE` (mt-admin writes
-`/etc/lunarwing/ports.json`) so `health-lunarvision.sh` discovers every tenant.
-Only set `HEALTH_LUNARVISION_URL` when you intentionally force one override.
+**Multi-tenant LunarVision:** do **not** hardcode a single localhost target on MT
+hosts. Per-tenant sidecars expose their dedicated operational listener through
+registry `vision_health` ports (e.g. lunarium → `20006`). Leave the URL unset and
+set `SELF_HEAL_TENANTS_FILE` (mt-admin writes `/etc/lunarwing/ports.json`) so
+`health-lunarvision.sh` discovers every tenant. Without registry targets, the
+single-node fallback is `http://127.0.0.1:8089`; port `8088` is the API listener
+and retains `/health` only as a pre-v10 compatibility alias. Only set
+`HEALTH_LUNARVISION_URL` when you intentionally force one override.
 
 Put these in a shared env file (e.g. `/etc/lunarwing/health.env`) loaded by the
 timer/cron unit so every run picks them up.
@@ -421,7 +423,8 @@ bash tests/run-all.sh matrix chaos          # pick a subset
 bash tests/run-all.sh --list                # print suite names for CI introspection
 bash tests/test-self-heal-matrix.sh         # synthetic report matrix (sections A–O)
 bash tests/chaos-harness.sh                 # end-to-end fault-injection (13 scenarios: CH1–CH6, CH9–CH15)
-bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S13)
+bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios
+bash tests/test-lunarvision-init-templates.sh # systemd/OpenRC template contracts
 bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
 bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness scenarios
 ```
@@ -429,11 +432,12 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (151 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (152 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
-| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 83 assertions: reachability, JSON, dedicated/legacy registry discovery, VL and metrics behavior). |
+| `init-templates` | `test-lunarvision-init-templates.sh` | Parses both systemd templates and executes the standalone OpenRC lifecycle against mocks (26 assertions). |
 | `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
