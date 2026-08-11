@@ -423,7 +423,8 @@ bash tests/run-all.sh matrix chaos          # pick a subset
 bash tests/run-all.sh --list                # print suite names for CI introspection
 bash tests/test-self-heal-matrix.sh         # synthetic report matrix (sections A–O)
 bash tests/chaos-harness.sh                 # end-to-end fault-injection (13 scenarios: CH1–CH6, CH9–CH15)
-bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios (S1–S13)
+bash tests/test-health-openrc.sh            # health-openrc.sh probe scenarios
+bash tests/test-lunarvision-init-templates.sh # systemd/OpenRC template contracts
 bash tests/test-health-netbird.sh           # opt-in readiness probe scenarios
 bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness scenarios
 ```
@@ -431,11 +432,12 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | Suite | Script | What it does |
 |-------|--------|--------------|
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
-| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (151 assertions). |
+| `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (152 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
 | `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
-| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 81 assertions: reachability, HTTP codes, JSON parsing, VL availability logic, metrics integration, cache/rate-limit stats, capabilities inference, disabled mode). |
+| `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 83 assertions: reachability, JSON, dedicated/legacy registry discovery, VL and metrics behavior). |
+| `init-templates` | `test-lunarvision-init-templates.sh` | Parses both systemd templates and executes the standalone OpenRC lifecycle against mocks (26 assertions). |
 | `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
