@@ -1948,21 +1948,21 @@ async fn main() {
         .and(warp::get())
         .and(with_state(state.clone()))
         .and_then(health_handler);
+    let health_metrics_route = warp::path("vision")
+        .and(warp::path("metrics"))
+        .and(warp::get())
+        .and(with_state(state.clone()))
+        .and_then(metrics_handler);
+    let health_routes = health_route
+        .or(health_metrics_route)
+        .recover(handle_rejection);
 
-    // The health route runs on a SEPARATE port (OCR_HEALTH_PORT, default 8089)
-    // so that a saturated or panicked OCR/vision handler cannot prevent the
-    // host self-heal pipeline from probing /health. This mirrors the
-    // external-worker pattern (WSS + dedicated 8443 health port).
-    let health_state = state.clone();
+    // Operational routes run on a separate port so a saturated OCR/vision
+    // handler cannot starve health checks or metrics collection. Keep both
+    // listeners in this task: if either unexpectedly stops, exit non-zero and
+    // let systemd, OpenRC, or the container restart policy recover the service.
     let health_port = config.health_port;
-    tokio::spawn(async move {
-        tracing::info!("Health endpoint listening on port {}", health_port);
-        warp::serve(health_route)
-            .run(([0, 0, 0, 0], health_port))
-            .await;
-    });
-
-    // Main API routes — everything except /health, served on OCR_PORT.
+    let api_port = config.port;
     let routes = legacy_ocr_route
         .or(legacy_vision_route)
         .or(legacy_metrics_route)
@@ -1973,7 +1973,8 @@ async fn main() {
         .or(prometheus_route)
         .recover(handle_rejection);
 
-    tracing::info!("Starting Vision Service on port {}", config.port);
+    tracing::info!("Starting Vision Service on port {}", api_port);
+    tracing::info!("Health and metrics listening on port {}", health_port);
     tracing::info!(
         "PaddleOCR fallback: {}, Cache: {}, Rate limit: {}/s",
         config.enable_paddleocr,
@@ -1981,8 +1982,14 @@ async fn main() {
         config.rate_limit_per_second
     );
 
-    let _ = health_state; // keep alive for the duration of main
-    warp::serve(routes).run(([0, 0, 0, 0], config.port)).await;
+    let api_server = warp::serve(routes).run(([0, 0, 0, 0], api_port));
+    let health_server = warp::serve(health_routes).run(([0, 0, 0, 0], health_port));
+    let stopped_listener = tokio::select! {
+        _ = api_server => "API",
+        _ = health_server => "health",
+    };
+    tracing::error!(listener = stopped_listener, "listener stopped unexpectedly");
+    std::process::exit(1);
 }
 
 #[cfg(test)]
