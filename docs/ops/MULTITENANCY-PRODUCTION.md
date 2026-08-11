@@ -662,8 +662,9 @@ Registry feature flags keep intentionally disabled WeeChat, proxy, DarkIRC, and
 worker services classified as `skipped`; retired Nanocode units remain visible
 but cannot degrade host health. LunarVision health ports are discovered per
 tenant from `vision_health` in `/etc/lunarwing/ports.json`, so multi-tenant hosts
-must not force the single-node `127.0.0.1:8088` default. `SERVICES="svc1 svc2"`
-remains an intentional OpenRC override.
+must not force any single-node target. Without registry targets the dedicated
+single-node operational listener is `127.0.0.1:8089`; `8088` is the API listener.
+`SERVICES="svc1 svc2"` remains an intentional OpenRC override.
 
 Force init detection only when necessary with
 `LUNARWING_SERVICE_MANAGER=systemd` or `LUNARWING_SERVICE_MANAGER=openrc`.
