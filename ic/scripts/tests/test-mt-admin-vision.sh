@@ -152,6 +152,24 @@ assert_call 'rc-update:add lunarwing-vision-alpha-sup default'
 assert_call 'rc-service:lunarwing-vision-alpha-sup start'
 assert_before 'rc-service:lunarwing-vision-alpha start' 'rc-service:lunarwing-vision-alpha-sup start'
 
+INIT_SYSTEM=openrc
+tenant_proxy_enabled() { return 1; }
+tenant_weechat_enabled() { return 1; }
+tenant_darkirc_enabled() { return 1; }
+tenant_worker_enabled() { return 1; }
+mapfile -t writer_services < <(tenant_writer_services alpha)
+vision_sup_index=-1
+vision_direct_index=-1
+for index in "${!writer_services[@]}"; do
+  [[ "${writer_services[$index]}" == "lunarwing-vision-alpha-sup" ]] && vision_sup_index="$index"
+  [[ "${writer_services[$index]}" == "lunarwing-vision-alpha" ]] && vision_direct_index="$index"
+done
+if [[ "$vision_sup_index" -ge 0 && "$vision_direct_index" -gt "$vision_sup_index" ]]; then
+  pass "writer quiescence stops vision supervisor before direct unit"
+else
+  fail "writer quiescence vision stop ordering"
+fi
+
 # ── Imperative container reconciliation is convergent and health-gated ───────
 
 CONTAINER_EXISTS=true
