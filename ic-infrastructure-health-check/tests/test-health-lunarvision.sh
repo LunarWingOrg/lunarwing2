@@ -390,6 +390,17 @@ assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q3")" "override" "Q6: explicit 
 assert_eq "$(jq -r '.metrics.target_count' <<<"$out_Q3")" "1" "Q7: override → single target"
 assert_contains "$(jq -r '.metrics.url' <<<"$out_Q3")" "8088" "Q8: override URL preserved"
 
+# Pre-v10 registry keeps the dedicated health port under reserved_6.
+PORTS_LEGACY="$ROOT/ports-legacy.json"
+echo '{"tenants":{"legacy":{"extended_ports":{"vision_service":22005,"reserved_6":22006}}}}' > "$PORTS_LEGACY"
+unset HEALTH_LUNARVISION_URL || true
+out_Q_legacy=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+    SELF_HEAL_TENANTS_FILE="$PORTS_LEGACY" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+assert_contains "$(jq -r '.metrics.url' <<<"$out_Q_legacy")" "22006" "Q8a: legacy registry prefers reserved health port"
+assert_absent "$(jq -r '.metrics.url' <<<"$out_Q_legacy")" "22005" "Q8b: legacy registry avoids API port"
+
 # Empty registry → dedicated single-node health port 8089
 PORTS_EMPTY="$ROOT/ports-empty.json"
 echo '{"tenants":{}}' > "$PORTS_EMPTY"
