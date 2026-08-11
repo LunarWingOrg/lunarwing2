@@ -76,7 +76,8 @@ else
     tenants_file=""
     if tenants_file="$(_resolve_tenants_file)"; then
         if command -v jq >/dev/null 2>&1; then
-            # Prefer dedicated vision_health; fall back to vision_service if older registry.
+            # Prefer the dedicated field, then its pre-v10 reserved name. The
+            # API-port fallback supports truly old registries without slot 6.
             while IFS=$'\t' read -r tname port; do
                 [ -n "$tname" ] && [ -n "$port" ] && [ "$port" != "null" ] || continue
                 TARGETS+=("${tname}|http://127.0.0.1:${port}")
@@ -86,6 +87,7 @@ else
                 | . as $e
                 | (
                     $e.value.extended_ports.vision_health
+                    // $e.value.extended_ports.reserved_6
                     // $e.value.extended_ports.vision_service
                     // empty
                   ) as $p
