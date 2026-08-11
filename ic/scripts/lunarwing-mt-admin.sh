@@ -7052,13 +7052,46 @@ _create_vision_container() {
     "$VISION_SIDECAR_IMAGE" >/dev/null
 }
 
+_vision_has_unsupported_openrc_healthcheck() {
+  local name="$1" container="$2" healthcheck
+  _openrc_podman_uses_init_health || return 1
+  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  case "$healthcheck" in
+    ""|null|*'"NONE"'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+_stop_vision_supervision() {
+  local name="$1" container="$2" path
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _stop_vision_openrc_supervisor "$container"
+    return
+  fi
+  [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+    && "$CONTAINER_RT" == "podman" ]] || return 0
+  path="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  if [[ ! -f "$path" || -L "$path" ]] \
+      || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVision fallback$' "$path"; then
+    say "ERROR: refusing to stop unmanaged systemd unit $path" >&2
+    return 1
+  fi
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1
+}
+
 _reconcile_vision_container() {
-  local name="$1" container="$2" env_path="$3" contract="$4"
-  _reconcile_openrc_podman_healthcheck "$name" "$container"
-  if _ctr "$name" inspect "$container" &>/dev/null \
-      && _container_config_changed "$name" "$container" "$env_path" "$contract"; then
-    say "config or image changed for $container; force-recreating"
-    _stop_vision_openrc_supervisor "$container" || return 1
+  local name="$1" container="$2" env_path="$3" contract="$4" recreate=false
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    if _vision_has_unsupported_openrc_healthcheck "$name" "$container" \
+        || _container_config_changed "$name" "$container" "$env_path" "$contract"; then
+      recreate=true
+    fi
+  fi
+
+  if [[ "$recreate" == "true" ]]; then
+    say "config, image, or health ownership changed for $container; force-recreating"
+    _stop_vision_supervision "$name" "$container" || return 1
     if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$container" ]]; then
       rc-service "$container" stop >/dev/null 2>&1 || true
     fi
@@ -7070,6 +7103,7 @@ _reconcile_vision_container() {
     _create_vision_container "$name" "$container" "$env_path" \
       "$(ports_get "$name" vision_service)" "$(ports_get "$name" vision_health)" || return 1
   elif ! _vision_container_healthy "$name" "$container"; then
+    _stop_vision_supervision "$name" "$container" || return 1
     _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
     _ctr "$name" start "$container" >/dev/null || return 1
   fi
@@ -7144,10 +7178,10 @@ EOF
 
 _prepare_vision_systemd_fallback() {
   local name="$1" container="lunarwing-vision-${1}" qfile
-  _remove_vision_systemd_fallback "$name" || return 1
   qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  [[ ! -e "$qfile" && ! -L "$qfile" ]] && return 0
   _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
-  rm -f "$qfile"
+  rm -f -- "$qfile"
   _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
 }
 
@@ -7214,9 +7248,8 @@ start_tenant_vision() {
     return 0
   fi
 
-  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    _stop_vision_openrc_supervisor "$container" || return 1
-  elif [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+      && "$CONTAINER_RT" == "podman" ]]; then
     _prepare_vision_systemd_fallback "$name" || return 1
   fi
   _reconcile_vision_container "$name" "$container" "$env_path" "$contract" || return 1
