@@ -390,7 +390,7 @@ assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q3")" "override" "Q6: explicit 
 assert_eq "$(jq -r '.metrics.target_count' <<<"$out_Q3")" "1" "Q7: override → single target"
 assert_contains "$(jq -r '.metrics.url' <<<"$out_Q3")" "8088" "Q8: override URL preserved"
 
-# Empty registry → single-node default 8088
+# Empty registry → dedicated single-node health port 8089
 PORTS_EMPTY="$ROOT/ports-empty.json"
 echo '{"tenants":{}}' > "$PORTS_EMPTY"
 unset HEALTH_LUNARVISION_URL || true
@@ -399,7 +399,7 @@ out_Q4=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
     HEALTH_LUNARVISION_FETCH_METRICS=false \
     run_check)
 assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q4")" "single" "Q9: empty registry → single discovery"
-assert_contains "$(jq -r '.metrics.url' <<<"$out_Q4")" "8088" "Q10: empty registry falls back to 8088"
+assert_contains "$(jq -r '.metrics.url' <<<"$out_Q4")" "8089" "Q10: empty registry falls back to health port 8089"
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
