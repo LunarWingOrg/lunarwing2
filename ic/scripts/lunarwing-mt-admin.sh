@@ -10401,10 +10401,10 @@ remove_tenant() {
 
 # Re-render a tenant's service units from the current generator WITHOUT touching
 # secrets/env or restarting anything — for applying a generator change (e.g. an
-# updated init-script status()) to an already-provisioned tenant. The systemd
-# renderer daemon-reloads internally; OpenRC reads the script per invocation. A
-# status()/health change takes effect immediately; a change to the run command
-# needs a restart.
+# updated init-script status()) to an already-provisioned tenant. The command
+# daemon-reloads once after all systemd assets are written; OpenRC reads scripts
+# per invocation. A status()/health change takes effect immediately; a change to
+# the run command needs a restart.
 render_tenant_units() {
   local name="$1"
   name="$(sanitize_name "$name")"
