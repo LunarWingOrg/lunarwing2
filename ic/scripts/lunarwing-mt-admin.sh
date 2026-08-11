@@ -8520,6 +8520,8 @@ uninstall_tenant_systemd() {
   for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service"; do
     rm -f "$user_unit_dir/$svc"
   done
+  _remove_vision_systemd_fallback "$name" || return 1
+  rm -f "$(_hash_dir "$name")/lunarwing-vision-${name}.hash"
 
   # Quadlet .container units (rootless pg + workers + vision sidecar). Remove the
   # worker containers (their workspace data is bind-mounted in the home); the pg
@@ -11168,13 +11170,16 @@ status_tenant() {
   say "Services ($INIT_SYSTEM):"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
     local svcs=("lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" \
-                "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" \
-                "lunarwing-vision-${name}")
+                "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
     if tenant_darkirc_enabled "$name"; then
       svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi
-    # pg + workers are Quadlet units only on rootless podman; on rootful docker
-    # they run as plain containers (shown above), not systemd units.
+    # LunarVision is supervised for every rootless Podman systemd deployment:
+    # Quadlet where supported, otherwise the managed podman-wait fallback unit.
+    if [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
+      svcs+=("lunarwing-vision-${name}")
+    fi
+    # PostgreSQL and workers use Quadlet only when the Podman version supports it.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
       svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
       tenant_voice_enabled "$name" && svcs+=("lunarwing-voice-${name}")
