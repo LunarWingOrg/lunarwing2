@@ -10006,7 +10006,7 @@ SELF_HEAL_MAX_REPORT_AGE=$(( HEALTH_INTERVAL_MIN * 60 * 4 ))
 
 # LunarVision: leave HEALTH_LUNARVISION_URL unset so health-lunarvision.sh
 # auto-discovers every tenant's vision_health port from the ports registry
-# (single-node still falls back to http://127.0.0.1:8088). Only set the URL
+# (single-node still falls back to http://127.0.0.1:8089). Only set the URL
 # if you intentionally force a single override target.
 # HEALTH_LUNARVISION_URL=
 
