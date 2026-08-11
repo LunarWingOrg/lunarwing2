@@ -8462,13 +8462,8 @@ start_tenant_systemd() {
       || die "effective DarkIRC systemd unit is stale or overridden; run render-units $name"
   fi
   # Quadlet-generated units (pg, supported workers, vision) are NOT in the
-  # enable_list: `systemctl enable` fails on generated/transient units with
-  # "Failed to enable unit: ... is transient or generated", and under
-  # `set -euo pipefail` that non-zero exit aborts the entire enable batch —
-  # leaving every regular service disabled. Each Quadlet unit is already
-  # started by its own start_tenant_* function (which renders the quadlet,
-  # reloads the daemon, and starts the unit). The imperative `start` below
-  # is belt-and-suspenders for the vision unit (harmless if already running).
+  # enable_list: `systemctl enable` fails on generated/transient units. Each is
+  # rendered, started, and health-gated by its owning start_tenant_* function.
   local enable_list=("lunarwing-${name}.service" "xmpp-bridge-${name}.service")
   # WeeChat units join the enable list only when the tenant's registry flag
   # allows them (ISSUE-006): a disabled tenant must not be re-enabled for
@@ -8487,7 +8482,6 @@ start_tenant_systemd() {
     _systemctl_user "$name" start "lunarwing-darkirc-${name}.service"
     sleep 2
   fi
-  _systemctl_user "$name" start "lunarwing-vision-${name}.service" 2>/dev/null || true
   _systemctl_user "$name" start "lunarwing-${name}.service"
   sleep 2
   if _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service"; then
