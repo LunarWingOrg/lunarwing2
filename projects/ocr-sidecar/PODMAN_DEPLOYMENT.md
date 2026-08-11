@@ -1,225 +1,171 @@
-# Podman Rootless Deployment Guide
+# Rootless Podman Deployment Guide
 
-This guide covers deploying the OCR sidecar with rootless Podman.
+This guide covers standalone LunarVision deployment. Multi-tenant operators
+should use `ic/scripts/lunarwing-mt-admin.sh`; it owns tenant ports, rootless
+stores, systemd user units, OpenRC services, container recreation, and health
+pipeline integration.
+
+## Runtime contract
+
+LunarVision has two listeners:
+
+- `8088`: authenticated OCR/vision API plus `/metrics` and `/vision/metrics`
+- `8089`: unauthenticated `/health` and `/vision/metrics` operational routes
+
+Publish both on loopback. The dedicated listener lets health checks keep working
+when inference traffic saturates the API listener. The process exits non-zero if
+either listener unexpectedly stops, allowing init supervision to recover it.
 
 ## Prerequisites
 
-- Podman 4.3+ (for `--health-on-failure` support)
-- Podman 4.7+ (for native `podman compose` - recommended)
-- `podman-compose` (alternative for older Podman versions)
-- Tesseract OCR installed on the host (optional, for local development)
+- Podman with a working Compose provider (`podman compose version`)
+- The repository checkout at the path configured by the service template
+- A rootless service account with a persistent runtime directory
+- A mode-`0600`, service-account-owned environment file containing at least
+  `LUNARWING_AUTH_TOKEN`
 
-## Quick Start
-
-### Using Podman Compose (Recommended)
+## Quick start
 
 ```bash
-# Build and start
+cd projects/ocr-sidecar
+install -m 0600 /dev/null "$HOME/.config/lunarwing/ocr-sidecar.env"
+printf 'LUNARWING_AUTH_TOKEN=%s\n' 'replace-with-a-random-token' \
+  >"$HOME/.config/lunarwing/ocr-sidecar.env"
+set -a
+. "$HOME/.config/lunarwing/ocr-sidecar.env"
+set +a
 podman compose up --build -d
 
-# Check health
+curl --fail http://127.0.0.1:8089/health
+curl --fail http://127.0.0.1:8089/vision/metrics
 podman inspect lunarwing-ocr-sidecar --format '{{.State.Health.Status}}'
-
-# View logs
-podman logs -f lunarwing-ocr-sidecar
-
-# Stop
-podman compose down
 ```
 
-### Using Podman Run
+Use `podman compose logs -f` for logs and `podman compose down` to stop the
+standalone deployment.
+
+## Direct `podman run`
 
 ```bash
-# Build the image
 podman build -t lunarwing/vision-service .
-
-# Run with healthcheck auto-restart (Podman 4.3+)
 podman run -d \
   --name lunarwing-ocr-sidecar \
-  --health-on-failure=restart \
-  -p 8088:8088 \
-  -e LUNARWING_AUTH_TOKEN=your-secret-token \
+  --env-file "$HOME/.config/lunarwing/ocr-sidecar.env" \
+  --security-opt=no-new-privileges \
+  -p 127.0.0.1:8088:8088 \
+  -p 127.0.0.1:8089:8089 \
   -v ocr_cache:/app/cache \
   lunarwing/vision-service
-
-# Check health
-podman inspect lunarwing-ocr-sidecar --format '{{.State.Health.Status}}'
 ```
 
-## Systemd Integration (Rootless)
+Do not rely on an image health check alone for crash recovery. Use systemd,
+OpenRC, or another supervisor that restarts the container lifecycle.
 
-### Install the User Unit
+## systemd user service
+
+The standalone template is
+`../../ic-infrastructure-health-check/init-templates/ocr-sidecar.service`.
+Review its `WorkingDirectory`, then install it as the same user that owns the
+rootless Podman store:
 
 ```bash
-# Copy the unit file to your user systemd directory
-mkdir -p ~/.config/systemd/user
-cp init-templates/ocr-sidecar.service ~/.config/systemd/user/
-
-# Reload systemd
+mkdir -p "$HOME/.config/systemd/user" "$HOME/.config/lunarwing"
+cp ../../ic-infrastructure-health-check/init-templates/ocr-sidecar.service \
+  "$HOME/.config/systemd/user/ocr-sidecar.service"
 systemctl --user daemon-reload
-
-# Enable and start
 systemctl --user enable --now ocr-sidecar.service
-
-# Check status
 systemctl --user status ocr-sidecar.service
 ```
 
-### Enable Lingering (Optional)
-
-To keep the service running after logout:
+Enable lingering when the service must survive logout:
 
 ```bash
-sudo loginctl enable-linger $USER
+sudo loginctl enable-linger "$USER"
 ```
 
-## OpenRC Integration
+The user unit runs Compose in the foreground, validates startup through the
+container health check, restarts failed runs, and executes `compose down` during
+an intentional stop.
+
+## OpenRC service (Gentoo)
+
+The standalone template is
+`../../ic-infrastructure-health-check/init-templates/ocr-sidecar`. Set
+`ocr_user`, `ocr_home`, and `directory` in `/etc/conf.d/ocr-sidecar`; the default
+service account is `lunarwing`.
 
 ```bash
-# Install the init script
-sudo cp init-templates/ocr-sidecar /etc/init.d/
-sudo chmod +x /etc/init.d/ocr-sidecar
-
-# Add to default runlevel
+sudo cp ../../ic-infrastructure-health-check/init-templates/ocr-sidecar \
+  /etc/init.d/ocr-sidecar
+sudo chmod 0755 /etc/init.d/ocr-sidecar
+sudo install -m 0644 /dev/null /etc/conf.d/ocr-sidecar
 sudo rc-update add ocr-sidecar default
-
-# Start the service
 sudo rc-service ocr-sidecar start
-
-# Check status
 sudo rc-service ocr-sidecar status
 ```
 
-## Health Monitoring
+OpenRC uses `supervise-daemon` around foreground `podman compose up`, prepares
+`HOME` and `XDG_RUNTIME_DIR` for the rootless account, and runs `compose down`
+after an intentional stop. A missing runtime, environment file, service user, or
+Compose directory is a start failure rather than a silent skip.
 
-### Podman Health Status
+For multi-tenant Gentoo hosts, do not install this global service. Run
+`lunarwing-mt-admin.sh start-tenant <tenant>` instead; it renders per-tenant
+`lunarwing-vision-<tenant>` health units plus `-sup` crash supervisors.
+
+## Health and metrics
 
 ```bash
-# Check container health
-podman inspect lunarwing-ocr-sidecar --format '{{.State.Health.Status}}'
-# Output: healthy | unhealthy | starting | ""
+# Dedicated operational listener
+curl --fail http://127.0.0.1:8089/health
+curl --fail http://127.0.0.1:8089/vision/metrics
 
-# View health logs
+# API-listener Prometheus endpoint
+curl --fail http://127.0.0.1:8088/metrics
+
+# Container-level health history
 podman inspect lunarwing-ocr-sidecar --format '{{json .State.Health}}' | jq
 ```
 
-### Prometheus Metrics
+On multi-tenant hosts, leave `HEALTH_LUNARVISION_URL` unset. The infrastructure
+health pipeline discovers every tenant's `vision_health` port from
+`/etc/lunarwing/ports.json`. The single-node fallback is `127.0.0.1:8089`; port
+`8088` is not the default health target.
 
-```bash
-# Scrape metrics endpoint
-curl http://localhost:8088/metrics
-```
+## Configuration
 
-### Health Check Endpoint
+Common environment variables:
 
-```bash
-curl http://localhost:8088/health
-```
+- `LUNARWING_AUTH_TOKEN`: bearer token for OCR/vision POST APIs
+- `OCR_PORT`: API listener, default `8088`
+- `OCR_HEALTH_PORT`: operational listener, default `8089`
+- `VL_URL`, `VL_API_KEY`, `VL_MODEL`, `VL_TIMEOUT_SECS`: VL backend
+- `ENABLE_PADDLEOCR`, `ENABLE_CACHE`, `CACHE_PERSIST`, `CACHE_DIR`
+- `ENABLE_PROMETHEUS`, `RATE_LIMIT_PER_SECOND`
 
-## Rootless Podman Considerations
-
-### Port Binding
-
-Rootless Podman can bind to ports ≥ 1024 without privileges. Port 8088 works fine.
-
-### User Namespaces
-
-The container runs in a user namespace. The sidecar listens on `0.0.0.0:8088` inside the container, which maps to the host's non-privileged port.
-
-### Volume Ownership
-
-Volumes are owned by the user running Podman. No special permissions needed.
-
-### Socket Path
-
-Rootless Podman uses `~/.config/containers/podman.sock` instead of `/var/run/docker.sock`.
+Keep secret-bearing environment files out of the checkout, mode `0600`, and owned
+by the service account. Bind both host ports to loopback unless an authenticated
+reverse proxy and explicit network policy protect them; operational endpoints
+are intentionally unauthenticated.
 
 ## Troubleshooting
 
-### Health Check Failing
-
 ```bash
-# Check if curl is in the container
-podman exec lunarwing-ocr-sidecar which curl
+# Confirm both listeners from inside the container
+podman exec lunarwing-ocr-sidecar curl --fail http://127.0.0.1:8089/health
+podman exec lunarwing-ocr-sidecar curl --fail http://127.0.0.1:8089/vision/metrics
 
-# Manually test the health endpoint
-podman exec lunarwing-ocr-sidecar curl -f http://localhost:8088/health
+# Confirm loopback publications
+podman port lunarwing-ocr-sidecar
+
+# systemd user logs
+journalctl --user -u ocr-sidecar.service
+
+# OpenRC logs use output_log/error_log from /etc/conf.d/ocr-sidecar
+sudo rc-service ocr-sidecar status
 ```
 
-### Permission Denied on Port
-
-If you see permission errors binding to port 8088:
-
-```bash
-# Check if port is in use
-ss -tlnp | grep 8088
-
-# Kill the process or use a different port
-podman compose down
-podman compose up -d
-```
-
-### Container Won't Start After Unhealthy
-
-Podman doesn't auto-restart unhealthy containers by default. Options:
-
-1. **Use `--health-on-failure=restart`** (Podman 4.3+):
-   ```bash
-   podman run --health-on-failure=restart ...
-   ```
-
-2. **Use systemd** (recommended for production):
-   The systemd unit has `Restart=on-failure` which handles this.
-
-3. **Use the LunarWing self-heal watchdog**:
-   The watchdog monitors health and restarts unhealthy services.
-
-## Migration from Docker
-
-If you're migrating from Docker:
-
-```bash
-# Stop Docker containers
-podman compose down
-
-# Remove Docker images (optional)
-docker rmi lunarwing/vision-service
-
-# Start with Podman
-podman compose up -d
-```
-
-The compose file is compatible with both Docker and Podman.
-
-## Environment Variables
-
-All environment variables from the Docker deployment work with Podman:
-
-- `LUNARWING_AUTH_TOKEN` - Required authentication token
-- `VL_URL` - Vision language model endpoint
-- `VL_API_KEY` - Vision language API key
-- `VL_MODEL` - Vision language model name
-- `VL_TIMEOUT_SECS` - Vision language request timeout
-- `ENABLE_PADDLEOCR` - Enable PaddleOCR fallback
-- `ENABLE_CACHE` - Enable response caching
-- `ENABLE_PROMETHEUS` - Enable Prometheus metrics endpoint
-- `RATE_LIMIT_PER_SECOND` - Request rate limit
-
-Set them in `/etc/lunarwing/ocr-sidecar.env` or pass via `-e` flags.
-
-## Security Notes
-
-- Rootless Podman is more secure than rootful Docker
-- The container runs as a non-root user
-- No Docker daemon socket exposure
-- User namespace isolation
-- Seccomp and AppArmor profiles enabled by default
-
-## Performance
-
-Podman is generally faster than Docker for:
-- Container startup (no daemon overhead)
-- Image pulls (parallel layer downloads)
-- Health checks (direct process inspection)
-
-Memory usage is similar or slightly lower than Docker.
+If the container exists but uses stale ports, environment, or image data, remove
+and recreate it; `podman start` cannot change creation-time configuration.
+`lunarwing-mt-admin.sh start-tenant` performs this reconciliation automatically
+for managed tenants.
