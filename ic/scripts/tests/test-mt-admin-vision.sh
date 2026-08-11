@@ -202,6 +202,56 @@ ports_get() {
 }
 INIT_SYSTEM=systemd
 
+# ── render-units refreshes existing assets without starting services ─────────
+
+render_vision_quadlet() { CALLS+=("render-quadlet:$1"); }
+render_vision_systemd_fallback_unit() { CALLS+=("render-fallback:$1"); }
+QUADLET_SUPPORTED=true
+podman_supports_quadlet() { [[ "$QUADLET_SUPPORTED" == true ]]; }
+qfile="$(tenant_quadlet_dir alpha)/lunarwing-vision-alpha.container"
+fallback="$(tenant_home alpha)/.config/systemd/user/lunarwing-vision-alpha.service"
+rm -f -- "$qfile" "$fallback"
+
+CONTAINER_EXISTS=false
+CALLS=()
+render_vision_systemd_assets alpha
+assert_no_call_prefix 'render-quadlet:'
+assert_no_call_prefix 'render-fallback:'
+assert_no_call_prefix 'systemctl:'
+
+CONTAINER_EXISTS=true
+CALLS=()
+render_vision_systemd_assets alpha
+assert_call 'render-quadlet:alpha'
+assert_no_call_prefix 'systemctl:'
+
+mkdir -p "$(dirname "$fallback")"
+touch "$fallback"
+QUADLET_SUPPORTED=false
+CALLS=()
+render_vision_systemd_assets alpha
+assert_call 'render-fallback:alpha'
+assert_no_call_prefix 'systemctl:'
+rm -f -- "$fallback"
+
+CONTAINER_EXISTS=false
+rm -f -- "$OPENRC_INITD_DIR/lunarwing-vision-alpha" "$OPENRC_INITD_DIR/lunarwing-vision-alpha-sup"
+CALLS=()
+render_vision_openrc_assets alpha
+assert_no_call_prefix 'render-openrc:'
+assert_no_call_prefix 'render-supervisor:'
+
+CONTAINER_EXISTS=true
+touch "$OPENRC_INITD_DIR/lunarwing-vision-alpha"
+CALLS=()
+render_vision_openrc_assets alpha
+assert_call 'render-openrc:alpha'
+assert_call "render-supervisor:alpha vision lunarwing-vision-alpha 1001 $(tenant_home alpha)"
+assert_no_call_prefix 'rc-service:'
+assert_no_call_prefix 'rc-update:'
+
+CONTAINER_EXISTS=true
+QUADLET_SUPPORTED=true
 CALLS=()
 _reconcile_vision_container alpha lunarwing-vision-alpha "$(tenant_env_dir alpha)/vision.env" contract-a
 assert_no_call_prefix 'stop-supervision:'
