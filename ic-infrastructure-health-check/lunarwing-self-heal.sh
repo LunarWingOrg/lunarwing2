@@ -223,7 +223,10 @@ unit_tenant() {
         lunarwing-opencode-*)        printf '%s' "${u#lunarwing-opencode-}" ;;
         lunarwing-kimi-*)            printf '%s' "${u#lunarwing-kimi-}" ;;
         lunarwing-pebble-*)          printf '%s' "${u#lunarwing-pebble-}" ;;
-        lunarwing-vision-*)          printf '%s' "${u#lunarwing-vision-}" ;;
+        lunarwing-vision-*)
+            u="${u#lunarwing-vision-}"
+            printf '%s' "${u%-sup}" ;;
+
         lunarwing-weechat-adapter-*) printf '%s' "${u#lunarwing-weechat-adapter-}" ;;
         lunarwing-weechat-*)         printf '%s' "${u#lunarwing-weechat-}" ;;
         xmpp-bridge-*)               printf '%s' "${u#xmpp-bridge-}" ;;
