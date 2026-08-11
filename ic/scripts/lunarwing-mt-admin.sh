@@ -9666,6 +9666,7 @@ tenant_writer_services() {
   if tenant_darkirc_enabled "$name"; then
     printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
   fi
+  [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-vision-${name}-sup"
   printf '%s\n' "lunarwing-vision-${name}"
   local worker
   for worker in pebble opencode kimi; do
