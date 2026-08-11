@@ -250,6 +250,18 @@ assert_call "render-supervisor:alpha vision lunarwing-vision-alpha 1001 $(tenant
 assert_no_call_prefix 'rc-service:'
 assert_no_call_prefix 'rc-update:'
 
+_retire_tenant_nanocode() { CALLS+=("retire:$1"); }
+ensure_init_system() { INIT_SYSTEM=systemd; }
+tenant_voice_enabled() { return 1; }
+render_tenant_systemd_units() { CALLS+=("render-systemd:$1"); }
+_systemctl_user() { CALLS+=("systemctl:$*"); }
+CALLS=()
+_render_tenant_units_locked alpha
+assert_call 'render-systemd:alpha'
+assert_call 'systemctl:alpha daemon-reload'
+assert_no_call_prefix 'systemctl:alpha start'
+assert_no_call_prefix 'systemctl:alpha restart'
+
 CONTAINER_EXISTS=true
 QUADLET_SUPPORTED=true
 CALLS=()
