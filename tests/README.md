@@ -6,7 +6,7 @@ Matrix test suite for LunarWing worker types:
 
 | Worker | Source | Docker Service | Description |
 |--------|--------|----------------|-------------|
-| **Opencode** | `opencode4lunarwing/` | `opencode_worker` | Opencode (sst/opencode) coding-agent worker |
+| **Opencode** | `opencode4lunarwing/` | `opencode_worker` | Opencode (anomalyco/opencode) coding-agent worker |
 | **Kimi Code** | `kimicode4lunarwing/` | `kimi_worker` | MoonshotAI Kimi Code coding-agent worker |
 | **Pebble** | `pebble4lunarwing/` | `pebble_worker` | Pebble Rust-based coding-agent worker container |
 | **Built-in** | `ic/src/worker/` | `builtin_worker` | Native worker inside the LunarWing daemon |

@@ -35,7 +35,7 @@ console = Console()
 
 WORKER_LABELS = {
     WorkerType.PEBBLE: "pebble (Rust harness)",
-    WorkerType.OPENCODE: "opencode (sst/opencode)",
+    WorkerType.OPENCODE: "opencode (anomalyco/opencode)",
     WorkerType.KIMI: "kimi (MoonshotAI/kimi-code)",
 }
 
