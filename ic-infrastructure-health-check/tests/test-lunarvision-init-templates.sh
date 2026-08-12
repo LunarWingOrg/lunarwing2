@@ -105,7 +105,11 @@ assert_absent "$OPENRC" '. "${ocr_env_file}"' \
 
 # Execute OpenRC lifecycle functions with mocked init/runtime primitives. This
 # verifies argument ordering and fail-loud env validation without an OpenRC host.
-mkdir -p "$TMP/home/.config/lunarwing" "$TMP/compose" "$TMP/log"
+mkdir -p "$TMP/bin" "$TMP/home/.config/lunarwing" "$TMP/compose" "$TMP/log"
+printf '#!/bin/sh\nexit 0\n' >"$TMP/bin/sudo"
+printf '#!/bin/sh\nexit 0\n' >"$TMP/bin/podman"
+chmod 0755 "$TMP/bin/sudo" "$TMP/bin/podman"
+PATH="$TMP/bin:$PATH"
 ENV_FILE="$TMP/home/.config/lunarwing/ocr-sidecar.env"
 printf 'LUNARWING_AUTH_TOKEN=test-only-token\n' >"$ENV_FILE"
 chmod 0600 "$ENV_FILE"
@@ -129,6 +133,8 @@ error_log="$TMP/log/ocr-sidecar.err"
 ocr_wait=2
 # shellcheck source=../init-templates/ocr-sidecar
 source "$OPENRC"
+# shellcheck disable=SC2034  # Consumed by sourced start_pre.
+command="$TMP/bin/podman"
 
 checkpath() { printf 'checkpath:%s\n' "$*" >>"$CALL_LOG"; }
 eerror() { printf 'eerror:%s\n' "$*" >>"$CALL_LOG"; }
