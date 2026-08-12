@@ -152,7 +152,11 @@ class AnalyzerTests(unittest.TestCase):
                 ),
                 b"new-data",
             )
-            path.unlink()
+            # Rotate the way real rotators do: move the old file aside first,
+            # then create the replacement. unlink+recreate can recycle the
+            # freed inode, which would make the new file indistinguishable
+            # from the baseline via (st_dev, st_ino).
+            path.rename(Path(raw) / "service.log.1")
             path.write_bytes(b"rotated-new-log")
             self.assertEqual(
                 analyzer.regular_slice_nofollow(

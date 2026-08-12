@@ -14,6 +14,7 @@ pass=0
 fail=0
 ok() { printf 'PASS: %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf 'FAIL: %s\n      %s\n' "$1" "$2"; fail=$((fail + 1)); }
+skip() { printf 'SKIP: %s\n' "$1"; }
 
 assert_contains() {
     local file="$1" needle="$2" label="$3"
@@ -82,7 +83,10 @@ if command -v systemd-analyze >/dev/null 2>&1; then
         bad "direct systemd unit passes systemd-analyze" "unit parser rejected template"
     fi
 else
-    bad "systemd templates parsed" "systemd-analyze not installed"
+    # systemd-analyze only exists on systemd hosts (not the CI lint image or
+    # OpenRC dev boxes); the static-contract assertions above still apply, so
+    # treat the parser check as skipped rather than failed here.
+    skip "systemd templates parsed (systemd-analyze not installed)"
 fi
 
 # OpenRC static contract.
