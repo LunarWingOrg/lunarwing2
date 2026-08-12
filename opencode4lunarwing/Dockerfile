@@ -23,7 +23,7 @@ RUN set -e; \
       git python3 make g++ ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/sst/opencode.git /build/opencode
+RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/anomalyco/opencode.git /build/opencode
 
 WORKDIR /build/opencode
 RUN (bun install --frozen-lockfile || bun install) \
