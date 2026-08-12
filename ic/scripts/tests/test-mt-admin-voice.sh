@@ -120,9 +120,13 @@ CONTAINER_RT=true
 chown() { :; }  # Hardened renderers chown like the vision ones; no tenant users here.
 mkdir -p "$OPENRC_INITD_DIR"
 ports_set_voice alpha true
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_voice_quadlet alpha
 assert_eq "$(grep -c '^Before=lunarwing-alpha.service$' "$ROOT/quadlets/lunarwing-voice-alpha.container")" 1 "systemd orders voice before daemon"
 assert_eq "$(grep -c '^EnvironmentFile=' "$ROOT/quadlets/lunarwing-voice-alpha.container")" 1 "quadlet uses protected tenant env"
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_voice_openrc_unit alpha
 assert_eq "$(grep -c 'before lunarwing-alpha' "$OPENRC_INITD_DIR/lunarwing-voice-alpha")" 1 "OpenRC orders voice before daemon"
 
@@ -212,6 +216,8 @@ id() {
   if [[ "${1:-}" == "-u" && "${2:-}" == "alpha" ]]; then printf '1001\n'; return 0; fi
   builtin command id "$@"
 }
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_voice_systemd_fallback_unit alpha
 fallback="$ROOT/home/.config/systemd/user/lunarwing-voice-alpha.service"
 assert_eq "$(grep -c '^# Managed by lunarwing-mt-admin: LunarVoice fallback$' "$fallback")" 1 "fallback carries managed marker"
