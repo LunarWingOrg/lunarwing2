@@ -172,7 +172,7 @@
 
     function stepWorkers(b) {
       b.appendChild(checkField(data, 'w_pebble', 'pebble (Rust harness)'));
-      b.appendChild(checkField(data, 'w_opencode', 'opencode (sst/opencode)', (checked) => {
+      b.appendChild(checkField(data, 'w_opencode', 'opencode (anomalyco/opencode)', (checked) => {
         if (!checked) { data.opencode_model = ''; data.opencode_base_url = ''; }
         render();
       }));

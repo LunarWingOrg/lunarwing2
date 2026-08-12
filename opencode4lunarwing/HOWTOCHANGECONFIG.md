@@ -5,7 +5,7 @@
 The config files are plain files in the repo, baked into the image by `COPY` in the Dockerfile:
 
 ```dockerfile
-# opencode4lunarwing/Dockerfile:119-121
+# opencode4lunarwing/Dockerfile:187-189
 COPY --chown=opencode:opencode entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY --chown=opencode:opencode scripts/ ./scripts/
 COPY --chown=opencode:opencode config/ ./config/
@@ -45,7 +45,7 @@ This is the part worth understanding so you don't get confused later. There are 
 1. **Baked defaults** (in `config/opencode.json`, applied to *every* tenant at boot unless overridden).
 2. **Per-tenant overrides** (via `OPENCODE_MODEL` / `OPENCODE_BASE_URL` env vars, set by `configure-opencode`).
 
-At container startup, `entrypoint.sh:73-96` does this:
+At container startup, `entrypoint.sh:84-135` does this:
 
 ```
 if OPENCODE_MODEL or OPENCODE_BASE_URL is set:

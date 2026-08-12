@@ -4,9 +4,9 @@
 FROM docker.io/oven/bun:debian AS builder
 
 # Pin opencode to a release tag for reproducible builds.
-# Override with: docker build --build-arg OPENCODE_REF=v1.17.13 ...
+# Override with: docker build --build-arg OPENCODE_REF=v1.18.9 ...
 # Bump this default when upgrading the worker to a newer opencode release.
-ARG OPENCODE_REF=v1.17.13
+ARG OPENCODE_REF=v1.18.9
 
 WORKDIR /build
 
@@ -23,7 +23,7 @@ RUN set -e; \
       git python3 make g++ ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/sst/opencode.git /build/opencode
+RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/anomalyco/opencode.git /build/opencode
 
 WORKDIR /build/opencode
 RUN (bun install --frozen-lockfile || bun install) \

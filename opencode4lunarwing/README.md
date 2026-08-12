@@ -1,6 +1,6 @@
 # opencode4lunarwing
 
-WebSocket bridge that integrates [opencode](https://opencode.ai) (sst/opencode) as a LunarWing external worker.
+WebSocket bridge that integrates [opencode](https://opencode.ai) (anomalyco/opencode, formerly sst/opencode) as a LunarWing external worker.
 
 ## Quick Start
 

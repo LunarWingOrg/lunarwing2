@@ -117,6 +117,7 @@ tenant_home() { printf '%s' "$ROOT/home"; }
 OPENRC_INITD_DIR="$ROOT/init.d"
 # shellcheck disable=SC2034  # Mock container runtime consumed by sourced mt-admin functions.
 CONTAINER_RT=true
+chown() { :; }  # Hardened renderers chown like the vision ones; no tenant users here.
 mkdir -p "$OPENRC_INITD_DIR"
 ports_set_voice alpha true
 render_voice_quadlet alpha
@@ -124,6 +125,290 @@ assert_eq "$(grep -c '^Before=lunarwing-alpha.service$' "$ROOT/quadlets/lunarwin
 assert_eq "$(grep -c '^EnvironmentFile=' "$ROOT/quadlets/lunarwing-voice-alpha.container")" 1 "quadlet uses protected tenant env"
 render_voice_openrc_unit alpha
 assert_eq "$(grep -c 'before lunarwing-alpha' "$OPENRC_INITD_DIR/lunarwing-voice-alpha")" 1 "OpenRC orders voice before daemon"
+
+# ── Hardening parity with LunarVision (systemd/OpenRC supervision) ───────────
+
+CALLS=()
+assert_call() {
+  local expected="$1" call
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "$expected" ]] && { ok "$expected"; return; }
+  done
+  bad "missing call: $expected" "not recorded"
+}
+assert_no_call_prefix() {
+  local prefix="$1" call
+  for call in "${CALLS[@]}"; do
+    [[ "$call" != "$prefix"* ]] || { bad "unexpected call: $call" "prefix $prefix"; return; }
+  done
+  ok "no call starting with: $prefix"
+}
+assert_before() {
+  local first="$1" second="$2" first_index=-1 second_index=-1 index
+  for index in "${!CALLS[@]}"; do
+    [[ "${CALLS[$index]}" == "$first" ]] && first_index="$index"
+    [[ "${CALLS[$index]}" == "$second" ]] && second_index="$index"
+  done
+  if [[ "$first_index" -ge 0 && "$second_index" -gt "$first_index" ]]; then
+    ok "$first before $second"
+  else
+    bad "expected '$first' before '$second'" "order violated"
+  fi
+}
+
+if _voice_port_valid 40000 && ! _voice_port_valid 0 && ! _voice_port_valid 65536 \
+    && ! _voice_port_valid "" && ! _voice_port_valid abc; then
+  ok "voice ports are range-checked"
+else
+  bad "voice ports are range-checked" "validation misclassified a port"
+fi
+
+quadlet="$ROOT/quadlets/lunarwing-voice-alpha.container"
+assert_eq "$(grep -c '^HealthCmd=curl -sf http://127.0.0.1:8091/health || exit 1$' "$quadlet")" 1 "quadlet health-checks dedicated listener"
+assert_eq "$(grep -c '^PodmanArgs=--security-opt=no-new-privileges$' "$quadlet")" 1 "quadlet sets no-new-privileges"
+assert_eq "$(grep -c '^PublishPort=127.0.0.1:40000:8090$' "$quadlet")" 1 "quadlet publishes API port on loopback"
+assert_eq "$(grep -c '^PublishPort=127.0.0.1:40001:8091$' "$quadlet")" 1 "quadlet publishes health port on loopback"
+assert_eq "$(grep -c "^Volume=${VOICE_MODELS_DIR}:/models:ro\$" "$quadlet")" 1 "quadlet mounts model store read-only"
+assert_eq "$(grep -c '^TimeoutStartSec=180$' "$quadlet")" 1 "quadlet allows slow STT model load"
+if grep -qF 'stable-token' "$quadlet"; then bad "quadlet embeds no auth token" "token found"; else ok "quadlet embeds no auth token"; fi
+
+mv "$quadlet" "$quadlet.saved"
+ln -s "$ROOT/elsewhere" "$quadlet"
+if render_voice_quadlet alpha >/dev/null 2>&1; then
+  bad "quadlet refuses symlink path" "symlink target accepted"
+else
+  ok "quadlet refuses symlink path"
+fi
+rm -f "$quadlet"
+mv "$quadlet.saved" "$quadlet"
+
+mv "$env_dir/voice.env" "$env_dir/voice.env.saved"
+if render_voice_quadlet alpha >/dev/null 2>&1; then
+  bad "quadlet requires existing env file" "missing env accepted"
+else
+  ok "quadlet requires existing env file"
+fi
+mv "$env_dir/voice.env.saved" "$env_dir/voice.env"
+
+openrc_unit="$OPENRC_INITD_DIR/lunarwing-voice-alpha"
+assert_eq "$(grep -c 'container runtime unavailable' "$openrc_unit")" 1 "OpenRC fails loudly without runtime"
+assert_eq "$(grep -c '_voice exec "\${voice_container}" curl' "$openrc_unit")" 1 "OpenRC probes health inside container"
+assert_eq "$(grep -c 'checkpath -d -m 0700' "$openrc_unit")" 1 "OpenRC prepares rootless runtime dir"
+
+# Supervised user-unit fallback for rootless Podman without Quadlet support.
+helper="$ROOT/lunarwing-ctr-babysit"
+printf '#!/bin/sh\nexit 0\n' >"$helper"
+chmod 0755 "$helper"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+LUNARWING_MT_BABYSITTER_HELPER="$helper"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+CONTAINER_RT=podman
+ensure_babysitter_helper() { :; }
+command() {
+  if [[ "${1:-}" == "-v" && "${2:-}" == "podman" ]]; then printf '/usr/bin/podman\n'; return 0; fi
+  builtin command "$@"
+}
+id() {
+  if [[ "${1:-}" == "-u" && "${2:-}" == "alpha" ]]; then printf '1001\n'; return 0; fi
+  builtin command id "$@"
+}
+render_voice_systemd_fallback_unit alpha
+fallback="$ROOT/home/.config/systemd/user/lunarwing-voice-alpha.service"
+assert_eq "$(grep -c '^# Managed by lunarwing-mt-admin: LunarVoice fallback$' "$fallback")" 1 "fallback carries managed marker"
+assert_eq "$(grep -c "^ExecStart=${helper} lunarwing-voice-alpha\$" "$fallback")" 1 "fallback supervises podman wait"
+assert_eq "$(grep -c '^Restart=always$' "$fallback")" 1 "fallback restarts babysitter"
+assert_eq "$(grep -c '^Environment=XDG_RUNTIME_DIR=/run/user/1001$' "$fallback")" 1 "fallback has rootless runtime dir"
+
+rm "$fallback"
+printf '# handwritten override\n' >"$fallback"
+if render_voice_systemd_fallback_unit alpha >/dev/null 2>&1; then
+  bad "fallback refuses unmanaged unit" "handwritten unit overwritten"
+else
+  ok "fallback refuses unmanaged unit"
+fi
+if _remove_voice_systemd_fallback alpha >/dev/null 2>&1; then
+  bad "fallback removal refuses unmanaged unit" "handwritten unit removed"
+else
+  ok "fallback removal refuses unmanaged unit"
+fi
+rm -f "$fallback"
+
+# OpenRC registration renders the direct health unit and the crash supervisor.
+render_voice_openrc_unit() { CALLS+=("render-openrc:$1"); }
+render_container_babysitter_unit() { CALLS+=("render-supervisor:$*"); }
+rc-update() { CALLS+=("rc-update:$*"); }
+rc-service() { CALLS+=("rc-service:$*"); return 0; }
+CALLS=()
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
+MT_ROOTLESS=true
+_register_voice_openrc alpha
+assert_call 'render-openrc:alpha'
+assert_call 'rc-update:add lunarwing-voice-alpha default'
+assert_call 'rc-service:lunarwing-voice-alpha start'
+assert_call "render-supervisor:alpha voice lunarwing-voice-alpha 1001 $ROOT/home"
+assert_call 'rc-update:add lunarwing-voice-alpha-sup default'
+assert_call 'rc-service:lunarwing-voice-alpha-sup start'
+assert_before 'rc-service:lunarwing-voice-alpha start' 'rc-service:lunarwing-voice-alpha-sup start'
+
+# Imperative container reconciliation is convergent and health-gated.
+CONTAINER_EXISTS=true
+CONFIG_CHANGED=false
+UNSUPPORTED_HEALTH=false
+CONTAINER_HEALTHY=true
+_ctr() {
+  local name="$1" action="$2"
+  shift 2
+  CALLS+=("ctr:$name $action $*")
+  case "$action" in
+    inspect) [[ "$CONTAINER_EXISTS" == true ]] ;;
+    rm) CONTAINER_EXISTS=false ;;
+  esac
+}
+_container_config_changed() { [[ "$CONFIG_CHANGED" == true ]]; }
+_voice_has_unsupported_openrc_healthcheck() { [[ "$UNSUPPORTED_HEALTH" == true ]]; }
+_voice_container_healthy() { [[ "$CONTAINER_HEALTHY" == true ]]; }
+_wait_tenant_voice_healthy() { CALLS+=("wait:$*"); return 0; }
+_stop_voice_supervision() { CALLS+=("stop-supervision:$*"); }
+_create_voice_container() { CALLS+=("create:$*"); CONTAINER_EXISTS=true; }
+_store_container_hash() { CALLS+=("store:$*"); }
+
+CALLS=()
+_reconcile_voice_container alpha lunarwing-voice-alpha "$env_dir/voice.env" contract-a
+assert_no_call_prefix 'stop-supervision:'
+assert_no_call_prefix 'create:'
+assert_no_call_prefix 'ctr:alpha stop'
+assert_no_call_prefix 'ctr:alpha start'
+assert_call "store:alpha lunarwing-voice-alpha $env_dir/voice.env contract-a"
+
+CONFIG_CHANGED=true
+CALLS=()
+_reconcile_voice_container alpha lunarwing-voice-alpha "$env_dir/voice.env" contract-b
+assert_call 'stop-supervision:alpha lunarwing-voice-alpha'
+assert_call 'ctr:alpha stop --time 30 lunarwing-voice-alpha'
+assert_call 'ctr:alpha rm -f lunarwing-voice-alpha'
+assert_call "create:alpha lunarwing-voice-alpha $env_dir/voice.env 40000 40001"
+assert_before 'stop-supervision:alpha lunarwing-voice-alpha' 'ctr:alpha rm -f lunarwing-voice-alpha'
+
+CONFIG_CHANGED=false
+CONTAINER_HEALTHY=false
+CALLS=()
+_reconcile_voice_container alpha lunarwing-voice-alpha "$env_dir/voice.env" contract-c
+assert_call 'stop-supervision:alpha lunarwing-voice-alpha'
+assert_call 'ctr:alpha stop --time 30 lunarwing-voice-alpha'
+assert_call 'ctr:alpha start lunarwing-voice-alpha'
+assert_call 'wait:alpha lunarwing-voice-alpha'
+
+# render-units refreshes existing voice assets without starting services.
+CONTAINER_HEALTHY=true
+render_voice_quadlet() { CALLS+=("render-quadlet:$1"); }
+render_voice_systemd_fallback_unit() { CALLS+=("render-fallback:$1"); }
+QUADLET_SUPPORTED=true
+podman_supports_quadlet() { [[ "$QUADLET_SUPPORTED" == true ]]; }
+qfile="$ROOT/quadlets/lunarwing-voice-alpha.container"
+rm -f -- "$qfile" "$fallback"
+
+CONTAINER_EXISTS=false
+CALLS=()
+render_voice_systemd_assets alpha
+assert_no_call_prefix 'render-quadlet:'
+assert_no_call_prefix 'render-fallback:'
+
+CONTAINER_EXISTS=true
+CALLS=()
+render_voice_systemd_assets alpha
+assert_call 'render-quadlet:alpha'
+
+mkdir -p "$(dirname "$fallback")"
+touch "$fallback"
+QUADLET_SUPPORTED=false
+CALLS=()
+render_voice_systemd_assets alpha
+assert_call 'render-fallback:alpha'
+assert_no_call_prefix 'render-quadlet:'
+rm -f -- "$fallback"
+
+touch "$qfile"
+QUADLET_SUPPORTED=true
+CALLS=()
+render_voice_systemd_assets alpha
+assert_call 'render-quadlet:alpha'
+
+touch "$fallback"
+CALLS=()
+if render_voice_systemd_assets alpha >/dev/null 2>&1; then
+  bad "conflicting voice quadlet and fallback rejected" "both shapes accepted"
+else
+  ok "conflicting voice quadlet and fallback rejected"
+fi
+rm -f -- "$qfile" "$fallback"
+
+ports_set_voice alpha false
+touch "$qfile"
+CALLS=()
+render_voice_systemd_assets alpha
+assert_no_call_prefix 'render-quadlet:'
+assert_no_call_prefix 'render-fallback:'
+[[ ! -e "$qfile" ]] && ok "disabled tenant quadlet removed" || bad "disabled tenant quadlet removed" "quadlet still present"
+ports_set_voice alpha true
+
+CONTAINER_EXISTS=false
+rm -f -- "$OPENRC_INITD_DIR/lunarwing-voice-alpha" "$OPENRC_INITD_DIR/lunarwing-voice-alpha-sup"
+CALLS=()
+render_voice_openrc_assets alpha
+assert_no_call_prefix 'render-openrc:'
+assert_no_call_prefix 'render-supervisor:'
+
+CONTAINER_EXISTS=true
+touch "$OPENRC_INITD_DIR/lunarwing-voice-alpha"
+CALLS=()
+render_voice_openrc_assets alpha
+assert_call 'render-openrc:alpha'
+assert_call "render-supervisor:alpha voice lunarwing-voice-alpha 1001 $ROOT/home"
+assert_no_call_prefix 'rc-service:'
+assert_no_call_prefix 'rc-update:'
+
+ports_set_voice alpha false
+CALLS=()
+render_voice_openrc_assets alpha
+assert_no_call_prefix 'render-openrc:'
+[[ ! -e "$OPENRC_INITD_DIR/lunarwing-voice-alpha" ]] \
+  && ok "disabled tenant OpenRC unit removed" \
+  || bad "disabled tenant OpenRC unit removed" "unit still present"
+ports_set_voice alpha true
+
+# Required ports fail before any image/container mutation.
+# shellcheck disable=SC2034  # Updates state consumed by sourced mt-admin functions.
+ensure_init_system() { INIT_SYSTEM=systemd; }
+_ensure_tenant_image() { CALLS+=("ensure-image:$*"); }
+ports_get() {
+  case "$2" in
+    voice_service) printf '40000' ;;
+    voice_health) return 1 ;;
+    *) return 1 ;;
+  esac
+}
+CALLS=()
+if start_tenant_voice alpha >/dev/null 2>&1; then
+  bad "missing voice health port accepted" "start succeeded"
+else
+  ok "missing voice health port fails start"
+fi
+assert_no_call_prefix 'ensure-image:'
+
+ports_get() {
+  case "$2" in
+    voice_service) printf '40001' ;;
+    voice_health) printf '40001' ;;
+    *) return 1 ;;
+  esac
+}
+CALLS=()
+if start_tenant_voice alpha >/dev/null 2>&1; then
+  bad "identical voice ports accepted" "start succeeded"
+else
+  ok "identical voice ports fail start"
+fi
+assert_no_call_prefix 'ensure-image:'
 
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]

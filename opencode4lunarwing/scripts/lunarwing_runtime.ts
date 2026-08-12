@@ -3,7 +3,7 @@
  * for the LunarWing WebSocket protocol (lunarwing-agent-v1, with the legacy
  * ironclaw-agent-v1 alias still accepted for one deprecation cycle).
  *
- * Adapted for the opencode worker (upstream sst/opencode).
+ * Adapted for the opencode worker (upstream anomalyco/opencode, formerly sst/opencode).
  */
 
 import { randomUUID } from "crypto"
