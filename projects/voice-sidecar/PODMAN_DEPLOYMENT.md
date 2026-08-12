@@ -42,3 +42,33 @@ curl -fsS http://127.0.0.1:8091/ready
 
 `/health` proves process liveness. `/ready` proves the required STT model was
 loaded. A healthy but unready service must not receive transcription traffic.
+
+## Bare metal (systemd / OpenRC)
+
+`systemd/voice-sidecar.service` and `init.d/voice-sidecar` run the released
+binary directly instead of a container. Both require the secret environment as
+a regular, non-symlinked, owner-only file — the OpenRC unit refuses to start
+against anything else:
+
+```bash
+sudo install -d -m 0755 /etc/lunarwing
+sudo install -m 0600 /dev/null /etc/lunarwing/voice-sidecar.env
+# write VOICE_AUTH_TOKEN=... and any VOICE_* overrides into the env file
+```
+
+```bash
+# systemd
+sudo install -m 0644 systemd/voice-sidecar.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now voice-sidecar
+
+# OpenRC (Gentoo)
+sudo install -m 0755 init.d/voice-sidecar /etc/init.d/voice-sidecar
+sudo rc-update add voice-sidecar default && sudo rc-service voice-sidecar start
+```
+
+The OpenRC unit runs under `supervise-daemon` (bounded respawn) and gates
+startup on `http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}/health`; a sidecar
+that never becomes healthy fails the start loudly instead of reporting
+"started" against a dead process. The systemd unit applies the standard
+sandbox set (`ProtectSystem=strict`, read-only model store, `UMask=0077`,
+bounded restart storms).
