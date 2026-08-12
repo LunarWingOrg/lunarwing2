@@ -7474,12 +7474,240 @@ build_voice_sidecar_image() {
   say "LunarVoice sidecar image built: $VOICE_SIDECAR_IMAGE"
 }
 
+_voice_port_valid() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port > 0 && 10#$port <= 65535 ))
+}
+
+# Launch contract for the voice sidecar: captures every input that must force a
+# container recreate when it drifts (image, env, port mapping, model store,
+# runtime/init shape) but is not visible in a rendered unit file.
+_voice_launch_contract() {
+  local name="$1" voice_port="$2" health_port="$3" env_path="$4" image_id env_hash
+  image_id="$(_ctr "$name" image inspect -f '{{.Id}}' "$VOICE_SIDECAR_IMAGE" 2>/dev/null)" || return 1
+  env_hash="$(_container_config_hash "$env_path")" || return 1
+  [[ -n "$image_id" && -n "$env_hash" ]] || return 1
+  printf 'image=%s;env=%s;api=%s:%s;health=%s:%s;models=%s;runtime=%s;rootless=%s;init=%s;no_new_privileges=true' \
+    "$image_id" "$env_hash" "$voice_port" "$VOICE_SIDECAR_INTERNAL_PORT" \
+    "$health_port" "$VOICE_SIDECAR_HEALTH_PORT" "$VOICE_MODELS_DIR" "$CONTAINER_RT" \
+    "$MT_ROOTLESS" "$INIT_SYSTEM"
+}
+
+_voice_container_healthy() {
+  local name="$1" container="$2" running
+  running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
+  [[ "$running" == "true" ]] || return 1
+  _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
+    "http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}/health" 2>/dev/null
+}
+
+# STT model load can take a while on a cold box, so the default wait is 60s.
+_wait_tenant_voice_healthy() {
+  local name="$1" container="$2" attempts="${3:-60}" attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    _voice_container_healthy "$name" "$container" && return 0
+    (( attempt < attempts )) && sleep 1
+  done
+  return 1
+}
+
+_stop_voice_openrc_supervisor() {
+  local container="$1" supervisor="${1}-sup"
+  [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$supervisor" ]] || return 0
+  rc-service "$supervisor" stop >/dev/null 2>&1 && return 0
+  rc-service "$supervisor" status 2>&1 | grep -Eqi 'stopped|inactive|dead'
+}
+
+_create_voice_container() {
+  local name="$1" container="$2" env_path="$3" voice_port="$4" health_port="$5"
+  local -a healthcheck_args=() restart_arg=()
+  _openrc_podman_uses_init_health && healthcheck_args=(--no-healthcheck)
+  [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+  say "creating voice sidecar container $container on ports $voice_port/$health_port"
+  _ctr "$name" run -d \
+    --name "$container" \
+    "${healthcheck_args[@]}" \
+    --env-file "$env_path" \
+    -p "127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}" \
+    -p "127.0.0.1:${health_port}:${VOICE_SIDECAR_HEALTH_PORT}" \
+    -v "$VOICE_MODELS_DIR:/models:ro" \
+    --security-opt=no-new-privileges \
+    "${restart_arg[@]}" \
+    "$VOICE_SIDECAR_IMAGE" >/dev/null
+}
+
+_voice_has_unsupported_openrc_healthcheck() {
+  local name="$1" container="$2" healthcheck
+  _openrc_podman_uses_init_health || return 1
+  healthcheck="$(_ctr "$name" inspect -f '{{json .Config.Healthcheck}}' "$container" 2>/dev/null || true)"
+  case "$healthcheck" in
+    ""|null|*'"NONE"'*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Stop whichever supervision owns the voice container before mutating it, or the
+# supervisor respawns the container mid-mutation. Refuses to touch a systemd
+# fallback unit that was not rendered by mt-admin.
+_stop_voice_supervision() {
+  local name="$1" container="$2" path
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _stop_voice_openrc_supervisor "$container"
+    return
+  fi
+  [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+    && "$CONTAINER_RT" == "podman" ]] || return 0
+  path="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  if [[ ! -f "$path" || -L "$path" ]] \
+      || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVoice fallback$' "$path"; then
+    say "ERROR: refusing to stop unmanaged systemd unit $path" >&2
+    return 1
+  fi
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1
+}
+
+# Converge the voice container toward the current launch contract: recreate on
+# config/image/health-ownership drift, restart when unhealthy, and fail loudly
+# when the sidecar never becomes healthy. Idempotent when nothing drifted.
+_reconcile_voice_container() {
+  local name="$1" container="$2" env_path="$3" contract="$4" recreate=false
+  if _ctr "$name" inspect "$container" &>/dev/null; then
+    if _voice_has_unsupported_openrc_healthcheck "$name" "$container" \
+        || _container_config_changed "$name" "$container" "$env_path" "$contract"; then
+      recreate=true
+    fi
+  fi
+
+  if [[ "$recreate" == "true" ]]; then
+    say "config, image, or health ownership changed for $container; force-recreating"
+    _stop_voice_supervision "$name" "$container" || return 1
+    if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/$container" ]]; then
+      rc-service "$container" stop >/dev/null 2>&1 || true
+    fi
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    _ctr "$name" rm -f "$container" >/dev/null || return 1
+  fi
+
+  if ! _ctr "$name" inspect "$container" &>/dev/null; then
+    _create_voice_container "$name" "$container" "$env_path" \
+      "$(ports_get "$name" voice_service)" "$(ports_get "$name" voice_health)" || return 1
+  elif ! _voice_container_healthy "$name" "$container"; then
+    _stop_voice_supervision "$name" "$container" || return 1
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    _ctr "$name" start "$container" >/dev/null || return 1
+  fi
+
+  if ! _wait_tenant_voice_healthy "$name" "$container"; then
+    say "ERROR: voice sidecar $container did not become healthy" >&2
+    return 1
+  fi
+  _store_container_hash "$name" "$container" "$env_path" "$contract"
+}
+
+_remove_voice_systemd_fallback() {
+  local name="$1" service="lunarwing-voice-${1}.service" path
+  path="$(tenant_home "$name")/.config/systemd/user/$service"
+  [[ ! -e "$path" && ! -L "$path" ]] && return 0
+  if [[ ! -f "$path" || -L "$path" ]] \
+      || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVoice fallback$' "$path"; then
+    say "ERROR: refusing to remove unmanaged systemd unit $path" >&2
+    return 1
+  fi
+  _systemctl_user "$name" disable --now "$service" >/dev/null 2>&1 || true
+  rm -f -- "$path"
+}
+
+# Older Podman (<4.6) has no Quadlet generator, so rootless tenants get a
+# supervised user unit around the babysitter helper instead (podman wait).
+render_voice_systemd_fallback_unit() {
+  local name="$1" container="lunarwing-voice-${1}" unit_dir path tmp runtime_bin babysitter home uid
+  unit_dir="$(tenant_home "$name")/.config/systemd/user"
+  path="$unit_dir/${container}.service"
+  runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
+  babysitter="${LUNARWING_MT_BABYSITTER_HELPER:-/usr/local/sbin/lunarwing-ctr-babysit}"
+  home="$(tenant_home "$name")"
+  uid="$(id -u "$name" 2>/dev/null || true)"
+  [[ "$CONTAINER_RT" == "podman" && -n "$runtime_bin" && -n "$uid" ]] || return 1
+  ensure_babysitter_helper
+  [[ -x "$babysitter" ]] || return 1
+  if [[ -e "$path" || -L "$path" ]]; then
+    if [[ ! -f "$path" || -L "$path" ]] \
+        || ! grep -q '^# Managed by lunarwing-mt-admin: LunarVoice fallback$' "$path"; then
+      say "ERROR: refusing to overwrite unmanaged systemd unit $path" >&2
+      return 1
+    fi
+  fi
+  mkdir -p "$unit_dir"
+  tmp="$(mktemp "$unit_dir/.${container}.service.XXXXXX")" || return 1
+  cat >"$tmp" <<EOF
+# Managed by lunarwing-mt-admin: LunarVoice fallback
+[Unit]
+Description=LunarVoice ONNX sidecar ($name)
+After=network-online.target
+Wants=network-online.target
+Before=lunarwing-${name}.service
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+Environment=HOME=${home}
+Environment=XDG_RUNTIME_DIR=/run/user/${uid}
+ExecStart=${babysitter} ${container}
+ExecStop=${runtime_bin} stop --time 30 ${container}
+Restart=always
+RestartSec=2
+TimeoutStopSec=45
+
+[Install]
+WantedBy=default.target
+EOF
+  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path"
+}
+
+# Switching from Quadlet to the fallback shape: retire the generated unit first
+# so both never own the same container.
+_prepare_voice_systemd_fallback() {
+  local name="$1" container="lunarwing-voice-${1}" qfile
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  [[ ! -e "$qfile" && ! -L "$qfile" ]] && return 0
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
+  rm -f -- "$qfile"
+  _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+}
+
+_register_voice_systemd_fallback() {
+  local name="$1" container="lunarwing-voice-${1}"
+  render_voice_systemd_fallback_unit "$name" || return 1
+  _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+  _systemctl_user "$name" reset-failed "${container}.service" >/dev/null 2>&1 || true
+  _systemctl_user "$name" enable --now "${container}.service" >/dev/null 2>&1 || return 1
+  _wait_tenant_voice_healthy "$name" "$container"
+}
+
+_register_voice_openrc() {
+  local name="$1" container="lunarwing-voice-${1}" uid home
+  render_voice_openrc_unit "$name" || return 1
+  rc-update add "$container" default >/dev/null 2>&1 || return 1
+  rc-service "$container" start >/dev/null 2>&1 || return 1
+  [[ "$MT_ROOTLESS" == "true" ]] || return 0
+  uid="$(id -u "$name")" || return 1
+  home="$(tenant_home "$name")"
+  render_container_babysitter_unit "$name" voice "$container" "$uid" "$home" || return 1
+  rc-update add "${container}-sup" default >/dev/null 2>&1 || return 1
+  rc-service "${container}-sup" start >/dev/null 2>&1 || return 1
+}
+
 start_tenant_voice() {
   local name="$1"
   tenant_voice_enabled "$name" || { say "LunarVoice disabled for $name (skipping)"; return 0; }
   voice_models_ready "$name" \
     || { say "ERROR: verified STT models missing under $VOICE_MODELS_DIR" >&2; return 1; }
   ensure_container_runtime
+  ensure_init_system
 
   # SELinux: the shared model store must carry a container-readable label or
   # the sidecar gets EACCES on /models. chcon (not :z) because the dir is
@@ -7488,11 +7716,14 @@ start_tenant_voice() {
     chcon -Rt container_file_t "$VOICE_MODELS_DIR" 2>/dev/null || true
   fi
 
-  local voice_port voice_health_port container_name env_path
+  local voice_port voice_health_port container_name env_path contract quadlet_file
   voice_port="$(ports_get "$name" voice_service)" || true
   voice_health_port="$(ports_get "$name" voice_health)" || true
-  [[ -n "$voice_port" && -n "$voice_health_port" ]] \
-    || { say "ERROR: LunarVoice ports missing for $name" >&2; return 1; }
+  if ! _voice_port_valid "$voice_port" || ! _voice_port_valid "$voice_health_port" \
+      || [[ "$voice_port" == "$voice_health_port" ]]; then
+    say "ERROR: distinct valid voice_service and voice_health ports are required for $name" >&2
+    return 1
+  fi
   if ! _ensure_tenant_image "$name" "$VOICE_SIDECAR_IMAGE"; then
     say "ERROR: LunarVoice image unavailable; run 'build-voice-sidecar' first" >&2
     return 1
@@ -7500,81 +7731,83 @@ start_tenant_voice() {
   container_name="lunarwing-voice-$name"
   env_path="$(tenant_env_dir "$name")/voice.env"
   [[ -f "$env_path" ]] || write_tenant_voice_env "$name" >/dev/null
+  contract="$(_voice_launch_contract "$name" "$voice_port" "$voice_health_port" "$env_path")" || return 1
 
-  ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file
+    _remove_voice_systemd_fallback "$name" || return 1
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
-    render_voice_quadlet "$name"
-    _systemctl_user "$name" daemon-reload 2>/dev/null || true
-    if _container_config_changed "$name" "$container_name" "$quadlet_file"; then
+    render_voice_quadlet "$name" || return 1
+    _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || return 1
+    if _container_config_changed "$name" "$container_name" "$quadlet_file" "$contract"; then
       _recreate_quadlet_container "$name" "${container_name}.service" "$container_name"
     fi
-    if _systemctl_user "$name" start "${container_name}.service" >/dev/null 2>&1; then
-      _store_container_hash "$name" "$container_name" "$quadlet_file"
-      say "LunarVoice ready via quadlet (${container_name}.service, port $voice_port)"
-    else
-      say "WARNING: ${container_name}.service failed to start" >&2
-      _systemctl_user "$name" status "${container_name}.service" --no-pager >&2 || true
+    _systemctl_user "$name" reset-failed "${container_name}.service" >/dev/null 2>&1 || true
+    if ! _systemctl_user "$name" start "${container_name}.service" >/dev/null 2>&1 \
+        || ! _wait_tenant_voice_healthy "$name" "$container_name"; then
+      say "ERROR: ${container_name}.service failed to become healthy" >&2
+      _systemctl_user "$name" status "${container_name}.service" --no-pager --full >&2 || true
       return 1
     fi
+    _store_container_hash "$name" "$container_name" "$quadlet_file" "$contract"
+    say "LunarVoice ready via Quadlet (${container_name}.service, ports $voice_port/$voice_health_port)"
     return 0
   fi
 
-  local -a healthcheck_args=()
-  if _openrc_podman_uses_init_health; then
-    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
-    healthcheck_args=(--no-healthcheck)
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" \
+      && "$CONTAINER_RT" == "podman" ]]; then
+    _prepare_voice_systemd_fallback "$name" || return 1
   fi
-
-  if _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" start "$container_name" >/dev/null 2>&1 || true
-  else
-    local -a restart_arg=()
-    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
-    _ctr "$name" run -d \
-      --name "$container_name" \
-      "${healthcheck_args[@]}" \
-      --env-file "$env_path" \
-      -p "127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}" \
-      -p "127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}" \
-      -v "$VOICE_MODELS_DIR:/models:ro" \
-      --security-opt=no-new-privileges \
-      "${restart_arg[@]}" \
-      "$VOICE_SIDECAR_IMAGE" >/dev/null
-  fi
-  say "LunarVoice ready ($container_name, port $voice_port)"
-
+  _reconcile_voice_container "$name" "$container_name" "$env_path" "$contract" || return 1
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
-    render_voice_openrc_unit "$name"
-    rc-update add "$container_name" default >/dev/null 2>&1 || true
-    rc-service "$container_name" start >/dev/null 2>&1 \
-      || { say "ERROR: rc-service $container_name start failed" >&2; return 1; }
+    _register_voice_openrc "$name" || return 1
+  elif [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
+    _register_voice_systemd_fallback "$name" || return 1
   fi
+  say "LunarVoice ready ($container_name, ports $voice_port/$voice_health_port)"
 }
 
 stop_tenant_voice() {
-  local name="$1" container_name="lunarwing-voice-$1"
+  local name="$1" container_name="lunarwing-voice-$1" running
   ensure_container_runtime
   ensure_init_system
-  if [[ "$INIT_SYSTEM" == "openrc" && -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
-    rc-service "$container_name" stop >/dev/null 2>&1 || true
-  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
-    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+  # Supervision stops before the container or it respawns mid-stop.
+  if [[ "$INIT_SYSTEM" == "openrc" ]]; then
+    _stop_voice_openrc_supervisor "$container_name" || return 1
+    if [[ -f "$OPENRC_INITD_DIR/${container_name}" ]]; then
+      rc-service "$container_name" stop >/dev/null 2>&1 || true
+    fi
+  else
+    _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 || true
+  fi
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" stop --time 30 "$container_name" >/dev/null 2>&1 || true
+    running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null || true)"
+    if [[ "$running" == "true" ]]; then
+      say "ERROR: voice sidecar remained running after stop ($container_name)" >&2
+      return 1
+    fi
   fi
   say "LunarVoice stopped ($container_name)"
 }
 
 render_voice_quadlet() {
-  local name="$1" qdir voice_port voice_health_port env_path
+  local name="$1" qdir voice_port voice_health_port env_path path tmp
   qdir="$(tenant_quadlet_dir "$name")"
-  voice_port="$(ports_get "$name" voice_service)"
-  voice_health_port="$(ports_get "$name" voice_health)"
+  voice_port="$(ports_get "$name" voice_service)" || return 1
+  voice_health_port="$(ports_get "$name" voice_health)" || return 1
+  _voice_port_valid "$voice_port" && _voice_port_valid "$voice_health_port" || return 1
   env_path="$(tenant_env_dir "$name")/voice.env"
-  [[ -f "$env_path" ]] || write_tenant_voice_env "$name" >/dev/null
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || { say "ERROR: regular LunarVoice env file required: $env_path" >&2; return 1; }
   mkdir -p "$qdir"
-  cat >"$qdir/lunarwing-voice-${name}.container" <<EOF
+  path="$qdir/lunarwing-voice-${name}.container"
+  if [[ -e "$path" || -L "$path" ]]; then
+    [[ -f "$path" && ! -L "$path" ]] \
+      || { say "ERROR: refusing to overwrite unsafe Quadlet path $path" >&2; return 1; }
+  fi
+  tmp="$(mktemp "$qdir/.lunarwing-voice-${name}.container.XXXXXX")" || return 1
+  cat >"$tmp" <<EOF
 [Unit]
 Description=LunarVoice ONNX sidecar ($name)
 After=network-online.target
@@ -7590,36 +7823,56 @@ PublishPort=127.0.0.1:${voice_port}:${VOICE_SIDECAR_INTERNAL_PORT}
 PublishPort=127.0.0.1:${voice_health_port}:${VOICE_SIDECAR_HEALTH_PORT}
 EnvironmentFile=${env_path}
 Volume=${VOICE_MODELS_DIR}:/models:ro
+HealthCmd=curl -sf http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}/health || exit 1
+HealthInterval=15s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=60s
+PodmanArgs=--security-opt=no-new-privileges
 SecurityLabelDisable=false
 
 [Service]
 Restart=on-failure
 RestartSec=10
+TimeoutStartSec=180
 
 [Install]
 WantedBy=default.target
 EOF
+  chown "$name:$name" "$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod 0644 "$tmp" || { rm -f -- "$tmp"; return 1; }
+  mv -f -- "$tmp" "$path"
 }
 
 render_voice_openrc_unit() {
-  local name="$1" runtime_bin container uid home voice_health_port
+  local name="$1" runtime_bin="" container uid home unit_path
+  ensure_container_runtime
   container="lunarwing-voice-${name}"
-  uid="$(id -u "$name" 2>/dev/null || echo "")"
+  uid="$(id -u "$name" 2>/dev/null || true)"
   home="$(tenant_home "$name")"
-  voice_health_port="$(ports_get "$name" voice_health)"
   [[ -n "${CONTAINER_RT:-}" ]] && runtime_bin="$(command -v "$CONTAINER_RT" 2>/dev/null || true)"
-  cat >"$OPENRC_INITD_DIR/${container}" <<INITEOF
+  unit_path="$OPENRC_INITD_DIR/${container}"
+  mkdir -p "$OPENRC_INITD_DIR"
+  cat >"$unit_path" <<INITEOF
 #!/sbin/openrc-run
-description="LunarVoice sidecar ($name)"
+
+description="LunarVoice ONNX sidecar ($name)"
+
 : "\${voice_runtime:=$runtime_bin}"
 : "\${voice_container:=$container}"
 : "\${voice_rootless:=$MT_ROOTLESS}"
 : "\${voice_user:=$name}"
 : "\${voice_home:=$home}"
 : "\${voice_uid:=$uid}"
-: "\${voice_health_port:=$voice_health_port}"
+: "\${voice_health_internal_port:=$VOICE_SIDECAR_HEALTH_PORT}"
+: "\${voice_wait:=60}"
 
-depend() { need net localmount; after firewall; before lunarwing-${name}; }
+depend() {
+    need net localmount
+    after firewall
+    before lunarwing-${name}
+}
+
 _voice() {
     if [ "\${voice_rootless}" = "true" ]; then
         sudo -u "\${voice_user}" env HOME="\${voice_home}" XDG_RUNTIME_DIR="/run/user/\${voice_uid}" "\${voice_runtime}" "\$@"
@@ -7627,28 +7880,101 @@ _voice() {
         "\${voice_runtime}" "\$@"
     fi
 }
-_healthy() {
+
+_voice_healthy() {
     [ "\$(_voice inspect -f '{{.State.Running}}' "\${voice_container}" 2>/dev/null)" = "true" ] || return 1
-    curl -fsS --max-time 3 "http://127.0.0.1:\${voice_health_port}/health" >/dev/null 2>&1
+    _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/health" 2>/dev/null
 }
+
 start() {
+    [ -n "\${voice_runtime}" ] && [ -x "\${voice_runtime}" ] || { eend 1 "container runtime unavailable"; return 1; }
     ebegin "Starting LunarVoice (\${voice_container})"
-    _voice start "\${voice_container}" >/dev/null 2>&1 || { eend 1; return 1; }
-    _wait=0
-    while ! _healthy; do
-        _wait=\$((_wait + 1)); [ "\$_wait" -lt 60 ] || { eend 1 "not healthy"; return 1; }
+    if [ "\${voice_rootless}" = "true" ]; then
+        [ -n "\${voice_uid}" ] || { eend 1 "tenant uid unavailable"; return 1; }
+        checkpath -d -m 0700 -o "\${voice_user}:\${voice_user}" "/run/user/\${voice_uid}"
+    fi
+    _voice start "\${voice_container}" >/dev/null 2>&1 || { eend 1 "container start failed"; return 1; }
+    _w=0
+    while ! _voice_healthy; do
+        _w=\$((_w + 1))
+        [ "\$_w" -lt "\${voice_wait}" ] || { eend 1 "voice sidecar not healthy after \${voice_wait}s"; return 1; }
         sleep 1
     done
     eend 0
 }
+
 stop() {
+    [ -n "\${voice_runtime}" ] && [ -x "\${voice_runtime}" ] || return 0
     ebegin "Stopping LunarVoice (\${voice_container})"
     _voice stop --time 30 "\${voice_container}" >/dev/null 2>&1
     eend \$?
 }
-status() { _healthy && { einfo "\${voice_container}: started"; return 0; }; einfo "\${voice_container}: stopped"; return 3; }
+
+status() {
+    if _voice_healthy; then
+        einfo "\${voice_container}: started"; return 0
+    fi
+    einfo "\${voice_container}: stopped"; return 3
+}
 INITEOF
-  chmod 0755 "$OPENRC_INITD_DIR/${container}"
+  chmod 0755 "$unit_path"
+}
+
+# Refresh an enabled tenant's existing voice supervision shape without starting
+# anything (render-units). Disabled tenants get their managed units removed.
+# Selection and image availability decide whether units should exist at all;
+# start_tenant_voice owns first render + start.
+render_voice_systemd_assets() {
+  local name="$1" container qfile fallback has_quadlet=false has_fallback=false
+  ensure_container_runtime
+  container="lunarwing-voice-${name}"
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  fallback="$(tenant_home "$name")/.config/systemd/user/${container}.service"
+  if ! tenant_voice_enabled "$name"; then
+    rm -f -- "$qfile"
+    [[ ! -e "$fallback" && ! -L "$fallback" ]] && return 0
+    _remove_voice_systemd_fallback "$name"
+    return
+  fi
+  [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] || return 0
+  [[ -e "$qfile" || -L "$qfile" ]] && has_quadlet=true
+  [[ -e "$fallback" || -L "$fallback" ]] && has_fallback=true
+  if [[ "$has_quadlet" == "true" && "$has_fallback" == "true" ]]; then
+    say "ERROR: conflicting LunarVoice Quadlet and fallback unit for $name" >&2
+    return 1
+  fi
+  if [[ "$has_fallback" == "true" ]]; then
+    render_voice_systemd_fallback_unit "$name"
+  elif [[ "$has_quadlet" == "true" ]]; then
+    render_voice_quadlet "$name"
+  elif ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  elif podman_supports_quadlet; then
+    render_voice_quadlet "$name"
+  else
+    render_voice_systemd_fallback_unit "$name"
+  fi
+}
+
+render_voice_openrc_assets() {
+  local name="$1" uid home container="lunarwing-voice-${1}" direct supervisor
+  direct="$OPENRC_INITD_DIR/$container"
+  supervisor="$OPENRC_INITD_DIR/${container}-sup"
+  if ! tenant_voice_enabled "$name"; then
+    rc-update del "${container}-sup" default >/dev/null 2>&1 || true
+    rc-update del "$container" default >/dev/null 2>&1 || true
+    rm -f -- "$direct" "$supervisor"
+    return 0
+  fi
+  if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
+      && ! _ctr "$name" inspect "$container" &>/dev/null; then
+    return 0
+  fi
+  render_voice_openrc_unit "$name" || return 1
+  [[ "$MT_ROOTLESS" == "true" ]] || return 0
+  uid="$(id -u "$name")" || return 1
+  home="$(tenant_home "$name")"
+  render_container_babysitter_unit "$name" voice "$container" "$uid" "$home"
 }
 
 configure_voice() {
@@ -7683,11 +8009,17 @@ remove_tenant_voice_unit() {
   local name="$1" container_name="lunarwing-voice-$1"
   ensure_init_system
   if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _remove_voice_systemd_fallback "$name" || return 1
     rm -f "$(tenant_quadlet_dir "$name")/${container_name}.container"
+    rm -f "$(_hash_dir "$name")/${container_name}.hash"
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
   else
+    rc-service "${container_name}-sup" stop >/dev/null 2>&1 || true
+    rc-update del "${container_name}-sup" default >/dev/null 2>&1 || true
+    rm -f "$OPENRC_INITD_DIR/${container_name}-sup"
     rc-update del "$container_name" default >/dev/null 2>&1 || true
     rm -f "$OPENRC_INITD_DIR/$container_name"
+    rm -f "$(_hash_dir "$name")/${container_name}.hash"
   fi
 }
 
@@ -8581,7 +8913,7 @@ stop_tenant_systemd() {
   local uid
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
     if _systemctl_user "$name" is-active --quiet "$svc" 2>/dev/null; then
       _systemctl_user "$name" stop "$svc"
       say "stopped $svc"
@@ -8599,8 +8931,10 @@ uninstall_tenant_systemd() {
   done
   _remove_vision_systemd_fallback "$name" || return 1
   rm -f "$(_hash_dir "$name")/lunarwing-vision-${name}.hash"
+  _remove_voice_systemd_fallback "$name" || return 1
+  rm -f "$(_hash_dir "$name")/lunarwing-voice-${name}.hash"
 
-  # Quadlet .container units (rootless pg + workers + vision sidecar). Remove the
+  # Quadlet .container units (rootless pg + workers + vision/voice sidecars). Remove the
   # worker containers (their workspace data is bind-mounted in the home); the pg
   # container + named volume are handled by stop_tenant_postgres /
   # reset_tenant_postgres so non-purge removals keep the data for a later re-add.
@@ -8610,7 +8944,8 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-pebble-${name}.container" \
         "$qdir/lunarwing-opencode-${name}.container" \
         "$qdir/lunarwing-kimi-${name}.container" \
-        "$qdir/lunarwing-vision-${name}.container"
+        "$qdir/lunarwing-vision-${name}.container" \
+        "$qdir/lunarwing-voice-${name}.container"
   if id -u "$name" >/dev/null 2>&1; then
     # Retirement preserves stopped Nanocode containers for rollback and manual
     # recovery. Supported workers remain disposable because their state lives
@@ -8619,6 +8954,7 @@ uninstall_tenant_systemd() {
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true
+    _ctr "$name" rm -f "lunarwing-voice-${name}" >/dev/null 2>&1 || true
   fi
 
   _systemctl_user "$name" daemon-reload 2>/dev/null || true
@@ -9375,7 +9711,7 @@ start_tenant_openrc() {
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}" "lunarwing-voice-${name}-sup")
   if tenant_weechat_enabled "$name"; then
     boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
   fi
@@ -9414,10 +9750,11 @@ stop_tenant_openrc() {
       || die "failed to stop OpenRC service lunarwing-darkirc-${name}"
   fi
   # Container babysitters must stop before their containers or they immediately respawn them.
-  for worker in nanocode pebble opencode kimi vision; do
+  for worker in nanocode pebble opencode kimi vision voice; do
     rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
   done
   rc-service "lunarwing-vision-${name}" stop 2>/dev/null || true
+  rc-service "lunarwing-voice-${name}" stop 2>/dev/null || true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
   rc-service "lunarwing-pg-${name}-sup" stop 2>/dev/null || true
   rc-service "lunarwing-pg-${name}" stop 2>/dev/null || true
@@ -9899,7 +10236,7 @@ darkirc_health_strict() {
 
 uninstall_tenant_openrc() {
   local name="$1"
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup"; do
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
     rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
@@ -10419,20 +10756,11 @@ _render_tenant_units_locked() {
   ensure_init_system
   say "--- Re-rendering $INIT_SYSTEM units for $name ---"
   if [[ "$INIT_SYSTEM" == "systemd" ]]; then
-    if tenant_voice_enabled "$name"; then
-      render_voice_quadlet "$name"
-    else
-      rm -f "$(tenant_quadlet_dir "$name")/lunarwing-voice-${name}.container"
-    fi
+    render_voice_systemd_assets "$name" || return 1
     render_tenant_systemd_units "$name" || return 1
     _systemctl_user "$name" daemon-reload >/dev/null || return 1
   else
-    if tenant_voice_enabled "$name"; then
-      render_voice_openrc_unit "$name"
-    else
-      rc-update del "lunarwing-voice-${name}" default >/dev/null 2>&1 || true
-      rm -f "$OPENRC_INITD_DIR/lunarwing-voice-${name}"
-    fi
+    render_voice_openrc_assets "$name" || return 1
     render_tenant_openrc_units "$name"
   fi
   say "units re-rendered for '$name' (services NOT restarted)."
