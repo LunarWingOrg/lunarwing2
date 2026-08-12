@@ -761,6 +761,23 @@ Test skill
     }
 
     #[tokio::test]
+    async fn check_http_ignores_universal_extension_credential_mapping() {
+        let store = test_store();
+        let mgr = make_auth_manager(store);
+        let registry = make_registry_with_mapping("extension_api_token", "*");
+
+        let params = serde_json::json!({"url": "https://unrelated.example/"});
+        let result = mgr
+            .check_action_auth("http", &params, "user1", &registry)
+            .await;
+
+        assert!(
+            matches!(result, AuthCheckResult::NoAuthRequired),
+            "Expected NoAuthRequired, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn check_http_no_url_param() {
         let store = test_store();
         let mgr = make_auth_manager(store);
