@@ -27,6 +27,7 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 - `Agent` owns session/thread/turn handling, submission parsing, the LLM/tool loop, approvals, routines, and background runtime behavior.
 - `AppBuilder` is the composition root that wires database, secrets, LLMs, tools, workspace, extensions, skills, hooks, and cost controls before the agent starts.
 - The web gateway is a browser-facing API/UI layered on top of the same agent/session/tool systems, not a separate product path.
+- When working with LunarWing, use the lunarwing study-notes MCP if it is available and mark notes that may be stale as "stale" (if possible)
 
 ## Where to Work
 
@@ -56,30 +57,30 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 
 This machine is a dedicated dev/test machine with limited resources. **All cargo commands must follow these rules:**
 
-- **6 threads max**: prefix every cargo command with `taskset -c 0-5`
+- **6 threads max**: prefix every cargo command with `taskset -c 0-9`
 - **Use `cargo check` for compile verification, NOT `cargo build`** — DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. Reserve release builds (`cargo build --release`) for deploying to a new tenant or upgrading an existing tenant's release binary.
-- **Use `taskset -c 0-5` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
+- **Use `taskset -c 0-9` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
 - DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS
 - Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
 
 ```bash
-taskset -c 0-5 cargo check -j6                              # compile check
-taskset -c 0-5 cargo check -j6 --no-default-features --features postgres  # postgres-only
-taskset -c 0-5 cargo check -j6 --no-default-features --features libsql    # libsql-only
-taskset -c 0-5 cargo check -j6 --all-features               # all features
-taskset -c 0-5 cargo test -j6 -- --test-threads=6            # unit tests
-taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples -- -D warnings  # lint
-taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples --all-features -- -D warnings
+taskset -c 0-9 cargo check -j10                              # compile check
+taskset -c 0-9 cargo check -j10 --no-default-features --features postgres  # postgres-only
+taskset -c 0-9 cargo check -j10 --no-default-features --features libsql    # libsql-only
+taskset -c 0-9 cargo check -j10 --all-features               # all features
+taskset -c 0-9 cargo test -j10 -- --test-threads=6            # unit tests
+taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples -- -D warnings  # lint
+taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples --all-features -- -D warnings
 ```
 
 Long-running commands (5–20+ minutes) **must use tmux**:
 ```bash
-tmux new-session -d -s build "taskset -c 0-5 cargo build --release -j6 2>&1 | tee /tmp/build.log"
+tmux new-session -d -s build "taskset -c 0-9 cargo build --release -j10 2>&1 | tee /tmp/build.log"
 ```
 
 ## Build, Test, and Lint Commands
 
-Run these from the `ic/` directory. Apply `taskset -c 0-5` and `-j6` per the build constraints above.
+Run these from the `ic/` directory. Apply `taskset -c 0-9` and `-j10` per the build constraints above.
 
 ```bash
 # Compile check (preferred over cargo build for verification)
