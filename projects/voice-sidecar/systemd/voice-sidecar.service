@@ -2,6 +2,8 @@
 Description=LunarVoice ONNX Sidecar
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,11 +14,18 @@ Environment=LD_LIBRARY_PATH=/opt/lunarvoice/lib
 ExecStart=/opt/lunarvoice/lunarwing-voice-sidecar
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=30
+UMask=0077
 NoNewPrivileges=true
+PrivateDevices=true
 PrivateTmp=true
-ProtectSystem=strict
+ProtectControlGroups=true
 ProtectHome=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
 ReadOnlyPaths=/var/lib/lunarvoice/models
+RestrictSUIDSGID=true
 MemoryDenyWriteExecute=false
 
 [Install]

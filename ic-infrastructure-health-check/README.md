@@ -439,6 +439,7 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 83 assertions: reachability, JSON, dedicated/legacy registry discovery, VL and metrics behavior). |
 | `init-templates` | `test-lunarvision-init-templates.sh` | Parses both systemd templates and executes the standalone OpenRC lifecycle against mocks (26 assertions). |
 | `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
+| `voice-init-templates` | `test-lunarvoice-init-templates.sh` | Validates the standalone LunarVoice systemd unit, Compose manifest, and executes the OpenRC lifecycle against mocks. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
