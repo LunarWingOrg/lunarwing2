@@ -24,12 +24,13 @@ by CI source-version policy. CI/CD contains no hardcoded LunarWing package-versi
 10. [x] come up with codename ideas for release. put into new doc in docs/ops - base the name on all changes made since 2.0.6.0 — DONE (2026-08-12): [`CODENAME_IDEAS_v2.0.7.0.md`](CODENAME_IDEAS_v2.0.7.0.md) analyzes the changes since `v2.0.6.0` (un-stuck agent/approval flows, deterministic coordination with responder election, LunarVision supervision and health gating across systemd/OpenRC, MCP Part 2 audit remediation, and dual self-audits) and proposes ten Japanese candidates following the established naming lineage. Top picks: **Mihari (見張り)** — recommended, **Karakuri (絡繰り)**, and **Hikeshi (火消し)**.
 11. [ ] go over items in work items ( hint: can use gitlab api to access work items without auth ). make note/document of any that are already confirmed fix and should be closed - put note/doc in docs/ops - check when done - you may use existing documentation for reference
 12. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.7.0 explaining all relevant changes since v2.0.6.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `Mihari (見張り)` — The file you write will be `RELEASE-v2.0.7.0.md` and should be written to the ROOT of the repo
-13. [ ] update any outdated documents in docs/proposals
-14. [ ] update any outdated documents in docs/guides
-15. [ ] update README.md in repo root (if necessary)
-16. [ ] review first draft of release notes from prev step and update any inconsistencies
-17. [ ] update readme from prev step and update any inconsistencies
-18. [x] Run cargo update and lockfile reconciliation before tag if necessary
+13. [ ] update README.md in repo root (if necessary)
+14. [ ] review first draft of release notes from prev step and update any inconsistencies
+15. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+16. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+17. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+18. [ ] update anything outdated in docs/guides - verify against code rather than docs
+19. [x] Run cargo update and lockfile reconciliation before tag if necessary
 
 ---
 
