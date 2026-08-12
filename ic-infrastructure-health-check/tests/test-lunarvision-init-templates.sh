@@ -112,12 +112,20 @@ chmod 0600 "$ENV_FILE"
 CALL_LOG="$TMP/calls.log"
 : >"$CALL_LOG"
 
+# ShellCheck cannot see these globals consumed by the sourced OpenRC functions.
+# shellcheck disable=SC2034
 ocr_user="$(id -un)"
+# shellcheck disable=SC2034
 ocr_home="$TMP/home"
+# shellcheck disable=SC2034
 ocr_env_file="$ENV_FILE"
+# shellcheck disable=SC2034
 directory="$TMP/compose"
+# shellcheck disable=SC2034
 output_log="$TMP/log/ocr-sidecar.log"
+# shellcheck disable=SC2034
 error_log="$TMP/log/ocr-sidecar.err"
+# shellcheck disable=SC2034
 ocr_wait=2
 # shellcheck source=../init-templates/ocr-sidecar
 source "$OPENRC"
