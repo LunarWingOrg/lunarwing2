@@ -25,16 +25,20 @@ by CI source-version policy. CI/CD contains no hardcoded LunarWing package-versi
 11. [ ] fix item #48 in GITLAB_WORK_ITEMS_REVIEW_v2.0.7.0.md review
 12. [ ] identify and fix issues with the gitlab tool specifically. item #49 in work items https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/49 does have some info but its an inaccurate report. the "always" call makes the tool get stuck. and there is the issue of pagination when attempting to get a list of all work items. this doc might have better clues docs/ops/MYSTERIOUS_GITLAB_ISSUES.md
 13. [ ] look into and fix item #50 in work items - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 - having issue with this on builds from 2.0.5.0 - might be fixed but maybe not - relates to self improving skills and missions
-14. [x] Write up FIRST DRAFT release notes (at root of repo) for v2.0.7.0 explaining all relevant changes since v2.0.6.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `Mihari (見張り)` — The file you write will be `RELEASE-v2.0.7.0.md` and should be written to the ROOT of the repo — DONE (2026-08-12): [`RELEASE-v2.0.7.0.md`](../RELEASE-v2.0.7.0.md) at repo root follows the v2.0.6.0 format (codename blurb, overview, highlights, compatibility table, changes, upgrade notes, known issues). Changes verified against `git log v2.0.6.0..HEAD` and the item summaries in this checklist: agent stall/approval fixes, coordination hardening, MCP Part 2 audit remediation, LunarVision cross-init hardening, CI fixes, reqwest 0.13 migration, and the 2.0.7 version bump. Verified no new SQL migrations (V26 latest) and port registry unchanged at v15. Known issues revised: v2.0.6.0 entries re-checked against code (SSE query-token, engine truncation, MCP deferrals all still open) and new draft-time entries added for the init-templates harness failure and pending opencode/LunarVoice polish
-15. [ ] update README.md in repo root (if necessary)
-16. [ ] review first draft of release notes from prev step and update any inconsistencies
-17. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-18. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-19. [ ] update anything outdated in docs/proposals - verify against code rather than docs
-20. [ ] update anything outdated in docs/guides - verify against code rather than docs
-21. [x] Run cargo update and lockfile reconciliation before tag if necessary
-22. [ ] update anything outdated in docs/internal - verify against code rather than docs
-23. [ ] update release notes draft in root of repo with anything might have missed that may be relevant
-24. [ ] create a second document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md but for Arch Linux hosts
+14. [ ] investigate cause of agents getting "stuck" in some kind of loop after accepting that they will perform a tool call and sometimes requiring multiple prompts in order to get them to use that tool (you may spin up a test tenant for this investigation) - fix the underlying issue if possible
+15. [x] Write up FIRST DRAFT release notes (at root of repo) for v2.0.7.0 explaining all relevant changes since v2.0.6.0 as well as revising and including an ACCURATE VERSION OF `known issues list`. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is: `Mihari (見張り)` — The file you write will be `RELEASE-v2.0.7.0.md` and should be written to the ROOT of the repo — DONE (2026-08-12): [`RELEASE-v2.0.7.0.md`](../RELEASE-v2.0.7.0.md) at repo root follows the v2.0.6.0 format (codename blurb, overview, highlights, compatibility table, changes, upgrade notes, known issues). Changes verified against `git log v2.0.6.0..HEAD` and the item summaries in this checklist: agent stall/approval fixes, coordination hardening, MCP Part 2 audit remediation, LunarVision cross-init hardening, CI fixes, reqwest 0.13 migration, and the 2.0.7 version bump. Verified no new SQL migrations (V26 latest) and port registry unchanged at v15. Known issues revised: v2.0.6.0 entries re-checked against code (SSE query-token, engine truncation, MCP deferrals all still open) and new draft-time entries added for the init-templates harness failure and pending opencode/LunarVoice polish
+16. [ ] investigate tool approval code for any issues and create a document pointing any of them out
+17. [x] update README.md in repo root (if necessary)
+18. [x] review first draft of release notes from prev step and update any inconsistencies
+19. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+20. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+21. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+22. [ ] update anything outdated in docs/guides - verify against code rather than docs
+23. [x] Run cargo update and lockfile reconciliation before tag if necessary
+24. [ ] update anything outdated in docs/internal - verify against code rather than docs
+25. [ ] update release notes draft in root of repo with anything might have missed that may be relevant
+26. [ ] create a second document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md but for Arch Linux hosts
+27. [ ] review first draft of release notes from prev step and update any inconsistencies
+28. [ ] update README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
 
 ---
