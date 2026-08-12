@@ -106,9 +106,13 @@ mkdir -p "$(tenant_env_dir alpha)" "$ROOT/init.d"
 printf '%s\n' 'LUNARWING_AUTH_TOKEN=test-only-token' 'OCR_PORT=8088' 'OCR_HEALTH_PORT=8089' \
   >"$(tenant_env_dir alpha)/vision.env"
 OPENRC_INITD_DIR="$ROOT/init.d"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 CONTAINER_RT=podman
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 MT_ROOTLESS=true
 
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_vision_quadlet alpha
 quadlet="$(tenant_quadlet_dir alpha)/lunarwing-vision-alpha.container"
 quadlet_text="$(<"$quadlet")"
@@ -119,6 +123,8 @@ assert_contains "$quadlet_text" 'PodmanArgs=--security-opt=no-new-privileges' "Q
 assert_contains "$quadlet_text" "EnvironmentFile=$(tenant_env_dir alpha)/vision.env" "Quadlet uses secret env file"
 if grep -qF 'test-only-token' "$quadlet"; then fail "Quadlet embedded auth token"; else pass "Quadlet does not embed auth token"; fi
 
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_vision_openrc_unit alpha
 openrc_text="$(<"$OPENRC_INITD_DIR/lunarwing-vision-alpha")"
 assert_contains "$openrc_text" 'before lunarwing-alpha' "OpenRC starts vision before daemon"
@@ -128,7 +134,10 @@ assert_contains "$openrc_text" 'http://127.0.0.1:${vis_health_internal_port}/hea
 helper="$ROOT/lunarwing-ctr-babysit"
 printf '#!/bin/sh\nexit 0\n' >"$helper"
 chmod 0755 "$helper"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 LUNARWING_MT_BABYSITTER_HELPER="$helper"
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 render_vision_systemd_fallback_unit alpha
 fallback="$(tenant_home alpha)/.config/systemd/user/lunarwing-vision-alpha.service"
 fallback_text="$(<"$fallback")"
@@ -251,6 +260,7 @@ assert_no_call_prefix 'rc-service:'
 assert_no_call_prefix 'rc-update:'
 
 _retire_tenant_nanocode() { CALLS+=("retire:$1"); }
+# shellcheck disable=SC2034  # Updates state consumed by sourced mt-admin functions.
 ensure_init_system() { INIT_SYSTEM=systemd; }
 tenant_voice_enabled() { return 1; }
 render_tenant_systemd_units() { CALLS+=("render-systemd:$1"); }
@@ -293,6 +303,7 @@ assert_call 'wait:alpha lunarwing-vision-alpha'
 
 # ── Required ports fail before image/container mutation ──────────────────────
 
+# shellcheck disable=SC2034  # Updates state consumed by sourced mt-admin functions.
 ensure_init_system() { INIT_SYSTEM=systemd; }
 _ensure_tenant_image() { CALLS+=("ensure-image:$*"); }
 ports_get() {
