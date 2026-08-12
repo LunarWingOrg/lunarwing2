@@ -4,9 +4,9 @@
 FROM docker.io/oven/bun:debian AS builder
 
 # Pin opencode to a release tag for reproducible builds.
-# Override with: docker build --build-arg OPENCODE_REF=v1.17.13 ...
+# Override with: docker build --build-arg OPENCODE_REF=v1.18.9 ...
 # Bump this default when upgrading the worker to a newer opencode release.
-ARG OPENCODE_REF=v1.17.13
+ARG OPENCODE_REF=v1.18.9
 
 WORKDIR /build
 
