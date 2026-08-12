@@ -377,6 +377,7 @@ assert_no_call_prefix 'render-openrc:'
 ports_set_voice alpha true
 
 # Required ports fail before any image/container mutation.
+# shellcheck disable=SC2034  # Updates state consumed by sourced mt-admin functions.
 ensure_init_system() { INIT_SYSTEM=systemd; }
 _ensure_tenant_image() { CALLS+=("ensure-image:$*"); }
 ports_get() {
