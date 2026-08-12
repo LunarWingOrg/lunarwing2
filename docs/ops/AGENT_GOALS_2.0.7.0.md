@@ -40,5 +40,6 @@ by CI source-version policy. CI/CD contains no hardcoded LunarWing package-versi
 26. [ ] create a second document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md but for Arch Linux hosts
 27. [ ] review first draft of release notes from prev step and update any inconsistencies
 28. [ ] update README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
+29. [ ] doublecheck ci/cd
 
 ---
