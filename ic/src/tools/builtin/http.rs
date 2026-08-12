@@ -1288,6 +1288,22 @@ mod tests {
     }
 
     #[test]
+    fn test_universal_extension_mapping_does_not_credential_unrelated_get() {
+        use crate::secrets::CredentialMapping;
+        use crate::tools::wasm::SharedCredentialRegistry;
+
+        let registry = Arc::new(SharedCredentialRegistry::new());
+        registry.add_mappings(vec![CredentialMapping::bearer("extension_token", "*")]);
+        let tool = HttpTool::new().with_credentials(registry, Arc::new(test_secrets_store()));
+        let params = serde_json::json!({
+            "method": "GET",
+            "url": "https://unrelated.example/"
+        });
+
+        assert_eq!(tool.requires_approval(&params), ApprovalRequirement::Never);
+    }
+
+    #[test]
     fn test_url_query_param_credential_returns_unless_auto_approved() {
         let tool = HttpTool::new();
         let params = serde_json::json!({

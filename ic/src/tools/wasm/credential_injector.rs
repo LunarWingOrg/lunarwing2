@@ -60,7 +60,7 @@ impl From<SecretError> for InjectionError {
     }
 }
 
-/// Thread-safe, append-only registry of credential mappings from all installed tools.
+/// Thread-safe registry of host-scoped credential mappings from installed tools.
 ///
 /// Aggregates credential mappings from WASM tools so the built-in HTTP tool can
 /// auto-inject credentials for matching hosts. Uses `std::sync::RwLock` so
@@ -77,8 +77,15 @@ impl SharedCredentialRegistry {
         }
     }
 
-    /// Add credential mappings tagged with an extension name (called when WASM tools register).
+    /// Add credential mappings from a WASM tool.
+    ///
+    /// Bare `*` patterns remain local to the owning WASM sandbox. Sharing them
+    /// would let one extension inject credentials into every built-in HTTP request.
     pub fn add_mappings(&self, mappings: impl IntoIterator<Item = CredentialMapping>) {
+        let mappings = mappings.into_iter().filter_map(|mut mapping| {
+            mapping.host_patterns.retain(|pattern| pattern != "*");
+            (!mapping.host_patterns.is_empty()).then_some(mapping)
+        });
         match self.mappings.write() {
             Ok(mut guard) => {
                 guard.extend(mappings);
@@ -588,6 +595,28 @@ mod tests {
         assert!(registry.has_credentials_for_host("api.github.com"));
         assert!(registry.has_credentials_for_host("uploads.github.com"));
         assert!(!registry.has_credentials_for_host("github.com"));
+    }
+
+    #[test]
+    fn test_shared_registry_rejects_universal_host_mapping() {
+        let registry = SharedCredentialRegistry::new();
+        registry.add_mappings(vec![CredentialMapping::bearer("extension_token", "*")]);
+
+        assert!(!registry.has_credentials_for_host("unrelated.example"));
+        assert!(registry.find_for_host("unrelated.example").is_empty());
+    }
+
+    #[test]
+    fn test_shared_registry_keeps_scoped_hosts_from_mixed_mapping() {
+        let registry = SharedCredentialRegistry::new();
+        let mut mapping = CredentialMapping::bearer("service_token", "*");
+        mapping.host_patterns.push("api.example.com".to_string());
+        registry.add_mappings(vec![mapping]);
+
+        assert!(!registry.has_credentials_for_host("unrelated.example"));
+        let found = registry.find_for_host("api.example.com");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host_patterns, vec!["api.example.com"]);
     }
 
     #[test]
