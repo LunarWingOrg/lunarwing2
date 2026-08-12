@@ -16,6 +16,7 @@
 | # | Title | Verdict | Evidence |
 |---|-------|---------|----------|
 | #26 | [BUG-005] Multica daemon connection refused on 127.0.0.1:6680 | 🔒 **Close as duplicate of closed #25 ([BUG-006])** | The 2026-08-02 repository audit (`SUNBURST_BUG_LIST.md`) established BUG-005 is **misclassified**: no Multica source uses port 6680 or `/poll`; both belong to the DarkIRC adapter (`ic/channels-src/darkirc/src/lib.rs:10`, `:307-311`, `darkirc_adapter.py:50`). The underlying defect is BUG-006 ("DarkIRC adapter not deployed as managed service"), which is **fixed in source** — `lunarwing-mt-admin.sh` renders/enables/starts the per-tenant DarkIRC adapter on both systemd-user and OpenRC (`ic/scripts/lunarwing-mt-admin.sh:6409-6428`, `:7192-7253`) — and its own GitLab issue #25 is already closed. Deployed tenants pick the fix up through `render-units` / normal upgrade deployment. Nothing Multica-side remains to track here. |
+| #48 | http tool doesn't work in WeeChat (likely DarkIRC too) | 🔒 **Recommend close — reproduced failure fixed** | Tool execution and response routing work from WeeChat; the reproduced failure was a cross-extension credential collision. A WASM extension with `host_patterns: ["*"]` published that mapping into `SharedCredentialRegistry`, so unrelated built-in `http` requests entered Engine V2's missing-credential flow and could receive the extension's secret. `SharedCredentialRegistry::add_mappings` now keeps bare `*` mappings local to the owning WASM sandbox while retaining exact and `*.domain` mappings for built-in HTTP injection. Regressions cover registry matching, HTTP approval classification, and Engine V2 auth preflight. Issue #47 remains separate: WASM channels still suppress tool-activity status events. |
 
 ## Close candidates pending owner confirmation
 
@@ -27,7 +28,6 @@
 
 | # | Title | Verdict | Evidence |
 |---|-------|---------|----------|
-| #48 | http tool doesn't work in WeeChat (likely DarkIRC too) | 🟡 **Keep open** — confirmed bug, no fix landed | Labeled `bug, confirmed, high`; updated 2026-08-12 (day of this review). No commits since the report address tool execution/routing for WASM channels; recent WeeChat/DarkIRC changes are version bumps and service-rendering refactors only. Group with #47 during WASM-channel work. |
 | #47 | [Feature] tool_activity flag to route StatusUpdate tool events to WASM channels | 🟡 **Keep open** — feature not implemented | Verified: `debug_mode` exists only in native channels (`ic/src/channels/signal.rs`, `ic/src/channels/repl.rs`); no `tool_activity` config flag exists anywhere in `ic/src`, and WASM channels still do not consume `StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}`. |
 | #45 | darkirc hsm key exchange | 🟡 **Keep open** — Stage A implemented, acceptance pending | Per `DARKIRC-KEYEXCHANGE-STATUS.md` (baseline `fb548a6`): Stage A source, audit fixes, and local validation are complete; live OpenRC/systemd-user H3 acceptance runs, final release CI, and Stages B–D remain pending. The issue itself records "progress: stage a". |
 | #42 | XMPP Bridge Issue — agent cannot attach images and send correctly | 🟡 **Keep open** — confirmed bug, no fix landed | Labeled `bug, confirmed, high`. No xmpp-bridge attachment fix commits since the 2026-08-07 report; subsequent `ic/bridges/xmpp-bridge/` changes are 2.0.7 version bumps and lockfile refreshes only. |
@@ -48,6 +48,6 @@
 
 ## Summary
 
-- **Recommend close now: 1** — #26 (duplicate of fixed/closed #25).
+- **Recommend close now: 2** — #26 (duplicate of fixed/closed #25) and #48 (cross-extension credential collision fixed).
 - **Close after owner confirmation: 1** — #2 (inbound LunarVision enrichment exists in `vision_enrichment.rs`).
-- **Verified still open with evidence: 10** — #48, #47, #45, #42, #40, #41, #4, #3, #1, #5.
+- **Verified still open with evidence: 9** — #47, #45, #42, #40, #41, #4, #3, #1, #5.

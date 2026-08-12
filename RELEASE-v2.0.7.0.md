@@ -42,6 +42,9 @@ previous compatibility baseline.
   and registry-aware port discovery with fail-loud container recreation.
 - Migrated direct `reqwest` declarations from 0.12 to 0.13, collapsing the
   dependency graph to a single `reqwest 0.13.4` copy; refreshed lockfiles.
+- Isolated universal WASM credential mappings from the built-in HTTP tool so
+  one extension cannot trigger auth prompts or inject secrets for unrelated
+  hosts; extension-local wildcard requests continue to work.
 
 ## Compatibility
 
@@ -83,6 +86,19 @@ previous compatibility baseline.
   configuration.
 - Legacy and Engine V2 paths honor disables and the master switch uniformly;
   agent targeting is safe by default with derived safe aliases.
+
+### HTTP Credential Isolation
+
+- Bare `*` credential mappings remain local to their owning WASM sandbox and
+  are no longer published into the built-in HTTP tool's shared credential
+  registry. Exact hosts and `*.domain` mappings retain shared auto-injection.
+- This fixes the reproduced issue #48 failure: unrelated HTTP requests from
+  WeeChat entered Engine V2's missing-credential flow because another
+  extension had registered a universal host mapping. Tool execution and
+  response routing were not channel-specific failure points.
+- Regression coverage spans shared matching, HTTP approval classification,
+  and Engine V2 auth preflight. Tool-activity status visibility remains tracked
+  separately by issue #47.
 
 ### MCP Part 2 Remediation
 
