@@ -269,9 +269,10 @@ No chaos-harness changes; the exporter never mutates services.
    `ic/scripts/install-lunarwing-watchdog.sh`.
 3. **Phase 3** — threshold config + `early_warning` series + deduplicated
    Gotify warning path + `contrib/` alerting rules and Grafana dashboard.
-4. Roadmap bookkeeping: item #29 ("add new health stuff to roadmap") should
-   reference this document; the internal analysis report's M4 milestone flips
-   to Done when Phase 1 lands.
+4. Roadmap bookkeeping: DONE (2026-08-13) — v2.0.7.0 goals item #28 added the
+   health exporter to `docs/ops/ROADMAP_2026.md` (target v2.0.8.0) referencing
+   this document; the internal analysis report's M4 milestone flips to Done
+   when Phase 1 lands.
 5. When LTX lands as a healthpoint, verify its metrics appear with correct
    labels — add only a README row, no exporter changes expected.
 
