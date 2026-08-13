@@ -39,6 +39,11 @@ pub enum GitlabAction {
         per_page: u32,
         #[serde(default = "default_page")]
         page: u32,
+        /// Fetch every page in one bounded call; use when the user wants all
+        /// matching issues (e.g. "list all work items"). Response pagination
+        /// gains `fetched_pages`, `truncated`, and `resume_page` fields.
+        #[serde(default)]
+        all_pages: bool,
     },
     GetIssue {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]

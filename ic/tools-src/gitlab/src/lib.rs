@@ -42,8 +42,11 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
          issues and comments, merge requests and approvals, branches, repository files, \
          search, pipelines, jobs, and current-user lookup. Use project numeric ID or \
          group/project path; use per-project iid for issues and merge requests. Token is \
-         injected by LunarWing and never exposed to WASM. Calls require approval unless \
-         you choose to always allow this tool."
+         injected by LunarWing and never exposed to WASM. List and search responses carry \
+         a pagination object beside items; when the user wants every matching issue \
+         (\"all work items\"), call list_issues with all_pages=true to fetch all pages in \
+         one bounded call instead of paging one call at a time. Calls require approval \
+         unless you choose to always allow this tool."
             .to_string()
     }
 }
@@ -92,7 +95,8 @@ fn execute_inner(params: &str) -> Result<String, String> {
             state,
             per_page,
             page,
-        } => api::list_issues(&client, &project, &state, per_page, page)?,
+            all_pages,
+        } => api::list_issues(&client, &project, &state, per_page, page, all_pages)?,
         GitlabAction::GetIssue { project, iid } => api::get_issue(&client, &project, iid)?,
         GitlabAction::CreateIssue {
             project,
@@ -402,6 +406,28 @@ mod tests {
 
         // Negative IDs are not valid project references.
         assert!(parse_action(r#"{"action":"list_issues","project":-1}"#).is_err());
+    }
+
+    #[test]
+    fn list_issues_accepts_all_pages_flag() {
+        let action =
+            parse_action(r#"{"action":"list_issues","project":35,"state":"all","all_pages":true}"#)
+                .unwrap_or_else(|e| panic!("rejected all_pages: {e}"));
+        let GitlabAction::ListIssues {
+            all_pages, state, ..
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert!(all_pages);
+        assert_eq!(state, "all");
+
+        // Default is single-page behavior.
+        let action = parse_action(r#"{"action":"list_issues","project":35}"#).unwrap();
+        let GitlabAction::ListIssues { all_pages, .. } = action else {
+            panic!("wrong variant");
+        };
+        assert!(!all_pages);
     }
 
     #[test]
