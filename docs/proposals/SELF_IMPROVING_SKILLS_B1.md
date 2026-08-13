@@ -7,7 +7,11 @@
 > never broadcast, `trigger_payload` was never seeded into mission state, a
 > permanent-lease leak, and the missing mission write path for skill docs (why
 > zero `source: "extracted"` skills existed). B-2 demotion/pruning and B-3
-> cross-agent sharing remain separate deferred work.
+> cross-agent sharing remain separate deferred work. A further v2.0.7.0 repair
+> (goals item #13, 2026-08-13) made `recent_conversation_thread_goals` sort by
+> `created_at` before sampling, since `HybridStore::list_threads` returns
+> arbitrary HashMap order; the BUG-003 mission-goal pollution exclusion was
+> confirmed already present.
 
 Implement the Hermes-style "skill patching" loop: when a thread fails and the
 failure traces back to an active skill, diagnose it, patch the skill's
