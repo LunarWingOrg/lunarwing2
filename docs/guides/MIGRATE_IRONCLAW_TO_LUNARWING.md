@@ -34,13 +34,13 @@ For the safest rehearsal, restore the dump into a new PostgreSQL database and co
 Use a published release artifact when available. If a local deployment build is required, run a bounded release build from `ic/`:
 
 ```bash
-taskset -c 0-5 cargo build --release -j6 --bin lunarwing
+taskset -c 0-9 cargo build --release -j10 --bin lunarwing
 ```
 
 Build the XMPP bridge or WASM extensions only when the instance uses them:
 
 ```bash
-taskset -c 0-5 cargo build --release -j6 -p xmpp-bridge
+taskset -c 0-9 cargo build --release -j10 -p xmpp-bridge
 scripts/build-wasm-extensions.sh
 ```
 
