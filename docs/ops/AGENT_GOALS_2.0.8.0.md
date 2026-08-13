@@ -12,8 +12,12 @@
 
 ---
 
-1. [ ] update kimi dev loop if havent already - Rares
-2. [ ] update kimi dev loop if havent already - AJ
+1. [x] update kimi dev loop if havent already - Rares
+2. [x] update kimi dev loop if havent already - AJ
+https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54
+3. [ ] https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/53
+https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 verify if done
+https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/47 verify if done
 3. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference
 4. [ ] clean up repo - remove uncessary files - organize files in repo root a bit better - for example - crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg in root of repo - maybe change file name? and move very old documentation to historical archive directory. dont just delete it
 5. [ ] implement Publisher signatures dependency locks, marketplace revocation distribution, mandatory sandbox profiles, persistent external-worker placement, a bundled gateway control-plane service, and generic external runtime descriptors for MCP part 2
