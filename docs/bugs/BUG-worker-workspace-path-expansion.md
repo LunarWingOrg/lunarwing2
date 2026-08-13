@@ -1,6 +1,6 @@
 # Worker workspace path expansion
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-03).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-13).**
 > Structured worker project directories now normalize `~`; prompt text and the
 > Pebble executor still pass user-supplied paths without that normalization.
 
@@ -46,7 +46,7 @@ OpenCode executor forwards that prompt unchanged
 `lunarwing_runtime.ts:63-109`), so the helper cannot rewrite paths generated
 later by the worker. Pebble likewise uses `request.context.project_dir`
 directly as its process working directory
-(`pebble4lunarwing/src/executor.rs:95-126`, key lines `:99-103,116`). The
+(`pebble4lunarwing/src/executor.rs:103-126`, key lines `:108-112,123`). The
 daemon also forwards `project_dir` to workers verbatim
 (`ic/src/orchestrator/external_worker.rs:95-102`). No `HOME=/workspace`
 override is present in the opencode image (`opencode4lunarwing/Dockerfile`:
@@ -59,7 +59,9 @@ symptom remains possible. Pebble still needs an explicit normalization decision.
 ## Verification record
 
 Verification used source inspection and Git ancestry. The checked-in OpenCode
-TypeScript self-check covers the helper; Bun is now available in this
-environment and `bun scripts/path_expand_test.ts` passed on 2026-08-03. No
-worker container or Cargo command was run. Runtime prompt behavior remains
-unverified.
+TypeScript self-check covers the helper; Bun is no longer on `PATH` in this
+environment, so on 2026-08-13 (revision `7e813db4`) the five assertions were
+re-run under Node against a byte-identical port of `workspace_path.ts`
+(`diff`-confirmed) and passed. No worker container or Cargo command was run.
+Runtime prompt behavior remains unverified. The OpenCode Dockerfile line
+references (`:174-179`, `:220`) were re-confirmed after the v1.18.9 bump.

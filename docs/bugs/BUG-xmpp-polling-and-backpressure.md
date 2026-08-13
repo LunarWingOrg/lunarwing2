@@ -1,6 +1,6 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-03).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-13).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
@@ -55,16 +55,16 @@ a failure criterion.
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
   poll loop with exponential backoff after an error or panic
-  (`ic/src/channels/wasm/wrapper.rs:2284-2448`).
+  (`ic/src/channels/wasm/wrapper.rs:2284-2456`).
 - Poll callbacks are bounded by the configured callback timeout
   (`ic/src/channels/wasm/wrapper.rs:2484-2513`).
 - `health_check()` detects a dead supervisor and a stale
   `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2906-2948`).
 - Dedicated tests cover dead and stalled poll tasks
-  (`ic/src/channels/wasm/wrapper.rs:5641-5688`).
+  (`ic/src/channels/wasm/wrapper.rs:5642-5705`).
 - Channel health is aggregated by `ChannelManager`
-  (`ic/src/channels/manager.rs:210-220`) and exposed by the gateway
-  (`ic/src/channels/web/server.rs:2887-2961`).
+  (`ic/src/channels/manager.rs:303-310`) and exposed by the gateway
+  (`ic/src/channels/web/server.rs:2929-2969`).
 - The watchdog has optional deep channel-health checks on systemd and OpenRC
   (`ic/scripts/lunarwing-watchdog.sh:60-88` and
   `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
@@ -89,7 +89,7 @@ and trips the stall detector once `max(3 x poll interval, 30s)` elapses.
 The earlier direct coupling to a synchronous worker turn is no longer current:
 the active-turn loop continues polling the merged channel stream, defers
 ordinary messages in a bounded FIFO, and rejects overflow explicitly
-(`ic/src/agent/agent_loop.rs:1056-1138`, `ic/src/agent/dispatch.rs:6-51`). That
+(`ic/src/agent/agent_loop.rs:1078-1156`, `ic/src/agent/dispatch.rs:6-51`). That
 prevents `wait=true` by itself from halting downstream reads. The residual is
 the unbounded queue-send await under an independently stalled or overloaded
 consumer, not evidence that crash supervision is absent.
@@ -117,7 +117,10 @@ resolved.
 Status is based on current source, in-tree regression tests, and the watchdog
 scripts. No Cargo command, live bridge run, or full E2E run was performed in
 this documentation pass; the backpressure path is therefore a residual risk,
-not a reproduced current outage. Re-verified on 2026-08-03: the residual
-section was corrected — the poll epoch is stored only after a successful
-dispatch (`wrapper.rs:2382-2389`), so a queue-blocked poll is visible to the
-stall detector, and a full queue blocks `reserve_many` rather than erroring.
+not a reproduced current outage. Re-verified on 2026-08-13 (revision
+`7e813db4`): the residual section was re-checked — the poll epoch is still
+stored only after a successful dispatch (`wrapper.rs:2382-2390`), so a
+queue-blocked poll remains visible to the stall detector, and a full queue
+still blocks `reserve_many` (`wrapper.rs:2612-2617`) rather than erroring.
+Line references were refreshed for `wrapper.rs`, `manager.rs`, `server.rs`,
+and `agent_loop.rs` churn.
