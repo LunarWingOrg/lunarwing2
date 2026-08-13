@@ -11,8 +11,12 @@ create), and the known issues with their fix status.
 > rules from scratch. This is the authoritative reference so that doesn't happen again.
 
 Line numbers below drift; treat them as hints, not contracts. Source of truth:
-`lunarwing_weechat_wss/weechat_relay/src/lib.rs` (the WASM channel), `…/ws_adapter.py`
-(the adapter), and `ic/src/channels/wasm/` (the host runtime).
+`ic/channels-src/weechat/src/lib.rs` (the WASM channel — the registry entry
+`ic/registry/channels/weechat.json` points `build-wasm-extensions.sh` at
+`channels-src/weechat`; `lunarwing_weechat_wss/weechat_relay/src/lib.rs` is a
+mirror kept for the tenant-clone layout), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py`
+(the adapter — mt-admin runs it from that path in the tenant clone), and
+`ic/src/channels/wasm/` (the host runtime).
 
 ---
 
@@ -22,7 +26,7 @@ Line numbers below drift; treat them as hints, not contracts. Source of truth:
 |-----------|-------|------|
 | **WeeChat** | per-tenant, runs in `tmux` (`lunarwing-weechat-<tenant>.service`) | The actual IRC client. Exposes the **relay `api`** plugin on the `weechat` port (MT: base+5). |
 | **`ws_adapter.py`** | per-tenant Python process (`lunarwing-weechat-adapter-<tenant>.service`), `lunarwing_weechat_wss/weechat_relay/ws_adapter.py` | Holds a **WebSocket** to WeeChat's relay, subscribes to updates, buffers lines, and re-serves them over a small **HTTP API** on the `weechat_adapter` port (MT: base+9). |
-| **WeeChat WASM channel** | in the LunarWing daemon; source `lunarwing_weechat_wss/weechat_relay/src/lib.rs` → `wasm32-wasip2`; loaded/run by `ic/src/channels/wasm/{loader,wrapper,runtime,setup}.rs` | Sandboxed channel that **long-polls (or polls) the adapter over HTTP**, applies policy, and emits `IncomingMessage`s to the agent; sends replies back to WeeChat. |
+| **WeeChat WASM channel** | in the LunarWing daemon; source `ic/channels-src/weechat/src/lib.rs` (registry-driven build; mirrored at `lunarwing_weechat_wss/weechat_relay/src/lib.rs`) → `wasm32-wasip2`; loaded/run by `ic/src/channels/wasm/{loader,wrapper,runtime,setup}.rs` | Sandboxed channel that **long-polls (or polls) the adapter over HTTP**, applies policy, and emits `IncomingMessage`s to the agent; sends replies back to WeeChat. |
 
 ### The three hops — only one is a WebSocket
 
@@ -404,5 +408,7 @@ The adapter and WASM must update **together** (the WASM probes `/api/health` for
    dependency + automation.
 - `ic/scripts/lunarwing-weechat-preflight.sh` — read-only pre-flight that validates the generated
   relay configuration and dedicated minimal env without sourcing either file.
-- Code: `lunarwing_weechat_wss/weechat_relay/src/lib.rs`, `…/ws_adapter.py`,
+- Code: `ic/channels-src/weechat/src/lib.rs` (mirrored at
+  `lunarwing_weechat_wss/weechat_relay/src/lib.rs`),
+  `lunarwing_weechat_wss/weechat_relay/ws_adapter.py`,
   `ic/src/channels/wasm/{setup,wrapper,runtime,loader}.rs`.
