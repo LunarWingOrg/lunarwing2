@@ -1,6 +1,6 @@
 # WeeChat relay `rand_check` stub
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-03).** The
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-13).** The
 > stale `HttpEndpointConfig` import warning is gone; `rand_check` still ignores
 > its probability argument and always returns `false`.
 
@@ -32,4 +32,6 @@ or call sites change and a focused test exists.
 ## Verification record
 
 Status comes from current source inspection and `git log --all`; no Rust build
-or test command was run.
+or test command was run. Re-verified on 2026-08-13 (revision `7e813db4`):
+`rand_check` is unchanged at `lib.rs:2164-2172`, still has no call sites, and
+the import block at `:44-51` remains free of unused imports.
