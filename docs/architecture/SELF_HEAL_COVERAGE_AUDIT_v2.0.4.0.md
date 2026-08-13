@@ -71,3 +71,12 @@ across fail/recover cycles.
 `ic-infrastructure-health-check/tests/run-all.sh` is canonical aggregate suite.
 It includes regression, matrix, chaos, OpenRC, systemd, LunarVision, and NetBird
 suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
+
+> **Update (2026-08-13, v2.0.7.0):** `run-all.sh` has since grown beyond the
+> seven suites listed above. It now also registers `init-templates`
+> (LunarVision init templates), `lunarvoice`, and `voice-init-templates` —
+> LunarVoice health coverage (`health-lunarvoice.sh`) did not exist at audit
+> time. LunarVision and LunarVoice tenant lifecycles were further hardened in
+> v2.0.7.0 (distinct registry health ports, `-sup` crash supervisors on
+> OpenRC, health-gated starts, drifted-container recreation); the audit's
+> coverage table otherwise still reflects the pipeline's structure.

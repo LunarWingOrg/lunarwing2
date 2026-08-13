@@ -5,7 +5,9 @@
 > OpenRC/rootless. Quadlet supervision covers systemd/rootless, so the gap is
 > closed on both supported init paths. The problem statement below preserves the
 > June pre-fix unit set; current worker babysitters cover Pebble, OpenCode, and
-> Kimi Code, while Nanocode is retired. See
+> Kimi Code, while Nanocode is retired. The v2.0.7.0 sidecar hardening (goals
+> items #7/#9) extended the same babysitter renderer to LunarVision and
+> LunarVoice `-sup` crash-supervisor units on OpenRC. See
 > [`../specs/podman-wait-babysitter.md`](../specs/podman-wait-babysitter.md).
 
 *Drafted 2026-06-16, on the experimental rootless-podman + OpenRC multi-tenant

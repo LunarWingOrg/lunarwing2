@@ -1,7 +1,7 @@
 # Agent and worker lifecycle bugs
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-03).** The fire-and-forget completion race is fixed, one earlier
+> 2026-08-13).** The fire-and-forget completion race is fixed, one earlier
 > notification-task report is invalidated, and priority interrupts are now
 > handled during active turns. A synchronous `wait=true` worker call still
 > occupies the originating turn and serializes ordinary message handling.
@@ -33,26 +33,27 @@ channel stream stops being polled is also stale. `Agent::run` now spawns the
 active message task and continues selecting from `message_stream`; exact
 interrupt submissions are dispatched immediately, while ordinary messages are
 held in a 256-entry FIFO and replayed after the active task ends
-(`ic/src/agent/agent_loop.rs:1056-1169`, `ic/src/agent/dispatch.rs:6-51`). Queue
+(`ic/src/agent/agent_loop.rs:1078-1188`, `ic/src/agent/dispatch.rs:6-51`). Queue
 overflow receives an explicit busy response. This removes the former
 daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
 
 ### Current implementation evidence
 
 - `create_job` defaults `wait` to true only for the built-in Docker sandbox
-  (schema text at `ic/src/tools/builtin/job.rs:1289`, parameter parsing at
-  `:1493`). External workers default to `wait=false` (`job.rs:165-170`,
-  applied at `:1451`; schema note at `:1309-1314`).
-- The built-in sandbox path (`execute_sandbox`, `job.rs:547-847`) waits for
-  the container/polling result when `wait` is true (`job.rs:683-846`); the
-  external path (`execute_external`, `job.rs:850-1097`) awaits the worker
-  result directly (`:972-1036`).
+  (schema text at `ic/src/tools/builtin/job.rs:1311`, parameter parsing at
+  `:1531`). External workers default to `wait=false` (`job.rs:167-173`,
+  applied at `:1489`; schema note at `:1333-1337`).
+- The built-in sandbox path (`execute_sandbox`, `job.rs:557-871`) waits for
+  the container/polling result when `wait` is true (`job.rs:705-870`); the
+  external path (`execute_external`, `job.rs:872-1119`) awaits the worker
+  result directly (`:994-1055`).
   The active task remains the current turn until completion, timeout, or
-  interruption (`ic/src/agent/agent_loop.rs:1108-1169`).
+  interruption (`ic/src/agent/agent_loop.rs:1126-1188`).
 - The default agent message timeout is 630 seconds
   (`ic/src/settings.rs:654-656,717-719`), so a long worker can consume most of a turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
-  (`ic/src/tools/builtin/job.rs:649-681`).
+  (`ic/src/tools/builtin/job.rs:672-702` for the sandbox path, `:1086-1105`
+  for external workers).
 - Regression tests cover active-turn interrupts, FIFO replay, scoped interrupt
   rejection, bounded-queue overflow, and soft-timeout detach
   (`ic/tests/engine_v2_interrupt_ingress.rs:180-398`).
@@ -95,19 +96,19 @@ completion event could be missed, leaving a job slot occupied in the in-memory
 
 - `report_complete` persists the result, broadcasts `SseEvent::JobResult`, and
   directly transitions `ContextManager` out of `InProgress`
-  (`ic/src/orchestrator/api.rs:229-322`).
+  (`ic/src/orchestrator/api.rs:236-366`).
 - The container watcher also transitions the context when a container exits
   without a completion report and broadcasts a failure event
-  (`ic/src/orchestrator/job_manager.rs:470-576`).
+  (`ic/src/orchestrator/job_manager.rs:765-876`).
 - Fire-and-forget monitors subscribe before dispatch, transition on completion
   or channel close, and have a 630-second deadline
-  (`ic/src/tools/builtin/job.rs:649-668`,
-  `ic/src/agent/job_monitor.rs:83-204,206-282`).
+  (`ic/src/tools/builtin/job.rs:672-690`,
+  `ic/src/agent/job_monitor.rs:83-207,209-283`).
 - Regression coverage exercises the context transition and timeout paths
-  (`ic/src/agent/job_monitor.rs:468-711`).
+  (`ic/src/agent/job_monitor.rs:469-712`).
 
 `complete_job` still primarily owns container cleanup
-(`ic/src/orchestrator/job_manager.rs:640-695`); the context transition is now
+(`ic/src/orchestrator/job_manager.rs:935-992`); the context transition is now
 deliberately handled by the API/watcher paths above. The old reference to
 `job_manager.rs:529` was therefore stale.
 
@@ -119,16 +120,15 @@ The old report treated every `while let Some(response) = recv().await` as an
 unbounded leak. In the current tree the channels are bounded and normal Tokio
 `mpsc` semantics end the loop when all senders are dropped:
 
-- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:758-759`
-  and the forwarder receive loop is at `:773`.
+- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:769-770`
+  and the forwarder receive loop is at `:784`.
 - Routine notifications use `mpsc::channel(32)` at
-  `ic/src/agent/agent_loop.rs:906-907` and the forwarder receive loop is at
-  `:934`.
-- The owning heartbeat/routine tasks retain the sender while active and the
-  agent aborts their handles during shutdown
-  (`ic/src/agent/heartbeat.rs:490-508`,
-  `ic/src/agent/routine_engine.rs:114-119,897-902,2142-2149`,
-  `ic/src/agent/agent_loop.rs:1174-1181`).
+  `ic/src/agent/agent_loop.rs:924-925` and the forwarder receive loop is at
+  `:952`.
+- The owning heartbeat/routine tasks retain the sender while active
+  (`ic/src/agent/heartbeat.rs:217`,
+  `ic/src/agent/routine_engine.rs:115,146-158`) and the agent aborts their
+  handles during shutdown (`ic/src/agent/agent_loop.rs:1190-1208`).
 - The previously cited relay channel no longer exists in v2.
 
 Waiting while a live producer remains active is expected notification-forwarder
@@ -142,7 +142,8 @@ All statuses above were established by source inspection, in-tree regression
 inspection, and local Git history; no Cargo command or full build was run. The
 worker behavior was cross-checked against the current tool schema, active-turn
 dispatcher, deferred queue, monitor, and API paths. The report's original live
-outage was not re-run. Re-verified on 2026-08-03: line references refreshed
-after post-2026-07-28 `agent_loop.rs`/`dispatcher.rs` churn, and the `wait`
-default corrected to sandbox-only (external workers have defaulted to
-`wait=false` since `777de3e`, 2026-07-27).
+outage was not re-run. Re-verified on 2026-08-13 (revision `7e813db4`): line
+references refreshed after post-2026-08-03 churn in `agent_loop.rs`,
+`job.rs`, `api.rs`, `job_manager.rs`, `heartbeat.rs`, and `routine_engine.rs`
+(coordination hardening, MCP worker grants, and orchestrator auth work moved
+the cited regions; no behavior described here changed).

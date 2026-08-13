@@ -1,6 +1,6 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against current source on 2026-08-03).** The
+> **Status: UNVERIFIED (checked against current source on 2026-08-13).** The
 > historical fallback-spam symptom has not been reproduced against the current
 > bridge and no current source path proves that it is resolved. The separate
 > stuck `Processing`-thread failure has a current static fix and is recorded
@@ -37,7 +37,7 @@ section is not present in this checkout.
 - The setting is forwarded to the bridge configure request
   (`ic/channels-src/xmpp/src/lib.rs:300-319`).
 - Unit tests cover direct-message fallback when enabled and suppress it when
-  disabled (`ic/src/channels/xmpp/mod.rs:3592-3666`). These tests do not cover
+  disabled (`ic/src/channels/xmpp/mod.rs:3593-3662`). These tests do not cover
   encrypted MUC routing or repeated notices to a separate 1:1 JID.
 
 These checks show that the configuration knob and DM guard exist; they do not
@@ -63,9 +63,9 @@ turn` followed by no reply. The documented root cause was cancellation of
 agent loop runs `handle_message` in a spawned task, keeps it alive through the
 soft timeout, and uses a hard-kill recovery that calls `fail_turn` while
 preserving queued messages (the queue-clearing `fail_turn_hard` no longer
-exists) (`ic/src/agent/agent_loop.rs:1094-1156,1391-1471`). The
+exists) (`ic/src/agent/agent_loop.rs:1118-1156,1393,1471`). The
 regression tests cover resetting a stuck thread and draining its queued
-messages (`ic/src/agent/session.rs:1658-1722`).
+messages (`ic/src/agent/session.rs:1669-1697`).
 
 This fixes the generic processing-state failure; it does not establish that the
 historical OMEMO fallback spam was caused by that failure.
@@ -75,5 +75,8 @@ historical OMEMO fallback spam was caused by that failure.
 The separate polling/supervision issue is tracked in
 [`BUG-xmpp-polling-and-backpressure.md`](BUG-xmpp-polling-and-backpressure.md).
 No Cargo command, live XMPP bridge run, or full E2E run was performed in this
-documentation pass. Re-verified on 2026-08-03 with refreshed line references
-after post-2026-07-28 churn in `channels/xmpp/mod.rs` and `agent_loop.rs`.
+documentation pass. Re-verified on 2026-08-13 (revision `7e813db4`) with
+refreshed line references after post-2026-08-03 churn in `agent_loop.rs` and
+`session.rs`; the `allow_plaintext_fallback` default/forwarding
+(`channels-src/xmpp/src/lib.rs:291,314`) and DM-fallback unit tests
+(`ic/src/channels/xmpp/mod.rs:3593-3662`) are unchanged.

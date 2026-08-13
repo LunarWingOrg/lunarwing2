@@ -1,7 +1,13 @@
 # Bug tracker
 
-Reconciled against current source (revision `94dfd58`) on **2026-08-03** (prior
-passes on 2026-07-28 and against revision `51ae5a8` on 2026-07-20). All 38
+Reconciled against current source (revision `7e813db4`) on **2026-08-13**
+(prior passes against revision `94dfd58` on 2026-08-03, on 2026-07-28, and
+against revision `51ae5a8` on 2026-07-20). The 2026-08-13 pass re-verified
+every active canonical report against code: no status changed, stale line
+references were refreshed (notably `lunarwing-mt-admin.sh`, `agent_loop.rs`,
+`job.rs`, `orchestrator/*`, `wasm/wrapper.rs`, `manager.rs`, `server.rs`), the
+SSH-Git bare-HEAD reproduction was re-run live (same exit-0/empty-checkout
+result), and the OpenCode path self-check was re-run under Node. All 38
 Markdown documents in this tracker (36
 report/pointer files plus two README files) were checked against current source,
 scripts, tests, and reachable Git history. Closely related reports remain

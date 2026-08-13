@@ -25,7 +25,7 @@ Please also see README.md and MANIFESTO for additional information about what th
 - Prefer clear fork-local behavior over generic abstractions when they conflict.
 - Upstream merges, if any, should be treated as deliberate porting work, not
   routine synchronization.
-- If a change modifies behavior tracked in `FEATURE_PARITY.md`, update that
+- If a change modifies behavior tracked in `ic/FEATURE_PARITY.md`, update that
   file only when the fork still cares about that parity entry.
 
 ## Protected Runtime Behavior
@@ -55,7 +55,7 @@ Expected runtime pieces may include:
 - WASM channels, especially XMPP.
 - WASM tools, especially Gotify.
 - Gateway API used for status and runtime configuration.
-- Systemd units and helper scripts under `systemd/` and `scripts/`.
+- Systemd units and helper scripts under `ic/systemd/` and `ic/scripts/`.
 
 The XMPP bridge is a separate process that connects to XMPP as a normal user,
 not as a Prosody component. OMEMO encryption/decryption happens in the XMPP
@@ -79,8 +79,15 @@ By design, Lunarwing uses the encrypted database to store secrets. However, this
 
 Therefore, some secrets may exist in:
 
-- `/home/user/.ironclaw/.env` (old path)
-- `/home/user/lunarwing/env/*`
+- `<base_dir>/.env` — default `~/.lunarwing/.env` (current; `LUNARWING_BASE_DIR`
+  overrides the base dir, legacy alias `IRONCLAW_BASE_DIR`). Loaded via dotenvy
+  early in startup (see `ic/src/bootstrap.rs`, `ic/src/config/mod.rs`).
+- `~/.ironclaw/.env` (legacy fallback, still honored when no base-dir override
+  is set)
+- `<base_dir>/env/lunarwing.env` and sibling env files (e.g.
+  `/home/<user>/lunarwing/env/*`) — systemd/service deployments inject these via
+  `EnvironmentFile`; they take precedence over `<base_dir>/.env` because dotenvy
+  never overwrites an already-set var.
 - systemd service environment - (in older versions only)
 - local database rows. (only secret names)
 
@@ -89,9 +96,12 @@ values in logs, diffs, or final answers.
 
 ## Build and Test
 
-Preferred baseline commands:
+Preferred baseline commands (run from the `ic/` directory; prefix with
+`taskset -c 0-9` and use `-j10` per the root `AGENTS.md` build constraints,
+and prefer `cargo check` over full debug builds for compile verification):
 
 ```sh
+cargo check
 cargo test
 cargo build --release
 ```
@@ -108,14 +118,18 @@ Scheduled routines can become blocked if old rows in `routine_runs` remain in
 `status='running'`. Most older routines use `max_concurrent=1`, so one stale running
 row can block future scheduled runs.
 
-Known failure mode:
+Automatic recovery now exists in `ic/src/agent/routine_engine.rs`:
 
-- Lightweight routine runs can be stuck with `job_id IS NULL`.
-- The current recovery path may not finalize those rows.
-- Full-job routine runs with old pending jobs may also remain active until the
-  linked job state is resolved.
+- `sweep_stuck_lightweight_runs()` finds lightweight runs (`job_id IS NULL`)
+  stuck in `running` beyond `lightweight_timeout_secs` and marks them failed
+  with "Timed out (stuck run recovery)".
+- `sync_dispatched_runs()` reconciles orphaned full-job runs with their linked
+  job outcomes; it runs on every tick as a crash-recovery mechanism (orphaned
+  runs whose linked job is missing are failed, completed jobs finalize the run).
+- Startup recovery processes any backlog before normal scheduling resumes.
 
-Operational cleanup should be explicit and careful:
+Manual cleanup is therefore a last resort, for rows the automatic sweep cannot
+classify. If it is ever needed, be explicit and careful:
 
 - Stop the service before mutating routine state.
 - Back up the database first.
@@ -132,7 +146,7 @@ Gotify channel implementation is registered. A routine that needs Gotify should
 call the `gotify` tool inside its prompt and return the same message as backup
 output.
 
-See `docs/GOTIFY_ROUTINE_PROMPT.md` for the current working prompt pattern. (Verify this is correct)
+See `ic/docs/GOTIFY_ROUTINE_PROMPT.md` for the current working prompt pattern. (Verify this is correct)
 
 ## XMPP and OMEMO Notes
 
@@ -150,16 +164,25 @@ Known operational behavior:
 
 ## Repository Boundaries
 
-Canonical source areas:
+Canonical source areas (the core daemon and its supporting trees live under
+`ic/`):
 
-- `src/`
-- `bridges/`
-- `channels-src/`
-- `tools-src/`
-- `migrations/`
-- `docs/`
-- `systemd/`
-- `scripts/`
+- `ic/src/`
+- `ic/bridges/`
+- `ic/channels-src/`
+- `ic/tools-src/`
+- `ic/migrations/`
+- `ic/docs/`
+- `ic/systemd/`
+- `ic/scripts/`
+- `docs/` (repo-root documentation)
+- `scripts/` (repo-root helper scripts)
+
+Sibling top-level trees also tracked as canonical include the WASM/tool
+sources (`lunarwing-gotify-tool/`, `gotify-wasm/`, `darkirc_channel_for_lunarwing/`,
+`lunarwing_weechat_wss/`), ops tooling (`ic-infrastructure-health-check/`,
+`lunarwing_mt_onboard/`, `lunarwing_mt_onboard_web/`), and worker packaging
+(`opencode4lunarwing/`, `kimicode4lunarwing/`, `pebble4lunarwing/`).
 
 Generated, disposable, or review-carefully areas:
 

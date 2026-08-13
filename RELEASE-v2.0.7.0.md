@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.7.0: Codename `Mihari (見張り)`
 
-**Status:** FIRST DRAFT (2026-08-12) — pending final review before tag
+**Status:** DRAFT (2026-08-12, updated 2026-08-13) — pending final review before tag
 
 > *Mihari* (見張り) means "lookout" or "watchman." LunarWing v2.0.7.0 posts
 > watchmen over its own machinery: supervised sidecars, health gates,
@@ -12,8 +12,8 @@
 LunarWing v2.0.7.0 is a reliability, supervision, and protocol-hardening
 release built on v2.0.6.0. It fixes agent stalls after tool calls and
 approval decisions, makes multi-agent coordination deterministic, closes the
-audited MCP Part 2 gaps, and hardens LunarVision lifecycle management across
-both systemd and OpenRC hosts.
+audited MCP Part 2 gaps, and hardens LunarVision and LunarVoice lifecycle
+management across both systemd and OpenRC hosts.
 
 The release and tag use `2.0.7.0`; LunarWing-owned Rust crates and channel
 packages use `2.0.7`. Rust 2024 and MSRV `1.96.1` remain unchanged. There are
@@ -40,6 +40,15 @@ previous compatibility baseline.
 - Hardened LunarVision across systemd and OpenRC: supervised health-gated
   lifecycles, dedicated operational listeners, crash-supervisor `-sup` units,
   and registry-aware port discovery with fail-loud container recreation.
+- Ported the same supervision contract to LunarVoice: distinct registry
+  ports, launch-contract tracking with force-recreate on drift, health-gated
+  starts against the dedicated `8091` listener, and `-sup` crash supervisors
+  on both init systems.
+- Fixed the GitLab WASM tool stalls: `list_issues` now walks all pages in one
+  bounded, single-approval call, and blank or repeating pagination headers no
+  longer send agents into a silent re-fetch loop.
+- Updated the opencode external worker to opencode `1.18.9` and repointed
+  builds to the canonical `anomalyco/opencode` repository.
 - Migrated direct `reqwest` declarations from 0.12 to 0.13, collapsing the
   dependency graph to a single `reqwest 0.13.4` copy; refreshed lockfiles.
 - Isolated universal WASM credential mappings from the built-in HTTP tool so
@@ -58,6 +67,7 @@ previous compatibility baseline.
 | MCP negotiated version | Exactly `2024-11-05`; anything else fails before activation |
 | MCP runtime registry | Internal closed dispatch boundary, not a plugin API |
 | LunarVision health | Dedicated operational listener (`8089` single-node); API-port alias kept only for pre-v10 compatibility |
+| LunarVoice health | Dedicated operational listener (`8091` single-node); starts fail loudly if the sidecar never goes healthy |
 | CI scope | Source verification; no package publication or tenant deployment |
 
 ## Changes
@@ -74,6 +84,11 @@ previous compatibility baseline.
   trust boundary; its real failure mode now raises explicit errors instead of
   returning silent `False`.
 - Added embedded-Monty regression coverage plus an approval/auth matrix.
+- Conversation-insight goal selection now sorts hybrid-store threads by
+  `created_at` before taking the latest five, so
+  `recent_conversation_thread_goals` reflects recency rather than HashMap
+  iteration order. Mission goals remain excluded from the insight payload;
+  the exclusion was re-verified against work item #50.
 
 ### Coordination Protocol
 
@@ -100,6 +115,20 @@ previous compatibility baseline.
   and Engine V2 auth preflight. Tool-activity status visibility remains tracked
   separately by issue #47.
 
+### GitLab Tool
+
+- `list_issues` accepts `all_pages: true`, walking every page in one bounded
+  call (caps: 20 pages / 2000 items / 3 MiB source JSON) and reporting
+  `fetched_pages`/`truncated`/`resume_page` in the merged pagination object.
+  Listing all work items now needs a single approval instead of one prompt
+  per page, which previously stalled multi-call bursts mid-sequence.
+- Blank `x-next-page` headers on GitLab's last page are omitted instead of
+  being surfaced as `"next_page": ""`, and a repeated next-page value
+  terminates the fetch — closing the silent re-fetch loop that an "always
+  allow" grant made invisible (work item #49).
+- Registry entry bumped to 0.1.2; guest unit tests cover merge, page, item,
+  and byte caps, the repeat guard, and error paths.
+
 ### MCP Part 2 Remediation
 
 - Initialization advertises empty client capabilities, and inbound JSON-RPC
@@ -120,7 +149,7 @@ previous compatibility baseline.
 - Later-revision annotation fields deserialize canonically but remain
   untrusted advisory input; operator approval policy stays authoritative.
 
-### LunarVision and Multi-Tenant Operations
+### LunarVision, LunarVoice, and Multi-Tenant Operations
 
 - The API and dedicated operational listeners now fail together; JSON metrics
   are exposed beside `8089/health`, and single-node/legacy registry health
@@ -133,6 +162,21 @@ previous compatibility baseline.
 - systemd uses health-aware tenant Quadlets with a supervised older-Podman
   user-unit fallback; OpenRC pairs endpoint-aware direct units with
   `podman wait` `-sup` crash supervisors.
+- LunarVoice now follows the same contract: distinct valid
+  `voice_service`/`voice_health` registry ports are required before any image
+  or container mutation, a stored launch contract (image, env, ports, model
+  store, runtime, init) forces recreation of drifted containers instead of
+  blindly restarting them, and every start path is health-gated against the
+  dedicated `8091` listener with loud failure otherwise.
+- LunarVoice systemd tenants get a health-aware Quadlet plus a supervised
+  `podman wait` fallback user unit; OpenRC tenants get an endpoint-aware
+  direct unit paired with a `-sup` crash supervisor. Disable, stop,
+  uninstall, and remove clean up the fallback unit, supervisor, Quadlet,
+  container, and stored hash on both inits, and `render-units` refreshes
+  existing voice assets without starting services.
+- Standalone LunarVoice assets were hardened to match: bounded restart storms
+  and the full systemd sandbox set, supervise-daemon respawn with strict
+  secret-env validation under OpenRC, and a Compose healthcheck on `8091`.
 - Standalone Compose/systemd/OpenRC assets bind loopback, keep tokens in
   validated env files, and health-gate startup.
 
@@ -141,6 +185,12 @@ previous compatibility baseline.
 - Shell harness fixes: the LunarVision init-template suite reports SKIP for
   the `systemd-analyze` parser check when the tool is absent, and the DarkIRC
   log-rotation test no longer depends on filesystem inode recycling.
+- Fixed the ShellCheck SC2218 CI failure in the mt-admin LunarVoice test
+  harness via scoped annotations on the three calls that intentionally use
+  implementations replaced by call-recording mocks later in the test.
+- Updated the opencode external worker build to opencode `v1.18.9` and moved
+  the build-time clone plus all live references to the canonical
+  `anomalyco/opencode` repository after the upstream transfer.
 - Fixed CI secret-detection false positives and refreshed the coordination
   canary fingerprint.
 - Crate security audit recorded no newly fixable advisories; direct `reqwest`
@@ -156,9 +206,11 @@ previous compatibility baseline.
    state.
 2. No new SQL or port-registry migrations ship in this release; startup
    migration state from v2.0.6.0 (V26, registry v15) carries over unchanged.
-3. Re-render LunarVision units (`render-units`) so health-aware Quadlets,
-   OpenRC `-sup` supervisors, and managed assets match the new contracts;
-   stale containers are recreated automatically on the next start.
+3. Re-render LunarVision and LunarVoice units (`render-units`) so
+   health-aware Quadlets, OpenRC `-sup` supervisors, and managed assets match
+   the new contracts; stale containers are recreated automatically on the
+   next start. LunarVoice starts now fail loudly if the `8091` health
+   listener never reports healthy.
 4. Review MCP server pins: pinned stdio servers on Linux now execute through
    the sealed `memfd` path, and version negotiation accepts exactly
    `2024-11-05`. Servers pinned to other revisions must be re-pinned or run
@@ -200,15 +252,23 @@ previous compatibility baseline.
   only for trusted private networks.
 - Engine output safety still truncates oversized prefixes before later
   redaction/policy transforms and does not re-cap every later transformation.
+- The XMPP bridge still cannot attach and send images correctly (work item
+  #42); no fix ships in this release.
+- The `image_generate` and `image_edit` tools double the `/v1` path segment
+  when the provider base URL already ends in `/v1`, producing 404s against
+  TensorZero-style endpoints (work item #40).
+- WASM channels do not surface tool-activity status events yet (work item
+  #47).
 - Kawarimi remains PostgreSQL-only.
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
 
-### Open at Time of First Draft (2026-08-12)
+### Resolved Since the First Draft (2026-08-12)
 
-- The shell-harness `init-templates` suite still reports one failed and one
-  exited case, possibly systemd-related; under investigation.
-- Opencode external-worker polishing, including the opencode 1.18.9 update,
-  is still in progress.
-- LunarVoice stability polishing across systemd/OpenRC (mirroring the
-  LunarVision work) is still in progress.
+- The shell-harness failure flagged at first draft is resolved: the mt-admin
+  LunarVoice ShellCheck SC2218 errors were fixed, and the full shell-harness
+  aggregate is green.
+- Opencode external-worker polishing landed, including the opencode 1.18.9
+  update and the move to the canonical `anomalyco/opencode` repository.
+- LunarVoice stability polishing across systemd/OpenRC landed, mirroring the
+  LunarVision supervision contract.
