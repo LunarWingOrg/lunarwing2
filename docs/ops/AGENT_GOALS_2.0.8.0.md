@@ -13,7 +13,7 @@
 ---
 
  1. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference
- 2. [ ] clean up repo - remove uncessary files - organize files in repo root a bit better
+ 2. [ ] clean up repo - remove uncessary files - organize files in repo root a bit better - for example - crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg in root of repo - maybe change file name?
  3. [ ] refactor mt admin - you may use this old branch from 2.0.5.0 era for inspiration - in fact, most of this can be reused likely - ref2/sunburst/mtadmin-refactor-v2.0.6.0
  4. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.7. we need bump to 2.0.8 - ensure CI/CD is also updated for the new crate versions — lockfiles must be refreshed - all channel registry patch versions must be also be bumped to comply with CI/CD by CI source-version policy. CI/CD contains no hardcoded LunarWing package-version pin and derives versions from Cargo manifests; verify GitLab config validation passes if possible - cargo update and all that good stuff as usual
  5. [ ] mcp part 3 work - see existing documentation for details - pick one thing from extensive list and update this goal with what was done. state any work that was deferred or is incomplete. ensure that the whole project builds after you finish your thing - see roadmap for information as well
