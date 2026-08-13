@@ -9,7 +9,8 @@
 > `env-generation`, `health-pipeline`, `owner-scope`, `ports-registry`,
 > `postgres`, `tenant-build`, `tenant-lifecycle`, `units-openrc`,
 > `units-systemd`, `worker-config`). That split is **not yet merged** into the
-> release branch — the current tree still has the monolithic ~8300-line script.
+> release branch — the current tree still has the monolithic script (~12,600
+> lines as of v2.0.7.0 after the LunarVision/LunarVoice supervision growth).
 > This document is retained as the design record of the rejected approach.
 >
 > **Original status (2026-07-22): PROPOSAL — reviewed, ready for implementation**
