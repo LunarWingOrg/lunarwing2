@@ -57,6 +57,16 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
 DarkIRC is opt-in. It is not rendered or built for a new tenant unless the operator enables it and builds its supporting service. External-worker choice is stored when a tenant is created; build flags prepare the matching shared image but do not change an existing tenant's selection.
 
+### MCP servers and sandboxed WASM runtimes
+
+LunarWing connects to Model Context Protocol (MCP) servers through explicit operator-managed lifecycle actions (install, activate, authenticate, update, remove) available from the CLI, the browser settings UI, the authenticated API, and conversational flows.
+
+MCP-over-WASM servers run as one persistent sandboxed component actor per server. The guest communicates over a raw JSON-RPC WIT boundary with no WASI or host imports, so it has no ambient access to the filesystem, network, or process environment. Artifacts load through a single-open path with optional operator-pinned digest verification, and execution is bounded by memory, fuel, wall-time, and message-size limits. A trapped component is rebuilt or replaced within bounded jittered retries and a circuit breaker. The transport is deliberately synchronous client-to-server tool calls only — server-initiated requests, resources, prompts, and subscriptions are not exposed — and the negotiated protocol revision is exactly `2024-11-05`.
+
+Host-local stdio servers get defense in depth as well: optional OS sandboxing applies resource limits, core-dump control, process-group isolation, `no_new_privileges`, seccomp denial of ptrace/process_vm, a Landlock read-only root, and network-namespace isolation. On Linux, pinned stdio servers execute verified sealed bytes atomically through `memfd` + `execveat`. Secret references stay owner- or job-scoped, and worker children receive scrubbed environments.
+
+Automatic npm/pip package installation remains disabled by design until provenance, dependency locking, containment, and revocation policies exist. Details and current scope: [MCP overall status](docs/ops/MCP_OVERALL_STATUS.md) and [MCP additions](docs/ops/MCP_ADDITIONS.md).
+
 ### Memory, lorebooks, and learning
 
 LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
@@ -74,6 +84,8 @@ The optional reflex compiler detects recurring prompts and compiles them into WA
 An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds tagged-message policy, secret detection, engagement and first-responder controls, rate limiting, violation-based disabling, and outbound coalescing for designated XMPP or IRC rooms. It is disabled unless explicitly configured.
 
 The included [infrastructure health system](ic-infrastructure-health-check/README.md) aggregates service and dependency checks and can remediate unhealthy services with grace periods, exponential backoff, flapping protection, and post-restart verification. Its multi-tenant service and port discovery supports both systemd and OpenRC.
+
+The optional LunarVision OCR and LunarVoice speech sidecars follow the same supervision contract on both init systems: health-gated starts against dedicated operational listeners, launch-contract tracking that recreates drifted containers instead of blindly restarting them, and crash-supervisor units.
 
 ### Model providers
 
@@ -210,6 +222,7 @@ Additional test surfaces:
 | Architecture | [docs/architecture/](docs/architecture/) |
 | Operator guides | [docs/guides/](docs/guides/) |
 | Production operations | [docs/ops/](docs/ops/) |
+| Release notes | [docs/releases/](docs/releases/) |
 | Known bugs and status | [docs/bugs/README.md](docs/bugs/README.md) |
 | Project blog | [https://blog.lunarwing.org/](https://blog.lunarwing.org/) |
 | Canonical source (GitLab) | [https://git.lunarwing.org/lunarwing/lunarwing2](https://git.lunarwing.org/lunarwing/lunarwing2) |
