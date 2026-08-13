@@ -1,5 +1,11 @@
 # Agent Rules
 
+## Quick tips
+- When working with LunarWing, use the lunarwing study-notes MCP if it is available and mark notes that may be stale as "stale" (if possible)
+- When working with LunarWing, use the context7 MCP if it is available https://context7.com/git_git_lunarwing_org/lunarwing_lunarwing2
+- When working with LunarWing, use memory search if it is available
+- use tmux for long running builds/commands or else timeout will occur
+
 ## Purpose and Precedence
 
 ### Some information may be outdated
@@ -27,9 +33,8 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 - `Agent` owns session/thread/turn handling, submission parsing, the LLM/tool loop, approvals, routines, and background runtime behavior.
 - `AppBuilder` is the composition root that wires database, secrets, LLMs, tools, workspace, extensions, skills, hooks, and cost controls before the agent starts.
 - The web gateway is a browser-facing API/UI layered on top of the same agent/session/tool systems, not a separate product path.
-- When working with LunarWing, use the lunarwing study-notes MCP if it is available and mark notes that may be stale as "stale" (if possible)
 
-## Where to Work
+## Where to Work - some places to check
 
 - Agent/runtime behavior: `src/agent/`
 - Web gateway/API/SSE/WebSocket: `src/channels/web/`
@@ -57,18 +62,18 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 
 This machine is a dedicated dev/test machine with limited resources. **All cargo commands must follow these rules:**
 
-- **6 threads max**: prefix every cargo command with `taskset -c 0-9`
+- **10 threads max**: prefix every cargo command with `taskset -c 0-9`
 - **Use `cargo check` for compile verification, NOT `cargo build`** — DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. Reserve release builds (`cargo build --release`) for deploying to a new tenant or upgrading an existing tenant's release binary.
 - **Use `taskset -c 0-9` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
 - DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS
-- Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid.
+- Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid so do not do this ever
 
 ```bash
 taskset -c 0-9 cargo check -j10                              # compile check
 taskset -c 0-9 cargo check -j10 --no-default-features --features postgres  # postgres-only
 taskset -c 0-9 cargo check -j10 --no-default-features --features libsql    # libsql-only
 taskset -c 0-9 cargo check -j10 --all-features               # all features
-taskset -c 0-9 cargo test -j10 -- --test-threads=6            # unit tests
+taskset -c 0-9 cargo test -j10 -- --test-threads=10            # unit tests
 taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples -- -D warnings  # lint
 taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples --all-features -- -D warnings
 ```
@@ -133,7 +138,7 @@ cargo bench --all-features --no-run
 
 ## Repo-Wide Coding Rules
 
-- **Edition**: Rust 2024, MSRV 1.96.1.
+- **Edition**: Rust 2024, MSRV 1.96.1
 - **Formatting**: Standard `rustfmt`. Run `cargo fmt --all` before committing.
 - **Imports**: Prefer `crate::` for cross-module references. Group std, external, then internal crates.
 - **Error handling**: Use `thiserror` for structured errors and `anyhow` for propagation. Avoid `.unwrap()` and `.expect()` in production; they are allowed only in tests or for truly infallible invariants (e.g., literals/regexes) with a safety comment.
