@@ -16,9 +16,12 @@
  2. [ ] clean up repo - remove uncessary files - organize files in repo root a bit better
  3. [ ] refactor mt admin - you may use this old branch from 2.0.5.0 era for inspiration - in fact, most of this can be reused likely - ref2/sunburst/mtadmin-refactor-v2.0.6.0
  4. [ ] Bump lunarwing crate versions and wasm channel crates for lunarwing that have same version. they are at 2.0.7. we need bump to 2.0.8 - ensure CI/CD is also updated for the new crate versions — lockfiles must be refreshed - all channel registry patch versions must be also be bumped to comply with CI/CD by CI source-version policy. CI/CD contains no hardcoded LunarWing package-version pin and derives versions from Cargo manifests; verify GitLab config validation passes if possible - cargo update and all that good stuff as usual
- 5. [ ] mcp part 3 work - see existing documentation for details - pick one thing from extensive list and update this goal with what was done. state any work that was deferred or is incomplete. ensure that the whole project builds after you finish your thing
+ 5. [ ] mcp part 3 work - see existing documentation for details - pick one thing from extensive list and update this goal with what was done. state any work that was deferred or is incomplete. ensure that the whole project builds after you finish your thing - see roadmap for information as well
  6. [ ] Additional Opencode External Worker Polishing, including updating the version of opencode to 1.18.18
  7. [ ] health service improvements - see recent document in docs/proposals for more information
+ 8. [ ] Cross-tenant knowledge sharing via coordination pipeline - see existing documentation
+ 9. [ ] Vector embeddings hybrid ranking - see existing documentation
+ 10. [ ] update roadmap in docs/ops with state of each goal
  8. [x] (S) fix cicd
  9. [x] (S) LunarVoice/Lunarvision polishing
 10. [x] (S) investigate cause of agents getting "stuck" in some kind of loop after accepting that they will perform a tool call and sometimes requiring multiple prompts in order to get them to use that tool (you may spin up a test tenant for this investigation) - fix the underlying issue if possible
