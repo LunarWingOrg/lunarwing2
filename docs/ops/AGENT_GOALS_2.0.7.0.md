@@ -37,7 +37,7 @@ by CI source-version policy. CI/CD contains no hardcoded LunarWing package-versi
 23. [x] Run cargo update and lockfile reconciliation before tag if necessary
 24. [ ] update anything outdated in docs/internal - verify against code rather than docs
 25. [ ] update release notes draft in root of repo with anything might have missed that may be relevant
-26. [ ] create a second document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md but for Arch Linux hosts
+26. [x] create a second document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md but for Arch Linux hosts — DONE (2026-08-13): [`guide-for-spin-up-arch-tenants.md`](guide-for-spin-up-arch-tenants.md) mirrors the Gentoo guide's four-subcommand flow (`add-tenant` → `build-tenant` → `start-tenant` → `status`) for stock Arch hosts (systemd + rootless podman), verified against `ic/scripts/lunarwing-mt-admin.sh`: pacman preconditions mapped to every `doctor` gate (incl. the first-run `/etc/subuid`/`/etc/subgid` caveat), pinned `LUNARWING_SERVICE_MANAGER=systemd` selection, tenant user-level units under `~/.config/systemd/user/` with linger-based boot persistence, Quadlet `.container` supervision for pg/LunarVision/LunarVoice/workers (podman ≥ 4.6), correct `systemctl --user` manual fallbacks (never the system bus), and registry-driven LunarVision health verification
 27. [ ] review first draft of release notes from prev step and update any inconsistencies
 28. [ ] update README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
 29. [ ] doublecheck ci/cd
