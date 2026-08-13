@@ -620,7 +620,9 @@ mod tests {
 
     #[tokio::test]
     async fn real_component_fuel_exhaustion_is_terminal() {
-        let transport = load_fixture(1).await;
+        // Keep epoch interruption well behind a deliberately small fuel budget
+        // so this test deterministically exercises fuel exhaustion under CI load.
+        let transport = load_fixture_with_fuel(60, 10_000_000).await;
         exercise_fixture(Arc::clone(&transport)).await;
 
         let error = transport
