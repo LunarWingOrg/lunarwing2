@@ -34,7 +34,7 @@ For a repository-wide extension build:
 
 ```bash
 cd ic
-taskset -c 0-5 scripts/build-wasm-extensions.sh --channels
+taskset -c 0-9 scripts/build-wasm-extensions.sh --channels
 ```
 
 The source crate produces `darkirc_channel.wasm`; the installer publishes it as `darkirc.wasm` with `darkirc.capabilities.json` in the configured channel directory. Do not edit installed copies and then expect the source registry to retain those changes.
@@ -43,7 +43,7 @@ For a manual source build during channel development:
 
 ```bash
 cd darkirc_channel_for_lunarwing/darkirc
-taskset -c 0-5 cargo build --release -j6 --target wasm32-wasip2
+taskset -c 0-9 cargo build --release -j10 --target wasm32-wasip2
 ```
 
 Use the committed `build.sh` only after reviewing its install destination. It can install directly into `${LUNARWING_HOME:-$HOME/.lunarwing}/channels/`.
