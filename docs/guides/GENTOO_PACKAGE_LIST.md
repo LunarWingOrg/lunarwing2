@@ -68,7 +68,7 @@ schedule (`*/5` by default). `fcron` is preferred (supports catch-up of missed r
 
 | Package | Notes |
 |---------|-------|
-| `dev-util/rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + `wasm32-wasip1`/`wasm32-wasip2` targets. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
+| `dev-util/rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + the `wasm32-wasip2` target. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
 | `sys-devel/clang` (or `llvm-core/clang`) | Provides `libclang`, needed by Rust crates that use `bindgen`/`-sys` native bindings during the build. (`gcc` is already present for the C toolchain.) |
 
 `cargo-component` + `wasm-tools` (for `build-tenant --with-wasm`) are installed **per tenant** via

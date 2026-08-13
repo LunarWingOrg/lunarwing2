@@ -83,7 +83,7 @@ installs the schedule (`*/5` by default).
 
 | Package | Notes |
 |---------|-------|
-| `rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + `wasm32-wasip1`/`wasm32-wasip2` targets. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
+| `rustup` | **Optional on the host** — `add-tenant` auto-installs rustup *per tenant* (via rustup.sh into the tenant's home) and sets the stable toolchain + the `wasm32-wasip2` target. The `doctor` `[FAIL] rustup installed` for the host is therefore harmless. |
 | `build-essential` | C toolchain (`gcc`, `ld`, ...) used by `-sys` crates during tenant builds. |
 | `pkg-config` + `libssl-dev` | `openssl-sys` is in the build graph and probes for system OpenSSL via pkg-config; missing headers fail the tenant build. |
 | `clang` + `libclang-dev` | Provides `libclang`, needed by Rust crates that use `bindgen`/`-sys` native bindings during the build. |
