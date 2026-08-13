@@ -1097,15 +1097,20 @@ def run_loop(context, goal, actions, state, config):
                 return complete_result(state, "completed", final_answer)
 
             # Check for tool intent nudge. The same bounded counter also guards
-            # format-recovery nudges below.
-            if nudge_enabled and consecutive_nudges < max_nudges and signals_tool_intent(text):
+            # format-recovery nudges below. The nudge must match the CodeAct
+            # contract from the system prompt (```repl blocks); telling the
+            # model to "use the tool_calls mechanism" contradicts that contract
+            # and makes confused models repeat the promise instead of acting.
+            intent_signalled = signals_tool_intent(text)
+            if nudge_enabled and consecutive_nudges < max_nudges and intent_signalled:
                 consecutive_nudges += 1
                 append_message(
                     working_messages,
                     "User",
                     "You said you would perform an action, but you did not include any tool calls.\n"
                     "Do NOT describe what you intend to do — actually call the tool now.\n"
-                    "Use the tool_calls mechanism to invoke the appropriate tool.",
+                    "Respond with a ```repl code block that calls the appropriate tool as a "
+                    "Python function (or FINAL(answer) if the task is already complete).",
                 )
                 continue
 
@@ -1125,9 +1130,18 @@ def run_loop(context, goal, actions, state, config):
                 )
                 continue
 
+            # A model that promised an action and burned through the intent
+            # nudges without ever calling a tool has created an action
+            # obligation on its own. Escalate so the stronger obligation nudge
+            # gets a chance instead of silently completing with an unfulfilled
+            # promise (which forces the user to re-prompt in a loop).
+            if (intent_signalled
+                    and consecutive_nudges > 0
+                    and not state.get("_obligation_resolved", False)):
+                obligation_enabled = True
+
             available_actions = __get_actions__()
             if (obligation_enabled
-                    and consecutive_nudges == 0
                     and len(available_actions) > 0
                     and not state.get("_obligation_resolved", False)
                     and state.get("_obligation_nudge_count", 0) < max_obligation_nudges):
@@ -1137,12 +1151,12 @@ def run_loop(context, goal, actions, state, config):
                     "User",
                     "You were asked to perform an action, but you responded with text only.\n"
                     "Do NOT describe or explain — call the appropriate tool now.\n"
-                    "Use the tool_calls mechanism to invoke the tool.",
+                    "Respond with a ```repl code block that calls the tool as a Python function.",
                 )
                 continue
 
             # Non-intent text response — reset nudge counter and finish
-            if not signals_tool_intent(text):
+            if not intent_signalled:
                 consecutive_nudges = 0
 
             # Plain text response - done

@@ -1508,6 +1508,96 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("did not include any tool calls"))
         );
+        // The nudge must point at the CodeAct contract (```repl blocks), not
+        // the V1-style "tool_calls mechanism" wording that contradicts the
+        // system prompt and keeps confused models promising instead of acting.
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|m| m.content.contains("did not include any tool calls")
+                    && m.content.contains("```repl"))
+        );
+    }
+
+    #[tokio::test]
+    async fn persistent_tool_intent_escalates_to_action_obligation() {
+        // The stuck-loop report: the model keeps promising an action without
+        // ever calling a tool. Once the intent-nudge budget is exhausted the
+        // engine must escalate to the action-obligation nudge instead of
+        // silently completing with an unfulfilled promise.
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("Let me search for that file."),
+                text_response("I'll fetch the data now."),
+                text_response("Let me check the logs first."),
+                code_response("FINAL('done')"),
+            ],
+            vec![],
+            ThreadConfig {
+                enable_tool_intent_nudge: true,
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "done"));
+        assert_eq!(exec.thread.step_count, 4);
+        let intent_nudges = exec
+            .thread
+            .internal_messages
+            .iter()
+            .filter(|m| m.content.contains("did not include any tool calls"))
+            .count();
+        assert_eq!(intent_nudges, 2, "intent nudge budget is two");
+        assert!(
+            exec.thread
+                .internal_messages
+                .iter()
+                .any(|m| m.content.contains("responded with text only")),
+            "third unfulfilled promise must escalate to the action-obligation nudge"
+        );
+    }
+
+    #[tokio::test]
+    async fn unfulfilled_intent_completes_after_all_nudges_exhausted() {
+        // Once intent AND obligation nudge budgets are both spent, the loop
+        // must still terminate with the text response rather than nudging
+        // forever.
+        let (mut exec, _tx) = make_loop(
+            vec![
+                text_response("Let me search for that file."),
+                text_response("I'll fetch the data now."),
+                text_response("Let me check the logs first."),
+                text_response("I'm going to look up the record."),
+                text_response("Let me find the answer."),
+            ],
+            vec![],
+            ThreadConfig {
+                enable_tool_intent_nudge: true,
+                max_tool_intent_nudges: 2,
+                ..ThreadConfig::default()
+            },
+        )
+        .await;
+
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(r) } if r == "Let me find the answer.")
+        );
+        assert_eq!(exec.thread.step_count, 5);
+        let obligation_nudges = exec
+            .thread
+            .internal_messages
+            .iter()
+            .filter(|m| m.content.contains("responded with text only"))
+            .count();
+        assert_eq!(
+            obligation_nudges, 2,
+            "obligation nudge budget is two, then the loop must terminate"
+        );
     }
 
     #[tokio::test]
