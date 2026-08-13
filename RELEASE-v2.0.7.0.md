@@ -188,6 +188,10 @@ previous compatibility baseline.
 - Fixed the ShellCheck SC2218 CI failure in the mt-admin LunarVoice test
   harness via scoped annotations on the three calls that intentionally use
   implementations replaced by call-recording mocks later in the test.
+- Isolated a flaky CI race in the WASM fuel-exhaustion regression by giving
+  the test a small dedicated fuel budget and a generous epoch deadline, so
+  Wasmtime epoch interruption under CI load can no longer mask the
+  fuel-specific assertion; production runtime limits are unchanged.
 - Updated the opencode external worker build to opencode `v1.18.9` and moved
   the build-time clone plus all live references to the canonical
   `anomalyco/opencode` repository after the upstream transfer.
@@ -211,11 +215,14 @@ previous compatibility baseline.
    the new contracts; stale containers are recreated automatically on the
    next start. LunarVoice starts now fail loudly if the `8091` health
    listener never reports healthy.
-4. Review MCP server pins: pinned stdio servers on Linux now execute through
+4. Rebuild the opencode external-worker image so the pinned opencode
+   `v1.18.9` build from the canonical `anomalyco/opencode` repository takes
+   effect.
+5. Review MCP server pins: pinned stdio servers on Linux now execute through
    the sealed `memfd` path, and version negotiation accepts exactly
    `2024-11-05`. Servers pinned to other revisions must be re-pinned or run
    unpinned.
-5. Coordination responder election is deterministic and roster-persisted;
+6. Coordination responder election is deterministic and roster-persisted;
    re-render tenant environments so the managed seven-rule bundle auto-loads.
 
 ## Known Issues
@@ -265,9 +272,10 @@ previous compatibility baseline.
 
 ### Resolved Since the First Draft (2026-08-12)
 
-- The shell-harness failure flagged at first draft is resolved: the mt-admin
-  LunarVoice ShellCheck SC2218 errors were fixed, and the full shell-harness
-  aggregate is green.
+- The shell-harness `init-templates` suite flagged at first draft is green
+  again (24/24, with the `systemd-analyze` parser check reporting SKIP when
+  the tool is absent); the separate mt-admin LunarVoice ShellCheck SC2218 CI
+  failure was also fixed, and the full shell-harness aggregate is green.
 - Opencode external-worker polishing landed, including the opencode 1.18.9
   update and the move to the canonical `anomalyco/opencode` repository.
 - LunarVoice stability polishing across systemd/OpenRC landed, mirroring the
