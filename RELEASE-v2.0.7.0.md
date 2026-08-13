@@ -230,7 +230,7 @@ previous compatibility baseline.
 ### Security, Runtime, and Release Limitations
 
 - Seven accepted RustSec advisories remain in the shipped graph, blocked by
-  libSQL's legacy TLS stack, unpatched RSA via russh, and the vendored Signal
+  libSQL's legacy TLS stack and the vendored Signal
   wrapper. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.7.0.md`.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   delivery remain disabled; Stage A live-host release acceptance remains a
@@ -240,10 +240,8 @@ previous compatibility baseline.
   profiles, persistent external-worker placement, a bundled gateway
   control-plane service, and generic external runtime descriptors remain
   deferred. Custom MCP HTTP header values are still stored directly rather
-  than through owner-scoped secret references.
-- MCP verification gaps remain: bidirectional MCP-over-WASM and real guest
-  interoperability, end-to-end shared gateway behavior, and cross-route
-  session/OAuth isolation still lack live smoke coverage.
+  than through owner-scoped secret references. However, a stdio mcp bridge tool
+  can be installed to use http mcp servers with proper secret management!
 - Full release test aggregation remains blocked by unavailable real channel
   WASM artifacts and existing skill-selection/TensorZero streaming
   expectations.
@@ -261,9 +259,6 @@ previous compatibility baseline.
   redaction/policy transforms and does not re-cap every later transformation.
 - The XMPP bridge still cannot attach and send images correctly (work item
   #42); no fix ships in this release.
-- The `image_generate` and `image_edit` tools double the `/v1` path segment
-  when the provider base URL already ends in `/v1`, producing 404s against
-  TensorZero-style endpoints (work item #40).
 - WASM channels do not surface tool-activity status events yet (work item
   #47).
 - Kawarimi remains PostgreSQL-only.
