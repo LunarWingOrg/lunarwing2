@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.7.0: Codename `Mihari (見張り)`
 
-** Release Date: ** 2026-08-14
+** Release Date: ** 2026-08-13
 
 > *Mihari* (見張り) means "lookout" or "watchman." LunarWing v2.0.7.0 posts
 > watchmen over its own machinery: supervised sidecars, health gates,
