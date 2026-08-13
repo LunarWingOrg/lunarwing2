@@ -80,8 +80,10 @@ generation-safe recovery after terminal traps.
 ### Bundled extensions and lifecycle
 
 - Bundled WASM tools (`ic/tools-src/`): gitlab, multica-bridge, llm-context,
-  vision-analyze, cavepony, web-search, ssh, voice-transcribe; plus
-  `ic/lunarwing-gotify-tool/`.
+  vision-analyze, cavepony, web-search, ssh, voice-transcribe, gotify. The
+  authoritative source dirs are the `source.dir` entries in
+  `ic/registry/tools/*.json`; `ic/lunarwing-gotify-tool/` is a stale
+  unreferenced copy of the gotify tool kept for provenance.
 - Bundled WASM channels (`ic/channels-src/`): xmpp, weechat, darkirc, multica.
 - Build orchestration: `ic/scripts/build-wasm-extensions.sh`.
 - Install/auth/activate/remove lifecycle: `ic/src/extensions/manager.rs`;
