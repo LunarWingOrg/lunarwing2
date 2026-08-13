@@ -1,10 +1,14 @@
 # Podman Wait Babysitter Pattern
 
-> **Current status (updated 2026-08-04): IMPLEMENTED.** The helper, OpenRC
+> **Current status (updated 2026-08-13): IMPLEMENTED.** The helper, OpenRC
 > unit renderer, register/deregister lifecycle, worker and PostgreSQL wiring, and
 > `pg_isready` status check are in current source. Supported worker babysitters
 > are Pebble, OpenCode, and Kimi Code; Nanocode references below are historical.
-> Helper ownership belongs to mt-admin rather than the watchdog installer. See
+> The same `render_container_babysitter_unit` renderer also produces the
+> `lunarwing-vision-<t>-sup` and `lunarwing-voice-<t>-sup` crash supervisors
+> added in the v2.0.7.0 LunarVision/LunarVoice hardening (AGENT_GOALS items
+> #7/#9). Helper ownership belongs to mt-admin rather than the watchdog
+> installer. See
 > [`../specs/podman-wait-babysitter.md`](../specs/podman-wait-babysitter.md) for
 > the current as-built contract.
 
@@ -23,7 +27,8 @@ The podman wait babysitter provides docker-parity crash recovery for rootless Po
    - Runs as tenant user with proper rootless environment (HOME, XDG_RUNTIME_DIR)
 
 2. **Babysitter OpenRC Units** (`/etc/init.d/lunarwing-<type>-<tenant>-sup`)
-   - One per container type: pg, pebble, opencode, kimi
+   - One per container type: pg, pebble, opencode, kimi (workers/PG); plus
+     vision and voice since the v2.0.7.0 sidecar hardening
    - Uses `supervisor="supervise-daemon"`
    - Foreground command: `lunarwing-ctr-babysit <container-name>`
    - Runs as tenant user via `command_user`
@@ -42,6 +47,8 @@ The podman wait babysitter provides docker-parity crash recovery for rootless Po
 | `lunarwing-pebble-<tenant>` | `lunarwing-pebble-<tenant>-sup` |
 | `lunarwing-opencode-<tenant>` | `lunarwing-opencode-<tenant>-sup` |
 | `lunarwing-kimi-<tenant>` | `lunarwing-kimi-<tenant>-sup` |
+| `lunarwing-vision-<tenant>` | `lunarwing-vision-<tenant>-sup` |
+| `lunarwing-voice-<tenant>` | `lunarwing-voice-<tenant>-sup` |
 
 ## Integration Points
 
