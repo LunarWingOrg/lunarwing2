@@ -68,7 +68,7 @@ fn allow_private_ips() -> bool {
 ```
 
 This pattern already exists in:
-- `ic/src/config/helpers.rs:256` (config-time URL validation)
+- `ic/src/config/helpers.rs:293` (config-time URL validation)
 - `ic/src/tools/wasm/wrapper.rs.ALLOW_PRIVATE_IPS.patch` (WASM tool wrapper)
 
 But is **missing** from `ic/src/tools/builtin/http.rs`. Adding it there, gated behind the env var, would allow test harness downloads while keeping production secure.
