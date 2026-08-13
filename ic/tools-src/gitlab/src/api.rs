@@ -57,12 +57,22 @@ pub fn list_issues(
     state: &str,
     per_page: u32,
     page_number: u32,
+    all_pages: bool,
 ) -> Result<Value, String> {
     validate_choice("state", state, &["opened", "closed", "all"])?;
+    let project = project_path(project)?;
+    if all_pages {
+        // One tool call walks the whole list, so "list all work items" needs
+        // a single approval instead of one approval per page.
+        let endpoint = format!(
+            "/projects/{project}/issues?state={}&per_page=100",
+            url_encode(state)
+        );
+        return client.request_all_pages(&endpoint);
+    }
     let (per_page, page_number) = page(per_page, page_number);
     let endpoint = format!(
-        "/projects/{}/issues?state={}&per_page={per_page}&page={page_number}",
-        project_path(project)?,
+        "/projects/{project}/issues?state={}&per_page={per_page}&page={page_number}",
         url_encode(state)
     );
     client.request_json("GET", &endpoint, None)

@@ -44,7 +44,17 @@ Merge approval and merge actions require current merge-request HEAD `sha`.
 Existing-file updates and deletes require current `last_commit_id`; obtain it
 with `get_file_content`. Guards prevent acting on code changed since review.
 List and search responses include GitLab pagination headers in a `pagination`
-object beside `items` when those headers are present.
+object beside `items` when those headers are present; blank boundary values
+(GitLab sends an empty `x-next-page` on the last page) are omitted.
+
+`list_issues` also accepts `all_pages: true` to walk every page in a single
+bounded call — use it for "list all work items" requests instead of paging one
+call at a time, so the whole listing needs only one approval. Pages are
+fetched at `per_page=100` and merged; the run stops at 20 pages, 2000 items,
+or 3 MiB of source JSON, whichever comes first. The merged `pagination`
+object reports `fetched_pages` and `truncated`; when truncated it also carries
+`resume_page`, which can be passed as `page` to a normal paged `list_issues`
+call (without `all_pages`) to continue where the run stopped.
 
 ## Another Self-hosted Host
 
