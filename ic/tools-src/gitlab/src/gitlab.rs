@@ -9,10 +9,12 @@ const CONFIG_PATH: &str = "config/gitlab.json";
 const TOKEN_SECRET: &str = "gitlab_token";
 const MAX_ERROR_CHARS: usize = 2048;
 /// Auto-pagination safety caps: 20 pages stay well under the per-execution
-/// host HTTP-request budget; 2000 items keep merged responses within the
-/// configured response-size limit.
+/// host HTTP-request budget; 2000 items / 3 MiB of source JSON keep merged
+/// responses within the configured response-size limit and the guest memory
+/// ceiling (a parsed Value tree is several times its JSON text size).
 const MAX_AUTO_PAGES: u32 = 20;
 const MAX_AUTO_ITEMS: usize = 2_000;
+const MAX_AUTO_BYTES: usize = 3 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -83,10 +85,11 @@ impl GitlabClient {
 
     /// Fetch every page of a paginated GET endpoint in one call.
     ///
-    /// Follows `x-next-page` until it is absent/blank, the page cap, or the
-    /// item cap is hit, then merges all items into a single response. The
-    /// `pagination` object describes the merged result: `fetched_pages`,
-    /// `truncated`, and (only when truncated) `resume_page` for continuation.
+    /// Follows `x-next-page` until it is absent/blank or a safety cap (pages,
+    /// items, or accumulated bytes) is hit, then merges all items into a
+    /// single response. The `pagination` object describes the merged result:
+    /// `fetched_pages`, `truncated`, and (only when truncated) `resume_page`
+    /// for continuation with a normal paged call.
     pub fn request_all_pages(&self, endpoint: &str) -> Result<Value, String> {
         let fetch = |page_number: u32| {
             let separator = if endpoint.contains('?') { '&' } else { '?' };
@@ -96,13 +99,13 @@ impl GitlabClient {
             let value: Value = serde_json::from_slice(&bytes)
                 .map_err(|_| format!("GitLab returned invalid JSON (HTTP {status})"))?;
             match value {
-                Value::Array(items) => Ok((items, headers)),
+                Value::Array(items) => Ok((items, headers, bytes.len())),
                 _ => Err(format!(
                     "GitLab list endpoint returned a non-array body (HTTP {status})"
                 )),
             }
         };
-        let outcome = collect_all_pages(fetch, MAX_AUTO_PAGES, MAX_AUTO_ITEMS)?;
+        let outcome = collect_all_pages(fetch, MAX_AUTO_PAGES, MAX_AUTO_ITEMS, MAX_AUTO_BYTES)?;
         Ok(all_pages_value(outcome))
     }
 
@@ -302,22 +305,28 @@ struct AllPagesOutcome {
 }
 
 /// Loop over pages via `fetch`, merging items until there is no next page or
-/// a safety cap is hit. A next page equal to the current page is treated as
-/// "no further page" so a misbehaving server cannot loop the fetch forever.
+/// a safety cap (pages, items, or accumulated source bytes) is hit. A next
+/// page equal to the current page is treated as "no further page" so a
+/// misbehaving server cannot loop the fetch forever. `fetch` returns the
+/// page's items, its response headers, and the raw body length in bytes.
 fn collect_all_pages(
-    mut fetch: impl FnMut(u32) -> Result<(Vec<Value>, String), String>,
+    mut fetch: impl FnMut(u32) -> Result<(Vec<Value>, String, usize), String>,
     max_pages: u32,
     max_items: usize,
+    max_bytes: usize,
 ) -> Result<AllPagesOutcome, String> {
     let mut items = Vec::new();
+    let mut total_bytes = 0usize;
     let mut page_number = 1u32;
     let mut fetched_pages = 0u32;
     loop {
-        let (mut page_items, headers) = fetch(page_number)?;
+        let (mut page_items, headers, byte_len) = fetch(page_number)?;
         fetched_pages += 1;
         items.append(&mut page_items);
+        total_bytes = total_bytes.saturating_add(byte_len);
         let next = parse_next_page(&headers).filter(|next| *next != page_number);
-        let capped = fetched_pages >= max_pages || items.len() >= max_items;
+        let capped =
+            fetched_pages >= max_pages || items.len() >= max_items || total_bytes >= max_bytes;
         let resume_page = match (next, capped) {
             (Some(next_page), false) => {
                 page_number = next_page;
@@ -381,8 +390,8 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_all_pages, extract_error, normalize_api_base, page, parse_next_page, project_path,
-        url_encode, with_pagination,
+        MAX_AUTO_BYTES, collect_all_pages, extract_error, normalize_api_base, page,
+        parse_next_page, project_path, url_encode, with_pagination,
     };
     use serde_json::{Value, json};
 
@@ -476,12 +485,20 @@ mod tests {
         assert_eq!(parse_next_page("not json"), None);
     }
 
-    fn canned_page(ids: &[u64], next_page: &str) -> (Vec<Value>, String) {
+    fn canned_page(ids: &[u64], next_page: &str) -> (Vec<Value>, String, usize) {
+        canned_page_sized(ids, next_page, 128)
+    }
+
+    fn canned_page_sized(
+        ids: &[u64],
+        next_page: &str,
+        byte_len: usize,
+    ) -> (Vec<Value>, String, usize) {
         let items = ids.iter().map(|id| json!({"id": id})).collect();
         let headers = format!(
             r#"{{"x-next-page":"{next_page}","x-total":"6","x-total-pages":"3","x-per-page":"2"}}"#
         );
-        (items, headers)
+        (items, headers, byte_len)
     }
 
     #[test]
@@ -499,6 +516,7 @@ mod tests {
             },
             20,
             2_000,
+            MAX_AUTO_BYTES,
         )
         .unwrap();
         assert_eq!(calls, vec![1, 2, 3]);
@@ -523,6 +541,7 @@ mod tests {
             |page_number| Ok(canned_page(&[1, 2], &(page_number + 1).to_string())),
             2,
             2_000,
+            MAX_AUTO_BYTES,
         )
         .unwrap();
         assert_eq!(outcome.fetched_pages, 2);
@@ -539,6 +558,7 @@ mod tests {
             |page_number| Ok(canned_page(&[1, 2, 3], &(page_number + 1).to_string())),
             20,
             3,
+            MAX_AUTO_BYTES,
         )
         .unwrap();
         assert_eq!(outcome.fetched_pages, 1);
@@ -546,9 +566,29 @@ mod tests {
     }
 
     #[test]
+    fn auto_pagination_byte_cap_reports_resume_page() {
+        let outcome = collect_all_pages(
+            |page_number| {
+                Ok(canned_page_sized(
+                    &[1, 2],
+                    &(page_number + 1).to_string(),
+                    1024,
+                ))
+            },
+            20,
+            2_000,
+            1_500,
+        )
+        .unwrap();
+        assert_eq!(outcome.fetched_pages, 2);
+        assert_eq!(outcome.resume_page, Some(3));
+    }
+
+    #[test]
     fn auto_pagination_repeated_next_page_does_not_loop() {
         // A server that keeps advertising the current page must not loop.
-        let outcome = collect_all_pages(|_| Ok(canned_page(&[1], "1")), 20, 2_000).unwrap();
+        let outcome =
+            collect_all_pages(|_| Ok(canned_page(&[1], "1")), 20, 2_000, MAX_AUTO_BYTES).unwrap();
         assert_eq!(outcome.fetched_pages, 1);
         assert_eq!(outcome.resume_page, None);
     }
@@ -565,6 +605,7 @@ mod tests {
             },
             20,
             2_000,
+            MAX_AUTO_BYTES,
         );
         assert_eq!(result.err().as_deref(), Some("boom"));
     }
