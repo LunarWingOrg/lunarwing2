@@ -47,10 +47,17 @@ const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
 ];
 
 fn recent_conversation_thread_goals(threads: &[Thread], limit: usize) -> Vec<String> {
-    threads
+    // Stores are not required to return threads in chronological order (e.g.
+    // `HybridStore::list_threads` iterates an in-memory HashMap), so sort by
+    // creation time here instead of relying on slice order plus `.rev()`.
+    let mut conversations: Vec<&Thread> = threads
         .iter()
-        .rev()
         .filter(|thread| thread.thread_type != ThreadType::Mission)
+        .collect();
+    conversations.sort_by_key(|thread| thread.created_at);
+    conversations
+        .into_iter()
+        .rev()
         .take(limit)
         .map(|thread| thread.goal.clone())
         .collect()
@@ -2651,6 +2658,38 @@ mod tests {
                 "conversation 2",
                 "conversation 1",
             ]
+        );
+    }
+
+    #[test]
+    fn conversation_insight_goals_use_recency_not_store_order() {
+        let project_id = ProjectId::new();
+        let base = chrono::Utc::now();
+        let make_thread = |goal: &str, thread_type, minutes_ago: i64| {
+            let mut thread = Thread::new(
+                goal,
+                thread_type,
+                project_id,
+                "test-user",
+                ThreadConfig::default(),
+            );
+            thread.created_at = base - chrono::Duration::minutes(minutes_ago);
+            thread
+        };
+        // Simulate an unordered store result (e.g. HashMap iteration order):
+        // oldest and newest threads interleaved, with a fresh mission thread
+        // that must never leak into the payload.
+        let threads = vec![
+            make_thread("ancient conversation", ThreadType::Foreground, 600),
+            make_thread("newest conversation", ThreadType::Foreground, 1),
+            make_thread("mission specification", ThreadType::Mission, 0),
+            make_thread("middle conversation", ThreadType::Foreground, 30),
+            make_thread("older conversation", ThreadType::Foreground, 120),
+        ];
+
+        assert_eq!(
+            recent_conversation_thread_goals(&threads, 2),
+            ["newest conversation", "middle conversation"]
         );
     }
 
