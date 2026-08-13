@@ -1,4 +1,10 @@
-# Roadmap Document
+# Roadmap Document (SUPERSEDED)
+
+> **Status: SUPERSEDED.** This roadmap was the original 2026 plan from the
+> IronClaw fork transition era. The current live roadmap is
+> [`ROADMAP_2026.md`](ROADMAP_2026.md). This file is retained for historical
+> reference only — release targets, feature priorities, and the project name
+> have all evolved. Last reviewed 2026-08-13 (item #27 staleness sweep).
 
 Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`): odd-numbered releases focus on bug fixes / security / polish / cleanup, even-numbered releases focus on features, and major versions such as 2.0.0 or 2.1.0 will typically include massive overhauls of existing systems.
 

@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.7.0: Codename `Mihari (見張り)`
 
-**Status:** DRAFT (2026-08-12, updated 2026-08-13) — pending final review before tag
+** Release Date: ** 2026-08-13
 
 > *Mihari* (見張り) means "lookout" or "watchman." LunarWing v2.0.7.0 posts
 > watchmen over its own machinery: supervised sidecars, health gates,
@@ -188,6 +188,10 @@ previous compatibility baseline.
 - Fixed the ShellCheck SC2218 CI failure in the mt-admin LunarVoice test
   harness via scoped annotations on the three calls that intentionally use
   implementations replaced by call-recording mocks later in the test.
+- Isolated a flaky CI race in the WASM fuel-exhaustion regression by giving
+  the test a small dedicated fuel budget and a generous epoch deadline, so
+  Wasmtime epoch interruption under CI load can no longer mask the
+  fuel-specific assertion; production runtime limits are unchanged.
 - Updated the opencode external worker build to opencode `v1.18.9` and moved
   the build-time clone plus all live references to the canonical
   `anomalyco/opencode` repository after the upstream transfer.
@@ -211,11 +215,14 @@ previous compatibility baseline.
    the new contracts; stale containers are recreated automatically on the
    next start. LunarVoice starts now fail loudly if the `8091` health
    listener never reports healthy.
-4. Review MCP server pins: pinned stdio servers on Linux now execute through
+4. Rebuild the opencode external-worker image so the pinned opencode
+   `v1.18.9` build from the canonical `anomalyco/opencode` repository takes
+   effect.
+5. Review MCP server pins: pinned stdio servers on Linux now execute through
    the sealed `memfd` path, and version negotiation accepts exactly
    `2024-11-05`. Servers pinned to other revisions must be re-pinned or run
    unpinned.
-5. Coordination responder election is deterministic and roster-persisted;
+6. Coordination responder election is deterministic and roster-persisted;
    re-render tenant environments so the managed seven-rule bundle auto-loads.
 
 ## Known Issues
@@ -223,7 +230,7 @@ previous compatibility baseline.
 ### Security, Runtime, and Release Limitations
 
 - Seven accepted RustSec advisories remain in the shipped graph, blocked by
-  libSQL's legacy TLS stack, unpatched RSA via russh, and the vendored Signal
+  libSQL's legacy TLS stack and the vendored Signal
   wrapper. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.7.0.md`.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   delivery remain disabled; Stage A live-host release acceptance remains a
@@ -233,10 +240,8 @@ previous compatibility baseline.
   profiles, persistent external-worker placement, a bundled gateway
   control-plane service, and generic external runtime descriptors remain
   deferred. Custom MCP HTTP header values are still stored directly rather
-  than through owner-scoped secret references.
-- MCP verification gaps remain: bidirectional MCP-over-WASM and real guest
-  interoperability, end-to-end shared gateway behavior, and cross-route
-  session/OAuth isolation still lack live smoke coverage.
+  than through owner-scoped secret references. However, a stdio mcp bridge tool
+  can be installed to use http mcp servers with proper secret management!
 - Full release test aggregation remains blocked by unavailable real channel
   WASM artifacts and existing skill-selection/TensorZero streaming
   expectations.
@@ -254,9 +259,6 @@ previous compatibility baseline.
   redaction/policy transforms and does not re-cap every later transformation.
 - The XMPP bridge still cannot attach and send images correctly (work item
   #42); no fix ships in this release.
-- The `image_generate` and `image_edit` tools double the `/v1` path segment
-  when the provider base URL already ends in `/v1`, producing 404s against
-  TensorZero-style endpoints (work item #40).
 - WASM channels do not surface tool-activity status events yet (work item
   #47).
 - Kawarimi remains PostgreSQL-only.
@@ -265,9 +267,10 @@ previous compatibility baseline.
 
 ### Resolved Since the First Draft (2026-08-12)
 
-- The shell-harness failure flagged at first draft is resolved: the mt-admin
-  LunarVoice ShellCheck SC2218 errors were fixed, and the full shell-harness
-  aggregate is green.
+- The shell-harness `init-templates` suite flagged at first draft is green
+  again (24/24, with the `systemd-analyze` parser check reporting SKIP when
+  the tool is absent); the separate mt-admin LunarVoice ShellCheck SC2218 CI
+  failure was also fixed, and the full shell-harness aggregate is green.
 - Opencode external-worker polishing landed, including the opencode 1.18.9
   update and the move to the canonical `anomalyco/opencode` repository.
 - LunarVoice stability polishing across systemd/OpenRC landed, mirroring the
