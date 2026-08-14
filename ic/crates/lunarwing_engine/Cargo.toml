@@ -1,6 +1,6 @@
 [package]
 name = "lunarwing_engine"
-version = "2.0.7"
+version = "2.0.8"
 edition = "2024"
 rust-version = "1.96.1"
 description = "Unified thread-capability-CodeAct execution engine for LunarWing"
@@ -16,8 +16,8 @@ dist = false
 [dependencies]
 async-trait = "0.1"
 futures = "0.3"
-lunarwing_common = { path = "../lunarwing_common", version = "2.0.7" }
-lunarwing_skills = { path = "../lunarwing_skills", version = "2.0.7", default-features = false }
+lunarwing_common = { path = "../lunarwing_common", version = "2.0.8" }
+lunarwing_skills = { path = "../lunarwing_skills", version = "2.0.8", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"
