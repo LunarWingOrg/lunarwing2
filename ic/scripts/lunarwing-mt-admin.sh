@@ -2491,11 +2491,99 @@ clone_tenant_repo() {
 
 # ── Build management ─────────────────────────────────────────────────────────
 
+# Convert a systemd-style CPUQuota percentage (e.g. "800%") into the cgroup v2
+# cpu.max "quota period" form OpenRC expects in rc_cgroup_settings. Returns 1
+# for anything outside the simple "<n>%" form so callers can omit the knob.
+_openrc_cpu_max_from_quota() {
+  local quota="$1" pct
+  pct="${quota%\%}"
+  [[ "$pct" == "$quota" || -z "$pct" ]] && return 1
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  printf '%d %d' "$((pct * 1000))" 100000
+}
+
+# Portable cgroup v2 availability probe for the operator build path (work item
+# #54): unified hierarchy mounted at /sys/fs/cgroup and writable by root. This
+# is the non-systemd equivalent of "systemd-run --user works".
+_openrc_build_cgroup_supported() {
+  [[ -d /sys/fs/cgroup ]] || return 1
+  grep -qw cgroup2 /proc/filesystems || return 1
+  [[ -f /sys/fs/cgroup/cgroup.controllers ]] || return 1
+  [[ -w /sys/fs/cgroup ]] || return 1
+}
+
+# Reap whatever still lives in a build cgroup and remove the directory.
+# Best-effort: a still-populated cgroup survives rmdir and is retried by the
+# next build's stale-cgroup cleanup.
+_openrc_build_cgroup_cleanup() {
+  local cg="$1" pid
+  [[ -d "$cg" ]] || return 0
+  if [[ -w "$cg/cgroup.kill" ]]; then
+    # kernel 5.14+: SIGKILL every member atomically
+    printf '1' >"$cg/cgroup.kill" 2>/dev/null || true
+  elif [[ -r "$cg/cgroup.procs" ]]; then
+    while read -r pid; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done <"$cg/cgroup.procs"
+  fi
+  local tries=0
+  while [[ -d "$cg" ]] && (( tries < 10 )); do
+    rmdir "$cg" 2>/dev/null && break
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  [[ ! -d "$cg" ]]
+}
+
+# Run one tenant build inside a temporary, tenant-delegated cgroup v2
+# directory with the BUILD_* memory ceilings — the OpenRC-portable equivalent
+# of the systemd BUILD_SLICE scope (work item #54). Returns 2 without running
+# the build when the cgroup cannot be set up, so the caller can fall back to
+# plain nice; otherwise propagates the build's own exit status.
+_run_tenant_build_cgroup() {
+  local name="$1" build_cmd="$2"
+  local cg="/sys/fs/cgroup/lunarwing-build-$name"
+  local uid
+  uid="$(id -u "$name")"
+  if [[ -e "$cg" ]]; then
+    # Stale cgroup from an interrupted run: reap it before reusing the name.
+    _openrc_build_cgroup_cleanup "$cg" || return 2
+  fi
+  mkdir "$cg" || return 2
+  # Ceilings: a controller file that is not delegated to us is skipped, so
+  # partially configured hosts still get whatever bounding is available.
+  local knob value
+  for knob in memory.high memory.max; do
+    case "$knob" in
+      memory.high) value="$BUILD_MEMORY_HIGH" ;;
+      memory.max) value="$BUILD_MEMORY_MAX" ;;
+    esac
+    if [[ -w "$cg/$knob" ]]; then
+      printf '%s' "$value" >"$cg/$knob" 2>/dev/null || true
+    fi
+  done
+  # Delegate the cgroup to the tenant so its build shell can move itself in.
+  if ! chown "$uid:$uid" "$cg" "$cg/cgroup.procs" 2>/dev/null \
+    || ! sudo -u "$name" test -w "$cg/cgroup.procs"; then
+    _openrc_build_cgroup_cleanup "$cg" || true
+    return 2
+  fi
+  local rc=0
+  sudo -u "$name" bash -c '
+    printf "%s" "$$" >"$1/cgroup.procs" || exit 2
+    exec nice -n 10 bash -c "$2"
+  ' _ "$cg" "$build_cmd" || rc=$?
+  _openrc_build_cgroup_cleanup "$cg" || true
+  return "$rc"
+}
+
 # Run one tenant build step with resource bounding (BUG-005). On systemd the
 # step runs as a transient scope in BUILD_SLICE via the tenant's own user
 # manager, so cargo/rustc memory is capped and accounted outside both the
-# operator's session and the daemon service. Falls back to a plain nice'd
-# invocation when no user manager is reachable (OpenRC, or not yet started).
+# operator's session and the daemon service. On other init systems a
+# temporary cgroup v2 directory provides the same ceilings (work item #54).
+# Falls back to a plain nice'd invocation only when neither mechanism can be
+# set up, so a missing cgroup delegation never breaks the build.
 _run_tenant_build() {
   local name="$1" build_cmd="$2"
   local uid
@@ -2509,9 +2597,17 @@ _run_tenant_build() {
       --property="MemoryHigh=$BUILD_MEMORY_HIGH" \
       --property="MemoryMax=$BUILD_MEMORY_MAX" \
       bash -c "$build_cmd"
-  else
-    sudo -u "$name" nice -n 10 bash -c "$build_cmd"
+    return
   fi
+  if [[ "$INIT_SYSTEM" != systemd* ]] && _openrc_build_cgroup_supported; then
+    local rc=0
+    _run_tenant_build_cgroup "$name" "$build_cmd" || rc=$?
+    if [[ "$rc" -ne 2 ]]; then
+      return "$rc"
+    fi
+    say "cgroup v2 bounding unavailable for $name build; running nice-only" >&2
+  fi
+  sudo -u "$name" nice -n 10 bash -c "$build_cmd"
 }
 
 build_tenant() {
@@ -9252,6 +9348,12 @@ INITEOF
   render_container_babysitter_unit "$name" pg "$pg_container" "$pg_uid" "$pg_home"
 
   # ── Main daemon init script ──
+  # Work item #54: convert the workload CPU quota for rc_cgroup_settings.
+  # Empty when WORKLOAD_CPU_QUOTA is not a plain "<n>%" — the cpu.max knob is
+  # then skipped while memory/pids ceilings still apply.
+  local openrc_cpu_max
+  openrc_cpu_max="$(_openrc_cpu_max_from_quota "$WORKLOAD_CPU_QUOTA" || true)"
+
   cat >"$OPENRC_INITD_DIR/lunarwing-${name}" <<INITEOF
 #!/sbin/openrc-run
 
@@ -9275,6 +9377,31 @@ description="LunarWing AI assistant ($name)"
 : "\${lunarwing_respawn_max:=5}"
 : "\${lunarwing_respawn_period:=60}"
 : "\${lunarwing_retry:=SIGTERM/30/KILL/5}"
+
+# Work item #54: hard cgroup v2 ceilings — the OpenRC equivalent of the
+# systemd daemon-unit caps plus lunarwing-workloads.slice (BUG-005). OpenRC
+# has no transient scopes, so the daemon and its agent-spawned workloads share
+# this one service cgroup; the defaults are therefore the workload outer
+# bounds, not the smaller daemon-only caps. OpenRC applies these only when the
+# host mounts cgroup v2 (unified mode); any knob whose controller file is not
+# delegated to the service is skipped, so the unit still starts unbounded on
+# legacy/cgroup-less hosts. rc_cgroup_cleanup kills every leftover process in
+# the cgroup on stop (systemd KillMode=control-group parity).
+: "\${lunarwing_cgroup_limits_enabled:=true}"
+: "\${lunarwing_cgroup_memory_high:=$WORKLOAD_MEMORY_HIGH}"
+: "\${lunarwing_cgroup_memory_max:=$WORKLOAD_MEMORY_MAX}"
+: "\${lunarwing_cgroup_cpu_max:=$openrc_cpu_max}"
+: "\${lunarwing_cgroup_pids_max:=$WORKLOAD_TASKS_MAX}"
+rc_cgroup_cleanup="YES"
+rc_cgroup_settings=""
+if yesno "\${lunarwing_cgroup_limits_enabled}"; then
+    rc_cgroup_settings="
+memory.high \${lunarwing_cgroup_memory_high}
+memory.max \${lunarwing_cgroup_memory_max}
+cpu.max \${lunarwing_cgroup_cpu_max}
+pids.max \${lunarwing_cgroup_pids_max}
+"
+fi
 
 command="\${lunarwing_openrc_env_exec}"
 command_args="--env-file \${lunarwing_env_file} -- \${lunarwing_command} \${lunarwing_args}"
@@ -9622,12 +9749,20 @@ INITEOF
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
 lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
 
-# BUG-005 note: agent-spawned shell/compile workloads are isolated into their
-# own process group and reaped on timeout/cancel by the daemon itself (see
-# ic/src/tools/process.rs), so runaway trees cannot leak on any init system.
-# Hard cgroup memory/CPU caps for those workloads are currently applied only
-# on systemd hosts (lunarwing-workloads.slice); OpenRC has no equivalent
-# transient-scope mechanism. Optional process-level caps can be added here:
+# BUG-005 / work item #54: agent-spawned shell/compile workloads are isolated
+# into their own process group and reaped on timeout/cancel by the daemon
+# itself (see ic/src/tools/process.rs), so runaway trees cannot leak on any
+# init system. Hard cgroup v2 ceilings (memory.high/memory.max/cpu.max/
+# pids.max) are composed into the init script's rc_cgroup_settings; OpenRC has
+# no transient scopes, so the daemon and its workloads share one cgroup and
+# the defaults use the workload outer bounds. Tune per tenant here, e.g.:
+#lunarwing_cgroup_memory_max="12G"
+#lunarwing_cgroup_cpu_max="400000 100000"
+#lunarwing_cgroup_pids_max="4096"
+#lunarwing_cgroup_limits_enabled="false"   # emergency opt-out
+# Ceilings apply only on cgroup v2 (unified) hosts; OpenRC skips knobs whose
+# controller files are not delegated to the service. Optional process-level
+# fallback cap (works on any host):
 #rc_ulimit="-v 8388608"
 CONFD
 
