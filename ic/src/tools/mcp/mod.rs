@@ -31,9 +31,11 @@
 pub mod auth;
 mod client;
 pub mod config;
+pub mod descriptor;
 pub mod factory;
 pub(crate) mod gateway_transport;
 pub(crate) mod http_transport;
+pub mod marketplace;
 pub(crate) mod process;
 mod protocol;
 pub mod provenance;
@@ -52,7 +54,15 @@ pub(crate) use client::{MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS};
 pub use config::{
     McpGatewayMode, McpPlacement, McpServerConfig, McpServersFile, McpTransportConfig, OAuthConfig,
 };
+pub use descriptor::{
+    DescriptorError, EXTERNAL_OPTIONS_ENV, ExternalRuntimeDescriptor, ExternalRuntimeRegistry,
+};
 pub use factory::{McpFactoryError, create_client_from_config};
+pub use marketplace::{
+    DependencyLockfile, LockedDependency, ManifestDiff, MarketplaceError, PackageManifest,
+    PublisherSigningKey, PublisherTrustStore, RevocationEntry, RevocationList, RevocationStore,
+    SignedDependencyLockfile, SignedPackageManifest, SignedRevocationList, diff_manifests,
+};
 pub use process::{McpProcessManager, McpProcessState};
 pub use protocol::{InitializeResult, McpRequest, McpResponse, McpTool};
 pub use provenance::{McpPackageProvenance, PackageEcosystem, PackageTrust, ProvenanceError};
