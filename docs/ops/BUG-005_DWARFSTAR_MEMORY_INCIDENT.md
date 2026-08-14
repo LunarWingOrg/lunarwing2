@@ -987,14 +987,20 @@ disposable-tenant runtime validation remains required:
   still start with portable process-tree cleanup; the documented boolean is the
   explicit emergency opt-out from cgroup enforcement.
 - **Operator builds** on non-systemd hosts (`_run_tenant_build`) now run
-  inside a temporary, tenant-delegated cgroup v2 directory carrying the
+  inside a temporary cgroup v2 directory carrying the
   `BUILD_*` memory ceilings (16G/24G) — the portable equivalent of
   `lunarwing-build.slice` — with `cgroup.kill`/`cgroup.procs` reaping on
   completion. Setup failure falls back to the previous nice-only invocation,
   so a missing cgroup delegation never breaks a build; a build's own exit
   status is propagated unchanged. Setup now requires and verifies the memory
-  controller plus both limit files; a real status 2 or post-setup placement
-  failure cannot be mistaken for setup failure and rerun without bounds.
+  controller plus both limit files. The tenant build wrapper publishes its PID
+  and blocks on a gate FIFO until the privileged launcher moves it into the
+  cgroup — tenant-side self-migration is impossible on stock cgroup v2 (the
+  kernel requires write access on the common ancestor's `cgroup.procs`, which
+  a tenant shell started outside a delegated subtree never has). Because the
+  build cannot start before placement succeeds, a real status 2 (or any other
+  build status) is never mistaken for setup failure and rerun without bounds,
+  and a placement failure kills the gated wrapper before any build work runs.
 - **Operator overrides survive upgrades.** The generated main conf.d uses an
   atomic managed dependency block. `render-units` changes only that block and
   preserves cgroup knobs, `rc_ulimit`, comments, unrelated settings, owner, and
