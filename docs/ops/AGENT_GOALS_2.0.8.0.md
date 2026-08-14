@@ -14,7 +14,7 @@
 
 1. [x] update kimi dev loop if havent already - Rares
 2. [x] update kimi dev loop if havent already - AJ
-3. [ ] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54
+3. [x] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54 — DONE 2026-08-14 (Rares): OpenRC hard cgroup v2 ceilings implemented — tenant daemon units now render `rc_cgroup_settings` (memory.high/max, cpu.max, pids.max; workload outer bounds 6G/8G/800%/2048, conf.d-overridable) + `rc_cgroup_cleanup="YES"`; operator builds on non-systemd hosts run in a temporary tenant-delegated cgroup with BUILD_* memory caps (nice-only fallback preserved); render harness extended to 35 checks; BUG-005 doc postscript added. Runtime validation on a real Gentoo/OpenRC host deferred to next tenant reprovision (dev VM is systemd-booted).
 4. [ ] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 verify if done
 5. [ ] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/47 verify if done
 6. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference as well as the following work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/53 
