@@ -157,14 +157,18 @@ impl RouteStore {
             path: self.path.to_string_lossy().into_owned(),
             reason,
         };
-        let guard = self.routes.read().map_err(|_| GatewayControlError::InvalidData {
-            reason: "route table lock poisoned".to_string(),
-        })?;
+        let guard = self
+            .routes
+            .read()
+            .map_err(|_| GatewayControlError::InvalidData {
+                reason: "route table lock poisoned".to_string(),
+            })?;
         let file = RouteTableFile {
             routes: guard.clone(),
         };
         drop(guard);
-        let bytes = serde_json::to_vec_pretty(&file).map_err(|error| io_error(error.to_string()))?;
+        let bytes =
+            serde_json::to_vec_pretty(&file).map_err(|error| io_error(error.to_string()))?;
         let Some(parent) = self.path.parent() else {
             return Err(io_error("route table path has no parent".to_string()));
         };
@@ -184,11 +188,12 @@ impl RouteStore {
         validate_route_name(name)?;
         route.validate()?;
         {
-            let mut guard = self.routes.write().map_err(|error| {
-                GatewayControlError::InvalidData {
-                    reason: format!("route table lock poisoned: {error}"),
-                }
-            })?;
+            let mut guard =
+                self.routes
+                    .write()
+                    .map_err(|error| GatewayControlError::InvalidData {
+                        reason: format!("route table lock poisoned: {error}"),
+                    })?;
             if !guard.contains_key(name) && guard.len() >= MAX_GATEWAY_ROUTES {
                 return Err(GatewayControlError::InvalidData {
                     reason: format!("route table is full ({MAX_GATEWAY_ROUTES} routes)"),
@@ -201,11 +206,12 @@ impl RouteStore {
 
     fn remove(&self, name: &str) -> Result<bool, GatewayControlError> {
         let removed = {
-            let mut guard = self.routes.write().map_err(|error| {
-                GatewayControlError::InvalidData {
-                    reason: format!("route table lock poisoned: {error}"),
-                }
-            })?;
+            let mut guard =
+                self.routes
+                    .write()
+                    .map_err(|error| GatewayControlError::InvalidData {
+                        reason: format!("route table lock poisoned: {error}"),
+                    })?;
             guard.remove(name).is_some()
         };
         if removed {
@@ -301,12 +307,13 @@ pub async fn serve(
 ) -> Result<(), GatewayControlError> {
     let bind = config.bind;
     let router = router(config)?;
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(|error| GatewayControlError::Bind {
-            addr: bind.to_string(),
-            reason: error.to_string(),
-        })?;
+    let listener =
+        tokio::net::TcpListener::bind(bind)
+            .await
+            .map_err(|error| GatewayControlError::Bind {
+                addr: bind.to_string(),
+                reason: error.to_string(),
+            })?;
     tracing::info!(%bind, "MCP gateway control plane listening");
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
@@ -349,7 +356,11 @@ async fn upsert_route(
     Json(route): Json<GatewayRoute>,
 ) -> Response {
     match state.store.upsert(&name, route) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "upserted": name }))).into_response(),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "upserted": name })),
+        )
+            .into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
@@ -375,7 +386,11 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     let Some(route_name) = route_name else {
-        return (StatusCode::BAD_REQUEST, "missing X-LunarWing-MCP-Route header").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing X-LunarWing-MCP-Route header",
+        )
+            .into_response();
     };
     let Some(route) = state.store.get(&route_name) else {
         return (StatusCode::NOT_FOUND, "unknown route").into_response();
@@ -422,12 +437,11 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
     let response = match upstream {
         Ok(response) => response,
         Err(error) => {
-            return (StatusCode::BAD_GATEWAY, format!("upstream error: {error}"))
-                .into_response();
+            return (StatusCode::BAD_GATEWAY, format!("upstream error: {error}")).into_response();
         }
     };
-    let status = StatusCode::from_u16(response.status().as_u16())
-        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -441,7 +455,9 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
     if let Some(content_type) = content_type
         && let Ok(value) = HeaderValue::from_str(&content_type)
     {
-        reply.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+        reply
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
     }
     reply
 }
@@ -453,12 +469,14 @@ async fn read_bounded(response: reqwest::Response) -> Result<Vec<u8>, Response> 
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            (StatusCode::BAD_GATEWAY, format!("upstream read error: {error}")).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream read error: {error}"),
+            )
+                .into_response()
         })?;
         if body.len() + chunk.len() > MAX_PROXY_BODY_BYTES {
-            return Err(
-                (StatusCode::BAD_GATEWAY, "upstream response too large").into_response()
-            );
+            return Err((StatusCode::BAD_GATEWAY, "upstream response too large").into_response());
         }
         body.extend_from_slice(&chunk);
     }
@@ -546,11 +564,7 @@ mod tests {
                 .upsert(&"x".repeat(129), route("https://mcp.example.com/mcp"))
                 .is_err()
         );
-        assert!(
-            store
-                .upsert("ok", route("http://203.0.113.5/mcp"))
-                .is_err()
-        );
+        assert!(store.upsert("ok", route("http://203.0.113.5/mcp")).is_err());
     }
 
     async fn spawn_upstream() -> String {
@@ -650,7 +664,11 @@ mod tests {
             listed["routes"]["project-tools"]["has_bearer_token"],
             serde_json::Value::Bool(true)
         );
-        assert!(listed["routes"]["project-tools"].get("bearer_token").is_none());
+        assert!(
+            listed["routes"]["project-tools"]
+                .get("bearer_token")
+                .is_none()
+        );
 
         // Delete.
         let removed = client
