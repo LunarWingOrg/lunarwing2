@@ -916,6 +916,27 @@ impl RevocationStore {
         }
     }
 
+    /// Check a persisted provenance record against the current revocation
+    /// list. Records without a package identity cannot match and pass.
+    pub fn check_provenance(
+        &self,
+        provenance: &crate::tools::mcp::provenance::McpPackageProvenance,
+    ) -> Result<(), MarketplaceError> {
+        let Some(package_id) = &provenance.package_id else {
+            return Ok(());
+        };
+        let digest = provenance
+            .command_sha256
+            .as_deref()
+            .or(provenance.component_sha256.as_deref());
+        if self.is_revoked(package_id, provenance.version.as_deref(), digest) {
+            return Err(MarketplaceError::InvalidData {
+                reason: format!("package '{package_id}' is revoked by the marketplace list"),
+            });
+        }
+        Ok(())
+    }
+
     /// Persist the verified bytes atomically (write temp, fsync, rename).
     fn persist(&self, bytes: &[u8]) -> Result<(), MarketplaceError> {
         let io_error = |reason: String| MarketplaceError::RevocationCacheIo {
@@ -1277,6 +1298,23 @@ mod tests {
             .expect("reopen");
         assert_eq!(reopened.current_sequence(), 1);
         assert!(reopened.is_revoked("@acme/files", Some("1.0.0"), None));
+
+        // Provenance records for revoked packages are blocked; unknown
+        // packages and unversioned records pass.
+        let mut provenance = crate::tools::mcp::provenance::McpPackageProvenance::with_trust(
+            crate::tools::mcp::provenance::PackageTrust::Pinned,
+        );
+        provenance.package_id = Some("@acme/files".to_string());
+        provenance.version = Some("1.0.0".to_string());
+        assert!(reopened.check_provenance(&provenance).is_err());
+        provenance.version = Some("2.0.0".to_string());
+        reopened
+            .check_provenance(&provenance)
+            .expect("unrevoked version passes");
+        provenance.package_id = None;
+        reopened
+            .check_provenance(&provenance)
+            .expect("identity-less record passes");
     }
 
     #[test]

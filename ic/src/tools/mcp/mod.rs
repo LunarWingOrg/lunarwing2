@@ -33,6 +33,7 @@ mod client;
 pub mod config;
 pub mod descriptor;
 pub mod factory;
+pub mod gateway_control;
 pub(crate) mod gateway_transport;
 pub(crate) mod http_transport;
 pub mod marketplace;
@@ -58,6 +59,9 @@ pub use descriptor::{
     DescriptorError, EXTERNAL_OPTIONS_ENV, ExternalRuntimeDescriptor, ExternalRuntimeRegistry,
 };
 pub use factory::{McpFactoryError, create_client_from_config};
+pub use gateway_control::{
+    GatewayControlConfig, GatewayControlError, GatewayControlPlane, GatewayRoute,
+};
 pub use marketplace::{
     DependencyLockfile, LockedDependency, ManifestDiff, MarketplaceError, PackageManifest,
     PublisherSigningKey, PublisherTrustStore, RevocationEntry, RevocationList, RevocationStore,
