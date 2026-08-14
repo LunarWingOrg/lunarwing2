@@ -62,30 +62,30 @@ Start with these deeper docs as needed (keep in mind most of these are outdated 
 
 This machine is a dedicated dev/test machine with limited resources. **All cargo commands must follow these rules:**
 
-- **10 threads max**: prefix every cargo command with `taskset -c 0-9`
+- **12 threads max**: prefix every cargo command with `taskset -c 0-11`
 - **Use `cargo check` for compile verification, NOT `cargo build`** — DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS. Reserve release builds (`cargo build --release`) for deploying to a new tenant or upgrading an existing tenant's release binary.
-- **Use `taskset -c 0-9` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
+- **Use `taskset -c 0-11` for every cargo command**, not just `cargo build`. This applies to `cargo check`, `cargo test`, `cargo clippy`, `cargo doc`, etc.
 - DO NOT USE FULL DEBUG BUILDS DO NOT USE FULL DEBUG BUILDS. WASTEFUL AND TO BE AVOIDED AT ALL COSTS
 - Using /tmp as a place to store logs or other small files is totally acceptable. However, in general, storing massive files (over 1GB) to /tmp should not happen. You shouldn't be building entire rust binaries to /tmp - it's really stupid so do not do this ever
 
 ```bash
-taskset -c 0-9 cargo check -j10                              # compile check
-taskset -c 0-9 cargo check -j10 --no-default-features --features postgres  # postgres-only
-taskset -c 0-9 cargo check -j10 --no-default-features --features libsql    # libsql-only
-taskset -c 0-9 cargo check -j10 --all-features               # all features
-taskset -c 0-9 cargo test -j10 -- --test-threads=10            # unit tests
-taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples -- -D warnings  # lint
-taskset -c 0-9 cargo clippy -j10 --all --benches --tests --examples --all-features -- -D warnings
+taskset -c 0-11 cargo check -j12                              # compile check
+taskset -c 0-11 cargo check -j12 --no-default-features --features postgres  # postgres-only
+taskset -c 0-11 cargo check -j12 --no-default-features --features libsql    # libsql-only
+taskset -c 0-11 cargo check -j12 --all-features               # all features
+taskset -c 0-11 cargo test -j12 -- --test-threads=12            # unit tests
+taskset -c 0-11 cargo clippy -j12 --all --benches --tests --examples -- -D warnings  # lint
+taskset -c 0-11 cargo clippy -j12 --all --benches --tests --examples --all-features -- -D warnings
 ```
 
 Long-running commands (5–20+ minutes) **must use tmux**:
 ```bash
-tmux new-session -d -s build "taskset -c 0-9 cargo build --release -j10 2>&1 | tee /tmp/build.log"
+tmux new-session -d -s build "taskset -c 0-11 cargo build --release -j12 2>&1 | tee /tmp/build.log"
 ```
 
 ## Build, Test, and Lint Commands
 
-Run these from the `ic/` directory. Apply `taskset -c 0-9` and `-j10` per the build constraints above.
+Run these from the `ic/` directory. Apply `taskset -c 0-11` and `-j12` per the build constraints above.
 
 ```bash
 # Compile check (preferred over cargo build for verification)
