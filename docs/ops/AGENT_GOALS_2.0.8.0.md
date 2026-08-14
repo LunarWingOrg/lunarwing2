@@ -14,7 +14,7 @@
 
 1. [x] update kimi dev loop if havent already - Rares
 2. [x] update kimi dev loop if havent already - AJ
-3. [ ] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54 — PARTIAL 2026-08-14: OpenRC service cgroup v2 ceilings and non-systemd build memory cgroups are implemented, the 35-check render harness passes, and MR !469's 17-job pipeline passed. Review found correctness gaps and no real OpenRC runtime coverage; keep unchecked until fixes and the host validation below pass.
+3. [ ] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54 — PARTIAL 2026-08-14: reviewed correctness gaps are fixed: OpenRC stop always runs a portable cgroup cleanup fallback, cgroup v2 startup verifies every configured effective limit, direct memory values are converted to bytes, build setup fails safely when memory enforcement is absent, real build exit status 2 is never rerun unbounded, and operator conf.d overrides survive atomic rerenders. Expanded fixture/runtime harness passes. Keep unchecked until disposable-tenant OpenRC validation sections 2-4 in `2.0.8.0-GOAL-3-DETAILS.md` pass.
 4. [x] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 verify if done — DONE (verified 2026-08-14 on aj/kimi-4-20260814-0001): fix cf4b1164 excludes `ThreadType::Mission` from the conversation-insights `thread_goals` payload + event listener skips Mission threads; e999db6d sorts goals by recency; regression tests `conversation_insight_goals_exclude_mission_threads` and `conversation_insight_goals_use_recency_not_store_order` pass (ic/crates/lunarwing_engine/src/runtime/mission.rs). Independent review found no correctness gaps; all 67 mission tests and MR !468 pipeline 1739 passed. Residual gap: no single integration test asserts the exact generated conversation-insights payload end to end.
 5. [ ] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/47 verify if done
 6. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference as well as the following work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/53 
@@ -43,4 +43,3 @@
 29. [ ] update README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
 
 ---
-

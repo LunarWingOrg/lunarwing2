@@ -965,38 +965,48 @@ cgroup.
 ## 2026-08-14 postscript 3 — OpenRC hard ceilings (work item #54)
 
 The remaining documented gap — "OpenRC has portable process-tree cleanup but
-not systemd-equivalent hard memory, CPU, and task ceilings" — is now closed
-at the service-management layer using OpenRC's native cgroup v2 support
-(verified against OpenRC 0.63.1's `rc-cgroup.sh`):
+not systemd-equivalent hard memory, CPU, and task ceilings" — is addressed at
+the service-management layer using OpenRC's native cgroup v2 support. A
+follow-up correctness review found and fixed gaps in the first implementation;
+disposable-tenant runtime validation remains required:
 
 - **Tenant daemon units** rendered by `render_tenant_openrc_units()` now
   compose `rc_cgroup_settings` (`memory.high`/`memory.max`/`cpu.max`/
-  `pids.max`) and set `rc_cgroup_cleanup="YES"` (systemd
-  `KillMode=control-group` parity: every leftover cgroup process is killed on
-  stop). Because OpenRC has no transient scopes, the daemon and its
+  `pids.max`) and set `rc_cgroup_cleanup="YES"`. Memory values with K/M/G/T
+  suffixes are converted to byte counts before OpenRC writes the kernel files.
+  Generated scripts also carry a bounded cleanup hook for OpenRC packages
+  affected by issue #910, where native cleanup checks the wrong cgroup v2 path.
+  Because OpenRC has no transient scopes, the daemon and its
   agent-spawned workloads share one service cgroup, so the defaults are the
   workload outer bounds (6G/8G, 800% CPU as `800000 100000`, 2048 pids) rather
   than the smaller daemon-only caps. Per-tenant conf.d knobs
   (`lunarwing_cgroup_memory_max`, `..._memory_high`, `..._cpu_max`,
   `..._pids_max`, plus a `lunarwing_cgroup_limits_enabled` opt-out) tune or
-  disable the ceilings; they apply only on cgroup v2 unified hosts, and OpenRC
-  silently skips any knob whose controller file is not delegated, so the unit
-  still starts on legacy hosts.
+  disable the ceilings. On cgroup v2 hosts, `start_pre` verifies every effective
+  value and fails startup if OpenRC skipped a controller or write. Legacy hosts
+  still start with portable process-tree cleanup; the documented boolean is the
+  explicit emergency opt-out from cgroup enforcement.
 - **Operator builds** on non-systemd hosts (`_run_tenant_build`) now run
   inside a temporary, tenant-delegated cgroup v2 directory carrying the
   `BUILD_*` memory ceilings (16G/24G) — the portable equivalent of
   `lunarwing-build.slice` — with `cgroup.kill`/`cgroup.procs` reaping on
   completion. Setup failure falls back to the previous nice-only invocation,
   so a missing cgroup delegation never breaks a build; a build's own exit
-  status is propagated unchanged.
+  status is propagated unchanged. Setup now requires and verifies the memory
+  controller plus both limit files; a real status 2 or post-setup placement
+  failure cannot be mistaken for setup failure and rerun without bounds.
+- **Operator overrides survive upgrades.** The generated main conf.d uses an
+  atomic managed dependency block. `render-units` changes only that block and
+  preserves cgroup knobs, `rc_ulimit`, comments, unrelated settings, owner, and
+  mode.
 - The single-node committed template `ic/systemd/lunarwing.confd` documents
   the same `rc_cgroup_settings` knobs as a commented, opt-in example,
   mirroring the single-node systemd template (which also ships without
   ceilings).
 
-Render-harness coverage in
-`ic/scripts/tests/test-workload-isolation-rendering.sh` (now 35 checks)
-asserts the rendered ceilings, conf.d override propagation, the cgroup build
-path preference, the setup-failure fallback, and the CPUQuota→cpu.max
-conversion. Runtime behaviour on an actual OpenRC host remains to be
-validated on the next Gentoo tenant reprovision; the dev VM is systemd-booted.
+`ic/scripts/tests/test-workload-isolation-rendering.sh` now covers rendered
+ceilings, generated conversion and cleanup helpers, strict memory setup,
+build-status propagation, conf.d migration/preservation/idempotence, and unsafe
+target rejection. Effective values, process placement, stop cleanup, and build
+cleanup still require the disposable-tenant OpenRC procedure in
+`docs/ops/2.0.8.0-GOAL-3-DETAILS.md`.
