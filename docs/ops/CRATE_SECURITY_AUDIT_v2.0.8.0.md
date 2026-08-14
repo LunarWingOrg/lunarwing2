@@ -152,3 +152,15 @@ crate is not in the shipped graph and still does not belong in `ic/deny.toml`.
 4. Let checklist item 10 apply the 19 compatible maintenance updates during
    its lockfile refresh, then re-run the CI advisory check before tagging —
    RustSec data changes independently of source.
+
+## Follow-up (item 10, 2026-08-14)
+
+Checklist item 10 ran the release lockfile refresh in `ic/`: the deferred
+maintenance updates landed (the full `icu_*`/`zerovec` families,
+`generic-array`, `http-body-util`, `litemap`, `num-integer`, `potential_utf`,
+`rangemap`, `tinystr`, `whoami`, `writeable`, `zerotrie`, plus patch releases
+published since the audit: `cc 1.4.3`, `find-msvc-tools 0.1.11`,
+`libredox 0.1.20`, `pkg-config 0.3.34`) alongside the 2.0.8 manifest bumps.
+Re-ran the CI advisory check (cargo-deny 0.20.2, fresh advisory fetch):
+`advisories ok, bans ok, licenses ok, sources ok` — the seven accepted
+findings remain and no new advisory appeared.
