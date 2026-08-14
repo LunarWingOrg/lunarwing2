@@ -961,3 +961,42 @@ The ~450 MiB idle plateau and the 37.6 GB build-accounting incident are both
 closed: baseline is back inside the historical 80–165 MB per-instance band,
 and agent/operator compiles are capped and accounted outside the daemon
 cgroup.
+
+## 2026-08-14 postscript 3 — OpenRC hard ceilings (work item #54)
+
+The remaining documented gap — "OpenRC has portable process-tree cleanup but
+not systemd-equivalent hard memory, CPU, and task ceilings" — is now closed
+at the service-management layer using OpenRC's native cgroup v2 support
+(verified against OpenRC 0.63.1's `rc-cgroup.sh`):
+
+- **Tenant daemon units** rendered by `render_tenant_openrc_units()` now
+  compose `rc_cgroup_settings` (`memory.high`/`memory.max`/`cpu.max`/
+  `pids.max`) and set `rc_cgroup_cleanup="YES"` (systemd
+  `KillMode=control-group` parity: every leftover cgroup process is killed on
+  stop). Because OpenRC has no transient scopes, the daemon and its
+  agent-spawned workloads share one service cgroup, so the defaults are the
+  workload outer bounds (6G/8G, 800% CPU as `800000 100000`, 2048 pids) rather
+  than the smaller daemon-only caps. Per-tenant conf.d knobs
+  (`lunarwing_cgroup_memory_max`, `..._memory_high`, `..._cpu_max`,
+  `..._pids_max`, plus a `lunarwing_cgroup_limits_enabled` opt-out) tune or
+  disable the ceilings; they apply only on cgroup v2 unified hosts, and OpenRC
+  silently skips any knob whose controller file is not delegated, so the unit
+  still starts on legacy hosts.
+- **Operator builds** on non-systemd hosts (`_run_tenant_build`) now run
+  inside a temporary, tenant-delegated cgroup v2 directory carrying the
+  `BUILD_*` memory ceilings (16G/24G) — the portable equivalent of
+  `lunarwing-build.slice` — with `cgroup.kill`/`cgroup.procs` reaping on
+  completion. Setup failure falls back to the previous nice-only invocation,
+  so a missing cgroup delegation never breaks a build; a build's own exit
+  status is propagated unchanged.
+- The single-node committed template `ic/systemd/lunarwing.confd` documents
+  the same `rc_cgroup_settings` knobs as a commented, opt-in example,
+  mirroring the single-node systemd template (which also ships without
+  ceilings).
+
+Render-harness coverage in
+`ic/scripts/tests/test-workload-isolation-rendering.sh` (now 35 checks)
+asserts the rendered ceilings, conf.d override propagation, the cgroup build
+path preference, the setup-failure fallback, and the CPUQuota→cpu.max
+conversion. Runtime behaviour on an actual OpenRC host remains to be
+validated on the next Gentoo tenant reprovision; the dev VM is systemd-booted.
