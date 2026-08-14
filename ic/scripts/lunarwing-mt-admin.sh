@@ -2625,13 +2625,56 @@ _openrc_build_cgroup_cleanup() {
   [[ ! -d "$cg" ]]
 }
 
-# Run one tenant build inside a temporary, tenant-delegated cgroup v2
-# directory with the BUILD_* memory ceilings — the OpenRC-portable equivalent
-# of the systemd BUILD_SLICE scope (work item #54). The setup-complete flag lets
-# the caller distinguish setup failure from every possible build exit status.
+# Launch the tenant build wrapper and place it into the prepared cgroup from
+# the privileged side, then release it to exec the build. The wrapper
+# publishes its PID and blocks on a gate FIFO, so no build work can run
+# before placement: tenant-side self-migration would also need write access
+# on the common ancestor's cgroup.procs, which a tenant shell started outside
+# a delegated subtree never has (EACCES). Placement failure kills the
+# still-gated wrapper — the build never runs — and leaves
+# _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false so the caller falls back.
+_openrc_build_cgroup_run() {
+  local name="$1" cg="$2" syncdir="$3" build_cmd="$4"
+  local launcher_pid pid tries
+  sudo -u "$name" bash -c '
+    printf "%s\n" "$$" >"$1/pid" || exit 1
+    read -r _ <"$1/gate" || true
+    exec nice -n 10 bash -c "$2"
+  ' _ "$syncdir" "$build_cmd" </dev/null &
+  launcher_pid=$!
+  pid=""
+  tries=0
+  while (( tries < 50 )); do
+    if [[ -s "$syncdir/pid" ]]; then
+      pid="$(<"$syncdir/pid")"
+      break
+    fi
+    kill -0 "$launcher_pid" 2>/dev/null || break
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  if [[ "$pid" =~ ^[0-9]+$ ]] \
+    && printf '%s\n' "$pid" >"$cg/cgroup.procs" 2>/dev/null \
+    && grep -qx "$pid" "$cg/cgroup.procs"; then
+    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
+    : >"$syncdir/gate" # release the wrapper into the bounded exec
+  else
+    say "cgroup v2 placement failed for $name build; bounding ineffective, falling back" >&2
+    [[ -z "$pid" ]] || kill -KILL "$pid" 2>/dev/null || true
+    kill -KILL "$launcher_pid" 2>/dev/null || true
+  fi
+  local rc=0
+  wait "$launcher_pid" 2>/dev/null || rc=$?
+  return "$rc"
+}
+
+# Run one tenant build inside a temporary cgroup v2 directory with the
+# BUILD_* memory ceilings — the OpenRC-portable equivalent of the systemd
+# BUILD_SLICE scope (work item #54). The setup-complete flag lets the caller
+# distinguish setup failure from every possible build exit status.
 _run_tenant_build_cgroup() {
   local name="$1" build_cmd="$2"
-  local root cg uid
+  local root cg uid syncdir
   _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
   root="$(_openrc_cgroup_root)"
   cg="$root/lunarwing-build-$name"
@@ -2649,28 +2692,19 @@ _run_tenant_build_cgroup() {
     _openrc_build_cgroup_cleanup "$cg" || true
     return 1
   fi
-  # Delegate the cgroup to the tenant so its build shell can move itself in.
-  if ! chown "$uid:$uid" "$cg" "$cg/cgroup.procs" 2>/dev/null \
-    || ! sudo -u "$name" test -w "$cg/cgroup.procs"; then
+  # The tenant wrapper writes its PID into this dir and reads the gate FIFO.
+  syncdir="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-build-$name.XXXXXX")" || {
+    _openrc_build_cgroup_cleanup "$cg" || true
+    return 1
+  }
+  if ! mkfifo "$syncdir/gate" || ! chown "$uid:$uid" "$syncdir"; then
+    rm -rf "$syncdir"
     _openrc_build_cgroup_cleanup "$cg" || true
     return 1
   fi
-  _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
   local rc=0
-  sudo -u "$name" bash -c '
-    printf "%s" "$$" >"$1/cgroup.procs" || exit 125
-    exec nice -n 10 bash -c "$2"
-  ' _ "$cg" "$build_cmd" || rc=$?
-  if (( rc == 125 )); then
-    # Self-migration into the delegated cgroup was denied: the kernel also
-    # requires write access on the closest common ancestor's cgroup.procs,
-    # which a tenant shell started outside a delegated subtree never has. The
-    # build itself never ran (the wrapper exits 125 before exec; cargo never
-    # uses 125), so report setup as incomplete and let the caller fall back
-    # to the plain nice'd invocation instead of failing the build.
-    say "cgroup v2 self-migration denied for $name build; bounding ineffective, falling back" >&2
-    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
-  fi
+  _openrc_build_cgroup_run "$name" "$cg" "$syncdir" "$build_cmd" || rc=$?
+  rm -rf "$syncdir"
   if ! _openrc_build_cgroup_cleanup "$cg"; then
     say "WARNING: could not clean up build cgroup $cg" >&2
     (( rc != 0 )) || rc=1
