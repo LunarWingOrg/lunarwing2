@@ -2491,11 +2491,190 @@ clone_tenant_repo() {
 
 # ── Build management ─────────────────────────────────────────────────────────
 
+# Convert a systemd-style CPUQuota percentage (e.g. "800%") into the cgroup v2
+# cpu.max "quota period" form OpenRC expects in rc_cgroup_settings. Returns 1
+# for anything outside the simple "<n>%" form so callers can omit the knob.
+_openrc_cpu_max_from_quota() {
+  local quota="$1" pct
+  pct="${quota%\%}"
+  [[ "$pct" == "$quota" || -z "$pct" ]] && return 1
+  [[ "$pct" =~ ^[0-9]+$ ]] || return 1
+  printf '%d %d' "$((pct * 1000))" 100000
+}
+
+# Convert the systemd-style memory sizes accepted by mt-admin into bytes for
+# direct cgroup v2 writes. Bash arithmetic is signed 64-bit, so reject inputs
+# that cannot be checked without overflow.
+_cgroup_memory_bytes() {
+  local raw="$1" number suffix multiplier bytes
+  [[ "$raw" =~ ^([0-9]+)([KkMmGgTt]?)$ ]] || return 1
+  number="${BASH_REMATCH[1]}"
+  suffix="${BASH_REMATCH[2]^^}"
+  while [[ "$number" == 0* && ${#number} -gt 1 ]]; do
+    number="${number#0}"
+  done
+  [[ ${#number} -le 18 ]] || return 1
+  number=$((10#$number))
+  (( number > 0 )) || return 1
+  case "$suffix" in
+    "") multiplier=1 ;;
+    K) multiplier=1024 ;;
+    M) multiplier=$((1024 * 1024)) ;;
+    G) multiplier=$((1024 * 1024 * 1024)) ;;
+    T) multiplier=$((1024 * 1024 * 1024 * 1024)) ;;
+    *) return 1 ;;
+  esac
+  (( number <= 9223372036854775807 / multiplier )) || return 1
+  bytes=$((number * multiplier))
+  printf '%d\n' "$bytes"
+}
+
+# Kept behind a function so fixture tests can supply an inert hierarchy without
+# making a root-run production command honor an environment-controlled path.
+_openrc_cgroup_root() {
+  printf '/sys/fs/cgroup\n'
+}
+
+# Portable cgroup v2 availability probe for the operator build path (work item
+# #54). A writable root is insufficient: memory must be available and either
+# delegated already or writable in cgroup.subtree_control.
+_openrc_build_cgroup_supported() {
+  local root
+  root="$(_openrc_cgroup_root)"
+  [[ -d "$root" && -w "$root" ]] || return 1
+  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || return 1
+  [[ -r "$root/cgroup.controllers" ]] || return 1
+  grep -qw memory "$root/cgroup.controllers" || return 1
+  [[ -r "$root/cgroup.subtree_control" ]] || return 1
+  grep -qw memory "$root/cgroup.subtree_control" \
+    || [[ -w "$root/cgroup.subtree_control" ]]
+}
+
+_openrc_build_memory_controller_ready() {
+  local root="$1"
+  [[ -r "$root/cgroup.controllers" ]] || return 1
+  grep -qw memory "$root/cgroup.controllers" || return 1
+  [[ -r "$root/cgroup.subtree_control" ]] || return 1
+  if ! grep -qw memory "$root/cgroup.subtree_control"; then
+    [[ -w "$root/cgroup.subtree_control" ]] || return 1
+    printf '+memory' >"$root/cgroup.subtree_control" 2>/dev/null || return 1
+  fi
+  grep -qw memory "$root/cgroup.subtree_control"
+}
+
+_openrc_build_cgroup_set_memory_limits() {
+  local cg="$1" high max knob expected path actual
+  high="$(_cgroup_memory_bytes "$BUILD_MEMORY_HIGH")" || {
+    say "invalid build memory.high value: $BUILD_MEMORY_HIGH" >&2
+    return 1
+  }
+  max="$(_cgroup_memory_bytes "$BUILD_MEMORY_MAX")" || {
+    say "invalid build memory.max value: $BUILD_MEMORY_MAX" >&2
+    return 1
+  }
+  if (( high > max )); then
+    say "build memory.high exceeds memory.max" >&2
+    return 1
+  fi
+  for knob in memory.high memory.max; do
+    case "$knob" in
+      memory.high) expected="$high" ;;
+      memory.max) expected="$max" ;;
+    esac
+    path="$cg/$knob"
+    [[ -f "$path" && ! -L "$path" && -w "$path" ]] || {
+      say "build cgroup missing writable $knob" >&2
+      return 1
+    }
+    printf '%s' "$expected" >"$path" 2>/dev/null || {
+      say "failed to set build cgroup $knob" >&2
+      return 1
+    }
+    actual="$(<"$path")"
+    [[ "$actual" =~ ^[0-9]+$ && "$actual" == "$expected" ]] || {
+      say "build cgroup $knob readback mismatch" >&2
+      return 1
+    }
+  done
+}
+
+_openrc_cgroup_kill_all() {
+  printf '1' >"$1/cgroup.kill" 2>/dev/null
+}
+
+# Reap whatever still lives in a build cgroup and remove the directory.
+# Best-effort: a still-populated cgroup survives rmdir and is retried by the
+# next build's stale-cgroup cleanup.
+_openrc_build_cgroup_cleanup() {
+  local cg="$1" pid
+  [[ -d "$cg" ]] || return 0
+  if [[ -w "$cg/cgroup.kill" ]] && _openrc_cgroup_kill_all "$cg"; then
+    # kernel 5.14+: SIGKILL every member atomically
+    :
+  elif [[ -r "$cg/cgroup.procs" ]]; then
+    while read -r pid; do
+      kill -KILL "$pid" 2>/dev/null || true
+    done <"$cg/cgroup.procs"
+  fi
+  local tries=0
+  while [[ -d "$cg" ]] && (( tries < 10 )); do
+    rmdir "$cg" 2>/dev/null && break
+    sleep 0.2
+    tries=$((tries + 1))
+  done
+  [[ ! -d "$cg" ]]
+}
+
+# Run one tenant build inside a temporary, tenant-delegated cgroup v2
+# directory with the BUILD_* memory ceilings — the OpenRC-portable equivalent
+# of the systemd BUILD_SLICE scope (work item #54). The setup-complete flag lets
+# the caller distinguish setup failure from every possible build exit status.
+_run_tenant_build_cgroup() {
+  local name="$1" build_cmd="$2"
+  local root cg uid
+  _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
+  root="$(_openrc_cgroup_root)"
+  cg="$root/lunarwing-build-$name"
+  uid="$(id -u "$name")"
+  if [[ -e "$cg" ]]; then
+    # Stale cgroup from an interrupted run: reap it before reusing the name.
+    _openrc_build_cgroup_cleanup "$cg" || return 1
+  fi
+  if ! _openrc_build_memory_controller_ready "$root"; then
+    say "memory controller is unavailable for $name build cgroup" >&2
+    return 1
+  fi
+  mkdir "$cg" || return 1
+  if ! _openrc_build_cgroup_set_memory_limits "$cg"; then
+    _openrc_build_cgroup_cleanup "$cg" || true
+    return 1
+  fi
+  # Delegate the cgroup to the tenant so its build shell can move itself in.
+  if ! chown "$uid:$uid" "$cg" "$cg/cgroup.procs" 2>/dev/null \
+    || ! sudo -u "$name" test -w "$cg/cgroup.procs"; then
+    _openrc_build_cgroup_cleanup "$cg" || true
+    return 1
+  fi
+  _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
+  local rc=0
+  sudo -u "$name" bash -c '
+    printf "%s" "$$" >"$1/cgroup.procs" || exit 125
+    exec nice -n 10 bash -c "$2"
+  ' _ "$cg" "$build_cmd" || rc=$?
+  if ! _openrc_build_cgroup_cleanup "$cg"; then
+    say "WARNING: could not clean up build cgroup $cg" >&2
+    (( rc != 0 )) || rc=1
+  fi
+  return "$rc"
+}
+
 # Run one tenant build step with resource bounding (BUG-005). On systemd the
 # step runs as a transient scope in BUILD_SLICE via the tenant's own user
 # manager, so cargo/rustc memory is capped and accounted outside both the
-# operator's session and the daemon service. Falls back to a plain nice'd
-# invocation when no user manager is reachable (OpenRC, or not yet started).
+# operator's session and the daemon service. On other init systems a
+# temporary cgroup v2 directory provides the same ceilings (work item #54).
+# Falls back to a plain nice'd invocation only when neither mechanism can be
+# set up, so a missing cgroup delegation never breaks the build.
 _run_tenant_build() {
   local name="$1" build_cmd="$2"
   local uid
@@ -2509,9 +2688,20 @@ _run_tenant_build() {
       --property="MemoryHigh=$BUILD_MEMORY_HIGH" \
       --property="MemoryMax=$BUILD_MEMORY_MAX" \
       bash -c "$build_cmd"
-  else
-    sudo -u "$name" nice -n 10 bash -c "$build_cmd"
+    return
   fi
+  if [[ "$INIT_SYSTEM" != systemd* ]]; then
+    if _openrc_build_cgroup_supported; then
+      local rc=0
+      _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
+      _run_tenant_build_cgroup "$name" "$build_cmd" || rc=$?
+      if [[ "$_OPENRC_BUILD_CGROUP_SETUP_COMPLETE" == true ]]; then
+        return "$rc"
+      fi
+    fi
+    say "cgroup v2 bounding unavailable for $name build; running nice-only" >&2
+  fi
+  sudo -u "$name" nice -n 10 bash -c "$build_cmd"
 }
 
 build_tenant() {
@@ -9121,6 +9311,131 @@ install_openrc_env_exec() {
     || die "OpenRC tenant env launcher must be root:root, single-link mode 0755"
 }
 
+_render_openrc_lunarwing_confd() {
+  local name="$1" dependencies="$2"
+  local path begin end header tmp begin_count end_count first second
+  local links mode owner group dir_mode dir_owner dir_group
+  path="$OPENRC_CONFD_DIR/lunarwing-$name"
+  begin="# BEGIN lunarwing-mt-admin managed dependencies"
+  end="# END lunarwing-mt-admin managed dependencies"
+  header="# Auto-generated by lunarwing-mt-admin.sh for tenant: $name"
+
+  [[ -d "$OPENRC_CONFD_DIR" && ! -L "$OPENRC_CONFD_DIR" ]] \
+    || die "unsafe OpenRC conf.d directory: $OPENRC_CONFD_DIR"
+  dir_mode="$(stat -c %a "$OPENRC_CONFD_DIR" 2>/dev/null || true)"
+  dir_owner="$(stat -c %u "$OPENRC_CONFD_DIR" 2>/dev/null || true)"
+  dir_group="$(stat -c %g "$OPENRC_CONFD_DIR" 2>/dev/null || true)"
+  [[ "$dir_mode" =~ ^[0-7]+$ && "$dir_owner" =~ ^[0-9]+$ && "$dir_group" =~ ^[0-9]+$ ]] \
+    || die "cannot validate OpenRC conf.d directory metadata: $OPENRC_CONFD_DIR"
+  (( (8#$dir_mode & 022) == 0 )) || die "unsafe writable OpenRC conf.d directory: $OPENRC_CONFD_DIR"
+  [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] \
+    || die "refusing to replace non-regular OpenRC conf.d file: $path"
+  if [[ -e "$path" ]]; then
+    links="$(stat -c %h "$path" 2>/dev/null || true)"
+    mode="$(stat -c %a "$path" 2>/dev/null || true)"
+    owner="$(stat -c %u "$path" 2>/dev/null || true)"
+    group="$(stat -c %g "$path" 2>/dev/null || true)"
+    [[ "$links" == 1 && "$mode" =~ ^[0-7]+$ && "$group" =~ ^[0-9]+$ \
+      && "$owner" == "$dir_owner" ]] \
+      || die "unsafe OpenRC conf.d ownership, link count, or mode: $path"
+    (( (8#$mode & 022) == 0 )) || die "unsafe writable OpenRC conf.d mode: $path"
+  fi
+
+  tmp="$(mktemp "$OPENRC_CONFD_DIR/.lunarwing-$name.confd.XXXXXX")"
+  if [[ ! -e "$path" ]]; then
+    cat >"$tmp" <<CONFD
+$header
+$begin
+lunarwing_rc_need="$dependencies"
+$end
+
+# BUG-005 / work item #54: agent-spawned shell/compile workloads are isolated
+# into their own process group and reaped on timeout/cancel by the daemon
+# itself (see ic/src/tools/process.rs), so runaway trees cannot leak on any
+# init system. Hard cgroup v2 ceilings (memory.high/memory.max/cpu.max/
+# pids.max) are composed into the init script's rc_cgroup_settings; OpenRC has
+# no transient scopes, so the daemon and its workloads share one cgroup and
+# the defaults use the workload outer bounds. Tune per tenant here, e.g.:
+#lunarwing_cgroup_memory_max="12G"
+#lunarwing_cgroup_cpu_max="400000 100000"
+#lunarwing_cgroup_pids_max="4096"
+#lunarwing_cgroup_limits_enabled="false"   # emergency opt-out
+# K/M/G/T memory suffixes use powers of 1024 and are converted to bytes before
+# OpenRC writes cgroup files. On cgroup v2 hosts, startup fails if OpenRC skips
+# a configured knob; use the explicit opt-out only for emergency recovery.
+# Optional process-level fallback cap (works on any host):
+#rc_ulimit="-v 8388608"
+CONFD
+  else
+    begin_count="$(grep -Fxc -- "$begin" "$path" 2>/dev/null || true)"
+    end_count="$(grep -Fxc -- "$end" "$path" 2>/dev/null || true)"
+    if [[ "$begin_count" == 1 && "$end_count" == 1 ]]; then
+      if ! awk -v begin="$begin" -v end="$end" -v dependencies="$dependencies" '
+        $0 == begin {
+          if (seen || inside) exit 42
+          print begin
+          print "lunarwing_rc_need=\"" dependencies "\""
+          print end
+          seen = 1
+          inside = 1
+          next
+        }
+        $0 == end {
+          if (!inside) exit 43
+          inside = 0
+          next
+        }
+        inside { next }
+        /^lunarwing_rc_need=/ { exit 44 }
+        { print }
+        END { if (inside || seen != 1) exit 45 }
+      ' "$path" >"$tmp"; then
+        rm -f -- "$tmp"
+        die "malformed managed dependency block in $path"
+      fi
+    elif [[ "$begin_count" == 0 && "$end_count" == 0 ]]; then
+      first="$(sed -n '1p' "$path")"
+      second="$(sed -n '2p' "$path")"
+      if [[ "$first" == "$header" && "$second" == lunarwing_rc_need=* ]]; then
+        {
+          printf '%s\n%s\nlunarwing_rc_need="%s"\n%s\n' \
+            "$header" "$begin" "$dependencies" "$end"
+          sed -n '3,$p' "$path"
+        } >"$tmp"
+      else
+        if grep -q '^lunarwing_rc_need=' "$path"; then
+          rm -f -- "$tmp"
+          die "refusing to replace unmanaged lunarwing_rc_need in $path"
+        fi
+        {
+          printf '%s\nlunarwing_rc_need="%s"\n%s\n\n' \
+            "$begin" "$dependencies" "$end"
+          cat "$path"
+        } >"$tmp"
+      fi
+    else
+      rm -f -- "$tmp"
+      die "malformed managed dependency block in $path"
+    fi
+  fi
+
+  if [[ -e "$path" ]]; then
+    if ! chmod --reference="$path" "$tmp" || ! chown --reference="$path" "$tmp"; then
+      rm -f -- "$tmp"
+      die "failed to preserve OpenRC conf.d metadata: $path"
+    fi
+  else
+    if ! chmod 0644 "$tmp" || ! chown --reference="$OPENRC_CONFD_DIR" "$tmp"; then
+      rm -f -- "$tmp"
+      die "failed to set OpenRC conf.d metadata: $path"
+    fi
+  fi
+  mv -T -- "$tmp" "$path" || {
+    rm -f -- "$tmp"
+    die "failed to install OpenRC conf.d file: $path"
+  }
+}
+
 render_tenant_openrc_units() {
   local name="$1"
   local repo env_dir state_dir log_dir run_dir
@@ -9252,6 +9567,12 @@ INITEOF
   render_container_babysitter_unit "$name" pg "$pg_container" "$pg_uid" "$pg_home"
 
   # ── Main daemon init script ──
+  # Work item #54: convert the workload CPU quota for rc_cgroup_settings.
+  # Empty when WORKLOAD_CPU_QUOTA is not a plain "<n>%" — the cpu.max knob is
+  # then skipped while memory/pids ceilings still apply.
+  local openrc_cpu_max
+  openrc_cpu_max="$(_openrc_cpu_max_from_quota "$WORKLOAD_CPU_QUOTA" || true)"
+
   cat >"$OPENRC_INITD_DIR/lunarwing-${name}" <<INITEOF
 #!/sbin/openrc-run
 
@@ -9276,6 +9597,175 @@ description="LunarWing AI assistant ($name)"
 : "\${lunarwing_respawn_period:=60}"
 : "\${lunarwing_retry:=SIGTERM/30/KILL/5}"
 
+# Work item #54: hard cgroup v2 ceilings — the OpenRC equivalent of the
+# systemd daemon-unit caps plus lunarwing-workloads.slice (BUG-005). OpenRC
+# has no transient scopes, so the daemon and its agent-spawned workloads share
+# this one service cgroup; the defaults are therefore the workload outer
+# bounds, not the smaller daemon-only caps. Legacy/cgroup-less hosts retain the
+# portable process-tree fallback. On cgroup v2, start_pre verifies every
+# configured effective value and fails startup if OpenRC skipped a controller.
+# The stop wrapper supplies cleanup parity even on OpenRC releases affected by
+# upstream issue #910 and still runs when supervise-daemon stop reports failure.
+: "\${lunarwing_cgroup_limits_enabled:=true}"
+: "\${lunarwing_cgroup_memory_high:=$WORKLOAD_MEMORY_HIGH}"
+: "\${lunarwing_cgroup_memory_max:=$WORKLOAD_MEMORY_MAX}"
+: "\${lunarwing_cgroup_cpu_max:=$openrc_cpu_max}"
+: "\${lunarwing_cgroup_pids_max:=$WORKLOAD_TASKS_MAX}"
+
+_lunarwing_cgroup_memory_bytes() {
+    _lw_raw="\$1"
+    case "\${_lw_raw}" in
+        *[Kk]) _lw_number="\${_lw_raw%?}"; _lw_multiplier=1024; _lw_max=9007199254740991 ;;
+        *[Mm]) _lw_number="\${_lw_raw%?}"; _lw_multiplier=1048576; _lw_max=8796093022207 ;;
+        *[Gg]) _lw_number="\${_lw_raw%?}"; _lw_multiplier=1073741824; _lw_max=8589934591 ;;
+        *[Tt]) _lw_number="\${_lw_raw%?}"; _lw_multiplier=1099511627776; _lw_max=8388607 ;;
+        *)     _lw_number="\${_lw_raw}"; _lw_multiplier=1; _lw_max=999999999999999999 ;;
+    esac
+    case "\${_lw_number}" in
+        ""|*[!0-9]*) return 1 ;;
+    esac
+    while [ "\${_lw_number#0}" != "\${_lw_number}" ] && [ "\${#_lw_number}" -gt 1 ]; do
+        _lw_number="\${_lw_number#0}"
+    done
+    [ "\${_lw_number}" -gt 0 ] 2>/dev/null || return 1
+    [ "\${#_lw_number}" -le "\${#_lw_max}" ] || return 1
+    [ "\${_lw_number}" -le "\${_lw_max}" ] 2>/dev/null || return 1
+    printf '%s\n' "\$((_lw_number * _lw_multiplier))"
+}
+
+rc_cgroup_cleanup="YES"
+rc_cgroup_settings=""
+_lw_cgroup_config_error=""
+if yesno "\${lunarwing_cgroup_limits_enabled}"; then
+    if ! _lw_memory_high="\$(_lunarwing_cgroup_memory_bytes "\${lunarwing_cgroup_memory_high}")"; then
+        _lw_cgroup_config_error="invalid lunarwing_cgroup_memory_high: \${lunarwing_cgroup_memory_high}"
+    elif ! _lw_memory_max="\$(_lunarwing_cgroup_memory_bytes "\${lunarwing_cgroup_memory_max}")"; then
+        _lw_cgroup_config_error="invalid lunarwing_cgroup_memory_max: \${lunarwing_cgroup_memory_max}"
+    elif [ "\${_lw_memory_high}" -gt "\${_lw_memory_max}" ]; then
+        _lw_cgroup_config_error="lunarwing_cgroup_memory_high exceeds lunarwing_cgroup_memory_max"
+    else
+        rc_cgroup_settings="
+memory.high \${_lw_memory_high}
+memory.max \${_lw_memory_max}
+cpu.max \${lunarwing_cgroup_cpu_max}
+pids.max \${lunarwing_cgroup_pids_max}
+"
+    fi
+fi
+
+_lunarwing_service_cgroup_path() {
+    _lw_root="\${1:-/sys/fs/cgroup}"
+    for _lw_candidate in \
+        "\${_lw_root}/openrc.\${RC_SVCNAME}" \
+        "\${_lw_root}/unified/openrc.\${RC_SVCNAME}"
+    do
+        if [ -d "\${_lw_candidate}" ]; then
+            printf '%s\n' "\${_lw_candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_lunarwing_cgroup_value_matches() {
+    _lw_cg="\$1"
+    _lw_knob="\$2"
+    _lw_expected="\$3"
+    [ -n "\${_lw_expected}" ] || {
+        eerror "LunarWing service cgroup value is empty: \${_lw_knob}"
+        return 1
+    }
+    [ -r "\${_lw_cg}/\${_lw_knob}" ] || {
+        eerror "LunarWing service cgroup missing \${_lw_knob}: \${_lw_cg}"
+        return 1
+    }
+    _lw_actual="\$(cat "\${_lw_cg}/\${_lw_knob}")"
+    [ "\${_lw_actual}" = "\${_lw_expected}" ] || {
+        eerror "LunarWing service cgroup \${_lw_knob} mismatch: expected \${_lw_expected}, got \${_lw_actual}"
+        return 1
+    }
+}
+
+_lunarwing_validate_service_cgroup() {
+    _lw_root="\${1:-/sys/fs/cgroup}"
+    # Preserve legacy/cgroup-less startup. On a cgroup v2 host, enabled limits
+    # are fail-closed so OpenRC cannot silently skip a missing controller.
+    if [ ! -r "\${_lw_root}/cgroup.controllers" ] \
+        && [ ! -r "\${_lw_root}/unified/cgroup.controllers" ]; then
+        return 0
+    fi
+    _lw_cg="\$(_lunarwing_service_cgroup_path "\${_lw_root}")" || {
+        eerror "OpenRC did not create LunarWing service cgroup for \${RC_SVCNAME}"
+        return 1
+    }
+    _lunarwing_cgroup_value_matches "\${_lw_cg}" memory.high "\${_lw_memory_high}" || return 1
+    _lunarwing_cgroup_value_matches "\${_lw_cg}" memory.max "\${_lw_memory_max}" || return 1
+    if [ -n "\${lunarwing_cgroup_cpu_max}" ]; then
+        _lunarwing_cgroup_value_matches "\${_lw_cg}" cpu.max "\${lunarwing_cgroup_cpu_max}" || return 1
+    fi
+    _lunarwing_cgroup_value_matches "\${_lw_cg}" pids.max "\${lunarwing_cgroup_pids_max}"
+}
+
+_lunarwing_cgroup_has_other_members() {
+    _lw_cg="\$1"
+    while IFS= read -r _lw_pid; do
+        [ -n "\${_lw_pid}" ] || continue
+        [ "\${_lw_pid}" = "\$\$" ] || return 0
+    done <"\${_lw_cg}/cgroup.procs"
+    return 1
+}
+
+_lunarwing_service_cgroup_cleanup() {
+    _LUNARWING_CGROUP_CLEANUP_HANDLED=false
+    _lw_root="\${1:-/sys/fs/cgroup}"
+    _lw_cg="\$(_lunarwing_service_cgroup_path "\${_lw_root}")" || return 0
+    _lw_parent="\${_lw_cg%/openrc.*}"
+    [ -r "\${_lw_cg}/cgroup.procs" ] || {
+        ewarn "cannot inspect LunarWing service cgroup: \${_lw_cg}"
+        return 1
+    }
+
+    # Move this openrc-run process out before using cgroup.kill; otherwise the
+    # cleanup syscall would kill its own stop transaction.
+    if [ -w "\${_lw_parent}/cgroup.procs" ] && [ -w "\${_lw_cg}/cgroup.kill" ] \
+        && printf '%s' "\$\$" >"\${_lw_parent}/cgroup.procs" 2>/dev/null \
+        && printf '1' >"\${_lw_cg}/cgroup.kill" 2>/dev/null \
+        && ! _lunarwing_cgroup_has_other_members "\${_lw_cg}"; then
+        _LUNARWING_CGROUP_CLEANUP_HANDLED=true
+        return 0
+    fi
+
+    _lw_tries=0
+    while _lunarwing_cgroup_has_other_members "\${_lw_cg}"; do
+        if [ "\${_lw_tries}" -ge 5 ]; then
+            ewarn "leftover processes survived LunarWing cgroup cleanup: \${_lw_cg}"
+            return 1
+        fi
+        while IFS= read -r _lw_pid; do
+            [ -n "\${_lw_pid}" ] || continue
+            [ "\${_lw_pid}" = "\$\$" ] && continue
+            kill -KILL "\${_lw_pid}" 2>/dev/null || true
+        done <"\${_lw_cg}/cgroup.procs"
+        _lw_tries=\$((_lw_tries + 1))
+        sleep 1
+    done
+    _LUNARWING_CGROUP_CLEANUP_HANDLED=true
+}
+
+stop() {
+    _lw_stop_rc=0
+    _lw_cleanup_rc=0
+    default_stop || _lw_stop_rc=\$?
+    _lunarwing_service_cgroup_cleanup || _lw_cleanup_rc=\$?
+    # Our compatibility path handled v2. Leave native cleanup enabled for v1
+    # or hosts where no v2 service cgroup was present.
+    if [ "\${_LUNARWING_CGROUP_CLEANUP_HANDLED}" = true ]; then
+        rc_cgroup_cleanup="NO"
+    fi
+    [ "\${_lw_cleanup_rc}" -eq 0 ] || return "\${_lw_cleanup_rc}"
+    return "\${_lw_stop_rc}"
+}
+
 command="\${lunarwing_openrc_env_exec}"
 command_args="--env-file \${lunarwing_env_file} -- \${lunarwing_command} \${lunarwing_args}"
 command_user="\${lunarwing_user}:\${lunarwing_group}"
@@ -9298,6 +9788,13 @@ depend() {
 }
 
 start_pre() {
+    if [ -n "\${_lw_cgroup_config_error}" ]; then
+        eerror "\${_lw_cgroup_config_error}"
+        return 1
+    fi
+    if yesno "\${lunarwing_cgroup_limits_enabled}"; then
+        _lunarwing_validate_service_cgroup || return 1
+    fi
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_state_dir}"
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_log_dir}"
     checkpath -d -m 0750 -o "\${lunarwing_user}:\${lunarwing_group}" "\${lunarwing_runtime_dir}"
@@ -9618,18 +10115,8 @@ INITEOF
   if [[ "$weechat_enabled" == "true" ]]; then
     weechat_rc_need=" lunarwing-weechat-${name} lunarwing-weechat-adapter-${name}"
   fi
-  cat >"$OPENRC_CONFD_DIR/lunarwing-${name}" <<CONFD
-# Auto-generated by lunarwing-mt-admin.sh for tenant: $name
-lunarwing_rc_need="xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
-
-# BUG-005 note: agent-spawned shell/compile workloads are isolated into their
-# own process group and reaped on timeout/cancel by the daemon itself (see
-# ic/src/tools/process.rs), so runaway trees cannot leak on any init system.
-# Hard cgroup memory/CPU caps for those workloads are currently applied only
-# on systemd hosts (lunarwing-workloads.slice); OpenRC has no equivalent
-# transient-scope mechanism. Optional process-level caps can be added here:
-#rc_ulimit="-v 8388608"
-CONFD
+  _render_openrc_lunarwing_confd "$name" \
+    "xmpp-bridge-${name}${proxy_rc_need}${weechat_rc_need}${darkirc_rc_need}"
 
   cat >"$OPENRC_CONFD_DIR/xmpp-bridge-${name}" <<CONFD
 # Auto-generated by lunarwing-mt-admin.sh for tenant: $name
@@ -9729,35 +10216,46 @@ start_tenant_openrc() {
   say "enabled boot persistence (default runlevel) for $name's running services"
 }
 
+_openrc_stop_service() {
+  local service="$1"
+  if rc-service "$service" stop; then
+    return 0
+  fi
+  say "failed to stop OpenRC service $service"
+  return 1
+}
+
+_openrc_stop_service_if_installed() {
+  local service="$1"
+  [[ -f "$OPENRC_INITD_DIR/$service" && ! -L "$OPENRC_INITD_DIR/$service" ]] || return 0
+  _openrc_stop_service "$service"
+}
+
 stop_tenant_openrc() {
   local name="$1"
-  rc-service "lunarwing-${name}" stop 2>/dev/null || true
-  rc-service "xmpp-bridge-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-proxy-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-weechat-adapter-${name}" stop 2>/dev/null || true
-  if rc-service "lunarwing-weechat-${name}" status >/dev/null 2>&1; then
-    if ! rc-service "lunarwing-weechat-${name}" stop; then
-      say "failed to stop lunarwing-weechat-${name}; refusing to continue"
-      return 1
-    fi
-  fi
+  local stop_failed=false worker
+  _openrc_stop_service "lunarwing-${name}" || stop_failed=true
+  _openrc_stop_service "xmpp-bridge-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-proxy-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-weechat-adapter-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-weechat-${name}" || stop_failed=true
   if tenant_darkirc_enabled "$name"; then
-    rc-service "lunarwing-darkirc-adapter-${name}" stop \
-      || rc-service "lunarwing-darkirc-adapter-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
-      || die "failed to stop OpenRC service lunarwing-darkirc-adapter-${name}"
-    rc-service "lunarwing-darkirc-${name}" stop \
-      || rc-service "lunarwing-darkirc-${name}" status 2>&1 | grep -Eqi 'stopped|inactive|dead' \
-      || die "failed to stop OpenRC service lunarwing-darkirc-${name}"
+    _openrc_stop_service "lunarwing-darkirc-adapter-${name}" || stop_failed=true
+    _openrc_stop_service "lunarwing-darkirc-${name}" || stop_failed=true
   fi
   # Container babysitters must stop before their containers or they immediately respawn them.
   for worker in nanocode pebble opencode kimi vision voice; do
-    rc-service "lunarwing-${worker}-${name}-sup" stop 2>/dev/null || true
+    _openrc_stop_service_if_installed "lunarwing-${worker}-${name}-sup" || stop_failed=true
   done
-  rc-service "lunarwing-vision-${name}" stop 2>/dev/null || true
-  rc-service "lunarwing-voice-${name}" stop 2>/dev/null || true
+  _openrc_stop_service_if_installed "lunarwing-vision-${name}" || stop_failed=true
+  _openrc_stop_service_if_installed "lunarwing-voice-${name}" || stop_failed=true
   # Postgres last: the daemon depends on it, so it stops after its consumers.
-  rc-service "lunarwing-pg-${name}-sup" stop 2>/dev/null || true
-  rc-service "lunarwing-pg-${name}" stop 2>/dev/null || true
+  _openrc_stop_service_if_installed "lunarwing-pg-${name}-sup" || stop_failed=true
+  _openrc_stop_service "lunarwing-pg-${name}" || stop_failed=true
+  if [[ "$stop_failed" == true ]]; then
+    say "OpenRC tenant shutdown completed with service stop errors for $name"
+    return 1
+  fi
   say "OpenRC services stopped for $name"
 }
 

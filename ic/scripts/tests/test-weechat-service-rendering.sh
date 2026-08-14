@@ -350,6 +350,8 @@ fi
 
 echo "=== OpenRC tenant stop propagation ==="
 
+export OPENRC_INITD_DIR="$openrc_out"
+
 function rc-service {
   if [[ "$1" == "lunarwing-weechat-render-test" && "$2" == "status" ]]; then
     return 0
@@ -357,7 +359,7 @@ function rc-service {
   if [[ "$1" == "lunarwing-weechat-render-test" && "$2" == "stop" ]]; then
     return 1
   fi
-  return 1
+  return 0
 }
 
 if stop_tenant_openrc "render-test" >/dev/null 2>&1; then

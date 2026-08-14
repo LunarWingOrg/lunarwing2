@@ -25,3 +25,21 @@ lunarwing_rust_log="lunarwing=info"
 # Optional OpenRC dependency wiring.
 # Set this when the companion bridge is installed and should be started first.
 lunarwing_rc_need="xmpp-bridge"
+
+# Optional hard resource ceilings (cgroup v2, OpenRC unified mode).
+# The daemon and any agent-spawned workloads share one cgroup on OpenRC (no
+# transient scopes), so size these for the combined tree. OpenRC skips any
+# knob whose controller file is not delegated to the service, so these are
+# safe to leave in place on hosts without controllers. Direct cgroup memory
+# values are bytes; K/M/G/T suffix parsing belongs to systemd and is not done by
+# OpenRC. cpu.max uses the "quota period" form (800000 100000 == 8 CPUs).
+# Native cleanup requires an OpenRC package containing the issue #910 path fix.
+#rc_cgroup_cleanup="YES"
+#rc_cgroup_settings="
+#memory.high 6442450944
+#memory.max 8589934592
+#cpu.max 800000 100000
+#pids.max 2048
+#"
+# Process-level fallback cap that works on any host:
+#rc_ulimit="-v 8388608"
