@@ -442,6 +442,7 @@ if (
     shift 2
     "$@"
   }
+  chown() { :; } # syncdir delegation is a no-op for the fixture user
   _openrc_build_cgroup_cleanup() { rm -rf "$1"; }
   actual_rc=0
   _run_tenant_build_cgroup t1 "exit 2" || actual_rc=$?
@@ -468,20 +469,19 @@ if (
       : >"$target/memory.high"
       : >"$target/memory.max"
       : >"$target/cgroup.procs"
+      # Launcher-side placement into the build cgroup denied: an unwritable
+      # cgroup.procs makes the privileged write fail before the gated wrapper
+      # is released, so the build may only run through the nice fallback.
+      chmod 0444 "$target/cgroup.procs"
     fi
   }
   sudo() {
     [[ "$1" == -u ]] || return 1
     shift 2
-    if [[ "${1:-}" == bash && "${2:-}" == -c ]]; then
-      # Tenant self-migration into the delegated cgroup denied by the kernel's
-      # common-ancestor rule: the wrapper exits 125 before the build ever runs.
-      echo "SUDO cgroup-wrapper DENIED" >>"$CAPTURE"
-      return 125
-    fi
     echo "SUDO $*" >>"$CAPTURE"
     "$@"
   }
+  chown() { :; } # syncdir delegation is a no-op for the fixture user
   _openrc_build_cgroup_cleanup() { rm -rf "$1"; }
   export CAPTURE
   : >"$CAPTURE"
@@ -489,13 +489,14 @@ if (
   _run_tenant_build t1 'echo FALLBACK-RAN >>"$CAPTURE"' || denied_rc=$?
   [[ "$denied_rc" == 0 ]]
   [[ "${_OPENRC_BUILD_CGROUP_SETUP_COMPLETE:-unset}" == false ]]
-  grep -qF 'SUDO cgroup-wrapper DENIED' "$CAPTURE"
-  grep -qF 'FALLBACK-RAN' "$CAPTURE"
+  # The gated wrapper is killed before exec, so the build command runs exactly
+  # once, through the nice-only fallback.
+  [[ "$(grep -cF 'FALLBACK-RAN' "$CAPTURE")" == 1 ]]
   grep -qF 'nice -n 10' "$CAPTURE"
 ); then
-  echo "  PASS: cgroup self-migration denial falls back to nice build"
+  echo "  PASS: cgroup placement denial falls back to nice build"
 else
-  echo "  FAIL: cgroup self-migration denial fallback"
+  echo "  FAIL: cgroup placement denial fallback"
   failures=$((failures + 1))
 fi
 

@@ -2654,7 +2654,7 @@ _openrc_build_cgroup_run() {
     tries=$((tries + 1))
   done
   if [[ "$pid" =~ ^[0-9]+$ ]] \
-    && printf '%s\n' "$pid" >"$cg/cgroup.procs" 2>/dev/null \
+    && printf '%s\n' "$pid" 2>/dev/null >"$cg/cgroup.procs" \
     && grep -qx "$pid" "$cg/cgroup.procs"; then
     _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
     : >"$syncdir/gate" # release the wrapper into the bounded exec
