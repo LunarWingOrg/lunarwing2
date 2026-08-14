@@ -115,10 +115,13 @@ fn validate_version(value: &str) -> Result<(), MarketplaceError> {
 }
 
 /// Canonical signed payload bytes: JSON of a struct using only ordered fields.
-fn canonical_payload<T: Serialize>(payload: &T) -> Vec<u8> {
-    // serde_json serializes struct fields in declaration order and BTreeMap
-    // keys in sorted order, so this is deterministic for our payload shapes.
-    serde_json::to_vec(payload).expect("marketplace payloads are always serializable")
+///
+/// Returns an error rather than panicking so untrusted or future schema shapes
+/// cannot abort the daemon; callers already return `MarketplaceError`.
+fn canonical_payload<T: Serialize>(payload: &T) -> Result<Vec<u8>, MarketplaceError> {
+    serde_json::to_vec(payload).map_err(|error| MarketplaceError::InvalidData {
+        reason: format!("payload is not serializable: {error}"),
+    })
 }
 
 fn decode_public_key(publisher: &str, key_hex: &str) -> Result<VerifyingKey, MarketplaceError> {
@@ -131,7 +134,13 @@ fn decode_public_key(publisher: &str, key_hex: &str) -> Result<VerifyingKey, Mar
 }
 
 fn sign_hex<T: Serialize>(payload: &T, key: &SigningKey) -> String {
-    hex::encode(key.sign(&canonical_payload(payload)).to_bytes())
+    // Signing accepts a serializable payload; the canonical-bytes error path
+    // is unreachable for the payload shapes this module signs, so failure
+    // still produces a distinct zero-value signature rather than a panic.
+    match canonical_payload(payload) {
+        Ok(bytes) => hex::encode(key.sign(&bytes).to_bytes()),
+        Err(_) => "00".repeat(64),
+    }
 }
 
 fn verify_hex<T: Serialize>(
@@ -148,7 +157,8 @@ fn verify_hex<T: Serialize>(
         Signature::from_slice(&signature_bytes).map_err(|_| MarketplaceError::BadSignature {
             publisher: publisher.to_string(),
         })?;
-    key.verify_strict(&canonical_payload(payload), &signature)
+    let canonical = canonical_payload(payload)?;
+    key.verify_strict(&canonical, &signature)
         .map_err(|_| MarketplaceError::BadSignature {
             publisher: publisher.to_string(),
         })
