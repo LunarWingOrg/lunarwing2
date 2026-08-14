@@ -203,7 +203,6 @@ command chmod 0640 "$daemon_confd"
 unset -f chmod
 _render_openrc_lunarwing_confd t1 "xmpp-bridge-t1"
 assert_eq "OpenRC conf.d preserves mode" "640" "$(stat -c %a "$daemon_confd")"
-chmod() { :; }
 
 export WORKLOAD_TASKS_MAX=2048
 export WORKLOAD_MEMORY_MAX=8G
