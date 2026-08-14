@@ -805,6 +805,7 @@ impl ToolUpdateTool {
                     Ok(McpServerConfig::new_unix(&existing.name, socket_path))
                 }
                 EffectiveTransport::Wasm { .. } => Ok(existing.clone()),
+                EffectiveTransport::External { .. } => Ok(existing.clone()),
                 EffectiveTransport::Gateway { .. } => {
                     let mut updated = existing.clone();
                     if let Some(url) = params

@@ -286,11 +286,42 @@ deferred rather than regressions in the delivered Part 2 runtime slices:
 - automatic npm/PyPI installation and arbitrary package-manager execution;
 - publisher signatures, signing trust roots, dependency locks, capability/upgrade
   diffs, and marketplace revocation distribution;
-- mandatory default sandbox profiles and device isolation;
-- bundled gateway control plane, cross-daemon HA, and centralized cross-tenant
+- ~~mandatory default sandbox profiles and device isolation~~;
+- ~~bundled gateway control plane~~, cross-daemon HA, and centralized cross-tenant
   credential ownership;
-- persistent external-worker MCP placement and a general dedicated-worker contract;
+- ~~persistent external-worker MCP placement~~ and a general dedicated-worker contract;
 - configurable per-server startup/request timeouts for every transport.
+
+**Update (2026-08-14, item #8 / `aj/kimi-8-20260814-1200`):** four deferrals are now
+implemented in `ic/src/tools/mcp/`:
+
+- **Publisher signatures, dependency locks, revocation distribution, upgrade diffs** —
+  `marketplace.rs`: ed25519 publisher signatures over canonical manifests, a trust
+  store, signed lockfiles that pin exact version+SHA-256 per dependency, signed
+  revocation lists with monotonic sequences and a `RevocationStore` that persists
+  atomically, refuses rollback/replay, fetches bounded updates over HTTPS, and
+  checks persisted provenance records (`check_provenance`).
+- **Mandatory sandbox profiles** — `McpSandboxConfig::default_profile()` plus
+  `McpServersFile::require_sandbox_profiles`, which rejects enabled host stdio
+  servers missing mandatory controls (legacy opt-in remains the default).
+- **Persistent external-worker placement** — `McpPlacement::ExternalWorker` with a
+  validated `external_worker` name, durable in the servers file; host and worker
+  factories fail closed since activation belongs to the named persistent worker.
+- **Bundled gateway control plane** — `gateway_control.rs`: a bearer-authenticated
+  admin API over a persisted route table plus a data plane that speaks the existing
+  routing-header contract, strips client routing headers, injects per-route upstream
+  credentials, and proxies with bounded bodies/timeouts.
+- **Generic external runtime descriptors** — `descriptor.rs` plus
+  `McpTransportConfig::External`: versioned descriptors register out-of-tree runtimes
+  without new core enum variants; activation spawns the descriptor's adapter over
+  MCP stdio with bounded options and at least the mandatory sandbox baseline when
+  the descriptor requires it.
+
+Still deferred: automatic npm/PyPI installation and arbitrary package-manager
+execution (blocked until provenance, locking, containment, audit, revocation,
+health, and rollback are jointly enforced end to end), cross-daemon gateway HA and
+centralized cross-tenant credential ownership, and per-server configurable
+startup/request timeouts for every transport.
 
 Automatic package installation must remain blocked until provenance, immutable locking,
 containment, audit, revocation, health, and rollback are jointly enforced.

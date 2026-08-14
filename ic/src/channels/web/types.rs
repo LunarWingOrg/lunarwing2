@@ -1052,6 +1052,7 @@ impl InstallExtensionRequest {
                 EffectiveTransport::Unix { .. } | EffectiveTransport::Wasm { .. } => {
                     existing.clone()
                 }
+                EffectiveTransport::External { .. } => existing.clone(),
                 EffectiveTransport::Gateway { .. } => {
                     let mut current = existing.clone();
                     if let Some(url) = self.url.as_deref().filter(|url| !url.is_empty()) {

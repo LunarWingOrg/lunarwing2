@@ -4,8 +4,11 @@
 //! compromised**. It complements package provenance (what code is this); it
 //! does not replace it. A sandboxed stdio child still runs as the LunarWing
 //! service account, but with reduced process, resource, filesystem, and
-//! network reach. Every restriction is opt-in per server and activation
-//! fails closed when a requested restriction is unavailable.
+//! network reach. Restrictions are configured per server and activation
+//! fails closed when a requested restriction is unavailable. Deployments can
+//! make a baseline profile mandatory: `McpServersFile::require_sandbox_profiles`
+//! rejects any host stdio server whose policy does not cover
+//! [`McpSandboxConfig::default_profile`]'s mandatory minimum.
 //!
 //! Portable restrictions (all unix):
 //! - `max_memory_mb`, `max_cpu_seconds`, `max_file_descriptors`,
@@ -166,6 +169,58 @@ impl McpSandboxConfig {
             parts.push("network-isolated".to_string());
         }
         parts.join(", ")
+    }
+
+    /// Documented hardened baseline for mandatory sandbox deployments.
+    ///
+    /// The baseline combines portable controls (process-group isolation, core
+    /// dumps disabled, resource caps) with the Linux privilege and ptrace
+    /// blocks. Operators can layer stricter limits on top; activation fails
+    /// closed when a requested control is unavailable on the host.
+    pub fn default_profile() -> Self {
+        Self {
+            max_memory_mb: Some(512),
+            max_cpu_seconds: None,
+            max_file_descriptors: Some(256),
+            max_processes: Some(64),
+            max_file_size_mb: None,
+            allow_core_dumps: false,
+            isolate_process_group: true,
+            no_new_privileges: true,
+            deny_ptrace: true,
+            read_only_root: false,
+            writable_paths: Vec::new(),
+            network_isolated: false,
+        }
+    }
+
+    /// Mandatory controls this policy does not request, as human-readable
+    /// names. An empty list means the policy satisfies the mandatory profile.
+    ///
+    /// The mandatory minimum is the privilege/containment invariant set:
+    /// process-group isolation, core dumps disabled, `no_new_privileges`, and
+    /// `deny_ptrace`. Resource caps stay operator-tunable and are not part of
+    /// the minimum.
+    pub fn missing_mandatory_controls(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if !self.isolate_process_group {
+            missing.push("isolate_process_group");
+        }
+        if self.allow_core_dumps {
+            missing.push("allow_core_dumps=false");
+        }
+        if !self.no_new_privileges {
+            missing.push("no_new_privileges");
+        }
+        if !self.deny_ptrace {
+            missing.push("deny_ptrace");
+        }
+        missing
+    }
+
+    /// Whether this policy requests every mandatory control.
+    pub fn meets_mandatory_profile(&self) -> bool {
+        self.missing_mandatory_controls().is_empty()
     }
 }
 
@@ -742,6 +797,28 @@ mod tests {
         config.validate().expect("default sandbox validates");
         assert!(!config.requires_linux());
         assert_eq!(config.describe(), "no-core-dumps");
+    }
+
+    #[test]
+    fn default_profile_meets_mandatory_minimum() {
+        let profile = McpSandboxConfig::default_profile();
+        profile.validate().expect("baseline profile validates");
+        assert!(profile.meets_mandatory_profile());
+        assert!(profile.requires_linux());
+        assert!(profile.describe().contains("no-new-privileges"));
+
+        // The opt-in default does not satisfy the mandatory profile.
+        let minimal = McpSandboxConfig::default();
+        let missing = minimal.missing_mandatory_controls();
+        assert!(missing.contains(&"isolate_process_group"));
+        assert!(missing.contains(&"no_new_privileges"));
+        assert!(missing.contains(&"deny_ptrace"));
+        assert!(!minimal.meets_mandatory_profile());
+
+        // Enabling core dumps breaks the mandatory profile.
+        let mut coredumps = McpSandboxConfig::default_profile();
+        coredumps.allow_core_dumps = true;
+        assert!(!coredumps.meets_mandatory_profile());
     }
 
     #[test]

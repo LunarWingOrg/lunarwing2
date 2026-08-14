@@ -80,13 +80,17 @@ pub async fn create_client_with_runtime_registry(
 }
 
 fn require_host_placement(server: &McpServerConfig) -> Result<(), McpFactoryError> {
-    if server.placement == McpPlacement::Host {
-        return Ok(());
+    match server.placement {
+        McpPlacement::Host => Ok(()),
+        McpPlacement::JobWorker => Err(McpFactoryError::InvalidConfig {
+            name: server.name.clone(),
+            reason: "host factory cannot activate a job-worker MCP server".to_string(),
+        }),
+        McpPlacement::ExternalWorker => Err(McpFactoryError::InvalidConfig {
+            name: server.name.clone(),
+            reason: "external-worker MCP servers are activated by the named persistent external worker, not the host factory".to_string(),
+        }),
     }
-    Err(McpFactoryError::InvalidConfig {
-        name: server.name.clone(),
-        reason: "host factory cannot activate a job-worker MCP server".to_string(),
-    })
 }
 
 fn require_worker_stdio_placement(server: &McpServerConfig) -> Result<(), McpFactoryError> {
@@ -134,12 +138,27 @@ fn validate_activation_config(server: &McpServerConfig) -> Result<(), McpFactory
 }
 
 fn default_runtime_registry() -> McpRuntimeRegistry {
+    runtime_registry_with_external_runtimes(Arc::new(
+        crate::tools::mcp::descriptor::ExternalRuntimeRegistry::new(),
+    ))
+}
+
+/// Build the built-in runtime registry with a populated external runtime
+/// descriptor registry. Composition roots that support out-of-tree MCP
+/// runtimes pass their descriptors here; the default registry registers none,
+/// so external transports fail closed with an unknown-runtime error.
+pub fn runtime_registry_with_external_runtimes(
+    external: Arc<crate::tools::mcp::descriptor::ExternalRuntimeRegistry>,
+) -> McpRuntimeRegistry {
     let adapters: Vec<Arc<dyn McpRuntimeAdapter>> = vec![
         Arc::new(HttpRuntimeAdapter),
         Arc::new(StdioRuntimeAdapter),
         Arc::new(UnixRuntimeAdapter),
         Arc::new(WasmRuntimeAdapter),
         Arc::new(GatewayRuntimeAdapter),
+        Arc::new(ExternalRuntimeAdapter {
+            descriptors: external,
+        }),
     ];
     McpRuntimeRegistry::new(adapters)
 }
@@ -215,6 +234,12 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
                 return Err(McpFactoryError::InvalidConfig {
                     name: server_name,
                     reason: "job-worker MCP runtime requires worker-scoped environment".to_string(),
+                });
+            }
+            (McpPlacement::ExternalWorker, _) => {
+                return Err(McpFactoryError::InvalidConfig {
+                    name: server_name,
+                    reason: "external-worker MCP servers are activated by the named persistent external worker, not the stdio runtime".to_string(),
                 });
             }
         };
@@ -412,6 +437,91 @@ fn runtime_mismatch(name: &str) -> McpFactoryError {
     McpFactoryError::InvalidConfig {
         name: name.to_string(),
         reason: "runtime adapter received a mismatched transport".to_string(),
+    }
+}
+
+struct ExternalRuntimeAdapter {
+    descriptors: Arc<crate::tools::mcp::descriptor::ExternalRuntimeRegistry>,
+}
+
+#[async_trait]
+impl McpRuntimeAdapter for ExternalRuntimeAdapter {
+    fn kind(&self) -> crate::tools::mcp::runtime::McpRuntimeKind {
+        crate::tools::mcp::runtime::McpRuntimeKind::External
+    }
+
+    /// Activate an out-of-tree runtime by spawning its descriptor's adapter
+    /// process as a stdio MCP server. The server entry's options JSON is
+    /// passed in `LUNARWING_MCP_EXTERNAL_OPTIONS`; descriptors that declare
+    /// `require_sandbox` get at least the mandatory baseline sandbox profile.
+    async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
+        use crate::tools::mcp::descriptor::EXTERNAL_OPTIONS_ENV;
+
+        let (server, context) = request.into_parts();
+        let server_name = server.name.clone();
+        let EffectiveTransport::External { runtime, options } = server.effective_transport() else {
+            return Err(runtime_mismatch(&server_name));
+        };
+        let external_error = |reason: String| McpFactoryError::External {
+            name: server_name.clone(),
+            reason,
+        };
+        let descriptor = self
+            .descriptors
+            .get(runtime)
+            .ok_or_else(|| {
+                external_error(format!(
+                    "no external runtime descriptor registered for '{runtime}'"
+                ))
+            })?
+            .clone();
+        let options_json =
+            serde_json::to_string(options).map_err(|error| external_error(error.to_string()))?;
+        if options_json.len() > crate::tools::mcp::descriptor::MAX_EXTERNAL_OPTIONS_BYTES {
+            return Err(external_error(format!(
+                "external runtime options exceed {} bytes",
+                crate::tools::mcp::descriptor::MAX_EXTERNAL_OPTIONS_BYTES
+            )));
+        }
+
+        let mut env = descriptor.env.clone();
+        env.insert(EXTERNAL_OPTIONS_ENV.to_string(), options_json);
+        let env_values = env
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()));
+
+        let default_sandbox;
+        let sandbox = match server.sandbox.as_ref() {
+            Some(sandbox) => Some(sandbox),
+            None if descriptor.require_sandbox => {
+                default_sandbox = crate::tools::mcp::sandbox::McpSandboxConfig::default_profile();
+                Some(&default_sandbox)
+            }
+            None => None,
+        };
+        let transport = context
+            .process_manager()
+            .spawn_stdio(
+                &server_name,
+                &descriptor.command,
+                descriptor.args.clone(),
+                env_values,
+                false,
+                sandbox,
+            )
+            .await
+            .map_err(|error| McpFactoryError::StdioSpawn {
+                name: server_name.clone(),
+                reason: error.to_string(),
+            })?;
+        Ok(McpClient::new_with_transport(
+            &server_name,
+            transport as Arc<dyn McpTransport>,
+            None,
+            context.secrets(),
+            context.user_id(),
+            Some(server),
+        ))
     }
 }
 

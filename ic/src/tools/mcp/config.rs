@@ -49,6 +49,11 @@ pub enum McpPlacement {
     Host,
     /// Run inside an isolated job worker.
     JobWorker,
+    /// Activated by a named persistent external worker speaking
+    /// `lunarwing-agent-v1` (see `external_worker`). Unlike job workers,
+    /// external workers are long-lived: the placement persists across daemon
+    /// restarts and jobs, and the server stays registered with the worker.
+    ExternalWorker,
 }
 
 /// Transport configuration for an MCP server.
@@ -88,6 +93,16 @@ pub enum McpTransportConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
     },
+    /// Out-of-tree runtime activated through a registered external runtime
+    /// descriptor (see `descriptor.rs`). The descriptor's adapter process is
+    /// spawned and bridges the foreign runtime to MCP over stdio.
+    External {
+        /// Runtime kind name registered in the external runtime registry.
+        runtime: String,
+        /// Opaque options handed to the adapter as JSON.
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        options: serde_json::Value,
+    },
 }
 
 const fn default_wasm_memory_mb() -> u64 {
@@ -118,6 +133,12 @@ pub struct McpServerConfig {
     /// Runtime placement responsible for activating this server.
     #[serde(default)]
     pub placement: McpPlacement,
+
+    /// Name of the persistent external worker (from the orchestrator's
+    /// `external_workers` configuration) that activates this server. Required
+    /// when `placement` is `external_worker`; forbidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_worker: Option<String>,
 
     /// Custom headers to include in every HTTP request.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -174,6 +195,13 @@ impl McpServerConfig {
         self.enabled && !self.recovery_circuit_open && self.placement == McpPlacement::JobWorker
     }
 
+    /// Whether a persistent external worker should activate this server.
+    pub fn should_run_in_external_worker(&self) -> bool {
+        self.enabled
+            && !self.recovery_circuit_open
+            && self.placement == McpPlacement::ExternalWorker
+    }
+
     /// Backward-compatible alias for host daemon startup.
     pub fn should_auto_start(&self) -> bool {
         self.should_host_auto_start()
@@ -186,6 +214,7 @@ impl McpServerConfig {
             url: url.into(),
             transport: None,
             placement: McpPlacement::Host,
+            external_worker: None,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -225,6 +254,7 @@ impl McpServerConfig {
                 env_secrets,
             }),
             placement: McpPlacement::Host,
+            external_worker: None,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -245,6 +275,7 @@ impl McpServerConfig {
                 socket_path: socket_path.into(),
             }),
             placement: McpPlacement::Host,
+            external_worker: None,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -268,6 +299,7 @@ impl McpServerConfig {
                 timeout_seconds: default_wasm_timeout_seconds(),
             }),
             placement: McpPlacement::Host,
+            external_worker: None,
             headers: HashMap::new(),
             oauth: None,
             enabled: true,
@@ -291,6 +323,21 @@ impl McpServerConfig {
         config
     }
 
+    /// Create an MCP server activated through a registered external runtime
+    /// descriptor.
+    pub fn new_external(
+        name: impl Into<String>,
+        runtime: impl Into<String>,
+        options: serde_json::Value,
+    ) -> Self {
+        let mut config = Self::new(name, "");
+        config.transport = Some(McpTransportConfig::External {
+            runtime: runtime.into(),
+            options,
+        });
+        config
+    }
+
     /// Override resource limits for an MCP-over-WASM server.
     pub fn with_wasm_limits(mut self, memory_mb: u64, fuel: u64, timeout_seconds: u64) -> Self {
         if let Some(McpTransportConfig::Wasm {
@@ -310,6 +357,13 @@ impl McpServerConfig {
     /// Set runtime placement.
     pub fn with_placement(mut self, placement: McpPlacement) -> Self {
         self.placement = placement;
+        self
+    }
+
+    /// Place this server on a named persistent external worker.
+    pub fn with_external_worker(mut self, worker_name: impl Into<String>) -> Self {
+        self.placement = McpPlacement::ExternalWorker;
+        self.external_worker = Some(worker_name.into());
         self
     }
 
@@ -388,6 +442,9 @@ impl McpServerConfig {
                 mode: *mode,
                 route: route.as_deref(),
             },
+            Some(McpTransportConfig::External { runtime, options }) => {
+                EffectiveTransport::External { runtime, options }
+            }
         }
     }
 
@@ -420,6 +477,45 @@ impl McpServerConfig {
                     reason: "Job-worker MCP servers cannot use custom headers".to_string(),
                 });
             }
+        }
+
+        match (self.placement, &self.external_worker) {
+            (McpPlacement::ExternalWorker, Some(worker)) => {
+                if worker.trim().is_empty()
+                    || worker.len() > 128
+                    || worker.bytes().any(|b| b < 0x21 || b == 0x7f)
+                {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: format!("Invalid external worker name '{worker}'"),
+                    });
+                }
+                // The worker applies its own containment; host sandbox policies
+                // and interactive OAuth flows cannot run on an external worker.
+                if self.sandbox.is_some() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "External-worker MCP servers cannot use host sandbox policies"
+                            .to_string(),
+                    });
+                }
+                if self.oauth.is_some() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "External-worker MCP servers cannot use OAuth".to_string(),
+                    });
+                }
+            }
+            (McpPlacement::ExternalWorker, None) => {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "external_worker placement requires an external_worker name"
+                        .to_string(),
+                });
+            }
+            (_, Some(_)) => {
+                return Err(ConfigError::InvalidConfig {
+                    reason: "external_worker is only valid with external_worker placement"
+                        .to_string(),
+                });
+            }
+            _ => {}
         }
 
         match self.effective_transport() {
@@ -575,6 +671,30 @@ impl McpServerConfig {
                     }
                 }
             }
+            EffectiveTransport::External { runtime, options } => {
+                crate::tools::mcp::descriptor::validate_runtime_name(runtime).map_err(|error| {
+                    ConfigError::InvalidConfig {
+                        reason: error.to_string(),
+                    }
+                })?;
+                let options_json =
+                    serde_json::to_string(options).map_err(|error| ConfigError::InvalidConfig {
+                        reason: format!("external runtime options are not serializable: {error}"),
+                    })?;
+                if options_json.len() > crate::tools::mcp::descriptor::MAX_EXTERNAL_OPTIONS_BYTES {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: format!(
+                            "external runtime options exceed {} bytes",
+                            crate::tools::mcp::descriptor::MAX_EXTERNAL_OPTIONS_BYTES
+                        ),
+                    });
+                }
+                if self.oauth.is_some() {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: "external runtime MCP servers cannot use OAuth".to_string(),
+                    });
+                }
+            }
         }
 
         // Validate custom header names and values using the http crate's RFC 9110
@@ -650,7 +770,12 @@ impl McpServerConfig {
 
         if let Some(sandbox) = &self.sandbox {
             sandbox.validate()?;
-            if !matches!(self.effective_transport(), EffectiveTransport::Stdio { .. }) {
+            // External runtimes spawn a local stdio adapter process, so host
+            // sandbox policies apply to them exactly like stdio servers.
+            if !matches!(
+                self.effective_transport(),
+                EffectiveTransport::Stdio { .. } | EffectiveTransport::External { .. }
+            ) {
                 return Err(ConfigError::InvalidConfig {
                     reason: "sandbox policies only apply to stdio servers".to_string(),
                 });
@@ -1070,6 +1195,13 @@ pub struct McpServersFile {
     /// Schema version for future compatibility.
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
+
+    /// When true, every enabled host-placement stdio server must carry a
+    /// sandbox policy covering the mandatory baseline
+    /// ([`crate::tools::mcp::sandbox::McpSandboxConfig::default_profile`]'s
+    /// mandatory minimum). Defaults to false (legacy opt-in sandboxing).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_sandbox_profiles: bool,
 }
 
 fn default_schema_version() -> u32 {
@@ -1090,6 +1222,39 @@ impl McpServersFile {
                     reason: format!("Duplicate server name: '{}'", server.name),
                 });
             }
+            self.validate_mandatory_sandbox(server)?;
+        }
+        Ok(())
+    }
+
+    /// Enforce the deployment-wide mandatory sandbox baseline when enabled.
+    fn validate_mandatory_sandbox(&self, server: &McpServerConfig) -> Result<(), ConfigError> {
+        if !self.require_sandbox_profiles || !server.enabled {
+            return Ok(());
+        }
+        if server.placement != McpPlacement::Host
+            || !matches!(
+                server.effective_transport(),
+                EffectiveTransport::Stdio { .. }
+            )
+        {
+            return Ok(());
+        }
+        let invalid = |reason: String| ConfigError::InvalidConfig {
+            reason: format!("Server '{name}': {reason}", name = server.name),
+        };
+        let Some(sandbox) = &server.sandbox else {
+            return Err(invalid(
+                "require_sandbox_profiles is set: host stdio servers must carry a sandbox policy (see McpSandboxConfig::default_profile)"
+                    .to_string(),
+            ));
+        };
+        let missing = sandbox.missing_mandatory_controls();
+        if !missing.is_empty() {
+            return Err(invalid(format!(
+                "sandbox policy misses mandatory controls: {}",
+                missing.join(", ")
+            )));
         }
         Ok(())
     }
@@ -1137,6 +1302,13 @@ impl McpServersFile {
         self.servers
             .iter()
             .filter(|server| server.should_run_in_job())
+    }
+
+    /// Get servers placed on persistent external workers.
+    pub fn external_worker_servers(&self) -> impl Iterator<Item = &McpServerConfig> {
+        self.servers
+            .iter()
+            .filter(|server| server.should_run_in_external_worker())
     }
 }
 
@@ -1632,6 +1804,10 @@ pub enum EffectiveTransport<'a> {
         mode: McpGatewayMode,
         route: Option<&'a str>,
     },
+    External {
+        runtime: &'a str,
+        options: &'a serde_json::Value,
+    },
 }
 
 #[cfg(test)]
@@ -2101,6 +2277,130 @@ mod tests {
                 .to_string()
                 .contains("headers")
         );
+    }
+
+    #[test]
+    fn mandatory_sandbox_profiles_enforced_for_host_stdio_servers() {
+        use crate::tools::mcp::sandbox::McpSandboxConfig;
+
+        let unsandboxed = McpServerConfig::new_stdio("local", "server", Vec::new(), HashMap::new());
+        let file = McpServersFile {
+            servers: vec![unsandboxed],
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        let error = file.validate().expect_err("unsandboxed stdio must fail");
+        assert!(error.to_string().contains("require_sandbox_profiles"));
+
+        // A sandbox missing mandatory controls also fails.
+        let weak = McpServerConfig::new_stdio("local", "server", Vec::new(), HashMap::new())
+            .with_sandbox(McpSandboxConfig::default());
+        let file = McpServersFile {
+            servers: vec![weak],
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        let error = file.validate().expect_err("weak sandbox must fail");
+        assert!(error.to_string().contains("isolate_process_group"));
+
+        // The documented baseline passes, and remote servers are unaffected.
+        let hardened = McpServerConfig::new_stdio("local", "server", Vec::new(), HashMap::new())
+            .with_sandbox(McpSandboxConfig::default_profile());
+        let remote = McpServerConfig::new("remote", "https://mcp.example.com");
+        let file = McpServersFile {
+            servers: vec![hardened, remote],
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        file.validate().expect("hardened stdio and remote pass");
+
+        // Disabled servers are not activated, so they are exempt.
+        let mut disabled = McpServerConfig::new_stdio("off", "server", Vec::new(), HashMap::new());
+        disabled.enabled = false;
+        let file = McpServersFile {
+            servers: vec![disabled],
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        file.validate().expect("disabled server exempt");
+
+        // Opt-in default keeps legacy unsandboxed configs valid.
+        let legacy = McpServersFile {
+            servers: vec![McpServerConfig::new_stdio(
+                "local",
+                "server",
+                Vec::new(),
+                HashMap::new(),
+            )],
+            ..Default::default()
+        };
+        legacy.validate().expect("opt-in default preserves legacy");
+    }
+
+    #[test]
+    fn require_sandbox_profiles_survives_serde_roundtrip() {
+        let file = McpServersFile {
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&file).expect("serialize");
+        let parsed: McpServersFile = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.require_sandbox_profiles);
+
+        let default_file: McpServersFile = serde_json::from_str("{}").expect("empty file parses");
+        assert!(!default_file.require_sandbox_profiles);
+    }
+
+    #[test]
+    fn external_worker_placement_validates_and_persists() {
+        // Valid persistent external-worker placement.
+        let server = McpServerConfig::new_stdio("tools", "server", Vec::new(), HashMap::new())
+            .with_external_worker("pebble-1");
+        server.validate().expect("external-worker stdio validates");
+        assert!(server.should_run_in_external_worker());
+        assert!(!server.should_host_auto_start());
+        assert!(!server.should_run_in_job());
+        assert_eq!(server.external_worker.as_deref(), Some("pebble-1"));
+
+        // Serde roundtrip keeps placement and worker name.
+        let json = serde_json::to_string(&server).expect("serialize");
+        let parsed: McpServerConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.placement, McpPlacement::ExternalWorker);
+        assert_eq!(parsed.external_worker.as_deref(), Some("pebble-1"));
+
+        // The file-level iterator surfaces persistent external-worker servers.
+        let file = McpServersFile {
+            servers: vec![parsed],
+            ..Default::default()
+        };
+        assert_eq!(file.external_worker_servers().count(), 1);
+
+        // Placement without a worker name fails.
+        let missing = McpServerConfig::new_stdio("tools", "server", Vec::new(), HashMap::new())
+            .with_placement(McpPlacement::ExternalWorker);
+        assert!(
+            missing
+                .validate()
+                .expect_err("worker name required")
+                .to_string()
+                .contains("external_worker")
+        );
+
+        // A worker name without the placement fails.
+        let mut misplaced =
+            McpServerConfig::new_stdio("tools", "server", Vec::new(), HashMap::new());
+        misplaced.external_worker = Some("pebble-1".to_string());
+        assert!(misplaced.validate().is_err());
+
+        // Host-only features are rejected on external workers.
+        let sandboxed = McpServerConfig::new_stdio("tools", "server", Vec::new(), HashMap::new())
+            .with_sandbox(crate::tools::mcp::sandbox::McpSandboxConfig::default_profile())
+            .with_external_worker("pebble-1");
+        assert!(sandboxed.validate().is_err());
+        let oauth = McpServerConfig::new("remote", "https://mcp.example.com")
+            .with_oauth(OAuthConfig::new("client"))
+            .with_external_worker("pebble-1");
+        assert!(oauth.validate().is_err());
     }
 
     #[test]

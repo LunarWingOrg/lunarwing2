@@ -528,6 +528,7 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
         EffectiveTransport::Unix { .. } => "unix",
         EffectiveTransport::Wasm { .. } => "wasm",
         EffectiveTransport::Gateway { .. } => "gateway",
+        EffectiveTransport::External { .. } => "external",
     };
     let state = if server.enabled {
         "enabled"
@@ -537,6 +538,7 @@ fn preflight_mcp_server(server: &crate::tools::mcp::config::McpServerConfig) -> 
     let placement = match server.placement {
         McpPlacement::Host => "host",
         McpPlacement::JobWorker => "job-worker",
+        McpPlacement::ExternalWorker => "external-worker",
     };
     let mut detail = format!("{} [{} {} {}]", server.name, transport, placement, state);
     let mut invalid = false;

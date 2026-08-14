@@ -25,6 +25,9 @@ pub enum McpRuntimeKind {
     Unix,
     Wasm,
     Gateway,
+    /// Out-of-tree runtime dispatched through a registered external runtime
+    /// descriptor (see `descriptor.rs`).
+    External,
 }
 
 impl McpRuntimeKind {
@@ -36,6 +39,7 @@ impl McpRuntimeKind {
             EffectiveTransport::Unix { .. } => Self::Unix,
             EffectiveTransport::Wasm { .. } => Self::Wasm,
             EffectiveTransport::Gateway { .. } => Self::Gateway,
+            EffectiveTransport::External { .. } => Self::External,
         }
     }
 }
@@ -135,6 +139,8 @@ pub enum McpRuntimeError {
     Gateway { name: String, reason: String },
     #[error("Invalid configuration for MCP server '{name}': {reason}")]
     InvalidConfig { name: String, reason: String },
+    #[error("External MCP runtime error for server '{name}': {reason}")]
+    External { name: String, reason: String },
     #[error("Package provenance check failed for MCP server '{name}': {reason}")]
     Provenance { name: String, reason: String },
     #[error("No MCP runtime adapter is registered for {kind:?}")]
