@@ -399,6 +399,7 @@ fn placement_label(placement: McpPlacement) -> &'static str {
     match placement {
         McpPlacement::Host => "host",
         McpPlacement::JobWorker => "job-worker",
+        McpPlacement::ExternalWorker => "external-worker",
     }
 }
 
@@ -753,6 +754,7 @@ async fn list_servers(
             }
             EffectiveTransport::Wasm { .. } => "wasm".to_string(),
             EffectiveTransport::Gateway { mode, .. } => format!("gateway ({mode:?})"),
+            EffectiveTransport::External { runtime, .. } => format!("external ({runtime})"),
         };
 
         if verbose {
@@ -808,6 +810,12 @@ async fn list_servers(
                         println!("      Route: {route}");
                     }
                 }
+                EffectiveTransport::External { runtime, options } => {
+                    println!("      External runtime: {runtime}");
+                    if !options.is_null() {
+                        println!("      Options: {options}");
+                    }
+                }
             }
             if let Some(ref desc) = server.description {
                 println!("      Description: {}", desc);
@@ -853,6 +861,7 @@ async fn list_servers(
                 EffectiveTransport::Wasm { component_path, .. } => {
                     component_path.display().to_string()
                 }
+                EffectiveTransport::External { runtime, .. } => format!("runtime:{runtime}"),
             };
             println!(
                 "  {} {} - {} [{}; {}]{}",
@@ -1136,6 +1145,7 @@ fn build_update_config(
             EffectiveTransport::Unix { .. } => Some("unix".to_string()),
             EffectiveTransport::Wasm { .. } => Some("wasm".to_string()),
             EffectiveTransport::Gateway { .. } => Some("gateway".to_string()),
+            EffectiveTransport::External { .. } => Some("external".to_string()),
         });
 
     if transport.as_deref() != Some("stdio") && args.secret_env.is_some() {

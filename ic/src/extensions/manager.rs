@@ -1469,6 +1469,9 @@ impl ExtensionManager {
                                     crate::tools::mcp::config::EffectiveTransport::Gateway {
                                         ..
                                     } => "gateway",
+                                    crate::tools::mcp::config::EffectiveTransport::External {
+                                        ..
+                                    } => "external",
                                 }
                                 .to_string(),
                             ),
@@ -2941,6 +2944,7 @@ impl ExtensionManager {
             crate::tools::mcp::config::EffectiveTransport::Unix { .. } => "Unix socket",
             crate::tools::mcp::config::EffectiveTransport::Wasm { .. } => "WASM actor",
             crate::tools::mcp::config::EffectiveTransport::Gateway { .. } => "gateway",
+            crate::tools::mcp::config::EffectiveTransport::External { .. } => "external runtime",
         };
 
         self.add_mcp_server(config, user_id)
