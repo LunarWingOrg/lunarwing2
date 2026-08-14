@@ -455,6 +455,51 @@ else
 fi
 
 if (
+  denied_root="$MT_FIXTURE/cgroup-root-denied"
+  mkdir -p "$denied_root"
+  printf '%s\n' 'cpu memory pids' >"$denied_root/cgroup.controllers"
+  : >"$denied_root/cgroup.subtree_control"
+  _openrc_cgroup_root() { printf '%s\n' "$denied_root"; }
+  _openrc_build_cgroup_supported() { return 0; }
+  mkdir() {
+    local target="${*: -1}"
+    command mkdir "$@"
+    if [[ "$target" == "$denied_root/lunarwing-build-t1" ]]; then
+      : >"$target/memory.high"
+      : >"$target/memory.max"
+      : >"$target/cgroup.procs"
+    fi
+  }
+  sudo() {
+    [[ "$1" == -u ]] || return 1
+    shift 2
+    if [[ "${1:-}" == bash && "${2:-}" == -c ]]; then
+      # Tenant self-migration into the delegated cgroup denied by the kernel's
+      # common-ancestor rule: the wrapper exits 125 before the build ever runs.
+      echo "SUDO cgroup-wrapper DENIED" >>"$CAPTURE"
+      return 125
+    fi
+    echo "SUDO $*" >>"$CAPTURE"
+    "$@"
+  }
+  _openrc_build_cgroup_cleanup() { rm -rf "$1"; }
+  export CAPTURE
+  : >"$CAPTURE"
+  denied_rc=0
+  _run_tenant_build t1 'echo FALLBACK-RAN >>"$CAPTURE"' || denied_rc=$?
+  [[ "$denied_rc" == 0 ]]
+  [[ "${_OPENRC_BUILD_CGROUP_SETUP_COMPLETE:-unset}" == false ]]
+  grep -qF 'SUDO cgroup-wrapper DENIED' "$CAPTURE"
+  grep -qF 'FALLBACK-RAN' "$CAPTURE"
+  grep -qF 'nice -n 10' "$CAPTURE"
+); then
+  echo "  PASS: cgroup self-migration denial falls back to nice build"
+else
+  echo "  FAIL: cgroup self-migration denial fallback"
+  failures=$((failures + 1))
+fi
+
+if (
   cleanup_cg="$MT_FIXTURE/failed-cgroup-kill"
   mkdir -p "$cleanup_cg"
   : >"$cleanup_cg/cgroup.kill"
