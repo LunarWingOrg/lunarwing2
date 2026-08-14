@@ -125,21 +125,22 @@ Result: the webhook binds localhost-only and the `http` channel starts cleanly
 
 ### `start-tenant` and the WeeChat units
 
-`start_tenant_openrc()` starts **five** services in order — `weechat-<t>`,
-`lunarwing-weechat-adapter-<t>`, `lunarwing-proxy-<t>`, `xmpp-bridge-<t>`, `lunarwing-<t>` —
-and does **not** guard them with `|| true`. If the `weechat` binary or the Python `aiohttp`
-package is missing, the weechat/adapter services fail and `start-tenant` aborts **before**
-starting the main daemon.
+`start_tenant_openrc()` starts PostgreSQL first, then enabled optional services,
+the XMPP bridge, and the main daemon. WeeChat is registry-gated and optional;
+missing optional dependencies no longer prevent the core stack from starting.
 
-The main daemon does **not** actually require WeeChat: its `depend()` is only
-`need net localmount` (weechat is soft `after`-ordering), and the `lunarwing_rc_need` variable in
-`/etc/conf.d/lunarwing-<t>` is inert (nothing reads it).
+The main daemon reads `lunarwing_rc_need` from
+`/etc/conf.d/lunarwing-<t>` through `depend()`. `render-units` owns only its
+marked dependency block; operator cgroup overrides, `rc_ulimit`, comments, and
+unrelated settings outside that block survive upgrades.
 
-**If you don't need the WeeChat channel,** start the three core services directly and skip
-weechat + adapter:
+**If you don't need the WeeChat channel,** use `start-tenant`; registry gating
+skips WeeChat automatically. For manual recovery, start required services in
+dependency order (and start the proxy only when enabled):
 
 ```bash
-sudo rc-service lunarwing-proxy-<t>   start
+sudo rc-service lunarwing-pg-<t>      start
+sudo rc-service lunarwing-proxy-<t>   start  # only when enabled
 sudo rc-service xmpp-bridge-<t>       start
 sudo rc-service lunarwing-<t>         start
 ```
@@ -152,13 +153,10 @@ To enable the full documented `start-tenant` flow (incl. WeeChat) instead, insta
 
 Boot persistence is handled automatically by `lunarwing-mt-admin.sh` on OpenRC — no manual steps:
 
-- **Postgres containers** — `render_tenant_openrc_units` bakes a container bring-up into each tenant
-  daemon's OpenRC `start_pre()`. At render time it resolves the container runtime path
-  (`lunarwing_pg_runtime`) and the container name (`lunarwing_pg_container`); on every start
-  (including boot) `start_pre` runs `<runtime> start lunarwing-pg-<t>` and blocks on `pg_isready`
-  (up to `lunarwing_pg_wait`=60s) before launching the daemon. This covers the
-  Podman-has-no-restart-daemon gap and is idempotent on Docker. `start_pre` runs as root, so it can
-  manage the rootful container.
+- **Postgres containers** — `render_tenant_openrc_units` creates a dedicated
+  `lunarwing-pg-<t>` service plus container babysitter. The main daemon declares
+  it as a hard dependency. PostgreSQL start waits for `pg_isready`, and shutdown
+  stops consumers before the babysitter and container service.
 - **Service enablement** — `start_tenant_openrc` auto-runs `rc-update add ... default` for each
   service that actually started, so the stack returns after a reboot. Optional channels
   (weechat/adapter) are now started *non-fatally*, so a missing `aiohttp`/`weechat` no longer
@@ -169,13 +167,14 @@ Verify with:
 
 ```bash
 sudo rc-update show default | grep lunarwing               # services enabled at boot
-sudo grep lunarwing_pg_runtime /etc/init.d/lunarwing-<t>   # baked-in PG bring-up in the unit
+sudo rc-service lunarwing-pg-<t> status
+sudo rc-service lunarwing-<t> status
 ```
 
-**Verified** in this session: with all three tenants' Postgres containers stopped, restarting each
-daemon (`rc-service lunarwing-<t> restart`) brought its container back up via `start_pre` and the
-daemon reconnected (gateway healthy). The earlier standalone `lunarwing-pg` OpenRC service was
-removed once this baked-in path was proven.
+Historical versions baked PostgreSQL startup into daemon `start_pre`; current
+rendering uses the dedicated service described above. Use current mt-admin
+status and disposable-tenant validation rather than this document's old host
+observations as release evidence.
 
 ---
 

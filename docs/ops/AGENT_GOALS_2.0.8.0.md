@@ -12,10 +12,10 @@
 
 ---
 
-1. [x] update kimi dev loop if havent already - Rares
+1. [ ] upgrade antelope tenant if it is available using upgrade-tenant and --target of this current branch - additionall create a new tenant called henry - record results
 2. [x] update kimi dev loop if havent already - AJ
-3. [ ] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54
-4. [ ] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 verify if done
+3. [ ] work on the following work item - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/54 — PARTIAL 2026-08-14: reviewed correctness gaps are fixed: OpenRC stop always runs a portable cgroup cleanup fallback, cgroup v2 startup verifies every configured effective limit, direct memory values are converted to bytes, build setup fails safely when memory enforcement is absent, real build exit status 2 is never rerun unbounded, and operator conf.d overrides survive atomic rerenders. Expanded fixture/runtime harness passes. Keep unchecked until disposable-tenant OpenRC validation sections 2-4 in `2.0.8.0-GOAL-3-DETAILS.md` pass.
+4. [x] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/50 verify if done — DONE (verified 2026-08-14 on aj/kimi-4-20260814-0001): fix cf4b1164 excludes `ThreadType::Mission` from the conversation-insights `thread_goals` payload + event listener skips Mission threads; e999db6d sorts goals by recency; regression tests `conversation_insight_goals_exclude_mission_threads` and `conversation_insight_goals_use_recency_not_store_order` pass (ic/crates/lunarwing_engine/src/runtime/mission.rs). Independent review found no correctness gaps; all 67 mission tests and MR !468 pipeline 1739 passed. Residual gap: no single integration test asserts the exact generated conversation-insights payload end to end.
 5. [ ] verify that the following work item was completed - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/47 verify if done
 6. [ ] investigate if any crates should be upgraded for security reasons. make a new document in docs/ops detailing findings - you may use existing documentation for reference as well as the following work item https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/53 
 7. [ ] clean up repo - remove uncessary files - organize files in repo root a bit better - for example - crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg in root of repo - maybe change file name? and move very old documentation to historical archive directory. dont just delete it
