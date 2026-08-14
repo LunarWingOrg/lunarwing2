@@ -2661,6 +2661,16 @@ _run_tenant_build_cgroup() {
     printf "%s" "$$" >"$1/cgroup.procs" || exit 125
     exec nice -n 10 bash -c "$2"
   ' _ "$cg" "$build_cmd" || rc=$?
+  if (( rc == 125 )); then
+    # Self-migration into the delegated cgroup was denied: the kernel also
+    # requires write access on the closest common ancestor's cgroup.procs,
+    # which a tenant shell started outside a delegated subtree never has. The
+    # build itself never ran (the wrapper exits 125 before exec; cargo never
+    # uses 125), so report setup as incomplete and let the caller fall back
+    # to the plain nice'd invocation instead of failing the build.
+    say "cgroup v2 self-migration denied for $name build; bounding ineffective, falling back" >&2
+    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
+  fi
   if ! _openrc_build_cgroup_cleanup "$cg"; then
     say "WARNING: could not clean up build cgroup $cg" >&2
     (( rc != 0 )) || rc=1
@@ -11950,7 +11960,8 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" kimi; then
     with_kimi="true"
   fi
-  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"
+  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" \
+    || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
 
   if [[ "$do_render" == "true" ]]; then
     render_tenant_units "$name"
