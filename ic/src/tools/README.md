@@ -148,7 +148,7 @@ Both are first-class in the extension system (`lunarwing tool install` handles b
 | Host sandboxing | Stdio supports an opt-in OS policy. MCP-over-WASM exposes no WASI or host imports and bounds artifact/message sizes, memory, replenished fuel, and epoch deadlines. |
 | Protocol surface | Client capabilities are empty; inbound envelopes are strictly classified; negotiation accepts exactly `2024-11-05`; `tools/list` pagination is bounded. Negotiated `tools.listChanged` signals trigger generation-safe atomic wrapper refresh through streams and persistent HTTP GET/SSE, including gateways. Later-revision annotations deserialize canonically but remain untrusted hints, not `2024-11-05` claims. LunarWing exposes tools only. WebSocket transport is not implemented. |
 | Runtime placement | Host-local process, in-daemon WASM actor, remote HTTP, Unix, external dedicated/shared gateway, and core Docker job-worker placement are implemented. A bundled gateway control-plane service is not implemented. |
-| Reliability | Explicit lifecycle cleanup and whole-runtime stdio/WASM crash recovery are implemented. WASM traps stop and discard the actor before manager reconstruction; per-message deadlines and shutdown bounds are enforced. General configurable startup/request timeouts remain open. |
+| Reliability | Explicit lifecycle cleanup and whole-runtime stdio/WASM crash recovery are implemented. WASM traps stop and discard the actor before manager reconstruction; per-message deadlines and shutdown bounds are enforced. Per-server configurable startup/request timeouts cover every transport via the `timeouts` config section (`--request-timeout-seconds` / `--startup-timeout-seconds` on `mcp add`, 1-600s, defaults 30s/60s). |
 
 #### MCP-over-WASM servers
 
