@@ -342,7 +342,8 @@ impl GatewayControlConfig {
 struct GatewayState {
     store: RouteStore,
     admin_token: SecretString,
-    client: reqwest::Client,
+    request_client: reqwest::Client,
+    stream_client: reqwest::Client,
 }
 
 /// The bundled gateway control plane. Build a [`Router`] with [`router`] for
@@ -352,16 +353,23 @@ pub struct GatewayControlPlane;
 /// Build the control-plane + data-plane router (embedding-friendly).
 pub fn router(config: GatewayControlConfig) -> Result<Router, GatewayControlError> {
     let store = RouteStore::load(config.routes_path)?;
-    let client = reqwest::Client::builder()
+    let request_client = reqwest::Client::builder()
         .timeout(DEFAULT_UPSTREAM_TIMEOUT)
         .build()
         .map_err(|error| GatewayControlError::InvalidData {
             reason: format!("cannot build upstream HTTP client: {error}"),
         })?;
+    let stream_client = reqwest::Client::builder()
+        .connect_timeout(DEFAULT_UPSTREAM_TIMEOUT)
+        .build()
+        .map_err(|error| GatewayControlError::InvalidData {
+            reason: format!("cannot build upstream streaming HTTP client: {error}"),
+        })?;
     let state = Arc::new(GatewayState {
         store,
         admin_token: config.admin_token,
-        client,
+        request_client,
+        stream_client,
     });
     let admin = Router::new()
         .route("/admin/routes", get(list_routes))
@@ -455,6 +463,8 @@ async fn remove_route(
 
 /// Headers a client may pass through to the upstream MCP server.
 const FORWARDED_CLIENT_HEADERS: &[&str] = &["content-type", "accept", "mcp-session-id"];
+/// MCP response headers the gateway may return to its client.
+const FORWARDED_UPSTREAM_HEADERS: &[&str] = &["content-type", "mcp-session-id"];
 
 async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> Response {
     let route_name = request
@@ -503,61 +513,68 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
         Ok(body) => body,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
     };
-
-    let upstream = state
-        .client
-        .request(method, &route.upstream)
-        .headers(upstream_headers)
-        .body(body)
-        .send()
-        .await;
+    let client = if method == axum::http::Method::GET {
+        &state.stream_client
+    } else {
+        &state.request_client
+    };
+    let upstream = tokio::time::timeout(
+        DEFAULT_UPSTREAM_TIMEOUT,
+        client
+            .request(method, &route.upstream)
+            .headers(upstream_headers)
+            .body(body)
+            .send(),
+    )
+    .await;
     let response = match upstream {
-        Ok(response) => response,
-        Err(error) => {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {error}")).into_response();
         }
+        Err(_) => {
+            return (StatusCode::GATEWAY_TIMEOUT, "upstream response timed out").into_response();
+        }
     };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROXY_BODY_BYTES as u64)
+    {
+        return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
+    }
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = response
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string);
-    let body = match read_bounded(response).await {
-        Ok(body) => body,
-        Err(response) => return response,
-    };
-    let mut reply = (status, body).into_response();
-    if let Some(content_type) = content_type
-        && let Ok(value) = HeaderValue::from_str(&content_type)
-    {
-        reply
-            .headers_mut()
-            .insert(axum::http::header::CONTENT_TYPE, value);
+    let headers = response.headers().clone();
+    let mut reply = Response::new(bounded_response_body(response));
+    *reply.status_mut() = status;
+    for name in FORWARDED_UPSTREAM_HEADERS {
+        if let Some(value) = headers.get(*name) {
+            reply.headers_mut().insert(*name, value.clone());
+        }
     }
     reply
 }
 
-async fn read_bounded(response: reqwest::Response) -> Result<Vec<u8>, Response> {
+fn bounded_response_body(response: reqwest::Response) -> axum::body::Body {
     use futures::StreamExt;
 
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| {
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("upstream read error: {error}"),
-            )
-                .into_response()
-        })?;
-        if body.len() + chunk.len() > MAX_PROXY_BODY_BYTES {
-            return Err((StatusCode::BAD_GATEWAY, "upstream response too large").into_response());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    let stream = futures::stream::try_unfold(
+        (response.bytes_stream(), 0_usize),
+        |(mut stream, total)| async move {
+            let Some(chunk) = stream.next().await else {
+                return Ok::<_, std::io::Error>(None);
+            };
+            let chunk = chunk.map_err(std::io::Error::other)?;
+            let total = total
+                .checked_add(chunk.len())
+                .ok_or_else(|| std::io::Error::other("upstream response too large"))?;
+            if total > MAX_PROXY_BODY_BYTES {
+                return Err(std::io::Error::other("upstream response too large"));
+            }
+            Ok(Some((chunk, (stream, total))))
+        },
+    );
+    axum::body::Body::from_stream(stream)
 }
 
 #[cfg(test)]
