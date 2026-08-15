@@ -3222,14 +3222,16 @@ mod tests {
         key: &crate::tools::mcp::marketplace::PublisherSigningKey,
         servers: Vec<McpServerConfig>,
     ) -> McpServersFile {
-        let mut file = McpServersFile::default();
-        file.marketplace = Some(MarketplaceConfig {
-            trust_store_path: None,
-            revocation_cache_path: Some(cache),
-            revocation_url: None,
-            revocation_publisher: Some("lunarwing".to_string()),
-            revocation_public_key_hex: Some(key.public_key_hex()),
-        });
+        let mut file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                trust_store_path: None,
+                revocation_cache_path: Some(cache),
+                revocation_url: None,
+                revocation_publisher: Some("lunarwing".to_string()),
+                revocation_public_key_hex: Some(key.public_key_hex()),
+            }),
+            ..Default::default()
+        };
         for server in servers {
             file.upsert(server);
         }
@@ -3238,19 +3240,25 @@ mod tests {
 
     #[test]
     fn marketplace_requires_complete_revocation_fields() {
-        let mut file = McpServersFile::default();
-        file.marketplace = Some(MarketplaceConfig {
-            revocation_cache_path: Some(PathBuf::from("/tmp/cache.json")),
+        let file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                revocation_cache_path: Some(PathBuf::from("/tmp/cache.json")),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let error = file.validate().expect_err("partial revocation config");
         assert!(error.to_string().contains("must be set together"));
 
-        let mut file = McpServersFile::default();
-        file.marketplace = Some(MarketplaceConfig {
-            revocation_url: Some("https://marketplace.example.com/revocations.json".to_string()),
+        let file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                revocation_url: Some(
+                    "https://marketplace.example.com/revocations.json".to_string(),
+                ),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         let error = file
             .validate()
             .expect_err("revocation url without cache path");
@@ -3318,11 +3326,13 @@ mod tests {
     #[test]
     fn marketplace_fails_closed_on_unreadable_trust_store() {
         let dir = tempdir().unwrap();
-        let mut file = McpServersFile::default();
-        file.marketplace = Some(MarketplaceConfig {
-            trust_store_path: Some(dir.path().join("missing.json")),
+        let mut file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                trust_store_path: Some(dir.path().join("missing.json")),
+                ..Default::default()
+            }),
             ..Default::default()
-        });
+        };
         assert!(file.validate().is_err());
 
         let trust_path = dir.path().join("trust.json");
@@ -3347,8 +3357,10 @@ mod tests {
             capabilities: Vec::new(),
         };
 
-        let mut file = McpServersFile::default();
-        file.external_runtimes = vec![descriptor("node-compat")];
+        let mut file = McpServersFile {
+            external_runtimes: vec![descriptor("node-compat")],
+            ..Default::default()
+        };
         file.validate().expect("valid descriptor");
         let registry = file.external_runtime_registry().expect("registry");
         assert_eq!(registry.names(), vec!["node-compat"]);
@@ -3357,10 +3369,12 @@ mod tests {
         let error = file.validate().expect_err("duplicate descriptor");
         assert!(error.to_string().contains("node-compat"));
 
-        let mut file = McpServersFile::default();
         let mut invalid = descriptor("bad name");
         invalid.name = "bad name".to_string();
-        file.external_runtimes = vec![invalid];
+        let file = McpServersFile {
+            external_runtimes: vec![invalid],
+            ..Default::default()
+        };
         assert!(file.validate().is_err());
     }
 
