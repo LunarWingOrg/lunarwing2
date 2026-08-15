@@ -1,12 +1,16 @@
+# Pin opencode to a release tag for reproducible builds.
+# Override with: docker build --build-arg OPENCODE_REF=v1.18.18 ...
+# Bump this default when upgrading the worker to a newer opencode release.
+# Declared in global scope so both stages share one default; each stage
+# re-declares `ARG OPENCODE_REF` (no default) to consume it.
+ARG OPENCODE_REF=v1.18.18
+
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
 FROM docker.io/oven/bun:debian AS builder
 
-# Pin opencode to a release tag for reproducible builds.
-# Override with: docker build --build-arg OPENCODE_REF=v1.18.18 ...
-# Bump this default when upgrading the worker to a newer opencode release.
-ARG OPENCODE_REF=v1.18.18
+ARG OPENCODE_REF
 
 WORKDIR /build
 
@@ -70,6 +74,12 @@ FROM docker.io/oven/bun:debian AS runtime
 # Also gates the heavy -dev packages and build tools (cmake, clang, llvm, etc.)
 # which are only needed to compile native dependencies at runtime.
 ARG WITH_TOOLCHAINS=false
+
+# Consume the global pin and record it in the runtime image so operators can
+# tell which upstream opencode ref a running worker was built from
+# (surfaced on the /health endpoint as `opencode_ref`).
+ARG OPENCODE_REF
+ENV OPENCODE_IMAGE_REF="${OPENCODE_REF}"
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
