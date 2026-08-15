@@ -6,7 +6,8 @@
 The coordination pipeline enforces "pager system / ops room" discipline on
 designated coordination channels (XMPP MUC, IRC): tagged single-line messages,
 secret detection, per-agent rate limits, engagement policy, first-responder
-correlation, three-strike auto-disable, and an outbound coalesce window.
+correlation, three-strike auto-disable, an outbound coalesce window, and
+optional cross-tenant knowledge sharing via `KNOW:` messages.
 
 Everything is **off by default**. Nothing activates unless `COORD_ENABLED=true`
 plus the required identity/channel variables are set.
@@ -58,6 +59,7 @@ and DMs remain unaffected.
 | Hook | Priority | Point | Mode |
 |------|----------|-------|------|
 | `coordination.secret_entropy` | 5 | beforeInbound, beforeOutbound, transformResponse | fail-closed |
+| `coordination.knowledge_share` | 13 | beforeInbound | fail-open (see below) |
 | `coordination.engagement_policy` | 15 | beforeInbound | fail-open |
 | `coordination.first_responder` | 16 | beforeInbound | fail-open |
 | `coordination.tag_schema` | 14 | beforeInbound, transformResponse | fail-closed |
@@ -157,6 +159,50 @@ channel, native and installable WASM XMPP channels coalesce identically.
   (`OutboundRateLimiter`, see also `scripts/xmpp-rate-limit.sh` for the
   bridge-level control) — coalescing reduces volume, it doesn't bypass limits.
 
+## Cross-tenant knowledge sharing (`KNOW:` tag)
+
+`ic/src/hooks/coordination_knowledge.rs`, off by default
+(`COORD_KNOWLEDGE_SHARE=true` plus a database-backed workspace to enable).
+
+A coordination room is watched by one daemon per tenant. A `KNOW:` message is
+a one-line durable finding that **every watching daemon ingests into its own
+tenant's shared ("herd") knowledge scope** as a `needs-verification` study
+note — the same store the native `knowledge_search` / `knowledge_get_topic`
+tools read. That makes the coordination pipeline a cross-tenant knowledge
+propagation bus with no shared database between tenants.
+
+Wire format (single line, subject to all coordination channel discipline):
+
+    KNOW: <topic-slug> | <one-line finding>
+
+- The topic slug follows the knowledge-store contract (lowercase, digits,
+  dashes). Invalid or malformed shares are ignored silently — the tag-schema
+  hook owns structural enforcement and strikes.
+- The sender (JID/nick/agent id) is slugified into the note's `agent` field
+  (`study-notes/<sender-slug>/<topic>.md`), so the same sender resending a
+  topic updates only their own version, and different tenants' agents keep
+  independent versions — identical to normal knowledge-store versioning.
+- Trust model: wire-ingested notes are remote claims, never locally
+  verified. They are always stored `needs-verification` with
+  `confidence: null` and the raw sender recorded in `submitted_by`, tagged
+  `coordination`. Agents must verify before relying on them (same policy as
+  the study-notes skill).
+- Ingestion is fail-open and side-effect-only: the hook never modifies or
+  rejects the message, so room routing is unchanged. It runs at priority 13
+  — before tag-schema (14) and engagement (15) — so broadcast shares are
+  ingested even when this daemon would not engage.
+- Rate limit: max notes per sender per hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`,
+  default 30) plus a minimum finding length
+  (`COORD_KNOWLEDGE_MIN_CHARS`, default 12). Rate-limited shares are
+  dropped (never ingested) but the message itself still flows.
+- Outbound sharing needs no new machinery: `KNOW` is an allowed coordination
+  tag, so agents (and humans) can emit it directly. When sharing is enabled,
+  the coordination prompt policy appends the `KNOW:` format so agents share
+  durable findings with sibling tenants unprompted.
+- The background knowledge sweep treats ingested notes like any other: an
+  unverified note stays `needs-verification` until an agent verifies or
+  supersedes it.
+
 ## Configuration reference
 
 | Variable | Default | Description |
@@ -172,6 +218,9 @@ channel, native and installable WASM XMPP channels coalesce identically.
 | `COORD_ENTROPY_THRESHOLD` | `4.8` | Shannon entropy threshold (bits/char) |
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy checks |
 | `COORD_XMPP_STATUS_UPDATES` | `false` | Allow transient thinking/tool/reasoning status messages in configured XMPP coordination rooms |
+| `COORD_KNOWLEDGE_SHARE` | `false` | Cross-tenant knowledge sharing: ingest `KNOW:` messages into the shared herd knowledge scope (needs DB-backed workspace) |
+| `COORD_KNOWLEDGE_MAX_PER_HOUR` | `30` | Max ingested knowledge notes per sender per hour |
+| `COORD_KNOWLEDGE_MIN_CHARS` | `12` | Minimum finding length (characters) to ingest |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 | `COORD_VIOLATION_MAX` | `3` | Strikes before auto-disable |
 | `COORD_VIOLATION_DISABLE_DURATION` | `86400` | Auto-disable seconds (24h) |

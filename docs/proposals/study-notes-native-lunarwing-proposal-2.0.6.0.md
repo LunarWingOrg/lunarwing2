@@ -7,6 +7,14 @@
 > implementation landed first (branches `rarity/kimi-1-20260806-1802` and
 > `aj/kimi-2-20260807-0001`), so everything below describes verified tree
 > state, not planned work.
+>
+> **Addendum (2026-08-15, v2.0.8.0 item #14):** the coordination pipeline now
+> writes into this store. `KNOW: <topic-slug> | <one-line finding>` messages
+> on coordination channels are ingested by every watching tenant daemon into
+> its own shared herd scope as `needs-verification` notes with sender
+> provenance (`ic/src/hooks/coordination_knowledge.rs`, gated by
+> `COORD_KNOWLEDGE_SHARE=true`). See
+> `docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`.
 
 ## Goal
 
