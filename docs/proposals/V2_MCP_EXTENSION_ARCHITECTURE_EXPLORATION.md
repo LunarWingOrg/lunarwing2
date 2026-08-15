@@ -1,13 +1,13 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-08-11): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
+> **Current status (2026-08-15): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
 > stdio lifecycle, an internal built-in runtime-dispatch registry, stateful
-> MCP-over-WASM, and dedicated/shared gateway client placement are implemented. Core Docker job workers
-> also support explicit worker-local stdio placement with immutable owner snapshots,
-> separate credential grants, and bounded lifecycle. The runtime-neutral
-> package model, persistent-worker MCP placement, marketplace signatures/dependency locks,
-> automatic package installation, and a bundled gateway control-plane service
-> remain open.
+> MCP-over-WASM, dedicated/shared gateway client placement, and an optional bundled
+> gateway control/data plane are implemented. Core Docker job workers also support
+> explicit worker-local stdio placement with immutable owner snapshots, separate
+> credential grants, and bounded lifecycle. The runtime-neutral package model,
+> persistent-worker MCP delivery, a marketplace install/upgrade flow, automatic
+> package installation, and cross-daemon gateway HA remain open.
 
 **Status:** Exploratory V2 architecture with implemented runtime slices; host-local
 stdio landed on 2026-07-09, lifecycle/recovery hardening landed through 2026-08-03,
@@ -468,10 +468,13 @@ servers and presents one controlled endpoint to LunarWing.
 Client placement for this option is implemented. `McpGatewayMode` distinguishes a
 dedicated endpoint from a shared endpoint; shared mode requires a validated route,
 and the gateway transport injects host-owned mode/route headers while retaining
-Streamable HTTP session and OAuth behavior. LunarWing does not bundle the gateway
-service itself, so cross-daemon sessions, HA, centralized policy, and credential
-ownership remain responsibilities of the separately deployed gateway. Gateway
-placement is not mandatory for workspace-local or dedicated-worker capabilities.
+Streamable HTTP session and OAuth behavior. LunarWing also bundles an optional
+loopback-default control/data plane with authenticated route administration,
+HTTPS-only upstreams, bounded streaming responses, MCP session-header forwarding,
+and end-to-end GET/SSE notification delivery. Cross-daemon sessions, HA,
+centralized policy, and credential ownership remain responsibilities of the
+deployment. Gateway placement is not mandatory for workspace-local or
+dedicated-worker capabilities.
 
 ### 7. Signed extension marketplace
 
