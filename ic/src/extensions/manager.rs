@@ -6884,11 +6884,7 @@ done
     }
 
     fn materialize_mcp_wasm_fixture(dir: &std::path::Path) -> std::path::PathBuf {
-        let source = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/mcp-wasm/stateful-server.wat"
-        );
-        let component = wat::parse_file(source).expect("parse MCP component fixture source");
+        let component = crate::tools::mcp::wasm_transport::render_stateful_mcp_fixture();
         let path = dir.join("stateful-server.wasm");
         std::fs::write(&path, component).expect("materialize MCP component fixture");
         path

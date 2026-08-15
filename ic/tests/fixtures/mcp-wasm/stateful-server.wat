@@ -15,7 +15,11 @@
     ;; Expected host envelopes. Byte-exact comparison makes this fixture fail
     ;; closed if method, id, params, protocol, capabilities, cursor, or arguments
     ;; change. In particular, notification has no id field.
-    (data (i32.const 5000) "{\22jsonrpc\22:\222.0\22,\22id\22:1,\22method\22:\22initialize\22,\22params\22:{\22capabilities\22:{},\22clientInfo\22:{\22name\22:\22lunarwing\22,\22version\22:\222.0.7\22},\22protocolVersion\22:\222024-11-05\22}}")
+    ;;
+    ;; The initialize envelope is templated: the host substitutes the exact
+    ;; bytes produced by McpRequest::initialize(1) at fixture-render time, so
+    ;; the embedded clientInfo version can never drift from the crate version.
+    (data (i32.const 5000) "__INITIALIZE_ENVELOPE__")
     (data (i32.const 5200) "{\22jsonrpc\22:\222.0\22,\22method\22:\22notifications/initialized\22}")
     (data (i32.const 5280) "{\22jsonrpc\22:\222.0\22,\22id\22:2,\22method\22:\22tools/list\22}")
     (data (i32.const 5360) "{\22jsonrpc\22:\222.0\22,\22id\22:3,\22method\22:\22tools/list\22,\22params\22:{\22cursor\22:\22page-2\22}}")
@@ -89,7 +93,7 @@
         local.get $request
         local.get $request-len
         i32.const 5000
-        i32.const 158
+        i32.const __INITIALIZE_LEN__
         call $assert-request
         i32.const 1024
         local.set $ptr
