@@ -4635,13 +4635,49 @@ impl ExtensionManager {
                 "Host runtime cannot prepare job-worker MCP server '{name}'"
             )));
         }
+        // Resolve operator-declared external runtime descriptors from the same
+        // configuration the server entry came from. An unbuildable registry
+        // fails closed (external transports get an unknown-runtime error).
+        // The load also re-runs the marketplace revocation gate; when a store
+        // is configured, re-check this server against the freshest cached list
+        // to close the race between the caller's load and activation.
+        let (external_runtimes, revocation_store) = match self.load_mcp_servers(user_id).await {
+            Ok(file) => {
+                let store = file
+                    .marketplace
+                    .as_ref()
+                    .and_then(|marketplace| marketplace.revocation_store().ok().flatten());
+                (
+                    Arc::new(file.external_runtime_registry().unwrap_or_default()),
+                    store,
+                )
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "MCP configuration reload failed during activation; external transports fail closed"
+                );
+                (
+                    Arc::new(crate::tools::mcp::descriptor::ExternalRuntimeRegistry::new()),
+                    None,
+                )
+            }
+        };
+        if let (Some(store), Some(provenance)) = (&revocation_store, &server.provenance) {
+            store.check_provenance(provenance).map_err(|error| {
+                ExtensionError::ActivationFailed(format!(
+                    "MCP server '{name}' is revoked by the marketplace list: {error}"
+                ))
+            })?;
+        }
         let client = Arc::new(
-            crate::tools::mcp::create_client_from_config(
+            crate::tools::mcp::create_client_from_config_with_external_runtimes(
                 server,
                 &self.mcp_session_manager,
                 &self.mcp_process_manager,
                 Some(Arc::clone(&self.secrets)),
                 user_id,
+                external_runtimes,
             )
             .await
             .map_err(|error| ExtensionError::ActivationFailed(error.to_string()))?,

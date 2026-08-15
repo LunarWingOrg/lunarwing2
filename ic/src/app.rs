@@ -613,6 +613,25 @@ impl AppBuilder {
                 };
                 match servers_result {
                     Ok(mut servers) => {
+                        // Pull the newest signed marketplace revocation list
+                        // before activation; failures keep the cached list.
+                        let revocation_store =
+                            crate::tools::mcp::config::refresh_marketplace_revocations(&servers)
+                                .await;
+                        // Operator-declared external runtime descriptors are
+                        // validated at load; an empty registry fails closed.
+                        let external_runtimes = match servers.external_runtime_registry() {
+                            Ok(registry) => Arc::new(registry),
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    "External MCP runtimes unavailable; external transports fail closed"
+                                );
+                                Arc::new(
+                                    crate::tools::mcp::descriptor::ExternalRuntimeRegistry::new(),
+                                )
+                            }
+                        };
                         if let Some(home) = std::env::var_os(STUDY_NOTES_HOME_ENV) {
                             let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
                             let allow_write = parse_study_notes_allow_write(
@@ -670,7 +689,27 @@ impl AppBuilder {
                                 "Suppressed managed Study Notes write mode without live opt-in"
                             );
                         }
-                        let enabled: Vec<_> = servers.host_auto_start_servers().cloned().collect();
+                        let enabled: Vec<_> = servers
+                            .host_auto_start_servers()
+                            .filter(|server| {
+                                // Defense in depth: a list applied by the
+                                // refresh above may revoke a package after the
+                                // load-time validation gate already ran.
+                                let blocked = revocation_store.as_ref().is_some_and(|store| {
+                                    server.provenance.as_ref().is_some_and(|provenance| {
+                                        store.check_provenance(provenance).is_err()
+                                    })
+                                });
+                                if blocked {
+                                    tracing::warn!(
+                                        server = %server.name,
+                                        "Skipping startup activation: package is revoked by the marketplace list"
+                                    );
+                                }
+                                !blocked
+                            })
+                            .cloned()
+                            .collect();
                         if !enabled.is_empty() {
                             tracing::debug!(
                                 "Loading {} configured MCP server(s)...",
@@ -686,17 +725,19 @@ impl AppBuilder {
                             let pm = Arc::clone(&pm);
                             let owner_id = owner_id.clone();
                             let startup_db = db.clone();
+                            let external_runtimes = Arc::clone(&external_runtimes);
 
                             join_set.spawn(async move {
                                 let server_name = server.name.clone();
                                 let expected_server = server.clone();
 
-                                let client = match crate::tools::mcp::create_client_from_config(
+                                let client = match crate::tools::mcp::create_client_from_config_with_external_runtimes(
                                     server,
                                     &mcp_sm,
                                     &pm,
                                     secrets,
                                     &owner_id,
+                                    external_runtimes,
                                 )
                                 .await
                                 {
