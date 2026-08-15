@@ -351,9 +351,10 @@ mod tests {
         // Empty finding.
         assert!(parse_knowledge_share("KNOW: topic |", min).is_none());
         // Extra pipes keep the first split; trailing content stays.
-        let with_pipes = parse_knowledge_share("KNOW: topic | a | b", min).expect("parses");
+        let with_pipes =
+            parse_knowledge_share("KNOW: topic | a | b findings", min).expect("parses");
         assert_eq!(with_pipes.topic, "topic");
-        assert_eq!(with_pipes.content, "a | b");
+        assert_eq!(with_pipes.content, "a | b findings");
     }
 
     #[test]
