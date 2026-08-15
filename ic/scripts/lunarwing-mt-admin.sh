@@ -2559,10 +2559,19 @@ _openrc_build_cgroup_supported() {
     say "cgroup build bounding unavailable: $root is not a writable directory" >&2
     return 1
   fi
-  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || {
+  if [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]]; then
+    :
+  elif [[ "$(stat -fc %T "$root" 2>/dev/null)" == tmpfs && -d "$root/unified" ]] \
+    && [[ "$(stat -fc %T "$root/unified" 2>/dev/null)" == cgroup2fs ]]; then
+    say "cgroup build bounding unavailable: hybrid cgroup mode detected" >&2
+    say "  (v1 controllers at $root, v2 only at $root/unified — controllers such" >&2
+    say "   as memory are bound to v1 there and cannot be delegated for bounding)." >&2
+    say "  fix: set rc_cgroup_mode=\"unified\" in /etc/rc.conf and reboot" >&2
+    return 1
+  else
     say "cgroup build bounding unavailable: $root is not a cgroup v2 hierarchy" >&2
     return 1
-  }
+  fi
   [[ -r "$root/cgroup.controllers" ]] \
     && grep -qw memory "$root/cgroup.controllers" || {
       say "cgroup build bounding unavailable: memory controller missing at $root (kernel boot arg?)" >&2
@@ -2883,7 +2892,7 @@ setup_cgroups() {
   local root
   root="$(_openrc_cgroup_root)"
   [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] \
-    || die "cgroup v2 hierarchy not mounted at $root"
+    || die "cgroup v2 hierarchy not mounted at $root (hybrid mode? set rc_cgroup_mode=\"unified\" in /etc/rc.conf and reboot)"
   [[ -r "$root/cgroup.controllers" ]] \
     && grep -qw memory "$root/cgroup.controllers" \
     || die "memory controller not available at $root"
