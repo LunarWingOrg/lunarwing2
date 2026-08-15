@@ -96,7 +96,7 @@ pub async fn run_doctor_command() -> anyhow::Result<()> {
 
     check(
         "MCP servers",
-        check_mcp_config().await,
+        check_mcp_config(&settings).await,
         &mut passed,
         &mut failed,
         &mut skipped,
@@ -465,7 +465,7 @@ fn check_gateway_config(settings: &Settings) -> CheckResult {
 
 // ── MCP servers ─────────────────────────────────────────────
 
-async fn check_mcp_config() -> CheckResult {
+async fn check_mcp_config(settings: &Settings) -> CheckResult {
     let file = match crate::tools::mcp::config::load_mcp_servers().await {
         Ok(f) => f,
         Err(e) => {
@@ -494,6 +494,42 @@ async fn check_mcp_config() -> CheckResult {
             missing_enabled += 1;
         }
         details.push(pre.detail);
+    }
+
+    // Cross-check external-worker placements against configured workers so a
+    // typo'd worker name surfaces here instead of at worker activation time.
+    let external_workers = crate::config::ExternalWorkerConfig::resolve_from_settings(settings);
+    let worker_names: std::collections::HashSet<&str> = external_workers
+        .iter()
+        .map(|worker| worker.name.as_str())
+        .collect();
+    for server in file.external_worker_servers() {
+        let worker = server.external_worker.as_deref().unwrap_or("");
+        if !worker_names.contains(worker) {
+            invalid += 1;
+            details.push(format!(
+                "{} — external worker '{worker}' is not configured",
+                server.name
+            ));
+        }
+    }
+
+    // Cross-check external transports against the declared runtime registry;
+    // activation fails closed on an unknown runtime.
+    let external_registry = file.external_runtime_registry().ok();
+    for server in servers {
+        if let crate::tools::mcp::config::EffectiveTransport::External { runtime, .. } =
+            server.effective_transport()
+            && external_registry
+                .as_ref()
+                .is_none_or(|registry| registry.get(runtime).is_none())
+        {
+            invalid += 1;
+            details.push(format!(
+                "{} — external runtime '{runtime}' has no descriptor in external_runtimes",
+                server.name
+            ));
+        }
     }
 
     if invalid > 0 || missing_enabled > 0 {
@@ -1091,7 +1127,8 @@ mod tests {
 
     #[tokio::test]
     async fn check_mcp_config_does_not_panic() {
-        let result = check_mcp_config().await;
+        let settings = Settings::load();
+        let result = check_mcp_config(&settings).await;
         match result {
             CheckResult::Pass(_) | CheckResult::Fail(_) | CheckResult::Skip(_) => {}
         }

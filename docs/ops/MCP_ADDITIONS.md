@@ -118,9 +118,18 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   retains the matching stdio or WASM record; switching runtime types drops the digest
   and demotes pinned to unverified. Web/conversational updates do not carry
   provenance and reset the record; re-pin after using them.
-- Not yet covered: publisher signatures, trusted signing keys, locked
-  dependency graphs, upgrade diffs, marketplace trust roots, and revocation
-  distribution for compromised publishers.
+- Marketplace trust and revocation (implemented): ed25519 publisher signatures,
+  a publisher trust store (`PublisherTrustStore`), signed dependency lockfiles
+  pinning exact versions and SHA-256 digests, manifest upgrade diffs, and
+  signed revocation lists with monotonic sequences live in
+  `ic/src/tools/mcp/marketplace.rs`. Operators enable enforcement through the
+  `marketplace` section of `mcp-servers.json` (`trust_store_path`,
+  `revocation_cache_path`, `revocation_url`, `revocation_publisher`,
+  `revocation_public_key_hex`): loads fail closed on revoked packages, startup
+  pulls the newest signed list over bounded HTTPS, and manual activation
+  re-checks the cached list. Not yet covered: a signed-package marketplace
+  install/upgrade flow (the primitives are library-level but no CLI installs
+  from a catalog yet).
 
 ### Host OS sandboxing for stdio children
 
@@ -147,17 +156,27 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 - Limits: the seccomp filter blocks the memory-inspection syscalls but not
   same-UID `/proc/<pid>/mem` reads (a kernel credential check, not a syscall);
   `PR_SET_DUMPABLE` does not survive `execve`, so inbound memory-read
-  protection cannot be applied from the spawn path. Device isolation and
-  mandatory default sandbox profiles remain future work.
+  protection cannot be applied from the spawn path. Device isolation remains
+  future work; `require_sandbox_profiles = true` in `mcp-servers.json` makes
+  the mandatory baseline deployment-wide for enabled host stdio servers.
 
 ### Runtime adapters, MCP-over-WASM, and gateways
 
 - `ic/src/tools/mcp/runtime.rs` defines the internal `McpRuntimeAdapter` boundary,
   activation context/request types, stable runtime kinds, typed activation errors,
-  and a closed registry for built-in dispatch. It is not a production plugin API;
-  generic external runtime descriptors remain deferred. The factory validates
-  persisted intent and provenance once, then dispatches HTTP, stdio, Unix, WASM, or
-  gateway activation through the registry. Every adapter returns the same `McpClient`,
+  and a closed registry for built-in dispatch. Generic external runtime descriptors
+  (`ic/src/tools/mcp/descriptor.rs`) extend it without new core enum variants:
+  operators declare adapters in the `external_runtimes` section of
+  `mcp-servers.json`, attach servers with `lunarwing mcp add --transport external
+  --external-runtime <name> [--external-options '<json>']`, and activation spawns
+  the descriptor's adapter over stdio (options JSON via
+  `LUNARWING_MCP_EXTERNAL_OPTIONS`, pinned provenance digests verified on the
+  adapter executable, `require_sandbox` descriptors get at least the mandatory
+  baseline profile). Empty registries fail closed with an unknown-runtime error.
+  The factory validates
+  persisted intent and provenance once, then dispatches HTTP, stdio, Unix, WASM,
+  gateway, or external activation through the registry. Every adapter returns the
+  same `McpClient`,
   preserving discovery, wrapper ownership, approval, update, deactivation, and
   shutdown behavior.
 - `ic/wit/mcp-server.wit` defines a stateful synchronous actor ABI carrying JSON-RPC
@@ -249,9 +268,9 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 | Feature | Current status and reason |
 |---------|---------------------------|
 | Automatic npm/pip installation | No production package installer exists. LunarWing runs an operator-installed command. Safe automation needs immutable package identity, digest/signature verification, dependency locking, capability review, sandboxing, audit, revocation, health checks, and rollback. Provenance pinning (below) covers the identity/digest/trust subset; the rest remains. |
-| MCP package provenance | Partially implemented: operator-pinned stdio executable and WASM component digests, package identity, trust state, and revocation. Publisher signatures, signing-key trust roots, dependency lock data, upgrade diffs, and marketplace revocation remain design work. |
-| Host-local stdio OS sandbox | Partially implemented: opt-in per-server policy covering resource limits, core-dump control, process-group isolation and group teardown (all unix), plus Linux-only no_new_privileges, seccomp ptrace/process_vm denial, Landlock read-only root with writable paths, and user+network namespace network isolation. Remaining: device isolation, mandatory default profiles, and same-UID `/proc/<pid>/mem` inbound reads (kernel credential check, not syscall-filterable). |
-| Bundled gateway service | LunarWing implements dedicated/shared gateway client placement and a protected routing contract, but does not bundle or operate the external gateway control-plane service. Cross-daemon HA, centralized package policy, and cross-tenant credential ownership belong to that deployment. |
+| MCP package provenance | Implemented further: operator-pinned stdio executable and WASM component digests, package identity, trust state, and revocation; plus ed25519 publisher signatures, signing-key trust stores, signed dependency lockfiles, manifest upgrade diffs, and signed marketplace revocation lists enforced at load/activation via the `marketplace` config section with startup HTTPS refresh. Remaining: a signed-package marketplace install/upgrade CLI flow. |
+| Host-local stdio OS sandbox | Partially implemented: opt-in per-server policy covering resource limits, core-dump control, process-group isolation and group teardown (all unix), plus Linux-only no_new_privileges, seccomp ptrace/process_vm denial, Landlock read-only root with writable paths, and user+network namespace network isolation. `require_sandbox_profiles` makes the mandatory baseline deployment-wide. Remaining: device isolation and same-UID `/proc/<pid>/mem` inbound reads (kernel credential check, not syscall-filterable). |
+| Bundled gateway service | Implemented and opt-in: `LUNARWING_MCP_GATEWAY_CONTROL_BIND` + `LUNARWING_MCP_GATEWAY_ADMIN_TOKEN` run the bundled control plane (`/admin/routes` bearer-authenticated CRUD, `/mcp` data plane with routing-header stripping and HTTPS-only upstreams); loopback-only unless `LUNARWING_MCP_GATEWAY_CONTROL_ALLOW_NON_LOOPBACK=1`. Cross-daemon HA, centralized package policy, and cross-tenant credential ownership remain deferred. Note: the data plane buffers responses, so SSE `listChanged` passthrough is not supported through it. |
 | Per-server lifecycle timeouts | WASM message deadlines are configurable and transport/process shutdown is bounded. Configurable startup and request timeout controls for every transport remain deferred. |
 
 ## Historical v2.0.4 Release Boundary and Assumptions

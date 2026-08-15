@@ -1140,6 +1140,28 @@ async fn async_main() -> anyhow::Result<()> {
         mgr.spawn_eviction_task(shutdown_tx.subscribe());
     }
 
+    // Bundled MCP gateway control plane (opt-in via environment; see
+    // tools/mcp/gateway_control.rs for the enabling variables).
+    match lunarwing::tools::mcp::gateway_control::GatewayControlConfig::from_env() {
+        Ok(Some(control_config)) => {
+            let mut control_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                let shutdown = async move {
+                    let _ = control_shutdown.recv().await;
+                };
+                if let Err(error) =
+                    lunarwing::tools::mcp::gateway_control::serve(control_config, shutdown).await
+                {
+                    tracing::error!(%error, "MCP gateway control plane stopped with an error");
+                }
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(%error, "MCP gateway control plane disabled: invalid configuration");
+        }
+    }
+
     #[cfg(unix)]
     {
         // Collect all channels that support secret updates
