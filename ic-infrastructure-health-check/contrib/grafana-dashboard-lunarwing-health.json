@@ -1,0 +1,177 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Datasource scraping the LunarWing healthpoint metrics (textfile collector or loopback listener)",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "LunarWing Healthpoint Metrics",
+  "uid": "lunarwing-healthpoint",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "1m",
+  "time": { "from": "now-6h", "to": "now" },
+  "tags": ["lunarwing", "health", "infrastructure"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "query": "prometheus"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Overall status (0 healthy · 1 degraded · 2 critical · 3 unknown)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "targets": [{ "expr": "lunarwing_health_overall_status", "legendFormat": "{{instance}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 2,
+      "title": "Report staleness",
+      "description": "Age of the newest aggregated report. Alerting rule fires at 40m.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "targets": [{ "expr": "lunarwing_health_report_age_seconds", "legendFormat": "{{instance}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2400 },
+              { "color": "red", "value": 7200 }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "title": "Component status",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "targets": [{ "expr": "lunarwing_health_status", "legendFormat": "{{component}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "fillOpacity": 10 },
+          "max": 3,
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "healthy", "color": "green" }, "1": { "text": "degraded", "color": "yellow" }, "2": { "text": "critical", "color": "red" }, "3": { "text": "unknown", "color": "gray" } } }
+          ]
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "title": "Early warnings firing",
+      "description": "Emitted by health-metrics-exporter.sh when a threshold in /etc/lunarwing/health-metrics-thresholds.conf crosses.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "targets": [{ "expr": "sum(lunarwing_health_early_warning)", "legendFormat": "warnings" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "title": "TensorZero p95 latency (early warning: warn >1500ms, crit >4000ms)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 5 },
+      "targets": [{ "expr": "lunarwing_health_tensorzero_p95_ms", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "ms", "custom": { "fillOpacity": 10, "thresholdsStyle": { "mode": "line" } }, "thresholds": { "mode": "absolute", "steps": [{ "color": "transparent", "value": null }, { "color": "yellow", "value": 1500 }, { "color": "red", "value": 4000 }] } }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "title": "TensorZero error rate (early warning: crit >5%)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 5 },
+      "targets": [{ "expr": "lunarwing_health_tensorzero_error_rate", "legendFormat": "{{instance}}" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "custom": { "fillOpacity": 10 }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.05 }] } }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "title": "Self-heal remediation pressure",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 5 },
+      "targets": [
+        { "expr": "lunarwing_health_selfheal_restarts_total", "legendFormat": "restarts: {{service}}" },
+        { "expr": "lunarwing_health_selfheal_flapping", "legendFormat": "flapping: {{service}}" },
+        { "expr": "lunarwing_health_selfheal_consecutive_unhealthy", "legendFormat": "unhealthy streak: {{service}}" }
+      ],
+      "fieldConfig": { "defaults": { "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    },
+    {
+      "id": 8,
+      "title": "Per-tenant LunarVision / LunarVoice status",
+      "description": "Tenant labels come from the health report itself (ports-registry discovery), never a hardcoded port.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
+      "targets": [{ "expr": "lunarwing_health_lunarvision_instance_status", "legendFormat": "vision: {{tenant}} @ {{instance}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 2 }, { "color": "gray", "value": 3 }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "title": "Init-agnostic unit status (systemd / openrc / launchd)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
+      "targets": [{ "expr": "lunarwing_health_unit_status", "legendFormat": "{{init}}: {{unit}}" }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 2 }, { "color": "gray", "value": 3 }] }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "title": "Check duration by component",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 18 },
+      "targets": [{ "expr": "lunarwing_health_check_duration_seconds", "legendFormat": "{{component}}" }],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 10 } }, "overrides": [] }
+    }
+  ]
+}

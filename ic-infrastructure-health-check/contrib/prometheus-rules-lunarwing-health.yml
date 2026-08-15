@@ -1,0 +1,125 @@
+# Prometheus alerting rules for the LunarWing healthpoint metrics exporter
+# (ic-infrastructure-health-check/health-metrics-exporter.sh).
+#
+# Load with:
+#   prometheus --rules=.../prometheus-rules-lunarwing-health.yml
+# or reference it from your main rule file list. These rules are independent of
+# the exporter's optional early-warning layer (health-metrics-thresholds.conf):
+# thresholds fire at export time with the report, these fire in Prometheus
+# against scraped history — use either or both.
+#
+# Status codes: 0=healthy 1=degraded 2=critical 3=unknown/skipped.
+
+groups:
+  - name: lunarwing-health
+    rules:
+      # ── Pipeline liveness ────────────────────────────────────────────────
+      # The exporter only writes when a report is produced. A stale report
+      # means the health timer itself broke — the meta-alert that catches
+      # "monitoring is down".
+      - alert: LunarWingHealthReportStale
+        expr: lunarwing_health_report_age_seconds > 2400
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LunarWing health report is stale on {{ $labels.instance }}"
+          description: >-
+            No new aggregated health report for
+            {{ $value | humanizeDuration }} (threshold 40m). The
+            infrastructure-health-check timer is not producing reports.
+
+      # ── Overall + component status ───────────────────────────────────────
+      - alert: LunarWingHealthCritical
+        expr: lunarwing_health_overall_status == 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LunarWing overall health critical on {{ $labels.instance }}"
+          description: >-
+            One or more components reported critical. Inspect
+            lunarwing_health_status for the failing component.
+
+      - alert: LunarWingComponentDegraded
+        expr: lunarwing_health_status{component!=""} >= 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LunarWing component {{ $labels.component }} degraded on {{ $labels.instance }}"
+          description: >-
+            Status code {{ $value }} (1=degraded, 2=critical, 3=unknown).
+            Persistent degradation should be investigated before self-heal
+            escalates.
+
+      - alert: LunarWingUnitDown
+        expr: lunarwing_health_unit_up == 0
+          and on (instance, unit) lunarwing_health_unit_status >= 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LunarWing unit {{ $labels.unit }} down ({{ $labels.init }})"
+          description: >-
+            Unit {{ $labels.unit }} (tenant {{ with .Labels.tenant }}{{ . }}{{ else }}host{{ end }})
+            is not up and reports status critical.
+
+      # ── Graduated early warnings (rising latency / error rate) ───────────
+      - alert: LunarWingTensorZeroLatencyRising
+        expr: lunarwing_health_tensorzero_p95_ms > 1500
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TensorZero p95 latency high on {{ $labels.instance }}"
+          description: >-
+            p95 {{ printf "%.0f" $value }}ms sustained >15m (warn 1500ms,
+            crit 4000ms). Typically precedes timeouts and restart cycles.
+
+      - alert: LunarWingTensorZeroLatencyCritical
+        expr: lunarwing_health_tensorzero_p95_ms > 4000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "TensorZero p95 latency critical on {{ $labels.instance }}"
+          description: "p95 {{ printf \"%.0f\" $value }}ms exceeds 4000ms."
+
+      - alert: LunarWingTensorZeroErrorRateRising
+        expr: lunarwing_health_tensorzero_error_rate > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TensorZero error rate elevated on {{ $labels.instance }}"
+          description: >-
+            {{ printf "%.1f" ($value * 100) }}% of requests failing
+            sustained >10m. Model provider or network fault likely.
+
+      # ── Self-heal pressure ───────────────────────────────────────────────
+      # Escalated services need manual intervention; self-heal has given up.
+      - alert: LunarWingSelfHealEscalated
+        expr: lunarwing_health_selfheal_escalated == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Self-heal escalated {{ $labels.service }}"
+          description: >-
+            {{ $labels.service }} exhausted retries and paged for manual
+            intervention. Restart history:
+            lunarwing_health_selfheal_restarts_total.
+
+      # Flapping = restarts inside the flap window approaching the circuit
+      # breaker; warn before self-heal stops the loop.
+      - alert: LunarWingSelfHealFlapping
+        expr: lunarwing_health_selfheal_flapping > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Self-heal flapping on {{ $labels.service }}"
+          description: >-
+            {{ $value }} restarts inside the flap window. The circuit
+            breaker will escalate if this continues.
