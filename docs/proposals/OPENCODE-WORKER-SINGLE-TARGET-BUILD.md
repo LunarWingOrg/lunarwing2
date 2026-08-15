@@ -148,7 +148,7 @@ Notes:
    stage. The separate SDK assertion imports `@opencode-ai/sdk/v2/client` and
    verifies `createOpencodeClient`.
 4. **Upstream flag stability.** `--single` is parsed by the pinned opencode
-   release (`OPENCODE_REF=v1.18.9`; flag and `dist/opencode-<os>-<arch>`
+   release (`OPENCODE_REF=v1.18.18`; flag and `dist/opencode-<os>-<arch>`
    output layout re-verified against that tag). If a future opencode bump
    renames or removes the flag, the strict build fails immediately. Verify
    on each OpenCode version bump.
