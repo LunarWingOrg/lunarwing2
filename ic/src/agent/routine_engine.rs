@@ -1832,9 +1832,7 @@ fn recover_routine_model_failure(
     messages: &mut Vec<ChatMessage>,
     partial_tokens: Option<i32>,
 ) -> RoutineModelFailure {
-    if !*recovery_attempted
-        && let Some(instruction) = error.recovery_instruction()
-    {
+    if !*recovery_attempted && let Some(instruction) = error.recovery_instruction() {
         *recovery_attempted = true;
         messages.push(ChatMessage::system(instruction));
         return RoutineModelFailure::Retry;
