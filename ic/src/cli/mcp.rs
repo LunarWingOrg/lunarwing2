@@ -16,7 +16,7 @@ use crate::tools::mcp::{
     OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
-    factory::create_client_from_config,
+    factory::create_client_from_config_with_external_runtimes,
     provenance::{McpPackageProvenance, PackageEcosystem, PackageTrust, ProvenanceIdentity},
     sandbox::McpSandboxConfig,
 };
@@ -69,7 +69,7 @@ pub struct McpAddArgs {
     /// Server URL (e.g., "https://mcp.notion.com") -- required for http transport
     pub url: Option<String>,
 
-    /// Transport type: http (default), stdio, unix, wasm, gateway
+    /// Transport type: http (default), stdio, unix, wasm, gateway, external
     #[arg(long, default_value = "http")]
     pub transport: String,
 
@@ -121,6 +121,16 @@ pub struct McpAddArgs {
     #[arg(long, value_name = "ROUTE")]
     pub gateway_route: Option<String>,
 
+    /// External runtime kind name (external transport; must match a
+    /// descriptor in the `external_runtimes` section of mcp-servers.json)
+    #[arg(long, value_name = "RUNTIME")]
+    pub external_runtime: Option<String>,
+
+    /// Opaque options JSON handed to the external runtime adapter
+    /// (external transport)
+    #[arg(long, value_name = "JSON")]
+    pub external_options: Option<String>,
+
     /// Custom HTTP headers (KEY:VALUE format, can be repeated)
     #[arg(long = "header", value_parser = parse_header)]
     pub headers: Vec<(String, String)>,
@@ -145,7 +155,8 @@ pub struct McpAddArgs {
     #[arg(long)]
     pub description: Option<String>,
 
-    /// Enable the baseline host OS sandbox (stdio transport): the child runs
+    /// Enable the baseline host OS sandbox (stdio or external transport): the
+    /// child runs
     /// as an isolated process-group leader with no_new_privileges and a
     /// seccomp filter denying ptrace/process_vm_* syscalls (Linux)
     #[arg(long)]
@@ -497,8 +508,8 @@ fn validate_add_runtime_options(
     if transport != "stdio" && !args.secret_env.is_empty() {
         anyhow::bail!("--secret-env is only supported with stdio transport");
     }
-    if sandbox.is_some() && transport != "stdio" {
-        anyhow::bail!("sandbox options are only supported with stdio transport");
+    if sandbox.is_some() && !matches!(transport.as_str(), "stdio" | "external") {
+        anyhow::bail!("sandbox options are only supported with stdio or external transport");
     }
     if args.client_id.is_some() && !matches!(transport.as_str(), "http" | "gateway") {
         anyhow::bail!("OAuth authentication is only supported with http or gateway transport");
@@ -533,10 +544,24 @@ fn build_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
             .ok_or_else(|| anyhow::anyhow!("URL is required for http transport")),
         "wasm" => build_wasm_add_transport(args),
         "gateway" => build_gateway_add_transport(args),
+        "external" => build_external_add_transport(args),
         other => anyhow::bail!(
-            "Unknown transport type '{other}'. Supported: http, stdio, unix, wasm, gateway"
+            "Unknown transport type '{other}'. Supported: http, stdio, unix, wasm, gateway, external"
         ),
     }
+}
+
+fn build_external_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
+    let runtime = args
+        .external_runtime
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--external-runtime is required for external transport"))?;
+    let options = match &args.external_options {
+        Some(raw) => serde_json::from_str(raw)
+            .map_err(|error| anyhow::anyhow!("--external-options must be valid JSON: {error}"))?,
+        None => serde_json::Value::Null,
+    };
+    Ok(McpServerConfig::new_external(&args.name, runtime, options))
 }
 
 fn build_wasm_add_transport(args: &McpAddArgs) -> anyhow::Result<McpServerConfig> {
@@ -1004,12 +1029,13 @@ async fn test_server(
         return Ok(());
     }
 
-    let client = create_client_from_config(
+    let client = create_client_from_config_with_external_runtimes(
         server.clone(),
         &session_manager,
         &process_manager,
         Some(secrets),
         &user_id,
+        Arc::new(servers.external_runtime_registry()?),
     )
     .await
     .map_err(|e| anyhow::anyhow!("{}", e))?;

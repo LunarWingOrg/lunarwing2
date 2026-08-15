@@ -132,22 +132,43 @@ These are validation and coverage tasks, not known production-code defects.
 ## Deferred MCP Work
 
 - Automatic npm/pip package installation.
-- Publisher signatures, trusted signing keys, dependency locking, upgrade
-  diffs, and marketplace revocation distribution. (Operator-pinned stdio executable
-  and WASM component digests, package identity, trust state, and revocation are
-  implemented.)
-- Device-level sandboxing and mandatory default sandbox profiles. (Opt-in
-  host sandboxing for stdio servers — resource limits, core-dump control,
-  process-group isolation, no_new_privileges, seccomp ptrace/process_vm
-  denial, Landlock read-only root, and network namespace isolation — is
-  implemented as of 2026-08-08.)
-- A bundled gateway control-plane service, cross-daemon HA policy, and
-  centralized cross-tenant credential ownership. The dedicated/shared client
-  placement contract is implemented.
+- A signed-package marketplace *install flow* (CLI install/upgrade against a
+  marketplace catalog). The underlying primitives are implemented and wired:
+  ed25519 publisher signatures and trust stores, signed dependency lockfiles
+  pinning exact versions and digests, manifest upgrade diffs, and signed
+  revocation lists with monotonic sequences. Revocation enforcement is
+  operator-reachable via the `marketplace` section of `mcp-servers.json`
+  (`trust_store_path`, `revocation_cache_path`, `revocation_url`,
+  `revocation_publisher`, `revocation_public_key_hex`): configuration loads
+  fail closed on revoked packages, daemon startup pulls the newest signed list
+  (`refresh_marketplace_revocations`), and manual activation re-checks the
+  cached list. (Operator-pinned stdio executable and WASM component digests,
+  package identity, trust state, and revocation are implemented.)
+- Device-level sandboxing beyond the current baseline. (Opt-in host sandboxing
+  for stdio servers — resource limits, core-dump control, process-group
+  isolation, no_new_privileges, seccomp ptrace/process_vm denial, Landlock
+  read-only root, and network namespace isolation — is implemented, and
+  `require_sandbox_profiles = true` in `mcp-servers.json` makes the mandatory
+  baseline deployment-wide.)
+- Cross-daemon HA policy and centralized cross-tenant credential ownership.
+  The bundled gateway control-plane service is implemented and opt-in via
+  environment (`LUNARWING_MCP_GATEWAY_CONTROL_BIND`,
+  `LUNARWING_MCP_GATEWAY_ADMIN_TOKEN`, optional
+  `LUNARWING_MCP_GATEWAY_ROUTES_PATH`; loopback-only unless
+  `LUNARWING_MCP_GATEWAY_CONTROL_ALLOW_NON_LOOPBACK=1`). The dedicated/shared
+  client placement contract is implemented.
 - Configurable startup and request timeouts for every transport. MCP-over-WASM
   per-message deadlines and bounded transport/process shutdown are implemented.
-- Generic external runtime descriptors and production adapter-plugin composition. Current
-  runtime registry intentionally remains an internal closed built-in dispatch boundary.
+- Persistent external-worker MCP activation delivery: the `external_worker`
+  placement vocabulary, worker selection exclusion from job snapshots, and
+  `lunarwing doctor` cross-checks (unknown worker names, undeclared external
+  runtimes) are implemented, but the `lunarwing-agent-v1` worker protocol has
+  no MCP registration message yet, so external-worker servers are not pushed
+  to workers. Generic external runtime descriptors are implemented and
+  reachable: declare adapters in the `external_runtimes` section of
+  `mcp-servers.json` and attach servers with `lunarwing mcp add --transport
+  external --external-runtime <name> [--external-options '<json>']`; empty
+  registries fail closed with an unknown-runtime error.
 
 Automatic npm/pip installation must remain blocked until provenance, dependency
 locking, containment, audit, revocation, health, and rollback policies exist.

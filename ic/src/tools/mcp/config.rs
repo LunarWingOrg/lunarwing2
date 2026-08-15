@@ -1202,6 +1202,154 @@ pub struct McpServersFile {
     /// mandatory minimum). Defaults to false (legacy opt-in sandboxing).
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_sandbox_profiles: bool,
+
+    /// Marketplace trust anchor and revocation distribution configuration.
+    /// Absent means legacy behavior: no publisher trust store is consulted
+    /// and no revocation list is enforced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marketplace: Option<MarketplaceConfig>,
+
+    /// External runtime descriptors available to `transport = "external"`
+    /// server entries. Empty means no external runtimes are registered and
+    /// external transports fail closed with an unknown-runtime error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_runtimes: Vec<crate::tools::mcp::descriptor::ExternalRuntimeDescriptor>,
+}
+
+/// Marketplace trust anchor and revocation distribution configuration.
+///
+/// All revocation fields (`revocation_cache_path`, `revocation_publisher`,
+/// `revocation_public_key_hex`) must appear together so a partial deployment
+/// cannot silently skip revocation enforcement. `revocation_url` is optional;
+/// without it the cached list is still enforced but never refreshed over the
+/// network (out-of-band distribution, e.g. configuration management, can
+/// still update the cache file).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarketplaceConfig {
+    /// Path to the publisher trust store JSON (`PublisherTrustStoreFile`).
+    /// When set, the file must parse and verify at validation time —
+    /// a corrupt trust store fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_store_path: Option<PathBuf>,
+
+    /// Local cache path for the signed revocation list. The cache is written
+    /// atomically by the revocation store and verified on every load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_cache_path: Option<PathBuf>,
+
+    /// HTTPS URL distributing signed revocation lists (localhost HTTP is
+    /// allowed for test harnesses). Requires `revocation_cache_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_url: Option<String>,
+
+    /// Publisher name expected to sign revocation lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_publisher: Option<String>,
+
+    /// Hex-encoded ed25519 public key verifying revocation list signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revocation_public_key_hex: Option<String>,
+}
+
+/// Maximum accepted size of a publisher trust store file.
+const MAX_TRUST_STORE_BYTES: u64 = 256 * 1024;
+
+impl MarketplaceConfig {
+    /// Whether signed revocation list enforcement is configured.
+    pub fn revocation_configured(&self) -> bool {
+        self.revocation_cache_path.is_some()
+    }
+
+    /// Structural validation plus fail-closed loading of the trust store and
+    /// revocation cache. `servers` are checked against the current revocation
+    /// list so a revoked package cannot pass configuration loading.
+    pub fn validate(&self, servers: &[McpServerConfig]) -> Result<(), ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidConfig {
+            reason: format!("marketplace: {reason}"),
+        };
+        let revocation_fields = [
+            self.revocation_cache_path.is_some(),
+            self.revocation_publisher.is_some(),
+            self.revocation_public_key_hex.is_some(),
+        ];
+        if revocation_fields.iter().any(|present| *present)
+            && revocation_fields.iter().any(|absent| !absent)
+        {
+            return Err(invalid(
+                "revocation_cache_path, revocation_publisher, and revocation_public_key_hex must be set together"
+                    .to_string(),
+            ));
+        }
+        if self.revocation_url.is_some() && self.revocation_cache_path.is_none() {
+            return Err(invalid(
+                "revocation_url requires revocation_cache_path".to_string(),
+            ));
+        }
+        if let Some(url) = &self.revocation_url
+            && !url.to_lowercase().starts_with("https://")
+            && !is_localhost_url(url)
+        {
+            return Err(invalid(format!("revocation_url '{url}' must use HTTPS")));
+        }
+        if let Some(path) = &self.trust_store_path {
+            Self::load_trust_store(path)?;
+        }
+        if let Some(store) = self.revocation_store()? {
+            for server in servers.iter().filter(|server| server.enabled) {
+                let Some(provenance) = &server.provenance else {
+                    continue;
+                };
+                store
+                    .check_provenance(provenance)
+                    .map_err(|error| invalid(format!("server '{}': {error}", server.name)))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Load and verify the publisher trust store (bounded, fail-closed).
+    fn load_trust_store(
+        path: &Path,
+    ) -> Result<crate::tools::mcp::marketplace::PublisherTrustStore, ConfigError> {
+        let invalid = |reason: String| ConfigError::InvalidConfig {
+            reason: format!("marketplace: trust store '{}': {reason}", path.display()),
+        };
+        let metadata =
+            std::fs::metadata(path).map_err(|error| invalid(format!("cannot stat: {error}")))?;
+        if metadata.len() > MAX_TRUST_STORE_BYTES {
+            return Err(invalid(format!("exceeds {MAX_TRUST_STORE_BYTES} bytes")));
+        }
+        let bytes =
+            std::fs::read(path).map_err(|error| invalid(format!("cannot read: {error}")))?;
+        let file: crate::tools::mcp::marketplace::PublisherTrustStoreFile =
+            serde_json::from_slice(&bytes)
+                .map_err(|error| invalid(format!("invalid JSON: {error}")))?;
+        crate::tools::mcp::marketplace::PublisherTrustStore::from_file(file)
+            .map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Open the configured revocation store, or `None` when revocation
+    /// enforcement is not configured. A corrupt or invalid cache fails closed.
+    pub fn revocation_store(
+        &self,
+    ) -> Result<Option<crate::tools::mcp::marketplace::RevocationStore>, ConfigError> {
+        let (Some(cache_path), Some(publisher), Some(public_key_hex)) = (
+            &self.revocation_cache_path,
+            &self.revocation_publisher,
+            &self.revocation_public_key_hex,
+        ) else {
+            return Ok(None);
+        };
+        crate::tools::mcp::marketplace::RevocationStore::open(
+            cache_path.clone(),
+            publisher,
+            public_key_hex,
+        )
+        .map(Some)
+        .map_err(|error| ConfigError::InvalidConfig {
+            reason: format!("marketplace: revocation store: {error}"),
+        })
+    }
 }
 
 fn default_schema_version() -> u32 {
@@ -1224,7 +1372,32 @@ impl McpServersFile {
             }
             self.validate_mandatory_sandbox(server)?;
         }
+        self.external_runtime_registry()?;
+        if let Some(marketplace) = &self.marketplace {
+            marketplace.validate(&self.servers)?;
+        }
         Ok(())
+    }
+
+    /// Build the external runtime registry declared by this file.
+    ///
+    /// Composition roots pass the registry to
+    /// [`crate::tools::mcp::factory::create_client_from_config_with_external_runtimes`]
+    /// so `transport = "external"` servers resolve their adapter. Validation
+    /// runs the same builder, so invalid or duplicated descriptors fail
+    /// configuration loading before any activation attempt.
+    pub fn external_runtime_registry(
+        &self,
+    ) -> Result<crate::tools::mcp::descriptor::ExternalRuntimeRegistry, ConfigError> {
+        let mut registry = crate::tools::mcp::descriptor::ExternalRuntimeRegistry::new();
+        for descriptor in &self.external_runtimes {
+            registry
+                .register(descriptor.clone())
+                .map_err(|error| ConfigError::InvalidConfig {
+                    reason: format!("external runtimes: {error}"),
+                })?;
+        }
+        Ok(registry)
     }
 
     /// Enforce the deployment-wide mandatory sandbox baseline when enabled.
@@ -1394,6 +1567,43 @@ pub async fn load_mcp_servers_from(path: impl AsRef<Path>) -> Result<McpServersF
     config.validate()?;
 
     Ok(config)
+}
+
+/// Open the configured revocation store and pull the newest signed list.
+///
+/// This is the revocation distribution entry point for daemon startup: when
+/// the marketplace section configures a revocation URL, the store fetches and
+/// applies any newer signed list before servers activate. Fetch failures are
+/// logged and never clear or roll back the cached list. Returns the open
+/// store when revocation enforcement is configured, so callers can re-check
+/// servers against the freshest list.
+pub async fn refresh_marketplace_revocations(
+    servers: &McpServersFile,
+) -> Option<std::sync::Arc<crate::tools::mcp::marketplace::RevocationStore>> {
+    let marketplace = servers.marketplace.as_ref()?;
+    let store = match marketplace.revocation_store() {
+        Ok(Some(store)) => std::sync::Arc::new(store),
+        Ok(None) => return None,
+        Err(error) => {
+            // validate() already fails closed on a corrupt cache, so reaching
+            // this means the cache broke between load and refresh.
+            tracing::warn!(%error, "Marketplace revocation store unavailable");
+            return None;
+        }
+    };
+    if let Some(url) = &marketplace.revocation_url {
+        let client = reqwest::Client::new();
+        match store.fetch_and_apply(url, &client).await {
+            Ok(Some(sequence)) => {
+                tracing::info!(sequence, "Applied newer marketplace revocation list");
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, url, "Marketplace revocation fetch failed; using cached list");
+            }
+        }
+    }
+    Some(store)
 }
 
 /// Save MCP server configurations to the default location.
@@ -2976,5 +3186,226 @@ mod tests {
             Some(" project-tools ".to_string()),
         );
         assert!(whitespace_route.validate().is_err());
+    }
+
+    fn signed_revocation_cache(
+        dir: &Path,
+        key: &crate::tools::mcp::marketplace::PublisherSigningKey,
+        entries: Vec<crate::tools::mcp::marketplace::RevocationEntry>,
+    ) -> PathBuf {
+        let list = crate::tools::mcp::marketplace::RevocationList {
+            schema_version: 1,
+            sequence: 1,
+            issued_at: chrono::Utc::now(),
+            entries,
+        };
+        let signed =
+            crate::tools::mcp::marketplace::SignedRevocationList::sign(list, "lunarwing", key);
+        let cache = dir.join("revocations.json");
+        std::fs::write(&cache, serde_json::to_vec(&signed).unwrap()).unwrap();
+        cache
+    }
+
+    fn provenance_for_package(
+        package_id: &str,
+    ) -> crate::tools::mcp::provenance::McpPackageProvenance {
+        let mut provenance = crate::tools::mcp::provenance::McpPackageProvenance::with_trust(
+            crate::tools::mcp::provenance::PackageTrust::Unverified,
+        );
+        provenance.package_id = Some(package_id.to_string());
+        provenance.version = Some("1.0.0".to_string());
+        provenance
+    }
+
+    fn marketplace_file(
+        cache: PathBuf,
+        key: &crate::tools::mcp::marketplace::PublisherSigningKey,
+        servers: Vec<McpServerConfig>,
+    ) -> McpServersFile {
+        let mut file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                trust_store_path: None,
+                revocation_cache_path: Some(cache),
+                revocation_url: None,
+                revocation_publisher: Some("lunarwing".to_string()),
+                revocation_public_key_hex: Some(key.public_key_hex()),
+            }),
+            ..Default::default()
+        };
+        for server in servers {
+            file.upsert(server);
+        }
+        file
+    }
+
+    #[test]
+    fn marketplace_requires_complete_revocation_fields() {
+        let file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                revocation_cache_path: Some(PathBuf::from("/tmp/cache.json")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = file.validate().expect_err("partial revocation config");
+        assert!(error.to_string().contains("must be set together"));
+
+        let file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                revocation_url: Some(
+                    "https://marketplace.example.com/revocations.json".to_string(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = file
+            .validate()
+            .expect_err("revocation url without cache path");
+        assert!(error.to_string().contains("revocation_cache_path"));
+    }
+
+    #[test]
+    fn marketplace_rejects_non_https_revocation_url() {
+        let key = crate::tools::mcp::marketplace::PublisherSigningKey::generate();
+        let dir = tempdir().unwrap();
+        let cache = signed_revocation_cache(dir.path(), &key, Vec::new());
+        let mut file = marketplace_file(cache, &key, Vec::new());
+        file.marketplace.as_mut().unwrap().revocation_url =
+            Some("http://marketplace.example.com/revocations.json".to_string());
+        let error = file.validate().expect_err("plain http url");
+        assert!(error.to_string().contains("must use HTTPS"));
+    }
+
+    #[test]
+    fn marketplace_revocation_blocks_revoked_enabled_server() {
+        let key = crate::tools::mcp::marketplace::PublisherSigningKey::generate();
+        let dir = tempdir().unwrap();
+        let cache = signed_revocation_cache(
+            dir.path(),
+            &key,
+            vec![crate::tools::mcp::marketplace::RevocationEntry {
+                package_id: "evil-package".to_string(),
+                version: None,
+                sha256: None,
+                reason: Some("compromised".to_string()),
+            }],
+        );
+
+        let mut revoked = McpServerConfig::new("remote", "https://mcp.example.com");
+        revoked.provenance = Some(provenance_for_package("evil-package"));
+        let file = marketplace_file(cache.clone(), &key, vec![revoked]);
+        let error = file.validate().expect_err("revoked package must fail");
+        assert!(error.to_string().contains("remote"));
+        assert!(error.to_string().contains("revoked"));
+
+        // A disabled revoked server stays loadable so operators can inspect or
+        // remove it; only activation-relevant (enabled) servers are blocked.
+        let mut disabled = McpServerConfig::new("remote", "https://mcp.example.com");
+        disabled.enabled = false;
+        disabled.provenance = Some(provenance_for_package("evil-package"));
+        let file = marketplace_file(cache.clone(), &key, vec![disabled]);
+        file.validate().expect("disabled revoked server loads");
+
+        let mut clean = McpServerConfig::new("remote", "https://mcp.example.com");
+        clean.provenance = Some(provenance_for_package("good-package"));
+        let file = marketplace_file(cache, &key, vec![clean]);
+        file.validate().expect("unrevoked package loads");
+    }
+
+    #[test]
+    fn marketplace_fails_closed_on_corrupt_revocation_cache() {
+        let key = crate::tools::mcp::marketplace::PublisherSigningKey::generate();
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("revocations.json");
+        std::fs::write(&cache, b"not json").unwrap();
+        let file = marketplace_file(cache, &key, Vec::new());
+        assert!(file.validate().is_err());
+    }
+
+    #[test]
+    fn marketplace_fails_closed_on_unreadable_trust_store() {
+        let dir = tempdir().unwrap();
+        let mut file = McpServersFile {
+            marketplace: Some(MarketplaceConfig {
+                trust_store_path: Some(dir.path().join("missing.json")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(file.validate().is_err());
+
+        let trust_path = dir.path().join("trust.json");
+        std::fs::write(&trust_path, b"{ not json").unwrap();
+        file.marketplace = Some(MarketplaceConfig {
+            trust_store_path: Some(trust_path),
+            ..Default::default()
+        });
+        assert!(file.validate().is_err());
+    }
+
+    #[test]
+    fn external_runtimes_register_and_reject_duplicates() {
+        let descriptor = |name: &str| crate::tools::mcp::descriptor::ExternalRuntimeDescriptor {
+            descriptor_version: crate::tools::mcp::descriptor::DESCRIPTOR_VERSION,
+            name: name.to_string(),
+            description: None,
+            command: "/usr/local/bin/adapter".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            require_sandbox: false,
+            capabilities: Vec::new(),
+        };
+
+        let mut file = McpServersFile {
+            external_runtimes: vec![descriptor("node-compat")],
+            ..Default::default()
+        };
+        file.validate().expect("valid descriptor");
+        let registry = file.external_runtime_registry().expect("registry");
+        assert_eq!(registry.names(), vec!["node-compat"]);
+
+        file.external_runtimes.push(descriptor("node-compat"));
+        let error = file.validate().expect_err("duplicate descriptor");
+        assert!(error.to_string().contains("node-compat"));
+
+        let mut invalid = descriptor("bad name");
+        invalid.name = "bad name".to_string();
+        let file = McpServersFile {
+            external_runtimes: vec![invalid],
+            ..Default::default()
+        };
+        assert!(file.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn marketplace_and_external_runtimes_survive_serde_roundtrip() {
+        let key = crate::tools::mcp::marketplace::PublisherSigningKey::generate();
+        let dir = tempdir().unwrap();
+        let cache = signed_revocation_cache(dir.path(), &key, Vec::new());
+        let mut file = marketplace_file(cache.clone(), &key, Vec::new());
+        file.marketplace.as_mut().unwrap().revocation_url =
+            Some("https://marketplace.example.com/revocations.json".to_string());
+        file.external_runtimes = vec![crate::tools::mcp::descriptor::ExternalRuntimeDescriptor {
+            descriptor_version: crate::tools::mcp::descriptor::DESCRIPTOR_VERSION,
+            name: "node-compat".to_string(),
+            description: None,
+            command: "/usr/local/bin/adapter".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            require_sandbox: false,
+            capabilities: Vec::new(),
+        }];
+
+        let path = dir.path().join("mcp-servers.json");
+        save_mcp_servers_to(&file, &path).await.unwrap();
+        let loaded = load_mcp_servers_from(&path).await.unwrap();
+        let marketplace = loaded.marketplace.as_ref().expect("marketplace section");
+        assert_eq!(
+            marketplace.revocation_cache_path.as_deref(),
+            Some(cache.as_path())
+        );
+        assert!(loaded.external_runtime_registry().is_ok());
+        assert_eq!(loaded.external_runtimes.len(), 1);
     }
 }

@@ -12,6 +12,35 @@
 
 Recipe. But first key correctness point: PAM subtree alone does NOT fix mt-admin builds, because mt-admin spawns build via `sudo -u` from operator shell — fork inherits **caller's** cgroup, PAM hook never fires. Login subtree fixes tenant **login sessions**; for mt-admin build path you still need root-side migration (setpriv patch) or switch spawn to `su`/ssh (PAM-authenticated). Both included below.
 
+## 0. Prerequisites (host-level, easy to miss)
+
+1. **Unified cgroup v2 mode.** The whole layout assumes `/sys/fs/cgroup` *is* the
+   v2 hierarchy. Gentoo OpenRC commonly boots **hybrid** by default, where
+   `/sys/fs/cgroup` is a tmpfs with v1 controllers and v2 lives only at
+   `/sys/fs/cgroup/unified` — memory stays bound to v1 there and cannot be
+   delegated, so build bounding is impossible in hybrid mode. Check:
+
+   ```sh
+   stat -fc %T /sys/fs/cgroup        # must print: cgroup2fs
+   ```
+
+   If it prints `tmpfs`, switch to unified: set `rc_cgroup_mode="unified"` in
+   `/etc/rc.conf` (the stock entry is commented out) and reboot. Both
+   `setup-cgroups` and the per-build probe in mt-admin fail with an explicit
+   hybrid-mode message on affected hosts.
+
+2. **`memory` in the root `cgroup.controllers`**, and either enabled in root
+   `cgroup.subtree_control` already or the file writable by root (mt-admin
+   enables it itself). Absent memory usually means a kernel without the
+   controller or a `cgroup_disable=memory` boot arg.
+
+3. **`setpriv`** — required by the root-side migration spawn that places builds
+   into `lunarwing-<name>/build`. On Gentoo it comes from `sys-apps/util-linux`
+   but is **gated behind the `caps` USE flag** (`$(use_enable caps setpriv)` in
+   the ebuild): a default util-linux install has no setpriv, and every build
+   silently falls back to nice-only. Set `sys-apps/util-linux caps` in
+   `/etc/portage/package.use/`, rebuild, and verify `command -v setpriv`.
+
 ## 1. Hierarchy layout (respects no-internal-process rule)
 
 ```

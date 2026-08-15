@@ -2546,17 +2546,47 @@ _openrc_cgroup_root() {
 # #54). A writable root is insufficient: memory must be available and either
 # delegated already or writable in cgroup.subtree_control. setpriv (util-linux)
 # is required for the root-side migration spawn used to place the build.
+# Every check reports its own failure so "bounding unavailable" is never a
+# mystery: the reason lands on stderr right before the nice-only fallback.
 _openrc_build_cgroup_supported() {
   local root
   root="$(_openrc_cgroup_root)"
-  command -v setpriv >/dev/null 2>&1 || return 1
-  [[ -d "$root" && -w "$root" ]] || return 1
-  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || return 1
-  [[ -r "$root/cgroup.controllers" ]] || return 1
-  grep -qw memory "$root/cgroup.controllers" || return 1
-  [[ -r "$root/cgroup.subtree_control" ]] || return 1
+  command -v setpriv >/dev/null 2>&1 || {
+    say "cgroup build bounding unavailable: setpriv not found (install sys-apps/util-linux)" >&2
+    return 1
+  }
+  if ! [[ -d "$root" && -w "$root" ]]; then
+    say "cgroup build bounding unavailable: $root is not a writable directory" >&2
+    return 1
+  fi
+  if [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]]; then
+    :
+  elif [[ "$(stat -fc %T "$root" 2>/dev/null)" == tmpfs && -d "$root/unified" ]] \
+    && [[ "$(stat -fc %T "$root/unified" 2>/dev/null)" == cgroup2fs ]]; then
+    say "cgroup build bounding unavailable: hybrid cgroup mode detected" >&2
+    say "  (v1 controllers at $root, v2 only at $root/unified — controllers such" >&2
+    say "   as memory are bound to v1 there and cannot be delegated for bounding)." >&2
+    say "  fix: set rc_cgroup_mode=\"unified\" in /etc/rc.conf and reboot" >&2
+    return 1
+  else
+    say "cgroup build bounding unavailable: $root is not a cgroup v2 hierarchy" >&2
+    return 1
+  fi
+  [[ -r "$root/cgroup.controllers" ]] \
+    && grep -qw memory "$root/cgroup.controllers" || {
+      say "cgroup build bounding unavailable: memory controller missing at $root (kernel boot arg?)" >&2
+      return 1
+    }
+  [[ -r "$root/cgroup.subtree_control" ]] || {
+    say "cgroup build bounding unavailable: $root/cgroup.subtree_control unreadable" >&2
+    return 1
+  }
   grep -qw memory "$root/cgroup.subtree_control" \
-    || [[ -w "$root/cgroup.subtree_control" ]]
+    || [[ -w "$root/cgroup.subtree_control" ]] || {
+      say "cgroup build bounding unavailable: memory not enabled in $root/cgroup.subtree_control and not writable" >&2
+      return 1
+    }
+  return 0
 }
 
 # Resolve a tenant's home directory for the build spawn environment. The sudo
@@ -2862,7 +2892,7 @@ setup_cgroups() {
   local root
   root="$(_openrc_cgroup_root)"
   [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] \
-    || die "cgroup v2 hierarchy not mounted at $root"
+    || die "cgroup v2 hierarchy not mounted at $root (hybrid mode? set rc_cgroup_mode=\"unified\" in /etc/rc.conf and reboot)"
   [[ -r "$root/cgroup.controllers" ]] \
     && grep -qw memory "$root/cgroup.controllers" \
     || die "memory controller not available at $root"

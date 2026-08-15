@@ -53,12 +53,15 @@ pub use auth::{is_authenticated, refresh_access_token};
 pub use client::McpClient;
 pub(crate) use client::{MAX_WORKER_MCP_TOOL_BYTES, MAX_WORKER_MCP_TOOLS};
 pub use config::{
-    McpGatewayMode, McpPlacement, McpServerConfig, McpServersFile, McpTransportConfig, OAuthConfig,
+    MarketplaceConfig, McpGatewayMode, McpPlacement, McpServerConfig, McpServersFile,
+    McpTransportConfig, OAuthConfig,
 };
 pub use descriptor::{
     DescriptorError, EXTERNAL_OPTIONS_ENV, ExternalRuntimeDescriptor, ExternalRuntimeRegistry,
 };
-pub use factory::{McpFactoryError, create_client_from_config};
+pub use factory::{
+    McpFactoryError, create_client_from_config, create_client_from_config_with_external_runtimes,
+};
 pub use gateway_control::{
     GatewayControlConfig, GatewayControlError, GatewayControlPlane, GatewayRoute,
 };

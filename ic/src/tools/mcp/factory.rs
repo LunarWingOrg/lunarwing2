@@ -19,6 +19,11 @@ use crate::tools::mcp::{McpClient, McpProcessManager, McpSessionManager, McpTran
 pub use crate::tools::mcp::runtime::McpRuntimeError as McpFactoryError;
 
 /// Create an `McpClient` with the built-in runtime adapters.
+///
+/// No external runtime descriptors are registered, so `transport = "external"`
+/// servers fail closed with an unknown-runtime error. Composition roots that
+/// load operator-declared descriptors should use
+/// [`create_client_from_config_with_external_runtimes`].
 pub async fn create_client_from_config(
     server: McpServerConfig,
     session_manager: &Arc<McpSessionManager>,
@@ -26,8 +31,29 @@ pub async fn create_client_from_config(
     secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
     user_id: &str,
 ) -> Result<McpClient, McpFactoryError> {
+    create_client_from_config_with_external_runtimes(
+        server,
+        session_manager,
+        process_manager,
+        secrets,
+        user_id,
+        Arc::new(crate::tools::mcp::descriptor::ExternalRuntimeRegistry::new()),
+    )
+    .await
+}
+
+/// Create an `McpClient` with the built-in runtime adapters plus the
+/// operator-declared external runtime descriptors.
+pub async fn create_client_from_config_with_external_runtimes(
+    server: McpServerConfig,
+    session_manager: &Arc<McpSessionManager>,
+    process_manager: &Arc<McpProcessManager>,
+    secrets: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    user_id: &str,
+    external: Arc<crate::tools::mcp::descriptor::ExternalRuntimeRegistry>,
+) -> Result<McpClient, McpFactoryError> {
     require_host_placement(&server)?;
-    let registry = default_runtime_registry();
+    let registry = runtime_registry_with_external_runtimes(external);
     create_client_with_runtime_registry(
         server,
         session_manager,
@@ -499,21 +525,43 @@ impl McpRuntimeAdapter for ExternalRuntimeAdapter {
             }
             None => None,
         };
-        let transport = context
-            .process_manager()
-            .spawn_stdio(
-                &server_name,
-                &descriptor.command,
-                descriptor.args.clone(),
-                env_values,
-                false,
-                sandbox,
-            )
-            .await
-            .map_err(|error| McpFactoryError::StdioSpawn {
-                name: server_name.clone(),
-                reason: error.to_string(),
-            })?;
+        // A pinned provenance record applies to the adapter executable the
+        // descriptor spawns; verify it exactly like a stdio command.
+        let verified_executable = if let Some(provenance) = server.provenance.clone() {
+            verify_stdio_provenance(&server_name, provenance, &descriptor.command).await?
+        } else {
+            None
+        };
+        let spawn = if let Some(executable) = verified_executable {
+            context
+                .process_manager()
+                .spawn_verified_stdio(
+                    &server_name,
+                    &descriptor.command,
+                    descriptor.args.clone(),
+                    env_values,
+                    false,
+                    sandbox,
+                    executable,
+                )
+                .await
+        } else {
+            context
+                .process_manager()
+                .spawn_stdio(
+                    &server_name,
+                    &descriptor.command,
+                    descriptor.args.clone(),
+                    env_values,
+                    false,
+                    sandbox,
+                )
+                .await
+        };
+        let transport = spawn.map_err(|error| McpFactoryError::StdioSpawn {
+            name: server_name.clone(),
+            reason: error.to_string(),
+        })?;
         Ok(McpClient::new_with_transport(
             &server_name,
             transport as Arc<dyn McpTransport>,
