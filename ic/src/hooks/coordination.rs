@@ -36,14 +36,8 @@ pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 420;
 
 /// Default allowed coordination message tags. `KNOW` carries a one-line
 /// cross-tenant knowledge share (see `hooks::coordination_knowledge`).
-pub const DEFAULT_ALLOWED_TAGS: [&str; 6] = [
-    "STATUS",
-    "ALERT",
-    "COORD",
-    "ANNOUNCE",
-    "QUERY",
-    "KNOW",
-];
+pub const DEFAULT_ALLOWED_TAGS: [&str; 6] =
+    ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY", "KNOW"];
 
 /// Maximum accepted coordination agent identifier length.
 pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
@@ -1154,20 +1148,21 @@ pub async fn register_coordination_hooks(
     // engagement (15) hooks so broadcast shares are ingested even when this
     // daemon would not otherwise engage, and before the room's structural
     // validation can reject the message.
-    let knowledge_hook = knowledge_workspace.filter(|_| config.knowledge_share_enabled).map(
-        |workspace| {
-            let limits =
-                crate::hooks::coordination_knowledge::KnowledgeShareLimits::from_env();
+    let knowledge_hook = knowledge_workspace
+        .filter(|_| config.knowledge_share_enabled)
+        .map(|workspace| {
+            let limits = crate::hooks::coordination_knowledge::KnowledgeShareLimits::from_env();
             (
-                Arc::new(crate::hooks::coordination_knowledge::KnowledgeShareHook::new(
-                    state.clone(),
-                    workspace,
-                    limits,
-                )) as Arc<dyn Hook>,
+                Arc::new(
+                    crate::hooks::coordination_knowledge::KnowledgeShareHook::new(
+                        state.clone(),
+                        workspace,
+                        limits,
+                    ),
+                ) as Arc<dyn Hook>,
                 13,
             )
-        },
-    );
+        });
     let hooks = match knowledge_hook {
         Some(entry) => {
             let mut all = Vec::with_capacity(hooks.len() + 1);

@@ -711,11 +711,9 @@ async fn async_main() -> anyhow::Result<()> {
             coordination_config.is_actionable() && coordination_config.knowledge_share_enabled;
         match (want, components.db.clone()) {
             (true, Some(db)) => {
-                let shared = Workspace::new_with_db(
-                    lunarwing::workspace::KNOWLEDGE_SHARED_SCOPE,
-                    db,
-                )
-                .with_search_config(&config.search);
+                let shared =
+                    Workspace::new_with_db(lunarwing::workspace::KNOWLEDGE_SHARED_SCOPE, db)
+                        .with_search_config(&config.search);
                 tracing::info!("Coordination knowledge sharing enabled (KNOW: tag ingestion)");
                 Some(Arc::new(shared))
             }

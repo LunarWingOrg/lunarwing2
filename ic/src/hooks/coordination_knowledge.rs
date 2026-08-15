@@ -38,8 +38,8 @@ use crate::hooks::hook::{
     Hook, HookContext, HookError, HookEvent, HookFailureMode, HookOutcome, HookPoint,
 };
 use crate::workspace::{
-    KnowledgeNoteMeta, KnowledgeStatus, Workspace, MAX_CONTENT_BYTES, MAX_SLUG_BYTES,
-    MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown,
+    KnowledgeNoteMeta, KnowledgeStatus, MAX_CONTENT_BYTES, MAX_SLUG_BYTES, MAX_TITLE_BYTES,
+    Workspace, is_valid_slug, note_path, render_note_markdown,
 };
 
 /// Coordination tag that carries a shareable finding.
@@ -84,13 +84,13 @@ impl KnowledgeShareLimits {
     /// Load limits from environment variables.
     pub fn from_env() -> Self {
         let mut limits = Self::default();
-        if let Some(value) = env_parse::<usize>("COORD_KNOWLEDGE_MAX_PER_HOUR")
-            .filter(|value| *value > 0)
+        if let Some(value) =
+            env_parse::<usize>("COORD_KNOWLEDGE_MAX_PER_HOUR").filter(|value| *value > 0)
         {
             limits.max_per_hour = value;
         }
-        if let Some(value) = env_parse::<usize>("COORD_KNOWLEDGE_MIN_CHARS")
-            .filter(|value| *value > 0)
+        if let Some(value) =
+            env_parse::<usize>("COORD_KNOWLEDGE_MIN_CHARS").filter(|value| *value > 0)
         {
             limits.min_chars = value;
         }
@@ -326,11 +326,8 @@ mod tests {
         );
         // Case-insensitive tag, surrounding whitespace tolerated.
         assert!(
-            parse_knowledge_share(
-                "  know: t-1 | a finding long enough",
-                DEFAULT_MIN_CHARS
-            )
-            .is_some()
+            parse_knowledge_share("  know: t-1 | a finding long enough", DEFAULT_MIN_CHARS)
+                .is_some()
         );
     }
 
@@ -372,7 +369,10 @@ mod tests {
                 "slug for {sender:?} must be valid: {slug:?}"
             );
         }
-        assert_eq!(sender_agent_slug("Applejack@conf.example"), "applejack-conf-example");
+        assert_eq!(
+            sender_agent_slug("Applejack@conf.example"),
+            "applejack-conf-example"
+        );
         // Deterministic: same sender, same slug (stable note paths).
         assert_eq!(
             sender_agent_slug("Applejack@conf.example"),
@@ -396,7 +396,10 @@ mod tests {
     fn limits_env_parsing_ignores_invalid_values() {
         // Invalid / zero values keep defaults; env is read-only here so this
         // only exercises the parse helper contract.
-        assert_eq!(KnowledgeShareLimits::default().max_per_hour, DEFAULT_MAX_PER_HOUR);
+        assert_eq!(
+            KnowledgeShareLimits::default().max_per_hour,
+            DEFAULT_MAX_PER_HOUR
+        );
         assert_eq!(KnowledgeShareLimits::default().min_chars, DEFAULT_MIN_CHARS);
     }
 
@@ -407,10 +410,7 @@ mod tests {
         use crate::testing::test_db;
         use crate::workspace::KnowledgeNoteMeta;
 
-        fn hook(
-            workspace: Arc<Workspace>,
-            limits: KnowledgeShareLimits,
-        ) -> KnowledgeShareHook {
+        fn hook(workspace: Arc<Workspace>, limits: KnowledgeShareLimits) -> KnowledgeShareHook {
             let state = CoordinationState::new(
                 vec!["coord@conference.example".to_string()],
                 Vec::new(),
@@ -435,7 +435,10 @@ mod tests {
             agent: &str,
             topic: &str,
         ) -> Option<KnowledgeNoteMeta> {
-            let doc = workspace.read_primary(&note_path(agent, topic)).await.ok()?;
+            let doc = workspace
+                .read_primary(&note_path(agent, topic))
+                .await
+                .ok()?;
             KnowledgeNoteMeta::from_metadata_json(&doc.metadata)
         }
 
@@ -454,14 +457,20 @@ mod tests {
                     &Default::default(),
                 )
                 .await;
-            assert!(matches!(outcome, Ok(HookOutcome::Continue { modified: None })));
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
 
             let meta = shared_note(&workspace, "applejack-conf-example-res", "mt-admin-cgroups")
                 .await
                 .expect("note ingested");
             assert_eq!(meta.status, KnowledgeStatus::NeedsVerification);
             assert_eq!(meta.agent, "applejack-conf-example-res");
-            assert_eq!(meta.submitted_by.as_deref(), Some("Applejack@conf.example/res"));
+            assert_eq!(
+                meta.submitted_by.as_deref(),
+                Some("Applejack@conf.example/res")
+            );
             assert_eq!(meta.tags, vec![COORDINATION_TAG.to_string()]);
             assert!(meta.confidence.is_none());
         }
@@ -499,7 +508,10 @@ mod tests {
             let hook = hook(workspace.clone(), KnowledgeShareLimits::default());
 
             hook.execute(
-                &inbound("KNOW: topic-y | applejack version of the finding", "applejack"),
+                &inbound(
+                    "KNOW: topic-y | applejack version of the finding",
+                    "applejack",
+                ),
                 &Default::default(),
             )
             .await
@@ -511,7 +523,11 @@ mod tests {
             .await
             .expect("fail-open");
 
-            assert!(shared_note(&workspace, "applejack", "topic-y").await.is_some());
+            assert!(
+                shared_note(&workspace, "applejack", "topic-y")
+                    .await
+                    .is_some()
+            );
             assert!(shared_note(&workspace, "rarity", "topic-y").await.is_some());
         }
 
@@ -541,8 +557,16 @@ mod tests {
             .await
             .expect("fail-open");
 
-            assert!(shared_note(&workspace, "applejack", "topic-z").await.is_none());
-            assert!(shared_note(&workspace, "applejack", "status").await.is_none());
+            assert!(
+                shared_note(&workspace, "applejack", "topic-z")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                shared_note(&workspace, "applejack", "status")
+                    .await
+                    .is_none()
+            );
         }
 
         #[tokio::test]
@@ -570,7 +594,10 @@ mod tests {
                 )
                 .await;
             // Rate-limited share is dropped but the message itself is never rejected.
-            assert!(matches!(outcome, Ok(HookOutcome::Continue { modified: None })));
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
 
             assert!(shared_note(&workspace, "flooder", "rl-a").await.is_some());
             assert!(shared_note(&workspace, "flooder", "rl-b").await.is_none());
