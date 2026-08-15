@@ -34,8 +34,12 @@ Recipe. But first key correctness point: PAM subtree alone does NOT fix mt-admin
    enables it itself). Absent memory usually means a kernel without the
    controller or a `cgroup_disable=memory` boot arg.
 
-3. **`setpriv`** (`sys-apps/util-linux`) — required by the root-side migration
-   spawn that places builds into `lunarwing-<name>/build`.
+3. **`setpriv`** — required by the root-side migration spawn that places builds
+   into `lunarwing-<name>/build`. On Gentoo it comes from `sys-apps/util-linux`
+   but is **gated behind the `caps` USE flag** (`$(use_enable caps setpriv)` in
+   the ebuild): a default util-linux install has no setpriv, and every build
+   silently falls back to nice-only. Set `sys-apps/util-linux caps` in
+   `/etc/portage/package.use/`, rebuild, and verify `command -v setpriv`.
 
 ## 1. Hierarchy layout (respects no-internal-process rule)
 

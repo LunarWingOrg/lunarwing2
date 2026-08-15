@@ -21,11 +21,43 @@ The admin script, the per-tenant daemons, and the health/self-heal pipeline need
 | `dev-vcs/git` | Per-tenant repo clones |
 | `dev-lang/python` (python3) | TensorZero proxy, WeeChat WS adapter, all `health-*.sh` scripts |
 | `net-misc/curl` | Self-heal Gotify pages, `health-models` probe, gateway deep-checks |
-| `sys-apps/util-linux` | Provides `flock` — build lock + self-heal single-instance lock (usually already installed) |
+| `sys-apps/util-linux` | Provides `flock` — build lock + self-heal single-instance lock (usually already installed). Also provides `setpriv` — **required for cgroup v2 build bounding, and gated behind the `caps` USE flag** (see §1b). |
 
 ```bash
 sudo emerge app-misc/jq dev-vcs/git net-misc/curl
 ```
+
+### 1b. cgroup v2 build bounding — host prerequisites
+
+`build-tenant` caps each tenant build's memory (`BUILD_MEMORY_HIGH`/`BUILD_MEMORY_MAX`)
+inside a cgroup v2 build scope. On OpenRC this needs **all three** of:
+
+1. **`setpriv` present** — Gentoo's util-linux ebuild builds it only with the
+   `caps` USE flag (`$(use_enable caps setpriv)`). A default rebuild without
+   `caps` installs util-linux *without* setpriv, and every build silently
+   degrades to nice-only (`cgroup v2 bounding unavailable ... running nice-only`):
+
+   ```bash
+   echo 'sys-apps/util-linux caps' | sudo tee /etc/portage/package.use/lunarwing-mt
+   sudo emerge --ask --oneshot sys-apps/util-linux   # pulls sys-libs/libcap-ng
+   command -v setpriv   # expect /usr/bin/setpriv
+   ```
+
+2. **Unified cgroup v2 mode.** `stat -fc %T /sys/fs/cgroup` must print
+   `cgroup2fs`. Gentoo OpenRC commonly boots **hybrid** by default (`/sys/fs/cgroup`
+   is tmpfs, v2 lives only at `/sys/fs/cgroup/unified`), where the memory
+   controller cannot be delegated — bounding is impossible. Fix:
+
+   ```bash
+   sudo sed -i 's/^#rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf && sudo reboot
+   ```
+
+3. **`memory` in the root `cgroup.controllers`** — absent only with kernels
+   built without it or `cgroup_disable=memory` boot args:
+   `grep -w memory /sys/fs/cgroup/cgroup.controllers`.
+
+Current mt-admin versions print the exact failing prerequisite before the
+nice-only fallback; see `docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md` §0 for details.
 
 ## 2. Container runtime (required) — Podman or Docker
 
@@ -148,6 +180,7 @@ shipped requirements files is the recommended route:
 
 ```bash
 echo 'net-firewall/iptables nftables' | sudo tee /etc/portage/package.use/lunarwing-mt
+echo 'sys-apps/util-linux caps' | sudo tee -a /etc/portage/package.use/lunarwing-mt
 sudo emerge \
   app-misc/jq dev-vcs/git net-misc/curl sys-apps/util-linux \
   app-containers/podman \
