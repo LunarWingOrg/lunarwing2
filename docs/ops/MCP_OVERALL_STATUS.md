@@ -159,6 +159,14 @@ These are validation and coverage tasks, not known production-code defects.
   client placement contract is implemented.
 - Configurable startup and request timeouts for every transport. MCP-over-WASM
   per-message deadlines and bounded transport/process shutdown are implemented.
+  **Implemented 2026-08-15 (item #18):** `McpServerConfig.timeouts`
+  (`request_seconds`, `startup_seconds`, 1-600s each) now applies to every
+  transport — HTTP and gateway reqwest request deadlines, stdio request/response
+  waits (host, external-runtime adapter, and worker factories, pinned or plain),
+  unix socket request waits, and the `McpClient::initialize` handshake bound.
+  CLI: `mcp add --request-timeout-seconds/--startup-timeout-seconds`; `mcp
+  update` retains overrides; `mcp list --verbose` prints them. Defaults are
+  unchanged (30s request, 60s startup).
 - Persistent external-worker MCP activation delivery: the `external_worker`
   placement vocabulary, worker selection exclusion from job snapshots, and
   `lunarwing doctor` cross-checks (unknown worker names, undeclared external
