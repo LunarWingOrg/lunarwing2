@@ -1,5 +1,15 @@
 # Adding pre-delegated subtree support for OpenRC multi-tenant setups
 
+> **Status (v2.0.8.0): implemented in mt-admin.** `lunarwing-mt-admin.sh setup-cgroups`
+> automates steps 1–3 below (boot-time `/etc/local.d/lunarwing-cgroups.start`, the
+> `pam_exec` login hook, PAM wiring for `system-login`/`sshd`/`su`/`login` — never
+> `sudo`/shared includes), and `add-tenant`/`remove-tenant` keep the subtree and
+> boot script in sync automatically. Step 4 uses **Option A**: `build-tenant`
+> places each build into `lunarwing-<name>/build` by root-side `setpriv`
+> migration behind a rendezvous gate — no tenant self-migration, no chown
+> delegation, no PAM dependency. The manual recipe below is kept as reference
+> documentation of the deployed layout.
+
 Recipe. But first key correctness point: PAM subtree alone does NOT fix mt-admin builds, because mt-admin spawns build via `sudo -u` from operator shell — fork inherits **caller's** cgroup, PAM hook never fires. Login subtree fixes tenant **login sessions**; for mt-admin build path you still need root-side migration (setpriv patch) or switch spawn to `su`/ssh (PAM-authenticated). Both included below.
 
 ## 1. Hierarchy layout (respects no-internal-process rule)

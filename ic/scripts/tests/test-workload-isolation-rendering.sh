@@ -7,8 +7,11 @@
 #  - OpenRC daemon unit carries rc_cgroup_settings cgroup v2 ceilings
 #    (memory.high/memory.max/cpu.max/pids.max) with conf.d-overridable knobs
 #  - _run_tenant_build scopes builds on systemd, bounds them with a temporary
-#    cgroup v2 dir on other inits when available, and nice's them otherwise,
-#    passing -j$BUILD_JOBS to cargo
+#    cgroup v2 dir on other inits when available (root-side setpriv migration,
+#    inside the pre-delegated tenant subtree when present), and nice's them
+#    otherwise, passing -j$BUILD_JOBS to cargo
+#  - setup-cgroups renders the boot-time local.d script, installs/wires the
+#    PAM login hook (never sudo), and ensures per-tenant cgroup subtrees
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -437,10 +440,13 @@ if (
       : >"$target/cgroup.procs"
     fi
   }
-  sudo() {
-    [[ "$1" == -u ]] || return 1
-    shift 2
-    "$@"
+  id() { echo 1001; }
+  getent() { echo "t1:x:1001:1001::$MT_FIXTURE:/bin/bash"; }
+  setpriv() {
+    # Drop the privilege flags and exec the rest in place, so the backgrounded
+    # pid is the rendezvous reader exactly like the real setpriv exec chain.
+    while [[ "$1" == --* ]]; do shift; done
+    exec "$@"
   }
   _openrc_build_cgroup_cleanup() { rm -rf "$1"; }
   actual_rc=0
@@ -467,18 +473,21 @@ if (
     if [[ "$target" == "$denied_root/lunarwing-build-t1" ]]; then
       : >"$target/memory.high"
       : >"$target/memory.max"
-      : >"$target/cgroup.procs"
+      # cgroup.procs as a DIRECTORY: the root-side migration write fails (on a
+      # plain fs a redirect to a missing file would succeed), so the wrapper
+      # is killed behind its rendezvous gate before the build ever runs.
+      command mkdir "$target/cgroup.procs"
     fi
+  }
+  id() { echo 1001; }
+  getent() { echo "t1:x:1001:1001::$MT_FIXTURE:/bin/bash"; }
+  setpriv() {
+    while [[ "$1" == --* ]]; do shift; done
+    exec "$@"
   }
   sudo() {
     [[ "$1" == -u ]] || return 1
     shift 2
-    if [[ "${1:-}" == bash && "${2:-}" == -c ]]; then
-      # Tenant self-migration into the delegated cgroup denied by the kernel's
-      # common-ancestor rule: the wrapper exits 125 before the build ever runs.
-      echo "SUDO cgroup-wrapper DENIED" >>"$CAPTURE"
-      return 125
-    fi
     echo "SUDO $*" >>"$CAPTURE"
     "$@"
   }
@@ -489,13 +498,52 @@ if (
   _run_tenant_build t1 'echo FALLBACK-RAN >>"$CAPTURE"' || denied_rc=$?
   [[ "$denied_rc" == 0 ]]
   [[ "${_OPENRC_BUILD_CGROUP_SETUP_COMPLETE:-unset}" == false ]]
-  grep -qF 'SUDO cgroup-wrapper DENIED' "$CAPTURE"
   grep -qF 'FALLBACK-RAN' "$CAPTURE"
   grep -qF 'nice -n 10' "$CAPTURE"
 ); then
-  echo "  PASS: cgroup self-migration denial falls back to nice build"
+  echo "  PASS: cgroup root-side migration failure falls back to nice build"
 else
-  echo "  FAIL: cgroup self-migration denial fallback"
+  echo "  FAIL: cgroup root-side migration failure fallback"
+  failures=$((failures + 1))
+fi
+
+echo "== pre-delegated subtree build path =="
+if (
+  sub_root="$MT_FIXTURE/cgroup-root-subtree"
+  mkdir -p "$sub_root/lunarwing-t1"
+  printf '%s\n' 'cpu memory pids' >"$sub_root/cgroup.controllers"
+  printf '%s\n' memory >"$sub_root/cgroup.subtree_control"
+  printf '%s\n' 'cpu memory pids' >"$sub_root/lunarwing-t1/cgroup.controllers"
+  : >"$sub_root/lunarwing-t1/cgroup.subtree_control"
+  _openrc_cgroup_root() { printf '%s\n' "$sub_root"; }
+  mkdir() {
+    local target="${*: -1}"
+    command mkdir "$@"
+    if [[ "$target" == "$sub_root/lunarwing-t1/build" ]]; then
+      echo "MKDIR $target" >>"$CAPTURE"
+      : >"$target/memory.high"
+      : >"$target/memory.max"
+      : >"$target/cgroup.procs"
+    fi
+  }
+  id() { echo 1001; }
+  getent() { echo "t1:x:1001:1001::$MT_FIXTURE:/bin/bash"; }
+  setpriv() {
+    while [[ "$1" == --* ]]; do shift; done
+    exec "$@"
+  }
+  _openrc_build_cgroup_cleanup() { rm -rf "$1"; }
+  export CAPTURE
+  : >"$CAPTURE"
+  sub_rc=0
+  _run_tenant_build_cgroup t1 "exit 0" || sub_rc=$?
+  [[ "$sub_rc" == 0 ]]
+  grep -qF "MKDIR $sub_root/lunarwing-t1/build" "$CAPTURE"
+  grep -qw memory "$sub_root/lunarwing-t1/cgroup.subtree_control"
+); then
+  echo "  PASS: build uses pre-delegated tenant subtree and enables memory in it"
+else
+  echo "  FAIL: pre-delegated subtree build path"
   failures=$((failures + 1))
 fi
 
@@ -563,6 +611,149 @@ build_rc=0
 _run_tenant_build t1 "exit 125" || build_rc=$?
 assert_eq "post-setup placement failure propagates" "125" "$build_rc"
 assert_not_contains "placement failure never reruns fallback" "$CAPTURE" "nice -n 10"
+
+echo "== tenant subtree ensure/remove =="
+if (
+  ensure_root="$MT_FIXTURE/cgroup-root-ensure"
+  mkdir -p "$ensure_root"
+  printf '%s\n' 'cpu memory pids' >"$ensure_root/cgroup.controllers"
+  : >"$ensure_root/cgroup.subtree_control"
+  _openrc_cgroup_root() { printf '%s\n' "$ensure_root"; }
+  id() { echo 1001; }
+  chown() { echo "CHOWN $*" >>"$CAPTURE"; }
+  export CAPTURE
+  : >"$CAPTURE"
+  _openrc_tenant_subtree_ensure t1
+  [[ -d "$ensure_root/lunarwing-t1/session" ]]
+  grep -qw memory "$ensure_root/cgroup.subtree_control"
+  grep -qw memory "$ensure_root/lunarwing-t1/cgroup.subtree_control"
+  grep -qF 'CHOWN 1001:1001' "$CAPTURE"
+  # Idempotent: a second run over an existing subtree also succeeds.
+  _openrc_tenant_subtree_ensure t1
+); then
+  echo "  PASS: tenant subtree ensure creates and delegates"
+else
+  echo "  FAIL: tenant subtree ensure"
+  failures=$((failures + 1))
+fi
+
+if (
+  remove_root="$MT_FIXTURE/cgroup-root-remove"
+  mkdir -p "$remove_root"
+  printf '%s\n' 'cpu memory pids' >"$remove_root/cgroup.controllers"
+  : >"$remove_root/cgroup.subtree_control"
+  _openrc_cgroup_root() { printf '%s\n' "$remove_root"; }
+  id() { echo 1001; }
+  chown() { :; }
+  # Plain fixture files block a real rmdir; cgroupfs removes them with the
+  # cgroup, so simulate directory removal wholesale.
+  rmdir() { rm -rf "$@"; }
+  _openrc_tenant_subtree_ensure t1
+  _openrc_tenant_subtree_remove t1
+  [[ ! -d "$remove_root/lunarwing-t1" ]]
+); then
+  echo "  PASS: tenant subtree remove reaps children and the parent"
+else
+  echo "  FAIL: tenant subtree remove"
+  failures=$((failures + 1))
+fi
+
+echo "== cgroup login hook + PAM wiring =="
+if (
+  hook_dir="$MT_FIXTURE/usr-local-sbin"
+  pam_dir="$MT_FIXTURE/pam.d"
+  mkdir -p "$hook_dir" "$pam_dir"
+  _openrc_cgroup_login_hook_path() { printf '%s\n' "$hook_dir/lunarwing-cgroup-login"; }
+  _openrc_cgroup_pam_targets() {
+    local f
+    for f in system-login sshd su login; do
+      [[ -f "$pam_dir/$f" ]] && printf '%s\n' "$pam_dir/$f"
+    done
+  }
+  chmod() { command chmod "$@"; }
+  chown() { :; }
+  _openrc_cgroup_login_hook_install
+  [[ -x "$hook_dir/lunarwing-cgroup-login" ]]
+  grep -qF 'PAM_TYPE' "$hook_dir/lunarwing-cgroup-login"
+  bash -n "$hook_dir/lunarwing-cgroup-login"
+  # Idempotent: unchanged content is not rewritten.
+  _openrc_cgroup_login_hook_install
+  # Only existing PAM targets get the line; sudo is never wired.
+  : >"$pam_dir/sshd"; : >"$pam_dir/su"; : >"$pam_dir/sudo"
+  _openrc_cgroup_pam_wire
+  grep -qF 'session    optional    pam_exec.so' "$pam_dir/sshd"
+  grep -qF 'session    optional    pam_exec.so' "$pam_dir/su"
+  ! grep -qF 'pam_exec' "$pam_dir/sudo"
+  [[ ! -f "$pam_dir/login" ]]
+  # Idempotent re-wire adds no duplicates.
+  _openrc_cgroup_pam_wire
+  [[ "$(grep -c pam_exec "$pam_dir/sshd")" == 1 ]]
+); then
+  echo "  PASS: login hook install + PAM wiring (idempotent, sudo untouched)"
+else
+  echo "  FAIL: login hook / PAM wiring"
+  failures=$((failures + 1))
+fi
+
+echo "== local.d render =="
+if (
+  locald="$MT_FIXTURE/local.d/lunarwing-cgroups.start"
+  mkdir -p "$MT_FIXTURE/local.d"
+  _openrc_cgroups_locald_path() { printf '%s\n' "$locald"; }
+  chmod() { command chmod "$@"; }
+  chown() { :; }
+  PORTS_REGISTRY="$MT_FIXTURE/ports.json"
+  cat >"$PORTS_REGISTRY" <<'JSON'
+{"version":15,"tenants":{"t1":{},"t2":{}}}
+JSON
+  _openrc_cgroups_locald_render
+  [[ -x "$locald" ]]
+  grep -qF 'TENANTS="t1 t2"' "$locald"
+  grep -qF '/sys/fs/cgroup' "$locald"
+  grep -qF 'cgroup.subtree_control' "$locald"
+  bash -n "$locald"
+); then
+  echo "  PASS: local.d boot script renders registered tenants"
+else
+  echo "  FAIL: local.d render"
+  failures=$((failures + 1))
+fi
+
+echo "== setup-cgroups end-to-end (fixture) =="
+if (
+  setup_root="$MT_FIXTURE/cgroup-root-setup"
+  mkdir -p "$setup_root" "$MT_FIXTURE/setup-bin" "$MT_FIXTURE/setup-pam" "$MT_FIXTURE/setup-locald"
+  printf '%s\n' 'cpu memory pids' >"$setup_root/cgroup.controllers"
+  : >"$setup_root/cgroup.subtree_control"
+  _openrc_cgroup_root() { printf '%s\n' "$setup_root"; }
+  _openrc_cgroup_login_hook_path() { printf '%s\n' "$MT_FIXTURE/setup-bin/lunarwing-cgroup-login"; }
+  _openrc_cgroups_locald_path() { printf '%s\n' "$MT_FIXTURE/setup-locald/lunarwing-cgroups.start"; }
+  _openrc_cgroup_pam_targets() { printf '%s\n' "$MT_FIXTURE/setup-pam/su"; }
+  : >"$MT_FIXTURE/setup-pam/su"
+  PORTS_REGISTRY="$MT_FIXTURE/ports.json"
+  cat >"$PORTS_REGISTRY" <<'JSON'
+{"version":15,"tenants":{"t1":{},"t2":{}}}
+JSON
+  id() { echo 1001; }
+  chown() { :; }
+  chmod() { command chmod "$@"; }
+  stat() { if [[ "$1" == -fc ]]; then echo cgroup2fs; else command stat "$@"; fi; }
+  rc-update() { echo 'local | default'; }
+  INIT_SYSTEM=openrc
+  setup_cgroups >/dev/null
+  [[ -x "$MT_FIXTURE/setup-bin/lunarwing-cgroup-login" ]]
+  grep -qF pam_exec "$MT_FIXTURE/setup-pam/su"
+  grep -qF 'TENANTS="t1 t2"' "$MT_FIXTURE/setup-locald/lunarwing-cgroups.start"
+  [[ -d "$setup_root/lunarwing-t1/session" ]]
+  [[ -d "$setup_root/lunarwing-t2/session" ]]
+  grep -qw memory "$setup_root/lunarwing-t1/cgroup.subtree_control"
+  grep -qw memory "$setup_root/cgroup.subtree_control"
+); then
+  echo "  PASS: setup-cgroups installs assets and ensures all tenant subtrees"
+else
+  echo "  FAIL: setup-cgroups end-to-end"
+  failures=$((failures + 1))
+fi
 
 echo "== cpu quota conversion =="
 assert_eq "800% -> cpu.max" "800000 100000" "$(_openrc_cpu_max_from_quota "800%")"

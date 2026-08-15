@@ -677,6 +677,13 @@ Commands:
   status <name>                    Detailed status for one tenant
   tokens [name]                    Print gateway auth tokens (all or one)
   doctor                           System dependency and health checks
+  setup-cgroups                    (OpenRC) Install pre-delegated tenant cgroup v2
+                                   subtrees (docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md):
+                                   boot-time /etc/local.d/lunarwing-cgroups.start,
+                                   PAM session hook for login shells, and per-tenant
+                                   subtrees for every registered tenant. add-tenant
+                                   runs this automatically; use it to upgrade hosts
+                                   and tenants provisioned before subtree support.
 
   backup-tenant <name>             pg_dump a tenant's DB (custom format) to
                                    $LUNARWING_MT_BACKUP_DIR/<name>/
@@ -2537,10 +2544,12 @@ _openrc_cgroup_root() {
 
 # Portable cgroup v2 availability probe for the operator build path (work item
 # #54). A writable root is insufficient: memory must be available and either
-# delegated already or writable in cgroup.subtree_control.
+# delegated already or writable in cgroup.subtree_control. setpriv (util-linux)
+# is required for the root-side migration spawn used to place the build.
 _openrc_build_cgroup_supported() {
   local root
   root="$(_openrc_cgroup_root)"
+  command -v setpriv >/dev/null 2>&1 || return 1
   [[ -d "$root" && -w "$root" ]] || return 1
   [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || return 1
   [[ -r "$root/cgroup.controllers" ]] || return 1
@@ -2548,6 +2557,16 @@ _openrc_build_cgroup_supported() {
   [[ -r "$root/cgroup.subtree_control" ]] || return 1
   grep -qw memory "$root/cgroup.subtree_control" \
     || [[ -w "$root/cgroup.subtree_control" ]]
+}
+
+# Resolve a tenant's home directory for the build spawn environment. The sudo
+# spawn this replaced got HOME from sudo's env_reset; setpriv changes no
+# environment, so the caller must supply it explicitly.
+_tenant_home_dir() {
+  local home
+  home="$(getent passwd "$1" 2>/dev/null | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || return 1
+  printf '%s\n' "$home"
 }
 
 _openrc_build_memory_controller_ready() {
@@ -2625,17 +2644,273 @@ _openrc_build_cgroup_cleanup() {
   [[ ! -d "$cg" ]]
 }
 
-# Run one tenant build inside a temporary, tenant-delegated cgroup v2
-# directory with the BUILD_* memory ceilings — the OpenRC-portable equivalent
-# of the systemd BUILD_SLICE scope (work item #54). The setup-complete flag lets
-# the caller distinguish setup failure from every possible build exit status.
+# ── Pre-delegated tenant cgroup subtrees (OpenRC) ───────────────────────────
+# Implements docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md: a tenant-owned
+# /sys/fs/cgroup/lunarwing-<name>/ hierarchy with a session/ child for login
+# shells (placed by a pam_exec hook) and a build/ child created per build by
+# _run_tenant_build_cgroup. cgroupfs is not persistent across reboot, so a
+# rendered /etc/local.d/lunarwing-cgroups.start recreates the layout at boot.
+# Kept behind path functions so fixture tests can redirect every host path.
+
+_openrc_cgroup_login_hook_path() {
+  printf '/usr/local/sbin/lunarwing-cgroup-login\n'
+}
+
+_openrc_cgroups_locald_path() {
+  printf '/etc/local.d/lunarwing-cgroups.start\n'
+}
+
+# PAM files whose session stack places user login shells. system-login covers
+# sshd/login/su on hosts where pambase provides it; the leaf files cover hosts
+# without it. Never wire sudo or a shared include like system-auth: a pam_exec
+# hook there would migrate the operator's own `sudo -u <tenant>` processes
+# into the tenant cgroup — the wrong direction entirely.
+_openrc_cgroup_pam_targets() {
+  local f
+  for f in system-login sshd su login; do
+    [[ -f "/etc/pam.d/$f" ]] && printf '/etc/pam.d/%s\n' "$f"
+  done
+}
+
+# Install the pam_exec helper that moves a login session's process into the
+# tenant's session cgroup. Idempotent: only rewrites when content differs.
+_openrc_cgroup_login_hook_install() {
+  local path tmp
+  path="$(_openrc_cgroup_login_hook_path)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/lunarwing-cgroup-login.XXXXXXXX")" || return 1
+  cat >"$tmp" <<'EOF'
+#!/bin/bash
+# pam_exec helper installed by lunarwing-mt-admin.sh setup-cgroups.
+# Moves the PAM application (PPID — sshd's per-connection process, login, or
+# su) into the tenant's pre-delegated session cgroup so the whole login
+# session inherits membership. Wired as `session optional`, so it must never
+# fail authentication: every exit path is 0.
+[[ "$PAM_TYPE" == open_session ]] || exit 0
+# Tenant names are Linux account names; refuse anything that could escape the
+# lunarwing- prefix (defense in depth — useradd already forbids these).
+case "$PAM_USER" in
+  ""|*[!a-z0-9_-]*) exit 0 ;;
+esac
+cg="/sys/fs/cgroup/lunarwing-$PAM_USER/session"
+[[ -w "$cg/cgroup.procs" ]] || exit 0
+echo "$PPID" >"$cg/cgroup.procs" 2>/dev/null || true
+exit 0
+EOF
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+  chown root:root "$path" || return 1
+  say "installed PAM cgroup login hook: $path"
+}
+
+# Wire the login hook into the session stack of every PAM target that exists.
+# Idempotent line append; /etc/pam.d/sudo is deliberately never touched.
+_openrc_cgroup_pam_wire() {
+  local hook_path target line
+  hook_path="$(_openrc_cgroup_login_hook_path)"
+  line="session    optional    pam_exec.so $hook_path"
+  local wired=0
+  while IFS= read -r target; do
+    [[ -n "$target" ]] || continue
+    if grep -qF "pam_exec.so $hook_path" "$target"; then
+      continue
+    fi
+    printf '%s\n' "$line" >>"$target" || return 1
+    say "wired cgroup login hook into $target"
+    wired=$((wired + 1))
+  done < <(_openrc_cgroup_pam_targets)
+  return 0
+}
+
+# Render the boot-time local.d script that recreates the controller delegation
+# and every registered tenant's subtree (cgroupfs does not survive reboot).
+# Regenerated by add-tenant/remove-tenant/setup-cgroups so the baked-in
+# tenant list always matches the ports registry; getent guards staleness.
+_openrc_cgroups_locald_render() {
+  local path tenants tmp
+  path="$(_openrc_cgroups_locald_path)"
+  tenants="$(all_tenant_names | paste -sd' ' -)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/lunarwing-cgroups.start.XXXXXXXX")" || return 1
+  {
+    printf '%s\n' '#!/bin/bash'
+    cat <<'EOF'
+# Rendered by lunarwing-mt-admin.sh (setup-cgroups / add-tenant /
+# remove-tenant). Regenerate with `lunarwing-mt-admin.sh setup-cgroups`.
+# Recreates the pre-delegated tenant cgroup v2 subtrees at boot — cgroupfs is
+# not persistent across reboot. See docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md.
+CG=/sys/fs/cgroup
+[ -r "$CG/cgroup.controllers" ] || exit 0
+grep -qw memory "$CG/cgroup.controllers" || exit 0
+# The root cgroup is exempt from the no-internal-process rule, so controllers
+# can be enabled here even with processes in the root.
+for ctl in memory pids; do
+  grep -qw "$ctl" "$CG/cgroup.controllers" || continue
+  grep -qw "$ctl" "$CG/cgroup.subtree_control" && continue
+  echo "+$ctl" >"$CG/cgroup.subtree_control" 2>/dev/null || true
+done
+grep -qw memory "$CG/cgroup.subtree_control" || exit 0
+EOF
+    printf 'TENANTS="%s"\n' "$tenants"
+    cat <<'EOF'
+for t in $TENANTS; do
+  getent passwd "$t" >/dev/null || continue
+  uid="$(id -u "$t")"; gid="$(id -g "$t")"
+  d="$CG/lunarwing-$t"
+  mkdir -p "$d/session"
+  # Controllers enabled on lunarwing-<t> mean that dir itself must hold no
+  # processes — login shells live in the session/ child.
+  for ctl in memory pids; do
+    echo "+$ctl" >"$d/cgroup.subtree_control" 2>/dev/null || true
+  done
+  chown "$uid:$gid" "$d" "$d/session" \
+    "$d/cgroup.procs" "$d/cgroup.subtree_control" \
+    "$d/session/cgroup.procs" 2>/dev/null || true
+done
+exit 0
+EOF
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0755 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+  chown root:root "$path" || return 1
+  say "rendered boot-time cgroup setup: $path (tenants: ${tenants:-none})"
+}
+
+# Create one tenant's pre-delegated subtree on the running system. Idempotent.
+_openrc_tenant_subtree_ensure() {
+  local name="$1" root d uid gid ctl
+  root="$(_openrc_cgroup_root)"
+  d="$root/lunarwing-$name"
+  [[ -r "$root/cgroup.controllers" ]] || return 1
+  grep -qw memory "$root/cgroup.controllers" || return 1
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  gid="$(id -g "$name" 2>/dev/null)" || return 1
+  # Enable the available controllers in one write: cgroupfs applies each
+  # "+ctl" additively, but a multi-write sequence leaves partial state behind
+  # when a later write fails (and reads back wrong on non-cgroupfs fixtures).
+  local enable=""
+  for ctl in memory pids; do
+    grep -qw "$ctl" "$root/cgroup.controllers" || continue
+    grep -qw "$ctl" "$root/cgroup.subtree_control" 2>/dev/null && continue
+    enable="$enable +$ctl"
+  done
+  if [[ -n "$enable" ]]; then
+    # pids is nice-to-have for session containment; memory is required.
+    printf '%s' "${enable# }" >"$root/cgroup.subtree_control" 2>/dev/null \
+      || printf '+memory' >"$root/cgroup.subtree_control" 2>/dev/null \
+      || return 1
+  fi
+  grep -qw memory "$root/cgroup.subtree_control" || return 1
+  mkdir -p "$d/session" || return 1
+  enable=""
+  for ctl in memory pids; do
+    grep -qw "$ctl" "$root/cgroup.controllers" || continue
+    enable="$enable +$ctl"
+  done
+  # Same single-write form for the tenant dir; best-effort beyond memory.
+  printf '%s' "${enable# }" >"$d/cgroup.subtree_control" 2>/dev/null \
+    || printf '+memory' >"$d/cgroup.subtree_control" 2>/dev/null \
+    || true
+  grep -qw memory "$d/cgroup.subtree_control" || {
+    say "cannot delegate memory into $d (processes in the tenant cgroup root?)" >&2
+    return 1
+  }
+  chown "$uid:$gid" "$d" "$d/session" \
+    "$d/cgroup.procs" "$d/cgroup.subtree_control" \
+    "$d/session/cgroup.procs"
+}
+
+# Remove one tenant's subtree, reaping anything still inside (a tenant being
+# removed has its services stopped already; leftover login shells of the
+# removed account go with it). Best-effort like the build-cgroup cleanup.
+_openrc_tenant_subtree_remove() {
+  local name="$1" root d child
+  root="$(_openrc_cgroup_root)"
+  d="$root/lunarwing-$name"
+  [[ -d "$d" ]] || return 0
+  for child in "$d"/*/; do
+    [[ -d "$child" ]] || continue
+    _openrc_build_cgroup_cleanup "${child%/}" || true
+  done
+  printf '%s' '-memory -pids' >"$d/cgroup.subtree_control" 2>/dev/null || true
+  rmdir "$d" 2>/dev/null || {
+    say "WARNING: could not remove cgroup subtree $d" >&2
+    return 1
+  }
+}
+
+# Full per-tenant setup used by add-tenant: login hook, PAM wiring, live
+# subtree, and the boot-time local.d render.
+setup_tenant_cgroups() {
+  local name="$1"
+  _openrc_cgroup_login_hook_install || return 1
+  _openrc_cgroup_pam_wire || return 1
+  _openrc_tenant_subtree_ensure "$name" || return 1
+  _openrc_cgroups_locald_render || return 1
+}
+
+# Fleet-wide `setup-cgroups` command: installs the hook/PAM/local.d assets and
+# ensures every registered tenant's subtree on the running system. This is
+# also the upgrade path for tenants provisioned before subtree support.
+setup_cgroups() {
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd* ]]; then
+    die "setup-cgroups is only for OpenRC hosts (systemd uses per-tenant user-manager slices)"
+  fi
+  local root
+  root="$(_openrc_cgroup_root)"
+  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] \
+    || die "cgroup v2 hierarchy not mounted at $root"
+  [[ -r "$root/cgroup.controllers" ]] \
+    && grep -qw memory "$root/cgroup.controllers" \
+    || die "memory controller not available at $root"
+  _openrc_cgroup_login_hook_install || die "failed to install the PAM cgroup login hook"
+  _openrc_cgroup_pam_wire || die "failed to wire the PAM cgroup login hook"
+  _openrc_cgroups_locald_render || die "failed to render the boot-time cgroup setup"
+  if rc-update show default 2>/dev/null | grep -qw local; then
+    :
+  else
+    say "WARNING: the 'local' service is not in the default runlevel; boot-time cgroup setup will not run (fix: rc-update add local default)" >&2
+  fi
+  local name failures=0 count=0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    count=$((count + 1))
+    if _openrc_tenant_subtree_ensure "$name"; then
+      say "subtree ready: $root/lunarwing-$name/{session,build}"
+    else
+      say "WARNING: cgroup subtree setup failed for tenant '$name'" >&2
+      failures=$((failures + 1))
+    fi
+  done < <(all_tenant_names)
+  (( count > 0 )) || say "no tenants registered; host assets installed only"
+  (( failures == 0 )) || die "$failures tenant subtree(s) failed to set up"
+  say "pre-delegated cgroup setup complete for $count tenant(s)"
+}
+
+# Run one tenant build inside a temporary cgroup v2 directory with the BUILD_*
+# memory ceilings — the OpenRC-portable equivalent of the systemd BUILD_SLICE
+# scope (work item #54). When the pre-delegated tenant subtree exists
+# (setup-cgroups; docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md), the build cgroup is
+# created inside it as lunarwing-<name>/build; otherwise a root-level
+# lunarwing-build-<name> cgroup is used so builds stay bounded on hosts where
+# the subtree has not been deployed yet. The setup-complete flag lets the
+# caller distinguish setup failure from every possible build exit status.
 _run_tenant_build_cgroup() {
   local name="$1" build_cmd="$2"
-  local root cg uid
+  local root cg uid gid home
   _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
   root="$(_openrc_cgroup_root)"
-  cg="$root/lunarwing-build-$name"
-  uid="$(id -u "$name")"
+  if [[ -d "$root/lunarwing-$name" ]]; then
+    cg="$root/lunarwing-$name/build"
+  else
+    cg="$root/lunarwing-build-$name"
+  fi
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  gid="$(id -g "$name" 2>/dev/null)" || return 1
+  home="$(_tenant_home_dir "$name")" || return 1
   if [[ -e "$cg" ]]; then
     # Stale cgroup from an interrupted run: reap it before reusing the name.
     _openrc_build_cgroup_cleanup "$cg" || return 1
@@ -2644,33 +2919,18 @@ _run_tenant_build_cgroup() {
     say "memory controller is unavailable for $name build cgroup" >&2
     return 1
   fi
+  if [[ "$cg" == "$root/lunarwing-$name/build" ]] \
+    && ! _openrc_build_memory_controller_ready "$root/lunarwing-$name"; then
+    say "memory controller is unavailable in the $name cgroup subtree" >&2
+    return 1
+  fi
   mkdir "$cg" || return 1
   if ! _openrc_build_cgroup_set_memory_limits "$cg"; then
     _openrc_build_cgroup_cleanup "$cg" || true
     return 1
   fi
-  # Delegate the cgroup to the tenant so its build shell can move itself in.
-  if ! chown "$uid:$uid" "$cg" "$cg/cgroup.procs" 2>/dev/null \
-    || ! sudo -u "$name" test -w "$cg/cgroup.procs"; then
-    _openrc_build_cgroup_cleanup "$cg" || true
-    return 1
-  fi
-  _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
   local rc=0
-  sudo -u "$name" bash -c '
-    printf "%s" "$$" >"$1/cgroup.procs" || exit 125
-    exec nice -n 10 bash -c "$2"
-  ' _ "$cg" "$build_cmd" || rc=$?
-  if (( rc == 125 )); then
-    # Self-migration into the delegated cgroup was denied: the kernel also
-    # requires write access on the closest common ancestor's cgroup.procs,
-    # which a tenant shell started outside a delegated subtree never has. The
-    # build itself never ran (the wrapper exits 125 before exec; cargo never
-    # uses 125), so report setup as incomplete and let the caller fall back
-    # to the plain nice'd invocation instead of failing the build.
-    say "cgroup v2 self-migration denied for $name build; bounding ineffective, falling back" >&2
-    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
-  fi
+  _run_tenant_build_cgroup_spawn "$name" "$uid" "$gid" "$home" "$cg" "$build_cmd" || rc=$?
   if ! _openrc_build_cgroup_cleanup "$cg"; then
     say "WARNING: could not clean up build cgroup $cg" >&2
     (( rc != 0 )) || rc=1
@@ -2678,13 +2938,60 @@ _run_tenant_build_cgroup() {
   return "$rc"
 }
 
+# Spawn the tenant build behind a rendezvous gate, migrate it into the build
+# cgroup as root, then release it — Option A (root-side migrate + drop privs)
+# from docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md. Unlike the old tenant
+# self-migration this needs no tenant write access on any cgroup.procs, no
+# chown delegation, and no PAM hook, so bounding works on every OpenRC host;
+# every child the build spawns inherits membership at fork.
+#
+# The gate is a "go" file the wrapper polls for: it cannot start the build
+# before the migration write lands, and a failed migration kills the wrapper
+# before the build ever runs (setup stays incomplete, so the caller falls
+# back to the nice'd invocation). A poll loop is used instead of a FIFO/signal
+# rendezvous because both of those have unfixable races here: FIFO open/read
+# semantics deadlock once inherited writer fds enter the picture, and
+# SIGCONT sent before a self-SIGSTOP is lost. The loop is bounded so an
+# aborted mt-admin can never leave a wrapper parked forever.
+_run_tenant_build_cgroup_spawn() {
+  local name="$1" uid="$2" gid="$3" home="$4" cg="$5" build_cmd="$6"
+  local sync_dir build_pid rc=0
+  sync_dir="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-build-sync.XXXXXXXX")" || return 1
+  # The tenant wrapper must be able to stat the go file inside.
+  chmod 0755 "$sync_dir" || { rm -rf "$sync_dir"; return 1; }
+  setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+    env HOME="$home" USER="$name" LOGNAME="$name" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin" \
+    bash -c 'for ((i=0; i<600; i++)); do
+               [[ -e "$2" ]] && break
+               sleep 0.05
+             done
+             [[ -e "$2" ]] || exit 125
+             exec nice -n 10 bash -c "$1"' _ "$build_cmd" "$sync_dir/go" &
+  build_pid=$!
+  if { printf '%s' "$build_pid" >"$cg/cgroup.procs"; } 2>/dev/null; then
+    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
+    : >"$sync_dir/go"
+    wait "$build_pid" || rc=$?
+  else
+    kill -KILL "$build_pid" 2>/dev/null || true
+    wait "$build_pid" 2>/dev/null || true
+    say "cgroup v2 root-side migration failed for $name build; bounding ineffective, falling back" >&2
+    rc=1
+  fi
+  rm -rf "$sync_dir"
+  return "$rc"
+}
+
 # Run one tenant build step with resource bounding (BUG-005). On systemd the
 # step runs as a transient scope in BUILD_SLICE via the tenant's own user
 # manager, so cargo/rustc memory is capped and accounted outside both the
 # operator's session and the daemon service. On other init systems a
-# temporary cgroup v2 directory provides the same ceilings (work item #54).
-# Falls back to a plain nice'd invocation only when neither mechanism can be
-# set up, so a missing cgroup delegation never breaks the build.
+# temporary cgroup v2 directory provides the same ceilings (work item #54);
+# the build is placed there by root-side migration, so no tenant-side cgroup
+# write access is required. Falls back to a plain nice'd invocation only when
+# neither mechanism can be set up, so a missing cgroup setup never breaks the
+# build.
 _run_tenant_build() {
   local name="$1" build_cmd="$2"
   local uid
@@ -11151,6 +11458,17 @@ add_tenant() {
   fi
   say ""
 
+  # Pre-delegated cgroup v2 subtree (docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md):
+  # contains tenant login sessions and hosts the per-build cgroup. Warn-only:
+  # the build path bounds without it, and `setup-cgroups` can repair it later.
+  if [[ "$INIT_SYSTEM" != systemd* ]]; then
+    say "--- Setting up pre-delegated cgroup v2 subtree ---"
+    if ! setup_tenant_cgroups "$name"; then
+      say "WARNING: cgroup subtree setup failed for '$name' (recovery: sudo $0 setup-cgroups)" >&2
+    fi
+    say ""
+  fi
+
   # Host-global health-check + self-heal pipeline (auto-covers every tenant).
   if [[ "$DEFAULT_HEALTH_ENABLED" == "true" && "$HEALTH_OPT_OUT" != "true" ]]; then
     ensure_health_pipeline
@@ -11234,6 +11552,17 @@ remove_tenant() {
 
   remove_tenant_user "$name" "$purge"
   say ""
+
+  # Drop the pre-delegated cgroup subtree and re-render the boot-time setup
+  # without the removed tenant (only when the host assets were ever installed).
+  if [[ "$INIT_SYSTEM" != systemd* ]]; then
+    _openrc_tenant_subtree_remove "$name" || true
+    if [[ -f "$(_openrc_cgroups_locald_path)" ]]; then
+      _openrc_cgroups_locald_render \
+        || say "WARNING: could not re-render boot-time cgroup setup" >&2
+    fi
+    say ""
+  fi
 
   # If that was the last tenant, retire the host-global health pipeline schedule.
   if [[ -z "$(all_tenant_names)" ]]; then
@@ -13077,6 +13406,12 @@ main() {
 
     doctor)
       doctor
+      ;;
+
+    setup-cgroups)
+      require_root
+      ports_registry_init
+      setup_cgroups
       ;;
 
     help|--help|-h)
