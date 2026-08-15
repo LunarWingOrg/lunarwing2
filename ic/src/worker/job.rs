@@ -399,8 +399,13 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 // Completion was already handled in handle_text_response via mark_completed
             }
             LoopOutcome::MaxIterations => {
-                self.mark_failed("Maximum iterations exceeded: job hit the iteration cap")
-                    .await?;
+                self.mark_failed(
+                    "Maximum iterations exceeded after a final recovery turn. Retry with narrower scope or a higher max_iterations value.",
+                )
+                .await?;
+            }
+            LoopOutcome::Failed(message) => {
+                self.mark_failed(&message).await?;
             }
             LoopOutcome::Stopped => {
                 // Stop signal handled — nothing more to do
@@ -544,14 +549,18 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 Err(HookError::Rejected { reason }) => {
                     return Err(crate::error::ToolError::ExecutionFailed {
                         name: tool_name.to_string(),
-                        reason: format!("Blocked by hook: {}", reason),
+                        reason: format!(
+                            "Blocked by hook: {reason}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to change policy."
+                        ),
                     }
                     .into());
                 }
                 Err(err) => {
                     return Err(crate::error::ToolError::ExecutionFailed {
                         name: tool_name.to_string(),
-                        reason: format!("Blocked by hook failure mode: {}", err),
+                        reason: format!(
+                            "Blocked by hook failure mode: {err}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to repair the hook policy."
+                        ),
                     }
                     .into());
                 }
@@ -828,10 +837,17 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                     &e,
                     Error::Tool(crate::error::ToolError::AutonomousUnavailable { .. })
                 ) {
-                    Err(e)
-                } else {
-                    Ok(())
+                    self.log_event(
+                        "status",
+                        serde_json::json!({
+                            "message": "Required capability is unavailable; asking the model to choose an allowed alternative.",
+                        }),
+                    );
                 }
+
+                // The model-facing tool result already contains the failure and
+                // unlock path. Continue the loop so the model can change approach.
+                Ok(())
             }
         }
     }
@@ -1127,9 +1143,8 @@ impl<'a> JobDelegate<'a> {
         );
 
         if count >= Self::MAX_CONSECUTIVE_RATE_LIMITS {
-            self.worker
-                .mark_failed("Persistent rate limiting: exceeded retry limit")
-                .await?;
+            // Let the shared loop produce a single typed failure with concrete
+            // wait/fallback guidance; it owns terminal state transitions.
             return Err(crate::error::LlmError::RateLimited {
                 provider: "rate-limit-exhausted".to_string(),
                 retry_after: None,
@@ -1266,32 +1281,35 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         reason_ctx: &mut ReasoningContext,
         _iteration: usize,
     ) -> Result<crate::llm::RespondOutput, crate::error::Error> {
-        // Try select_tools first, fall back to respond_with_tools
-        match reasoning.select_tools(reason_ctx).await {
-            Ok(s) if !s.is_empty() => {
-                // Reset counter after a successful LLM call
-                self.consecutive_rate_limits
-                    .store(0, std::sync::atomic::Ordering::Relaxed);
-                // Preserve the LLM's reasoning text so it appears in the
-                // assistant_with_tool_calls message pushed by execute_tool_calls.
-                let reasoning_text = s
-                    .iter()
-                    .find_map(|sel| (!sel.reasoning.is_empty()).then_some(sel.reasoning.clone()));
-                let tool_calls: Vec<ToolCall> = selections_to_tool_calls(&s);
-                return Ok(crate::llm::RespondOutput {
-                    result: RespondResult::ToolCalls {
-                        tool_calls,
-                        content: reasoning_text,
-                    },
-                    usage: crate::llm::TokenUsage::default(),
-                });
-            }
-            Ok(_) => {} // empty selections, fall through
-            Err(crate::error::LlmError::RateLimited { retry_after, .. }) => {
-                return self.handle_rate_limit(retry_after, "tool selection").await;
-            }
-            Err(e) => return Err(e.into()),
-        };
+        // The final recovery turn is text-only; skip the selection request so
+        // a provider cannot spend it proposing another unavailable tool call.
+        if !reason_ctx.force_text {
+            match reasoning.select_tools(reason_ctx).await {
+                Ok(s) if !s.is_empty() => {
+                    // Reset counter after a successful LLM call
+                    self.consecutive_rate_limits
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    // Preserve the LLM's reasoning text so it appears in the
+                    // assistant_with_tool_calls message pushed by execute_tool_calls.
+                    let reasoning_text = s.iter().find_map(|sel| {
+                        (!sel.reasoning.is_empty()).then_some(sel.reasoning.clone())
+                    });
+                    let tool_calls: Vec<ToolCall> = selections_to_tool_calls(&s);
+                    return Ok(crate::llm::RespondOutput {
+                        result: RespondResult::ToolCalls {
+                            tool_calls,
+                            content: reasoning_text,
+                        },
+                        usage: crate::llm::TokenUsage::default(),
+                    });
+                }
+                Ok(_) => {} // empty selections, fall through
+                Err(crate::error::LlmError::RateLimited { retry_after, .. }) => {
+                    return self.handle_rate_limit(retry_after, "tool selection").await;
+                }
+                Err(e) => return Err(e.into()),
+            };
+        }
 
         // Fall back to respond_with_tools
         match reasoning.respond_with_tools(reason_ctx).await {
@@ -1959,6 +1977,38 @@ mod tests {
             Err(Error::Tool(crate::error::ToolError::AutonomousUnavailable { name, .. }))
                 if name == "always_approval"
         ));
+    }
+
+    #[tokio::test]
+    async fn test_autonomous_unavailable_result_returns_to_model_for_recovery() {
+        let worker = make_worker(vec![]).await;
+        let mut reason_ctx = ReasoningContext::new();
+        let selection = ToolSelection {
+            tool_name: "always_approval".to_string(),
+            parameters: serde_json::json!({}),
+            reasoning: String::new(),
+            alternatives: vec![],
+            tool_call_id: "call-disabled".to_string(),
+        };
+        let error = crate::error::ToolError::AutonomousUnavailable {
+            name: selection.tool_name.clone(),
+            reason: "Choose an allowed alternative or ask the user to run this interactively."
+                .to_string(),
+        }
+        .into();
+
+        worker
+            .process_tool_result_job(&mut reason_ctx, &selection, Err(error))
+            .await
+            .unwrap();
+
+        assert_eq!(reason_ctx.messages.len(), 1);
+        assert_eq!(reason_ctx.messages[0].role, crate::llm::Role::Tool);
+        assert!(
+            reason_ctx.messages[0]
+                .content
+                .contains("Choose an allowed alternative")
+        );
     }
 
     #[tokio::test]
