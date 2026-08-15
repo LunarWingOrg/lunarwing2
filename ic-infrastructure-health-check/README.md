@@ -221,13 +221,72 @@ Report shape:
 {
   "timestamp": "2026-06-16T12:00:00Z",
   "overall_status": "degraded",
-  "components": [ { "component": "gateway", "status": "healthy", "metrics": {…} }, … ],
+  "components": [ { "component": "gateway", "status": "healthy", "duration_seconds": 2, "metrics": {…} }, … ],
   "alerts":     [ { "component": "xmpp", "severity": "warning", "message": "xmpp is degraded" } ]
 }
 ```
 
 `overall_status` is the worst component status; a component reporting `unknown`
-(timeout, crash, invalid JSON) degrades the overall result.
+(timeout, crash, invalid JSON) degrades the overall result. Each component
+object carries the orchestrator-measured wall `duration_seconds` (additive;
+older consumers ignore it) — this powers
+`lunarwing_health_check_duration_seconds` in the metrics exporter.
+
+## Metrics Exporter (Prometheus)
+
+`health-metrics-exporter.sh` turns the newest report into Prometheus text
+exposition format and atomically writes `metrics.prom` (mode 0600) next to the
+reports. `cron-wrapper.sh` runs it after every health check, gated on
+`HEALTH_METRICS_EXPORT_ENABLED` (default `true`) — no listener and no port by
+default. Point node_exporter/VictoriaMetrics at it:
+
+```bash
+node_exporter --collector.textfile.directory=$LUNARWING_BASE_DIR/workspace/reports/health
+```
+
+Exported series (`lunarwing_health_*`):
+
+| Family | Meaning |
+|--------|---------|
+| `overall_status`, `status{component}` | 0 healthy · 1 degraded · 2 critical · 3 unknown/skipped |
+| `report_timestamp_seconds`, `report_age_seconds`, `alerts_total` | staleness guard — alert when the report itself stops |
+| `component_enabled{component}` | disabled components export `0` and **no** status series (off ≠ failing) |
+| `check_duration_seconds{component}` | per-check wall time |
+| `<component>_<key>` | every numeric/boolean leaf of `metrics` flattened (booleans 0/1; strings dropped, so no secret material can leak); nested objects keep their path (`cache_hit_rate`) |
+| `lunarvision_*{tenant=…}`, `lunarvoice_*{tenant=…}` | per-tenant instance series from the report's own tenant labels |
+| `unit_status/unit_up/unit_restarts_total{init,unit[,tenant]}` | init-agnostic (systemd/openrc/launchd) unit series |
+| `selfheal_*{service}` | restarts, escalated, consecutive_unhealthy, flapping window, backoff next-attempt (absent state file → series omitted) |
+| `early_warning{metric,severity}` | threshold crossings (below) |
+
+Early-warning layer: copy `health-metrics-thresholds.conf.example` to
+`/etc/lunarwing/health-metrics-thresholds.conf` and set
+`THRESHOLD_<metric>="warn:>N crit:>M"` rules. Crossings emit the
+`early_warning` series and — with `HEALTH_METRICS_EARLY_WARNING_NOTIFY=true` —
+a Gotify warning via `send-notification.sh`, deduplicated per metric+severity
+by `HEALTH_METRICS_NOTIFY_COOLDOWN` (defaults to `SELF_HEAL_ESCALATE_COOLDOWN`).
+This is deliberately separate from the per-run degraded notify.
+
+Optional loopback listener (Phase 2): for hosts without a textfile collector,
+`ic/crates/lunarwing_health_metrics` serves the same exposition on
+`GET /metrics`, loopback-only (non-loopback binds refused at startup,
+non-loopback peers dropped), optional bearer token via `HEALTH_METRICS_TOKEN`
+(constant-time compare). Build + install:
+
+```bash
+cd ic && cargo build --release --bin lunarwing-health-metrics
+install -Dm0755 target/release/lunarwing-health-metrics \
+    /usr/local/lib/lunarwing-health/lunarwing-health-metrics
+sudo ic/scripts/install-health-metrics-listener.sh   # auto-detects systemd/OpenRC/launchd
+```
+
+On multi-tenant hosts the listener port comes from the ports registry v16
+`health_metrics` slot (`ic/scripts/migrate-ports-v16.sh`; default 50000) —
+never hardcode a tenant port. Tenant-scoped listeners are not planned; one
+host-global exporter carries per-tenant labels.
+
+`contrib/` ships a Prometheus alerting-rules YAML and a Grafana dashboard JSON
+covering the three canonical early warnings (rising latency, rising error
+rate, report staleness) plus unit/self-heal alerting.
 
 ## Self-Healing
 

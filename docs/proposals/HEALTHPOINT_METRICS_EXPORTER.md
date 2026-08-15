@@ -1,13 +1,21 @@
 # Healthpoint Metrics Exporter
 
-> **Current status (2026-08-13): PROPOSED — post-v2.0.7.0 roadmap item.** No
-> code exists yet. Source: Rares' notes at
-> `~/.hermes/notes/healthpoint-metrics-exporter.md` (2026-08-13), capturing a
-> Discord message from cmc / IRC discussion with Christopher, who called a
-> dedicated metrics exporter for every healthpoint "the ideal path going
-> forward." This document turns that idea into an implementation plan.
-> It also closes the long-open **M4 – Prometheus exporter** milestone recorded
-> in
+> **Status (2026-08-15): IMPLEMENTED (v2.0.8.0 goal #16) — Phases 1–3 landed.**
+> Phase 1: `health-metrics-exporter.sh` (textfile export of the aggregated
+> report + self-heal series), `duration_seconds` in the report, cron-wrapper
+> wiring, `tests/test-health-metrics-exporter.sh` (61 assertions) in
+> `tests/run-all.sh`, config/threshold examples, and `contrib/` alert rules +
+> Grafana dashboard. Phase 2: `ic/crates/lunarwing_health_metrics` loopback
+> listener (bearer-token, loopback-enforced), `ic/scripts/install-health-metrics-listener.sh`
+> (systemd/OpenRC/launchd), and the ports-registry **v16** migration allocating
+> the host-global `health_metrics` slot (`ic/scripts/migrate-ports-v16.sh`).
+> Phase 3: threshold conf + `early_warning` series + deduplicated Gotify path.
+> Historical origin: PROPOSED 2026-08-13 from Rares' notes at
+> `~/.hermes/notes/healthpoint-metrics-exporter.md`, capturing a Discord
+> message from cmc / IRC discussion with Christopher, who called a dedicated
+> metrics exporter for every healthpoint "the ideal path going forward."
+> This document closes the long-open **M4 – Prometheus exporter** milestone
+> recorded in
 > [`../internal/ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md`](../internal/ic-infrastructure-health-check/draft-ic-infrastructure-health-check-analysis-report.md).
 
 ## Overview
@@ -259,20 +267,23 @@ No chaos-harness changes; the exporter never mutates services.
 
 ## Rollout plan (post-v2.0.7.0)
 
-1. **Phase 1** — `health-metrics-exporter.sh` + `duration_seconds` report
-   field + textfile output + self-heal series + test suite + README /
-   `config.sh.example` updates. Smallest possible diff; no listeners, no
-   registry change.
-2. **Phase 2** — optional loopback listener + port-registry **v16**
-   migration (`health_metrics` slot) + systemd/OpenRC/launchd units rendered
-   through the same auto-detect pattern as
-   `ic/scripts/install-lunarwing-watchdog.sh`.
-3. **Phase 3** — threshold config + `early_warning` series + deduplicated
-   Gotify warning path + `contrib/` alerting rules and Grafana dashboard.
+1. **Phase 1** — DONE 2026-08-15: `health-metrics-exporter.sh` +
+   `duration_seconds` report field + textfile output + self-heal series +
+   test suite (61 assertions) + README / `config.sh.example` updates.
+2. **Phase 2** — DONE 2026-08-15: optional loopback listener
+   (`ic/crates/lunarwing_health_metrics`) + port-registry **v16** migration
+   (`health_metrics` slot, host-global, default 50000) + systemd/OpenRC/launchd
+   units rendered through `ic/scripts/install-health-metrics-listener.sh`
+   following the install-lunarwing-watchdog.sh auto-detect pattern.
+3. **Phase 3** — DONE 2026-08-15: threshold config
+   (`health-metrics-thresholds.conf.example`) + `early_warning` series +
+   deduplicated Gotify warning path (per-metric+severity cooldown stamps,
+   `SELF_HEAL_ESCALATE_COOLDOWN` discipline) + `contrib/` alerting rules and
+   Grafana dashboard.
 4. Roadmap bookkeeping: DONE (2026-08-13) — v2.0.7.0 goals item #28 added the
    health exporter to `docs/ops/ROADMAP_2026.md` (target v2.0.8.0) referencing
    this document; the internal analysis report's M4 milestone flips to Done
-   when Phase 1 lands.
+   with this implementation.
 5. When LTX lands as a healthpoint, verify its metrics appear with correct
    labels — add only a README row, no exporter changes expected.
 
