@@ -2787,19 +2787,32 @@ _openrc_tenant_subtree_ensure() {
   grep -qw memory "$root/cgroup.controllers" || return 1
   uid="$(id -u "$name" 2>/dev/null)" || return 1
   gid="$(id -g "$name" 2>/dev/null)" || return 1
+  # Enable the available controllers in one write: cgroupfs applies each
+  # "+ctl" additively, but a multi-write sequence leaves partial state behind
+  # when a later write fails (and reads back wrong on non-cgroupfs fixtures).
+  local enable=""
   for ctl in memory pids; do
     grep -qw "$ctl" "$root/cgroup.controllers" || continue
     grep -qw "$ctl" "$root/cgroup.subtree_control" 2>/dev/null && continue
-    printf '+%s' "$ctl" >"$root/cgroup.subtree_control" 2>/dev/null || {
-      # pids is nice-to-have for session containment; memory is required.
-      [[ "$ctl" == pids ]] || return 1
-    }
+    enable="$enable +$ctl"
   done
+  if [[ -n "$enable" ]]; then
+    # pids is nice-to-have for session containment; memory is required.
+    printf '%s' "${enable# }" >"$root/cgroup.subtree_control" 2>/dev/null \
+      || printf '+memory' >"$root/cgroup.subtree_control" 2>/dev/null \
+      || return 1
+  fi
   grep -qw memory "$root/cgroup.subtree_control" || return 1
   mkdir -p "$d/session" || return 1
+  enable=""
   for ctl in memory pids; do
-    printf '+%s' "$ctl" >"$d/cgroup.subtree_control" 2>/dev/null || true
+    grep -qw "$ctl" "$root/cgroup.controllers" || continue
+    enable="$enable +$ctl"
   done
+  # Same single-write form for the tenant dir; best-effort beyond memory.
+  printf '%s' "${enable# }" >"$d/cgroup.subtree_control" 2>/dev/null \
+    || printf '+memory' >"$d/cgroup.subtree_control" 2>/dev/null \
+    || true
   grep -qw memory "$d/cgroup.subtree_control" || {
     say "cannot delegate memory into $d (processes in the tenant cgroup root?)" >&2
     return 1
@@ -2925,45 +2938,44 @@ _run_tenant_build_cgroup() {
   return "$rc"
 }
 
-# Spawn the tenant build behind a rendezvous FIFO, migrate it into the build
+# Spawn the tenant build behind a rendezvous gate, migrate it into the build
 # cgroup as root, then release it — Option A (root-side migrate + drop privs)
 # from docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md. Unlike the old tenant
 # self-migration this needs no tenant write access on any cgroup.procs, no
 # chown delegation, and no PAM hook, so bounding works on every OpenRC host;
-# every child the build spawns inherits membership at fork. The FIFO closes the
-# race between spawn and migration: the build cannot start before the write
-# lands, and a failed migration kills the wrapper before the build ever runs
-# (setup stays incomplete, so the caller falls back to the nice'd invocation).
+# every child the build spawns inherits membership at fork.
+#
+# The gate is a "go" file the wrapper polls for: it cannot start the build
+# before the migration write lands, and a failed migration kills the wrapper
+# before the build ever runs (setup stays incomplete, so the caller falls
+# back to the nice'd invocation). A poll loop is used instead of a FIFO/signal
+# rendezvous because both of those have unfixable races here: FIFO open/read
+# semantics deadlock once inherited writer fds enter the picture, and
+# SIGCONT sent before a self-SIGSTOP is lost. The loop is bounded so an
+# aborted mt-admin can never leave a wrapper parked forever.
 _run_tenant_build_cgroup_spawn() {
   local name="$1" uid="$2" gid="$3" home="$4" cg="$5" build_cmd="$6"
-  local sync_dir sync_fifo build_pid rc=0
+  local sync_dir build_pid rc=0
   sync_dir="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-build-sync.XXXXXXXX")" || return 1
-  sync_fifo="$sync_dir/fifo"
-  if ! mkfifo "$sync_fifo"; then
-    rm -rf "$sync_dir"
-    return 1
-  fi
-  local sync_fd
-  # Holding a writer fd ourselves makes the child's `read` gate deterministic:
-  # its open succeeds immediately, and its read returns (EOF) only when we
-  # close the fd after the migration write. O_RDWR never blocks, so a dead
-  # child can never wedge us on the FIFO open either.
-  exec {sync_fd}<>"$sync_fifo" || { rm -rf "$sync_dir"; return 1; }
+  # The tenant wrapper must be able to stat the go file inside.
+  chmod 0755 "$sync_dir" || { rm -rf "$sync_dir"; return 1; }
   setpriv --reuid="$uid" --regid="$gid" --clear-groups \
     env HOME="$home" USER="$name" LOGNAME="$name" \
       PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin" \
-    bash -c 'read -r _ <"$2"; exec nice -n 10 bash -c "$1"' _ "$build_cmd" "$sync_fifo" &
+    bash -c 'for ((i=0; i<600; i++)); do
+               [[ -e "$2" ]] && break
+               sleep 0.05
+             done
+             [[ -e "$2" ]] || exit 125
+             exec nice -n 10 bash -c "$1"' _ "$build_cmd" "$sync_dir/go" &
   build_pid=$!
-  if printf '%s' "$build_pid" >"$cg/cgroup.procs" 2>/dev/null; then
+  if { printf '%s' "$build_pid" >"$cg/cgroup.procs"; } 2>/dev/null; then
     _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
-    exec {sync_fd}>&-
+    : >"$sync_dir/go"
     wait "$build_pid" || rc=$?
   else
-    # Kill first (the wrapper is still blocked on the read), then close: this
-    # ordering guarantees no unbounded build process can escape the gate.
     kill -KILL "$build_pid" 2>/dev/null || true
     wait "$build_pid" 2>/dev/null || true
-    exec {sync_fd}>&-
     say "cgroup v2 root-side migration failed for $name build; bounding ineffective, falling back" >&2
     rc=1
   fi
