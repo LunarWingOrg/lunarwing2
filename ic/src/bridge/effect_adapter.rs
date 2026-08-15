@@ -359,6 +359,10 @@ impl EffectBridgeAdapter {
                 let webhook_secret = params
                     .get("webhook_secret")
                     .and_then(serde_json::Value::as_str);
+                let max_threads_per_day = params
+                    .get("max_threads_per_day")
+                    .and_then(Self::coerce_to_u64)
+                    .map(|max| max as u32);
                 match parse_cadence_with_secret(cadence_str, webhook_secret) {
                     Ok(cadence) => match mgr
                         .create_mission(
@@ -371,9 +375,34 @@ impl EffectBridgeAdapter {
                         )
                         .await
                     {
-                        Ok(id) => Ok(
-                            serde_json::json!({"mission_id": id.to_string(), "status": "created"}),
-                        ),
+                        Ok(id) => {
+                            // Apply the optional daily budget right after
+                            // creation; the cron schedule was just set to a
+                            // future fire time, so no run can race this.
+                            let budget_result = match max_threads_per_day {
+                                Some(max) => {
+                                    let updates = lunarwing_engine::MissionUpdate {
+                                        max_threads_per_day: Some(max),
+                                        ..Default::default()
+                                    };
+                                    Some(mgr.update_mission(id, &context.user_id, updates).await)
+                                }
+                                None => None,
+                            };
+                            match budget_result {
+                                Some(Err(e)) => Err(e),
+                                _ => {
+                                    let mut out = serde_json::json!({
+                                        "mission_id": id.to_string(),
+                                        "status": "created",
+                                    });
+                                    if let Some(max) = max_threads_per_day {
+                                        out["max_threads_per_day"] = serde_json::json!(max);
+                                    }
+                                    Ok(out)
+                                }
+                            }
+                        }
                         Err(e) => Err(e),
                     },
                     Err(e) => Err(e),
@@ -387,6 +416,8 @@ impl EffectBridgeAdapter {
                     let list: Vec<serde_json::Value> = missions
                         .iter()
                         .map(|m| {
+                            let budget_exhausted = m.max_threads_per_day > 0
+                                && m.threads_today >= m.max_threads_per_day;
                             serde_json::json!({
                                 "id": m.id.to_string(),
                                 "name": m.name,
@@ -395,6 +426,9 @@ impl EffectBridgeAdapter {
                                 "threads": m.thread_history.len(),
                                 "current_focus": m.current_focus,
                                 "notify_channels": m.notify_channels,
+                                "threads_today": m.threads_today,
+                                "max_threads_per_day": m.max_threads_per_day,
+                                "budget_exhausted": budget_exhausted,
                             })
                         })
                         .collect();
@@ -409,9 +443,34 @@ impl EffectBridgeAdapter {
                         Ok(Some(tid)) => {
                             Ok(serde_json::json!({"thread_id": tid.to_string(), "status": "fired"}))
                         }
-                        Ok(None) => Ok(
-                            serde_json::json!({"status": "not_fired", "reason": "mission is terminal or budget exhausted"}),
-                        ),
+                        Ok(None) => {
+                            // Distinguish why nothing fired so an active-but-
+                            // budget-exhausted mission is not mistaken for a
+                            // dead one (work item #56).
+                            let reason = match mgr.get_mission(id).await {
+                                Ok(Some(m)) if m.is_terminal() => {
+                                    format!("mission is terminal ({:?})", m.status)
+                                }
+                                Ok(Some(m))
+                                    if m.status == lunarwing_engine::types::mission::MissionStatus::Paused =>
+                                {
+                                    "mission is paused".to_string()
+                                }
+                                Ok(Some(m))
+                                    if m.max_threads_per_day > 0
+                                        && m.threads_today >= m.max_threads_per_day =>
+                                {
+                                    format!(
+                                        "daily thread budget exhausted ({}/{}); resets at the next UTC day",
+                                        m.threads_today, m.max_threads_per_day
+                                    )
+                                }
+                                Ok(Some(_)) => "mission did not fire".to_string(),
+                                Ok(None) => "mission not found".to_string(),
+                                Err(_) => "mission is terminal or budget exhausted".to_string(),
+                            };
+                            Ok(serde_json::json!({"status": "not_fired", "reason": reason}))
+                        }
                         Err(e) => Err(e),
                     },
                     Err(e) => Err(e),

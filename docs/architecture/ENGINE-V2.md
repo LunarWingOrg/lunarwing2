@@ -277,6 +277,16 @@ the next occurrence even when the daily thread budget blocks a run; manual
 fires do not shift the cron schedule. Daily thread budgets reset on UTC day
 boundaries.
 
+The daily thread budget (`max_threads_per_day`, default 10, 0 = unlimited) is
+configurable at creation time through `mission_create` and afterwards through
+`mission_update`. `mission_list` and the web mission list/detail views expose
+`threads_today`, `max_threads_per_day`, and a derived `budget_exhausted` flag
+so an active-but-exhausted mission is distinguishable from a dead one. Budget
+exhaustion is logged at warn level with the mission name and counters; the
+mission stays Active and resumes spawning at the next UTC day rather than
+going terminal. `mission_fire` reports the precise reason when nothing fires
+(terminal, paused, or budget exhausted).
+
 `MissionManager::ensure_learning_missions()` provisions three baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.

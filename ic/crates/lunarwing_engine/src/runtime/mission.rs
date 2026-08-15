@@ -708,7 +708,16 @@ impl MissionManager {
             if advance_schedule || budget_date_changed {
                 self.store.save_mission(&mission).await?;
             }
-            debug!(mission_id = %id, "daily thread budget exhausted");
+            // Budget exhaustion must be operator-visible: the mission stays
+            // Active and auto-resumes at the next UTC day, but until then it
+            // silently spawns nothing (see git.lunarwing.org work item #56).
+            warn!(
+                mission_id = %id,
+                mission_name = %mission.name,
+                threads_today = mission.threads_today,
+                max_threads_per_day = mission.max_threads_per_day,
+                "mission daily thread budget exhausted; no threads will spawn until the next UTC day"
+            );
             return Ok(None);
         }
 
