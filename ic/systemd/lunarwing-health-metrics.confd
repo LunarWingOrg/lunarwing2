@@ -1,0 +1,15 @@
+# /etc/conf.d/lunarwing-health-metrics
+#
+# Optional configuration for the Gentoo/OpenRC health metrics listener.
+
+# Bind address + port. MUST be loopback-only; the daemon refuses non-loopback.
+# On multi-tenant hosts derive this from the ports registry:
+#   HEALTH_METRICS_LISTEN="127.0.0.1:$(jq -r '.health_metrics_port // 50000' /etc/lunarwing/ports.json)"
+export HEALTH_METRICS_LISTEN="127.0.0.1:50000"
+
+# Optional bearer token; empty = no auth on loopback.
+export HEALTH_METRICS_TOKEN=""
+
+# Report directory and update interval (seconds) for the served snapshot.
+#export HEALTH_REPORT_DIR="/var/lib/lunarwing/workspace/reports/health"
+#export HEALTH_METRICS_REFRESH_SECS=15
