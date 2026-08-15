@@ -15,7 +15,7 @@ use crate::agent::compaction::ContextCompactor;
 use crate::agent::dispatcher::{
     AgenticLoopResult, check_auth_required, execute_chat_tool_standalone, parse_auth_result,
 };
-use crate::agent::session::{MAX_PENDING_MESSAGES, PendingApproval, Session, ThreadState};
+use crate::agent::session::{MAX_PENDING_MESSAGES, PendingApproval, Session, Thread, ThreadState};
 use crate::agent::submission::SubmissionResult;
 use crate::channels::web::util::truncate_preview;
 use crate::channels::{IncomingMessage, StatusUpdate};
@@ -26,6 +26,38 @@ use crate::tools::permissions::PermissionState;
 use crate::tools::redact_params;
 
 const FORGED_THREAD_ID_ERROR: &str = "Invalid or unauthorized thread ID.";
+
+fn approval_denial_message(tool_name: &str) -> String {
+    format!(
+        "User denied tool '{tool_name}'. It was not executed. Do not retry this call unchanged. Choose an alternative that does not require it; if it is essential, explain why and ask the user to approve a new request."
+    )
+}
+
+fn build_denied_approval_context(pending: PendingApproval) -> Vec<ChatMessage> {
+    let PendingApproval {
+        tool_name,
+        tool_call_id,
+        mut context_messages,
+        deferred_tool_calls,
+        ..
+    } = pending;
+    context_messages.push(ChatMessage::tool_result(
+        &tool_call_id,
+        &tool_name,
+        approval_denial_message(&tool_name),
+    ));
+    for deferred in deferred_tool_calls {
+        context_messages.push(ChatMessage::tool_result(
+            &deferred.id,
+            &deferred.name,
+            format!(
+                "Tool '{}' was not executed because an earlier call in this assistant batch was denied. Re-evaluate the plan and issue a new allowed call only if it is still needed.",
+                deferred.name
+            ),
+        ));
+    }
+    context_messages
+}
 
 fn requires_preexisting_uuid_thread(channel: &str) -> bool {
     // Gateway-style channels send server-issued conversation UUIDs.
@@ -1105,6 +1137,128 @@ impl Agent {
         Ok(SubmissionResult::ok_with_message("Thread cleared."))
     }
 
+    async fn finish_resumed_response(
+        &self,
+        message: &IncomingMessage,
+        thread_id: Uuid,
+        thread: &mut Thread,
+        response: String,
+    ) -> Result<SubmissionResult, Error> {
+        let (response, suggestions) = crate::agent::dispatcher::extract_suggestions(&response);
+        let response = self
+            .transform_response(message, &thread_id.to_string(), response)
+            .await;
+        let Some(response) = response else {
+            thread.suppress_turn();
+            let (turn_number, tool_calls) = thread
+                .turns
+                .last()
+                .map(|turn| (turn.turn_number, turn.tool_calls.clone()))
+                .unwrap_or_default();
+            self.persist_tool_calls(
+                thread_id,
+                &message.channel,
+                &message.user_id,
+                turn_number,
+                &tool_calls,
+            )
+            .await;
+            return Ok(SubmissionResult::Suppressed);
+        };
+
+        thread.complete_turn(&response);
+        let (turn_number, tool_calls) = thread
+            .turns
+            .last()
+            .map(|turn| (turn.turn_number, turn.tool_calls.clone()))
+            .unwrap_or_default();
+        self.persist_tool_calls(
+            thread_id,
+            &message.channel,
+            &message.user_id,
+            turn_number,
+            &tool_calls,
+        )
+        .await;
+        self.persist_assistant_response(thread_id, &message.channel, &message.user_id, &response)
+            .await;
+        let _ = self
+            .channels
+            .send_status(
+                &message.channel,
+                StatusUpdate::Status("Done".into()),
+                &message.metadata,
+            )
+            .await;
+        if !suggestions.is_empty() {
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Suggestions { suggestions },
+                    &message.metadata,
+                )
+                .await;
+        }
+        Ok(SubmissionResult::response(response))
+    }
+
+    async fn finish_resumed_agentic_loop(
+        &self,
+        message: &IncomingMessage,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        result: Result<AgenticLoopResult, Error>,
+    ) -> Result<SubmissionResult, Error> {
+        let mut sess = session.lock().await;
+        let thread = sess
+            .threads
+            .get_mut(&thread_id)
+            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+        match result {
+            Ok(AgenticLoopResult::Response(response)) => {
+                self.finish_resumed_response(message, thread_id, thread, response)
+                    .await
+            }
+            Ok(AgenticLoopResult::NeedApproval {
+                pending: new_pending,
+            }) => {
+                let request_id = new_pending.request_id;
+                let tool_name = new_pending.tool_name.clone();
+                let description = new_pending.description.clone();
+                let parameters = new_pending.display_parameters.clone();
+                let allow_always = new_pending.allow_always;
+                thread.await_approval(*new_pending);
+                let _ = self
+                    .channels
+                    .send_status(
+                        &message.channel,
+                        StatusUpdate::ApprovalNeeded {
+                            request_id: request_id.to_string(),
+                            tool_name: tool_name.clone(),
+                            description: description.clone(),
+                            parameters: parameters.clone(),
+                            allow_always,
+                        },
+                        &message.metadata,
+                    )
+                    .await;
+                Ok(SubmissionResult::NeedApproval {
+                    request_id,
+                    tool_name,
+                    description,
+                    parameters,
+                    allow_always,
+                })
+            }
+            Err(error) => {
+                thread.fail_turn(error.to_string());
+                Ok(SubmissionResult::error(error.to_string()))
+            }
+        }
+    }
+
     /// Process an approval or rejection of a pending tool execution.
     pub(super) async fn process_approval(
         &self,
@@ -1609,188 +1763,44 @@ impl Agent {
                 });
             }
 
-            // Continue the agentic loop (a tool was already executed this turn)
+            // Continue the agentic loop (a tool was already executed this turn).
             let result = self
                 .run_agentic_loop(message, session.clone(), thread_id, context_messages)
                 .await;
-
-            // Handle the result
-            let mut sess = session.lock().await;
-            let thread = sess
-                .threads
-                .get_mut(&thread_id)
-                .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
-
-            match result {
-                Ok(AgenticLoopResult::Response(response)) => {
-                    let (response, suggestions) =
-                        crate::agent::dispatcher::extract_suggestions(&response);
-                    let response = self
-                        .transform_response(message, &thread_id.to_string(), response)
-                        .await;
-                    let Some(response) = response else {
-                        thread.suppress_turn();
-                        let (turn_number, tool_calls) = thread
-                            .turns
-                            .last()
-                            .map(|t| (t.turn_number, t.tool_calls.clone()))
-                            .unwrap_or_default();
-                        self.persist_tool_calls(
-                            thread_id,
-                            &message.channel,
-                            &message.user_id,
-                            turn_number,
-                            &tool_calls,
-                        )
-                        .await;
-                        return Ok(SubmissionResult::Suppressed);
-                    };
-                    thread.complete_turn(&response);
-                    let (turn_number, tool_calls) = thread
-                        .turns
-                        .last()
-                        .map(|t| (t.turn_number, t.tool_calls.clone()))
-                        .unwrap_or_default();
-                    // User message already persisted at turn start; save tool calls then assistant response
-                    self.persist_tool_calls(
-                        thread_id,
-                        &message.channel,
-                        &message.user_id,
-                        turn_number,
-                        &tool_calls,
-                    )
-                    .await;
-                    self.persist_assistant_response(
-                        thread_id,
-                        &message.channel,
-                        &message.user_id,
-                        &response,
-                    )
-                    .await;
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::Status("Done".into()),
-                            &message.metadata,
-                        )
-                        .await;
-                    if !suggestions.is_empty() {
-                        let _ = self
-                            .channels
-                            .send_status(
-                                &message.channel,
-                                StatusUpdate::Suggestions { suggestions },
-                                &message.metadata,
-                            )
-                            .await;
-                    }
-                    Ok(SubmissionResult::response(response))
-                }
-                Ok(AgenticLoopResult::NeedApproval {
-                    pending: new_pending,
-                }) => {
-                    let request_id = new_pending.request_id;
-                    let tool_name = new_pending.tool_name.clone();
-                    let description = new_pending.description.clone();
-                    let parameters = new_pending.display_parameters.clone();
-                    let allow_always = new_pending.allow_always;
-                    thread.await_approval(*new_pending);
-                    let _ = self
-                        .channels
-                        .send_status(
-                            &message.channel,
-                            StatusUpdate::ApprovalNeeded {
-                                request_id: request_id.to_string(),
-                                tool_name: tool_name.clone(),
-                                description: description.clone(),
-                                parameters: parameters.clone(),
-                                allow_always,
-                            },
-                            &message.metadata,
-                        )
-                        .await;
-                    Ok(SubmissionResult::NeedApproval {
-                        request_id,
-                        tool_name,
-                        description,
-                        parameters,
-                        allow_always,
-                    })
-                }
-                Err(e) => {
-                    thread.fail_turn(e.to_string());
-                    // User message already persisted at turn start
-                    Ok(SubmissionResult::error(e.to_string()))
-                }
-            }
+            self.finish_resumed_agentic_loop(message, session, thread_id, result)
+                .await
         } else {
-            // Rejected - complete the turn with a rejection message and persist
+            let denied_tool_name = pending.tool_name.clone();
             tracing::debug!(
                 %thread_id,
-                tool_name = %pending.tool_name,
-                "process_approval: rejection branch entered"
+                tool_name = %denied_tool_name,
+                "process_approval: rejection branch entered; resuming for alternative"
             );
-            let rejection = format!(
-                "Tool '{}' was rejected. The agent will not execute this tool.\n\n\
-                 You can continue the conversation or try a different approach.",
-                pending.tool_name
-            );
+            let context_messages = build_denied_approval_context(pending);
             {
                 let mut sess = session.lock().await;
-                if let Some(thread) = sess.threads.get_mut(&thread_id) {
-                    let pre_state = thread.state;
-                    thread.clear_pending_approval();
-                    let after_clear = thread.state;
-                    thread.complete_turn(&rejection);
-                    let after_complete = thread.state;
-                    tracing::debug!(
-                        %thread_id,
-                        ?pre_state,
-                        ?after_clear,
-                        ?after_complete,
-                        "process_approval: rejection state transitions"
-                    );
-                    // User message already persisted at turn start; save rejection response
-                    self.persist_assistant_response(
-                        thread_id,
-                        &message.channel,
-                        &message.user_id,
-                        &rejection,
-                    )
-                    .await;
-                } else {
-                    tracing::error!(
-                        %thread_id,
-                        "process_approval: rejection branch — thread missing when applying state!"
-                    );
-                }
-            }
-
-            // Defensive paranoia: re-read final state for the log so we can correlate
-            // with later "Message queued" errors if the user reports them.
-            {
-                let sess = session.lock().await;
-                if let Some(thread) = sess.threads.get(&thread_id) {
-                    tracing::debug!(
-                        %thread_id,
-                        final_state = ?thread.state,
-                        pending_messages_len = thread.pending_message_count(),
-                        "process_approval: rejection final state before respond"
-                    );
-                }
+                let thread = sess.threads.get_mut(&thread_id).ok_or_else(|| {
+                    Error::from(crate::error::JobError::NotFound { id: thread_id })
+                })?;
+                thread.state = ThreadState::Processing;
             }
 
             let _ = self
                 .channels
                 .send_status(
                     &message.channel,
-                    StatusUpdate::Status("Rejected".into()),
+                    StatusUpdate::Status(format!(
+                        "Rejected {denied_tool_name}; trying an allowed alternative"
+                    )),
                     &message.metadata,
                 )
                 .await;
 
-            Ok(SubmissionResult::response(rejection))
+            let result = self
+                .run_agentic_loop(message, session.clone(), thread_id, context_messages)
+                .await;
+            self.finish_resumed_agentic_loop(message, session, thread_id, result)
+                .await
         }
     }
 
@@ -2102,6 +2112,49 @@ fn rebuild_chat_messages_from_db(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn denied_approval_context_resolves_every_tool_call_with_next_steps() {
+        let primary = ToolCall {
+            id: "call-primary".to_string(),
+            name: "shell".to_string(),
+            arguments: serde_json::json!({"command": "dangerous"}),
+            reasoning: None,
+        };
+        let deferred = ToolCall {
+            id: "call-deferred".to_string(),
+            name: "file_read".to_string(),
+            arguments: serde_json::json!({"path": "result.txt"}),
+            reasoning: None,
+        };
+        let pending = PendingApproval {
+            request_id: Uuid::new_v4(),
+            tool_name: primary.name.clone(),
+            parameters: primary.arguments.clone(),
+            display_parameters: primary.arguments.clone(),
+            description: "Run a command".to_string(),
+            tool_call_id: primary.id.clone(),
+            context_messages: vec![ChatMessage::assistant_with_tool_calls(
+                None,
+                vec![primary, deferred.clone()],
+            )],
+            deferred_tool_calls: vec![deferred],
+            user_timezone: None,
+            allow_always: false,
+        };
+
+        let messages = build_denied_approval_context(pending);
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("call-primary"));
+        assert!(
+            messages[1]
+                .content
+                .contains("Do not retry this call unchanged")
+        );
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("call-deferred"));
+        assert!(messages[2].content.contains("earlier call"));
+    }
 
     #[cfg(feature = "libsql")]
     async fn tool_approval_test_agent() -> (Agent, Arc<dyn crate::db::Database>, tempfile::TempDir)
