@@ -150,7 +150,9 @@ pub use crate::llm::error::LlmError;
 /// Tool execution errors.
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
-    #[error("Tool {name} not found")]
+    #[error(
+        "Tool {name} not found. Choose an advertised tool, or ask the user/operator to install and activate it before retrying."
+    )]
     NotFound { name: String },
 
     #[error("Tool {name} execution failed: {reason}")]
@@ -162,19 +164,25 @@ pub enum ToolError {
     #[error("Invalid parameters for tool {name}: {reason}")]
     InvalidParameters { name: String, reason: String },
 
-    #[error("Tool {name} is disabled: {reason}")]
+    #[error(
+        "Tool {name} is disabled: {reason}. This call cannot succeed unchanged; choose an enabled tool, or ask the user/operator to enable it before retrying."
+    )]
     Disabled { name: String, reason: String },
 
     #[error("Sandbox error for tool {name}: {reason}")]
     Sandbox { name: String, reason: String },
 
-    #[error("Tool {name} requires authentication")]
+    #[error(
+        "Tool {name} requires authentication. Ask the user to authenticate it before retrying, or choose an unauthenticated alternative."
+    )]
     AuthRequired { name: String },
 
     #[error("Tool {name} is not available for autonomous execution: {reason}")]
     AutonomousUnavailable { name: String, reason: String },
 
-    #[error("Tool {name} is rate limited, retry after {retry_after:?}")]
+    #[error(
+        "Tool {name} is rate limited, retry after {retry_after:?}. Wait for the limit to reset, reduce call rate, or choose another tool."
+    )]
     RateLimited {
         name: String,
         retry_after: Option<Duration>,
@@ -539,6 +547,30 @@ mod tests {
             msg.contains("invalid token"),
             "Should mention reason: {msg}"
         );
+    }
+
+    #[test]
+    fn tool_capability_errors_include_unlock_guidance() {
+        let missing = ToolError::NotFound {
+            name: "search".to_string(),
+        }
+        .to_string();
+        assert!(missing.contains("advertised tool"));
+        assert!(missing.contains("install and activate"));
+
+        let disabled = ToolError::Disabled {
+            name: "shell".to_string(),
+            reason: "operator policy".to_string(),
+        }
+        .to_string();
+        assert!(disabled.contains("cannot succeed unchanged"));
+        assert!(disabled.contains("enable it before retrying"));
+
+        let auth = ToolError::AuthRequired {
+            name: "calendar".to_string(),
+        }
+        .to_string();
+        assert!(auth.contains("authenticate it before retrying"));
     }
 
     #[test]
