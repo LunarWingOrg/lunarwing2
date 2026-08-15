@@ -2,6 +2,7 @@
 //!
 //! Connects to an existing Unix socket and communicates using
 //! newline-delimited JSON-RPC.
+//! Per-request deadlines are configurable via `connect_with_timeout`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,19 @@ use crate::tools::mcp::transport::{
 };
 use crate::tools::tool::ToolError;
 
+/// Default request deadline when no per-server override is configured.
+#[cfg(test)]
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: Duration =
+    Duration::from_secs(crate::tools::mcp::config::DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS);
+
+/// Keep configured deadlines inside the documented bounds and above one
+/// second so a zero timeout cannot starve response waits.
+fn clamp_timeout(timeout: Duration) -> Duration {
+    const MAX: Duration = Duration::from_secs(crate::tools::mcp::config::MAX_MCP_TIMEOUT_SECONDS);
+    const MIN: Duration = Duration::from_secs(1);
+    timeout.max(MIN).min(MAX)
+}
+
 /// MCP transport that communicates over a Unix domain socket.
 ///
 /// Connects to an existing Unix socket at the given path. Requests are
@@ -32,6 +46,8 @@ pub struct UnixMcpTransport {
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<McpResponse>>>>,
     notifications: Arc<McpNotificationState>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Deadline for one request/response exchange.
+    request_timeout: Duration,
 }
 
 impl UnixMcpTransport {
@@ -41,9 +57,11 @@ impl UnixMcpTransport {
     ///
     /// * `name` - Human-readable server name for logging.
     /// * `socket_path` - Path to the Unix domain socket.
+    /// * `request_timeout` - Deadline for one request/response exchange.
     pub async fn connect(
         name: impl Into<String>,
         socket_path: impl AsRef<Path>,
+        request_timeout: Duration,
     ) -> Result<Self, ToolError> {
         let server_name = name.into();
         let socket_path = socket_path.as_ref().to_path_buf();
@@ -78,6 +96,7 @@ impl UnixMcpTransport {
             pending,
             notifications,
             reader_handle: Mutex::new(Some(reader_handle)),
+            request_timeout: clamp_timeout(request_timeout),
         })
     }
 
@@ -106,7 +125,7 @@ impl McpTransport for UnixMcpTransport {
             &self.pending,
             request,
             &self.server_name,
-            Duration::from_secs(30),
+            self.request_timeout,
         )
         .await
     }
@@ -156,7 +175,8 @@ mod tests {
         let tmp_dir = tempfile::tempdir().expect("create temp dir");
         let socket_path = tmp_dir.path().join("nonexistent.sock");
 
-        let result = UnixMcpTransport::connect("test", &socket_path).await;
+        let result =
+            UnixMcpTransport::connect("test", &socket_path, DEFAULT_REQUEST_TIMEOUT_SECONDS).await;
 
         let err = result.err().expect("should be an error").to_string();
         assert!(
@@ -208,9 +228,10 @@ mod tests {
         });
 
         // Connect to the socket via our transport.
-        let transport = UnixMcpTransport::connect("test-uds", &socket_path)
-            .await
-            .expect("connect should succeed");
+        let transport =
+            UnixMcpTransport::connect("test-uds", &socket_path, DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                .await
+                .expect("connect should succeed");
 
         assert_eq!(transport.socket_path(), socket_path.as_path());
         assert_eq!(transport.server_name(), "test-uds");
@@ -241,9 +262,10 @@ mod tests {
             let _stream = listener.accept().await;
         });
 
-        let transport = UnixMcpTransport::connect("test-idle", &socket_path)
-            .await
-            .expect("connect");
+        let transport =
+            UnixMcpTransport::connect("test-idle", &socket_path, DEFAULT_REQUEST_TIMEOUT_SECONDS)
+                .await
+                .expect("connect");
 
         // Calling shutdown twice should not panic or error.
         transport.shutdown().await.expect("first shutdown");

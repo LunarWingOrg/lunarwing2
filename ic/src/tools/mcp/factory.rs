@@ -289,6 +289,7 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
         let env_values = resolved_env
             .iter()
             .map(|(name, value)| (name.as_str(), value.expose_secret()));
+        let request_timeout = std::time::Duration::from_secs(server.request_timeout_seconds());
         let transport = if let Some(executable) = verified_executable {
             context
                 .process_manager()
@@ -300,6 +301,7 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
                     !env_secrets.is_empty(),
                     server.sandbox.as_ref(),
                     executable,
+                    request_timeout,
                 )
                 .await
         } else {
@@ -312,6 +314,7 @@ impl McpRuntimeAdapter for StdioRuntimeAdapter {
                     env_values,
                     !env_secrets.is_empty(),
                     server.sandbox.as_ref(),
+                    request_timeout,
                 )
                 .await
         }
@@ -347,6 +350,7 @@ impl McpRuntimeAdapter for UnixRuntimeAdapter {
             let transport = crate::tools::mcp::unix_transport::UnixMcpTransport::connect(
                 &server_name,
                 socket_path,
+                std::time::Duration::from_secs(server.request_timeout_seconds()),
             )
             .await
             .map_err(|error| McpFactoryError::UnixConnect {
@@ -447,6 +451,7 @@ impl McpRuntimeAdapter for GatewayRuntimeAdapter {
             mode,
             route,
             Arc::clone(context.session_manager()),
+            std::time::Duration::from_secs(server.request_timeout_seconds()),
         );
         Ok(McpClient::new_with_transport(
             &server_name,
@@ -532,6 +537,7 @@ impl McpRuntimeAdapter for ExternalRuntimeAdapter {
         } else {
             None
         };
+        let request_timeout = std::time::Duration::from_secs(server.request_timeout_seconds());
         let spawn = if let Some(executable) = verified_executable {
             context
                 .process_manager()
@@ -543,6 +549,7 @@ impl McpRuntimeAdapter for ExternalRuntimeAdapter {
                     false,
                     sandbox,
                     executable,
+                    request_timeout,
                 )
                 .await
         } else {
@@ -555,6 +562,7 @@ impl McpRuntimeAdapter for ExternalRuntimeAdapter {
                     env_values,
                     false,
                     sandbox,
+                    request_timeout,
                 )
                 .await
         };

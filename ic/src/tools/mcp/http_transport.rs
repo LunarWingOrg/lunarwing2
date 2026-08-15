@@ -15,12 +15,25 @@ use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::tools::mcp::config::DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS;
 use crate::tools::mcp::protocol::{
     InboundJsonRpc, McpRequest, McpResponse, classify_inbound_value,
 };
 use crate::tools::mcp::session::McpSessionManager;
 use crate::tools::mcp::transport::{McpNotificationState, McpTransport};
 use crate::tools::tool::ToolError;
+
+/// Default request deadline when no per-server override is configured.
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: Duration =
+    Duration::from_secs(DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS);
+
+/// Keep configured deadlines inside the documented bounds and above one
+/// second so coarse SSE responses cannot be starved by a zero timeout.
+fn clamp_timeout(timeout: Duration) -> Duration {
+    const MAX: Duration = Duration::from_secs(crate::tools::mcp::config::MAX_MCP_TIMEOUT_SECONDS);
+    const MIN: Duration = Duration::from_secs(1);
+    timeout.max(MIN).min(MAX)
+}
 
 /// MCP transport that communicates with a server over HTTP.
 ///
@@ -54,6 +67,16 @@ struct NotificationListener {
 impl HttpMcpTransport {
     /// Create a new HTTP transport for the given server URL.
     pub fn new(server_url: impl Into<String>, server_name: impl Into<String>) -> Self {
+        Self::with_request_timeout(server_url, server_name, DEFAULT_REQUEST_TIMEOUT_SECONDS)
+    }
+
+    /// Create a new HTTP transport with an explicit per-request deadline.
+    pub fn with_request_timeout(
+        server_url: impl Into<String>,
+        server_name: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Self {
+        let request_timeout = clamp_timeout(request_timeout);
         Self {
             server_url: server_url.into(),
             server_name: server_name.into(),
@@ -62,7 +85,7 @@ impl HttpMcpTransport {
             // feature set. Panic is acceptable here (same as reqwest's own
             // `Client::new()`).
             http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
+                .timeout(request_timeout)
                 .build()
                 .expect("Failed to create HTTP client"), // safety: TLS init with default rustls cannot fail
             notification_client: reqwest::Client::builder()

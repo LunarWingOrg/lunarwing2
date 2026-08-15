@@ -56,6 +56,39 @@ pub enum McpPlacement {
     ExternalWorker,
 }
 
+/// Per-server lifecycle timeout overrides in seconds.
+///
+/// Applies to every transport: `request_seconds` bounds one JSON-RPC
+/// request/response exchange, and `startup_seconds` bounds the whole
+/// initialize handshake. Unset fields keep the documented transport default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpTimeouts {
+    /// Deadline for a single request/response exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_seconds: Option<u64>,
+    /// Deadline for the initialize handshake (including the
+    /// `notifications/initialized` notification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_seconds: Option<u64>,
+}
+
+impl McpTimeouts {
+    /// Whether every timeout override is unset.
+    pub fn is_empty(&self) -> bool {
+        self.request_seconds.is_none() && self.startup_seconds.is_none()
+    }
+}
+
+/// Default per-request deadline shared by HTTP, stdio, unix, and gateway
+/// transports when no override is configured.
+pub const DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS: u64 = 30;
+
+/// Default deadline for the MCP initialize handshake.
+pub const DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS: u64 = 60;
+
+/// Upper bound for any configured MCP timeout.
+pub const MAX_MCP_TIMEOUT_SECONDS: u64 = 600;
+
 /// Transport configuration for an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
@@ -174,6 +207,11 @@ pub struct McpServerConfig {
     /// Absent means legacy unsandboxed execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<crate::tools::mcp::sandbox::McpSandboxConfig>,
+
+    /// Per-server request and startup timeout overrides.
+    /// Absent keeps the per-transport defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeouts: Option<McpTimeouts>,
 }
 
 fn default_true() -> bool {
@@ -223,6 +261,7 @@ impl McpServerConfig {
             always_require_approval: Vec::new(),
             provenance: None,
             sandbox: None,
+            timeouts: None,
         }
     }
 
@@ -263,6 +302,7 @@ impl McpServerConfig {
             always_require_approval: Vec::new(),
             provenance: None,
             sandbox: None,
+            timeouts: None,
         }
     }
 
@@ -284,6 +324,7 @@ impl McpServerConfig {
             always_require_approval: Vec::new(),
             provenance: None,
             sandbox: None,
+            timeouts: None,
         }
     }
 
@@ -308,6 +349,7 @@ impl McpServerConfig {
             always_require_approval: Vec::new(),
             provenance: None,
             sandbox: None,
+            timeouts: None,
         }
     }
 
@@ -409,6 +451,29 @@ impl McpServerConfig {
         self
     }
 
+    /// Set per-server timeout overrides. An all-unset value clears the
+    /// override so persisted configuration keeps its previous shape.
+    pub fn with_timeouts(mut self, timeouts: McpTimeouts) -> Self {
+        self.timeouts = (!timeouts.is_empty()).then_some(timeouts);
+        self
+    }
+
+    /// Effective per-request deadline in seconds.
+    pub fn request_timeout_seconds(&self) -> u64 {
+        self.timeouts
+            .and_then(|timeouts| timeouts.request_seconds)
+            .filter(|seconds| (1..=MAX_MCP_TIMEOUT_SECONDS).contains(seconds))
+            .unwrap_or(DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS)
+    }
+
+    /// Effective initialize-handshake deadline in seconds.
+    pub fn startup_timeout_seconds(&self) -> u64 {
+        self.timeouts
+            .and_then(|timeouts| timeouts.startup_seconds)
+            .filter(|seconds| (1..=MAX_MCP_TIMEOUT_SECONDS).contains(seconds))
+            .unwrap_or(DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS)
+    }
+
     /// Get the effective transport type.
     pub fn effective_transport(&self) -> EffectiveTransport<'_> {
         match &self.transport {
@@ -454,6 +519,23 @@ impl McpServerConfig {
             return Err(ConfigError::InvalidConfig {
                 reason: "Server name cannot be empty".to_string(),
             });
+        }
+
+        if let Some(timeouts) = self.timeouts {
+            for (label, seconds) in [
+                ("request", timeouts.request_seconds),
+                ("startup", timeouts.startup_seconds),
+            ] {
+                if let Some(seconds) = seconds
+                    && !(1..=MAX_MCP_TIMEOUT_SECONDS).contains(&seconds)
+                {
+                    return Err(ConfigError::InvalidConfig {
+                        reason: format!(
+                            "MCP {label} timeout must be between 1 and {MAX_MCP_TIMEOUT_SECONDS} seconds"
+                        ),
+                    });
+                }
+            }
         }
 
         if self.placement == McpPlacement::JobWorker {
@@ -2024,6 +2106,68 @@ pub enum EffectiveTransport<'a> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn timeout_overrides_apply_and_validate() {
+        let server =
+            McpServerConfig::new("remote", "https://mcp.example.com").with_timeouts(McpTimeouts {
+                request_seconds: Some(120),
+                startup_seconds: Some(45),
+            });
+        server.validate().expect("bounded overrides are valid");
+        assert_eq!(server.request_timeout_seconds(), 120);
+        assert_eq!(server.startup_timeout_seconds(), 45);
+
+        // Unset fields fall back to the transport defaults.
+        let defaults = McpServerConfig::new("remote2", "https://mcp2.example.com");
+        assert_eq!(
+            defaults.request_timeout_seconds(),
+            DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS
+        );
+        assert_eq!(
+            defaults.startup_timeout_seconds(),
+            DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS
+        );
+
+        // Out-of-range values fail validation.
+        for seconds in [0, MAX_MCP_TIMEOUT_SECONDS + 1] {
+            let invalid = McpServerConfig::new("remote3", "https://mcp3.example.com")
+                .with_timeouts(McpTimeouts {
+                    request_seconds: Some(seconds),
+                    startup_seconds: None,
+                });
+            let error = invalid
+                .validate()
+                .expect_err("out-of-range timeout must fail");
+            assert!(error.to_string().contains("request timeout"));
+        }
+    }
+
+    #[test]
+    fn timeout_overrides_survive_serde_roundtrip() {
+        let config =
+            McpServerConfig::new("remote", "https://mcp.example.com").with_timeouts(McpTimeouts {
+                request_seconds: Some(90),
+                startup_seconds: None,
+            });
+        let json = serde_json::to_value(&config).expect("serialize");
+        let parsed: McpServerConfig = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(parsed.timeouts, config.timeouts);
+        assert_eq!(parsed.request_timeout_seconds(), 90);
+
+        // A config without overrides must not grow a `timeouts` key, keeping
+        // persisted files byte-compatible with older configurations.
+        let legacy = McpServerConfig::new("legacy", "https://legacy.example.com");
+        let json = serde_json::to_value(&legacy).expect("serialize");
+        assert!(json.get("timeouts").is_none());
+    }
+
+    #[test]
+    fn empty_timeout_override_clears() {
+        let config = McpServerConfig::new("remote", "https://mcp.example.com")
+            .with_timeouts(McpTimeouts::default());
+        assert!(config.timeouts.is_none());
+    }
 
     #[test]
     fn sandbox_policy_only_applies_to_stdio() {

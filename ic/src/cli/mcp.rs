@@ -113,6 +113,14 @@ pub struct McpAddArgs {
     #[arg(long, value_name = "SECONDS")]
     pub wasm_timeout_seconds: Option<u64>,
 
+    /// Per-request timeout for every transport (1-600 seconds, default 30)
+    #[arg(long, value_name = "SECONDS")]
+    pub request_timeout_seconds: Option<u64>,
+
+    /// Initialize-handshake timeout for every transport (1-600 seconds, default 60)
+    #[arg(long, value_name = "SECONDS")]
+    pub startup_timeout_seconds: Option<u64>,
+
     /// Gateway deployment mode: dedicated or shared
     #[arg(long, value_name = "MODE")]
     pub gateway_mode: Option<String>,
@@ -622,6 +630,13 @@ fn apply_add_metadata(
     if let Some(sandbox) = sandbox {
         config = config.with_sandbox(sandbox);
     }
+    let timeouts = crate::tools::mcp::config::McpTimeouts {
+        request_seconds: args.request_timeout_seconds,
+        startup_seconds: args.startup_timeout_seconds,
+    };
+    if !timeouts.is_empty() {
+        config = config.with_timeouts(timeouts);
+    }
     if let Some(client_id) = &args.client_id {
         let mut oauth = OAuthConfig::new(client_id);
         if let (Some(auth), Some(token)) = (&args.auth_url, &args.token_url) {
@@ -844,6 +859,14 @@ async fn list_servers(
             }
             if let Some(ref desc) = server.description {
                 println!("      Description: {}", desc);
+            }
+            if let Some(ref timeouts) = server.timeouts {
+                if let Some(seconds) = timeouts.request_seconds {
+                    println!("      Request timeout: {seconds}s");
+                }
+                if let Some(seconds) = timeouts.startup_seconds {
+                    println!("      Startup timeout: {seconds}s");
+                }
             }
             if let Some(ref provenance) = server.provenance {
                 println!("      Provenance: {}", provenance.trust);
@@ -1276,6 +1299,8 @@ fn build_update_config(
     config.headers = existing.headers.clone();
     config.description = existing.description.clone();
     config.always_require_approval = existing.always_require_approval.clone();
+    // Timeout overrides are transport-independent; retain them across updates.
+    config.timeouts = existing.timeouts;
     // Retain only the pin associated with the selected local runtime.
     config.provenance = existing.provenance.clone().map(|mut provenance| {
         match config.effective_transport() {

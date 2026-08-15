@@ -138,9 +138,10 @@ impl McpClient {
                     .to_string(),
             ));
         }
-        let transport = Arc::new(HttpMcpTransport::new(
+        let transport = Arc::new(HttpMcpTransport::with_request_timeout(
             config.url.clone(),
             config.name.clone(),
+            Duration::from_secs(config.request_timeout_seconds()),
         ));
 
         Ok(Self {
@@ -165,8 +166,12 @@ impl McpClient {
         user_id: impl Into<String>,
     ) -> Result<Self, ToolError> {
         let transport = Arc::new(
-            HttpMcpTransport::new(config.url.clone(), config.name.clone())
-                .with_session_manager(Arc::clone(&session_manager)),
+            HttpMcpTransport::with_request_timeout(
+                config.url.clone(),
+                config.name.clone(),
+                Duration::from_secs(config.request_timeout_seconds()),
+            )
+            .with_session_manager(Arc::clone(&session_manager)),
         );
         let mut client = Self::new_with_config(config)?;
         client.transport = transport;
@@ -185,8 +190,12 @@ impl McpClient {
         user_id: impl Into<String>,
     ) -> Self {
         let transport = Arc::new(
-            HttpMcpTransport::new(config.url.clone(), config.name.clone())
-                .with_session_manager(session_manager.clone()),
+            HttpMcpTransport::with_request_timeout(
+                config.url.clone(),
+                config.name.clone(),
+                Duration::from_secs(config.request_timeout_seconds()),
+            )
+            .with_session_manager(session_manager.clone()),
         );
 
         let custom_headers = config.headers.clone();
@@ -564,9 +573,25 @@ impl McpClient {
     /// handshake, even under concurrent access. Subsequent calls return
     /// immediately.
     pub async fn initialize(&self) -> Result<InitializeResult, ToolError> {
+        let startup_timeout = Duration::from_secs(
+            self.server_config
+                .as_ref()
+                .map(McpServerConfig::startup_timeout_seconds)
+                .unwrap_or(crate::tools::mcp::config::DEFAULT_MCP_STARTUP_TIMEOUT_SECONDS),
+        );
         let result = self
             .initialized
-            .get_or_try_init(|| async { self.reinitialize_session().await })
+            .get_or_try_init(|| async {
+                tokio::time::timeout(startup_timeout, self.reinitialize_session())
+                    .await
+                    .map_err(|_| {
+                        ToolError::ExternalService(format!(
+                            "MCP initialization for '{}' exceeded {} second startup limit",
+                            self.server_name,
+                            startup_timeout.as_secs()
+                        ))
+                    })?
+            })
             .await?;
 
         Ok(result.clone())

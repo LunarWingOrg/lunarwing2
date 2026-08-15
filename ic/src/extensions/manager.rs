@@ -7291,6 +7291,7 @@ done
                 std::collections::HashMap::<String, String>::new(),
                 false,
                 None,
+                std::time::Duration::from_secs(30),
             )
             .await
             .expect("spawn managed test process");

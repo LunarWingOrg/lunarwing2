@@ -18,6 +18,19 @@ use crate::tools::mcp::protocol::{McpRequest, McpResponse};
 use crate::tools::mcp::transport::{McpTransport, spawn_jsonrpc_reader, stream_transport_send};
 use crate::tools::tool::ToolError;
 
+/// Default request deadline when no per-server override is configured.
+#[cfg(test)]
+const DEFAULT_REQUEST_TIMEOUT_SECONDS: Duration =
+    Duration::from_secs(crate::tools::mcp::config::DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS);
+
+/// Keep configured deadlines inside the documented bounds and above one
+/// second so a zero timeout cannot starve response waits.
+fn clamp_timeout(timeout: Duration) -> Duration {
+    const MAX: Duration = Duration::from_secs(crate::tools::mcp::config::MAX_MCP_TIMEOUT_SECONDS);
+    const MIN: Duration = Duration::from_secs(1);
+    timeout.max(MIN).min(MAX)
+}
+
 const SAFE_INHERITED_ENV: &[&str] = &[
     "HOME",
     "LANG",
@@ -223,6 +236,8 @@ pub struct StdioMcpTransport {
     /// Shutdown SIGKILLs the child's whole process group (sandboxed servers
     /// run as group leaders so grandchildren cannot outlive the server).
     kill_process_group: bool,
+    /// Deadline for one request/response exchange.
+    request_timeout: Duration,
 }
 
 impl StdioMcpTransport {
@@ -237,6 +252,7 @@ impl StdioMcpTransport {
     /// * `suppress_stderr` - Hide raw stderr when credentials were injected.
     /// * `sandbox` - Optional host OS sandbox policy for the child. A policy
     ///   that cannot be enforced fails the spawn before any process starts.
+    /// * `request_timeout` - Deadline for one request/response exchange.
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         name: impl Into<String>,
@@ -245,8 +261,19 @@ impl StdioMcpTransport {
         env: impl IntoIterator<Item = (impl AsRef<std::ffi::OsStr>, impl AsRef<std::ffi::OsStr>)>,
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
+        request_timeout: Duration,
     ) -> Result<Self, ToolError> {
-        Self::spawn_inner(name, command, args, env, suppress_stderr, sandbox, None).await
+        Self::spawn_inner(
+            name,
+            command,
+            args,
+            env,
+            suppress_stderr,
+            sandbox,
+            None,
+            request_timeout,
+        )
+        .await
     }
 
     /// Spawn using descriptor retained by pinned provenance verification.
@@ -259,6 +286,7 @@ impl StdioMcpTransport {
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
         executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+        request_timeout: Duration,
     ) -> Result<Self, ToolError> {
         Self::spawn_inner(
             name,
@@ -268,6 +296,7 @@ impl StdioMcpTransport {
             suppress_stderr,
             sandbox,
             Some(executable),
+            request_timeout,
         )
         .await
     }
@@ -281,6 +310,7 @@ impl StdioMcpTransport {
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
         executable: Option<crate::tools::mcp::provenance::VerifiedStdioExecutable>,
+        request_timeout: Duration,
     ) -> Result<Self, ToolError> {
         let server_name = name.into();
         let args = args
@@ -396,6 +426,7 @@ impl StdioMcpTransport {
             stderr_handle: Mutex::new(Some(stderr_handle)),
             child: Arc::new(Mutex::new(child)),
             kill_process_group: crate::tools::mcp::sandbox::kills_process_group(sandbox),
+            request_timeout: clamp_timeout(request_timeout),
         })
     }
 
@@ -431,7 +462,7 @@ impl McpTransport for StdioMcpTransport {
             &self.pending,
             request,
             &self.server_name,
-            Duration::from_secs(30),
+            self.request_timeout,
         )
         .await
     }
@@ -510,6 +541,7 @@ mod tests {
             &env,
             false,
             None,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await;
 
@@ -540,6 +572,7 @@ mod tests {
             &env,
             false,
             None,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await
         .expect("cat should be available");
@@ -559,6 +592,7 @@ mod tests {
             &env,
             true,
             None,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await
         .expect("spawn shell");
@@ -616,6 +650,7 @@ mod tests {
             false,
             Some(&sandbox),
             executable,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await
         .expect("spawn verified descriptor");
@@ -645,6 +680,7 @@ mod tests {
             &env,
             false,
             None,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await
         .expect("cat should be available");
@@ -680,9 +716,17 @@ mod tests {
         let env: HashMap<String, String> = HashMap::new();
         let mut args = vec!["-c", script, "sandbox-test"];
         args.extend_from_slice(script_args);
-        let transport = StdioMcpTransport::spawn(name, "sh", args, &env, false, Some(sandbox))
-            .await
-            .expect("sandboxed shell should spawn");
+        let transport = StdioMcpTransport::spawn(
+            name,
+            "sh",
+            args,
+            &env,
+            false,
+            Some(sandbox),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        )
+        .await
+        .expect("sandboxed shell should spawn");
         let status = transport
             .child
             .lock()
@@ -755,6 +799,7 @@ mod tests {
             &env,
             false,
             Some(&sandbox),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await;
         let error = match result {
@@ -783,6 +828,7 @@ mod tests {
             &env,
             false,
             Some(&sandbox),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await
         .expect("spawn sandboxed cat");
@@ -871,6 +917,7 @@ mod tests {
             &env,
             false,
             Some(&sandbox),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         )
         .await;
         let transport = match result {

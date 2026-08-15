@@ -28,15 +28,17 @@ pub struct GatewayMcpTransport {
 }
 
 impl GatewayMcpTransport {
+    /// Build a gateway transport with an explicit per-request deadline.
     pub fn new(
         endpoint: impl Into<String>,
         server_name: impl Into<String>,
         mode: McpGatewayMode,
         route: Option<String>,
         session_manager: Arc<McpSessionManager>,
+        request_timeout: std::time::Duration,
     ) -> Self {
         Self {
-            inner: HttpMcpTransport::new(endpoint, server_name)
+            inner: HttpMcpTransport::with_request_timeout(endpoint, server_name, request_timeout)
                 .with_session_manager(session_manager),
             mode,
             route,
@@ -112,6 +114,11 @@ impl McpTransport for GatewayMcpTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    const DEFAULT_REQUEST_TIMEOUT_SECONDS: Duration =
+        Duration::from_secs(crate::tools::mcp::config::DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS);
+
     use super::*;
 
     async fn spawn_echo_server() -> (String, tokio::task::JoinHandle<()>) {
@@ -156,6 +163,7 @@ mod tests {
             McpGatewayMode::Dedicated,
             None,
             Arc::new(McpSessionManager::new()),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         );
         let supplied = HashMap::from([
             (
@@ -186,6 +194,7 @@ mod tests {
             McpGatewayMode::Shared,
             Some("project-tools".to_string()),
             Arc::new(McpSessionManager::new()),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         );
         let headers = transport.managed_headers(&HashMap::new());
 
@@ -208,6 +217,7 @@ mod tests {
             McpGatewayMode::Shared,
             Some("project-tools".to_string()),
             Arc::new(McpSessionManager::new()),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         );
         let supplied = HashMap::from([
             (GATEWAY_MODE_HEADER.to_string(), "dedicated".to_string()),
@@ -232,6 +242,7 @@ mod tests {
             McpGatewayMode::Dedicated,
             None,
             Arc::new(McpSessionManager::new()),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         );
         let response = transport
             .send(
@@ -254,6 +265,7 @@ mod tests {
             McpGatewayMode::Dedicated,
             None,
             Arc::new(McpSessionManager::new()),
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
         );
         transport.set_tools_list_changed(true);
         assert!(

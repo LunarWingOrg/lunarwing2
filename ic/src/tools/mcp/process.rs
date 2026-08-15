@@ -47,6 +47,7 @@ impl McpProcessManager {
         env: impl IntoIterator<Item = (impl AsRef<OsStr>, impl AsRef<OsStr>)>,
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
+        request_timeout: std::time::Duration,
     ) -> Result<Arc<StdioMcpTransport>, ToolError> {
         let name = name.into();
         let command = command.into();
@@ -57,7 +58,16 @@ impl McpProcessManager {
             )));
         }
         let transport = Arc::new(
-            StdioMcpTransport::spawn(&name, &command, args, env, suppress_stderr, sandbox).await?,
+            StdioMcpTransport::spawn(
+                &name,
+                &command,
+                args,
+                env,
+                suppress_stderr,
+                sandbox,
+                request_timeout,
+            )
+            .await?,
         );
         transports.insert(name, Arc::clone(&transport));
 
@@ -75,6 +85,7 @@ impl McpProcessManager {
         suppress_stderr: bool,
         sandbox: Option<&crate::tools::mcp::sandbox::McpSandboxConfig>,
         executable: crate::tools::mcp::provenance::VerifiedStdioExecutable,
+        request_timeout: std::time::Duration,
     ) -> Result<Arc<StdioMcpTransport>, ToolError> {
         let name = name.into();
         let command = command.into();
@@ -93,6 +104,7 @@ impl McpProcessManager {
                 suppress_stderr,
                 sandbox,
                 executable,
+                request_timeout,
             )
             .await?,
         );
@@ -160,6 +172,11 @@ impl Default for McpProcessManager {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    const DEFAULT_PROCESS_REQUEST_TIMEOUT: Duration =
+        Duration::from_secs(crate::tools::mcp::config::DEFAULT_MCP_REQUEST_TIMEOUT_SECONDS);
+
     use super::*;
 
     #[test]
@@ -190,6 +207,7 @@ mod tests {
                 HashMap::<String, String>::new(),
                 false,
                 None,
+                DEFAULT_PROCESS_REQUEST_TIMEOUT,
             )
             .await
             .expect("spawn cat");
@@ -207,6 +225,7 @@ mod tests {
                 HashMap::<String, String>::new(),
                 false,
                 None,
+                DEFAULT_PROCESS_REQUEST_TIMEOUT,
             )
             .await
             .expect("spawn false");
@@ -230,6 +249,7 @@ mod tests {
                 HashMap::<String, String>::new(),
                 false,
                 None,
+                DEFAULT_PROCESS_REQUEST_TIMEOUT,
             )
             .await
             .expect("spawn live child with closed stdout");
@@ -261,6 +281,7 @@ mod tests {
                 HashMap::<String, String>::new(),
                 false,
                 None,
+                DEFAULT_PROCESS_REQUEST_TIMEOUT,
             )
             .await
             .expect("spawn first process");
@@ -272,6 +293,7 @@ mod tests {
                 HashMap::<String, String>::new(),
                 false,
                 None,
+                DEFAULT_PROCESS_REQUEST_TIMEOUT,
             )
             .await
         {
