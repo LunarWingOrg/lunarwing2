@@ -28,6 +28,9 @@ def _build_health() -> dict:
         "mode": os.environ.get("CODEX_MODE", "websocket"),
         "version": os.environ.get("CODEX_VERSION", "opencode-worker-1.0.0"),
         "worker_id": os.environ.get("LUNARWING_WORKER_ID", "worker-opencode-01"),
+        # Pinned upstream opencode ref baked into the image at build time
+        # (Dockerfile OPENCODE_REF). "unknown" when running outside the image.
+        "opencode_ref": os.environ.get("OPENCODE_IMAGE_REF", "unknown"),
     }
 
 def _load_ws_state() -> dict | None:

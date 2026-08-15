@@ -50,8 +50,8 @@ directly as its process working directory
 daemon also forwards `project_dir` to workers verbatim
 (`ic/src/orchestrator/external_worker.rs:95-102`). No `HOME=/workspace`
 override is present in the opencode image (`opencode4lunarwing/Dockerfile`:
-non-root user with home `/home/opencode` at `:174-179`, `USER 10001:10001` at
-`:220`, no `ENV HOME`).
+non-root user with home `/home/opencode` at `:184-189`, `USER 10001:10001` at
+`:230`, no `ENV HOME`).
 
 Therefore the structured-directory bug is fixed, but the broader prompt-driven
 symptom remains possible. Pebble still needs an explicit normalization decision.
@@ -64,4 +64,4 @@ environment, so on 2026-08-13 (revision `7e813db4`) the five assertions were
 re-run under Node against a byte-identical port of `workspace_path.ts`
 (`diff`-confirmed) and passed. No worker container or Cargo command was run.
 Runtime prompt behavior remains unverified. The OpenCode Dockerfile line
-references (`:174-179`, `:220`) were re-confirmed after the v1.18.9 bump.
+references (`:184-189`, `:230`) were re-confirmed after the v1.18.18 bump.

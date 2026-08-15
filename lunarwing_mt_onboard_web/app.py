@@ -27,8 +27,7 @@ from .security import token_matches
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
-REPO_ROOT = PACKAGE_DIR.parent
-LOGO_PATH = REPO_ROOT / "crszsslw2412c09c1-8ea9-46bd-8063-084ccdd2f332.jpg"
+LOGO_PATH = STATIC_DIR / "branding" / "lunarwing-onboarding.jpg"
 
 
 def create_app(*, token: str, demo: bool, log_dir: str | None) -> FastAPI:

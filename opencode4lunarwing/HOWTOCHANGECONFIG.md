@@ -5,7 +5,7 @@
 The config files are plain files in the repo, baked into the image by `COPY` in the Dockerfile:
 
 ```dockerfile
-# opencode4lunarwing/Dockerfile:187-189
+# opencode4lunarwing/Dockerfile:197-199
 COPY --chown=opencode:opencode entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY --chown=opencode:opencode scripts/ ./scripts/
 COPY --chown=opencode:opencode config/ ./config/
