@@ -262,6 +262,83 @@ pub struct GatewayControlConfig {
     pub routes_path: PathBuf,
 }
 
+/// Bind address enabling the bundled MCP gateway control plane.
+pub const GATEWAY_CONTROL_BIND_ENV: &str = "LUNARWING_MCP_GATEWAY_CONTROL_BIND";
+/// Bearer token required on the control-plane `/admin/*` endpoints.
+pub const GATEWAY_CONTROL_ADMIN_TOKEN_ENV: &str = "LUNARWING_MCP_GATEWAY_ADMIN_TOKEN";
+/// Override for the persisted route table path
+/// (default: `<lunarwing base dir>/mcp-gateway-routes.json`).
+pub const GATEWAY_CONTROL_ROUTES_PATH_ENV: &str = "LUNARWING_MCP_GATEWAY_ROUTES_PATH";
+/// Explicit opt-in to binding the control plane off-loopback.
+pub const GATEWAY_CONTROL_ALLOW_NON_LOOPBACK_ENV: &str =
+    "LUNARWING_MCP_GATEWAY_CONTROL_ALLOW_NON_LOOPBACK";
+
+/// Minimum accepted admin token length; shorter tokens are rejected.
+const MIN_ADMIN_TOKEN_LEN: usize = 16;
+
+impl GatewayControlConfig {
+    /// Resolve the control-plane configuration from the process environment.
+    ///
+    /// Returns `Ok(None)` when [`GATEWAY_CONTROL_BIND_ENV`] is unset — the
+    /// service is opt-in. When set, the admin token is mandatory, the bind
+    /// address must be loopback unless
+    /// [`GATEWAY_CONTROL_ALLOW_NON_LOOPBACK_ENV`] is `1`/`true`, and the
+    /// route table defaults to the LunarWing base directory.
+    pub fn from_env() -> Result<Option<Self>, GatewayControlError> {
+        Self::resolve(
+            std::env::var(GATEWAY_CONTROL_BIND_ENV).ok(),
+            std::env::var(GATEWAY_CONTROL_ADMIN_TOKEN_ENV).ok(),
+            std::env::var(GATEWAY_CONTROL_ROUTES_PATH_ENV).ok(),
+            std::env::var(GATEWAY_CONTROL_ALLOW_NON_LOOPBACK_ENV).ok(),
+        )
+    }
+
+    fn resolve(
+        bind: Option<String>,
+        admin_token: Option<String>,
+        routes_path: Option<String>,
+        allow_non_loopback: Option<String>,
+    ) -> Result<Option<Self>, GatewayControlError> {
+        let invalid = |reason: String| GatewayControlError::InvalidData { reason };
+        let Some(bind) = bind else {
+            return Ok(None);
+        };
+        let bind: SocketAddr = bind.trim().parse().map_err(|error| {
+            invalid(format!(
+                "{GATEWAY_CONTROL_BIND_ENV} '{bind}' is not a valid socket address: {error}"
+            ))
+        })?;
+        let non_loopback_allowed =
+            allow_non_loopback.is_some_and(|value| matches!(value.as_str(), "1" | "true"));
+        if !bind.ip().is_loopback() && !non_loopback_allowed {
+            return Err(invalid(format!(
+                "{GATEWAY_CONTROL_BIND_ENV} '{bind}' is not loopback; set {GATEWAY_CONTROL_ALLOW_NON_LOOPBACK_ENV}=1 to expose the control plane"
+            )));
+        }
+        let token = admin_token.ok_or_else(|| {
+            invalid(format!(
+                "{GATEWAY_CONTROL_ADMIN_TOKEN_ENV} is required when {GATEWAY_CONTROL_BIND_ENV} is set"
+            ))
+        })?;
+        if token.len() < MIN_ADMIN_TOKEN_LEN {
+            return Err(invalid(format!(
+                "{GATEWAY_CONTROL_ADMIN_TOKEN_ENV} must be at least {MIN_ADMIN_TOKEN_LEN} characters"
+            )));
+        }
+        let routes_path = routes_path
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                crate::bootstrap::lunarwing_base_dir().join("mcp-gateway-routes.json")
+            });
+        Ok(Some(Self {
+            bind,
+            admin_token: SecretString::from(token),
+            routes_path,
+        }))
+    }
+}
+
 struct GatewayState {
     store: RouteStore,
     admin_token: SecretString,
@@ -500,6 +577,75 @@ mod tests {
             bearer_token: Some("upstream-secret".to_string()),
             description: Some("test route".to_string()),
         }
+    }
+
+    #[test]
+    fn env_resolution_is_opt_in_and_loopback_only() {
+        // Unset bind address disables the service.
+        assert!(
+            GatewayControlConfig::resolve(None, None, None, None)
+                .expect("no bind")
+                .is_none()
+        );
+
+        // Valid loopback configuration resolves with the default routes path.
+        let config = GatewayControlConfig::resolve(
+            Some("127.0.0.1:9700".to_string()),
+            Some("a-very-long-admin-token".to_string()),
+            None,
+            None,
+        )
+        .expect("loopback config")
+        .expect("enabled");
+        assert_eq!(config.bind.port(), 9700);
+        assert!(config.routes_path.ends_with("mcp-gateway-routes.json"));
+
+        // Admin token is mandatory and must be long enough.
+        assert!(
+            GatewayControlConfig::resolve(Some("127.0.0.1:9700".to_string()), None, None, None)
+                .is_err()
+        );
+        assert!(
+            GatewayControlConfig::resolve(
+                Some("127.0.0.1:9700".to_string()),
+                Some("short".to_string()),
+                None,
+                None,
+            )
+            .is_err()
+        );
+
+        // Non-loopback binds require the explicit override.
+        assert!(
+            GatewayControlConfig::resolve(
+                Some("0.0.0.0:9700".to_string()),
+                Some("a-very-long-admin-token".to_string()),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            GatewayControlConfig::resolve(
+                Some("0.0.0.0:9700".to_string()),
+                Some("a-very-long-admin-token".to_string()),
+                None,
+                Some("1".to_string()),
+            )
+            .expect("override resolves")
+            .is_some()
+        );
+
+        // Garbage bind addresses are rejected.
+        assert!(
+            GatewayControlConfig::resolve(
+                Some("not an address".to_string()),
+                Some("a-very-long-admin-token".to_string()),
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
