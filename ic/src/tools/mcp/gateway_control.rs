@@ -764,6 +764,55 @@ mod tests {
         url
     }
 
+    #[derive(Clone)]
+    struct StreamingUpstreamState {
+        started: Arc<tokio::sync::Notify>,
+        continue_signal: Arc<tokio::sync::Notify>,
+    }
+
+    async fn streaming_upstream_handler(State(state): State<StreamingUpstreamState>) -> Response {
+        use futures::StreamExt;
+        use std::convert::Infallible;
+
+        state.started.notify_one();
+        let continue_signal = Arc::clone(&state.continue_signal);
+        let stream = futures::stream::once(async {
+            Ok::<_, Infallible>(bytes::Bytes::from_static(b"data: first\n\n"))
+        })
+        .chain(futures::stream::once(async move {
+            continue_signal.notified().await;
+            Ok::<_, Infallible>(bytes::Bytes::from_static(b"data: second\n\n"))
+        }));
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .header("mcp-session-id", "stream-session")
+            .body(axum::body::Body::from_stream(stream))
+            .expect("streaming response")
+    }
+
+    async fn spawn_streaming_upstream()
+    -> (String, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let continue_signal = Arc::new(tokio::sync::Notify::new());
+        let app = Router::new()
+            .route("/mcp", any(streaming_upstream_handler))
+            .with_state(StreamingUpstreamState {
+                started: Arc::clone(&started),
+                continue_signal: Arc::clone(&continue_signal),
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming upstream");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve streaming upstream");
+        });
+        (url, started, continue_signal)
+    }
+
     async fn spawn_control_plane(routes_path: PathBuf) -> String {
         let router = router(GatewayControlConfig {
             bind: "127.0.0.1:0".parse().expect("bind addr"),
@@ -907,5 +956,67 @@ mod tests {
         );
         assert!(!headers.contains_key("x-lunarwing-mcp-route"));
         assert!(!headers.contains_key("x-lunarwing-mcp-gateway-mode"));
+    }
+
+    #[tokio::test]
+    async fn data_plane_streams_sse_and_forwards_response_headers() {
+        use futures::StreamExt;
+
+        let (upstream, started, continue_signal) = spawn_streaming_upstream().await;
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/streaming"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        // The upstream waits after its first chunk. A buffered gateway would
+        // therefore never return response headers to this client.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .get(format!("{base}/mcp"))
+                .header(GATEWAY_ROUTE_HEADER, "streaming")
+                .send(),
+        )
+        .await
+        .expect("streaming response headers")
+        .expect("streaming request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("stream-session")
+        );
+        started.notified().await;
+
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("first stream chunk")
+            .expect("first chunk exists")
+            .expect("first chunk reads");
+        assert_eq!(first, bytes::Bytes::from_static(b"data: first\n\n"));
+
+        continue_signal.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("second stream chunk")
+            .expect("second chunk exists")
+            .expect("second chunk reads");
+        assert_eq!(second, bytes::Bytes::from_static(b"data: second\n\n"));
     }
 }
