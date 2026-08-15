@@ -3210,7 +3210,7 @@ mod tests {
         package_id: &str,
     ) -> crate::tools::mcp::provenance::McpPackageProvenance {
         let mut provenance = crate::tools::mcp::provenance::McpPackageProvenance::with_trust(
-            crate::tools::mcp::provenance::PackageTrust::Pinned,
+            crate::tools::mcp::provenance::PackageTrust::Unverified,
         );
         provenance.package_id = Some(package_id.to_string());
         provenance.version = Some("1.0.0".to_string());
