@@ -2546,17 +2546,38 @@ _openrc_cgroup_root() {
 # #54). A writable root is insufficient: memory must be available and either
 # delegated already or writable in cgroup.subtree_control. setpriv (util-linux)
 # is required for the root-side migration spawn used to place the build.
+# Every check reports its own failure so "bounding unavailable" is never a
+# mystery: the reason lands on stderr right before the nice-only fallback.
 _openrc_build_cgroup_supported() {
   local root
   root="$(_openrc_cgroup_root)"
-  command -v setpriv >/dev/null 2>&1 || return 1
-  [[ -d "$root" && -w "$root" ]] || return 1
-  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || return 1
-  [[ -r "$root/cgroup.controllers" ]] || return 1
-  grep -qw memory "$root/cgroup.controllers" || return 1
-  [[ -r "$root/cgroup.subtree_control" ]] || return 1
+  command -v setpriv >/dev/null 2>&1 || {
+    say "cgroup build bounding unavailable: setpriv not found (install sys-apps/util-linux)" >&2
+    return 1
+  }
+  if ! [[ -d "$root" && -w "$root" ]]; then
+    say "cgroup build bounding unavailable: $root is not a writable directory" >&2
+    return 1
+  fi
+  [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || {
+    say "cgroup build bounding unavailable: $root is not a cgroup v2 hierarchy" >&2
+    return 1
+  }
+  [[ -r "$root/cgroup.controllers" ]] \
+    && grep -qw memory "$root/cgroup.controllers" || {
+      say "cgroup build bounding unavailable: memory controller missing at $root (kernel boot arg?)" >&2
+      return 1
+    }
+  [[ -r "$root/cgroup.subtree_control" ]] || {
+    say "cgroup build bounding unavailable: $root/cgroup.subtree_control unreadable" >&2
+    return 1
+  }
   grep -qw memory "$root/cgroup.subtree_control" \
-    || [[ -w "$root/cgroup.subtree_control" ]]
+    || [[ -w "$root/cgroup.subtree_control" ]] || {
+      say "cgroup build bounding unavailable: memory not enabled in $root/cgroup.subtree_control and not writable" >&2
+      return 1
+    }
+  return 0
 }
 
 # Resolve a tenant's home directory for the build spawn environment. The sudo
