@@ -6,6 +6,8 @@
 //! designated coordination channels (XMPP MUC, IRC):
 //!
 //! - [`SecretEntropyHook`] (priority 5) — Shannon-entropy secret detection
+//! - [`crate::hooks::coordination_knowledge::KnowledgeShareHook`] (priority
+//!   13, optional) — cross-tenant `KNOW:` knowledge-share ingestion
 //! - [`EngagementPolicyHook`] (priority 15) — target/elect one responder
 //! - [`FirstResponderHook`] (priority 16) — suppress replayed deliveries
 //! - [`TagSchemaHook`] (priority 14) — messages must start with an allowed tag
@@ -32,8 +34,16 @@ use crate::hooks::registry::HookRegistry;
 /// Default maximum coordination message length (single line).
 pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 420;
 
-/// Default allowed coordination message tags.
-pub const DEFAULT_ALLOWED_TAGS: [&str; 5] = ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY"];
+/// Default allowed coordination message tags. `KNOW` carries a one-line
+/// cross-tenant knowledge share (see `hooks::coordination_knowledge`).
+pub const DEFAULT_ALLOWED_TAGS: [&str; 6] = [
+    "STATUS",
+    "ALERT",
+    "COORD",
+    "ANNOUNCE",
+    "QUERY",
+    "KNOW",
+];
 
 /// Maximum accepted coordination agent identifier length.
 pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
@@ -188,6 +198,9 @@ pub struct CoordinationHookConfig {
     pub max_message_length: usize,
     /// Allowed tag prefixes (without the colon).
     pub allowed_tags: Vec<String>,
+    /// Cross-tenant knowledge-share ingestion switch
+    /// (`COORD_KNOWLEDGE_SHARE`, default false).
+    pub knowledge_share_enabled: bool,
 }
 
 impl Default for CoordinationHookConfig {
@@ -206,6 +219,7 @@ impl Default for CoordinationHookConfig {
             admin_users: Vec::new(),
             max_message_length: DEFAULT_MAX_MESSAGE_LENGTH,
             allowed_tags: DEFAULT_ALLOWED_TAGS.iter().map(|s| s.to_string()).collect(),
+            knowledge_share_enabled: false,
         }
     }
 }
@@ -215,6 +229,7 @@ impl CoordinationHookConfig {
     pub fn from_env() -> Self {
         let mut config = Self {
             enabled: env_flag("COORD_ENABLED"),
+            knowledge_share_enabled: env_flag("COORD_KNOWLEDGE_SHARE"),
             ..Self::default()
         };
         if let Ok(v) = std::env::var("COORD_AGENT_ID") {
@@ -268,11 +283,17 @@ impl CoordinationPromptPolicy {
         }
         let channel_matcher =
             regex::Regex::new(&coordination_channel_guard(&config.coordination_channels)).ok()?;
+        let know_format = if config.knowledge_share_enabled {
+            " Share durable codebase findings with sibling tenants as \
+             'KNOW: <topic-slug> | <one-line finding>' (topic slug: lowercase, digits, dashes)."
+        } else {
+            ""
+        };
         let instruction = format!(
             "Coordination-channel protocol overrides persona and style instructions for this turn. \
              Final user-visible response (inside <final> when required) must be one line, at most {} \
              characters, and begin immediately with one of these tags followed by a colon: {}. \
-             Put no preamble before the tag. Use concise operational prose only; no markdown or roleplay.",
+             Put no preamble before the tag. Use concise operational prose only; no markdown or roleplay.{know_format}",
             config.max_message_length,
             config.allowed_tags.join(", ")
         );
@@ -1046,10 +1067,16 @@ impl Hook for RateLimitHook {
 ///
 /// Called from hook bootstrap when `COORD_ENABLED=true`. Returns the number
 /// of hooks registered (0 when the config is not actionable).
+///
+/// `knowledge_workspace` enables cross-tenant knowledge sharing: when
+/// `COORD_KNOWLEDGE_SHARE=true` and a shared-scope workspace is supplied,
+/// a [`crate::hooks::coordination_knowledge::KnowledgeShareHook`] is
+/// registered to ingest `KNOW:` messages from coordination channels.
 pub async fn register_coordination_hooks(
     registry: &Arc<HookRegistry>,
     config: CoordinationHookConfig,
     violations: Option<Arc<ViolationStore>>,
+    knowledge_workspace: Option<Arc<crate::workspace::Workspace>>,
 ) -> HookRegistrationSummary {
     let mut summary = HookRegistrationSummary::default();
     if !config.is_actionable() {
@@ -1114,7 +1141,7 @@ pub async fn register_coordination_hooks(
         ),
         (
             Arc::new(RateLimitHook::new(
-                state,
+                state.clone(),
                 config.agent_id.clone(),
                 config.max_messages,
                 config.rate_window,
@@ -1122,6 +1149,34 @@ pub async fn register_coordination_hooks(
             25,
         ),
     ];
+
+    // Cross-tenant knowledge sharing: runs before the tag-schema (14) and
+    // engagement (15) hooks so broadcast shares are ingested even when this
+    // daemon would not otherwise engage, and before the room's structural
+    // validation can reject the message.
+    let knowledge_hook = knowledge_workspace.filter(|_| config.knowledge_share_enabled).map(
+        |workspace| {
+            let limits =
+                crate::hooks::coordination_knowledge::KnowledgeShareLimits::from_env();
+            (
+                Arc::new(crate::hooks::coordination_knowledge::KnowledgeShareHook::new(
+                    state.clone(),
+                    workspace,
+                    limits,
+                )) as Arc<dyn Hook>,
+                13,
+            )
+        },
+    );
+    let hooks = match knowledge_hook {
+        Some(entry) => {
+            let mut all = Vec::with_capacity(hooks.len() + 1);
+            all.push(entry);
+            all.extend(hooks);
+            all
+        }
+        None => hooks,
+    };
 
     for (hook, priority) in hooks {
         registry.register_with_priority(hook, priority).await;
@@ -1241,6 +1296,7 @@ mod tests {
             admin_users: vec!["sun".to_string()],
             max_message_length: DEFAULT_MAX_MESSAGE_LENGTH,
             allowed_tags: DEFAULT_ALLOWED_TAGS.iter().map(|s| s.to_string()).collect(),
+            knowledge_share_enabled: false,
         }
     }
 
@@ -1891,7 +1947,7 @@ mod tests {
     async fn test_register_coordination_hooks_counts() {
         let registry = Arc::new(HookRegistry::new());
         let config = test_config();
-        let summary = register_coordination_hooks(&registry, config, None).await;
+        let summary = register_coordination_hooks(&registry, config, None, None).await;
         assert_eq!(summary.hooks, 5);
         assert_eq!(summary.errors, 0);
         let names = registry.list().await;
@@ -1906,7 +1962,7 @@ mod tests {
     async fn test_register_coordination_hooks_disabled_is_noop() {
         let registry = Arc::new(HookRegistry::new());
         let config = CoordinationHookConfig::default(); // enabled=false
-        let summary = register_coordination_hooks(&registry, config, None).await;
+        let summary = register_coordination_hooks(&registry, config, None, None).await;
         assert_eq!(summary.hooks, 0);
         assert_eq!(summary.errors, 0);
         assert!(registry.list().await.is_empty());

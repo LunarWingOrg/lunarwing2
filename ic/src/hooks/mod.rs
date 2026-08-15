@@ -15,6 +15,7 @@
 pub mod bootstrap;
 pub mod bundled;
 pub mod coordination;
+pub mod coordination_knowledge;
 pub mod hook;
 pub mod registry;
 

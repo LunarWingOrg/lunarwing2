@@ -30,6 +30,7 @@ use lunarwing::{
     pairing::PairingStore,
     tracing_fmt::{init_cli_tracing, init_worker_tracing},
     webhooks::{self, ToolWebhookState},
+    workspace::Workspace,
 };
 
 #[cfg(unix)]
@@ -701,10 +702,38 @@ async fn async_main() -> anyhow::Result<()> {
             && !coalesce_config.coordination_channels.is_empty())
         .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
     };
+    // Cross-tenant knowledge sharing: a `KNOW:` message on a coordination
+    // channel is ingested by every watching daemon into its own shared
+    // ("herd") knowledge scope, so findings propagate across tenants without
+    // a shared database. Needs a DB-backed shared-scope workspace.
+    let coordination_knowledge_workspace: Option<Arc<lunarwing::workspace::Workspace>> = {
+        let want =
+            coordination_config.is_actionable() && coordination_config.knowledge_share_enabled;
+        match (want, components.db.clone()) {
+            (true, Some(db)) => {
+                let shared = Workspace::new_with_db(
+                    lunarwing::workspace::KNOWLEDGE_SHARED_SCOPE,
+                    db,
+                )
+                .with_search_config(&config.search);
+                tracing::info!("Coordination knowledge sharing enabled (KNOW: tag ingestion)");
+                Some(Arc::new(shared))
+            }
+            (true, None) => {
+                tracing::warn!(
+                    "COORD_KNOWLEDGE_SHARE=true but no database is available; \
+                     knowledge sharing disabled"
+                );
+                None
+            }
+            (false, _) => None,
+        }
+    };
     let coordination_summary = register_coordination_hooks(
         &components.hooks,
         coordination_config.clone(),
         coordination_store.clone(),
+        coordination_knowledge_workspace,
     )
     .await;
     if coordination_summary.hooks > 0 {
