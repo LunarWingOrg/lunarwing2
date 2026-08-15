@@ -36,11 +36,17 @@ pub enum LoopOutcome {
     Response(String),
     /// Loop was stopped by a signal.
     Stopped,
-    /// Max iterations exceeded.
+    /// Max iterations exceeded after the final recovery turn.
     MaxIterations,
+    /// A provider failure could not be recovered; contains safe next steps.
+    Failed(String),
     /// A tool requires user approval before continuing (chat delegate only).
     NeedApproval(Box<PendingApproval>),
 }
+
+const ITERATION_RECOVERY_INSTRUCTION: &str = "Loop warning: the iteration limit was reached. This is the final recovery turn. \
+     Do not call more tools; provide the best final answer now, state any incomplete work, \
+     and name the narrower scope or higher iteration limit needed to continue.";
 
 /// Configuration for the agentic loop.
 pub struct AgenticLoopConfig {
@@ -123,6 +129,79 @@ pub trait LoopDelegate: Send + Sync {
     async fn after_iteration(&self, _iteration: usize) {}
 }
 
+enum LlmCallOutcome {
+    Output(crate::llm::RespondOutput),
+    Retry,
+    Failed(String),
+}
+
+async fn call_llm_with_recovery(
+    delegate: &dyn LoopDelegate,
+    reasoning: &Reasoning,
+    reason_ctx: &mut ReasoningContext,
+    iteration: usize,
+    can_retry: bool,
+    recovery_attempted: &mut bool,
+) -> Result<LlmCallOutcome, Error> {
+    match delegate.call_llm(reasoning, reason_ctx, iteration).await {
+        Ok(output) => Ok(LlmCallOutcome::Output(output)),
+        Err(Error::Llm(error)) => {
+            let kind = error.recovery_kind();
+            if can_retry
+                && !*recovery_attempted
+                && let Some(instruction) = error.recovery_instruction()
+            {
+                *recovery_attempted = true;
+                tracing::warn!(
+                    iteration,
+                    failure_kind = kind,
+                    error = %error,
+                    "LLM call failed; scheduling one model-visible recovery turn"
+                );
+                reason_ctx.messages.push(ChatMessage::system(instruction));
+                return Ok(LlmCallOutcome::Retry);
+            }
+
+            tracing::error!(
+                iteration,
+                failure_kind = kind,
+                error = %error,
+                "LLM call failed without remaining recovery path"
+            );
+            Ok(LlmCallOutcome::Failed(
+                error.terminal_guidance().to_string(),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn log_llm_output(iteration: usize, result: &RespondResult) {
+    match result {
+        RespondResult::Text(text) => {
+            tracing::debug!(
+                iteration,
+                len = text.len(),
+                has_suggestions = text.contains("<suggestions>"),
+                response = %text,
+                "LLM text response"
+            );
+        }
+        RespondResult::ToolCalls {
+            tool_calls,
+            content,
+        } => {
+            let names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+            tracing::debug!(
+                iteration,
+                tools = ?names,
+                has_content = content.is_some(),
+                "LLM tool_calls response"
+            );
+        }
+    }
+}
+
 /// Run the unified agentic loop.
 ///
 /// This is the single implementation used by all three consumers (chat, job, container).
@@ -134,53 +213,46 @@ pub async fn run_agentic_loop(
     config: &AgenticLoopConfig,
 ) -> Result<LoopOutcome, Error> {
     let mut consecutive_tool_intent_nudges: u32 = 0;
+    let mut provider_recovery_attempted = false;
+    let hard_max_iterations = config.max_iterations.saturating_add(1);
 
-    for iteration in 1..=config.max_iterations {
-        // Check for external signals (stop, cancellation, user messages)
+    for iteration in 1..=hard_max_iterations {
         match delegate.check_signals().await {
             LoopSignal::Continue => {}
             LoopSignal::Stop => return Ok(LoopOutcome::Stopped),
-            LoopSignal::InjectMessage(msg) => {
-                reason_ctx.messages.push(ChatMessage::user(&msg));
-            }
+            LoopSignal::InjectMessage(msg) => reason_ctx.messages.push(ChatMessage::user(&msg)),
         }
 
-        // Pre-LLM call hook (cost guard, tool refresh, iteration limit nudge)
         if let Some(outcome) = delegate.before_llm_call(reason_ctx, iteration).await {
             return Ok(outcome);
         }
 
-        // Call LLM
-        let output = delegate.call_llm(reasoning, reason_ctx, iteration).await?;
-
-        match &output.result {
-            RespondResult::Text(text) => {
-                tracing::debug!(
-                    iteration,
-                    len = text.len(),
-                    has_suggestions = text.contains("<suggestions>"),
-                    response = %text,
-                    "LLM text response"
-                );
-            }
-            RespondResult::ToolCalls {
-                tool_calls,
-                content,
-            } => {
-                let names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-                tracing::debug!(
-                    iteration,
-                    tools = ?names,
-                    has_content = content.is_some(),
-                    "LLM tool_calls response"
-                );
-            }
+        if iteration > config.max_iterations {
+            reason_ctx
+                .messages
+                .push(ChatMessage::system(ITERATION_RECOVERY_INSTRUCTION));
+            reason_ctx.available_tools.clear();
+            reason_ctx.force_text = true;
         }
+
+        let output = match call_llm_with_recovery(
+            delegate,
+            reasoning,
+            reason_ctx,
+            iteration,
+            iteration < hard_max_iterations,
+            &mut provider_recovery_attempted,
+        )
+        .await?
+        {
+            LlmCallOutcome::Output(output) => output,
+            LlmCallOutcome::Retry => continue,
+            LlmCallOutcome::Failed(message) => return Ok(LoopOutcome::Failed(message)),
+        };
+        log_llm_output(iteration, &output.result);
 
         match output.result {
             RespondResult::Text(text) => {
-                // Tool intent nudge: if the LLM says "let me search..." without
-                // actually calling a tool, inject a nudge message.
                 if config.enable_tool_intent_nudge
                     && !reason_ctx.available_tools.is_empty()
                     && !reason_ctx.force_text
@@ -201,7 +273,6 @@ pub async fn run_agentic_loop(
                     continue;
                 }
 
-                // Reset nudge counter since we got a non-intent text response
                 if !crate::llm::llm_signals_tool_intent(&text) {
                     consecutive_tool_intent_nudges = 0;
                 }
@@ -216,7 +287,6 @@ pub async fn run_agentic_loop(
                 content,
             } => {
                 consecutive_tool_intent_nudges = 0;
-
                 if let Some(outcome) = delegate
                     .execute_tool_calls(tool_calls, content, reason_ctx)
                     .await?
@@ -248,7 +318,7 @@ pub fn truncate_for_preview(s: &str, max: usize) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::{RespondOutput, TokenUsage, ToolCall};
+    use crate::llm::{LlmError, RespondOutput, TokenUsage, ToolCall, ToolDefinition};
     use crate::testing::StubLlm;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -287,7 +357,7 @@ mod tests {
     /// Configurable mock delegate for testing run_agentic_loop.
     struct MockDelegate {
         signal: Mutex<LoopSignal>,
-        llm_responses: Mutex<Vec<RespondOutput>>,
+        llm_responses: Mutex<Vec<Result<RespondOutput, Error>>>,
         tool_exec_count: AtomicUsize,
         tool_exec_outcome: Mutex<Option<LoopOutcome>>,
         iterations_seen: Mutex<Vec<usize>>,
@@ -297,6 +367,10 @@ mod tests {
 
     impl MockDelegate {
         fn new(responses: Vec<RespondOutput>) -> Self {
+            Self::with_llm_results(responses.into_iter().map(Ok).collect())
+        }
+
+        fn with_llm_results(responses: Vec<Result<RespondOutput, Error>>) -> Self {
             Self {
                 signal: Mutex::new(LoopSignal::Continue),
                 llm_responses: Mutex::new(responses),
@@ -352,7 +426,7 @@ mod tests {
             if responses.is_empty() {
                 panic!("MockDelegate: no more LLM responses queued");
             }
-            Ok(responses.remove(0))
+            responses.remove(0)
         }
 
         async fn handle_text_response(
@@ -476,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_iterations_reached() {
+    async fn test_max_iterations_gets_one_text_only_recovery_turn() {
         struct ContinueDelegate;
 
         #[async_trait]
@@ -520,6 +594,11 @@ mod tests {
         let delegate = ContinueDelegate;
         let reasoning = stub_reasoning();
         let mut ctx = ReasoningContext::new();
+        ctx.available_tools.push(ToolDefinition {
+            name: "search".to_string(),
+            description: "Search files".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        });
         let config = AgenticLoopConfig {
             max_iterations: 3,
             ..Default::default()
@@ -535,7 +614,78 @@ mod tests {
             .iter()
             .filter(|m| m.role == crate::llm::Role::Assistant)
             .count();
-        assert_eq!(assistant_count, 3);
+        assert_eq!(assistant_count, 4);
+        assert!(ctx.force_text);
+        assert!(ctx.available_tools.is_empty());
+        assert!(ctx.messages.iter().any(|message| {
+            message.role == crate::llm::Role::System
+                && message.content.contains("final recovery turn")
+                && message.content.contains("higher iteration limit")
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_recoverable_provider_failure_gets_one_model_visible_retry() {
+        let delegate = MockDelegate::with_llm_results(vec![
+            Err(LlmError::RequestFailed {
+                provider: "test-provider".to_string(),
+                reason: "sensitive upstream diagnostic".to_string(),
+            }
+            .into()),
+            Ok(text_output("Recovered safely")),
+        ]);
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig {
+            max_iterations: 3,
+            ..Default::default()
+        };
+
+        let outcome = run_agentic_loop(&delegate, &reasoning, &mut ctx, &config)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, LoopOutcome::Response(ref text) if text == "Recovered safely"));
+        assert!(delegate.llm_responses.lock().await.is_empty());
+        assert!(ctx.messages.iter().any(|message| {
+            message.role == crate::llm::Role::System
+                && message.content.contains("provider temporarily failed")
+        }));
+        assert!(
+            ctx.messages
+                .iter()
+                .all(|message| !message.content.contains("sensitive upstream diagnostic"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_nonrecoverable_provider_failure_returns_actionable_next_steps() {
+        let delegate = MockDelegate::with_llm_results(vec![
+            Err(LlmError::AuthFailed {
+                provider: "private-provider-name".to_string(),
+            }
+            .into()),
+            Ok(text_output("unreachable")),
+        ]);
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig {
+            max_iterations: 3,
+            ..Default::default()
+        };
+
+        let outcome = run_agentic_loop(&delegate, &reasoning, &mut ctx, &config)
+            .await
+            .unwrap();
+
+        match outcome {
+            LoopOutcome::Failed(message) => {
+                assert!(message.contains("renew provider credentials"));
+                assert!(!message.contains("private-provider-name"));
+            }
+            _ => panic!("Expected LoopOutcome::Failed"),
+        }
+        assert_eq!(delegate.llm_responses.lock().await.len(), 1);
     }
 
     #[tokio::test]
