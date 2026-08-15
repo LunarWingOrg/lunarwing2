@@ -412,14 +412,40 @@ fn empty_notification_response() -> McpResponse {
     }
 }
 
+/// Fixture source for the stateful MCP-over-WASM test component.
+#[cfg(test)]
+pub(crate) const STATEFUL_MCP_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/mcp-wasm/stateful-server.wat"
+);
+
+/// Render the stateful-server MCP component fixture.
+///
+/// The fixture's byte-exact `initialize` envelope is templated
+/// (`__INITIALIZE_ENVELOPE__` / `__INITIALIZE_LEN__`) and substituted with the
+/// exact bytes produced by `McpRequest::initialize(1)` serialized through the
+/// same `serde_json::to_string` path the transport uses, so the embedded
+/// `clientInfo` version tracks `CARGO_PKG_VERSION` instead of drifting on
+/// crate version bumps.
+#[cfg(test)]
+pub(crate) fn render_stateful_mcp_fixture() -> Vec<u8> {
+    let source = std::fs::read_to_string(STATEFUL_MCP_FIXTURE).expect("read fixture source");
+    let initialize = serde_json::to_string(&McpRequest::initialize(1))
+        .expect("serialize initialize envelope for fixture");
+    let escaped = initialize.replace('\\', "\\5C").replace('"', "\\22");
+    let rendered = source
+        .replace("__INITIALIZE_ENVELOPE__", &escaped)
+        .replace("__INITIALIZE_LEN__", &initialize.len().to_string());
+    assert!(
+        !rendered.contains("__INITIALIZE_"),
+        "unsubstituted placeholder in MCP WASM fixture source"
+    );
+    wat::parse_str(&rendered).expect("parse MCP component fixture source")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/mcp-wasm/stateful-server.wat"
-    );
 
     async fn load_fixture(timeout_seconds: u64) -> Arc<WasmMcpTransport> {
         load_fixture_with_limits(64, timeout_seconds, crate::tools::wasm::DEFAULT_FUEL_LIMIT).await
@@ -434,7 +460,7 @@ mod tests {
         timeout_seconds: u64,
         fuel: u64,
     ) -> Arc<WasmMcpTransport> {
-        let component = wat::parse_file(FIXTURE).expect("parse MCP component fixture source");
+        let component = render_stateful_mcp_fixture();
         let temp = tempfile::tempdir().expect("fixture temp dir");
         let component_path = temp.path().join("stateful-server.wasm");
         std::fs::write(&component_path, component).expect("materialize MCP component fixture");
