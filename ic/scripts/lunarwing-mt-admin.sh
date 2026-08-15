@@ -2537,10 +2537,12 @@ _openrc_cgroup_root() {
 
 # Portable cgroup v2 availability probe for the operator build path (work item
 # #54). A writable root is insufficient: memory must be available and either
-# delegated already or writable in cgroup.subtree_control.
+# delegated already or writable in cgroup.subtree_control. setpriv (util-linux)
+# is required for the root-side migration spawn used to place the build.
 _openrc_build_cgroup_supported() {
   local root
   root="$(_openrc_cgroup_root)"
+  command -v setpriv >/dev/null 2>&1 || return 1
   [[ -d "$root" && -w "$root" ]] || return 1
   [[ "$(stat -fc %T "$root" 2>/dev/null)" == cgroup2fs ]] || return 1
   [[ -r "$root/cgroup.controllers" ]] || return 1
@@ -2548,6 +2550,16 @@ _openrc_build_cgroup_supported() {
   [[ -r "$root/cgroup.subtree_control" ]] || return 1
   grep -qw memory "$root/cgroup.subtree_control" \
     || [[ -w "$root/cgroup.subtree_control" ]]
+}
+
+# Resolve a tenant's home directory for the build spawn environment. The sudo
+# spawn this replaced got HOME from sudo's env_reset; setpriv changes no
+# environment, so the caller must supply it explicitly.
+_tenant_home_dir() {
+  local home
+  home="$(getent passwd "$1" 2>/dev/null | cut -d: -f6)"
+  [[ -n "$home" && -d "$home" ]] || return 1
+  printf '%s\n' "$home"
 }
 
 _openrc_build_memory_controller_ready() {
@@ -2625,17 +2637,27 @@ _openrc_build_cgroup_cleanup() {
   [[ ! -d "$cg" ]]
 }
 
-# Run one tenant build inside a temporary, tenant-delegated cgroup v2
-# directory with the BUILD_* memory ceilings — the OpenRC-portable equivalent
-# of the systemd BUILD_SLICE scope (work item #54). The setup-complete flag lets
-# the caller distinguish setup failure from every possible build exit status.
+# Run one tenant build inside a temporary cgroup v2 directory with the BUILD_*
+# memory ceilings — the OpenRC-portable equivalent of the systemd BUILD_SLICE
+# scope (work item #54). When the pre-delegated tenant subtree exists
+# (setup-cgroups; docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md), the build cgroup is
+# created inside it as lunarwing-<name>/build; otherwise a root-level
+# lunarwing-build-<name> cgroup is used so builds stay bounded on hosts where
+# the subtree has not been deployed yet. The setup-complete flag lets the
+# caller distinguish setup failure from every possible build exit status.
 _run_tenant_build_cgroup() {
   local name="$1" build_cmd="$2"
-  local root cg uid
+  local root cg uid gid home
   _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
   root="$(_openrc_cgroup_root)"
-  cg="$root/lunarwing-build-$name"
-  uid="$(id -u "$name")"
+  if [[ -d "$root/lunarwing-$name" ]]; then
+    cg="$root/lunarwing-$name/build"
+  else
+    cg="$root/lunarwing-build-$name"
+  fi
+  uid="$(id -u "$name" 2>/dev/null)" || return 1
+  gid="$(id -g "$name" 2>/dev/null)" || return 1
+  home="$(_tenant_home_dir "$name")" || return 1
   if [[ -e "$cg" ]]; then
     # Stale cgroup from an interrupted run: reap it before reusing the name.
     _openrc_build_cgroup_cleanup "$cg" || return 1
@@ -2644,33 +2666,18 @@ _run_tenant_build_cgroup() {
     say "memory controller is unavailable for $name build cgroup" >&2
     return 1
   fi
+  if [[ "$cg" == "$root/lunarwing-$name/build" ]] \
+    && ! _openrc_build_memory_controller_ready "$root/lunarwing-$name"; then
+    say "memory controller is unavailable in the $name cgroup subtree" >&2
+    return 1
+  fi
   mkdir "$cg" || return 1
   if ! _openrc_build_cgroup_set_memory_limits "$cg"; then
     _openrc_build_cgroup_cleanup "$cg" || true
     return 1
   fi
-  # Delegate the cgroup to the tenant so its build shell can move itself in.
-  if ! chown "$uid:$uid" "$cg" "$cg/cgroup.procs" 2>/dev/null \
-    || ! sudo -u "$name" test -w "$cg/cgroup.procs"; then
-    _openrc_build_cgroup_cleanup "$cg" || true
-    return 1
-  fi
-  _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
   local rc=0
-  sudo -u "$name" bash -c '
-    printf "%s" "$$" >"$1/cgroup.procs" || exit 125
-    exec nice -n 10 bash -c "$2"
-  ' _ "$cg" "$build_cmd" || rc=$?
-  if (( rc == 125 )); then
-    # Self-migration into the delegated cgroup was denied: the kernel also
-    # requires write access on the closest common ancestor's cgroup.procs,
-    # which a tenant shell started outside a delegated subtree never has. The
-    # build itself never ran (the wrapper exits 125 before exec; cargo never
-    # uses 125), so report setup as incomplete and let the caller fall back
-    # to the plain nice'd invocation instead of failing the build.
-    say "cgroup v2 self-migration denied for $name build; bounding ineffective, falling back" >&2
-    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=false
-  fi
+  _run_tenant_build_cgroup_spawn "$name" "$uid" "$gid" "$home" "$cg" "$build_cmd" || rc=$?
   if ! _openrc_build_cgroup_cleanup "$cg"; then
     say "WARNING: could not clean up build cgroup $cg" >&2
     (( rc != 0 )) || rc=1
@@ -2678,13 +2685,61 @@ _run_tenant_build_cgroup() {
   return "$rc"
 }
 
+# Spawn the tenant build behind a rendezvous FIFO, migrate it into the build
+# cgroup as root, then release it — Option A (root-side migrate + drop privs)
+# from docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md. Unlike the old tenant
+# self-migration this needs no tenant write access on any cgroup.procs, no
+# chown delegation, and no PAM hook, so bounding works on every OpenRC host;
+# every child the build spawns inherits membership at fork. The FIFO closes the
+# race between spawn and migration: the build cannot start before the write
+# lands, and a failed migration kills the wrapper before the build ever runs
+# (setup stays incomplete, so the caller falls back to the nice'd invocation).
+_run_tenant_build_cgroup_spawn() {
+  local name="$1" uid="$2" gid="$3" home="$4" cg="$5" build_cmd="$6"
+  local sync_dir sync_fifo build_pid rc=0
+  sync_dir="$(mktemp -d "${TMPDIR:-/tmp}/lunarwing-build-sync.XXXXXXXX")" || return 1
+  sync_fifo="$sync_dir/fifo"
+  if ! mkfifo "$sync_fifo"; then
+    rm -rf "$sync_dir"
+    return 1
+  fi
+  local sync_fd
+  # Holding a writer fd ourselves makes the child's `read` gate deterministic:
+  # its open succeeds immediately, and its read returns (EOF) only when we
+  # close the fd after the migration write. O_RDWR never blocks, so a dead
+  # child can never wedge us on the FIFO open either.
+  exec {sync_fd}<>"$sync_fifo" || { rm -rf "$sync_dir"; return 1; }
+  setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+    env HOME="$home" USER="$name" LOGNAME="$name" \
+      PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/bin" \
+    bash -c 'read -r _ <"$2"; exec nice -n 10 bash -c "$1"' _ "$build_cmd" "$sync_fifo" &
+  build_pid=$!
+  if printf '%s' "$build_pid" >"$cg/cgroup.procs" 2>/dev/null; then
+    _OPENRC_BUILD_CGROUP_SETUP_COMPLETE=true
+    exec {sync_fd}>&-
+    wait "$build_pid" || rc=$?
+  else
+    # Kill first (the wrapper is still blocked on the read), then close: this
+    # ordering guarantees no unbounded build process can escape the gate.
+    kill -KILL "$build_pid" 2>/dev/null || true
+    wait "$build_pid" 2>/dev/null || true
+    exec {sync_fd}>&-
+    say "cgroup v2 root-side migration failed for $name build; bounding ineffective, falling back" >&2
+    rc=1
+  fi
+  rm -rf "$sync_dir"
+  return "$rc"
+}
+
 # Run one tenant build step with resource bounding (BUG-005). On systemd the
 # step runs as a transient scope in BUILD_SLICE via the tenant's own user
 # manager, so cargo/rustc memory is capped and accounted outside both the
 # operator's session and the daemon service. On other init systems a
-# temporary cgroup v2 directory provides the same ceilings (work item #54).
-# Falls back to a plain nice'd invocation only when neither mechanism can be
-# set up, so a missing cgroup delegation never breaks the build.
+# temporary cgroup v2 directory provides the same ceilings (work item #54);
+# the build is placed there by root-side migration, so no tenant-side cgroup
+# write access is required. Falls back to a plain nice'd invocation only when
+# neither mechanism can be set up, so a missing cgroup setup never breaks the
+# build.
 _run_tenant_build() {
   local name="$1" build_cmd="$2"
   local uid
