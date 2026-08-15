@@ -1179,7 +1179,8 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "goal": {"type": "string", "description": "What this mission should accomplish each run"},
                         "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
                         "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
-                        "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."}
+                        "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
+                        "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 10 when omitted."}
                     },
                     "required": ["name", "goal"]
                 }),
@@ -3870,6 +3871,11 @@ pub struct EngineMissionInfo {
     pub thread_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_focus: Option<String>,
+    pub threads_today: u32,
+    pub max_threads_per_day: u32,
+    /// True when today's daily thread budget is spent; the mission stays
+    /// Active and resumes spawning at the next UTC day.
+    pub budget_exhausted: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -3884,8 +3890,6 @@ pub struct EngineMissionDetail {
     pub notify_channels: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub success_criteria: Option<String>,
-    pub threads_today: u32,
-    pub max_threads_per_day: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_fire_at: Option<String>,
     pub threads: Vec<EngineThreadInfo>,
@@ -3932,6 +3936,23 @@ fn thread_to_info(t: &lunarwing_engine::Thread) -> EngineThreadInfo {
         total_tokens: t.total_tokens_used,
         created_at: t.created_at.to_rfc3339(),
         updated_at: t.updated_at.to_rfc3339(),
+    }
+}
+
+fn mission_to_info(m: &lunarwing_engine::types::mission::Mission) -> EngineMissionInfo {
+    EngineMissionInfo {
+        id: m.id.to_string(),
+        name: m.name.clone(),
+        goal: m.goal.clone(),
+        status: format!("{:?}", m.status),
+        cadence_type: cadence_type_label(&m.cadence).to_string(),
+        thread_count: m.thread_history.len(),
+        current_focus: m.current_focus.clone(),
+        threads_today: m.threads_today,
+        max_threads_per_day: m.max_threads_per_day,
+        budget_exhausted: m.max_threads_per_day > 0 && m.threads_today >= m.max_threads_per_day,
+        created_at: m.created_at.to_rfc3339(),
+        updated_at: m.updated_at.to_rfc3339(),
     }
 }
 
@@ -4192,20 +4213,7 @@ pub async fn list_engine_missions(
         .await
         .map_err(|e| engine_err("list missions", e))?;
 
-    Ok(missions
-        .iter()
-        .map(|m| EngineMissionInfo {
-            id: m.id.to_string(),
-            name: m.name.clone(),
-            goal: m.goal.clone(),
-            status: format!("{:?}", m.status),
-            cadence_type: cadence_type_label(&m.cadence).to_string(),
-            thread_count: m.thread_history.len(),
-            current_focus: m.current_focus.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            updated_at: m.updated_at.to_rfc3339(),
-        })
-        .collect())
+    Ok(missions.iter().map(mission_to_info).collect())
 }
 
 /// Get a single mission by ID.
@@ -4248,23 +4256,11 @@ pub async fn get_engine_mission(
     }
 
     Ok(Some(EngineMissionDetail {
-        info: EngineMissionInfo {
-            id: m.id.to_string(),
-            name: m.name.clone(),
-            goal: m.goal.clone(),
-            status: format!("{:?}", m.status),
-            cadence_type: cadence_type_label(&m.cadence).to_string(),
-            thread_count: m.thread_history.len(),
-            current_focus: m.current_focus.clone(),
-            created_at: m.created_at.to_rfc3339(),
-            updated_at: m.updated_at.to_rfc3339(),
-        },
+        info: mission_to_info(&m),
         cadence: cadence_json,
         approach_history: m.approach_history.clone(),
         notify_channels: m.notify_channels.clone(),
         success_criteria: m.success_criteria.clone(),
-        threads_today: m.threads_today,
-        max_threads_per_day: m.max_threads_per_day,
         next_fire_at: m.next_fire_at.map(|dt| dt.to_rfc3339()),
         threads,
     }))
