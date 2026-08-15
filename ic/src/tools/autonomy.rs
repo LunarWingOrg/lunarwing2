@@ -35,9 +35,13 @@ pub fn is_autonomous_tool_denylisted(tool_name: &str) -> bool {
 
 pub fn autonomous_unavailable_message(tool_name: &str, owner_id: &str) -> String {
     if is_autonomous_tool_denylisted(tool_name) {
-        format!("Tool '{tool_name}' is not available in autonomous jobs or routines")
+        format!(
+            "Tool '{tool_name}' is not available in autonomous jobs or routines. This call cannot succeed unchanged; choose an advertised autonomous tool, or ask the user to run '{tool_name}' interactively."
+        )
     } else {
-        format!("Tool '{tool_name}' is not currently available for owner '{owner_id}'")
+        format!(
+            "Tool '{tool_name}' is not currently available for owner '{owner_id}'. Choose an advertised tool, or ask the owner/operator to install, activate, or grant this tool before retrying."
+        )
     }
 }
 
@@ -154,6 +158,22 @@ mod tests {
             None,
             Vec::new(),
         ))
+    }
+
+    #[test]
+    fn denylisted_tool_message_names_interactive_unlock_path() {
+        let message = autonomous_unavailable_message("restart", "default");
+
+        assert!(message.contains("cannot succeed unchanged"));
+        assert!(message.contains("run 'restart' interactively"));
+    }
+
+    #[test]
+    fn owner_scoped_tool_message_names_install_or_grant_unlock_path() {
+        let message = autonomous_unavailable_message("owner_tool", "tenant-a");
+
+        assert!(message.contains("advertised tool"));
+        assert!(message.contains("install, activate, or grant"));
     }
 
     #[tokio::test]
