@@ -376,7 +376,9 @@ impl Hook for KnowledgeShareHook {
             tracing::warn!("coordination knowledge share ignored: invalid or missing sender_id");
             return Ok(HookOutcome::ok());
         };
-        let key = format!("knowledge:{}", sender.to_ascii_lowercase());
+        // A NUL-prefixed internal namespace cannot collide with outbound keys,
+        // whose first component is a validated coordination agent ID.
+        let key = format!("\0knowledge-share\0{}", sender.to_ascii_lowercase());
         if !self
             .state
             .try_consume_rate_limit(&key, self.limits.max_per_hour, INGEST_WINDOW)
