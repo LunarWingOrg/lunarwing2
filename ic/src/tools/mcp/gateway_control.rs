@@ -986,11 +986,21 @@ mod tests {
     }
 
     async fn spawn_control_plane(routes_path: PathBuf) -> String {
-        let router = router(GatewayControlConfig {
-            bind: "127.0.0.1:0".parse().expect("bind addr"),
-            admin_token: SecretString::from("admin-token"),
-            routes_path,
-        })
+        spawn_control_plane_with_timeouts(routes_path, UpstreamTimeouts::default()).await
+    }
+
+    async fn spawn_control_plane_with_timeouts(
+        routes_path: PathBuf,
+        timeouts: UpstreamTimeouts,
+    ) -> String {
+        let router = router_with_timeouts(
+            GatewayControlConfig {
+                bind: "127.0.0.1:0".parse().expect("bind addr"),
+                admin_token: SecretString::from("admin-token"),
+                routes_path,
+            },
+            timeouts,
+        )
         .expect("build router");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1596,5 +1606,247 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(reclaimed.is_some(), "permits were not reclaimed");
+    }
+
+    #[tokio::test]
+    async fn data_plane_stalled_upstream_is_cut_by_read_timeout() {
+        use futures::StreamExt;
+
+        // Upstream answers headers and one event, then goes silent forever.
+        let hanging = spawn_hanging_upstream().await;
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane_with_timeouts(
+            path,
+            UpstreamTimeouts {
+                overall: Duration::from_secs(5),
+                read: Duration::from_millis(200),
+            },
+        )
+        .await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/hang"))
+            .bearer_auth("admin-token")
+            .json(&route(&hanging))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .get(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "hang")
+            .send()
+            .await
+            .expect("stalled stream request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("first chunk")
+            .expect("first chunk exists")
+            .expect("first chunk reads");
+        assert_eq!(first, bytes::Bytes::from_static(b"data: held\n\n"));
+
+        // The upstream never produces again: the per-read timeout must sever
+        // the stream promptly instead of pinning it for the 30 s default.
+        let stalled = tokio::time::timeout(Duration::from_secs(5), body.next())
+            .await
+            .expect("read timeout must terminate the stalled stream");
+        assert!(
+            !matches!(stalled, Some(Ok(_))),
+            "stalled upstream yielded more data instead of being cut"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_downstream_disconnect_cancels_upstream_stream() {
+        use futures::StreamExt;
+        use std::convert::Infallible;
+
+        // Notified when the upstream response body is dropped server-side,
+        // which only happens once the gateway closes the upstream connection.
+        struct DropGuard(Arc<tokio::sync::Notify>);
+        impl Drop for DropGuard {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        let guard_notify = Arc::clone(&dropped);
+        let app = Router::new().route(
+            "/mcp",
+            any(move || {
+                let guard_notify = Arc::clone(&guard_notify);
+                async move {
+                    let guard = DropGuard(guard_notify);
+                    let stream = futures::stream::unfold(guard, |guard| async move {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        let heartbeat = Ok::<_, Infallible>(bytes::Bytes::from_static(b": hb\n\n"));
+                        Some((heartbeat, guard))
+                    });
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from_stream(stream))
+                        .expect("heartbeat response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind heartbeat upstream");
+        let upstream = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve heartbeat upstream");
+        });
+
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/heartbeat"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .get(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "heartbeat")
+            .send()
+            .await
+            .expect("heartbeat stream request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.bytes_stream();
+        tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("first heartbeat")
+            .expect("first heartbeat exists")
+            .expect("first heartbeat reads");
+
+        // Dropping the incomplete body stream cannot be reused by the pool,
+        // so the downstream connection closes; the gateway must then drop the
+        // upstream body, closing the upstream connection and the stream.
+        drop(body);
+        tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+            .await
+            .expect("upstream stream was not cancelled after downstream disconnect");
+    }
+
+    #[tokio::test]
+    async fn data_plane_strips_non_allowlisted_upstream_response_headers() {
+        use std::convert::Infallible;
+
+        // Buffered JSON path: allowlisted headers pass, everything else dies.
+        let app = Router::new().route(
+            "/mcp",
+            any(|| async {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", "allowlisted-session")
+                    .header("set-cookie", "session=upstream-tracking")
+                    .header("x-upstream-internal", "internal-only")
+                    .header("www-authenticate", "Bearer realm=upstream")
+                    .body("{}".to_string())
+                    .expect("json response with junk headers")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind junk-header upstream");
+        let json_upstream = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve junk-header upstream");
+        });
+
+        // Streaming SSE path: the same allowlist applies to streamed replies.
+        let sse_app = Router::new().route(
+            "/mcp",
+            any(|| async {
+                let stream = futures::stream::once(async {
+                    Ok::<_, Infallible>(bytes::Bytes::from_static(b"data: one\n\n"))
+                });
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .header("mcp-session-id", "allowlisted-stream-session")
+                    .header("set-cookie", "session=stream-tracking")
+                    .header("x-upstream-internal", "stream-internal-only")
+                    .body(axum::body::Body::from_stream(stream))
+                    .expect("sse response with junk headers")
+            }),
+        );
+        let sse_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind junk-header sse upstream");
+        let sse_upstream = format!("http://{}/mcp", sse_listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(sse_listener, sse_app)
+                .await
+                .expect("serve junk-header sse upstream");
+        });
+
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        for (name, upstream) in [("json-junk", &json_upstream), ("sse-junk", &sse_upstream)] {
+            client
+                .put(format!("{base}/admin/routes/{name}"))
+                .bearer_auth("admin-token")
+                .json(&route(upstream))
+                .send()
+                .await
+                .expect("upsert route");
+        }
+
+        let assert_allowlist = |headers: &HeaderMap, session: &str| {
+            assert_eq!(
+                headers.get("mcp-session-id").and_then(|v| v.to_str().ok()),
+                Some(session)
+            );
+            assert!(headers.get("set-cookie").is_none());
+            assert!(headers.get("x-upstream-internal").is_none());
+            assert!(headers.get("www-authenticate").is_none());
+        };
+
+        let buffered = client
+            .post(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "json-junk")
+            .body("{}")
+            .send()
+            .await
+            .expect("buffered junk-header request");
+        assert_eq!(buffered.status(), StatusCode::OK);
+        assert_eq!(
+            buffered
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_allowlist(buffered.headers(), "allowlisted-session");
+
+        let streamed = client
+            .get(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "sse-junk")
+            .send()
+            .await
+            .expect("streaming junk-header request");
+        assert_eq!(streamed.status(), StatusCode::OK);
+        assert_eq!(
+            streamed
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert_allowlist(streamed.headers(), "allowlisted-stream-session");
     }
 }
