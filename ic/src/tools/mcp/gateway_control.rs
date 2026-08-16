@@ -521,7 +521,7 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
 
     let upstream_headers = match build_upstream_headers(&request, &route) {
         Ok(headers) => headers,
-        Err(response) => return response,
+        Err(status) => return (status, "invalid route token").into_response(),
     };
     let body = match axum::body::to_bytes(request.into_body(), MAX_PROXY_BODY_BYTES).await {
         Ok(body) => body,
@@ -568,7 +568,10 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
 
 /// Forward only the MCP-relevant client headers; routing headers and any
 /// client-supplied Authorization never cross the gateway boundary.
-fn build_upstream_headers(request: &Request, route: &GatewayRoute) -> Result<HeaderMap, Response> {
+fn build_upstream_headers(
+    request: &Request,
+    route: &GatewayRoute,
+) -> Result<HeaderMap, StatusCode> {
     let mut upstream_headers = HeaderMap::new();
     for name in FORWARDED_CLIENT_HEADERS {
         if let Some(value) = request.headers().get(*name) {
@@ -580,11 +583,7 @@ fn build_upstream_headers(request: &Request, route: &GatewayRoute) -> Result<Hea
             Ok(value) => {
                 upstream_headers.insert(axum::http::header::AUTHORIZATION, value);
             }
-            Err(_) => {
-                return Err(
-                    (StatusCode::INTERNAL_SERVER_ERROR, "invalid route token").into_response()
-                );
-            }
+            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     }
     Ok(upstream_headers)
