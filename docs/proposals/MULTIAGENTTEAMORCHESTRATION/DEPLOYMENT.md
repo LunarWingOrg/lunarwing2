@@ -272,6 +272,10 @@ created partial document deleted) on a best-effort rollback path.
 Ingestion attempts are limited per normalized sender identity per daemon and
 hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000).
 Rate-limited records are not persisted but still follow normal room routing.
+Quota is consumed before the duplicate/ownership/preflight checks by design:
+every inbound record a sender emits spends its allowance, so a noisy sender
+cannot flood the daemon with ingestion work (spawned tasks, preflight reads)
+under the guise of duplicates it knows will be no-ops.
 The in-memory limiter drops expired windows on every call and caps the number
 of distinct keys (4096); beyond that, callers share one budget-sized bucket so
 a rotating-identity client cannot buy fresh allowances or grow the map. The
