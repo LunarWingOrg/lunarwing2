@@ -129,13 +129,13 @@ fn parse_knowledge_share_with_limit(
     }
     let trimmed = content.trim_start();
     let tag_len = KNOWLEDGE_SHARE_TAG.len();
-    let prefix = trimmed.get(..tag_len + 1)?;
-    if !prefix[..tag_len].eq_ignore_ascii_case(KNOWLEDGE_SHARE_TAG)
-        || prefix.as_bytes().last() != Some(&b':')
+    let tag = trimmed.get(..tag_len)?;
+    if !tag.eq_ignore_ascii_case(KNOWLEDGE_SHARE_TAG)
+        || trimmed.as_bytes().get(tag_len) != Some(&b':')
     {
         return None;
     }
-    let (topic, finding) = trimmed[tag_len + 1..].trim().split_once('|')?;
+    let (topic, finding) = trimmed.get(tag_len + 1..)?.trim().split_once('|')?;
     let topic = topic.trim();
     let finding = finding.trim();
     if !is_valid_slug(topic, MAX_SLUG_BYTES)
@@ -173,8 +173,8 @@ pub fn sender_agent_slug(sender: &str) -> String {
     let canonical = sender.trim().to_ascii_lowercase();
     let digest = format!("{:x}", Sha256::digest(canonical.as_bytes()));
     let suffix = &digest[..SENDER_HASH_HEX_LEN];
-    let readable_limit = MAX_SLUG_BYTES
-        .saturating_sub(WIRE_AGENT_PREFIX.len() + SENDER_HASH_HEX_LEN + 2);
+    let readable_limit =
+        MAX_SLUG_BYTES.saturating_sub(WIRE_AGENT_PREFIX.len() + SENDER_HASH_HEX_LEN + 2);
     let mut readable = String::with_capacity(readable_limit.min(canonical.len()));
     let mut last_was_dash = true;
     for character in canonical.chars() {
@@ -424,6 +424,7 @@ mod tests {
         for malformed in [
             "STATUS: routine update",
             "KNOWLEDGE: t | finding text",
+            "💡NOW: t | unicode prefix must not panic",
             "KNOW: topic without separator",
             "KNOW: Not_A_Slug | finding text",
             "KNOW: | finding text",
@@ -458,7 +459,10 @@ mod tests {
             assert!(is_valid_slug(&slug, MAX_SLUG_BYTES));
             assert_eq!(slug, sender_agent_slug(sender));
         }
-        assert_eq!(sender_agent_slug("Applejack"), sender_agent_slug("applejack"));
+        assert_eq!(
+            sender_agent_slug("Applejack"),
+            sender_agent_slug("applejack")
+        );
         assert_ne!(sender_agent_slug("a@b"), sender_agent_slug("a-b"));
         assert_ne!(sender_agent_slug("a/b"), sender_agent_slug("a-b"));
     }
@@ -528,7 +532,10 @@ mod tests {
                     &Default::default(),
                 )
                 .await;
-            assert!(matches!(outcome, Ok(HookOutcome::Continue { modified: None })));
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
 
             let meta = shared_note(&workspace, sender, "mt-admin-cgroups")
                 .await
@@ -558,10 +565,12 @@ mod tests {
             let path = note_path(&sender_agent_slug("rarity"), "topic-x");
             let document = workspace.read_primary(&path).await.expect("read note");
             assert!(document.content.contains("corrected finding"));
-            assert!(workspace
-                .read_primary(&note_path("rarity", "topic-x"))
-                .await
-                .is_err());
+            assert!(
+                workspace
+                    .read_primary(&note_path("rarity", "topic-x"))
+                    .await
+                    .is_err()
+            );
         }
 
         #[tokio::test]
@@ -616,12 +625,25 @@ mod tests {
             .await
             .expect("fail-open hook");
 
-            assert!(shared_note(&workspace, "applejack", "casual").await.is_none());
-            assert!(shared_note(&workspace, "applejack", "malformed").await.is_none());
-            assert!(workspace
-                .read_primary(&note_path(&sender_agent_slug("workspace-owner"), "no-actor"))
-                .await
-                .is_err());
+            assert!(
+                shared_note(&workspace, "applejack", "casual")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                shared_note(&workspace, "applejack", "malformed")
+                    .await
+                    .is_none()
+            );
+            assert!(
+                workspace
+                    .read_primary(&note_path(
+                        &sender_agent_slug("workspace-owner"),
+                        "no-actor"
+                    ))
+                    .await
+                    .is_err()
+            );
         }
 
         #[tokio::test]
@@ -637,18 +659,27 @@ mod tests {
             );
 
             hook.execute(
-                &inbound("KNOW: rl-a | first finding within the limit", Some("flooder")),
+                &inbound(
+                    "KNOW: rl-a | first finding within the limit",
+                    Some("flooder"),
+                ),
                 &Default::default(),
             )
             .await
             .expect("fail-open hook");
             let outcome = hook
                 .execute(
-                    &inbound("KNOW: rl-b | second finding beyond the limit", Some("flooder")),
+                    &inbound(
+                        "KNOW: rl-b | second finding beyond the limit",
+                        Some("flooder"),
+                    ),
                     &Default::default(),
                 )
                 .await;
-            assert!(matches!(outcome, Ok(HookOutcome::Continue { modified: None })));
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
             assert!(shared_note(&workspace, "flooder", "rl-a").await.is_some());
             assert!(shared_note(&workspace, "flooder", "rl-b").await.is_none());
         }
