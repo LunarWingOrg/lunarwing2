@@ -42,6 +42,12 @@ pub const DEFAULT_ALLOWED_TAGS: [&str; 6] =
 /// Maximum accepted coordination agent identifier length.
 pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
 
+/// Cap on distinct rate-limit keys retained in memory. Real fleets derive
+/// keys from configured agent/channel pairs; exceeding this means keys are
+/// being rotated, at which point callers share one bucket instead of
+/// growing the map. Expired windows are pruned on every call regardless.
+pub const MAX_RATE_LIMIT_KEYS: usize = 4_096;
+
 /// Shared coordination agent-ID contract used by hooks and admin routes.
 pub fn valid_coordination_agent_id(id: &str) -> bool {
     !id.is_empty()
@@ -421,6 +427,11 @@ impl CoordinationState {
 
     /// Sliding-window rate limit. Records the attempt and returns whether it
     /// is under the limit.
+    ///
+    /// Keys are caller-derived, so the map is defensively bounded: expired
+    /// windows are dropped on every call and a pathological number of
+    /// distinct keys tips the whole map into a shared-budget mode rather
+    /// than growing without bound.
     pub async fn try_consume_rate_limit(
         &self,
         key: &str,
@@ -429,9 +440,23 @@ impl CoordinationState {
     ) -> bool {
         let mut guard = self.inner.lock().await;
         let now = std::time::Instant::now();
-        let stamps = guard.rate_limit_windows.entry(key.to_string()).or_default();
+        guard.rate_limit_windows.retain(|_, stamps| {
+            stamps.retain(|t| now.duration_since(*t) < window);
+            !stamps.is_empty()
+        });
+        let saturated = guard.rate_limit_windows.len() >= MAX_RATE_LIMIT_KEYS;
+        // Too many distinct keys for per-key isolation: collapse the callers
+        // into one shared bucket (sized to the original budget so a
+        // rotating-key client cannot buy fresh allowances). Configured
+        // fleets keep per-key behavior.
+        let (effective_key, budget) = if saturated {
+            (String::new(), max_messages)
+        } else {
+            (key.to_string(), max_messages)
+        };
+        let stamps = guard.rate_limit_windows.entry(effective_key).or_default();
         stamps.retain(|t| now.duration_since(*t) < window);
-        if stamps.len() >= max_messages {
+        if stamps.len() >= budget {
             return false;
         }
         stamps.push(now);
@@ -1505,6 +1530,38 @@ mod tests {
         assert!(
             !state
                 .try_consume_rate_limit("a:c", 2, Duration::from_secs(60))
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_key_rotation_collapses_into_a_shared_bucket() {
+        // A rotating-key client must not buy a fresh allowance per key: once
+        // the key count saturates, callers share one budget-sized bucket, so
+        // total throughput is capped no matter how many new keys appear.
+        let state = test_state();
+        let window = Duration::from_secs(60);
+        for i in 0..MAX_RATE_LIMIT_KEYS {
+            assert!(
+                state.try_consume_rate_limit(&format!("rotator-{i}"), 2, window).await,
+                "pre-saturation key {i} must pass"
+            );
+        }
+        // Map saturated: the shared bucket accepts the remaining budget...
+        assert!(
+            state
+                .try_consume_rate_limit("rotator-fresh-1", 2, window)
+                .await
+        );
+        assert!(
+            state
+                .try_consume_rate_limit("rotator-fresh-2", 2, window)
+                .await
+        );
+        // ...and nothing beyond it, regardless of key novelty.
+        assert!(
+            !state
+                .try_consume_rate_limit("rotator-fresh-3", 2, window)
                 .await
         );
     }

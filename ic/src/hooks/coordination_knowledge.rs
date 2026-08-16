@@ -16,6 +16,10 @@
 //! Wire-origin agent slugs use a dedicated `coord-` namespace plus a stable
 //! sender hash so they cannot overwrite locally authored agent versions or
 //! collide merely because two sender IDs normalize to the same readable slug.
+//!
+//! Trust boundary: room occupancy is not authentication. Only sender IDs on
+//! the operator-configured publisher allowlist are ingested; everything else
+//! is ignored without rejecting the room traffic it arrived on.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,6 +69,15 @@ pub struct KnowledgeShareLimits {
     /// Minimum finding length in characters (`COORD_KNOWLEDGE_MIN_CHARS`,
     /// default 12, maximum the coordination message cap).
     pub min_chars: usize,
+    /// Sender IDs allowed to publish `KNOW:` shares into this tenant
+    /// (`COORD_KNOWLEDGE_PUBLISHERS`, default empty = deny all).
+    ///
+    /// Room occupancy is not authentication: any occupant can claim any
+    /// sender identity the room forwards. Ingestion therefore only accepts
+    /// senders an operator explicitly listed. Entries match the full inbound
+    /// sender ID case-insensitively (for XMPP MUC that is
+    /// `room@server/nick`, so the resource/nick is significant).
+    pub publishers: Vec<String>,
 }
 
 impl Default for KnowledgeShareLimits {
@@ -72,6 +85,7 @@ impl Default for KnowledgeShareLimits {
         Self {
             max_per_hour: DEFAULT_MAX_PER_HOUR,
             min_chars: DEFAULT_MIN_CHARS,
+            publishers: Vec::new(),
         }
     }
 }
@@ -80,22 +94,69 @@ impl KnowledgeShareLimits {
     /// Load bounded limits from environment variables.
     pub fn from_env() -> Self {
         let mut limits = Self::default();
-        if let Some(value) = env_parse::<usize>("COORD_KNOWLEDGE_MAX_PER_HOUR")
-            .filter(|value| (1..=MAX_CONFIGURED_PER_HOUR).contains(value))
-        {
-            limits.max_per_hour = value;
-        }
-        if let Some(value) = env_parse::<usize>("COORD_KNOWLEDGE_MIN_CHARS")
-            .filter(|value| (1..=DEFAULT_MAX_MESSAGE_LENGTH).contains(value))
-        {
-            limits.min_chars = value;
+        apply_bounded_env(
+            "COORD_KNOWLEDGE_MAX_PER_HOUR",
+            1..=MAX_CONFIGURED_PER_HOUR,
+            |value| limits.max_per_hour = value,
+            DEFAULT_MAX_PER_HOUR,
+        );
+        apply_bounded_env(
+            "COORD_KNOWLEDGE_MIN_CHARS",
+            1..=DEFAULT_MAX_MESSAGE_LENGTH,
+            |value| limits.min_chars = value,
+            DEFAULT_MIN_CHARS,
+        );
+        if let Ok(raw) = std::env::var("COORD_KNOWLEDGE_PUBLISHERS") {
+            for entry in raw.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                if let Some(validated) = usable_sender(entry) {
+                    if !limits
+                        .publishers
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(validated))
+                    {
+                        limits.publishers.push(validated.to_string());
+                    }
+                } else {
+                    tracing::warn!(
+                        entry,
+                        "COORD_KNOWLEDGE_PUBLISHERS entry is not a usable sender ID; skipping it"
+                    );
+                }
+            }
         }
         limits
     }
+
+    /// Whether a validated inbound sender may publish knowledge shares.
+    pub fn is_allowed_publisher(&self, sender: &str) -> bool {
+        self.publishers
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(sender))
+    }
 }
 
-fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok()?.trim().parse().ok()
+fn apply_bounded_env(
+    name: &str,
+    range: std::ops::RangeInclusive<usize>,
+    apply: impl FnOnce(usize),
+    default: usize,
+) {
+    let Ok(raw) = std::env::var(name) else {
+        return;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if range.contains(&value) => apply(value),
+        _ => tracing::warn!(
+            name,
+            raw = raw.trim(),
+            default,
+            "invalid coordination knowledge limit; using default"
+        ),
+    }
 }
 
 /// Parsed `KNOW:` share payload.
@@ -221,6 +282,16 @@ fn wire_note_owned_by(
     })
 }
 
+/// Detect a note stranded between the content and metadata commits of an
+/// earlier cancelled ingest: study-note provenance is missing, but the body
+/// carries the `KNOW:` wire title header only this pipeline writes. Because
+/// the path embeds the sender's agent slug, a stranded path is reachable
+/// only by that same sender's next share, which repairs it.
+fn incomplete_wire_write(document: &crate::workspace::MemoryDocument) -> bool {
+    KnowledgeNoteMeta::from_metadata_json(&document.metadata).is_none()
+        && document.content.starts_with("# KNOW: ")
+}
+
 /// Priority 13 — ingest `KNOW:` shares from coordination channels into the
 /// daemon-local shared knowledge scope. It is fail-open and side-effect-only:
 /// room routing is never modified or rejected.
@@ -229,7 +300,10 @@ pub struct KnowledgeShareHook {
     workspace: Arc<Workspace>,
     limits: KnowledgeShareLimits,
     max_message_chars: usize,
-    ingest_lock: Mutex<()>,
+    /// Serializes write-then-metadata pairs so two concurrent shares cannot
+    /// interleave into mismatched content/metadata states. Shared with the
+    /// detached ingest tasks, which outlive individual hook executions.
+    ingest_lock: Arc<Mutex<()>>,
 }
 
 impl KnowledgeShareHook {
@@ -244,7 +318,7 @@ impl KnowledgeShareHook {
             workspace,
             limits,
             max_message_chars: DEFAULT_MAX_MESSAGE_LENGTH,
-            ingest_lock: Mutex::new(()),
+            ingest_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -255,20 +329,16 @@ impl KnowledgeShareHook {
     }
 
     async fn restore_previous(
-        &self,
+        workspace: &Workspace,
         path: &str,
         previous: Option<&crate::workspace::MemoryDocument>,
     ) {
         let result = match previous {
-            Some(document) => match self.workspace.write(path, &document.content).await {
-                Ok(_) => {
-                    self.workspace
-                        .set_document_metadata(path, &document.metadata)
-                        .await
-                }
+            Some(document) => match workspace.write(path, &document.content).await {
+                Ok(_) => workspace.set_document_metadata(path, &document.metadata).await,
                 Err(error) => Err(error),
             },
-            None => self.workspace.delete(path).await,
+            None => workspace.delete(path).await,
         };
         if let Err(error) = result {
             tracing::error!(%path, %error, "coordination knowledge rollback failed");
@@ -277,13 +347,27 @@ impl KnowledgeShareHook {
 
     /// Write one note while preserving content/metadata consistency and
     /// refusing to overwrite a path not already owned by this wire sender.
-    async fn ingest(&self, message: &KnowledgeShareMessage, sender: &str) {
-        let _guard = self.ingest_lock.lock().await;
+    ///
+    /// Runs as a detached task (see [`Hook::execute`]) so the registry's
+    /// hook deadline can never cancel it between the content and metadata
+    /// commits. Should a crash or shutdown still strand a note between the
+    /// two commits, the preflight below recognizes it and the next share for
+    /// that sender/topic repairs the path instead of wedging it behind an
+    /// ownership refusal.
+    async fn ingest(
+        workspace: Arc<Workspace>,
+        ingest_lock: Arc<Mutex<()>>,
+        message: &KnowledgeShareMessage,
+        sender: &str,
+    ) {
+        let _guard = ingest_lock.lock().await;
         let agent = sender_agent_slug(sender);
         let path = note_path(&agent, &message.topic);
-        let previous = match self.workspace.read_primary(&path).await {
+        let previous = match workspace.read_primary(&path).await {
             Ok(document) => {
-                if !wire_note_owned_by(&document.metadata, sender, &agent, &message.topic) {
+                let owned =
+                    wire_note_owned_by(&document.metadata, sender, &agent, &message.topic);
+                if !owned && !incomplete_wire_write(&document) {
                     tracing::warn!(%path, sender, "coordination knowledge path ownership mismatch");
                     return;
                 }
@@ -315,17 +399,16 @@ impl KnowledgeShareHook {
             tracing::debug!(%path, sender, "duplicate coordination knowledge share ignored");
             return;
         }
-        if let Err(error) = self.workspace.write(&path, &markdown).await {
+        if let Err(error) = workspace.write(&path, &markdown).await {
             tracing::warn!(%path, %error, "coordination knowledge share write failed");
             return;
         }
-        if let Err(error) = self
-            .workspace
+        if let Err(error) = workspace
             .set_document_metadata(&path, &meta.to_metadata_json())
             .await
         {
             tracing::warn!(%path, %error, "coordination knowledge share metadata failed");
-            self.restore_previous(&path, previous.as_ref()).await;
+            Self::restore_previous(&workspace, &path, previous.as_ref()).await;
             return;
         }
         tracing::info!(%path, sender, "coordination knowledge note ingested");
@@ -376,6 +459,17 @@ impl Hook for KnowledgeShareHook {
             tracing::warn!("coordination knowledge share ignored: invalid or missing sender_id");
             return Ok(HookOutcome::ok());
         };
+        // Room occupancy is not authentication: an occupant can claim any
+        // nick the room forwards. Only operator-listed publishers enter the
+        // knowledge scope, so unlisted senders are ignored without affecting
+        // room traffic.
+        if !self.limits.is_allowed_publisher(sender) {
+            tracing::debug!(
+                sender,
+                "coordination knowledge share from non-allowlisted sender ignored"
+            );
+            return Ok(HookOutcome::ok());
+        }
         // A NUL-prefixed internal namespace cannot collide with outbound keys,
         // whose first component is a validated coordination agent ID.
         let key = format!("\0knowledge-share\0{}", sender.to_ascii_lowercase());
@@ -392,7 +486,16 @@ impl Hook for KnowledgeShareHook {
             );
             return Ok(HookOutcome::ok());
         }
-        self.ingest(&message, sender).await;
+        // Detached: the registry drops hook futures at their deadline, and a
+        // drop between the content and metadata commits would strand the
+        // note. The ingest task runs to completion on its own budget.
+        let workspace = Arc::clone(&self.workspace);
+        let ingest_lock = Arc::clone(&self.ingest_lock);
+        let message = message.clone();
+        let sender = sender.to_string();
+        tokio::spawn(async move {
+            Self::ingest(workspace, ingest_lock, &message, &sender).await;
+        });
         Ok(HookOutcome::ok())
     }
 }
@@ -488,6 +591,13 @@ mod tests {
         use crate::hooks::hook::Hook;
         use crate::testing::test_db;
 
+        fn limits_for(publishers: &[&str]) -> KnowledgeShareLimits {
+            KnowledgeShareLimits {
+                publishers: publishers.iter().map(|p| p.to_string()).collect(),
+                ..KnowledgeShareLimits::default()
+            }
+        }
+
         fn hook(workspace: Arc<Workspace>, limits: KnowledgeShareLimits) -> KnowledgeShareHook {
             let state = CoordinationState::new(
                 vec!["coord@conference.example".to_string()],
@@ -518,12 +628,31 @@ mod tests {
             KnowledgeNoteMeta::from_metadata_json(&document.metadata)
         }
 
+        /// Ingestion runs on a detached task; poll briefly for its result so
+        /// assertions stay deterministic without production-side handles.
+        async fn await_ingest(
+            workspace: &Workspace,
+            sender: &str,
+            topic: &str,
+        ) -> Option<KnowledgeNoteMeta> {
+            let path = note_path(&sender_agent_slug(sender), topic);
+            for _ in 0..500 {
+                if let Ok(document) = workspace.read_primary(&path).await {
+                    if let Some(meta) = KnowledgeNoteMeta::from_metadata_json(&document.metadata) {
+                        return Some(meta);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            shared_note(workspace, sender, topic).await
+        }
+
         #[tokio::test]
         async fn ingests_unverified_share_with_sender_provenance() {
             let (db, _dir) = test_db().await;
             let workspace = Arc::new(Workspace::new_with_db("shared", db));
-            let hook = hook(Arc::clone(&workspace), KnowledgeShareLimits::default());
             let sender = "Applejack@conf.example/res";
+            let hook = hook(Arc::clone(&workspace), limits_for(&[sender]));
 
             let outcome = hook
                 .execute(
@@ -539,7 +668,7 @@ mod tests {
                 Ok(HookOutcome::Continue { modified: None })
             ));
 
-            let meta = shared_note(&workspace, sender, "mt-admin-cgroups")
+            let meta = await_ingest(&workspace, sender, "mt-admin-cgroups")
                 .await
                 .expect("note ingested");
             assert_eq!(meta.status, KnowledgeStatus::NeedsVerification);
@@ -550,10 +679,62 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn non_allowlisted_sender_is_ignored_without_rejecting_the_room() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            // Empty allowlist: nobody may publish.
+            let deny_all = hook(Arc::clone(&workspace), limits_for(&[]));
+
+            let outcome = deny_all
+                .execute(
+                    &inbound(
+                        "KNOW: topic-a | a finding long enough to ingest",
+                        Some("stranger"),
+                    ),
+                    &Default::default(),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
+            assert!(shared_note(&workspace, "stranger", "topic-a").await.is_none());
+
+            // An allowlisted nick does not admit a different sender identity,
+            // even one differing only by MUC resource. The refusal is
+            // synchronous, so no settle wait is needed.
+            let allowlisted = hook(Arc::clone(&workspace), limits_for(&["rarity"]));
+            allowlisted
+                .execute(
+                    &inbound(
+                        "KNOW: topic-b | another finding long enough to ingest",
+                        Some("rarity@conf.example/impostor"),
+                    ),
+                    &Default::default(),
+                )
+                .await
+                .expect("fail-open hook");
+            assert!(
+                shared_note(&workspace, "rarity@conf.example/impostor", "topic-b")
+                    .await
+                    .is_none()
+            );
+        }
+
+        #[test]
+        fn publisher_allowlist_matches_full_sender_case_insensitively() {
+            let limits = limits_for(&["Applejack@conf.example/res", "rarity"]);
+            assert!(limits.is_allowed_publisher("applejack@conf.example/RES"));
+            assert!(limits.is_allowed_publisher("Rarity"));
+            assert!(!limits.is_allowed_publisher("applejack@conf.example/other"));
+            assert!(!limits.is_allowed_publisher("stranger"));
+        }
+
+        #[tokio::test]
         async fn same_sender_replaces_only_its_wire_version() {
             let (db, _dir) = test_db().await;
             let workspace = Arc::new(Workspace::new_with_db("shared", db));
-            let hook = hook(Arc::clone(&workspace), KnowledgeShareLimits::default());
+            let hook = hook(Arc::clone(&workspace), limits_for(&["rarity"]));
 
             for content in [
                 "KNOW: topic-x | first finding about the component",
@@ -562,11 +743,28 @@ mod tests {
                 hook.execute(&inbound(content, Some("rarity")), &Default::default())
                     .await
                     .expect("fail-open hook");
+                await_ingest(&workspace, "rarity", "topic-x")
+                    .await
+                    .expect("share ingested");
             }
-
+            // The second share replaces the first; the poll above may have
+            // observed the first version's metadata, so await the new body
+            // with a bounded retry.
             let path = note_path(&sender_agent_slug("rarity"), "topic-x");
-            let document = workspace.read_primary(&path).await.expect("read note");
-            assert!(document.content.contains("corrected finding"));
+            let mut document = None;
+            for _ in 0..500 {
+                let current = workspace.read_primary(&path).await.expect("read note");
+                if current.content.contains("corrected finding") {
+                    document = Some(current);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                document.expect("corrected finding eventually ingested")
+                    .content
+                    .contains("corrected finding")
+            );
             assert!(
                 workspace
                     .read_primary(&note_path("rarity", "topic-x"))
@@ -579,7 +777,7 @@ mod tests {
         async fn normalized_sender_collisions_keep_independent_versions() {
             let (db, _dir) = test_db().await;
             let workspace = Arc::new(Workspace::new_with_db("shared", db));
-            let hook = hook(Arc::clone(&workspace), KnowledgeShareLimits::default());
+            let hook = hook(Arc::clone(&workspace), limits_for(&["a@b", "a-b"]));
 
             hook.execute(
                 &inbound("KNOW: topic-y | finding from sender at-sign", Some("a@b")),
@@ -593,16 +791,62 @@ mod tests {
             )
             .await
             .expect("fail-open hook");
+            await_ingest(&workspace, "a@b", "topic-y")
+                .await
+                .expect("at-sign note ingested");
+            await_ingest(&workspace, "a-b", "topic-y")
+                .await
+                .expect("dash note ingested");
 
             assert!(shared_note(&workspace, "a@b", "topic-y").await.is_some());
             assert!(shared_note(&workspace, "a-b", "topic-y").await.is_some());
         }
 
         #[tokio::test]
+        async fn repairs_a_stranded_write_from_a_cancelled_ingest() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "repairer";
+            let hook = hook(Arc::clone(&workspace), limits_for(&[sender]));
+
+            // Simulate a hook timeout after the content commit: the note body
+            // exists but never received study-note metadata. Without the
+            // repair path this wedges the sender/topic behind an ownership
+            // refusal forever.
+            let path = note_path(&sender_agent_slug(sender), "topic-r");
+            let stranded_title = share_title("stranded finding about the component");
+            workspace
+                .write(&path, &render_note_markdown(&stranded_title, "stranded finding"))
+                .await
+                .expect("strand note");
+            assert!(incomplete_wire_write(
+                &workspace.read_primary(&path).await.expect("read stranded")
+            ));
+
+            hook.execute(
+                &inbound(
+                    "KNOW: topic-r | repaired finding about the component",
+                    Some(sender),
+                ),
+                &Default::default(),
+            )
+            .await
+            .expect("fail-open hook");
+            let meta = await_ingest(&workspace, sender, "topic-r")
+                .await
+                .expect("stranded note repaired");
+            assert_eq!(meta.topic, "topic-r");
+            assert_eq!(meta.submitted_by.as_deref(), Some(sender));
+        }
+
+        #[tokio::test]
         async fn ignores_wrong_scope_malformed_payload_and_missing_sender() {
             let (db, _dir) = test_db().await;
             let workspace = Arc::new(Workspace::new_with_db("shared", db));
-            let hook = hook(Arc::clone(&workspace), KnowledgeShareLimits::default());
+            let hook = hook(
+                Arc::clone(&workspace),
+                limits_for(&["applejack", "workspace-owner"]),
+            );
             let casual = HookEvent::Inbound {
                 user_id: "workspace-owner".to_string(),
                 sender_id: Some("applejack".to_string()),
@@ -626,6 +870,9 @@ mod tests {
             )
             .await
             .expect("fail-open hook");
+            // All three refusals are synchronous; a short grace period keeps
+            // the negative assertions from racing a late spawn.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             assert!(
                 shared_note(&workspace, "applejack", "casual")
@@ -656,7 +903,8 @@ mod tests {
                 Arc::clone(&workspace),
                 KnowledgeShareLimits {
                     max_per_hour: 1,
-                    min_chars: DEFAULT_MIN_CHARS,
+                    publishers: vec!["flooder".to_string()],
+                    ..KnowledgeShareLimits::default()
                 },
             );
 
@@ -669,6 +917,9 @@ mod tests {
             )
             .await
             .expect("fail-open hook");
+            await_ingest(&workspace, "flooder", "rl-a")
+                .await
+                .expect("first share ingested");
             let outcome = hook
                 .execute(
                     &inbound(
@@ -684,6 +935,29 @@ mod tests {
             ));
             assert!(shared_note(&workspace, "flooder", "rl-a").await.is_some());
             assert!(shared_note(&workspace, "flooder", "rl-b").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn duplicate_share_is_an_ingest_noop() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "repeater";
+            let hook = hook(Arc::clone(&workspace), limits_for(&[sender]));
+            let share = "KNOW: topic-d | an idempotent finding about the component";
+
+            for _ in 0..2 {
+                hook.execute(&inbound(share, Some(sender)), &Default::default())
+                    .await
+                    .expect("fail-open hook");
+                await_ingest(&workspace, sender, "topic-d")
+                    .await
+                    .expect("note present");
+            }
+
+            let meta = shared_note(&workspace, sender, "topic-d")
+                .await
+                .expect("note present");
+            assert_eq!(meta.submitted_by.as_deref(), Some(sender));
         }
     }
 }
