@@ -552,7 +552,14 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = response.headers().clone();
     if is_event_stream(&headers) {
-        streaming_reply(response, &route_name, &route.upstream, status, &headers, permit)
+        streaming_reply(
+            response,
+            &route_name,
+            &route.upstream,
+            status,
+            &headers,
+            permit,
+        )
     } else {
         // Buffered replies finish inside this handler, so the permit drops here.
         buffered_reply(response, &route_name, &route.upstream, status, &headers).await
@@ -575,7 +582,7 @@ fn build_upstream_headers(request: &Request, route: &GatewayRoute) -> Result<Hea
             }
             Err(_) => {
                 return Err(
-                    (StatusCode::INTERNAL_SERVER_ERROR, "invalid route token").into_response(),
+                    (StatusCode::INTERNAL_SERVER_ERROR, "invalid route token").into_response()
                 );
             }
         }
@@ -1143,5 +1150,411 @@ mod tests {
             .expect("second chunk exists")
             .expect("second chunk reads");
         assert_eq!(second, bytes::Bytes::from_static(b"data: second\n\n"));
+    }
+
+    /// SSE upstream that streams `chunks` events of `chunk_len` payload bytes
+    /// each, crossing the buffered body cap in aggregate.
+    async fn spawn_large_streaming_upstream(chunks: usize, chunk_len: usize) -> String {
+        use std::convert::Infallible;
+
+        let events: Vec<Result<bytes::Bytes, Infallible>> = (0..chunks)
+            .map(|_| {
+                let mut event = Vec::with_capacity(chunk_len + 8);
+                event.extend_from_slice(b"data: ");
+                event.extend_from_slice(&vec![b'a'; chunk_len]);
+                event.extend_from_slice(b"\n\n");
+                Ok(bytes::Bytes::from(event))
+            })
+            .collect();
+        let app = Router::new().route(
+            "/mcp",
+            any(|| async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from_stream(futures::stream::iter(events)))
+                    .expect("large streaming response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind large streaming upstream");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve large streaming upstream");
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn data_plane_sse_streams_past_buffered_body_cap() {
+        use futures::StreamExt;
+
+        // Nine 512 KiB events ≈ 4.6 MiB total: beyond MAX_PROXY_BODY_BYTES.
+        // A cumulative lifetime cap would sever this healthy stream.
+        let upstream = spawn_large_streaming_upstream(9, 512 * 1024).await;
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/large-stream"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .get(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "large-stream")
+            .send()
+            .await
+            .expect("streaming request");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut received = 0_u64;
+        let mut body = response.bytes_stream();
+        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .expect("stream chunk timed out")
+        {
+            received += chunk.expect("chunk reads").len() as u64;
+        }
+        assert!(received > MAX_PROXY_BODY_BYTES as u64);
+    }
+
+    #[tokio::test]
+    async fn data_plane_post_sse_streams_without_method_gate() {
+        use futures::StreamExt;
+
+        let (upstream, started, continue_signal) = spawn_streaming_upstream().await;
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/post-stream"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        // MCP Streamable HTTP permits text/event-stream responses to POST;
+        // the upstream waits between chunks, so a buffered gateway would
+        // never deliver the first event here.
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            client
+                .post(format!("{base}/mcp"))
+                .header(GATEWAY_ROUTE_HEADER, "post-stream")
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+                .send(),
+        )
+        .await
+        .expect("POST streaming response headers")
+        .expect("POST streaming request");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        started.notified().await;
+
+        let mut body = response.bytes_stream();
+        let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("first POST stream chunk")
+            .expect("first chunk exists")
+            .expect("first chunk reads");
+        assert_eq!(first, bytes::Bytes::from_static(b"data: first\n\n"));
+        continue_signal.notify_one();
+        let second = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("second POST stream chunk")
+            .expect("second chunk exists")
+            .expect("second chunk reads");
+        assert_eq!(second, bytes::Bytes::from_static(b"data: second\n\n"));
+    }
+
+    #[tokio::test]
+    async fn data_plane_buffered_oversized_json_is_clean_502() {
+        // Declared length over the cap: rejected before any status is sent.
+        let oversized = "x".repeat(MAX_PROXY_BODY_BYTES + 1);
+        let app = Router::new().route(
+            "/mcp",
+            any(move || {
+                let body = oversized.clone();
+                async move {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .expect("oversized response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind oversized upstream");
+        let upstream = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve oversized upstream");
+        });
+
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/oversized"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .post(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "oversized")
+            .body("{}")
+            .send()
+            .await
+            .expect("oversized request");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("error body")
+                .contains("upstream response too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_buffered_chunked_overflow_is_clean_502() {
+        use std::convert::Infallible;
+
+        // No declared length (chunked): the cap must fire mid-collection.
+        let chunk = bytes::Bytes::from(vec![b'x'; 512 * 1024]);
+        let events: Vec<Result<bytes::Bytes, Infallible>> =
+            (0..9).map(|_| Ok(chunk.clone())).collect();
+        let app = Router::new().route(
+            "/mcp",
+            any(|| async move {
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from_stream(futures::stream::iter(events)))
+                    .expect("chunked oversized response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind chunked oversized upstream");
+        let upstream = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve chunked oversized upstream");
+        });
+
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/chunked-oversized"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .post(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "chunked-oversized")
+            .body("{}")
+            .send()
+            .await
+            .expect("chunked oversized request");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            response
+                .text()
+                .await
+                .expect("error body")
+                .contains("upstream response too large")
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_buffered_mid_body_failure_is_clean_502() {
+        use futures::StreamExt;
+
+        // Upstream sends JSON headers and one chunk, then fails the body.
+        let app = Router::new().route(
+            "/mcp",
+            any(|| async {
+                let stream = futures::stream::once(async {
+                    Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"{\"partial\":"))
+                })
+                .chain(futures::stream::once(async {
+                    Err(std::io::Error::other("upstream died mid-body"))
+                }));
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from_stream(stream))
+                    .expect("failing response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing upstream");
+        let upstream = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve failing upstream");
+        });
+
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        client
+            .put(format!("{base}/admin/routes/failing"))
+            .bearer_auth("admin-token")
+            .json(&route(&upstream))
+            .send()
+            .await
+            .expect("upsert route");
+
+        let response = client
+            .post(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "failing")
+            .body("{}")
+            .send()
+            .await
+            .expect("failing request");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// SSE upstream that answers headers and one event, then never produces
+    /// again: each connection holds a gateway permit until dropped.
+    async fn spawn_hanging_upstream() -> String {
+        use futures::StreamExt;
+        use std::convert::Infallible;
+
+        let app = Router::new().route(
+            "/mcp",
+            any(|| async {
+                let stream = futures::stream::once(async {
+                    Ok::<_, Infallible>(bytes::Bytes::from_static(b"data: held\n\n"))
+                })
+                .chain(futures::stream::pending());
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(axum::body::Body::from_stream(stream))
+                    .expect("hanging response")
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hanging upstream");
+        let url = format!("http://{}/mcp", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve hanging upstream");
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn data_plane_bounds_concurrent_streams_and_reclaims_permits() {
+        let hanging = spawn_hanging_upstream().await;
+        let echo = spawn_upstream().await;
+        let (_dir, path) = temp_routes_path();
+        let base = spawn_control_plane(path).await;
+        let client = reqwest::Client::new();
+        for (name, upstream) in [("hang", &hanging), ("echo", &echo)] {
+            client
+                .put(format!("{base}/admin/routes/{name}"))
+                .bearer_auth("admin-token")
+                .json(&route(upstream))
+                .send()
+                .await
+                .expect("upsert route");
+        }
+
+        // Saturate every permit with long-lived SSE connections.
+        let (holding_tx, mut holding_rx) =
+            tokio::sync::mpsc::channel(MAX_CONCURRENT_PROXY_CONNECTIONS);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut holders = Vec::new();
+        for _ in 0..MAX_CONCURRENT_PROXY_CONNECTIONS {
+            let client = client.clone();
+            let base = base.clone();
+            let holding_tx = holding_tx.clone();
+            let release = Arc::clone(&release);
+            holders.push(tokio::spawn(async move {
+                let response = client
+                    .get(format!("{base}/mcp"))
+                    .header(GATEWAY_ROUTE_HEADER, "hang")
+                    .send()
+                    .await
+                    .expect("held stream headers");
+                assert_eq!(response.status(), StatusCode::OK);
+                holding_tx.send(()).await.expect("holding signal");
+                release.notified().await;
+                drop(response);
+            }));
+        }
+        for _ in 0..MAX_CONCURRENT_PROXY_CONNECTIONS {
+            tokio::time::timeout(Duration::from_secs(10), holding_rx.recv())
+                .await
+                .expect("all streams holding")
+                .expect("holding channel open");
+        }
+
+        // One more proxied connection must fail fast instead of queueing.
+        let saturated = client
+            .post(format!("{base}/mcp"))
+            .header(GATEWAY_ROUTE_HEADER, "echo")
+            .body("{}")
+            .send()
+            .await
+            .expect("saturated request");
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Dropping the streams releases their permits for new connections.
+        release.notify_waiters();
+        for holder in holders {
+            holder.await.expect("holder task");
+        }
+        let mut reclaimed = None;
+        for _ in 0..200 {
+            let attempt = client
+                .post(format!("{base}/mcp"))
+                .header(GATEWAY_ROUTE_HEADER, "echo")
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+                .send()
+                .await
+                .expect("reclamation request");
+            if attempt.status() == StatusCode::OK {
+                reclaimed = Some(());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(reclaimed.is_some(), "permits were not reclaimed");
     }
 }
