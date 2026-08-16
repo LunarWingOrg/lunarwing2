@@ -34,8 +34,10 @@ use crate::hooks::registry::HookRegistry;
 /// Default maximum coordination message length (single line).
 pub const DEFAULT_MAX_MESSAGE_LENGTH: usize = 420;
 
-/// Default allowed coordination message tags.
-pub const DEFAULT_ALLOWED_TAGS: [&str; 5] = ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY"];
+/// Default allowed coordination message tags. `KNOW` remains schema-valid on
+/// daemons that do not ingest it, so mixed opt-in fleets never strike senders.
+pub const DEFAULT_ALLOWED_TAGS: [&str; 6] =
+    ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY", "KNOW"];
 
 /// Maximum accepted coordination agent identifier length.
 pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
@@ -261,6 +263,21 @@ impl CoordinationHookConfig {
 
     fn effective_allowed_tags(&self) -> Vec<String> {
         let mut tags = self.allowed_tags.clone();
+        if !tags.iter().any(|tag| {
+            tag.eq_ignore_ascii_case(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG)
+        }) {
+            tags.push(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG.to_string());
+        }
+        tags
+    }
+
+    fn prompt_allowed_tags(&self) -> Vec<String> {
+        let mut tags = self.allowed_tags.clone();
+        tags.retain(|tag| {
+            self.knowledge_share_enabled
+                || !tag
+                    .eq_ignore_ascii_case(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG)
+        });
         if self.knowledge_share_enabled
             && !tags.iter().any(|tag| {
                 tag.eq_ignore_ascii_case(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG)
@@ -287,7 +304,7 @@ impl CoordinationPromptPolicy {
         }
         let channel_matcher =
             regex::Regex::new(&coordination_channel_guard(&config.coordination_channels)).ok()?;
-        let allowed_tags = config.effective_allowed_tags();
+        let allowed_tags = config.prompt_allowed_tags();
         let knowledge_instruction = config.knowledge_share_enabled.then_some(
             " Share durable codebase findings with sibling tenants as \
              'KNOW: <topic-slug> | <one-line finding>' (topic slug: lowercase, digits, dashes).",
@@ -1429,7 +1446,8 @@ mod tests {
             .instruction_for_scope("COORD@conference.example")
             .expect("case-insensitive coordination channel match");
         assert!(instruction.contains("STATUS, ALERT, COORD, ANNOUNCE, QUERY"));
-        assert!(!instruction.contains("KNOW:"));
+        assert!(!instruction.contains("QUERY, KNOW"));
+        assert!(!instruction.contains("KNOW: <topic-slug>"));
         assert!(instruction.contains("420 characters"));
         assert!(
             policy
@@ -1441,15 +1459,18 @@ mod tests {
     #[test]
     fn knowledge_share_opt_in_extends_prompt_and_schema_tags() {
         let mut config = test_config();
+        config.allowed_tags = vec!["STATUS".to_string()];
+        assert_eq!(
+            config.effective_allowed_tags(),
+            vec!["STATUS".to_string(), "KNOW".to_string()]
+        );
         config.knowledge_share_enabled = true;
-        let tags = config.effective_allowed_tags();
-        assert_eq!(tags.last().map(String::as_str), Some("KNOW"));
 
         let policy = CoordinationPromptPolicy::from_config(&config).expect("actionable config");
         let instruction = policy
             .instruction_for_scope("coord@conference.example")
             .expect("configured room");
-        assert!(instruction.contains("STATUS, ALERT, COORD, ANNOUNCE, QUERY, KNOW"));
+        assert!(instruction.contains("followed by a colon: STATUS, KNOW"));
         assert!(instruction.contains("KNOW: <topic-slug> | <one-line finding>"));
     }
 
