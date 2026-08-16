@@ -22,10 +22,26 @@ cherry-picked from `rarity/kimi-11-20260816-0001`, then hardened):
 
 Coverage gaps closed: stream crossing 4 MiB, POST SSE, declared + chunked
 oversized buffered 502, mid-body failure 502, 64-stream saturation and permit
-reclamation (6 new tests; 13/13 `gateway_control` tests pass). Still open:
-live stalled-upstream read-timeout test (30 s constant too slow for unit
-tests), downstream-disconnect cancellation test, response-header allowlist
-enforcement test.
+reclamation (6 new tests; 13/13 `gateway_control` tests pass).
+
+Follow-up (2026-08-16, rarity/kimi-11-20260816-1202): the three remaining
+coverage gaps are now closed too. `router()` was split over an internal
+`router_with_timeouts()` so tests inject short upstream deadlines instead of
+waiting out the 30 s production default (no production behavior change), and
+three tests were added (16/16 `gateway_control` tests pass):
+
+- `data_plane_stalled_upstream_is_cut_by_read_timeout` — headers-plus-one-
+  event upstream that then goes silent is severed by the per-read timeout
+  instead of pinning the stream forever.
+- `data_plane_downstream_disconnect_cancels_upstream_stream` — a drop guard
+  on an infinite heartbeat upstream proves the gateway closes the upstream
+  connection when the downstream client disconnects mid-stream.
+- `data_plane_strips_non_allowlisted_upstream_response_headers` —
+  `set-cookie` / `x-upstream-internal` / `www-authenticate` never cross the
+  gateway on either the buffered JSON or streaming SSE path, while
+  `content-type` and `mcp-session-id` pass through.
+
+Nothing from this review remains open.
 
 ## Review Findings
 1.
