@@ -197,17 +197,19 @@ are never persisted by the knowledge hook.
 The optional hook runs at priority 13, after secret detection (5) and before
 tag-schema validation (14) and engagement policy (15). This means a secret is
 rejected before it can be stored, while a valid broadcast `KNOW:` claim is
-persisted by every watching daemon even when that daemon is not elected to
-answer. Because it runs before tag-schema, the hook independently enforces the
-single-line/control-character and length contracts before writing anything.
+persisted by every opted-in watching daemon even when that daemon is not elected
+to answer. Because it runs before tag-schema, the hook independently enforces
+the single-line/control-character and length contracts before writing anything.
 The hook is fail-open and side-effect-only: storage errors never reject or
 modify the room message.
 
-When sharing is enabled, `KNOW` is added to the effective schema tags and the
-coordination-scoped system instruction includes the wire format. Outbound
-`KNOW:` records bypass the Phase 4 coalescer so two rapid findings cannot be
-merged into one ambiguous topic/body record. The normal secret, schema,
-coordination-rate, and transport-rate checks still apply.
+`KNOW` is always schema-valid, including on daemons with ingestion disabled and
+with operator-customized tag lists. This keeps rolling/mixed-opt-in fleets from
+striking a sender merely because only some tenants consume the protocol. Only
+opted-in daemons advertise the wire format to their model or persist records.
+Outbound `KNOW:` records bypass the Phase 4 coalescer so two rapid findings
+cannot be merged into one ambiguous topic/body record. The normal secret,
+schema, coordination-rate, and transport-rate checks still apply.
 
 ### Storage, provenance, and replacement
 
