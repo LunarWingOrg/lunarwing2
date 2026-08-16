@@ -3476,10 +3476,26 @@ fn interpret_message_event(role: &str, content_preview: &str) -> Option<&'static
     }
 }
 
+/// Coordination tags whose records tolerate display decoration. Derived from
+/// the presentation-safe subset of the wire schema, never the full schema:
+/// machine-readable records such as `KNOW:` must survive verbatim because
+/// sibling tenants parse them positionally.
+const MISSION_DECORATION_TAGS: [&str; 5] = ["STATUS", "ALERT", "COORD", "ANNOUNCE", "QUERY"];
+
 fn format_mission_notification(mission_name: &str, text: &str) -> String {
     let trimmed = text.trim_start();
+    let know_tag = crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG;
+    if trimmed
+        .get(..know_tag.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(know_tag))
+        && trimmed.as_bytes().get(know_tag.len()) == Some(&b':')
+    {
+        // Machine-readable knowledge-share record: any prefix or markdown
+        // would corrupt the `KNOW: <topic-slug> | <finding>` wire grammar.
+        return text.trim().to_string();
+    }
     if let Some((tag, body)) = trimmed.split_once(':')
-        && crate::hooks::coordination::DEFAULT_ALLOWED_TAGS
+        && MISSION_DECORATION_TAGS
             .iter()
             .any(|allowed| tag.eq_ignore_ascii_case(allowed))
     {
@@ -6469,6 +6485,35 @@ mod tests {
         assert_eq!(public["Webhook"]["secret_configured"], true);
         assert!(!public.to_string().contains("do-not-return-this"));
         assert!(public["Webhook"].get("secret").is_none());
+    }
+
+    #[test]
+    fn mission_formatting_preserves_machine_readable_know_records() {
+        let record = "KNOW: mt-admin-cgroups | Bounded builds use per-tenant subtrees";
+        assert_eq!(
+            format_mission_notification("daily-review", record),
+            record,
+            "KNOW wire records must pass through undecorated"
+        );
+        assert_eq!(
+            format_mission_notification("daily-review", "  know: topic | a finding text"),
+            "know: topic | a finding text"
+        );
+        // Presentation-safe tags keep the decorated form.
+        assert_eq!(
+            format_mission_notification("daily-review", "STATUS: mission complete"),
+            "STATUS: **[daily-review]** mission complete"
+        );
+        // Plain prose keeps the historical prefix form.
+        assert_eq!(
+            format_mission_notification("daily-review", "mission complete"),
+            "**[daily-review]** mission complete"
+        );
+        // A tag lookalike that is not a wire tag is still prose.
+        assert_eq!(
+            format_mission_notification("daily-review", "KNOWLEDGE: summary of findings"),
+            "**[daily-review]** KNOWLEDGE: summary of findings"
+        );
     }
 
     #[tokio::test]
