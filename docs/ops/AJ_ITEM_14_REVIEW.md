@@ -1,156 +1,152 @@
-# Review
+# Review: `aj/kimi-14-20260816-0601`
 
-## Review: `aj/kimi-14-20260816-0002` vs `origin/master`
+## Scope
 
-## Summary
+This review covers the current item 14 implementation against `origin/master`. The branch includes the original cross-tenant knowledge-sharing feature plus follow-up hardening for publisher trust, stranded writes, limiter saturation, mission formatting, configuration warnings, and additional tests.
 
-This branch is a 16-commit feature series introducing cross-tenant knowledge sharing through a new coordination record:
+The wire format is:
 
 ```text
 KNOW: <topic-slug> | <one-line finding>
 ```
 
-The changes add parsing and ingestion, daemon registration, coalescing behavior, multi-tenant environment propagation, documentation, and tests. The implementation includes several sound safeguards, but it also introduces compatibility, trust-boundary, consistency, and resource-exhaustion risks.
+## Summary
 
-**Recommendation:** Do not merge until findings 1 through 3 are resolved. Findings 4 and 5 should be addressed before enabling the feature in shared production rooms.
+The hardening work addresses most findings from the previous attempt: publisher allowlisting, stranded-write repair, limiter key bounding, mission formatting, invalid-limit warnings, and additional tests.
+
+The branch still has one high-severity enforcement gap and several lower-severity correctness and operational issues.
+
+**Recommendation:** Do not merge until the outbound publish gate and independent rate-window handling are fixed and covered by tests.
 
 ## Findings
 
-### 1. High: Rolling-fleet compatibility does not cover older binaries
+### 1. High: `COORD_KNOWLEDGE_PUBLISH` is advisory, not an emission gate
 
-`ic/src/hooks/coordination.rs:39` adds `KNOW` to the default coordination schema. `docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md:206` states that this keeps rolling and mixed-opt-in fleets from striking senders.
+The flag only changes the model-visible coordination prompt:
 
-That protection applies only to upgraded daemons. A daemon still running `origin/master` recognizes only the original five tags. It will reject an inbound `KNOW:` message as a schema violation and can contribute to the sender's three-strike disablement.
+- `ic/src/hooks/coordination.rs:291`
+- `ic/src/hooks/coordination.rs:326`
 
-This means `KNOW` cannot safely be emitted during a genuine mixed-version rollout.
+Outbound and response validation still add `KNOW` unconditionally through `effective_allowed_tags`:
 
-**Recommended fix:** Do not enable emission until all room participants support `KNOW`, or introduce explicit protocol capability/version negotiation.
+- `ic/src/hooks/coordination.rs:281`
+- `ic/src/hooks/coordination.rs:1172`
 
-### 2. Medium: Any room occupant can inject content into tenants' default knowledge context
+`TagSchemaHook` accepts `KNOW:` for `ResponseTransform` events without consulting `knowledge_publish_enabled`:
 
-`ic/src/hooks/coordination_knowledge.rs:375` accepts any non-empty, bounded ASCII `sender_id`. It does not require the sender to appear in `COORD_ADMIN_USERS`, `COORD_RESPONDER_ROSTER`, or a dedicated publisher allowlist.
+- `ic/src/hooks/coordination.rs:994`
+- `ic/src/hooks/coordination.rs:1035`
 
-Accepted content is written verbatim into the shared knowledge scope at `ic/src/hooks/coordination_knowledge.rs:298`. Knowledge tools search private and shared scopes by default at `ic/src/tools/builtin/knowledge.rs:118`, and include every lifecycle status unless callers explicitly filter at `ic/src/tools/builtin/knowledge.rs:293`.
+A user can explicitly instruct the agent to emit `KNOW:` even when publishing is disabled, and the response passes schema validation. This can still send `KNOW:` to pre-feature daemons, causing schema violations and sender strikes. The branch's goal entry claims this risk is eliminated, but the implementation only suppresses normal prompt guidance.
 
-The tools then return this content without sanitization:
+**Recommended fix:** Enforce `knowledge_publish_enabled` in outbound and response-transform validation. Add a regression test proving that `KNOW:` is rejected when the flag is disabled.
 
-- `knowledge_search`: `ic/src/tools/builtin/knowledge.rs:331`
-- `knowledge_get_topic`: `ic/src/tools/builtin/knowledge.rs:422`
+### 2. Medium: Independent rate windows contaminate each other
 
-The existing safeguards reduce but do not eliminate the risk:
+`CoordinationState::try_consume_rate_limit` prunes every key using the current caller's window:
 
-- Records are marked `needs-verification`.
-- Messages must be one line and normally no more than 420 characters.
-- Provenance and the `coordination` tag are retained.
-- Secret detection runs before ingestion.
+- `ic/src/hooks/coordination.rs:450`
+- `ic/src/hooks/coordination.rs:458`
 
-A compromised or unexpected room participant can still plant instruction-like text that later enters another tenant's model context. The ownership check proves consistency with the claimed sender; it does not authenticate that sender.
+The existing outbound limiter uses configurable `COORD_RATE_WINDOW_SECS`:
 
-**Recommended fix:** Add an explicit knowledge-publisher allowlist, preferably bound to authenticated channel identities. At minimum, document the trusted-room-membership requirement and sanitize content returned by the knowledge tools.
+- `ic/src/hooks/coordination.rs:1110`
 
-### 3. Medium: Timeout cancellation can permanently wedge a sender/topic path
+The knowledge limiter always uses a fixed one-hour window:
 
-The ingestion path performs two separate mutations:
+- `ic/src/hooks/coordination_knowledge.rs:55`
+- `ic/src/hooks/coordination_knowledge.rs:478`
 
-1. Write content and search chunks at `ic/src/hooks/coordination_knowledge.rs:318`.
-2. Attach study-note metadata at `ic/src/hooks/coordination_knowledge.rs:322`.
+Examples:
 
-Hooks use a five-second default timeout at `ic/src/hooks/hook.rs:253`. The registry drops the hook future when that deadline expires at `ic/src/hooks/registry.rs:103`.
+- With `COORD_RATE_WINDOW_SECS=86400`, a `KNOW:` call after one hour can erase outbound timestamps that should remain active for 24 hours.
+- With `COORD_RATE_WINDOW_SECS=60`, an outbound call can erase knowledge-ingestion timestamps before the intended one-hour limit expires.
 
-If cancellation occurs after the content transaction commits but before metadata is attached, `restore_previous` never runs because rollback only handles an explicit metadata error. The resulting document has missing or stale metadata.
+The default configuration masks the defect because both windows are one hour.
 
-Knowledge-specific queries will not return a new document without the `study-note` provenance marker, but future shares for the same sender and topic fail the ownership check at `ic/src/hooks/coordination_knowledge.rs:284`. The path remains unusable until an operator manually repairs or deletes it.
+**Recommended fix:** Store the configured window with each key, use separate maps for outbound and knowledge limits, or prune each key using its own window.
 
-The global ingestion mutex increases the likelihood of queued shares reaching the timeout during slow database operations.
+### 3. Low-Medium: Saturation fallback mixes unrelated budgets
 
-**Recommended fix:** Commit content and metadata in one database transaction. If that is not immediately possible, add a cancellation-safe repair path for incomplete wire notes and review the hook timeout.
+When `MAX_RATE_LIMIT_KEYS` is reached, all callers collapse into the same empty-string bucket:
 
-### 4. Medium: Sender-controlled limiter keys permit unbounded memory and note growth
+- `ic/src/hooks/coordination.rs:462`
+- `ic/src/hooks/coordination.rs:467`
 
-The ingestion limiter key contains the room-controlled sender identity at `ic/src/hooks/coordination_knowledge.rs:381`.
+Knowledge ingestion can use a budget as high as 1,000, while normal outbound coordination defaults to 2. Once saturated, knowledge traffic can fill the shared bucket and cause outbound messages to be rejected. Those outbound rejections record violations against the local agent and can eventually trigger auto-disablement.
 
-`CoordinationState` stores limiter windows in a `HashMap<String, Vec<Instant>>`. At `ic/src/hooks/coordination.rs:422`, timestamps are pruned only for the selected key; empty or expired keys are never removed from the map.
+The allowlist makes saturation less likely, but an operator can configure more than 4,096 publishers.
 
-Before this branch, limiter keys were effectively bounded by configured agent/channel pairs. A participant can now rotate sender identities to:
+**Recommended fix:** Use separate saturation buckets for inbound knowledge and outbound coordination traffic, or move rate limiting into separate state domains.
 
-- Create process-lifetime map entries.
-- Obtain a fresh per-sender ingestion allowance.
-- Create distinct persistent note paths for each sender and topic.
-- Queue additional work behind the global ingestion mutex.
+### 4. Low-Medium: Enabling ingestion with an empty publisher list fails silently
 
-The in-memory map resets on restart and each key is bounded in size, but the number of keys is not bounded.
+`COORD_KNOWLEDGE_SHARE=true` with an empty `COORD_KNOWLEDGE_PUBLISHERS` list produces an inert feature. Every sender is rejected at `ic/src/hooks/coordination_knowledge.rs:469`.
 
-**Recommended fix:** Add whole-map expiry and a maximum key count, enforce a global ingestion budget, and bind limiter identity to authenticated publishers.
+The rejection is logged only at `debug` level, while startup reports knowledge sharing as enabled at `ic/src/hooks/coordination.rs:1247`.
 
-### 5. Medium: Mission formatting corrupts machine-readable `KNOW` records
+This is easy for operators to misconfigure because the default environment generated by `mt-admin` contains an empty publisher list.
 
-`format_mission_notification` uses `DEFAULT_ALLOWED_TAGS` at `ic/src/bridge/router.rs:3479`. Because this branch adds `KNOW` to that global constant, a mission result such as:
+**Recommended fix:** Emit a startup warning when knowledge ingestion is enabled but the publisher allowlist is empty, or refuse to register the ingestion hook until at least one publisher is configured.
 
-```text
-KNOW: topic | finding
-```
+### 5. Low: `COORD_KNOWLEDGE_MAX_PER_HOUR=0` cannot disable ingestion
 
-is transformed into content similar to:
+The accepted range is `1..=1000` at `ic/src/hooks/coordination_knowledge.rs:97`.
 
-```text
-KNOW: **[mission]** topic | finding
-```
+A value of `0` warns and falls back to the default of 30 rather than disabling ingestion. Although the documented range excludes zero, operators commonly use zero to mean "disable."
 
-The receiver interprets `**[mission]** topic` as the topic slug and rejects it. The added Markdown also violates the coordination protocol's machine-readable, no-Markdown requirement.
+**Recommended fix:** Treat zero as an explicit disabled state, or fail closed rather than silently restoring the default.
 
-**Recommended fix:** Do not decorate `KNOW` records, or give machine-readable tags a separate formatting path rather than deriving mission behavior from the global schema tag list.
+### 6. Low: PostgreSQL remains untested
 
-### 6. Low: PostgreSQL and failure-path coverage is missing
+The integration module remains gated on libSQL at `ic/src/hooks/coordination_knowledge.rs:591`.
 
-All knowledge-ingestion integration tests are gated on libSQL at `ic/src/hooks/coordination_knowledge.rs:485`. Provisioned multi-tenant deployments use PostgreSQL, so the primary production path has no direct coverage of the content, chunk, and JSONB metadata interactions.
+Multi-tenant provisioning uses PostgreSQL, so the production backend still lacks direct coverage for:
 
-Important untested behavior includes:
+- Content and metadata writes.
+- JSONB metadata round trips.
+- Ownership checks.
+- Rollback behavior.
+- Repair of stranded notes.
+- Knowledge search visibility after ingestion.
 
-- PostgreSQL write and metadata round trips.
-- Ownership-mismatch refusal.
-- Exact duplicate no-op behavior.
-- Metadata failure and cancellation recovery.
-- Configured message-cap enforcement.
-- Invalid environment limit handling.
-- Secret detection running before ingestion.
-- Successful six-hook registration and priority ordering.
-- End-to-end ingestion followed by `knowledge_search`.
+The branch documents this limitation, but it remains a meaningful coverage gap for a database-backed feature.
 
-This is primarily a coverage gap, but it affects the highest-risk invariants in the feature.
+## Residual Trust Limitation
 
-## Secondary Observations
+The publisher allowlist is a substantial improvement and defaults to deny-all. However, XMPP MUC `sender_id` is room/nickname-derived rather than a cryptographically authenticated identity. An allowlisted nickname can potentially be reused after the original occupant disconnects. The code documents this limitation, but operators should not treat the allowlist as proof of authorship.
 
-- Invalid `COORD_KNOWLEDGE_MAX_PER_HOUR` and `COORD_KNOWLEDGE_MIN_CHARS` values silently fall back to defaults without warning.
-- Rate-limit quota is consumed before duplicate, ownership, and preflight failure checks.
-- Self-echo suppression is reliable in the native XMPP path, but other adapters or reconnect races may produce redundant `coord-<self>` notes.
-- Unrelated editorial changes to goal items 13 and 16 add avoidable documentation churn.
+## Resolved Findings
 
-## Verified Behavior
+The following previous findings appear addressed:
 
-The following parts were reviewed and appear sound:
+- Publisher allowlisting through `COORD_KNOWLEDGE_PUBLISHERS`.
+- Deny-all default for ingestion.
+- Detached ingestion outside the five-second hook timeout.
+- Repair of recognizable stranded writes.
+- Limiter expiry pruning and key-count bounding.
+- Mission formatting preservation for machine-readable `KNOW:` records.
+- Invalid-limit warnings.
+- Duplicate, allowlist-refusal, repair-path, and limiter-saturation tests.
+- Coalescer bypass for `KNOW:` records.
 
-- Unicode-safe tag parsing and UTF-8 truncation.
-- Single-line and control-character enforcement.
-- Exact coordination-room matching.
-- Secret detection runs before knowledge ingestion.
-- `coord-` namespace prevents ordinary native-note path collisions.
-- The 96-bit sender hash distinguishes normalized sender collisions.
-- Missing sender provenance does not fall back to the tenant owner.
-- `KNOW:` bypasses outbound coalescing without changing `ALERT:` behavior.
-- Multi-tenant environment defaults, preservation, and backfill are init-agnostic.
-- No bare tenant `systemctl` or `rc-service` logic was introduced.
+## Scope and Documentation
 
-## Verification Results
+The branch adds these review artifacts:
 
-Reviewed 16 branch commits over merge base `41f15de6`, covering 11 changed files and 1,031 insertions.
+- `docs/ops/AJ_ITEM_14_REVIEW.md`
+- `docs/ops/ajreviewformatted.md`
+- `docs/ops/RARAITEM11REVIEW.md`
 
-The following checks passed:
+`RARAITEM11REVIEW.md` is unrelated to item 14. The two item 14 review files are duplicates and add review-process artifacts to the feature branch. They should be removed unless intentionally retained as project documentation.
+
+## Verification
+
+Passed:
 
 - `cargo fmt --all -- --check`
-- `bash -n` for the modified shell scripts
-- `scripts/tests/test-add-tenant-env-flags.sh`
-- Coordination-filtered test suite: 59 passed
-- Focused knowledge-hook suite: 9 passed
+- `bash scripts/tests/test-add-tenant-env-flags.sh`
 - `git diff --check`
+- Worktree cleanliness check
 
-The worktree remained clean.
+The targeted Cargo test run was started with `taskset -c 0-11`, but it could not complete independently because concurrent Cargo processes held the shared build-directory lock. The branch's self-reported test counts were therefore not treated as independent verification.
