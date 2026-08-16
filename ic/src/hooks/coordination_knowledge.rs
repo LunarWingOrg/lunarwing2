@@ -640,10 +640,10 @@ mod tests {
         ) -> Option<KnowledgeNoteMeta> {
             let path = note_path(&sender_agent_slug(sender), topic);
             for _ in 0..500 {
-                if let Ok(document) = workspace.read_primary(&path).await {
-                    if let Some(meta) = KnowledgeNoteMeta::from_metadata_json(&document.metadata) {
-                        return Some(meta);
-                    }
+                if let Ok(document) = workspace.read_primary(&path).await
+                    && let Some(meta) = KnowledgeNoteMeta::from_metadata_json(&document.metadata)
+                {
+                    return Some(meta);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
