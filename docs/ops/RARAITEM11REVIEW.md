@@ -1,5 +1,32 @@
 # Review
 
+## Resolution (2026-08-16, rarity/kimi-11-20260816-0601)
+
+All findings addressed on branch `rarity/kimi-11-20260816-0601` (work
+cherry-picked from `rarity/kimi-11-20260816-0001`, then hardened):
+
+1. Fixed — stream selection keys off upstream `Content-Type`;
+   `text/event-stream` relays chunks with no cumulative cap; the 4 MiB cap
+   governs request bodies and buffered responses only.
+2. Fixed — single upstream client with `connect_timeout` + per-read
+   `read_timeout` (30 s); stalled upstreams are cut, SSE heartbeats reset it.
+3. Fixed — 64-permit semaphore bounds concurrent `/mcp` connections; fast
+   `503` on saturation; permits release on stream end or client disconnect.
+4. Fixed — method-based client gate removed; POST/DELETE SSE streams.
+5. Fixed — non-SSE responses buffer under the cap; oversized bodies and
+   mid-body failures return clean `502` before any status line.
+6. Fixed — mid-stream and buffered failures `tracing::warn!` route, upstream,
+   transferred bytes, and reason; saturating arithmetic.
+7. Fixed — docs now state the listener is plain HTTP (loopback by default)
+   and only upstreams are HTTPS-restricted; TLS proxy noted for non-loopback.
+
+Coverage gaps closed: stream crossing 4 MiB, POST SSE, declared + chunked
+oversized buffered 502, mid-body failure 502, 64-stream saturation and permit
+reclamation (6 new tests; 13/13 `gateway_control` tests pass). Still open:
+live stalled-upstream read-timeout test (30 s constant too slow for unit
+tests), downstream-disconnect cancellation test, response-header allowlist
+enforcement test.
+
 ## Review Findings
 1.
 High: the 4 MiB cumulative cap breaks long-lived SSE by design.
