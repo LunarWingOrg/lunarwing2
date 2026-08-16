@@ -11,13 +11,21 @@
 //!   sends — `GATEWAY_MODE_HEADER` and [`GATEWAY_ROUTE_HEADER`] — looks the
 //!   route up, strips the routing headers, optionally injects the route's
 //!   upstream bearer token, and proxies the request to the upstream MCP
-//!   server with bounded bodies and timeouts.
+//!   server. `text/event-stream` responses stream chunk-by-chunk without a
+//!   cumulative byte cap; all other responses are buffered under
+//!   [`MAX_PROXY_BODY_BYTES`] so upstream read failures still map to a clean
+//!   `502` before any status line is sent.
 //!
 //! Security invariants:
 //! - Admin endpoints require a constant-time-compared bearer token.
 //! - Client-supplied `X-LunarWing-*` routing headers never reach upstreams.
 //! - Upstreams must be HTTPS (loopback HTTP allowed for development).
-//! - Request and response bodies are capped; upstream calls time out.
+//! - Request bodies and buffered upstream responses are capped at
+//!   [`MAX_PROXY_BODY_BYTES`]; connect, time-to-headers, and per-read stalls
+//!   time out so a silent upstream cannot pin a stream forever.
+//! - Concurrent proxied `/mcp` connections are bounded by
+//!   [`MAX_CONCURRENT_PROXY_CONNECTIONS`]; saturation answers `503` and every
+//!   permit is released when its stream completes or the client disconnects.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -39,10 +47,19 @@ use crate::tools::mcp::gateway_transport::GATEWAY_ROUTE_HEADER;
 
 /// Maximum routes in one gateway route table.
 pub const MAX_GATEWAY_ROUTES: usize = 256;
-/// Maximum proxied request or upstream response body (4 MiB).
+/// Maximum proxied request body or buffered upstream response body (4 MiB).
+///
+/// `text/event-stream` responses are forwarded chunk-by-chunk and are *not*
+/// subject to this cumulative cap — buffering never accumulates for streams,
+/// so a lifetime byte total would only sever healthy long-lived SSE.
 pub const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
-/// Default upstream request timeout.
+/// Upstream connect / time-to-headers / buffered-body timeout, and the
+/// per-read stall timeout for streaming responses (resets on every chunk).
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maximum concurrent proxied `/mcp` connections. Long-lived SSE streams hold
+/// two sockets each, so ownership must be bounded independently of body size;
+/// excess requests fail fast with `503` instead of queueing unboundedly.
+const MAX_CONCURRENT_PROXY_CONNECTIONS: usize = 64;
 
 /// Error returned by the bundled gateway control plane.
 #[derive(Debug, thiserror::Error)]
@@ -342,8 +359,8 @@ impl GatewayControlConfig {
 struct GatewayState {
     store: RouteStore,
     admin_token: SecretString,
-    request_client: reqwest::Client,
-    stream_client: reqwest::Client,
+    client: reqwest::Client,
+    proxy_permits: Arc<tokio::sync::Semaphore>,
 }
 
 /// The bundled gateway control plane. Build a [`Router`] with [`router`] for
@@ -353,23 +370,24 @@ pub struct GatewayControlPlane;
 /// Build the control-plane + data-plane router (embedding-friendly).
 pub fn router(config: GatewayControlConfig) -> Result<Router, GatewayControlError> {
     let store = RouteStore::load(config.routes_path)?;
-    let request_client = reqwest::Client::builder()
-        .timeout(DEFAULT_UPSTREAM_TIMEOUT)
+    // No whole-request timeout: it would sever long-lived SSE responses.
+    // Connect/time-to-headers is bounded explicitly at the call site and
+    // `read_timeout` resets after every chunk, so only genuinely stalled
+    // upstreams are cut; buffered bodies get their own overall deadline.
+    let client = reqwest::Client::builder()
+        .connect_timeout(DEFAULT_UPSTREAM_TIMEOUT)
+        .read_timeout(DEFAULT_UPSTREAM_TIMEOUT)
         .build()
         .map_err(|error| GatewayControlError::InvalidData {
             reason: format!("cannot build upstream HTTP client: {error}"),
         })?;
-    let stream_client = reqwest::Client::builder()
-        .connect_timeout(DEFAULT_UPSTREAM_TIMEOUT)
-        .build()
-        .map_err(|error| GatewayControlError::InvalidData {
-            reason: format!("cannot build upstream streaming HTTP client: {error}"),
-        })?;
     let state = Arc::new(GatewayState {
         store,
         admin_token: config.admin_token,
-        request_client,
-        stream_client,
+        client,
+        proxy_permits: Arc::new(tokio::sync::Semaphore::new(
+            MAX_CONCURRENT_PROXY_CONNECTIONS,
+        )),
     });
     let admin = Router::new()
         .route("/admin/routes", get(list_routes))
@@ -490,37 +508,31 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
         return (StatusCode::METHOD_NOT_ALLOWED, "unsupported MCP method").into_response();
     }
 
-    // Forward only the MCP-relevant client headers; routing headers and any
-    // client-supplied Authorization never cross the gateway boundary.
-    let mut upstream_headers = HeaderMap::new();
-    for name in FORWARDED_CLIENT_HEADERS {
-        if let Some(value) = request.headers().get(*name) {
-            upstream_headers.insert(*name, value.clone());
-        }
-    }
-    if let Some(token) = &route.bearer_token {
-        match HeaderValue::from_str(&format!("Bearer {token}")) {
-            Ok(value) => {
-                upstream_headers.insert(axum::http::header::AUTHORIZATION, value);
-            }
-            Err(_) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, "invalid route token").into_response();
-            }
-        }
-    }
+    // Bound concurrent ownership: every proxied connection holds a client
+    // socket, an upstream socket, and (for SSE) long-lived stream tasks.
+    // Fail fast on saturation rather than queueing unboundedly.
+    let Ok(permit) = Arc::clone(&state.proxy_permits).try_acquire_owned() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "gateway busy: too many concurrent proxied connections",
+        )
+            .into_response();
+    };
 
+    let upstream_headers = match build_upstream_headers(&request, &route) {
+        Ok(headers) => headers,
+        Err(response) => return response,
+    };
     let body = match axum::body::to_bytes(request.into_body(), MAX_PROXY_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => return (StatusCode::PAYLOAD_TOO_LARGE, "request body too large").into_response(),
     };
-    let client = if method == axum::http::Method::GET {
-        &state.stream_client
-    } else {
-        &state.request_client
-    };
+    // Bounds connect and time-to-headers; streaming reads afterwards are
+    // bounded per chunk by the client's read timeout.
     let upstream = tokio::time::timeout(
         DEFAULT_UPSTREAM_TIMEOUT,
-        client
+        state
+            .client
             .request(method, &route.upstream)
             .headers(upstream_headers)
             .body(body)
@@ -536,16 +548,53 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
             return (StatusCode::GATEWAY_TIMEOUT, "upstream response timed out").into_response();
         }
     };
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_PROXY_BODY_BYTES as u64)
-    {
-        return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
-    }
     let status =
         StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let headers = response.headers().clone();
-    let mut reply = Response::new(bounded_response_body(response));
+    if is_event_stream(&headers) {
+        streaming_reply(response, &route_name, &route.upstream, status, &headers, permit)
+    } else {
+        // Buffered replies finish inside this handler, so the permit drops here.
+        buffered_reply(response, &route_name, &route.upstream, status, &headers).await
+    }
+}
+
+/// Forward only the MCP-relevant client headers; routing headers and any
+/// client-supplied Authorization never cross the gateway boundary.
+fn build_upstream_headers(request: &Request, route: &GatewayRoute) -> Result<HeaderMap, Response> {
+    let mut upstream_headers = HeaderMap::new();
+    for name in FORWARDED_CLIENT_HEADERS {
+        if let Some(value) = request.headers().get(*name) {
+            upstream_headers.insert(*name, value.clone());
+        }
+    }
+    if let Some(token) = &route.bearer_token {
+        match HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(value) => {
+                upstream_headers.insert(axum::http::header::AUTHORIZATION, value);
+            }
+            Err(_) => {
+                return Err(
+                    (StatusCode::INTERNAL_SERVER_ERROR, "invalid route token").into_response(),
+                );
+            }
+        }
+    }
+    Ok(upstream_headers)
+}
+
+/// Whether the upstream response is an SSE stream (`text/event-stream`).
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Build the downstream reply: upstream status plus allowlisted headers.
+fn reply(status: StatusCode, headers: &HeaderMap, body: axum::body::Body) -> Response {
+    let mut reply = Response::new(body);
     *reply.status_mut() = status;
     for name in FORWARDED_UPSTREAM_HEADERS {
         if let Some(value) = headers.get(*name) {
@@ -555,26 +604,102 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
     reply
 }
 
-fn bounded_response_body(response: reqwest::Response) -> axum::body::Body {
+/// Forward an SSE response chunk-by-chunk. No cumulative byte cap applies:
+/// chunks are relayed as they arrive so memory stays flat, and the semaphore
+/// permit moves into the body so it releases on completion or disconnect.
+fn streaming_reply(
+    response: reqwest::Response,
+    route_name: &str,
+    upstream: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
     use futures::StreamExt;
 
+    struct StreamState {
+        chunks: futures::stream::BoxStream<'static, Result<bytes::Bytes, reqwest::Error>>,
+        transferred: u64,
+        route_name: String,
+        upstream: String,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+
     let stream = futures::stream::try_unfold(
-        (response.bytes_stream(), 0_usize),
-        |(mut stream, total)| async move {
-            let Some(chunk) = stream.next().await else {
-                return Ok::<_, std::io::Error>(None);
-            };
-            let chunk = chunk.map_err(std::io::Error::other)?;
-            let total = total
-                .checked_add(chunk.len())
-                .ok_or_else(|| std::io::Error::other("upstream response too large"))?;
-            if total > MAX_PROXY_BODY_BYTES {
-                return Err(std::io::Error::other("upstream response too large"));
+        StreamState {
+            chunks: Box::pin(response.bytes_stream()),
+            transferred: 0,
+            route_name: route_name.to_string(),
+            upstream: upstream.to_string(),
+            _permit: permit,
+        },
+        |mut state| async move {
+            match state.chunks.next().await {
+                None => Ok::<_, std::io::Error>(None),
+                Some(Ok(chunk)) => {
+                    state.transferred = state.transferred.saturating_add(chunk.len() as u64);
+                    Ok(Some((chunk, state)))
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(
+                        route = %state.route_name,
+                        upstream = %state.upstream,
+                        transferred_bytes = state.transferred,
+                        reason = %error,
+                        "upstream event stream failed mid-body"
+                    );
+                    Err(std::io::Error::other(error))
+                }
             }
-            Ok(Some((chunk, (stream, total))))
         },
     );
-    axum::body::Body::from_stream(stream)
+    reply(status, headers, axum::body::Body::from_stream(stream))
+}
+
+/// Buffer a non-streaming upstream response under the body cap so a read
+/// failure or oversized body still produces a clean `502` before any status
+/// line is sent, instead of aborting an already-committed `200`.
+async fn buffered_reply(
+    response: reqwest::Response,
+    route_name: &str,
+    upstream: &str,
+    status: StatusCode,
+    headers: &HeaderMap,
+) -> Response {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROXY_BODY_BYTES as u64)
+    {
+        return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
+    }
+    let collected = tokio::time::timeout(DEFAULT_UPSTREAM_TIMEOUT, collect_capped(response)).await;
+    let body = match collected {
+        Ok(Ok(body)) => body,
+        Ok(Err(reason)) => {
+            tracing::warn!(route = %route_name, %upstream, %reason, "buffered upstream response failed");
+            return (StatusCode::BAD_GATEWAY, reason).into_response();
+        }
+        Err(_) => {
+            return (StatusCode::GATEWAY_TIMEOUT, "upstream response timed out").into_response();
+        }
+    };
+    reply(status, headers, axum::body::Body::from(body))
+}
+
+/// Collect an upstream body, refusing to buffer past [`MAX_PROXY_BODY_BYTES`].
+async fn collect_capped(response: reqwest::Response) -> Result<bytes::Bytes, &'static str> {
+    use futures::StreamExt;
+
+    let mut chunks = response.bytes_stream();
+    let mut body = bytes::BytesMut::new();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|_| "upstream response read failed")?;
+        if body.len().saturating_add(chunk.len()) > MAX_PROXY_BODY_BYTES {
+            return Err("upstream response too large");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 #[cfg(test)]
