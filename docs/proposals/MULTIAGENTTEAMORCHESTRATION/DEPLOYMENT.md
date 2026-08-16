@@ -178,6 +178,23 @@ Activation requires all of:
   five coordination hooks still register, but local ingestion is disabled and
   startup reports an error/warning.
 
+Emission of `KNOW:` records is gated separately by `COORD_KNOWLEDGE_PUBLISH`
+(default `false`). Ingestion is safe in any fleet — receivers that never
+heard of the tag still treat it as schema-valid — but *emitting* into a room
+where any daemon still runs a pre-`KNOW` binary earns that sender a schema
+violation strike (three strikes auto-disable). Enabling
+`COORD_KNOWLEDGE_PUBLISH` therefore asserts the operator has confirmed every
+participant of every configured coordination room accepts the tag. Until it
+is enabled, the per-turn coordination instruction never teaches the model the
+`KNOW:` wire format, so mixed-version fleets stay safe by default.
+
+Ingestion is additionally restricted to an explicit sender allowlist
+(`COORD_KNOWLEDGE_PUBLISHERS`). Room occupancy is not authentication: any
+occupant can claim any nick the room forwards, so only operator-listed sender
+IDs are stored. Entries match the full inbound sender ID case-insensitively
+(for XMPP MUC that is `room@server/nick`, so the resource is significant). An
+empty allowlist — the default — denies every publisher.
+
 The one-line wire format is:
 
 ```text
@@ -205,8 +222,12 @@ modify the room message.
 
 `KNOW` is always schema-valid, including on daemons with ingestion disabled and
 with operator-customized tag lists. This keeps rolling/mixed-opt-in fleets from
-striking a sender merely because only some tenants consume the protocol. Only
-opted-in daemons advertise the wire format to their model or persist records.
+striking a sender merely because only some tenants consume the protocol — but
+note that protection applies to upgraded daemons only: a daemon still running a
+pre-`KNOW` binary recognizes just the original five tags and will strike the
+sender. That is why emission is gated behind `COORD_KNOWLEDGE_PUBLISH` while
+ingestion is not. Only opted-in daemons advertise the wire format to their
+model or persist records.
 Outbound `KNOW:` records bypass the Phase 4 coalescer so two rapid findings
 cannot be merged into one ambiguous topic/body record. The normal secret,
 schema, coordination-rate, and transport-rate checks still apply.
@@ -220,7 +241,9 @@ Each accepted wire claim becomes a native study note with:
 - tag `coordination`; and
 - bounded raw `sender_id` in `submitted_by`. Missing, non-ASCII/control-bearing,
   or over-128-byte sender identities are not ingested; the hook never falls
-  back to the tenant owner ID for provenance.
+  back to the tenant owner ID for provenance. Senders not on the
+  `COORD_KNOWLEDGE_PUBLISHERS` allowlist are ignored without affecting room
+  routing.
 
 Wire versions use a dedicated path namespace:
 
@@ -233,15 +256,35 @@ version. The sender hash distinguishes identities that normalize to the same
 readable slug. A sender may update its own wire version of a topic; the hook
 refuses an existing path whose metadata does not prove the same wire sender,
 topic, and coordination provenance. Exact duplicate content/metadata is a
-no-op. Content and metadata writes are serialized per daemon; if metadata
-attachment fails after a content write, the previous document is restored (or
-a newly created partial document is deleted) on a best-effort rollback path.
+no-op.
+
+Content and metadata cannot share one database transaction through the
+workspace API, so the write is decoupled from the hook's execution budget:
+ingestion runs on a detached task that the registry's hook deadline cannot
+cancel mid-commit. Ingest attempts are still serialized per daemon. Should a
+process crash or shutdown land between the two commits anyway, the resulting
+note has study-note-shaped content but no study-note metadata; the preflight
+recognizes exactly that shape and lets the next share from the same sender and
+topic repair the path instead of wedging it behind an ownership refusal. If a
+metadata write fails outright, the previous document is restored (or a newly
+created partial document deleted) on a best-effort rollback path.
 
 Ingestion attempts are limited per normalized sender identity per daemon and
 hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000).
 Rate-limited records are not persisted but still follow normal room routing.
-Operators and agents must verify wire notes against local source before marking
-them active; the normal stale-list/status lifecycle remains authoritative.
+The in-memory limiter drops expired windows on every call and caps the number
+of distinct keys (4096); beyond that, callers share one budget-sized bucket so
+a rotating-identity client cannot buy fresh allowances or grow the map. The
+knowledge hook derives its limiter keys from the publisher allowlist, so the
+per-key allowance is operator-bounded as well. Invalid
+`COORD_KNOWLEDGE_MAX_PER_HOUR`/`COORD_KNOWLEDGE_MIN_CHARS` values log a
+warning and fall back to the defaults. Operators and agents must verify wire
+notes against local source before marking them active; the normal
+stale-list/status lifecycle remains authoritative.
+
+The ingestion integration tests run against the libSQL backend because the CI
+test jobs have no PostgreSQL server; the write/metadata/search calls go
+through the same `Database` trait used by the PostgreSQL backend.
 
 ## Configuration reference
 
@@ -259,6 +302,8 @@ them active; the normal stale-list/status lifecycle remains authoritative.
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy checks |
 | `COORD_XMPP_STATUS_UPDATES` | `false` | Allow transient thinking/tool/reasoning status messages in configured XMPP coordination rooms |
 | `COORD_KNOWLEDGE_SHARE` | `false` | Ingest valid `KNOW:` room records into this daemon's shared native knowledge scope; requires a database |
+| `COORD_KNOWLEDGE_PUBLISH` | `false` | Emit `KNOW:` records (teaches the model the wire format); enable only when every room daemon accepts the tag |
+| `COORD_KNOWLEDGE_PUBLISHERS` | (empty) | Comma-separated sender IDs whose `KNOW:` shares are ingested; empty denies all |
 | `COORD_KNOWLEDGE_MAX_PER_HOUR` | `30` | Per-sender inbound ingest cap; accepted range 1–1000 |
 | `COORD_KNOWLEDGE_MIN_CHARS` | `12` | Minimum finding characters; accepted range 1–420 |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |

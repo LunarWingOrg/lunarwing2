@@ -4439,6 +4439,8 @@ write_tenant_lunarwing_env() {
   coord_responder_roster="$(_env_existing "$path" COORD_RESPONDER_ROSTER)"
   coord_channels="$(_env_existing "$path" COORD_CHANNELS)"
   coord_knowledge_share="$(_env_existing "$path" COORD_KNOWLEDGE_SHARE)"; coord_knowledge_share="${coord_knowledge_share:-false}"
+  coord_knowledge_publish="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
+  coord_knowledge_publishers="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
   coord_knowledge_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
   coord_knowledge_min_chars="$(_env_existing "$path" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
   coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
@@ -4564,6 +4566,8 @@ COORD_AGENT_ALIASES=$coord_agent_aliases
 COORD_RESPONDER_ROSTER=$coord_responder_roster
 COORD_CHANNELS=$coord_channels
 COORD_KNOWLEDGE_SHARE=$coord_knowledge_share
+COORD_KNOWLEDGE_PUBLISH=$coord_knowledge_publish
+COORD_KNOWLEDGE_PUBLISHERS=$coord_knowledge_publishers
 COORD_KNOWLEDGE_MAX_PER_HOUR=$coord_knowledge_max_per_hour
 COORD_KNOWLEDGE_MIN_CHARS=$coord_knowledge_min_chars
 COORD_ADMIN_USERS=$coord_admin_users
@@ -6107,6 +6111,14 @@ patch_tenant_coordination_env() {
   if ! grep -q '^COORD_KNOWLEDGE_SHARE=' "$env_path"; then
     printf 'COORD_KNOWLEDGE_SHARE=false\n' >>"$env_path"
     say "added COORD_KNOWLEDGE_SHARE=false to $env_path"
+  fi
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISH=' "$env_path"; then
+    printf 'COORD_KNOWLEDGE_PUBLISH=false\n' >>"$env_path"
+    say "added COORD_KNOWLEDGE_PUBLISH=false to $env_path"
+  fi
+  if ! grep -q '^COORD_KNOWLEDGE_PUBLISHERS=' "$env_path"; then
+    printf 'COORD_KNOWLEDGE_PUBLISHERS=\n' >>"$env_path"
+    say "added COORD_KNOWLEDGE_PUBLISHERS= (empty allowlist) to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_path"; then
     printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' >>"$env_path"

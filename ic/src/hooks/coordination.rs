@@ -201,6 +201,15 @@ pub struct CoordinationHookConfig {
     /// Cross-tenant knowledge-share ingestion switch
     /// (`COORD_KNOWLEDGE_SHARE`, default false).
     pub knowledge_share_enabled: bool,
+    /// Cross-tenant knowledge-share emission switch
+    /// (`COORD_KNOWLEDGE_PUBLISH`, default false).
+    ///
+    /// Ingesting `KNOW:` records is safe in any fleet: receivers that do not
+    /// know the tag still treat it as schema-valid. Emitting is not — a
+    /// pre-`KNOW` daemon enforces the original five-tag schema and strikes
+    /// the sender. Enabling this asserts the operator has confirmed every
+    /// daemon in the coordination room accepts the tag.
+    pub knowledge_publish_enabled: bool,
 }
 
 impl Default for CoordinationHookConfig {
@@ -220,6 +229,7 @@ impl Default for CoordinationHookConfig {
             max_message_length: DEFAULT_MAX_MESSAGE_LENGTH,
             allowed_tags: DEFAULT_ALLOWED_TAGS.iter().map(|s| s.to_string()).collect(),
             knowledge_share_enabled: false,
+            knowledge_publish_enabled: false,
         }
     }
 }
@@ -230,6 +240,7 @@ impl CoordinationHookConfig {
         let mut config = Self {
             enabled: env_flag("COORD_ENABLED"),
             knowledge_share_enabled: env_flag("COORD_KNOWLEDGE_SHARE"),
+            knowledge_publish_enabled: env_flag("COORD_KNOWLEDGE_PUBLISH"),
             ..Self::default()
         };
         if let Ok(v) = std::env::var("COORD_AGENT_ID") {
@@ -277,14 +288,18 @@ impl CoordinationHookConfig {
         tags
     }
 
+    /// Tags the model may emit. `KNOW` appears only when the operator has
+    /// explicitly enabled emission (`COORD_KNOWLEDGE_PUBLISH`): mixed-version
+    /// rooms can still strike pre-`KNOW` senders, so sharing (ingestion)
+    /// alone must not teach the model the wire format.
     fn prompt_allowed_tags(&self) -> Vec<String> {
         let mut tags = self.allowed_tags.clone();
         tags.retain(|tag| {
-            self.knowledge_share_enabled
+            self.knowledge_publish_enabled
                 || !tag
                     .eq_ignore_ascii_case(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG)
         });
-        if self.knowledge_share_enabled
+        if self.knowledge_publish_enabled
             && !tags.iter().any(|tag| {
                 tag.eq_ignore_ascii_case(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG)
             })
@@ -311,7 +326,7 @@ impl CoordinationPromptPolicy {
         let channel_matcher =
             regex::Regex::new(&coordination_channel_guard(&config.coordination_channels)).ok()?;
         let allowed_tags = config.prompt_allowed_tags();
-        let knowledge_instruction = config.knowledge_share_enabled.then_some(
+        let knowledge_instruction = config.knowledge_publish_enabled.then_some(
             " Share durable codebase findings with sibling tenants as \
              'KNOW: <topic-slug> | <one-line finding>' (topic slug: lowercase, digits, dashes).",
         );
@@ -1345,6 +1360,7 @@ mod tests {
             max_message_length: DEFAULT_MAX_MESSAGE_LENGTH,
             allowed_tags: DEFAULT_ALLOWED_TAGS.iter().map(|s| s.to_string()).collect(),
             knowledge_share_enabled: false,
+            knowledge_publish_enabled: false,
         }
     }
 
@@ -1482,15 +1498,25 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_share_opt_in_extends_prompt_and_schema_tags() {
+    fn knowledge_share_ingests_without_emitting_until_publish_opt_in() {
         let mut config = test_config();
         config.allowed_tags = vec!["STATUS".to_string()];
+        // Ingestion alone: schema keeps KNOW valid for mixed fleets, but the
+        // prompt must not advertise emission.
+        config.knowledge_share_enabled = true;
         assert_eq!(
             config.effective_allowed_tags(),
             vec!["STATUS".to_string(), "KNOW".to_string()]
         );
-        config.knowledge_share_enabled = true;
+        let policy = CoordinationPromptPolicy::from_config(&config).expect("actionable config");
+        let instruction = policy
+            .instruction_for_scope("coord@conference.example")
+            .expect("configured room");
+        assert!(!instruction.contains("KNOW"));
+        assert!(!instruction.contains("followed by a colon: STATUS, KNOW"));
 
+        // Emission requires the explicit fleet-readiness opt-in.
+        config.knowledge_publish_enabled = true;
         let policy = CoordinationPromptPolicy::from_config(&config).expect("actionable config");
         let instruction = policy
             .instruction_for_scope("coord@conference.example")

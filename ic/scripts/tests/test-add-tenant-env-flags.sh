@@ -119,6 +119,10 @@ assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
 assert_eq "default coordination knowledge sharing disabled" \
   "$(envval COORD_KNOWLEDGE_SHARE)" "false"
+assert_eq "default coordination knowledge publishing disabled" \
+  "$(envval COORD_KNOWLEDGE_PUBLISH)" "false"
+assert_eq "default coordination knowledge publishers empty" \
+  "$(envval COORD_KNOWLEDGE_PUBLISHERS)" ""
 assert_eq "default coordination knowledge hourly cap" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "30"
 assert_eq "default coordination knowledge minimum length" \
@@ -150,6 +154,8 @@ sed -i \
   -e 's/^COORD_RESPONDER_ROSTER=.*/COORD_RESPONDER_ROSTER=custom-agent,peer-agent/' \
   -e 's/^COORD_CHANNELS=.*/COORD_CHANNELS=ops@conference.example/' \
   -e 's/^COORD_KNOWLEDGE_SHARE=.*/COORD_KNOWLEDGE_SHARE=true/' \
+  -e 's/^COORD_KNOWLEDGE_PUBLISH=.*/COORD_KNOWLEDGE_PUBLISH=true/' \
+  -e 's/^COORD_KNOWLEDGE_PUBLISHERS=.*/COORD_KNOWLEDGE_PUBLISHERS=ops-bot@conf.example\/res/' \
   -e 's/^COORD_KNOWLEDGE_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_MAX_PER_HOUR=77/' \
   -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=24/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
@@ -175,6 +181,10 @@ assert_eq "rerun preserves COORD_RESPONDER_ROSTER" \
 assert_eq "rerun preserves COORD_CHANNELS" "$(envval COORD_CHANNELS)" "ops@conference.example"
 assert_eq "rerun preserves COORD_KNOWLEDGE_SHARE" \
   "$(envval COORD_KNOWLEDGE_SHARE)" "true"
+assert_eq "rerun preserves COORD_KNOWLEDGE_PUBLISH" \
+  "$(envval COORD_KNOWLEDGE_PUBLISH)" "true"
+assert_eq "rerun preserves COORD_KNOWLEDGE_PUBLISHERS" \
+  "$(envval COORD_KNOWLEDGE_PUBLISHERS)" "ops-bot@conf.example/res"
 assert_eq "rerun preserves COORD_KNOWLEDGE_MAX_PER_HOUR" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "77"
 assert_eq "rerun preserves COORD_KNOWLEDGE_MIN_CHARS" \
