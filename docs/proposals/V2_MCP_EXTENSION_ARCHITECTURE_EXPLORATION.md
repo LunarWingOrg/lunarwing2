@@ -470,8 +470,9 @@ dedicated endpoint from a shared endpoint; shared mode requires a validated rout
 and the gateway transport injects host-owned mode/route headers while retaining
 Streamable HTTP session and OAuth behavior. LunarWing also bundles an optional
 loopback-default control/data plane with authenticated route administration,
-HTTPS-only upstreams, bounded streaming responses, MCP session-header forwarding,
-and end-to-end GET/SSE notification delivery. Cross-daemon sessions, HA,
+HTTPS-only upstreams, concurrency-bounded streaming responses (SSE relays
+chunks without a cumulative cap; other bodies buffer under the body cap), MCP
+session-header forwarding, and end-to-end GET/SSE notification delivery. Cross-daemon sessions, HA,
 centralized policy, and credential ownership remain responsibilities of the
 deployment. Gateway placement is not mandatory for workspace-local or
 dedicated-worker capabilities.
