@@ -117,6 +117,12 @@ assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
 assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
+assert_eq "default coordination knowledge sharing disabled" \
+  "$(envval COORD_KNOWLEDGE_SHARE)" "false"
+assert_eq "default coordination knowledge hourly cap" \
+  "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "30"
+assert_eq "default coordination knowledge minimum length" \
+  "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "12"
 assert_eq "coordination admin token generated" \
   "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
@@ -143,6 +149,9 @@ sed -i \
   -e 's/^COORD_AGENT_ID=.*/COORD_AGENT_ID=custom-agent/' \
   -e 's/^COORD_RESPONDER_ROSTER=.*/COORD_RESPONDER_ROSTER=custom-agent,peer-agent/' \
   -e 's/^COORD_CHANNELS=.*/COORD_CHANNELS=ops@conference.example/' \
+  -e 's/^COORD_KNOWLEDGE_SHARE=.*/COORD_KNOWLEDGE_SHARE=true/' \
+  -e 's/^COORD_KNOWLEDGE_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_MAX_PER_HOUR=77/' \
+  -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=24/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
@@ -164,6 +173,12 @@ assert_eq "rerun preserves COORD_AGENT_ID" "$(envval COORD_AGENT_ID)" "custom-ag
 assert_eq "rerun preserves COORD_RESPONDER_ROSTER" \
   "$(envval COORD_RESPONDER_ROSTER)" "custom-agent,peer-agent"
 assert_eq "rerun preserves COORD_CHANNELS" "$(envval COORD_CHANNELS)" "ops@conference.example"
+assert_eq "rerun preserves COORD_KNOWLEDGE_SHARE" \
+  "$(envval COORD_KNOWLEDGE_SHARE)" "true"
+assert_eq "rerun preserves COORD_KNOWLEDGE_MAX_PER_HOUR" \
+  "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "77"
+assert_eq "rerun preserves COORD_KNOWLEDGE_MIN_CHARS" \
+  "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "24"
 assert_eq "rerun preserves COORD_ADMIN_TOKEN" "$(envval COORD_ADMIN_TOKEN)" "preserved-coord-token"
 assert_eq "rerun preserves LW2STUDYMCP_HOME" \
   "$(envval LW2STUDYMCP_HOME)" "/srv/lunarwing/lw2studymcp"
@@ -203,13 +218,29 @@ assert_eq "backfill coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-t
 assert_eq "backfill coordination channels" "$(envval COORD_CHANNELS)" ""
 assert_eq "backfill coordination aliases" "$(envval COORD_AGENT_ALIASES)" ""
 assert_eq "backfill coordination responder roster" "$(envval COORD_RESPONDER_ROSTER)" ""
+assert_eq "backfill coordination knowledge disabled" \
+  "$(envval COORD_KNOWLEDGE_SHARE)" "false"
+assert_eq "backfill coordination knowledge hourly cap" \
+  "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "30"
+assert_eq "backfill coordination knowledge minimum length" \
+  "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "12"
 assert_eq "backfill coordination admin users" "$(envval COORD_ADMIN_USERS)" ""
 assert_eq "backfill coordination token" \
   "$(envval COORD_ADMIN_TOKEN)" "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 assert_eq "backfill coordination admin port" "$(envval COORD_ADMIN_PORT)" "20009"
-sed -i 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=backfill-preserved/' \
+sed -i \
+  -e 's/^COORD_KNOWLEDGE_SHARE=.*/COORD_KNOWLEDGE_SHARE=true/' \
+  -e 's/^COORD_KNOWLEDGE_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_MAX_PER_HOUR=88/' \
+  -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=20/' \
+  -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=backfill-preserved/' \
   "$MT_FIXTURE/env/lunarwing.env"
 patch_tenant_coordination_env fixture-tenant "$MT_FIXTURE/env/lunarwing.env"
+assert_eq "backfill knowledge opt-in remains stable" \
+  "$(envval COORD_KNOWLEDGE_SHARE)" "true"
+assert_eq "backfill knowledge hourly cap remains stable" \
+  "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "88"
+assert_eq "backfill knowledge minimum remains stable" \
+  "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "20"
 assert_eq "backfill token remains stable" "$(envval COORD_ADMIN_TOKEN)" "backfill-preserved"
 assert_eq "backfill env mode" \
   "$(stat -c '%a' "$MT_FIXTURE/env/lunarwing.env")" "600"

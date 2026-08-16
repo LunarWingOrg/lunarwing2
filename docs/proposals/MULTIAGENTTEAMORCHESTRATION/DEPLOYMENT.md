@@ -6,10 +6,12 @@
 The coordination pipeline enforces "pager system / ops room" discipline on
 designated coordination channels (XMPP MUC, IRC): tagged single-line messages,
 secret detection, per-agent rate limits, engagement policy, first-responder
-correlation, three-strike auto-disable, and an outbound coalesce window.
+correlation, three-strike auto-disable, an outbound coalesce window, and
+optional cross-tenant propagation of unverified knowledge claims.
 
 Everything is **off by default**. Nothing activates unless `COORD_ENABLED=true`
-plus the required identity/channel variables are set.
+plus the required identity/channel variables are set. Knowledge propagation has
+an additional independent opt-in: `COORD_KNOWLEDGE_SHARE=true`.
 
 ---
 
@@ -58,9 +60,10 @@ and DMs remain unaffected.
 | Hook | Priority | Point | Mode |
 |------|----------|-------|------|
 | `coordination.secret_entropy` | 5 | beforeInbound, beforeOutbound, transformResponse | fail-closed |
+| `coordination.knowledge_share` | 13 | beforeInbound | fail-open, opt-in |
+| `coordination.tag_schema` | 14 | beforeInbound, transformResponse | fail-closed |
 | `coordination.engagement_policy` | 15 | beforeInbound | fail-open |
 | `coordination.first_responder` | 16 | beforeInbound | fail-open |
-| `coordination.tag_schema` | 14 | beforeInbound, transformResponse | fail-closed |
 | `coordination.rate_limit` | 25 | beforeOutbound | fail-closed |
 
 Notes:
@@ -143,7 +146,8 @@ channel, native and installable WASM XMPP channels coalesce identically.
 
 - 2s window (default), max 3 merges; merged same-tag messages join with
   `" | "`, first tag wins on mixed tags, exact duplicates stripped.
-- `ALERT:` messages bypass coalescing entirely.
+- `ALERT:` messages bypass coalescing entirely. `KNOW:` messages also bypass:
+  one wire message is one topic/body record, so merging would corrupt its grammar.
 - Overflow beyond 420 chars flushes the pending message first, then buffers
   the new one (sequential delivery).
 - Lookup/merge/insert happen atomically under one lock and timer identity is a
@@ -156,6 +160,88 @@ channel, native and installable WASM XMPP channels coalesce identically.
 - Coalesced flushes pass through the existing XMPP hourly rate limiter
   (`OutboundRateLimiter`, see also `scripts/xmpp-rate-limit.sh` for the
   bridge-level control) — coalescing reduces volume, it doesn't bypass limits.
+
+## Cross-tenant knowledge propagation (`KNOW:`)
+
+`ic/src/hooks/coordination_knowledge.rs` turns an existing coordination room
+into a propagation bus for the native study-notes store. There is no central
+cross-tenant database and no credential sharing: every participating daemon
+receives the same room message and writes it into that tenant's own database
+under the well-known `shared` workspace scope.
+
+Activation requires all of:
+
+- actionable coordination settings (`COORD_ENABLED=true`, a valid
+  `COORD_AGENT_ID`, and at least one exact `COORD_CHANNELS` destination);
+- `COORD_KNOWLEDGE_SHARE=true`; and
+- a database-backed workspace. If the database is unavailable, the original
+  five coordination hooks still register, but local ingestion is disabled and
+  startup reports an error/warning.
+
+The one-line wire format is:
+
+```text
+KNOW: <topic-slug> | <one-line finding>
+```
+
+The tag is case-insensitive. The topic follows the native knowledge slug
+contract (`a-z`, `0-9`, dashes; no leading/trailing dash; maximum 100 bytes).
+The complete message must contain no control characters and must fit the
+coordination character cap (420 by default); the finding must meet
+`COORD_KNOWLEDGE_MIN_CHARS`. Extra `|` characters remain part of the finding.
+Malformed messages keep flowing through normal coordination enforcement but
+are never persisted by the knowledge hook.
+
+### Ordering and routing
+
+The optional hook runs at priority 13, after secret detection (5) and before
+tag-schema validation (14) and engagement policy (15). This means a secret is
+rejected before it can be stored, while a valid broadcast `KNOW:` claim is
+persisted by every opted-in watching daemon even when that daemon is not elected
+to answer. Because it runs before tag-schema, the hook independently enforces
+the single-line/control-character and length contracts before writing anything.
+The hook is fail-open and side-effect-only: storage errors never reject or
+modify the room message.
+
+`KNOW` is always schema-valid, including on daemons with ingestion disabled and
+with operator-customized tag lists. This keeps rolling/mixed-opt-in fleets from
+striking a sender merely because only some tenants consume the protocol. Only
+opted-in daemons advertise the wire format to their model or persist records.
+Outbound `KNOW:` records bypass the Phase 4 coalescer so two rapid findings
+cannot be merged into one ambiguous topic/body record. The normal secret,
+schema, coordination-rate, and transport-rate checks still apply.
+
+### Storage, provenance, and replacement
+
+Each accepted wire claim becomes a native study note with:
+
+- status `needs-verification` (never `active` from an untrusted wire claim);
+- no confidence, source commit, studied timestamp, or session assertion;
+- tag `coordination`; and
+- bounded raw `sender_id` in `submitted_by`. Missing, non-ASCII/control-bearing,
+  or over-128-byte sender identities are not ingested; the hook never falls
+  back to the tenant owner ID for provenance.
+
+Wire versions use a dedicated path namespace:
+
+```text
+study-notes/coord-<readable-sender>-<96-bit-sender-hash>/<topic>.md
+```
+
+The namespace prevents a room sender from overwriting a locally authored agent
+version. The sender hash distinguishes identities that normalize to the same
+readable slug. A sender may update its own wire version of a topic; the hook
+refuses an existing path whose metadata does not prove the same wire sender,
+topic, and coordination provenance. Exact duplicate content/metadata is a
+no-op. Content and metadata writes are serialized per daemon; if metadata
+attachment fails after a content write, the previous document is restored (or
+a newly created partial document is deleted) on a best-effort rollback path.
+
+Ingestion attempts are limited per normalized sender identity per daemon and
+hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000).
+Rate-limited records are not persisted but still follow normal room routing.
+Operators and agents must verify wire notes against local source before marking
+them active; the normal stale-list/status lifecycle remains authoritative.
 
 ## Configuration reference
 
@@ -172,6 +258,9 @@ channel, native and installable WASM XMPP channels coalesce identically.
 | `COORD_ENTROPY_THRESHOLD` | `4.8` | Shannon entropy threshold (bits/char) |
 | `COORD_MIN_SECRET_LENGTH` | `32` | Min token length for entropy checks |
 | `COORD_XMPP_STATUS_UPDATES` | `false` | Allow transient thinking/tool/reasoning status messages in configured XMPP coordination rooms |
+| `COORD_KNOWLEDGE_SHARE` | `false` | Ingest valid `KNOW:` room records into this daemon's shared native knowledge scope; requires a database |
+| `COORD_KNOWLEDGE_MAX_PER_HOUR` | `30` | Per-sender inbound ingest cap; accepted range 1–1000 |
+| `COORD_KNOWLEDGE_MIN_CHARS` | `12` | Minimum finding characters; accepted range 1–420 |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 | `COORD_VIOLATION_MAX` | `3` | Strikes before auto-disable |
 | `COORD_VIOLATION_DISABLE_DURATION` | `86400` | Auto-disable seconds (24h) |
