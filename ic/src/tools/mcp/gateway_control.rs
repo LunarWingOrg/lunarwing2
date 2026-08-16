@@ -56,6 +56,27 @@ pub const MAX_PROXY_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Upstream connect / time-to-headers / buffered-body timeout, and the
 /// per-read stall timeout for streaming responses (resets on every chunk).
 const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Deadlines bounding upstream proxy work.
+///
+/// Tests inject short values so stall/timeout behavior is exercisable without
+/// waiting out the 30 s production default.
+#[derive(Debug, Clone, Copy)]
+struct UpstreamTimeouts {
+    /// Connect, time-to-headers, and buffered-body overall deadline.
+    overall: Duration,
+    /// Per-read stall deadline for streaming bodies (resets on every chunk).
+    read: Duration,
+}
+
+impl Default for UpstreamTimeouts {
+    fn default() -> Self {
+        Self {
+            overall: DEFAULT_UPSTREAM_TIMEOUT,
+            read: DEFAULT_UPSTREAM_TIMEOUT,
+        }
+    }
+}
 /// Maximum concurrent proxied `/mcp` connections. Long-lived SSE streams hold
 /// two sockets each, so ownership must be bounded independently of body size;
 /// excess requests fail fast with `503` instead of queueing unboundedly.
@@ -361,6 +382,7 @@ struct GatewayState {
     admin_token: SecretString,
     client: reqwest::Client,
     proxy_permits: Arc<tokio::sync::Semaphore>,
+    timeouts: UpstreamTimeouts,
 }
 
 /// The bundled gateway control plane. Build a [`Router`] with [`router`] for
@@ -369,14 +391,23 @@ pub struct GatewayControlPlane;
 
 /// Build the control-plane + data-plane router (embedding-friendly).
 pub fn router(config: GatewayControlConfig) -> Result<Router, GatewayControlError> {
+    router_with_timeouts(config, UpstreamTimeouts::default())
+}
+
+/// Build the router with explicit upstream deadlines. Production callers use
+/// [`router`]; tests pass short timeouts to exercise stall handling.
+fn router_with_timeouts(
+    config: GatewayControlConfig,
+    timeouts: UpstreamTimeouts,
+) -> Result<Router, GatewayControlError> {
     let store = RouteStore::load(config.routes_path)?;
     // No whole-request timeout: it would sever long-lived SSE responses.
     // Connect/time-to-headers is bounded explicitly at the call site and
     // `read_timeout` resets after every chunk, so only genuinely stalled
     // upstreams are cut; buffered bodies get their own overall deadline.
     let client = reqwest::Client::builder()
-        .connect_timeout(DEFAULT_UPSTREAM_TIMEOUT)
-        .read_timeout(DEFAULT_UPSTREAM_TIMEOUT)
+        .connect_timeout(timeouts.overall)
+        .read_timeout(timeouts.read)
         .build()
         .map_err(|error| GatewayControlError::InvalidData {
             reason: format!("cannot build upstream HTTP client: {error}"),
@@ -388,6 +419,7 @@ pub fn router(config: GatewayControlConfig) -> Result<Router, GatewayControlErro
         proxy_permits: Arc::new(tokio::sync::Semaphore::new(
             MAX_CONCURRENT_PROXY_CONNECTIONS,
         )),
+        timeouts,
     });
     let admin = Router::new()
         .route("/admin/routes", get(list_routes))
@@ -530,7 +562,7 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
     // Bounds connect and time-to-headers; streaming reads afterwards are
     // bounded per chunk by the client's read timeout.
     let upstream = tokio::time::timeout(
-        DEFAULT_UPSTREAM_TIMEOUT,
+        state.timeouts.overall,
         state
             .client
             .request(method, &route.upstream)
@@ -562,7 +594,15 @@ async fn proxy_mcp(State(state): State<Arc<GatewayState>>, request: Request) -> 
         )
     } else {
         // Buffered replies finish inside this handler, so the permit drops here.
-        buffered_reply(response, &route_name, &route.upstream, status, &headers).await
+        buffered_reply(
+            response,
+            &route_name,
+            &route.upstream,
+            status,
+            &headers,
+            state.timeouts.overall,
+        )
+        .await
     }
 }
 
@@ -671,6 +711,7 @@ async fn buffered_reply(
     upstream: &str,
     status: StatusCode,
     headers: &HeaderMap,
+    overall_timeout: Duration,
 ) -> Response {
     if response
         .content_length()
@@ -678,7 +719,7 @@ async fn buffered_reply(
     {
         return (StatusCode::BAD_GATEWAY, "upstream response too large").into_response();
     }
-    let collected = tokio::time::timeout(DEFAULT_UPSTREAM_TIMEOUT, collect_capped(response)).await;
+    let collected = tokio::time::timeout(overall_timeout, collect_capped(response)).await;
     let body = match collected {
         Ok(Ok(body)) => body,
         Ok(Err(reason)) => {
