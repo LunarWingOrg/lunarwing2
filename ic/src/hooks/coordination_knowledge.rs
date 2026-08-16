@@ -335,7 +335,11 @@ impl KnowledgeShareHook {
     ) {
         let result = match previous {
             Some(document) => match workspace.write(path, &document.content).await {
-                Ok(_) => workspace.set_document_metadata(path, &document.metadata).await,
+                Ok(_) => {
+                    workspace
+                        .set_document_metadata(path, &document.metadata)
+                        .await
+                }
                 Err(error) => Err(error),
             },
             None => workspace.delete(path).await,
@@ -365,8 +369,7 @@ impl KnowledgeShareHook {
         let path = note_path(&agent, &message.topic);
         let previous = match workspace.read_primary(&path).await {
             Ok(document) => {
-                let owned =
-                    wire_note_owned_by(&document.metadata, sender, &agent, &message.topic);
+                let owned = wire_note_owned_by(&document.metadata, sender, &agent, &message.topic);
                 if !owned && !incomplete_wire_write(&document) {
                     tracing::warn!(%path, sender, "coordination knowledge path ownership mismatch");
                     return;
@@ -698,7 +701,11 @@ mod tests {
                 outcome,
                 Ok(HookOutcome::Continue { modified: None })
             ));
-            assert!(shared_note(&workspace, "stranger", "topic-a").await.is_none());
+            assert!(
+                shared_note(&workspace, "stranger", "topic-a")
+                    .await
+                    .is_none()
+            );
 
             // An allowlisted nick does not admit a different sender identity,
             // even one differing only by MUC resource. The refusal is
@@ -761,7 +768,8 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
             assert!(
-                document.expect("corrected finding eventually ingested")
+                document
+                    .expect("corrected finding eventually ingested")
                     .content
                     .contains("corrected finding")
             );
@@ -816,7 +824,10 @@ mod tests {
             let path = note_path(&sender_agent_slug(sender), "topic-r");
             let stranded_title = share_title("stranded finding about the component");
             workspace
-                .write(&path, &render_note_markdown(&stranded_title, "stranded finding"))
+                .write(
+                    &path,
+                    &render_note_markdown(&stranded_title, "stranded finding"),
+                )
                 .await
                 .expect("strand note");
             assert!(incomplete_wire_write(

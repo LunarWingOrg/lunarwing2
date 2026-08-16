@@ -1569,7 +1569,9 @@ mod tests {
         let window = Duration::from_secs(60);
         for i in 0..MAX_RATE_LIMIT_KEYS {
             assert!(
-                state.try_consume_rate_limit(&format!("rotator-{i}"), 2, window).await,
+                state
+                    .try_consume_rate_limit(&format!("rotator-{i}"), 2, window)
+                    .await,
                 "pre-saturation key {i} must pass"
             );
         }
