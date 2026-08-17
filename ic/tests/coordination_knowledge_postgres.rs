@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+#![cfg(all(feature = "postgres", feature = "integration"))]
 //! PostgreSQL integration coverage for coordination knowledge ingestion.
 //!
 //! Set `DATABASE_URL` to an isolated test database with LunarWing migrations
