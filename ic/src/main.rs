@@ -974,7 +974,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Register message tool for sending messages to connected channels
     components
         .tools
-        .register_message_tools(Arc::clone(&channels), components.extension_manager.clone())
+        .register_message_tools_with_coordination(
+            Arc::clone(&channels),
+            components.extension_manager.clone(),
+            Some(coordination_config),
+        )
         .await;
 
     // Default user ID for extension operations (single-user mode).
