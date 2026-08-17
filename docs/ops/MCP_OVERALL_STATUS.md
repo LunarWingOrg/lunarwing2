@@ -61,8 +61,10 @@ Implemented through 2026-08-11:
   bearer token otherwise travels in cleartext. It strips host routing headers and
   spoofed client authorization, streams `text/event-stream` responses chunk-by-chunk
   with no cumulative cap while buffering other responses under the body cap, bounds
-  concurrent proxied connections, and forwards content/session headers so persistent
-  GET/SSE notifications arrive without whole-body buffering.
+  separate transient and SSE concurrency pools (so notification streams cannot
+  starve tool-call POSTs), bounds request-body reads, sanitizes upstream URLs in
+  logs/errors, and forwards content/session headers so persistent GET/SSE
+  notifications arrive without whole-body buffering.
   Cross-daemon HA and centralized cross-tenant policy remain deployment concerns.
 - Explicit `host` and `job_worker` placement separates daemon and job activation.
   Legacy configs default to `host`; worker placement accepts stdio only.
