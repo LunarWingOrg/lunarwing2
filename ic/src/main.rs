@@ -23,7 +23,7 @@ use lunarwing::{
     gate::violation_store::{ViolationStore, ViolationStoreConfig},
     hooks::{
         CoordinationHookConfig, CoordinationPromptPolicy, bootstrap_hooks,
-        register_coordination_hooks,
+        register_coordination_hooks_with_knowledge,
     },
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
@@ -701,10 +701,28 @@ async fn async_main() -> anyhow::Result<()> {
             && !coalesce_config.coordination_channels.is_empty())
         .then(|| lunarwing::channels::coalesce::CoalesceBuffer::new(coalesce_config))
     };
-    let coordination_summary = register_coordination_hooks(
+    // Each participating daemon writes KNOW: shares into its own database's
+    // shared herd scope. The room is the propagation bus; databases remain
+    // tenant-isolated and no cross-tenant credentials are introduced.
+    let coordination_knowledge_workspace =
+        if coordination_config.is_actionable() && coordination_config.knowledge_share_enabled {
+            components.db.clone().map(|db| {
+                Arc::new(
+                    lunarwing::workspace::Workspace::new_with_db(
+                        lunarwing::workspace::KNOWLEDGE_SHARED_SCOPE,
+                        db,
+                    )
+                    .with_search_config(&config.search),
+                )
+            })
+        } else {
+            None
+        };
+    let coordination_summary = register_coordination_hooks_with_knowledge(
         &components.hooks,
         coordination_config.clone(),
         coordination_store.clone(),
+        coordination_knowledge_workspace,
     )
     .await;
     if coordination_summary.hooks > 0 {
@@ -956,7 +974,11 @@ async fn async_main() -> anyhow::Result<()> {
     // Register message tool for sending messages to connected channels
     components
         .tools
-        .register_message_tools(Arc::clone(&channels), components.extension_manager.clone())
+        .register_message_tools_with_coordination(
+            Arc::clone(&channels),
+            components.extension_manager.clone(),
+            Some(coordination_config),
+        )
         .await;
 
     // Default user ID for extension operations (single-user mode).

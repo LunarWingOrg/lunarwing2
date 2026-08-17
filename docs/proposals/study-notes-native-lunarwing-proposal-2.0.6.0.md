@@ -7,6 +7,14 @@
 > implementation landed first (branches `rarity/kimi-1-20260806-1802` and
 > `aj/kimi-2-20260807-0001`), so everything below describes verified tree
 > state, not planned work.
+>
+> **v2.0.8.0 addendum (item #14):** the optional coordination hook in
+> `ic/src/hooks/coordination_knowledge.rs` propagates one-line
+> `KNOW: <topic> | <finding>` records between tenant daemons watching the same
+> room. Each daemon writes into its own database's `shared` scope. Wire claims
+> use collision-resistant `coord-*` agent paths and always enter as
+> `needs-verification`; they never become verified merely by crossing the room.
+> See `MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md` for the protocol and limits.
 
 ## Goal
 
