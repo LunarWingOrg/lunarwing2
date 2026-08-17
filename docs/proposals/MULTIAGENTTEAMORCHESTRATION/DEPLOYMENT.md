@@ -272,21 +272,25 @@ metadata write fails outright, the previous document is restored (or a newly
 created partial document deleted) on a best-effort rollback path.
 
 Ingestion attempts are limited per normalized sender identity per daemon and
-hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000).
+hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000), then
+against an independent daemon-wide window
+(`COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`, default 300, accepted range 1–10000).
 Rate-limited records are not persisted but still follow normal room routing.
-Quota is consumed before the duplicate/ownership/preflight checks by design:
-every inbound record a sender emits spends its allowance, so a noisy sender
-cannot flood the daemon with ingestion work (spawned tasks, preflight reads)
-under the guise of duplicates it knows will be no-ops.
-The in-memory limiter drops expired windows on every call and caps the number
-of distinct keys (4096); beyond that, callers share one budget-sized bucket so
-a rotating-identity client cannot buy fresh allowances or grow the map. The
-knowledge hook derives its limiter keys from the publisher allowlist, so the
-per-key allowance is operator-bounded as well. Invalid
-`COORD_KNOWLEDGE_MAX_PER_HOUR`/`COORD_KNOWLEDGE_MIN_CHARS` values log a
-warning and fall back to the defaults. Operators and agents must verify wire
-notes against local source before marking them active; the normal
-stale-list/status lifecycle remains authoritative.
+The sender quota is consumed before the duplicate/ownership/preflight checks by
+design: every inbound record a sender emits spends its allowance, so a noisy
+sender cannot flood the daemon with ingestion work (spawned tasks, preflight
+reads) under the guise of duplicates it knows will be no-ops. Attempts already
+rejected by the sender limit do not consume the global budget.
+The shared in-memory limiter drops expired windows on every call and caps all
+retained buckets — including its reserved overflow bucket — at exactly 4096;
+beyond that, unseen callers share one budget-sized bucket so a rotating-identity
+client cannot buy fresh allowances or grow the map. The knowledge hook derives
+its limiter keys from the publisher allowlist, so the per-key allowance is
+operator-bounded as well. Invalid `COORD_KNOWLEDGE_MAX_PER_HOUR`,
+`COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`, or `COORD_KNOWLEDGE_MIN_CHARS` values log
+a warning and fall back to the defaults. Operators and agents must verify wire
+notes against local source before marking them active; the normal stale-list/status
+lifecycle remains authoritative.
 
 Content-bearing knowledge reads preserve this trust boundary. For notes tagged
 `coordination`, `knowledge_search` and `knowledge_get_topic` return
@@ -295,9 +299,11 @@ label, and wrap snippets/full content in the standard external-content security
 notice. The two tools also declare that their output requires sanitization.
 Locally authored notes without the tag retain their existing output shape.
 
-The ingestion integration tests run against the libSQL backend because the CI
-test jobs have no PostgreSQL server; the write/metadata/search calls go
-through the same `Database` trait used by the PostgreSQL backend.
+The always-on ingestion integration tests run against libSQL. An additional
+PostgreSQL integration test compiles in PostgreSQL builds and, when
+`DATABASE_URL` points at an isolated migrated test database, exercises the
+production `Database` path end to end: ingest, JSONB metadata, full-text search,
+topic lookup, and cleanup. It skips cleanly when no test database is configured.
 
 ## Configuration reference
 
@@ -318,6 +324,7 @@ through the same `Database` trait used by the PostgreSQL backend.
 | `COORD_KNOWLEDGE_PUBLISH` | `false` | Emit `KNOW:` records (teaches the model the wire format); enable only when every room daemon accepts the tag |
 | `COORD_KNOWLEDGE_PUBLISHERS` | (empty) | Comma-separated sender IDs whose `KNOW:` shares are ingested; empty denies all |
 | `COORD_KNOWLEDGE_MAX_PER_HOUR` | `30` | Per-sender inbound ingest cap; accepted range 1–1000 |
+| `COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR` | `300` | Daemon-wide inbound ingest cap; accepted range 1–10000 |
 | `COORD_KNOWLEDGE_MIN_CHARS` | `12` | Minimum finding characters; accepted range 1–420 |
 | `COORD_ADMIN_USERS` | (empty) | Comma-separated admin user IDs |
 | `COORD_VIOLATION_MAX` | `3` | Strikes before auto-disable |
