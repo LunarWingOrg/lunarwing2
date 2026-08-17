@@ -4426,7 +4426,7 @@ write_tenant_lunarwing_env() {
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
   local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
-  local coord_knowledge_share coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
+  local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
