@@ -2220,6 +2220,36 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn knowledge_share_registers_six_hooks_in_priority_order() {
+        let registry = Arc::new(HookRegistry::new());
+        let mut config = test_config();
+        config.knowledge_share_enabled = true;
+        let (db, _dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(crate::workspace::Workspace::new_with_db(
+            crate::workspace::KNOWLEDGE_SHARED_SCOPE,
+            db,
+        ));
+
+        let summary =
+            register_coordination_hooks_with_knowledge(&registry, config, None, Some(workspace))
+                .await;
+        assert_eq!(summary.hooks, 6);
+        assert_eq!(summary.errors, 0);
+        assert_eq!(
+            registry.list().await,
+            vec![
+                "coordination.secret_entropy",
+                "coordination.knowledge_share",
+                "coordination.tag_schema",
+                "coordination.engagement_policy",
+                "coordination.first_responder",
+                "coordination.rate_limit",
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_first_responder_hook_flow() {
         // Two agents sharing one state store: first claim wins.
