@@ -22,7 +22,7 @@
 //! is ignored without rejecting the room traffic it arrived on.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -55,8 +55,12 @@ const SENDER_HASH_HEX_LEN: usize = 24;
 const INGEST_WINDOW: Duration = Duration::from_secs(3600);
 /// Default maximum ingested notes per sender per hour.
 const DEFAULT_MAX_PER_HOUR: usize = 30;
-/// Hard cap preventing an operator typo from creating an unbounded timestamp vector.
+/// Hard cap preventing an operator typo from creating an unbounded sender window.
 const MAX_CONFIGURED_PER_HOUR: usize = 1_000;
+/// Default daemon-wide maximum ingested notes per hour.
+const DEFAULT_GLOBAL_MAX_PER_HOUR: usize = 300;
+/// Hard cap preventing an unbounded daemon-wide timestamp window.
+const MAX_CONFIGURED_GLOBAL_PER_HOUR: usize = 10_000;
 /// Default minimum finding length in characters.
 const DEFAULT_MIN_CHARS: usize = 12;
 
@@ -66,6 +70,9 @@ pub struct KnowledgeShareLimits {
     /// Max ingested notes per sender per hour
     /// (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, maximum 1000).
     pub max_per_hour: usize,
+    /// Max ingested notes across all senders per daemon per hour
+    /// (`COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`, default 300, maximum 10000).
+    pub global_max_per_hour: usize,
     /// Minimum finding length in characters (`COORD_KNOWLEDGE_MIN_CHARS`,
     /// default 12, maximum the coordination message cap).
     pub min_chars: usize,
@@ -84,6 +91,7 @@ impl Default for KnowledgeShareLimits {
     fn default() -> Self {
         Self {
             max_per_hour: DEFAULT_MAX_PER_HOUR,
+            global_max_per_hour: DEFAULT_GLOBAL_MAX_PER_HOUR,
             min_chars: DEFAULT_MIN_CHARS,
             publishers: Vec::new(),
         }
@@ -99,6 +107,12 @@ impl KnowledgeShareLimits {
             1..=MAX_CONFIGURED_PER_HOUR,
             |value| limits.max_per_hour = value,
             DEFAULT_MAX_PER_HOUR,
+        );
+        apply_bounded_env(
+            "COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR",
+            1..=MAX_CONFIGURED_GLOBAL_PER_HOUR,
+            |value| limits.global_max_per_hour = value,
+            DEFAULT_GLOBAL_MAX_PER_HOUR,
         );
         apply_bounded_env(
             "COORD_KNOWLEDGE_MIN_CHARS",
@@ -304,6 +318,8 @@ pub struct KnowledgeShareHook {
     /// interleave into mismatched content/metadata states. Shared with the
     /// detached ingest tasks, which outlive individual hook executions.
     ingest_lock: Arc<Mutex<()>>,
+    /// Daemon-wide ingress window, independent of per-sender buckets.
+    global_window: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl KnowledgeShareHook {
@@ -319,6 +335,7 @@ impl KnowledgeShareHook {
             limits,
             max_message_chars: DEFAULT_MAX_MESSAGE_LENGTH,
             ingest_lock: Arc::new(Mutex::new(())),
+            global_window: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -326,6 +343,17 @@ impl KnowledgeShareHook {
     pub fn with_max_message_chars(mut self, max_message_chars: usize) -> Self {
         self.max_message_chars = max_message_chars.max(1);
         self
+    }
+
+    async fn try_consume_global_limit(&self) -> bool {
+        let now = Instant::now();
+        let mut window = self.global_window.lock().await;
+        window.retain(|timestamp| now.duration_since(*timestamp) < INGEST_WINDOW);
+        if window.len() >= self.limits.global_max_per_hour {
+            return false;
+        }
+        window.push(now);
+        true
     }
 
     async fn restore_previous(
@@ -485,7 +513,16 @@ impl Hook for KnowledgeShareHook {
                 sender,
                 topic = %message.topic,
                 limit = self.limits.max_per_hour,
-                "coordination knowledge share rate-limited; note not ingested"
+                "coordination knowledge share sender rate-limited; note not ingested"
+            );
+            return Ok(HookOutcome::ok());
+        }
+        if !self.try_consume_global_limit().await {
+            tracing::warn!(
+                sender,
+                topic = %message.topic,
+                limit = self.limits.global_max_per_hour,
+                "coordination knowledge share global rate limit reached; note not ingested"
             );
             return Ok(HookOutcome::ok());
         }
@@ -946,6 +983,59 @@ mod tests {
             ));
             assert!(shared_note(&workspace, "flooder", "rl-a").await.is_some());
             assert!(shared_note(&workspace, "flooder", "rl-b").await.is_none());
+        }
+
+        #[tokio::test]
+        async fn global_rate_limit_caps_cross_sender_ingest_work() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let hook = hook(
+                Arc::clone(&workspace),
+                KnowledgeShareLimits {
+                    max_per_hour: 10,
+                    global_max_per_hour: 1,
+                    publishers: vec!["sender-a".to_string(), "sender-b".to_string()],
+                    ..KnowledgeShareLimits::default()
+                },
+            );
+
+            hook.execute(
+                &inbound(
+                    "KNOW: global-a | first finding within the daemon budget",
+                    Some("sender-a"),
+                ),
+                &Default::default(),
+            )
+            .await
+            .expect("fail-open hook");
+            await_ingest(&workspace, "sender-a", "global-a")
+                .await
+                .expect("first share ingested");
+
+            let outcome = hook
+                .execute(
+                    &inbound(
+                        "KNOW: global-b | second sender exceeds daemon budget",
+                        Some("sender-b"),
+                    ),
+                    &Default::default(),
+                )
+                .await;
+            assert!(matches!(
+                outcome,
+                Ok(HookOutcome::Continue { modified: None })
+            ));
+            assert!(
+                shared_note(&workspace, "sender-a", "global-a")
+                    .await
+                    .is_some()
+            );
+            assert!(
+                shared_note(&workspace, "sender-b", "global-b")
+                    .await
+                    .is_none()
+            );
+            assert_eq!(hook.global_window.lock().await.len(), 1);
         }
 
         #[tokio::test]
