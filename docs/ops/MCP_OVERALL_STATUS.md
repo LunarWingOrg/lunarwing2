@@ -54,8 +54,18 @@ Implemented through 2026-08-11:
 - CLI add/list/test/pin, doctor, startup, lifecycle management, conversational
   installation, extension status, and authenticated web installation support the
   new runtime types.
-- LunarWing provides the gateway client/routing contract, not a bundled gateway
-  control-plane service; operators may deploy and scale that service separately.
+- An optional bundled gateway provides bearer-authenticated route administration and
+  a `/mcp` data plane restricted to HTTPS upstreams. The listener itself is plain
+  HTTP and loopback-bound unless `LUNARWING_MCP_GATEWAY_CONTROL_ALLOW_NON_LOOPBACK=1`;
+  front it with an external TLS proxy when binding beyond loopback, since the admin
+  bearer token otherwise travels in cleartext. It strips host routing headers and
+  spoofed client authorization, streams `text/event-stream` responses chunk-by-chunk
+  with no cumulative cap while buffering other responses under the body cap, bounds
+  separate transient and SSE concurrency pools (so notification streams cannot
+  starve tool-call POSTs), bounds request-body reads, sanitizes upstream URLs in
+  logs/errors, and forwards content/session headers so persistent GET/SSE
+  notifications arrive without whole-body buffering.
+  Cross-daemon HA and centralized cross-tenant policy remain deployment concerns.
 - Explicit `host` and `job_worker` placement separates daemon and job activation.
   Legacy configs default to `host`; worker placement accepts stdio only.
 - Job creation takes an immutable owner-scoped snapshot of explicitly selected enabled
