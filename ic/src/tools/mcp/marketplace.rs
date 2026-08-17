@@ -46,6 +46,14 @@ pub const MAX_LOCKED_DEPENDENCIES: usize = 1_024;
 pub const MAX_CAPABILITIES: usize = 4_096;
 /// Timeout for one revocation-list fetch.
 const REVOCATION_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Maximum accepted size of a serialized marketplace catalog.
+pub const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum signed manifests in one marketplace catalog.
+pub const MAX_CATALOG_ENTRIES: usize = 2_048;
+/// Artifact kind for a stdio executable digest inside a [`PackageManifest`].
+pub const ARTIFACT_KIND_STDIO: &str = "stdio";
+/// Artifact kind for a MCP-over-WASM component digest inside a [`PackageManifest`].
+pub const ARTIFACT_KIND_WASM: &str = "wasm";
 
 /// Error returned by marketplace signing, lock, or revocation operations.
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +88,21 @@ pub enum MarketplaceError {
     RevocationFetch { url: String, reason: String },
     #[error("revocation cache IO error at '{path}': {reason}")]
     RevocationCacheIo { path: String, reason: String },
+    #[error("package '{package_id}' is not in the marketplace catalog")]
+    PackageNotInCatalog { package_id: String },
+    #[error("catalog fetch from '{url}' failed: {reason}")]
+    CatalogFetch { url: String, reason: String },
+    #[error("package '{package_id}' manifest has no '{kind}' artifact digest")]
+    ArtifactKindMissing { package_id: String, kind: String },
+    #[error(
+        "package '{package_id}' {kind} artifact digest mismatch: catalog pins {expected}, local artifact hashes {actual}"
+    )]
+    ArtifactDigestMismatch {
+        package_id: String,
+        kind: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Validate a publisher or package identifier: printable, bounded, no controls.
@@ -392,6 +415,150 @@ impl SignedPackageManifest {
             })?;
         signed.verify(store)?;
         Ok(signed)
+    }
+}
+
+/// A marketplace catalog: one verified [`SignedPackageManifest`] per package.
+///
+/// The catalog is the signed distribution point for the CLI install/upgrade
+/// flow. Every embedded manifest must carry a valid signature from a
+/// publisher in the operator's trust store before the catalog parses, so an
+/// untrusted catalog file fails closed. Revocation is checked separately
+/// against the [`RevocationStore`] at install/upgrade time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketplaceCatalog {
+    /// Catalog schema version; currently 1.
+    pub schema_version: u32,
+    /// Signed manifests, one per package identity.
+    #[serde(default)]
+    pub packages: Vec<SignedPackageManifest>,
+}
+
+impl MarketplaceCatalog {
+    /// Build a catalog from already-signed manifests.
+    pub fn new(packages: Vec<SignedPackageManifest>) -> Self {
+        Self {
+            schema_version: 1,
+            packages,
+        }
+    }
+
+    /// Structural validation independent of signatures.
+    pub fn validate(&self) -> Result<(), MarketplaceError> {
+        if self.schema_version != 1 {
+            return Err(MarketplaceError::InvalidData {
+                reason: format!("unsupported catalog schema_version {}", self.schema_version),
+            });
+        }
+        if self.packages.len() > MAX_CATALOG_ENTRIES {
+            return Err(MarketplaceError::InvalidData {
+                reason: format!("catalog exceeds {MAX_CATALOG_ENTRIES} packages"),
+            });
+        }
+        let mut seen = BTreeSet::new();
+        for signed in &self.packages {
+            signed.manifest.validate()?;
+            if !seen.insert(signed.manifest.package_id.clone()) {
+                return Err(MarketplaceError::InvalidData {
+                    reason: format!(
+                        "catalog contains duplicate package '{}'",
+                        signed.manifest.package_id
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a bounded JSON document, validating structure and verifying every
+    /// embedded publisher signature against the trust store.
+    pub fn from_json(bytes: &[u8], store: &PublisherTrustStore) -> Result<Self, MarketplaceError> {
+        if bytes.len() > MAX_CATALOG_BYTES {
+            return Err(MarketplaceError::InvalidData {
+                reason: format!("catalog exceeds {MAX_CATALOG_BYTES} bytes"),
+            });
+        }
+        let catalog: Self =
+            serde_json::from_slice(bytes).map_err(|error| MarketplaceError::InvalidData {
+                reason: format!("catalog JSON: {error}"),
+            })?;
+        catalog.verify(store)?;
+        Ok(catalog)
+    }
+
+    /// Verify structural validity and every embedded manifest signature.
+    pub fn verify(&self, store: &PublisherTrustStore) -> Result<(), MarketplaceError> {
+        self.validate()?;
+        for signed in &self.packages {
+            signed.verify(store)?;
+        }
+        Ok(())
+    }
+
+    /// Number of packages in the catalog.
+    pub fn len(&self) -> usize {
+        self.packages.len()
+    }
+
+    /// Whether the catalog holds no packages.
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty()
+    }
+
+    /// The verified manifest for one canonical package identity.
+    pub fn find(&self, package_id: &str) -> Option<&PackageManifest> {
+        self.packages
+            .iter()
+            .map(|signed| &signed.manifest)
+            .find(|manifest| manifest.package_id == package_id)
+    }
+
+    /// Require a package to exist, failing closed with a catalog-specific error.
+    pub fn require(&self, package_id: &str) -> Result<&PackageManifest, MarketplaceError> {
+        self.find(package_id)
+            .ok_or_else(|| MarketplaceError::PackageNotInCatalog {
+                package_id: package_id.to_string(),
+            })
+    }
+
+    /// Fetch a catalog over HTTPS (localhost HTTP allowed for harnesses) and
+    /// verify it against the trust store.
+    pub async fn fetch(
+        url: &str,
+        store: &PublisherTrustStore,
+        client: &reqwest::Client,
+    ) -> Result<Self, MarketplaceError> {
+        if !url.to_lowercase().starts_with("https://")
+            && !crate::tools::mcp::config::is_localhost_url(url)
+        {
+            return Err(MarketplaceError::CatalogFetch {
+                url: url.to_string(),
+                reason: "catalogs must be fetched over HTTPS".to_string(),
+            });
+        }
+        let response = client
+            .get(url)
+            .timeout(REVOCATION_FETCH_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| MarketplaceError::CatalogFetch {
+                url: url.to_string(),
+                reason: error.to_string(),
+            })?;
+        if !response.status().is_success() {
+            return Err(MarketplaceError::CatalogFetch {
+                url: url.to_string(),
+                reason: format!("HTTP {}", response.status()),
+            });
+        }
+        let bytes = read_bounded_body(response, MAX_CATALOG_BYTES, |reason| {
+            MarketplaceError::CatalogFetch {
+                url: url.to_string(),
+                reason,
+            }
+        })
+        .await?;
+        Self::from_json(&bytes, store)
     }
 }
 
@@ -902,7 +1069,13 @@ impl RevocationStore {
                 reason: format!("HTTP {}", response.status()),
             });
         }
-        let bytes = read_bounded_body(response, MAX_REVOCATION_LIST_BYTES).await?;
+        let bytes = read_bounded_body(response, MAX_REVOCATION_LIST_BYTES, |reason| {
+            MarketplaceError::RevocationFetch {
+                url: url.to_string(),
+                reason,
+            }
+        })
+        .await?;
         match self.apply_update(&bytes) {
             Ok(sequence) => Ok(Some(sequence)),
             Err(MarketplaceError::RevocationRollback { .. }) => Ok(None),
@@ -971,20 +1144,19 @@ impl RevocationStore {
     }
 }
 
-/// Read a response body with a hard byte cap.
+/// Read a response body with a hard byte cap, mapping stream errors through
+/// `map_error` so each caller surfaces its own fetch error variant.
 async fn read_bounded_body(
     response: reqwest::Response,
     limit: usize,
+    map_error: impl Fn(String) -> MarketplaceError,
 ) -> Result<Vec<u8>, MarketplaceError> {
     use futures::StreamExt;
 
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| MarketplaceError::RevocationFetch {
-            url: String::new(),
-            reason: error.to_string(),
-        })?;
+        let chunk = chunk.map_err(|error| map_error(error.to_string()))?;
         if body.len() + chunk.len() > limit {
             return Err(MarketplaceError::InvalidData {
                 reason: format!("response body exceeds {limit} bytes"),
@@ -1406,6 +1578,121 @@ mod tests {
         assert!(
             store
                 .fetch_and_apply("http://203.0.113.10/revocations.json", &client)
+                .await
+                .is_err()
+        );
+    }
+
+    fn second_manifest() -> PackageManifest {
+        let mut second = manifest();
+        second.package_id = "@acme/search".to_string();
+        second.artifacts = BTreeMap::from([("wasm".to_string(), "c".repeat(64))]);
+        second
+    }
+
+    #[test]
+    fn catalog_verifies_all_embedded_manifests() {
+        let catalog = MarketplaceCatalog::new(vec![
+            SignedPackageManifest::sign(manifest(), &publisher_key()),
+            SignedPackageManifest::sign(second_manifest(), &publisher_key()),
+        ]);
+        let store = trust_store();
+        catalog.verify(&store).expect("catalog verifies");
+
+        let json = serde_json::to_vec(&catalog).expect("serialize catalog");
+        let parsed = MarketplaceCatalog::from_json(&json, &store).expect("parse catalog");
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.find("@acme/files").is_some());
+        assert!(parsed.find("@acme/search").is_some());
+        assert!(parsed.find("@acme/missing").is_none());
+        assert!(matches!(
+            parsed
+                .require("@acme/missing")
+                .expect_err("missing package"),
+            MarketplaceError::PackageNotInCatalog { .. }
+        ));
+    }
+
+    #[test]
+    fn catalog_fails_closed_on_untrusted_entry() {
+        // One signed-by-unknown-publisher entry poisons the whole catalog.
+        let mut evil = second_manifest();
+        evil.publisher = "evil".to_string();
+        let catalog = MarketplaceCatalog::new(vec![
+            SignedPackageManifest::sign(manifest(), &publisher_key()),
+            SignedPackageManifest::sign(evil, &other_key()),
+        ]);
+        let store = trust_store();
+        let error = catalog
+            .verify(&store)
+            .expect_err("catalog must fail closed");
+        assert!(matches!(error, MarketplaceError::UntrustedPublisher { .. }));
+
+        let json = serde_json::to_vec(&catalog).expect("serialize");
+        assert!(MarketplaceCatalog::from_json(&json, &store).is_err());
+    }
+
+    #[test]
+    fn catalog_rejects_duplicates_and_bad_schema() {
+        let catalog = MarketplaceCatalog::new(vec![
+            SignedPackageManifest::sign(manifest(), &publisher_key()),
+            SignedPackageManifest::sign(manifest(), &publisher_key()),
+        ]);
+        assert!(catalog.validate().is_err());
+
+        let mut bad_schema = MarketplaceCatalog::new(vec![]);
+        bad_schema.schema_version = 99;
+        assert!(bad_schema.validate().is_err());
+    }
+
+    #[test]
+    fn catalog_size_bounds_fail_closed() {
+        let mut oversized = MarketplaceCatalog::new(vec![]);
+        oversized.packages = vec![
+            SignedPackageManifest::sign(manifest(), &publisher_key());
+            MAX_CATALOG_ENTRIES + 1
+        ];
+        assert!(oversized.validate().is_err());
+
+        let store = trust_store();
+        let json = serde_json::to_vec(&oversized).expect("serialize");
+        assert!(MarketplaceCatalog::from_json(&json, &store).is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_fetch_rejects_non_https_and_serves_verified_entries() {
+        use axum::{Router, routing::get};
+        use tokio::net::TcpListener;
+
+        let catalog = MarketplaceCatalog::new(vec![SignedPackageManifest::sign(
+            manifest(),
+            &publisher_key(),
+        )]);
+        let body = serde_json::to_vec(&catalog).expect("serialize catalog");
+        let app = Router::new().route(
+            "/catalog.json",
+            get(move || {
+                let body = body.clone();
+                async move { body }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let url = format!(
+            "http://{}/catalog.json",
+            listener.local_addr().expect("addr")
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let store = trust_store();
+        let client = reqwest::Client::new();
+        let fetched = MarketplaceCatalog::fetch(&url, &store, &client)
+            .await
+            .expect("fetch verified catalog");
+        assert_eq!(fetched.len(), 1);
+
+        // Plain HTTP to a non-loopback host is refused before any request.
+        assert!(
+            MarketplaceCatalog::fetch("http://203.0.113.10/catalog.json", &store, &client)
                 .await
                 .is_err()
         );
