@@ -160,7 +160,7 @@ fn is_coordination_query(content: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("QUERY:"))
 }
 
-fn is_knowledge_share_record(content: &str) -> bool {
+pub(crate) fn is_knowledge_share_record(content: &str) -> bool {
     let trimmed = content.trim_start();
     let tag = crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG;
     trimmed
