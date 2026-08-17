@@ -144,6 +144,17 @@ These are validation and coverage tasks, not known production-code defects.
   (`refresh_marketplace_revocations`), and manual activation re-checks the
   cached list. (Operator-pinned stdio executable and WASM component digests,
   package identity, trust state, and revocation are implemented.)
+  **Update (2026-08-17, MCP part 3 / `aj/kimi-18-20260817-0001`):** the CLI
+  install/upgrade flow is implemented. `MarketplaceCatalog`
+  (`ic/src/tools/mcp/marketplace.rs`) holds one verified
+  `SignedPackageManifest` per package; `lunarwing mcp install <package>` and
+  `lunarwing mcp upgrade <server>` load a catalog from `--file`/`--url`,
+  verify every publisher signature against the configured trust store, refuse
+  revoked packages, pin the local stdio/WASM artifact, require the pinned
+  digest to match the signed catalog digest, and support `--dry-run`/`--no-db`.
+  Still deferred in this flow: per-package `SignedDependencyLockfile`
+  enforcement during install and automatic artifact download (artifacts must
+  already be staged locally).
 - Device-level sandboxing beyond the current baseline. (Opt-in host sandboxing
   for stdio servers — resource limits, core-dump control, process-group
   isolation, no_new_privileges, seccomp ptrace/process_vm denial, Landlock
