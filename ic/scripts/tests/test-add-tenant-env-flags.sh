@@ -125,6 +125,8 @@ assert_eq "default coordination knowledge publishers empty" \
   "$(envval COORD_KNOWLEDGE_PUBLISHERS)" ""
 assert_eq "default coordination knowledge hourly cap" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "30"
+assert_eq "default coordination knowledge global hourly cap" \
+  "$(envval COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)" "300"
 assert_eq "default coordination knowledge minimum length" \
   "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "12"
 assert_eq "coordination admin token generated" \
@@ -157,6 +159,7 @@ sed -i \
   -e 's/^COORD_KNOWLEDGE_PUBLISH=.*/COORD_KNOWLEDGE_PUBLISH=true/' \
   -e 's/^COORD_KNOWLEDGE_PUBLISHERS=.*/COORD_KNOWLEDGE_PUBLISHERS=ops-bot@conf.example\/res/' \
   -e 's/^COORD_KNOWLEDGE_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_MAX_PER_HOUR=77/' \
+  -e 's/^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=777/' \
   -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=24/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
@@ -187,6 +190,8 @@ assert_eq "rerun preserves COORD_KNOWLEDGE_PUBLISHERS" \
   "$(envval COORD_KNOWLEDGE_PUBLISHERS)" "ops-bot@conf.example/res"
 assert_eq "rerun preserves COORD_KNOWLEDGE_MAX_PER_HOUR" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "77"
+assert_eq "rerun preserves COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR" \
+  "$(envval COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)" "777"
 assert_eq "rerun preserves COORD_KNOWLEDGE_MIN_CHARS" \
   "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "24"
 assert_eq "rerun preserves COORD_ADMIN_TOKEN" "$(envval COORD_ADMIN_TOKEN)" "preserved-coord-token"
@@ -232,6 +237,8 @@ assert_eq "backfill coordination knowledge disabled" \
   "$(envval COORD_KNOWLEDGE_SHARE)" "false"
 assert_eq "backfill coordination knowledge hourly cap" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "30"
+assert_eq "backfill coordination knowledge global hourly cap" \
+  "$(envval COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)" "300"
 assert_eq "backfill coordination knowledge minimum length" \
   "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "12"
 assert_eq "backfill coordination admin users" "$(envval COORD_ADMIN_USERS)" ""
@@ -241,6 +248,7 @@ assert_eq "backfill coordination admin port" "$(envval COORD_ADMIN_PORT)" "20009
 sed -i \
   -e 's/^COORD_KNOWLEDGE_SHARE=.*/COORD_KNOWLEDGE_SHARE=true/' \
   -e 's/^COORD_KNOWLEDGE_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_MAX_PER_HOUR=88/' \
+  -e 's/^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=888/' \
   -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=20/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=backfill-preserved/' \
   "$MT_FIXTURE/env/lunarwing.env"
@@ -249,6 +257,8 @@ assert_eq "backfill knowledge opt-in remains stable" \
   "$(envval COORD_KNOWLEDGE_SHARE)" "true"
 assert_eq "backfill knowledge hourly cap remains stable" \
   "$(envval COORD_KNOWLEDGE_MAX_PER_HOUR)" "88"
+assert_eq "backfill knowledge global hourly cap remains stable" \
+  "$(envval COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)" "888"
 assert_eq "backfill knowledge minimum remains stable" \
   "$(envval COORD_KNOWLEDGE_MIN_CHARS)" "20"
 assert_eq "backfill token remains stable" "$(envval COORD_ADMIN_TOKEN)" "backfill-preserved"
