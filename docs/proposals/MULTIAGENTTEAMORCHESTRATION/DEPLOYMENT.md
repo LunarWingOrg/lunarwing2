@@ -186,7 +186,9 @@ violation strike (three strikes auto-disable). Enabling
 `COORD_KNOWLEDGE_PUBLISH` therefore asserts the operator has confirmed every
 participant of every configured coordination room accepts the tag. Until it
 is enabled, the per-turn coordination instruction never teaches the model the
-`KNOW:` wire format, so mixed-version fleets stay safe by default.
+`KNOW:` wire format, and the outbound schema hook rejects manually produced
+`KNOW:` records as a final fail-closed guard, so mixed-version fleets stay safe
+by default.
 
 Ingestion is additionally restricted to an explicit sender allowlist
 (`COORD_KNOWLEDGE_PUBLISHERS`). Room occupancy is not authentication: any
