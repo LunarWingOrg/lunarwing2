@@ -70,9 +70,6 @@ pub struct KnowledgeShareLimits {
     /// Max ingested notes per sender per hour
     /// (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, maximum 1000).
     pub max_per_hour: usize,
-    /// Max ingested notes across all senders per daemon per hour
-    /// (`COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`, default 300, maximum 10000).
-    pub global_max_per_hour: usize,
     /// Minimum finding length in characters (`COORD_KNOWLEDGE_MIN_CHARS`,
     /// default 12, maximum the coordination message cap).
     pub min_chars: usize,
@@ -91,7 +88,6 @@ impl Default for KnowledgeShareLimits {
     fn default() -> Self {
         Self {
             max_per_hour: DEFAULT_MAX_PER_HOUR,
-            global_max_per_hour: DEFAULT_GLOBAL_MAX_PER_HOUR,
             min_chars: DEFAULT_MIN_CHARS,
             publishers: Vec::new(),
         }
@@ -107,12 +103,6 @@ impl KnowledgeShareLimits {
             1..=MAX_CONFIGURED_PER_HOUR,
             |value| limits.max_per_hour = value,
             DEFAULT_MAX_PER_HOUR,
-        );
-        apply_bounded_env(
-            "COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR",
-            1..=MAX_CONFIGURED_GLOBAL_PER_HOUR,
-            |value| limits.global_max_per_hour = value,
-            DEFAULT_GLOBAL_MAX_PER_HOUR,
         );
         apply_bounded_env(
             "COORD_KNOWLEDGE_MIN_CHARS",
@@ -171,6 +161,17 @@ fn apply_bounded_env(
             "invalid coordination knowledge limit; using default"
         ),
     }
+}
+
+fn global_max_per_hour_from_env() -> usize {
+    let mut limit = DEFAULT_GLOBAL_MAX_PER_HOUR;
+    apply_bounded_env(
+        "COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR",
+        1..=MAX_CONFIGURED_GLOBAL_PER_HOUR,
+        |value| limit = value,
+        DEFAULT_GLOBAL_MAX_PER_HOUR,
+    );
+    limit
 }
 
 /// Parsed `KNOW:` share payload.
@@ -320,6 +321,7 @@ pub struct KnowledgeShareHook {
     ingest_lock: Arc<Mutex<()>>,
     /// Daemon-wide ingress window, independent of per-sender buckets.
     global_window: Arc<Mutex<Vec<Instant>>>,
+    global_max_per_hour: usize,
 }
 
 impl KnowledgeShareHook {
@@ -336,6 +338,7 @@ impl KnowledgeShareHook {
             max_message_chars: DEFAULT_MAX_MESSAGE_LENGTH,
             ingest_lock: Arc::new(Mutex::new(())),
             global_window: Arc::new(Mutex::new(Vec::new())),
+            global_max_per_hour: global_max_per_hour_from_env(),
         }
     }
 
@@ -345,11 +348,17 @@ impl KnowledgeShareHook {
         self
     }
 
+    #[cfg(test)]
+    fn with_global_max_per_hour(mut self, limit: usize) -> Self {
+        self.global_max_per_hour = limit.max(1);
+        self
+    }
+
     async fn try_consume_global_limit(&self) -> bool {
         let now = Instant::now();
         let mut window = self.global_window.lock().await;
         window.retain(|timestamp| now.duration_since(*timestamp) < INGEST_WINDOW);
-        if window.len() >= self.limits.global_max_per_hour {
+        if window.len() >= self.global_max_per_hour {
             return false;
         }
         window.push(now);
@@ -521,7 +530,7 @@ impl Hook for KnowledgeShareHook {
             tracing::warn!(
                 sender,
                 topic = %message.topic,
-                limit = self.limits.global_max_per_hour,
+                limit = self.global_max_per_hour,
                 "coordination knowledge share global rate limit reached; note not ingested"
             );
             return Ok(HookOutcome::ok());
@@ -993,11 +1002,11 @@ mod tests {
                 Arc::clone(&workspace),
                 KnowledgeShareLimits {
                     max_per_hour: 10,
-                    global_max_per_hour: 1,
                     publishers: vec!["sender-a".to_string(), "sender-b".to_string()],
                     ..KnowledgeShareLimits::default()
                 },
-            );
+            )
+            .with_global_max_per_hour(1);
 
             hook.execute(
                 &inbound(
