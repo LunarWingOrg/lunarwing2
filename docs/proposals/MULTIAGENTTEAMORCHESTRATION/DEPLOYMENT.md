@@ -187,9 +187,10 @@ violation strike (three strikes auto-disable). Enabling
 participant of every configured coordination room accepts the tag. Until it
 is enabled, the per-turn coordination instruction never teaches the model the
 `KNOW:` wire format. The outbound schema hook rejects manually produced
-`KNOW:` responses, and the `message` tool applies the same exact-room policy
-before any direct channel broadcast, so mixed-version fleets stay safe by
-default.
+`KNOW:` responses, the `message` tool applies the same exact-room policy before
+direct broadcasts, and `ChannelManager` enforces it again at the common delivery
+boundary for responses, missions, heartbeat/routine notifications, and all
+proactive broadcasts. Mixed-version fleets therefore stay safe by default.
 
 Ingestion is additionally restricted to an explicit sender allowlist
 (`COORD_KNOWLEDGE_PUBLISHERS`). Room occupancy is not authentication: any
