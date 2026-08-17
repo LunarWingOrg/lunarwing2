@@ -725,6 +725,87 @@ mod tests {
             assert_eq!(meta.submitted_by.as_deref(), Some(sender));
             assert_eq!(meta.tags, vec![COORDINATION_TAG.to_string()]);
             assert!(meta.confidence.is_none());
+
+            let hits = workspace
+                .knowledge_search(
+                    &["shared".to_string()],
+                    "bounded builds tenant subtrees",
+                    &crate::workspace::KnowledgeFilter::default(),
+                    10,
+                )
+                .await
+                .expect("search ingested share");
+            assert!(hits.iter().any(|hit| hit.meta == meta));
+        }
+
+        #[tokio::test]
+        async fn configured_message_cap_is_enforced_before_ingest() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "bounded-sender";
+            let hook =
+                hook(Arc::clone(&workspace), limits_for(&[sender])).with_max_message_chars(40);
+
+            hook.execute(
+                &inbound(
+                    "KNOW: capped-topic | this finding exceeds the configured room cap",
+                    Some(sender),
+                ),
+                &Default::default(),
+            )
+            .await
+            .expect("fail-open hook");
+
+            assert!(
+                shared_note(&workspace, sender, "capped-topic")
+                    .await
+                    .is_none()
+            );
+            assert!(hook.global_window.lock().await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn secret_hook_rejects_before_knowledge_ingest() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "secret-sender";
+            let state = CoordinationState::new(
+                vec!["coord@conference.example".to_string()],
+                Vec::new(),
+                None,
+            );
+            let registry = crate::hooks::HookRegistry::new();
+            registry
+                .register_with_priority(
+                    Arc::new(crate::hooks::coordination::SecretEntropyHook::new(
+                        state.clone(),
+                        "local-agent".to_string(),
+                        4.8,
+                        32,
+                    )),
+                    5,
+                )
+                .await;
+            let knowledge = Arc::new(KnowledgeShareHook::new(
+                state,
+                Arc::clone(&workspace),
+                limits_for(&[sender]),
+            ));
+            registry.register_with_priority(knowledge.clone(), 13).await;
+
+            let result = registry
+                .run(&inbound(
+                    "KNOW: secret-order | api_key=abcdefghijklmnop",
+                    Some(sender),
+                ))
+                .await;
+            assert!(matches!(result, Err(HookError::Rejected { .. })));
+            assert!(
+                shared_note(&workspace, sender, "secret-order")
+                    .await
+                    .is_none()
+            );
+            assert!(knowledge.global_window.lock().await.is_empty());
         }
 
         #[tokio::test]
@@ -781,6 +862,56 @@ mod tests {
             assert!(limits.is_allowed_publisher("Rarity"));
             assert!(!limits.is_allowed_publisher("applejack@conf.example/other"));
             assert!(!limits.is_allowed_publisher("stranger"));
+        }
+
+        #[tokio::test]
+        async fn ownership_mismatch_refuses_existing_wire_path() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "owner-a";
+            let topic = "owned-topic";
+            let path = note_path(&sender_agent_slug(sender), topic);
+            let foreign_meta = KnowledgeNoteMeta {
+                topic: topic.to_string(),
+                agent: sender_agent_slug(sender),
+                title: "Foreign note".to_string(),
+                status: KnowledgeStatus::Active,
+                confidence: Some(1.0),
+                studied_at: None,
+                source_commit: Some("verified".to_string()),
+                tags: vec!["local".to_string()],
+                superseded_by: None,
+                submitted_by: Some("different-owner".to_string()),
+                session_id: None,
+            };
+            let original = render_note_markdown("Foreign note", "verified local content");
+            workspace
+                .write(&path, &original)
+                .await
+                .expect("seed foreign note");
+            workspace
+                .set_document_metadata(&path, &foreign_meta.to_metadata_json())
+                .await
+                .expect("seed foreign metadata");
+            let hook = hook(Arc::clone(&workspace), limits_for(&[sender]));
+
+            hook.execute(
+                &inbound(
+                    "KNOW: owned-topic | replacement must be refused",
+                    Some(sender),
+                ),
+                &Default::default(),
+            )
+            .await
+            .expect("fail-open hook");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let document = workspace
+                .read_primary(&path)
+                .await
+                .expect("read foreign note");
+            assert_eq!(document.content, original);
+            assert_eq!(document.metadata, foreign_meta.to_metadata_json());
         }
 
         #[tokio::test]
