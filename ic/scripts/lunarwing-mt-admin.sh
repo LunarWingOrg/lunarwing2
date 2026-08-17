@@ -4426,7 +4426,7 @@ write_tenant_lunarwing_env() {
   # break the already-registered XMPP account. Generate fresh ONLY on first write.
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
   local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
-  local coord_knowledge_share coord_knowledge_max_per_hour coord_knowledge_min_chars
+  local coord_knowledge_share coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
@@ -4442,6 +4442,7 @@ write_tenant_lunarwing_env() {
   coord_knowledge_publish="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISH)"; coord_knowledge_publish="${coord_knowledge_publish:-false}"
   coord_knowledge_publishers="$(_env_existing "$path" COORD_KNOWLEDGE_PUBLISHERS)"; coord_knowledge_publishers="${coord_knowledge_publishers:-}"
   coord_knowledge_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_MAX_PER_HOUR)"; coord_knowledge_max_per_hour="${coord_knowledge_max_per_hour:-30}"
+  coord_knowledge_global_max_per_hour="$(_env_existing "$path" COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR)"; coord_knowledge_global_max_per_hour="${coord_knowledge_global_max_per_hour:-300}"
   coord_knowledge_min_chars="$(_env_existing "$path" COORD_KNOWLEDGE_MIN_CHARS)"; coord_knowledge_min_chars="${coord_knowledge_min_chars:-12}"
   coord_admin_users="$(_env_existing "$path" COORD_ADMIN_USERS)"
   coord_admin_token="$(_env_existing "$path" COORD_ADMIN_TOKEN)"; coord_admin_token="${coord_admin_token:-$(generate_token)}"
@@ -4569,6 +4570,7 @@ COORD_KNOWLEDGE_SHARE=$coord_knowledge_share
 COORD_KNOWLEDGE_PUBLISH=$coord_knowledge_publish
 COORD_KNOWLEDGE_PUBLISHERS=$coord_knowledge_publishers
 COORD_KNOWLEDGE_MAX_PER_HOUR=$coord_knowledge_max_per_hour
+COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=$coord_knowledge_global_max_per_hour
 COORD_KNOWLEDGE_MIN_CHARS=$coord_knowledge_min_chars
 COORD_ADMIN_USERS=$coord_admin_users
 COORD_ADMIN_TOKEN=$coord_admin_token
@@ -6123,6 +6125,10 @@ patch_tenant_coordination_env() {
   if ! grep -q '^COORD_KNOWLEDGE_MAX_PER_HOUR=' "$env_path"; then
     printf 'COORD_KNOWLEDGE_MAX_PER_HOUR=30\n' >>"$env_path"
     say "added COORD_KNOWLEDGE_MAX_PER_HOUR=30 to $env_path"
+  fi
+  if ! grep -q '^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=' "$env_path"; then
+    printf 'COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300\n' >>"$env_path"
+    say "added COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=300 to $env_path"
   fi
   if ! grep -q '^COORD_KNOWLEDGE_MIN_CHARS=' "$env_path"; then
     printf 'COORD_KNOWLEDGE_MIN_CHARS=12\n' >>"$env_path"
