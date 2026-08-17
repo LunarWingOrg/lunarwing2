@@ -160,6 +160,15 @@ fn is_coordination_query(content: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("QUERY:"))
 }
 
+fn is_knowledge_share_record(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    let tag = crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG;
+    trimmed
+        .get(..tag.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+        && trimmed.as_bytes().get(tag.len()) == Some(&b':')
+}
+
 fn elected_responder<'a>(correlation_id: &str, roster: &'a [String]) -> Option<&'a str> {
     roster
         .iter()
@@ -311,6 +320,17 @@ impl CoordinationHookConfig {
             tags.push(crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG.to_string());
         }
         tags
+    }
+
+    /// Whether a direct channel send would bypass the disabled KNOW publish gate.
+    pub fn blocks_knowledge_publish(&self, target: &str, content: &str) -> bool {
+        self.is_actionable()
+            && !self.knowledge_publish_enabled
+            && self
+                .coordination_channels
+                .iter()
+                .any(|channel| channel.eq_ignore_ascii_case(target))
+            && is_knowledge_share_record(content)
     }
 }
 
@@ -1005,15 +1025,6 @@ impl TagSchemaHook {
             }
         })
     }
-
-    fn is_knowledge_record(content: &str) -> bool {
-        let trimmed = content.trim_start();
-        let tag = crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG;
-        trimmed
-            .get(..tag.len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
-            && trimmed.as_bytes().get(tag.len()) == Some(&b':')
-    }
 }
 
 #[async_trait]
@@ -1052,7 +1063,7 @@ impl Hook for TagSchemaHook {
         }
         if !matches!(event, HookEvent::Inbound { .. })
             && !self.knowledge_publish_enabled
-            && Self::is_knowledge_record(content)
+            && is_knowledge_share_record(content)
         {
             tracing::warn!(
                 agent,
@@ -1568,6 +1579,20 @@ mod tests {
             .expect("configured room");
         assert!(!instruction.contains("KNOW"));
         assert!(!instruction.contains("followed by a colon: STATUS, KNOW"));
+        assert!(config.blocks_knowledge_publish(
+            "COORD@conference.example",
+            "know: topic | finding long enough"
+        ));
+        assert!(!config.blocks_knowledge_publish(
+            "other@conference.example",
+            "KNOW: topic | finding long enough"
+        ));
+        assert!(
+            !config.blocks_knowledge_publish(
+                "coord@conference.example",
+                "KNOWLEDGE: not the wire tag"
+            )
+        );
 
         // Emission requires the explicit fleet-readiness opt-in.
         config.knowledge_publish_enabled = true;
@@ -1577,6 +1602,10 @@ mod tests {
             .expect("configured room");
         assert!(instruction.contains("followed by a colon: STATUS, KNOW"));
         assert!(instruction.contains("KNOW: <topic-slug> | <one-line finding>"));
+        assert!(!config.blocks_knowledge_publish(
+            "coord@conference.example",
+            "KNOW: topic | finding long enough"
+        ));
     }
 
     #[tokio::test]
