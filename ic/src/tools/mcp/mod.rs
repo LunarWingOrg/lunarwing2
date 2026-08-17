@@ -66,8 +66,9 @@ pub use gateway_control::{
     GatewayControlConfig, GatewayControlError, GatewayControlPlane, GatewayRoute,
 };
 pub use marketplace::{
-    DependencyLockfile, LockedDependency, ManifestDiff, MarketplaceError, PackageManifest,
-    PublisherSigningKey, PublisherTrustStore, RevocationEntry, RevocationList, RevocationStore,
+    ARTIFACT_KIND_STDIO, ARTIFACT_KIND_WASM, DependencyLockfile, LockedDependency, ManifestDiff,
+    MarketplaceCatalog, MarketplaceError, PackageManifest, PublisherSigningKey,
+    PublisherTrustStore, RevocationEntry, RevocationList, RevocationStore,
     SignedDependencyLockfile, SignedPackageManifest, SignedRevocationList, diff_manifests,
 };
 pub use process::{McpProcessManager, McpProcessState};

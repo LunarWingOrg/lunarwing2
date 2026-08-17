@@ -2,8 +2,9 @@
 //!
 //! Commands for adding, removing, authenticating, and testing MCP servers.
 
+use std::collections::BTreeMap;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Args, Subcommand};
@@ -12,11 +13,15 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::secrets::SecretsStore;
 use crate::tools::mcp::{
-    McpGatewayMode, McpPlacement, McpProcessManager, McpServerConfig, McpSessionManager,
-    OAuthConfig,
+    MarketplaceCatalog, McpGatewayMode, McpPlacement, McpProcessManager, McpServerConfig,
+    McpSessionManager, OAuthConfig,
     auth::{authorize_mcp_server, is_authenticated},
     config::{self, EffectiveTransport, McpServersFile},
     factory::create_client_from_config_with_external_runtimes,
+    marketplace::{
+        ARTIFACT_KIND_STDIO, ARTIFACT_KIND_WASM, ManifestDiff, MarketplaceError,
+        PublisherTrustStore,
+    },
     provenance::{McpPackageProvenance, PackageEcosystem, PackageTrust, ProvenanceIdentity},
     sandbox::McpSandboxConfig,
 };
@@ -369,6 +374,76 @@ pub enum McpCommand {
         #[arg(long)]
         offline: bool,
     },
+
+    /// Install an MCP server package from a signed marketplace catalog
+    Install(Box<McpMarketplaceInstallArgs>),
+
+    /// Upgrade an installed MCP server package from a signed marketplace catalog
+    Upgrade(Box<McpMarketplaceUpgradeArgs>),
+}
+
+/// Shared flags for marketplace catalog install/upgrade.
+#[derive(Args, Debug, Clone)]
+pub struct McpMarketplaceCatalogArgs {
+    /// Local path to a signed catalog JSON file
+    #[arg(long, conflicts_with = "url")]
+    pub file: Option<PathBuf>,
+
+    /// HTTPS URL serving a signed catalog JSON document
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// Show the manifest diff / plan without writing configuration
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Manage configuration on disk instead of the database
+    #[arg(long)]
+    pub no_db: bool,
+}
+
+/// `mcp install` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct McpMarketplaceInstallArgs {
+    #[command(flatten)]
+    pub catalog: McpMarketplaceCatalogArgs,
+
+    /// Canonical package identity from the catalog (e.g. `@acme/files`)
+    pub package: String,
+
+    /// Local server name to install as (defaults to the package identity)
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Executable command to run for stdio packages
+    #[arg(long, conflicts_with = "component")]
+    pub command: Option<String>,
+
+    /// Arguments for the stdio command
+    #[arg(long)]
+    pub args: Option<Vec<String>>,
+
+    /// Local MCP-over-WASM component file for wasm packages
+    #[arg(long)]
+    pub component: Option<PathBuf>,
+}
+
+/// `mcp upgrade` arguments.
+#[derive(Args, Debug, Clone)]
+pub struct McpMarketplaceUpgradeArgs {
+    #[command(flatten)]
+    pub catalog: McpMarketplaceCatalogArgs,
+
+    /// Local server name whose package should be upgraded
+    pub name: String,
+
+    /// Local stdio executable to pin after upgrade (defaults to the existing command)
+    #[arg(long)]
+    pub command: Option<String>,
+
+    /// Local MCP-over-WASM component to pin after upgrade (defaults to the existing component)
+    #[arg(long)]
+    pub component: Option<PathBuf>,
 }
 
 fn parse_header(s: &str) -> Result<(String, String), String> {
@@ -479,6 +554,8 @@ pub async fn run_mcp_command(
             token,
             offline,
         } => revoke_server(name, url, token, offline, config_path, no_db).await,
+        McpCommand::Install(args) => install_marketplace_package(*args, config_path).await,
+        McpCommand::Upgrade(args) => upgrade_marketplace_package(*args, config_path).await,
     }
 }
 
@@ -1513,6 +1590,358 @@ fn print_provenance(provenance: &McpPackageProvenance) {
         println!("    Component SHA-256: {digest}");
     }
     println!("    Recorded: {}", provenance.recorded_at);
+}
+
+/// Load a signed marketplace catalog from `--file` or `--url`, verifying every
+/// embedded manifest against the configured publisher trust store.
+async fn load_marketplace_catalog(
+    args: &McpMarketplaceCatalogArgs,
+) -> anyhow::Result<MarketplaceCatalog> {
+    let servers = config::load_mcp_servers().await?;
+    let Some(marketplace) = servers.marketplace.as_ref() else {
+        anyhow::bail!(
+            "No marketplace section in mcp-servers.json; marketplace install requires a configured trust store"
+        );
+    };
+    let Some(trust_path) = marketplace.trust_store_path.as_ref() else {
+        anyhow::bail!(
+            "Marketplace configuration has no trust_store_path; cannot verify catalog signatures"
+        );
+    };
+    let store = load_publisher_trust_store(trust_path)?;
+
+    match (args.file.as_ref(), args.url.as_ref()) {
+        (Some(path), None) => {
+            let bytes = std::fs::read(path).map_err(|error| {
+                anyhow::anyhow!("cannot read catalog '{}': {error}", path.display())
+            })?;
+            MarketplaceCatalog::from_json(&bytes, &store)
+                .map_err(|error| anyhow::anyhow!("catalog verification failed: {error}"))
+        }
+        (None, Some(url)) => MarketplaceCatalog::fetch(url, &store, &reqwest::Client::new())
+            .await
+            .map_err(|error| anyhow::anyhow!("catalog fetch failed: {error}")),
+        _ => anyhow::bail!("exactly one of --file or --url is required"),
+    }
+}
+
+/// Load and verify the publisher trust store (bounded, fail-closed).
+fn load_publisher_trust_store(path: &Path) -> anyhow::Result<PublisherTrustStore> {
+    let metadata = std::fs::metadata(path).map_err(|error| {
+        anyhow::anyhow!("cannot stat trust store '{}': {error}", path.display())
+    })?;
+    if metadata.len() > 256 * 1024 {
+        anyhow::bail!("trust store '{}' exceeds 256 KiB", path.display());
+    }
+    let bytes = std::fs::read(path).map_err(|error| {
+        anyhow::anyhow!("cannot read trust store '{}': {error}", path.display())
+    })?;
+    let file: crate::tools::mcp::marketplace::PublisherTrustStoreFile =
+        serde_json::from_slice(&bytes)
+            .map_err(|error| anyhow::anyhow!("invalid trust store JSON: {error}"))?;
+    PublisherTrustStore::from_file(file).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Whether the current revocation list blocks installing this manifest.
+fn manifest_revoked(
+    servers: &McpServersFile,
+    manifest: &crate::tools::mcp::PackageManifest,
+) -> anyhow::Result<bool> {
+    let Some(marketplace) = servers.marketplace.as_ref() else {
+        return Ok(false);
+    };
+    let Some(store) = marketplace
+        .revocation_store()
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+    else {
+        return Ok(false);
+    };
+    Ok(store.is_revoked(
+        &manifest.package_id,
+        Some(&manifest.version),
+        manifest.artifacts.values().next().map(String::as_str),
+    ))
+}
+
+/// Resolve the local runtime artifact for a marketplace package and pin it
+/// against the catalog's signed digest.
+fn pin_marketplace_artifact(
+    manifest: &crate::tools::mcp::PackageManifest,
+    command: Option<&str>,
+    component: Option<&Path>,
+) -> anyhow::Result<McpPackageProvenance> {
+    let identity = ProvenanceIdentity {
+        package_id: Some(manifest.package_id.clone()),
+        ecosystem: manifest.ecosystem,
+        version: Some(manifest.version.clone()),
+        source: None,
+        publisher: Some(manifest.publisher.clone()),
+    };
+    match (command, component) {
+        (Some(command), None) => McpPackageProvenance::pin_for_command(command, identity)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+        (None, Some(path)) => McpPackageProvenance::pin_for_component(path, identity)
+            .map_err(|error| anyhow::anyhow!("{error}")),
+        _ => anyhow::bail!(
+            "package '{}' needs exactly one runtime artifact: --command for stdio or --component for wasm",
+            manifest.package_id
+        ),
+    }
+}
+
+/// Fail unless the catalog manifest pins the artifact kind being installed and
+/// the pinned local digest matches the catalog digest.
+fn verify_catalog_artifact_pin(
+    provenance: &McpPackageProvenance,
+    manifest: &crate::tools::mcp::PackageManifest,
+    kind: &str,
+) -> anyhow::Result<()> {
+    let Some(expected) = manifest.artifacts.get(kind) else {
+        return Err(anyhow::anyhow!(MarketplaceError::ArtifactKindMissing {
+            package_id: manifest.package_id.clone(),
+            kind: kind.to_string(),
+        }));
+    };
+    let actual = if kind == ARTIFACT_KIND_STDIO {
+        provenance.command_sha256.as_deref()
+    } else {
+        provenance.component_sha256.as_deref()
+    };
+    let Some(actual) = actual else {
+        anyhow::bail!(
+            "pinned provenance for '{}' has no {kind} digest",
+            manifest.package_id
+        );
+    };
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(anyhow::anyhow!(MarketplaceError::ArtifactDigestMismatch {
+            package_id: manifest.package_id.clone(),
+            kind: kind.to_string(),
+            expected: expected.clone(),
+            actual: actual.to_string(),
+        }));
+    }
+    Ok(())
+}
+
+/// Print a manifest diff for operator review.
+fn print_manifest_diff(diff: &ManifestDiff) {
+    println!("  Manifest changes:");
+    for cap in &diff.added_capabilities {
+        println!("    + capability: {cap}");
+    }
+    for cap in &diff.removed_capabilities {
+        println!("    - capability: {cap}");
+    }
+    for dep in diff
+        .added_dependencies
+        .iter()
+        .chain(diff.removed_dependencies.iter())
+    {
+        println!("    ± dependency: {dep}");
+    }
+    for dep in &diff.changed_dependencies {
+        println!("    ~ dependency pin changed: {dep}");
+    }
+    for kind in &diff.changed_artifacts {
+        println!("    ~ artifact digest changed: {kind}");
+    }
+    if diff.added_capabilities.is_empty()
+        && diff.removed_capabilities.is_empty()
+        && diff.added_dependencies.is_empty()
+        && diff.removed_dependencies.is_empty()
+        && diff.changed_dependencies.is_empty()
+        && diff.changed_artifacts.is_empty()
+    {
+        println!("    (no capability, dependency, or artifact changes)");
+    }
+}
+
+/// Install an MCP server package from a signed marketplace catalog.
+async fn install_marketplace_package(
+    args: McpMarketplaceInstallArgs,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let catalog_args = args.catalog.clone();
+    let catalog = load_marketplace_catalog(&catalog_args).await?;
+    let manifest = catalog
+        .require(&args.package)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    let servers = config::load_mcp_servers().await?;
+    if manifest_revoked(&servers, manifest)? {
+        anyhow::bail!(
+            "package '{}' version '{}' is revoked by the marketplace revocation list",
+            manifest.package_id,
+            manifest.version
+        );
+    }
+
+    let name = args.name.clone().unwrap_or_else(|| args.package.clone());
+    if servers.get(&name).is_some() {
+        anyhow::bail!(
+            "server '{name}' already exists; use `lunarwing mcp upgrade {name}` or a different --name"
+        );
+    }
+
+    let provenance =
+        pin_marketplace_artifact(manifest, args.command.as_deref(), args.component.as_deref())?;
+    let kind = if provenance.component_sha256.is_some() {
+        ARTIFACT_KIND_WASM
+    } else {
+        ARTIFACT_KIND_STDIO
+    };
+    verify_catalog_artifact_pin(&provenance, manifest, kind)?;
+
+    let mut server = match (args.command.as_deref(), args.component.as_deref()) {
+        (Some(command), None) => {
+            let mut transport_config =
+                McpServerConfig::new(name.clone(), "stdio://local".to_string());
+            transport_config.transport = Some(crate::tools::mcp::McpTransportConfig::Stdio {
+                command: command.to_string(),
+                args: args.args.clone().unwrap_or_default(),
+                env: std::collections::HashMap::new(),
+                env_secrets: std::collections::HashMap::new(),
+            });
+            transport_config
+        }
+        (None, Some(path)) => {
+            let mut wasm_config = McpServerConfig::new(name.clone(), "wasm://local".to_string());
+            wasm_config.transport = Some(crate::tools::mcp::McpTransportConfig::Wasm {
+                component_path: path.to_path_buf(),
+                memory_mb: 64,
+                fuel: 1_000_000_000,
+                timeout_seconds: 30,
+            });
+            wasm_config
+        }
+        _ => anyhow::bail!("exactly one of --command or --component is required"),
+    };
+    server.description = Some(format!(
+        "Installed from marketplace publisher '{}'",
+        manifest.publisher
+    ));
+    server.provenance = Some(provenance);
+
+    println!(
+        "  Install plan for '{name}' ({} {}):",
+        manifest.package_id, manifest.version
+    );
+    println!("    Capabilities: {}", manifest.capabilities.join(", "));
+    if args.catalog.dry_run {
+        println!("  Dry run: no configuration written.");
+        return Ok(());
+    }
+
+    persist_server_with_path(server, false, config_path, args.catalog.no_db).await?;
+    println!("  ✓ Installed '{name}' from the marketplace catalog (pinned to catalog digests).");
+    Ok(())
+}
+
+/// Upgrade an installed MCP server package from a signed marketplace catalog.
+async fn upgrade_marketplace_package(
+    args: McpMarketplaceUpgradeArgs,
+    config_path: Option<&Path>,
+) -> anyhow::Result<()> {
+    let catalog = load_marketplace_catalog(&args.catalog).await?;
+    let db = connect_db(config_path, args.catalog.no_db).await?;
+    let servers = load_servers(db.as_ref()).await?;
+    let mut server = servers
+        .get(&args.name)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Server '{}' not found", args.name))?;
+
+    require_host_cli_operation(&server, "marketplace upgrade")?;
+    let Some(existing) = server.provenance.as_ref() else {
+        anyhow::bail!(
+            "server '{}' has no provenance record; only marketplace-pinned servers can be upgraded",
+            server.name
+        );
+    };
+    let Some(package_id) = existing.package_id.clone() else {
+        anyhow::bail!(
+            "server '{}' provenance has no package identity",
+            server.name
+        );
+    };
+    let manifest = catalog
+        .require(&package_id)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+
+    if manifest_revoked(&servers, manifest)? {
+        anyhow::bail!(
+            "package '{}' version '{}' is revoked by the marketplace revocation list",
+            manifest.package_id,
+            manifest.version
+        );
+    }
+
+    // Resolve the local artifact: explicit flags override the live transport.
+    let (command, component): (Option<String>, Option<PathBuf>) = match (
+        args.command.clone(),
+        args.component.clone(),
+    ) {
+        (Some(command), None) => (Some(command), None),
+        (None, Some(path)) => (None, Some(path)),
+        (None, None) => match server.effective_transport() {
+            EffectiveTransport::Stdio { command, .. } => (Some(command.to_string()), None),
+            EffectiveTransport::Wasm { component_path, .. } => {
+                (None, Some(component_path.to_path_buf()))
+            }
+            _ => anyhow::bail!(
+                "server '{}' uses a transport without a local artifact; pass --command or --component",
+                server.name
+            ),
+        },
+        _ => anyhow::bail!("pass at most one of --command or --component"),
+    };
+
+    let provenance = pin_marketplace_artifact(manifest, command.as_deref(), component.as_deref())?;
+    let kind = if provenance.component_sha256.is_some() {
+        ARTIFACT_KIND_WASM
+    } else {
+        ARTIFACT_KIND_STDIO
+    };
+    verify_catalog_artifact_pin(&provenance, manifest, kind)?;
+
+    // Show the operator what changes between the installed manifest provenance
+    // and the catalog version using the existing diff machinery on digests.
+    let old_manifest = crate::tools::mcp::PackageManifest {
+        schema_version: 1,
+        package_id: manifest.package_id.clone(),
+        ecosystem: existing.ecosystem,
+        version: existing.version.clone().unwrap_or_default(),
+        publisher: existing.publisher.clone().unwrap_or_default(),
+        artifacts: BTreeMap::new(),
+        dependencies: Vec::new(),
+        capabilities: Vec::new(),
+        issued_at: chrono::Utc::now(),
+    };
+    let new_manifest = crate::tools::mcp::PackageManifest {
+        artifacts: manifest.artifacts.clone(),
+        dependencies: manifest.dependencies.clone(),
+        capabilities: manifest.capabilities.clone(),
+        ..old_manifest.clone()
+    };
+    let diff = crate::tools::mcp::diff_manifests(&old_manifest, &new_manifest);
+
+    println!(
+        "  Upgrade plan for '{}' ({} -> {}):",
+        server.name, old_manifest.version, manifest.version
+    );
+    print_manifest_diff(&diff);
+    if args.catalog.dry_run {
+        println!("  Dry run: no configuration written.");
+        return Ok(());
+    }
+
+    server.provenance = Some(provenance);
+    persist_updated_server(db.as_ref(), server).await?;
+    println!(
+        "  ✓ Upgraded '{}' against the marketplace catalog.",
+        args.name
+    );
+    Ok(())
 }
 
 /// Toggle server enabled/disabled state.
@@ -2690,5 +3119,84 @@ mod tests {
         );
         assert!(parse_secret_env_ref("API_TOKEN=").is_err());
         assert!(parse_secret_env_ref("api_token").is_err());
+    }
+
+    #[test]
+    fn test_mcp_install_and_upgrade_flags_parse() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let install = TestCli::try_parse_from([
+            "test",
+            "install",
+            "@acme/files",
+            "--file",
+            "/tmp/catalog.json",
+            "--name",
+            "acme-files",
+            "--command",
+            "/opt/acme/files-server",
+            "--args",
+            "/data",
+            "--dry-run",
+            "--no-db",
+        ])
+        .expect("install flags");
+        let McpCommand::Install(install) = install.cmd else {
+            panic!("expected install command");
+        };
+        assert_eq!(install.package, "@acme/files");
+        assert_eq!(install.name.as_deref(), Some("acme-files"));
+        assert_eq!(install.command.as_deref(), Some("/opt/acme/files-server"));
+        assert_eq!(
+            install.catalog.file.as_deref(),
+            Some(std::path::Path::new("/tmp/catalog.json"))
+        );
+        assert!(install.catalog.dry_run);
+        assert!(install.catalog.no_db);
+
+        let upgrade = TestCli::try_parse_from([
+            "test",
+            "upgrade",
+            "acme-files",
+            "--url",
+            "https://marketplace.example.com/catalog.json",
+        ])
+        .expect("upgrade flags");
+        let McpCommand::Upgrade(upgrade) = upgrade.cmd else {
+            panic!("expected upgrade command");
+        };
+        assert_eq!(upgrade.name, "acme-files");
+        assert_eq!(
+            upgrade.catalog.url.as_deref(),
+            Some("https://marketplace.example.com/catalog.json")
+        );
+    }
+
+    #[test]
+    fn test_marketplace_install_rejects_file_and_url_together() {
+        use clap::Parser;
+
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: McpCommand,
+        }
+
+        let result = TestCli::try_parse_from([
+            "test",
+            "install",
+            "@acme/files",
+            "--file",
+            "/tmp/catalog.json",
+            "--url",
+            "https://marketplace.example.com/catalog.json",
+        ]);
+        assert!(result.is_err(), "--file and --url must conflict");
     }
 }
