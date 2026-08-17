@@ -288,6 +288,13 @@ warning and fall back to the defaults. Operators and agents must verify wire
 notes against local source before marking them active; the normal
 stale-list/status lifecycle remains authoritative.
 
+Content-bearing knowledge reads preserve this trust boundary. For notes tagged
+`coordination`, `knowledge_search` and `knowledge_get_topic` return
+`untrusted: true`, replace the sender-controlled title with a topic-derived
+label, and wrap snippets/full content in the standard external-content security
+notice. The two tools also declare that their output requires sanitization.
+Locally authored notes without the tag retain their existing output shape.
+
 The ingestion integration tests run against the libSQL backend because the CI
 test jobs have no PostgreSQL server; the write/metadata/search calls go
 through the same `Database` trait used by the PostgreSQL backend.
