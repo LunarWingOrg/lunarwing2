@@ -42,11 +42,15 @@ pub const DEFAULT_ALLOWED_TAGS: [&str; 6] =
 /// Maximum accepted coordination agent identifier length.
 pub const MAX_COORD_AGENT_ID_LEN: usize = 128;
 
-/// Cap on distinct rate-limit keys retained in memory. Real fleets derive
-/// keys from configured agent/channel pairs; exceeding this means keys are
-/// being rotated, at which point callers share one bucket instead of
-/// growing the map. Expired windows are pruned on every call regardless.
+/// Cap on rate-limit buckets retained in memory, including the overflow
+/// bucket. Real fleets derive keys from configured agent/channel pairs;
+/// exceeding this means keys are being rotated, at which point callers share
+/// one bucket instead of growing the map. Expired windows are pruned on every
+/// call regardless.
 pub const MAX_RATE_LIMIT_KEYS: usize = 4_096;
+
+/// Internal bucket shared by previously unseen keys after the map saturates.
+const RATE_LIMIT_OVERFLOW_KEY: &str = "\0rate-limit-overflow";
 
 /// Shared coordination agent-ID contract used by hooks and admin routes.
 pub fn valid_coordination_agent_id(id: &str) -> bool {
@@ -459,19 +463,29 @@ impl CoordinationState {
             stamps.retain(|t| now.duration_since(*t) < window);
             !stamps.is_empty()
         });
-        let saturated = guard.rate_limit_windows.len() >= MAX_RATE_LIMIT_KEYS;
-        // Too many distinct keys for per-key isolation: collapse the callers
-        // into one shared bucket (sized to the original budget so a
-        // rotating-key client cannot buy fresh allowances). Configured
-        // fleets keep per-key behavior.
-        let (effective_key, budget) = if saturated {
-            (String::new(), max_messages)
+        let known_key = guard.rate_limit_windows.contains_key(key);
+        let overflow_exists = guard
+            .rate_limit_windows
+            .contains_key(RATE_LIMIT_OVERFLOW_KEY);
+        let reserve_overflow_at = MAX_RATE_LIMIT_KEYS.saturating_sub(1);
+        // Too many distinct keys for per-key isolation: collapse unseen callers
+        // into one shared bucket (sized to the original budget so a rotating-key
+        // client cannot buy fresh allowances). Existing keys keep their own
+        // windows; one slot is reserved so the overflow bucket cannot push the
+        // map beyond MAX_RATE_LIMIT_KEYS.
+        let effective_key = if known_key {
+            key
+        } else if overflow_exists || guard.rate_limit_windows.len() >= reserve_overflow_at {
+            RATE_LIMIT_OVERFLOW_KEY
         } else {
-            (key.to_string(), max_messages)
+            key
         };
-        let stamps = guard.rate_limit_windows.entry(effective_key).or_default();
+        let stamps = guard
+            .rate_limit_windows
+            .entry(effective_key.to_string())
+            .or_default();
         stamps.retain(|t| now.duration_since(*t) < window);
-        if stamps.len() >= budget {
+        if stamps.len() >= max_messages {
             return false;
         }
         stamps.push(now);
@@ -1607,7 +1621,7 @@ mod tests {
         // total throughput is capped no matter how many new keys appear.
         let state = test_state();
         let window = Duration::from_secs(60);
-        for i in 0..MAX_RATE_LIMIT_KEYS {
+        for i in 0..MAX_RATE_LIMIT_KEYS.saturating_sub(1) {
             assert!(
                 state
                     .try_consume_rate_limit(&format!("rotator-{i}"), 2, window)
@@ -1615,7 +1629,7 @@ mod tests {
                 "pre-saturation key {i} must pass"
             );
         }
-        // Map saturated: the shared bucket accepts the remaining budget...
+        // The reserved overflow bucket accepts the shared budget...
         assert!(
             state
                 .try_consume_rate_limit("rotator-fresh-1", 2, window)
@@ -1631,6 +1645,13 @@ mod tests {
             !state
                 .try_consume_rate_limit("rotator-fresh-3", 2, window)
                 .await
+        );
+        let guard = state.inner.lock().await;
+        assert_eq!(guard.rate_limit_windows.len(), MAX_RATE_LIMIT_KEYS);
+        assert!(
+            guard
+                .rate_limit_windows
+                .contains_key(RATE_LIMIT_OVERFLOW_KEY)
         );
     }
 
