@@ -127,9 +127,18 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
   `revocation_cache_path`, `revocation_url`, `revocation_publisher`,
   `revocation_public_key_hex`): loads fail closed on revoked packages, startup
   pulls the newest signed list over bounded HTTPS, and manual activation
-  re-checks the cached list. Not yet covered: a signed-package marketplace
-  install/upgrade flow (the primitives are library-level but no CLI installs
-  from a catalog yet).
+  re-checks the cached list. The signed-package marketplace install/upgrade
+  flow is now implemented: `MarketplaceCatalog` carries one verified
+  `SignedPackageManifest` per package (every embedded signature is checked
+  against the trust store before the catalog parses), and
+  `lunarwing mcp install` / `lunarwing mcp upgrade` resolve a package from a
+  local `--file` or HTTPS `--url` catalog, refuse revoked packages, pin the
+  local stdio/WASM artifact, and require the pinned digest to equal the
+  signed catalog digest before persisting; both support `--dry-run` and
+  `--no-db`. Not yet covered: catalog-side dependency-lockfile enforcement
+  during install (the lockfile verification primitives are library-level but
+  the CLI does not fetch or match a per-package `SignedDependencyLockfile`),
+  and automatic artifact download (operators stage artifacts locally).
 
 ### Host OS sandboxing for stdio children
 
