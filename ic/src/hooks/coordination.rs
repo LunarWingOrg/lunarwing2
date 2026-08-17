@@ -927,6 +927,7 @@ pub struct TagSchemaHook {
     agent_id: String,
     allowed_tags: Vec<String>,
     max_message_length: usize,
+    knowledge_publish_enabled: bool,
 }
 
 impl TagSchemaHook {
@@ -942,7 +943,14 @@ impl TagSchemaHook {
             agent_id,
             allowed_tags,
             max_message_length,
+            knowledge_publish_enabled: false,
         }
+    }
+
+    /// Allow outbound `KNOW:` records after fleet compatibility is confirmed.
+    pub fn with_knowledge_publish_enabled(mut self, enabled: bool) -> Self {
+        self.knowledge_publish_enabled = enabled;
+        self
     }
 
     /// Actor, policy scope, and content for schema-scoped events.
@@ -983,6 +991,15 @@ impl TagSchemaHook {
             }
         })
     }
+
+    fn is_knowledge_record(content: &str) -> bool {
+        let trimmed = content.trim_start();
+        let tag = crate::hooks::coordination_knowledge::KNOWLEDGE_SHARE_TAG;
+        trimmed
+            .get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+            && trimmed.as_bytes().get(tag.len()) == Some(&b':')
+    }
 }
 
 #[async_trait]
@@ -993,11 +1010,15 @@ impl Hook for TagSchemaHook {
 
     fn hook_points(&self) -> &[HookPoint] {
         // Inbound validation prevents malformed room traffic from waking the
-        // model. Outbound validation stays at one point: every model response
-        // passes TransformResponse exactly once per turn. Registering both
-        // TransformResponse and BeforeOutbound made one malformed response
-        // consume two local-agent strikes (ISSUE-004).
-        &[HookPoint::BeforeInbound, HookPoint::TransformResponse]
+        // model. Schema validation stays at TransformResponse so malformed
+        // output consumes one local-agent strike (ISSUE-004). BeforeOutbound
+        // only enforces the non-striking KNOW publish gate as a final safety
+        // net for callers that bypass response transforms.
+        &[
+            HookPoint::BeforeInbound,
+            HookPoint::BeforeOutbound,
+            HookPoint::TransformResponse,
+        ]
     }
 
     fn failure_mode(&self) -> HookFailureMode {
@@ -1013,6 +1034,22 @@ impl Hook for TagSchemaHook {
             return Ok(HookOutcome::ok());
         };
         if !self.state.is_coordination_channel(channel).await {
+            return Ok(HookOutcome::ok());
+        }
+        if !matches!(event, HookEvent::Inbound { .. })
+            && !self.knowledge_publish_enabled
+            && Self::is_knowledge_record(content)
+        {
+            tracing::warn!(
+                agent,
+                channel,
+                "outbound coordination knowledge share blocked: publishing is disabled"
+            );
+            return Ok(HookOutcome::reject(
+                "coord: KNOW publishing is disabled; set COORD_KNOWLEDGE_PUBLISH=true only after confirming fleet compatibility",
+            ));
+        }
+        if matches!(event, HookEvent::Outbound { .. }) {
             return Ok(HookOutcome::ok());
         }
         if content.contains('\n') || content.contains('\r') {
@@ -1198,12 +1235,15 @@ pub async fn register_coordination_hooks_with_knowledge(
             16,
         ),
         (
-            Arc::new(TagSchemaHook::new(
-                state.clone(),
-                config.agent_id.clone(),
-                allowed_tags,
-                config.max_message_length,
-            )),
+            Arc::new(
+                TagSchemaHook::new(
+                    state.clone(),
+                    config.agent_id.clone(),
+                    allowed_tags,
+                    config.max_message_length,
+                )
+                .with_knowledge_publish_enabled(config.knowledge_publish_enabled),
+            ),
             14,
         ),
         (
@@ -1741,9 +1781,10 @@ mod tests {
     }
 
     #[test]
-    fn test_tag_schema_enforces_inbound_and_once_outbound() {
+    fn test_tag_schema_enforces_inbound_transform_and_outbound_publish_gate() {
         // Inbound structure is checked before generation. Model output keeps
-        // one enforcement point so one malformed response costs one strike.
+        // one schema-enforcement point so one malformed response costs one
+        // strike; BeforeOutbound only provides the hard KNOW publish gate.
         let config = test_config();
         let hook = TagSchemaHook::new(
             test_state(),
@@ -1753,8 +1794,74 @@ mod tests {
         );
         assert_eq!(
             hook.hook_points(),
-            &[HookPoint::BeforeInbound, HookPoint::TransformResponse]
+            &[
+                HookPoint::BeforeInbound,
+                HookPoint::BeforeOutbound,
+                HookPoint::TransformResponse,
+            ]
         );
+    }
+
+    #[tokio::test]
+    async fn knowledge_publish_gate_blocks_only_outbound_records_until_enabled() {
+        let config = test_config();
+        let disabled = TagSchemaHook::new(
+            test_state(),
+            config.agent_id.clone(),
+            config.allowed_tags.clone(),
+            config.max_message_length,
+        );
+        let record = "KNOW: fleet-readiness | Every room daemon accepts this tag";
+
+        // Receiving remains compatible and available independently of emission.
+        assert!(matches!(
+            disabled
+                .execute(
+                    &inbound("remote-peer", "coord@conference.example", record),
+                    &ctx(),
+                )
+                .await,
+            Ok(HookOutcome::Continue { .. })
+        ));
+        // Both normal transformed responses and direct outbound callers are
+        // fail-closed while the operator opt-in remains disabled.
+        for event in [
+            transformed("coord@conference.example", record),
+            outbound("agent-1", "coord@conference.example", record),
+        ] {
+            assert!(matches!(
+                disabled.execute(&event, &ctx()).await,
+                Ok(HookOutcome::Reject { .. })
+            ));
+        }
+        // BeforeOutbound does not repeat schema enforcement for normal model
+        // responses; TransformResponse remains the single strike point.
+        assert!(matches!(
+            disabled
+                .execute(
+                    &outbound("agent-1", "coord@conference.example", "untagged"),
+                    &ctx(),
+                )
+                .await,
+            Ok(HookOutcome::Continue { .. })
+        ));
+
+        let enabled = TagSchemaHook::new(
+            test_state(),
+            config.agent_id,
+            config.allowed_tags,
+            config.max_message_length,
+        )
+        .with_knowledge_publish_enabled(true);
+        for event in [
+            transformed("coord@conference.example", record),
+            outbound("agent-1", "coord@conference.example", record),
+        ] {
+            assert!(matches!(
+                enabled.execute(&event, &ctx()).await,
+                Ok(HookOutcome::Continue { .. })
+            ));
+        }
     }
 
     #[tokio::test]
