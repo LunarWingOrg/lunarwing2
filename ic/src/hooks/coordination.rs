@@ -2178,7 +2178,8 @@ mod tests {
             config.agent_id,
             config.allowed_tags.clone(),
             config.max_message_length,
-        );
+        )
+        .with_knowledge_publish_enabled(true);
         for tag in &config.allowed_tags {
             for content in [
                 tag.to_string(),
