@@ -634,6 +634,73 @@ mod tests {
         assert!(title.starts_with("KNOW: "));
     }
 
+    /// Process-env limit parsing must reject non-numeric and out-of-range
+    /// values with a warning and fall back to the documented defaults, never
+    /// producing an unbounded or zero window.
+    #[test]
+    fn invalid_env_limits_fall_back_to_defaults() {
+        let _env_lock = crate::config::helpers::lock_env();
+        // SAFETY: the env lock is held for the whole test, so no other
+        // env-mutating test runs concurrently; the guard restores on drop.
+        unsafe {
+            std::env::set_var("COORD_KNOWLEDGE_MAX_PER_HOUR", "not-a-number");
+            std::env::set_var("COORD_KNOWLEDGE_MIN_CHARS", "0");
+            std::env::set_var("COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR", "999999");
+        }
+        let limits = KnowledgeShareLimits::from_env();
+        assert_eq!(limits.max_per_hour, DEFAULT_MAX_PER_HOUR);
+        assert_eq!(limits.min_chars, DEFAULT_MIN_CHARS);
+        assert_eq!(global_max_per_hour_from_env(), DEFAULT_GLOBAL_MAX_PER_HOUR);
+    }
+
+    #[test]
+    fn env_limits_accept_range_boundaries() {
+        let _env_lock = crate::config::helpers::lock_env();
+        // SAFETY: see invalid_env_limits_fall_back_to_defaults.
+        unsafe {
+            std::env::set_var("COORD_KNOWLEDGE_MAX_PER_HOUR", "1000");
+            std::env::set_var("COORD_KNOWLEDGE_MIN_CHARS", "1");
+            std::env::set_var("COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR", "10000");
+        }
+        let limits = KnowledgeShareLimits::from_env();
+        assert_eq!(limits.max_per_hour, MAX_CONFIGURED_PER_HOUR);
+        assert_eq!(limits.min_chars, 1);
+        assert_eq!(
+            global_max_per_hour_from_env(),
+            MAX_CONFIGURED_GLOBAL_PER_HOUR
+        );
+        // SAFETY: same lock still held.
+        unsafe {
+            std::env::set_var("COORD_KNOWLEDGE_MAX_PER_HOUR", "1001");
+            std::env::set_var(
+                "COORD_KNOWLEDGE_MIN_CHARS",
+                (DEFAULT_MAX_MESSAGE_LENGTH + 1).to_string(),
+            );
+        }
+        let limits = KnowledgeShareLimits::from_env();
+        assert_eq!(limits.max_per_hour, DEFAULT_MAX_PER_HOUR);
+        assert_eq!(limits.min_chars, DEFAULT_MIN_CHARS);
+    }
+
+    #[test]
+    fn publisher_env_entries_are_validated_and_deduplicated() {
+        let _env_lock = crate::config::helpers::lock_env();
+        // SAFETY: see invalid_env_limits_fall_back_to_defaults.
+        unsafe {
+            std::env::set_var(
+                "COORD_KNOWLEDGE_PUBLISHERS",
+                "Agent@Conf.example/Res, ,bad sender,agent@conf.example/res,peer-b",
+            );
+        }
+        let limits = KnowledgeShareLimits::from_env();
+        assert_eq!(
+            limits.publishers,
+            vec!["Agent@Conf.example/Res".to_string(), "peer-b".to_string()]
+        );
+        assert!(limits.is_allowed_publisher("agent@conf.example/RES"));
+        assert!(!limits.is_allowed_publisher("bad sender"));
+    }
+
     #[cfg(feature = "libsql")]
     mod integration {
         use super::*;
