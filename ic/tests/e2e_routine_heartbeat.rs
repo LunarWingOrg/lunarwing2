@@ -241,9 +241,7 @@ mod tests {
                 steps.push(TraceStep {
                     request_hint: None,
                     response: TraceResponse::Text {
-                        content: format!(
-                            "owner_gate is still unavailable; cannot proceed ({i})."
-                        ),
+                        content: format!("owner_gate is still unavailable; cannot proceed ({i})."),
                         input_tokens: 20,
                         output_tokens: 5,
                     },
