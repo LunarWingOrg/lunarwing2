@@ -39,14 +39,14 @@ impl exports::lunarwing::agent::tool::Guest for GitlabTool {
 
     fn description() -> String {
         "Manage a self-hosted GitLab instance through REST API v4. Supports projects, \
-         issues and comments, merge requests and approvals, branches, repository files, \
-         search, pipelines, jobs, and current-user lookup. Use project numeric ID or \
-         group/project path; use per-project iid for issues and merge requests. Token is \
-         injected by LunarWing and never exposed to WASM. List and search responses carry \
-         a pagination object beside items; when the user wants every matching issue \
-         (\"all work items\"), call list_issues with all_pages=true to fetch all pages in \
-         one bounded call instead of paging one call at a time. Calls require approval \
-         unless you choose to always allow this tool."
+         classic issues and comments, unified Work Items (Issues, Tasks, and hierarchy), \
+         merge requests and approvals, branches, repository files, search, pipelines, \
+         jobs, and current-user lookup. Use project numeric ID or group/project path; \
+         use project-local iid values. Token is injected by LunarWing and never exposed \
+         to WASM. List responses carry explicit pagination metadata. Use list_issues \
+         with all_pages=true for classic issues, or list_work_items with all_pages=true \
+         for a bounded, single-approval inventory across Issue and Task types. Calls \
+         require approval unless you choose to always allow this tool."
             .to_string()
     }
 }
@@ -98,6 +98,21 @@ fn execute_inner(params: &str) -> Result<String, String> {
             all_pages,
         } => api::list_issues(&client, &project, &state, per_page, page, all_pages)?,
         GitlabAction::GetIssue { project, iid } => api::get_issue(&client, &project, iid)?,
+        GitlabAction::GetWorkItem { project, iid } => api::get_work_item(&client, &project, iid)?,
+        GitlabAction::ListWorkItems {
+            project,
+            state,
+            per_page,
+            cursor,
+            all_pages,
+        } => api::list_work_items(
+            &client,
+            &project,
+            &state,
+            per_page,
+            cursor.as_deref(),
+            all_pages,
+        )?,
         GitlabAction::CreateIssue {
             project,
             title,
@@ -336,6 +351,8 @@ fn action_name(action: &GitlabAction) -> &'static str {
         GitlabAction::CreateProject { .. } => "create_project",
         GitlabAction::ListIssues { .. } => "list_issues",
         GitlabAction::GetIssue { .. } => "get_issue",
+        GitlabAction::GetWorkItem { .. } => "get_work_item",
+        GitlabAction::ListWorkItems { .. } => "list_work_items",
         GitlabAction::CreateIssue { .. } => "create_issue",
         GitlabAction::UpdateIssue { .. } => "update_issue",
         GitlabAction::ListIssueNotes { .. } => "list_issue_notes",
@@ -428,6 +445,37 @@ mod tests {
             panic!("wrong variant");
         };
         assert!(!all_pages);
+    }
+
+    #[test]
+    fn work_items_actions_accept_tasks_and_keyset_cursor() {
+        let action = parse_action(
+            r#"{"action":"list_work_items","project":35,"state":"all","per_page":100,"cursor":"opaque/cursor","all_pages":true}"#,
+        )
+        .unwrap();
+        let GitlabAction::ListWorkItems {
+            project,
+            state,
+            per_page,
+            cursor,
+            all_pages,
+        } = action
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(project, "35");
+        assert_eq!(state, "all");
+        assert_eq!(per_page, 100);
+        assert_eq!(cursor.as_deref(), Some("opaque/cursor"));
+        assert!(all_pages);
+
+        let action =
+            parse_action(r#"{"action":"get_work_item","project":"group/repo","iid":45}"#).unwrap();
+        assert!(matches!(
+            action,
+            GitlabAction::GetWorkItem { project, iid }
+                if project == "group/repo" && iid == 45
+        ));
     }
 
     #[test]

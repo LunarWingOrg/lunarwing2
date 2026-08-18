@@ -79,8 +79,105 @@ pub fn list_issues(
 }
 
 pub fn get_issue(client: &GitlabClient, project: &str, iid: u64) -> Result<Value, String> {
-    let endpoint = format!("/projects/{}/issues/{iid}", project_path(project)?);
-    client.request_json("GET", &endpoint, None)
+    let project = project_path(project)?;
+    let endpoint = format!("/projects/{project}/issues/{iid}");
+    match client.request_json_allow_404("GET", &endpoint, None)? {
+        Some(issue) => Ok(issue),
+        None => get_work_item_by_path(client, &project, iid),
+    }
+}
+
+/// Retrieve any GitLab Work Item type. The collection `iids` filter is used
+/// instead of the single-item REST endpoint because GitLab 19.2 may expose
+/// the collection while feature-gating `/-/work_items/:iid` for API tokens.
+pub fn get_work_item(client: &GitlabClient, project: &str, iid: u64) -> Result<Value, String> {
+    get_work_item_by_path(client, &project_path(project)?, iid)
+}
+
+fn get_work_item_by_path(
+    client: &GitlabClient,
+    encoded_project: &str,
+    iid: u64,
+) -> Result<Value, String> {
+    let endpoint = format!(
+        "/projects/{encoded_project}/-/work_items?iids={iid}&per_page=2&fields={}&features={}",
+        url_encode(
+            "state,confidential,work_item_type,archived,created_at,updated_at,closed_at,author,web_url"
+        ),
+        url_encode("description,labels,assignees,hierarchy")
+    );
+    let value = client.request_json("GET", &endpoint, None)?;
+    let mut items = match value {
+        Value::Array(items) => items,
+        Value::Object(mut object) => object
+            .remove("items")
+            .and_then(|items| items.as_array().cloned())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    match items.len() {
+        1 => {
+            let mut item = items.remove(0);
+            if let Some(object) = item.as_object_mut() {
+                object.insert("retrieved_via".into(), Value::String("work_items".into()));
+            }
+            Ok(item)
+        }
+        0 => Err(format!(
+            "GitLab Work Item #{iid} was not found in project '{encoded_project}'"
+        )),
+        count => Err(format!(
+            "GitLab Work Items API returned {count} records for IID {iid}; expected exactly one"
+        )),
+    }
+}
+
+pub fn list_work_items(
+    client: &GitlabClient,
+    project: &str,
+    state: &str,
+    per_page: u32,
+    cursor: Option<&str>,
+    all_pages: bool,
+) -> Result<Value, String> {
+    let endpoint = work_items_endpoint(project, state, per_page, cursor, all_pages)?;
+    if all_pages {
+        client.request_all_keyset_pages(&endpoint)
+    } else {
+        client.request_keyset_page(&endpoint)
+    }
+}
+
+fn work_items_endpoint(
+    project: &str,
+    state: &str,
+    per_page: u32,
+    cursor: Option<&str>,
+    all_pages: bool,
+) -> Result<String, String> {
+    validate_choice("state", state, &["opened", "closed", "all"])?;
+    let (requested_per_page, _) = page(per_page, 1);
+    let per_page = if all_pages { 100 } else { requested_per_page };
+    let mut endpoint = format!(
+        "/projects/{}/-/work_items?per_page={per_page}&fields={}",
+        project_path(project)?,
+        url_encode("state,confidential,work_item_type")
+    );
+    if state != "all" {
+        endpoint.push_str("&state=");
+        endpoint.push_str(&url_encode(state));
+    }
+    if let Some(raw_cursor) = cursor {
+        if raw_cursor.len() > 2_048 || raw_cursor.chars().any(char::is_control) {
+            return Err("cursor must be at most 2048 characters without control characters".into());
+        }
+        let cursor = raw_cursor.trim();
+        if !cursor.is_empty() {
+            endpoint.push_str("&cursor=");
+            endpoint.push_str(&url_encode(cursor));
+        }
+    }
+    Ok(endpoint)
 }
 
 pub fn create_issue(
@@ -628,7 +725,7 @@ fn nonempty_optional(value: Option<&str>) -> Option<&str> {
 mod tests {
     use serde_json::Map;
 
-    use super::{require_changes, validate_choice, validate_file_path};
+    use super::{require_changes, validate_choice, validate_file_path, work_items_endpoint};
 
     #[test]
     fn validates_enums() {
@@ -648,6 +745,21 @@ mod tests {
             assert!(validate_file_path(path).is_err(), "accepted {path}");
         }
         assert!(validate_file_path("src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn work_items_endpoint_clamps_pages_and_bounds_cursors() {
+        let single = work_items_endpoint("35", "opened", 500, Some("abc/123"), false).unwrap();
+        assert!(single.contains("per_page=100"));
+        assert!(single.contains("state=opened"));
+        assert!(single.contains("cursor=abc%2F123"));
+
+        let all = work_items_endpoint("group/project", "all", 1, None, true).unwrap();
+        assert!(all.contains("/projects/group%2Fproject/-/work_items?per_page=100"));
+        assert!(!all.contains("&state="));
+
+        assert!(work_items_endpoint("35", "opened", 20, Some("\n"), false).is_err());
+        assert!(work_items_endpoint("35", "opened", 20, Some(&"x".repeat(2_049)), false).is_err());
     }
 
     #[test]

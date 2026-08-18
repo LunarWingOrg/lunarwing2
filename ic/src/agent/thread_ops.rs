@@ -128,14 +128,24 @@ impl Agent {
         true
     }
 
-    fn tool_execution_earned_always(tool_name: &str, result: &Result<String, Error>) -> bool {
-        let Ok(output) = result else {
-            return false;
-        };
+    fn tool_execution_allows_always_persistence(
+        tool_name: &str,
+        result: &Result<String, Error>,
+    ) -> bool {
+        // The user explicitly chose "always" and PendingApproval::clamp_always
+        // already limits this path to tools that opt into persistent approval.
+        // Persist the preference even when an external API call fails (404,
+        // timeout, provider outage); otherwise "always" behaves exactly like
+        // one-time "yes" until a call happens to succeed.
         if tool_name != "ssh" {
             return true;
         }
 
+        // SSH is the deliberate exception: do not persist a remote-command
+        // bypass until the command itself exits successfully.
+        let Ok(output) = result else {
+            return false;
+        };
         serde_json::from_str::<serde_json::Value>(output)
             .ok()
             .and_then(|value| value.get("success").and_then(serde_json::Value::as_bool))
@@ -1365,9 +1375,8 @@ impl Agent {
                 .execute_chat_tool(&pending.tool_name, &pending.parameters, &job_ctx)
                 .await;
 
-            // Failed execution must not earn a future approval bypass.
             if always
-                && Self::tool_execution_earned_always(&pending.tool_name, &tool_result)
+                && Self::tool_execution_allows_always_persistence(&pending.tool_name, &tool_result)
                 && self
                     .persist_tool_always_grant(&session, &pending.tool_name)
                     .await
@@ -2211,14 +2220,39 @@ mod tests {
     }
 
     #[test]
-    fn ssh_command_must_exit_successfully_to_earn_always() {
+    fn explicit_always_persists_after_external_tool_failure_but_not_failed_ssh() {
+        let api_failure = Err(crate::error::ToolError::ExecutionFailed {
+            name: "gitlab-tool".into(),
+            reason: "GitLab API returned HTTP 404".into(),
+        }
+        .into());
+        assert!(Agent::tool_execution_allows_always_persistence(
+            "gitlab-tool",
+            &api_failure
+        ));
+
         let success = Ok(serde_json::json!({"success": true, "exit_code": 0}).to_string());
         let nonzero = Ok(serde_json::json!({"success": false, "exit_code": 1}).to_string());
         let malformed = Ok("not json".to_string());
+        let ssh_failure = Err(crate::error::ToolError::ExecutionFailed {
+            name: "ssh".into(),
+            reason: "connection failed".into(),
+        }
+        .into());
 
-        assert!(Agent::tool_execution_earned_always("ssh", &success));
-        assert!(!Agent::tool_execution_earned_always("ssh", &nonzero));
-        assert!(!Agent::tool_execution_earned_always("ssh", &malformed));
+        assert!(Agent::tool_execution_allows_always_persistence(
+            "ssh", &success
+        ));
+        assert!(!Agent::tool_execution_allows_always_persistence(
+            "ssh", &nonzero
+        ));
+        assert!(!Agent::tool_execution_allows_always_persistence(
+            "ssh", &malformed
+        ));
+        assert!(!Agent::tool_execution_allows_always_persistence(
+            "ssh",
+            &ssh_failure
+        ));
     }
 
     #[test]

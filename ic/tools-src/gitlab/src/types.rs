@@ -50,6 +50,28 @@ pub enum GitlabAction {
         project: String,
         iid: u64,
     },
+    /// Retrieve a GitLab Work Item of any type (Issue, Task, Incident, ...).
+    GetWorkItem {
+        #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
+        project: String,
+        iid: u64,
+    },
+    /// List GitLab's unified Work Items model, including Issue and Task types.
+    ListWorkItems {
+        #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
+        project: String,
+        #[serde(default = "default_issue_state")]
+        state: String,
+        #[serde(default = "default_per_page")]
+        per_page: u32,
+        /// Opaque keyset cursor returned as `pagination.next_cursor`.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Fetch every page in one bounded call by following GitLab's keyset
+        /// `Link: rel="next"` cursor chain.
+        #[serde(default)]
+        all_pages: bool,
+    },
     CreateIssue {
         #[serde(alias = "project_id", deserialize_with = "deserialize_project")]
         project: String,
