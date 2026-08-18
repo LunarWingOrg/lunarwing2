@@ -76,24 +76,28 @@ run_check() {
 
     if [ $exit_code -eq 124 ]; then
         log "WARNING: $component check timed out after 30 seconds"
-        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"timeout\"}"
+        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"timeout\", \"duration_seconds\": $duration}"
         return 1
     fi
 
     if [ $exit_code -ne 0 ] && [ -z "$output" ]; then
         log "ERROR: $component check failed with exit code $exit_code (no output)"
-        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"check_failed\"}"
+        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"check_failed\", \"duration_seconds\": $duration}"
         return $exit_code
     fi
 
     # Validate JSON output
     if ! echo "$output" | jq . >/dev/null 2>&1; then
         log "ERROR: $component check returned invalid JSON"
-        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"invalid_json\"}"
+        echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"invalid_json\", \"duration_seconds\": $duration}"
         return 1
     fi
 
-    echo "$output"
+    # Stamp the measured wall duration into the component object. The check
+    # scripts don't know how long the orchestrator waited for them, so this is
+    # the only accurate place. Powers lunarwing_health_check_duration_seconds
+    # in health-metrics-exporter.sh; unknown to older consumers (safe).
+    echo "$output" | jq --argjson d "$duration" '. + {duration_seconds: $d}'
     log "$component check completed in ${duration}s (exit: $exit_code)"
     return $exit_code
 }
