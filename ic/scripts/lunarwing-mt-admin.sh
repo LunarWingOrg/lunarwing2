@@ -312,6 +312,12 @@ tenant_log_dir() { printf '%s/logs' "$(tenant_lw_root "$1")"; }
 tenant_run_dir() { printf '%s/run' "$(tenant_lw_root "$1")"; }
 STUDY_NOTES_CONTAINER_HOME="/opt/lw2studymcp"
 STUDY_NOTES_CONTAINER_STATE_HOME="/var/lib/lw2studymcp"
+# Shared host checkout of the lw2studymcp study-notes MCP. `add-tenant
+# --with-study-mcp` and a `configure-study-mcp` without an explicit --home
+# sync this checkout to the latest upstream before wiring it into the tenant,
+# so every new LunarWing starts with current knowledge of its own codebase.
+STUDY_NOTES_REPO="${LUNARWING_MT_STUDY_NOTES_REPO:-https://git.lunarwing.org/cmc/lw2studymcp.git}"
+STUDY_NOTES_DEFAULT_HOME="${LUNARWING_MT_STUDY_NOTES_HOME:-/var/cache/lunarwing/lw2studymcp}"
 OPENCODE_CONTAINER_UID="10001"
 OPENCODE_CONTAINER_GID="10001"
 OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"
@@ -4001,6 +4007,38 @@ study_notes_write_enabled() {  # <raw boolean>
   esac
 }
 
+sync_study_notes_checkout() {  # <checkout home>
+  # Clone the shared lw2studymcp checkout when missing, or fast-forward an
+  # existing clean git checkout to the latest upstream. A non-git directory or
+  # a dirty checkout is never modified — the operator must repair it by hand.
+  local home="$1" parent
+  validate_study_notes_path "$home" "Study Notes home"
+  require_cmd git
+  parent="$(dirname -- "$home")"
+  if [[ ! -d "$parent" ]]; then
+    install -d -m 0755 -- "$parent" \
+      || die "failed to create Study Notes parent directory: $parent"
+  fi
+  # Serialize concurrent tenant adds racing to clone/update the shared checkout.
+  (
+    flock -x 200
+    if [[ ! -e "$home" ]]; then
+      say "cloning Study Notes MCP checkout: $STUDY_NOTES_REPO -> $home"
+      git clone --quiet "$STUDY_NOTES_REPO" "$home" \
+        || die "Study Notes clone failed: $STUDY_NOTES_REPO"
+    else
+      [[ -d "$home" ]] || die "Study Notes home is not a directory: $home"
+      [[ -d "$home/.git" ]] \
+        || die "Study Notes home is not a git checkout; cannot sync to latest: $home"
+      [[ -z "$(git -C "$home" status --porcelain 2>/dev/null)" ]] \
+        || die "Study Notes checkout has local changes; refusing to sync: $home"
+      say "syncing Study Notes MCP checkout to latest upstream: $home"
+      git -C "$home" pull --ff-only --quiet \
+        || die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
+    fi
+  ) 200>"$parent/.study-notes-sync.lock"
+}
+
 # Resolve a tenant's XMPP JID: an explicit <jid> wins; else PRESERVE the one
 # already in lunarwing.env; else fall back to <name>@xmpp.localhost (first-time
 # provision). lunarwing.env is the authoritative source — the bridge binary
@@ -6824,6 +6862,20 @@ configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
   say "Study Notes MCP configured for tenant '$name' from $home (write=$allow_write)"
   say "restart tenant to seed core MCP config and recreate opencode worker mount:"
   say "  sudo $0 restart-tenant $name"
+}
+
+provision_tenant_study_mcp() {  # <tenant> [checkout home]
+  # Auto-configuration used by add-tenant --with-study-mcp: always sync the
+  # shared checkout to the latest upstream first, then wire it in read-only
+  # (core writes stay opt-in via configure-study-mcp --allow-write).
+  # Runs in a subshell so a die() inside sync/configure is contained and the
+  # caller can treat auto-configuration failure as non-fatal for the tenant.
+  local name="$1" home="${2:-}"
+  [[ -n "$home" ]] || home="$STUDY_NOTES_DEFAULT_HOME"
+  (
+    sync_study_notes_checkout "$home"
+    configure_study_mcp "$name" "$home" false ""
+  )
 }
 
 start_tenant_opencode() {
