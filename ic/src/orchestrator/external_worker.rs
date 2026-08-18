@@ -79,6 +79,13 @@ struct TaskProgressPayload {
 #[serde(default)]
 pub struct TaskContext {
     /// Workspace/project directory path.
+    // Omit when None: TS bridges treat an explicit JSON `null` differently
+    // from an absent field. Kimi's `lunarwing_runtime.ts` rejects
+    // `project_dir: null` ("context.project_dir must be a string") while
+    // accepting an absent key, so serializing None as null breaks every kimi
+    // job dispatched without an explicit project dir. Pebble (Rust) and
+    // OpenCode (TS) treat both shapes as None/undefined.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub project_dir: Option<String>,
     /// Recent conversation messages for context.
     pub conversation_history: Vec<ConversationMessage>,
@@ -1056,7 +1063,10 @@ async fn run_external_task(
         },
     );
 
-    // Send task_request
+    // Send task_request. `timeout_ms` here is the already-resolved config
+    // default (a concrete u64, never Option) — it serializes as an integer.
+    // `TaskContext` omits None fields (project_dir) because the TS worker
+    // bridges reject explicit JSON nulls.
     let task_request = Envelope::new(
         "task_request",
         serde_json::json!({
@@ -1612,7 +1622,31 @@ mod tests {
         assert!(ctx.conversation_history.is_empty());
         assert!(ctx.environment.is_empty());
         assert_eq!(ctx.user_id, "");
+
         assert!(ctx.metadata.is_empty());
+    }
+
+    #[test]
+    fn task_context_omits_none_fields_on_wire() {
+        // The TS worker bridges (kimi/opencode) distinguish an absent JSON key
+        // from an explicit `null`: kimi's payload validator rejects
+        // `project_dir: null` ("context.project_dir must be a string") but
+        // accepts an absent key. Regression: serializing a default TaskContext
+        // must not emit `"project_dir": null`.
+        let ctx = TaskContext::default();
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(
+            !json.contains("project_dir"),
+            "project_dir must be omitted when None, got: {json}"
+        );
+        assert!(
+            !json.contains("null"),
+            "no field may serialize as JSON null, got: {json}"
+        );
+
+        // Round-trip stays lossless.
+        let deserialized: TaskContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.project_dir, None);
     }
 
     #[test]
