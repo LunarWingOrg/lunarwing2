@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/lunarwing_common", "crates/lunarwing_safety", "crates/lunarwing_skills", "crates/lunarwing_engine"]
+members = [".", "crates/lunarwing_common", "crates/lunarwing_safety", "crates/lunarwing_skills", "crates/lunarwing_engine", "crates/lunarwing_health_metrics"]
 exclude = [
     "job_prompt",
     "channels-src/xmpp",

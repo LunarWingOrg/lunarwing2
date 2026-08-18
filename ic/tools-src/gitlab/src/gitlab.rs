@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::Deserialize;
 use serde_json::Value;
 use url::Url;
@@ -71,6 +73,29 @@ impl GitlabClient {
         Ok(with_pagination(value, &headers))
     }
 
+    pub fn request_json_allow_404(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: Option<&Value>,
+    ) -> Result<Option<Value>, String> {
+        let serialized = body
+            .map(serde_json::to_vec)
+            .transpose()
+            .map_err(|error| format!("Failed to encode GitLab request: {error}"))?;
+        let (status, bytes, headers) = self.send(method, endpoint, serialized.as_deref())?;
+        if status == 404 {
+            return Ok(None);
+        }
+        ensure_success(status, &bytes)?;
+        if bytes.is_empty() {
+            return Ok(Some(Value::Null));
+        }
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("GitLab returned invalid JSON (HTTP {status})"))?;
+        Ok(Some(with_pagination(value, &headers)))
+    }
+
     pub fn resource_exists(&self, endpoint: &str) -> Result<bool, String> {
         let (status, bytes, _) = self.send("GET", endpoint, None)?;
         match status {
@@ -81,6 +106,39 @@ impl GitlabClient {
                 Ok(false)
             }
         }
+    }
+
+    /// Fetch one keyset-paginated Work Items page with an explicit opaque
+    /// continuation cursor extracted from GitLab's `Link: rel="next"` header.
+    pub fn request_keyset_page(&self, endpoint: &str) -> Result<Value, String> {
+        let (status, bytes, headers) = self.send("GET", endpoint, None)?;
+        ensure_success(status, &bytes)?;
+        let items: Vec<Value> = serde_json::from_slice(&bytes)
+            .map_err(|_| format!("GitLab returned invalid JSON (HTTP {status})"))?;
+        let next_endpoint = parse_next_link(&self.api_base, &headers)?;
+        Ok(keyset_page_value(items, next_endpoint.as_deref()))
+    }
+
+    /// Fetch every Work Items page by following GitLab's opaque keyset links.
+    /// Stops at the same page/item/byte caps used by offset auto-pagination.
+    pub fn request_all_keyset_pages(&self, endpoint: &str) -> Result<Value, String> {
+        let api_base = self.api_base.clone();
+        let fetch = |next_endpoint: &str| {
+            let (status, bytes, headers) = self.send("GET", next_endpoint, None)?;
+            ensure_success(status, &bytes)?;
+            let items: Vec<Value> = serde_json::from_slice(&bytes)
+                .map_err(|_| format!("GitLab returned invalid JSON (HTTP {status})"))?;
+            let next = parse_next_link(&api_base, &headers)?;
+            Ok((items, next, bytes.len()))
+        };
+        let outcome = collect_all_keyset_pages(
+            endpoint,
+            fetch,
+            MAX_AUTO_PAGES,
+            MAX_AUTO_ITEMS,
+            MAX_AUTO_BYTES,
+        )?;
+        Ok(all_keyset_pages_value(outcome))
     }
 
     /// Fetch every page of a paginated GET endpoint in one call.
@@ -278,6 +336,62 @@ fn pagination_headers(headers_json: &str) -> serde_json::Map<String, Value> {
     pagination
 }
 
+fn header_owned_string(headers_json: &str, wanted: &str) -> Option<String> {
+    let headers = serde_json::from_str::<serde_json::Map<String, Value>>(headers_json).ok()?;
+    let (_, value) = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))?;
+    value.as_str().map(ToOwned::to_owned)
+}
+
+/// Parse GitLab's RFC 5988-style `Link` header and return only a same-origin,
+/// same-API-base relative endpoint for `rel="next"`. This prevents a server or
+/// proxy from turning pagination into credential-bearing cross-origin SSRF.
+fn parse_next_link(api_base: &str, headers_json: &str) -> Result<Option<String>, String> {
+    let Some(link) = header_owned_string(headers_json, "link") else {
+        return Ok(None);
+    };
+    let Some(target) = link.split(',').find_map(|part| {
+        let mut sections = part.trim().split(';');
+        let target = sections.next()?.trim();
+        let is_next = sections.any(|section| {
+            let section = section.trim();
+            section.eq_ignore_ascii_case("rel=\"next\"") || section.eq_ignore_ascii_case("rel=next")
+        });
+        is_next.then_some(target)
+    }) else {
+        return Ok(None);
+    };
+    let target = target
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .ok_or_else(|| "GitLab pagination Link has an invalid next target".to_string())?;
+    let base =
+        Url::parse(api_base).map_err(|_| "Invalid configured GitLab API base".to_string())?;
+    let next =
+        Url::parse(target).map_err(|_| "GitLab pagination Link is not a valid URL".to_string())?;
+    let api_path = base.path().trim_end_matches('/');
+    let Some(relative_path) = next.path().strip_prefix(api_path) else {
+        return Err("GitLab pagination Link escaped the configured API path".to_string());
+    };
+    if next.scheme() != base.scheme()
+        || next.host_str() != base.host_str()
+        || next.port_or_known_default() != base.port_or_known_default()
+        || !relative_path.starts_with('/')
+        || !next.username().is_empty()
+        || next.password().is_some()
+        || next.fragment().is_some()
+    {
+        return Err("GitLab pagination Link escaped the configured API origin".to_string());
+    }
+    let mut endpoint = relative_path.to_string();
+    if let Some(query) = next.query() {
+        endpoint.push('?');
+        endpoint.push_str(query);
+    }
+    Ok(Some(endpoint))
+}
+
 /// Parse the `x-next-page` header, treating missing, blank, or malformed
 /// values as "no further page".
 fn parse_next_page(headers_json: &str) -> Option<u32> {
@@ -316,13 +430,14 @@ fn collect_all_pages(
     max_bytes: usize,
 ) -> Result<AllPagesOutcome, String> {
     let mut items = Vec::new();
+    let mut seen_items = HashSet::new();
     let mut total_bytes = 0usize;
     let mut page_number = 1u32;
     let mut fetched_pages = 0u32;
     loop {
-        let (mut page_items, headers, byte_len) = fetch(page_number)?;
+        let (page_items, headers, byte_len) = fetch(page_number)?;
         fetched_pages += 1;
-        items.append(&mut page_items);
+        append_unique_items(&mut items, &mut seen_items, page_items);
         total_bytes = total_bytes.saturating_add(byte_len);
         let next = parse_next_page(&headers).filter(|next| *next != page_number);
         let capped =
@@ -356,10 +471,168 @@ fn all_pages_value(outcome: AllPagesOutcome) -> Value {
         "fetched_pages".to_string(),
         Value::from(outcome.fetched_pages),
     );
-    let truncated = outcome.resume_page.is_some();
+    let total_matches = pagination
+        .get("total")
+        .and_then(Value::as_str)
+        .and_then(|total| total.parse::<usize>().ok())
+        .is_none_or(|total| total == outcome.items.len());
+    let truncated = outcome.resume_page.is_some() || !total_matches;
     pagination.insert("truncated".to_string(), Value::from(truncated));
+    pagination.insert("complete".to_string(), Value::from(!truncated));
+    pagination.insert(
+        "returned_items".to_string(),
+        Value::from(outcome.items.len() as u64),
+    );
     if let Some(resume_page) = outcome.resume_page {
         pagination.insert("resume_page".to_string(), Value::from(resume_page));
+    }
+    serde_json::json!({ "items": outcome.items, "pagination": pagination })
+}
+
+fn keyset_page_value(items: Vec<Value>, next_endpoint: Option<&str>) -> Value {
+    let next_cursor = next_endpoint.and_then(endpoint_cursor);
+    let complete = next_endpoint.is_none();
+    let returned_items = items.len() as u64;
+    let mut pagination = serde_json::Map::new();
+    pagination.insert("pagination".into(), Value::String("keyset".into()));
+    pagination.insert("has_next".into(), Value::from(!complete));
+    pagination.insert("complete".into(), Value::from(complete));
+    pagination.insert("returned_items".into(), Value::from(returned_items));
+    if complete {
+        pagination.insert("total".into(), Value::from(returned_items));
+    }
+    if let Some(cursor) = next_cursor {
+        pagination.insert("next_cursor".into(), Value::String(cursor));
+    }
+    serde_json::json!({ "items": items, "pagination": pagination })
+}
+
+fn endpoint_cursor(endpoint: &str) -> Option<String> {
+    let query = endpoint.split_once('?')?.1;
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name == "cursor" && !value.is_empty()).then(|| percent_decode(value))
+    })
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+        {
+            output.push((high << 4) | low);
+            index += 3;
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+struct AllKeysetPagesOutcome {
+    items: Vec<Value>,
+    fetched_pages: u32,
+    next_endpoint: Option<String>,
+    cycle_detected: bool,
+}
+
+fn append_unique_items(
+    destination: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    page_items: Vec<Value>,
+) {
+    for item in page_items {
+        let stable_id = item
+            .get("global_id")
+            .or_else(|| item.get("id"))
+            .or_else(|| item.get("iid"))
+            .map(Value::to_string);
+        if stable_id.as_ref().is_none_or(|id| seen.insert(id.clone())) {
+            destination.push(item);
+        }
+    }
+}
+
+fn collect_all_keyset_pages(
+    first_endpoint: &str,
+    mut fetch: impl FnMut(&str) -> Result<(Vec<Value>, Option<String>, usize), String>,
+    max_pages: u32,
+    max_items: usize,
+    max_bytes: usize,
+) -> Result<AllKeysetPagesOutcome, String> {
+    let mut items = Vec::new();
+    let mut seen_items = HashSet::new();
+    let mut seen_endpoints = HashSet::new();
+    let mut fetched_pages = 0u32;
+    let mut total_bytes = 0usize;
+    let mut endpoint = first_endpoint.to_string();
+    loop {
+        if !seen_endpoints.insert(endpoint.clone()) {
+            return Ok(AllKeysetPagesOutcome {
+                items,
+                fetched_pages,
+                next_endpoint: None,
+                cycle_detected: true,
+            });
+        }
+        let current = endpoint.clone();
+        let (page_items, next_endpoint, byte_len) = fetch(&current)?;
+        fetched_pages += 1;
+        append_unique_items(&mut items, &mut seen_items, page_items);
+        total_bytes = total_bytes.saturating_add(byte_len);
+        let cycle_detected = next_endpoint
+            .as_ref()
+            .is_some_and(|next| seen_endpoints.contains(next));
+        let next_endpoint = next_endpoint.filter(|next| !seen_endpoints.contains(next));
+        let capped =
+            fetched_pages >= max_pages || items.len() >= max_items || total_bytes >= max_bytes;
+        match (next_endpoint, capped) {
+            (Some(next), false) => endpoint = next,
+            (next, _) => {
+                return Ok(AllKeysetPagesOutcome {
+                    items,
+                    fetched_pages,
+                    next_endpoint: next,
+                    cycle_detected,
+                });
+            }
+        }
+    }
+}
+
+fn all_keyset_pages_value(outcome: AllKeysetPagesOutcome) -> Value {
+    let next_cursor = outcome.next_endpoint.as_deref().and_then(endpoint_cursor);
+    let truncated = outcome.next_endpoint.is_some() || outcome.cycle_detected;
+    let returned_items = outcome.items.len() as u64;
+    let mut pagination = serde_json::Map::new();
+    pagination.insert("pagination".into(), Value::String("keyset".into()));
+    pagination.insert("fetched_pages".into(), Value::from(outcome.fetched_pages));
+    pagination.insert("truncated".into(), Value::from(truncated));
+    pagination.insert("complete".into(), Value::from(!truncated));
+    pagination.insert("returned_items".into(), Value::from(returned_items));
+    if !truncated {
+        pagination.insert("total".into(), Value::from(returned_items));
+    }
+    if outcome.cycle_detected {
+        pagination.insert("cycle_detected".into(), Value::from(true));
+    }
+    if let Some(cursor) = next_cursor {
+        pagination.insert("next_cursor".into(), Value::String(cursor));
     }
     serde_json::json!({ "items": outcome.items, "pagination": pagination })
 }
@@ -390,8 +663,9 @@ fn truncate(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_AUTO_BYTES, collect_all_pages, extract_error, normalize_api_base, page,
-        parse_next_page, project_path, url_encode, with_pagination,
+        MAX_AUTO_BYTES, all_keyset_pages_value, collect_all_keyset_pages, collect_all_pages,
+        endpoint_cursor, extract_error, keyset_page_value, normalize_api_base, page,
+        parse_next_link, parse_next_page, project_path, url_encode, with_pagination,
     };
     use serde_json::{Value, json};
 
@@ -529,10 +803,43 @@ mod tests {
         let pagination = &merged["pagination"];
         assert_eq!(pagination["fetched_pages"], 3);
         assert_eq!(pagination["truncated"], false);
+        assert_eq!(pagination["complete"], true);
+        assert_eq!(pagination["returned_items"], 6);
         assert_eq!(pagination["total"], "6");
         assert_eq!(pagination["total_pages"], "3");
         assert!(pagination.get("next_page").is_none());
         assert!(pagination.get("resume_page").is_none());
+    }
+
+    #[test]
+    fn auto_pagination_deduplicates_and_detects_total_mismatch() {
+        let outcome = collect_all_pages(
+            |page_number| {
+                Ok(match page_number {
+                    1 => canned_page(&[1, 2], "2"),
+                    2 => canned_page(&[2, 3], ""),
+                    other => panic!("unexpected page fetch {other}"),
+                })
+            },
+            20,
+            2_000,
+            MAX_AUTO_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome
+                .items
+                .iter()
+                .map(|item| item["id"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        let merged = super::all_pages_value(outcome);
+        // Canned headers claim six total while only three unique records were
+        // returned, so the response must not claim a complete inventory.
+        assert_eq!(merged["pagination"]["returned_items"], 3);
+        assert_eq!(merged["pagination"]["complete"], false);
+        assert_eq!(merged["pagination"]["truncated"], true);
     }
 
     #[test]
@@ -608,5 +915,127 @@ mod tests {
             MAX_AUTO_BYTES,
         );
         assert_eq!(result.err().as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn keyset_link_parser_returns_only_same_api_origin() {
+        let headers = r#"{"Link":"<https://git.example.test/api/v4/projects/35/-/work_items?cursor=abc%2F123&per_page=2>; rel=\"next\", <https://git.example.test/api/v4/projects/35/-/work_items?cursor=old>; rel=\"prev\""}"#;
+        let next = parse_next_link("https://git.example.test/api/v4", headers)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next,
+            "/projects/35/-/work_items?cursor=abc%2F123&per_page=2"
+        );
+        assert_eq!(endpoint_cursor(&next).as_deref(), Some("abc/123"));
+
+        let evil = r#"{"Link":"<https://evil.test/api/v4/items?cursor=secret>; rel=\"next\""}"#;
+        assert!(parse_next_link("https://git.example.test/api/v4", evil).is_err());
+    }
+
+    #[test]
+    fn keyset_single_page_reports_explicit_completion() {
+        let more = keyset_page_value(
+            vec![json!({"global_id":"gid://gitlab/WorkItem/2","iid":2})],
+            Some("/api/v4/projects/35/-/work_items?cursor=next%2F2"),
+        );
+        assert_eq!(more["pagination"]["has_next"], true);
+        assert_eq!(more["pagination"]["complete"], false);
+        assert_eq!(more["pagination"]["next_cursor"], "next/2");
+        assert_eq!(more["pagination"]["returned_items"], 1);
+
+        let last = keyset_page_value(Vec::new(), None);
+        assert_eq!(last["pagination"]["has_next"], false);
+        assert_eq!(last["pagination"]["complete"], true);
+        assert_eq!(last["pagination"]["total"], 0);
+    }
+
+    #[test]
+    fn keyset_auto_pagination_preserves_order_and_deduplicates_mixed_types() {
+        let first = "/api/v4/projects/35/-/work_items?per_page=2";
+        let second = "/api/v4/projects/35/-/work_items?cursor=page-2";
+        let outcome = collect_all_keyset_pages(
+            first,
+            |endpoint| match endpoint {
+                value if value == first => Ok((
+                    vec![
+                        json!({"global_id":"gid://gitlab/WorkItem/3","iid":3,"work_item_type":{"name":"Issue"}}),
+                        json!({"global_id":"gid://gitlab/WorkItem/2","iid":2,"work_item_type":{"name":"Task"}}),
+                    ],
+                    Some(second.to_string()),
+                    100,
+                )),
+                value if value == second => Ok((
+                    vec![
+                        json!({"global_id":"gid://gitlab/WorkItem/2","iid":2,"work_item_type":{"name":"Task"}}),
+                        json!({"global_id":"gid://gitlab/WorkItem/1","iid":1,"work_item_type":{"name":"Issue"}}),
+                    ],
+                    None,
+                    100,
+                )),
+                other => panic!("unexpected endpoint {other}"),
+            },
+            20,
+            2_000,
+            MAX_AUTO_BYTES,
+        )
+        .unwrap();
+        assert_eq!(outcome.fetched_pages, 2);
+        assert_eq!(outcome.next_endpoint, None);
+        assert_eq!(
+            outcome
+                .items
+                .iter()
+                .map(|item| item["iid"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [3, 2, 1]
+        );
+        let merged = all_keyset_pages_value(outcome);
+        assert_eq!(merged["pagination"]["complete"], true);
+        assert_eq!(merged["pagination"]["returned_items"], 3);
+        assert_eq!(merged["pagination"]["total"], 3);
+    }
+
+    #[test]
+    fn keyset_auto_pagination_cap_reports_next_cursor() {
+        let first = "/api/v4/projects/35/-/work_items?per_page=2";
+        let outcome = collect_all_keyset_pages(
+            first,
+            |_| {
+                Ok((
+                    vec![json!({"global_id":"gid://gitlab/WorkItem/1"})],
+                    Some("/api/v4/projects/35/-/work_items?cursor=resume%2F2".into()),
+                    100,
+                ))
+            },
+            1,
+            2_000,
+            MAX_AUTO_BYTES,
+        )
+        .unwrap();
+        let merged = all_keyset_pages_value(outcome);
+        assert_eq!(merged["pagination"]["truncated"], true);
+        assert_eq!(merged["pagination"]["complete"], false);
+        assert_eq!(merged["pagination"]["next_cursor"], "resume/2");
+    }
+
+    #[test]
+    fn keyset_auto_pagination_repeated_endpoint_does_not_loop() {
+        let first = "/api/v4/projects/35/-/work_items?per_page=2";
+        let outcome = collect_all_keyset_pages(
+            first,
+            |_| Ok((vec![json!({"id":1})], Some(first.to_string()), 10)),
+            20,
+            2_000,
+            MAX_AUTO_BYTES,
+        )
+        .unwrap();
+        assert_eq!(outcome.fetched_pages, 1);
+        assert_eq!(outcome.next_endpoint, None);
+        let merged = all_keyset_pages_value(outcome);
+        assert_eq!(merged["pagination"]["cycle_detected"], true);
+        assert_eq!(merged["pagination"]["complete"], false);
+        assert_eq!(merged["pagination"]["truncated"], true);
+        assert!(merged["pagination"].get("total").is_none());
     }
 }

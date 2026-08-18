@@ -1,0 +1,31 @@
+[Unit]
+Description=LunarWing healthpoint metrics exporter (loopback listener)
+Documentation=https://git.lunarwing.org/lunarwing/lunarwing2
+# The textfile path is the primary delivery mechanism and needs no listener;
+# this unit is only for hosts that cannot run a textfile collector.
+After=network.target
+
+[Service]
+Type=simple
+# Loopback-only by construction in the binary; it also refuses non-loopback
+# bind addresses. Port comes from HEALTH_METRICS_LISTEN (on MT hosts, from the
+# v16 health_metrics slot in /etc/lunarwing/ports.json — never hardcode one).
+EnvironmentFile=-/etc/lunarwing/health.env
+ExecStart=/usr/local/lib/lunarwing-health/lunarwing-health-metrics
+Restart=on-failure
+RestartSec=5
+# Hardening: the listener only ever READS the exported .prom file, so the
+# whole filesystem stays read-only and no privileges are needed. The exporter
+# writes the .prom world-readable (0644; series are non-secret by design) so
+# the dynamic user can read it from the pipeline report dir.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=lunarwing-health-metrics
+
+[Install]
+WantedBy=multi-user.target
