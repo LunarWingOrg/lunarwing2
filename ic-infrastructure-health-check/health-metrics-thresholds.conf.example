@@ -1,0 +1,43 @@
+# Example early-warning threshold configuration for
+# health-metrics-exporter.sh. Copy to /etc/lunarwing/health-metrics-thresholds.conf
+# (or point HEALTH_METRICS_THRESHOLDS_FILE at this file) and adjust per host.
+#
+# Format (one rule per exported metric):
+#   THRESHOLD_<metric_name>="<spec>"
+#
+# <spec> is one or more space-separated rules of the form
+#   warn:<op><number>   crit:<op><number>
+# where <op> is one of > >= < <= == !=. Each rule is evaluated at export time
+# against the largest exported value of the metric across all its label sets
+# (so a spike on one tenant cannot be hidden by a healthy rollup). A crossing
+# emits a lunarwing_health_early_warning{metric,severity} 1 series and, when
+# HEALTH_METRICS_EARLY_WARNING_NOTIFY=true, one deduplicated Gotify warning.
+#
+# Any metric exported by health-metrics-exporter.sh may be referenced; rules
+# for metrics that are not currently exported (e.g. a disabled component) are
+# skipped silently, so a shared config is safe across differently-shaped hosts.
+
+# Report staleness: the pipeline normally runs hourly, so a report older than
+# 40 minutes means the timer itself is broken.
+THRESHOLD_lunarwing_health_report_age_seconds="crit:>2400"
+
+# TensorZero inference latency (milliseconds) — rising p95 precedes restarts.
+THRESHOLD_lunarwing_health_tensorzero_p95_ms="warn:>1500 crit:>4000"
+
+# TensorZero error rate (fraction of requests).
+THRESHOLD_lunarwing_health_tensorzero_error_rate="crit:>0.05"
+
+# ClickHouse disk / memory pressure (percent).
+THRESHOLD_lunarwing_health_clickhouse_disk_pct="warn:>75 crit:>90"
+THRESHOLD_lunarwing_health_clickhouse_memory_pct="warn:>85 crit:>95"
+
+# LunarVision rollup latency (milliseconds) and cache efficiency.
+THRESHOLD_lunarwing_health_lunarvision_latency_ms="warn:>2000 crit:>5000"
+THRESHOLD_lunarwing_health_lunarvision_cache_hit_rate="warn:<0.5"
+
+# Self-heal remediation pressure: many restarts for one service in the flap
+# window is the classic precursor to an escalation page.
+THRESHOLD_lunarwing_health_selfheal_flapping="warn:>2 crit:>4"
+
+# Unhealthy streak climbing before self-heal's own escalation fires.
+THRESHOLD_lunarwing_health_selfheal_consecutive_unhealthy="warn:>1"

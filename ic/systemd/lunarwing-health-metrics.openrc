@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+# LunarWing healthpoint metrics exporter (loopback listener) — OpenRC service.
+# Optional companion to the textfile exporter; see
+# ic-infrastructure-health-check/health-metrics-exporter.sh.
+
+description="LunarWing healthpoint metrics exporter (loopback listener)"
+command="/usr/local/lib/lunarwing-health/lunarwing-health-metrics"
+command_background="yes"
+pidfile="/run/lunarwing-health-metrics.pid"
+output_log="/var/log/lunarwing-health-metrics.log"
+error_log="/var/log/lunarwing-health-metrics.log"
+
+extra_commands="healthcheck"
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	after net
+}
+
+healthcheck() {
+	ebegin "Checking lunarwing-health-metrics listener"
+	local listen="${HEALTH_METRICS_LISTEN:-127.0.0.1:50000}"
+	local port="${listen##*:}"
+	curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" >/dev/null
+	eend $?
+}
+
+reload() {
+	ebegin "Reloading lunarwing-health-metrics configuration"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}
