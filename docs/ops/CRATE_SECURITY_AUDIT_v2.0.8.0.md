@@ -164,3 +164,48 @@ published since the audit: `cc 1.4.3`, `find-msvc-tools 0.1.11`,
 Re-ran the CI advisory check (cargo-deny 0.20.2, fresh advisory fetch):
 `advisories ok, bans ok, licenses ok, sources ok` — the seven accepted
 findings remain and no new advisory appeared.
+
+## Follow-up (item 19, 2026-08-18)
+
+Work item 53 re-verification on branch `rarity/kimi-19-20260818-1200`. A fresh
+RustSec fetch shows the landscape changed since 2026-08-14: one **new**
+advisory now hits the shipped graph.
+
+### New advisory: RUSTSEC-2026-0258 (h2 unbounded empty DATA frames, low)
+
+Empty DATA frames are accepted and queued without limit; undrained streams can
+grow memory unboundedly or panic on length overflow. **Patched only in
+`h2 0.4.16`** — the 0.3 line ended at `0.3.27` with no backport (re-verified
+against crates.io 2026-08-18).
+
+Three lockfile roots carried `h2`:
+
+| Root | Before | Action | After |
+|---|---|---|---|
+| `ic` | `0.4.15` + `0.3.27` | `cargo update -p h2@0.4.15` → `0.4.16`; `0.3.27` only reachable via the legacy `libsql 0.6.0 -> tonic 0.11 -> hyper 0.14` chain, so it joined the accepted set in `ic/deny.toml` with an explanatory reason | patched 0.4 line + accepted 0.3 remainder |
+| `ic/bridges/xmpp-bridge` | `0.4.15` + `0.3.27` | same 0.4-line bump; the 0.3 copy is the same inherited libsql chain and is covered by the `ic/deny.toml` exception cargo-deny picks up from the workspace root | `advisories` check exit 0 |
+| `projects/ocr-sidecar` | `0.4.15` + `0.3.27` | `0.3.27` came in via **`warp 0.3.7`** (not libsql); upgraded `warp 0.3 -> 0.4.3` (hyper 1.x line, new non-default `server` feature enabled), which **eliminated the entire hyper 0.14 / h2 0.3 tree** from that lockfile | no h2 0.3 left; `advisories ok` with zero exceptions |
+
+### Verification (2026-08-18, cargo-deny 0.20.2, fresh advisory DB)
+
+- `cd ic && cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+- Empty-ignore rescan of `ic/`: exactly 8 vulnerability/unsound findings — the
+  original 7 accepted plus the h2 0.3.27 remainder; the `0.4.16` copy is no
+  longer flagged. No further new advisories.
+- `xmpp-bridge`: `cargo metadata --locked` ok; deny advisories exit 0.
+- `ocr-sidecar`: `cargo check` green on warp 0.4.3, `cargo test` 4/4 pass,
+  `advisories ok`.
+- `ic/` workspace `cargo check --locked` (taskset-bounded) green on the
+  bumped lockfile.
+- All 19 tracked lockfiles rescanned for `h2`: only the three roots above ever
+  carried it; all now lock `0.4.16` (ocr-sidecar additionally dropped 0.3.27).
+- Upstream re-check: no `h2 0.3.x` patch exists (0.3.27 is the newest 0.3
+  release; the advisory lists 0.4.16 as the only fix); clearing the `ic`
+  0.3.27 copy remains blocked on the same libsql migration as the webpki
+  findings.
+
+### Accepted-advisory count
+
+`ic/deny.toml` now accepts **8** findings: the original seven plus
+`RUSTSEC-2026-0258` scoped to the libsql legacy chain. The ocr-sidecar warp
+upgrade means one of the three roots needs no exception at all.
