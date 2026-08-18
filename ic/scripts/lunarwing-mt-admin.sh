@@ -518,6 +518,14 @@ Commands:
     --with-pebble                  Select the pebble worker for this tenant (as above)
     --with-opencode                Select the opencode worker for this tenant (as above)
     --with-kimi                    Select the kimi worker for this tenant (as above)
+    --with-study-mcp               Auto-configure the shared lw2studymcp Study Notes
+                                   MCP for this tenant (read-only) so it starts with
+                                   knowledge of the LunarWing codebase. The shared
+                                   checkout is always synced to the latest upstream
+                                   first (cloned when missing, fast-forwarded when
+                                   present and clean).
+    --study-mcp-home <path>        Use this checkout instead of the default shared one
+                                   ($STUDY_NOTES_DEFAULT_HOME; still synced to latest)
     --opencode-model <model>       Override the opencode worker's LLM model
                                    (written to lunarwing.env as OPENCODE_MODEL)
     --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
@@ -539,7 +547,7 @@ Commands:
    add-tenants <names> [options]    Comma-separated list (e.g. "Ruffles,Miyuki")
      (same options as add-tenant apply to all, including --enable-darkirc,
        --opencode-model/--opencode-base-url, --kimi-model/--kimi-base-url/
-       --kimi-api-key-file,
+       --kimi-api-key-file, --with-study-mcp/--study-mcp-home,
       --llm-model, --gateway-host, --xmpp-allow-from, and --no-weechat-bootstrap)
 
   remove-tenant <name>             Stop services, deallocate ports
@@ -638,8 +646,13 @@ Commands:
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-study-mcp <name>       Configure lw2studymcp for LunarWing and
-    --home <absolute-path>          its opencode worker using a shared host checkout
-    [--allow-write]                 Enable approved core-agent writes using separate state
+    [--home <absolute-path>]       its opencode worker using a shared host checkout
+                                   (default: STUDY_NOTES_DEFAULT_HOME; a default-home
+                                   run always syncs the checkout to latest upstream
+                                   first, cloning it when missing)
+    [--sync]                       Also fast-forward an explicit --home checkout to
+                                   latest upstream (must be a clean git checkout)
+    [--allow-write]                Enable approved core-agent writes using separate state
     [--state-home <absolute-path>]  State path (default: tenant lunarwing/study-notes-state)
                                    (restart the tenant after configuration)
 
@@ -11457,6 +11470,8 @@ add_tenant() {
   local kimi_base_url="${21:-}"
   local kimi_api_key="${22:-}"
   local darkirc_scope_override="${23:-}"
+  local with_study_mcp="${24:-false}"
+  local study_mcp_home="${25:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -11559,6 +11574,23 @@ add_tenant() {
     say "SSH harness: disabled (enabled=$DEFAULT_SSH_ENABLED, opt-out=$SSH_OPT_OUT)"
   fi
 
+  # Study Notes MCP (lw2studymcp): opt-in self-knowledge bootstrap. The shared
+  # host checkout is always synced to the latest upstream before wiring, so the
+  # new tenant starts with current knowledge of the LunarWing codebase.
+  # Non-fatal: a sync/checkout problem must not strand the base tenant.
+  local study_mcp_bootstrap_ok="disabled (pass --with-study-mcp to enable)"
+  if [[ "$with_study_mcp" == "true" ]]; then
+    say "--- Configuring Study Notes MCP (latest lw2studymcp) ---"
+    if provision_tenant_study_mcp "$name" "$study_mcp_home"; then
+      study_mcp_bootstrap_ok="configured (latest lw2studymcp checkout)"
+    else
+      study_mcp_bootstrap_ok="needs recovery"
+      say "WARNING: Study Notes MCP auto-configuration failed for tenant '$name'." >&2
+      say "         Recovery: sudo $0 configure-study-mcp $name --sync" >&2
+    fi
+    say ""
+  fi
+
   if ! "$CONTAINER_RT" image inspect "$VISION_SIDECAR_IMAGE" &>/dev/null; then
     build_vision_sidecar_image || true
   fi
@@ -11616,6 +11648,7 @@ add_tenant() {
   say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
+  say "  study mcp:        $study_mcp_bootstrap_ok"
   say ""
   say "Next steps:"
   say "  sudo $0 build-tenant $name --with-wasm"
@@ -12779,7 +12812,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" darkirc_scope_override=""
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -12794,6 +12827,8 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-study-mcp)  with_study_mcp="true"; shift ;;
+          --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
@@ -12821,12 +12856,12 @@ main() {
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
       name="$(sanitize_name "$name")"
-      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override"
+      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false"
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -12840,6 +12875,8 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-study-mcp)  with_study_mcp="true"; shift ;;
+          --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
           --llm-base-url)    llm_base_url="$2"; shift 2 ;;
           --tensorzero-url)  tz_url="$2"; shift 2 ;;
@@ -12875,7 +12912,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "" "$with_study_mcp" "$study_mcp_home"
       done
       ;;
 
@@ -13353,12 +13390,13 @@ main() {
 
     configure-study-mcp)
       require_root
-      local name="" study_home="" study_state_home="" study_allow_write="false"
+      local name="" study_home="" study_state_home="" study_allow_write="false" study_sync="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --home) study_home="$2"; shift 2 ;;
           --state-home) study_state_home="$2"; shift 2 ;;
           --allow-write) study_allow_write="true"; shift ;;
+          --sync) study_sync="true"; shift ;;
           -*)     die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -13367,8 +13405,18 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" && -n "$study_home" ]] \
-        || die "usage: configure-study-mcp <name> --home <path> [--allow-write] [--state-home <path>]"
+      [[ -n "$name" ]] \
+        || die "usage: configure-study-mcp <name> [--home <path>] [--sync] [--allow-write] [--state-home <path>]"
+      # No --home: use the shared default checkout and always sync it to the
+      # latest upstream first. An explicit --home stays operator-managed unless
+      # --sync is also passed (then it must be a clean git checkout).
+      if [[ -z "$study_home" ]]; then
+        study_home="$STUDY_NOTES_DEFAULT_HOME"
+        study_sync="true"
+      fi
+      if [[ "$study_sync" == "true" ]]; then
+        sync_study_notes_checkout "$study_home"
+      fi
       configure_study_mcp "$name" "$study_home" "$study_allow_write" "$study_state_home"
       ;;
 
