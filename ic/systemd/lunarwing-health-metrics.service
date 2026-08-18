@@ -14,13 +14,15 @@ EnvironmentFile=-/etc/lunarwing/health.env
 ExecStart=/usr/local/lib/lunarwing-health/lunarwing-health-metrics
 Restart=on-failure
 RestartSec=5
-# Hardening: read-only access to the report dir, no privileges needed.
+# Hardening: the listener only ever READS the exported .prom file, so the
+# whole filesystem stays read-only and no privileges are needed. The exporter
+# writes the .prom world-readable (0644; series are non-secret by design) so
+# the dynamic user can read it from the pipeline report dir.
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
-ReadWritePaths=/var/lib/lunarwing
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=lunarwing-health-metrics
