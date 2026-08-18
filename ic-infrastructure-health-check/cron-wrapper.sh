@@ -38,6 +38,23 @@ else
     "$HEALTH_CHECK" || true  # Always continue to self-heal, even if health check fails
 fi
 
+# ── Metrics export (textfile collector) ─────────────────────
+# Converts the report just written into Prometheus exposition format. Runs
+# before self-heal so the exporter sees the FRESH report, but is fully
+# optional: HEALTH_METRICS_EXPORT_ENABLED=false (default true) skips it and
+# export failures never block remediation.
+
+METRICS_EXPORTER="$SCRIPT_DIR/health-metrics-exporter.sh"
+
+if [[ "${HEALTH_METRICS_EXPORT_ENABLED:-true}" != "true" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] HEALTH_METRICS_EXPORT_ENABLED != true; skipping metrics export" >&2
+elif [[ ! -x "$METRICS_EXPORTER" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: health-metrics-exporter.sh not found at $METRICS_EXPORTER; skipping metrics export" >&2
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Exporting healthpoint metrics..." >&2
+    "$METRICS_EXPORTER" || echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: metrics export failed (non-fatal)" >&2
+fi
+
 # ── Run self-healing ────────────────────────────────────
 
 SELF_HEAL="$SCRIPT_DIR/lunarwing-self-heal.sh"

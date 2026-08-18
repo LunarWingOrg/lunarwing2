@@ -160,3 +160,39 @@
 # NetBird failures are monitor-only by default. Enable only when operator
 # delegates restart ownership to LunarWing.
 #SELF_HEAL_NETBIRD_REMEDIATE=false
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Metrics exporter (Prometheus textfile; see docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Master switch for the textfile export step run by cron-wrapper.sh after each
+# health check. No listener and no port are opened by the textfile path.
+#HEALTH_METRICS_EXPORT_ENABLED=true
+
+# Textfile collector target. Written atomically (tmp + mv, mode 0644 per the
+# node_exporter textfile convention; series are non-secret by design) in the
+# same directory. Point node_exporter's --collector.textfile.directory here.
+#HEALTH_METRICS_OUTPUT="/path/to/reports/health/metrics.prom"
+
+# Also export self-heal state series (restarts/escalated/backoff/flapping).
+#HEALTH_METRICS_INCLUDE_SELFHEAL=true
+
+# Early-warning threshold file (see health-metrics-thresholds.conf.example).
+#HEALTH_METRICS_THRESHOLDS_FILE=/etc/lunarwing/health-metrics-thresholds.conf
+
+# Send a Gotify warning when an early-warning threshold crosses. Warnings are
+# deduplicated per metric+severity using the cooldown below.
+#HEALTH_METRICS_EARLY_WARNING_NOTIFY=false
+
+# Early-warning notification cooldown in seconds. Defaults to
+# SELF_HEAL_ESCALATE_COOLDOWN when unset.
+#HEALTH_METRICS_NOTIFY_COOLDOWN=3600
+
+# Optional loopback-only HTTP listener ("127.0.0.1:<port>") serving the same
+# exposition on GET /metrics, for hosts without a textfile collector. Empty
+# (default) keeps the listener off. On multi-tenant hosts the port comes from
+# the v16 health_metrics slot in the ports registry — never hardcode one.
+#HEALTH_METRICS_LISTEN=""
+
+# Bearer token for the optional listener; empty = no auth on loopback.
+#HEALTH_METRICS_TOKEN=""

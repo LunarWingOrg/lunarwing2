@@ -1255,7 +1255,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "15" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "16" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -1499,6 +1499,37 @@ ports_migrate() {
   if [[ "$current_version" -lt 13 ]]; then ports_migrate_v13; fi
   if [[ "$current_version" -lt 14 ]]; then ports_migrate_v14; fi
   if [[ "$current_version" -lt 15 ]]; then ports_migrate_v15; fi
+  if [[ "$current_version" -lt 16 ]]; then ports_migrate_v16; fi
+}
+
+# v15 -> v16: allocate a host-global `health_metrics` slot for the optional
+# loopback-only LunarWing healthpoint metrics listener (proposal
+# HEALTHPOINT_METRICS_EXPORTER.md Phase 2). Tenant-scoped listeners are
+# explicitly NOT planned — one host-global exporter carries per-tenant labels —
+# so this is a single top-level port, allocated above every existing range
+# (voice ends at 49999) so no live tenant port can move.
+ports_migrate_v16() {
+  local tmp existing
+  existing="$(jq -r '.health_metrics_port // empty' "$PORTS_REGISTRY" 2>/dev/null || true)"
+  if [[ -n "$existing" ]] && jq -e --argjson p "$existing" '
+      [ .tenants[]
+        | ((.ports // {}) | to_entries[] | .value),
+          ((.extended_ports // {}) | to_entries[] | .value),
+          ((.kimi_ports // {}) | to_entries[] | .value),
+          ((.voice_ports // {}) | to_entries[] | .value)
+      ] | any(. == $p)
+    ' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    # Pre-existing slot collides with a tenant port (hand-edited registry).
+    # Refuse rather than silently moving a live port; operator must resolve.
+    die "health_metrics_port $existing collides with a tenant port; fix $PORTS_REGISTRY manually"
+  fi
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '.version = 16 | .health_metrics_port = ((.health_metrics_port) // 50000)' \
+    "$PORTS_REGISTRY" >"$tmp" \
+    || { rm -f "$tmp"; die "failed to migrate port registry to v16"; }
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v16 (host-global health_metrics slot: $(jq -r '.health_metrics_port' "$PORTS_REGISTRY"))"
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
