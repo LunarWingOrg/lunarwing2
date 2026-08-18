@@ -11,6 +11,11 @@ ignore = [
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 constrained by rustls 0.22 via libsql 0.6.0; blocked on upstream libsql release supporting rustls 0.23" },
     { id = "RUSTSEC-2026-0099", reason = "same as RUSTSEC-2026-0098" },
     { id = "RUSTSEC-2026-0104", reason = "same as RUSTSEC-2026-0098" },
+    # h2 empty DATA frames — low severity. The patched 0.4.16 is locked; the
+    # remaining 0.3.27 copy is unpatchable upstream (0.3 line ended at 0.3.27)
+    # and is reached only via the legacy libsql 0.6.0 -> tonic 0.11 -> hyper 0.14
+    # chain, same block as the webpki entries above.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 pinned by libsql 0.6.0 legacy chain; no 0.3-line patch exists; 0.4 line upgraded to 0.4.16" },
 ]
 
 [licenses]
