@@ -29,6 +29,7 @@ use hyper::header::{AUTHORIZATION, CONTENT_TYPE};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode, header};
 use hyper_util::rt::TokioIo;
+use secrecy::{ExposeSecret, SecretString};
 use tokio::net::TcpListener;
 
 /// Served snapshot: last successfully read exposition body.
@@ -40,13 +41,13 @@ struct Snapshot {
 /// Shared state: file to read, optional bearer token, cached snapshot.
 struct State {
     prom_path: PathBuf,
-    token: Option<String>,
+    token: Option<SecretString>,
     snapshot: tokio::sync::RwLock<Snapshot>,
     refresh: Duration,
 }
 
 impl State {
-    fn new(prom_path: PathBuf, token: Option<String>, refresh: Duration) -> Self {
+    fn new(prom_path: PathBuf, token: Option<SecretString>, refresh: Duration) -> Self {
         Self {
             prom_path,
             token,
@@ -84,7 +85,7 @@ impl State {
 
     /// Constant-time bearer check — see `AUTH_INVARIANT` in main.rs docs.
     fn authorized(&self, header_value: Option<&header::HeaderValue>) -> bool {
-        let Some(expected) = self.token.as_deref() else {
+        let Some(expected) = self.token.as_ref() else {
             return true; // no token configured: loopback trust
         };
         let Some(value) = header_value.and_then(|v| v.to_str().ok()) else {
@@ -93,7 +94,7 @@ impl State {
         let Some(presented) = value.strip_prefix("Bearer ") else {
             return false;
         };
-        constant_time_eq(expected.as_bytes(), presented.as_bytes())
+        constant_time_eq(expected.expose_secret().as_bytes(), presented.as_bytes())
     }
 }
 
@@ -183,7 +184,8 @@ async fn main() -> Result<()> {
         std::env::var("HEALTH_METRICS_LISTEN").unwrap_or_else(|_| "127.0.0.1:50000".to_string());
     let token = std::env::var("HEALTH_METRICS_TOKEN")
         .ok()
-        .filter(|t| !t.is_empty());
+        .filter(|t| !t.is_empty())
+        .map(SecretString::from);
     let refresh_secs: u64 = std::env::var("HEALTH_METRICS_REFRESH_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -283,7 +285,7 @@ mod tests {
     async fn authorization_gating() {
         let state = State::new(
             PathBuf::from("/nonexistent/metrics.prom"),
-            Some("sekrit".to_string()),
+            Some(SecretString::from("sekrit".to_string())),
             Duration::from_secs(60),
         );
         assert!(!state.authorized(None));

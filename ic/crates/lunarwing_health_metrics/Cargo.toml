@@ -22,10 +22,8 @@ anyhow = "1"
 http-body-util = "0.1"
 hyper = { version = "1.5", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
+secrecy = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "time", "fs"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [[bin]]
 name = "lunarwing-health-metrics"
