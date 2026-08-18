@@ -232,6 +232,24 @@ mod tests {
                     expected_tool_results: vec![],
                 });
             }
+        } else {
+            // Blocked-tool path: AutonomousUnavailable is returned to the model
+            // for recovery instead of failing the job immediately. Provide
+            // non-completion text so the job exhausts max_iterations without
+            // ever executing the gated tool.
+            for i in 0..6 {
+                steps.push(TraceStep {
+                    request_hint: None,
+                    response: TraceResponse::Text {
+                        content: format!(
+                            "owner_gate is still unavailable; cannot proceed ({i})."
+                        ),
+                        input_tokens: 20,
+                        output_tokens: 5,
+                    },
+                    expected_tool_results: vec![],
+                });
+            }
         }
         LlmTrace::single_turn("test-owner-gate", "run owner gate", steps)
     }
@@ -1528,15 +1546,21 @@ mod tests {
         let run = wait_for_run_completion(&db, routine.id, run_id).await;
 
         assert_eq!(run.status, RunStatus::Failed);
+        // Gated tool must never execute when inactive for this owner.
         assert_eq!(owner_gate_count(&db).await, 0);
         let failure_reason = db
             .get_agent_job_failure_reason(run.job_id.expect("linked job id"))
             .await
             .expect("load job failure reason")
             .expect("missing job failure reason");
+        // AutonomousUnavailable is recovered into the model loop; without a
+        // usable alternative the job ends via max-iterations / provider
+        // exhaustion rather than a direct tool-error terminal reason.
         assert!(
-            failure_reason.contains("owner_gate"),
-            "expected missing-tool failure reason, got {failure_reason}"
+            failure_reason.contains("owner_gate")
+                || failure_reason.contains("Maximum iterations")
+                || failure_reason.contains("kept failing after retries"),
+            "expected missing-tool block or post-recovery failure, got {failure_reason}"
         );
     }
 
@@ -1568,6 +1592,7 @@ mod tests {
         let run = wait_for_run_completion(&db, routine.id, run_id).await;
 
         assert_eq!(run.status, RunStatus::Failed);
+        // Other-owner activation must not grant the tool to this routine owner.
         assert_eq!(owner_gate_count(&db).await, 0);
         let failure_reason = db
             .get_agent_job_failure_reason(run.job_id.expect("linked job id"))
@@ -1575,8 +1600,10 @@ mod tests {
             .expect("load job failure reason")
             .expect("missing job failure reason");
         assert!(
-            failure_reason.contains("owner_gate"),
-            "expected owner-mismatch failure reason, got {failure_reason}"
+            failure_reason.contains("owner_gate")
+                || failure_reason.contains("Maximum iterations")
+                || failure_reason.contains("kept failing after retries"),
+            "expected owner-mismatch block or post-recovery failure, got {failure_reason}"
         );
     }
 
