@@ -1,0 +1,30 @@
+[package]
+name = "lunarwing_health_metrics"
+version = "2.0.8"
+edition = "2024"
+rust-version = "1.96.1"
+description = "Optional loopback-only Prometheus listener for LunarWing healthpoint metrics"
+authors = ["LunarWing Team"]
+license = "AGPL-3.0-or-later"
+homepage = "https://git.lunarwing.org/lunarwing/lunarwing2"
+repository = "https://git.lunarwing.org/lunarwing/lunarwing2"
+publish = false
+
+[package.metadata.dist]
+dist = false
+
+# Deliberately no workspace deps beyond what a tiny listener needs: this crate
+# must stay cheap to build and free of the daemon's dependency graph so hosts
+# can deploy it without pulling the world.
+
+[dependencies]
+anyhow = "1"
+http-body-util = "0.1"
+hyper = { version = "1.5", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "http1"] }
+secrecy = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "macros", "time", "fs"] }
+
+[[bin]]
+name = "lunarwing-health-metrics"
+path = "src/main.rs"
