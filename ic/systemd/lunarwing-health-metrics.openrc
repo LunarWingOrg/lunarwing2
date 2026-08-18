@@ -10,8 +10,10 @@ pidfile="/run/lunarwing-health-metrics.pid"
 output_log="/var/log/lunarwing-health-metrics.log"
 error_log="/var/log/lunarwing-health-metrics.log"
 
+# No reload command on purpose: the daemon is configured purely via
+# environment and installs no SIGHUP handler, so a HUP "reload" would kill it
+# (default disposition) with nothing supervising a restart. Use restart.
 extra_commands="healthcheck"
-extra_started_commands="reload"
 
 depend() {
 	need localmount
@@ -22,12 +24,13 @@ healthcheck() {
 	ebegin "Checking lunarwing-health-metrics listener"
 	local listen="${HEALTH_METRICS_LISTEN:-127.0.0.1:50000}"
 	local port="${listen##*:}"
-	curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" >/dev/null
-	eend $?
-}
-
-reload() {
-	ebegin "Reloading lunarwing-health-metrics configuration"
-	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	# A configured bearer token is required for /metrics; without it the
+	# probe would false-report the service as down on a 401.
+	if [ -n "${HEALTH_METRICS_TOKEN:-}" ]; then
+		curl -fsS --max-time 3 -H "Authorization: Bearer ${HEALTH_METRICS_TOKEN}" \
+			"http://127.0.0.1:${port}/metrics" >/dev/null
+	else
+		curl -fsS --max-time 3 "http://127.0.0.1:${port}/metrics" >/dev/null
+	fi
 	eend $?
 }
