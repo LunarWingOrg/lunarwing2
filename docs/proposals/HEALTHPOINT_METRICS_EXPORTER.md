@@ -242,8 +242,10 @@ rate, and report staleness.
   (`OPENROUTER_API_KEY` etc. are presence-only today and stay that way — the
   exporter copies only the numeric/boolean fields enumerated by an allowlist,
   never an arbitrary dump of `metrics`).
-- The `.prom` file is written `0600`-ish within the operator's existing
-  report directory permissions; nothing tenant-private leaves the host.
+- The `.prom` file is written `0644` (node_exporter textfile-collector
+  convention) — safe because the exposition carries only non-secret
+  numeric/boolean series, and required so the optional listener can read it
+  as an unprivileged user; nothing tenant-private leaves the host.
 
 ### Testing
 

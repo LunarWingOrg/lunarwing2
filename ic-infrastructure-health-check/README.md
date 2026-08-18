@@ -235,8 +235,10 @@ older consumers ignore it) — this powers
 ## Metrics Exporter (Prometheus)
 
 `health-metrics-exporter.sh` turns the newest report into Prometheus text
-exposition format and atomically writes `metrics.prom` (mode 0600) next to the
-reports. `cron-wrapper.sh` runs it after every health check, gated on
+exposition format and atomically writes `metrics.prom` (mode 0644 — the
+node_exporter textfile-collector convention; series are non-secret numeric
+leaves only, and the optional listener reads the file as an unprivileged
+user) next to the reports. `cron-wrapper.sh` runs it after every health check, gated on
 `HEALTH_METRICS_EXPORT_ENABLED` (default `true`) — no listener and no port by
 default. Point node_exporter/VictoriaMetrics at it:
 

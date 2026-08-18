@@ -169,7 +169,8 @@
 # health check. No listener and no port are opened by the textfile path.
 #HEALTH_METRICS_EXPORT_ENABLED=true
 
-# Textfile collector target. Written atomically (tmp + mv, mode 0600) in the
+# Textfile collector target. Written atomically (tmp + mv, mode 0644 per the
+# node_exporter textfile convention; series are non-secret by design) in the
 # same directory. Point node_exporter's --collector.textfile.directory here.
 #HEALTH_METRICS_OUTPUT="/path/to/reports/health/metrics.prom"
 

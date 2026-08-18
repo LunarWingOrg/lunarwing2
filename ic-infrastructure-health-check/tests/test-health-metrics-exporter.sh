@@ -79,7 +79,7 @@ type_first="$(awk '/^# TYPE lunarwing_health_overall_status gauge/{t=NR}
     /^lunarwing_health_overall_status /{s=NR} END{print (t<s) ? 1 : 0}' "$sb/reports/health/metrics.prom")"
 assert_eq "$type_first" "1" "TYPE line precedes samples"
 mode="$(stat -c '%a' "$sb/reports/health/metrics.prom")"
-assert_eq "$mode" "600" ".prom written mode 0600"
+assert_eq "$mode" "644" ".prom written mode 0644 (textfile-collector convention; non-secret series)"
 
 # No secret material: URLs and strings from metrics must never appear.
 assert_absent "$PROM" "http://" "no URL leaks into exposition"

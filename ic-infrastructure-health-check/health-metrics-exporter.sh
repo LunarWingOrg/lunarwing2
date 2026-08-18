@@ -332,7 +332,11 @@ if ! cat "$assembled" > "$tmp_out"; then
     rm -f "$tmp_out"
     die "failed to write temporary metrics file"
 fi
-chmod 0600 "$tmp_out"
+# World-readable on purpose (node_exporter textfile-collector convention):
+# the exposition contains only non-secret numeric/boolean series, and the
+# optional Phase-2 listener runs as an unprivileged dynamic user that must be
+# able to read this file.
+chmod 0644 "$tmp_out"
 mv "$tmp_out" "$OUTPUT_FILE" || { rm -f "$tmp_out"; die "failed to publish $OUTPUT_FILE"; }
 
 log "exported $(grep -cE '^[a-zA-Z_:][a-zA-Z0-9_:]*[ ({]' "$OUTPUT_FILE" 2>/dev/null || echo '?') series -> $OUTPUT_FILE"
