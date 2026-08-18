@@ -34,7 +34,8 @@ use crate::db::Database;
 use crate::error::RoutineError;
 use crate::extensions::ExtensionManager;
 use crate::llm::{
-    ChatMessage, CompletionRequest, FinishReason, LlmProvider, ToolCall, ToolCompletionRequest,
+    ChatMessage, CompletionRequest, FinishReason, LlmError, LlmProvider, ToolCall,
+    ToolCompletionRequest,
 };
 use crate::tools::{
     ToolError, ToolRegistry, autonomous_allowed_tool_names, autonomous_unavailable_message,
@@ -1820,6 +1821,30 @@ fn handle_text_response(
     Ok((RunStatus::Attention, Some(cleaned), total_tokens))
 }
 
+enum RoutineModelFailure {
+    Retry,
+    Terminal(RoutineError),
+}
+
+fn recover_routine_model_failure(
+    error: LlmError,
+    recovery_attempted: &mut bool,
+    messages: &mut Vec<ChatMessage>,
+    partial_tokens: Option<i32>,
+) -> RoutineModelFailure {
+    if !*recovery_attempted && let Some(instruction) = error.recovery_instruction() {
+        *recovery_attempted = true;
+        messages.push(ChatMessage::system(instruction));
+        return RoutineModelFailure::Retry;
+    }
+
+    RoutineModelFailure::Terminal(RoutineError::LlmFailed {
+        retryable: crate::llm::retry::is_retryable(&error),
+        reason: error.terminal_guidance().to_string(),
+        partial_tokens,
+    })
+}
+
 /// Execute a lightweight routine with tool execution support (agentic loop).
 ///
 /// This is a simplified version of the full dispatcher loop:
@@ -1851,6 +1876,8 @@ async fn execute_lightweight_with_tools(
     let mut iteration = 0;
     let mut total_input_tokens = 0;
     let mut total_output_tokens = 0;
+    let mut provider_recovery_attempted = false;
+    let mut iteration_warning_injected = false;
 
     // Create a minimal job context for tool execution with unique run ID
     let run_id = Uuid::new_v4();
@@ -1872,20 +1899,36 @@ async fn execute_lightweight_with_tools(
         let force_text = iteration >= max_iterations;
 
         if force_text {
-            // Final iteration: no tools, just get text response
-            let request = CompletionRequest::new(messages)
+            if !iteration_warning_injected {
+                messages.push(ChatMessage::system(
+                    "Routine iteration limit reached. This is the final text-only recovery response. Provide the best result now, state incomplete work, and name any capability that must be enabled or the higher max_tool_rounds/ROUTINES_LIGHTWEIGHT_MAX_ITERATIONS value needed to continue.",
+                ));
+                iteration_warning_injected = true;
+            }
+            let request = CompletionRequest::new(messages.clone())
                 .with_max_tokens(effective_max_tokens)
                 .with_temperature(0.3);
 
-            let response =
-                ctx.llm
-                    .complete(request)
-                    .await
-                    .map_err(|e| RoutineError::LlmFailed {
-                        retryable: crate::llm::retry::is_retryable(&e),
-                        reason: e.to_string(),
-                        partial_tokens: tokens_to_option(total_input_tokens, total_output_tokens),
-                    })?;
+            let response = match ctx.llm.complete(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        routine = %routine.name,
+                        failure_kind = error.recovery_kind(),
+                        error = %error,
+                        "Routine model call failed"
+                    );
+                    match recover_routine_model_failure(
+                        error,
+                        &mut provider_recovery_attempted,
+                        &mut messages,
+                        tokens_to_option(total_input_tokens, total_output_tokens),
+                    ) {
+                        RoutineModelFailure::Retry => continue,
+                        RoutineModelFailure::Terminal(error) => return Err(error),
+                    }
+                }
+            };
 
             total_input_tokens += response.input_tokens;
             total_output_tokens += response.output_tokens;
@@ -1911,13 +1954,26 @@ async fn execute_lightweight_with_tools(
                 .with_max_tokens(effective_max_tokens)
                 .with_temperature(0.3);
 
-            let response = ctx.llm.complete_with_tools(request).await.map_err(|e| {
-                RoutineError::LlmFailed {
-                    retryable: crate::llm::retry::is_retryable(&e),
-                    reason: e.to_string(),
-                    partial_tokens: tokens_to_option(total_input_tokens, total_output_tokens),
+            let response = match ctx.llm.complete_with_tools(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        routine = %routine.name,
+                        failure_kind = error.recovery_kind(),
+                        error = %error,
+                        "Routine tool-enabled model call failed"
+                    );
+                    match recover_routine_model_failure(
+                        error,
+                        &mut provider_recovery_attempted,
+                        &mut messages,
+                        tokens_to_option(total_input_tokens, total_output_tokens),
+                    ) {
+                        RoutineModelFailure::Retry => continue,
+                        RoutineModelFailure::Terminal(error) => return Err(error),
+                    }
                 }
-            })?;
+            };
 
             total_input_tokens += response.input_tokens;
             total_output_tokens += response.output_tokens;

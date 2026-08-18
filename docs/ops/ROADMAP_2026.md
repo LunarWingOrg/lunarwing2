@@ -11,8 +11,9 @@
 | LunarHub polish | v2.1.1.0 |
 | LunarVoice Two Way Voice Communication | v2.1.2.0 |
 | Memory as a capability-declaring extension — memory/knowledge providers advertise declared capabilities (search, get, submit, list-stale, stats) so providers are swappable (`docs/ops/35d44998cadf3e6d.md`) | v2.1.2.0 |
-| Polish | v2.1.3.0 |
-| LTX integration | v2.1.4.0 |
+| TPM 2.0 Decryption Integration via Clevis | v2.1.4.0 |
+| LunarVoice Two Way Voice Communication | v2.1.4.0 |
+| LTX integration | v2.1.6.0 |
 
 ### Unscoped discussed ideas (no release target yet)
 

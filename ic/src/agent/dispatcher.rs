@@ -146,7 +146,8 @@ impl Agent {
         ) && !cavepony_skill_active
         {
             return Ok(AgenticLoopResult::Response(
-                "Cavepony is unavailable under current skill settings.".to_string(),
+                "Cavepony is unavailable under current skill settings. Enable the bundled Cavepony skill, or retry without Cavepony mode."
+                    .to_string(),
             ));
         }
         let cavepony_instruction = match cavepony_activation {
@@ -334,7 +335,14 @@ impl Agent {
             .into()),
             LoopOutcome::MaxIterations => Err(crate::error::LlmError::InvalidResponse {
                 provider: "agent".to_string(),
-                reason: format!("Exceeded maximum tool iterations ({max_tool_iterations})"),
+                reason: format!(
+                    "Exceeded maximum tool iterations ({max_tool_iterations}) after a final recovery turn. Retry with narrower scope or raise AGENT_MAX_TOOL_ITERATIONS."
+                ),
+            }
+            .into()),
+            LoopOutcome::Failed(message) => Err(crate::error::LlmError::InvalidResponse {
+                provider: "agent-recovery".to_string(),
+                reason: message,
             }
             .into()),
             LoopOutcome::NeedApproval(pending) => Ok(AgenticLoopResult::NeedApproval { pending }),
@@ -638,8 +646,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     preflight.push((
                         tc,
                         PreflightOutcome::Rejected(format!(
-                            "Tool call rejected by hook: {}",
-                            reason
+                            "Tool call rejected by hook: {reason}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to change policy."
                         )),
                     ));
                     continue;
@@ -648,8 +655,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                     preflight.push((
                         tc,
                         PreflightOutcome::Rejected(format!(
-                            "Tool call blocked by hook policy: {}",
-                            err
+                            "Tool call blocked by hook policy: {err}. This call cannot succeed unchanged; choose an allowed tool or parameters, or ask the user/operator to repair the hook policy."
                         )),
                     ));
                     continue;

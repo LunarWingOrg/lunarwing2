@@ -8,6 +8,8 @@
 //!
 //! - Only active on configured coordination channels (`COORD_CHANNELS`).
 //! - `ALERT:` messages bypass the window entirely (priority flush).
+//! - `KNOW:` messages also bypass it: each wire record has one topic and body,
+//!   so merging two records would corrupt the knowledge-share grammar.
 //! - Merging: same tag prefix → concatenate with `" | "`; different tags →
 //!   keep the first message's tag; exact duplicates stripped; merges that
 //!   would exceed the length cap flush the pending message first and start
@@ -241,7 +243,7 @@ impl CoalesceBuffer {
         content: String,
         flush: FlushFn,
     ) -> CoalesceDecision {
-        if !self.config.applies_to(&key.channel_id) || is_alert(&content) {
+        if !self.config.applies_to(&key.channel_id) || bypasses_coalescing(&content) {
             return CoalesceDecision::SendNow(content);
         }
 
@@ -452,12 +454,15 @@ impl CoalesceActor {
     }
 }
 
-/// `ALERT:` messages bypass the coalesce window.
-fn is_alert(content: &str) -> bool {
-    content
-        .trim_start()
-        .get(..6)
-        .is_some_and(|p| p.eq_ignore_ascii_case("alert:"))
+/// `ALERT:` and `KNOW:` records bypass the coalesce window.
+fn bypasses_coalescing(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    ["ALERT", "KNOW"].iter().any(|tag| {
+        trimmed
+            .get(..tag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(tag))
+            && trimmed.as_bytes().get(tag.len()) == Some(&b':')
+    })
 }
 
 /// Split `"TAG: rest"` into `(Some("TAG"), "rest")` for uppercase tags.
@@ -572,10 +577,13 @@ mod tests {
     }
 
     #[test]
-    fn test_is_alert() {
-        assert!(is_alert("ALERT: disk full"));
-        assert!(is_alert("  alert: disk full"));
-        assert!(!is_alert("STATUS: all good"));
+    fn alert_and_knowledge_records_bypass_coalescing() {
+        assert!(bypasses_coalescing("ALERT: disk full"));
+        assert!(bypasses_coalescing("  alert: disk full"));
+        assert!(bypasses_coalescing("KNOW: topic | durable finding"));
+        assert!(bypasses_coalescing("  know: topic | durable finding"));
+        assert!(!bypasses_coalescing("KNOWLEDGE: ordinary message"));
+        assert!(!bypasses_coalescing("STATUS: all good"));
     }
 
     #[test]
@@ -617,6 +625,16 @@ mod tests {
             decision,
             CoalesceDecision::SendNow("ALERT: urgent".to_string())
         );
+        assert_eq!(buffer.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn knowledge_record_bypasses_coalesce() {
+        let buffer = CoalesceBuffer::new(test_config());
+        let (flush, _sent) = collector();
+        let content = "KNOW: workspace-search | FTS uses normalized query terms".to_string();
+        let decision = buffer.submit(key(), content.clone(), flush).await;
+        assert_eq!(decision, CoalesceDecision::SendNow(content));
         assert_eq!(buffer.pending_count().await, 0);
     }
 

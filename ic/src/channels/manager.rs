@@ -15,11 +15,13 @@ use crate::error::ChannelError;
 const COORD_ENABLED_ENV: &str = "COORD_ENABLED";
 const COORD_CHANNELS_ENV: &str = "COORD_CHANNELS";
 const COORD_XMPP_STATUS_UPDATES_ENV: &str = "COORD_XMPP_STATUS_UPDATES";
+const COORD_KNOWLEDGE_PUBLISH_ENV: &str = "COORD_KNOWLEDGE_PUBLISH";
 
 #[derive(Debug, Clone, Default)]
 struct CoordinationStatusPolicy {
     enabled: bool,
     xmpp_status_updates: bool,
+    knowledge_publish_enabled: bool,
     coordination_channels: Vec<String>,
 }
 
@@ -28,6 +30,7 @@ impl CoordinationStatusPolicy {
         Self {
             enabled: env_flag(COORD_ENABLED_ENV),
             xmpp_status_updates: env_flag(COORD_XMPP_STATUS_UPDATES_ENV),
+            knowledge_publish_enabled: env_flag(COORD_KNOWLEDGE_PUBLISH_ENV),
             coordination_channels: std::env::var(COORD_CHANNELS_ENV)
                 .map(|value| {
                     value
@@ -62,6 +65,16 @@ impl CoordinationStatusPolicy {
             .iter()
             .any(|configured| configured.eq_ignore_ascii_case(&scope))
     }
+
+    fn blocks_knowledge_publish(&self, target: &str, content: &str) -> bool {
+        self.enabled
+            && !self.knowledge_publish_enabled
+            && self
+                .coordination_channels
+                .iter()
+                .any(|configured| configured.eq_ignore_ascii_case(target))
+            && crate::hooks::coordination::is_knowledge_share_record(content)
+    }
 }
 
 fn env_flag(name: &str) -> bool {
@@ -80,6 +93,14 @@ fn is_transient_progress(status: &StatusUpdate) -> bool {
             | StatusUpdate::StreamChunk(_)
             | StatusUpdate::ReasoningUpdate { .. }
     )
+}
+
+fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
+    ChannelError::SendFailed {
+        name: channel_name.to_string(),
+        reason: "KNOW publishing is disabled; set COORD_KNOWLEDGE_PUBLISH=true only after confirming fleet compatibility"
+            .to_string(),
+    }
 }
 
 /// Manages multiple input channels and merges their message streams.
@@ -219,6 +240,13 @@ impl ChannelManager {
         msg: &IncomingMessage,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        let target = msg.routing_target().unwrap_or_else(|| msg.user_id.clone());
+        if self
+            .coordination_status_policy
+            .blocks_knowledge_publish(&target, &response.content)
+        {
+            return Err(knowledge_publish_blocked(&msg.channel));
+        }
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(&msg.channel) {
             channel.respond(msg, response).await
@@ -270,6 +298,12 @@ impl ChannelManager {
         user_id: &str,
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
+        if self
+            .coordination_status_policy
+            .blocks_knowledge_publish(user_id, &response.content)
+        {
+            return Err(knowledge_publish_blocked(channel_name));
+        }
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(channel_name) {
             channel.broadcast(user_id, response).await
@@ -293,7 +327,14 @@ impl ChannelManager {
         let mut results = Vec::new();
 
         for (name, channel) in channels.iter() {
-            let result = channel.broadcast(user_id, response.clone()).await;
+            let result = if self
+                .coordination_status_policy
+                .blocks_knowledge_publish(user_id, &response.content)
+            {
+                Err(knowledge_publish_blocked(name))
+            } else {
+                channel.broadcast(user_id, response.clone()).await
+            };
             results.push((name.clone(), result));
         }
 
@@ -356,6 +397,7 @@ mod tests {
         CoordinationStatusPolicy {
             enabled: true,
             xmpp_status_updates,
+            knowledge_publish_enabled: false,
             coordination_channels: vec!["ops@conference.example".to_string()],
         }
     }
@@ -407,6 +449,61 @@ mod tests {
         let metadata = serde_json::json!({ "xmpp_target": "ops@conference.example" });
         let status = StatusUpdate::Thinking("working".to_string());
         assert!(!policy.suppresses("xmpp", &status, &metadata));
+    }
+
+    #[tokio::test]
+    async fn channel_boundary_blocks_knowledge_publish_until_enabled() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false));
+        let (channel, captures) = RecordingBroadcastChannel::new("xmpp");
+        manager.add(Box::new(channel)).await;
+        let record = OutgoingResponse::text("KNOW: topic | finding long enough");
+
+        assert!(
+            manager
+                .broadcast("xmpp", "OPS@conference.example", record.clone())
+                .await
+                .is_err()
+        );
+        assert!(captures.lock().await.is_empty());
+        let results = manager
+            .broadcast_all("ops@conference.example", record.clone())
+            .await;
+        assert!(results.iter().all(|(_, result)| result.is_err()));
+        assert!(captures.lock().await.is_empty());
+
+        let mut policy = coordination_policy(false);
+        policy.knowledge_publish_enabled = true;
+        let manager = ChannelManager::with_coordination_status_policy(policy);
+        let (channel, captures) = RecordingBroadcastChannel::new("xmpp");
+        manager.add(Box::new(channel)).await;
+        manager
+            .broadcast("xmpp", "ops@conference.example", record)
+            .await
+            .expect("enabled KNOW publish reaches channel boundary");
+        assert_eq!(captures.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn response_boundary_blocks_knowledge_publish_until_enabled() {
+        let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false));
+        let (stub, _) = StubChannel::new("xmpp");
+        let responses = stub.captured_responses_handle();
+        manager.add(Box::new(stub)).await;
+        let message = IncomingMessage::new("xmpp", "owner", "request")
+            .with_sender_id("ops@conference.example");
+
+        assert!(
+            manager
+                .respond(
+                    &message,
+                    OutgoingResponse::text("KNOW: topic | finding long enough"),
+                )
+                .await
+                .is_err()
+        );
+        assert!(responses.lock().expect("poisoned").is_empty());
     }
 
     #[tokio::test]

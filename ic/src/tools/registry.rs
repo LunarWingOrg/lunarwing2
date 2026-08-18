@@ -766,10 +766,24 @@ impl ToolRegistry {
         channel_manager: Arc<crate::channels::ChannelManager>,
         extension_manager: Option<Arc<crate::extensions::ExtensionManager>>,
     ) {
+        self.register_message_tools_with_coordination(channel_manager, extension_manager, None)
+            .await;
+    }
+
+    /// Register message tools with optional coordination direct-send policy.
+    pub async fn register_message_tools_with_coordination(
+        &self,
+        channel_manager: Arc<crate::channels::ChannelManager>,
+        extension_manager: Option<Arc<crate::extensions::ExtensionManager>>,
+        coordination_config: Option<crate::hooks::CoordinationHookConfig>,
+    ) {
         use crate::tools::builtin::MessageTool;
         let mut tool = MessageTool::new(channel_manager);
         if let Some(extension_manager) = extension_manager {
             tool = tool.with_extension_manager(extension_manager);
+        }
+        if let Some(coordination_config) = coordination_config {
+            tool = tool.with_coordination_config(coordination_config);
         }
         let tool = Arc::new(tool);
         *self.message_tool.write().await = Some(Arc::clone(&tool));

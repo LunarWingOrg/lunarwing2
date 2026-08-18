@@ -26,6 +26,8 @@ pub struct MessageTool {
     default_target: Arc<RwLock<Option<String>>>,
     /// Base directory for attachment path validation (sandbox).
     pub(crate) base_dir: PathBuf,
+    /// Optional coordination policy for direct channel sends.
+    coordination_config: Option<crate::hooks::CoordinationHookConfig>,
 }
 
 impl MessageTool {
@@ -38,11 +40,20 @@ impl MessageTool {
             default_channel: Arc::new(RwLock::new(None)),
             default_target: Arc::new(RwLock::new(None)),
             base_dir,
+            coordination_config: None,
         }
     }
 
     pub fn with_extension_manager(mut self, extension_manager: Arc<ExtensionManager>) -> Self {
         self.extension_manager = Some(extension_manager);
+        self
+    }
+
+    pub fn with_coordination_config(
+        mut self,
+        config: crate::hooks::CoordinationHookConfig,
+    ) -> Self {
+        self.coordination_config = Some(config);
         self
     }
 
@@ -286,6 +297,16 @@ impl Tool for MessageTool {
                     .to_string(),
             ));
         };
+        if self
+            .coordination_config
+            .as_ref()
+            .is_some_and(|config| config.blocks_knowledge_publish(&target, content))
+        {
+            return Err(ToolError::NotAuthorized(
+                "KNOW publishing is disabled; set COORD_KNOWLEDGE_PUBLISH=true only after confirming fleet compatibility"
+                    .to_string(),
+            ));
+        }
 
         let attachments: Vec<String> = match params.get("attachments") {
             Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
@@ -443,6 +464,16 @@ mod tests {
         )
     }
 
+    fn coordination_config(publish: bool) -> crate::hooks::CoordinationHookConfig {
+        crate::hooks::CoordinationHookConfig {
+            enabled: true,
+            agent_id: "agent-1".to_string(),
+            coordination_channels: vec!["coord@conference.example".to_string()],
+            knowledge_publish_enabled: publish,
+            ..crate::hooks::CoordinationHookConfig::default()
+        }
+    }
+
     #[test]
     fn message_tool_name() {
         let tool = MessageTool::new(Arc::new(ChannelManager::new()));
@@ -479,6 +510,32 @@ mod tests {
 
         let params = schema.get("properties").unwrap();
         assert!(params.get("attachments").is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_knowledge_send_requires_publish_opt_in() {
+        let (disabled, _gateway, xmpp) = message_tool_with_recording_channels().await;
+        let disabled = disabled.with_coordination_config(coordination_config(false));
+        let params = serde_json::json!({
+            "content": "KNOW: topic | a finding long enough to publish",
+            "channel": "xmpp",
+            "target": "COORD@conference.example"
+        });
+        let ctx = crate::context::JobContext::new("test", "coordination send");
+        let error = disabled
+            .execute(params.clone(), &ctx)
+            .await
+            .expect_err("disabled KNOW publish must fail closed");
+        assert!(matches!(error, ToolError::NotAuthorized(_)));
+        assert!(xmpp.lock().await.is_empty());
+
+        let (enabled, _gateway, xmpp) = message_tool_with_recording_channels().await;
+        let enabled = enabled.with_coordination_config(coordination_config(true));
+        enabled
+            .execute(params, &ctx)
+            .await
+            .expect("enabled KNOW publish reaches the channel");
+        assert_eq!(xmpp.lock().await.len(), 1);
     }
 
     #[tokio::test]

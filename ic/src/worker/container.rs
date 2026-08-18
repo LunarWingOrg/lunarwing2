@@ -262,11 +262,26 @@ Work independently to complete this job. Report when done."#,
                 }
             }
             Ok(Ok(LoopOutcome::MaxIterations)) => {
-                let msg = format!("max iterations ({}) exceeded", self.config.max_iterations);
+                let msg = format!(
+                    "max iterations ({}) exceeded after a final recovery turn; retry with narrower scope or a higher max_iterations value",
+                    self.config.max_iterations
+                );
                 tracing::warn!("Worker failed for job {}: {}", self.config.job_id, msg);
                 CompletionReport {
                     success: false,
                     message: Some(format!("Execution failed: {msg}")),
+                    iterations,
+                }
+            }
+            Ok(Ok(LoopOutcome::Failed(message))) => {
+                tracing::warn!(
+                    "Worker failed for job {} after recovery: {}",
+                    self.config.job_id,
+                    message
+                );
+                CompletionReport {
+                    success: false,
+                    message: Some(format!("Execution failed: {message}")),
                     iterations,
                 }
             }
@@ -370,9 +385,24 @@ struct ContainerDelegate {
     /// Consecutive text-only responses (no tool calls). When this reaches
     /// the threshold the loop exits — the LLM has stopped doing work.
     consecutive_text_only: Mutex<u32>,
-    /// Consecutive iterations where every tool call failed. When the LLM
-    /// keeps retrying a broken command, this triggers an exit with failure.
+    /// Consecutive iterations where every tool call failed. The third failure
+    /// schedules one recovery turn; another all-failed round becomes terminal.
     consecutive_all_failed: Mutex<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedWorkRecovery {
+    Continue,
+    Warn,
+    Fail,
+}
+
+fn failed_work_recovery(consecutive_failures: u32) -> FailedWorkRecovery {
+    match consecutive_failures {
+        0..=2 => FailedWorkRecovery::Continue,
+        3 => FailedWorkRecovery::Warn,
+        _ => FailedWorkRecovery::Fail,
+    }
 }
 
 /// Detect post-work chatter: suggestions, follow-up offers, or XML tags
@@ -543,7 +573,6 @@ impl LoopDelegate for ContainerDelegate {
 
         // Execute tools sequentially (container context — no parallel execution)
         let mut any_succeeded = false;
-        let mut last_error = String::new();
 
         for tc in tool_calls {
             self.post_event(
@@ -583,14 +612,9 @@ impl LoopDelegate for ContainerDelegate {
             )
             .await;
 
-            match &result {
-                Ok(output) => {
-                    any_succeeded = true;
-                    *self.last_output.lock().await = output.clone();
-                }
-                Err(e) => {
-                    last_error = e.clone();
-                }
+            if let Ok(output) = &result {
+                any_succeeded = true;
+                *self.last_output.lock().await = output.clone();
             }
 
             // Use shared result processing
@@ -601,21 +625,31 @@ impl LoopDelegate for ContainerDelegate {
         // Track consecutive all-fail iterations to catch error loops
         // (e.g., "Permission denied" retried endlessly).
         let mut fail_count = self.consecutive_all_failed.lock().await;
-        if any_succeeded {
+        let recovery = if any_succeeded {
             *fail_count = 0;
+            FailedWorkRecovery::Continue
         } else {
             *fail_count += 1;
-            if *fail_count >= 3 {
-                drop(fail_count);
-                tracing::warn!("3 consecutive iterations with all tool calls failing — aborting");
-                return Ok(Some(LoopOutcome::Response(format!(
-                    "Job failed: tool calls failed 3 consecutive times. Last error: {}",
-                    last_error
-                ))));
-            }
-        }
+            failed_work_recovery(*fail_count)
+        };
+        drop(fail_count);
 
-        Ok(None)
+        match recovery {
+            FailedWorkRecovery::Continue => Ok(None),
+            FailedWorkRecovery::Warn => {
+                tracing::warn!(
+                    "3 consecutive iterations had no successful tool calls; scheduling recovery"
+                );
+                reason_ctx.messages.push(ChatMessage::system(
+                    "Tool failure warning: three consecutive tool rounds produced no successful work. This is the recovery turn. Do not repeat the same call unchanged; use different allowed tools or parameters, or state which capability or permission must be enabled and provide the best partial result.",
+                ));
+                Ok(None)
+            }
+            FailedWorkRecovery::Fail => Ok(Some(LoopOutcome::Failed(
+                "Tool calls kept failing after a recovery turn. Change approach or parameters, enable the required capability or permissions, then retry."
+                    .to_string(),
+            ))),
+        }
     }
 
     async fn on_tool_intent_nudge(&self, text: &str, _reason_ctx: &mut ReasoningContext) {
@@ -678,5 +712,13 @@ mod tests {
         assert!(is_post_work_chatter("What would you like to do next?"));
         assert!(!is_post_work_chatter("Running command: echo hello"));
         assert!(!is_post_work_chatter("The file has been updated."));
+    }
+
+    #[test]
+    fn failed_work_gets_exactly_one_recovery_round() {
+        assert_eq!(failed_work_recovery(1), FailedWorkRecovery::Continue);
+        assert_eq!(failed_work_recovery(2), FailedWorkRecovery::Continue);
+        assert_eq!(failed_work_recovery(3), FailedWorkRecovery::Warn);
+        assert_eq!(failed_work_recovery(4), FailedWorkRecovery::Fail);
     }
 }

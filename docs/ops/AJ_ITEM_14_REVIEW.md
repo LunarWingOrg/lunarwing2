@@ -154,3 +154,72 @@ The following checks passed:
 - `git diff --check`
 
 The worktree remained clean.
+
+---
+
+## Resolution (2026-08-17, aj/kimi-14-20260817-2100)
+
+All findings were addressed on `aj/kimi-14-20260817-1800` and verified after
+merge into `aj/kimi-14-20260817-2100`:
+
+1. **Rolling-fleet compatibility** — `KNOW` is schema-valid on every upgraded
+   daemon (`DEFAULT_ALLOWED_TAGS`), while emission is gated behind
+   `COORD_KNOWLEDGE_PUBLISH` (default `false`). Until opted in, the per-turn
+   prompt never teaches the model the wire format, `TagSchemaHook` rejects
+   outbound `KNOW:` at `BeforeOutbound` without striking, the `message` tool
+   refuses direct sends (`ToolError::NotAuthorized`), and `ChannelManager`
+   enforces the same gate at the respond/broadcast/broadcast_all delivery
+   boundary. Documented operator preconditions in
+   `docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md`.
+2. **Unauthenticated room injection** — ingestion requires the
+   `COORD_KNOWLEDGE_PUBLISHERS` sender allowlist (default empty = deny all),
+   matched case-insensitively against the full inbound sender ID. Knowledge
+   tools mark coordination notes `untrusted: true`, replace the
+   sender-controlled title with a topic-derived label, wrap snippets/content
+   in `lunarwing_safety::wrap_external_content`, and both content-reading
+   tools now declare `requires_sanitization() == true`.
+3. **Timeout cancellation wedge** — ingestion runs on a detached task the
+   registry hook deadline cannot cancel between the content and metadata
+   commits, serialized by a daemon-wide ingest mutex. A crash between commits
+   is recognized by the preflight (`incomplete_wire_write`) and repaired by
+   the same sender/topic's next share; outright metadata failure restores the
+   previous document (or deletes the partial new one).
+4. **Sender-controlled limiter keys** — `try_consume_rate_limit` prunes
+   expired windows on every call and caps retained buckets at exactly
+   `MAX_RATE_LIMIT_KEYS` (4096) including a reserved overflow bucket; unseen
+   keys past the cap share one budget-sized bucket. Knowledge ingestion adds
+   an independent daemon-wide window (`COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`,
+   default 300, max 10000), and knowledge limiter keys derive from the
+   operator allowlist.
+5. **Mission formatting corruption** — `format_mission_notification` returns
+   `KNOW:` records verbatim and derives decoration from the presentation-safe
+   `MISSION_DECORATION_TAGS` subset instead of the wire schema constant.
+6. **Coverage gaps** — PostgreSQL integration test
+   (`ic/tests/coordination_knowledge_postgres.rs`, gated on `DATABASE_URL`)
+   exercises ingest, JSONB metadata, full-text search, topic lookup, and
+   cleanup through the production `Database` path. libSQL integration tests
+   cover ownership refusal, duplicate no-op, stranded-write repair, message
+   cap, secret-before-ingest ordering, sender/global rate limits, and
+   six-hook registration order. Env-limit parsing tests (invalid/out-of-range
+   fallback, range boundaries, publisher validation/dedup) were added on this
+   branch.
+
+Secondary observations: invalid env values now log a warning and fall back to
+defaults; quota-before-duplicate ordering is documented as deliberate
+(flood protection); redundant self-echo notes are absorbed by the exact
+duplicate no-op; the unrelated goal-item 13/16 edits are not present in the
+merged branch.
+
+Additional fix on this branch: `write_tenant_lunarwing_env` in
+`ic/scripts/lunarwing-mt-admin.sh` now declares `coord_knowledge_publish` and
+`coord_knowledge_publishers` as `local` (they were assigned undeclared).
+
+### Resolution verification
+
+- `cargo fmt --all -- --check` clean
+- `cargo clippy --lib --tests -- -D warnings` exit 0
+- Targeted suites: coordination 59, coordination_knowledge 20 (incl. 3 new
+  env tests), channels::manager 11, channels::coalesce 25,
+  tools::builtin::message 26, tools::builtin::knowledge 10, bridge::router 61
+- `bash -n ic/scripts/lunarwing-mt-admin.sh` and
+  `ic/scripts/tests/test-add-tenant-env-flags.sh` pass
