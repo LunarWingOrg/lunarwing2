@@ -10,6 +10,8 @@ export HEALTH_METRICS_LISTEN="127.0.0.1:50000"
 # Optional bearer token; empty = no auth on loopback.
 export HEALTH_METRICS_TOKEN=""
 
-# Report directory and update interval (seconds) for the served snapshot.
-#export HEALTH_REPORT_DIR="/var/lib/lunarwing/workspace/reports/health"
+# Path to the .prom file to serve (must match the exporter's
+# HEALTH_METRICS_OUTPUT), and the refresh interval (seconds) for the served
+# snapshot.
+#export HEALTH_METRICS_OUTPUT="/var/lib/lunarwing-health/workspace/reports/health/metrics.prom"
 #export HEALTH_METRICS_REFRESH_SECS=15
