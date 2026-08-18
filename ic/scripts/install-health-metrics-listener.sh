@@ -133,6 +133,9 @@ install_launchd() {
 </dict>
 </plist>
 PLIST
+  # The plist embeds environment values (possibly the bearer token); keep it
+  # owner-read-only like every other secret-bearing config we render.
+  chmod 0600 "$plist"
   launchctl unload "$plist" >/dev/null 2>&1 || true
   launchctl load "$plist"
   say "installed + loaded ${plist}"
