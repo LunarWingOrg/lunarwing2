@@ -40,7 +40,6 @@
 26. [ ] update anything outdated in docs/internal - verify against code rather than docs
 27. [ ] create a fourth document in docs/ops similar in nature to docs/ops/guide-for-spin-up-gentoo-tenants.md and the arch guide and the fedora guide but for debian/ubuntu GNU/Linux hosts
 28. [ ] add new health stuff to roadmap and add new ideas discussed to roadmap that are not currently present
-29. [ ] update release notes draft in root of repo with anything might have missed that may be relevant
-29. [ ] update README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
+29. [ ] update release notes draft in root of repo with anything might have missed that may be relevant AND udate README.md in repo root (include information related to sandboxed WASM MCPs and any other relevant information that may be missing)
 
 ---
