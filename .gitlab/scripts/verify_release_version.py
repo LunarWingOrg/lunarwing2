@@ -19,6 +19,7 @@ MANIFESTS = [
     pathlib.Path("ic/Cargo.toml"),
     pathlib.Path("ic/crates/lunarwing_common/Cargo.toml"),
     pathlib.Path("ic/crates/lunarwing_engine/Cargo.toml"),
+    pathlib.Path("ic/crates/lunarwing_health_metrics/Cargo.toml"),
     pathlib.Path("ic/crates/lunarwing_safety/Cargo.toml"),
     pathlib.Path("ic/crates/lunarwing_skills/Cargo.toml"),
 ]
