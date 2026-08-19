@@ -507,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn tool_activity_suppressed_for_non_self_gating_channels_when_flag_off() {
         let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false));
-        let (stub, _) = StubChannel::new("xmpp").with_handles_tool_activity(false);
+        let stub = StubChannel::new("xmpp").0.with_handles_tool_activity(false);
         let statuses = stub.captured_statuses_handle();
         let manager = manager.with_tool_activity(false);
         manager.add(Box::new(stub)).await;
@@ -536,7 +536,7 @@ mod tests {
     async fn tool_activity_routed_to_non_self_gating_channels_when_flag_on() {
         let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false))
             .with_tool_activity(true);
-        let (stub, _) = StubChannel::new("xmpp").with_handles_tool_activity(false);
+        let stub = StubChannel::new("xmpp").0.with_handles_tool_activity(false);
         let statuses = stub.captured_statuses_handle();
         manager.add(Box::new(stub)).await;
 
