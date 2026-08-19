@@ -1159,7 +1159,7 @@ fn do_poll(poll_url: &str, relay_url: &str, relay_password: &str) {
         .unwrap_or(0)
         .wrapping_add(1);
     let _ = channel_host::workspace_write("state/poll_count", &poll_count.to_string());
-    if poll_count % 30 == 0 {
+    if poll_count.is_multiple_of(30) {
         if let Ok(new_buffers) = fetch_buffer_list(poll_url, relay_password) {
             let irc_buffers = filter_irc_buffers(&new_buffers);
             if let Ok(json) = serde_json::to_string(&irc_buffers) {
@@ -1577,10 +1577,10 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     }
 
     // Extract message details
-    let tags = line.tags.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let tags = line.tags.as_deref().unwrap_or(&[]);
 
     let nick = extract_nick_from_tags(tags)
-        .or_else(|| line.prefix.as_ref().map(|s| s.as_str()))
+        .or(line.prefix.as_deref())
         .unwrap_or("unknown");
 
     let host = extract_host_from_tags(tags).unwrap_or("");
@@ -1591,7 +1591,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     };
     let identity = weechat_sender_identity(network, nick, tags);
 
-    let message = line.message.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let message = line.message.as_deref().unwrap_or("");
     let text = strip_irc_formatting(message);
 
     if text.trim().is_empty() {
@@ -1835,18 +1835,18 @@ fn fetch_buffer_list(relay_url: &str, relay_password: &str) -> Result<Vec<Buffer
         serde_json::from_slice(&response.body).map_err(|e| format!("parse error: {}", e))?;
     let buffers = values
         .into_iter()
-        .filter_map(|v| {
+        .map(|v| {
             let id = v["id"].as_i64();
             let full_name = v["name"]
                 .as_str()
                 .or_else(|| v["full_name"].as_str())
                 .map(String::from);
             let short_name = v["short_name"].as_str().map(String::from);
-            Some(BufferInfo {
+            BufferInfo {
                 id,
                 full_name,
                 short_name,
-            })
+            }
         })
         .collect();
     Ok(buffers)
