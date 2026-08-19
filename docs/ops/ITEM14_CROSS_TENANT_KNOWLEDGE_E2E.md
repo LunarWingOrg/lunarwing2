@@ -167,6 +167,20 @@ run serially under a shared flock with twelve jobs`
   enforced on the full occupant JID (`coord@conference.localhost/intruder`
   is listed nowhere), and the ignore path logs at debug level only.
 
+#### T3 — malformed records rejected (PASS)
+
+Both sent by knowa (an allowlisted publisher, so rejection is attributable to
+record parsing, not the allowlist):
+
+1. Bad topic slug: `KNOW: Not_A_Slug | this finding has a deliberately
+   invalid topic slug` (uppercase + underscore fails `is_valid_slug`).
+2. Finding below `COORD_KNOWLEDGE_MIN_CHARS=12`: `KNOW: tiny-finding | short`
+   (5 chars).
+
+Results — study-note row counts unchanged in every tenant
+(knowa 0, knowb 1, knowc 1; the 1 is the T1 row) and `malformed_rows = 0`
+everywhere. Neither record produced a document.
+
 ## Teardown record
 
 _(filled in at teardown)_
