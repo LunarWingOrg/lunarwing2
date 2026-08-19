@@ -253,4 +253,25 @@ Verified in both watcher DBs (knowb + knowc):
 
 ## Teardown record
 
-_(filled in at teardown)_
+All test infrastructure destroyed on 2026-08-19, immediately after the
+matrix completed:
+
+- **Tenants:** `remove-tenant knowa|knowb|knowc --purge` via
+  `ic/scripts/lunarwing-mt-admin.sh` — services stopped, ports deallocated,
+  OS users and home directories (repo clones, state, env with XMPP
+  passwords) deleted. Verified afterwards: `id knowa|knowb|knowc` → no such
+  user; `/home/know*` gone; no `lunarwing-know*` units on the system or
+  user buses; no tenant containers remain.
+- **XMPP infra:** rootless podman container `item14-prosody` stopped and
+  removed (`podman ps -a` shows no `item14` containers). The prosody
+  accounts (`knowa`/`knowb`/`knowc`/`intruder@localhost`) died with the
+  container's ephemeral storage.
+- **Throwaway CA:** `/etc/ca-certificates/trust-source/anchors/item14-test-ca.pem`
+  deleted + `update-ca-trust` re-run. Verified: `trust list` has no item14
+  entry, and `openssl verify` of the prosody `localhost` certificate against
+  the system bundle now **fails** (previously `Verify return code: 0`).
+  The CA private key and the server key were shredded.
+- **Secrets:** `/tmp/item14-xmpp/accounts.txt` shredded (`shred -u`); XMPP
+  passwords were never written to the repo. The whole `/tmp/item14-xmpp`
+  helper directory and `/tmp/item14-builds.log` were removed afterwards.
+
