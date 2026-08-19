@@ -78,6 +78,33 @@ not need WASM extensions; daemon, gateway, and XMPP bridge are all native.)
 
 _Result: see "Build result" below (filled in during the run)._
 
+## Phase 2.5 — Direct server smoke test as the tenant user (while build runs)
+
+The daemon's exact launch command for the managed server is
+`python3 <home>/study_notes_mcp.py --db <home>/agent-notes.sqlite3 --notes <home>/agent-notes-by-agent`
+(no `--allow-write` in read-only mode — `ic/src/tools/mcp/config.rs:975-998`).
+That exact invocation was exercised **as `owlet`** against the shared checkout with a
+newline-delimited JSON-RPC client (the server's framing, confirmed at
+`study_notes_mcp.py:529-533`):
+
+- `initialize` → `serverInfo={'name': 'study-notes', 'version': '2.0.0'}`.
+- `tools/list` → **5 read-only tools**: `knowledge_search`, `knowledge_get_topic`,
+  `knowledge_list_topics`, `knowledge_list_stale`, `knowledge_stats`.
+- `tools/call knowledge_stats` →
+  `{"built_at": "2026-08-18T07:52:28Z", "documents": 515, "topics": 416, "sections": 6244,
+   "sources": 1043, "tags": 249, "statuses": {"active": 509, "needs-verification": 2,
+   "stale": 3, "superseded": 1}, "write_enabled": false, …}`.
+- `tools/call knowledge_search("tenant ports registry", limit 3)` → real LunarWing notes
+  (e.g. "Vision Enrichment Subsystem > Multi-Tenant Note", infrastructure-health-check
+  study notes) — FTS5 search functional.
+- **Read-only guard confirmed**: `knowledge_submit_note` / `knowledge_update_status` are
+  NOT exposed without `--allow-write`; `"write_enabled": false` in stats. The tenant
+  cannot mutate the shared knowledge base.
+
+Note: FTS5 rejects queries containing bare hyphens (`no such column: admin` for
+`mt-admin …`) — server-side query-syntax behavior, not a wiring problem; plain word
+queries work.
+
 ## Phase 3 — Start + live verification
 
 _(filled in during the run)_
