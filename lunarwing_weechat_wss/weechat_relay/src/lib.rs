@@ -1474,6 +1474,9 @@ fn is_actionable_irc_status(status: StatusType) -> bool {
             | StatusType::AuthCompleted
             | StatusType::ExternalWaiting
             | StatusType::JobStarted
+            | StatusType::ToolStarted
+            | StatusType::ToolCompleted
+            | StatusType::ToolResult
     )
 }
 
@@ -2820,7 +2823,15 @@ mod tests {
     fn unknown_generic_and_stream_statuses_remain_ignored() {
         assert!(!is_actionable_irc_status(StatusType::Status));
         assert!(!is_actionable_irc_status(StatusType::Thinking));
-        assert!(!is_actionable_irc_status(StatusType::ToolResult));
+    }
+
+    #[test]
+    fn tool_activity_statuses_are_actionable_when_routed() {
+        // The host only forwards these when the global `tool_activity` flag
+        // is on; when they arrive, they render as [status] lines.
+        assert!(is_actionable_irc_status(StatusType::ToolStarted));
+        assert!(is_actionable_irc_status(StatusType::ToolCompleted));
+        assert!(is_actionable_irc_status(StatusType::ToolResult));
     }
 
     #[test]
