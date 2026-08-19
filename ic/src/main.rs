@@ -440,7 +440,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // ── Channel setup ──────────────────────────────────────────────────
 
-    let channels = ChannelManager::new();
+    let channels = ChannelManager::new().with_tool_activity(config.channels.tool_activity);
     let mut channel_names: Vec<String> = Vec::new();
     let mut loaded_wasm_channel_names: Vec<String> = Vec::new();
     #[allow(clippy::type_complexity)]

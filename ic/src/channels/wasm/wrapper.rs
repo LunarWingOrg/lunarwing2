@@ -2903,6 +2903,13 @@ impl Channel for WasmChannel {
         self.handle_status_update(status, metadata).await
     }
 
+    fn handles_tool_activity(&self) -> bool {
+        // WASM guests only render tool-activity statuses on demand; the
+        // channel manager forwards them only when the global
+        // `tool_activity` flag is enabled (work item #47).
+        false
+    }
+
     async fn health_check(&self) -> Result<(), ChannelError> {
         if self.message_tx.read().await.is_none() {
             return Err(ChannelError::HealthCheckFailed {
@@ -3050,6 +3057,10 @@ impl Channel for SharedWasmChannel {
         metadata: &serde_json::Value,
     ) -> Result<(), ChannelError> {
         self.inner.send_status(status, metadata).await
+    }
+
+    fn handles_tool_activity(&self) -> bool {
+        self.inner.handles_tool_activity()
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
