@@ -79,6 +79,26 @@ review resolutions recorded in `docs/ops/AJ_ITEM_14_REVIEW.md`):
   `intruder` (passwords in `/tmp/item14-xmpp/accounts.txt` mode 600,
   destroyed at teardown; not recorded in the repo).
 
+### Phase 2 — tenant provisioning (DONE)
+
+- `add-tenant knowa|knowb|knowc --xmpp-jid <name>@localhost --xmpp-password …`
+  (passwords match the prosody accounts; never written to the repo).
+  knowa got port block 10020–10029 (bridge 10022, postgres 10023,
+  coord_admin 20029); knowb/knowc took the next sequential blocks.
+  Per-tenant PostgreSQL quadlet containers are up (`lunarwing-pg-<name>`).
+- Env edits per the table above applied to all three
+  `/home/<t>/lunarwing/env/lunarwing.env` **before first boot** (env→DB
+  settings migration happens on first daemon start). mt-admin auto-set
+  `COORD_AGENT_ID=<tenant>` at provisioning.
+- XMPP for tenants is the bridge-backed WASM channel model (`xmpp.wasm` →
+  loopback `xmpp-bridge`), so tenant builds run as
+  `build-tenant <t> --with-wasm` (release profile, flock-serialized, 12 jobs).
+
+### Phase 3 — builds (IN PROGRESS)
+
+- Three sequential `build-tenant --with-wasm` runs in tmux `item14build`,
+  log `/tmp/item14-builds.log`.
+
 ## Teardown record
 
 _(filled in at teardown)_
