@@ -65,7 +65,7 @@ assert_file_contains \
   "$EXPORT_SRC" "migration-export-boundary"
 assert_file_contains \
   "mt-admin passes inherited lifecycle lock descriptor" \
-  "$IC_DIR/scripts/lunarwing-mt-admin.sh" "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
+  "$IC_DIR/scripts/mt-admin-lib/04-tenant-lifecycle.sh" "LUNARWING_MT_INHERITED_LIFECYCLE_LOCK_FD"
 assert_file_contains \
   "export excludes DarkIRC from generic state archive" \
   "$EXPORT_SRC" "state/darkirc"
