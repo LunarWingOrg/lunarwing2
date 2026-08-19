@@ -467,6 +467,11 @@ fn render_status_message(update: &StatusUpdate) -> Option<String> {
         | StatusType::AuthCompleted
         | StatusType::ExternalWaiting
         | StatusType::JobStarted => Some(update.message.clone()),
+        // Tool-activity events reach the guest only when the host's
+        // global `tool_activity` flag is enabled; render them as-is.
+        StatusType::ToolStarted | StatusType::ToolCompleted | StatusType::ToolResult => {
+            Some(update.message.clone())
+        }
         StatusType::Status => {
             let trimmed = update.message.trim();
             if trimmed.eq_ignore_ascii_case("done")
@@ -584,6 +589,43 @@ mod tests {
     fn response_routing_rejects_missing_or_invalid_metadata() {
         assert!(target_from_metadata_json("{}").is_none());
         assert!(target_from_metadata_json("not-json").is_none());
+    }
+
+    fn status_update(status: StatusType, message: &str) -> StatusUpdate {
+        StatusUpdate {
+            status,
+            message: message.to_string(),
+            metadata_json: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn tool_activity_statuses_render_their_message() {
+        // The host only forwards these when the global `tool_activity`
+        // flag is enabled; when they arrive they must be rendered.
+        for status in [
+            StatusType::ToolStarted,
+            StatusType::ToolCompleted,
+            StatusType::ToolResult,
+        ] {
+            let update = status_update(status, "Tool started: shell");
+            assert_eq!(
+                render_status_message(&update).as_deref(),
+                Some("Tool started: shell")
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_and_done_statuses_still_render_nothing() {
+        assert!(render_status_message(&status_update(StatusType::Thinking, "thinking")).is_none());
+        assert!(render_status_message(&status_update(StatusType::Done, "done")).is_none());
+        assert!(render_status_message(&status_update(StatusType::Status, "done")).is_none());
+        assert_eq!(
+            render_status_message(&status_update(StatusType::Status, "service warning"))
+                .as_deref(),
+            Some("service warning")
+        );
     }
 }
 
