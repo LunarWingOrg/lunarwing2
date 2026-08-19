@@ -456,7 +456,9 @@ impl Guest for DarkircChannel {
                     );
                 }
             }
-            // Thinking, Done, ToolStarted, etc. ─ no IRC equivalent
+            // Thinking, Done, StreamChunk, etc. ─ no IRC equivalent.
+            // Tool* statuses are actionable but only reach the guest when the
+            // host `tool_activity` flag routes them.
             _ => {}
         }
     }
@@ -477,6 +479,9 @@ fn is_actionable_irc_status(status: StatusType) -> bool {
             | StatusType::AuthCompleted
             | StatusType::ExternalWaiting
             | StatusType::JobStarted
+            | StatusType::ToolStarted
+            | StatusType::ToolCompleted
+            | StatusType::ToolResult
     )
 }
 
@@ -815,11 +820,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn external_waiting_is_the_only_generic_status_delivered() {
+    fn generic_progress_statuses_are_not_delivered() {
         assert!(is_actionable_irc_status(StatusType::ExternalWaiting));
         assert!(!is_actionable_irc_status(StatusType::Status));
         assert!(!is_actionable_irc_status(StatusType::Thinking));
-        assert!(!is_actionable_irc_status(StatusType::ToolResult));
+    }
+
+    #[test]
+    fn tool_activity_statuses_are_actionable_when_routed() {
+        // The host only forwards these when the global `tool_activity` flag
+        // is on; when they arrive, they render as [status] lines.
+        assert!(is_actionable_irc_status(StatusType::ToolStarted));
+        assert!(is_actionable_irc_status(StatusType::ToolCompleted));
+        assert!(is_actionable_irc_status(StatusType::ToolResult));
     }
 
     // Shared invariants that EVERY test case must satisfy.

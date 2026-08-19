@@ -494,6 +494,11 @@ pub struct ChannelSettings {
     /// Directory containing WASM channel modules.
     #[serde(default)]
     pub wasm_channels_dir: Option<PathBuf>,
+
+    /// Route tool-activity status updates (ToolStarted/ToolCompleted/ToolResult)
+    /// to WASM channels. Default false: WASM guests never see tool events.
+    #[serde(default)]
+    pub tool_activity: bool,
 }
 
 impl Default for ChannelSettings {
@@ -530,6 +535,7 @@ impl Default for ChannelSettings {
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
+            tool_activity: false,
         }
     }
 }

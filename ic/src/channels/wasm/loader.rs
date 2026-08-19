@@ -28,6 +28,7 @@ pub struct WasmChannelLoader {
     settings_store: Option<Arc<dyn SettingsStore>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     owner_scope_id: String,
+    tool_activity: bool,
 }
 
 impl WasmChannelLoader {
@@ -44,12 +45,23 @@ impl WasmChannelLoader {
             settings_store,
             secrets_store: None,
             owner_scope_id: owner_scope_id.into(),
+            tool_activity: false,
         }
     }
 
     /// Set the secrets store for host-based credential injection in WASM channels.
     pub fn with_secrets_store(mut self, store: Arc<dyn SecretsStore + Send + Sync>) -> Self {
         self.secrets_store = Some(store);
+        self
+    }
+
+    /// Forward tool-activity status updates to loaded channels when enabled.
+    ///
+    /// This is the host-side half of the global `tool_activity` flag: channels
+    /// loaded with this set receive ToolStarted/ToolCompleted/ToolResult
+    /// status updates; otherwise those events are dropped before the guest.
+    pub fn with_tool_activity(mut self, tool_activity: bool) -> Self {
+        self.tool_activity = tool_activity;
         self
     }
 
@@ -156,7 +168,8 @@ impl WasmChannelLoader {
             config_json,
             self.pairing_store.clone(),
             self.settings_store.clone(),
-        );
+        )
+        .with_tool_activity(self.tool_activity);
         if let Some(ref secrets) = self.secrets_store {
             channel = channel.with_secrets_store(Arc::clone(secrets));
         }

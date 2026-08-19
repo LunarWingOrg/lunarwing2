@@ -728,6 +728,11 @@ pub struct WasmChannel {
     /// Secrets store for host-based credential injection.
     /// Used to pre-resolve credentials before each WASM callback.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+
+    /// Forward tool-activity status updates (ToolStarted/ToolCompleted/
+    /// ToolResult) to the guest. Off by default: tool events are dropped
+    /// host-side unless the global `tool_activity` flag opts in.
+    tool_activity: bool,
 }
 
 /// Update broadcast metadata in memory and persist to the settings store when
@@ -937,6 +942,7 @@ impl WasmChannel {
             owner_scope_id: owner_scope_id.into(),
             owner_actor_id: None,
             secrets_store: None,
+            tool_activity: false,
         }
     }
 
@@ -953,6 +959,16 @@ impl WasmChannel {
     /// Bind this channel to the external actor that maps to the configured owner.
     pub fn with_owner_actor_id(mut self, owner_actor_id: Option<String>) -> Self {
         self.owner_actor_id = owner_actor_id;
+        self
+    }
+
+    /// Enable or disable forwarding tool-activity status updates
+    /// (ToolStarted/ToolCompleted/ToolResult) to the guest.
+    ///
+    /// Off by default so WASM channels stay quiet unless the operator opts in
+    /// via the global `tool_activity` flag.
+    pub fn with_tool_activity(mut self, tool_activity: bool) -> Self {
+        self.tool_activity = tool_activity;
         self
     }
 
@@ -2067,6 +2083,17 @@ impl WasmChannel {
                 || trimmed.eq_ignore_ascii_case("rejected")
         }
 
+        // Tool-activity progress is opt-in for WASM channels: unless the
+        // global `tool_activity` flag is on, these events never invoke the
+        // guest (they are high-volume and most guests have no use for them).
+        if is_tool_activity_status(&status) && !self.tool_activity {
+            tracing::trace!(
+                channel = %self.name,
+                "Dropping tool-activity status (tool_activity disabled)"
+            );
+            return Ok(());
+        }
+
         match &status {
             StatusUpdate::Thinking(_) => {
                 // Cancel any existing typing task
@@ -3111,6 +3138,18 @@ fn truncate_status_text(input: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+/// Whether a status update is tool-activity progress (ToolStarted /
+/// ToolCompleted / ToolResult). WASM guests only receive these when the
+/// global `tool_activity` flag routes them.
+fn is_tool_activity_status(status: &StatusUpdate) -> bool {
+    matches!(
+        status,
+        StatusUpdate::ToolStarted { .. }
+            | StatusUpdate::ToolCompleted { .. }
+            | StatusUpdate::ToolResult { .. }
+    )
 }
 
 fn status_to_wit(
@@ -5067,6 +5106,45 @@ mod tests {
             assert_eq!(cloned.message, "sample");
             assert_eq!(cloned.metadata_json, "{}");
         }
+    }
+
+    #[test]
+    fn test_is_tool_activity_status() {
+        use super::is_tool_activity_status;
+        use crate::channels::StatusUpdate;
+
+        assert!(is_tool_activity_status(&StatusUpdate::ToolStarted {
+            name: "shell".to_string(),
+        }));
+        assert!(is_tool_activity_status(&StatusUpdate::ToolCompleted {
+            name: "shell".to_string(),
+            success: true,
+            error: None,
+            parameters: None,
+        }));
+        assert!(is_tool_activity_status(&StatusUpdate::ToolResult {
+            name: "shell".to_string(),
+            preview: "ok".to_string(),
+        }));
+
+        assert!(!is_tool_activity_status(&StatusUpdate::Thinking(
+            "working".to_string()
+        )));
+        assert!(!is_tool_activity_status(&StatusUpdate::Status(
+            "done".to_string()
+        )));
+        assert!(!is_tool_activity_status(&StatusUpdate::StreamChunk(
+            "chunk".to_string()
+        )));
+    }
+
+    #[test]
+    fn test_tool_activity_defaults_off_and_builder_enables() {
+        let channel = create_test_channel();
+        assert!(!channel.tool_activity);
+
+        let channel = channel.with_tool_activity(true);
+        assert!(channel.tool_activity);
     }
 
     #[test]
