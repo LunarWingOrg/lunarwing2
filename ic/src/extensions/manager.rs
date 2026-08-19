@@ -700,7 +700,6 @@ impl ExtensionManager {
         wasm_channel_router: Arc<WasmChannelRouter>,
         wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
         wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
-        tool_activity: bool,
     ) {
         *self.channel_runtime.write().await = Some(ChannelRuntimeState {
             channel_manager,
@@ -709,8 +708,18 @@ impl ExtensionManager {
             wasm_channel_router,
             wasm_channel_owner_ids,
             wasm_channel_owner_actor_ids,
-            tool_activity,
+            tool_activity: false,
         });
+    }
+
+    /// Set the global `tool_activity` flag for hot-activated WASM channels.
+    ///
+    /// Call after [`Self::set_channel_runtime`]; before runtime state exists
+    /// this is a no-op (hot activation is impossible then anyway).
+    pub async fn set_channel_tool_activity(&self, tool_activity: bool) {
+        if let Some(rt) = self.channel_runtime.write().await.as_mut() {
+            rt.tool_activity = tool_activity;
+        }
     }
 
     async fn current_channel_owner_actor_id(&self, name: &str) -> Option<String> {
@@ -9241,7 +9250,6 @@ done
                 router,
                 owner_ids,
                 HashMap::new(),
-                false,
             )
             .await;
 
@@ -9290,7 +9298,6 @@ done
                 router,
                 numeric_ids,
                 actor_ids,
-                false,
             )
             .await;
 
@@ -9406,7 +9413,6 @@ done
                 router,
                 owner_ids,
                 HashMap::new(),
-                false,
             )
             .await;
 
