@@ -1,6 +1,21 @@
 # Decomposing `lunarwing-mt-admin.sh` — Proposal
 
-> **Current status (2026-07-29): SUPERSEDED — do not implement as written.**
+> **Current status (2026-08-19): LANDED — v2.0.8.0, goals item #9
+> (rarity/kimi-9-20260819-0601).** The monolith (13,628 lines) was split into
+> a thin composition root (1,263 lines: constants, loader, `usage()`,
+> `main()`) plus fourteen sourced libraries under `ic/scripts/mt-admin-lib/`
+> (`00-common`, `01-detect`, `02-containers`, `03-ports-registry`,
+> `04-tenant-lifecycle`, `05-tenant-build`, `06-env-generation`,
+> `07-units-systemd`, `08-units-openrc`, `09-worker-config`, `10-owner-scope`,
+> `11-postgres`, `12-health-pipeline`, and `13-cgroups-openrc` for the
+> v2.0.8.0 cgroup work). The split kept the library structure of
+> `ref2/sunburst/mtadmin-refactor-v2.0.6.0` and was a pure line-range move:
+> no function body was rewritten, and the composed `declare -F` set is
+> byte-identical to the pre-split monolith. `check-mt-admin.sh` now
+> shellchecks the root **and** every library; fixture tests that grepped the
+> monolith for moved contracts were retargeted to the owning module.
+>
+> **Original status (2026-07-29): SUPERSEDED — do not implement as written.**
 > Goals item #24 (v2.0.3.0) reviewed the existing decomposition plans and found
 > **serious issues**; the maintainer chose a **completely different plan**. The
 > replacement split lives on branch `mtadminrefactor/meta4/v2.0.3.0` (commit
