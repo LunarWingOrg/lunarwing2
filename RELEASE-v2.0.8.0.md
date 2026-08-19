@@ -75,7 +75,7 @@ previous compatibility baseline.
 | New SQL migration | None; `V26__study_notes_knowledge.sql` remains latest |
 | Multi-tenant port registry | Unchanged at v15 |
 | MCP negotiated version | Exactly `2024-11-05`; anything else fails before activation |
-| Channel registry patches | darkirc 0.1.4, multica 0.1.7, weechat 0.2.4, xmpp 0.1.9 |
+| Channel registry patches | darkirc 0.1.5, multica 0.1.7, weechat 0.2.5, xmpp 0.1.10 |
 | LunarVision health | Dedicated operational listener (`8089` single-node); MT hosts discover per-tenant `vision_health` from the registry |
 | LunarVoice health | Dedicated operational listener (`8091` single-node); starts fail loudly if the sidecar never goes healthy |
 | CI scope | Source verification; no package publication or tenant deployment |
@@ -178,6 +178,23 @@ previous compatibility baseline.
   untrusted and wrap content before model exposure. mt-admin preserves and
   backfills all six `COORD_KNOWLEDGE_*` tenant env vars.
 
+### WASM Channel Tool Activity
+
+- New global `tool_activity` flag (env `TOOL_ACTIVITY` or the
+  `channels.tool_activity` setting, default off) routes
+  `StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}` events to WASM
+  channels, closing work item #47's observability gap: operators can now watch
+  an agent's tool calls land over XMPP, WeeChat, and DarkIRC instead of only
+  hearing the final answer.
+- The WASM host wrapper drops tool-activity events before invoking the guest
+  unless the flag is on, so default behavior and guest CPU usage are
+  unchanged; the flag is honored both at startup and for hot-activated
+  channels. Native channels keep their per-channel `/debug` toggles.
+- The XMPP guest renders the preformatted tool messages in DMs (groupchat
+  statuses stay suppressed as before); the DarkIRC and WeeChat guests render
+  them as `[status]` lines. Channel registry patches bumped per CI
+  source-version policy: darkirc 0.1.5, weechat 0.2.5, xmpp 0.1.10.
+
 ### CI, Dependencies, and Housekeeping
 
 - Fixed the `rust-test-lib` / `rust-test-libsql` CI failures: the stateful
@@ -189,8 +206,8 @@ previous compatibility baseline.
   same 7 accepted findings remain with no available upgrade clearing any of
   them. Details in `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
 - Version bump: all LunarWing crates and WASM channels 2.0.7 → 2.0.8,
-  channel registry patch bumps (darkirc 0.1.4, multica 0.1.7, weechat 0.2.4,
-  xmpp 0.1.9), full `cargo update` on the main lockfile (28 packages, MSRV
+  channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.5,
+  xmpp 0.1.10), full `cargo update` on the main lockfile (28 packages, MSRV
   1.96.1-compatible), cargo-deny clean.
 - Opencode external worker: `OPENCODE_REF` pinned to `v1.18.18` as a single
   global-scope ARG baked into the runtime image as `OPENCODE_IMAGE_REF` and
@@ -247,9 +264,6 @@ previous compatibility baseline.
   directly rather than through owner-scoped secret references. A stdio MCP
   bridge tool can be installed to use HTTP MCP servers with proper secret
   management.
-- WASM channels do not surface tool-activity status events yet (work item
-  #47; re-verified unimplemented in this cycle — guests drop ToolStarted /
-  ToolCompleted / ToolResult and no per-channel `/debug` toggle exists).
 - The XMPP bridge still cannot attach and send images correctly (work item
   #42); no fix ships in this release.
 - The web UI still places its bearer token in native `EventSource` query
@@ -285,6 +299,9 @@ previous compatibility baseline.
 - The opaque 10-threads-per-day mission limit: budgets are now configurable
   at creation, visible on list surfaces, and loudly logged on exhaustion
   (work item #56).
+- WASM channels silently dropping tool-activity status events: the global
+  `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to
+  the XMPP, WeeChat, and DarkIRC guests, which render them (work item #47).
 - MCP Part 2's library-only trust stack: signature, lockfile, and revocation
   checks now run on real config-load and activation paths, and the bundled
   gateway control plane can actually be enabled.
