@@ -94,10 +94,63 @@ review resolutions recorded in `docs/ops/AJ_ITEM_14_REVIEW.md`):
   loopback `xmpp-bridge`), so tenant builds run as
   `build-tenant <t> --with-wasm` (release profile, flock-serialized, 12 jobs).
 
-### Phase 3 — builds (IN PROGRESS)
+### Phase 3 — builds (DONE)
 
-- Three sequential `build-tenant --with-wasm` runs in tmux `item14build`,
-  log `/tmp/item14-builds.log`.
+- All three `build-tenant --with-wasm` runs completed (log
+  `/tmp/item14-builds.log`): release `lunarwing` binary, release
+  `xmpp-bridge` binary, and 13 WASM extensions (4 channels incl. `xmpp.wasm`,
+  9 tools) installed per tenant. No build failures.
+- `start-tenant knowa|knowb|knowc` (mt-admin, systemd user units): all
+  `lunarwing-<t>.service` and `xmpp-bridge-<t>.service` active; per-tenant
+  PostgreSQL containers running. Each bridge logged `XMPP connected
+  jid=<t>@localhost/<t>` and `XMPP room join requested
+  room=coord@conference.localhost nick=<t>`; each daemon logged `Coordination
+  hooks registered agent_id=<t> channels=["coord@conference.localhost"]
+  knowledge_share=true`.
+
+### Phase 4 — live test matrix
+
+Helper scripts (in `/tmp/item14-xmpp/`, not committed): `send-room.sh
+<tenant> <content>` posts a groupchat message through the tenant's loopback
+bridge API; `know-db.sh <tenant> [sql]` queries the tenant's postgres
+`memory_documents`; `wait-note.sh` polls for a path; `xmpp_inject.py` is a
+stdlib XMPP client for the intruder account.
+
+**Design correction discovered during bring-up (affects T1/T4
+expectations):** the XMPP layer drops *self-authored* MUC reflections —
+`ic/src/channels/xmpp/mod.rs:1543` compares the inbound occupant nick with
+the room's tracked `self_nick` (set at join for plain rooms too) and drops
+the echo. Therefore the *publishing* tenant never ingests its own `KNOW:`
+record; only the watching tenants do. Evidence for knowa below: its daemon
+log shows zero sightings of the T1 content and its DB has zero study-note
+rows, while both watchers ingested.
+
+#### T1 — knowa publishes; watchers ingest (PASS, with the self-drop note above)
+
+Sent (via knowa's bridge): `KNOW: mt-tenant-builds | Bounded tenant builds
+run serially under a shared flock with twelve jobs`
+
+- knowb daemon log: `coordination knowledge note ingested
+  path=study-notes/coord-coord-conference-localhost-knowa-b11877a387a8d59426d57106/mt-tenant-builds.md
+  sender="coord@conference.localhost/knowa"`.
+- knowb + knowc DBs (identical rows):
+
+  ```
+  study-notes/coord-coord-conference-localhost-knowa-b11877a387a8d59426d57106/mt-tenant-builds.md
+    status       = needs-verification
+    agent        = coord-coord-conference-localhost-knowa-b11877a387a8d59426d57106
+    submitted_by = coord@conference.localhost/knowa
+    tags         = ["coordination"]
+    confidence/studied_at/source_commit = null   (untrusted wire claim)
+  ```
+
+  The agent slug matches the independently computed
+  `sender_agent_slug("coord@conference.localhost/knowa")` (SHA-256
+  `b11877a387a8d59426d57106…`, 24 hex chars retained).
+- knowa DB: `(0 rows)` — publisher self-drop, by design (see above).
+- Shared scope confirmed: rows live in `memory_documents` under the daemon's
+  `shared` workspace scope (`user_id='shared'`), i.e. the native
+  `knowledge_search`/`knowledge_get_topic` tools can read them.
 
 ## Teardown record
 
