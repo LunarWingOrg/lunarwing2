@@ -317,6 +317,7 @@ mod tests {
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
             wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
         };
 
         let channels = builtin_channels(&config);

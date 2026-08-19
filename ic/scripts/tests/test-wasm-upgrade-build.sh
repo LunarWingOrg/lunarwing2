@@ -134,14 +134,18 @@ elif [[ "$output" == *'--require-wasm requires --with-wasm'* ]]; then
 else
   fail 'strict WASM mode returned the wrong validation error'
 fi
+# The upgrade-tenant build/worker-selection contract lives in
+# mt-admin-lib/04-tenant-lifecycle.sh after the mt-admin library split (the
+# root dispatcher sources the library).
+UPGRADE_LIB="$TEST_DIR/../mt-admin-lib/04-tenant-lifecycle.sh"
 # shellcheck disable=SC2016
-if grep -Fq 'build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"' "$ADMIN_SCRIPT"; then
+if grep -Fq 'build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true"' "$UPGRADE_LIB"; then
   pass 'upgrade-tenant requires successful WASM build'
 else
   fail 'upgrade-tenant does not enable strict WASM build mode'
 fi
 # shellcheck disable=SC2016
-if grep -Fq 'tenant_worker_enabled "$name" opencode' "$ADMIN_SCRIPT"; then
+if grep -Fq 'tenant_worker_enabled "$name" opencode' "$UPGRADE_LIB"; then
   pass 'upgrade-tenant rebuilds selected OpenCode worker'
 else
   fail 'upgrade-tenant ignores persisted OpenCode worker selection'

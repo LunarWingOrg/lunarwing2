@@ -1001,6 +1001,9 @@ async fn async_main() -> anyhow::Result<()> {
                 config.channels.wasm_channel_owner_actor_ids.clone(),
             )
             .await;
+        ext_mgr
+            .set_channel_tool_activity(config.channels.tool_activity)
+            .await;
         tracing::debug!("Channel runtime wired into extension manager for hot-activation");
 
         // Auto-activate WASM channels that were active in a previous session.

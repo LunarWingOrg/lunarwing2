@@ -467,6 +467,11 @@ fn render_status_message(update: &StatusUpdate) -> Option<String> {
         | StatusType::AuthCompleted
         | StatusType::ExternalWaiting
         | StatusType::JobStarted => Some(update.message.clone()),
+        // Tool-activity progress. These only reach the guest when the host
+        // `tool_activity` flag routes them, so render them when received.
+        StatusType::ToolStarted | StatusType::ToolCompleted | StatusType::ToolResult => {
+            Some(update.message.clone())
+        }
         StatusType::Status => {
             let trimmed = update.message.trim();
             if trimmed.eq_ignore_ascii_case("done")
@@ -584,6 +589,36 @@ mod tests {
     fn response_routing_rejects_missing_or_invalid_metadata() {
         assert!(target_from_metadata_json("{}").is_none());
         assert!(target_from_metadata_json("not-json").is_none());
+    }
+
+    #[test]
+    fn tool_activity_statuses_render_their_message() {
+        for status in [
+            StatusType::ToolStarted,
+            StatusType::ToolCompleted,
+            StatusType::ToolResult,
+        ] {
+            let update = StatusUpdate {
+                status,
+                message: "Tool started: shell".to_string(),
+                metadata_json: "{}".to_string(),
+            };
+            assert_eq!(
+                render_status_message(&update).as_deref(),
+                Some("Tool started: shell"),
+                "tool-activity statuses should render when the host routes them"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_status_still_dropped() {
+        let update = StatusUpdate {
+            status: StatusType::Thinking,
+            message: "working".to_string(),
+            metadata_json: "{}".to_string(),
+        };
+        assert!(render_status_message(&update).is_none());
     }
 }
 

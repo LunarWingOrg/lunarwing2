@@ -176,11 +176,16 @@ else
   fail 'add-tenant did not read Kimi API key from file'
 fi
 
-assert_contains "$MT_ADMIN" 'local source_root="${4:-$LUNARWING_ROOT}"' 'Kimi builder accepts source-root contract'
-assert_contains "$MT_ADMIN" '"$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to Kimi builder'
-assert_contains "$MT_ADMIN" 'local source_root="${3:-$LUNARWING_ROOT}"' 'OpenCode builder accepts source-root contract'
-assert_contains "$MT_ADMIN" 'build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to OpenCode builder'
-assert_contains "$MT_ADMIN" 'build-all refuses dirty worker source in tenant checkout' 'build-all rejects mismatched dirty worker trees'
+# These builder contracts live in mt-admin-lib/05-tenant-build.sh after the
+# mt-admin library split (the root dispatcher sources the library). Derive the
+# path from MT_ADMIN, not SCRIPT_DIR: sourcing "$MT_ADMIN" overwrites
+# SCRIPT_DIR with ic/scripts/.
+BUILD_LIB="$(dirname "$MT_ADMIN")/mt-admin-lib/05-tenant-build.sh"
+assert_contains "$BUILD_LIB" 'local source_root="${4:-$LUNARWING_ROOT}"' 'Kimi builder accepts source-root contract'
+assert_contains "$BUILD_LIB" '"$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to Kimi builder'
+assert_contains "$BUILD_LIB" 'local source_root="${3:-$LUNARWING_ROOT}"' 'OpenCode builder accepts source-root contract'
+assert_contains "$BUILD_LIB" 'build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to OpenCode builder'
+assert_contains "$BUILD_LIB" 'build-all refuses dirty worker source in tenant checkout' 'build-all rejects mismatched dirty worker trees'
 KIMI_DOCKERFILE="$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
 assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.30.0' 'Kimi image pins build-arg default'
 assert_contains "$KIMI_DOCKERFILE" 'npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION}' 'Kimi image installs selected package version'
@@ -198,7 +203,10 @@ if [[ "$help_output" == *'--kimi-api-key <key>'* || "$help_output" == *'--api-ke
 else
   pass 'help documents file-based Kimi API key input only'
 fi
-if grep -Fq 'env_flags+=(-e "KIMI_API_KEY=' "$MT_ADMIN"; then
+# Worker container argv is assembled in mt-admin-lib/09-worker-config.sh
+# (BUILD_LIB above points at 05-tenant-build.sh).
+WORKER_LIB="$(dirname "$MT_ADMIN")/mt-admin-lib/09-worker-config.sh"
+if grep -Fq 'env_flags+=(-e "KIMI_API_KEY=' "$WORKER_LIB"; then
   fail 'Kimi API key still enters container runtime argv'
 else
   pass 'Kimi API key stays out of container runtime argv'
