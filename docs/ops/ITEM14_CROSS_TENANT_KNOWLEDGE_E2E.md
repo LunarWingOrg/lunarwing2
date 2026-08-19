@@ -193,6 +193,20 @@ channel polls the loopback bridge for inbound room messages`
   the independently computed `sender_agent_slug` for knowb.
 - knowb DB: `self_ingested = 0` — publisher self-drop again, as designed.
 
+#### T5 — exact duplicate is a no-op (PASS)
+
+knowa re-sent the byte-identical T1 record. Before/after comparison on the
+`mt-tenant-builds` row in both watcher DBs:
+
+| tenant | updated_at before | updated_at after | len | rows | versions |
+|--------|-------------------|------------------|-----|------|----------|
+| knowb  | 08:15:02.681321+00 | 08:15:02.681321+00 | 155 | 1 | 0 |
+| knowc  | 08:15:02.834714+00 | 08:15:02.834714+00 | 155 | 1 | 0 |
+
+`updated_at` is bit-identical — the hook's duplicate check (content +
+metadata equality, `coordination_knowledge.rs:436`) skipped the write
+entirely. No duplicate rows, no version churn.
+
 ## Teardown record
 
 _(filled in at teardown)_
