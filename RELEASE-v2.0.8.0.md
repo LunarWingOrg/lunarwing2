@@ -64,6 +64,8 @@ previous compatibility baseline.
   ingest budgets, safe on mixed-version fleets.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
+- Kimi external worker bumped to Kimi Code CLI `0.37.2`, with the pinned
+  version baked into the image and exposed on the worker `/health` endpoint.
 
 ## Compatibility
 
@@ -196,6 +198,11 @@ previous compatibility baseline.
   global-scope ARG baked into the runtime image as `OPENCODE_IMAGE_REF` and
   surfaced on `/health` as `opencode_ref`; build contract re-verified against
   the canonical `anomalyco/opencode` tag.
+- Kimi external worker: `KIMI_CODE_VERSION` pinned to `0.37.2` as a single
+  global-scope ARG baked into the runtime image as `KIMI_CODE_IMAGE_VERSION`
+  and surfaced on `/health` as `kimi_code_version`; CLI contract
+  (`-p`/`--output-format stream-json`, stream-json line shapes, config keys)
+  re-verified against the `0.37.2` npm release.
 - Repo hygiene: root branding assets moved to owned, descriptive paths (README
   and onboarding references updated), stale root `PEBBLE.md` archived, empty
   `.codex` markers and a stale resume artifact removed. Full ledger in
@@ -226,7 +233,9 @@ previous compatibility baseline.
    `COORD_KNOWLEDGE_PUBLISH=1` and `COORD_KNOWLEDGE_PUBLISHERS` per tenant to
    opt in. Older daemons ignore KNOW records safely.
 7. Rebuild the opencode external-worker image so the pinned `v1.18.18` build
-   takes effect; check `/health` for `opencode_ref` afterward.
+   takes effect; check `/health` for `opencode_ref` afterward. Rebuild the
+   kimi external-worker image for the pinned `0.37.2` CLI; check `/health`
+   for `kimi_code_version`.
 
 ## Known Issues
 
