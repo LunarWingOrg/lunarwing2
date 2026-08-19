@@ -107,7 +107,53 @@ queries work.
 
 ## Phase 3 — Start + live verification
 
-_(filled in during the run)_
+`start-tenant owlet` → EXIT_RC=0. `mt-admin status owlet`:
+
+- `lunarwing-owlet.service: active`, PostgreSQL container running, LunarVision healthy
+  (20025/20026), gateway 10020 / http 10021.
+
+### BUG FOUND — MCP protocol version mismatch (live catch)
+
+Tenant daemon journal (`journalctl --user -u lunarwing-owlet.service`):
+
+```
+INFO Reconciled managed Study Notes MCP server home=/var/cache/lunarwing/lw2studymcp allow_write=false
+WARN Failed to connect to MCP server 'study_notes': External service error: Unsupported MCP protocol version '2025-03-26'
+```
+
+Root cause, verified in code on both sides:
+
+- LunarWing's MCP client sends `protocolVersion: "2024-11-05"` and **only accepted**
+  `2024-11-05` in the server's initialize response —
+  `ic/src/tools/mcp/protocol.rs` (`PROTOCOL_VERSION`, `SUPPORTED_PROTOCOL_VERSIONS`),
+  enforced fail-closed in `ic/src/tools/mcp/client.rs` (`initialize`).
+- The lw2studymcp server (`study_notes_mcp.py:33`) answers **every** initialize with
+  `PROTOCOL_VERSION = "2025-03-26"`, ignoring the requested version (spec-legal:
+  a server may respond with another version it supports; the client then decides).
+- Result: the managed `study_notes` server reconciled into config but could never
+  connect — a fresh tenant had knowledge *wired* but not *reachable*. This is invisible
+  to fixture tests (they never run the real handshake); only the live tenant exposed it.
+
+### Fix (this branch)
+
+`2025-03-26` is wire-identical to `2024-11-05` for the tools-only methods LunarWing's
+client uses (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`,
+`ping`), so accepting it is safe and strictly improves MCP interop:
+
+- `ic/src/tools/mcp/protocol.rs`: new `PROTOCOL_VERSION_2025_03_26`;
+  `SUPPORTED_PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26"]`. The client still
+  **requests** `2024-11-05` (lowest common denominator) but accepts either revision.
+- `ic/src/tools/mcp/client.rs` tests: the fail-closed rejection test now uses the truly
+  unsupported `2025-06-18`; new `test_initialize_accepts_protocol_version_2025_03_26`
+  asserts a `2025-03-26` server negotiates successfully (initialize →
+  notifications/initialized, no shutdown).
+
+Verified: `cargo test --lib tools::mcp` — **367 passed, 0 failed** (both touched tests
+green). Clippy result recorded below.
+
+### Post-fix live verification
+
+_(filled in after tenant rebuild/restart)_
 
 ## Phase 4 — Teardown
 
