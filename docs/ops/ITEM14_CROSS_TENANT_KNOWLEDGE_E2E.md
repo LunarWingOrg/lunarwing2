@@ -152,6 +152,21 @@ run serially under a shared flock with twelve jobs`
   `shared` workspace scope (`user_id='shared'`), i.e. the native
   `knowledge_search`/`knowledge_get_topic` tools can read them.
 
+#### T2 — intruder (non-allowlisted publisher) ignored; routing unaffected (PASS)
+
+`intruder@localhost` joined the room via `xmpp_inject.py` and sent:
+`KNOW: intruder-topic | this finding comes from an unlisted publisher`
+
+- All three tenant DBs: `SELECT count(*) … WHERE path LIKE '%intruder%'` →
+  **0 rows** in knowa, knowb, knowc.
+- Room routing itself was unaffected (fail-open design): knowb's daemon log
+  shows the message received and queued normally —
+  `WASM emit_message called user_id=coord@conference.localhost/intruder
+  user_name=Some("intruder")` → `Prepared polled message for agent queue`.
+  The knowledge hook declined to ingest it: the publisher allowlist is
+  enforced on the full occupant JID (`coord@conference.localhost/intruder`
+  is listed nowhere), and the ignore path logs at debug level only.
+
 ## Teardown record
 
 _(filled in at teardown)_
