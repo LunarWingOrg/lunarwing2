@@ -181,6 +181,18 @@ Results — study-note row counts unchanged in every tenant
 (knowa 0, knowb 1, knowc 1; the 1 is the T1 row) and `malformed_rows = 0`
 everywhere. Neither record produced a document.
 
+#### T4 — knowb publishes its own topic; watchers ingest (PASS)
+
+Sent (via knowb's bridge): `KNOW: bridge-polling-model | The xmpp wasm
+channel polls the loopback bridge for inbound room messages`
+
+- knowa + knowc DBs: ingested at
+  `study-notes/coord-coord-conference-localhost-knowb-06dd29f7aee42fd2c546fbb2/bridge-polling-model.md`
+  with `status = needs-verification`,
+  `submitted_by = coord@conference.localhost/knowb`. The agent slug matches
+  the independently computed `sender_agent_slug` for knowb.
+- knowb DB: `self_ingested = 0` — publisher self-drop again, as designed.
+
 ## Teardown record
 
 _(filled in at teardown)_
