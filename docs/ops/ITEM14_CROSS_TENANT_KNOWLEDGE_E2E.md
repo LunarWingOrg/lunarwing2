@@ -64,7 +64,20 @@ review resolutions recorded in `docs/ops/AJ_ITEM_14_REVIEW.md`):
 
 ## Results
 
-_(filled in as the test runs)_
+### Phase 1 — local XMPP infrastructure (DONE)
+
+- prosody 0.11.9 (`docker.io/prosody/prosody:0.11.9`, rootless podman
+  container `item14-prosody`) listening on `127.0.0.1:5222` only, no s2s.
+- VirtualHost `localhost`, MUC `conference.localhost`, room creation open.
+- Throwaway CA (`/tmp/item14-xmpp/certs/ca.crt`, 2-day validity) installed to
+  `/etc/ca-certificates/trust-source/anchors/item14-test-ca.pem` +
+  `update-ca-trust`; `openssl s_client -starttls xmpp -verify_hostname
+  localhost` against the system bundle: **Verify return code: 0 (ok)**;
+  python `ssl.create_default_context()` handshake + SASL feature negotiation
+  OK (PLAIN, SCRAM-SHA-1).
+- Accounts registered via `prosodyctl register`: `knowa`, `knowb`, `knowc`,
+  `intruder` (passwords in `/tmp/item14-xmpp/accounts.txt` mode 600,
+  destroyed at teardown; not recorded in the repo).
 
 ## Teardown record
 
