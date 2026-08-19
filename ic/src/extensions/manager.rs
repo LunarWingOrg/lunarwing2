@@ -94,6 +94,8 @@ struct ChannelRuntimeState {
     wasm_channel_router: Arc<WasmChannelRouter>,
     wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
     wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
+    /// Global `tool_activity` flag forwarded to hot-activated WASM channels.
+    tool_activity: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,6 +700,7 @@ impl ExtensionManager {
         wasm_channel_router: Arc<WasmChannelRouter>,
         wasm_channel_owner_ids: std::collections::HashMap<String, i64>,
         wasm_channel_owner_actor_ids: std::collections::HashMap<String, String>,
+        tool_activity: bool,
     ) {
         *self.channel_runtime.write().await = Some(ChannelRuntimeState {
             channel_manager,
@@ -706,6 +709,7 @@ impl ExtensionManager {
             wasm_channel_router,
             wasm_channel_owner_ids,
             wasm_channel_owner_actor_ids,
+            tool_activity,
         });
     }
 
@@ -4920,6 +4924,7 @@ impl ExtensionManager {
             wasm_channel_router,
             wasm_channel_owner_ids,
             wasm_channel_owner_actor_ids,
+            tool_activity,
         ) = {
             let rt_guard = self.channel_runtime.read().await;
             let rt = rt_guard.as_ref().ok_or_else(|| {
@@ -4932,6 +4937,7 @@ impl ExtensionManager {
                 Arc::clone(&rt.wasm_channel_router),
                 rt.wasm_channel_owner_ids.clone(),
                 rt.wasm_channel_owner_actor_ids.clone(),
+                rt.tool_activity,
             )
         };
 
@@ -4964,7 +4970,8 @@ impl ExtensionManager {
                 settings_store,
                 self.user_id.clone(),
             )
-            .with_secrets_store(Arc::clone(&self.secrets));
+            .with_secrets_store(Arc::clone(&self.secrets))
+            .with_tool_activity(tool_activity);
             loader
                 .load_from_files(name, &wasm_path, cap_path_option)
                 .await
@@ -9234,6 +9241,7 @@ done
                 router,
                 owner_ids,
                 HashMap::new(),
+                false,
             )
             .await;
 
@@ -9282,6 +9290,7 @@ done
                 router,
                 numeric_ids,
                 actor_ids,
+                false,
             )
             .await;
 
@@ -9397,6 +9406,7 @@ done
                 router,
                 owner_ids,
                 HashMap::new(),
+                false,
             )
             .await;
 

@@ -775,7 +775,8 @@ mod tests {
     #[test]
     fn resolve_tool_activity_from_settings_default_off() {
         let _guard = lock_env();
-        std::env::remove_var("TOOL_ACTIVITY");
+        // SAFETY: env lock held for the duration of the test.
+        unsafe { std::env::remove_var("TOOL_ACTIVITY") };
 
         let settings = Settings::default();
         let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
