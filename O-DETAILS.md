@@ -69,8 +69,18 @@ The four high/medium findings above are fixed:
   cleanup without cgroup ceilings.
 - Operator-build setup now requires the memory controller, enables and verifies
   subtree delegation, requires both memory files, verifies writes by readback,
-  and uses an explicit setup-complete state. Every real build status, including
-  2 and the post-setup placement status 125, is returned without a second run.
+  and uses an explicit setup-complete state. The build runs behind a bounded
+  go-file rendezvous: a `setpriv`-dropped tenant wrapper polls for the go file
+  while mt-admin migrates it into the build cgroup from the root side, so no
+  tenant-side `cgroup.procs` write access is needed (tenant self-migration is
+  EACCES-denied on stock cgroup v2 — the kernel requires write access on the
+  common ancestor). With the pre-delegated subtree from `setup-cgroups`
+  (docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md) the build cgroup is
+  `lunarwing-<name>/build`; otherwise the legacy root-level
+  `lunarwing-build-<name>` is used. The build cannot exec before placement
+  succeeds, so every real build status, including 2 and the post-setup
+  placement status 125, is returned without a second run, and a placement
+  failure kills the gated wrapper before any build work runs unbounded.
 - `/etc/conf.d/lunarwing-<tenant>` now has one atomic managed dependency block.
   Rerenders update that block while preserving cgroup overrides, `rc_ulimit`,
   comments, unrelated settings, owner, and mode. Legacy generated files migrate
@@ -80,10 +90,12 @@ The four high/medium findings above are fixed:
   strict build setup, exit-status propagation, legacy conf.d migration,
   override preservation, malformed-file rejection, and rerender idempotence.
 
-Disposable-tenant runtime validation below remains required before goal 3 can
-be checked. Current development host runs OpenRC 0.63.1 without the upstream
-`cgroup_running()` path fix, making the LunarWing fallback the required target
-for disposable-tenant validation.
+Disposable-tenant runtime validation has been re-executed on the development
+host against the current branch (which includes the `setup-cgroups`
+pre-delegated subtree rework from goal 1); results are recorded after the
+procedure sections below. The host runs OpenRC 0.63.1 without the upstream
+`cgroup_running()` path fix, so the LunarWing rendered fallback is what
+section 3 actually proves.
 
 ### Required OpenRC host validation
 
@@ -195,11 +207,29 @@ Use tmux because the probe is long-running:
 tmux new-session -d -s "lw-build-cgroup-$tenant" \
   "sudo env LUNARWING_SERVICE_MANAGER=openrc bash -c 'source \"$admin\"; _run_tenant_build \"$tenant\" \"sleep 60\"'"
 
-bcg="/sys/fs/cgroup/lunarwing-build-$tenant"
-until [ -d "$bcg" ] || ! tmux has-session -t "lw-build-cgroup-$tenant" 2>/dev/null; do
+bcg=
+for candidate in \
+  "/sys/fs/cgroup/lunarwing-$tenant/build" \
+  "/sys/fs/cgroup/lunarwing-build-$tenant"
+do
+  if [ -d "$candidate" ]; then
+    bcg="$candidate"
+    break
+  fi
+done
+until [ -n "$bcg" ] || ! tmux has-session -t "lw-build-cgroup-$tenant" 2>/dev/null; do
+  for candidate in \
+    "/sys/fs/cgroup/lunarwing-$tenant/build" \
+    "/sys/fs/cgroup/lunarwing-build-$tenant"
+  do
+    if [ -d "$candidate" ]; then
+      bcg="$candidate"
+      break
+    fi
+  done
   sleep 1
 done
-test -d "$bcg" || { printf 'temporary build cgroup not observed\n'; exit 1; }
+test -n "$bcg" || { printf 'temporary build cgroup not observed\n'; exit 1; }
 
 for knob in memory.high memory.max; do
   test -f "$bcg/$knob" || { printf 'missing build %s\n' "$knob"; exit 1; }
@@ -212,10 +242,74 @@ sudo cat "$bcg/cgroup.procs"
 Default effective values should be `17179869184` and `25769803776`, and
 `cgroup.procs` must be non-empty while the build runs. Missing files, `max`, an
 empty process list, or ignored write errors mean the build is not bounded.
+When the tenant has a pre-delegated subtree (`setup-cgroups`), the build
+cgroup is `lunarwing-<tenant>/build` inside it; the legacy root-level
+`lunarwing-build-<tenant>` is the no-subtree fallback.
+
+### Validation results (2026-08-19, branch `rarity/kimi-3-20260819-0001`)
+
+Host: Gentoo, OpenRC 0.63.1, cgroup v2 (`cgroup2fs`; root controllers and
+root `cgroup.subtree_control` both `cpuset cpu io memory hugetlb pids rdma
+misc dmem`). Disposable tenant: `henry` (pre-delegated subtree
+`/sys/fs/cgroup/lunarwing-henry` with `memory pids` delegation present from
+goal 1's `setup-cgroups`). All four sections passed against the current
+branch; this re-run was required because goal 1's subtree rework replaced the
+earlier launcher-side placement validated on 2026-08-14.
+
+1. **Cleanup support** — `/usr/libexec/rc/sh/rc-cgroup.sh` `cgroup_running()`
+   still checks only `unified/${RC_SVCNAME}`, `${RC_SVCNAME}`, and
+   `openrc/${RC_SVCNAME}`, never `openrc.${RC_SVCNAME}`: OpenRC issue #910 is
+   present on this host, so the rendered fallback is the required cleanup
+   path. Rendered `/etc/init.d/lunarwing-henry` contains
+   `_lunarwing_service_cgroup_cleanup`, `cgroup.kill`, and the bounded
+   `cgroup.procs` reaping fallback.
+2. **Effective service limits** — after `render-units` + `restart-tenant`,
+   `/sys/fs/cgroup/openrc.lunarwing-henry` read back exactly the defaults:
+   `memory.high=6442450944`, `memory.max=8589934592`, `cpu.max=800000 100000`,
+   `pids.max=2048`. The daemon (`henry` user, `lunarwing`) and its
+   `supervise-daemon` parent appear in `cgroup.procs` and report
+   `0::/openrc.lunarwing-henry` via `/proc/<pid>/cgroup`. Startup-time
+   `start_pre` verification passed (the daemon starts only when every
+   configured effective value verifies).
+3. **Stop cleanup** — a controlled root `sleep 600` was moved into the
+   service cgroup (confirmed in `cgroup.procs` and `/proc/<pid>/cgroup`).
+   `stop-tenant henry` reaped it: `kill -0` after the stop reported the
+   process gone (PASS). This exercises the LunarWing portable fallback, since
+   this host's OpenRC lacks upstream commit `1cf3944`. The tenant was
+   restarted afterwards and returned to service.
+4. **Operator-build bounding** — with the pre-delegated subtree present,
+   `_run_tenant_build henry "sleep 60"` created
+   `/sys/fs/cgroup/lunarwing-henry/build` (the subtree path, not the legacy
+   root-level name) with `memory.high=17179869184` and
+   `memory.max=25769803776`, and the tenant's `sleep 60` process ran inside it
+   (`0::/lunarwing-henry/build`, user `henry`) for the full minute via the
+   go-file rendezvous + root-side `setpriv` migration. On completion the
+   cgroup and sync dir were removed, no processes were left over, and no
+   fallback notice was printed. A second live probe with
+   `echo ran >> file; exit 2` ran the command exactly once, propagated exit
+   status 2 out of `_run_tenant_build`, and cleaned up its cgroup — the
+   finding-#2 double-run bug stays fixed at runtime, not just in fixtures.
+
+`ic/scripts/tests/test-workload-isolation-rendering.sh` passes all 94 checks
+(fixture and runtime-helper coverage, including strict build setup,
+exit-status propagation, conf.d override preservation, and rerender
+idempotence).
+
+Tenant-preservation note: the section-2 restart stopped `lunarwing-vision-henry`
+because `_ensure_tenant_image` requires the sidecar image in the root podman
+store as source of truth and this host's root store had been emptied (tenant
+rootless store still had it — pre-existing drift, not a regression from this
+branch). The image was copied back via `podman save` (tenant) | `podman load`
+(root) and `start-tenant henry` brought the sidecar back healthy
+(API/health ports 20035/20036); all henry services verified started via
+`mt-admin status henry` after validation.
 
 ### Goal 3 acceptance gate
 
-Check goal 3 only after all high/medium findings are fixed, focused regression
-tests cover exit-status propagation and conf.d preservation, installed OpenRC
-contains the cleanup path fix (or LunarWing supplies its own fallback), and all
-four host-validation sections pass.
+All acceptance conditions are met: the high/medium findings are fixed, focused
+regression tests cover exit-status propagation and conf.d preservation, the
+LunarWing rendered fallback supplies the cleanup this host's OpenRC 0.63.1
+lacks (upstream commit `1cf3944` not present), and all four host-validation
+sections passed on 2026-08-19 with disposable tenant `henry` against the
+current branch including goal 1's pre-delegated subtree build path
+(results above).
