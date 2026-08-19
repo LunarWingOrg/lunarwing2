@@ -622,8 +622,7 @@ mod tests {
         assert!(render_status_message(&status_update(StatusType::Done, "done")).is_none());
         assert!(render_status_message(&status_update(StatusType::Status, "done")).is_none());
         assert_eq!(
-            render_status_message(&status_update(StatusType::Status, "service warning"))
-                .as_deref(),
+            render_status_message(&status_update(StatusType::Status, "service warning")).as_deref(),
             Some("service warning")
         );
     }

@@ -560,10 +560,9 @@ mod tests {
         // toggle; the manager must keep forwarding regardless of the
         // global flag so that toggle keeps working.
         for flag in [false, true] {
-            let manager = ChannelManager::with_coordination_status_policy(coordination_policy(
-                false,
-            ))
-            .with_tool_activity(flag);
+            let manager =
+                ChannelManager::with_coordination_status_policy(coordination_policy(false))
+                    .with_tool_activity(flag);
             let (stub, _) = StubChannel::new("signal");
             let statuses = stub.captured_statuses_handle();
             manager.add(Box::new(stub)).await;
