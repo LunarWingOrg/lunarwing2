@@ -47,6 +47,9 @@ cron-wrapper.sh
   ├── infrastructure-health-check.sh   → writes JSON report to
   │       $LUNARWING_BASE_DIR/workspace/reports/health/<ts>.json
   │       (runs health-{gateway,xmpp,…}.sh + health-{systemd,openrc,launchd}.sh)
+  ├── health-metrics-exporter.sh       → flattens the fresh report + self-heal
+  │       state.json into Prometheus textfile exposition (optional;
+  │       HEALTH_METRICS_EXPORT_ENABLED=false skips it, failures are non-fatal)
   └── lunarwing-self-heal.sh            → reads the latest report, remediates
 ```
 
