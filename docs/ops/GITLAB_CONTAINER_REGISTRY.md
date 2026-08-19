@@ -163,7 +163,7 @@ Details:
 - Variable: `WITH_TOOLCHAINS` for both OpenCode and Kimi jobs (default
   `false`; set `true` on the selected manual job for the full toolchain image —
   mirrors mt-admin's `--with-toolchains`). Kimi also exposes
-  `KIMI_CODE_VERSION` (currently `0.30.0`).
+  `KIMI_CODE_VERSION` (currently `0.37.2`).
 - If gcr.io is unreachable from the runners, pull the executor image
   elsewhere, push it into our registry once section 1 is done, and update
   `.container-job`'s `image:name`.
