@@ -28,6 +28,9 @@ def _build_health() -> dict:
         "mode": os.environ.get("KIMI_MODE", "websocket"),
         "version": os.environ.get("KIMI_VERSION", "kimi-worker-1.0.0"),
         "worker_id": os.environ.get("LUNARWING_WORKER_ID", "worker-kimi-01"),
+        # Upstream kimi-code release this image was built with
+        # (Dockerfile KIMI_CODE_VERSION). "unknown" when running outside the image.
+        "kimi_code_version": os.environ.get("KIMI_CODE_IMAGE_VERSION", "unknown"),
     }
 
 def _load_ws_state() -> dict | None:
