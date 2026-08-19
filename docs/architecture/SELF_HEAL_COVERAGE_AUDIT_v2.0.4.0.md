@@ -80,3 +80,17 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > v2.0.7.0 (distinct registry health ports, `-sup` crash supervisors on
 > OpenRC, health-gated starts, drifted-container recreation); the audit's
 > coverage table otherwise still reflects the pipeline's structure.
+
+> **Update (2026-08-19, v2.0.8.0):** `run-all.sh` now also registers an
+> eleventh suite, `metrics-exporter` (`test-health-metrics-exporter.sh`), for
+> the healthpoint metrics exporter landed in this cycle:
+> `health-metrics-exporter.sh` runs from `cron-wrapper.sh` after each check
+> and flattens the newest aggregated report plus self-heal `state.json` into
+> Prometheus textfile exposition (per-check `duration_seconds` is now stamped
+> by `infrastructure-health-check.sh`). A graduated `THRESHOLD_<metric>`
+> early-warning layer with a deduplicated Gotify path and an optional
+> loopback-only listener crate (`ic/crates/lunarwing_health_metrics`,
+> installed by `ic/scripts/install-health-metrics-listener.sh` behind the
+> ports-registry v16 `health_metrics` slot) accompany it. Design:
+> `docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`. The audit's detection /
+> remedy coverage table still describes the self-heal pipeline itself.

@@ -279,6 +279,9 @@ Key migrations:
   equal for path uniqueness
 - `V23__exclude_engine_runtime_from_search.sql`: removes legacy search chunks
   for persisted Engine runtime state
+- `V26__study_notes_knowledge.sql`: study-notes knowledge layer metadata
+  (durable codebase-study findings stored as ordinary workspace documents
+  under `study-notes/<agent>/<topic>.md`)
 
 ### libSQL
 
@@ -418,6 +421,8 @@ The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves rele
 | `ic/src/workspace/chunker.rs` | Document chunking with overlap |
 | `ic/src/workspace/document.rs` | Core types (MemoryDocument, MemoryChunk, well-known paths) |
 | `ic/src/workspace/hygiene.rs` | Workspace cleanup/maintenance |
+| `ic/src/workspace/knowledge.rs` | Study-notes knowledge layer types (private/shared scopes) |
+| `ic/src/workspace/knowledge_sweep.rs` | Background sweep marking aging study notes stale |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
 | `ic/src/tools/builtin/memory.rs` | Agent-facing tools (search, read, write, tree) |
@@ -430,3 +435,4 @@ The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves rele
 | `ic/migrations/V16__document_versions.sql` | Document version storage |
 | `ic/migrations/V21__fix_null_agent_id_unique_constraint.sql` | Primary-scope path uniqueness fix |
 | `ic/migrations/V23__exclude_engine_runtime_from_search.sql` | Remove legacy Engine runtime search chunks |
+| `ic/migrations/V26__study_notes_knowledge.sql` | Study-notes knowledge layer |
