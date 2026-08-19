@@ -182,8 +182,41 @@ the item targets the study-MCP wiring, which is proven at the MCP layer.)
 
 ## Phase 4 — Teardown
 
-_(filled in during the run)_
+```
+ic/scripts/lunarwing-mt-admin.sh remove-tenant owlet --purge
+```
+
+Result: **EXIT_RC=0** — services stopped, systemd units uninstalled, PostgreSQL
+container + data volume removed, ports deallocated, OS user and home directory removed.
+
+Post-teardown assertions (all clean):
+
+- `mt-admin list` → 0 references to `owlet` (back to `alpha`, `antelope`, `hermes`).
+- `id owlet` → no such user; `/home/owlet` → gone.
+- `/etc/lunarwing/ports.json` → 0 references to `owlet`.
+- `podman ps -a` → 0 owlet containers.
+- `/var/cache/lunarwing/lw2studymcp` **retained, untouched and clean** — correct: it is
+  the shared host checkout future tenants sync/reuse, not tenant state.
 
 ## Verdict
 
-_(filled in at the end)_
+**PASS** — with one real bug found and fixed along the way:
+
+1. `add-tenant owlet --with-study-mcp` cloned the shared lw2studymcp checkout at current
+   upstream HEAD (`1876c42`) and wired the tenant read-only (env, permissions, port
+   block, summary `study mcp: configured (latest lw2studymcp checkout)`). The
+   "always latest repo when spinning up a new tenant" requirement works.
+2. Live start exposed a protocol-version deadlock (client accepted only `2024-11-05`;
+   lw2studymcp answers `2025-03-26`) — fixed on this branch by accepting both revisions
+   (`ic/src/tools/mcp/protocol.rs`, `ic/src/tools/mcp/client.rs` tests; 367 MCP tests +
+   clippy `-D warnings` green).
+3. After rebuild/restart, the tenant daemon reconciled and connected the managed
+   `study_notes` server; `lunarwing mcp list`/`mcp test study_notes` as the tenant user
+   proved the 5 read-only tools end to end through LunarWing's own MCP client; write
+   tools stay gated (`write_enabled: false`).
+4. Teardown left zero residue; the shared checkout persists for future tenants.
+
+Follow-up worth considering (out of scope here): upstream lw2studymcp should ideally
+echo the client's requested protocol version when it supports it (proper MCP
+negotiation) instead of always answering `2025-03-26`; LunarWing now tolerates that
+behavior either way.
