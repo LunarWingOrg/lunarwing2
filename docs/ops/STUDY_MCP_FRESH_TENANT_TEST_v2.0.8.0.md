@@ -153,7 +153,32 @@ green). Clippy result recorded below.
 
 ### Post-fix live verification
 
-_(filled in after tenant rebuild/restart)_
+The tenant checkout could not `git pull` (origin is the dev repo under
+`/home/applejack`, unreadable by the tenant user), so the two-file diff was applied with
+`git apply` (tenant is disposable; the branch carries the real commits), then
+`build-tenant owlet` (incremental release, 7m07s) and `restart-tenant owlet`.
+
+Daemon journal after restart — **the WARN is gone**:
+
+```
+INFO Reconciled managed Study Notes MCP server home=/var/cache/lunarwing/lw2studymcp allow_write=false
+INFO Injecting startup MCP clients into extension manager count=1
+```
+
+Tenant's own CLI, as `owlet` with the tenant env (PostgreSQL-backed config):
+
+- `lunarwing mcp list` → `● study_notes - python3 [stdio (python3); host]` — managed
+  server seeded into the tenant DB at daemon startup, exactly as designed.
+- `lunarwing mcp test study_notes` → **✓ Connection successful!** through LunarWing's
+  own MCP client (the same code path the agent loop uses), listing exactly the 5
+  read-only tools: `knowledge_search`, `knowledge_get_topic`, `knowledge_list_topics`,
+  `knowledge_list_stale`, `knowledge_stats`. No write tools — read-only contract holds
+  end to end.
+- Gateway sanity: `curl http://127.0.0.1:10021/agent/status` →
+  `{"success":true,"data":{"running":true,…}}`.
+
+(Full agent chat was not exercised: the test tenant has no LLM API key provisioned, and
+the item targets the study-MCP wiring, which is proven at the MCP layer.)
 
 ## Phase 4 — Teardown
 
