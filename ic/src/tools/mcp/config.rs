@@ -1961,6 +1961,11 @@ async fn mutate_mcp_servers_db<T>(
             None => McpServersFile::default(),
         };
         let result = mutate(&mut servers)?;
+        // Validate the whole file before persisting: file-level rules
+        // (require_sandbox_profiles, marketplace revocation gates) must not be
+        // bypassed by the DB write path — the disk path validates on save, and
+        // persisting an invalid file would poison every subsequent load.
+        servers.validate()?;
         let value = serde_json::to_value(&servers)?;
         if store
             .compare_and_set_setting(user_id, "mcp_servers", expected.as_ref(), &value)
@@ -3275,6 +3280,61 @@ mod tests {
             Some("http://marketplace.example.com/revocations.json".to_string());
         let error = file.validate().expect_err("plain http url");
         assert!(error.to_string().contains("must use HTTPS"));
+    }
+
+    /// Regression: the DB write path (`mutate_mcp_servers_db`) used to
+    /// CAS-persist the mutated file without re-running whole-file validation,
+    /// unlike the disk path (`save_mcp_servers` validates). That let
+    /// `mcp add` persist a server violating file-level rules (e.g.
+    /// `require_sandbox_profiles`), poisoning the stored config so every
+    /// subsequent load failed closed. Found live in the v2.0.8.0 item-8
+    /// tenant test; see docs/ops/v2.0.8.0_ITEM_8_MCP_TENANT_TEST.md.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn db_persist_rejects_whole_file_validation_failures() {
+        use crate::db::Database;
+
+        let dir = tempdir().unwrap();
+        let backend = crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("t.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+
+        let seed = McpServersFile {
+            require_sandbox_profiles: true,
+            ..Default::default()
+        };
+        save_mcp_servers_to_db(&backend, "owner", &seed)
+            .await
+            .expect("seed valid config");
+
+        let unsandboxed =
+            McpServerConfig::new_stdio("nosandbox", "/bin/true", vec![], HashMap::new());
+        let error = persist_mcp_server_db(&backend, "owner", unsandboxed, true)
+            .await
+            .expect_err("unsandboxed add must fail under require_sandbox_profiles");
+        assert!(
+            error.to_string().contains("require_sandbox_profiles"),
+            "unexpected error: {error}"
+        );
+
+        // The stored config was not poisoned by the rejected write.
+        let loaded = load_mcp_servers_from_db(&backend, "owner")
+            .await
+            .expect("stored config still loads");
+        assert!(loaded.get("nosandbox").is_none());
+
+        // A server carrying the mandatory baseline persists fine.
+        let sandboxed =
+            McpServerConfig::new_stdio("sandboxed", "/bin/true", vec![], HashMap::new())
+                .with_sandbox(crate::tools::mcp::sandbox::McpSandboxConfig::default_profile());
+        persist_mcp_server_db(&backend, "owner", sandboxed, true)
+            .await
+            .expect("sandboxed add succeeds");
+        let loaded = load_mcp_servers_from_db(&backend, "owner")
+            .await
+            .expect("load after sandboxed add");
+        assert!(loaded.get("sandboxed").is_some());
     }
 
     #[test]
