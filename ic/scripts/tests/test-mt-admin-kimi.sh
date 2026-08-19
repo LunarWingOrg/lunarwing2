@@ -203,7 +203,10 @@ if [[ "$help_output" == *'--kimi-api-key <key>'* || "$help_output" == *'--api-ke
 else
   pass 'help documents file-based Kimi API key input only'
 fi
-if grep -Fq 'env_flags+=(-e "KIMI_API_KEY=' "$MT_ADMIN"; then
+# Worker container argv is assembled in mt-admin-lib/09-worker-config.sh
+# (BUILD_LIB above points at 05-tenant-build.sh).
+WORKER_LIB="$(dirname "$MT_ADMIN")/mt-admin-lib/09-worker-config.sh"
+if grep -Fq 'env_flags+=(-e "KIMI_API_KEY=' "$WORKER_LIB"; then
   fail 'Kimi API key still enters container runtime argv'
 else
   pass 'Kimi API key stays out of container runtime argv'
