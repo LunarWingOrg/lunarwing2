@@ -122,7 +122,7 @@ grep -Fq 'legacy_field = "preserve-me"' "$CONFIG_DIR/darkirc_config.toml"
 [[ "$(stat -c '%a' "$CONFIG_DIR/darkirc_config.toml")" == 600 ]]
 [[ "$(stat -c '%a' "$CONFIG_DIR")" == 700 ]]
 
-if grep -Eq 'render_template[[:space:]]+.*darkirc_config\.toml' "$ADMIN_SCRIPT"; then
+if grep -Eq 'render_template[[:space:]]+.*darkirc_config\.toml' "$SCRIPT_DIR/../mt-admin-lib/06-env-generation.sh"; then
   fail "direct DarkIRC template writer reintroduced"
 fi
 

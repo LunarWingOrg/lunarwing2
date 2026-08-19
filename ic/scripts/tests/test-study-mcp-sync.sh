@@ -124,7 +124,8 @@ fi
 grep -Fq -- '--with-study-mcp' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq -- '--study-mcp-home' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq -- '--sync) study_sync="true"; shift ;;' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+# The add_tenant wiring call moved to the lifecycle library in the mt-admin split.
 grep -Fq 'provision_tenant_study_mcp "$name" "$study_mcp_home"' \
-  "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+  "$SCRIPT_DIR/mt-admin-lib/04-tenant-lifecycle.sh"
 
 printf 'Study MCP sync tests passed\n'
