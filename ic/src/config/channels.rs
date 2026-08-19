@@ -26,6 +26,10 @@ pub struct ChannelsConfig {
     pub wasm_channel_owner_ids: HashMap<String, i64>,
     /// Per-channel string actor IDs. Takes precedence over the legacy numeric map.
     pub wasm_channel_owner_actor_ids: HashMap<String, String>,
+    /// Route tool-activity status updates (ToolStarted/ToolCompleted/ToolResult)
+    /// to WASM channels. Resolved from `TOOL_ACTIVITY` env or the
+    /// `channels.tool_activity` setting; default false.
+    pub tool_activity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +467,7 @@ impl ChannelsConfig {
             )?,
             wasm_channel_owner_ids: cs.wasm_channel_owner_ids.clone(),
             wasm_channel_owner_actor_ids: cs.wasm_channel_owner_actor_ids.clone(),
+            tool_activity: parse_bool_env("TOOL_ACTIVITY", cs.tool_activity)?,
         })
     }
 
@@ -621,6 +626,7 @@ mod tests {
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
             wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
         };
         assert!(cfg.cli.enabled);
         assert!(cfg.http.is_none());
@@ -647,6 +653,7 @@ mod tests {
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
             wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
         };
         assert_eq!(cfg.wasm_channel_owner_ids.get("xmpp"), Some(&12345));
         assert_eq!(cfg.wasm_channel_owner_ids.get("weechat"), Some(&67890));
@@ -668,6 +675,7 @@ mod tests {
                 "weechat".to_string(),
                 "id:alice!user@example".to_string(),
             )]),
+            tool_activity: false,
         };
 
         assert_eq!(
@@ -762,5 +770,20 @@ mod tests {
         assert_eq!(xmpp.allow_rooms, vec!["room@conference.example.com"]);
         assert_eq!(xmpp.encrypted_rooms, vec!["room@conference.example.com"]);
         assert_eq!(xmpp.max_messages_per_hour, 6);
+    }
+
+    #[test]
+    fn resolve_tool_activity_from_settings_default_off() {
+        let _guard = lock_env();
+        std::env::remove_var("TOOL_ACTIVITY");
+
+        let settings = Settings::default();
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
+        assert!(!cfg.tool_activity);
+
+        let mut settings = Settings::default();
+        settings.channels.tool_activity = true;
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
+        assert!(cfg.tool_activity);
     }
 }

@@ -165,6 +165,7 @@ impl Config {
                 wasm_channels_enabled: false,
                 wasm_channel_owner_ids: HashMap::new(),
                 wasm_channel_owner_actor_ids: HashMap::new(),
+                tool_activity: false,
             },
             agent: AgentConfig::for_testing(),
             safety: SafetyConfig {
