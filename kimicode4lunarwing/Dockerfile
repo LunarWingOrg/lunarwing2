@@ -1,3 +1,10 @@
+# Pin the Kimi Code CLI to a reviewed npm release for reproducible builds.
+# Override with: docker build --build-arg KIMI_CODE_VERSION=0.37.2 ...
+# Bump this default when upgrading the worker to a newer kimi-code release.
+# Declared in global scope so both stages share one default; the runtime
+# stage re-declares `ARG KIMI_CODE_VERSION` (no default) to consume it.
+ARG KIMI_CODE_VERSION=0.37.2
+
 # ──────────────────────────────
 # Stage 1: build the bridge + tests
 # ──────────────────────────────
@@ -158,7 +165,11 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 
 # ── Kimi Code CLI ─────────────────────────────────────────────────────────────
 # Install the official Kimi Code CLI from npm. Pinned to a known-good release.
-ARG KIMI_CODE_VERSION=0.30.0
+# Consume the global pin and record it in the runtime image so operators can
+# tell which upstream kimi-code release a running worker was built from
+# (surfaced on the /health endpoint as `kimi_code_version`).
+ARG KIMI_CODE_VERSION
+ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
 RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} && \
     kimi --version && \
     npm cache clean --force
