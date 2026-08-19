@@ -553,9 +553,9 @@ The engine inherits most configuration from the host daemon (LLM provider settin
 Run these commands from `ic/`:
 
 ```bash
-taskset -c 0-5 cargo check -j6 -p lunarwing_engine
-taskset -c 0-5 cargo clippy -j6 -p lunarwing_engine --all-targets -- -D warnings
-taskset -c 0-5 cargo test -j6 -p lunarwing_engine -- --test-threads=6
+taskset -c 0-11 cargo check -j12 -p lunarwing_engine
+taskset -c 0-11 cargo clippy -j12 -p lunarwing_engine --all-targets -- -D warnings
+taskset -c 0-11 cargo test -j12 -p lunarwing_engine -- --test-threads=12
 ```
 
 ## Key Design Decisions
