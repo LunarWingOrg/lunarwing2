@@ -113,6 +113,18 @@ previous compatibility baseline.
   debug-only and silent), and `mission_fire` reports the precise not-fired
   reason (terminal / paused / budget exhausted, noting the UTC-day reset).
 
+### Channels
+
+- New global `tool_activity` flag (`channels.tool_activity` in settings, or
+  the `TOOL_ACTIVITY` env overlay; default off) routes
+  `StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}` events from the
+  host broadcast layer to WASM channels (work item #47). The XMPP, DarkIRC,
+  and WeeChat guests now render those events (XMPP bridge messages and
+  `[status] ...` lines for the IRC-style guests). Native channels (REPL,
+  Signal, Web) keep their existing per-channel `/debug` gating unchanged;
+  when the flag is off the events are suppressed at the channel manager
+  instead of being forwarded to guests that would drop them.
+
 ### MCP Marketplace Trust and Gateway (Parts 2 and 3)
 
 - Publisher signatures (ed25519 `verify_strict` over canonical manifests), a
@@ -247,9 +259,6 @@ previous compatibility baseline.
   directly rather than through owner-scoped secret references. A stdio MCP
   bridge tool can be installed to use HTTP MCP servers with proper secret
   management.
-- WASM channels do not surface tool-activity status events yet (work item
-  #47; re-verified unimplemented in this cycle — guests drop ToolStarted /
-  ToolCompleted / ToolResult and no per-channel `/debug` toggle exists).
 - The XMPP bridge still cannot attach and send images correctly (work item
   #42); no fix ships in this release.
 - The web UI still places its bearer token in native `EventSource` query
@@ -292,3 +301,9 @@ previous compatibility baseline.
   and `listChanged` passthrough is no longer structurally blocked.
 - The `rust-test-lib` / `rust-test-libsql` CI failures caused by the
   version-locked WAT fixture envelope.
+- WASM channels not surfacing tool-activity status events (work item #47):
+  a global `tool_activity` flag (`settings.channels.tool_activity` or the
+  `TOOL_ACTIVITY` env overlay) now routes `StatusUpdate::{ToolStarted,
+  ToolCompleted, ToolResult}` through the channel manager to WASM
+  channels, and the XMPP, DarkIRC, and WeeChat guests render them.
+  Native channels keep their per-channel `/debug` toggle unchanged.

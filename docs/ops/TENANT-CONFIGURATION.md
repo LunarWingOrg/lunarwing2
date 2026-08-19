@@ -258,6 +258,8 @@ WASM_CHANNELS_DIR=/home/<tenant>/lunarwing/state/channels
 
 WASM tools and channels are installed into the tenant's state directory. Disable WASM entirely by setting `WASM_ENABLED=false`.
 
+Set `TOOL_ACTIVITY=true` to route tool-activity status events (`ToolStarted` / `ToolCompleted` / `ToolResult`) to WASM channels (XMPP, DarkIRC, WeeChat). With the flag off (default) the host suppresses these events for WASM channels; native channels keep their own per-channel `/debug` toggle either way.
+
 ## WeeChat Relay Configuration
 
 During `add-tenant`, the WeeChat relay is configured automatically. The relay password is generated and stored as the literal expression `${env:RELAY_PASSWORD}` in `relay.conf`. The resolved value is provided through a dedicated `env/weechat.env` file (mode `0600`, owned by the tenant user) that contains only `RELAY_PASSWORD`. The full `lunarwing.env` is never loaded into the WeeChat process.
