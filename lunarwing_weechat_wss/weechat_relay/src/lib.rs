@@ -530,7 +530,10 @@ impl Guest for WeechatRelayChannel {
         let max_chunk = channel_host::workspace_read(MAX_CHUNK_LENGTH_PATH)
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or_else(default_max_chunk_length);
-        let chunks = split_message(&response.content, max_chunk);
+        let chunks: Vec<String> = outbound_lines(&response.content)
+            .iter()
+            .flat_map(|line| split_message(line, max_chunk))
+            .collect();
 
         let mut successful_chunks = 0;
         let mut last_error = None;
@@ -545,7 +548,7 @@ impl Guest for WeechatRelayChannel {
                     chunk,
                 )
             } else {
-                send_input(&relay_url, &relay_password, &route.buffer, chunk)
+                send_message(&relay_url, &relay_password, &route.buffer, chunk)
             };
 
             match result {
@@ -766,8 +769,13 @@ impl Guest for WeechatRelayChannel {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(420);
 
-        // Split response into IRC-friendly chunks
-        let chunks = split_message(&response.content, max_chunk);
+        // Split response into IRC-friendly chunks, one input call per source
+        // line: WeeChat truncates non-multiline buffer input at the first
+        // newline, so embedded '\n' would silently drop the rest of the text.
+        let chunks: Vec<String> = outbound_lines(&response.content)
+            .iter()
+            .flat_map(|line| split_message(line, max_chunk))
+            .collect();
 
         let mut successful_chunks = 0;
         let mut last_error = None;
@@ -783,7 +791,7 @@ impl Guest for WeechatRelayChannel {
                     chunk,
                 )
             } else {
-                send_input(&relay_url, &relay_password, &metadata.buffer, chunk)
+                send_message(&relay_url, &relay_password, &metadata.buffer, chunk)
             };
 
             match result {
@@ -871,7 +879,14 @@ impl Guest for WeechatRelayChannel {
                 let relay_password =
                     channel_host::workspace_read(RELAY_PASSWORD_PATH).unwrap_or_default();
 
-                let truncated = truncate_for_status(message);
+                // Flatten to a single IRC-safe line before truncation: an
+                // embedded newline would make WeeChat drop everything after
+                // the first line of this status.
+                let flattened = outbound_lines(message).join(" ");
+                if flattened.is_empty() {
+                    return;
+                }
+                let truncated = truncate_for_status(&flattened);
 
                 let status_text = format!("[status] {}", truncated);
 
@@ -885,7 +900,7 @@ impl Guest for WeechatRelayChannel {
                         &status_text,
                     )
                 } else {
-                    send_input(&relay_url, &relay_password, &metadata.buffer, &status_text)
+                    send_message(&relay_url, &relay_password, &metadata.buffer, &status_text)
                 };
                 if let Err(e) = send_result {
                     channel_host::log(
@@ -1159,7 +1174,7 @@ fn do_poll(poll_url: &str, relay_url: &str, relay_password: &str) {
         .unwrap_or(0)
         .wrapping_add(1);
     let _ = channel_host::workspace_write("state/poll_count", &poll_count.to_string());
-    if poll_count % 30 == 0 {
+    if poll_count.is_multiple_of(30) {
         if let Ok(new_buffers) = fetch_buffer_list(poll_url, relay_password) {
             let irc_buffers = filter_irc_buffers(&new_buffers);
             if let Ok(json) = serde_json::to_string(&irc_buffers) {
@@ -1575,10 +1590,10 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     }
 
     // Extract message details
-    let tags = line.tags.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let tags = line.tags.as_deref().unwrap_or(&[]);
 
     let nick = extract_nick_from_tags(tags)
-        .or_else(|| line.prefix.as_ref().map(|s| s.as_str()))
+        .or(line.prefix.as_deref())
         .unwrap_or("unknown");
 
     let host = extract_host_from_tags(tags).unwrap_or("");
@@ -1589,7 +1604,7 @@ fn handle_inbound_line(buffer_name: &str, line: &LineInfo) {
     };
     let identity = weechat_sender_identity(network, nick, tags);
 
-    let message = line.message.as_ref().map(|s| s.as_str()).unwrap_or("");
+    let message = line.message.as_deref().unwrap_or("");
     let text = strip_irc_formatting(message);
 
     if text.trim().is_empty() {
@@ -1774,7 +1789,7 @@ fn handle_pairing_request(buffer_name: &str, nick: &str, principal: &str) {
                         &reply,
                     )
                 } else {
-                    send_input(&relay_url, &relay_password, buffer_name, &reply)
+                    send_message(&relay_url, &relay_password, buffer_name, &reply)
                 };
                 if let Err(e) = send_result {
                     channel_host::log(
@@ -1833,18 +1848,18 @@ fn fetch_buffer_list(relay_url: &str, relay_password: &str) -> Result<Vec<Buffer
         serde_json::from_slice(&response.body).map_err(|e| format!("parse error: {}", e))?;
     let buffers = values
         .into_iter()
-        .filter_map(|v| {
+        .map(|v| {
             let id = v["id"].as_i64();
             let full_name = v["name"]
                 .as_str()
                 .or_else(|| v["full_name"].as_str())
                 .map(String::from);
             let short_name = v["short_name"].as_str().map(String::from);
-            Some(BufferInfo {
+            BufferInfo {
                 id,
                 full_name,
                 short_name,
-            })
+            }
         })
         .collect();
     Ok(buffers)
@@ -1859,10 +1874,12 @@ fn send_dm(
     nick: &str,
     text: &str,
 ) -> Result<(), String> {
-    match send_input(relay_url, relay_password, buffer_name, text) {
+    match send_message(relay_url, relay_password, buffer_name, text) {
         Err(ref e) if e.contains("404") || e.contains("not found") || e.contains("Not Found") => {
             // Use the server buffer with /msg <nick> <text> — IRC commands must run
             // in the context of a connected server buffer, not core.weechat.
+            // `text` goes verbatim as the /msg argument, so it must NOT be
+            // slash-escaped here (escaping is only for buffer input parsing).
             let server_buffer = format!("irc.server.{}", network);
             let msg_cmd = format!("/msg {} {}", nick, text);
             debug_log(&format!(
@@ -1899,6 +1916,28 @@ fn send_input(
     }
 
     Ok(())
+}
+
+/// Send a single-line message to a WeeChat buffer.
+///
+/// Unlike `send_input` (raw passthrough, used for intentional commands such
+/// as the `/msg` DM fallback), this applies `escape_command_prefix` so text
+/// that happens to start with '/' is delivered verbatim instead of being
+/// executed as a WeeChat command. `text` must already be a single line (see
+/// `outbound_lines`) — WeeChat truncates non-multiline buffer input at the
+/// first newline.
+fn send_message(
+    relay_url: &str,
+    relay_password: &str,
+    buffer_name: &str,
+    text: &str,
+) -> Result<(), String> {
+    send_input(
+        relay_url,
+        relay_password,
+        buffer_name,
+        &escape_command_prefix(text),
+    )
 }
 
 /// Seed watermarks for all IRC buffers to avoid replaying history.
@@ -2142,6 +2181,43 @@ fn split_message(text: &str, max_len: usize) -> Vec<String> {
     }
 
     chunks
+}
+
+/// Split outbound text into individual IRC-safe lines.
+///
+/// WeeChat's relay API feeds the `/api/input` command string through the same
+/// input path as typed user input, and for non-multiline buffers WeeChat
+/// truncates the string at the first '\n' — everything after the first line
+/// is silently dropped. Multi-line tool output must therefore be sent as one
+/// input call per line. Carriage returns, NUL bytes, and other control
+/// characters (except tab) are stripped: they are forbidden or display-
+/// corrupting in IRC messages. Empty lines are dropped because an empty
+/// PRIVMSG cannot be sent.
+fn outbound_lines(text: &str) -> Vec<String> {
+    text.split('\n')
+        .map(|line| {
+            line.chars()
+                .filter(|&c| c == '\t' || (!c.is_control() && c != '\u{7f}'))
+                .collect::<String>()
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+/// Escape a single outbound line for WeeChat's input parser.
+///
+/// WeeChat treats input beginning with '/' as a command (its paste heuristics
+/// only exempt "/ ", "/*", and "/path"-shaped text). A tool-output line like
+/// "/msg bob hi" would be *executed* — corrupting the output and potentially
+/// running arbitrary WeeChat commands in the operator's client. Prefixing one
+/// extra '/' makes WeeChat send the line verbatim: its input parser strips
+/// exactly one leading '/' and treats the rest as plain text.
+fn escape_command_prefix(line: &str) -> String {
+    if line.starts_with('/') {
+        format!("/{}", line)
+    } else {
+        line.to_string()
+    }
 }
 
 /// Parse ISO8601 timestamp to milliseconds.
@@ -2562,6 +2638,64 @@ mod tests {
         let chunks = split_message(text, 20);
         assert!(chunks[0].len() <= 20);
         assert!(chunks.len() >= 2);
+    }
+
+    #[test]
+    fn test_outbound_lines_splits_on_newlines() {
+        let lines = outbound_lines("first\nsecond\nthird");
+        assert_eq!(lines, vec!["first", "second", "third"]);
+        // No line may ever contain a newline: WeeChat truncates non-multiline
+        // buffer input at the first '\n', silently dropping the rest.
+        assert!(lines.iter().all(|l| !l.contains('\n')));
+    }
+
+    #[test]
+    fn test_outbound_lines_strips_cr_and_control_chars() {
+        // CRLF line endings from HTTP tool output must not leak '\r' into IRC.
+        assert_eq!(outbound_lines("a\r\nb\r"), vec!["a", "b"]);
+        // NUL and other control chars (ANSI escape, etc.) are stripped; tab
+        // is preserved. The ESC introducer is dropped but its parameter bytes
+        // remain as plain visible text.
+        assert_eq!(
+            outbound_lines("x\u{0}y\u{1b}[32mz\u{7f}\tq"),
+            vec!["xy[32mz\tq"]
+        );
+        // The IRC color introducer is stripped; its parameter digit remains
+        // as harmless literal text (no formatting can be injected).
+        assert_eq!(outbound_lines("a\u{3}4b"), vec!["a4b"]);
+    }
+
+    #[test]
+    fn test_outbound_lines_drops_empty_lines() {
+        assert_eq!(outbound_lines("a\n\n\nb"), vec!["a", "b"]);
+        assert!(outbound_lines("\n\r\n").is_empty());
+        assert!(outbound_lines("").is_empty());
+    }
+
+    #[test]
+    fn test_outbound_lines_preserves_multibyte_content() {
+        let lines = outbound_lines("héllo 🐴\n日本語");
+        assert_eq!(lines, vec!["héllo 🐴", "日本語"]);
+    }
+
+    #[test]
+    fn test_escape_command_prefix_escapes_leading_slash() {
+        // WeeChat executes "/msg bob hi" as a command; the escaped form is
+        // delivered verbatim (WeeChat strips exactly one leading '/').
+        assert_eq!(escape_command_prefix("/msg bob hi"), "//msg bob hi");
+        assert_eq!(escape_command_prefix("/quit"), "//quit");
+        // Already-escaped text round-trips: '///x' displays as '//x'.
+        assert_eq!(escape_command_prefix("//x"), "///x");
+    }
+
+    #[test]
+    fn test_escape_command_prefix_leaves_plain_text_untouched() {
+        assert_eq!(escape_command_prefix("hello"), "hello");
+        assert_eq!(escape_command_prefix("[status] done"), "[status] done");
+        assert_eq!(
+            escape_command_prefix("see https://example.com/a"),
+            "see https://example.com/a"
+        );
     }
 
     #[test]

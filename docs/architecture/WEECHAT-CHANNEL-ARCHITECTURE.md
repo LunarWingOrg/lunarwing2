@@ -98,9 +98,22 @@ configuration is never overwritten.
 
 ### Outbound (agent → IRC)
 
-`on_respond` parses the reply's `metadata_json` (buffer/network/target/nick), chunks the text
-to `max_chunk_length` (default 420), and `POST`s each chunk to the WeeChat **relay** `/api/input`
+`on_respond` parses the reply's `metadata_json` (buffer/network/target/nick), sanitizes the text
+with `outbound_lines` (split into single lines, strip `\r`/NUL/control chars), chunks each line to
+`max_chunk_length` (default 420), and `POST`s each chunk to the WeeChat **relay** `/api/input`
 (via `relay_url`, not the adapter). Replies therefore go straight to WeeChat.
+
+Two WeeChat input-parser behaviors make this sanitization mandatory (work item #66 — intermittent
+tool-output corruption):
+
+- **Newline truncation:** `/api/input` runs the command through the typed-input path with
+  `split_newline=0`, and non-multiline buffers are truncated at the first `\n` — everything after
+  the first line is silently dropped. Sending one input call per source line prevents the loss.
+- **Slash commands:** input starting with `/` is executed as a WeeChat command (paste heuristics
+  only exempt `/ `, `/*`, and `/path` shapes), so a tool-output line like `/msg bob hi` would run
+  in the operator's client. `send_message` applies `escape_command_prefix` (double the leading
+  slash — WeeChat strips exactly one and delivers the line verbatim); the intentional `/msg` DM
+  fallback stays raw.
 
 Proactive `on_broadcast` delivery requires an explicit, network-qualified full buffer name:
 `irc.<network>.<target>` (for example, `irc.libera.#lunarwing` or `irc.libera.alice`). Bare
