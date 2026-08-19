@@ -494,6 +494,16 @@ pub struct ChannelSettings {
     /// Directory containing WASM channel modules.
     #[serde(default)]
     pub wasm_channels_dir: Option<PathBuf>,
+
+    /// Global tool-activity flag.
+    ///
+    /// When enabled, the channel manager routes
+    /// `StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}` events to
+    /// channels that do not gate tool activity themselves (WASM channels:
+    /// XMPP, WeeChat, DarkIRC). Native channels keep their own per-channel
+    /// `/debug` toggle regardless of this flag.
+    #[serde(default)]
+    pub tool_activity: bool,
 }
 
 impl Default for ChannelSettings {
@@ -530,6 +540,7 @@ impl Default for ChannelSettings {
             wasm_channels: Vec::new(),
             wasm_channels_enabled: true,
             wasm_channels_dir: None,
+            tool_activity: false,
         }
     }
 }

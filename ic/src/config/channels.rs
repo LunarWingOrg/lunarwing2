@@ -26,6 +26,11 @@ pub struct ChannelsConfig {
     pub wasm_channel_owner_ids: HashMap<String, i64>,
     /// Per-channel string actor IDs. Takes precedence over the legacy numeric map.
     pub wasm_channel_owner_actor_ids: HashMap<String, String>,
+    /// Global tool-activity flag. When enabled, the channel manager routes
+    /// `StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}` events to
+    /// channels that do not gate tool activity themselves (WASM channels).
+    /// Native channels keep their own per-channel `/debug` toggle.
+    pub tool_activity: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -463,6 +468,7 @@ impl ChannelsConfig {
             )?,
             wasm_channel_owner_ids: cs.wasm_channel_owner_ids.clone(),
             wasm_channel_owner_actor_ids: cs.wasm_channel_owner_actor_ids.clone(),
+            tool_activity: parse_bool_env("TOOL_ACTIVITY", cs.tool_activity)?,
         })
     }
 
@@ -621,6 +627,7 @@ mod tests {
             wasm_channels_enabled: true,
             wasm_channel_owner_ids: HashMap::new(),
             wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
         };
         assert!(cfg.cli.enabled);
         assert!(cfg.http.is_none());
@@ -647,6 +654,7 @@ mod tests {
             wasm_channels_enabled: false,
             wasm_channel_owner_ids: ids,
             wasm_channel_owner_actor_ids: HashMap::new(),
+            tool_activity: false,
         };
         assert_eq!(cfg.wasm_channel_owner_ids.get("xmpp"), Some(&12345));
         assert_eq!(cfg.wasm_channel_owner_ids.get("weechat"), Some(&67890));
@@ -668,6 +676,7 @@ mod tests {
                 "weechat".to_string(),
                 "id:alice!user@example".to_string(),
             )]),
+            tool_activity: false,
         };
 
         assert_eq!(
@@ -762,5 +771,30 @@ mod tests {
         assert_eq!(xmpp.allow_rooms, vec!["room@conference.example.com"]);
         assert_eq!(xmpp.encrypted_rooms, vec!["room@conference.example.com"]);
         assert_eq!(xmpp.max_messages_per_hour, 6);
+    }
+
+    #[test]
+    fn resolve_tool_activity_defaults_to_disabled() {
+        let _guard = lock_env();
+        let settings = Settings::default();
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
+        assert!(!cfg.tool_activity);
+    }
+
+    #[test]
+    fn resolve_tool_activity_from_settings_and_env() {
+        let _guard = lock_env();
+
+        // Settings file value is honored when no env override is present.
+        let mut settings = Settings::default();
+        settings.channels.tool_activity = true;
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
+        assert!(cfg.tool_activity);
+
+        // TOOL_ACTIVITY env overlay wins over the settings value.
+        crate::config::helpers::set_runtime_env("TOOL_ACTIVITY", "false");
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve");
+        assert!(!cfg.tool_activity);
+        crate::config::helpers::set_runtime_env("TOOL_ACTIVITY", "");
     }
 }
