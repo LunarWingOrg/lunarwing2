@@ -207,6 +207,50 @@ knowa re-sent the byte-identical T1 record. Before/after comparison on the
 metadata equality, `coordination_knowledge.rs:436`) skipped the write
 entirely. No duplicate rows, no version churn.
 
+#### T6 — same-topic update (PARTIAL: replace works; row-level history is not kept on postgres)
+
+knowa sent an updated finding for the T1 topic:
+`KNOW: mt-tenant-builds | Bounded tenant builds share one flock so only one
+tenant compiles at a time`
+
+Verified in both watcher DBs (knowb + knowc):
+
+- **Same path replaced:** the existing
+  `study-notes/coord-…-knowa-…/mt-tenant-builds.md` row now holds the new
+  body and the new rendered title (`# KNOW: Bounded tenant builds share one
+  flock …`); `updated_at` advanced (08:15:02 → 08:28:02); still exactly one
+  row; provenance intact (`status=needs-verification`,
+  `submitted_by=coord@conference.localhost/knowa`). No ownership refusal —
+  the same wire sender may replace its own note, per design.
+- **Version history: NOT kept at row level on the postgres backend.**
+  `memory_document_versions` stays at 0 rows across the whole matrix.
+  Source check: the hook ingests via `Workspace::write`
+  (`coordination_knowledge.rs:442`), whose postgres path
+  (`workspace/repository.rs:472 update_document_and_replace_chunks`) never
+  inserts version rows, and `save_version`
+  (`workspace/repository.rs:1162`) has no production callers — only the
+  libsql backend records versions inline on write
+  (`db/libsql/workspace.rs:1548`). The previous finding is therefore
+  overwritten in place. What the system *does* retain is its per-agent
+  topic-version model: each publisher's current note for a topic is a
+  distinct document (`knowledge_topic_versions` lists them newest-first),
+  so different senders' takes on one topic coexist — but a replaced
+  single-sender revision is gone from the DB.
+- Flagged as a possible follow-up: if revision history for wire-ingested
+  notes is desired on postgres, the ingest path would need an explicit
+  `save_version` call before overwrite (matching libsql's inline behavior).
+
+### Matrix summary
+
+| # | Result |
+|---|--------|
+| T1 | PASS (watchers ingest with full provenance; publisher self-drop is by design) |
+| T2 | PASS (intruder ignored everywhere; room routing unaffected) |
+| T3 | PASS (bad slug + too-short finding rejected; counts unchanged) |
+| T4 | PASS (knowb topic propagated to knowa/knowc under its own namespace) |
+| T5 | PASS (exact duplicate = DB no-op, `updated_at` unchanged) |
+| T6 | PARTIAL (same-path replace + provenance OK; no row-level version history on postgres) |
+
 ## Teardown record
 
 _(filled in at teardown)_
