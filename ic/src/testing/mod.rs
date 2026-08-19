@@ -272,6 +272,7 @@ pub struct StubChannel {
     responses: Arc<Mutex<Vec<(IncomingMessage, OutgoingResponse)>>>,
     statuses: Arc<Mutex<Vec<StatusUpdate>>>,
     healthy: AtomicBool,
+    handles_tool_activity: bool,
 }
 
 impl StubChannel {
@@ -287,8 +288,19 @@ impl StubChannel {
             responses: Arc::new(Mutex::new(Vec::new())),
             statuses: Arc::new(Mutex::new(Vec::new())),
             healthy: AtomicBool::new(true),
+            handles_tool_activity: true,
         };
         (channel, tx)
+    }
+
+    /// Set the value returned by `Channel::handles_tool_activity()`.
+    ///
+    /// Pass `false` to emulate WASM channels, which only receive
+    /// tool-activity status events when the manager's global
+    /// `tool_activity` flag is enabled.
+    pub fn with_handles_tool_activity(mut self, handles: bool) -> Self {
+        self.handles_tool_activity = handles;
+        self
     }
 
     /// Get all captured (message, response) pairs.
@@ -361,6 +373,10 @@ impl Channel for StubChannel {
     ) -> Result<(), ChannelError> {
         self.statuses.lock().expect("poisoned").push(status);
         Ok(())
+    }
+
+    fn handles_tool_activity(&self) -> bool {
+        self.handles_tool_activity
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {

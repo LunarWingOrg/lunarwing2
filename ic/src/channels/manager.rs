@@ -95,6 +95,17 @@ fn is_transient_progress(status: &StatusUpdate) -> bool {
     )
 }
 
+/// Tool-activity events gated by the global `tool_activity` flag for
+/// channels that do not consume them on their own (WASM channels).
+fn is_tool_activity(status: &StatusUpdate) -> bool {
+    matches!(
+        status,
+        StatusUpdate::ToolStarted { .. }
+            | StatusUpdate::ToolCompleted { .. }
+            | StatusUpdate::ToolResult { .. }
+    )
+}
+
 fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
     ChannelError::SendFailed {
         name: channel_name.to_string(),
@@ -113,6 +124,10 @@ pub struct ChannelManager {
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
     coordination_status_policy: CoordinationStatusPolicy,
+    /// Global tool-activity flag. When enabled, tool-activity status
+    /// events are also routed to channels that do not gate them
+    /// themselves (WASM channels); see `Channel::handles_tool_activity`.
+    tool_activity: bool,
 }
 
 impl ChannelManager {
@@ -130,7 +145,19 @@ impl ChannelManager {
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
+            tool_activity: false,
         }
+    }
+
+    /// Enable or disable the global tool-activity flag (work item #47).
+    ///
+    /// When enabled, `StatusUpdate::{ToolStarted, ToolCompleted,
+    /// ToolResult}` events are routed to every channel, including WASM
+    /// channels that do not gate tool activity themselves. Channels with
+    /// their own `/debug` toggle are unaffected either way.
+    pub fn with_tool_activity(mut self, enabled: bool) -> Self {
+        self.tool_activity = enabled;
+        self
     }
 
     /// Get a clone of the injection sender.
@@ -282,6 +309,14 @@ impl ChannelManager {
 
         let channels = self.channels.read().await;
         if let Some(channel) = channels.get(channel_name) {
+            if !self.tool_activity && is_tool_activity(&status) && !channel.handles_tool_activity()
+            {
+                tracing::debug!(
+                    channel = channel_name,
+                    "Suppressed tool-activity status (tool_activity disabled)"
+                );
+                return Ok(());
+            }
             channel.send_status(status, metadata).await
         } else {
             // Silently ignore if channel not found (status is best-effort)
@@ -449,6 +484,100 @@ mod tests {
         let metadata = serde_json::json!({ "xmpp_target": "ops@conference.example" });
         let status = StatusUpdate::Thinking("working".to_string());
         assert!(!policy.suppresses("xmpp", &status, &metadata));
+    }
+
+    fn tool_statuses() -> Vec<StatusUpdate> {
+        vec![
+            StatusUpdate::ToolStarted {
+                name: "shell".to_string(),
+            },
+            StatusUpdate::ToolCompleted {
+                name: "shell".to_string(),
+                success: true,
+                error: None,
+                parameters: None,
+            },
+            StatusUpdate::ToolResult {
+                name: "shell".to_string(),
+                preview: "ok".to_string(),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn tool_activity_suppressed_for_non_self_gating_channels_when_flag_off() {
+        let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false));
+        let (stub, _) = StubChannel::new("xmpp").with_handles_tool_activity(false);
+        let statuses = stub.captured_statuses_handle();
+        let manager = manager.with_tool_activity(false);
+        manager.add(Box::new(stub)).await;
+
+        for status in tool_statuses() {
+            manager
+                .send_status("xmpp", status, &serde_json::json!({}))
+                .await
+                .expect("send_status");
+        }
+        manager
+            .send_status(
+                "xmpp",
+                StatusUpdate::Thinking("working".to_string()),
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("send_status");
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(captured[0], StatusUpdate::Thinking(_)));
+    }
+
+    #[tokio::test]
+    async fn tool_activity_routed_to_non_self_gating_channels_when_flag_on() {
+        let manager = ChannelManager::with_coordination_status_policy(coordination_policy(false))
+            .with_tool_activity(true);
+        let (stub, _) = StubChannel::new("xmpp").with_handles_tool_activity(false);
+        let statuses = stub.captured_statuses_handle();
+        manager.add(Box::new(stub)).await;
+
+        for status in tool_statuses() {
+            manager
+                .send_status("xmpp", status, &serde_json::json!({}))
+                .await
+                .expect("send_status");
+        }
+
+        let captured = statuses.lock().expect("poisoned");
+        assert_eq!(captured.len(), 3);
+        assert!(matches!(captured[0], StatusUpdate::ToolStarted { .. }));
+        assert!(matches!(captured[1], StatusUpdate::ToolCompleted { .. }));
+        assert!(matches!(captured[2], StatusUpdate::ToolResult { .. }));
+    }
+
+    #[tokio::test]
+    async fn tool_activity_always_reaches_self_gating_channels() {
+        // Native channels gate tool activity with their own `/debug`
+        // toggle; the manager must keep forwarding regardless of the
+        // global flag so that toggle keeps working.
+        for flag in [false, true] {
+            let manager = ChannelManager::with_coordination_status_policy(coordination_policy(
+                false,
+            ))
+            .with_tool_activity(flag);
+            let (stub, _) = StubChannel::new("signal");
+            let statuses = stub.captured_statuses_handle();
+            manager.add(Box::new(stub)).await;
+
+            for status in tool_statuses() {
+                manager
+                    .send_status("signal", status, &serde_json::json!({}))
+                    .await
+                    .expect("send_status");
+            }
+
+            let captured = statuses.lock().expect("poisoned");
+            assert_eq!(captured.len(), 3, "flag={flag}");
+        }
     }
 
     #[tokio::test]

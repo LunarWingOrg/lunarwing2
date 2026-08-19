@@ -509,6 +509,18 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Whether the channel consumes tool-activity status events
+    /// (`StatusUpdate::{ToolStarted, ToolCompleted, ToolResult}`) on its
+    /// own — e.g. native channels with a per-channel `/debug` toggle or
+    /// the web gateway UI.
+    ///
+    /// When this returns `false` (WASM channels, which only render tool
+    /// activity on demand), the channel manager forwards those events
+    /// only while the global `tool_activity` flag is enabled.
+    fn handles_tool_activity(&self) -> bool {
+        true
+    }
+
     /// Send a proactive message without a prior incoming message.
     ///
     /// Used for alerts, heartbeat notifications, and other agent-initiated communication.
