@@ -1,6 +1,9 @@
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL.** A dedicated
-> `vision_health` port landed in ports schema v10. The SSH socket note remains
-> correct; the separate 30000-range or reverse-proxy decision remains open.
+> **Current status (reverified 2026-08-20): PARTIAL.** A dedicated
+> `vision_health` port landed in ports schema v10; the registry has since
+> grown to **v16** (`ic/scripts/migrate-ports-v16.sh`), which added the
+> host-global `health_metrics` slot for the optional healthpoint metrics
+> listener. The SSH socket note remains correct; the separate 30000-range or
+> reverse-proxy decision remains open.
 
 - Vision sidecar health check — **implemented** through the registry-backed
   `vision_health` port; multi-tenant health probes must discover it from the
