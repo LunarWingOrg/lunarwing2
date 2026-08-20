@@ -1364,7 +1364,16 @@ impl WorkspaceStore for LibSqlBackend {
                 else {
                     continue;
                 };
-                if !filter.tags.is_empty() && !filter.tags.iter().any(|t| meta.tags.contains(t)) {
+                // Canonical-store semantics: every listed tag must be present.
+                if !filter.tags.is_empty() && !filter.tags.iter().all(|t| meta.tags.contains(t)) {
+                    continue;
+                }
+                // Notes without a recorded confidence are excluded while a
+                // minimum confidence filter is set.
+                if filter
+                    .min_confidence
+                    .is_some_and(|min| meta.confidence.is_none_or(|c| c < min))
+                {
                     continue;
                 }
                 hits.push(crate::workspace::KnowledgeSearchHit {
@@ -2101,6 +2110,8 @@ mod tests {
                 source_commit: Some("commit-a".to_string()),
                 tags: tags.iter().map(|t| t.to_string()).collect(),
                 superseded_by: None,
+                stale_after_days: None,
+                status_reason: None,
                 submitted_by: None,
                 session_id: None,
             };
