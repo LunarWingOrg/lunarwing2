@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.8.0 (FIRST DRAFT): Codename `Sekisho (関所)`
 
-** Release Date: ** TBD (draft 2026-08-18)
+** Release Date: ** TBD (draft 2026-08-20)
 
 > *Sekisho* (関所) were the checkpoint stations of Edo-period Japan, where
 > travelers, documents, and goods were inspected before being allowed to
@@ -18,13 +18,14 @@ v2 resource ceilings and automated subtree delegation to OpenRC/Gentoo tenant
 hosts, wires the MCP Part 2 trust stack (publisher signatures, dependency
 locks, revocation distribution) into real activation paths, streams SSE
 through the bundled MCP gateway, makes every agent termination path tell the
-model what would unlock the call, and adds opt-in cross-tenant knowledge
-sharing over the coordination pipeline.
+model what would unlock the call, adds opt-in cross-tenant knowledge sharing
+over the coordination pipeline, and adds a Prometheus healthpoint metrics
+exporter with an early-warning threshold layer for host health.
 
 The release and tag use `2.0.8.0`; LunarWing-owned Rust crates and channel
 packages use `2.0.8`. Rust 2024 and MSRV `1.96.1` remain unchanged. There are
-no new SQL migrations — `V26` remains the latest — and the multi-tenant port
-registry stays at v15.
+no new SQL migrations — `V26` remains the latest — while the multi-tenant
+port registry advances to v16 for a host-global health-metrics slot.
 
 See the [v2.0.7.0 release notes](docs/releases/RELEASE-v2.0.7.0.md) for the
 previous compatibility baseline.
@@ -44,6 +45,14 @@ previous compatibility baseline.
   default 10 kept as a cost guardrail, 0 = unlimited), remaining-budget
   visibility on CLI and web list/detail surfaces, warn-level exhaustion logs,
   and precise not-fired reasons (work item #56).
+- Mission triggers are now deduplicated at the engine: a persisted,
+  FIFO-bounded `processed_trigger_keys` set skips already-processed payloads
+  before any threads or budget are spent, so daemon restarts and listener
+  re-deliveries no longer re-fire stale missions (work item #69).
+- `SKILL_SELF_IMPROVEMENT=0` now really means disabled: skill-extraction and
+  skill-maintenance missions are gate-paused at bootstrap/reconcile, their
+  triggers are suppressed, and re-enabling resumes exactly the gate-paused
+  missions while operator pauses stay paused (work item #69).
 - MCP Part 2 trust stack is integrated, not just library code: ed25519
   publisher signatures, signed dependency lockfiles, and signed revocation
   lists are enforced fail-closed on config load and startup activation; the
@@ -58,10 +67,27 @@ previous compatibility baseline.
   turn, denied approvals resume the loop with per-call denial results, and
   disabled/not-found/auth-required/rate-limited errors all state what unlocks
   the call.
+- Engine V2 now persists an explicit "always" approval at tool level even
+  when the approved invocation fails (ssh excepted), so flaky tools like the
+  GitLab WASM tool stop re-prompting on every call (work item #70).
+- WeeChat outbound integrity fix: multi-line tool results and agent replies
+  no longer lose everything after the first newline, and lines starting with
+  `/` are escaped instead of being executed as WeeChat commands in the
+  operator's client (work item #66).
+- Healthpoint metrics exporter: the host health pipeline now emits a
+  Prometheus textfile exposition of the aggregated report and self-heal
+  state after every check, with per-check durations, a graduated
+  warn/crit early-warning threshold layer, a deduplicated Gotify
+  notification path, and an optional loopback-only listener behind the new
+  port-registry v16 `health_metrics` slot.
 - Cross-tenant knowledge sharing: opt-in `KNOW: <topic> | <finding>` room
   records propagate one durable finding into every watching tenant's `shared`
   study-notes scope as `needs-verification`, behind publisher allowlists and
   ingest budgets, safe on mixed-version fleets.
+- The built-in study-notes knowledge layer reaches full parity with the
+  canonical seven-tool store, and mt-admin can now provision every new tenant
+  with a read-only, always-current study-notes MCP server via
+  `add-tenant --with-study-mcp`.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
 - Kimi external worker bumped to Kimi Code CLI `0.37.2`, with the pinned
@@ -75,9 +101,9 @@ previous compatibility baseline.
 | Crate/package version | `2.0.8` for LunarWing-owned release packages |
 | Rust edition / MSRV | Rust 2024 / `1.96.1` |
 | New SQL migration | None; `V26__study_notes_knowledge.sql` remains latest |
-| Multi-tenant port registry | Unchanged at v15 |
-| MCP negotiated version | Exactly `2024-11-05`; anything else fails before activation |
-| Channel registry patches | darkirc 0.1.5, multica 0.1.7, weechat 0.2.5, xmpp 0.1.10 |
+| Multi-tenant port registry | v16 — new host-global `health_metrics` slot (default port 50000, above all tenant ranges); auto-migrates from v15 |
+| MCP negotiated version | Client requests `2024-11-05` and also accepts `2025-03-26` from servers that answer it; anything else fails before activation |
+| Channel registry patches | darkirc 0.1.5, multica 0.1.7, weechat 0.2.6, xmpp 0.1.10 |
 | LunarVision health | Dedicated operational listener (`8089` single-node); MT hosts discover per-tenant `vision_health` from the registry |
 | LunarVoice health | Dedicated operational listener (`8091` single-node); starts fail loudly if the sidecar never goes healthy |
 | CI scope | Source verification; no package publication or tenant deployment |
@@ -105,6 +131,17 @@ previous compatibility baseline.
   survive atomic rerenders. Hybrid cgroup mode is detected and documented;
   when self-migration is denied the build falls back to nice-only with the
   reason reported.
+- mt-admin itself was refactored into a thin composition root over fourteen
+  numbered `mt-admin-lib/NN-*.sh` modules (common, detect, containers,
+  ports-registry, tenant-lifecycle, tenant-build, env-generation,
+  units-systemd, units-openrc, worker-config, owner-scope, postgres,
+  health-pipeline, cgroups-openrc). The CLI surface and entrypoint are
+  unchanged; all tenant lifecycle work in this release was re-validated
+  against the post-split layout.
+- New tenants no longer have the legacy `IRONCLAW_BASE_DIR` and
+  `IRONCLAW_SOCKET` aliases written into their generated env — only the
+  `LUNARWING_*` primaries. Both legacy variables remain accepted by the
+  daemon, CLI, and REPL, so existing tenant envs keep working unchanged.
 
 ### Missions
 
@@ -114,6 +151,24 @@ previous compatibility baseline.
 - Budget exhaustion logs at warn with the mission name and counters (was
   debug-only and silent), and `mission_fire` reports the precise not-fired
   reason (terminal / paused / budget exhausted, noting the UTC-day reset).
+- Trigger-level dedup (work item #69): each mission persists a FIFO-bounded
+  (512) `processed_trigger_keys` set derived from trigger payloads
+  (`src:<source_thread_id>[:<content_hash>]` / `hash:<content_hash>`), and
+  `fire_mission` skips already-processed payloads before budget accounting
+  and context retrieval — zero threads, zero budget, zero tokens on
+  re-delivery. The key is recorded in the same durable reservation as the
+  thread and rolled back on spawn failure so retries still work. The
+  conversation-insights listener stamps each batch with a stable content hash
+  so daemon restarts no longer re-fire stale batches.
+- "Disabled means disabled" for skill learning (work item #69):
+  `SKILL_SELF_IMPROVEMENT=0` now gates the skill-extraction and
+  skill-maintenance (pruning) missions in addition to self-improvement —
+  they are paused at bootstrap/reconcile with a `skill_learning_gate_paused`
+  marker, their fires and operator resumes are rejected with the unlock
+  path, and the extraction trigger is gated at the listener. Re-enabling
+  resumes exactly the gate-paused missions; explicit operator pauses stay
+  paused. Conversation-insights and expected-behavior missions are
+  deliberately not gated.
 
 ### MCP Marketplace Trust and Gateway (Parts 2 and 3)
 
@@ -146,6 +201,22 @@ previous compatibility baseline.
   request-body read deadline (`408` on timeout), upstream userinfo rejection,
   sanitized upstream URLs in logs/client errors, a production SSE per-read
   idle timeout (default 300 s), and 1..=4096 visible-ASCII bearer tokens.
+- The MCP client now accepts protocol revision `2025-03-26` in addition to
+  the requested `2024-11-05`, so servers that answer with the newer revision
+  (including the managed study-notes server) connect instead of failing
+  activation with `Unsupported MCP protocol version`.
+
+### Approval Persistence on Engine V2
+
+- The engine v2 gate resume path now persists an explicit "always" grant at
+  tool level regardless of whether the approved invocation succeeded (work
+  item #70), matching the v1 chat path. Previously a grant was silently
+  discarded whenever the call returned `is_error: true` — exactly what flaky
+  tools do (GitLab REST 404s, timeouts), so "always" was indistinguishable
+  from "yes" and every later call prompted again.
+- ssh remains the exception: its persistent grant is still earned only after
+  a genuinely successful command, and tools that disallow persistent grants
+  are still filtered by `allows_always_approval`.
 
 ### Agent Failure Recovery With Next Steps
 
@@ -179,6 +250,60 @@ previous compatibility baseline.
   channel delivery boundary; knowledge tools mark coordination notes
   untrusted and wrap content before model exposure. mt-admin preserves and
   backfills all six `COORD_KNOWLEDGE_*` tenant env vars.
+- Hardening follow-ups: the global ingest lock was replaced with 64
+  FNV-striped per-path locks so unrelated KNOW writes ingest concurrently;
+  the periodic knowledge sweep now reaps stranded coordination wire notes
+  (wire namespace + sentinel + no metadata, 24h grace); a hard
+  `<!-- lunarwing:coordination-wire-note -->` sentinel is written from the
+  first content commit; `knowledge_list_stale` gained an
+  `include_coordination=false` opt-out and `knowledge_stats` a coordination
+  count.
+
+### Study-Notes Knowledge Store
+
+- The built-in (native) knowledge layer now ships all seven canonical tools:
+  `knowledge_list_topics` (topic coverage survey) and
+  `knowledge_update_status` (metadata-only lifecycle updates with canonical
+  merge semantics) join the existing five, and both are registered and
+  protected.
+- Metadata parity with the canonical store: `stale_after_days` (default 90)
+  and `status_reason` fields on every note, per-note stale thresholds honored
+  by stale detection, a `min_confidence` search filter on both backends, and
+  tags filters aligned to canonical "require every listed tag" semantics.
+- mt-admin study-MCP provisioning: `add-tenant --with-study-mcp` wires a new
+  tenant to a read-only managed `study_notes` MCP server during provisioning.
+  The shared checkout (default `/var/cache/lunarwing/lw2studymcp`,
+  overridable via `LUNARWING_MT_STUDY_NOTES_REPO` /
+  `LUNARWING_MT_STUDY_NOTES_HOME`) is flock-serialized, cloned when missing,
+  fast-forwarded when clean, and refused when dirty — so tenants always start
+  with the latest upstream knowledge of the LunarWing codebase.
+  `configure-study-mcp --home` is now optional, and `--sync` forces a latest
+  upstream pull for an explicit home.
+
+### Health Observability (Healthpoint Metrics)
+
+- New `health-metrics-exporter.sh` runs from the health pipeline's
+  `cron-wrapper.sh` after every check (default on, non-fatal) and flattens
+  the newest aggregated report plus self-heal `state.json` into an atomic
+  Prometheus textfile exposition: status 0/1/2/3, `component_enabled`
+  (off ≠ failing), per-check `duration_seconds`, per-tenant
+  lunarvision/lunarvoice labels discovered from the ports registry (never a
+  hardcoded single-node port), init-agnostic unit series, and self-heal
+  restart/escalation/backoff/flapping gauges. Only numeric and boolean
+  leaves are exported, so no secret strings can leak.
+- Graduated early-warning thresholds: `THRESHOLD_<metric>="warn:>N crit:>M"`
+  config emits `lunarwing_health_early_warning` series and drives a
+  deduplicated Gotify notification path (per metric+severity cooldown);
+  ready-made Prometheus rules and a Grafana dashboard ship under
+  `ic-infrastructure-health-check/contrib/`.
+- Port registry v16 allocates one host-global `health_metrics` slot (default
+  50000, above every tenant range; hand-edited collisions are refused). The
+  migration runs automatically on the next mt-admin registry operation or
+  via the standalone `ic/scripts/migrate-ports-v16.sh`.
+- Optional loopback-only listener (`ic/crates/lunarwing_health_metrics`)
+  serves the exposition over HTTP with loopback bind + peer enforcement and
+  constant-time bearer comparison; its installer supports systemd, OpenRC,
+  and launchd.
 
 ### WASM Channel Tool Activity
 
@@ -194,8 +319,23 @@ previous compatibility baseline.
   channels. Native channels keep their per-channel `/debug` toggles.
 - The XMPP guest renders the preformatted tool messages in DMs (groupchat
   statuses stay suppressed as before); the DarkIRC and WeeChat guests render
-  them as `[status]` lines. Channel registry patches bumped per CI
-  source-version policy: darkirc 0.1.5, weechat 0.2.5, xmpp 0.1.10.
+  them as `[status]` lines.
+
+### WeeChat Outbound Integrity
+
+- Fixed tool output corruption in the WeeChat channel (work item #66): the
+  relay's `POST /api/input` routes through the typed-input path, which
+  truncates non-multiline buffers at the first newline — every multi-line
+  tool result or agent reply lost everything after its first line. Outbound
+  messages are now split per line (stripping `\r`, NUL, and control chars)
+  before chunking.
+- Lines starting with `/` were previously executed as WeeChat commands in
+  the operator's client (e.g. a tool-output line like `/msg bob hi`);
+  buffer-message sends now escape the command prefix by doubling the leading
+  slash. The intentional `/msg` DM fallback stays raw.
+- Channel registry patches bumped per CI source-version policy, final
+  versions for this release: darkirc 0.1.5, weechat 0.2.6 (0.2.5 carried the
+  tool-activity rendering, 0.2.6 the outbound integrity fix), xmpp 0.1.10.
 
 ### CI, Dependencies, and Housekeeping
 
@@ -204,12 +344,17 @@ previous compatibility baseline.
   placeholders rendered from the same `McpRequest::initialize` code path the
   transport uses, so it tracks `CARGO_PKG_VERSION` forever (4738 lib tests
   green, libsql-feature 4725 green).
-- Fresh RustSec audit of all 19 tracked lockfiles: no new advisories; the
-  same 7 accepted findings remain with no available upgrade clearing any of
-  them. Details in `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
+- Fresh RustSec audit of all 19 tracked lockfiles: one new advisory since the
+  last pass, `RUSTSEC-2026-0258` (h2 unbounded empty DATA frames), was fixed
+  everywhere it was fixable — h2 0.4.15 → 0.4.16 in the main and xmpp-bridge
+  lockfiles, and the OCR sidecar's warp 0.3 → 0.4.3 upgrade eliminated its
+  entire hyper 0.14 / h2 0.3 tree. The one remaining h2 0.3.27 copy
+  (reachable only through the legacy libsql → tonic → hyper 0.14 chain, with
+  no 0.3-line patch) was accepted with reason, bringing the accepted-findings
+  count to eight. Details in `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
 - Version bump: all LunarWing crates and WASM channels 2.0.7 → 2.0.8,
-  channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.5,
-  xmpp 0.1.10), full `cargo update` on the main lockfile (28 packages, MSRV
+  channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.6,
+  xmpp 0.1.10), full `cargo update` on the main lockfile (MSRV
   1.96.1-compatible), cargo-deny clean.
 - Opencode external worker: `OPENCODE_REF` pinned to `v1.18.18` as a single
   global-scope ARG baked into the runtime image as `OPENCODE_IMAGE_REF` and
@@ -220,6 +365,10 @@ previous compatibility baseline.
   and surfaced on `/health` as `kimi_code_version`; CLI contract
   (`-p`/`--output-format stream-json`, stream-json line shapes, config keys)
   re-verified against the `0.37.2` npm release.
+- New operator documentation: a Debian/Ubuntu tenant spin-up guide joins the
+  existing Gentoo/Arch/Fedora guides, and the architecture, bugs, guides,
+  internal, and proposals doc sets were each re-verified against the code for
+  this release.
 - Repo hygiene: root branding assets moved to owned, descriptive paths (README
   and onboarding references updated), stale root `PEBBLE.md` archived, empty
   `.codex` markers and a stale resume artifact removed. Full ledger in
@@ -231,8 +380,11 @@ previous compatibility baseline.
 1. Back up PostgreSQL, tenant env files, `/etc/lunarwing/ports.json`,
    workspace state, rendered units, worker data, voice models, and channel
    state.
-2. No new SQL or port-registry migrations ship in this release; startup
-   migration state from v2.0.7.0 (V26, registry v15) carries over unchanged.
+2. No new SQL migrations ship in this release (V26 remains latest). The
+   multi-tenant port registry migrates v15 → v16 automatically on the next
+   mt-admin registry operation (or run `ic/scripts/migrate-ports-v16.sh`
+   manually); the migration only adds the host-global `health_metrics` slot
+   and refuses to proceed if a hand-edited collision exists.
 3. OpenRC/Gentoo multi-tenant hosts: run
    `ic/scripts/lunarwing-mt-admin.sh setup-cgroups` once to render the
    boot-time subtree script and PAM hook, then re-add or re-render tenants so
@@ -253,15 +405,29 @@ previous compatibility baseline.
    takes effect; check `/health` for `opencode_ref` afterward. Rebuild the
    kimi external-worker image for the pinned `0.37.2` CLI; check `/health`
    for `kimi_code_version`.
+8. Tenants created before this release may carry the legacy
+   `IRONCLAW_BASE_DIR`/`IRONCLAW_SOCKET` env aliases. No action is needed —
+   both remain accepted — but newly generated tenant envs contain only the
+   `LUNARWING_*` primaries.
+9. The healthpoint metrics exporter runs with the host health pipeline by
+   default and only writes a local `.prom` file. Serving it over HTTP is
+   opt-in: install the loopback-only listener with
+   `ic/scripts/install-health-metrics-listener.sh` after the v16 port
+   migration has allocated the `health_metrics` slot.
+10. If you previously set `SKILL_SELF_IMPROVEMENT=0`, note it now also pauses
+    the skill-extraction and skill-maintenance missions (previously only
+    self-improvement was gated). Re-enabling the flag resumes exactly those
+    gate-paused missions; missions you paused yourself stay paused.
 
 ## Known Issues
 
 ### Security, Runtime, and Release Limitations
 
-- Seven accepted RustSec advisories remain in the shipped graph, blocked by
-  libSQL's legacy TLS stack and the vendored Signal wrapper; the v2.0.8.0
-  re-audit found no newly fixable advisories and no available upgrade that
-  clears any of the seven. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
+- Eight accepted RustSec advisories remain in the shipped graph, blocked by
+  libSQL's legacy TLS stack, the vendored Signal wrapper, and the unpatchable
+  h2 0.3 line in libSQL's legacy chain; the v2.0.8.0 re-audit fixed
+  `RUSTSEC-2026-0258` everywhere an upgrade exists and found no other newly
+  fixable advisories. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   delivery remain disabled; Stage A live-host release acceptance remains a
   release/deployment gate rather than proof of activated contact security.
@@ -308,6 +474,18 @@ previous compatibility baseline.
 - The opaque 10-threads-per-day mission limit: budgets are now configurable
   at creation, visible on list surfaces, and loudly logged on exhaustion
   (work item #56).
+- Missions re-firing stale triggers after daemon restarts or listener
+  re-deliveries (skill-extraction and conversation-insights token burn):
+  trigger-level dedup keys now make re-delivery a zero-cost skip, and
+  `SKILL_SELF_IMPROVEMENT=0` fully gates the skill-learning missions (work
+  item #69).
+- Engine V2 discarding "always" approvals whenever the approved tool call
+  failed, making the GitLab WASM tool re-prompt on every call: grants now
+  persist at tool level independent of call success, ssh excepted (work item
+  #70).
+- WeeChat truncating multi-line tool output at the first newline and
+  executing outbound lines starting with `/` as client commands (work item
+  #66).
 - WASM channels silently dropping tool-activity status events: the global
   `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to
   the XMPP, WeeChat, and DarkIRC guests, which render them (work item #47).
@@ -316,5 +494,12 @@ previous compatibility baseline.
   gateway control plane can actually be enabled.
 - The bundled MCP gateway's buffered data plane: SSE responses now stream,
   and `listChanged` passthrough is no longer structurally blocked.
+- The built-in study-notes layer lagging the canonical store: all seven
+  tools, the current metadata model, and canonical filter semantics now ship
+  natively, and `add-tenant --with-study-mcp` provisions new tenants with
+  the always-current read-only store automatically.
+- MCP servers answering initialize with protocol `2025-03-26` (such as the
+  managed study-notes server) failing to connect: the client now accepts that
+  revision alongside the requested `2024-11-05`.
 - The `rust-test-lib` / `rust-test-libsql` CI failures caused by the
   version-locked WAT fixture envelope.
