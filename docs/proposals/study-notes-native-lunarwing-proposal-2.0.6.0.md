@@ -15,6 +15,18 @@
 > use collision-resistant `coord-*` agent paths and always enter as
 > `needs-verification`; they never become verified merely by crossing the room.
 > See `MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md` for the protocol and limits.
+>
+> **v2.0.8.0 addendum (item #10, 2026-08-20):** the native layer reached full
+> parity with the canonical lw2studymcp store (7 tools). Added
+> `knowledge_list_topics` (topic coverage survey) and `knowledge_update_status`
+> (metadata-only lifecycle patch: only provided fields change, explicit null
+> clears nullable fields, `superseded` requires `superseded_by`) — both
+> registered and in `PROTECTED_TOOL_NAMES`. `KnowledgeNoteMeta` gained
+> `stale_after_days` (default 90) and `status_reason`; stale detection honors
+> the per-note threshold when no explicit age limit is passed (the sweep's
+> configured limit still overrides). `knowledge_search` gained a
+> `min_confidence` filter, and the tags filter is now canonical
+> require-every-tag on both backends (Postgres `?&`, libSQL all-of).
 
 ## Goal
 
@@ -53,7 +65,8 @@ export/import (see Kawarimi below).
 
 ## Phase 1: Core knowledge store (item #1)
 
-Five native built-in tools in `ic/src/tools/builtin/knowledge.rs`, registered
+Five native built-in tools in `ic/src/tools/builtin/knowledge.rs` (seven since
+the v2.0.8.0 parity pass — see the item #10 addendum above), registered
 next to the memory tools for both single-tenant and multi-tenant workspace
 resolvers (`ic/src/app.rs`), and protected from dynamic shadowing in
 `PROTECTED_TOOL_NAMES`:
