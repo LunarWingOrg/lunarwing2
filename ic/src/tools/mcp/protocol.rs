@@ -73,11 +73,19 @@ where
     }
 }
 
-/// MCP protocol version.
+/// MCP protocol version this client requests by default.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// MCP protocol revision `2025-03-26`.
+///
+/// Wire-identical to `2024-11-05` for the tools-only methods this client uses
+/// (`initialize`, `notifications/initialized`, `tools/list`, `tools/call`), so
+/// servers that answer with their own newer revision (e.g. lw2studymcp's
+/// `study_notes` server) can be talked to safely.
+pub const PROTOCOL_VERSION_2025_03_26: &str = "2025-03-26";
+
 /// MCP protocol versions this client can negotiate.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION, PROTOCOL_VERSION_2025_03_26];
 
 /// An MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
