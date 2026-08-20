@@ -33,8 +33,8 @@ pub use job::{
 };
 pub use json::JsonTool;
 pub use knowledge::{
-    KnowledgeGetTopicTool, KnowledgeListStaleTool, KnowledgeSearchTool, KnowledgeStatsTool,
-    KnowledgeSubmitNoteTool,
+    KnowledgeGetTopicTool, KnowledgeListStaleTool, KnowledgeListTopicsTool, KnowledgeSearchTool,
+    KnowledgeStatsTool, KnowledgeSubmitNoteTool, KnowledgeUpdateStatusTool,
 };
 pub use memory::{MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool};
 pub use message::MessageTool;

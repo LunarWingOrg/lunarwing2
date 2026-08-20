@@ -16,9 +16,13 @@ use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
     KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta,
     KnowledgeNoteRow, KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES,
-    MAX_SLUG_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, is_valid_slug, note_path,
-    render_note_markdown,
+    MAX_SLUG_BYTES, MAX_STATUS_REASON_BYTES, MAX_STALE_AFTER_DAYS, MAX_TAG_BYTES, MAX_TAGS,
+    MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown, summarize_topics,
 };
+
+/// Default per-note staleness threshold applied on submit when the caller
+/// passes no `stale_after_days` (canonical lw2studymcp default).
+const DEFAULT_NOTE_STALE_AFTER_DAYS: u32 = 90;
 
 const MAX_KNOWLEDGE_QUERY_BYTES: usize = 1_024;
 const MAX_KNOWLEDGE_OUTPUT_BYTES: usize = 8_000;
@@ -185,6 +189,164 @@ fn optional_include_coordination(params: &serde_json::Value) -> Result<bool, Too
     }
 }
 
+// ── Metadata patch helpers (knowledge_update_status) ───────────────
+
+/// Maximum superseded_by length (UTF-8 bytes), matching the canonical store.
+const MAX_SUPERSEDED_BY_BYTES: usize = 200;
+
+/// Tri-state for metadata-only updates: absent leaves the stored value,
+/// explicit null clears it, and a value replaces it. Mirrors the canonical
+/// lw2studymcp `knowledge_update_status` merge semantics.
+#[derive(Debug, Clone, PartialEq)]
+enum MetadataPatch<T> {
+    Absent,
+    Clear,
+    Set(T),
+}
+
+fn apply_patch<T>(patch: MetadataPatch<T>, slot: &mut Option<T>) {
+    match patch {
+        MetadataPatch::Absent => {}
+        MetadataPatch::Clear => *slot = None,
+        MetadataPatch::Set(value) => *slot = Some(value),
+    }
+}
+
+fn patch_string(
+    params: &serde_json::Value,
+    key: &str,
+    max_bytes: usize,
+) -> Result<MetadataPatch<String>, ToolError> {
+    match params.get(key) {
+        None => Ok(MetadataPatch::Absent),
+        Some(serde_json::Value::Null) => Ok(MetadataPatch::Clear),
+        Some(serde_json::Value::String(value)) if value.len() <= max_bytes => {
+            Ok(MetadataPatch::Set(value.clone()))
+        }
+        Some(serde_json::Value::String(_)) => Err(ToolError::InvalidParameters(format!(
+            "{key} exceeds {max_bytes} UTF-8 bytes"
+        ))),
+        Some(_) => Err(ToolError::InvalidParameters(format!(
+            "{key} must be a string or null"
+        ))),
+    }
+}
+
+fn patch_status_reason(params: &serde_json::Value) -> Result<MetadataPatch<String>, ToolError> {
+    match patch_string(params, "status_reason", MAX_STATUS_REASON_BYTES)? {
+        MetadataPatch::Set(value) => {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                Err(ToolError::InvalidParameters(
+                    "status_reason must be a non-empty string or null".to_string(),
+                ))
+            } else {
+                Ok(MetadataPatch::Set(trimmed.to_string()))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+fn patch_confidence(params: &serde_json::Value) -> Result<MetadataPatch<f32>, ToolError> {
+    match params.get("confidence") {
+        None => Ok(MetadataPatch::Absent),
+        Some(serde_json::Value::Null) => Ok(MetadataPatch::Clear),
+        Some(value) => {
+            let confidence = value.as_f64().ok_or_else(|| {
+                ToolError::InvalidParameters("confidence must be a number or null".to_string())
+            })?;
+            if !(0.0..=1.0).contains(&confidence) {
+                return Err(ToolError::InvalidParameters(
+                    "confidence must be between 0.0 and 1.0".to_string(),
+                ));
+            }
+            Ok(MetadataPatch::Set(confidence as f32))
+        }
+    }
+}
+
+fn patch_studied_at(
+    params: &serde_json::Value,
+) -> Result<MetadataPatch<chrono::DateTime<chrono::Utc>>, ToolError> {
+    match patch_string(params, "studied_at", 64)? {
+        MetadataPatch::Set(value) => {
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&value)
+                .map_err(|_| {
+                    ToolError::InvalidParameters(
+                        "studied_at must be an RFC 3339 timestamp or null".to_string(),
+                    )
+                })?
+                .with_timezone(&chrono::Utc);
+            Ok(MetadataPatch::Set(timestamp))
+        }
+        MetadataPatch::Clear => Ok(MetadataPatch::Clear),
+        MetadataPatch::Absent => Ok(MetadataPatch::Absent),
+    }
+}
+
+/// Tags are not nullable in the canonical update schema: present means set.
+fn patch_tags(params: &serde_json::Value) -> Result<MetadataPatch<Vec<String>>, ToolError> {
+    match params.get("tags") {
+        None => Ok(MetadataPatch::Absent),
+        Some(serde_json::Value::Null) => Err(ToolError::InvalidParameters(
+            "tags must be an array of strings".to_string(),
+        )),
+        Some(_) => Ok(MetadataPatch::Set(optional_tags(params)?)),
+    }
+}
+
+/// Non-nullable staleness threshold: absent keeps the stored value.
+fn patch_stale_after_days(params: &serde_json::Value) -> Result<Option<u32>, ToolError> {
+    match params.get("stale_after_days") {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .and_then(|days| u32::try_from(days).ok())
+            .filter(|days| (1..=MAX_STALE_AFTER_DAYS).contains(days))
+            .map(Some)
+            .ok_or_else(|| {
+                ToolError::InvalidParameters(format!(
+                    "stale_after_days must be an integer from 1 to {MAX_STALE_AFTER_DAYS}"
+                ))
+            }),
+    }
+}
+
+/// Submit-side staleness threshold: defaults to the canonical 90 days.
+fn optional_stale_after_days(params: &serde_json::Value) -> Result<Option<u32>, ToolError> {
+    Ok(patch_stale_after_days(params)?.or(Some(DEFAULT_NOTE_STALE_AFTER_DAYS)))
+}
+
+/// Submit-side status reason: absent or explicit null means no reason.
+fn optional_status_reason(params: &serde_json::Value) -> Result<Option<String>, ToolError> {
+    match patch_status_reason(params)? {
+        MetadataPatch::Absent | MetadataPatch::Clear => Ok(None),
+        MetadataPatch::Set(value) => Ok(Some(value)),
+    }
+}
+
+/// Optional confidence-valued filter parameter (search `min_confidence`).
+fn optional_confidence_param(
+    params: &serde_json::Value,
+    key: &str,
+) -> Result<Option<f32>, ToolError> {
+    match params.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(value) => {
+            let confidence = value.as_f64().ok_or_else(|| {
+                ToolError::InvalidParameters(format!("{key} must be a number"))
+            })?;
+            if !(0.0..=1.0).contains(&confidence) {
+                return Err(ToolError::InvalidParameters(format!(
+                    "{key} must be between 0.0 and 1.0"
+                )));
+            }
+            Ok(Some(confidence as f32))
+        }
+    }
+}
+
 /// Filter one metadata scan down to rows needing verification.
 ///
 /// With `include_coordination=false`, wire-ingested coordination notes are
@@ -233,6 +395,8 @@ fn meta_json(meta: &KnowledgeNoteMeta) -> serde_json::Value {
         "source_commit": meta.source_commit,
         "tags": meta.tags,
         "superseded_by": meta.superseded_by,
+        "stale_after_days": meta.stale_after_days,
+        "status_reason": meta.status_reason,
         "submitted_by": meta.submitted_by,
         "session_id": meta.session_id,
     });
@@ -318,7 +482,13 @@ impl Tool for KnowledgeSearchTool {
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tag slugs; notes carrying at least one match."
+                    "description": "Optional tag slugs; only notes carrying every listed tag match."
+                },
+                "min_confidence": {
+                    "type": "number",
+                    "description": "Optional minimum confidence 0.0-1.0; notes without a recorded confidence are excluded while set.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
                 },
                 "scope": {
                     "type": "string",
@@ -354,6 +524,7 @@ impl Tool for KnowledgeSearchTool {
             agent: optional_slug(&params, "agent")?,
             status: optional_status(&params)?,
             tags: optional_tags(&params)?,
+            min_confidence: optional_confidence_param(&params, "min_confidence")?,
         };
         let limit = search_limit(&params);
         let scopes = read_scopes(&ctx.user_id, optional_string(&params, "scope")?.as_deref())?;
@@ -544,17 +715,33 @@ fn validate_submission(params: &serde_json::Value) -> Result<SubmittedNote, Tool
             "source_commit exceeds {MAX_COMMIT_BYTES} UTF-8 bytes"
         )));
     }
+    let superseded_by = optional_string(params, "superseded_by")?;
+    if let Some(ref replacement) = superseded_by
+        && replacement.len() > MAX_SUPERSEDED_BY_BYTES
+    {
+        return Err(ToolError::InvalidParameters(format!(
+            "superseded_by exceeds {MAX_SUPERSEDED_BY_BYTES} UTF-8 bytes"
+        )));
+    }
+    let status = optional_status(params)?.unwrap_or(KnowledgeStatus::Active);
+    if status == KnowledgeStatus::Superseded && superseded_by.is_none() {
+        return Err(ToolError::InvalidParameters(
+            "superseded notes require superseded_by".to_string(),
+        ));
+    }
     Ok(SubmittedNote {
         meta: KnowledgeNoteMeta {
             topic: required_slug(params, "topic")?,
             agent: required_slug(params, "agent")?,
             title: title.to_string(),
-            status: optional_status(params)?.unwrap_or(KnowledgeStatus::Active),
+            status,
             confidence,
             studied_at,
             source_commit,
             tags: optional_tags(params)?,
-            superseded_by: None,
+            superseded_by,
+            stale_after_days: optional_stale_after_days(params)?,
+            status_reason: optional_status_reason(params)?,
             submitted_by: None,
             session_id: None,
         },
@@ -631,6 +818,20 @@ impl Tool for KnowledgeSubmitNoteTool {
                 "source_commit": {
                     "type": "string",
                     "description": "Repository commit the findings were verified against."
+                },
+                "stale_after_days": {
+                    "type": "integer",
+                    "description": "Per-note staleness threshold in days (1-36500); used when stale checks pass no explicit age limit (default: 90).",
+                    "minimum": 1,
+                    "maximum": 36500
+                },
+                "status_reason": {
+                    "type": "string",
+                    "description": "Optional human-readable reason for the lifecycle status (max 1,000 bytes)."
+                },
+                "superseded_by": {
+                    "type": "string",
+                    "description": "Topic/version replacing this note; required when status is 'superseded' (max 200 bytes)."
                 },
                 "tags": {
                     "type": "array",
@@ -727,7 +928,8 @@ impl Tool for KnowledgeListStaleTool {
 
     fn description(&self) -> &str {
         "List study notes needing verification: status stale/needs-verification, studied \
-         older than max_age_days, or recorded against a different source commit. Pass the \
+         older than max_age_days (or the note's own stale_after_days when no explicit limit \
+         is passed), or recorded against a different source commit. Pass the \
          current repository commit when freshness materially affects your task. \
          Coordination-origin wire notes are flagged untrusted in the output; pass \
          include_coordination=false to exclude those unverified cross-tenant claims from \
@@ -885,6 +1087,279 @@ impl Tool for KnowledgeStatsTool {
     }
 }
 
+// ── knowledge_list_topics ──────────────────────────────────────────
+
+/// Topic coverage listing with per-topic version and provenance aggregates.
+pub struct KnowledgeListTopicsTool {
+    resolver: Arc<dyn WorkspaceResolver>,
+}
+
+impl KnowledgeListTopicsTool {
+    /// Create a new list-topics tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+#[async_trait]
+impl Tool for KnowledgeListTopicsTool {
+    fn name(&self) -> &str {
+        "knowledge_list_topics"
+    }
+
+    fn description(&self) -> &str {
+        "List canonical study-note topics with per-topic version counts, scopes, agents, \
+         lifecycle statuses, and tags. Use to survey existing research coverage before starting \
+         a new codebase study. Covers your private scope and the shared herd scope unless \
+         narrowed with 'scope'."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "string",
+                    "description": "Optional substring filter on the topic slug."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["all", "private", "shared"],
+                    "description": "Which knowledge scopes to list (default: all)."
+                }
+            }
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let filter = optional_string(&params, "filter")?;
+        let scopes = read_scopes(&ctx.user_id, optional_string(&params, "scope")?.as_deref())?;
+
+        let workspace = self.resolver.resolve(&ctx.user_id).await;
+        let rows = workspace
+            .knowledge_list_notes(&scopes, KNOWLEDGE_SCAN_CAP)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
+
+        let topics = summarize_topics(&rows, filter.as_deref());
+        let output = serde_json::json!({
+            "scopes": scopes,
+            "scanned_notes": rows.len(),
+            "topic_count": topics.len(),
+            "topics": topics,
+        });
+        let (mut output, truncated) = bound_results(output, "topics");
+        output["truncated"] = serde_json::Value::Bool(truncated);
+        Ok(ToolOutput::success(output, start.elapsed()))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false // Metadata-only aggregate, like knowledge_stats.
+    }
+}
+
+// ── knowledge_update_status ────────────────────────────────────────
+
+/// Parsed metadata-only update for `knowledge_update_status`.
+struct StatusUpdate {
+    status: KnowledgeStatus,
+    confidence: MetadataPatch<f32>,
+    tags: MetadataPatch<Vec<String>>,
+    studied_at: MetadataPatch<chrono::DateTime<chrono::Utc>>,
+    source_commit: MetadataPatch<String>,
+    stale_after_days: Option<u32>,
+    status_reason: MetadataPatch<String>,
+    superseded_by: MetadataPatch<String>,
+}
+
+fn parse_status_update(params: &serde_json::Value) -> Result<StatusUpdate, ToolError> {
+    let status = optional_status(params)?
+        .ok_or_else(|| ToolError::InvalidParameters("status is required".to_string()))?;
+    Ok(StatusUpdate {
+        status,
+        confidence: patch_confidence(params)?,
+        tags: patch_tags(params)?,
+        studied_at: patch_studied_at(params)?,
+        source_commit: patch_string(params, "source_commit", MAX_COMMIT_BYTES)?,
+        stale_after_days: patch_stale_after_days(params)?,
+        status_reason: patch_status_reason(params)?,
+        superseded_by: patch_string(params, "superseded_by", MAX_SUPERSEDED_BY_BYTES)?,
+    })
+}
+
+/// Merge a parsed update into existing metadata (canonical store semantics):
+/// only provided fields change, superseded notes must name their replacement,
+/// and leaving superseded without an explicit superseded_by clears it.
+fn apply_status_update(
+    meta: &mut KnowledgeNoteMeta,
+    update: StatusUpdate,
+) -> Result<(), ToolError> {
+    meta.status = update.status;
+    apply_patch(update.confidence, &mut meta.confidence);
+    if let MetadataPatch::Set(tags) = update.tags {
+        meta.tags = tags;
+    }
+    apply_patch(update.studied_at, &mut meta.studied_at);
+    apply_patch(update.source_commit, &mut meta.source_commit);
+    if let Some(days) = update.stale_after_days {
+        meta.stale_after_days = Some(days);
+    }
+    apply_patch(update.status_reason, &mut meta.status_reason);
+    let superseded_by_absent = matches!(update.superseded_by, MetadataPatch::Absent);
+    apply_patch(update.superseded_by, &mut meta.superseded_by);
+    if meta.status == KnowledgeStatus::Superseded && meta.superseded_by.is_none() {
+        return Err(ToolError::InvalidParameters(
+            "superseded notes require superseded_by".to_string(),
+        ));
+    }
+    if meta.status != KnowledgeStatus::Superseded && superseded_by_absent {
+        meta.superseded_by = None;
+    }
+    Ok(())
+}
+
+/// Metadata-only lifecycle updates for existing study notes.
+pub struct KnowledgeUpdateStatusTool {
+    resolver: Arc<dyn WorkspaceResolver>,
+}
+
+impl KnowledgeUpdateStatusTool {
+    /// Create a new update-status tool with a workspace resolver.
+    pub fn new(resolver: Arc<dyn WorkspaceResolver>) -> Self {
+        Self { resolver }
+    }
+}
+
+#[async_trait]
+impl Tool for KnowledgeUpdateStatusTool {
+    fn name(&self) -> &str {
+        "knowledge_update_status"
+    }
+
+    fn description(&self) -> &str {
+        "Update a study note's lifecycle and verification metadata — status, confidence, tags, \
+         studied timestamp, source commit, staleness threshold, status reason, supersession — \
+         without changing its content. Only provided fields change; explicit null clears \
+         nullable fields. Moving to 'superseded' requires superseded_by; moving away from \
+         'superseded' clears superseded_by unless provided. Content changes require \
+         knowledge_submit_note with replace=true on your own agent's version. Targets your \
+         private scope unless scope='shared'."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agent": {
+                    "type": "string",
+                    "description": "Agent slug that owns the note version (lowercase, dashes)."
+                },
+                "topic": {
+                    "type": "string",
+                    "description": "Canonical topic slug of the note to update."
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "stale", "superseded", "needs-verification"],
+                    "description": "New lifecycle status (required)."
+                },
+                "confidence": {
+                    "type": ["number", "null"],
+                    "description": "Evidence-backed confidence 0.0-1.0; null clears.",
+                    "minimum": 0.0,
+                    "maximum": 1.0
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replacement tag slugs (max 16); omit to keep current tags."
+                },
+                "studied_at": {
+                    "type": ["string", "null"],
+                    "description": "RFC 3339 verification timestamp; null clears."
+                },
+                "source_commit": {
+                    "type": ["string", "null"],
+                    "description": "Repository commit the findings were verified against; null clears."
+                },
+                "stale_after_days": {
+                    "type": "integer",
+                    "description": "Per-note staleness threshold in days (1-36500); omit to keep current value.",
+                    "minimum": 1,
+                    "maximum": 36500
+                },
+                "status_reason": {
+                    "type": ["string", "null"],
+                    "description": "Human-readable reason for the new status (max 1,000 bytes); null clears."
+                },
+                "superseded_by": {
+                    "type": ["string", "null"],
+                    "description": "Topic/version replacing this note (max 200 bytes); required with status 'superseded', null clears."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["private", "shared"],
+                    "description": "Scope holding the note: your private tenant scope (default) or the shared herd scope."
+                }
+            },
+            "required": ["agent", "topic", "status"]
+        })
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+        let agent = required_slug(&params, "agent")?;
+        let topic = required_slug(&params, "topic")?;
+        let update = parse_status_update(&params)?;
+        let target_scope =
+            write_scope(&ctx.user_id, optional_string(&params, "scope")?.as_deref())?;
+        let path = note_path(&agent, &topic);
+
+        let workspace = self.resolver.resolve(&target_scope).await;
+        let document = workspace.read_primary(&path).await.map_err(|e| match e {
+            crate::error::WorkspaceError::DocumentNotFound { .. } => {
+                ToolError::InvalidParameters(format!(
+                    "note '{path}' not found in scope '{target_scope}'; submit it with knowledge_submit_note first"
+                ))
+            }
+            other => ToolError::ExecutionFailed(format!("Knowledge read failed: {other}")),
+        })?;
+        let mut meta = KnowledgeNoteMeta::from_metadata_json(&document.metadata).ok_or_else(|| {
+            ToolError::InvalidParameters(format!("document '{path}' is not a study note"))
+        })?;
+        apply_status_update(&mut meta, update)?;
+        workspace
+            .set_document_metadata(&path, &meta.to_metadata_json())
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("Knowledge metadata update failed: {e}"))
+            })?;
+
+        let output = serde_json::json!({
+            "updated": true,
+            "scope": target_scope,
+            "path": path,
+            "topic": topic,
+            "agent": agent,
+            "status": meta.status.as_str(),
+        });
+        Ok(ToolOutput::success(output, start.elapsed()))
+    }
+
+    fn requires_sanitization(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -900,6 +1375,8 @@ mod tests {
             source_commit: None,
             tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
             superseded_by: None,
+            stale_after_days: None,
+            status_reason: None,
             submitted_by: Some("alice".to_string()),
             session_id: None,
         }
@@ -1099,8 +1576,151 @@ mod tests {
                 "agent": "a", "topic": "t", "title": "x", "content": "y",
                 "studied_at": "not-a-date"
             }),
+            serde_json::json!({
+                "agent": "a", "topic": "t", "title": "x", "content": "y",
+                "status": "superseded"
+            }),
+            serde_json::json!({
+                "agent": "a", "topic": "t", "title": "x", "content": "y",
+                "stale_after_days": 0
+            }),
+            serde_json::json!({
+                "agent": "a", "topic": "t", "title": "x", "content": "y",
+                "status_reason": "   "
+            }),
         ] {
             assert!(validate_submission(&bad).is_err(), "should reject: {bad}");
         }
+    }
+
+    #[test]
+    fn submission_accepts_canonical_lifecycle_fields() {
+        let params = serde_json::json!({
+            "agent": "kimi-1", "topic": "memory-search",
+            "title": "Hybrid search", "content": "Findings...",
+            "status": "superseded", "superseded_by": "memory-search-v2",
+            "stale_after_days": 45, "status_reason": "replaced after refactor"
+        });
+        let parsed = validate_submission(&params).unwrap();
+        assert_eq!(parsed.meta.status, KnowledgeStatus::Superseded);
+        assert_eq!(parsed.meta.superseded_by.as_deref(), Some("memory-search-v2"));
+        assert_eq!(parsed.meta.stale_after_days, Some(45));
+        assert_eq!(
+            parsed.meta.status_reason.as_deref(),
+            Some("replaced after refactor")
+        );
+        // Canonical default applies when the threshold is omitted.
+        let minimal = serde_json::json!({
+            "agent": "kimi-1", "topic": "t", "title": "x", "content": "y"
+        });
+        let parsed = validate_submission(&minimal).unwrap();
+        assert_eq!(
+            parsed.meta.stale_after_days,
+            Some(DEFAULT_NOTE_STALE_AFTER_DAYS)
+        );
+        assert_eq!(parsed.meta.status_reason, None);
+        assert_eq!(parsed.meta.superseded_by, None);
+    }
+
+    #[test]
+    fn metadata_patch_parsing() {
+        // Absent vs explicit null vs set.
+        let absent = serde_json::json!({});
+        assert_eq!(
+            patch_string(&absent, "source_commit", MAX_COMMIT_BYTES).unwrap(),
+            MetadataPatch::Absent
+        );
+        let cleared = serde_json::json!({"source_commit": null});
+        assert_eq!(
+            patch_string(&cleared, "source_commit", MAX_COMMIT_BYTES).unwrap(),
+            MetadataPatch::Clear
+        );
+        let set = serde_json::json!({"source_commit": "abc123"});
+        assert_eq!(
+            patch_string(&set, "source_commit", MAX_COMMIT_BYTES).unwrap(),
+            MetadataPatch::Set("abc123".to_string())
+        );
+        // Out-of-range and wrong-type values are rejected.
+        assert!(patch_confidence(&serde_json::json!({"confidence": 2.0})).is_err());
+        assert!(patch_confidence(&serde_json::json!({"confidence": "high"})).is_err());
+        assert!(patch_stale_after_days(&serde_json::json!({"stale_after_days": null})).is_err());
+        assert!(patch_stale_after_days(&serde_json::json!({"stale_after_days": 36501})).is_err());
+        assert!(patch_tags(&serde_json::json!({"tags": null})).is_err());
+        assert!(patch_studied_at(&serde_json::json!({"studied_at": "yesterday"})).is_err());
+        assert!(
+            patch_status_reason(&serde_json::json!({"status_reason": "x".repeat(1001)})).is_err()
+        );
+        // Min-confidence filter parsing.
+        assert_eq!(
+            optional_confidence_param(&serde_json::json!({"min_confidence": 0.5}), "min_confidence")
+                .unwrap(),
+            Some(0.5)
+        );
+        assert!(
+            optional_confidence_param(&serde_json::json!({"min_confidence": 1.5}), "min_confidence")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn status_update_merge_semantics() {
+        // Only provided fields change.
+        let mut meta = sample_meta(&["memory"]);
+        meta.status = KnowledgeStatus::Active;
+        meta.confidence = Some(0.4);
+        let update = parse_status_update(&serde_json::json!({
+            "status": "active",
+            "confidence": 0.95,
+            "stale_after_days": 10,
+            "status_reason": "verified today"
+        }))
+        .unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.confidence, Some(0.95));
+        assert_eq!(meta.stale_after_days, Some(10));
+        assert_eq!(meta.status_reason.as_deref(), Some("verified today"));
+        assert_eq!(meta.tags, vec!["memory".to_string()], "tags untouched");
+
+        // Superseded requires superseded_by (merged state).
+        let mut meta = sample_meta(&["memory"]);
+        let update = parse_status_update(&serde_json::json!({"status": "superseded"})).unwrap();
+        assert!(apply_status_update(&mut meta, update).is_err());
+        let update = parse_status_update(&serde_json::json!({
+            "status": "superseded",
+            "superseded_by": "memory-search-v2"
+        }))
+        .unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.superseded_by.as_deref(), Some("memory-search-v2"));
+
+        // Leaving superseded without an explicit superseded_by clears it.
+        let update = parse_status_update(&serde_json::json!({"status": "active"})).unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.superseded_by, None);
+
+        // Explicit null clears nullable fields.
+        let update = parse_status_update(&serde_json::json!({
+            "status": "active",
+            "confidence": null,
+            "status_reason": null
+        }))
+        .unwrap();
+        apply_status_update(&mut meta, update).unwrap();
+        assert_eq!(meta.confidence, None);
+        assert_eq!(meta.status_reason, None);
+
+        // status is required.
+        assert!(parse_status_update(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn new_tools_metadata_only_and_named() {
+        let resolver: Arc<dyn WorkspaceResolver> = Arc::new(UnusedResolver);
+        let list_topics = KnowledgeListTopicsTool::new(Arc::clone(&resolver));
+        let update_status = KnowledgeUpdateStatusTool::new(resolver);
+        assert_eq!(list_topics.name(), "knowledge_list_topics");
+        assert_eq!(update_status.name(), "knowledge_update_status");
+        assert!(!list_topics.requires_sanitization());
+        assert!(!update_status.requires_sanitization());
     }
 }
