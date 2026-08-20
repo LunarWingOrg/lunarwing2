@@ -1,6 +1,6 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-13).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-20).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
@@ -55,35 +55,35 @@ a failure criterion.
 
 - `WasmChannel::start_polling` creates an outer supervisor and respawns the inner
   poll loop with exponential backoff after an error or panic
-  (`ic/src/channels/wasm/wrapper.rs:2284-2456`).
+  (`ic/src/channels/wasm/wrapper.rs:2311-2476`).
 - Poll callbacks are bounded by the configured callback timeout
   (`ic/src/channels/wasm/wrapper.rs:2484-2513`).
 - `health_check()` detects a dead supervisor and a stale
-  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2906-2948`).
+  `last_poll_epoch_ms` (`ic/src/channels/wasm/wrapper.rs:2933-2975`).
 - Dedicated tests cover dead and stalled poll tasks
-  (`ic/src/channels/wasm/wrapper.rs:5642-5705`).
+  (`ic/src/channels/wasm/wrapper.rs:5719-5783`).
 - Channel health is aggregated by `ChannelManager`
-  (`ic/src/channels/manager.rs:303-310`) and exposed by the gateway
-  (`ic/src/channels/web/server.rs:2929-2969`).
+  (`ic/src/channels/manager.rs:345-354`) and exposed by the gateway
+  (`ic/src/channels/web/server.rs:2929-2971`).
 - The watchdog has optional deep channel-health checks on systemd and OpenRC
   (`ic/scripts/lunarwing-watchdog.sh:60-88` and
   `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
 
 These changes resolve the original silent-exit failure mode. Older references
 to the polling block near line 2285 no longer match the current wrapper layout
-(`start_polling` is now at line 2284).
+(`start_polling` is now at line 2311).
 
 ## Residual backpressure path
 
 The channel's message queue is bounded (capacity 256, created at
-`ic/src/channels/wasm/wrapper.rs:969,2743`). `dispatch_emitted_messages`
-(`wrapper.rs:2568-2651`) awaits `tx.reserve_many` (`:2611-2617`) and sends via
+`ic/src/channels/wasm/wrapper.rs:985,2770`). `dispatch_emitted_messages`
+(`wrapper.rs:2595-2678`) awaits `tx.reserve_many` (`:2639-2645`) and sends via
 permits. If downstream consumption stalls, or sustained ingress exceeds the
 consumer's drain rate, this queue can fill and the `reserve_many` await blocks
 indefinitely; the dispatch path only errors for a closed queue, a missing
 sender, an oversized batch, or rate limiting. The poll task stores
 `last_poll_epoch_ms` only after a successful dispatch
-(`wrapper.rs:2382-2389`), so a queue-blocked poll stops refreshing the epoch
+(`wrapper.rs:2409-2416`), so a queue-blocked poll stops refreshing the epoch
 and trips the stall detector once `max(3 x poll interval, 30s)` elapses.
 
 The earlier direct coupling to a synchronous worker turn is no longer current:
@@ -119,8 +119,12 @@ scripts. No Cargo command, live bridge run, or full E2E run was performed in
 this documentation pass; the backpressure path is therefore a residual risk,
 not a reproduced current outage. Re-verified on 2026-08-13 (revision
 `7e813db4`): the residual section was re-checked — the poll epoch is still
-stored only after a successful dispatch (`wrapper.rs:2382-2390`), so a
-queue-blocked poll remains visible to the stall detector, and a full queue
-still blocks `reserve_many` (`wrapper.rs:2612-2617`) rather than erroring.
-Line references were refreshed for `wrapper.rs`, `manager.rs`, `server.rs`,
-and `agent_loop.rs` churn.
+stored only after a successful dispatch, so a queue-blocked poll remains
+visible to the stall detector, and a full queue still blocks `reserve_many`
+rather than erroring. Re-verified on 2026-08-20 (revision `2d10832a`): the
+same residual holds — epoch store at `wrapper.rs:2409-2416`, `reserve_many`
+await at `:2639-2645` — and line references were refreshed again for
+`wrapper.rs` (`start_polling` `:2311-2476`, `health_check` `:2933-2975`, queue
+creation `:985,2770`, `dispatch_emitted_messages` `:2595-2678`, poll tests
+`:5719-5783`), `manager.rs` (`health_check_all` `:345-354`), and `server.rs`
+(`:2929-2971`) churn. No status changed.
