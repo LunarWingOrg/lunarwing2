@@ -6,7 +6,8 @@ Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
 present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching). Multi-tenant
-provisioning (`ic/scripts/lunarwing-mt-admin.sh`) writes `ENGINE_V2=true` and
+provisioning (`ic/scripts/lunarwing-mt-admin.sh`, env generation in
+`mt-admin-lib/06-env-generation.sh`) writes `ENGINE_V2=true` and
 `ENGINE_V2_CHANNELS=xmpp,weechat,darkirc` into new tenant envs by default and
 preserves existing tenant values across upgrade/rebuild/re-render.
 
@@ -423,7 +424,7 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 33 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 30 Store-trait methods for threads, steps, events, projects, docs, leases, missions, conversations
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
