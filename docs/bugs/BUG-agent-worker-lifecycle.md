@@ -1,7 +1,7 @@
 # Agent and worker lifecycle bugs
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-13).** The fire-and-forget completion race is fixed, one earlier
+> 2026-08-20).** The fire-and-forget completion race is fixed, one earlier
 > notification-task report is invalidated, and priority interrupts are now
 > handled during active turns. A synchronous `wait=true` worker call still
 > occupies the originating turn and serializes ordinary message handling.
@@ -50,7 +50,7 @@ daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
   The active task remains the current turn until completion, timeout, or
   interruption (`ic/src/agent/agent_loop.rs:1126-1188`).
 - The default agent message timeout is 630 seconds
-  (`ic/src/settings.rs:654-656,717-719`), so a long worker can consume most of a turn.
+  (`ic/src/settings.rs:660-662,723-725`), so a long worker can consume most of a turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
   (`ic/src/tools/builtin/job.rs:672-702` for the sandbox path, `:1086-1105`
   for external workers).
@@ -146,4 +146,6 @@ outage was not re-run. Re-verified on 2026-08-13 (revision `7e813db4`): line
 references refreshed after post-2026-08-03 churn in `agent_loop.rs`,
 `job.rs`, `api.rs`, `job_manager.rs`, `heartbeat.rs`, and `routine_engine.rs`
 (coordination hardening, MCP worker grants, and orchestrator auth work moved
-the cited regions; no behavior described here changed).
+the cited regions; no behavior described here changed). Re-verified on
+2026-08-20 (revision `2d10832a`): no status changed; the only drift was the
+630-second timeout default moving to `settings.rs:660-662,723-725`.

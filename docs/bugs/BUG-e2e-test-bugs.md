@@ -1,7 +1,7 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> current source on 2026-08-13).** The tool-execution failure is resolved in
+> current source on 2026-08-20).** The tool-execution failure is resolved in
 > the current test/code paths. The old Gmail OAuth fixture was retired. The
 > bootstrap greeting production path is fixed, but both E2E assertions are
 > currently `#[ignore]`'d due to a harness timing race. The clipboard test
@@ -166,4 +166,7 @@ remains unverified because this environment does not provide the E2E runtime.
 Re-verified on 2026-08-13 (revision `7e813db4`); the bootstrap tests'
 `#[ignore]` markers were re-confirmed against `ic/tests/e2e_advanced_traces.rs`
 (`:761`, `:805`), and line references were refreshed after post-2026-08-03
-churn in `agent_loop.rs` and `app.js`.
+churn in `agent_loop.rs` and `app.js`. Re-verified on 2026-08-20 (revision
+`2d10832a`): all cited paths and line references still match; no status
+changed. Playwright/Pytest remain unavailable in this environment, so the
+clipboard item stays UNVERIFIED.

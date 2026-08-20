@@ -1,7 +1,7 @@
 # Multi-tenant external-worker configuration
 
 > **Status: FIXED in source and unit tests (verified against current source on
-> 2026-08-13); live runtime re-check not yet run.** Tenant provisioning
+> 2026-08-20); live runtime re-check not yet run.** Tenant provisioning
 > generates Pebble, OpenCode, and Kimi endpoint blocks, in-memory settings
 > merges preserve their bearer tokens, and `Settings::save_toml` now re-injects
 > worker and endpoint `auth_token` values into every full TOML rewrite, with
@@ -11,6 +11,10 @@
 This tracks the current config round-trip finding. Historical Nanocode config
 coverage moved to `history/MISSING-CONFIG-FOR-NANOCODE.md` after retirement.
 
+Since v2.0.8.0 `ic/scripts/lunarwing-mt-admin.sh` is a thin composition root
+that sources the numbered modules under `ic/scripts/mt-admin-lib/`; the
+provisioning references below name the owning module.
+
 ## 1. Provisioning-time generation
 
 **Status: FIXED.**
@@ -19,9 +23,12 @@ Fresh tenants previously lacked `[[sandbox.external_workers]]` routes until an
 operator edited `config.toml`. Current generation is idempotent and writes each
 selected supported worker's per-tenant WSS URL, timeout, and gateway token:
 
-- `ensure_external_worker_config` (`ic/scripts/lunarwing-mt-admin.sh:4796-4875`)
-- `add-tenant` calls it for Pebble, OpenCode, and Kimi (`:10591-10593`)
-- retrofit calls are present in `patch-env` (`:5714-5716`)
+- `ensure_external_worker_config`
+  (`ic/scripts/mt-admin-lib/09-worker-config.sh:213-292`)
+- `add-tenant` calls it for Pebble, OpenCode, and Kimi
+  (`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:513-515`)
+- retrofit calls are present in `patch-env`
+  (`ic/scripts/mt-admin-lib/06-env-generation.sh:1938-1940`)
 - TOML shape is covered by `ic/src/config/sandbox.rs:146-158,168-176`
 
 The generated shape remains:
@@ -39,23 +46,28 @@ default. The token mirrors `GATEWAY_AUTH_TOKEN` because the worker starts with
 that value as `AGENT_AUTH_TOKEN`.
 
 Worker selection is separate from config generation: `--with-*` flags persist
-selection into the ports registry (`.tenants[<name>].workers.<worker>`,
-written at `lunarwing-mt-admin.sh:10555-10558`) and the start path gates
-workers on that selection (`tenant_worker_enabled`, `:415-428`; `--with-*`
-parsing at `:11837-11839`; build selection at `:2520-2522,2580-2597`). An
-endpoint block alone does not build or start a worker.
+selection into the ports registry (`.tenants[<name>].workers.<worker>`; the
+JSON object is built at `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:478-480`
+and written by `ports_allocate` at
+`ic/scripts/mt-admin-lib/03-ports-registry.sh:649-667`) and the start path
+gates workers on that selection (`tenant_worker_enabled`,
+`ic/scripts/mt-admin-lib/00-common.sh:294-299`, applied in the start loop at
+`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:899-910`; `--with-*` parsing at
+`ic/scripts/lunarwing-mt-admin.sh:494-496`; build selection at
+`ic/scripts/mt-admin-lib/05-tenant-build.sh:421-427,484-500`). An endpoint
+block alone does not build or start a worker.
 
 ## 2. Auth-token loss on settings rewrites
 
 **Status: FIXED in source and unit tests (live runtime re-check not yet run).**
 
 `ExternalWorkerSettings.auth_token` is `Option<SecretString>` with
-`#[serde(default, skip_serializing)]` (`ic/src/settings.rs:875-876`). The
+`#[serde(default, skip_serializing)]` (`ic/src/settings.rs:881-882`). The
 settings writer previously serialized the whole struct and dropped the token.
 Since commit `6904394` (2026-07-31), `Settings::save_toml` calls
-`reinject_external_worker_tokens` before writing (`settings.rs:1336`), which
+`reinject_external_worker_tokens` before writing (`settings.rs:1342`), which
 re-inserts worker-level and endpoint-level `auth_token` values from the
-in-memory settings into the serialized TOML tree (`settings.rs:1380-1458`).
+in-memory settings into the serialized TOML tree (`settings.rs:1386-1458`).
 Full-TOML writers such as `/model` (`ic/src/agent/commands.rs:935-960`),
 profile persistence (`ic/src/tools/builtin/memory.rs:603-611`), CLI model
 changes (`ic/src/cli/models.rs:137-147`), and `config init`
@@ -65,14 +77,14 @@ changes (`ic/src/cli/models.rs:137-147`), and `config init`
 
 `Settings::merge_from` also restores skipped worker and endpoint tokens after
 its JSON merge, falling back to the base secrets when the overlay omits them
-(`ic/src/settings.rs:1460-1517`), so in-memory configuration merges are covered
+(`ic/src/settings.rs:1466-1523`), so in-memory configuration merges are covered
 as well.
 
 Round-trip tests now exist:
 `toml_save_preserves_external_worker_auth_tokens`,
 `toml_save_preserves_external_worker_endpoint_auth_tokens`, and
 `toml_save_keeps_absent_external_worker_tokens_absent`
-(`ic/src/settings.rs:1982-2088`), plus merge coverage at `:2090-2164`. That
+(`ic/src/settings.rs:1987-2093`), plus merge coverage at `:2095-2167`. That
 satisfies the persistence half of this report's original closing criterion.
 The other half — a live daemon restart followed by a real worker request that
 no longer returns 401 — has not been executed in this documentation pass, so
@@ -90,4 +102,10 @@ restart, or worker connection was run. Re-verified on 2026-08-13 (revision
 `7e813db4`) with updated source line references; `lunarwing-mt-admin.sh` grew
 substantially since the previous pass (LunarVision/LunarVoice supervision
 work), and the worker-selection refs now name the registry-backed
-`tenant_worker_enabled` gate explicitly.
+`tenant_worker_enabled` gate explicitly. Re-verified on 2026-08-20 (revision
+`2d10832a`): mt-admin was split into `scripts/mt-admin-lib/NN-*.sh` modules in
+v2.0.8.0, so all provisioning references were re-mapped to the owning modules
+(`00-common.sh`, `03-ports-registry.sh`, `04-tenant-lifecycle.sh`,
+`05-tenant-build.sh`, `06-env-generation.sh`, `09-worker-config.sh`); the
+`settings.rs` references shifted by a few lines and were refreshed. No status
+changed.

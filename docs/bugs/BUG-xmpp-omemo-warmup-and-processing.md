@@ -1,6 +1,6 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against current source on 2026-08-13).** The
+> **Status: UNVERIFIED (checked against current source on 2026-08-20).** The
 > historical fallback-spam symptom has not been reproduced against the current
 > bridge and no current source path proves that it is resolved. The separate
 > stuck `Processing`-thread failure has a current static fix and is recorded
@@ -79,4 +79,7 @@ documentation pass. Re-verified on 2026-08-13 (revision `7e813db4`) with
 refreshed line references after post-2026-08-03 churn in `agent_loop.rs` and
 `session.rs`; the `allow_plaintext_fallback` default/forwarding
 (`channels-src/xmpp/src/lib.rs:291,314`) and DM-fallback unit tests
-(`ic/src/channels/xmpp/mod.rs:3593-3662`) are unchanged.
+(`ic/src/channels/xmpp/mod.rs:3593-3662`) are unchanged. Re-verified on
+2026-08-20 (revision `2d10832a`): all cited references still match,
+`fail_turn_hard` remains absent, and no live bridge capture has appeared;
+statuses unchanged.
