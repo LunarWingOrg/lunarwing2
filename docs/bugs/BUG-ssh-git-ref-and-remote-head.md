@@ -1,7 +1,7 @@
 # SSH Git ref handling and bare-remote HEAD diagnostics
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-13).** Null-like `ref` values are normalized. A bare repository whose
+> 2026-08-20).** Null-like `ref` values are normalized. A bare repository whose
 > remote HEAD points at a missing branch still produces an empty/unborn checkout
 > that `ssh_git` marks successful, with only Git's raw stderr warning.
 
@@ -51,7 +51,7 @@ clone command exits successfully but prints Git's warning that the remote HEAD
 refers to a nonexistent ref. The checkout is empty/unborn; the old title and
 symptom saying the clone command fails are inaccurate. A local reproduction of
 this exact Git sequence returned exit 0 with that warning (re-run again on
-2026-08-13 with the same result).
+2026-08-13 and on 2026-08-20 with the same result).
 
 ### Current code evidence
 
@@ -77,8 +77,10 @@ return a specific warning, but making `ref` mandatory is not current behavior.
 ## Verification record
 
 Verification used current Rust source/tests, Git ancestry for `c8b277d`, and a
-local bare-Git reproduction (re-run on 2026-08-13 against revision `7e813db4`:
+local bare-Git reproduction (re-run on 2026-08-13 against revision `7e813db4`
+and re-run again on 2026-08-20 against revision `2d10832a`:
 exit 0, `warning: remote HEAD refers to nonexistent ref, unable to checkout`,
 empty checkout). No Cargo command or SSH service was run. The only source
 change since the previous pass is an added `allows_autonomous_execution() ->
 false` override (`ssh_git.rs:267-271`), which does not affect either finding.
+All cited line references were re-confirmed unchanged on 2026-08-20.
