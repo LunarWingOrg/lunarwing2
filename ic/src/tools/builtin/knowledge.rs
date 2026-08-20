@@ -173,6 +173,40 @@ fn is_coordination_note(meta: &KnowledgeNoteMeta) -> bool {
     meta.tags.iter().any(|tag| tag == COORDINATION_TAG)
 }
 
+/// Parse the `include_coordination` flag (default true, preserving the
+/// behavior routine sweeps already rely on).
+fn optional_include_coordination(params: &serde_json::Value) -> Result<bool, ToolError> {
+    match params.get("include_coordination") {
+        None | Some(serde_json::Value::Null) => Ok(true),
+        Some(serde_json::Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(ToolError::InvalidParameters(
+            "include_coordination must be a boolean".to_string(),
+        )),
+    }
+}
+
+/// Filter one metadata scan down to rows needing verification.
+///
+/// With `include_coordination=false`, wire-ingested coordination notes are
+/// dropped, so routine sweeps that auto-process `needs-verification` notes
+/// never act on unverified claims from other tenants.
+fn select_stale_rows<'a>(
+    rows: &'a [KnowledgeNoteRow],
+    include_coordination: bool,
+    max_age_days: Option<i64>,
+    repository_commit: Option<&str>,
+    limit: usize,
+) -> Vec<&'a KnowledgeNoteRow> {
+    rows.iter()
+        .filter(|row| include_coordination || !is_coordination_note(&row.meta))
+        .filter(|row| {
+            row.meta
+                .needs_verification(row.updated_at, max_age_days, repository_commit)
+        })
+        .take(limit)
+        .collect()
+}
+
 fn protect_note_content(meta: &KnowledgeNoteMeta, content: &str, max_bytes: usize) -> String {
     let bounded = truncate_utf8(content, max_bytes);
     if is_coordination_note(meta) {
@@ -694,7 +728,10 @@ impl Tool for KnowledgeListStaleTool {
     fn description(&self) -> &str {
         "List study notes needing verification: status stale/needs-verification, studied \
          older than max_age_days, or recorded against a different source commit. Pass the \
-         current repository commit when freshness materially affects your task."
+         current repository commit when freshness materially affects your task. \
+         Coordination-origin wire notes are flagged untrusted in the output; pass \
+         include_coordination=false to exclude those unverified cross-tenant claims from \
+         routine sweeps that auto-process flagged notes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -721,6 +758,11 @@ impl Tool for KnowledgeListStaleTool {
                     "default": 25,
                     "minimum": 1,
                     "maximum": 50
+                },
+                "include_coordination": {
+                    "type": "boolean",
+                    "description": "Include untrusted coordination-room wire notes (default: true). Routines that auto-process flagged notes should pass false.",
+                    "default": true
                 }
             }
         })
@@ -746,22 +788,22 @@ impl Tool for KnowledgeListStaleTool {
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
 
-        let stale: Vec<serde_json::Value> = rows
-            .iter()
-            .filter(|row| {
-                row.meta.needs_verification(
-                    row.updated_at,
-                    max_age_days,
-                    repository_commit.as_deref(),
-                )
-            })
-            .take(limit)
-            .map(note_row_json)
-            .collect();
+        let include_coordination = optional_include_coordination(&params)?;
+        let stale: Vec<serde_json::Value> = select_stale_rows(
+            &rows,
+            include_coordination,
+            max_age_days,
+            repository_commit.as_deref(),
+            limit,
+        )
+        .into_iter()
+        .map(note_row_json)
+        .collect();
         let output = serde_json::json!({
             "criteria": {
                 "max_age_days": max_age_days,
                 "repository_commit": repository_commit,
+                "include_coordination": include_coordination,
             },
             "scopes": scopes,
             "scanned_notes": rows.len(),
@@ -800,7 +842,8 @@ impl Tool for KnowledgeStatsTool {
 
     fn description(&self) -> &str {
         "Report knowledge-store statistics across your private scope and the shared herd \
-         scope: total notes, distinct topics, lifecycle status counts, and per-scope counts."
+         scope: total notes, distinct topics, lifecycle status counts, the count of \
+         untrusted coordination-room wire notes, and per-scope counts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -969,6 +1012,48 @@ mod tests {
             protect_note_content(&meta, "verified local finding", MAX_SNIPPET_BYTES),
             "verified local finding"
         );
+    }
+
+    #[test]
+    fn include_coordination_param_defaults_true() {
+        assert!(optional_include_coordination(&serde_json::json!({})).unwrap());
+        assert!(
+            optional_include_coordination(&serde_json::json!({"include_coordination": true}))
+                .unwrap()
+        );
+        assert!(
+            !optional_include_coordination(&serde_json::json!({"include_coordination": false}))
+                .unwrap()
+        );
+        assert!(
+            optional_include_coordination(&serde_json::json!({"include_coordination": "no"}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_selection_can_exclude_coordination_notes() {
+        let now = chrono::Utc::now();
+        let wire = KnowledgeNoteRow {
+            scope: "shared".to_string(),
+            path: note_path("coord-alice-0123456789abcdef01234567", "wire-topic"),
+            updated_at: now,
+            meta: sample_meta(&[COORDINATION_TAG]),
+        };
+        let local = KnowledgeNoteRow {
+            scope: "shared".to_string(),
+            path: note_path("kimi-1", "local-topic"),
+            updated_at: now,
+            meta: sample_meta(&["memory"]),
+        };
+        let rows = vec![wire, local];
+
+        // sample_meta is needs-verification, so both rows are flagged.
+        let all = select_stale_rows(&rows, true, None, None, 10);
+        assert_eq!(all.len(), 2);
+        let without_wire = select_stale_rows(&rows, false, None, None, 10);
+        assert_eq!(without_wire.len(), 1);
+        assert_eq!(without_wire[0].meta.tags, vec!["memory".to_string()]);
     }
 
     struct UnusedResolver;

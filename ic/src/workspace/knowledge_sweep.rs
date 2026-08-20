@@ -6,6 +6,13 @@
 //! private scope and the shared herd scope. Notes already marked `stale`,
 //! `superseded`, or `needs-verification` are left untouched.
 //!
+//! The shared-scope pass also reaps stranded coordination wire notes: bodies
+//! left behind when an ingest died between the content and metadata commits
+//! whose sender never shared again to trigger the self-repair path. Only
+//! wire-namespace paths carrying the wire sentinel and older than a grace
+//! period are removed, so an in-flight or freshly stranded ingest is never
+//! touched.
+//!
 //! A global [`AtomicBool`] guard prevents concurrent sweeps, mirroring the
 //! hygiene pass guard, so overlapping heartbeat ticks cannot double-mark.
 
@@ -16,7 +23,15 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::lunarwing_base_dir;
-use crate::workspace::{KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, Workspace};
+use crate::workspace::{
+    KNOWLEDGE_DIR, KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, WIRE_AGENT_PREFIX,
+    Workspace, is_incomplete_wire_write,
+};
+
+/// Minimum age before a stranded wire note is reaped. Ingest tasks finish in
+/// seconds, so anything older than a day is final unless the sender shares
+/// again (which repairs it before this sweep would ever see it).
+const STRANDED_WIRE_GRACE_HOURS: i64 = 24;
 
 /// Global guard preventing concurrent sweeps.
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -62,14 +77,16 @@ pub struct KnowledgeSweepReport {
     pub notes_scanned: u32,
     /// Notes newly marked stale.
     pub notes_marked_stale: u32,
+    /// Stranded coordination wire notes reaped from the shared scope.
+    pub stranded_removed: u32,
     /// Whether the run was skipped (disabled, cadence, or concurrent).
     pub skipped: bool,
 }
 
 impl KnowledgeSweepReport {
-    /// True if any note was marked stale.
+    /// True if any note was marked stale or any stranded note was reaped.
     pub fn had_work(&self) -> bool {
-        self.notes_marked_stale > 0
+        self.notes_marked_stale > 0 || self.stranded_removed > 0
     }
 }
 
@@ -150,12 +167,22 @@ pub async fn run_knowledge_sweep_if_due(
             }
             Err(e) => tracing::warn!("knowledge sweep: shared-scope scan failed: {e}"),
         }
+        match sweep_stranded_wire_writes(
+            shared_ws,
+            chrono::Duration::hours(STRANDED_WIRE_GRACE_HOURS),
+        )
+        .await
+        {
+            Ok(removed) => report.stranded_removed += removed,
+            Err(e) => tracing::warn!("knowledge sweep: stranded wire-note pass failed: {e}"),
+        }
     }
 
     if report.had_work() {
         tracing::info!(
             notes_scanned = report.notes_scanned,
             notes_marked_stale = report.notes_marked_stale,
+            stranded_removed = report.stranded_removed,
             stale_after_days = config.stale_after_days,
             "knowledge sweep: marked aging study notes stale"
         );
@@ -203,6 +230,52 @@ async fn sweep_scope(
         marked += 1;
     }
     Ok((scanned, marked))
+}
+
+/// Reap coordination wire notes stranded between the content and metadata
+/// commits of an ingest whose sender never shared again to trigger the
+/// hook's self-repair path. Only paths inside the wire agent namespace whose
+/// body carries the wire marker (and no study-note metadata) and whose last
+/// update is older than `grace` are removed; anything newer may still belong
+/// to an in-flight ingest. `workspace` must be scoped to the shared scope so
+/// deletes stay primary-scope. Returns the number of notes reaped.
+async fn sweep_stranded_wire_writes(
+    workspace: &Workspace,
+    grace: chrono::Duration,
+) -> Result<u32, crate::workspace::WorkspaceError> {
+    let wire_prefix = format!("{KNOWLEDGE_DIR}/{WIRE_AGENT_PREFIX}-");
+    let mut removed = 0u32;
+    for path in workspace.list_all().await? {
+        if !path.starts_with(&wire_prefix) {
+            continue;
+        }
+        let document = match workspace.read_primary(&path).await {
+            Ok(document) => document,
+            Err(error) => {
+                tracing::debug!(%path, %error, "knowledge sweep: stranded-candidate read failed");
+                continue;
+            }
+        };
+        if !is_incomplete_wire_write(&document.metadata, &document.content) {
+            continue;
+        }
+        if Utc::now().signed_duration_since(document.updated_at) < grace {
+            continue;
+        }
+        match workspace.delete(&path).await {
+            Ok(()) => {
+                removed += 1;
+                tracing::info!(
+                    %path,
+                    "knowledge sweep: reaped stranded coordination wire note"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(%path, %error, "knowledge sweep: stranded wire-note delete failed");
+            }
+        }
+    }
+    Ok(removed)
 }
 
 struct RunningGuard;
@@ -276,6 +349,7 @@ mod tests {
         use super::*;
         use crate::workspace::{
             KnowledgeNoteMeta, KnowledgeStatus, note_path, render_note_markdown,
+            render_wire_note_markdown,
         };
 
         async fn submit_note(
@@ -421,6 +495,77 @@ mod tests {
             assert!(!first.skipped);
             let second = run_knowledge_sweep_if_due(&alice, None, &config).await;
             assert!(second.skipped);
+        }
+
+        #[tokio::test]
+        async fn sweep_reaps_only_grace_expired_stranded_wire_notes() {
+            let (db, _dir) = crate::testing::test_db().await;
+            let shared = Workspace::new_with_db(KNOWLEDGE_SHARED_SCOPE, db);
+            let wire_agent = "coord-alice-0123456789abcdef01234567";
+
+            // Stranded: wire-sentinel body, no provenance metadata.
+            let stranded = note_path(wire_agent, "stranded-topic");
+            shared
+                .write(
+                    &stranded,
+                    &render_wire_note_markdown("KNOW: stranded", "stranded body"),
+                )
+                .await
+                .expect("write stranded note");
+            // Complete wire note: same namespace, metadata committed.
+            let complete = note_path(wire_agent, "complete-topic");
+            shared
+                .write(
+                    &complete,
+                    &render_wire_note_markdown("KNOW: complete", "complete body"),
+                )
+                .await
+                .expect("write complete note");
+            let complete_meta = KnowledgeNoteMeta {
+                topic: "complete-topic".to_string(),
+                agent: wire_agent.to_string(),
+                title: "KNOW: complete".to_string(),
+                status: KnowledgeStatus::NeedsVerification,
+                confidence: None,
+                studied_at: None,
+                source_commit: None,
+                tags: vec!["coordination".to_string()],
+                superseded_by: None,
+                submitted_by: Some("room@conf/alice".to_string()),
+                session_id: None,
+            };
+            shared
+                .set_document_metadata(&complete, &complete_meta.to_metadata_json())
+                .await
+                .expect("set complete metadata");
+            // Unmarked document in the wire namespace: no marker, no metadata.
+            let unmarked = note_path(wire_agent, "unmarked-topic");
+            shared
+                .write(&unmarked, "# Some other document\n\nbody\n")
+                .await
+                .expect("write unmarked note");
+            // Wire-marker body outside the wire namespace is never touched.
+            let outside = note_path("kimi-1", "sentinel-topic");
+            shared
+                .write(&outside, &render_wire_note_markdown("KNOW: x", "body"))
+                .await
+                .expect("write outside note");
+
+            // Within the grace period everything fresh survives.
+            let removed = sweep_stranded_wire_writes(&shared, chrono::Duration::hours(24))
+                .await
+                .expect("sweep within grace");
+            assert_eq!(removed, 0);
+
+            // Grace expired: only the stranded wire note is reaped.
+            let removed = sweep_stranded_wire_writes(&shared, chrono::Duration::zero())
+                .await
+                .expect("sweep past grace");
+            assert_eq!(removed, 1);
+            assert!(shared.read_primary(&stranded).await.is_err());
+            assert!(shared.read_primary(&complete).await.is_ok());
+            assert!(shared.read_primary(&unmarked).await.is_ok());
+            assert!(shared.read_primary(&outside).await.is_ok());
         }
     }
 }

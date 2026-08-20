@@ -310,7 +310,8 @@ impl HeartbeatRunner {
                 if report.had_work() {
                     tracing::info!(
                         notes_marked_stale = report.notes_marked_stale,
-                        "heartbeat: knowledge sweep marked aging study notes stale"
+                        stranded_removed = report.stranded_removed,
+                        "heartbeat: knowledge sweep marked aging notes stale, reaped stranded wire notes"
                     );
                 }
             });

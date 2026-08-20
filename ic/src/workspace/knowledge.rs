@@ -299,6 +299,8 @@ pub struct KnowledgeStats {
     pub superseded: u64,
     /// Notes awaiting verification.
     pub needs_verification: u64,
+    /// Notes ingested from coordination rooms (untrusted wire claims).
+    pub coordination: u64,
     /// Notes per scope.
     pub per_scope: Vec<KnowledgeScopeCount>,
 }
@@ -330,6 +332,9 @@ impl KnowledgeStats {
                 KnowledgeStatus::Superseded => stats.superseded += 1,
                 KnowledgeStatus::NeedsVerification => stats.needs_verification += 1,
             }
+            if row.meta.tags.iter().any(|tag| tag == "coordination") {
+                stats.coordination += 1;
+            }
             *per_scope.entry(row.scope.as_str()).or_default() += 1;
         }
         stats.topics = topics.len() as u64;
@@ -349,6 +354,45 @@ impl KnowledgeStats {
 /// Render the canonical Markdown body for a study note.
 pub fn render_note_markdown(title: &str, content: &str) -> String {
     format!("# {title}\n\n{}\n", content.trim_end())
+}
+
+/// Agent-slug namespace prefix reserved for wire-ingested coordination notes.
+///
+/// Wire notes live under `study-notes/{WIRE_AGENT_PREFIX}-<sender>-<hash>/`,
+/// so they can never overwrite locally authored agent versions.
+pub const WIRE_AGENT_PREFIX: &str = "coord";
+
+/// Machine-checkable sentinel marking a coordination wire-ingested note body.
+///
+/// The cross-tenant knowledge-share pipeline
+/// (`crate::hooks::coordination_knowledge`) commits note content before its
+/// provenance metadata; a crash or shutdown between the two commits strands a
+/// body with no metadata. The sentinel is part of the body from the first
+/// content commit, so stranded writes are detectable by exact match instead
+/// of a title heuristic. It is an HTML comment: invisible in rendered
+/// Markdown and inert to readers.
+pub const WIRE_NOTE_SENTINEL: &str = "<!-- lunarwing:coordination-wire-note -->";
+
+/// Render the canonical Markdown body for a coordination wire note.
+///
+/// Identical to [`render_note_markdown`] with the [`WIRE_NOTE_SENTINEL`]
+/// marker line prepended, so every wire note — including one stranded before
+/// its metadata commit — carries the hard marker.
+pub fn render_wire_note_markdown(title: &str, content: &str) -> String {
+    format!(
+        "{WIRE_NOTE_SENTINEL}\n\n{}",
+        render_note_markdown(title, content)
+    )
+}
+
+/// Detect a note stranded between the content and metadata commits of a
+/// coordination ingest: study-note provenance is absent, but the body carries
+/// the [`WIRE_NOTE_SENTINEL`] hard marker. Notes stranded before the sentinel
+/// existed are still recognized by the legacy `KNOW:` title prefix, which
+/// only that pipeline writes.
+pub fn is_incomplete_wire_write(metadata: &serde_json::Value, content: &str) -> bool {
+    KnowledgeNoteMeta::from_metadata_json(metadata).is_none()
+        && (content.starts_with(WIRE_NOTE_SENTINEL) || content.starts_with("# KNOW: "))
 }
 
 #[cfg(test)]
@@ -504,6 +548,7 @@ mod tests {
                 meta: KnowledgeNoteMeta {
                     topic: "b".to_string(),
                     status: KnowledgeStatus::NeedsVerification,
+                    tags: vec!["coordination".to_string()],
                     ..sample_meta()
                 },
             },
@@ -515,6 +560,7 @@ mod tests {
         assert_eq!(stats.stale, 1);
         assert_eq!(stats.needs_verification, 1);
         assert_eq!(stats.superseded, 0);
+        assert_eq!(stats.coordination, 1);
         assert_eq!(stats.per_scope.len(), 2);
         assert_eq!(stats.per_scope[0].scope, "alice");
         assert_eq!(stats.per_scope[0].notes, 1);
@@ -526,5 +572,30 @@ mod tests {
     fn render_markdown_has_title_and_body() {
         let md = render_note_markdown("My Title", "body text\n\n");
         assert_eq!(md, "# My Title\n\nbody text\n");
+    }
+
+    #[test]
+    fn wire_note_markdown_carries_the_sentinel() {
+        let md = render_wire_note_markdown("KNOW: finding", "finding body\n");
+        assert!(md.starts_with(WIRE_NOTE_SENTINEL));
+        assert!(md.contains("# KNOW: finding\n\nfinding body\n"));
+    }
+
+    #[test]
+    fn incomplete_wire_write_detection() {
+        let no_metadata = serde_json::json!({});
+        // Hard marker: sentinel body without provenance metadata.
+        let stranded = render_wire_note_markdown("KNOW: x", "stranded body");
+        assert!(is_incomplete_wire_write(&no_metadata, &stranded));
+        // Legacy marker: pre-sentinel notes used the KNOW title prefix only.
+        let legacy = render_note_markdown("KNOW: x", "stranded body");
+        assert!(is_incomplete_wire_write(&no_metadata, &legacy));
+        // A complete wire note (metadata committed) is not stranded.
+        let meta = sample_meta().to_metadata_json();
+        assert!(!is_incomplete_wire_write(&meta, &stranded));
+        // A native note body never matches, with or without metadata.
+        let native = render_note_markdown("Hybrid memory search", "body");
+        assert!(!is_incomplete_wire_write(&no_metadata, &native));
+        assert!(!is_incomplete_wire_write(&meta, &native));
     }
 }
