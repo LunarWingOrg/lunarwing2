@@ -1,14 +1,20 @@
 # Bug tracker
 
-Reconciled against current source (revision `7e813db4`) on **2026-08-13**
-(prior passes against revision `94dfd58` on 2026-08-03, on 2026-07-28, and
-against revision `51ae5a8` on 2026-07-20). The 2026-08-13 pass re-verified
-every active canonical report against code: no status changed, stale line
-references were refreshed (notably `lunarwing-mt-admin.sh`, `agent_loop.rs`,
-`job.rs`, `orchestrator/*`, `wasm/wrapper.rs`, `manager.rs`, `server.rs`), the
-SSH-Git bare-HEAD reproduction was re-run live (same exit-0/empty-checkout
-result), and the OpenCode path self-check was re-run under Node. All 38
-Markdown documents in this tracker (36
+Reconciled against current source (revision `2d10832a`) on **2026-08-20**
+(prior passes against revision `7e813db4` on 2026-08-13, `94dfd58` on
+2026-08-03, on 2026-07-28, and against revision `51ae5a8` on 2026-07-20). The
+2026-08-20 pass re-verified every active canonical report against code: no
+status changed. Line references were refreshed where source drifted since
+2026-08-13 — most notably the v2.0.8.0 split of `lunarwing-mt-admin.sh` into
+`ic/scripts/mt-admin-lib/NN-*.sh` modules (external-worker provisioning refs
+now name the owning module), plus churn in `wasm/wrapper.rs` (`start_polling`,
+`health_check`, queue creation, `dispatch_emitted_messages`, poll tests),
+`channels/manager.rs` (`health_check_all`), `settings.rs` (timeout default and
+token re-injection regions), `orchestrator/external_worker.rs`, and
+`lunarwing_weechat_wss/weechat_relay/src/lib.rs` (`rand_check` moved to
+`:2243-2251`). The SSH-Git bare-HEAD reproduction was re-run live again (same
+exit-0/empty-checkout result), and the OpenCode path self-check was re-run
+under Node (passed). All 38 Markdown documents in this tracker (36
 report/pointer files plus two README files) were checked against current source,
 scripts, tests, and reachable Git history. Closely related reports remain
 grouped; their original filenames and technical evidence are named in the
@@ -28,11 +34,11 @@ Some superseded files remain as compatibility pointers, including pointers in
 |---|---|---|---|
 | [BUG-agent-worker-lifecycle.md](BUG-agent-worker-lifecycle.md) | PARTIAL | `wait=true` (sandbox default; external workers default to `wait=false`) still occupies the originating turn; priority interrupts are handled and ordinary messages are deferred in a bounded FIFO; the old completion race is fixed | `job.rs`, `agent_loop.rs`, `dispatch.rs`, `job_monitor.rs`, interrupt regressions; source-only |
 | [BUG-e2e-test-bugs.md](BUG-e2e-test-bugs.md) | PARTIAL | Bootstrap/tool tests fixed; Gmail OAuth fixture retired; bootstrap E2E tests are now `#[ignore]`'d (harness race); clipboard test remains unverified | `agent_loop.rs`, E2E scenarios; current environment lacks both Pytest and Playwright |
-| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | FIXED* | Provisioning, in-memory merges, and `save_toml` token re-injection all work, with round-trip tests; *live daemon/worker auth re-check still pending | `lunarwing-mt-admin.sh`, `settings.rs`, `commands.rs`, `config/sandbox.rs` |
+| [BUG-external-worker-config-persistence.md](BUG-external-worker-config-persistence.md) | FIXED* | Provisioning, in-memory merges, and `save_toml` token re-injection all work, with round-trip tests; *live daemon/worker auth re-check still pending | `scripts/mt-admin-lib/*` (modularized `lunarwing-mt-admin.sh`), `settings.rs`, `commands.rs`, `config/sandbox.rs` |
 | [BUG-kawarimi-import-flag-parity.md](BUG-kawarimi-import-flag-parity.md) | OPEN | Import rejects an explicit `--with-wasm` although it adds the flag internally | `ic/scripts/import-tenant.sh:85-105,1043`; related flag harness |
 | [BUG-ssh-git-ref-and-remote-head.md](BUG-ssh-git-ref-and-remote-head.md) | PARTIAL | Null-like refs fixed; bare remote HEAD mismatch still reports success for an empty checkout, with only raw Git stderr | `ssh_git.rs`, null-ref tests, local bare-Git reproduction |
-| [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2164-2172` |
-| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Bun self-check re-run green on 2026-08-03 |
+| [BUG-weechat-relay-rand-check.md](BUG-weechat-relay-rand-check.md) | PARTIAL | Unused import fixed; `rand_check` still always returns false | `lunarwing_weechat_wss/weechat_relay/src/lib.rs:46-50,2243-2251` |
+| [BUG-worker-workspace-path-expansion.md](BUG-worker-workspace-path-expansion.md) | PARTIAL | Structured OpenCode project paths expand `~`; prompt-generated paths and Pebble remain open | worker TypeScript/Rust files; Node self-check re-run green on 2026-08-20 |
 | [BUG-xmpp-polling-and-backpressure.md](BUG-xmpp-polling-and-backpressure.md) | PARTIAL | Poll-loop supervision/health is implemented; an unbounded send await on a full downstream queue remains a residual risk, now visible to the stall detector/watchdog | WASM wrapper, active-turn dispatcher, channel manager, watchdog, XMPP bridge source |
 | [BUG-xmpp-omemo-warmup-and-processing.md](BUG-xmpp-omemo-warmup-and-processing.md) | UNVERIFIED | Historical MUC fallback-spam has no current live verification; generic stuck-`Processing` recovery is fixed | XMPP config/tests, release v1.0.7, agent timeout path; source-only |
 
