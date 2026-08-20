@@ -95,9 +95,9 @@ Result: **EXIT_RC=0**. Summary reported
 
 ### Phase 2 — Build (`build-tenant puffin`)
 
-Running in tmux `build-puffin`, log `/tmp/build-puffin.log`. WASM extension build
+Run in tmux `build-puffin`, log `/tmp/build-puffin.log`. WASM extension build
 skipped — the Study Notes MCP is a managed stdio MCP server; daemon, gateway, and
-XMPP bridge are all native. _Result recorded below._
+XMPP bridge are all native.
 
 ### Phase 2.5 — Direct server smoke test as the tenant user (while build runs)
 
@@ -117,4 +117,77 @@ was exercised as `puffin` with a newline-delimited JSON-RPC client:
 - Write tools (`knowledge_submit_note`, `knowledge_update_status`) **not exposed**
   without `--allow-write` — the tenant cannot mutate the shared knowledge base.
 
-_RESULTS BELOW — start, MCP verification, teardown._
+Build result: **BUILD_RC=0** (cold release build in tmux, ~24 min). Reminder to set
+`LLM_API_KEY` printed as usual; not needed for this MCP-layer test.
+
+### Phase 3 — Start + live verification
+
+`start-tenant puffin` → **EXIT_RC=0** (SSH key uploaded, daemon restarted with the
+agent active). `status puffin`: `lunarwing-puffin.service: active`, xmpp-bridge /
+weechat / weechat-adapter / vision / pg all active, LunarVision healthy
+(20025/20026), workers inactive as unselected — the expected healthy set.
+
+Daemon journal (`journalctl --user -u lunarwing-puffin.service`):
+
+```
+INFO Reconciled managed Study Notes MCP server home=/var/cache/lunarwing/lw2studymcp allow_write=false
+INFO Injecting startup MCP clients into extension manager count=1
+```
+
+**Zero** `Unsupported MCP protocol version` / `Failed to connect to MCP server`
+lines — the protocol fix holds live (pre-fix this WARN fired on every boot).
+
+Tenant's own CLI, as `puffin` with the tenant env (PostgreSQL-backed config):
+
+- `lunarwing mcp list` → `● study_notes - python3 [stdio (python3); host]` — managed
+  server seeded into the tenant DB at daemon startup.
+- `lunarwing mcp test study_notes` → **✓ Connection successful!** through
+  LunarWing's own MCP client (the same code path the agent loop uses), listing
+  exactly the 5 read-only tools (`knowledge_search`, `knowledge_get_topic`,
+  `knowledge_list_topics`, `knowledge_list_stale`, `knowledge_stats`). No write
+  tools — read-only contract holds end to end.
+- Gateway sanity: `curl http://127.0.0.1:10021/agent/status` →
+  `{"success":true,"data":{"running":true,…}}`.
+
+(Full agent chat not exercised: the test tenant has no LLM API key provisioned, and
+the item targets the study-MCP wiring, which is proven at the MCP layer.)
+
+### Phase 4 — Teardown
+
+`remove-tenant puffin --purge` → **EXIT_RC=0**: services stopped, systemd units
+uninstalled, PostgreSQL container + data volume removed, ports deallocated, OS user
+and home directory removed.
+
+Post-teardown assertions (all clean):
+
+- `mt-admin list` → 0 references to `puffin` (back to `alpha`, `antelope`,
+  `hermes`).
+- `id puffin` → no such user; `/home/puffin` → gone.
+- `/etc/lunarwing/ports.json` → 0 references to `puffin`.
+- `podman ps -a` → 0 puffin containers.
+- `/var/cache/lunarwing/lw2studymcp` **retained at `278a0bc`, clean** — correct: it
+  is the shared host checkout future tenants sync/reuse, not tenant state.
+
+## Verdict
+
+**PASS** on the post-split tree:
+
+1. Post-split integration verified in place: CLI surface in the root script;
+   `sync_study_notes_checkout`/`validate_study_notes_home` in
+   `mt-admin-lib/06-env-generation.sh`; `configure_study_mcp`/
+   `provision_tenant_study_mcp` in `09-worker-config.sh`; the `add_tenant` wiring
+   call in `04-tenant-lifecycle.sh`. `bash -n` clean over root + all modules; all
+   three fixture suites pass unmodified (the sync test already asserts the
+   post-split wiring location).
+2. The prior run's live catch (MCP client accepted only `2024-11-05`; lw2studymcp
+   answers `2025-03-26`) was missing from this tree — re-applied
+   (`ic/src/tools/mcp/protocol.rs`, `ic/src/tools/mcp/client.rs`; 368 MCP tests
+   green).
+3. `add-tenant puffin --with-study-mcp` fast-forwarded the retained shared checkout
+   `1876c42` → `278a0bc` (= upstream HEAD) and wired the tenant read-only — "always
+   latest repo when spinning up a new tenant" confirmed on the sync path.
+4. After build/start, the daemon reconciled and connected the managed `study_notes`
+   server with zero protocol warnings; `lunarwing mcp list` / `mcp test
+   study_notes` as the tenant user proved the 5 read-only tools end to end through
+   LunarWing's own MCP client; write tools stay gated (`write_enabled: false`).
+5. Teardown left zero residue; the shared checkout persists for future tenants.
