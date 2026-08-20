@@ -11,7 +11,7 @@ Record the exact commit, host profile, feature set, database backend, init syste
 - [ ] Review schema changes and take a restorable database backup before migration tests.
 - [ ] Prepare isolated test credentials and disposable tenants; do not use production secrets.
 - [ ] Start long-running Rust and harness checks in `tmux`.
-- [ ] Limit every Cargo command to ten CPUs and ten jobs (`taskset -c 0-9`, `-j10`), as documented in the repo-root `AGENTS.md` build constraints.
+- [ ] Limit every Cargo command to twelve CPUs and twelve jobs (`taskset -c 0-11`, `-j12`), as documented in the repo-root `AGENTS.md` build constraints.
 - [ ] Use `cargo check` for compile verification; do not run a full debug build.
 
 ## Automated Baseline
@@ -20,7 +20,7 @@ Run the required tiers from [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] default and all-feature `cargo check`
-- [ ] Rust tests with at most ten test threads
+- [ ] Rust tests with at most twelve test threads
 - [ ] all-feature Clippy with warnings denied
 - [ ] single-tenant/full-stack harness build, start, verify, and cleanup
 - [ ] authenticated `ic/scripts/release-test.sh` gateway smoke tests

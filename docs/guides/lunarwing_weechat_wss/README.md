@@ -73,14 +73,14 @@ For a repository-wide channel build:
 
 ```bash
 cd ic
-taskset -c 0-9 scripts/build-wasm-extensions.sh --channels
+taskset -c 0-11 scripts/build-wasm-extensions.sh --channels
 ```
 
 For manual channel development:
 
 ```bash
 cd lunarwing_weechat_wss/weechat_relay
-taskset -c 0-9 cargo build --release -j10 --target wasm32-wasip2
+taskset -c 0-11 cargo build --release -j12 --target wasm32-wasip2
 ```
 
 The installer publishes the channel WASM and current capability sidecar. Do not patch global URL validation for loopback HTTP; current validation allows localhost, and the capability file explicitly allowlists `127.0.0.1` and `localhost`.
