@@ -299,6 +299,8 @@ pub struct KnowledgeStats {
     pub superseded: u64,
     /// Notes awaiting verification.
     pub needs_verification: u64,
+    /// Notes ingested from coordination rooms (untrusted wire claims).
+    pub coordination: u64,
     /// Notes per scope.
     pub per_scope: Vec<KnowledgeScopeCount>,
 }
@@ -329,6 +331,9 @@ impl KnowledgeStats {
                 KnowledgeStatus::Stale => stats.stale += 1,
                 KnowledgeStatus::Superseded => stats.superseded += 1,
                 KnowledgeStatus::NeedsVerification => stats.needs_verification += 1,
+            }
+            if row.meta.tags.iter().any(|tag| tag == "coordination") {
+                stats.coordination += 1;
             }
             *per_scope.entry(row.scope.as_str()).or_default() += 1;
         }
@@ -543,6 +548,7 @@ mod tests {
                 meta: KnowledgeNoteMeta {
                     topic: "b".to_string(),
                     status: KnowledgeStatus::NeedsVerification,
+                    tags: vec!["coordination".to_string()],
                     ..sample_meta()
                 },
             },
@@ -554,6 +560,7 @@ mod tests {
         assert_eq!(stats.stale, 1);
         assert_eq!(stats.needs_verification, 1);
         assert_eq!(stats.superseded, 0);
+        assert_eq!(stats.coordination, 1);
         assert_eq!(stats.per_scope.len(), 2);
         assert_eq!(stats.per_scope[0].scope, "alice");
         assert_eq!(stats.per_scope[0].notes, 1);

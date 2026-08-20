@@ -816,7 +816,10 @@ mod tests {
                     .content
                     .starts_with(crate::workspace::WIRE_NOTE_SENTINEL)
             );
-            assert!(!is_incomplete_wire_write(&document.metadata, &document.content));
+            assert!(!is_incomplete_wire_write(
+                &document.metadata,
+                &document.content
+            ));
 
             let hits = workspace
                 .knowledge_search(

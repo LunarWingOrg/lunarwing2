@@ -265,13 +265,20 @@ no-op.
 Content and metadata cannot share one database transaction through the
 workspace API, so the write is decoupled from the hook's execution budget:
 ingestion runs on a detached task that the registry's hook deadline cannot
-cancel mid-commit. Ingest attempts are still serialized per daemon. Should a
-process crash or shutdown land between the two commits anyway, the resulting
-note has study-note-shaped content but no study-note metadata; the preflight
-recognizes exactly that shape and lets the next share from the same sender and
-topic repair the path instead of wedging it behind an ownership refusal. If a
-metadata write fails outright, the previous document is restored (or a newly
-created partial document deleted) on a best-effort rollback path.
+cancel mid-commit. Write/metadata pairs are serialized per note path across 64
+striped locks, so concurrent shares for different senders or topics ingest in
+parallel while same-path writes can never interleave into mismatched
+content/metadata states. Every wire body carries a machine-checkable sentinel
+comment (`<!-- lunarwing:coordination-wire-note -->`) from the first content
+commit. Should a process crash or shutdown land between the two commits
+anyway, the resulting note has study-note-shaped content but no study-note
+metadata; the preflight recognizes it by the sentinel (pre-sentinel notes by
+the legacy `KNOW:` title prefix) and lets the next share from the same sender
+and topic repair the path instead of wedging it behind an ownership refusal.
+Stranded notes whose sender never shares again are reaped by the periodic
+knowledge sweep once they pass a 24-hour grace period. If a metadata write
+fails outright, the previous document is restored (or a newly created partial
+document deleted) on a best-effort rollback path.
 
 Ingestion attempts are limited per normalized sender identity per daemon and
 hour (`COORD_KNOWLEDGE_MAX_PER_HOUR`, default 30, accepted range 1–1000), then
@@ -288,7 +295,10 @@ retained buckets — including its reserved overflow bucket — at exactly 4096;
 beyond that, unseen callers share one budget-sized bucket so a rotating-identity
 client cannot buy fresh allowances or grow the map. The knowledge hook derives
 its limiter keys from the publisher allowlist, so the per-key allowance is
-operator-bounded as well. Invalid `COORD_KNOWLEDGE_MAX_PER_HOUR`,
+operator-bounded as well. Both the per-sender and daemon-wide windows are
+check-and-insert under a single lock apiece, so concurrent hook executions
+cannot overrun either budget: the caps are hard admission guarantees, not
+best-effort flood protection. Invalid `COORD_KNOWLEDGE_MAX_PER_HOUR`,
 `COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR`, or `COORD_KNOWLEDGE_MIN_CHARS` values log
 a warning and fall back to the defaults. Operators and agents must verify wire
 notes against local source before marking them active; the normal stale-list/status
@@ -300,6 +310,11 @@ Content-bearing knowledge reads preserve this trust boundary. For notes tagged
 label, and wrap snippets/full content in the standard external-content security
 notice. The two tools also declare that their output requires sanitization.
 Locally authored notes without the tag retain their existing output shape.
+`knowledge_list_stale` flags wire notes `untrusted` in its metadata rows, and
+routine sweeps that auto-process flagged notes can pass
+`include_coordination=false` to skip those unverified cross-tenant claims
+entirely. `knowledge_stats` reports a `coordination` note count so operators
+can see how much untrusted material the store holds.
 
 The always-on ingestion integration tests run against libSQL. An additional
 PostgreSQL integration test compiles in PostgreSQL builds and, when
