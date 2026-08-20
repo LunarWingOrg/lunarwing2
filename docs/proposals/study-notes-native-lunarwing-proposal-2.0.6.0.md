@@ -120,7 +120,11 @@ cannot collide with the native tools, which are primary
 `ic/src/workspace/knowledge_sweep.rs` (modeled on memory hygiene) marks
 `active` notes `stale` once `studied_at` (falling back to the document's
 last update) ages past the threshold. Notes already `stale`, `superseded`,
-or `needs-verification` are untouched.
+or `needs-verification` are untouched. The shared-scope pass also reaps
+**stranded coordination wire notes** (`coord-*` writes whose ingest never
+finished) once they age past a 24-hour grace period
+(`STRANDED_WIRE_GRACE_HOURS`); a note still inside the grace window is never
+removed, so an in-flight ingest is safe.
 
 - Config: `ic/src/config/knowledge.rs` —
   `KNOWLEDGE_SWEEP_ENABLED` (default true),
