@@ -134,6 +134,12 @@ assert_eq "coordination admin token generated" \
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
 assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+# Legacy IRONCLAW_* aliases must NOT be generated for new tenants (v2.0.8.0);
+# the daemon still accepts them for existing tenants.
+assert_eq "base dir written" "$(envval LUNARWING_BASE_DIR)" "$MT_FIXTURE/state"
+assert_eq "socket written" "$(envval LUNARWING_SOCKET)" "$MT_FIXTURE/run/lunarwing.sock"
+assert_eq "no legacy IRONCLAW lines generated" \
+  "$(grep -c '^IRONCLAW_' "$MT_FIXTURE/env/lunarwing.env" || true)" "0"
 
 # Case 2: all three flags on first write
 out="$(run_writer fixture-tenant \

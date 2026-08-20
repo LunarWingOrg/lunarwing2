@@ -674,10 +674,11 @@ write_tenant_lunarwing_env() {
   (
     umask 077
     cat >"$path" <<ENVEOF
+# Legacy IRONCLAW_BASE_DIR / IRONCLAW_SOCKET aliases are no longer generated for
+# new tenants (v2.0.8.0). The daemon still accepts both as fallbacks, so existing
+# tenant envs that carry them keep working unchanged.
 LUNARWING_BASE_DIR=$state_dir
-IRONCLAW_BASE_DIR=$state_dir
 LUNARWING_SOCKET=$run_dir/lunarwing.sock
-IRONCLAW_SOCKET=$run_dir/lunarwing.sock
 
 # Database
 DATABASE_BACKEND=postgres
