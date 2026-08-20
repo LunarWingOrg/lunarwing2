@@ -422,7 +422,7 @@ The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves rele
 | `ic/src/workspace/document.rs` | Core types (MemoryDocument, MemoryChunk, well-known paths) |
 | `ic/src/workspace/hygiene.rs` | Workspace cleanup/maintenance |
 | `ic/src/workspace/knowledge.rs` | Study-notes knowledge layer types (private/shared scopes) |
-| `ic/src/workspace/knowledge_sweep.rs` | Background sweep marking aging study notes stale |
+| `ic/src/workspace/knowledge_sweep.rs` | Background sweep marking aging study notes stale (configured `stale_after_days`, default 30) and reaping stranded coordination wire notes after a 24h grace period |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
 | `ic/src/tools/builtin/memory.rs` | Agent-facing tools (search, read, write, tree) |
