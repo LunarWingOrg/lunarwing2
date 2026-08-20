@@ -100,22 +100,34 @@ agents. They are stored as ordinary workspace documents under
 `study-notes/<agent>/<topic>.md` (per-agent versions of a canonical topic) with
 a `study-note` provenance tag plus structured metadata (agent attribution,
 topic slug, confidence 0.0-1.0, status `active`/`stale`/`superseded`/
-`needs-verification`, studied timestamp, source commit, tags array) in the
+`needs-verification`, studied timestamp, source commit, tags array, per-note
+`stale_after_days` threshold, `status_reason`) in the
 document `metadata` JSONB. Because they are workspace documents, they flow
 through the normal chunking and PostgreSQL FTS pipeline (`memory_chunks`
-`content_tsv` GIN index, `ts_rank_cd` ranking).
+`content_tsv` GIN index, `ts_rank_cd` ranking). The tool surface and metadata
+model match the canonical [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
+store.
 
-Five native tools (see `src/tools/builtin/knowledge.rs`):
+Seven native tools (see `src/tools/builtin/knowledge.rs`):
 
 - **`knowledge_search`** — PostgreSQL FTS over study-note chunks with optional
-  topic/agent/status/tags filters; best-ranked snippet per note.
+  topic/agent/status/min-confidence filters and every-listed-tag matching;
+  best-ranked snippet per note.
 - **`knowledge_get_topic`** — all per-agent versions of one topic with content.
+- **`knowledge_list_topics`** — topic coverage survey: per-topic version
+  counts, scopes, agents, statuses, and tags; optional substring `filter`.
 - **`knowledge_submit_note`** — validated write (slug/topic/title/content
-  limits, confidence 0-1, RFC 3339 `studied_at`); `replace=true` updates the
+  limits, confidence 0-1, RFC 3339 `studied_at`, `stale_after_days` defaulting
+  to the canonical 90 days, `status_reason`); `replace=true` updates the
   caller's own agent version only (other agents' versions live at different
-  paths).
+  paths). `status=superseded` requires `superseded_by`.
+- **`knowledge_update_status`** — metadata-only lifecycle update; only provided
+  fields change, explicit null clears nullable fields, and leaving `superseded`
+  without an explicit `superseded_by` clears it. Content changes go through
+  `knowledge_submit_note` with `replace=true`.
 - **`knowledge_list_stale`** — notes needing verification by status, age
-  (`max_age_days`), or `repository_commit` mismatch.
+  (`max_age_days`, falling back to the note's own `stale_after_days`), or
+  `repository_commit` mismatch.
 - **`knowledge_stats`** — totals, distinct topics, per-status and per-scope counts.
 
 Scopes: reads span the caller's private scope plus the shared herd scope

@@ -535,12 +535,16 @@ capability review, sandbox, audit, revocation, upgrade, and rollback contracts e
 #### LunarWing Study Notes
 
 > **v2.0.6.0+:** the native `knowledge_*` built-in tools
-> (`knowledge_search`, `knowledge_get_topic`, `knowledge_submit_note`,
-> `knowledge_list_stale`, `knowledge_stats` — see
+> (`knowledge_search`, `knowledge_get_topic`, `knowledge_list_topics`,
+> `knowledge_submit_note`, `knowledge_update_status`, `knowledge_list_stale`,
+> `knowledge_stats` — see
 > `src/workspace/README.md` § Study-Notes Knowledge Store) are the primary
 > study-notes path and need no external server. The bundled `study-notes`
 > skill (v3) uses them directly. The external lw2studymcp setup below remains
-> for backward compatibility with existing deployments.
+> for backward compatibility with existing deployments. As of v2.0.8.0 the
+> native tool surface and metadata model (per-note `stale_after_days`,
+> `status_reason`, `min_confidence`, every-listed-tag matching) match the
+> canonical lw2studymcp store.
 
 LunarWing can seed the shared [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp)
 checkout as a managed stdio server. Read-only mode is default. Clone it at an
