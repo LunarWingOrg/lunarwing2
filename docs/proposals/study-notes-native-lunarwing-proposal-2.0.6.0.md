@@ -95,7 +95,9 @@ Notes are ordinary `memory_documents` rows, so they move with the tenant:
 
 - `ic/scripts/export-tenant.sh` dumps the **whole** tenant database
   (`pg_dump -Fc`, no table exclusions) into the kawarimi bundle.
-- On import, the owner-scope rekey in `ic/scripts/lunarwing-mt-admin.sh`
+- On import, the owner-scope rekey in
+  `ic/scripts/mt-admin-lib/10-owner-scope.sh` (invoked via
+  `ic/scripts/lunarwing-mt-admin.sh`)
   covers `memory_documents` (with content salvage on collisions), so study
   notes are rekeyed to the new tenant scope like any other workspace
   document.
