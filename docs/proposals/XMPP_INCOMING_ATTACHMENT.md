@@ -1,6 +1,11 @@
-> **Current status (2026-07-20, rev `50c8f99`): SUPERSEDED.** This pasted warning
-> is stale: `incoming_attachment_for_url` is test-gated and used by current XMPP
-> regression tests.
+> **Current status (reverified 2026-08-20): SUPERSEDED.** The pasted warning is
+> stale and its 2026-07-20 explanation is now stale too:
+> `incoming_attachment_for_url` no longer exists in the tree. Inbound XMPP
+> attachments are handled by the OOB/aesgcm pipeline in
+> `ic/src/channels/xmpp/mod.rs` (`collect_inbound_attachment_urls`,
+> `extract_inbound_attachments`, `download_oob_file`,
+> `download_aesgcm_file`), with egress/SSRF policy checks
+> (`policy_checked_download_client`) added in v2.0.8.0 hardening.
 
 warning: function `incoming_attachment_for_url` is never used
     --> src/channels/xmpp/mod.rs:2962:4

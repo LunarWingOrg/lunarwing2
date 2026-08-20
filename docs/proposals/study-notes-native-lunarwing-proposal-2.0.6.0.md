@@ -15,6 +15,18 @@
 > use collision-resistant `coord-*` agent paths and always enter as
 > `needs-verification`; they never become verified merely by crossing the room.
 > See `MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md` for the protocol and limits.
+>
+> **v2.0.8.0 addendum (item #10, 2026-08-20):** the native layer reached full
+> parity with the canonical lw2studymcp store (7 tools). Added
+> `knowledge_list_topics` (topic coverage survey) and `knowledge_update_status`
+> (metadata-only lifecycle patch: only provided fields change, explicit null
+> clears nullable fields, `superseded` requires `superseded_by`) — both
+> registered and in `PROTECTED_TOOL_NAMES`. `KnowledgeNoteMeta` gained
+> `stale_after_days` (default 90) and `status_reason`; stale detection honors
+> the per-note threshold when no explicit age limit is passed (the sweep's
+> configured limit still overrides). `knowledge_search` gained a
+> `min_confidence` filter, and the tags filter is now canonical
+> require-every-tag on both backends (Postgres `?&`, libSQL all-of).
 
 ## Goal
 
@@ -53,7 +65,8 @@ export/import (see Kawarimi below).
 
 ## Phase 1: Core knowledge store (item #1)
 
-Five native built-in tools in `ic/src/tools/builtin/knowledge.rs`, registered
+Five native built-in tools in `ic/src/tools/builtin/knowledge.rs` (seven since
+the v2.0.8.0 parity pass — see the item #10 addendum above), registered
 next to the memory tools for both single-tenant and multi-tenant workspace
 resolvers (`ic/src/app.rs`), and protected from dynamic shadowing in
 `PROTECTED_TOOL_NAMES`:
@@ -82,7 +95,9 @@ Notes are ordinary `memory_documents` rows, so they move with the tenant:
 
 - `ic/scripts/export-tenant.sh` dumps the **whole** tenant database
   (`pg_dump -Fc`, no table exclusions) into the kawarimi bundle.
-- On import, the owner-scope rekey in `ic/scripts/lunarwing-mt-admin.sh`
+- On import, the owner-scope rekey in
+  `ic/scripts/mt-admin-lib/10-owner-scope.sh` (invoked via
+  `ic/scripts/lunarwing-mt-admin.sh`)
   covers `memory_documents` (with content salvage on collisions), so study
   notes are rekeyed to the new tenant scope like any other workspace
   document.
@@ -107,7 +122,11 @@ cannot collide with the native tools, which are primary
 `ic/src/workspace/knowledge_sweep.rs` (modeled on memory hygiene) marks
 `active` notes `stale` once `studied_at` (falling back to the document's
 last update) ages past the threshold. Notes already `stale`, `superseded`,
-or `needs-verification` are untouched.
+or `needs-verification` are untouched. The shared-scope pass also reaps
+**stranded coordination wire notes** (`coord-*` writes whose ingest never
+finished) once they age past a 24-hour grace period
+(`STRANDED_WIRE_GRACE_HOURS`); a note still inside the grace window is never
+removed, so an in-flight ingest is safe.
 
 - Config: `ic/src/config/knowledge.rs` —
   `KNOWLEDGE_SWEEP_ENABLED` (default true),
