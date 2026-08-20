@@ -575,7 +575,7 @@ impl PendingActionOutcome {
 struct PendingActionApproval {
     already_granted: bool,
     event: Option<(String, bool)>,
-    enable_always_after_success: bool,
+    enable_always: bool,
 }
 
 async fn finalize_silently_stopped_thread(
@@ -686,11 +686,12 @@ async fn execute_pending_gate_action(
                 let _ = finalize_silently_stopped_pending_thread(state, pending).await;
                 return Ok(PendingActionOutcome::ExecutionStopped);
             }
-            // Only a genuinely successful action earns AlwaysAllow: tool-level
-            // failures arrive as Ok(ActionResult { is_error: true }) and must
-            // not permanently auto-approve the tool.
-            if approval.enable_always_after_success
-                && action_result_earned_always(&pending.action_name, &result)
+            // The user explicitly chose "always": persist the tool-level
+            // grant even when the invocation itself failed (tool errors are
+            // `Ok(ActionResult { is_error: true })`); `ssh` remains gated on
+            // a successful command. See `action_allows_always_persistence`.
+            if approval.enable_always
+                && action_allows_always_persistence(&pending.action_name, &result)
             {
                 enable_always_allow(state, pending).await;
             }
@@ -2009,14 +2010,34 @@ pub fn clamp_always_to_resume_kind(
         )
 }
 
-fn action_result_earned_always(action_name: &str, result: &lunarwing_engine::ActionResult) -> bool {
+/// Whether an approved action permits persisting the user's explicit
+/// "always" grant for the tool.
+///
+/// The grant is tool-level: it must not depend on whether this particular
+/// invocation succeeded. Tool-level failures (HTTP 404, timeout, provider
+/// outage) arrive as `Ok(ActionResult { is_error: true, .. })`; withholding
+/// the grant on failure makes "always" behave exactly like one-time "yes"
+/// until a call happens to succeed (work item #70 — gitlab WASM tool, whose
+/// calls routinely surface REST/Work-Items 404s). This mirrors the v1 chat
+/// path (`Agent::tool_execution_allows_always_persistence`). Tools that do
+/// not permit persistent grants are still filtered out downstream by
+/// `allows_always_approval` in `persist_always_allow`.
+///
+/// `ssh` is the deliberate exception: a remote-command bypass is only
+/// persisted after the command itself exits successfully.
+fn action_allows_always_persistence(
+    action_name: &str,
+    result: &lunarwing_engine::ActionResult,
+) -> bool {
+    if action_name != "ssh" {
+        return true;
+    }
     !result.is_error
-        && (action_name != "ssh"
-            || result
-                .output
-                .get("success")
-                .and_then(serde_json::Value::as_bool)
-                == Some(true))
+        && result
+            .output
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
 }
 
 /// Resolve a unified pending gate.
@@ -2105,7 +2126,7 @@ pub async fn resolve_gate(
                 PendingActionApproval {
                     already_granted: true,
                     event: Some((pending.call_id.clone(), true)),
-                    enable_always_after_success: always,
+                    enable_always: always,
                 },
             )
             .await;
@@ -2276,7 +2297,7 @@ pub async fn resolve_gate(
                         PendingActionApproval {
                             already_granted: false,
                             event: None,
-                            enable_always_after_success: false,
+                            enable_always: false,
                         },
                     )
                     .await
@@ -2332,7 +2353,7 @@ pub async fn resolve_gate(
                     PendingActionApproval {
                         already_granted: false,
                         event: None,
-                        enable_always_after_success: false,
+                        enable_always: false,
                     },
                 )
                 .await
@@ -6355,13 +6376,47 @@ mod tests {
             is_error: false,
             duration: std::time::Duration::ZERO,
         };
-        assert!(!action_result_earned_always("ssh", &result));
+        assert!(!action_allows_always_persistence("ssh", &result));
 
         let success = lunarwing_engine::ActionResult {
             output: serde_json::json!({"success": true, "exit_code": 0}),
             ..result
         };
-        assert!(action_result_earned_always("ssh", &success));
+        assert!(action_allows_always_persistence("ssh", &success));
+    }
+
+    #[test]
+    fn ssh_infra_error_does_not_earn_always() {
+        let result = lunarwing_engine::ActionResult {
+            call_id: "call-1".to_string(),
+            action_name: "ssh".to_string(),
+            output: serde_json::json!({"error": "connection refused"}),
+            is_error: true,
+            duration: std::time::Duration::ZERO,
+        };
+        assert!(!action_allows_always_persistence("ssh", &result));
+    }
+
+    /// Work item #70: an explicit "always" grant is tool-level and must
+    /// survive tool-level failures — otherwise "always" degrades to one-time
+    /// "yes" for flaky external tools such as the gitlab WASM tool.
+    #[test]
+    fn tool_level_error_still_allows_always_persistence() {
+        let result = lunarwing_engine::ActionResult {
+            call_id: "call-1".to_string(),
+            action_name: "gitlab".to_string(),
+            output: serde_json::json!({"error": "404 Issue Not Found"}),
+            is_error: true,
+            duration: std::time::Duration::ZERO,
+        };
+        assert!(action_allows_always_persistence("gitlab", &result));
+
+        let success = lunarwing_engine::ActionResult {
+            output: serde_json::json!({"items": []}),
+            is_error: false,
+            ..result
+        };
+        assert!(action_allows_always_persistence("gitlab", &success));
     }
 
     #[test]
