@@ -195,7 +195,12 @@ does **not** check that a key secret exists (keys may be uploaded later).
 The Rust daemon does **not** push credentials into workers, and the worker code
 paths (`orchestrator/external_worker.rs`, `tools/builtin/job.rs`,
 `context/state.rs`, `channels/wasm/wrapper.rs`) contain **no SSH code** at all.
-Injection is done entirely by `ic/scripts/lunarwing-mt-admin.sh`:
+Injection is done entirely by `ic/scripts/lunarwing-mt-admin.sh` (since the
+v2.0.8.0 refactor a thin composition root over `mt-admin-lib/NN-*.sh` — the
+socket pre-creation and daemon-first ordering live in
+`mt-admin-lib/04-tenant-lifecycle.sh`, the worker bind-mounts in
+`mt-admin-lib/09-worker-config.sh`, and the unit-level mounts in
+`mt-admin-lib/07-units-systemd.sh` / `08-units-openrc.sh`):
 
 1. **Pre-create** the socket path as a touch-file before the daemon starts, so
    podman doesn't materialize it as a directory.
@@ -384,5 +389,5 @@ integration test coverage remains an open gap.
 | Settings field | `ic/src/settings.rs` (`Settings.ssh`) |
 | Startup wiring | `ic/src/app.rs` (`AppComponents.ssh_bridge`) |
 | API mount | `ic/src/main.rs` |
-| Deployment / injection | `ic/scripts/lunarwing-mt-admin.sh` |
+| Deployment / injection | `ic/scripts/lunarwing-mt-admin.sh` + `ic/scripts/mt-admin-lib/{04-tenant-lifecycle,07-units-systemd,08-units-openrc,09-worker-config}.sh` |
 | Operator guide | `docs/ops/SSH-HARNESS-SETUP.md` |

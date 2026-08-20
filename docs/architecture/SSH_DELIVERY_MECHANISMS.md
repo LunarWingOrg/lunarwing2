@@ -52,7 +52,9 @@ set, so ordinary `git`/`ssh` inside the container authenticate through the
 daemon's agent. Keys stay in the daemon; the worker only gets signing capability
 via the socket.
 
-**How it's enabled.** `ic/scripts/lunarwing-mt-admin.sh` wires this: it
+**How it's enabled.** `ic/scripts/lunarwing-mt-admin.sh` wires this (post-split
+implementation in `mt-admin-lib/04-tenant-lifecycle.sh` and
+`mt-admin-lib/09-worker-config.sh`): it
 pre-creates the socket path, starts the daemon (which binds the real socket),
 then starts workers with `-v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e
 SSH_AUTH_SOCK=/tmp/ssh-agent.sock`. `<run_dir>` is
@@ -256,6 +258,6 @@ host and use `host_key_mode = "Strict"`. AcceptFirst is a convenience.
 | WASM `ssh-exec` host function + capability | `ic/src/tools/wasm/wrapper.rs`, `capabilities.rs`, `host.rs` |
 | WASM `ssh` guest | `ic/tools-src/ssh/` + `ic/registry/tools/ssh.json` |
 | WIT (`ssh-exec` import) | `ic/wit/tool.wit` |
-| Worker socket injection | `ic/scripts/lunarwing-mt-admin.sh` |
+| Worker socket injection | `ic/scripts/lunarwing-mt-admin.sh` + `ic/scripts/mt-admin-lib/{04-tenant-lifecycle,07-units-systemd,08-units-openrc,09-worker-config}.sh` |
 | Core design | [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) |
 | Operator setup | [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md) |

@@ -13,6 +13,13 @@ init-scan discovery). As of v1.1.9, `lunarwing-mt-admin.sh add-tenant` calls
 env file, and schedules the pipeline (systemd timer or OpenRC cron) in one step.
 It can be opted out with `--no-health`.
 
+> **v2.0.8.0 note (mt-admin refactor):** `ic/scripts/lunarwing-mt-admin.sh` is
+> now a thin composition root that sources `ic/scripts/mt-admin-lib/NN-*.sh`
+> modules. `ensure_health_pipeline()` lives in
+> `mt-admin-lib/12-health-pipeline.sh` and is invoked from `add_tenant()` in
+> `mt-admin-lib/04-tenant-lifecycle.sh`; the CLI surface described here is
+> unchanged.
+
 The watchdog installer (`install-lunarwing-watchdog.sh`) is a separate,
 manually-run host-level step focused on the **service-level watchdog** (restarts
 `lunarwing.service` if down). On systemd and OpenRC, it also copies the self-heal scripts into
@@ -115,19 +122,22 @@ documented in `ic-infrastructure-health-check/README.md`.
 
 `lunarwing-mt-admin.sh add-tenant <name>` calls `ensure_health_pipeline()` as
 the final step of tenant provisioning (unless `--no-health` is passed). The full
-`add_tenant()` flow:
+`add_tenant()` flow (`mt-admin-lib/04-tenant-lifecycle.sh`):
 
 1. Allocate a port block (registry)
 2. Create the tenant OS user
 3. Clone the tenant repo
-4. Write env/config files (vision / LunarWing / bridge / optional proxy and
-   DarkIRC / Gotify / external workers)
-5. Bootstrap the WeeChat relay, provision the SSH harness, and build the vision
-   sidecar image if it is missing
+4. Write env/config files (vision / voice / LunarWing / bridge / optional proxy
+   and DarkIRC / Gotify / external workers)
+5. Bootstrap the WeeChat relay, provision the SSH harness, optionally wire the
+   Study Notes MCP (`--with-study-mcp`), and build the vision sidecar image if
+   it is missing
 6. Start the per-tenant PostgreSQL container
 7. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
    `lunarwing-proxy-<name>`, weechat adapter, …)
-8. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
+8. On non-systemd inits, set up the pre-delegated cgroup v2 subtree (warn-only;
+   repairable later via `setup-cgroups`)
+9. **Call `ensure_health_pipeline()`** — installs + schedules the host-global
    health-check → self-heal pipeline (covers all tenants automatically).
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
