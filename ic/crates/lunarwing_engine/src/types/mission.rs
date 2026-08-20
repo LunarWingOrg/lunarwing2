@@ -368,7 +368,10 @@ mod tests {
         for i in 0..MAX_PROCESSED_TRIGGER_KEYS + 10 {
             mission.record_processed_trigger(format!("src:k{i}"));
         }
-        assert_eq!(mission.processed_trigger_keys.len(), MAX_PROCESSED_TRIGGER_KEYS);
+        assert_eq!(
+            mission.processed_trigger_keys.len(),
+            MAX_PROCESSED_TRIGGER_KEYS
+        );
         // Oldest keys evicted FIFO: "src:a" and k0..k9 are gone, k10 remains.
         assert!(!mission.has_processed_trigger("src:a"));
         assert!(!mission.has_processed_trigger("src:k9"));
