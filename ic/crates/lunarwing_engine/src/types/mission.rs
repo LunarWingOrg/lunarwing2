@@ -150,11 +150,47 @@ pub struct Mission {
     /// Injected into the thread's context so the code can access it.
     pub last_trigger_payload: Option<serde_json::Value>,
 
+    // ── Trigger dedup ──
+    /// Dedup keys of trigger payloads this mission has already processed
+    /// (see [`trigger_dedup_key`]). Persisted with the mission so re-delivered
+    /// events are skipped at trigger time — even across daemon restarts —
+    /// instead of spawning a duplicate thread (work item #69). Bounded to
+    /// [`MAX_PROCESSED_TRIGGER_KEYS`] with FIFO eviction.
+    #[serde(default)]
+    pub processed_trigger_keys: Vec<String>,
+
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// When the next thread should be spawned (for Cron cadence).
     pub next_fire_at: Option<DateTime<Utc>>,
+}
+
+/// Maximum number of processed trigger dedup keys retained per mission.
+/// Oldest keys are evicted FIFO once the cap is exceeded.
+pub const MAX_PROCESSED_TRIGGER_KEYS: usize = 512;
+
+/// Derive a stable dedup key from a mission trigger payload.
+///
+/// Event producers identify re-deliveries with `source_thread_id` (the thread
+/// whose completion emitted the event) and/or `content_hash` (a producer-chosen
+/// content identity). Returns `None` when the payload carries neither — such
+/// fires are never deduplicated (e.g. cron and manual fires pass no payload).
+pub fn trigger_dedup_key(payload: &serde_json::Value) -> Option<String> {
+    let source = payload
+        .get("source_thread_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let hash = payload
+        .get("content_hash")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    match (source, hash) {
+        (Some(source), Some(hash)) => Some(format!("src:{source}:{hash}")),
+        (Some(source), None) => Some(format!("src:{source}")),
+        (None, Some(hash)) => Some(format!("hash:{hash}")),
+        (None, None) => None,
+    }
 }
 
 impl Mission {
@@ -183,6 +219,7 @@ impl Mission {
             threads_today: 0,
             threads_today_date: Some(now.date_naive()),
             last_trigger_payload: None,
+            processed_trigger_keys: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             created_at: now,
             updated_at: now,
@@ -207,6 +244,24 @@ impl Mission {
     pub fn record_thread(&mut self, thread_id: ThreadId) {
         self.thread_history.push(thread_id);
         self.updated_at = Utc::now();
+    }
+
+    /// Whether a trigger payload with this dedup key was already processed.
+    pub fn has_processed_trigger(&self, key: &str) -> bool {
+        self.processed_trigger_keys.iter().any(|k| k == key)
+    }
+
+    /// Mark a trigger dedup key as processed, evicting the oldest keys once
+    /// [`MAX_PROCESSED_TRIGGER_KEYS`] is exceeded.
+    pub fn record_processed_trigger(&mut self, key: String) {
+        if self.has_processed_trigger(&key) {
+            return;
+        }
+        self.processed_trigger_keys.push(key);
+        if self.processed_trigger_keys.len() > MAX_PROCESSED_TRIGGER_KEYS {
+            let overflow = self.processed_trigger_keys.len() - MAX_PROCESSED_TRIGGER_KEYS;
+            self.processed_trigger_keys.drain(..overflow);
+        }
     }
 
     /// Whether the mission is in a terminal state.
@@ -239,6 +294,85 @@ mod tests {
 
         let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
         assert_eq!(restored.threads_today_date, None);
+    }
+
+    #[test]
+    fn legacy_mission_without_processed_trigger_keys_still_deserializes() {
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(mission).expect("serialize mission");
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .remove("processed_trigger_keys");
+
+        let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
+        assert!(restored.processed_trigger_keys.is_empty());
+    }
+
+    #[test]
+    fn trigger_dedup_key_combinations() {
+        assert_eq!(
+            trigger_dedup_key(&serde_json::json!({
+                "source_thread_id": "3bfdad4f",
+                "content_hash": "abc123",
+            })),
+            Some("src:3bfdad4f:abc123".to_string())
+        );
+        assert_eq!(
+            trigger_dedup_key(&serde_json::json!({"source_thread_id": "3bfdad4f"})),
+            Some("src:3bfdad4f".to_string())
+        );
+        assert_eq!(
+            trigger_dedup_key(&serde_json::json!({"content_hash": "abc123"})),
+            Some("hash:abc123".to_string())
+        );
+        // Empty strings and missing fields yield no key — never dedup those.
+        assert_eq!(
+            trigger_dedup_key(&serde_json::json!({
+                "source_thread_id": "",
+                "content_hash": "",
+            })),
+            None
+        );
+        assert_eq!(trigger_dedup_key(&serde_json::json!({"goal": "x"})), None);
+        // Non-string values are ignored rather than stringified.
+        assert_eq!(
+            trigger_dedup_key(&serde_json::json!({"source_thread_id": 42})),
+            None
+        );
+    }
+
+    #[test]
+    fn processed_trigger_keys_are_deduped_and_bounded() {
+        let mut mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "dedup",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        assert!(!mission.has_processed_trigger("src:a"));
+
+        mission.record_processed_trigger("src:a".to_string());
+        assert!(mission.has_processed_trigger("src:a"));
+        // Re-recording the same key does not grow the set.
+        mission.record_processed_trigger("src:a".to_string());
+        assert_eq!(mission.processed_trigger_keys.len(), 1);
+
+        for i in 0..MAX_PROCESSED_TRIGGER_KEYS + 10 {
+            mission.record_processed_trigger(format!("src:k{i}"));
+        }
+        assert_eq!(mission.processed_trigger_keys.len(), MAX_PROCESSED_TRIGGER_KEYS);
+        // Oldest keys evicted FIFO: "src:a" and k0..k9 are gone, k10 remains.
+        assert!(!mission.has_processed_trigger("src:a"));
+        assert!(!mission.has_processed_trigger("src:k9"));
+        assert!(mission.has_processed_trigger("src:k10"));
     }
 
     #[test]
