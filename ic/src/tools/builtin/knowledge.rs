@@ -16,7 +16,7 @@ use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
     KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta,
     KnowledgeNoteRow, KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES,
-    MAX_SLUG_BYTES, MAX_STATUS_REASON_BYTES, MAX_STALE_AFTER_DAYS, MAX_TAG_BYTES, MAX_TAGS,
+    MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS,
     MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown, summarize_topics,
 };
 
@@ -334,9 +334,9 @@ fn optional_confidence_param(
     match params.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(value) => {
-            let confidence = value.as_f64().ok_or_else(|| {
-                ToolError::InvalidParameters(format!("{key} must be a number"))
-            })?;
+            let confidence = value
+                .as_f64()
+                .ok_or_else(|| ToolError::InvalidParameters(format!("{key} must be a number")))?;
             if !(0.0..=1.0).contains(&confidence) {
                 return Err(ToolError::InvalidParameters(format!(
                     "{key} must be between 0.0 and 1.0"
@@ -1333,9 +1333,10 @@ impl Tool for KnowledgeUpdateStatusTool {
             }
             other => ToolError::ExecutionFailed(format!("Knowledge read failed: {other}")),
         })?;
-        let mut meta = KnowledgeNoteMeta::from_metadata_json(&document.metadata).ok_or_else(|| {
-            ToolError::InvalidParameters(format!("document '{path}' is not a study note"))
-        })?;
+        let mut meta =
+            KnowledgeNoteMeta::from_metadata_json(&document.metadata).ok_or_else(|| {
+                ToolError::InvalidParameters(format!("document '{path}' is not a study note"))
+            })?;
         apply_status_update(&mut meta, update)?;
         workspace
             .set_document_metadata(&path, &meta.to_metadata_json())
@@ -1603,7 +1604,10 @@ mod tests {
         });
         let parsed = validate_submission(&params).unwrap();
         assert_eq!(parsed.meta.status, KnowledgeStatus::Superseded);
-        assert_eq!(parsed.meta.superseded_by.as_deref(), Some("memory-search-v2"));
+        assert_eq!(
+            parsed.meta.superseded_by.as_deref(),
+            Some("memory-search-v2")
+        );
         assert_eq!(parsed.meta.stale_after_days, Some(45));
         assert_eq!(
             parsed.meta.status_reason.as_deref(),
@@ -1652,13 +1656,19 @@ mod tests {
         );
         // Min-confidence filter parsing.
         assert_eq!(
-            optional_confidence_param(&serde_json::json!({"min_confidence": 0.5}), "min_confidence")
-                .unwrap(),
+            optional_confidence_param(
+                &serde_json::json!({"min_confidence": 0.5}),
+                "min_confidence"
+            )
+            .unwrap(),
             Some(0.5)
         );
         assert!(
-            optional_confidence_param(&serde_json::json!({"min_confidence": 1.5}), "min_confidence")
-                .is_err()
+            optional_confidence_param(
+                &serde_json::json!({"min_confidence": 1.5}),
+                "min_confidence"
+            )
+            .is_err()
         );
     }
 

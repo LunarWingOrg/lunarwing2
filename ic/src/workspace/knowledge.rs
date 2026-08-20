@@ -422,7 +422,10 @@ pub fn summarize_topics(
         std::collections::BTreeMap::new();
     for row in rows {
         let topic = row.meta.topic.as_str();
-        if needle.as_ref().is_some_and(|needle| !topic.contains(needle)) {
+        if needle
+            .as_ref()
+            .is_some_and(|needle| !topic.contains(needle))
+        {
             continue;
         }
         let summary = by_topic
@@ -649,7 +652,10 @@ mod tests {
             memory.scopes,
             vec!["alice".to_string(), "shared".to_string()]
         );
-        assert_eq!(memory.agents, vec!["kimi-1".to_string(), "kimi-2".to_string()]);
+        assert_eq!(
+            memory.agents,
+            vec!["kimi-1".to_string(), "kimi-2".to_string()]
+        );
         assert_eq!(
             memory.statuses,
             vec!["active".to_string(), "needs-verification".to_string()]
