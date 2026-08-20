@@ -37,7 +37,8 @@ use crate::hooks::hook::{
 };
 use crate::workspace::{
     KnowledgeNoteMeta, KnowledgeStatus, MAX_CONTENT_BYTES, MAX_SLUG_BYTES, MAX_TITLE_BYTES,
-    Workspace, is_valid_slug, note_path, render_note_markdown,
+    WIRE_AGENT_PREFIX, Workspace, is_incomplete_wire_write, is_valid_slug, note_path,
+    render_wire_note_markdown,
 };
 
 /// Coordination tag carrying a shareable finding.
@@ -45,12 +46,15 @@ pub const KNOWLEDGE_SHARE_TAG: &str = "KNOW";
 
 /// Tag attached to wire-ingested study notes.
 const COORDINATION_TAG: &str = "coordination";
-/// Namespace preventing wire notes from overwriting native agent versions.
-const WIRE_AGENT_PREFIX: &str = "coord";
 /// Readable fallback for sender IDs with no slug-compatible characters.
 const FALLBACK_AGENT_SLUG: &str = "remote";
 /// Hex characters retained from the sender digest (96 bits).
 const SENDER_HASH_HEX_LEN: usize = 24;
+/// Number of per-path ingest lock stripes. Writes to the same note path
+/// always serialize; writes to different paths land on independent stripes
+/// and proceed concurrently, so one busy room no longer queues every KNOW
+/// write behind a single daemon-wide mutex.
+const INGEST_LOCK_STRIPES: usize = 64;
 /// Ingestion rate-limit window.
 const INGEST_WINDOW: Duration = Duration::from_secs(3600);
 /// Default maximum ingested notes per sender per hour.
@@ -297,14 +301,15 @@ fn wire_note_owned_by(
     })
 }
 
-/// Detect a note stranded between the content and metadata commits of an
-/// earlier cancelled ingest: study-note provenance is missing, but the body
-/// carries the `KNOW:` wire title header only this pipeline writes. Because
-/// the path embeds the sender's agent slug, a stranded path is reachable
-/// only by that same sender's next share, which repairs it.
-fn incomplete_wire_write(document: &crate::workspace::MemoryDocument) -> bool {
-    KnowledgeNoteMeta::from_metadata_json(&document.metadata).is_none()
-        && document.content.starts_with("# KNOW: ")
+/// Map a note path to its ingest lock stripe. FNV-1a: cheap and fully
+/// deterministic; striping only needs consistency within this process.
+fn ingest_stripe(path: &str) -> usize {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (hash as usize) % INGEST_LOCK_STRIPES
 }
 
 /// Priority 13 — ingest `KNOW:` shares from coordination channels into the
@@ -315,10 +320,12 @@ pub struct KnowledgeShareHook {
     workspace: Arc<Workspace>,
     limits: KnowledgeShareLimits,
     max_message_chars: usize,
-    /// Serializes write-then-metadata pairs so two concurrent shares cannot
-    /// interleave into mismatched content/metadata states. Shared with the
-    /// detached ingest tasks, which outlive individual hook executions.
-    ingest_lock: Arc<Mutex<()>>,
+    /// Per-path striped locks serializing write-then-metadata pairs so two
+    /// concurrent shares for the same note cannot interleave into mismatched
+    /// content/metadata states, while shares for different paths proceed
+    /// concurrently. Shared with the detached ingest tasks, which outlive
+    /// individual hook executions.
+    ingest_locks: Arc<Vec<Mutex<()>>>,
     /// Daemon-wide ingress window, independent of per-sender buckets.
     global_window: Arc<Mutex<Vec<Instant>>>,
     global_max_per_hour: usize,
@@ -336,7 +343,7 @@ impl KnowledgeShareHook {
             workspace,
             limits,
             max_message_chars: DEFAULT_MAX_MESSAGE_LENGTH,
-            ingest_lock: Arc::new(Mutex::new(())),
+            ingest_locks: Arc::new((0..INGEST_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             global_window: Arc::new(Mutex::new(Vec::new())),
             global_max_per_hour: global_max_per_hour_from_env(),
         }
@@ -392,22 +399,26 @@ impl KnowledgeShareHook {
     /// Runs as a detached task (see [`Hook::execute`]) so the registry's
     /// hook deadline can never cancel it between the content and metadata
     /// commits. Should a crash or shutdown still strand a note between the
-    /// two commits, the preflight below recognizes it and the next share for
-    /// that sender/topic repairs the path instead of wedging it behind an
-    /// ownership refusal.
+    /// two commits, the preflight below recognizes it via the wire sentinel
+    /// (see [`is_incomplete_wire_write`]) and the next share for that
+    /// sender/topic repairs the path instead of wedging it behind an
+    /// ownership refusal. Stranded notes whose sender never shares again are
+    /// reaped by the periodic knowledge sweep.
     async fn ingest(
         workspace: Arc<Workspace>,
-        ingest_lock: Arc<Mutex<()>>,
+        ingest_locks: Arc<Vec<Mutex<()>>>,
         message: &KnowledgeShareMessage,
         sender: &str,
     ) {
-        let _guard = ingest_lock.lock().await;
         let agent = sender_agent_slug(sender);
         let path = note_path(&agent, &message.topic);
+        // Only same-path writes must serialize; the stripe lock keeps
+        // unrelated paths (other senders/topics) fully concurrent.
+        let _guard = ingest_locks[ingest_stripe(&path)].lock().await;
         let previous = match workspace.read_primary(&path).await {
             Ok(document) => {
                 let owned = wire_note_owned_by(&document.metadata, sender, &agent, &message.topic);
-                if !owned && !incomplete_wire_write(&document) {
+                if !owned && !is_incomplete_wire_write(&document.metadata, &document.content) {
                     tracing::warn!(%path, sender, "coordination knowledge path ownership mismatch");
                     return;
                 }
@@ -432,7 +443,7 @@ impl KnowledgeShareHook {
             submitted_by: Some(sender.to_string()),
             session_id: None,
         };
-        let markdown = render_note_markdown(&meta.title, &message.content);
+        let markdown = render_wire_note_markdown(&meta.title, &message.content);
         if previous.as_ref().is_some_and(|document| {
             document.content == markdown && document.metadata == meta.to_metadata_json()
         }) {
@@ -539,11 +550,11 @@ impl Hook for KnowledgeShareHook {
         // drop between the content and metadata commits would strand the
         // note. The ingest task runs to completion on its own budget.
         let workspace = Arc::clone(&self.workspace);
-        let ingest_lock = Arc::clone(&self.ingest_lock);
+        let ingest_locks = Arc::clone(&self.ingest_locks);
         let message = message.clone();
         let sender = sender.to_string();
         tokio::spawn(async move {
-            Self::ingest(workspace, ingest_lock, &message, &sender).await;
+            Self::ingest(workspace, ingest_locks, &message, &sender).await;
         });
         Ok(HookOutcome::ok())
     }
@@ -793,6 +804,20 @@ mod tests {
             assert_eq!(meta.tags, vec![COORDINATION_TAG.to_string()]);
             assert!(meta.confidence.is_none());
 
+            // The stored body carries the hard wire sentinel from the first
+            // content commit (stranded-write detection, sweep eligibility),
+            // and the completed note no longer reads as stranded.
+            let document = workspace
+                .read_primary(&note_path(&meta.agent, "mt-admin-cgroups"))
+                .await
+                .expect("read ingested note");
+            assert!(
+                document
+                    .content
+                    .starts_with(crate::workspace::WIRE_NOTE_SENTINEL)
+            );
+            assert!(!is_incomplete_wire_write(&document.metadata, &document.content));
+
             let hits = workspace
                 .knowledge_search(
                     &["shared".to_string()],
@@ -951,7 +976,8 @@ mod tests {
                 submitted_by: Some("different-owner".to_string()),
                 session_id: None,
             };
-            let original = render_note_markdown("Foreign note", "verified local content");
+            let original =
+                crate::workspace::render_note_markdown("Foreign note", "verified local content");
             workspace
                 .write(&path, &original)
                 .await
@@ -1070,12 +1096,14 @@ mod tests {
             workspace
                 .write(
                     &path,
-                    &render_note_markdown(&stranded_title, "stranded finding"),
+                    &render_wire_note_markdown(&stranded_title, "stranded finding"),
                 )
                 .await
                 .expect("strand note");
-            assert!(incomplete_wire_write(
-                &workspace.read_primary(&path).await.expect("read stranded")
+            let stranded_doc = workspace.read_primary(&path).await.expect("read stranded");
+            assert!(is_incomplete_wire_write(
+                &stranded_doc.metadata,
+                &stranded_doc.content
             ));
 
             hook.execute(
@@ -1243,6 +1271,49 @@ mod tests {
                     .is_none()
             );
             assert_eq!(hook.global_window.lock().await.len(), 1);
+        }
+
+        /// The daemon-wide budget is a hard admission guarantee: the
+        /// check-and-insert runs under one lock, so concurrent hook
+        /// executions cannot both slip past it. 50 racing admissions for a
+        /// budget of 5 must admit exactly 5.
+        #[tokio::test]
+        async fn global_limit_admission_is_atomic_under_concurrency() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let hook = Arc::new(
+                hook(
+                    Arc::clone(&workspace),
+                    KnowledgeShareLimits {
+                        max_per_hour: 100,
+                        publishers: vec!["burst".to_string()],
+                        ..KnowledgeShareLimits::default()
+                    },
+                )
+                .with_global_max_per_hour(5),
+            );
+
+            let mut handles = Vec::new();
+            for index in 0..50 {
+                let hook = Arc::clone(&hook);
+                handles.push(tokio::spawn(async move {
+                    hook.execute(
+                        &inbound(
+                            &format!("KNOW: burst-{index} | concurrent admission probe finding"),
+                            Some("burst"),
+                        ),
+                        &Default::default(),
+                    )
+                    .await
+                }));
+            }
+            for handle in handles {
+                handle
+                    .await
+                    .expect("spawn panicked")
+                    .expect("fail-open hook");
+            }
+            assert_eq!(hook.global_window.lock().await.len(), 5);
         }
 
         #[tokio::test]
