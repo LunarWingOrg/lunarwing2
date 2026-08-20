@@ -49,8 +49,9 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - XMPP file attachments via XEP-0363 HTTP File Upload
 - WeeChat buffer restoration across service restarts and clean reboots
-- MCP runtimes for HTTP/HTTPS, Unix sockets, host-local stdio, persistent WASM components, separately deployed dedicated/shared gateways, and explicitly selected core Docker job workers
+- MCP runtimes for HTTP/HTTPS, Unix sockets, host-local stdio, persistent WASM components, separately deployed dedicated/shared gateways, explicitly selected core Docker job workers, and operator-described external runtimes
 - MCP artifact pinning for host stdio/WASM, optional OS sandboxing for host stdio, bounded stdio/WASM crash recovery, and owner- or job-scoped credential grants
+- MCP marketplace trust stack: ed25519 publisher signatures, signed dependency lockfiles, and signed revocation lists, enforced fail-closed on config load and activation once configured
 - Optional [LunarVoice](projects/voice-sidecar/README.md) local ONNX speech processing with Whisper or Parakeet-TDT STT, Kokoro TTS, and Silero VAD
 - Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
 - Persistent Pebble, OpenCode, and Kimi Code worker containers
@@ -61,21 +62,23 @@ DarkIRC is opt-in. It is not rendered or built for a new tenant unless the opera
 
 LunarWing connects to Model Context Protocol (MCP) servers through explicit operator-managed lifecycle actions (install, activate, authenticate, update, remove) available from the CLI, the browser settings UI, the authenticated API, and conversational flows.
 
-MCP-over-WASM servers run as one persistent sandboxed component actor per server. The guest communicates over a raw JSON-RPC WIT boundary with no WASI or host imports, so it has no ambient access to the filesystem, network, or process environment. Artifacts load through a single-open path with optional operator-pinned digest verification, and execution is bounded by memory, fuel, wall-time, and message-size limits. A trapped component is rebuilt or replaced within bounded jittered retries and a circuit breaker. The transport is deliberately synchronous client-to-server tool calls only — server-initiated requests, resources, prompts, and subscriptions are not exposed — and the negotiated protocol revision is exactly `2024-11-05`.
+MCP-over-WASM servers run as one persistent sandboxed component actor per server. The guest communicates over a raw JSON-RPC WIT boundary with no WASI or host imports, so it has no ambient access to the filesystem, network, or process environment. Artifacts load through a single-open path with optional operator-pinned digest verification, and execution is bounded by memory, fuel, wall-time, and message-size limits. A trapped component is rebuilt or replaced within bounded jittered retries and a circuit breaker. The transport is deliberately synchronous client-to-server tool calls only — server-initiated requests, resources, prompts, and subscriptions are not exposed — and the client negotiates protocol revision `2024-11-05`, also accepting `2025-03-26` from servers that answer it.
 
-Host-local stdio servers get defense in depth as well: optional OS sandboxing applies resource limits, core-dump control, process-group isolation, `no_new_privileges`, seccomp denial of ptrace/process_vm, a Landlock read-only root, and network-namespace isolation. On Linux, pinned stdio servers execute verified sealed bytes atomically through `memfd` + `execveat`. Secret references stay owner- or job-scoped, and worker children receive scrubbed environments.
+Host-local stdio servers get defense in depth as well: optional OS sandboxing applies resource limits, core-dump control, process-group isolation, `no_new_privileges`, seccomp denial of ptrace/process_vm, a Landlock read-only root, and network-namespace isolation. On Linux, pinned stdio servers execute verified sealed bytes atomically through `memfd` + `execveat`. Secret references stay owner- or job-scoped, and worker children receive scrubbed environments. Mandatory sandbox profiles can be required across all servers with legacy opt-in behavior preserved as the default.
 
-Automatic npm/pip package installation remains disabled by design until provenance, dependency locking, containment, and revocation policies exist. Details and current scope: [MCP overall status](docs/ops/MCP_OVERALL_STATUS.md) and [MCP additions](docs/ops/MCP_ADDITIONS.md).
+An optional marketplace trust stack gates MCP packages at the checkpoint: ed25519 publisher signatures over canonical manifests, signed lockfiles pinning exact versions and digests, and signed revocation lists with monotonic sequence numbers. Once the `marketplace` section of `mcp-servers.json` is populated, revoked packages and corrupt trust stores fail closed at config load and at every activation. A bundled gateway can front MCP servers with SSE streaming passthrough and an optional loopback-only control plane, and generic external runtime descriptors can be registered via `lunarwing mcp add --transport external` with pinned provenance digests verified by the adapter.
+
+Automatic npm/pip package installation remains disabled by design. The provenance, dependency-locking, containment, and revocation primitives now ship and are enforced when configured, but there is no signed-package marketplace install/upgrade CLI yet — catalog installation stays manual. Details and current scope: [MCP overall status](docs/ops/MCP_OVERALL_STATUS.md) and [MCP additions](docs/ops/MCP_ADDITIONS.md).
 
 ### Memory, lorebooks, and learning
 
 LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
 
-The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) gives agents provenance-aware tools to search, compare, submit, and identify stale source-verified findings. Per-agent versions remain distinct, lifecycle metadata is preserved, and notes migrate with the tenant workspace.
+The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) gives agents provenance-aware tools to search, compare, submit, and identify stale source-verified findings. All seven canonical tools ship natively with per-note staleness thresholds and lifecycle metadata, per-agent versions remain distinct, and notes migrate with the tenant workspace. Multi-tenant hosts can auto-provision every new tenant with a read-only, always-current study-notes MCP server via `add-tenant --with-study-mcp`.
 
 Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Lorebooks are disabled by default (`LOREBOOK_ENABLED=true` opts in) because activation scanning is computationally expensive. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
 
-Skills add reusable prompt-driven capabilities. Optional self-improvement missions can extract reusable skill documents from completed threads, while skill patches and removals remain proposals until a user approves them.
+Skills add reusable prompt-driven capabilities. Optional self-improvement missions can extract reusable skill documents from completed threads, while skill patches and removals remain proposals until a user approves them. Setting `SKILL_SELF_IMPROVEMENT=0` fully disables the skill-learning missions, and mission triggers are deduplicated so daemon restarts never re-fire stale work.
 
 ### Automation, coordination, and health
 
@@ -83,7 +86,9 @@ The optional reflex compiler detects recurring prompts and compiles them into WA
 
 An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds tagged-message policy, secret detection, engagement and first-responder controls, rate limiting, violation-based disabling, and outbound coalescing for designated XMPP or IRC rooms. It is disabled unless explicitly configured.
 
-The included [infrastructure health system](ic-infrastructure-health-check/README.md) aggregates service and dependency checks and can remediate unhealthy services with grace periods, exponential backoff, flapping protection, and post-restart verification. Its multi-tenant service and port discovery supports both systemd and OpenRC.
+Cross-tenant knowledge sharing builds on that pipeline: opted-in tenants can propagate durable `KNOW: <topic> | <finding>` findings into every watching tenant's shared study-notes scope as `needs-verification`, behind publisher allowlists and per-sender ingest budgets. It is off by default and older daemons ignore the records safely.
+
+The included [infrastructure health system](ic-infrastructure-health-check/README.md) aggregates service and dependency checks and can remediate unhealthy services with grace periods, exponential backoff, flapping protection, and post-restart verification. Its multi-tenant service and port discovery supports both systemd and OpenRC. A Prometheus textfile exporter turns every health run into metrics — with a graduated warn/crit early-warning threshold layer and deduplicated Gotify notifications — and an optional loopback-only listener can serve the exposition behind the host-global `health_metrics` port-registry slot.
 
 The optional LunarVision OCR and LunarVoice speech sidecars follow the same supervision contract on both init systems: health-gated starts against dedicated operational listeners, launch-contract tracking that recreates drifted containers instead of blindly restarting them, and crash-supervisor units.
 
