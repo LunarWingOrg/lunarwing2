@@ -440,6 +440,8 @@ impl KnowledgeShareHook {
             source_commit: None,
             tags: vec![COORDINATION_TAG.to_string()],
             superseded_by: None,
+            stale_after_days: None,
+            status_reason: None,
             submitted_by: Some(sender.to_string()),
             session_id: None,
         };
@@ -976,6 +978,8 @@ mod tests {
                 source_commit: Some("verified".to_string()),
                 tags: vec!["local".to_string()],
                 superseded_by: None,
+                stale_after_days: None,
+                status_reason: None,
                 submitted_by: Some("different-owner".to_string()),
                 session_id: None,
             };

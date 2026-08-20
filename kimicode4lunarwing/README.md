@@ -75,7 +75,7 @@ turn. Set `wait: true` only for short tasks that must return synchronously.
 
 ## Health Endpoints
 
-- `GET /health` — Worker status, uptime, version
+- `GET /health` — Worker status, uptime, version, pinned `kimi_code_version`
 - `GET /ready` — WebSocket readiness and connection count
 
 ## Protocol
@@ -88,7 +88,7 @@ See `.env.example` for the full list with descriptions.
 
 ## How It Works
 
-The worker does not run a Kimi Code headless server (unlike the opencode worker which runs a persistent server). Instead, each task spawns a fresh `kimi -p <prompt> --output-format stream-json --yolo` subprocess:
+The worker does not run a Kimi Code headless server (unlike the opencode worker which runs a persistent server). Instead, each task spawns a fresh `kimi -p <prompt> --output-format stream-json` subprocess (no `--yolo` — the CLI rejects it in combination with `-p`; auto-approval comes from `default_permission_mode = "yolo"` in the baked `config/config.toml`):
 
 1. The bridge receives a `task_request` envelope from LunarWing.
 2. The executor spawns `kimi -p` with the assembled prompt (including bounded untrusted history).

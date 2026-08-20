@@ -204,6 +204,7 @@ tail -f /home/luna1/lunarwing/logs/lunarwing.log
 
 - Gentoo/OpenRC sister guide: [`guide-for-spin-up-gentoo-tenants.md`](guide-for-spin-up-gentoo-tenants.md)
 - Arch Linux sister guide: [`guide-for-spin-up-arch-tenants.md`](guide-for-spin-up-arch-tenants.md)
+- Debian/Ubuntu sister guide: [`guide-for-spin-up-debian-ubuntu-tenants.md`](guide-for-spin-up-debian-ubuntu-tenants.md)
 - Fedora host package list (full dependency tables): [`../guides/FEDORA_PACKAGE_LIST.md`](../guides/FEDORA_PACKAGE_LIST.md)
 - Production reference: [`MULTITENANCY-PRODUCTION.md`](MULTITENANCY-PRODUCTION.md)
 - Admin quickstart: [`../guides/MT-ADMIN-QUICKSTART.md`](../guides/MT-ADMIN-QUICKSTART.md)

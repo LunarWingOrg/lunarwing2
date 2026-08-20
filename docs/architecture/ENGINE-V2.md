@@ -6,7 +6,8 @@ Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
 present in `ENGINE_V2_CHANNELS` (case-insensitive exact matching). Multi-tenant
-provisioning (`ic/scripts/lunarwing-mt-admin.sh`) writes `ENGINE_V2=true` and
+provisioning (`ic/scripts/lunarwing-mt-admin.sh`, env generation in
+`mt-admin-lib/06-env-generation.sh`) writes `ENGINE_V2=true` and
 `ENGINE_V2_CHANNELS=xmpp,weechat,darkirc` into new tenant envs by default and
 preserves existing tenant values across upgrade/rebuild/re-render.
 
@@ -287,13 +288,16 @@ mission stays Active and resumes spawning at the next UTC day rather than
 going terminal. `mission_fire` reports the precise reason when nothing fires
 (terminal, paused, or budget exhausted).
 
-`MissionManager::ensure_learning_missions()` provisions three baseline missions
-and, when `SKILL_SELF_IMPROVEMENT=true`, two additional skill-improvement
+`MissionManager::ensure_learning_missions()` provisions two baseline missions
+and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.
 These system-managed missions are recurring: one successful event run cannot
 mark them complete. Startup reconciliation repairs older terminal records and
 refreshes their compiled prompt, cadence, success criteria, and daily budget
-while preserving operator pauses and mission history.
+while preserving operator pauses and mission history. When the
+`SKILL_SELF_IMPROVEMENT` gate is off, the gated missions are paused with a
+gate-driven marker; re-enabling the toggle resumes exactly those missions,
+while missions paused by an operator stay paused.
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -302,6 +306,14 @@ while normal terminal cleanup removes it. Conversation-insight cadence is
 tracked per project and user, preventing one user's completions from advancing
 another user's mission.
 
+Trigger payloads are deduplicated at fire time: a payload carrying a
+`source_thread_id` and/or `content_hash` that the mission has already processed
+spawns no thread and consumes no daily budget. The processed-key set is
+persisted on the mission (FIFO-bounded to 512 keys), so re-delivered events are
+skipped even across daemon restarts (work item #69). The conversation-insights
+listener keys each batch by project and completed-thread count so a restart
+(which resets the in-memory counter) does not re-fire stale batches.
+
 ### Error Diagnosis (`self-improvement`)
 
 - **Trigger**: fires when a thread completes with actionable Warning/Error trace
@@ -309,9 +321,10 @@ another user's mission.
   budget.
 - **Action**: diagnoses root cause and applies prompt overlays or orchestrator patches
 
-### Skill Extraction (`skill-extraction`)
+### Skill Extraction (`skill-extraction`, feature-gated)
 
-- **Trigger**: fires when a thread succeeds with 5+ steps and 3+ tool actions
+- **Trigger**: fires when a thread succeeds with 5+ steps and 3+ tool actions,
+  and only when `SKILL_SELF_IMPROVEMENT=true`
 - **Action**: extracts reusable skills with activation metadata, evidence-backed
   optional CodeAct snippets, and domain tags. The bounded trigger summary cannot
   be expanded into invented commands, arguments, outputs, regexes, or snippets.
@@ -335,8 +348,10 @@ another user's mission.
 - **Action**: identifies confidently dead or quarantined skills and stages
   user-approved prune/archive proposals
 
-`self-improvement` is also feature-gated. With the flag disabled, skill usage
-tracking, automatic demotion, patch proposals, and prune proposals are inert.
+`self-improvement`, `skill-extraction`, and `skill-maintenance` are all
+feature-gated. With the flag disabled, those missions are paused (and resume on
+re-enable unless an operator paused them), and skill usage tracking, automatic
+demotion, patch proposals, and prune proposals are inert.
 
 Capability leases are revoked in memory and persistence when their owning thread
 reaches `Done` or `Failed`. Startup cleanup also reconciles valid leases left by
@@ -409,7 +424,7 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 33 CRUD methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 30 Store-trait methods for threads, steps, events, projects, docs, leases, missions, conversations
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
@@ -542,7 +557,9 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 # Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
 # (existing tenant values preserved on re-render; ENGINE_V2=false or
 #  ENGINE_V2_CHANNELS=none opts out durably)
-SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle
+SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
+                               # self-improvement/skill-extraction/skill-maintenance
+                               # missions (paused while off, resumed on re-enable)
 ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
 ```
 

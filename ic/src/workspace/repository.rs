@@ -985,6 +985,7 @@ impl Repository {
         } else {
             Some(filter.tags.clone())
         };
+        let min_confidence = filter.min_confidence.map(f64::from);
         let rows = conn
             .query(
                 r#"
@@ -1003,7 +1004,8 @@ impl Repository {
                       AND ($4::text IS NULL OR d.metadata ->> 'topic' = $4)
                       AND ($5::text IS NULL OR d.metadata ->> 'agent' = $5)
                       AND ($6::text IS NULL OR d.metadata ->> 'status' = $6)
-                      AND ($7::text[] IS NULL OR d.metadata -> 'tags' ?| $7)
+                      AND ($7::text[] IS NULL OR d.metadata -> 'tags' ?& $7)
+                      AND ($9::float8 IS NULL OR (d.metadata ->> 'confidence')::float8 >= $9)
                     ORDER BY d.id, rank DESC
                 ) hits
                 ORDER BY rank DESC
@@ -1018,6 +1020,7 @@ impl Repository {
                     &status,
                     &tags,
                     &(limit as i64),
+                    &min_confidence,
                 ],
             )
             .await

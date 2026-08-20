@@ -2,7 +2,7 @@
 
 > **Current status (2026-08-19): LANDED — v2.0.8.0, goals item #9
 > (rarity/kimi-9-20260819-0601).** The monolith (13,628 lines) was split into
-> a thin composition root (1,263 lines: constants, loader, `usage()`,
+> a thin composition root (1,264 lines: constants, loader, `usage()`,
 > `main()`) plus fourteen sourced libraries under `ic/scripts/mt-admin-lib/`
 > (`00-common`, `01-detect`, `02-containers`, `03-ports-registry`,
 > `04-tenant-lifecycle`, `05-tenant-build`, `06-env-generation`,

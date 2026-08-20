@@ -369,6 +369,8 @@ mod tests {
                 source_commit: Some("commit-a".to_string()),
                 tags: Vec::new(),
                 superseded_by: None,
+                stale_after_days: None,
+                status_reason: None,
                 submitted_by: None,
                 session_id: None,
             };
@@ -531,6 +533,8 @@ mod tests {
                 source_commit: None,
                 tags: vec!["coordination".to_string()],
                 superseded_by: None,
+                stale_after_days: None,
+                status_reason: None,
                 submitted_by: Some("room@conf/alice".to_string()),
                 session_id: None,
             };

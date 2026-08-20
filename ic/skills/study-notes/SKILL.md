@@ -1,6 +1,6 @@
 ---
 name: study-notes
-version: 3.0.0
+version: 3.1.0
 description: Search shared LunarWing codebase-study notes before broad exploration
 activation:
   keywords:
@@ -57,17 +57,28 @@ only when the user requested recording or maintaining shared notes.
 - Use `status="needs-verification"` for unresolved findings; use `active` only
   for findings verified against current source in this session.
 - Include `source_commit`, `confidence`, and lowercase `tags` when known.
+- `stale_after_days` sets a per-note staleness threshold (default 90 days);
+  `status_reason` records why a lifecycle status was chosen.
+- Adjust lifecycle later with `knowledge_update_status` — metadata only
+  (status, confidence, tags, studied timestamp, source commit, staleness
+  threshold, status reason, supersession). Content changes always go through
+  `knowledge_submit_note` with `replace=true`.
 
 ## Tools
 
 - `knowledge_search`: Ranked PostgreSQL FTS over study-note chunks with
-  topic/agent/status/tags filters; covers private + shared scopes by default.
+  topic/agent/status/min-confidence filters and every-listed-tag matching;
+  covers private + shared scopes by default.
 - `knowledge_get_topic`: All per-agent versions of one topic with content and
   provenance.
+- `knowledge_list_topics`: Topic coverage survey — per-topic version counts,
+  scopes, agents, statuses, and tags.
 - `knowledge_submit_note`: Validated note creation/replacement (native write
   path; no external MCP required).
-- `knowledge_list_stale`: Notes needing verification by status, age, or source
-  commit.
+- `knowledge_update_status`: Metadata-only lifecycle updates on an existing
+  note version; `superseded` requires `superseded_by`.
+- `knowledge_list_stale`: Notes needing verification by status, age (explicit
+  limit or the note's own `stale_after_days`), or source commit.
 - `knowledge_stats`: Store totals, lifecycle status counts, per-scope counts.
 
 ## Search patterns

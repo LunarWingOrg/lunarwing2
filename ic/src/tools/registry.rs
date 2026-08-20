@@ -20,11 +20,12 @@ use crate::tools::builder::{
 use crate::tools::builtin::{
     ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
     JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, KnowledgeGetTopicTool,
-    KnowledgeListStaleTool, KnowledgeSearchTool, KnowledgeStatsTool, KnowledgeSubmitNoteTool,
-    ListDirTool, ListJobsTool, MemoryReadTool, MemorySearchTool, MemoryTreeTool, MemoryWriteTool,
-    PromptQueue, ReadFileTool, ShellTool, SkillInstallTool, SkillListTool, SkillRemoveTool,
-    SkillSearchTool, TimeTool, ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool,
-    ToolListTool, ToolRemoveTool, ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
+    KnowledgeListStaleTool, KnowledgeListTopicsTool, KnowledgeSearchTool, KnowledgeStatsTool,
+    KnowledgeSubmitNoteTool, KnowledgeUpdateStatusTool, ListDirTool, ListJobsTool, MemoryReadTool,
+    MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
+    SkillInstallTool, SkillListTool, SkillRemoveTool, SkillSearchTool, TimeTool, ToolActivateTool,
+    ToolAuthTool, ToolDeactivateTool, ToolInstallTool, ToolListTool, ToolRemoveTool,
+    ToolSearchTool, ToolUpdateTool, ToolUpgradeTool, WriteFileTool,
 };
 use crate::tools::rate_limiter::RateLimiter;
 use crate::tools::tool::{ApprovalRequirement, Tool, ToolDomain};
@@ -55,7 +56,9 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "memory_tree",
     "knowledge_search",
     "knowledge_get_topic",
+    "knowledge_list_topics",
     "knowledge_submit_note",
+    "knowledge_update_status",
     "knowledge_list_stale",
     "knowledge_stats",
     "create_job",
@@ -539,13 +542,19 @@ impl ToolRegistry {
     ) {
         self.register_sync(Arc::new(KnowledgeSearchTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(KnowledgeGetTopicTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(KnowledgeListTopicsTool::new(Arc::clone(
+            &resolver,
+        ))));
         self.register_sync(Arc::new(KnowledgeSubmitNoteTool::new(Arc::clone(
+            &resolver,
+        ))));
+        self.register_sync(Arc::new(KnowledgeUpdateStatusTool::new(Arc::clone(
             &resolver,
         ))));
         self.register_sync(Arc::new(KnowledgeListStaleTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(KnowledgeStatsTool::new(resolver)));
 
-        tracing::debug!("Registered 5 knowledge tools");
+        tracing::debug!("Registered 7 knowledge tools");
     }
 
     /// Register job management tools.
