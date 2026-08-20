@@ -85,8 +85,7 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const PROTOCOL_VERSION_2025_03_26: &str = "2025-03-26";
 
 /// MCP protocol versions this client can negotiate.
-pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
-    &[PROTOCOL_VERSION, PROTOCOL_VERSION_2025_03_26];
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[PROTOCOL_VERSION, PROTOCOL_VERSION_2025_03_26];
 
 /// An MCP tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
