@@ -1,6 +1,6 @@
 # Worker workspace path expansion
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-13).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-20).**
 > Structured worker project directories now normalize `~`; prompt text and the
 > Pebble executor still pass user-supplied paths without that normalization.
 
@@ -48,7 +48,7 @@ later by the worker. Pebble likewise uses `request.context.project_dir`
 directly as its process working directory
 (`pebble4lunarwing/src/executor.rs:103-126`, key lines `:108-112,123`). The
 daemon also forwards `project_dir` to workers verbatim
-(`ic/src/orchestrator/external_worker.rs:95-102`). No `HOME=/workspace`
+(`ic/src/orchestrator/external_worker.rs:100-114`). No `HOME=/workspace`
 override is present in the opencode image (`opencode4lunarwing/Dockerfile`:
 non-root user with home `/home/opencode` at `:184-189`, `USER 10001:10001` at
 `:230`, no `ENV HOME`).
@@ -62,6 +62,10 @@ Verification used source inspection and Git ancestry. The checked-in OpenCode
 TypeScript self-check covers the helper; Bun is no longer on `PATH` in this
 environment, so on 2026-08-13 (revision `7e813db4`) the five assertions were
 re-run under Node against a byte-identical port of `workspace_path.ts`
-(`diff`-confirmed) and passed. No worker container or Cargo command was run.
-Runtime prompt behavior remains unverified. The OpenCode Dockerfile line
-references (`:184-189`, `:230`) were re-confirmed after the v1.18.18 bump.
+(`diff`-confirmed) and passed; the same Node port was re-run on 2026-08-20
+(revision `2d10832a`) and passed again. No worker container or Cargo command
+was run. Runtime prompt behavior remains unverified. The OpenCode Dockerfile
+line references (`:184-189`, `:230`) were re-confirmed after the v1.18.18 bump
+and again on 2026-08-20. The daemon-side reference was widened to
+`external_worker.rs:100-114` so it covers the whole `build_task_context`
+forwarding body; the `project_dir` field is still mapped verbatim.
