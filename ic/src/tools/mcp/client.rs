@@ -1443,7 +1443,7 @@ mod tests {
     async fn test_initialize_rejects_unsupported_version_before_notification() {
         let mut response = successful_initialize_response();
         response.result.as_mut().expect("result")["protocolVersion"] =
-            serde_json::json!("2025-03-26");
+            serde_json::json!("2025-06-18");
         let transport = Arc::new(MockTransport::new(false, vec![response]));
         let client = test_client(transport.clone());
 
@@ -1459,6 +1459,33 @@ mod tests {
         assert_eq!(requests[0].method, "initialize");
         assert!(transport.shutdown_called());
         assert!(client.initialized.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_initialize_accepts_protocol_version_2025_03_26() {
+        // Servers answering with their own newer revision (e.g. lw2studymcp's
+        // study_notes server) must still negotiate successfully: 2025-03-26 is
+        // wire-identical for the tools-only methods this client uses.
+        let mut response = successful_initialize_response();
+        response.result.as_mut().expect("result")["protocolVersion"] =
+            serde_json::json!("2025-03-26");
+        let transport = Arc::new(MockTransport::new(
+            false,
+            vec![response, notification_ack()],
+        ));
+        let client = test_client(transport.clone());
+
+        client
+            .initialize()
+            .await
+            .expect("2025-03-26 must be accepted");
+
+        assert!(client.initialized.get().is_some());
+        assert!(!transport.shutdown_called());
+        let requests = transport.recorded_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "initialize");
+        assert_eq!(requests[1].method, "notifications/initialized");
     }
 
     #[tokio::test]
