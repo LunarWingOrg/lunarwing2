@@ -35,6 +35,12 @@ pub const MAX_TAGS: usize = 16;
 pub const MAX_TAG_BYTES: usize = 40;
 /// Maximum source-commit length (UTF-8 bytes).
 pub const MAX_COMMIT_BYTES: usize = 200;
+/// Maximum status-reason length (UTF-8 bytes), matching the canonical
+/// lw2studymcp metadata model.
+pub const MAX_STATUS_REASON_BYTES: usize = 1_000;
+/// Maximum per-note staleness threshold in days, matching the canonical
+/// lw2studymcp metadata model.
+pub const MAX_STALE_AFTER_DAYS: u32 = 36_500;
 /// Hard cap on notes scanned for stale/statistics evaluation.
 pub const KNOWLEDGE_SCAN_CAP: usize = 1_000;
 
@@ -129,6 +135,14 @@ pub struct KnowledgeNoteMeta {
     pub tags: Vec<String>,
     /// Topic/version superseding this note, when status is superseded.
     pub superseded_by: Option<String>,
+    /// Per-note staleness threshold in days (1-36500). When set, stale
+    /// detection uses it as the default age limit whenever the caller passes
+    /// no explicit `max_age_days`, matching the canonical lw2studymcp store.
+    #[serde(default)]
+    pub stale_after_days: Option<u32>,
+    /// Human-readable reason for the current lifecycle status.
+    #[serde(default)]
+    pub status_reason: Option<String>,
     /// User scope that actually submitted the note. Recorded from the
     /// caller's job context so shared-scope notes keep submitter attribution.
     #[serde(default)]
@@ -152,6 +166,8 @@ impl KnowledgeNoteMeta {
             "source_commit": self.source_commit,
             "tags": self.tags,
             "superseded_by": self.superseded_by,
+            "stale_after_days": self.stale_after_days,
+            "status_reason": self.status_reason,
             "submitted_by": self.submitted_by,
             "session_id": self.session_id,
         })
@@ -200,6 +216,15 @@ impl KnowledgeNoteMeta {
                 .get("superseded_by")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            stale_after_days: metadata
+                .get("stale_after_days")
+                .and_then(|v| v.as_u64())
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|days| (1..=MAX_STALE_AFTER_DAYS).contains(days)),
+            status_reason: metadata
+                .get("status_reason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
             submitted_by: metadata
                 .get("submitted_by")
                 .and_then(|v| v.as_str())
@@ -214,9 +239,11 @@ impl KnowledgeNoteMeta {
     /// Whether this note needs verification given age/commit criteria.
     ///
     /// A note is stale when its status is `stale`/`needs-verification`, when
-    /// it was studied more than `max_age_days` ago (falling back to
+    /// it was studied more than the effective age limit ago (falling back to
     /// `updated_at` when no studied timestamp is recorded), or when its
-    /// source commit differs from `repository_commit`.
+    /// source commit differs from `repository_commit`. The effective age
+    /// limit is the caller's `max_age_days` when given, otherwise the note's
+    /// own `stale_after_days` threshold (canonical lw2studymcp semantics).
     pub fn needs_verification(
         &self,
         updated_at: DateTime<Utc>,
@@ -226,7 +253,8 @@ impl KnowledgeNoteMeta {
         if self.status.is_unverified() {
             return true;
         }
-        if let Some(days) = max_age_days {
+        let age_limit_days = max_age_days.or_else(|| self.stale_after_days.map(i64::from));
+        if let Some(days) = age_limit_days {
             let studied = self.studied_at.unwrap_or(updated_at);
             if Utc::now() - studied > chrono::Duration::days(days) {
                 return true;
@@ -278,8 +306,11 @@ pub struct KnowledgeFilter {
     pub agent: Option<String>,
     /// Restrict to one lifecycle status.
     pub status: Option<KnowledgeStatus>,
-    /// Require at least one of these tags.
+    /// Require every listed tag (canonical lw2studymcp semantics).
     pub tags: Vec<String>,
+    /// Require at least this confidence (0.0-1.0). Notes without a recorded
+    /// confidence are excluded while the filter is set.
+    pub min_confidence: Option<f32>,
 }
 
 /// Aggregate knowledge-store statistics across the searched scopes.
@@ -351,6 +382,70 @@ impl KnowledgeStats {
     }
 }
 
+/// Per-topic aggregate returned by `knowledge_list_topics`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct KnowledgeTopicSummary {
+    /// Canonical topic slug.
+    pub topic: String,
+    /// Number of per-agent versions across the scanned scopes.
+    pub versions: u64,
+    /// Distinct scopes holding a version of this topic.
+    pub scopes: Vec<String>,
+    /// Distinct submitting agents.
+    pub agents: Vec<String>,
+    /// Distinct lifecycle statuses across versions.
+    pub statuses: Vec<String>,
+    /// Distinct tags across versions.
+    pub tags: Vec<String>,
+}
+
+fn push_unique(target: &mut Vec<String>, value: &str) {
+    if !target.iter().any(|existing| existing == value) {
+        target.push(value.to_string());
+    }
+}
+
+/// Aggregate scanned note rows into per-topic summaries sorted by topic slug.
+///
+/// `filter` is a substring match on the topic slug; since slugs are always
+/// lowercase, lowercasing the needle reproduces the canonical store's
+/// case-insensitive `LIKE` semantics.
+pub fn summarize_topics(
+    rows: &[KnowledgeNoteRow],
+    filter: Option<&str>,
+) -> Vec<KnowledgeTopicSummary> {
+    let needle = filter
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    let mut by_topic: std::collections::BTreeMap<&str, KnowledgeTopicSummary> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        let topic = row.meta.topic.as_str();
+        if needle.as_ref().is_some_and(|needle| !topic.contains(needle)) {
+            continue;
+        }
+        let summary = by_topic
+            .entry(topic)
+            .or_insert_with(|| KnowledgeTopicSummary {
+                topic: topic.to_string(),
+                versions: 0,
+                scopes: Vec::new(),
+                agents: Vec::new(),
+                statuses: Vec::new(),
+                tags: Vec::new(),
+            });
+        summary.versions += 1;
+        push_unique(&mut summary.scopes, &row.scope);
+        push_unique(&mut summary.agents, &row.meta.agent);
+        push_unique(&mut summary.statuses, row.meta.status.as_str());
+        for tag in &row.meta.tags {
+            push_unique(&mut summary.tags, tag);
+        }
+    }
+    by_topic.into_values().collect()
+}
+
 /// Render the canonical Markdown body for a study note.
 pub fn render_note_markdown(title: &str, content: &str) -> String {
     format!("# {title}\n\n{}\n", content.trim_end())
@@ -412,6 +507,8 @@ mod tests {
             source_commit: Some("abc123".to_string()),
             tags: vec!["memory".to_string(), "search".to_string()],
             superseded_by: None,
+            stale_after_days: None,
+            status_reason: None,
             submitted_by: Some("alice".to_string()),
             session_id: Some("session-1".to_string()),
         }
@@ -458,6 +555,120 @@ mod tests {
         assert_eq!(json["provenance"], KNOWLEDGE_PROVENANCE);
         let parsed = KnowledgeNoteMeta::from_metadata_json(&json);
         assert_eq!(parsed, Some(meta));
+    }
+
+    #[test]
+    fn lifecycle_metadata_fields_roundtrip() {
+        let meta = KnowledgeNoteMeta {
+            stale_after_days: Some(45),
+            status_reason: Some("verified against abc123".to_string()),
+            ..sample_meta()
+        };
+        let json = meta.to_metadata_json();
+        assert_eq!(json["stale_after_days"], 45);
+        assert_eq!(json["status_reason"], "verified against abc123");
+        assert_eq!(
+            KnowledgeNoteMeta::from_metadata_json(&json),
+            Some(meta.clone())
+        );
+        // Out-of-range thresholds are dropped on parse, never trusted.
+        let mut bad = meta.to_metadata_json();
+        bad["stale_after_days"] = serde_json::json!(0);
+        let parsed = KnowledgeNoteMeta::from_metadata_json(&bad).expect("parses");
+        assert_eq!(parsed.stale_after_days, None);
+        bad["stale_after_days"] = serde_json::json!(MAX_STALE_AFTER_DAYS + 1);
+        let parsed = KnowledgeNoteMeta::from_metadata_json(&bad).expect("parses");
+        assert_eq!(parsed.stale_after_days, None);
+    }
+
+    #[test]
+    fn needs_verification_honors_per_note_stale_after_days() {
+        let now = Utc::now();
+        let meta = KnowledgeNoteMeta {
+            stale_after_days: Some(30),
+            studied_at: Some(now - chrono::Duration::days(45)),
+            ..sample_meta()
+        };
+        // The note's own threshold applies when the caller passes no limit.
+        assert!(meta.needs_verification(now, None, None));
+        // A more generous caller limit overrides the note threshold.
+        assert!(!meta.needs_verification(now, Some(60), None));
+        // A stricter caller limit also wins.
+        assert!(meta.needs_verification(now, Some(10), None));
+        // Notes without the field keep the no-default-age-check behavior.
+        let plain = KnowledgeNoteMeta {
+            studied_at: Some(now - chrono::Duration::days(45)),
+            ..sample_meta()
+        };
+        assert!(!plain.needs_verification(now, None, None));
+    }
+
+    #[test]
+    fn summarize_topics_aggregates_versions() {
+        let now = Utc::now();
+        let rows = vec![
+            KnowledgeNoteRow {
+                scope: "alice".to_string(),
+                path: note_path("kimi-1", "memory-search"),
+                updated_at: now,
+                meta: sample_meta(),
+            },
+            KnowledgeNoteRow {
+                scope: "shared".to_string(),
+                path: note_path("kimi-2", "memory-search"),
+                updated_at: now,
+                meta: KnowledgeNoteMeta {
+                    agent: "kimi-2".to_string(),
+                    status: KnowledgeStatus::NeedsVerification,
+                    tags: vec!["vectors".to_string()],
+                    ..sample_meta()
+                },
+            },
+            KnowledgeNoteRow {
+                scope: "shared".to_string(),
+                path: note_path("kimi-1", "approvals"),
+                updated_at: now,
+                meta: KnowledgeNoteMeta {
+                    topic: "approvals".to_string(),
+                    status: KnowledgeStatus::Stale,
+                    tags: vec![],
+                    ..sample_meta()
+                },
+            },
+        ];
+        let summaries = summarize_topics(&rows, None);
+        assert_eq!(summaries.len(), 2);
+        // Sorted by topic slug: approvals before memory-search.
+        assert_eq!(summaries[0].topic, "approvals");
+        assert_eq!(summaries[0].versions, 1);
+        assert_eq!(summaries[0].statuses, vec!["stale".to_string()]);
+        let memory = &summaries[1];
+        assert_eq!(memory.topic, "memory-search");
+        assert_eq!(memory.versions, 2);
+        assert_eq!(
+            memory.scopes,
+            vec!["alice".to_string(), "shared".to_string()]
+        );
+        assert_eq!(memory.agents, vec!["kimi-1".to_string(), "kimi-2".to_string()]);
+        assert_eq!(
+            memory.statuses,
+            vec!["active".to_string(), "needs-verification".to_string()]
+        );
+        assert_eq!(
+            memory.tags,
+            vec![
+                "memory".to_string(),
+                "search".to_string(),
+                "vectors".to_string()
+            ]
+        );
+        // Substring filter narrows the set (case-insensitive needle).
+        let filtered = summarize_topics(&rows, Some("MEMORY"));
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].topic, "memory-search");
+        assert!(summarize_topics(&rows, Some("missing")).is_empty());
+        // Blank filters behave like no filter.
+        assert_eq!(summarize_topics(&rows, Some("  ")).len(), 2);
     }
 
     #[test]
