@@ -75,7 +75,7 @@ mod tests {
             .expect("embedded Study Notes skill should parse");
 
         assert_eq!(parsed.manifest.name, "study-notes");
-        assert_eq!(parsed.manifest.version, "3.0.0");
+        assert_eq!(parsed.manifest.version, "3.1.0");
         assert!(
             parsed
                 .manifest
@@ -100,5 +100,7 @@ mod tests {
         // The skill body must direct agents at the native tools.
         assert!(content.contains("knowledge_submit_note"));
         assert!(content.contains("knowledge_search"));
+        assert!(content.contains("knowledge_list_topics"));
+        assert!(content.contains("knowledge_update_status"));
     }
 }
