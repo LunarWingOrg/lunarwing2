@@ -26,7 +26,7 @@ use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::is_shared_owner;
 use crate::types::memory::MemoryDoc;
-use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
+use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus, trigger_dedup_key};
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
 use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadType};
@@ -38,6 +38,18 @@ const MANAGED_RECURRING_METADATA_KEY: &str = "managed_recurring";
 const MANAGED_DEFINITION_VERSION_KEY: &str = "managed_definition_version";
 const MANAGED_DEFINITION_VERSION: u64 = 1;
 const SKILL_MAINTENANCE_EVENT: &str = "skill_maintenance_due";
+/// Metadata marker recording that a mission was paused by the
+/// `SKILL_SELF_IMPROVEMENT` gate rather than by an operator. Only
+/// marker-carrying paused missions auto-resume when the toggle is
+/// re-enabled; operator pauses (no marker) are preserved.
+const GATE_PAUSED_METADATA_KEY: &str = "skill_learning_gate_paused";
+/// Metadata flags of the missions owned by the skill self-improvement
+/// subsystem (B-1/B-2/B-3): error diagnosis, skill extraction, and the
+/// skill-maintenance prune sweep. These pause/resume with the
+/// `SKILL_SELF_IMPROVEMENT` toggle; conversation-insights and
+/// expected-behavior are not skill missions and stay ungated.
+const SKILL_LEARNING_METADATA_KEYS: &[&str] =
+    &["self_improvement", "skill_extraction", "skill_maintenance"];
 const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
     "self_improvement",
     "skill_extraction",
@@ -76,6 +88,39 @@ fn is_recurring_learning_mission(mission: &Mission) -> bool {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false)
         })
+}
+
+/// Whether a mission belongs to the skill self-improvement subsystem and is
+/// therefore gated by the `SKILL_SELF_IMPROVEMENT` toggle. "Disabled" means
+/// disabled for these missions: they are paused while the toggle is off and
+/// resumed on re-enable (see [`GATE_PAUSED_METADATA_KEY`]).
+fn is_skill_learning_mission(mission: &Mission) -> bool {
+    SKILL_LEARNING_METADATA_KEYS.iter().any(|key| {
+        mission
+            .metadata
+            .get(*key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Mark a mission as paused by the skill-learning gate. Only missions that
+/// are not already paused get the marker — an existing pause without the
+/// marker is an operator pause and must survive a gate re-enable.
+fn mark_gate_paused(mission: &mut Mission) {
+    if mission.status == MissionStatus::Paused {
+        return;
+    }
+    if !mission.metadata.is_object() {
+        mission.metadata = serde_json::json!({});
+    }
+    if let Some(metadata) = mission.metadata.as_object_mut() {
+        metadata.insert(
+            GATE_PAUSED_METADATA_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    mission.status = MissionStatus::Paused;
 }
 
 fn mark_managed_recurring(mission: &mut Mission, metadata_key: &str) -> bool {
@@ -339,7 +384,7 @@ impl MissionManager {
             .into_iter()
             .filter(|mission| {
                 !existing.contains(&mission.id)
-                    || (!self_improvement_on && is_self_improvement_mission(mission))
+                    || (!self_improvement_on && is_skill_learning_mission(mission))
             })
             .collect();
         self.bootstrap_from_missions(new_missions, self_improvement_on)
@@ -356,8 +401,8 @@ impl MissionManager {
             if mission.status != MissionStatus::Active {
                 continue;
             }
-            if !self_improvement_on && is_self_improvement_mission(&mission) {
-                mission.status = MissionStatus::Paused;
+            if !self_improvement_on && is_skill_learning_mission(&mission) {
+                mark_gate_paused(&mut mission);
                 mission.updated_at = Utc::now();
                 self.store.save_mission(&mission).await?;
                 self.active.write().await.retain(|id| *id != mission.id);
@@ -496,7 +541,8 @@ impl MissionManager {
     pub async fn pause_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
-        if let Some(mission) = self.store.load_mission(id).await?
+        let loaded = self.store.load_mission(id).await?;
+        if let Some(mission) = &loaded
             && !(mission.is_owned_by(user_id)
                 || mission.owner_id().is_shared() && is_shared_owner(user_id))
         {
@@ -505,9 +551,23 @@ impl MissionManager {
                 entity: format!("mission {id}"),
             });
         }
-        self.store
-            .update_mission_status(id, MissionStatus::Paused)
-            .await?;
+        // An explicit operator pause clears any gate-pause marker so a later
+        // gate re-enable does not resume a mission the operator paused.
+        match loaded {
+            Some(mut mission) if mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_some() => {
+                if let Some(metadata) = mission.metadata.as_object_mut() {
+                    metadata.remove(GATE_PAUSED_METADATA_KEY);
+                }
+                mission.status = MissionStatus::Paused;
+                mission.updated_at = Utc::now();
+                self.store.save_mission(&mission).await?;
+            }
+            _ => {
+                self.store
+                    .update_mission_status(id, MissionStatus::Paused)
+                    .await?;
+            }
+        }
         self.active.write().await.retain(|mid| *mid != id);
         debug!(mission_id = %id, "mission paused");
         Ok(())
@@ -534,15 +594,19 @@ impl MissionManager {
                 entity: format!("mission {id}"),
             });
         }
-        if is_self_improvement_mission(&mission)
+        if is_skill_learning_mission(&mission)
             && !self.self_improvement_enabled.load(Ordering::Relaxed)
         {
             return Err(EngineError::Effect {
-                reason: "self-improvement is disabled".into(),
+                reason: "skill self-improvement is disabled; re-enable SKILL_SELF_IMPROVEMENT to resume this mission".into(),
             });
         }
         mission.status = MissionStatus::Active;
         mission.updated_at = Utc::now();
+        // An explicit operator resume clears any gate-pause marker.
+        if let Some(metadata) = mission.metadata.as_object_mut() {
+            metadata.remove(GATE_PAUSED_METADATA_KEY);
+        }
         refresh_next_fire_at(&mut mission, Utc::now())?;
         self.store.save_mission(&mission).await?;
         let mut active = self.active.write().await;
@@ -677,10 +741,22 @@ impl MissionManager {
             debug!(mission_id = %id, "cannot fire paused mission");
             return Ok(None);
         }
-        if is_self_improvement_mission(&mission)
+        if is_skill_learning_mission(&mission)
             && !self.self_improvement_enabled.load(Ordering::Relaxed)
         {
-            debug!(mission_id = %id, "self-improvement disabled; mission suppressed");
+            debug!(mission_id = %id, "skill self-improvement disabled; learning mission suppressed");
+            return Ok(None);
+        }
+
+        // Trigger-level dedup (work item #69): a re-delivered payload whose
+        // dedup key this mission already processed spawns no thread and
+        // consumes no daily budget. The key set is persisted with the
+        // mission, so dedup survives daemon restarts.
+        let dedup_key = trigger_payload.as_ref().and_then(trigger_dedup_key);
+        if let Some(key) = &dedup_key
+            && mission.has_processed_trigger(key)
+        {
+            debug!(mission_id = %id, dedup_key = %key, "mission trigger already processed; skipping spawn");
             return Ok(None);
         }
 
@@ -742,11 +818,16 @@ impl MissionManager {
             ..ThreadConfig::default()
         };
         // Reserve history and quota before execution can perform side effects.
+        // The trigger dedup key rides the same durable reservation so a failed
+        // spawn rolls it back and the payload may be retried.
         let thread_id = ThreadId::new();
         let mut updated = mission.clone();
         updated.record_thread(thread_id);
         updated.threads_today += 1;
         updated.last_trigger_payload = trigger_payload.clone();
+        if let Some(key) = dedup_key {
+            updated.record_processed_trigger(key);
+        }
         self.store.save_mission(&updated).await?;
 
         // Seed the payload into the mission thread's initial orchestrator state
@@ -1234,6 +1315,8 @@ impl MissionManager {
                         }
 
                         // ── Trigger 3: Skill extraction ──────────────────
+                        // Gated by SKILL_SELF_IMPROVEMENT like the rest of the
+                        // skill self-improvement subsystem (work item #69).
                         let action_count = thread
                             .events
                             .iter()
@@ -1245,7 +1328,8 @@ impl MissionManager {
                             })
                             .count();
 
-                        if thread.state == crate::types::thread::ThreadState::Done
+                        if mgr.self_improvement_enabled.load(Ordering::Relaxed)
+                            && thread.state == crate::types::thread::ThreadState::Done
                             && trace
                                 .issues
                                 .iter()
@@ -1323,6 +1407,15 @@ impl MissionManager {
                             let payload = serde_json::json!({
                                 "project_id": thread.project_id.0.to_string(),
                                 "completed_thread_count": *count,
+                                // Stable dedup identity for this batch. The
+                                // per-conversation counter is in-memory, so a
+                                // daemon restart would otherwise re-fire stale
+                                // batches; trigger-level dedup skips them
+                                // (work item #69).
+                                "content_hash": format!(
+                                    "insights:{}:{count}",
+                                    thread.project_id.0
+                                ),
                                 "thread_goals": thread_goals,
                                 "sample_user_messages": sample_messages,
                             });
@@ -1429,30 +1522,32 @@ impl MissionManager {
         // 0. Seed compiled-in orchestrator v0 so it's visible in workspace
         self.seed_orchestrator_v0(project_id).await?;
 
-        // 1. Error diagnosis (self-improvement) — per-user
+        // 1. Error diagnosis (self-improvement) and 2. skill extraction are
+        // gated by SKILL_SELF_IMPROVEMENT — "disabled" means disabled, so the
+        // extraction/pruning missions pause too (work item #69).
         if self_improvement_on {
             self.ensure_self_improvement_mission(project_id, user_id)
                 .await?;
+
+            // 2. Skill extraction (formerly playbook extraction)
+            self.ensure_mission_by_metadata(
+                project_id,
+                user_id,
+                "skill_extraction",
+                "skill-extraction",
+                SKILL_EXTRACTION_GOAL,
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "thread_completed_with_learnings".into(),
+                },
+                "Extract reusable skills from successful multi-step threads",
+                3, // max 3/day
+            )
+            .await?;
         } else {
-            self.deactivate_self_improvement_missions(project_id, user_id)
+            self.deactivate_skill_learning_missions(project_id, user_id)
                 .await?;
         }
-
-        // 2. Skill extraction (formerly playbook extraction)
-        self.ensure_mission_by_metadata(
-            project_id,
-            user_id,
-            "skill_extraction",
-            "skill-extraction",
-            SKILL_EXTRACTION_GOAL,
-            MissionCadence::OnSystemEvent {
-                source: "engine".into(),
-                event_type: "thread_completed_with_learnings".into(),
-            },
-            "Extract reusable skills from successful multi-step threads",
-            3, // max 3/day
-        )
-        .await?;
 
         // 3. Conversation insights
         self.ensure_mission_by_metadata(
@@ -1509,7 +1604,12 @@ impl MissionManager {
         Ok(())
     }
 
-    async fn deactivate_self_improvement_missions(
+    /// Pause all active skill-learning missions (self-improvement, skill
+    /// extraction, skill maintenance) while the `SKILL_SELF_IMPROVEMENT`
+    /// toggle is off. Each pause is marked as gate-driven so re-enabling the
+    /// toggle resumes exactly these missions; operator pauses carry no marker
+    /// and are preserved.
+    async fn deactivate_skill_learning_missions(
         &self,
         project_id: ProjectId,
         user_id: &str,
@@ -1518,14 +1618,14 @@ impl MissionManager {
             .store
             .list_missions_with_shared(project_id, user_id)
             .await?;
-        for mission in missions
+        for mut mission in missions
             .into_iter()
-            .filter(|mission| mission.is_owned_by(user_id) && is_self_improvement_mission(mission))
+            .filter(|mission| mission.is_owned_by(user_id) && is_skill_learning_mission(mission))
         {
             if mission.status == MissionStatus::Active {
-                self.store
-                    .update_mission_status(mission.id, MissionStatus::Paused)
-                    .await?;
+                mark_gate_paused(&mut mission);
+                mission.updated_at = Utc::now();
+                self.store.save_mission(&mission).await?;
             }
             self.active.write().await.retain(|id| *id != mission.id);
         }
@@ -1629,6 +1729,18 @@ impl MissionManager {
                 mission.status,
                 MissionStatus::Completed | MissionStatus::Failed
             ) {
+                mission.status = MissionStatus::Active;
+                changed = true;
+            } else if mission.status == MissionStatus::Paused
+                && mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_some()
+            {
+                // This pause was gate-driven, and this reconcile only runs
+                // for gated missions while the gate is enabled — resume the
+                // mission and clear the marker. Operator pauses carry no
+                // marker and are preserved.
+                if let Some(metadata) = mission.metadata.as_object_mut() {
+                    metadata.remove(GATE_PAUSED_METADATA_KEY);
+                }
                 mission.status = MissionStatus::Active;
                 changed = true;
             }
@@ -4460,8 +4572,9 @@ mod tests {
 
         assert_eq!(alice_missions.len(), bob_missions.len());
         assert!(
-            alice_missions.len() >= 3,
-            "at least 3 learning missions per user"
+            alice_missions.len() >= 2,
+            "at least the ungated learning missions (conversation-insights, \
+             expected-behavior) per user; skill missions are gated off by default"
         );
 
         // No overlap in mission IDs
@@ -5425,5 +5538,436 @@ mod tests {
         mgr.complete_mission_with_owner(id, "alice").await.unwrap();
         let m = mgr.get_mission(id).await.unwrap().unwrap();
         assert_eq!(m.status, MissionStatus::Completed);
+    }
+
+    // ── Trigger-level dedup (work item #69) ──────────────────
+
+    #[tokio::test]
+    async fn fire_mission_dedups_repeated_trigger_payload() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "extraction",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let payload = serde_json::json!({"source_thread_id": "3bfdad4f", "goal": "g"});
+        let first = mgr
+            .fire_mission(id, "test-user", Some(payload.clone()))
+            .await
+            .unwrap();
+        assert!(first.is_some(), "first delivery spawns a thread");
+
+        // Re-delivery of the same source thread spawns nothing and consumes
+        // no budget/history.
+        let second = mgr
+            .fire_mission(id, "test-user", Some(payload))
+            .await
+            .unwrap();
+        assert!(second.is_none(), "re-delivery is skipped at trigger time");
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.thread_history.len(), 1);
+        assert_eq!(mission.threads_today, 1);
+        assert!(mission.has_processed_trigger("src:3bfdad4f"));
+
+        // A different source thread is new work and fires normally.
+        let third = mgr
+            .fire_mission(
+                id,
+                "test-user",
+                Some(serde_json::json!({"source_thread_id": "feedface"})),
+            )
+            .await
+            .unwrap();
+        assert!(third.is_some());
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.thread_history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn trigger_dedup_state_survives_restart() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "extraction",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let payload = serde_json::json!({"source_thread_id": "3bfdad4f"});
+        assert!(
+            mgr.fire_mission(id, "test-user", Some(payload.clone()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Simulate a daemon restart: a fresh MissionManager over the same
+        // store must still skip the already-processed payload.
+        drop(mgr);
+        let mgr2 = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let refired = mgr2
+            .fire_mission(id, "test-user", Some(payload))
+            .await
+            .unwrap();
+        assert!(
+            refired.is_none(),
+            "dedup state persists across manager restarts"
+        );
+        let mission = mgr2.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.thread_history.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn payload_without_dedup_identity_never_dedups() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "plain",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        for _ in 0..2 {
+            let fired = mgr
+                .fire_mission(
+                    id,
+                    "test-user",
+                    Some(serde_json::json!({"goal": "no identity fields"})),
+                )
+                .await
+                .unwrap();
+            assert!(fired.is_some(), "payloads without dedup keys always fire");
+        }
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.thread_history.len(), 2);
+        assert!(mission.processed_trigger_keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn content_hash_payload_dedups_insights_batches() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "conversation-insights",
+                "goal",
+                MissionCadence::Manual,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        // The insights listener keys batches by project + completed count, so
+        // a restart (counter reset) re-delivers the same key while new batches
+        // get fresh keys.
+        let batch5 = serde_json::json!({
+            "project_id": project_id.0.to_string(),
+            "completed_thread_count": 5,
+            "content_hash": format!("insights:{}:5", project_id.0),
+        });
+        assert!(
+            mgr.fire_mission(id, "test-user", Some(batch5.clone()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            mgr.fire_mission(id, "test-user", Some(batch5))
+                .await
+                .unwrap()
+                .is_none(),
+            "stale batch re-delivery after restart is skipped"
+        );
+
+        let batch10 = serde_json::json!({
+            "project_id": project_id.0.to_string(),
+            "completed_thread_count": 10,
+            "content_hash": format!("insights:{}:10", project_id.0),
+        });
+        assert!(
+            mgr.fire_mission(id, "test-user", Some(batch10))
+                .await
+                .unwrap()
+                .is_some(),
+            "the next batch is new work"
+        );
+    }
+
+    // ── Skill-learning gate ergonomics (work item #69) ───────
+
+    #[tokio::test]
+    async fn disabled_gate_pauses_extraction_and_pruning_missions() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        // Enabled first so all five learning missions exist and are active.
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        let missions = store.list_missions(project_id, "test-user").await.unwrap();
+        assert_eq!(missions.len(), 5);
+        assert!(missions.iter().all(|m| m.status == MissionStatus::Active));
+
+        // Disabling the toggle pauses the skill missions and marks the pause
+        // as gate-driven; conversation-insights/expected-behavior stay active.
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", false)
+            .await
+            .unwrap();
+        let missions = store.list_missions(project_id, "test-user").await.unwrap();
+        for mission in &missions {
+            let gated = is_skill_learning_mission(mission);
+            let marked = mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_some();
+            if gated {
+                assert_eq!(
+                    mission.status,
+                    MissionStatus::Paused,
+                    "{} must pause with the gate",
+                    mission.name
+                );
+                assert!(marked, "{} pause must be marked gate-driven", mission.name);
+            } else {
+                assert_eq!(
+                    mission.status,
+                    MissionStatus::Active,
+                    "{} is not a skill mission and stays active",
+                    mission.name
+                );
+                assert!(!marked);
+            }
+        }
+
+        // Gate-paused missions are out of the active index, so events spawn
+        // nothing for them.
+        let spawned = mgr
+            .fire_on_system_event(
+                "engine",
+                "thread_completed_with_learnings",
+                "test-user",
+                Some(serde_json::json!({"source_thread_id": "abc"})),
+            )
+            .await
+            .unwrap();
+        assert!(spawned.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reenable_resumes_gate_paused_but_preserves_operator_pause() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        let extraction_id = store
+            .list_missions(project_id, "test-user")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "skill-extraction")
+            .expect("skill-extraction mission exists")
+            .id;
+
+        // Operator pauses extraction while the gate is on.
+        mgr.pause_mission(extraction_id, "test-user").await.unwrap();
+
+        // Gate off: self-improvement/maintenance get gate-paused (marked);
+        // the operator-paused extraction must not acquire the marker.
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", false)
+            .await
+            .unwrap();
+        let extraction = mgr.get_mission(extraction_id).await.unwrap().unwrap();
+        assert_eq!(extraction.status, MissionStatus::Paused);
+        assert!(
+            extraction.metadata.get(GATE_PAUSED_METADATA_KEY).is_none(),
+            "operator pause must not be marked gate-driven"
+        );
+
+        // Gate back on: gate-paused missions resume with the marker cleared;
+        // the operator-paused extraction stays paused.
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        let missions = store.list_missions(project_id, "test-user").await.unwrap();
+        for mission in &missions {
+            if mission.id == extraction_id {
+                assert_eq!(
+                    mission.status,
+                    MissionStatus::Paused,
+                    "operator pause survives a gate re-enable"
+                );
+            } else if is_skill_learning_mission(mission) {
+                assert_eq!(
+                    mission.status,
+                    MissionStatus::Active,
+                    "{} resumed on re-enable",
+                    mission.name
+                );
+                assert!(mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_none());
+            }
+        }
+        let active = mgr.active.read().await;
+        assert!(!active.contains(&extraction_id));
+        for mission in missions.iter().filter(|m| is_skill_learning_mission(m)) {
+            if mission.id != extraction_id {
+                assert!(
+                    active.contains(&mission.id),
+                    "{} re-activated",
+                    mission.name
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_pause_during_gate_off_sticks_across_reenable() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", false)
+            .await
+            .unwrap();
+        let extraction_id = store
+            .list_missions(project_id, "test-user")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.name == "skill-extraction")
+            .expect("skill-extraction mission exists")
+            .id;
+        // Gate-paused right now (marker present).
+        let extraction = mgr.get_mission(extraction_id).await.unwrap().unwrap();
+        assert!(extraction.metadata.get(GATE_PAUSED_METADATA_KEY).is_some());
+
+        // The operator explicitly pauses it too — the marker is cleared so the
+        // mission no longer auto-resumes with the gate.
+        mgr.pause_mission(extraction_id, "test-user").await.unwrap();
+        let extraction = mgr.get_mission(extraction_id).await.unwrap().unwrap();
+        assert!(extraction.metadata.get(GATE_PAUSED_METADATA_KEY).is_none());
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        let extraction = mgr.get_mission(extraction_id).await.unwrap().unwrap();
+        assert_eq!(
+            extraction.status,
+            MissionStatus::Paused,
+            "explicit operator pause during gate-off wins over re-enable"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_of_gated_mission_rejected_while_gate_disabled() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", true)
+            .await
+            .unwrap();
+        mgr.ensure_learning_missions_with_gate(project_id, "test-user", false)
+            .await
+            .unwrap();
+
+        let missions = store.list_missions(project_id, "test-user").await.unwrap();
+        let extraction = missions
+            .iter()
+            .find(|m| m.name == "skill-extraction")
+            .expect("skill-extraction mission exists");
+        let err = mgr
+            .resume_mission(extraction.id, "test-user")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::Effect { .. }),
+            "gated mission cannot be resumed while disabled: {err:?}"
+        );
+
+        // Conversation-insights is not a skill-learning mission; resuming it
+        // is not blocked by the skill gate.
+        let insights = missions
+            .iter()
+            .find(|m| m.name == "conversation-insights")
+            .expect("conversation-insights mission exists");
+        mgr.pause_mission(insights.id, "test-user").await.unwrap();
+        mgr.resume_mission(insights.id, "test-user")
+            .await
+            .expect("ungated mission resumes regardless of the skill gate");
+    }
+
+    #[tokio::test]
+    async fn gate_disabled_suppresses_active_gated_mission_fire() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+        let other_project = ProjectId::new();
+
+        // A skill-extraction mission that is still Active (e.g. persisted by
+        // an older version before the gate existed).
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "skill-extraction",
+            "goal",
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "thread_completed_with_learnings".into(),
+            },
+        );
+        mission.metadata = serde_json::json!({"skill_extraction": true});
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        // Flip the manager's gate off without touching this mission.
+        mgr.ensure_learning_missions_with_gate(other_project, "test-user", false)
+            .await
+            .unwrap();
+
+        let fired = mgr
+            .fire_mission(
+                id,
+                "test-user",
+                Some(serde_json::json!({"source_thread_id": "xyz"})),
+            )
+            .await
+            .unwrap();
+        assert!(
+            fired.is_none(),
+            "active gated mission is suppressed at fire time while disabled"
+        );
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(mission.thread_history.is_empty());
     }
 }
