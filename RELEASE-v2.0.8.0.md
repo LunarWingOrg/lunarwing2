@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.8.0 (FIRST DRAFT): Codename `Sekisho (関所)`
 
-** Release Date: ** TBD (draft 2026-08-20)
+** Release Date: ** TBD (draft 2026-08-21)
 
 > *Sekisho* (関所) were the checkpoint stations of Edo-period Japan, where
 > travelers, documents, and goods were inspected before being allowed to
@@ -104,6 +104,7 @@ previous compatibility baseline.
 | Multi-tenant port registry | v16 — new host-global `health_metrics` slot (default port 50000, above all tenant ranges); auto-migrates from v15 |
 | MCP negotiated version | Client requests `2024-11-05` and also accepts `2025-03-26` from servers that answer it; anything else fails before activation |
 | Channel registry patches | darkirc 0.1.5, multica 0.1.7, weechat 0.2.6, xmpp 0.1.10 |
+| Tool registry patches | gitlab 0.1.3 |
 | LunarVision health | Dedicated operational listener (`8089` single-node); MT hosts discover per-tenant `vision_health` from the registry |
 | LunarVoice health | Dedicated operational listener (`8091` single-node); starts fail loudly if the sidecar never goes healthy |
 | CI scope | Source verification; no package publication or tenant deployment |
@@ -217,6 +218,20 @@ previous compatibility baseline.
 - ssh remains the exception: its persistent grant is still earned only after
   a genuinely successful command, and tools that disallow persistent grants
   are still filtered by `allows_always_approval`.
+
+### GitLab WASM Tool
+
+- The bundled GitLab tool now speaks GitLab's unified Work Items API (work
+  item #60): new `get_work_item` and `list_work_items` operations cover Issue
+  and Task types, and `get_issue` falls back from classic-API 404s to an
+  exact Work Items IID lookup, so issues migrated to Work Items stay
+  reachable.
+- Listing follows bounded same-origin keyset pagination with explicit
+  completion data, deduplicates stable IDs, and reconciles classic issue
+  totals — closing the pagination stalls and miscounts seen against large
+  projects.
+- The tool package, capabilities sidecar, and registry entry were bumped to
+  0.1.3.
 
 ### Agent Failure Recovery With Next Steps
 
@@ -355,7 +370,14 @@ previous compatibility baseline.
 - Version bump: all LunarWing crates and WASM channels 2.0.7 → 2.0.8,
   channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.6,
   xmpp 0.1.10), full `cargo update` on the main lockfile (MSRV
-  1.96.1-compatible), cargo-deny clean.
+  1.96.1-compatible), cargo-deny clean. The new `lunarwing_health_metrics`
+  crate is enrolled in the CI release-version policy.
+- Fixed an external-worker wire bug found by live smoke testing: the
+  orchestrator serialized `TaskContext.project_dir` as an explicit JSON
+  `null` when unset, which the Kimi worker's TypeScript bridge rejects —
+  every Kimi job dispatched without an explicit project directory failed at
+  the bridge before the worker could start. The field is now omitted when
+  unset, a shape all three workers (Pebble, OpenCode, Kimi Code) accept.
 - Opencode external worker: `OPENCODE_REF` pinned to `v1.18.18` as a single
   global-scope ARG baked into the runtime image as `OPENCODE_IMAGE_REF` and
   surfaced on `/health` as `opencode_ref`; build contract re-verified against
@@ -440,7 +462,8 @@ previous compatibility baseline.
   bridge tool can be installed to use HTTP MCP servers with proper secret
   management.
 - The XMPP bridge still cannot attach and send images correctly (work item
-  #42); no fix ships in this release.
+  #42), and the XMPP-to-LunarVision inbound image hook remains unimplemented
+  (work item #2); no fix for either ships in this release.
 - The web UI still places its bearer token in native `EventSource` query
   strings. Keep access/proxy logs protected until short-lived SSE tickets or
   cookie-scoped sessions replace this transport.
@@ -483,6 +506,12 @@ previous compatibility baseline.
   failed, making the GitLab WASM tool re-prompt on every call: grants now
   persist at tool level independent of call success, ssh excepted (work item
   #70).
+- The GitLab tool's classic-issues-only API: unified Work Items support,
+  bounded keyset pagination, and a `get_issue` 404 fallback now cover
+  GitLab's Work Items migration (work item #60).
+- Kimi external-worker jobs failing at dispatch whenever no explicit project
+  directory was set — the worker bridge rejected the serialized JSON `null`:
+  `TaskContext.project_dir` is now omitted on the wire when unset.
 - WeeChat truncating multi-line tool output at the first newline and
   executing outbound lines starting with `/` as client commands (work item
   #66).
