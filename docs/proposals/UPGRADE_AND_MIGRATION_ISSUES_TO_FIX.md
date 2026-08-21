@@ -5,6 +5,14 @@
 > risk, and upgrade-tool responsibilities are explicit. The migration-on-boot,
 > backup discipline, PostgreSQL config-hash, and key-continuity notes remain
 > useful operational cautions.
+>
+> **Post-split note (2026-08-21):** the `lunarwing-mt-admin.sh:NNNN` line
+> references below are to the pre-split monolith; the mechanisms they describe
+> were re-verified against current code. Since v2.0.8.0, `migrate_owner_scope`
+> (15-table rekey) and `_owner_scope_needs_migration` (5-table sample, returns
+> false when PG is unreachable) live in `ic/scripts/mt-admin-lib/10-owner-scope.sh:95,68`,
+> with auto-fire hooks in `04-tenant-lifecycle.sh:827` (start),
+> `05-tenant-build.sh:508` (build), and `06-env-generation.sh:1829` (patch-env).
 
 ## The core problem: no tooling fits rootless-Podman tenants
 
