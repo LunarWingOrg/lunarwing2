@@ -2,7 +2,7 @@
 
 > **Current status (2026-07-21, rev `61d0c1e`): RANGE AUDIT COMPLETE / BACKLOG OPEN.**
 > Implemented rows remain present, while the open backlog remains open. The
-> Wasmtime baseline is now 36.0.12 rather than 28.x, so advisory counts below
+> Wasmtime baseline is now 36.0.13 rather than 28.x, so advisory counts below
 > require a fresh `cargo deny check` before security prioritization.
 
 > **Note:** These are pre-fork IronClaw (upstream) port analyses, kept for reference.

@@ -11,7 +11,17 @@
 > (goals item #13, 2026-08-13) made `recent_conversation_thread_goals` sort by
 > `created_at` before sampling, since `HybridStore::list_threads` returns
 > arbitrary HashMap order; the BUG-003 mission-goal pollution exclusion was
-> confirmed already present.
+> confirmed already present. Two v2.0.8.0 follow-ups (goals item #9, work item
+> #69) landed in `ic/crates/lunarwing_engine/src/runtime/mission.rs`: (a) the
+> `SKILL_SELF_IMPROVEMENT` toggle now gates the whole skill-learning subsystem —
+> self-improvement, skill-extraction, and skill-maintenance (prune sweep)
+> missions — via `is_skill_learning_mission` (:97) keyed on the
+> `self_improvement`/`skill_extraction`/`skill_maintenance` metadata flags, so
+> "disabled" gate-pauses them at bootstrap/reconcile and re-enabling resumes
+> exactly the gate-paused ones (operator pauses survive); and (b) trigger-level
+> dedup (`Mission.processed_trigger_keys`, FIFO-bounded at 512) skips
+> already-processed trigger payloads before budget accounting, so daemon
+> restarts no longer re-fire stale extraction/insights batches.
 
 Implement the Hermes-style "skill patching" loop: when a thread fails and the
 failure traces back to an active skill, diagnose it, patch the skill's
