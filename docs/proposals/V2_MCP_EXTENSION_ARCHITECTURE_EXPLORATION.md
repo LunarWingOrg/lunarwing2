@@ -167,8 +167,10 @@ pagination, calls, memory and fuel enforcement, timeout, traps, and wrapper repl
 ### Current MCP protocol scope is conservative and bounded
 
 The client advertises empty capabilities and strictly separates inbound JSON-RPC
-responses, errors, requests, and notifications. Initialization negotiates exactly
-`2024-11-05`. Tool discovery follows bounded pagination and rejects repeated cursors.
+responses, errors, requests, and notifications. Initialization requests
+`2024-11-05` and also accepts a server-negotiated `2025-03-26` (wire-identical
+for the tools-only methods used; `SUPPORTED_PROTOCOL_VERSIONS` in
+`ic/src/tools/mcp/protocol.rs:88`). Tool discovery follows bounded pagination and rejects repeated cursors.
 When negotiated, `tools.listChanged` signals flow through stream transports and one
 bounded persistent Streamable HTTP GET/SSE listener, including gateway placement, into
 generation-safe host and worker atomic wrapper refresh.
@@ -190,6 +192,15 @@ It does not by itself establish who published the extension, whether that
 publisher remains trusted, or whether a compromised registry entry should be
 revoked. A V2 marketplace needs package signatures and publisher trust metadata in
 addition to checksums.
+
+> **Update (2026-08-21, v2.0.8.0):** the trust primitives now exist as a library in
+> `ic/src/tools/mcp/marketplace.rs` — ed25519 `verify_strict` publisher signatures
+> over canonical manifests, a `PublisherTrustStore`, signed lockfiles pinning exact
+> version+sha256, `ManifestDiff` upgrade diffs, and signed revocation lists with
+> monotonic sequence + atomic `RevocationStore` persistence (fail-closed corrupt
+> cache, bounded fetch). They are **not yet wired into any activation path** (zero
+> callers outside tests; no trust-store/revocation-URL config or CLI surface), so
+> this section's gap statement still stands at the integration level.
 
 ### Automatic npm/pip MCP installation is not implemented
 
