@@ -79,11 +79,12 @@ By design, Lunarwing uses the encrypted database to store secrets. However, this
 
 Therefore, some secrets may exist in:
 
-- `<base_dir>/.env` — default `~/.lunarwing/.env` (current; `LUNARWING_BASE_DIR`
-  overrides the base dir, legacy alias `IRONCLAW_BASE_DIR`). Loaded via dotenvy
-  early in startup (see `ic/src/bootstrap.rs`, `ic/src/config/mod.rs`).
-- `~/.ironclaw/.env` (legacy fallback, still honored when no base-dir override
-  is set)
+- `<base_dir>/.env` — the base dir is set by `LUNARWING_BASE_DIR` (legacy alias
+  `IRONCLAW_BASE_DIR` still accepted; real deployments use e.g.
+  `/home/<user>/lunarwing`). When neither is set, the base dir defaults to
+  `~/.ironclaw` (backward compatibility), so `~/.ironclaw/.env` is the no-env
+  default. Loaded via dotenvy early in startup (see `ic/src/bootstrap.rs`,
+  `ic/src/config/mod.rs`).
 - `<base_dir>/env/lunarwing.env` and sibling env files (e.g.
   `/home/<user>/lunarwing/env/*`) — systemd/service deployments inject these via
   `EnvironmentFile`; they take precedence over `<base_dir>/.env` because dotenvy
