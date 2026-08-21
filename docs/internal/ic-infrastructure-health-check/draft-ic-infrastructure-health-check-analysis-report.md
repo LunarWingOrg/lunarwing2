@@ -2,6 +2,12 @@
 
 > **Updated 2026-08-13** — re-verified against the current subproject code
 > (driver, self-heal watchdog v2.1.0, checks, tests) for checklist item #24.
+> **Re-verified 2026-08-21 for checklist item #26:** the Prometheus metrics
+> exporter (former milestone M4) has since landed — `health-metrics-exporter.sh`
+> runs from `cron-wrapper.sh`, writes `metrics.prom`, and supports an
+> early-warning threshold layer plus an optional loopback listener
+> (`ic/crates/lunarwing_health_metrics`, ports-registry v16 `health_metrics`
+> slot); the test runner now registers 11 suites. Sections below updated.
 > The original draft described a much older tree (`ironclaw-watchdog.timer`,
 > `icservices/`, `icscripts/`, no self-heal, no config, no tests); all of that
 > has been corrected below.
@@ -9,7 +15,7 @@
 ## 1. Executive summary
 The **ic-infrastructure-health-check** subproject provides a Bash-based orchestration layer that runs health diagnostics across key LunarWing services (gateway, XMPP bridge, ClickHouse, TensorZero, model APIs, LunarVision/LunarVoice sidecars, NetBird tunnel, and the host service manager). Each diagnostic is a self-contained script that emits structured JSON, which the main driver (`infrastructure-health-check.sh`) aggregates, writes a timestamped report, produces a markdown summary, and optionally sends a Gotify notification when the overall status is degraded or critical. A separate watchdog (`lunarwing-self-heal.sh`, v2.1.0) reads the report and auto-remediates unhealthy services with a grace period, exponential backoff with jitter, a flapping guard, post-restart verification, escalation cooldown, and multi-tenant awareness.
 
-The pipeline runs through `cron-wrapper.sh`, which always proceeds to self-heal even if the health check fails. Scheduling is handled by the LunarWing watchdog assets that live in the main repo (`ic/systemd/lunarwing-watchdog.service`/`.timer`/`.confd`/`.cron.hourly`, `ic/systemd/com.lunarwing.watchdog.plist` for launchd), installed via `ic/scripts/install-lunarwing-watchdog.sh`; on multi-tenant hosts the pipeline is installed to `/usr/local/lib/lunarwing-health/` by `ic/scripts/lunarwing-mt-admin.sh`.
+The pipeline runs through `cron-wrapper.sh`, which exports Prometheus textfile metrics from the fresh report (default on, non-fatal) and always proceeds to self-heal even if the health check fails. Scheduling is handled by the LunarWing watchdog assets that live in the main repo (`ic/systemd/lunarwing-watchdog.service`/`.timer`/`.confd`/`.cron.hourly`, `ic/systemd/com.lunarwing.watchdog.plist` for launchd), installed via `ic/scripts/install-lunarwing-watchdog.sh`; on multi-tenant hosts the pipeline is installed to `/usr/local/lib/lunarwing-health/` by `ic/scripts/lunarwing-mt-admin.sh`.
 
 Key strengths:
 - Simple, dependency-light implementation (pure Bash, `jq`, `curl`; `nc` only for the XMPP check).
@@ -18,16 +24,18 @@ Key strengths:
 - Init-agnostic: exactly one of `health-systemd.sh` / `health-openrc.sh` / `health-launchd.sh` runs, auto-detected (or forced via `LUNARWING_SERVICE_MANAGER`).
 - Real self-healing with restart verification and escalation instead of alert-only monitoring.
 
-Remaining improvement areas: the check list is still hard-coded in the driver (no auto-discovery), there is no aggregate schema validation beyond "is valid JSON", and no Prometheus exporter.
+Remaining improvement areas: the check list is still hard-coded in the driver (no auto-discovery) and there is no aggregate schema validation beyond "is valid JSON".
 
 ## 2. Project structure
 ```
 ic-infrastructure-health-check/
-├─ README.md                      # High-level design & usage (kept current; last updated 2026-08-08)
+├─ README.md                      # High-level design & usage (last updated 2026-08-08; predates the metrics exporter)
 ├─ infrastructure-health-check.sh # Main driver (11 parallel checks → JSON report)
 ├─ lunarwing-self-heal.sh         # Watchdog: reads report → restarts → verifies → escalates (v2.1.0)
 ├─ send-notification.sh           # Gotify wrapper (report + escalation shapes)
-├─ cron-wrapper.sh                # Runs health check then self-heal; forwards args (e.g. --dry-run)
+├─ cron-wrapper.sh                # Runs health check → metrics export → self-heal; forwards args (e.g. --dry-run)
+├─ health-metrics-exporter.sh     # Prometheus textfile exporter (metrics.prom) + early-warning threshold layer
+├─ health-metrics-thresholds.conf.example # Sample THRESHOLD_<metric>="warn:>N crit:>M" definitions
 ├─ config.sh.example              # Optional central env configuration (copy to config.sh / source from env)
 ├─ init-templates/                # Standalone single-node LunarVision units
 │   ├─ ocr-sidecar                # OpenRC script (rootless Podman, supervise-daemon)
@@ -46,11 +54,12 @@ ic-infrastructure-health-check/
 ├─ health-openrc.sh               # OpenRC service health
 ├─ health-launchd.sh              # launchd agent health (macOS)
 ├─ tests/                         # Self-contained suites, no live services touched
-│   ├─ run-all.sh                 # Aggregate runner (10 registered suites)
+│   ├─ run-all.sh                 # Aggregate runner (11 registered suites)
 │   ├─ test-self-heal.sh          # Regression suite
 │   ├─ test-self-heal-matrix.sh   # Dry-run remediation matrix
 │   ├─ chaos-harness.sh           # Chaos tests against a mock init system
 │   ├─ test-health-{openrc,systemd,lunarvision,lunarvoice,netbird}.sh
+│   ├─ test-health-metrics-exporter.sh # Exporter + threshold-layer suite
 │   └─ test-{lunarvision,lunarvoice}-init-templates.sh
 └─ reports/ (runtime)             # Generated JSON & markdown per run, rotated after 7 days
 ```
@@ -85,7 +94,7 @@ previously needed; float comparisons now use `awk`.)
 ## 5. Core components & runtime flow
 1. **`infrastructure-health-check.sh`** (driver)
    - Resolves paths from `LUNARWING_BASE_DIR` (legacy alias `IRONCLAW_BASE_DIR`, default `$HOME/.lunarwing`).
-   - `run_check` executes a health script with a 30 s timeout, validates JSON, logs timing, and returns the exit code.
+   - `run_check` executes a health script with a 30 s timeout, validates JSON, logs timing, stamps each result with `duration_seconds` (which powers the `lunarwing_health_check_duration_seconds` metric), and returns the exit code.
    - Detects the service manager (`LUNARWING_SERVICE_MANAGER` override → Darwin → `/run/openrc/softlevel` → `/run/systemd/system` → binary fallback) and runs exactly one init-specific check.
    - Launches all eleven checks in parallel into a private `mktemp -d` workdir (no fixed `/tmp/check-*.tmp` paths, so concurrent tenants cannot collide; the earlier duplicated-launch bug is gone).
    - Aggregates into `$REPORT_DIR/<timestamp>.json` plus a `-summary.md`, rotates reports older than 7 days, and exits 0/1/2 (healthy/degraded/critical).
@@ -97,6 +106,7 @@ previously needed; float comparisons now use `awk`.)
    - `--dry-run` exercises the whole pipeline without restarting anything.
 3. **Individual `health-*.sh` scripts** – same contract: JSON object with `component`, `status`, `timestamp`, `metrics`, `issues`; exit 0/1/2.
 4. **`send-notification.sh`** – posts to Gotify when `GOTIFY_TOKEN` is set; handles both the full report shape and the self-heal escalation shape (null-defaulted so malformed input can never abort before `curl`).
+5. **`health-metrics-exporter.sh`** – runs from `cron-wrapper.sh` after the health check (before self-heal, so it sees the fresh report); flattens the newest aggregated report plus self-heal `state.json` into Prometheus exposition written atomically to `metrics.prom` (numeric/boolean leaves only, so no secret strings can leak), evaluates the optional `THRESHOLD_<metric>` warn/crit early-warning layer with a deduplicated Gotify path, and can be fronted by the optional loopback-only `lunarwing_health_metrics` listener.
 
 ## 6. Monitoring & observability capabilities
 - **JSON reports** under `<base>/workspace/reports/health/` – easy to ingest into Grafana Loki, Prometheus exporters, or custom dashboards; 7-day rotation built in.
@@ -106,7 +116,7 @@ previously needed; float comparisons now use `awk`.)
 - **Watchdog timer/cron** guarantees regular execution without manual cron management on all three supported inits.
 
 Remaining observability gaps:
-- No Prometheus metrics endpoint – health data is still file-based only.
+- ~~No Prometheus metrics endpoint~~ — **landed**: `health-metrics-exporter.sh` flattens the latest report + self-heal state into `metrics.prom` (default-on from `cron-wrapper.sh`, non-fatal), with a graduated warn/crit threshold layer (`health-metrics-thresholds.conf`) and a deduplicated Gotify path; an optional loopback-only listener (`ic/crates/lunarwing_health_metrics`, ports-registry v16 `health_metrics` slot) can serve `/metrics` to a scraper.
 - No structured log aggregation (per-run log appended to `health.log`, not exported).
 - Alert spam is mitigated (grace period, flap guard, escalation cooldown, `HEALTHCHECK_NOTIFY=false`) but there is no dedupe on the driver-side degraded/critical notification itself.
 
@@ -116,7 +126,7 @@ Remaining observability gaps:
 | **Adding a new component** | Create `health-<name>.sh` that obeys the JSON contract and add a `run_check` line plus aggregation entry in the driver. | Driver could iterate over `health-*.sh` instead of a hard-coded list (still not auto-discovered). |
 | **Configuration** | Optional central env file: `config.sh.example` documents every `HEALTH_*`/`SELF_HEAL_*` variable; copy to `config.sh` and source from the environment/systemd unit. Sane defaults throughout. | None outstanding — done (M2). |
 | **Parallel execution** | All checks run in parallel in a per-run `mktemp -d` workdir; the old duplicated `run_check` lines are fixed. | None outstanding — done (M1). |
-| **Testing** | `tests/` with 10 self-contained suites (`run-all.sh`), including a chaos harness with a mock init system and init-template rendering tests. | Wire into CI explicitly — partially done (suites exist; CI invocation is via the repo-wide shell harness). |
+| **Testing** | `tests/` with 11 self-contained suites (`run-all.sh`), including a chaos harness with a mock init system, init-template rendering tests, and a metrics-exporter suite. | Wire into CI explicitly — partially done (suites exist; CI invocation is via the repo-wide shell harness). |
 | **Language** | Pure Bash – easy to read but limited in robustness. | Consider moving core orchestration to Rust or Go for stronger typing (long-term, optional). |
 | **Packaging** | Deployed via source checkout + watchdog installer / mt-admin. | Provide a Docker image or installable package for reproducible deployments (open). |
 
@@ -132,7 +142,7 @@ Remaining observability gaps:
 2. **No aggregate schema validation** – The final report is only validated as well-formed JSON, not against a schema.
 3. **Hard-coded paths under base dir** – Scripts assume the `<base>/agents`, `<base>/workspace/...` layout; a relocated workspace must be expressed through `LUNARWING_BASE_DIR`.
 4. **Security** – API keys arrive via environment/env files; a secret-manager integration (Vault etc.) remains future work.
-5. **Observability** – No Prometheus exporter yet; file-based reports only.
+5. **Observability** – ~~No Prometheus exporter yet~~ — textfile export landed (see §6); an optional loopback listener exists for scrape-style serving.
 6. **Driver-side notify dedupe** – Repeated degraded runs still re-notify (self-heal escalations are cooldown-guarded, driver notifications are not).
 
 (Items from the original draft that are **fixed** and therefore removed: the duplicated `run_check` launches, the missing `health-irc.sh` README reference — the README no longer mentions IRC — the absent central configuration, the absent test suite, and the `$HOME/.ironclaw` path assumptions.)
@@ -142,11 +152,11 @@ Remaining observability gaps:
 |-----------|-------------|--------|
 | **M1 – Refactor driver** | Fix duplicated launch lines; private per-run workdir; bounded parallel checks. | **Done** (auto-discovery of `health-*.sh` still open, low priority). |
 | **M2 – Central configuration** | `config.sh.example` documents all thresholds/tunables; env/EnvironmentFile sourced. | **Done**. |
-| **M3 – Add unit tests** | BATS-style sandboxed suites for self-heal, chaos, per-init and per-sidecar checks, init templates. | **Done** (`tests/run-all.sh`, 10 suites). |
-| **M4 – Prometheus exporter** | Thin exporter reading the latest JSON report and exposing `/metrics`. | Open. |
+| **M3 – Add unit tests** | BATS-style sandboxed suites for self-heal, chaos, per-init and per-sidecar checks, init templates. | **Done** (`tests/run-all.sh`, 11 suites). |
+| **M4 – Prometheus exporter** | Thin exporter reading the latest JSON report and exposing `/metrics`. | **Done** — `health-metrics-exporter.sh` textfile export (`metrics.prom`) runs from `cron-wrapper.sh` with a warn/crit threshold layer; optional loopback listener `ic/crates/lunarwing_health_metrics` + ports-registry v16 `health_metrics` slot. |
 | **M5 – Docker packaging** | Lightweight image bundling the scripts on a schedule. | Open. |
 | **M6 – Secret management** | Replace plain-env API keys with Vault lookups; env fallback for dev. | Open. |
-| **M7 – Documentation refresh** | README covers configuration flow, data flow, and supported services. | **Done** (README kept current; this report re-verified 2026-08-13). |
+| **M7 – Documentation refresh** | README covers configuration flow, data flow, and supported services. | **Done** (README last updated 2026-08-08, predates the metrics exporter; this report re-verified 2026-08-21). |
 
 ---
-*Report generated by Admiral Starforce Nebula; updated 2026-08-13 against current code.*
+*Report generated by Admiral Starforce Nebula; updated 2026-08-21 against current code.*
