@@ -16,6 +16,18 @@ migration is needed now since 1.1.6"). **Reference:** `docs/ops/MT-MACHINE-MIGRA
 > integration points, the users-table FK behaviour, and the self-wipe hazard were each
 > confirmed against the code). Line numbers are current as of the branch HEAD; prefer the
 > named functions/subcommands as the durable anchors.
+>
+> **v2.0.8.0 note (mt-admin module split):** the monolithic `lunarwing-mt-admin.sh` is
+> now a thin composition root over `ic/scripts/mt-admin-lib/NN-*.sh`; the anchors above
+> moved — `pg_restore --single-transaction --clean --if-exists` → `11-postgres.sh:361`,
+> `_owner_scope_needs_migration` → `10-owner-scope.sh:68`, `migrate_owner_scope` (incl.
+> the self-wipe guard) → `10-owner-scope.sh:95`, the `migrate-owner-scope)` dispatch case
+> → `lunarwing-mt-admin.sh:1168`, and `LUNARWING_OWNER_ID=<tenant>` env generation →
+> `06-env-generation.sh:703`. Phase 1 detection/reconciliation landed in
+> `ic/scripts/import-tenant.sh` as `non_target_owner_scopes` /
+> `show_owner_scope_summary` / `reconcile_owner_scope` (no separate
+> `detect-owner-scopes` subcommand was added). Phase 2 (export-side hint, `users`-table
+> FK rekey) remains open.
 
 ---
 
