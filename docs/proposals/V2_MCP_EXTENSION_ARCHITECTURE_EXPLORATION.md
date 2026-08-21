@@ -193,6 +193,15 @@ publisher remains trusted, or whether a compromised registry entry should be
 revoked. A V2 marketplace needs package signatures and publisher trust metadata in
 addition to checksums.
 
+> **Update (2026-08-21, v2.0.8.0):** the trust primitives now exist as a library in
+> `ic/src/tools/mcp/marketplace.rs` — ed25519 `verify_strict` publisher signatures
+> over canonical manifests, a `PublisherTrustStore`, signed lockfiles pinning exact
+> version+sha256, `ManifestDiff` upgrade diffs, and signed revocation lists with
+> monotonic sequence + atomic `RevocationStore` persistence (fail-closed corrupt
+> cache, bounded fetch). They are **not yet wired into any activation path** (zero
+> callers outside tests; no trust-store/revocation-URL config or CLI surface), so
+> this section's gap statement still stands at the integration level.
+
 ### Automatic npm/pip MCP installation is not implemented
 
 Current stdio manifests describe a command, arguments, and environment. The MCP path
