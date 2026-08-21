@@ -5,6 +5,11 @@
 > risk, and upgrade-tool responsibilities are explicit. The migration-on-boot,
 > backup discipline, PostgreSQL config-hash, and key-continuity notes remain
 > useful operational cautions.
+>
+> **v2.0.8.0 note (mt-admin module split):** line refs below are pre-split. The
+> owner-scope functions now live in `ic/scripts/mt-admin-lib/10-owner-scope.sh`
+> (`migrate_owner_scope` :95, `_owner_scope_needs_migration` :68); the manual
+> mt-admin sequence itself is unchanged.
 
 ## The core problem: no tooling fits rootless-Podman tenants
 
