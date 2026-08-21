@@ -3,9 +3,10 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -34,6 +35,11 @@ const DEFAULT_MAX_MESSAGES: usize = 2048;
 /// HTTP 413 before the handler runs — which is why agents could not send
 /// ordinary photos (work item #42). 70 MiB covers the host cap with headroom
 /// while still bounding memory use on this loopback-only service.
+///
+/// The raised limit is scoped to the send route only (see
+/// `build_router_with_body_limit`); every other route keeps axum's 2 MiB
+/// default, and authorization runs as middleware before any body is buffered
+/// (`docs/ops/MEDIUM.MD`).
 const MAX_SEND_BODY_BYTES: usize = 70 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,27 +128,49 @@ fn build_router(state: AppState) -> Router {
     build_router_with_body_limit(state, MAX_SEND_BODY_BYTES)
 }
 
-/// Build the bridge router with an explicit JSON body limit (split out so
-/// tests can verify the bound without allocating 70 MiB payloads).
+/// Build the bridge router with an explicit JSON body limit for the send
+/// route (split out so tests can verify the bound without allocating 70 MiB
+/// payloads). All other routes keep axum's 2 MiB default body limit.
 fn build_router_with_body_limit(state: AppState, max_body_bytes: usize) -> Router {
     Router::new()
         .route("/v1/configure", post(configure_handler))
         .route("/v1/status", get(status_handler))
         .route("/v1/outbound-rate-limit", post(outbound_rate_limit_handler))
         .route("/v1/messages", get(messages_handler))
-        .route("/v1/messages/send", post(send_handler))
-        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .route(
+            "/v1/messages/send",
+            // Only the send route carries base64 attachments, so only it gets
+            // the raised limit; the remaining routes keep the 2 MiB default.
+            post(send_handler).layer(DefaultBodyLimit::max(max_body_bytes)),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_middleware,
+        ))
         .with_state(state)
 }
 
-async fn configure_handler(
+/// Authorize every request before any body extractor runs.
+///
+/// `authorize` needs only the peer address and headers, so as middleware it
+/// rejects unauthorized clients before the `Json` extractor buffers the
+/// request body (up to [`MAX_SEND_BODY_BYTES`] on the send route) — closing
+/// the pre-auth memory-amplification window from `docs/ops/MEDIUM.MD`.
+async fn authorize_middleware(
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, BridgeError> {
+    authorize(&state, &headers, remote)?;
+    Ok(next.run(request).await)
+}
+
+async fn configure_handler(
+    State(state): State<AppState>,
     Json(request): Json<ConfigureRequest>,
 ) -> Result<Json<ConfigureResponse>, BridgeError> {
-    authorize(&state, &headers, remote)?;
-
     let normalized = normalize_config(&request)?;
 
     {
@@ -264,12 +292,8 @@ async fn configure_handler(
 }
 
 async fn status_handler(
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<BridgeStatusResponse>, BridgeError> {
-    authorize(&state, &headers, remote)?;
-
     let (
         configured,
         running,
@@ -375,13 +399,9 @@ async fn status_handler(
 }
 
 async fn outbound_rate_limit_handler(
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<OutboundRateLimitRequest>,
 ) -> Result<Json<OutboundRateLimitResponse>, BridgeError> {
-    authorize(&state, &headers, remote)?;
-
     let (configured, configured_limit, channel) = {
         let inner = state.inner.read().await;
         (
@@ -424,13 +444,9 @@ async fn outbound_rate_limit_handler(
 }
 
 async fn messages_handler(
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<MessagesQuery>,
 ) -> Result<Json<MessagesResponse>, BridgeError> {
-    authorize(&state, &headers, remote)?;
-
     let cursor = query.cursor.unwrap_or(0);
     let inner = state.inner.read().await;
     let messages = inner
@@ -447,13 +463,9 @@ async fn messages_handler(
 }
 
 async fn send_handler(
-    ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<SendRequest>,
 ) -> Result<Json<serde_json::Value>, BridgeError> {
-    authorize(&state, &headers, remote)?;
-
     let metadata: serde_json::Value = serde_json::from_str(&request.metadata_json)
         .map_err(|e| BridgeError::bad_request(&format!("invalid metadata_json: {}", e)))?;
 
@@ -721,28 +733,47 @@ mod tests {
         }
     }
 
-    /// Send a `/v1/messages/send` request from a loopback peer and return the
-    /// response status. The bridge is intentionally left unconfigured, so a
-    /// body that survives extraction reaches the handler and surfaces as
+    fn test_state_with_token() -> AppState {
+        AppState {
+            expected_token: Some("bridge-token".to_string()),
+            ..test_state()
+        }
+    }
+
+    /// POST `body` to `path` from the given peer and return the response
+    /// status. The bridge is intentionally left unconfigured, so a send body
+    /// that survives extraction reaches the handler and surfaces as
     /// `409 CONFLICT`; a body rejected by the body limit never gets that far
-    /// and surfaces as `413 PAYLOAD TOO LARGE`.
-    async fn send_status_for_body(router: Router, body: Vec<u8>) -> StatusCode {
-        let mut request = Request::builder()
+    /// and surfaces as `413 PAYLOAD TOO LARGE`; a request rejected by the
+    /// auth middleware (before any body is buffered) surfaces as
+    /// `401 UNAUTHORIZED` / `403 FORBIDDEN`.
+    async fn post_status(
+        router: Router,
+        path: &str,
+        body: Vec<u8>,
+        auth: Option<&str>,
+        peer: &str,
+    ) -> StatusCode {
+        let mut builder = Request::builder()
             .method("POST")
-            .uri("/v1/messages/send")
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .expect("build send request");
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = auth {
+            builder = builder.header("authorization", format!("Bearer {}", token));
+        }
+        let mut request = builder.body(Body::from(body)).expect("build request");
         request.extensions_mut().insert(ConnectInfo(
-            "127.0.0.1:43210"
-                .parse::<SocketAddr>()
-                .expect("parse loopback peer address"),
+            peer.parse::<SocketAddr>().expect("parse peer address"),
         ));
         router
             .oneshot(request)
             .await
-            .expect("router should answer send request")
+            .expect("router should answer request")
             .status()
+    }
+
+    async fn send_status_for_body(router: Router, body: Vec<u8>) -> StatusCode {
+        post_status(router, "/v1/messages/send", body, None, "127.0.0.1:43210").await
     }
 
     #[tokio::test]
@@ -785,5 +816,73 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn non_send_routes_keep_default_body_limit() {
+        // docs/ops/MEDIUM.MD: the raised limit must be scoped to
+        // /v1/messages/send; every other route keeps axum's 2 MiB default so
+        // a local sprayer cannot make the bridge buffer huge bodies on cheap
+        // control routes.
+        let status = post_status(
+            build_router(test_state()),
+            "/v1/configure",
+            vec![0_u8; 3 * 1024 * 1024],
+            None,
+            "127.0.0.1:43210",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn unauthorized_over_limit_body_rejected_before_buffering() {
+        // docs/ops/MEDIUM.MD: authorize runs as middleware before the Json
+        // extractor, so an unauthenticated over-limit body gets 401 (not
+        // 413) and the bridge never buffers it.
+        let status = post_status(
+            build_router_with_body_limit(test_state_with_token(), 1024),
+            "/v1/messages/send",
+            vec![0_u8; 2048],
+            None,
+            "127.0.0.1:43210",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_peer_forbidden_before_buffering() {
+        let status = post_status(
+            build_router_with_body_limit(test_state(), 1024),
+            "/v1/messages/send",
+            vec![0_u8; 2048],
+            None,
+            "10.0.0.9:43210",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authorized_send_passes_middleware_and_reaches_handler() {
+        let status = post_status(
+            build_router(test_state_with_token()),
+            "/v1/messages/send",
+            br#"{"target":"u@example.com","content":"","metadata_json":"{}","attachments":[]}"#
+                .to_vec(),
+            Some("bridge-token"),
+            "127.0.0.1:43210",
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "authorized request must pass the middleware and reach the handler (unconfigured bridge)"
+        );
     }
 }
