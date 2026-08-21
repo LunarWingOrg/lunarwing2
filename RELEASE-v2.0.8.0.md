@@ -74,6 +74,12 @@ previous compatibility baseline.
   no longer lose everything after the first newline, and lines starting with
   `/` are escaped instead of being executed as WeeChat commands in the
   operator's client (work item #66).
+- XMPP image attachment fix: the bridge's `/v1/messages/send` endpoint was
+  silently bounded by axum's 2 MiB default body limit, so any base64-encoded
+  attachment larger than ~1.4 MiB raw was rejected with HTTP 413 before the
+  send handler ran — agents could not attach and send ordinary photos. The
+  send body limit is now an explicit 70 MiB, sized to the host's 50 MB
+  outbound attachment cap plus base64 inflation (work item #42).
 - Healthpoint metrics exporter: the host health pipeline now emits a
   Prometheus textfile exposition of the aggregated report and self-heal
   state after every check, with per-check durations, a graduated
@@ -439,8 +445,6 @@ previous compatibility baseline.
   directly rather than through owner-scoped secret references. A stdio MCP
   bridge tool can be installed to use HTTP MCP servers with proper secret
   management.
-- The XMPP bridge still cannot attach and send images correctly (work item
-  #42); no fix ships in this release.
 - The web UI still places its bearer token in native `EventSource` query
   strings. Keep access/proxy logs protected until short-lived SSE tickets or
   cookie-scoped sessions replace this transport.
@@ -486,6 +490,10 @@ previous compatibility baseline.
 - WeeChat truncating multi-line tool output at the first newline and
   executing outbound lines starting with `/` as client commands (work item
   #66).
+- XMPP bridge rejecting photo-sized image attachments with HTTP 413: the
+  `/v1/messages/send` JSON body limit is now an explicit 70 MiB instead of
+  axum's 2 MiB default, with a regression test proving large attachment sends
+  reach the handler (work item #42).
 - WASM channels silently dropping tool-activity status events: the global
   `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to
   the XMPP, WeeChat, and DarkIRC guests, which render them (work item #47).
