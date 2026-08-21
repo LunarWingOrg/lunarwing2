@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use axum::extract::{ConnectInfo, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -24,6 +24,17 @@ use tokio::sync::RwLock;
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8787";
 const DEFAULT_MAX_MESSAGES: usize = 2048;
+/// Maximum JSON body accepted by `/v1/messages/send`.
+///
+/// The daemon's WASM host caps outbound attachments at 50 MiB of raw bytes per
+/// response (`MAX_TOTAL_ATTACHMENT_BYTES` in `ic/src/channels/wasm/wrapper.rs`),
+/// and the guest base64-encodes those bytes into the send request (a 4/3 size
+/// inflation plus JSON framing). Without an explicit limit, axum's 2 MiB
+/// `DefaultBodyLimit` rejects any attachment larger than ~1.4 MiB raw with
+/// HTTP 413 before the handler runs — which is why agents could not send
+/// ordinary photos (work item #42). 70 MiB covers the host cap with headroom
+/// while still bounding memory use on this loopback-only service.
+const MAX_SEND_BODY_BYTES: usize = 70 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NormalizedConfig {
@@ -45,24 +56,13 @@ struct QueuedMessage {
     payload: BridgeMessage,
 }
 
+#[derive(Default)]
 struct BridgeInner {
     configured: Option<NormalizedConfig>,
     jid: Option<String>,
     channel: Option<Arc<XmppChannel>>,
     current_cursor: u64,
     messages: VecDeque<QueuedMessage>,
-}
-
-impl Default for BridgeInner {
-    fn default() -> Self {
-        Self {
-            configured: None,
-            jid: None,
-            channel: None,
-            current_cursor: 0,
-            messages: VecDeque::new(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -105,13 +105,7 @@ async fn main() -> anyhow::Result<()> {
         max_messages,
     };
 
-    let app = Router::new()
-        .route("/v1/configure", post(configure_handler))
-        .route("/v1/status", get(status_handler))
-        .route("/v1/outbound-rate-limit", post(outbound_rate_limit_handler))
-        .route("/v1/messages", get(messages_handler))
-        .route("/v1/messages/send", post(send_handler))
-        .with_state(state.clone());
+    let app = build_router(state.clone());
 
     tracing::info!(addr = %bind_addr, "xmpp-bridge listening");
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
@@ -121,6 +115,24 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Build the bridge router with the production send body limit.
+fn build_router(state: AppState) -> Router {
+    build_router_with_body_limit(state, MAX_SEND_BODY_BYTES)
+}
+
+/// Build the bridge router with an explicit JSON body limit (split out so
+/// tests can verify the bound without allocating 70 MiB payloads).
+fn build_router_with_body_limit(state: AppState, max_body_bytes: usize) -> Router {
+    Router::new()
+        .route("/v1/configure", post(configure_handler))
+        .route("/v1/status", get(status_handler))
+        .route("/v1/outbound-rate-limit", post(outbound_rate_limit_handler))
+        .route("/v1/messages", get(messages_handler))
+        .route("/v1/messages/send", post(send_handler))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
+        .with_state(state)
 }
 
 async fn configure_handler(
@@ -457,7 +469,9 @@ async fn send_handler(
         channel
             .broadcast(&request.target, response)
             .await
-            .map_err(|e| BridgeError::bad_gateway(&format!("failed to send XMPP message: {}", e)))?;
+            .map_err(|e| {
+                BridgeError::bad_gateway(&format!("failed to send XMPP message: {}", e))
+            })?;
     } else {
         let mut attachments = Vec::with_capacity(request.attachments.len());
         for attachment in request.attachments {
@@ -687,5 +701,89 @@ impl IntoResponse for BridgeError {
             })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use openclaw_xmpp_bridge_contract::BridgeAttachment;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn test_state() -> AppState {
+        AppState {
+            inner: Arc::new(RwLock::new(BridgeInner::default())),
+            expected_token: None,
+            max_messages: DEFAULT_MAX_MESSAGES,
+        }
+    }
+
+    /// Send a `/v1/messages/send` request from a loopback peer and return the
+    /// response status. The bridge is intentionally left unconfigured, so a
+    /// body that survives extraction reaches the handler and surfaces as
+    /// `409 CONFLICT`; a body rejected by the body limit never gets that far
+    /// and surfaces as `413 PAYLOAD TOO LARGE`.
+    async fn send_status_for_body(router: Router, body: Vec<u8>) -> StatusCode {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/v1/messages/send")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .expect("build send request");
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:43210"
+                .parse::<SocketAddr>()
+                .expect("parse loopback peer address"),
+        ));
+        router
+            .oneshot(request)
+            .await
+            .expect("router should answer send request")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn send_with_large_attachment_body_reaches_handler() {
+        // Work item #42 regression: a photo-sized attachment (~2.25 MiB raw)
+        // base64-encodes to ~3 MiB, which exceeded axum's 2 MiB default body
+        // limit and failed with 413 before the handler ever ran.
+        let raw = vec![0xAB_u8; 2_400_000];
+        let request = SendRequest {
+            target: "user@example.com".to_string(),
+            content: String::new(),
+            metadata_json: "{}".to_string(),
+            attachments: vec![BridgeAttachment {
+                filename: "photo.jpg".to_string(),
+                mime_type: "image/jpeg".to_string(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(raw),
+            }],
+        };
+        let body = serde_json::to_vec(&request).expect("serialize send request");
+        assert!(
+            body.len() > 2 * 1024 * 1024,
+            "regression test body must exceed the old 2 MiB default limit"
+        );
+
+        let status = send_status_for_body(build_router(test_state()), body).await;
+
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "large attachment body must reach the handler (unconfigured bridge), not be rejected by the body limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_body_stays_bounded_above_configured_limit() {
+        let status = send_status_for_body(
+            build_router_with_body_limit(test_state(), 1024),
+            vec![0_u8; 2048],
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
