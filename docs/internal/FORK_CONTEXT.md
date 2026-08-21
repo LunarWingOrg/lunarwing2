@@ -97,7 +97,7 @@ values in logs, diffs, or final answers.
 ## Build and Test
 
 Preferred baseline commands (run from the `ic/` directory; prefix with
-`taskset -c 0-9` and use `-j10` per the root `AGENTS.md` build constraints,
+`taskset -c 0-11` and use `-j12` per the root `AGENTS.md` build constraints,
 and prefer `cargo check` over full debug builds for compile verification):
 
 ```sh
