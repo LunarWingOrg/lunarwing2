@@ -167,8 +167,10 @@ pagination, calls, memory and fuel enforcement, timeout, traps, and wrapper repl
 ### Current MCP protocol scope is conservative and bounded
 
 The client advertises empty capabilities and strictly separates inbound JSON-RPC
-responses, errors, requests, and notifications. Initialization negotiates exactly
-`2024-11-05`. Tool discovery follows bounded pagination and rejects repeated cursors.
+responses, errors, requests, and notifications. Initialization requests
+`2024-11-05` and also accepts a server-negotiated `2025-03-26` (wire-identical
+for the tools-only methods used; `SUPPORTED_PROTOCOL_VERSIONS` in
+`ic/src/tools/mcp/protocol.rs:88`). Tool discovery follows bounded pagination and rejects repeated cursors.
 When negotiated, `tools.listChanged` signals flow through stream transports and one
 bounded persistent Streamable HTTP GET/SSE listener, including gateway placement, into
 generation-safe host and worker atomic wrapper refresh.
