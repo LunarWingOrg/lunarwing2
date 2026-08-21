@@ -8,7 +8,7 @@
 > v2.0.8.0 or later, not v2.0.7.0.
 
 - **Goal:** Item 9 in [`AGENT_GOALS_2.0.6.0.md`](AGENT_GOALS_2.0.6.0.md)
-- **Earlier analysis:** [`35d44998cadf3e6d.md`](35d44998cadf3e6d.md)
+- **Earlier analysis:** [`IRONCLAW_IDEAS_TAKEAWAYS.md`](IRONCLAW_IDEAS_TAKEAWAYS.md)
 - **LunarWing source inspected:** commit `9cb27d4b31a1acae4938671eb98a0b529e48e7cb`
 - **IronClaw source inspected:**
   [`0b5fcde996910137358fc1dfd25bce39ef98df91`](https://github.com/nearai/ironclaw/tree/0b5fcde996910137358fc1dfd25bce39ef98df91),
@@ -45,7 +45,7 @@ Recommended initial package scope:
 
 ## Corrections to the Earlier Analysis
 
-The direction in `35d44998cadf3e6d.md` is useful, but source review requires four
+The direction in `IRONCLAW_IDEAS_TAKEAWAYS.md` is useful, but source review requires four
 corrections.
 
 ### 1. IronClaw owns lifecycle; IronHub owns catalog delivery
