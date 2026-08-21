@@ -122,8 +122,10 @@ escalation flags).
   health env file (never logged, `secrecy`-style handling in the Rust
   option), must bind loopback only, and on multi-tenant hosts gets its port
   from the ports registry — a **v16 registry migration** allocating a
-  dedicated `health_metrics` slot (current registry is v15; follow the
-  `ports_migrate_v15` pattern at `ic/scripts/lunarwing-mt-admin.sh:1697`).
+  dedicated `health_metrics` slot. **(Landed:** `ports_migrate_v16` in
+  `ic/scripts/mt-admin-lib/03-ports-registry.sh:287` plus the standalone
+  `ic/scripts/migrate-ports-v16.sh`; the mt-admin monolith referenced here
+  pre-split has been decomposed into `mt-admin-lib/NN-*.sh` modules.**)**
   Tenant-scoped listeners are **not** planned: one host-global exporter
   carries per-tenant labels.
 
