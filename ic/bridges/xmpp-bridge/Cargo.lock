@@ -9864,6 +9864,7 @@ dependencies = [
  "secrecy",
  "serde_json",
  "tokio",
+ "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
 ]
