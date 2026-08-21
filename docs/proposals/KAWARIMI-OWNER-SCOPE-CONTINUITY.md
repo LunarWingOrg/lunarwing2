@@ -16,6 +16,15 @@ migration is needed now since 1.1.6"). **Reference:** `docs/ops/MT-MACHINE-MIGRA
 > integration points, the users-table FK behaviour, and the self-wipe hazard were each
 > confirmed against the code). Line numbers are current as of the branch HEAD; prefer the
 > named functions/subcommands as the durable anchors.
+>
+> **Post-split note (2026-08-21):** the `lunarwing-mt-admin.sh:NNNN` references below are
+> to the pre-split monolith. Since v2.0.8.0 the script is a thin composition root over
+> `ic/scripts/mt-admin-lib/NN-*.sh`: `migrate_owner_scope` / `_owner_scope_needs_migration`
+> now live in `10-owner-scope.sh:68,95`, the auto-fire hooks in `04-tenant-lifecycle.sh:827`
+> (start), `05-tenant-build.sh:508` (build), and `06-env-generation.sh:1829` (patch-env),
+> the `LUNARWING_OWNER_ID` env write in `06-env-generation.sh:703`, and the
+> `pg_restore --single-transaction --clean --if-exists` restore in `11-postgres.sh:361`
+> (`restore_tenant_postgres`).
 
 ---
 
