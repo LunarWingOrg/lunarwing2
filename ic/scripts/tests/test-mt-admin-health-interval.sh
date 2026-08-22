@@ -68,7 +68,6 @@ assert_eq "explicit interval overrides OpenRC default" "7" "$override_interval"
 SD_DIR="$(mktemp -d)"
 trap 'rm -rf "$SD_DIR"' EXIT
 systemctl() { :; }
-HEALTH_LAUNCHER="/usr/local/sbin/lunarwing-mt-health"
 
 # shellcheck disable=SC2034
 INIT_SYSTEM="systemd"
