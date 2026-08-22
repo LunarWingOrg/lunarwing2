@@ -193,10 +193,11 @@ g="$(sb)"; mk_wd_mock "$g"; wd_set "$g" lunarwing.service inactive
 : > "$g/calls"
 oG="$(run_wd "$g" WD_CALL_LOG="$g/calls" LUNARWING_WATCHDOG_SYSTEMD_SCOPE=user)"; rcG=$?
 assert_eq "$rcG" "0" "G1: user-scope restart exits 0"
+assert_contains "$oG" "restart succeeded" "G2: user-scope restart success logged"
 if [ -s "$g/calls" ] && ! grep -q '^system ' "$g/calls"; then
-    ok "G2: every systemctl call is on the user bus"
+    ok "G3: every systemctl call is on the user bus"
 else
-    bad "G2: every systemctl call is on the user bus" "$(cat "$g/calls")"
+    bad "G3: every systemctl call is on the user bus" "$(cat "$g/calls")"
 fi
 
 # ── H: invalid scope warns and falls back to the system bus ──────────────────
