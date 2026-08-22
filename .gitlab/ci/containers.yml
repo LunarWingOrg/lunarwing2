@@ -10,6 +10,12 @@
 #
 # If gcr.io is unreachable from the runners, mirror the executor image into
 # our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
+#
+# Tags: a moving version tag (WORKER_IMAGE_TAG, default v2.0.8.0) plus :latest.
+# Unique short-SHA tags are not pushed — they accumulate, and this registry's
+# tag-delete UI has 502ed while trying to clear them. Override WORKER_IMAGE_NAME
+# / WORKER_IMAGE_TAG when playing a job to push to a fresh repository or tag
+# if the existing one is wedged.
 
 .container-job:
   image:
@@ -22,6 +28,11 @@
   # consume test artifacts, and stage gating would block the manual trigger
   # behind the full Rust suite.
   needs: []
+  variables:
+    # Kaniko + GitLab registry over HTTP/2 502s on blob PATCH (Traefik/nginx
+    # in front of registry). GitLab's documented workaround: force HTTP/1.1.
+    GODEBUG: "http2client=0"
+    WORKER_IMAGE_TAG: "v2.0.8.0"
   before_script:
     - mkdir -p /kaniko/.docker
     - |
@@ -31,12 +42,15 @@
 
 worker-pebble-image:
   extends: .container-job
+  variables:
+    WORKER_IMAGE_NAME: worker-pebble
   script:
     - /kaniko/executor
       --context "$CI_PROJECT_DIR"
       --dockerfile "$CI_PROJECT_DIR/pebble4lunarwing/Dockerfile"
-      --destination "$CI_REGISTRY_IMAGE/worker-pebble:$CI_COMMIT_SHORT_SHA"
-      --destination "$CI_REGISTRY_IMAGE/worker-pebble:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --push-retry=5
   rules:
     - when: manual
       allow_failure: true
@@ -44,6 +58,7 @@ worker-pebble-image:
 worker-opencode-image:
   extends: .container-job
   variables:
+    WORKER_IMAGE_NAME: worker-opencode
     # Mirrors mt-admin's build_opencode_worker: slim by default; set
     # WITH_TOOLCHAINS=true on a manual pipeline for the fat toolchain image.
     WITH_TOOLCHAINS: "false"
@@ -52,8 +67,9 @@ worker-opencode-image:
       --context "$CI_PROJECT_DIR/opencode4lunarwing"
       --dockerfile "$CI_PROJECT_DIR/opencode4lunarwing/Dockerfile"
       --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
-      --destination "$CI_REGISTRY_IMAGE/worker-opencode:$CI_COMMIT_SHORT_SHA"
-      --destination "$CI_REGISTRY_IMAGE/worker-opencode:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --push-retry=5
   rules:
     - when: manual
       allow_failure: true
@@ -61,6 +77,7 @@ worker-opencode-image:
 worker-kimi-image:
   extends: .container-job
   variables:
+    WORKER_IMAGE_NAME: worker-kimi
     KIMI_CODE_VERSION: "0.37.2"
     # Keep parity with OpenCode: slim default, opt-in toolchain image.
     WITH_TOOLCHAINS: "false"
@@ -70,8 +87,9 @@ worker-kimi-image:
       --dockerfile "$CI_PROJECT_DIR/kimicode4lunarwing/Dockerfile"
       --build-arg "KIMI_CODE_VERSION=$KIMI_CODE_VERSION"
       --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
-      --destination "$CI_REGISTRY_IMAGE/worker-kimi:$CI_COMMIT_SHORT_SHA"
-      --destination "$CI_REGISTRY_IMAGE/worker-kimi:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --push-retry=5
   rules:
     - when: manual
       allow_failure: true
