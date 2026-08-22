@@ -553,10 +553,11 @@ previous compatibility baseline.
 - Engine output safety still truncates oversized prefixes before later
   redaction/policy transforms and does not re-cap every later transformation.
 - `cargo check --tests --no-default-features --features postgres` currently
-  fails on three pre-existing cfg(test) breakages on master (libsql-gated
-  `test_db` helpers and a multi-tenant test harness builder); CI never runs
-  that shape (postgres runs check-only, tests run under libsql), but a fix is
-  still owed.
+  fails on pre-existing cfg(test) breakages on master (libsql-gated `test_db`
+  helpers and a multi-tenant test harness builder in the lib tests, plus the
+  `trace_format` / `trace_llm_tests` integration test targets under the same
+  feature shape); CI never runs that shape (postgres runs check-only, tests
+  run under libsql), but a fix is still owed.
 - Kawarimi remains PostgreSQL-only.
 - Full release test aggregation remains blocked by unavailable real channel
   WASM artifacts and existing skill-selection/TensorZero streaming
