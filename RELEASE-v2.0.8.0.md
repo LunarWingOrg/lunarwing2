@@ -99,8 +99,11 @@ previous compatibility baseline.
   `add-tenant --with-study-mcp`.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
-- Kimi external worker bumped to Kimi Code CLI `0.37.2`, with the pinned
-  version baked into the image and exposed on the worker `/health` endpoint.
+- Kimi external worker bumped to Kimi Code CLI `0.37.2` and retargeted at the
+  LunarWing TensorZero gateway (`FrontierCODE` over the NetBird overlay) as
+  its baked default provider — the managed `api.kimi.com` service has failed
+  worker prompts since 0.37.2 — with the pinned version baked into the image
+  and exposed on the worker `/health` endpoint.
 
 ## Compatibility
 
@@ -408,7 +411,16 @@ previous compatibility baseline.
   global-scope ARG baked into the runtime image as `KIMI_CODE_IMAGE_VERSION`
   and surfaced on `/health` as `kimi_code_version`; CLI contract
   (`-p`/`--output-format stream-json`, stream-json line shapes, config keys)
-  re-verified against the `0.37.2` npm release.
+  re-verified against the `0.37.2` npm release. The baked default provider is
+  now the LunarWing TensorZero gateway (`tensorzero/FrontierCODE`,
+  OpenAI-compatible, reached over the NetBird overlay) — the same function
+  the OpenCode worker uses — because worker prompts against the managed
+  `api.kimi.com` service fail on 0.37.2. `KIMI_MODEL` overrides that do not
+  match an existing config alias retarget the baked model entry so
+  `default_model` stays resolvable (0.37.2 refuses startup otherwise),
+  `KIMI_API_KEY` falls back to `TENSORZERO_API_KEY`, and the previous
+  managed-service OAuth flow remains available by mounting a custom config
+  via `KIMI_CONFIG_SOURCE`.
 - New operator documentation: a Debian/Ubuntu tenant spin-up guide joins the
   existing Gentoo/Arch/Fedora guides, and the architecture, bugs, guides,
   internal, and proposals doc sets were each re-verified against the code for
