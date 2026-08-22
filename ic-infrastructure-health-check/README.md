@@ -379,7 +379,7 @@ is not valid JSON).
 | — | `SELF_HEAL_MAX_REPORT_AGE` | 0 | Refuse to act on a report older than this many seconds; `0` disables |
 | — | `SELF_HEAL_REMEDY_LOGICAL` | true | `false` → remediate **only** discovered init sub-units, not logical base services (MT hosts) |
 | — | `SELF_HEAL_SYSTEMD_SCOPE` | system | Bus for non-tenant LunarWing base services: `system` or `user`; host NetBird daemon stays on system bus |
-| — | `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` | 15 | Per-call timeout (s) for tenant user-bus restarts/probes; a wedged tenant manager can't stall the tick (needs `timeout(1)`) |
+| — | `SELF_HEAL_PROBE_TIMEOUT` | 15 | Per-call timeout (s) for init probes/remediations (tenant user-bus restarts/probes AND OpenRC `rc-service` status/restart); a wedged tenant manager or hung supervise-daemon can't stall the tick (needs `timeout(1)`). `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` is a legacy alias |
 | — | `SELF_HEAL_NETBIRD_REMEDIATE` | false | Allow NetBird daemon restart; otherwise NetBird failure is escalation-only |
 | — | `SELF_HEAL_STATE_DIR` | `<reports>/../self-heal` | State + lock + escalation directory |
 | — | `SELF_HEAL_LOG` | `<state-dir>/actions.log` | Action log path |
