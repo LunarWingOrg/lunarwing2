@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.8.0 (FIRST DRAFT): Codename `Sekisho (関所)`
 
-** Release Date: ** TBD (draft 2026-08-20)
+** Release Date: ** TBD (draft 2026-08-22)
 
 > *Sekisho* (関所) were the checkpoint stations of Edo-period Japan, where
 > travelers, documents, and goods were inspected before being allowed to
@@ -78,8 +78,11 @@ previous compatibility baseline.
   silently bounded by axum's 2 MiB default body limit, so any base64-encoded
   attachment larger than ~1.4 MiB raw was rejected with HTTP 413 before the
   send handler ran — agents could not attach and send ordinary photos. The
-  send body limit is now an explicit 70 MiB, sized to the host's 50 MB
-  outbound attachment cap plus base64 inflation (work item #42).
+  send body limit is now an explicit 70 MiB, sized to the host's 50 MiB
+  outbound attachment cap plus base64 inflation, scoped to the send route
+  only (every other route keeps the 2 MiB default), with bearer
+  authorization running as middleware before any request body is buffered
+  (work item #42).
 - Healthpoint metrics exporter: the host health pipeline now emits a
   Prometheus textfile exposition of the aggregated report and self-heal
   state after every check, with per-check durations, a graduated
@@ -96,8 +99,6 @@ previous compatibility baseline.
   `add-tenant --with-study-mcp`.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
-- Kimi external worker bumped to Kimi Code CLI `0.37.2`, with the pinned
-  version baked into the image and exposed on the worker `/health` endpoint.
 
 ## Compatibility
 
@@ -110,6 +111,7 @@ previous compatibility baseline.
 | Multi-tenant port registry | v16 — new host-global `health_metrics` slot (default port 50000, above all tenant ranges); auto-migrates from v15 |
 | MCP negotiated version | Client requests `2024-11-05` and also accepts `2025-03-26` from servers that answer it; anything else fails before activation |
 | Channel registry patches | darkirc 0.1.5, multica 0.1.7, weechat 0.2.6, xmpp 0.1.10 |
+| Tool registry patches | gitlab 0.1.3 |
 | LunarVision health | Dedicated operational listener (`8089` single-node); MT hosts discover per-tenant `vision_health` from the registry |
 | LunarVoice health | Dedicated operational listener (`8091` single-node); starts fail loudly if the sidecar never goes healthy |
 | CI scope | Source verification; no package publication or tenant deployment |
@@ -224,6 +226,22 @@ previous compatibility baseline.
   a genuinely successful command, and tools that disallow persistent grants
   are still filtered by `allows_always_approval`.
 
+### GitLab WASM Tool
+
+- The bundled GitLab tool now speaks GitLab's unified Work Items API (work
+  item #60): new `get_work_item` and `list_work_items` operations cover Issue
+  and Task types, and `get_issue` falls back from classic-API 404s to an
+  exact Work Items IID lookup, so issues migrated to Work Items stay
+  reachable. Single-item reads go through the collection `iids` filter
+  because GitLab 19.2 may expose the collection while feature-gating the
+  single-item REST endpoint for API tokens.
+- Listing follows bounded same-origin keyset pagination with explicit
+  completion data, deduplicates stable IDs, and reconciles classic issue
+  totals — closing the pagination stalls and miscounts seen against large
+  projects.
+- The tool package, capabilities sidecar, and registry entry were bumped to
+  0.1.3.
+
 ### Agent Failure Recovery With Next Steps
 
 - New safe `recovery_kind` / `recovery_instruction` / `terminal_guidance`
@@ -310,6 +328,36 @@ previous compatibility baseline.
   serves the exposition over HTTP with loopback bind + peer enforcement and
   constant-time bearer comparison; its installer supports systemd, OpenRC,
   and launchd.
+- systemd health-path hardening follow-ups: the watchdog can now target the
+  system or per-user manager via `LUNARWING_WATCHDOG_SYSTEMD_SCOPE`
+  (system|user); self-heal's per-tenant systemd user-bus probes are bounded
+  by `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` (default 15 s) so a hung user manager
+  can no longer stall the whole sweep; `health-systemd.sh` flags active
+  timers with no scheduled next wake (a monitoring blind spot where a timer
+  looks healthy but will never fire again); the mt-admin-rendered health
+  oneshot carries an explicit `TimeoutStartSec` instead of relying on
+  systemd's default; and the watchdog installer no longer aborts when the
+  initial smoke run fails. Covered by two new test suites
+  (`test-watchdog-systemd.sh`, `test-health-metrics-unit.sh`).
+- OpenRC health-path hardening follow-ups: `health-openrc.sh` closes the
+  cron-scheduler blind spot — when a LunarWing cron hook is installed but no
+  scheduler daemon (`fcron`/`cronie`/`dcron`/`crond`/`busybox-cron`) is
+  running, the component reports `metrics.scheduler` and degrades with an
+  explicit issue (report-only so self-heal never restarts a pseudo-service,
+  degraded at worst so it never masks a real per-service outage, inert when
+  no hook is installed). Self-heal's probe bound was generalized to
+  `SELF_HEAL_PROBE_TIMEOUT` (default 15 s; `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`
+  remains as a legacy alias) and now also bounds OpenRC `rc-service`
+  status/restart calls, so a hung supervise-daemon cannot stall a remediation
+  tick. The OpenRC watchdog bounds every `rc-service` call
+  (`lunarwing_watchdog_probe_timeout` / `LUNARWING_WATCHDOG_PROBE_TIMEOUT`,
+  default 15 s) so a wedged probe can no longer hold the watchdog flock and
+  silently disable every future run, and the installer now smoke-runs the
+  OpenRC wrapper once at install time (warn-only, parity with the systemd
+  oneshot). Covered by the new `test-watchdog-openrc.sh` suite (28
+  assertions) plus new `test-health-openrc.sh` and chaos-harness cases —
+  691/691 green across 14 suites; write-up in
+  `docs/ops/v2.0.8.0_GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
 
 ### WASM Channel Tool Activity
 
@@ -361,7 +409,14 @@ previous compatibility baseline.
 - Version bump: all LunarWing crates and WASM channels 2.0.7 → 2.0.8,
   channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.6,
   xmpp 0.1.10), full `cargo update` on the main lockfile (MSRV
-  1.96.1-compatible), cargo-deny clean.
+  1.96.1-compatible), cargo-deny clean. The new `lunarwing_health_metrics`
+  crate is enrolled in the CI release-version policy.
+- Fixed an external-worker wire bug found by live smoke testing: the
+  orchestrator serialized `TaskContext.project_dir` as an explicit JSON
+  `null` when unset, which the Kimi worker's TypeScript bridge rejects —
+  every Kimi job dispatched without an explicit project directory failed at
+  the bridge before the worker could start. The field is now omitted when
+  unset, a shape all three workers (Pebble, OpenCode, Kimi Code) accept.
 - Opencode external worker: `OPENCODE_REF` pinned to `v1.18.18` as a single
   global-scope ARG baked into the runtime image as `OPENCODE_IMAGE_REF` and
   surfaced on `/health` as `opencode_ref`; build contract re-verified against
@@ -380,6 +435,17 @@ previous compatibility baseline.
   `.codex` markers and a stale resume artifact removed. Full ledger in
   `docs/ops/v2.0.8.0_REPO_HYGIENE.md`.
 - CI now runs the full master job set on `aragents/kimil00p/*` branches.
+- Worker container images are now published under the moving `v2.0.8.0` and
+  `latest` tags plus an immutable `$CI_COMMIT_SHORT_SHA` tag per build, so
+  consumers that need a stable reference can pin the SHA tag (pruning relies
+  on the server-side registry cleanup policy). Kaniko registry pushes force
+  HTTP/1.1 with `--push-retry=5`, which fixed the earlier HTTP/2
+  `502 Bad Gateway` failures on blob PATCHes through the Traefik front end;
+  the remaining `499 Client Closed Request` failures on the largest images
+  were diagnosed as proxy-chain read timeouts (Traefik `respondingTimeouts`,
+  omnibus `registry_nginx` body/proxy timeouts) that must be raised on the
+  GitLab host — full diagnosis and host-side fix in
+  `docs/ops/REGISTRY_PUSH_499.md`.
 
 ## Upgrade Notes
 
@@ -410,7 +476,12 @@ previous compatibility baseline.
 7. Rebuild the opencode external-worker image so the pinned `v1.18.18` build
    takes effect; check `/health` for `opencode_ref` afterward. Rebuild the
    kimi external-worker image for the pinned `0.37.2` CLI; check `/health`
-   for `kimi_code_version`.
+   for `kimi_code_version`. Note the rebuilt kimi image defaults to the
+   LunarWing TensorZero gateway (`tensorzero/FrontierCODE`) as its provider:
+   provision `TENSORZERO_API_KEY` (or `KIMI_API_KEY`) if your gateway
+   requires a bearer token, and mount a custom config via
+   `KIMI_CONFIG_SOURCE` if you still need the managed `api.kimi.com` OAuth
+   flow.
 8. Tenants created before this release may carry the legacy
    `IRONCLAW_BASE_DIR`/`IRONCLAW_SOCKET` env aliases. No action is needed —
    both remain accepted — but newly generated tenant envs contain only the
@@ -424,6 +495,15 @@ previous compatibility baseline.
     the skill-extraction and skill-maintenance missions (previously only
     self-improvement was gated). Re-enabling the flag resumes exactly those
     gate-paused missions; missions you paused yourself stay paused.
+11. OpenRC health hardening is backward compatible: self-heal's per-call
+    probe timeout is now `SELF_HEAL_PROBE_TIMEOUT` (the old
+    `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` is honored as a legacy alias and the
+    bound now also covers OpenRC `rc-service` calls), and the OpenRC watchdog
+    gained `lunarwing_watchdog_probe_timeout` (default 15 s).
+    `health-openrc.sh` additionally reports a `metrics.scheduler` block and
+    degrades when a LunarWing cron hook is installed but no cron scheduler
+    daemon is running — a new degraded (never critical) signal worth
+    checking after upgrade.
 
 ## Known Issues
 
@@ -459,16 +539,21 @@ previous compatibility baseline.
 - Engine output safety still truncates oversized prefixes before later
   redaction/policy transforms and does not re-cap every later transformation.
 - `cargo check --tests --no-default-features --features postgres` currently
-  fails on three pre-existing cfg(test) breakages on master (libsql-gated
-  `test_db` helpers and a multi-tenant test harness builder); CI never runs
-  that shape (postgres runs check-only, tests run under libsql), but a fix is
-  still owed.
+  fails on pre-existing cfg(test) breakages on master (libsql-gated `test_db`
+  helpers and a multi-tenant test harness builder in the lib tests, plus the
+  `trace_format` / `trace_llm_tests` integration test targets under the same
+  feature shape); CI never runs that shape (postgres runs check-only, tests
+  run under libsql), but a fix is still owed.
 - Kawarimi remains PostgreSQL-only.
 - Full release test aggregation remains blocked by unavailable real channel
   WASM artifacts and existing skill-selection/TensorZero streaming
   expectations.
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
+- Large worker-image pushes (opencode, pebble) can still fail with registry
+  `499 Client Closed Request` until the proxy-chain read timeouts are raised
+  on the GitLab host; the fix is server-side and cannot be applied from this
+  repo (diagnosis and host-side steps: `docs/ops/REGISTRY_PUSH_499.md`).
 
 ### Resolved Since v2.0.7.0
 
@@ -487,12 +572,21 @@ previous compatibility baseline.
   failed, making the GitLab WASM tool re-prompt on every call: grants now
   persist at tool level independent of call success, ssh excepted (work item
   #70).
+- The GitLab tool's classic-issues-only API: unified Work Items support,
+  bounded keyset pagination, and a `get_issue` 404 fallback now cover
+  GitLab's Work Items migration (work item #60).
+- Kimi external-worker jobs failing at dispatch whenever no explicit project
+  directory was set — the worker bridge rejected the serialized JSON `null`:
+  `TaskContext.project_dir` is now omitted on the wire when unset.
 - WeeChat truncating multi-line tool output at the first newline and
   executing outbound lines starting with `/` as client commands (work item
   #66).
 - XMPP bridge rejecting photo-sized image attachments with HTTP 413: the
   `/v1/messages/send` JSON body limit is now an explicit 70 MiB instead of
-  axum's 2 MiB default, with a regression test proving large attachment sends
+  axum's 2 MiB default, scoped to the send route so every other route keeps
+  the default bound, and authorization now runs before the body is buffered
+  — closing the pre-auth memory-amplification window from
+  `docs/ops/MEDIUM.MD`. A regression test proves large attachment sends
   reach the handler (work item #42).
 - WASM channels silently dropping tool-activity status events: the global
   `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to

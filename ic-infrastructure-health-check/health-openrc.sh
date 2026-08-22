@@ -280,6 +280,95 @@ for svc in "${SERVICES_ARR[@]}"; do
   svc_results+=("$(svc_json "$svc" "$state" "$local_status")")
 done
 
+# ── Cron-scheduler blind spot (OpenRC analog of the systemd timer check) ─────
+# The OpenRC watchdog and the MT health pipeline are driven by cron: an hourly
+# hook under /etc/cron.hourly (or /etc/periodic/hourly), or an fcron/crontab
+# managed block. If the hook is installed but no cron scheduler daemon is
+# RUNNING, nothing will ever fire — watchdog, health pipeline, and self-heal
+# all silently stop — while every per-service probe above still reads healthy.
+# Report-only (the scheduler is never listed in .metrics.services[], so
+# self-heal will not try to restart a pseudo-service) and degraded at worst:
+# it never masks or downgrades a real per-service outage.
+
+# Cron hook directories to inspect for an installed watchdog hook.
+# Space-separated; overridable so the test suite can point at a fake tree.
+CRON_DIRS="${HEALTH_OPENRC_CRON_DIRS:-/etc/cron.hourly /etc/periodic/hourly}"
+
+# Cron scheduler daemons that can fire the hooks (superset of the installer's
+# hourly trio and mt-admin's _ensure_cron_runlevel list).
+SCHEDULER_CANDIDATES="fcron cronie dcron crond busybox-cron"
+
+# Bounded generic command runner (same timeout policy as probe_status).
+probe_cmd() {
+  if [ "$STATUS_TIMEOUT" != "0" ] && command -v timeout >/dev/null 2>&1; then
+    timeout -k 2 "$STATUS_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Is a LunarWing cron hook installed? Only then is a dead scheduler a problem;
+# an operator who never installed the cron-driven watchdog/pipeline has nothing
+# to fire, and the check stays inert (fail safe, no false degraded).
+watchdog_cron_hook_installed() {
+  local dir
+  for dir in $CRON_DIRS; do
+    [ -x "$dir/lunarwing-watchdog" ] && return 0
+  done
+  # fcron root tab (single-node watchdog managed block) and fcron/crontab
+  # managed block (MT health pipeline). Bounded so a wedged cron config
+  # cannot stall the component.
+  if command -v fcrontab >/dev/null 2>&1; then
+    probe_cmd fcrontab -l 2>/dev/null | grep -q "lunarwing" && return 0
+  fi
+  if command -v crontab >/dev/null 2>&1; then
+    probe_cmd crontab -l 2>/dev/null | grep -q "lunarwing" && return 0
+  fi
+  return 1
+}
+
+# Sets globals SCHED_STATUS (absent|healthy|degraded) and SCHED_RUNNING.
+check_scheduler() {
+  SCHED_RUNNING=""
+  if ! watchdog_cron_hook_installed; then
+    SCHED_STATUS="absent"
+    return 0
+  fi
+  local cron
+  for cron in $SCHEDULER_CANDIDATES; do
+    [ -x "$INITD_DIR/$cron" ] || continue
+    probe_status "$cron"
+    if [ "$STATUS_RC" -eq 0 ] && echo "$STATUS_OUT" | grep -qi "started"; then
+      SCHED_RUNNING="$cron"
+      break
+    fi
+  done
+  if [ -n "$SCHED_RUNNING" ]; then
+    SCHED_STATUS="healthy"
+  else
+    SCHED_STATUS="degraded"
+    issues+=("cron hook installed but no cron scheduler is running ($SCHEDULER_CANDIDATES); watchdog and health schedules will never fire")
+  fi
+}
+
+check_scheduler
+
+# A dead scheduler degrades the component at worst — it can raise a healthy
+# verdict to degraded, but never overrides a worse per-service verdict.
+if [ "$SCHED_STATUS" = "degraded" ] && [ "$overall_exit" -lt 1 ]; then
+  overall_exit=1
+  overall_status="degraded"
+fi
+
+sched_hook=false
+if [ "$SCHED_STATUS" != "absent" ]; then
+  sched_hook=true
+fi
+sched_running=null
+if [ -n "$SCHED_RUNNING" ]; then
+  sched_running="\"$SCHED_RUNNING\""
+fi
+
 issues_json="[]"
 if [ ${#issues[@]} -gt 0 ]; then
   issues_json=$(printf '%s\n' "${issues[@]}" | jq -R . | jq -s .)
@@ -293,7 +382,12 @@ cat <<EOF
   "status": "$overall_status",
   "timestamp": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "metrics": {
-    "services": $svcs_json
+    "services": $svcs_json,
+    "scheduler": {
+      "hook_installed": $sched_hook,
+      "running": $sched_running,
+      "status": "$SCHED_STATUS"
+    }
   },
   "issues": $issues_json
 }

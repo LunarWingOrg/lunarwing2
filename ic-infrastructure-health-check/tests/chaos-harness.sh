@@ -198,6 +198,35 @@ else
     ok "CH16: SKIP (timeout unavailable)"
 fi
 
+echo "=== CH17: wedged OpenRC rc-service -> bounded, counted as failed restart ==="
+# A hung rc-service (wedged supervise-daemon) must not stall the whole self-heal
+# tick: SELF_HEAL_PROBE_TIMEOUT bounds every OpenRC status/restart call.
+if command -v timeout >/dev/null 2>&1; then
+    c="$(sb)"; mk_mockbin "$c"
+    svc_down "$c" "lunarwing-acme"
+    report "$c" '{components:[{component:"openrc",status:"critical",metrics:{services:[
+      {name:"lunarwing-acme",status:"critical"}]}}]}'
+    # Mock wedged OpenRC: every rc-service call hangs.
+    cat > "$c/bin/rc-service" <<'EOF'
+#!/usr/bin/env bash
+sleep 300
+EOF
+    chmod +x "$c/bin/rc-service"
+    start=$SECONDS
+    o="$(run_chaos "$c" openrc SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
+        SELF_HEAL_PROBE_TIMEOUT=2)"
+    elapsed=$((SECONDS - start))
+    assert_contains "$o" "RESTART_FAIL" "CH17: wedged rc-service counted as failed restart"
+    assert_contains "$o" "Self-Healing complete" "CH17: tick completes despite the wedged rc-service"
+    assert_range "$elapsed" 0 30 "CH17: tick bounded (~2s probe timeout, not 300s hang)"
+    assert_eq "$(state_of "$c" '.["lunarwing-acme"].retries // 0')" "1" "CH17: retry recorded for next tick"
+else
+    ok "CH17: SKIP (timeout unavailable)"
+    ok "CH17: SKIP (timeout unavailable)"
+    ok "CH17: SKIP (timeout unavailable)"
+    ok "CH17: SKIP (timeout unavailable)"
+fi
+
 echo
 echo "Note: CH7 (DNS failure) is modeled by CH6's stuck-service escalation path."
 echo "Note: CH8 (disk full) requires real disk-fault injection and is out of scope"

@@ -6,3 +6,8 @@ lunarwing_watchdog_service="lunarwing"
 lunarwing_watchdog_log="/var/log/lunarwing-watchdog.log"
 lunarwing_watchdog_lock="/run/lunarwing-watchdog.lock"
 lunarwing_watchdog_post_restart_sleep_seconds="5"
+
+# Bound (seconds) around every rc-service call, so a wedged OpenRC /
+# supervise-daemon fails the probe instead of hanging the watchdog run (a hung
+# run holds the lock and would wedge every future run too).
+lunarwing_watchdog_probe_timeout="15"

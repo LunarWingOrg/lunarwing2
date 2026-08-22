@@ -157,9 +157,13 @@
 # always resolve through owning user's bus; host NetBird daemon stays on system.
 #SELF_HEAL_SYSTEMD_SCOPE=system
 
-# Bound (seconds) around each per-tenant systemd user-bus call (restart /
-# is-active / show). A wedged tenant user manager otherwise stalls the entire
-# self-heal tick. Requires coreutils timeout(1); unbounded when unavailable.
+# Bound (seconds) around each init-system probe/remediation call: per-tenant
+# systemd user-bus calls (restart / is-active / show) AND OpenRC rc-service
+# status/restart. A wedged tenant user manager or hung supervise-daemon
+# otherwise stalls the entire self-heal tick. Requires coreutils timeout(1);
+# unbounded when unavailable. SELF_HEAL_SYSTEMD_PROBE_TIMEOUT remains as a
+# legacy alias.
+#SELF_HEAL_PROBE_TIMEOUT=15
 #SELF_HEAL_SYSTEMD_PROBE_TIMEOUT=15
 
 # NetBird failures are monitor-only by default. Enable only when operator

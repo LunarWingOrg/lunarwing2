@@ -61,6 +61,7 @@ test("entrypoint accepts a missing Kimi API key", () => {
     KIMI_CONFIG_SOURCE: source,
   }
   delete env.KIMI_API_KEY
+  delete env.TENSORZERO_API_KEY
 
   const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
     encoding: "utf8",
@@ -69,6 +70,45 @@ test("entrypoint accepts a missing Kimi API key", () => {
 
   assert.equal(result.status, 0, result.stderr)
   assert.equal(readFileSync(join(home, "config.toml"), "utf8"), 'api_key = ""\n')
+})
+
+test("entrypoint retargets the baked model entry when KIMI_MODEL is a new model id", () => {
+  assert.ok(configSectionEnd > 0)
+  const root = mkdtempSync(join(tmpdir(), "kimi-config-retarget-"))
+  const home = join(root, "home")
+  const source = join(root, "source.toml")
+  writeFileSync(source, `default_model = "tensorzero/FrontierCODE"
+
+[providers.tensorzero]
+type = "openai"
+base_url = "http://100.88.232.146:3000/openai/v1"
+api_key = ""
+
+[models."tensorzero/FrontierCODE"]
+provider = "tensorzero"
+model = "tensorzero::function_name::FrontierCODE"
+max_context_size = 859000
+capabilities = ["tool_use"]
+`)
+
+  const result = spawnSync("bash", ["-c", entrypoint.slice(0, configSectionEnd)], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      KIMI_CODE_HOME: home,
+      KIMI_CONFIG_SOURCE: source,
+      KIMI_MODEL: "tensorzero::function_name::baud",
+    },
+  })
+  assert.equal(result.status, 0, result.stderr)
+  const config = readFileSync(join(home, "config.toml"), "utf8")
+  assert.match(config, /default_model = "tensorzero::function_name::baud"/)
+  assert.match(config, /\[models\."tensorzero::function_name::baud"\]/)
+  assert.match(config, /model = "tensorzero::function_name::baud"/)
+  assert.match(config, /provider = "tensorzero"/)
+  // provider/base_url lines untouched, exactly one model entry renamed
+  assert.match(config, /base_url = "http:\/\/100\.88\.232\.146:3000\/openai\/v1"/)
+  assert.equal(config.match(/\[models\./g)?.length, 1)
 })
 
 test("entrypoint CLI mode forces print and stream-json", () => {
