@@ -129,15 +129,21 @@ realm `https://git.lunarwing.org/jwt/auth`.)
 - **502 on Kaniko `PATCH .../blobs/uploads`:** not a missing backend — HTTP/2
   blob streaming through Traefik/nginx. CI forces `GODEBUG=http2client=0`
   and `--push-retry=5`. See section 4.
+- **499 Client Closed Request on Kaniko `PATCH .../blobs/uploads`:** a proxy
+  timeout firing mid-upload on multi-GB blobs (observed on the opencode/pebble
+  worker images). Needs Traefik/omnibus timeout changes on this host — full
+  diagnosis and exact config in `REGISTRY_PUSH_499.md`.
 - **Wrong token realm / scheme mismatch on `docker login`:** the
   `registry_nginx['proxy_set_headers']` block is missing.
 
 ### 1f. Large-image notes for Traefik
 
 Worker images can be multi-GB (especially opencode with toolchains). Traefik
-streams request bodies by default, which is fine; if very large layer pushes
-ever stall, raise `forwardingTimeouts` on the entrypoint or on the
-`gitlab-registry` router (`serversTransport`). Leave request buffering off.
+streams request bodies by default, which is fine; large layer pushes that die
+mid-`PATCH` with `499 Client Closed Request` mean a responding/forwarding
+timeout fired — raise `respondingTimeouts` on the `websecure` entrypoint and
+omnibus `registry_nginx` body/proxy timeouts per `REGISTRY_PUSH_499.md`.
+Leave request buffering off.
 
 ## 2. CI: build and push worker images
 
@@ -145,9 +151,9 @@ ever stall, raise `forwardingTimeouts` on the entrypoint or on the
 
 | Job | Context | Image pushed |
 |---|---|---|
-| `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{v2.0.8.0,latest}` |
-| `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{v2.0.8.0,latest}` |
-| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{v2.0.8.0,latest}` |
+| `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{v2.0.8.0,latest,<short-sha>}` |
+| `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{v2.0.8.0,latest,<short-sha>}` |
+| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{v2.0.8.0,latest,<short-sha>}` |
 
 Details:
 
@@ -167,11 +173,14 @@ Details:
   `false`; set `true` on the selected manual job for the full toolchain image —
   mirrors mt-admin's `--with-toolchains`). Kimi also exposes
   `KIMI_CODE_VERSION` (currently `0.37.2`).
-- Tags are a moving `WORKER_IMAGE_TAG` (default `v2.0.8.0`) plus `:latest`.
-  Unique short-SHA tags are not pushed: they accumulate, and this registry's
-  tag-delete UI has 502ed while trying to clear them. When playing a job,
-  override `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME` to retarget a
-  wedged tag or repository (e.g. `WORKER_IMAGE_NAME=worker-pebble-2080`).
+- Tags: a moving `WORKER_IMAGE_TAG` (default `v2.0.8.0`) plus `:latest`, plus
+  an immutable `$CI_COMMIT_SHORT_SHA` tag. The moving tags silently retarget
+  between builds — consumers that need a stable reference should pull the SHA
+  tag (or pin the digest it resolves to). SHA tags accumulate, so the
+  server-side cleanup policy (section 4) should be enabled to prune them; this
+  registry's tag-delete UI has 502ed while trying to clear tags manually.
+  When playing a job, override `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME`
+  to retarget a wedged tag or repository (e.g. `WORKER_IMAGE_NAME=worker-pebble-2080`).
 - Kaniko jobs set `GODEBUG=http2client=0` and `--push-retry=5`. HTTP/2 blob
   PATCH through Traefik/nginx in front of GitLab's registry is a known 502
   source; forcing HTTP/1.1 is GitLab's documented workaround.
@@ -208,10 +217,11 @@ plus an integrity check (digest pin per release).
 ## 4. Housekeeping
 
 - **Cleanup policy**: project → Settings → Packages and registries → Cleanup
-  policy for container repositories — e.g. keep 5 tags per repo, remove tags
-  older than 30 days matching `.*` except `latest` and `v2.0.8.0`. Historical
-  short-SHA tags may still exist from older pipelines; CI no longer creates
-  new ones.
+  policy for container repositories — e.g. keep 10 tags per repo, remove tags
+  older than 30 days matching `.*` except `latest` and `v2.0.8.0`. CI pushes a
+  new immutable short-SHA tag per build (for pinning), so this policy is what
+  keeps them from accumulating — enable it if it is not already on. The
+  tag-delete UI has 502ed on manual clears, so do not rely on it.
 - Registry-side garbage collection runs via omnibus defaults; no action
   needed unless storage grows.
 - **`502 Bad Gateway` on `PATCH .../blobs/uploads/...`:** Kaniko hitting
@@ -219,3 +229,6 @@ plus an integrity check (digest pin per release).
   If a specific tag/repo is wedged after a failed delete, replay the manual
   job with `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME` set to a fresh
   value rather than retrying the same destination.
+- **`499 Client Closed Request` on `PATCH .../blobs/uploads/...`:** proxy
+  timeout on large blobs, not fixable from CI — see `REGISTRY_PUSH_499.md`
+  for the GitLab-host Traefik/omnibus changes.
