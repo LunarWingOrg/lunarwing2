@@ -5,6 +5,7 @@
 |---------|--------|
 | MT Admin Hardening | v2.0.9.0 |
 | Additional Purification | v2.0.9.0 |
+| Additional fixes targetting closure of identified issues | v2.0.9.0 |
 | Interrupt/Steer - Mid-turn steering | v2.1.0.0 |
 | Lunarvision support for multimodal models | v2.1.1.0 |
 | Lunartica improvements | v2.1.2.0 |
