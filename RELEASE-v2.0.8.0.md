@@ -344,6 +344,25 @@ previous compatibility baseline.
   systemd's default; and the watchdog installer no longer aborts when the
   initial smoke run fails. Covered by two new test suites
   (`test-watchdog-systemd.sh`, `test-health-metrics-unit.sh`).
+- OpenRC health-path hardening follow-ups: `health-openrc.sh` closes the
+  cron-scheduler blind spot — when a LunarWing cron hook is installed but no
+  scheduler daemon (`fcron`/`cronie`/`dcron`/`crond`/`busybox-cron`) is
+  running, the component reports `metrics.scheduler` and degrades with an
+  explicit issue (report-only so self-heal never restarts a pseudo-service,
+  degraded at worst so it never masks a real per-service outage, inert when
+  no hook is installed). Self-heal's probe bound was generalized to
+  `SELF_HEAL_PROBE_TIMEOUT` (default 15 s; `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`
+  remains as a legacy alias) and now also bounds OpenRC `rc-service`
+  status/restart calls, so a hung supervise-daemon cannot stall a remediation
+  tick. The OpenRC watchdog bounds every `rc-service` call
+  (`lunarwing_watchdog_probe_timeout` / `LUNARWING_WATCHDOG_PROBE_TIMEOUT`,
+  default 15 s) so a wedged probe can no longer hold the watchdog flock and
+  silently disable every future run, and the installer now smoke-runs the
+  OpenRC wrapper once at install time (warn-only, parity with the systemd
+  oneshot). Covered by the new `test-watchdog-openrc.sh` suite (28
+  assertions) plus new `test-health-openrc.sh` and chaos-harness cases —
+  691/691 green across 14 suites; write-up in
+  `docs/ops/v2.0.8.0_GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
 
 ### WASM Channel Tool Activity
 
