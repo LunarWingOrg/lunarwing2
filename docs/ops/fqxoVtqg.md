@@ -30,7 +30,7 @@ Branch aj/kimi-28-20260822-0001, MR !615, 655 insertions. Baseline 575/575 green
 5. **MT health oneshot TimeoutStartSec** — floor of max(interval, 900s); ~90s distro default killed legit multi-tenant remediations mid-restart. Also `LUNARWING_MT_SYSTEMD_UNIT_DIR` override (install + remove paths).
 6. **New suites**: test-watchdog-systemd.sh (32 assertions incl. StartLimitBurst reset-failed ordering, gateway deep-check false-restart guards, user-scope routing, lock contention), test-health-metrics-unit.sh (15), mt-admin health-interval harness coverage.
 
-## Transferable to OpenRC #27 (Rarity's host)
+## Transferable to OpenRC goal item 27 (Rarity's host)
 - **Pattern 2 is init-agnostic**: `install_openrc_watchdog()` in the same installer likely has the same abort-after-success class (check `rc-service start` smoke under set -e).
 - **Pattern 4 applies to ANY init**: OpenRC `rc-service`/`supervise-daemon` calls on a dead daemon can hang identically — bound them with the same timeout helper philosophy.
 - **Pattern 3 has an OpenRC analog**: fcron/cron entries that silently stopped, or `started` status with dead supervise-daemon — the *concept* (status reads healthy but nothing will ever fire) deserves an OpenRC-specific check.
