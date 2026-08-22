@@ -14,7 +14,10 @@ telemetry = false
 [providers.tensorzero]
 type = "openai"
 base_url = "http://100.88.232.146:3000/openai/v1"
-api_key = ""
+# Non-secret placeholder: the gateway on the private overlay accepts any bearer,
+# and kimi-code refuses to run with an empty api_key. entrypoint.sh overwrites
+# this with KIMI_API_KEY / TENSORZERO_API_KEY when either is provisioned.
+api_key = "tensorzero"
 
 [models."tensorzero/FrontierCODE"]
 provider = "tensorzero"
