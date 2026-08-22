@@ -99,8 +99,11 @@ previous compatibility baseline.
   `add-tenant --with-study-mcp`.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
-- Kimi external worker bumped to Kimi Code CLI `0.37.2`, with the pinned
-  version baked into the image and exposed on the worker `/health` endpoint.
+- Kimi external worker bumped to Kimi Code CLI `0.37.2` and retargeted at the
+  LunarWing TensorZero gateway (`FrontierCODE` over the NetBird overlay) as
+  its baked default provider — the managed `api.kimi.com` service has failed
+  worker prompts since 0.37.2 — with the pinned version baked into the image
+  and exposed on the worker `/health` endpoint.
 
 ## Compatibility
 
@@ -341,6 +344,25 @@ previous compatibility baseline.
   systemd's default; and the watchdog installer no longer aborts when the
   initial smoke run fails. Covered by two new test suites
   (`test-watchdog-systemd.sh`, `test-health-metrics-unit.sh`).
+- OpenRC health-path hardening follow-ups: `health-openrc.sh` closes the
+  cron-scheduler blind spot — when a LunarWing cron hook is installed but no
+  scheduler daemon (`fcron`/`cronie`/`dcron`/`crond`/`busybox-cron`) is
+  running, the component reports `metrics.scheduler` and degrades with an
+  explicit issue (report-only so self-heal never restarts a pseudo-service,
+  degraded at worst so it never masks a real per-service outage, inert when
+  no hook is installed). Self-heal's probe bound was generalized to
+  `SELF_HEAL_PROBE_TIMEOUT` (default 15 s; `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`
+  remains as a legacy alias) and now also bounds OpenRC `rc-service`
+  status/restart calls, so a hung supervise-daemon cannot stall a remediation
+  tick. The OpenRC watchdog bounds every `rc-service` call
+  (`lunarwing_watchdog_probe_timeout` / `LUNARWING_WATCHDOG_PROBE_TIMEOUT`,
+  default 15 s) so a wedged probe can no longer hold the watchdog flock and
+  silently disable every future run, and the installer now smoke-runs the
+  OpenRC wrapper once at install time (warn-only, parity with the systemd
+  oneshot). Covered by the new `test-watchdog-openrc.sh` suite (28
+  assertions) plus new `test-health-openrc.sh` and chaos-harness cases —
+  691/691 green across 14 suites; write-up in
+  `docs/ops/v2.0.8.0_GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
 
 ### WASM Channel Tool Activity
 
@@ -408,7 +430,16 @@ previous compatibility baseline.
   global-scope ARG baked into the runtime image as `KIMI_CODE_IMAGE_VERSION`
   and surfaced on `/health` as `kimi_code_version`; CLI contract
   (`-p`/`--output-format stream-json`, stream-json line shapes, config keys)
-  re-verified against the `0.37.2` npm release.
+  re-verified against the `0.37.2` npm release. The baked default provider is
+  now the LunarWing TensorZero gateway (`tensorzero/FrontierCODE`,
+  OpenAI-compatible, reached over the NetBird overlay) — the same function
+  the OpenCode worker uses — because worker prompts against the managed
+  `api.kimi.com` service fail on 0.37.2. `KIMI_MODEL` overrides that do not
+  match an existing config alias retarget the baked model entry so
+  `default_model` stays resolvable (0.37.2 refuses startup otherwise),
+  `KIMI_API_KEY` falls back to `TENSORZERO_API_KEY`, and the previous
+  managed-service OAuth flow remains available by mounting a custom config
+  via `KIMI_CONFIG_SOURCE`.
 - New operator documentation: a Debian/Ubuntu tenant spin-up guide joins the
   existing Gentoo/Arch/Fedora guides, and the architecture, bugs, guides,
   internal, and proposals doc sets were each re-verified against the code for
@@ -419,9 +450,16 @@ previous compatibility baseline.
   `docs/ops/v2.0.8.0_REPO_HYGIENE.md`.
 - CI now runs the full master job set on `aragents/kimil00p/*` branches.
 - Worker container images are now published under the moving `v2.0.8.0` and
-  `latest` tags instead of accumulating a unique short-SHA tag per build,
-  and Kaniko registry pushes force HTTP/1.1 with `--push-retry=5` so blob
-  PATCHes through the Traefik front end stop failing with 502 Bad Gateway.
+  `latest` tags plus an immutable `$CI_COMMIT_SHORT_SHA` tag per build, so
+  consumers that need a stable reference can pin the SHA tag (pruning relies
+  on the server-side registry cleanup policy). Kaniko registry pushes force
+  HTTP/1.1 with `--push-retry=5`, which fixed the earlier HTTP/2
+  `502 Bad Gateway` failures on blob PATCHes through the Traefik front end;
+  the remaining `499 Client Closed Request` failures on the largest images
+  were diagnosed as proxy-chain read timeouts (Traefik `respondingTimeouts`,
+  omnibus `registry_nginx` body/proxy timeouts) that must be raised on the
+  GitLab host — full diagnosis and host-side fix in
+  `docs/ops/REGISTRY_PUSH_499.md`.
 
 ## Upgrade Notes
 
@@ -452,7 +490,12 @@ previous compatibility baseline.
 7. Rebuild the opencode external-worker image so the pinned `v1.18.18` build
    takes effect; check `/health` for `opencode_ref` afterward. Rebuild the
    kimi external-worker image for the pinned `0.37.2` CLI; check `/health`
-   for `kimi_code_version`.
+   for `kimi_code_version`. Note the rebuilt kimi image defaults to the
+   LunarWing TensorZero gateway (`tensorzero/FrontierCODE`) as its provider:
+   provision `TENSORZERO_API_KEY` (or `KIMI_API_KEY`) if your gateway
+   requires a bearer token, and mount a custom config via
+   `KIMI_CONFIG_SOURCE` if you still need the managed `api.kimi.com` OAuth
+   flow.
 8. Tenants created before this release may carry the legacy
    `IRONCLAW_BASE_DIR`/`IRONCLAW_SOCKET` env aliases. No action is needed —
    both remain accepted — but newly generated tenant envs contain only the
@@ -466,6 +509,15 @@ previous compatibility baseline.
     the skill-extraction and skill-maintenance missions (previously only
     self-improvement was gated). Re-enabling the flag resumes exactly those
     gate-paused missions; missions you paused yourself stay paused.
+11. OpenRC health hardening is backward compatible: self-heal's per-call
+    probe timeout is now `SELF_HEAL_PROBE_TIMEOUT` (the old
+    `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` is honored as a legacy alias and the
+    bound now also covers OpenRC `rc-service` calls), and the OpenRC watchdog
+    gained `lunarwing_watchdog_probe_timeout` (default 15 s).
+    `health-openrc.sh` additionally reports a `metrics.scheduler` block and
+    degrades when a LunarWing cron hook is installed but no cron scheduler
+    daemon is running — a new degraded (never critical) signal worth
+    checking after upgrade.
 
 ## Known Issues
 
@@ -501,16 +553,21 @@ previous compatibility baseline.
 - Engine output safety still truncates oversized prefixes before later
   redaction/policy transforms and does not re-cap every later transformation.
 - `cargo check --tests --no-default-features --features postgres` currently
-  fails on three pre-existing cfg(test) breakages on master (libsql-gated
-  `test_db` helpers and a multi-tenant test harness builder); CI never runs
-  that shape (postgres runs check-only, tests run under libsql), but a fix is
-  still owed.
+  fails on pre-existing cfg(test) breakages on master (libsql-gated `test_db`
+  helpers and a multi-tenant test harness builder in the lib tests, plus the
+  `trace_format` / `trace_llm_tests` integration test targets under the same
+  feature shape); CI never runs that shape (postgres runs check-only, tests
+  run under libsql), but a fix is still owed.
 - Kawarimi remains PostgreSQL-only.
 - Full release test aggregation remains blocked by unavailable real channel
   WASM artifacts and existing skill-selection/TensorZero streaming
   expectations.
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
+- Large worker-image pushes (opencode, pebble) can still fail with registry
+  `499 Client Closed Request` until the proxy-chain read timeouts are raised
+  on the GitLab host; the fix is server-side and cannot be applied from this
+  repo (diagnosis and host-side steps: `docs/ops/REGISTRY_PUSH_499.md`).
 
 ### Resolved Since v2.0.7.0
 
