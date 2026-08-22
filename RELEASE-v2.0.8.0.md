@@ -450,9 +450,16 @@ previous compatibility baseline.
   `docs/ops/v2.0.8.0_REPO_HYGIENE.md`.
 - CI now runs the full master job set on `aragents/kimil00p/*` branches.
 - Worker container images are now published under the moving `v2.0.8.0` and
-  `latest` tags instead of accumulating a unique short-SHA tag per build,
-  and Kaniko registry pushes force HTTP/1.1 with `--push-retry=5` so blob
-  PATCHes through the Traefik front end stop failing with 502 Bad Gateway.
+  `latest` tags plus an immutable `$CI_COMMIT_SHORT_SHA` tag per build, so
+  consumers that need a stable reference can pin the SHA tag (pruning relies
+  on the server-side registry cleanup policy). Kaniko registry pushes force
+  HTTP/1.1 with `--push-retry=5`, which fixed the earlier HTTP/2
+  `502 Bad Gateway` failures on blob PATCHes through the Traefik front end;
+  the remaining `499 Client Closed Request` failures on the largest images
+  were diagnosed as proxy-chain read timeouts (Traefik `respondingTimeouts`,
+  omnibus `registry_nginx` body/proxy timeouts) that must be raised on the
+  GitLab host — full diagnosis and host-side fix in
+  `docs/ops/REGISTRY_PUSH_499.md`.
 
 ## Upgrade Notes
 
@@ -542,6 +549,10 @@ previous compatibility baseline.
   expectations.
 - Current GitLab CI verifies source but does not publish release artifacts,
   packages, or tenant deployments.
+- Large worker-image pushes (opencode, pebble) can still fail with registry
+  `499 Client Closed Request` until the proxy-chain read timeouts are raised
+  on the GitLab host; the fix is server-side and cannot be applied from this
+  repo (diagnosis and host-side steps: `docs/ops/REGISTRY_PUSH_499.md`).
 
 ### Resolved Since v2.0.7.0
 
