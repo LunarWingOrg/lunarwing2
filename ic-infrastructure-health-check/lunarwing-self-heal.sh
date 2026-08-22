@@ -290,13 +290,16 @@ _systemd_restart() {
     fi
 }
 
-# Bound tenant-bus probes/remediations: a wedged user manager (or sudo into a
-# dead session) must not hang the entire self-heal tick. Falls back to
-# unbounded when timeout(1) is unavailable (matches ESCALATE_TIMEOUT policy).
-SYSTEMD_PROBE_TIMEOUT="${SELF_HEAL_SYSTEMD_PROBE_TIMEOUT:-15}"
+# Bound init-system probes/remediations: a wedged user manager (sudo into a
+# dead session) or a hung OpenRC rc-service/supervise-daemon call must not hang
+# the entire self-heal tick. Falls back to unbounded when timeout(1) is
+# unavailable (matches ESCALATE_TIMEOUT policy).
+# SELF_HEAL_PROBE_TIMEOUT is the generic knob; SELF_HEAL_SYSTEMD_PROBE_TIMEOUT
+# is honoured as a legacy alias for it.
+PROBE_TIMEOUT="${SELF_HEAL_PROBE_TIMEOUT:-${SELF_HEAL_SYSTEMD_PROBE_TIMEOUT:-15}}"
 _sh_timeout() {
     if command -v timeout >/dev/null 2>&1; then
-        timeout -k 2 "$SYSTEMD_PROBE_TIMEOUT" "$@"
+        timeout -k 2 "$PROBE_TIMEOUT" "$@"
     else
         "$@"
     fi
@@ -324,14 +327,16 @@ _systemd_user_active() {
     _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user is-active --quiet "$unit"
 }
 
-_openrc_active() { rc-service "$1" status >/dev/null 2>&1; }
+# OpenRC probes are bounded too: a wedged supervise-daemon or hung rc-service
+# must fail the probe (bounded), not stall the whole remediation tick.
+_openrc_active() { _sh_timeout rc-service "$1" status >/dev/null 2>&1; }
 _openrc_restart() {
     local svc="$1"
     if [[ "$DRY_RUN" == true ]]; then
         log "[DRY-RUN] would run: rc-service $svc restart"
         return 0
     fi
-    rc-service "$svc" restart
+    _sh_timeout rc-service "$svc" restart
 }
 
 _launchd_active() {

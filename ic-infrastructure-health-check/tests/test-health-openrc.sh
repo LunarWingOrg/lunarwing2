@@ -33,7 +33,7 @@ assert_json() { if jq -e . >/dev/null 2>&1 <<<"$1"; then ok "$2"; else bad "$2" 
 # $s/bin/rc-service (mock). Echoes $s.
 new_scenario() {
   local s; s="$(mktemp -d "$ROOT/s.XXXXXX")"
-  mkdir -p "$s/initd" "$s/fix" "$s/bin" "$s/runlevels/default"
+  mkdir -p "$s/initd" "$s/fix" "$s/bin" "$s/runlevels/default" "$s/crondirs"
   cat >"$s/bin/rc-service" <<'MOCK'
 #!/usr/bin/env bash
 # Mock OpenRC rc-service: honours $INITD_DIR for --exists and $RC_FIX for status.
@@ -50,7 +50,21 @@ if [ "$cmd" = "status" ]; then
 fi
 exit 0
 MOCK
-  chmod +x "$s/bin/rc-service"
+  # Hermetic cron-tab listers: serve $RC_FIX/<cmd>.tab when a scenario fixture
+  # provides one, else report an empty tab — the host's real crontab/fcrontab
+  # (and the host's real tabs) must never leak into a scenario.
+  local tab
+  for tab in crontab fcrontab; do
+    cat >"$s/bin/$tab" <<'MOCK'
+#!/usr/bin/env bash
+cmd="$(basename "$0")"
+[ "${1:-}" = "-l" ] || exit 1
+[ -f "${RC_FIX:?}/$cmd.tab" ] && { cat "$RC_FIX/$cmd.tab"; exit 0; }
+echo "no crontab for root" >&2
+exit 1
+MOCK
+  done
+  chmod +x "$s/bin"/*
   printf '%s' "$s"
 }
 
@@ -88,10 +102,17 @@ fix_set() {
 # run_hc <s> [ENV=VAL ...] -> sets OUT (stdout+stderr) and RC (exit code).
 run_hc() {
   local s="$1"; shift
-  OUT="$(env PATH="$s/bin:$PATH" INITD_DIR="$s/initd" RUNLEVELS_DIR="$s/runlevels" RC_FIX="$s/fix" SERVICES='' "$@" bash "$HC" 2>&1)"
+  OUT="$(env PATH="$s/bin:$PATH" INITD_DIR="$s/initd" RUNLEVELS_DIR="$s/runlevels" RC_FIX="$s/fix" \
+      HEALTH_OPENRC_CRON_DIRS="$s/crondirs" SERVICES='' "$@" bash "$HC" 2>&1)"
   RC=$?
 }
 svc_field() { jq -r --arg n "$2" '.metrics.services[] | select(.name==$n) | .'"$3" <<<"$1"; }
+
+# Install the single-node watchdog cron hook fixture. <s>
+mk_cron_hook() {
+  : >"$1/crondirs/lunarwing-watchdog"
+  chmod +x "$1/crondirs/lunarwing-watchdog"
+}
 
 # ── S1: discovery dedup + breadth (Rank 18) + no pid field (Rank 33) ──────────
 s="$(new_scenario)"
@@ -288,6 +309,85 @@ assert_eq "$(svc_field "$OUT" lunarwing-kimi-acme status)"   "critical" "S15: en
 assert_eq "$(svc_field "$OUT" lunarwing-kimi-acme-sup status)" "critical" "S15: enabled worker babysitter maps to started tenant"
 assert_eq "$(svc_field "$OUT" lunarwing-pebble-acme status)" "skipped"  "S15: unselected worker → skipped"
 assert_eq "$RC" 2 "S15: selected down worker exits 2"
+
+# ── S16: watchdog cron hook + running scheduler → scheduler healthy ─────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_unit "$s" cronie;         fix_set "$s" cronie         " * status: started" 0
+mk_cron_hook "$s"
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")"  "healthy" "S16: hook + running scheduler → scheduler healthy"
+assert_eq "$(jq -r '.metrics.scheduler.running' <<<"$OUT")" "cronie"  "S16: running scheduler named"
+assert_eq "$(jq -r '.metrics.scheduler.hook_installed' <<<"$OUT")" "true" "S16: hook detected"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S16: overall healthy"
+assert_eq "$(jq '.issues | length' <<<"$OUT")" "0" "S16: no issues"
+assert_eq "$(jq '[.metrics.services[]|select(.name=="cronie")]|length' <<<"$OUT")" "0" \
+  "S16: scheduler never listed as a service (self-heal will not restart it)"
+
+# ── S17: hook installed, scheduler installed but stopped → degraded ──────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_unit "$s" cronie;         fix_set "$s" cronie         " * status: stopped" 3
+mk_cron_hook "$s"
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "degraded" "S17: stopped scheduler → degraded (blind spot closed)"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "degraded" "S17: overall degraded"
+assert_eq "$RC" 1 "S17: exit 1"
+assert_eq "$(svc_field "$OUT" lunarwing-acme status)" "healthy" "S17: service itself still healthy (scheduler-only problem)"
+if jq -r '.issues[]?' <<<"$OUT" | grep -qF "no cron scheduler is running"; then
+  ok "S17: issue names the dead scheduler"
+else
+  bad "S17: issue names the dead scheduler" "issues: $(jq -c '.issues' <<<"$OUT")"
+fi
+
+# ── S18: hook installed, no scheduler init script at all → degraded ──────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_cron_hook "$s"
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "degraded" "S18: no scheduler installed → degraded"
+assert_eq "$(jq -r '.metrics.scheduler.running' <<<"$OUT")" "null" "S18: no scheduler running"
+assert_eq "$RC" 1 "S18: exit 1"
+
+# ── S19: no hook installed → scheduler check inert (fail safe) ───────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "absent" "S19: no hook → scheduler absent"
+assert_eq "$(jq -r '.metrics.scheduler.hook_installed' <<<"$OUT")" "false" "S19: hook_installed false"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S19: overall healthy (no false degraded)"
+assert_eq "$RC" 0 "S19: exit 0"
+
+# ── S20: fcron-tab hook + running fcron → healthy ────────────────────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_unit "$s" fcron;          fix_set "$s" fcron          " * status: started" 0
+printf '%s\n' '# BEGIN lunarwing-watchdog managed block' \
+  '%hourly /usr/local/sbin/lunarwing-watchdog-openrc' \
+  '# END lunarwing-watchdog managed block' >"$s/fix/fcrontab.tab"
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")"  "healthy" "S20: fcron-tab hook + running fcron → healthy"
+assert_eq "$(jq -r '.metrics.scheduler.running' <<<"$OUT")" "fcron"   "S20: fcron named"
+
+# ── S21: dead scheduler never overrides a worse per-service verdict ──────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: stopped" 3
+enable_unit "$s" lunarwing-acme
+mk_cron_hook "$s"   # no scheduler init scripts exist in this scenario
+run_hc "$s"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S21: critical service + dead scheduler → overall stays critical"
+assert_eq "$RC" 2 "S21: exit 2"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "degraded" "S21: scheduler still reported degraded alongside"
+
+# ── S22: crontab mt-health hook + running dcron → healthy ────────────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
+mk_unit "$s" dcron;          fix_set "$s" dcron          " * status: started" 0
+printf '%s\n' '# BEGIN lunarwing-mt-health managed block' \
+  '*/5 * * * * /usr/local/sbin/lunarwing-health-cron' \
+  '# END lunarwing-mt-health managed block' >"$s/fix/crontab.tab"
+run_hc "$s"
+assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "healthy" "S22: crontab mt-health hook + running dcron → healthy"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
