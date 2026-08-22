@@ -490,7 +490,12 @@ previous compatibility baseline.
 7. Rebuild the opencode external-worker image so the pinned `v1.18.18` build
    takes effect; check `/health` for `opencode_ref` afterward. Rebuild the
    kimi external-worker image for the pinned `0.37.2` CLI; check `/health`
-   for `kimi_code_version`.
+   for `kimi_code_version`. Note the rebuilt kimi image defaults to the
+   LunarWing TensorZero gateway (`tensorzero/FrontierCODE`) as its provider:
+   provision `TENSORZERO_API_KEY` (or `KIMI_API_KEY`) if your gateway
+   requires a bearer token, and mount a custom config via
+   `KIMI_CONFIG_SOURCE` if you still need the managed `api.kimi.com` OAuth
+   flow.
 8. Tenants created before this release may carry the legacy
    `IRONCLAW_BASE_DIR`/`IRONCLAW_SOCKET` env aliases. No action is needed —
    both remain accepted — but newly generated tenant envs contain only the
@@ -504,6 +509,15 @@ previous compatibility baseline.
     the skill-extraction and skill-maintenance missions (previously only
     self-improvement was gated). Re-enabling the flag resumes exactly those
     gate-paused missions; missions you paused yourself stay paused.
+11. OpenRC health hardening is backward compatible: self-heal's per-call
+    probe timeout is now `SELF_HEAL_PROBE_TIMEOUT` (the old
+    `SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` is honored as a legacy alias and the
+    bound now also covers OpenRC `rc-service` calls), and the OpenRC watchdog
+    gained `lunarwing_watchdog_probe_timeout` (default 15 s).
+    `health-openrc.sh` additionally reports a `metrics.scheduler` block and
+    degrades when a LunarWing cron hook is installed but no cron scheduler
+    daemon is running — a new degraded (never critical) signal worth
+    checking after upgrade.
 
 ## Known Issues
 
