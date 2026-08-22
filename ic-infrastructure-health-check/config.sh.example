@@ -157,6 +157,11 @@
 # always resolve through owning user's bus; host NetBird daemon stays on system.
 #SELF_HEAL_SYSTEMD_SCOPE=system
 
+# Bound (seconds) around each per-tenant systemd user-bus call (restart /
+# is-active / show). A wedged tenant user manager otherwise stalls the entire
+# self-heal tick. Requires coreutils timeout(1); unbounded when unavailable.
+#SELF_HEAL_SYSTEMD_PROBE_TIMEOUT=15
+
 # NetBird failures are monitor-only by default. Enable only when operator
 # delegates restart ownership to LunarWing.
 #SELF_HEAL_NETBIRD_REMEDIATE=false

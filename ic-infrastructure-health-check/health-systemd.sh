@@ -162,6 +162,20 @@ for unit in "${UNITS_ARR[@]}"; do
     issues+=("$unit restart count elevated: $restarts")
   fi
 
+  # Timer blind spot: an active/waiting timer whose next wake was never
+  # computed (empty/0/n/a — e.g. a calendar spec systemd could not schedule)
+  # will never fire, but reads "active" and would otherwise pass as healthy
+  # while the pipeline it drives silently stops. Only checked in `waiting`
+  # (while the triggered oneshot runs, the next elapse may legitimately be
+  # recomputed) and never downgrades an already-worse verdict.
+  if [[ "$unit" == *.timer && "$active" == "active" && "$sub" == "waiting" ]]; then
+    case "$next" in
+      ""|0|"n/a")
+        if [ "$exit_code" -eq 0 ]; then status="degraded"; exit_code=1; fi
+        issues+=("$unit active but no next elapse scheduled") ;;
+    esac
+  fi
+
   if [ $exit_code -gt $overall_exit ]; then
     overall_exit=$exit_code
     overall_status=$([ $overall_exit -eq 2 ] && echo critical || echo degraded)

@@ -6,6 +6,10 @@ Documentation=https://git.lunarwing.org/lunarwing/lunarwing2
 Type=oneshot
 Environment=LUNARWING_WATCHDOG_SERVICE=lunarwing.service
 Environment=LUNARWING_WATCHDOG_LOG=/var/log/lunarwing-watchdog.log
+# Single-node installs where lunarwing.service runs under the installing
+# user's manager (not the system manager) should set:
+#Environment=LUNARWING_WATCHDOG_SYSTEMD_SCOPE=user
+# and run this unit as that user (systemctl --user) instead.
 ExecStart=/usr/local/sbin/lunarwing-watchdog
 StandardOutput=journal
 StandardError=journal

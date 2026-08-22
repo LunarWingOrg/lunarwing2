@@ -86,8 +86,14 @@ _install_health_systemd_timer() {
   # systemd hosts: a root, system-level oneshot service + timer. Persistent=true
   # provides the missed-run catch-up fcron gives on OpenRC; system-level (not
   # --user) because one run remediates many tenants' user units via sudo.
-  local svc="/etc/systemd/system/lunarwing-mt-health.service"
-  local tmr="/etc/systemd/system/lunarwing-mt-health.timer"
+  local unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+  local svc="$unit_dir/lunarwing-mt-health.service"
+  local tmr="$unit_dir/lunarwing-mt-health.timer"
+  # Bound a single run: systemd's default TimeoutStartSec (~90s on many
+  # distros) can kill a legitimate multi-tenant remediation mid-restart, while
+  # a wedged tenant bus must never stall the pipeline forever. Floor of 900s,
+  # otherwise one full interval; Persistent=true replays a killed run.
+  local run_timeout=$(( HEALTH_INTERVAL_MIN * 60 > 900 ? HEALTH_INTERVAL_MIN * 60 : 900 ))
   if ! command -v systemctl >/dev/null 2>&1; then
     say "WARNING: systemctl not found — cannot schedule the pipeline on systemd."
     return 0
@@ -100,6 +106,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+TimeoutStartSec=$run_timeout
 ExecStart=$HEALTH_LAUNCHER
 UNITEOF
   cat >"$tmr" <<UNITEOF
@@ -260,8 +267,9 @@ remove_health_pipeline() {
       ;;
     systemd)
       if command -v systemctl >/dev/null 2>&1; then
+        local unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
         systemctl disable --now lunarwing-mt-health.timer >/dev/null 2>&1 || true
-        rm -f /etc/systemd/system/lunarwing-mt-health.timer /etc/systemd/system/lunarwing-mt-health.service
+        rm -f "$unit_dir/lunarwing-mt-health.timer" "$unit_dir/lunarwing-mt-health.service"
         systemctl daemon-reload >/dev/null 2>&1 || true
       fi
       ;;

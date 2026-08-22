@@ -290,6 +290,18 @@ _systemd_restart() {
     fi
 }
 
+# Bound tenant-bus probes/remediations: a wedged user manager (or sudo into a
+# dead session) must not hang the entire self-heal tick. Falls back to
+# unbounded when timeout(1) is unavailable (matches ESCALATE_TIMEOUT policy).
+SYSTEMD_PROBE_TIMEOUT="${SELF_HEAL_SYSTEMD_PROBE_TIMEOUT:-15}"
+_sh_timeout() {
+    if command -v timeout >/dev/null 2>&1; then
+        timeout -k 2 "$SYSTEMD_PROBE_TIMEOUT" "$@"
+    else
+        "$@"
+    fi
+}
+
 # Per-tenant systemd USER units: run as the tenant user against their bus.
 _systemd_user_restart() {
     local user="$1" unit="$2" uid
@@ -302,14 +314,14 @@ _systemd_user_restart() {
     # `-n`: never prompt for a password in this non-interactive (timer/cron)
     # context. reset-failed clears a start-limited (failed) unit so restart is
     # honored; harmless on a healthy unit.
-    sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user reset-failed "$unit" 2>/dev/null || true
-    sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user restart "$unit"
+    _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user reset-failed "$unit" 2>/dev/null || true
+    _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user restart "$unit"
 }
 _systemd_user_active() {
     local user="$1" unit="$2" uid
     uid="$(id -u "$user" 2>/dev/null || printf '?')"
     [[ "$uid" == '?' ]] && return 1
-    sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user is-active --quiet "$unit"
+    _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user is-active --quiet "$unit"
 }
 
 _openrc_active() { rc-service "$1" status >/dev/null 2>&1; }
@@ -387,7 +399,7 @@ service_substate() {
     if [[ -n "$user" ]]; then
         uid="$(id -u "$user" 2>/dev/null || echo '?')"
         [[ "$uid" == '?' ]] && return 0
-        sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user show -p SubState --value "$svc" 2>/dev/null || true
+        _sh_timeout sudo -n -u "$user" env "XDG_RUNTIME_DIR=/run/user/$uid" systemctl --user show -p SubState --value "$svc" 2>/dev/null || true
     else
         if _systemd_use_user_bus "$svc"; then
             systemctl --user show -p SubState --value "$svc" 2>/dev/null || true
