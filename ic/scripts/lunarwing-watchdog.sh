@@ -6,6 +6,11 @@ LOG_FILE="${LUNARWING_WATCHDOG_LOG:-${IRONCLAW_WATCHDOG_LOG:-/var/log/lunarwing-
 LOCK_FILE="${LUNARWING_WATCHDOG_LOCK:-${IRONCLAW_WATCHDOG_LOCK:-/run/lunarwing-watchdog.lock}}"
 POST_RESTART_SLEEP_SECONDS="${LUNARWING_WATCHDOG_POST_RESTART_SLEEP_SECONDS:-${IRONCLAW_WATCHDOG_POST_RESTART_SLEEP_SECONDS:-5}}"
 
+# Single-node services may live on either the system manager or the installing
+# user's manager. Probe/remediate on the same bus the service actually runs on
+# (parity with SELF_HEAL_SYSTEMD_SCOPE in the health-check/self-heal pipeline).
+SYSTEMD_SCOPE="${LUNARWING_WATCHDOG_SYSTEMD_SCOPE:-system}"
+
 timestamp() {
   date '+%Y-%m-%dT%H:%M:%S%z'
 }
@@ -33,7 +38,7 @@ log() {
 }
 
 state_summary() {
-  systemctl show "$SERVICE" --no-pager \
+  sctl show "$SERVICE" --no-pager \
     -p ActiveState \
     -p SubState \
     -p Result \
@@ -44,7 +49,24 @@ state_summary() {
     2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
+# systemctl dispatch on the configured manager scope.
+sctl() {
+  if [[ "$SYSTEMD_SCOPE" == "user" ]]; then
+    systemctl --user "$@"
+  else
+    systemctl "$@"
+  fi
+}
+
 prepare_log_file
+
+case "$SYSTEMD_SCOPE" in
+  system|user) ;;
+  *)
+    log "WARNING: invalid LUNARWING_WATCHDOG_SYSTEMD_SCOPE='$SYSTEMD_SCOPE'; using system"
+    SYSTEMD_SCOPE=system
+    ;;
+esac
 
 if command -v flock >/dev/null 2>&1; then
   if exec 9>"$LOCK_FILE"; then
@@ -57,7 +79,7 @@ if command -v flock >/dev/null 2>&1; then
   fi
 fi
 
-if systemctl is-active --quiet "$SERVICE"; then
+if sctl is-active --quiet "$SERVICE"; then
   # Optional deep health check via gateway status endpoint.
   GATEWAY_URL="${LUNARWING_WATCHDOG_GATEWAY_URL:-}"
   GATEWAY_TOKEN="${LUNARWING_WATCHDOG_GATEWAY_TOKEN:-}"
@@ -72,9 +94,9 @@ if systemctl is-active --quiet "$SERVICE"; then
         | jq -r '.channel_health // {} | to_entries[] | select(.value.healthy == false) | .key' 2>/dev/null || true)"
       if [[ -n "$unhealthy" ]]; then
         log "$SERVICE active but channels unhealthy: $unhealthy; restarting"
-        systemctl restart "$SERVICE" || log "deep-check restart failed"
+        sctl restart "$SERVICE" || log "deep-check restart failed"
         sleep "$POST_RESTART_SLEEP_SECONDS"
-        if systemctl is-active --quiet "$SERVICE"; then
+        if sctl is-active --quiet "$SERVICE"; then
           log "$SERVICE deep-check restart succeeded"
         else
           log "$SERVICE deep-check restart failed; service not active"
@@ -89,15 +111,15 @@ fi
 
 # If the unit hit StartLimitBurst, it enters "failed" state and systemctl restart
 # silently refuses to act. Reset the failure counter so restart can proceed.
-if systemctl is-failed --quiet "$SERVICE"; then
+if sctl is-failed --quiet "$SERVICE"; then
   log "$SERVICE in failed state (possible StartLimitBurst lockout); running reset-failed"
-  systemctl reset-failed "$SERVICE" || log "reset-failed returned non-zero"
+  sctl reset-failed "$SERVICE" || log "reset-failed returned non-zero"
 fi
 
 before_state="$(state_summary || true)"
 log "$SERVICE not active; attempting restart; before_state=\"$before_state\""
 
-if ! systemctl restart "$SERVICE"; then
+if ! sctl restart "$SERVICE"; then
   after_state="$(state_summary || true)"
   log "$SERVICE restart command failed; after_state=\"$after_state\""
   exit 1
@@ -105,7 +127,7 @@ fi
 
 sleep "$POST_RESTART_SLEEP_SECONDS"
 
-if systemctl is-active --quiet "$SERVICE"; then
+if sctl is-active --quiet "$SERVICE"; then
   after_state="$(state_summary || true)"
   log "$SERVICE restart succeeded; after_state=\"$after_state\""
   exit 0
