@@ -1,20 +1,26 @@
 # Kimi Code CLI default configuration (baked into the worker image).
 # Overridden per-tenant by KIMI_MODEL / KIMI_BASE_URL env vars in entrypoint.sh.
+#
+# The default provider is the LunarWing TensorZero gateway (OpenAI-compatible
+# endpoint), the same function the OpenCode worker uses. It is reached over the
+# NetBird overlay (cotterhomelab3.netbird.selfhosted) instead of the LAN static
+# IP (192.168.1.157). The managed Kimi Code service (api.kimi.com) is no longer
+# the default: since kimi-code 0.37.2, worker prompts against it fail.
 
-default_model = "managed:kimi-code/kimi-for-coding"
+default_model = "tensorzero/FrontierCODE"
 default_permission_mode = "yolo"
 telemetry = false
 
-[providers."managed:kimi-code"]
-type = "kimi"
-base_url = "https://api.kimi.com/coding/v1"
+[providers.tensorzero]
+type = "openai"
+base_url = "http://100.88.232.146:3000/openai/v1"
 api_key = ""
 
-[models."managed:kimi-code/kimi-for-coding"]
-provider = "managed:kimi-code"
-model = "kimi-for-coding"
-max_context_size = 262144
-capabilities = ["thinking", "always_thinking", "image_in", "video_in", "tool_use"]
+[models."tensorzero/FrontierCODE"]
+provider = "tensorzero"
+model = "tensorzero::function_name::FrontierCODE"
+max_context_size = 859000
+capabilities = ["tool_use"]
 
 [thinking]
 enabled = true
@@ -22,7 +28,7 @@ effort = "high"
 keep = "all"
 
 [loop_control]
-max_retries_per_step = 10
+max_attempts_per_step = 10
 reserved_context_size = 50000
 
 [background]
