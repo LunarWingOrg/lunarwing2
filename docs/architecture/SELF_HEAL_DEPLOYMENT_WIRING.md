@@ -88,7 +88,12 @@ of tenant provisioning (unless `--no-health` is passed). This function:
 4. Writes a launcher script that sources the env file and execs `cron-wrapper.sh`.
 5. Schedules the launcher:
    - **systemd**: installs + enables `lunarwing-mt-health.{service,timer}`
-     (default: every 15 min).
+     (default: every 15 min). The oneshot is explicitly bounded with
+     `TimeoutStartSec=max(900s, interval)` — the ~90s distro default can kill a
+     legitimate multi-tenant remediation mid-restart, and a wedged tenant user
+     bus must never stall the pipeline forever (a killed run is replayed via
+     `Persistent=true`). Per-tenant user-bus calls inside self-heal are
+     individually bounded too (`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT`, default 15s).
    - **OpenRC**: installs a managed `fcron`/`crontab` entry every 5 min
      (managed block).
 
@@ -112,7 +117,12 @@ watchdog**. On systemd it:
   - `lunarwing-self-heal.sh` → `/usr/local/sbin/lunarwing-self-heal`
   - `cron-wrapper.sh`        → `/usr/local/sbin/lunarwing-health-cron`
 
-The OpenRC path mirrors this. **Note:** the watchdog installer does **not**
+The OpenRC path mirrors this. On systemd hosts the watchdog probes the system
+bus by default; for single-node installs where `lunarwing.service` runs under
+the installing user's manager, set `LUNARWING_WATCHDOG_SYSTEMD_SCOPE=user`
+(mirroring `SELF_HEAL_SYSTEMD_SCOPE`) so every probe/restart uses
+`systemctl --user` — invalid values warn and fall back to `system`. **Note:**
+the watchdog installer does **not**
 create or enable a timer for the health-cron — that scheduling is now handled by
 the `add-tenant` `ensure_health_pipeline()` flow (Path 1 above). On hosts where
 `add-tenant` hasn't run, scheduling `cron-wrapper.sh` remains a **manual** step

@@ -168,6 +168,36 @@ assert_contains "$last" "FLAPPING: lunarwing" "CH15: recovery cycles do not eras
 assert_eq "$(restarts_of "$c" lunarwing)" "2" "CH15: flap threshold prevents third restart"
 assert_eq "$(state_of "$c" '.lunarwing.escalated')" "true" "CH15: repeated recovered flaps escalate"
 
+echo "=== CH16: wedged tenant user bus -> bounded, counted as failed restart ==="
+# A hung `systemctl --user` (dead tenant session bus) must not stall the whole
+# self-heal tick: SELF_HEAL_SYSTEMD_PROBE_TIMEOUT bounds each tenant-bus call.
+if command -v timeout >/dev/null 2>&1; then
+    c="$(sb)"; mk_mockbin "$c"
+    jq -n --arg u "$me" '{tenants:{acme:{user:$u}}}' > "$c/ports.json"
+    svc_down "$c" "lunarwing-acme.service"
+    report "$c" '{components:[{component:"systemd",status:"critical",metrics:{units:[
+      {name:"lunarwing-acme.service",status:"critical"}]}}]}'
+    # Mock a wedged tenant bus: every sudo-into-user-manager call hangs.
+    cat > "$c/bin/sudo" <<'EOF'
+#!/usr/bin/env bash
+sleep 300
+EOF
+    chmod +x "$c/bin/sudo"
+    start=$SECONDS
+    o="$(run_chaos "$c" systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false \
+        SELF_HEAL_TENANTS_FILE="$c/ports.json" SELF_HEAL_SYSTEMD_PROBE_TIMEOUT=2)"
+    elapsed=$((SECONDS - start))
+    assert_contains "$o" "RESTART_FAIL" "CH16: wedged tenant bus counted as failed restart"
+    assert_contains "$o" "Self-Healing complete" "CH16: tick completes despite the wedged bus"
+    assert_range "$elapsed" 0 30 "CH16: tick bounded (~2s probe timeout, not 300s hang)"
+    assert_eq "$(state_of "$c" '.["lunarwing-acme.service"].retries // 0')" "1" "CH16: retry recorded for next tick"
+else
+    ok "CH16: SKIP (timeout unavailable)"
+    ok "CH16: SKIP (timeout unavailable)"
+    ok "CH16: SKIP (timeout unavailable)"
+    ok "CH16: SKIP (timeout unavailable)"
+fi
+
 echo
 echo "Note: CH7 (DNS failure) is modeled by CH6's stuck-service escalation path."
 echo "Note: CH8 (disk full) requires real disk-fault injection and is out of scope"
