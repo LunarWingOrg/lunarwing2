@@ -23,6 +23,7 @@ x-worker-base: &worker-base
     AGENT_AUTH_TOKEN: ${AGENT_AUTH_TOKEN:?AGENT_AUTH_TOKEN is required}
     LUNARWING_WORKER_ID: ${LUNARWING_WORKER_ID:-worker-kimi-01}
     KIMI_API_KEY: ${KIMI_API_KEY:-}
+    TENSORZERO_API_KEY: ${TENSORZERO_API_KEY:-}
     WORKSPACE_ROOT: /workspace
     KIMI_CODE_HOME: /home/kimi/.kimi-code
     FILE_UMASK: ${FILE_UMASK:-0002}

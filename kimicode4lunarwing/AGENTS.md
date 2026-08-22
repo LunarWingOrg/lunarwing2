@@ -10,7 +10,7 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 - `scripts/kimi_task_executor.ts` — Task execution via the Kimi Code CLI subprocess. Controls process spawn, stream-json parsing, timeout/cancel.
 - `scripts/lunarwing_runtime.ts` — Shared types and envelope helpers. Keep in sync with `agent_comm_protocol.json`.
 - `entrypoint.sh` — Startup orchestration. Two modes: websocket, cli.
-- `config/config.toml` — Kimi Code CLI default config (model, provider, thinking). Mounted into container.
+- `config/config.toml` — Kimi Code CLI default config (model, provider, thinking). Mounted into container. Default provider is the TensorZero gateway (NetBird overlay `http://100.88.232.146:3000/openai/v1`, function `tensorzero::function_name::FrontierCODE`), not the managed api.kimi.com service — see README.
 
 ## Protocol Compatibility
 

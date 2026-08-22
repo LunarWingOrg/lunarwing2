@@ -71,6 +71,12 @@ done
 # Materialize the Kimi Code config (config.toml) from the baked default unless
 # a per-tenant KIMI_MODEL/KIMI_BASE_URL/KIMI_API_KEY override is present. Kimi
 # Code CLI reads its config from $KIMI_CODE_HOME/config.toml.
+# KIMI_MODEL replaces default_model; when it does not match an existing
+# [models] alias, the baked model entry is retargeted (alias + model id) so
+# default_model stays resolvable — 0.37.2 fails startup otherwise.
+# KIMI_API_KEY falls back to TENSORZERO_API_KEY for the TensorZero-backed
+# default provider.
+export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
 mkdir -p "$KIMI_CODE_HOME"
 
 if [ ! -f "$KIMI_CONFIG_SOURCE" ]; then
@@ -99,7 +105,32 @@ def replace_setting(config, name, value, required):
         raise ValueError(f"config missing {name}")
     return f'{name} = {toml_string(value)}\n{config}'
 
-text = replace_setting(text, "default_model", os.environ.get("KIMI_MODEL", ""), False)
+def retarget_model_entry(config, old_alias, new_model):
+    # KIMI_MODEL does not match an existing [models] alias: rename the baked
+    # model entry (table header + model id) so default_model stays resolvable.
+    # kimi-code >= 0.37 fails startup when default_model is not a known alias.
+    header = re.compile(rf'^\[models\.(?:"{re.escape(old_alias)}"|{re.escape(old_alias)})\]\s*$', re.MULTILINE)
+    match = header.search(config)
+    if not match:
+        # Custom KIMI_CONFIG_SOURCE without a matching models table: leave it
+        # untouched; whoever mounts it owns alias resolution.
+        return config
+    config = config[:match.start()] + f'[models.{toml_string(new_model)}]' + config[match.end():]
+    body = re.compile(r'^(\s*model\s*=).*$', re.MULTILINE).search(config, match.start())
+    if body:
+        config = config[:body.start()] + f'{body.group(1)} {toml_string(new_model)}' + config[body.end():]
+    return config
+
+kimi_model = os.environ.get("KIMI_MODEL", "")
+old_alias = ""
+if kimi_model:
+    try:
+        old_alias = tomllib.loads(text).get("default_model", "")
+    except tomllib.TOMLDecodeError:
+        old_alias = ""
+text = replace_setting(text, "default_model", kimi_model, False)
+if kimi_model and old_alias and old_alias != kimi_model:
+    text = retarget_model_entry(text, old_alias, kimi_model)
 text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
 text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
 tomllib.loads(text)
