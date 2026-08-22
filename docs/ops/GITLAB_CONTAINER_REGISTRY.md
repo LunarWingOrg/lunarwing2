@@ -126,6 +126,9 @@ realm `https://git.lunarwing.org/jwt/auth`.)
   `docker exec gitlab grep '^registry' /etc/gitlab/gitlab.rb`. If the
   registry lines are missing, the `GITLAB_OMNIBUS_CONFIG` env didn't render —
   it must be a block scalar (`|`) in compose, not list syntax.
+- **502 on Kaniko `PATCH .../blobs/uploads`:** not a missing backend — HTTP/2
+  blob streaming through Traefik/nginx. CI forces `GODEBUG=http2client=0`
+  and `--push-retry=5`. See section 4.
 - **Wrong token realm / scheme mismatch on `docker login`:** the
   `registry_nginx['proxy_set_headers']` block is missing.
 
@@ -142,9 +145,9 @@ ever stall, raise `forwardingTimeouts` on the entrypoint or on the
 
 | Job | Context | Image pushed |
 |---|---|---|
-| `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{sha,latest}` |
-| `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{sha,latest}` |
-| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{sha,latest}` |
+| `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{v2.0.8.0,latest}` |
+| `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{v2.0.8.0,latest}` |
+| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{v2.0.8.0,latest}` |
 
 Details:
 
@@ -164,6 +167,14 @@ Details:
   `false`; set `true` on the selected manual job for the full toolchain image —
   mirrors mt-admin's `--with-toolchains`). Kimi also exposes
   `KIMI_CODE_VERSION` (currently `0.37.2`).
+- Tags are a moving `WORKER_IMAGE_TAG` (default `v2.0.8.0`) plus `:latest`.
+  Unique short-SHA tags are not pushed: they accumulate, and this registry's
+  tag-delete UI has 502ed while trying to clear them. When playing a job,
+  override `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME` to retarget a
+  wedged tag or repository (e.g. `WORKER_IMAGE_NAME=worker-pebble-2080`).
+- Kaniko jobs set `GODEBUG=http2client=0` and `--push-retry=5`. HTTP/2 blob
+  PATCH through Traefik/nginx in front of GitLab's registry is a known 502
+  source; forcing HTTP/1.1 is GitLab's documented workaround.
 - If gcr.io is unreachable from the runners, pull the executor image
   elsewhere, push it into our registry once section 1 is done, and update
   `.container-job`'s `image:name`.
@@ -198,7 +209,13 @@ plus an integrity check (digest pin per release).
 
 - **Cleanup policy**: project → Settings → Packages and registries → Cleanup
   policy for container repositories — e.g. keep 5 tags per repo, remove tags
-  older than 30 days matching `.*` except `latest`. Keeps short-SHA tags from
-  accumulating.
+  older than 30 days matching `.*` except `latest` and `v2.0.8.0`. Historical
+  short-SHA tags may still exist from older pipelines; CI no longer creates
+  new ones.
 - Registry-side garbage collection runs via omnibus defaults; no action
   needed unless storage grows.
+- **`502 Bad Gateway` on `PATCH .../blobs/uploads/...`:** Kaniko hitting
+  Traefik/registry over HTTP/2. Confirm the job has `GODEBUG=http2client=0`.
+  If a specific tag/repo is wedged after a failed delete, replay the manual
+  job with `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME` set to a fresh
+  value rather than retrying the same destination.

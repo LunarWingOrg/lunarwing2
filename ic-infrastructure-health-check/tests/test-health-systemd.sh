@@ -53,9 +53,12 @@ case "$sub" in
     if [ -n "${HS_FAIL_UFS_USER:-}" ] && [ "${HS_TENANT_USER:-}" = "$HS_FAIL_UFS_USER" ] \
       && [ "${props[*]}" = "UnitFileState" ]; then exit 1; fi
     if [ -e "$SD/$unit" ]; then read -r LS AS SS NR UF < "$SD/$unit"; else LS=""; AS=""; SS=""; NR=""; UF=""; fi
+    EL=""; NE=""; [ -f "$SD/$unit.elapse" ] && read -r EL NE < "$SD/$unit.elapse"
     for p in "${props[@]}"; do case "$p" in
       LoadState) printf '%s\n' "$LS";; ActiveState) printf '%s\n' "$AS";; SubState) printf '%s\n' "$SS";;
-      NRestarts) printf '%s\n' "${NR:-0}";; UnitFileState) printf '%s\n' "$UF";; *) printf '\n';;
+      NRestarts) printf '%s\n' "${NR:-0}";; UnitFileState) printf '%s\n' "$UF";;
+      LastTriggerUSec) printf '%s\n' "$EL";; NextElapseUSecRealtime) printf '%s\n' "$NE";;
+      *) printf '\n';;
     esac; done ;;
   *) exit 0 ;;
 esac
@@ -369,5 +372,50 @@ if grep -q '^user ' "$t/systemctl-calls"; then
 else
     bad "T2: base-unit probe uses systemctl --user" "no user-bus call recorded"
 fi
+
+finish_marker=1
+# ── U: active/waiting timer with a scheduled wake is healthy ─────────────────
+echo "=== Section U: scheduled timer -> healthy ==="
+u="$(sb)"; mk_hs_mock "$u"
+unit_set "$u" lunarwing-mt-health.timer "loaded active waiting 0 enabled"
+printf '1760000000000000 1760000900000000\n' > "$u/units/lunarwing-mt-health.timer.elapse"
+oU="$(run_hs_single "$u" UNITS=lunarwing-mt-health.timer)"
+assert_eq "$(ustat "$oU" lunarwing-mt-health.timer)" "healthy" "U1: timer with next elapse is healthy"
+assert_eq "$(oall "$oU")" "healthy" "U2: overall healthy"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-mt-health.timer") | .extra.next_elapse' <<<"$oU")" \
+    "1760000900000000" "U3: next elapse surfaced in extra"
+
+# ── V: active/waiting timer with NO next elapse -> degraded (never fires) ─────
+echo "=== Section V: unscheduled timer -> degraded ==="
+v="$(sb)"; mk_hs_mock "$v"
+unit_set "$v" lunarwing-mt-health.timer "loaded active waiting 0 enabled"
+printf '1760000000000000 0\n' > "$v/units/lunarwing-mt-health.timer.elapse"
+oV="$(run_hs_single "$v" UNITS=lunarwing-mt-health.timer)"; rcV=$?
+assert_eq "$(ustat "$oV" lunarwing-mt-health.timer)" "degraded" "V1: no next elapse -> degraded"
+assert_eq "$rcV" "1" "V2: exit code 1 (degraded)"
+assert_contains "$oV" "no next elapse scheduled" "V3: blind-spot issue surfaced"
+
+v2="$(sb)"; mk_hs_mock "$v2"
+unit_set "$v2" lunarwing-mt-health.timer "loaded active waiting 0 enabled"
+# no .elapse file at all -> both timestamps empty (older systemd / missing props)
+oV2="$(run_hs_single "$v2" UNITS=lunarwing-mt-health.timer)"
+assert_eq "$(ustat "$oV2" lunarwing-mt-health.timer)" "degraded" "V4: empty next elapse -> degraded"
+
+# ── W: timer mid-run (sub=running) is not flagged by the blind-spot check ─────
+echo "=== Section W: running timer not flagged ==="
+w="$(sb)"; mk_hs_mock "$w"
+unit_set "$w" lunarwing-mt-health.timer "loaded active running 0 enabled"
+printf '1760000000000000 0\n' > "$w/units/lunarwing-mt-health.timer.elapse"
+oW="$(run_hs_single "$w" UNITS=lunarwing-mt-health.timer)"
+assert_eq "$(ustat "$oW" lunarwing-mt-health.timer)" "healthy" "W1: running timer with next=0 not flagged (gate on waiting)"
+assert_eq "$(oall "$oW")" "healthy" "W2: overall healthy"
+
+# ── X: inactive timer remains critical (existing behavior unchanged) ──────────
+echo "=== Section X: inactive timer -> critical ==="
+x="$(sb)"; mk_hs_mock "$x"
+unit_set "$x" lunarwing-mt-health.timer "loaded inactive dead 0 enabled"
+oX="$(run_hs_single "$x" UNITS=lunarwing-mt-health.timer)"; rcX=$?
+assert_eq "$(ustat "$oX" lunarwing-mt-health.timer)" "critical" "X1: inactive timer -> critical"
+assert_eq "$rcX" "2" "X2: exit code 2 (critical)"
 
 finish

@@ -344,10 +344,16 @@ install_systemd_watchdog() {
 
   systemctl daemon-reload
   systemctl enable --now lunarwing-watchdog.timer
-  systemctl start lunarwing-watchdog.service
+  # Smoke-run the oneshot once, but never abort the install over it: on a host
+  # where lunarwing.service is not (yet) installed/active the watchdog's
+  # restart attempt exits 1, which under set -e would kill the installer AFTER
+  # the timer was already successfully enabled.
+  if ! systemctl start lunarwing-watchdog.service; then
+    say "WARNING: initial watchdog run reported failure (see: journalctl -u lunarwing-watchdog.service); timer remains enabled"
+  fi
 
   say "Installed systemd watchdog timer."
-  systemctl status lunarwing-watchdog.timer --no-pager
+  systemctl status lunarwing-watchdog.timer --no-pager || true
 }
 
 install_openrc_watchdog() {
