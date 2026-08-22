@@ -383,6 +383,14 @@ install_openrc_watchdog() {
 
   ensure_log_file
 
+  # Smoke-run the wrapper once, but never abort the install over it (parity
+  # with the systemd oneshot smoke run): on a host where lunarwing is not
+  # (yet) installed/active the watchdog's start attempt exits 1, which under
+  # set -e would kill the installer AFTER the wrapper was fully installed.
+  if ! "$OPENRC_WRAPPER" >/dev/null 2>&1; then
+    say "WARNING: initial watchdog run reported failure (see: $WATCHDOG_LOG); scheduler setup continues"
+  fi
+
   if [[ "$schedule_mode" == "fcron" ]]; then
     install_openrc_fcron_entry
 
