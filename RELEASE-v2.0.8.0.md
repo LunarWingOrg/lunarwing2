@@ -1,6 +1,6 @@
 # Release Notes for LunarWing v2.0.8.0 Codename `Sekisho (関所)`
 
-** Release Date: ** 2026-08-24
+** Release Date: ** 2026-08-22
 
 > *Sekisho* (関所) were the checkpoint stations of Edo-period Japan, where
 > travelers, documents, and goods were inspected before being allowed to
