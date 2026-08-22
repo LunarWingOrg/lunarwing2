@@ -33,16 +33,16 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <tenant> --model <model> --
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 ```
 
-This sets `KIMI_MODEL` / `KIMI_BASE_URL` env vars in the tenant's `lunarwing.env`. At boot, `entrypoint.sh` materializes an overridden `$KIMI_CODE_HOME/config.toml` from the baked default with these values applied.
+This sets `KIMI_MODEL` / `KIMI_BASE_URL` env vars in the tenant's `lunarwing.env`. At boot, `entrypoint.sh` materializes an overridden `$KIMI_CODE_HOME/config.toml` from the baked default with these values applied. `KIMI_MODEL` is the model id sent to the API (e.g. another TensorZero function like `tensorzero::function_name::baud`); when it does not match an existing `[models]` alias, the entrypoint retargets the baked model entry so `default_model` stays resolvable (kimi-code 0.37.2 fails startup loudly otherwise).
 
-2. **Per-tenant API key** (via `configure-kimi --api-key`):
+2. **Per-tenant API key** (via `configure-kimi --api-key-file`):
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <tenant> --api-key sk-xxx
+sudo ic/scripts/lunarwing-mt-admin.sh configure-kimi <tenant> --api-key-file /path/to/key
 sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 ```
 
-This sets `KIMI_API_KEY` in the tenant's `lunarwing.env`, which `entrypoint.sh` writes into the runtime `config.toml`.
+This sets `KIMI_API_KEY` in the tenant's `lunarwing.env`, which `entrypoint.sh` writes into the runtime `config.toml`. When `KIMI_API_KEY` is unset, the entrypoint falls back to `TENSORZERO_API_KEY` for the TensorZero-backed default provider.
 
 ## Two-level config model
 
