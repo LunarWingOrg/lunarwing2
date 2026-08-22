@@ -373,7 +373,6 @@ else
     bad "T2: base-unit probe uses systemctl --user" "no user-bus call recorded"
 fi
 
-finish_marker=1
 # ── U: active/waiting timer with a scheduled wake is healthy ─────────────────
 echo "=== Section U: scheduled timer -> healthy ==="
 u="$(sb)"; mk_hs_mock "$u"
