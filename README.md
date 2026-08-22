@@ -53,7 +53,7 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 - MCP artifact pinning for host stdio/WASM, optional OS sandboxing for host stdio, bounded stdio/WASM crash recovery, and owner- or job-scoped credential grants
 - MCP marketplace trust stack: ed25519 publisher signatures, signed dependency lockfiles, and signed revocation lists, enforced fail-closed on config load and activation once configured
 - Optional [LunarVoice](projects/voice-sidecar/README.md) local ONNX speech processing with Whisper or Parakeet-TDT STT, Kokoro TTS, and Silero VAD
-- Optional Gotify notifications, SSH tooling, NetBird tunnels, and LunarVision OCR integration
+- Optional Gotify notifications, GitLab and SSH tooling, NetBird tunnels, and LunarVision OCR integration
 - Persistent Pebble, OpenCode, and Kimi Code worker containers
 
 DarkIRC is opt-in. It is not rendered or built for a new tenant unless the operator enables it and builds its supporting service. External-worker choice is stored when a tenant is created; build flags prepare the matching shared image but do not change an existing tenant's selection.
@@ -203,13 +203,13 @@ Kawarimi supports PostgreSQL tenants; libSQL bundles are refused. A real export 
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` and uses Rust 1.96.1 with edition 2024. On a resource-constrained development host, limit Cargo to six CPUs and prefer `cargo check` over a full debug build:
+The Rust workspace lives under `ic/` and uses Rust 1.96.1 with edition 2024. On a resource-constrained development host, limit every Cargo command to twelve CPUs and twelve jobs, and prefer `cargo check` over a full debug build:
 
 ```bash
 cd ic
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6
-taskset -c 0-5 cargo test -j6 -- --test-threads=6
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo test -j12 -- --test-threads=12
 ```
 
 Additional test surfaces:
