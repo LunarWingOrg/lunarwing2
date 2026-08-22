@@ -11,11 +11,14 @@
 # If gcr.io is unreachable from the runners, mirror the executor image into
 # our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
 #
-# Tags: a moving version tag (WORKER_IMAGE_TAG, default v2.0.8.0) plus :latest.
-# Unique short-SHA tags are not pushed — they accumulate, and this registry's
-# tag-delete UI has 502ed while trying to clear them. Override WORKER_IMAGE_NAME
-# / WORKER_IMAGE_TAG when playing a job to push to a fresh repository or tag
-# if the existing one is wedged.
+# Tags: a moving version tag (WORKER_IMAGE_TAG, default v2.0.8.0), :latest,
+# plus an immutable $CI_COMMIT_SHORT_SHA tag. The moving tags silently retarget
+# between builds, so consumers that need a stable reference must pin the SHA
+# tag (or the digest it resolves to). SHA tags accumulate — pruning relies on
+# the server-side registry cleanup policy (docs/ops/GITLAB_CONTAINER_REGISTRY.md
+# section 4) because this registry's tag-delete UI has 502ed while trying to
+# clear them. Override WORKER_IMAGE_NAME / WORKER_IMAGE_TAG when playing a job
+# to push to a fresh repository or tag if the existing one is wedged.
 
 .container-job:
   image:
@@ -50,6 +53,7 @@ worker-pebble-image:
       --dockerfile "$CI_PROJECT_DIR/pebble4lunarwing/Dockerfile"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
       --push-retry=5
   rules:
     - when: manual
@@ -69,6 +73,7 @@ worker-opencode-image:
       --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
       --push-retry=5
   rules:
     - when: manual
@@ -89,6 +94,7 @@ worker-kimi-image:
       --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
       --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
+      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
       --push-retry=5
   rules:
     - when: manual
