@@ -13,6 +13,11 @@ SERVICE="${SERVICE%.service}"
 LOG_FILE="${lunarwing_watchdog_log:-${LUNARWING_WATCHDOG_LOG:-${IRONCLAW_WATCHDOG_LOG:-/var/log/lunarwing-watchdog.log}}}"
 LOCK_FILE="${lunarwing_watchdog_lock:-${LUNARWING_WATCHDOG_LOCK:-${IRONCLAW_WATCHDOG_LOCK:-/run/lunarwing-watchdog.lock}}}"
 POST_RESTART_SLEEP_SECONDS="${lunarwing_watchdog_post_restart_sleep_seconds:-${LUNARWING_WATCHDOG_POST_RESTART_SLEEP_SECONDS:-${IRONCLAW_WATCHDOG_POST_RESTART_SLEEP_SECONDS:-5}}}"
+# Bound (seconds) around every rc-service call. A wedged OpenRC/supervise-daemon
+# must fail the probe instead of hanging the run: the run holds the flock, so a
+# hang would wedge every future run too (they exit early on lock contention).
+PROBE_TIMEOUT="${lunarwing_watchdog_probe_timeout:-${LUNARWING_WATCHDOG_PROBE_TIMEOUT:-${IRONCLAW_WATCHDOG_PROBE_TIMEOUT:-15}}}"
+case "$PROBE_TIMEOUT" in ''|*[!0-9]*) PROBE_TIMEOUT=15 ;; esac
 
 timestamp() {
   date '+%Y-%m-%dT%H:%M:%S%z'
@@ -41,7 +46,16 @@ log() {
 }
 
 state_summary() {
-  rc-service "$SERVICE" status 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+  _wd_timeout rc-service "$SERVICE" status 2>&1 | tr '\n' ' ' | sed 's/[[:space:]]*$//'
+}
+
+# Bounded rc-service wrapper; falls back to unbounded when timeout(1) is absent.
+_wd_timeout() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout -k 2 "$PROBE_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
 }
 
 prepare_log_file
@@ -57,7 +71,7 @@ if command -v flock >/dev/null 2>&1; then
   fi
 fi
 
-if rc-service "$SERVICE" status >/dev/null 2>&1; then
+if _wd_timeout rc-service "$SERVICE" status >/dev/null 2>&1; then
   # Optional deep health check via gateway status endpoint.
   GATEWAY_URL="${lunarwing_watchdog_gateway_url:-${LUNARWING_WATCHDOG_GATEWAY_URL:-}}"
   GATEWAY_TOKEN="${lunarwing_watchdog_gateway_token:-${LUNARWING_WATCHDOG_GATEWAY_TOKEN:-}}"
@@ -72,9 +86,9 @@ if rc-service "$SERVICE" status >/dev/null 2>&1; then
         | jq -r '.channel_health // {} | to_entries[] | select(.value.healthy == false) | .key' 2>/dev/null || true)"
       if [[ -n "$unhealthy" ]]; then
         log "$SERVICE active but channels unhealthy: $unhealthy; restarting"
-        rc-service "$SERVICE" restart >/dev/null 2>&1 || log "deep-check restart failed"
+        _wd_timeout rc-service "$SERVICE" restart >/dev/null 2>&1 || log "deep-check restart failed"
         sleep "$POST_RESTART_SLEEP_SECONDS"
-        if rc-service "$SERVICE" status >/dev/null 2>&1; then
+        if _wd_timeout rc-service "$SERVICE" status >/dev/null 2>&1; then
           log "$SERVICE deep-check restart succeeded"
         else
           log "$SERVICE deep-check restart failed; service not active"
@@ -90,7 +104,7 @@ fi
 before_state="$(state_summary || true)"
 log "$SERVICE not active; attempting start; before_state=\"$before_state\""
 
-if ! rc-service "$SERVICE" start >/dev/null 2>&1; then
+if ! _wd_timeout rc-service "$SERVICE" start >/dev/null 2>&1; then
   after_state="$(state_summary || true)"
   log "$SERVICE start command failed; after_state=\"$after_state\""
   exit 1
@@ -98,7 +112,7 @@ fi
 
 sleep "$POST_RESTART_SLEEP_SECONDS"
 
-if rc-service "$SERVICE" status >/dev/null 2>&1; then
+if _wd_timeout rc-service "$SERVICE" status >/dev/null 2>&1; then
   after_state="$(state_summary || true)"
   log "$SERVICE start succeeded; after_state=\"$after_state\""
   exit 0
