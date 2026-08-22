@@ -168,6 +168,7 @@ checks can instead be **disabled** so they report `healthy` with
 | `SERVICES` | health-openrc.sh | auto-discovered | Override the OpenRC services to probe (space-separated) |
 | `INITD_DIR` | health-openrc.sh | `/etc/init.d` | Init-script directory scanned for tenant services |
 | `HEALTH_OPENRC_STATUS_TIMEOUT` | health-openrc.sh | `8` | Per-unit `rc-service status` timeout (s); `0` disables |
+| `HEALTH_OPENRC_CRON_DIRS` | health-openrc.sh | `/etc/cron.hourly /etc/periodic/hourly` | Cron hook dirs scanned for the watchdog hook (scheduler blind-spot check) |
 | `AGENTS` | health-launchd.sh | auto-discovered | Override the launchd labels to probe |
 
 > `$BASE` above is `${LUNARWING_BASE_DIR:-${IRONCLAW_BASE_DIR:-$HOME/.lunarwing}}`.
@@ -496,13 +497,14 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | `regression` | `test-self-heal.sh` | Original regression checks (jq precedence, backoff, grace, flapping, …). |
 | `matrix` | `test-self-heal-matrix.sh` | Full A–O synthetic-report matrix: dry-run routing plus live state transitions against mock init (152 assertions). |
 | `chaos` | `chaos-harness.sh` | Drives the **real** self-heal loop (kill → restart → verify → recover/escalate) against a mock init system. |
-| `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units). |
+| `openrc` | `test-health-openrc.sh` | Exercises `health-openrc.sh` (discovery dedup, real exit-code capture, per-unit timeout, missing/stopped units, cron-scheduler blind-spot check). |
 | `systemd` | `test-health-systemd.sh` | Exercises tenant user-bus discovery, failure bias, and container health including LunarVision. |
 | `lunarvision` | `test-health-lunarvision.sh` | Exercises `health-lunarvision.sh` (mock curl, 83 assertions: reachability, JSON, dedicated/legacy registry discovery, VL and metrics behavior). |
 | `init-templates` | `test-lunarvision-init-templates.sh` | Parses both systemd templates and executes the standalone OpenRC lifecycle against mocks (26 assertions). |
 | `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
 | `voice-init-templates` | `test-lunarvoice-init-templates.sh` | Validates the standalone LunarVoice systemd unit, Compose manifest, and executes the OpenRC lifecycle against mocks. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
+| `watchdog-openrc` | `test-watchdog-openrc.sh` | Exercises the OpenRC service-level watchdog (start/verify, deep-check guards, bounded rc-service probes, lock contention) against a mock rc-service. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 
 `run-all.sh` runs each suite in its own process, tallies per-suite
