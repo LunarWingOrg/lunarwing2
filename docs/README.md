@@ -1,15 +1,17 @@
 # LunarWing Documentation
 
-All project documentation, organized by category. This index reflects the current tree —
-every **active** file is listed below. Archived material lives under
-[`internal/history/`](internal/history/) and subsystem archives such as
-[`guides/history/`](guides/history/).
+All project documentation, organized by category. This index reflects the current tree.
+The major active files are listed below; `ops/` additionally holds point-in-time
+working notes, audits, and review records that are not individually indexed. Archived
+material lives under [`internal/history/`](internal/history/) and subsystem archives
+such as [`guides/history/`](guides/history/).
 
 * Original Author: Starforce Nebula *
 * Updated on July 6th by Rarity to reflect recent changes to the documentation tree: added missing entries for reviews/, specs/, superpowers/; fixed broken links (ROADMAP_2026, DOCS_REORG_CHECKLIST); added READMEs to previously undocumentated subdirectories.*
 * Updated on July 20th, 2026 to reconcile the complete proposal index with current source and tests at revision `50c8f99`.*
 * Updated on July 28th, 2026 to reconcile this index with the current documentation tree.*
 * Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
+* Updated on August 23rd, 2026: fixed broken links (current AGENT_GOALS checklist, Near-Removal specs/plans now under history/, archived ops files), refreshed the releases/ index range through v2.0.8.0, de-duplicated the bugs/ and top-level sections, and collapsed the duplicated specs/, reviews/, and superpowers/ sections.*
 
 ## Directory Structure
 
@@ -28,6 +30,7 @@ System design and technical architecture documents (the authoritative specs).
 | [`XMPP_FILE_TRANSFERS.md`](architecture/XMPP_FILE_TRANSFERS.md) | XMPP file transfer (XEP-0363/0066/0454): inbound/outbound, OMEMO, limits |
 | [`SELF_HEAL_DEPLOYMENT_WIRING.md`](architecture/SELF_HEAL_DEPLOYMENT_WIRING.md) | How the infra health-check + self-heal pipeline is installed/scheduled (host-level, auto-scheduled by add-tenant as of v1.1.9) |
 | [`ATOMICBOOL_DEEPER_PROPAGATION.md`](architecture/ATOMICBOOL_DEEPER_PROPAGATION.md) | Design note: deeper AtomicBool suppression-flag propagation (deferred) |
+| [`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md`](architecture/SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md) | Self-heal coverage audit: implementation-complete record with residual gaps (ported and re-verified on v2.0.5.0) |
 
 ---
 
@@ -58,6 +61,7 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux MT host packages and Python tooling dependencies |
 | [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo/OpenRC MT packages and rootless Podman prerequisites |
 | [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective August 15th, 2026) |
+| [`CODE-CONTRIBUTION-POLICY.md`](guides/CODE-CONTRIBUTION-POLICY.md) | Canonical code contribution policy consolidating conventions from `AGENTS.md`, CI, and subsystem specs |
 | [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | DarkIRC registry, daemon, tenant, and contact-key build/deploy guide |
 | [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | Current per-tenant DarkIRC adapter architecture |
 | [`lunarwing_weechat_wss/README.md`](guides/lunarwing_weechat_wss/README.md) | Current WeeChat relay, adapter, and WASM channel guide |
@@ -100,8 +104,8 @@ Deployment, operations, multitenancy, and production guides.
 | [`GITLAB_CONTAINER_REGISTRY.md`](ops/GITLAB_CONTAINER_REGISTRY.md) | Enabling GitLab's built-in container registry and building/pulling worker images from CI |
 | [`IMPORT_EXPORT_EXAMPLE.txt`](ops/IMPORT_EXPORT_EXAMPLE.txt) | Worker import/export example |
 | [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
-| [`AGENT_GOALS_2.0.5.0.md`](ops/AGENT_GOALS_2.0.5.0.md) | Current agent-assigned pre-release checklist for LunarWing v2.0.5.0 |
-| [`history/AGENT_GOALS_2.0.3.0.md`](ops/history/AGENT_GOALS_2.0.3.0.md) | Archived v2.0.3.0 pre-release checklist |
+| [`AGENT_GOALS_2.0.9.0.md`](ops/AGENT_GOALS_2.0.9.0.md) | Current agent-assigned pre-release checklist for LunarWing v2.0.9.0 |
+| [`history/`](ops/history/) | Archived agent pre-release checklists (v1.1.9 and v2.0.0.0–v2.0.8.0) |
 | [`CICD_LOGIC_REVIEW.md`](ops/CICD_LOGIC_REVIEW.md) | GitLab CI/CD logic review, resolved priority findings, and remaining hardening suggestions |
 | [`CODENAME_IDEAS_v2.0.3.0.md`](ops/CODENAME_IDEAS_v2.0.3.0.md) | Release codename candidates for v2.0.3.0 with English context and top picks |
 | [`CRATE_AUDIT_v2.0.4.0.md`](ops/CRATE_AUDIT_v2.0.4.0.md) | Current v2.0.4.0 dependency, workspace-version, and toolchain audit |
@@ -120,9 +124,8 @@ Deployment, operations, multitenancy, and production guides.
 | [`MEMORY_IMPL.md`](ops/MEMORY_IMPL.md) | Planning stub for importing or integrating memory cleanup, de-duplication, and correction routines |
 | [`meta5.md`](ops/meta5.md) | `sun/meta5/v2.0.0.0` branch pointer |
 | [`NEAR_REMOVAL_COMPLETION_AUDIT.md`](ops/NEAR_REMOVAL_COMPLETION_AUDIT.md) | Completion audit of the Near/IronClaw naming migration and its unresolved compatibility work |
-| [`_OLD_AGENT_GOALS_2.0.0.0.md`](ops/_OLD_AGENT_GOALS_2.0.0.0.md) | Older agent pre-release checklist for v2.0.0.0 |
 | [`OLDROADMAP_2026.md`](ops/OLDROADMAP_2026.md) | Older LunarWing v2 roadmap snapshot |
-| [`_OUTDATED_CRATE_AUDIT_STATUS.md`](ops/_OUTDATED_CRATE_AUDIT_STATUS.md) | Outdated v2.0.0.0 crate-audit status retained for reference |
+| [`history/_OUTDATED_CRATE_AUDIT_STATUS.md`](ops/history/_OUTDATED_CRATE_AUDIT_STATUS.md) | Outdated v2.0.0.0 crate-audit status retained for reference |
 | [`P1_GAP_FINDINGS_v2.0.3.0.md`](ops/P1_GAP_FINDINGS_v2.0.3.0.md) | Verified v2.0.3.0 P1 gap findings across backends, workers, security, and operations |
 | [`questions.md`](ops/questions.md) | Notes on migrating the development loop from GitHub to Codeberg |
 | [`REVIEW_2.0.2.0_CHANGES.md`](ops/REVIEW_2.0.2.0_CHANGES.md) | Review of source changes and findings between v2.0.1.0 and v2.0.2.0 |
@@ -153,31 +156,6 @@ Protocol specs, contract definitions, and API references.
 
 ---
 
-### 📐 [`specs/`](specs/)
-
-Standalone specifications for specific features or patterns.
-
-| File | Description |
-|------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
-| [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait-babysitter pattern spec |
-| [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
-
----
-
-### 🔍 [`reviews/`](reviews/)
-
-Architecture and code reviews.
-
-| File | Description |
-|------|-------------|
-| [`SWEETIE-ARCH-REVIEW.md`](reviews/SWEETIE-ARCH-REVIEW.md) | Full codebase architecture review by SweetieBot |
-| [`SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md`](reviews/SELF_IMPROVING_SKILLS_AUDIT_2026-07-15.md) | Self-improving skills audit: B-1/B-2/B-3 tracks and Engine V2 feedback foundation, live E2E evidence, confirmed defects, corrected stale findings, P0/P1/P2 recommendations, default-disabled decision |
-| [`ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md`](reviews/ENGINE_V2_CHANNEL_PARITY_AUDIT_2026-07-18.md) | Engine V2 channel parity audit for XMPP, DarkIRC, and WeeChat: routing, controls, statuses, proactive delivery, attachments, security findings, test evidence, and rollout decisions |
-| [`ENGINE_V2_CHANNEL_PARITY_LIVE_VALIDATION_2026-07-19.md`](reviews/ENGINE_V2_CHANNEL_PARITY_LIVE_VALIDATION_2026-07-19.md) | Live WeeChat validation evidence for CHPAR-012, including delivery sentinels, security checks, cleanup, and remaining channel work |
-
----
-
 ### [`plans/`](plans/)
 
 Active implementation plans, execution backlogs, and delivery-status records.
@@ -188,20 +166,9 @@ Active implementation plans, execution backlogs, and delivery-status records.
 | [`e2e-skill-feedback.md`](plans/e2e-skill-feedback.md) | Live-tenant Engine V2 skill-feedback validation plan |
 | [`SELF_IMPROVING_SKILLS_B2_B3.md`](plans/SELF_IMPROVING_SKILLS_B2_B3.md) | B-2/B-3 self-improving skills implementation plan and delivered status |
 | [`WeeChat-Bootstrap.md`](plans/WeeChat-Bootstrap.md) | Secure tenant WeeChat relay provisioning plan |
-| [`Near-Removal.md`](plans/Near-Removal.md) | Provider and WIT ABI naming migration plan |
+| [`history/Near-Removal.md`](plans/history/Near-Removal.md) | Provider and WIT ABI naming migration plan (archived) |
 | [`PHASE5PLANSTATUSTODAYWED.md`](plans/PHASE5PLANSTATUSTODAYWED.md) | Engine V2 local compatibility phase status record |
 | [`SKILLb1b2b3STATUSTODAYWED.md`](plans/SKILLb1b2b3STATUSTODAYWED.md) | Self-improving skills implementation and verification status record |
-
----
-
-### 🚀 [`superpowers/`](superpowers/)
-
-Agent-driven plan and spec documents produced by the superpowers workflow.
-
-| Subdirectory | Description |
-|--------------|-------------|
-| [`plans/`](superpowers/plans/) | Implementation plans for LunarVision, mt-admin, MCP installation, Engine V2 streaming and compatibility, architecture refresh, and WeeChat bootstrap |
-| [`specs/`](superpowers/specs/) | Design specs for the implementation plans plus onboarding and channel-delivery work |
 
 ---
 
@@ -234,6 +201,7 @@ here while they are still present in `proposals/`.
 | [`EXTWORKERCONVERSATIONHIST.md`](proposals/EXTWORKERCONVERSATIONHIST.md) | Implemented | Concise `context_scope=recent` and local/Docker iteration-budget usage note |
 | [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Phase 1 active / Phase 2 partial | Green default-branch and MR pipelines verify the required CI; PostgreSQL/browser/coverage/standalone integration plus package and deployment phases remain |
 | [`GITWASM/README.md`](proposals/GITWASM/README.md) | Open | Gitoxide-based Git/Markdown WASM tool proposal |
+| [`HEALTHPOINT_METRICS_EXPORTER.md`](proposals/HEALTHPOINT_METRICS_EXPORTER.md) | Implemented (v2.0.8.0) | Healthpoint metrics exporter: Prometheus textfile export, loopback listener crate, and ports-registry slot |
 | [`HERMES-KAWARIMI-ADAPTER.md`](proposals/HERMES-KAWARIMI-ADAPTER.md) | Implemented (Phase 1) | Live-validated provision-then-populate Hermes import with owner-scope checks, encrypted secrets, explicit PG-only window, and failure cleanup |
 | [`HTTP_TOOL_SSRF_PROTECTIONS.md`](proposals/HTTP_TOOL_SSRF_PROTECTIONS.md) | Implemented / historical | Investigation record for the active HTTP-tool SSRF controls |
 | [`human-delay-mode-phase1-test-checklist.md`](proposals/human-delay-mode-phase1-test-checklist.md) | Implemented | Verified Phase 1 supervised-mode checklist |
@@ -248,6 +216,7 @@ here while they are still present in `proposals/`.
 | [`KAWARIMI-OWNER-SCOPE-CONTINUITY.md`](proposals/KAWARIMI-OWNER-SCOPE-CONTINUITY.md) | Partial | Core import reconciliation landed; Phase 2 export/FK work remains |
 | [`LOREBOOKS.md`](proposals/LOREBOOKS.md) | Implemented (v1) | Bounded SillyTavern World Info import subset with deterministic activation and prompt-write hardening |
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
+| [`lunarvoice-onnx-proposal-2.0.6.0.md`](proposals/lunarvoice-onnx-proposal-2.0.6.0.md) | Implemented (v2.0.6.0) | LunarVoice ONNX-based local voice processing proposal |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |
 | [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Superseded | Rejected split plan; item #24 chose the `mtadminrefactor/meta4/v2.0.3.0` mt-admin-lib decomposition instead |
@@ -299,10 +268,12 @@ here while they are still present in `proposals/`.
 | [`SSH_HARNESS_DELIVERY_OPTIONS.md`](proposals/SSH_HARNESS_DELIVERY_OPTIONS.md) | Implemented | All three SSH delivery mechanisms shipped |
 | [`SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md`](proposals/SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md) | Implemented / historical | Pre-implementation design record for shipped options 2 and 3 |
 | [`SUPERGATEWAY_MCP.md`](proposals/SUPERGATEWAY_MCP.md) | Superseded | Native stdio MCP support made the workaround optional |
+| [`study-notes-native-lunarwing-proposal-2.0.6.0.md`](proposals/study-notes-native-lunarwing-proposal-2.0.6.0.md) | Implemented | Native study-notes knowledge layer: as-built design for the core store and lifecycle integration |
 | [`TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md`](proposals/TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without a test plan |
 | [`TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md`](proposals/TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without web-GUI acceptance criteria |
 | [`UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md`](proposals/UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md) | Partial / mostly superseded | Owner-scope risk closed; remaining operational cautions retained |
 | [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / implemented incrementally | Host-local lifecycle, operator-pinned provenance, OS sandboxing, general MCP runtime adapters, stateful MCP-over-WASM, dedicated/shared gateway client placement, and core Docker worker-local stdio placement landed; marketplace trust, automatic package install, persistent-worker placement, and a bundled gateway service remain open |
+| [`wasm-expansion-proposal-2.0.6.0.md`](proposals/wasm-expansion-proposal-2.0.6.0.md) | Research complete / open | WASM functionality expansion research and proposal (release-goals item #10, v2.0.6.0) |
 | [`WEECHAT_CLIENT_RELAY_API_AUTOMATION.md`](proposals/WEECHAT_CLIENT_RELAY_API_AUTOMATION.md) | Partial | Relay bootstrap shipped; full client provisioning remains open |
 | [`WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md`](proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md) | Partial | Service and port automation landed; dependency install remains warn-only |
 | [`WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`](proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md) | Superseded | `ironclaw-sync` was renamed to `lunarwing-sync` |
@@ -333,7 +304,7 @@ Technical specifications for specific subsystems and patterns.
 
 | File | Description |
 |------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
+| [`history/Near-Removal.md`](specs/history/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification (archived) |
 | [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait babysitter pattern: OpenRC crash recovery for rootless Podman containers via `supervise-daemon` |
 | [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
 
@@ -393,18 +364,17 @@ Dated implementation plans and design specs produced by the superpowers agentic 
 
 ### 📦 [`releases/`](releases/)
 
-Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v1.1.8, latest: RELEASE-v1.1.8.md).
+Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.0.8.0, latest: RELEASE-v2.0.8.0.md).
 
 ---
 
 ### 🐛 [`bugs/`](bugs/)
 
-A maintained Open/Fixed bug tracker. The full index is **[`bugs/README.md`](bugs/README.md)**.
-Open bugs live in `bugs/`; resolved bugs are retained under [`bugs/history/`](bugs/history/).
 A maintained Open/Fixed bug tracker. The full index is **[`bugs/README.md`](bugs/README.md)** —
 it lists bug docs (Open + Fixed-retained-for-history) plus the two 1.1.4 multi-tenant
 pre-release issue logs under [`bugs/history/`](bugs/history/)
 (`SYSTEMD-MT-1.1.4-ISSUES.md`, `OPENRC-MT-1.1.4-ISSUES.md`).
+Open bugs live in `bugs/`; resolved bugs are retained under [`bugs/history/`](bugs/history/).
 
 ---
 
@@ -428,7 +398,6 @@ Internal notes, drafts, and working documents — incomplete or in-progress by n
 ### 📝 Top-level docs
 
 There are currently no top-level files in `docs/` outside the subdirectories above.
-- [`history/`](internal/history/) — superseded LunarWing docs relocated here during the reorg, by source area: `architecture/`, `guides/`, `internal/`, `proposals/`, `archive/`. See [`history/README.md`](internal/history/README.md).
 
 ---
 
