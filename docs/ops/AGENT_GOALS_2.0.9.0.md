@@ -15,10 +15,12 @@
 1. [ ] investigate work item and see if issue still persists and fix if necessary: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/55
 2. [ ] verify that work item here was addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/42
 3. [ ] Ensure that lunarwing2study mcp that is built into the agent is updated with the LATEST version of the knoweldge store/notes - can be found at: https://git.lunarwing.org/cmc/lw2studymcp.git
-18. [x] (S) reserved for ci/cd failures
-22. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-23. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-24. [ ] update anything outdated in docs/proposals - verify against code rather than docs
-29. [ ] update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
+4. [x] (S) reserved for ci/cd failures
+5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/65
+6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
+7. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+8. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+9. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+10. [ ] update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
 
 ---
