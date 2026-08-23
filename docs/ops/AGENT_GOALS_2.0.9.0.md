@@ -16,12 +16,15 @@
 2. [ ] verify that work item here was addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/42
 3. [ ] Ensure that lunarwing2study mcp that is built into the agent is updated with the LATEST version of the knoweldge store/notes - can be found at: https://git.lunarwing.org/cmc/lw2studymcp.git
 4. [x] (S) reserved for ci/cd failures
-5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/65
-6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
-7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/73
-8. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-9. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-10. [ ] update anything outdated in docs/proposals - verify against code rather than docs
-11. [ ] update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
+5. [ ] create a test tenant and ask it to create an automatic mission that fires each hour. investigate any failures. let it run for 3 hours at least before tearing down the tenant (RARES) - create full report of findings
+6. [ ] create a test tenant and ask it to create an automatic mission that fires each hour. investigate any failures. let it run for 3 hours at least before tearing down the tenant (AJ) - create full report of findings
+7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/65
+8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/73
+10. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+11. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+12. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+13. [x] (S) relnotes
+14. [x] (S) update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
 
 ---
