@@ -1,26 +1,24 @@
-# Release Notes for LunarWing v2.0.8.0 (FIRST DRAFT): Codename `Sekisho (関所)`
+# Release Notes for LunarWing v2.0.8.0 Codename `Sekisho (関所)`
 
-** Release Date: ** TBD (draft 2026-08-22)
+** Release Date: ** 2026-08-22
 
 > *Sekisho* (関所) were the checkpoint stations of Edo-period Japan, where
 > travelers, documents, and goods were inspected before being allowed to
 > pass. LunarWing v2.0.8.0 posts checkpoints over its own borders: signed
 > marketplace trust gates and revocation enforcement for MCP packages, hard
 > cgroup boundaries between tenants, health-gated sidecars, and fail-closed
-> activation paths that stop suspect cargo at the barrier. This is a first
-> draft; expect revision before the release ships.
+> activation paths that stop suspect cargo at the barrier.
 
 ## Overview
 
 LunarWing v2.0.8.0 is a multi-tenant hardening, MCP marketplace-security, and
-agent-resilience release built on v2.0.7.0 (`Mihari`). It brings hard cgroup
-v2 resource ceilings and automated subtree delegation to OpenRC/Gentoo tenant
-hosts, wires the MCP Part 2 trust stack (publisher signatures, dependency
-locks, revocation distribution) into real activation paths, streams SSE
-through the bundled MCP gateway, makes every agent termination path tell the
-model what would unlock the call, adds opt-in cross-tenant knowledge sharing
-over the coordination pipeline, and adds a Prometheus healthpoint metrics
-exporter with an early-warning threshold layer for host health.
+agent-resilience release. It brings hard cgroup v2 resource ceilings and automated
+subtree delegation to OpenRC/Gentoo tenant hosts, wires the MCP Part 2 trust
+stack (publisher signatures, dependency locks, revocation distribution) into real
+activation paths, streams SSE through the bundled MCP gateway, makes every
+agent termination path tell the model what would unlock the call, adds
+opt-in cross-tenant knowledge sharing over the coordination pipeline, and adds
+a Prometheus healthpoint metrics exporter with an early-warning threshold layer for host health.
 
 The release and tag use `2.0.8.0`; LunarWing-owned Rust crates and channel
 packages use `2.0.8`. Rust 2024 and MSRV `1.96.1` remain unchanged. There are
@@ -99,6 +97,7 @@ previous compatibility baseline.
   `add-tenant --with-study-mcp`.
 - Opencode external worker bumped to opencode `v1.18.18`, with the pinned ref
   baked into the image and exposed on the worker `/health` endpoint.
+- Kimi external worker also bumped to latest version.
 
 ## Compatibility
 
