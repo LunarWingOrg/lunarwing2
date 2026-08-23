@@ -173,7 +173,7 @@ Details:
   `false`; set `true` on the selected manual job for the full toolchain image —
   mirrors mt-admin's `--with-toolchains`). Kimi also exposes
   `KIMI_CODE_VERSION` (currently `0.37.2`).
-- Tags: a moving `WORKER_IMAGE_TAG` (default `v2.0.8.0`) plus `:latest`, plus
+- Tags: a moving `WORKER_IMAGE_TAG` (default `v2.0.9.0`) plus `:latest`, plus
   an immutable `$CI_COMMIT_SHORT_SHA` tag. The moving tags silently retarget
   between builds — consumers that need a stable reference should pull the SHA
   tag (or pin the digest it resolves to). SHA tags accumulate, so the
