@@ -18,9 +18,10 @@
 4. [x] (S) reserved for ci/cd failures
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/65
 6. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
-7. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-8. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-9. [ ] update anything outdated in docs/proposals - verify against code rather than docs
-10. [ ] update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
+7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/73
+8. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
+9. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+10. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+11. [ ] update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
 
 ---
