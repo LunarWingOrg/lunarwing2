@@ -12,5 +12,10 @@
 
 ---
 
+1. [ ] do another pass on the README.md at root of repo - update if necessary
+2. [ ] do pass through of all README.md docs in docs/ specifically
+3. [ ] investigate work item and see if issue still persists and fix if necessary: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/55
+4. [ ] see if this work item has been addressed and implement if possible https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/47
+5. [ ] verify that work item here was addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/42
 
 ---
