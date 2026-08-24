@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-20 · **Branch:** `aj/kimi-2-20260820-0301` · **Host:** Arch Linux (systemd, user-manager tenants)
 
-Addresses `docs/ops/CROSS_TENANT_KNOWLEDGE_SHARE_CONCERNS.md` (ruffles' review of
+Addresses `docs/ops/history/v2.0.8.0/GOAL2_INPUT_CONCERNS.md` (ruffles' review of
 the `KNOW:` cross-tenant knowledge pipeline, `ic/src/hooks/coordination_knowledge.rs`),
 then re-verifies live cross-tenant sharing with three throwaway tenants.
 
