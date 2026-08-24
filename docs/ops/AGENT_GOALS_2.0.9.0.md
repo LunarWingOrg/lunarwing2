@@ -17,7 +17,7 @@
 3. [ ] First, ensure that lunarwing2study mcp that is built into the agent is updated with the LATEST version of the knoweldge store/notes - can be found at: https://git.lunarwing.org/cmc/lw2studymcp.git - then create a mechanism that NEWLY created tenants can have their knowledge stores filled with the contents of the repo's database (dynamically). verify correctness by creating a new tenant. this process should also not populate/repopulate an existing tenant's knowledge store or overwrite it. verify this by creating a tenant on an older branch, then upgrading it using upgrade-tenant with a target of the working branch
 4. [x] (S) reserved for ci/cd failures
 5. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/73
-6. [x] (S) reserved
+6. [ ] further cleanup of repo is necessary, especially in the docs/ops dir
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/65
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
 9. [x] (S) reserved
