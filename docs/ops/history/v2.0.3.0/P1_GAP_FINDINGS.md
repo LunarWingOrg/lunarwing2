@@ -207,7 +207,7 @@ triaged separately for v2.0.4.0 fit.
 
 ### Files changed in initial review
 
-- `docs/ops/P1_GAP_FINDINGS_v2.0.3.0.md` — this document (new)
+- `docs/ops/history/v2.0.3.0/P1_GAP_FINDINGS.md` — this document (new; later archived)
 - `ic/src/db/CLAUDE.md` — recorded libSQL feature surface (new)
 - `AGENTS.md` — updated tunnel provider list to include NetBird
 - `ic/AGENTS.md` — updated tunnel provider list to include NetBird
