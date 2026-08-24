@@ -2197,6 +2197,35 @@ impl Store {
 
         Ok(())
     }
+
+    /// Clear failure state after a successful tool execution. Unlike
+    /// `mark_tool_repaired`, this leaves `repaired_at` untouched — the tool
+    /// was never repaired, it simply demonstrated it is not broken.
+    pub async fn record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError> {
+        let conn = self.conn().await?;
+
+        conn.execute(
+            "UPDATE tool_failures SET error_count = 0, repair_attempts = 0 WHERE tool_name = $1",
+            &[&tool_name],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Reset all repair-attempt counters (engine startup: fresh cycle per boot).
+    pub async fn reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError> {
+        let conn = self.conn().await?;
+
+        let rows = conn
+            .execute(
+                "UPDATE tool_failures SET repair_attempts = 0 WHERE repair_attempts > 0",
+                &[],
+            )
+            .await?;
+
+        Ok(rows)
+    }
 }
 
 // ==================== Settings ====================

@@ -688,6 +688,16 @@ pub trait ToolFailureStore: Send + Sync {
     async fn get_broken_tools(&self, threshold: i32) -> Result<Vec<BrokenTool>, DatabaseError>;
     async fn mark_tool_repaired(&self, tool_name: &str) -> Result<(), DatabaseError>;
     async fn increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError>;
+    /// Clear a tool's accumulated failure state after a successful execution
+    /// (last-known-good gate — a tool that just succeeded is not broken).
+    /// Resets `error_count` and `repair_attempts` but preserves `repaired_at`
+    /// and the failure timestamps for history.
+    async fn record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError>;
+    /// Reset every tool's repair-attempt counter. Called once at engine
+    /// startup so each boot gets a fresh repair cycle instead of inheriting
+    /// exhausted counters from the previous run. Returns the number of rows
+    /// whose counter was non-zero.
+    async fn reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError>;
 }
 
 #[async_trait]

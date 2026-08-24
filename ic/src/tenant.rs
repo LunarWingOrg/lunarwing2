@@ -596,6 +596,14 @@ impl AdminScope {
         self.inner.increment_repair_attempts(tool_name).await
     }
 
+    pub async fn record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError> {
+        self.inner.record_tool_success(tool_name).await
+    }
+
+    pub async fn reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError> {
+        self.inner.reset_tool_repair_attempts().await
+    }
+
     // === Sandbox housekeeping ===
 
     pub async fn cleanup_stale_sandbox_jobs(&self) -> Result<u64, DatabaseError> {
