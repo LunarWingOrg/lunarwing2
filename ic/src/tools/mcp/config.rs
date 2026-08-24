@@ -3288,7 +3288,7 @@ mod tests {
     /// `mcp add` persist a server violating file-level rules (e.g.
     /// `require_sandbox_profiles`), poisoning the stored config so every
     /// subsequent load failed closed. Found live in the v2.0.8.0 item-8
-    /// tenant test; see docs/ops/v2.0.8.0_ITEM_8_MCP_TENANT_TEST.md.
+    /// tenant test; see docs/ops/history/v2.0.8.0/ITEM8_MCP_TENANT_TEST.md.
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn db_persist_rejects_whole_file_validation_failures() {
