@@ -1,14 +1,25 @@
-# docs/ops/history — archived ops scratch
+# Archived operations records
 
-Historical, superseded ops files kept for the record. They are **not** maintained and may be
-inaccurate against the current tree — do not rely on them for current procedures.
+This directory contains superseded checklists, release-specific evidence, review
+snapshots, and scratch notes retained for provenance. These files are **not
+maintained** and may be inaccurate against the current tree; do not use them as
+operational procedures.
 
-| File | What it was |
-|------|-------------|
-| `GOALS_1.0.6.md` … `GOALS_1.1.8.md` | Per-release pre-release prep checklists (TODO lists) for shipped versions. Checkbox states are stale. The actual shipped records live in the `RELEASE-v*.md` notes (and `docs/releases/`). |
-| `TESTING_1.0.8.md` | One-line testing scratch note ("began fresh build"). |
+## Layout
 
-Additional stale ops files (scratch notes, review notes, one-liners) were moved to
-`docs/internal/history/archive/ops/` during the 1.1.9 stale-doc cleanup.
+- `GOALS_*.md` and `AGENT_GOALS_*.md` are completed or superseded release
+  checklists. Checkbox state is historical.
+- `v2.0.1.0/` through `v2.0.8.0/` contain release-bound audits, validation
+  reports, test plans, and codename notes.
+- Other files in this directory are point-in-time reviews or migration-era
+  scratch records whose filenames still carry useful provenance.
+- Older archived ops material also exists under
+  [`docs/internal/history/archive/ops/`](../../internal/history/archive/ops/).
 
-Current release planning lives in `docs/ops/AGENT_GOALS_2.0.4.0.md`.
+The maintained entry point is [`docs/ops/README.md`](../README.md). The active
+release checklist is the `AGENT_GOALS_*.md` file kept in the parent directory;
+current long-range planning lives in [`ROADMAP_2026.md`](../ROADMAP_2026.md).
+
+When archiving another release, move its completed evidence into a versioned
+subdirectory and repair repository links. Do not commit raw CI transcripts or
+one-line placeholders as archival records; Git history already preserves them.
