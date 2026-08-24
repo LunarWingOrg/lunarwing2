@@ -948,6 +948,32 @@ impl EffectBridgeAdapter {
             }
         }
     }
+
+    async fn registered_action_defs(&self) -> Vec<ActionDef> {
+        let tool_defs = self.tools.tool_definitions().await;
+        let mut actions = Vec::with_capacity(tool_defs.len());
+
+        for tool in tool_defs {
+            if is_v1_only_tool(&tool.name) || is_v1_auth_tool(&tool.name) {
+                continue;
+            }
+
+            actions.push(ActionDef {
+                name: tool.name.replace('-', "_"),
+                description: tool.description,
+                parameters_schema: tool.parameters,
+                effects: vec![],
+                // Approval is enforced at execute-time inside this adapter so
+                // thread-scoped one-shot approvals and auth-aware bypasses can
+                // participate. Advertising approval here would cause the engine
+                // policy preflight to interrupt before the adapter can apply
+                // those runtime checks.
+                requires_approval: false,
+            });
+        }
+
+        actions
+    }
 }
 
 #[async_trait::async_trait]
@@ -965,40 +991,21 @@ impl EffectExecutor for EffectBridgeAdapter {
 
     async fn available_actions(
         &self,
-        _leases: &[CapabilityLease],
+        leases: &[CapabilityLease],
     ) -> Result<Vec<ActionDef>, EngineError> {
-        let tool_defs = self.tools.tool_definitions().await;
+        let actions = self.registered_action_defs().await;
+        Ok(actions
+            .into_iter()
+            .filter(|action| {
+                leases
+                    .iter()
+                    .any(|lease| lease.is_valid() && lease.covers_action(&action.name))
+            })
+            .collect())
+    }
 
-        // Build action defs, excluding v1-only tools and v1 auth tools
-        let mut actions = Vec::with_capacity(tool_defs.len());
-        for td in tool_defs {
-            // Skip tools that can't work in engine v2
-            if is_v1_only_tool(&td.name) {
-                continue;
-            }
-
-            // Skip v1 auth management tools — auth is kernel-level in v2
-            if is_v1_auth_tool(&td.name) {
-                continue;
-            }
-
-            let python_name = td.name.replace('-', "_");
-
-            actions.push(ActionDef {
-                name: python_name,
-                description: td.description,
-                parameters_schema: td.parameters,
-                effects: vec![],
-                // Approval is enforced at execute-time inside this adapter so
-                // thread-scoped one-shot approvals and auth-aware bypasses can
-                // participate. Advertising approval here would cause the engine
-                // policy preflight to interrupt before the adapter can apply
-                // those runtime checks.
-                requires_approval: false,
-            });
-        }
-
-        Ok(actions)
+    async fn registered_actions(&self) -> Result<Vec<ActionDef>, EngineError> {
+        Ok(self.registered_action_defs().await)
     }
 }
 
@@ -2410,7 +2417,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
-    async fn engine_v2_exposes_create_job_action() {
+    async fn engine_v2_exposes_create_job_only_with_matching_lease() {
         use crate::context::ContextManager;
         use crate::tools::builtin::{CancelJobTool, CreateJobTool};
 
@@ -2429,12 +2436,35 @@ FINAL(echoed + "|" + http_result["error"])"#,
             Arc::new(HookRegistry::default()),
         );
 
-        let actions = EffectExecutor::available_actions(&adapter, &[])
+        let registered = EffectExecutor::registered_actions(&adapter)
+            .await
+            .expect("registered actions");
+        let registered_names: Vec<_> = registered
+            .iter()
+            .map(|action| action.name.as_str())
+            .collect();
+        assert!(registered_names.contains(&"create_job"));
+        assert!(!registered_names.contains(&"cancel_job"));
+
+        let mut matching_lease = lease();
+        matching_lease.granted_actions =
+            lunarwing_engine::GrantedActions::Specific(vec!["create_job".into()]);
+        let available = EffectExecutor::available_actions(&adapter, &[matching_lease])
             .await
             .expect("available actions");
-        let names: Vec<_> = actions.iter().map(|action| action.name.as_str()).collect();
-        assert!(names.contains(&"create_job"));
-        assert!(!names.contains(&"cancel_job"));
+        assert_eq!(available.len(), 1);
+        assert_eq!(available[0].name, "create_job");
+
+        let mut mission_lease = lease();
+        mission_lease.granted_actions =
+            lunarwing_engine::GrantedActions::Specific(vec!["memory_search".into()]);
+        let available = EffectExecutor::available_actions(&adapter, &[mission_lease])
+            .await
+            .expect("mission actions");
+        assert!(
+            available.iter().all(|action| action.name != "create_job"),
+            "mission-scoped leases must not advertise the full-job container tool"
+        );
     }
 
     // ── is_v1_auth_tool tests ─────────────────────────────────

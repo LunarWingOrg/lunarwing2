@@ -111,6 +111,7 @@ mod tests {
                 action("file_write", vec![EffectType::WriteLocal], false), // Stateful
                 action("shell", vec![EffectType::WriteLocal], true), // Privileged
                 action("http", vec![EffectType::WriteExternal], true), // Privileged
+                action("create_job", vec![EffectType::WriteLocal], true), // Administrative (denylisted)
                 action("routine_create", vec![EffectType::WriteLocal], false), // Administrative (denylisted)
                 action("tool_install", vec![EffectType::WriteLocal], false), // Administrative (denylisted)
             ],
@@ -150,7 +151,8 @@ mod tests {
         let plans = planner.plan_for_thread(ThreadType::Foreground, &mixed_registry());
         assert_eq!(plans.len(), 1);
         let actions = plans[0].granted_actions.actions();
-        assert_eq!(actions.len(), 7, "Foreground should get all 7 actions");
+        assert_eq!(actions.len(), 8, "Foreground should get all 8 actions");
+        assert!(plans[0].granted_actions.covers("create_job"));
         assert!(plans[0].granted_actions.covers("routine_create"));
         assert!(plans[0].granted_actions.covers("shell"));
     }
@@ -172,6 +174,7 @@ mod tests {
         assert!(plans[0].granted_actions.covers("read_file"));
         assert!(plans[0].granted_actions.covers("file_write"));
         assert!(!plans[0].granted_actions.covers("shell"));
+        assert!(!plans[0].granted_actions.covers("create_job"));
         assert!(!plans[0].granted_actions.covers("routine_create"));
     }
 
@@ -182,10 +185,11 @@ mod tests {
         assert_eq!(plans.len(), 1);
         let ga = &plans[0].granted_actions;
         // Includes ReadOnly, Stateful, and non-denylisted Privileged (shell, http).
-        // Excludes Administrative (routine_create, tool_install).
+        // Excludes Administrative (create_job, routine_create, tool_install).
         assert!(ga.covers("echo"));
         assert!(ga.covers("shell"));
         assert!(ga.covers("http"));
+        assert!(!ga.covers("create_job"));
         assert!(!ga.covers("routine_create"));
         assert!(!ga.covers("tool_install"));
     }
@@ -195,7 +199,7 @@ mod tests {
         let planner = LeasePlanner::new();
         let plans = planner.plan_for_thread(ThreadType::Mission, &mixed_registry());
         let ga = &plans[0].granted_actions;
-        // routine_create and tool_install are in the denylist
+        assert!(!ga.covers("create_job"));
         assert!(!ga.covers("routine_create"));
         assert!(!ga.covers("tool_install"));
     }
