@@ -14,19 +14,28 @@
 //! - **New tenants only.** The env flag is written exclusively on the
 //!   add-tenant path; existing tenants upgraded to a seed-capable binary
 //!   never carry it and are never seeded.
-//! - **Runs once.** A JSON state file records the completed seed; later
-//!   startups skip the pass entirely, so the store is never repopulated.
+//! - **Runs once.** A JSON state file records the completed pass; later
+//!   startups skip the seed entirely, so the store is never repopulated.
+//!   Per-note failures (unreadable or invalid files) are logged and recorded
+//!   in the state file but do not block the marker — upstream junk notes must
+//!   not turn the one-shot seed into a per-boot rescan. A crash mid-pass
+//!   leaves no marker, so the next startup simply resumes (already-seeded
+//!   notes are skipped); an operator can force a full re-seed by deleting
+//!   the state file, which is safe because existing notes are never
+//!   overwritten.
 //! - **Never overwrites.** A note whose workspace path already exists is
-//!   skipped, so operator-authored notes survive even a forced re-seed.
+//!   skipped, so operator-authored notes survive even a forced re-seed. The
+//!   only writes to existing paths are repairs of a previous pass's own
+//!   stranded rows: an exact byte-for-byte body missing provenance metadata
+//!   gets its metadata restored, and an empty placeholder row (created just
+//!   before a crash) gets filled in. Operator content never matches either
+//!   shape byte-for-byte, so it is left untouched.
 //! - **Wire namespace stays reserved.** Checkout directories under the
 //!   coordination wire prefix (`coord-*`) are never imported, so seeded
 //!   notes cannot collide with wire-ingested notes.
 //!
 //! Best-effort: individual note failures are logged and counted but never
-//! propagated, so the agent never crashes because a seed pass failed. When
-//! any note fails, the state file is withheld and the pass retries on the
-//! next startup; already-seeded notes are skipped, so retries are
-//! idempotent.
+//! propagated, so the agent never crashes because a seed pass failed.
 
 use std::path::{Path, PathBuf};
 
@@ -92,6 +101,8 @@ struct KnowledgeSeedState {
     source_home: PathBuf,
     notes_seeded: u32,
     notes_skipped_existing: u32,
+    /// Notes that failed to import (logged during the pass).
+    notes_failed: u32,
 }
 
 /// One candidate note file discovered in the checkout.
@@ -112,8 +123,9 @@ enum SeedOutcome {
 ///
 /// Writes are plain workspace documents, so chunking/FTS/embedding behave
 /// exactly as for `knowledge_submit_note`. The pass is idempotent: existing
-/// notes are skipped, and the state file is only written once every
-/// discovered note imported cleanly.
+/// notes are skipped. The state file is written once the pass has walked
+/// every discovered note — per-note failures are logged and recorded in it,
+/// never propagated — so a completed pass never rescans on later startups.
 pub async fn run_knowledge_seed_once(
     workspace: &Workspace,
     config: &KnowledgeSeedConfig,
@@ -157,14 +169,14 @@ pub async fn run_knowledge_seed_once(
         }
     }
 
-    if report.notes_failed == 0 {
-        save_state(&state_file, config, &report);
-    } else {
+    if report.notes_failed > 0 {
         tracing::warn!(
-            "knowledge seed: {} note(s) failed; seed will retry on next startup",
-            report.notes_failed
+            "knowledge seed: {} note(s) failed (recorded in {}); seed is complete and will not rerun",
+            report.notes_failed,
+            state_file.display()
         );
     }
+    save_state(&state_file, config, &report);
     report
 }
 
@@ -188,13 +200,25 @@ async fn seed_note(workspace: &Workspace, note: &NoteFile) -> Result<SeedOutcome
     let path = note_path(&note.agent, &note.topic);
     let markdown = render_note_markdown(&title, &body);
     if let Ok(existing) = workspace.read_primary(&path).await {
-        // A path that already exists is never overwritten. One exception: a
-        // previous seed pass stranded between the content and metadata
-        // commits leaves the exact seeded body without provenance metadata;
-        // repair just the metadata when the content matches byte-for-byte.
-        if KnowledgeNoteMeta::from_metadata_json(&existing.metadata).is_none()
-            && existing.content == markdown
-        {
+        // A path that already exists is never overwritten. Two crash shapes
+        // of a previous seed pass are repaired instead:
+        if KnowledgeNoteMeta::from_metadata_json(&existing.metadata).is_some() {
+            return Ok(SeedOutcome::AlreadyExists);
+        }
+        if existing.content == markdown {
+            // Stranded between the content and metadata commits: the exact
+            // seeded body without provenance metadata — repair metadata only.
+            workspace
+                .set_document_metadata(&path, &meta.to_metadata_json())
+                .await
+                .map_err(|error| format!("metadata repair failed: {error}"))?;
+        } else if existing.content.trim().is_empty() {
+            // Stranded between document creation and the content commit: an
+            // empty placeholder row — fill in body and metadata.
+            workspace
+                .write(&path, &markdown)
+                .await
+                .map_err(|error| format!("stranded-row write failed: {error}"))?;
             workspace
                 .set_document_metadata(&path, &meta.to_metadata_json())
                 .await
@@ -474,6 +498,7 @@ fn save_state(state_file: &Path, config: &KnowledgeSeedConfig, report: &Knowledg
         source_home: config.source_home.clone(),
         notes_seeded: report.notes_seeded,
         notes_skipped_existing: report.notes_skipped_existing,
+        notes_failed: report.notes_failed,
     };
     match serde_json::to_string_pretty(&state) {
         Ok(json) => {
@@ -766,6 +791,19 @@ mod tests {
                 )
                 .await
                 .expect("stranded write");
+            // A previous pass stranded between document creation and the
+            // content commit: an empty placeholder row.
+            write_note(
+                &notes_dir,
+                "rarity",
+                "placeholder.md",
+                "# Placeholder\n\nplaceholder body\n",
+            );
+            workspace
+                .write("study-notes/rarity/placeholder.md", "")
+                .await
+                .expect("placeholder write");
+
             // An operator-authored document whose content differs from the
             // checkout note must keep both its content and its metadata.
             workspace
@@ -784,7 +822,7 @@ mod tests {
             };
             let report = run_knowledge_seed_once(&workspace, &config).await;
             assert_eq!(report.notes_seeded, 0);
-            assert_eq!(report.notes_skipped_existing, 2);
+            assert_eq!(report.notes_skipped_existing, 3);
             assert_eq!(report.notes_failed, 0);
 
             let repaired = workspace
@@ -794,6 +832,15 @@ mod tests {
             let meta =
                 KnowledgeNoteMeta::from_metadata_json(&repaired.metadata).expect("repaired meta");
             assert_eq!(meta.tags, vec!["repair".to_string()]);
+
+            let filled = workspace
+                .read_primary("study-notes/rarity/placeholder.md")
+                .await
+                .expect("placeholder doc");
+            assert!(filled.content.contains("placeholder body"));
+            let meta =
+                KnowledgeNoteMeta::from_metadata_json(&filled.metadata).expect("placeholder meta");
+            assert_eq!(meta.topic, "placeholder");
 
             let operator = workspace
                 .read_primary("study-notes/rarity/operator.md")
