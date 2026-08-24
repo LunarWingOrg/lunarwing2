@@ -100,7 +100,7 @@ Standalone specifications for specific features or patterns.
 
 | File | Description |
 |------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
+| [`Near-Removal.md`](specs/history/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
 | [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait-babysitter pattern spec |
 | [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
 
@@ -129,7 +129,7 @@ Active implementation plans, execution backlogs, and delivery-status records.
 | [`e2e-skill-feedback.md`](plans/e2e-skill-feedback.md) | Live-tenant Engine V2 skill-feedback validation plan |
 | [`SELF_IMPROVING_SKILLS_B2_B3.md`](plans/SELF_IMPROVING_SKILLS_B2_B3.md) | B-2/B-3 self-improving skills implementation plan and delivered status |
 | [`WeeChat-Bootstrap.md`](plans/WeeChat-Bootstrap.md) | Secure tenant WeeChat relay provisioning plan |
-| [`Near-Removal.md`](plans/Near-Removal.md) | Provider and WIT ABI naming migration plan |
+| [`Near-Removal.md`](plans/history/Near-Removal.md) | Provider and WIT ABI naming migration plan |
 | [`PHASE5PLANSTATUSTODAYWED.md`](plans/PHASE5PLANSTATUSTODAYWED.md) | Engine V2 local compatibility phase status record |
 | [`SKILLb1b2b3STATUSTODAYWED.md`](plans/SKILLb1b2b3STATUSTODAYWED.md) | Self-improving skills implementation and verification status record |
 
@@ -274,7 +274,7 @@ Technical specifications for specific subsystems and patterns.
 
 | File | Description |
 |------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
+| [`Near-Removal.md`](specs/history/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
 | [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait babysitter pattern: OpenRC crash recovery for rootless Podman containers via `supervise-daemon` |
 | [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
 
