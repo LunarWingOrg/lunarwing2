@@ -13,7 +13,7 @@
 ---
 
 1. [ ] investigate work item and see if issue still persists and fix if necessary: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/55
-2. [ ] verify that work item here was addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/42
+2. [x] verified addressed: XMPP agent image attachments are base64-encoded by the WASM channel, decoded by the bridge, queued for XEP-0363 upload, and `/v1/messages/send` has a scoped 70 MiB body limit with pre-body authorization; bridge and native attachment regression tests pass: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/42
 3. [ ] Ensure that lunarwing2study mcp that is built into the agent is updated with the LATEST version of the knoweldge store/notes - can be found at: https://git.lunarwing.org/cmc/lw2studymcp.git
 4. [x] (S) reserved for ci/cd failures
 5. [ ] create a test tenant and ask it to create an automatic mission that fires each hour. investigate any failures. let it run for 3 hours at least before tearing down the tenant (RARES) - create full report of findings
