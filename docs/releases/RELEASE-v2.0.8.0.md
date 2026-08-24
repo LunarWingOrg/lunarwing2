@@ -356,7 +356,7 @@ previous compatibility baseline.
   oneshot). Covered by the new `test-watchdog-openrc.sh` suite (28
   assertions) plus new `test-health-openrc.sh` and chaos-harness cases —
   691/691 green across 14 suites; write-up in
-  `docs/ops/v2.0.8.0_GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
+  `docs/ops/history/v2.0.8.0/GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
 
 ### WASM Channel Tool Activity
 
