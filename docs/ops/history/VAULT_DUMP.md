@@ -1,8 +1,9 @@
 # Other v2 Scratch Tasks
 
 > **Historical snapshot.** This list predates v2.0.0.0 and is not a current
-> release checklist. Use [`AGENT_GOALS_2.0.4.0.md`](AGENT_GOALS_2.0.4.0.md) and
-> [`ROADMAP_2026.md`](ROADMAP_2026.md) for active release work and future targets.
+> release checklist. The contemporary scratch checklist is archived as
+> [`AGENT_GOALS_2.0.4.0_SCRATCH_FILE.md`](AGENT_GOALS_2.0.4.0_SCRATCH_FILE.md);
+> use [`ROADMAP_2026.md`](../ROADMAP_2026.md) for current future targets.
 
 # Before the 2.0.0.0 release (historical)
 

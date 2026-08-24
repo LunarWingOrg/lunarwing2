@@ -1,7 +1,7 @@
 # Goal List Gap Suggestions — v2.0.3.0
 
 > **Purpose:** Deliverable for item #3 in the archived
-> [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). Surfaces
+> [`AGENT_GOALS_2.0.3.0.md`](../AGENT_GOALS_2.0.3.0.md). Surfaces
 > release-track work that was **not** represented in the v2.0.3.0 goals list but
 > was verifiable against the repo on 2026-07-25. Each suggestion cites the
 > evidence so a human can triage add/defer in one pass.
@@ -37,13 +37,13 @@ committed. Security-relevant updates pulled (openssl, rustls, hyper, http, tokio
 Verified via `cargo check` (default + all-features). See `CRATE_AUDIT_STATUS.md` §"Changes
 since the 2026-07-12 audit" for the full list.
 
-`docs/ops/CRATE_AUDIT_STATUS.md` (item #8 deliverable) reports the committed
+`docs/ops/history/v2.0.2.0/CRATE_AUDIT_STATUS.md` (item #8 deliverable) reports the committed
 `ic/Cargo.lock` is behind by **155 patch/minor bumps, 14 additions, 18
 removals**, including security-relevant updates to `openssl`, `rustls`,
 `hyper`, `http`, `tokio`, and `libc`. Item #8 only asks for an *audit*; it does
 not track applying the result.
 
-- **Evidence:** `docs/ops/CRATE_AUDIT_STATUS.md` §"Pre-2.0.2.0 Action" (still
+- **Evidence:** `docs/ops/history/v2.0.2.0/CRATE_AUDIT_STATUS.md` §"Pre-2.0.2.0 Action" (still
   unactioned for 2.0.3.0); `ic/Cargo.lock`.
 - **Why it matters:** shipping a release 155 patches behind on TLS/HTTP/openssl
   is a known, avoidable CVE surface, and the audit already did the triage work.
@@ -112,7 +112,7 @@ extensions, MCP, gate, and pairing — all of which land on the shared DB trait.
 No goal verifies libSQL parity after these merges.
 
 - **Evidence:** `ic/src/db/` (dual-backend trait), `AGENTS.md` "Database,
-  Setup, and Config Rules"; `docs/ops/CRATE_AUDIT_STATUS.md` notes
+  Setup, and Config Rules"; `docs/ops/history/v2.0.2.0/CRATE_AUDIT_STATUS.md` notes
   `rust-test-libsql` is serialized for memory, confirming it runs but not that
   it is current.
 - **Why it matters:** a silent libSQL regression is the most likely
@@ -239,7 +239,7 @@ and none are tracked by any v2.0.3.0 goal despite the main daemon bumping to
   `docs/ops/PEBBLE-WORKER.md`.
 - **Proposed item:** "Decide per-sidecar whether to bump versions in lockstep
   with 2.0.3.0 or keep independent cadence; record the policy in
-  `docs/ops/CRATE_AUDIT_STATUS.md`."
+  `docs/ops/history/v2.0.2.0/CRATE_AUDIT_STATUS.md`."
 
 ### G12. Self-healing / self-repair coverage audit
 

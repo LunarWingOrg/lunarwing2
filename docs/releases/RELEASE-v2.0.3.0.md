@@ -340,11 +340,12 @@ it does not enable it.
 - Updated root `README.md` for v2.0.3.0.
 - Added Arch Linux multi-tenant package list (`docs/guides/ARCHLINUX_PACKAGE_LIST.md`).
 - Added missing Python packages to the Gentoo multi-tenant package list.
-- Added `docs/ops/XMPP_FT_REVIEW_R.md` and `docs/ops/XMPP_FT_REVIEW_A.md`
-  detailing XMPP file transfer and LunarVision enrichment findings.
+- Added `docs/ops/history/XMPP_FT_REVIEW_R.md` and
+  `docs/ops/history/XMPP_FT_REVIEW_A.md`, now archived as point-in-time XMPP
+  file-transfer and LunarVision enrichment reviews.
 - Added `docs/proposals/REFLEX_COMPILER_V2_UPGRADE_PLAN.md`.
 - Added `docs/proposals/MULTIAGENTTEAMORCHESTRATION_INTEGRATION_PLAN_v2.0.4.0.md`.
-- Added `docs/ops/CODENAME_IDEAS_v2.0.3.0.md`.
+- Added `docs/ops/history/v2.0.3.0/CODENAME_IDEAS.md`.
 - Added `docs/ops/SIS_FIX_PROPOSAL.md` documenting the self-improving skills
   root causes, fixes, verification coverage, and residual limits.
 

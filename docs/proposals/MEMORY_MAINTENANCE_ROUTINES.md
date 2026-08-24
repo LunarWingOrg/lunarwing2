@@ -15,7 +15,7 @@ The built-in option remains useful as a later promotion path for a small, review
 
 This is the design follow-up for issue #201, which the issue-status document
 records as an open stub with no implementation or proposal at its report
-snapshot ([`docs/ops/ISSUE_STATUS_REPORT.md`](../ops/ISSUE_STATUS_REPORT.md#L61-L66)).
+snapshot ([`docs/ops/history/ISSUE_STATUS_REPORT.md`](../ops/history/ISSUE_STATUS_REPORT.md#L61-L66)).
 
 ## Context, Goals, and Non-Goals
 

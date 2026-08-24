@@ -5,8 +5,8 @@
 > are stripped/redacted on failure paths, and downloads now use the shared HTTPS,
 > public-address, DNS-pinning, no-redirect, no-proxy policy. Line references and
 > the final verdict describe the reviewed 2026-07-28 branch, not current source.
-> See [`XMPP_TRANSFERS.md`](XMPP_TRANSFERS.md) and
-> [`XMPP_KNOWN_ISSUES.md`](XMPP_KNOWN_ISSUES.md) for current operator status.
+> See [`XMPP_TRANSFERS.md`](../XMPP_TRANSFERS.md) and
+> [`XMPP_KNOWN_ISSUES.md`](../XMPP_KNOWN_ISSUES.md) for current operator status.
 
 Review date: 2026-07-28
 Reviewer branch: `aj/kimi-26-20260728-2306`

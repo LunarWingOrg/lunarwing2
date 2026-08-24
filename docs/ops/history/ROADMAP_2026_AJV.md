@@ -2,7 +2,7 @@
 
 > **Superseded planning snapshot.** v2.0.4 entries below reflect an earlier
 > proposal-index pass, not current completion state or release targets. Use
-> [`ROADMAP_2026.md`](ROADMAP_2026.md) as the official operations roadmap.
+> [`ROADMAP_2026.md`](../ROADMAP_2026.md) as the official operations roadmap.
 
 LunarWing 2026 release roadmap. Each entry lists its target release; entries
 backed by a design or proposal document cite the source so the plan stays

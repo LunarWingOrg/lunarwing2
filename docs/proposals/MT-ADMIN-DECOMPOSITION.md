@@ -29,7 +29,7 @@
 > This document is retained as the design record of the rejected approach.
 >
 > **Original status (2026-07-22): PROPOSAL — reviewed, ready for implementation**
-> (superseded as above). Reviewed in `docs/ops/KUMOGAKURE_RECENT_REV_T.md`
+> (superseded as above). Reviewed in `docs/ops/history/v2.0.3.0/KUMOGAKURE_REVIEW.md`
 > (2026-07-21). Verdict at the time: "solid proposal, ready for sun to
 > greenlight implementation." This revision incorporates the review feedback
 > (see §5.1 Test Surface, §10.1 Updated Recommendations, and the 3a/3b note
@@ -168,7 +168,7 @@ the total to **five** (or **six** if `tenant-lifecycle.sh` is extracted too),
 comfortably satisfying the "AT LEAST FOUR" requirement.
 
 **3a/3b counting confirmation (per review feedback):** The
-`KUMOGAKURE_RECENT_REV_T.md` review flagged this as "worth confirming sun
+`docs/ops/history/v2.0.3.0/KUMOGAKURE_REVIEW.md` review flagged this as "worth confirming sun
 agrees that 3a/3b count separately." The justification is structural: the
 two renderers share zero code with each other — every coupling they have is
 to the composition root, never cross-init-system. They are independently
@@ -366,7 +366,7 @@ because it has the clearest independent test surface.
 > **Review note:** "No mention of how `shellcheck` scoping or a test harness
 > would attach to the new libraries — that's the stated motivation (§2.1) but
 > the proposal doesn't sketch the test surface. Worth a follow-up section
-> before implementation begins." — `KUMOGAKURE_RECENT_REV_T.md`
+> before implementation begins." — `docs/ops/history/v2.0.3.0/KUMOGAKURE_REVIEW.md`
 
 The decomposition is the *enabler* for per-library testing, not the test
 harness itself. This section sketches what that test surface looks like so
@@ -617,7 +617,7 @@ act on later. **Do not bundle them into the decomposition PRs.**
 > **Review note:** "Phase-2 `tenant-lifecycle.sh` extraction is flagged
 > optional; given it's the 1301-line dispatcher + verbs, it's where the real
 > reviewability win is. Recommend not deferring it indefinitely." —
-> `KUMOGAKURE_RECENT_REV_T.md`
+> `docs/ops/history/v2.0.3.0/KUMOGAKURE_REVIEW.md`
 
 **`tenant-lifecycle.sh` should be prioritized as PR 5, not indefinitely
 deferred.** The 1301-line high-level tenant verbs + dispatcher block
