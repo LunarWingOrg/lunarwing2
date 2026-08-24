@@ -22,7 +22,7 @@
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72
 9. [x] (S) reserved for ci/cd fixes
 10. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-11. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+11. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 12. [ ] update anything outdated in docs/proposals - verify against code rather than docs
 13. [x] (S) relnotes
 14. [x] (S) update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
