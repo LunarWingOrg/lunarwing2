@@ -5,7 +5,7 @@ This document audits the accuracy of
 against the current codebase and running configurations.
 
 > **Note:** The infodump has been superseded as an operational reference.
-> [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md) is the active operations guide.
+> [`WEECHAT-SERVICES.md`](../WEECHAT-SERVICES.md) is the active operations guide.
 > This verification report remains useful as a codebase audit and records which
 > discrepancies have been resolved. It describes the implementation-branch state
 > and does not claim a production release or deployment.
@@ -23,7 +23,7 @@ material issues identified in the original audit have been addressed:
    the WeeChat service unit / init script in several places, but the actual
    rendered name is `lunarwing-weechat-<name>` (with the `lunarwing-` prefix).
    The active operations guide
-   ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) now uses canonical names
+   ([`WEECHAT-SERVICES.md`](../WEECHAT-SERVICES.md)) now uses canonical names
    consistently. The infodump itself has been marked as historical/superseded.
 2. **Manual first-run relay setup (resolved):** Fresh tenants now receive an
    automatic relay bootstrap during `add-tenant`. The explicit recovery command
@@ -208,7 +208,7 @@ These items were open at the time of the original infodump and are now resolved:
 | WASM channel config `relay_password` env-source | ✅ Implemented ([`ic/src/channels/wasm/setup.rs:493`](https://codeberg.org/LunarWing/LunarWing_v2/src/branch/main/ic/src/channels/wasm/setup.rs)) |
 | WASM channel config `relay_url`, `ws_adapter_url` env-source | ✅ Implemented via capabilities-env bridge (fields with `"env"` key in `ChannelCapabilitiesFile`) |
 | OpenRC conf.d includes WeeChat ports | ✅ Verified (`lunarwing_rc_need` at line 5544) |
-| **Service naming `weechat-<name>` → `lunarwing-weechat-<name>`** | ✅ **Resolved** — active docs ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) use canonical names; infodump marked historical |
+| **Service naming `weechat-<name>` → `lunarwing-weechat-<name>`** | ✅ **Resolved** — active docs ([`WEECHAT-SERVICES.md`](../WEECHAT-SERVICES.md)) use canonical names; infodump marked historical |
 | **Manual relay setup required on first run** | ✅ **Resolved** — `add-tenant` performs automatic relay bootstrap; `configure-weechat-relay` provides explicit recovery; manual `/relay` is last-resort only |
 | **Dedicated minimal `weechat.env`** | ✅ **Implemented** — `env/weechat.env` (mode `0600`) contains only `RELAY_PASSWORD`; loaded by both systemd and OpenRC WeeChat services |
 | **Preflight validation of generated relay config** | ✅ **Extended** — `lunarwing-weechat-preflight.sh` validates `relay.conf` (literal password expression, loopback bind, API port) and `weechat.env` without sourcing either file |
@@ -233,7 +233,7 @@ These claims are constructed but can only be confirmed on a live deployment:
 ### Resolved
 
 1. **Service naming:** The active operations guide
-   ([`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md)) now uses canonical
+   ([`WEECHAT-SERVICES.md`](../WEECHAT-SERVICES.md)) now uses canonical
    `lunarwing-weechat-<name>` names consistently. The infodump has been
    marked historical/superseded.
 2. **Manual relay setup:** Fresh tenants receive automatic relay bootstrap
