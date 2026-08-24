@@ -569,7 +569,7 @@ write_tenant_lunarwing_env() {
   local gateway_token bridge_token relay_password secrets_key webhook_secret pg_password darkirc_adapter_secret
   local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
   local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
-  local study_notes_home study_notes_state_home study_notes_allow_write
+  local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -607,6 +607,9 @@ write_tenant_lunarwing_env() {
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
+  # One-shot knowledge seed: carry the flag only when it already exists (set
+  # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
+  knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
   local transcription_enabled transcription_provider transcription_model voice_enabled
   voice_enabled="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_ENABLED)"
   voice_enabled="${voice_enabled:-false}"
@@ -829,6 +832,8 @@ ENVEOF
       || printf 'LW2STUDYMCP_STATE_HOME=%s\n' "$study_notes_state_home" >> "$path"
     [[ -z "$study_notes_allow_write" ]] \
       || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$path"
+    [[ -z "$knowledge_seed_flag" ]] \
+      || printf 'KNOWLEDGE_SEED_FROM_STUDY_MCP=%s\n' "$knowledge_seed_flag" >> "$path"
   fi
   chown "$name:$name" "$path"
   say "wrote: $path"

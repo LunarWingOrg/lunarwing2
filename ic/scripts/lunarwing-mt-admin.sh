@@ -246,7 +246,11 @@ Commands:
                                    knowledge of the LunarWing codebase. The shared
                                    checkout is always synced to the latest upstream
                                    first (cloned when missing, fast-forwarded when
-                                   present and clean).
+                                   present and clean). Also arms a one-shot import
+                                   of the synced checkout into the tenant's own
+                                   knowledge store (KNOWLEDGE_SEED_FROM_STUDY_MCP=1,
+                                   first boot only; never re-populates or overwrites,
+                                   and upgrade-tenant never arms it).
     --study-mcp-home <path>        Use this checkout instead of the default shared one
                                    ($STUDY_NOTES_DEFAULT_HOME; still synced to latest)
     --opencode-model <model>       Override the opencode worker's LLM model

@@ -104,6 +104,35 @@ if grep -q '^LW2STUDYMCP_ALLOW_WRITE=' "$(tenant_env_dir test)/lunarwing.env"; t
   exit 1
 fi
 
+# The add-tenant path arms the one-shot knowledge seed exactly once.
+grep -Fqx 'KNOWLEDGE_SEED_FROM_STUDY_MCP=1' "$(tenant_env_dir test)/lunarwing.env"
+[[ "$(grep -c '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test)/lunarwing.env")" -eq 1 ]]
+
+# Arming never clobbers an explicit operator opt-out.
+mkdir -p "$(tenant_env_dir test3)"
+cat >"$(tenant_env_dir test3)/lunarwing.env" <<EOF
+GATEWAY_AUTH_TOKEN=test-token
+LLM_API_KEY=test-key
+KNOWLEDGE_SEED_FROM_STUDY_MCP=0
+EOF
+provision_tenant_study_mcp test3 ""
+grep -Fqx 'KNOWLEDGE_SEED_FROM_STUDY_MCP=0' "$(tenant_env_dir test3)/lunarwing.env"
+[[ "$(grep -c '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test3)/lunarwing.env")" -eq 1 ]]
+
+# The operator-facing configure-study-mcp path (existing tenants) never arms
+# the seed: only add-tenant does.
+mkdir -p "$(tenant_env_dir test4)"
+cat >"$(tenant_env_dir test4)/lunarwing.env" <<EOF
+GATEWAY_AUTH_TOKEN=test-token
+LLM_API_KEY=test-key
+EOF
+configure_study_mcp test4 "$STUDY_NOTES_DEFAULT_HOME" false ""
+grep -Fqx "LW2STUDYMCP_HOME=$STUDY_NOTES_DEFAULT_HOME" "$(tenant_env_dir test4)/lunarwing.env"
+if grep -q '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test4)/lunarwing.env"; then
+  printf 'configure-study-mcp unexpectedly armed the knowledge seed\n' >&2
+  exit 1
+fi
+
 # A failing sync is contained: the caller survives and the tenant stays unwired.
 mkdir -p "$(tenant_env_dir test2)"
 cat >"$(tenant_env_dir test2)/lunarwing.env" <<EOF
@@ -127,5 +156,11 @@ grep -Fq -- '--sync) study_sync="true"; shift ;;' "$SCRIPT_DIR/lunarwing-mt-admi
 # The add_tenant wiring call moved to the lifecycle library in the mt-admin split.
 grep -Fq 'provision_tenant_study_mcp "$name" "$study_mcp_home"' \
   "$SCRIPT_DIR/mt-admin-lib/04-tenant-lifecycle.sh"
+# The seed is armed only inside provision_tenant_study_mcp (add-tenant path)
+# and carried forward — never introduced — by env regeneration.
+grep -Fq 'arm_tenant_knowledge_seed "$name"' \
+  "$SCRIPT_DIR/mt-admin-lib/09-worker-config.sh"
+grep -Fq 'knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"' \
+  "$SCRIPT_DIR/mt-admin-lib/06-env-generation.sh"
 
 printf 'Study MCP sync tests passed\n'

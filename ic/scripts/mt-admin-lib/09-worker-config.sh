@@ -850,6 +850,23 @@ configure_study_mcp() {  # <tenant> <code home> <allow-write bool> [state home]
   say "  sudo $0 restart-tenant $name"
 }
 
+# Arm the one-shot knowledge seed for a NEWLY created tenant: the daemon
+# imports the synced lw2studymcp checkout into the tenant's private knowledge
+# store on first boot, then never runs again (state-file marker, existing
+# notes skipped). Written only here — the add-tenant path — so existing
+# tenants upgraded to a seed-capable binary are never populated, and a later
+# configure-study-mcp re-run never (re)arms the seed.
+arm_tenant_knowledge_seed() {  # <tenant>
+  local name="$1" env_path
+  name="$(sanitize_name "$name")"
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path"
+  grep -qE '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$env_path" && return 0
+  printf '\n# One-shot knowledge seed from the synced Study Notes checkout (new tenants only)\nKNOWLEDGE_SEED_FROM_STUDY_MCP=1\n' >> "$env_path"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+}
+
 provision_tenant_study_mcp() {  # <tenant> [checkout home]
   # Auto-configuration used by add-tenant --with-study-mcp: always sync the
   # shared checkout to the latest upstream first, then wire it in read-only
@@ -861,6 +878,7 @@ provision_tenant_study_mcp() {  # <tenant> [checkout home]
   (
     sync_study_notes_checkout "$home"
     configure_study_mcp "$name" "$home" false ""
+    arm_tenant_knowledge_seed "$name"
   )
 }
 
