@@ -585,7 +585,7 @@ previous compatibility baseline.
   axum's 2 MiB default, scoped to the send route so every other route keeps
   the default bound, and authorization now runs before the body is buffered
   — closing the pre-auth memory-amplification window from
-  `docs/ops/MEDIUM.MD`. A regression test proves large attachment sends
+  `docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`. A regression test proves large attachment sends
   reach the handler (work item #42).
 - WASM channels silently dropping tool-activity status events: the global
   `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to
