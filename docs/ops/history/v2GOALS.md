@@ -2,7 +2,7 @@
 
 > **Historical snapshot.** These targets predate the current v2.0.4 roadmap and
 > include deadlines that have already passed. Keep them as planning provenance;
-> use [`ROADMAP_2026.md`](ROADMAP_2026.md) for current targets.
+> use [`ROADMAP_2026.md`](../ROADMAP_2026.md) for current targets.
 
 Items are grouped to respect the release cadence (`docs/ops/RELEASE_CADENCE.md`): odd-numbered releases focus on bug fixes / security / polish / cleanup, even-numbered releases focus on features, and major versions such as 2.0.0 or 2.1.0 will typically include massive overhauls of existing systems.
 
