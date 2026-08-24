@@ -1,8 +1,8 @@
 # P1 Gap Findings — v2.0.3.0
 
 > **Deliverable for item #17** in the archived
-> [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). Addresses P1 items
-> (G4–G8) from `docs/ops/GOAL_GAP_SUGGESTIONS.md`.
+> [`AGENT_GOALS_2.0.3.0.md`](../AGENT_GOALS_2.0.3.0.md). Addresses P1 items
+> (G4–G8) from `docs/ops/history/v2.0.3.0/GOAL_GAP_SUGGESTIONS.md`.
 >
 > **Verified:** 2026-07-26 against branch `rarity/item-17-20260726-1501`
 > (merge-base `010987c`).
