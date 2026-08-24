@@ -8,7 +8,7 @@ Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 >
 > This "infodump" captured the state of WeeChat multi-tenant services as of an earlier
 > implementation phase. It has been **superseded** by the active operational guide:
-> [`WEECHAT-SERVICES.md`](WEECHAT-SERVICES.md).
+> [`WEECHAT-SERVICES.md`](../WEECHAT-SERVICES.md).
 >
 > Key differences in the active guide:
 > - Automatic relay bootstrap during `add-tenant` is the primary path.
@@ -26,7 +26,7 @@ Co-authored-by: Sisyphus <clio-agent@sisyphuslabs.ai>
 
 How WeeChat IRC access is managed as init services in LunarWing multi-tenant deployments. Each tenant runs a WeeChat instance in a tmux session plus a Python WebSocket adapter that bridges WeeChat's relay API to an HTTP endpoint polled by the LunarWing WASM channel.
 
-For general multi-tenant setup, see [`MULTITENANCY-PRODUCTION.md`](MULTITENANCY-PRODUCTION.md).
+For general multi-tenant setup, see [`MULTITENANCY-PRODUCTION.md`](../MULTITENANCY-PRODUCTION.md).
 
 ## Architecture
 
