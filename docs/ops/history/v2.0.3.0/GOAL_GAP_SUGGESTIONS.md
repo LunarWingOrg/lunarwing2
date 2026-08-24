@@ -1,7 +1,7 @@
 # Goal List Gap Suggestions — v2.0.3.0
 
 > **Purpose:** Deliverable for item #3 in the archived
-> [`AGENT_GOALS_2.0.3.0.md`](history/AGENT_GOALS_2.0.3.0.md). Surfaces
+> [`AGENT_GOALS_2.0.3.0.md`](../AGENT_GOALS_2.0.3.0.md). Surfaces
 > release-track work that was **not** represented in the v2.0.3.0 goals list but
 > was verifiable against the repo on 2026-07-25. Each suggestion cites the
 > evidence so a human can triage add/defer in one pass.
