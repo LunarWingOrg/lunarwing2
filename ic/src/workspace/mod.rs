@@ -46,6 +46,7 @@ mod embedding_cache;
 mod embeddings;
 pub mod hygiene;
 pub mod knowledge;
+pub mod knowledge_seed;
 pub mod knowledge_sweep;
 pub mod layer;
 pub mod privacy;
