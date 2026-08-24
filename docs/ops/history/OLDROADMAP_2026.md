@@ -2,7 +2,7 @@
 
 > **Status: SUPERSEDED.** This roadmap was the original 2026 plan from the
 > IronClaw fork transition era. The current live roadmap is
-> [`ROADMAP_2026.md`](ROADMAP_2026.md). This file is retained for historical
+> [`ROADMAP_2026.md`](../ROADMAP_2026.md). This file is retained for historical
 > reference only — release targets, feature priorities, and the project name
 > have all evolved. Last reviewed 2026-08-13 (item #27 staleness sweep).
 
