@@ -231,7 +231,7 @@ previous compatibility baseline.
 
 - Seven accepted RustSec advisories remain in the shipped graph, blocked by
   libSQL's legacy TLS stack and the vendored Signal
-  wrapper. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.7.0.md`.
+  wrapper. See `docs/ops/history/v2.0.7.0/CRATE_SECURITY_AUDIT.md`.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   delivery remain disabled; Stage A live-host release acceptance remains a
   release/deployment gate rather than proof of activated contact security.
