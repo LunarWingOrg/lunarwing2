@@ -6,7 +6,7 @@
 - **Status:** Implemented. Grafted from two independent attempts,
   `k-sis-m-2/2.0.3.0` and `g-sis-m-2/2.0.3.0`; see
   [Provenance](#provenance-and-graft-decisions).
-- **Source notes:** [`SIS.md`](SIS.md) — field observations from the
+- **Source notes:** [`history/SIS_FIELD_NOTES.md`](history/SIS_FIELD_NOTES.md) — field observations from the
   2026-07-28/29 mission test runs.
 - **Scope:** Engine V2 (`ic/crates/lunarwing_engine/`) + bridge store adapter
   (`ic/src/bridge/store_adapter.rs`). No schema migration; thread and mission
