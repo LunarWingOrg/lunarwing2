@@ -22,9 +22,9 @@
 8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/72 — DONE 100% 2026-08-24 (`aj/kimi-8-20260824-1801`): fixed mission threads being offered `create_job` even though their capability leases intentionally deny that administrative/full-job-container action. `EffectExecutor` now distinguishes the unscoped registered-action catalog used to provision late tools from lease-filtered actions advertised to execution prompts; `EffectBridgeAdapter::available_actions` returns only actions covered by a valid supplied lease, while `ThreadManager` uses the unscoped catalog solely for thread-type-aware lease planning. This preserves foreground `create_job` access and late tool activation while preventing missions and other restricted threads from attempting unnecessary full-job containers. Verified: adapter regression suite 40/40, capability planner tests 5/5, late-tool lease regression 1/1, `cargo fmt --all -- --check`, `cargo check -j12`, and zero-warning `cargo clippy -j12 --lib -- -D warnings` (all Cargo commands under `taskset -c 0-11`).
 9. [x] (S) reserved for ci/cd fixes
 10. [ ] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs
-11. [x] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
+11. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
 12. [ ] update anything outdated in docs/proposals - verify against code rather than docs
-13. [x] (S) relnotes
+13. [x] (S) look into system prompt
 14. [x] (S) update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
 
 ---
