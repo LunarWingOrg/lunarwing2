@@ -154,6 +154,22 @@ Scopes: reads span the caller's private scope plus the shared herd scope
 - **Skill** — the bundled `study-notes` skill (v3) directs agents through
   these native tools; the external study-notes MCP is no longer required.
 
+### New-tenant seed (Phase 3)
+
+- **One-shot seed** (`knowledge_seed`) — multi-tenant provisioning
+  (`lunarwing-mt-admin.sh add-tenant --with-study-mcp`) writes
+  `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` into the new tenant's env. On startup the
+  daemon imports every note from the synced lw2studymcp checkout
+  (`$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md`) into the
+  tenant's private scope, preserving the canonical metadata (status,
+  confidence, studied timestamp, source commit, tags, staleness thresholds).
+  A JSON state file (`knowledge_seed_state.json` under the base dir) makes
+  the pass run at most once; note paths that already exist are always
+  skipped, so the store is never repopulated and operator-authored notes are
+  never overwritten. The env flag is written only on the add-tenant path —
+  never by `configure-study-mcp` or `upgrade-tenant` — so existing tenants
+  upgraded to a seed-capable binary are never seeded.
+
 libSQL backend: implemented with FTS5 (`memory_chunks_fts`) and per-scope
 merge; note that FTS5 rank values are not comparable across scopes, so merged
 results carry descending ordinal ranks.
