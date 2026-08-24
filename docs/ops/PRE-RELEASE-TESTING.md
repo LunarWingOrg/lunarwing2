@@ -16,17 +16,17 @@ tmux new-session -s lunarwing-release-tests
 
 ## 1. Rust checks
 
-Run Cargo commands from `ic/` in that tmux session, limited to six CPUs and six
+Run Cargo commands from `ic/` in that tmux session, limited to 12 CPUs and 12
 jobs:
 
 ```bash
 cd ic
 
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6
-taskset -c 0-5 cargo check -j6 --all-features
-taskset -c 0-5 cargo test -j6 -- --test-threads=6
-taskset -c 0-5 cargo clippy -j6 --all --benches --tests --examples \
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo check -j12 --all-features
+taskset -c 0-11 cargo test -j12 -- --test-threads=12
+taskset -c 0-11 cargo clippy -j12 --all --benches --tests --examples \
   --all-features -- -D warnings
 ```
 
@@ -35,7 +35,7 @@ only in the environment required by those targets, and record any unavailable
 external dependency rather than reporting the tier as passed:
 
 ```bash
-taskset -c 0-5 cargo test -j6 --features integration -- --test-threads=6
+taskset -c 0-11 cargo test -j12 --features integration -- --test-threads=12
 ```
 
 Current deferred E2E details live in
@@ -53,9 +53,9 @@ artifacts. `up` does not build missing binaries.
 ```bash
 cd ic
 export LUNARWING_TEST_PROFILE=release
-export CARGO_BUILD_JOBS=6
+export CARGO_BUILD_JOBS=12
 scripts/lunarwing-xmpp-test-env.sh init
-taskset -c 0-5 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
+taskset -c 0-11 scripts/lunarwing-xmpp-test-env.sh build --with-wasm
 scripts/lunarwing-xmpp-test-env.sh up
 scripts/lunarwing-xmpp-test-env.sh verify
 scripts/lunarwing-xmpp-test-env.sh down
