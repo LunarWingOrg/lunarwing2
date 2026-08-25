@@ -8,7 +8,7 @@
 **Status:** Historical inspection notes; reviewed fixes subsequently landed.
 **Date:** 2026-06-21
 **Branch reviewed:** `origin/1.1.6-babysitter` (3 commits on `staging`: `a767c726`, `2a637854`, `86f55aee` "finished a first attempt …").
-**Reviewed against:** `origin/staging`; the branch's own `docs/proposals/PODMAN_WAIT_BABYSITTER.md`, `docs/specs/podman-wait-babysitter.md`, `docs/plans/rootless-podman-babysitter.md`; and the original gap doc `docs/proposals/ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md`.
+**Reviewed against:** `origin/staging`; the branch's own `docs/proposals/PODMAN_WAIT_BABYSITTER.md`, `docs/specs/podman-wait-babysitter.md`, and the implemented plan now retained at `docs/proposals/rootless-podman-babysitter.md`; plus the original gap doc `docs/proposals/ROOTLESS_PODMAN_CONTAINER_SUPERVISION_GAP.md`.
 **Method:** multi-agent read-only inspection (impl map + intent/spec + adversarial correctness → synthesis).
 
 ---
@@ -146,7 +146,7 @@ Supervised set = exactly `{pg, nanocode, pebble}`.
 ## Stray (unrelated) changes bundled on the branch
 
 1. **RELEASE-v1.1.5 note relocation** — deletes the 5-line stub `docs/RELEASE-NOTE-v1.1.5.md` and adds a fresh **201-line `docs/releases/RELEASE-v1.1.5.md`** (Kawarimi). Verified **not** a git rename (staging has no such file). Real, useful release-docs work, but **zero connection to the babysitter** — scope creep, not corruption. Should land on its own docs commit/PR.
-2. **New `docs/ops/GOALS_1.1.6.md`** — 16-line checklist, codename "Unknown," all items unchecked, no mention of the babysitter. Harmless; confirms 1.1.6 goals weren't updated for this feature.
+2. **New `docs/ops/GOALS_1.1.6.md`** — 16-line checklist, codename "Unknown," all items unchecked, no mention of the babysitter. That historical checklist is now archived at `docs/ops/history/GOALS_1.1.6.md`; the observation here remains about the reviewed branch.
 
 Both should be excluded from any eventual babysitter cherry-pick so the feature lands cleanly scoped.
 
