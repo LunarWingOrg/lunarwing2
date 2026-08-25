@@ -29,6 +29,7 @@
 16. [ ] same thing as item 15 but on systemd host
 17. [ ] Write up FIRST DRAFT release notes (at root of repo) for v2.0.9.0 explaining all relevant changes since v2.0.8.0 as well as revising and including an ACCURATE VERSION OF known issues list. Use previous release notes in docs/releases for reference as to how to write up this document. Keep it brief. The codename for this release is at top of this document — The file you write will be RELEASE-v2.0.9.0.md and should be written to the ROOT of the repo
 18. [x] (S) update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
-19. [ ] update README.md at root of repo if necessary
+19. [ ] pull all work items open still. verify completion of each one. update this goal inline with results
+20. [ ] update README.md at root of repo if necessary
 
 ---
