@@ -1,18 +1,23 @@
 # Self-Heal Repair Followups (triaged)
 
-> **Current status (2026-08-03): PARTIAL.** Notifier timeout, truncated-state
-> recovery, systemd timer installation/removal, and escalation cooldown have
-> landed. Per-tenant application-level health (10) remains deferred.
+> **Current status (reverified 2026-08-25): PARTIAL.** Notifier timeout,
+> truncated-state recovery, cross-init scheduling/removal, escalation cooldown,
+> systemd tenant-user-bus remediation, and bounded init probes have landed.
+> Per-tenant application-level channel health (10) remains deferred; the newer
+> base-daemon service watchdog deep check is a separate single-instance path.
 
 Followups for the host-global health-check + self-heal pipeline
-(`ic-infrastructure-health-check/`: `infrastructure-health-check.sh` → `lunarwing-self-heal.sh`,
-paged by `send-notification.sh`, wired into `ic/scripts/lunarwing-mt-admin.sh`).
+(`ic-infrastructure-health-check/`: `infrastructure-health-check.sh` →
+`lunarwing-self-heal.sh`, paged by `send-notification.sh`, provisioned through
+`ic/scripts/mt-admin-lib/12-health-pipeline.sh`).
 
-**Triaged 2026-06-15** against the actual scripts. The original list mixed three different kinds of
-work — real edits to the self-heal mechanism, ops/release tasks, and live validation — and a couple
-of items were already done. This rewrite separates them: **only 3 of the 10 are code changes to the
-self-heal mechanism** (§A); the rest are tracked elsewhere (§B). File:line anchors are included so
-each item is directly actionable.
+**Triaged 2026-06-15** against the actual scripts. The original list mixed three
+different kinds of work — real edits to the self-heal mechanism, ops/release
+tasks, and live validation — and a couple of items were already done. This
+rewrite separates them: **only 3 of the 10 are code changes to the self-heal
+mechanism** (§A); the rest are tracked elsewhere (§B). Historical line anchors
+below describe the pre-decomposition script; use the named functions and current
+module paths above when applying follow-up work.
 
 ## At a glance
 
@@ -69,34 +74,26 @@ Recovery already half-exists: `load_state` falls back to `{}` on parse failure a
 
 #### 2. Wire systemd `.timer/.service` scheduling — ✅ FIXED
 
-The implementation steps below are retained as the historical design record.
-`ensure_health_pipeline()` now installs either OpenRC scheduling or a systemd
-service/timer. The launcher (`/usr/local/sbin/lunarwing-mt-health`) and pipeline
-scripts remain shared and init-agnostic.
-All edits are in `ic/scripts/lunarwing-mt-admin.sh`:
+The original monolithic implementation steps are now historical. Current
+ownership is `ic/scripts/mt-admin-lib/12-health-pipeline.sh`:
 
-1. Delete the hard non-OpenRC skip at `:2235-2238`. Steps 1–4 (sync scripts, mkdir report dir, write
-   `health.env`, write launcher) are already init-agnostic and stay shared.
-2. Change the hardcoded `LUNARWING_SERVICE_MANAGER=openrc` (`:2260`) to `$INIT_SYSTEM`, so self-heal
-   picks the right `health-*.sh` + remediation path.
-3. Replace the unconditional `_install_health_cron` (`:2297`) with a
-   `case "$INIT_SYSTEM" in openrc) … ;; systemd) _install_health_systemd_timer ;; esac`.
-4. Add `_install_health_systemd_timer()` modeled on `ic/systemd/lunarwing-watchdog.{service,timer}`
-   (and mt-admin's existing inline-heredoc unit idiom): a `Type=oneshot` service running
-   `$HEALTH_LAUNCHER`, plus a timer `OnBootSec=5min` / `OnCalendar=*:0/${HEALTH_INTERVAL_MIN}`
-   (matches the `*/15` cron) / `Persistent=true` / `WantedBy=timers.target`, then `daemon-reload` +
-   `enable --now`.
-5. Mirror teardown in `remove_health_pipeline` (`:2301`, replace the OpenRC-only early-return) and
-   update the `doctor` scheduled-check (`:2667`) to also accept `systemctl is-enabled
-   lunarwing-mt-health.timer`.
+- `ensure_health_pipeline()` installs shared scripts and the launcher, then
+  selects OpenRC cron/fcron or `_install_health_systemd_timer()`.
+- systemd uses a root, system-level `lunarwing-mt-health` oneshot/timer because
+  one run discovers and remediates multiple tenants. OpenRC uses the matching
+  host-global scheduler path.
+- `remove_health_pipeline()` tears down the schedule for either supported init.
+- The write-if-absent `health.env` remains operator-editable, but subsequent
+  provisioning reconciles `LUNARWING_SERVICE_MANAGER` and the active tenants
+  registry path rather than retaining stale routing values.
 
-- **Use a root SYSTEM-level timer** (`/etc/systemd/system`), **not** `systemctl --user` — the pipeline
-  is host-global and runs as root, even though per-tenant tenant units are user-level.
-- **Follow-on (separate change, verify before declaring systemd closed):** self-heal *remediating*
-  user-scoped tenant units on systemd needs `systemctl --user` with the right `XDG_RUNTIME_DIR`/uid —
-  that lives in `lunarwing-self-heal.sh` / `health-systemd.sh`, not in this scheduling wiring.
-- Minor edge: `health.env` is write-if-absent (`:2254`), so a host that ran OpenRC first then switched
-  to systemd keeps a stale `LUNARWING_SERVICE_MANAGER=openrc` line. Irrelevant on a fresh systemd host.
+The former systemd follow-up is also complete. `health-systemd.sh` discovers
+per-tenant user units, and `lunarwing-self-heal.sh` probes/restarts them as the
+tenant with `XDG_RUNTIME_DIR=/run/user/<uid>` and `systemctl --user`. Calls that
+could hang are bounded by `SELF_HEAL_PROBE_TIMEOUT` (the older
+`SELF_HEAL_SYSTEMD_PROBE_TIMEOUT` spelling remains an alias). This does not close
+item 10: those checks establish unit/container liveness, not each tenant's
+authenticated gateway `channel_health` semantics.
 
 ### Needs one design choice — do now
 
