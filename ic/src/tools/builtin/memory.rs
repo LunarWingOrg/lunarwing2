@@ -434,7 +434,7 @@ impl Tool for MemoryWriteTool {
                 },
                 "append": {
                     "type": "boolean",
-                    "description": "If true, append to existing content. If false, replace entirely. Always use false for lorebooks/*.json documents.",
+                    "description": "If true, append to existing content. If false, replace entirely. Always use false for JSON documents (e.g. lorebooks/*.json, context/profile.json) — appending corrupts them.",
                     "default": true
                 },
                 "layer": {
