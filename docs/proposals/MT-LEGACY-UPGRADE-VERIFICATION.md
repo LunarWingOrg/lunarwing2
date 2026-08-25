@@ -1,8 +1,9 @@
 # Legacy Upgrade Harness: Live-Validation Plan (v1.0.3-era → v1.1.x)
 
-> **Current status (2026-07-20, rev `50c8f99`): VERIFICATION-PENDING.** The
+> **Current status (reverified 2026-08-25): VERIFICATION-PENDING.** The
 > reviewed implementation remains in tree, but the live checklist, rehearsal
-> evidence, canary soak, and sign-off below remain incomplete.
+> evidence, canary soak, and sign-off below remain incomplete. Historical goal
+> references now point into the operations archive.
 
 **Status:** Reviewed + hardened — **not yet live-validated**
 **Date:** 2026-06-21
@@ -373,7 +374,9 @@ with a real tenant.
    - Mark this document's status as "Live-validated — production-ready" with the date and operator
      name.
    - Update `docs/ops/ROADMAP_2026.md` to mark the legacy upgrade item as shipped.
-   - Update `docs/ops/GOALS_1.1.5.md` if this was tracked as a v1.1.5 goal.
+   - If historical bookkeeping is required, record it alongside the archived
+     `docs/ops/history/GOALS_1.1.5.md`; do not treat that frozen checklist as
+     current operator guidance.
 4. **If any item fails:** document the failure in `.sisyphus/notepads/legacy-upgrade-harness/issues.md`,
    fix the root cause in `ic/scripts/upgrade-tenant-version.sh` or
    `ic/scripts/rehearse-legacy-upgrade.sh`, re-run shellcheck, and re-execute the checklist from
