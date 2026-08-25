@@ -1,9 +1,13 @@
 # OpenRC Self-Heal + Health-Check + Rootless-Podman — Accurate Report (eris leg)
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / HISTORICAL REPORT.**
-> The curative state-loading, restart-output, and escalation-rendering fixes plus
-> their core regression coverage landed. The report's listed OpenRC-specific
-> health, observability, and hardening items mostly remain open.
+> **Current status (reverified 2026-08-25): PARTIAL / HISTORICAL REPORT.**
+> The June observations remain point-in-time evidence, but the previous
+> "OpenRC-specific items mostly remain open" summary is obsolete. Current code
+> closes the report's Ranks 5, 10, 13, 15, 18, 30, and 33; preserves flap
+> history (Rank 17); and implements the OpenRC half of linger teardown (Rank
+> 26). Later watchdog, scheduler, timeout, and test hardening is summarized
+> below. Recommendations not named as closed remain follow-up candidates rather
+> than implicitly completed work.
 
 *2026-06-16. Recalibrated from a 49-agent automated review against **read-only
 verification of the live host**. Companion to
@@ -16,6 +20,40 @@ and the self-healing series (archived under
 > Gentoo, OpenRC 0.63.1). The rootful-docker leg is unaffected unless noted.
 
 ---
+
+## Current-tree addendum (2026-08-25)
+
+The maintained OpenRC path has moved substantially beyond the June snapshot:
+
+- `health-openrc.sh` wraps each status probe with
+  `HEALTH_OPENRC_STATUS_TIMEOUT` (default 8 seconds), preserves the real
+  `rc-service` exit code, deduplicates one `lunarwing-*` discovery pass, includes
+  WeeChat and current worker unit names, and no longer emits the dead PID field.
+  `tests/test-health-openrc.sh` directly covers these former Ranks 5, 10, 13,
+  18, and 33, plus optional-service gating and scheduler states.
+- Rendered OpenRC PostgreSQL `status()` requires both a running container and a
+  successful bounded `pg_isready`, closing Rank 15. Rootless Podman OpenRC
+  provisioning renders `-sup` `podman wait` babysitters for PostgreSQL, worker,
+  LunarVision, and LunarVoice containers, closing the supervision gap in Rank
+  30; systemd continues to use user Quadlets or its managed fallback.
+- Self-heal preserves recent `restart_history` across recovery (Rank 17), uses
+  collision-resistant per-service page cooldown sidecars, and bounds OpenRC
+  status/restart calls through `SELF_HEAL_PROBE_TIMEOUT`. Chaos case CH17 proves
+  a wedged `rc-service` cannot stall the whole remediation tick.
+- If a managed LunarWing cron/fcron hook exists but no scheduler daemon is
+  running, `health-openrc.sh` now reports a degraded scheduler signal without
+  inventing a restartable pseudo-service. Scenarios S16–S22 cover running,
+  stopped, absent, fcron, crontab, and worse-service-result combinations.
+- The separate base-daemon OpenRC watchdog has bounded probes, deep gateway
+  channel-health checks, locking, installer smoke coverage, and a dedicated
+  `watchdog-openrc` suite. Tenant teardown calls `loginctl disable-linger` on
+  elogind/OpenRC hosts when available (the OpenRC half of Rank 26).
+
+The ordered current test inventory is `ic-infrastructure-health-check/tests/run-all.sh`;
+its fourteen registered suites include `openrc`, `watchdog-openrc`, metrics, and
+both self-heal matrices. The numbered tables below intentionally retain the
+original June evidence and recommendation wording; use this addendum when
+interpreting their status.
 
 ## 0. Headline (calibrated)
 

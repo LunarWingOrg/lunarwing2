@@ -1,11 +1,16 @@
 # Software Builder System — Analysis Report
 
-**Status (reverified 2026-08-04):** The §7 functional-gap summary remains
-current. `validate_wasm`, `run_tests`, `auto_register`, `wasm_output_dir`, and
-`cleanup_on_failure` are still configuration/result fields rather than executed
-build-loop stages; `TemplateEngine`, `TestHarness`, and `WasmValidator` remain
-unwired from `core.rs`. Templates still use the 2021 edition and raw `extern
-"C"` ABI. Line numbers below are the 2026-07-23 snapshot and may have shifted.
+**Status (reverified 2026-08-25):** The §7 builder functional-gap summary
+remains current. `validate_wasm`, `run_tests`, `auto_register`,
+`wasm_output_dir`, and `cleanup_on_failure` are still configuration/result
+fields rather than executed build-loop stages; `TemplateEngine`, `TestHarness`,
+and `WasmValidator` remain unwired from `core.rs`. Templates still use the 2021
+edition and raw `extern "C"` ABI. Self-repair changed independently: registered
+built-in Rust tools now clear a false broken flag instead of entering the WASM
+builder; successful executions reset failure/repair counters; exhausted repair
+cycles alert once per boot; and startup resets persisted repair-attempt counters.
+Broken WASM tools may still invoke this incomplete builder. Line numbers below
+are the 2026-07-23 snapshot and may have shifted.
 
 **Date:** 2026-07-23
 **Analyst:** Automated deep-dive
@@ -41,13 +46,13 @@ The builder runs a multi-phase iterative loop (`src/tools/builder/core.rs:1-23`)
 7. **Validate** — For WASM tools, validate interface compliance (WasmValidator)
 8. **Package** — Produce final artifact
 
-### Two Consumers
+### Three Consumers
 
-The builder is consumed by **two distinct subsystems**:
+The builder is consumed by **three distinct subsystems**:
 
 1. **Agent tool invocation** — The LLM calls `build_software` directly during a conversation (`BuildSoftwareTool`, `core.rs:907-1016`)
 2. **Reflex compiler** — Background daemon that detects repeated patterns and auto-compiles WASM tools (`src/agent/reflex.rs:680-696`)
-3. **Self-repair** — Repairs broken WASM tools by re-building them (`src/agent/self_repair.rs:266-301`)
+3. **Self-repair** — Rebuilds only broken tools that reach the WASM repair path. Registered built-ins are self-verified and have their false broken flag cleared without a build (`src/agent/self_repair.rs`).
 
 ---
 
@@ -132,12 +137,18 @@ Reflex compiler detects repeated pattern      [src/agent/reflex.rs:680-696]
 ### Self-Repair Build
 
 ```
-DefaultSelfRepair detects broken tool       [src/agent/self_repair.rs:266-301]
+DefaultSelfRepair detects broken tool       [src/agent/self_repair.rs]
     │
-    ├─ Create BuildRequirement from BrokenTool info
-    ├─ builder.build(&req)  ← same LlmSoftwareBuilder
-    └─ On success: auto-register repaired tool
+    ├─ registered built-in → clear false broken flag; no builder call
+    └─ other/broken WASM path
+         ├─ increment repair attempt
+         ├─ create BuildRequirement from BrokenTool info
+         ├─ builder.build(&req)  ← same LlmSoftwareBuilder
+         └─ successful result → mark repaired in DB
 ```
+
+The last step does **not** imply registration: the current builder always returns
+`registered: false`, so a rebuilt WASM artifact is not activated by this path.
 
 ### Initialization Flow
 

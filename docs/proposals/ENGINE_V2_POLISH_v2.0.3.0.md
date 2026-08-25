@@ -3,8 +3,13 @@
 **Created:** 2026-07-26
 **Author:** Rarity
 **Status:** Implemented — all P1 and P2 items landed on 2026-07-26 (goals items
-#9 and #11); P3.1/3.3 done, P3.2/3.4 deferred, P3.5 deferred to v2.0.4.0.
-Re-verified against source on 2026-07-29.
+#9 and #11); P3.1/3.3 are done, P3.4 is partially mitigated, and P3.2/P3.5
+remain open. Source reverified 2026-08-25. Later hardening now separates the unscoped live tool
+catalog used for lease planning from lease-filtered actions advertised to a
+thread; mission leases exclude administrative/autonomous-denylisted actions such
+as `create_job`, while foreground access is preserved. Job-worker and named
+persistent-external-worker MCP placement also landed after this release-scoped
+plan; the updated deferred table records that newer state.
 **Scope:** Engine V2 — mission lifecycle, gate handling, time budgets, provenance, and memory
 
 ---
@@ -212,17 +217,29 @@ implementation effort.
   mission instead of aborting via `?`.
 - **Effort:** Small.
 
-### 3.4 Add soft-timeout cleanup for overlapping agent turns — **DEFERRED**
+### 3.4 Add soft-timeout cleanup for overlapping agent turns — **PARTIALLY MITIGATED / STILL OPEN**
 
 **Release note (Known Issues, Engine):**
 > Soft agent timeout suppresses late output but allows the timed-out task to run
 > briefly; a later turn can overlap old side effects during that window.
 
-**Proposed fix:**
-- Track active timed-out task handles and ensure they are fully cancelled before
-  the next turn begins, or add a generation guard so late output is rejected.
-- **Effort:** Medium.
-- **Risk:** Medium — changes task lifecycle.
+**Current boundary (reverified 2026-08-25):**
+- The outer loop sets a suppression flag, sends the timeout response, and no
+  longer awaits the timed-out `handle_message` task. After
+  `HARD_KILL_GRACE_SECS` (30 seconds), a detached timer aborts that top-level
+  task and marks a still-processing legacy thread failed while preserving its
+  pending queue.
+- This bounds the wrapper task's lifetime but does not wait before dequeuing a
+  later message. Suppression also does not reach every `ChatDelegate`, approval,
+  authentication, tool-status, or Engine V2 delivery path, and independently
+  spawned remote effects/jobs may outlive the abort.
+
+**Remaining fix:**
+- Add a turn/generation-aware delivery boundary plus cooperative cancellation
+  ownership for spawned effects, or wait for cancellation before starting the
+  next queued turn. Keep timeout/control replies outside the invalidated turn.
+- **Effort:** Medium-Large.
+- **Risk:** Medium — changes task and delivery lifecycle.
 
 ### 3.5 Add durable mission notification outbox
 
@@ -247,8 +264,8 @@ v2.0.3.0 polish cycle. Status below includes later source-verified work:
 
 | Item | Current disposition |
 |---|---|
-| Worker-local MCP execution | Large security surface; track separately |
-| Automatic npm/pip MCP install | Security-sensitive; track separately |
+| Worker-local MCP execution | **Implemented after v2.0.3.0.** `McpPlacement::JobWorker` snapshots bounded stdio MCP config into Docker jobs; `McpPlacement::ExternalWorker` targets a named persistent external worker with validation and lifecycle synchronization. Host placement remains the default. |
+| Automatic npm/pip MCP install | Still absent; security-sensitive package acquisition remains a separate track |
 | Secret injection through stdio env | **Implemented in v2.0.4 continuation.** Config persists owner-scoped secret-name references; activation resolves values just before spawn and restricts inherited child environment. Host-local stdio remains unsandboxed and sees injected raw values. |
 | Broad dependency modernization | Separate crate-audit track (item #8) |
 | PostgreSQL vector search indexing (pgvector/ANN) | Infrastructure-scale work |
@@ -258,12 +275,12 @@ v2.0.3.0 polish cycle. Status below includes later source-verified work:
 
 ## Summary
 
-| Priority | Items | Effort | Status (2026-07-29) |
+| Priority | Items | Effort | Status (reverified 2026-08-25) |
 |---|---|---|---|
 | P1 (Security) | 1.1, 1.2, 1.3 | Small-Medium | ✅ All done (item #9) |
 | P2 (Reliability) | 2.1, 2.2, 2.3, 2.4 | Medium-Large | ✅ All done (item #11) |
-| P3 (Polish) | 3.1–3.5 | Small-Large | 3.1 ✓ and 3.3 ✓ done; 3.2, 3.4 deferred; 3.5 deferred to v2.0.4.0 |
-| P4 (Defer) | — | — | No |
+| P3 (Polish) | 3.1–3.5 | Small-Large | 3.1 ✓ and 3.3 ✓ done; 3.4 partially mitigated but open; 3.2 and 3.5 open |
+| P4 (Later tracks) | deferred items | Mixed | Worker MCP placement and stdio secret injection landed; package install, ANN search, and other tracks remain separate |
 
 ### Recommended minimal set for 2.0.3.0
 

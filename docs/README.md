@@ -148,10 +148,11 @@ Agent-driven plan and spec documents produced by the superpowers workflow.
 
 ### 💡 [`proposals/`](proposals/)
 
-The directory contains active proposals plus retained implementation, verification,
-superseded, and historical records. Statuses were reconciled against current
-source on 2026-08-04 at revision `be798a9`; point-in-time design and audit records
-retain their original evidence dates. Shipped or superseded records may later move to
+The directory contains active proposals plus retained implementation,
+verification, superseded, and historical records. All 102 tracked entries were
+reconciled against source on 2026-08-25 at revision `57e8a36f`; point-in-time
+design and audit records retain their original evidence dates. Shipped or
+superseded records may later move to
 [`internal/history/proposals/`](internal/history/proposals/), but remain indexed
 here while they are still present in `proposals/`.
 
@@ -175,23 +176,26 @@ here while they are still present in `proposals/`.
 | [`EXTWORKERCONVERSATIONHIST.md`](proposals/EXTWORKERCONVERSATIONHIST.md) | Implemented | Concise `context_scope=recent` and local/Docker iteration-budget usage note |
 | [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Phase 1 active / Phase 2 partial | Green default-branch and MR pipelines verify the required CI; PostgreSQL/browser/coverage/standalone integration plus package and deployment phases remain |
 | [`GITWASM/README.md`](proposals/GITWASM/README.md) | Open | Gitoxide-based Git/Markdown WASM tool proposal |
+| [`HEALTHPOINT_METRICS_EXPORTER.md`](proposals/HEALTHPOINT_METRICS_EXPORTER.md) | Implemented | Textfile metrics export, optional loopback listener, thresholds, and deduplicated warning path shipped in v2.0.8.0 |
 | [`HERMES-KAWARIMI-ADAPTER.md`](proposals/HERMES-KAWARIMI-ADAPTER.md) | Implemented (Phase 1) | Live-validated provision-then-populate Hermes import with owner-scope checks, encrypted secrets, explicit PG-only window, and failure cleanup |
 | [`HTTP_TOOL_SSRF_PROTECTIONS.md`](proposals/HTTP_TOOL_SSRF_PROTECTIONS.md) | Implemented / historical | Investigation record for the active HTTP-tool SSRF controls |
 | [`human-delay-mode-phase1-test-checklist.md`](proposals/human-delay-mode-phase1-test-checklist.md) | Implemented | Verified Phase 1 supervised-mode checklist |
 | [`human-delay-mode-phase1-verification-handoff.md`](proposals/human-delay-mode-phase1-verification-handoff.md) | Superseded | Fulfilled Phase 1 verification handoff |
 | [`human-delay-mode-phase2-plan.md`](proposals/human-delay-mode-phase2-plan.md) | Open | Timeout, gate-pipeline, modify-flow, and testing plan |
 | [`human-delay-mode-testing-guide.md`](proposals/human-delay-mode-testing-guide.md) | Superseded | Stale guide with nonexistent standalone gate/thread CLI examples |
-| [`IC_REPAIR_FOLLOWUPS.md`](proposals/IC_REPAIR_FOLLOWUPS.md) | Partial | Core self-heal fixes landed; escalation cooldown and deep tenant health remain |
+| [`IC_REPAIR_FOLLOWUPS.md`](proposals/IC_REPAIR_FOLLOWUPS.md) | Partial | Core cross-init fixes, escalation cooldown, bounded probes, and tenant user-bus remediation landed; authenticated per-tenant channel health remains deferred |
 | [`IRONCLAW_ADDITION_CANDIDATES.md`](proposals/IRONCLAW_ADDITION_CANDIDATES.md) | Open | Filtered current LunarWing port and hardening backlog |
 | [`IRONCLAW_TOP2_PRIORITY_PLAN.md`](proposals/IRONCLAW_TOP2_PRIORITY_PLAN.md) | Open | Implementation plan for the two highest-priority IronClaw-derived SSRF and egress hardening gaps |
 | [`IRONCLAW_TOP3_EASIEST_PLAN.md`](proposals/IRONCLAW_TOP3_EASIEST_PLAN.md) | Open | Implementation plan for three small, independent IronClaw-derived correctness fixes |
 | [`JINGLE_IBB_FEASIBILITY.md`](proposals/JINGLE_IBB_FEASIBILITY.md) | Historical | Deferred Jingle/IBB feasibility decision |
 | [`KAWARIMI-OWNER-SCOPE-CONTINUITY.md`](proposals/KAWARIMI-OWNER-SCOPE-CONTINUITY.md) | Partial | Core import reconciliation landed; Phase 2 export/FK work remains |
 | [`LOREBOOKS.md`](proposals/LOREBOOKS.md) | Implemented (v1) | Bounded SillyTavern World Info import subset with deterministic activation and prompt-write hardening |
+| [`LUNARHUB_ARTIFACT_BACKBONE.md`](proposals/LUNARHUB_ARTIFACT_BACKBONE.md) | Open | Fleet-private signed artifact and prebuilt-daemon backbone proposal |
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
+| [`lunarvoice-onnx-proposal-2.0.6.0.md`](proposals/lunarvoice-onnx-proposal-2.0.6.0.md) | Implemented | Local sherpa-onnx voice sidecar, verified models, per-tenant lifecycle, and health wiring |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |
-| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Superseded | Rejected split plan; item #24 chose the `mtadminrefactor/meta4/v2.0.3.0` mt-admin-lib decomposition instead |
+| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Implemented / historical | A fourteen-module `mt-admin-lib` decomposition landed in v2.0.8.0; the body retains the earlier rejected six-part design record |
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
@@ -217,7 +221,7 @@ here while they are still present in `proposals/`.
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md) | Analysis complete / selective backlog | Release-range audit recommending selective mechanism ports rather than an IronClaw architecture cutover |
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md) | Open | Selective Reborn mechanism backlog; no wholesale adoption |
 | [`OPENCODE-WORKER-SINGLE-TARGET-BUILD.md`](proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md) | Implemented | OpenCode worker now builds only its native target |
-| [`OPENRC_ACCURATE_REPORT_16_JUNE_2026.md`](proposals/OPENRC_ACCURATE_REPORT_16_JUNE_2026.md) | Partial / historical | Curative fixes landed; broader OpenRC hardening remains open |
+| [`OPENRC_ACCURATE_REPORT_16_JUNE_2026.md`](proposals/OPENRC_ACCURATE_REPORT_16_JUNE_2026.md) | Partial / historical | Major OpenRC timeout, accuracy, supervision, scheduler, watchdog, and test gaps landed; residual recommendations remain |
 | [`PASEO.MD`](proposals/PASEO.MD) | Open | Unscoped Paseo support link stub |
 | [`PAST.MD`](proposals/PAST.MD) | Open | Unscoped PAST+SS streaming idea |
 | [`PER_TENANT_WORKER_GATING.md`](proposals/PER_TENANT_WORKER_GATING.md) | Implemented | Per-tenant worker selection persistence and start gating landed |
@@ -237,18 +241,20 @@ here while they are still present in `proposals/`.
 | [`ROUTINE_ENGINE_IMPROVEMENTS.md`](proposals/ROUTINE_ENGINE_IMPROVEMENTS.md) | Partial | Items 1-3 landed; items 4-8 remain deprioritized |
 | [`SELF_IMPROVING_SKILLS_B1.md`](proposals/SELF_IMPROVING_SKILLS_B1.md) | Implemented | End-to-end reviewed skill-patching proposal flow |
 | [`SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md`](proposals/SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md) | Partial | Major fixes landed; remaining tracker items stay open |
-| [`SSH_HARNESS_DELIVERY_OPTIONS.md`](proposals/SSH_HARNESS_DELIVERY_OPTIONS.md) | Implemented | All three SSH delivery mechanisms shipped |
+| [`SSH_HARNESS_DELIVERY_OPTIONS.md`](proposals/SSH_HARNESS_DELIVERY_OPTIONS.md) | Implemented | Worker, built-in, and WASM SSH paths shipped with distinct isolation and host-targeting boundaries |
 | [`SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md`](proposals/SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md) | Implemented / historical | Pre-implementation design record for shipped options 2 and 3 |
 | [`SUPERGATEWAY_MCP.md`](proposals/SUPERGATEWAY_MCP.md) | Superseded | Native stdio MCP support made the workaround optional |
+| [`study-notes-native-lunarwing-proposal-2.0.6.0.md`](proposals/study-notes-native-lunarwing-proposal-2.0.6.0.md) | Implemented | Seven native knowledge tools, lifecycle sweep, coordination ingest, and one-shot new-tenant checkout seed |
 | [`TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md`](proposals/TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without a test plan |
 | [`TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md`](proposals/TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without web-GUI acceptance criteria |
 | [`UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md`](proposals/UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md) | Partial / mostly superseded | Owner-scope risk closed; remaining operational cautions retained |
-| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / implemented incrementally | Host-local lifecycle, operator-pinned provenance, OS sandboxing, general MCP runtime adapters, stateful MCP-over-WASM, dedicated/shared gateway client placement, and core Docker worker-local stdio placement landed; marketplace trust, automatic package install, persistent-worker placement, and a bundled gateway service remain open |
+| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / implemented incrementally | Host-local lifecycle, runtime adapters, stateful MCP-over-WASM, job-worker placement, gateway client plus bundled control/data plane, and optional revocation enforcement landed; signed install/upgrade, automatic packages, persistent-worker delivery, and gateway HA remain open |
+| [`wasm-expansion-proposal-2.0.6.0.md`](proposals/wasm-expansion-proposal-2.0.6.0.md) | Open / partially overtaken | WASM expansion research; later releases added MCP runtime slices, marketplace trust primitives, and SSH capability support |
 | [`WEECHAT_CLIENT_RELAY_API_AUTOMATION.md`](proposals/WEECHAT_CLIENT_RELAY_API_AUTOMATION.md) | Partial | Relay bootstrap shipped; full client provisioning remains open |
 | [`WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md`](proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md) | Partial | Service and port automation landed; dependency install remains warn-only |
 | [`WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`](proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md) | Superseded | `ironclaw-sync` was renamed to `lunarwing-sync` |
 | [`WORK_ON_LUNAR_SPRITE.md`](proposals/WORK_ON_LUNAR_SPRITE.md) | Open stub | Placeholder without a proposal or implementation |
-| [`XMPP_INCOMING_ATTACHMENT.md`](proposals/XMPP_INCOMING_ATTACHMENT.md) | Superseded | Stale compiler-warning capture; helper is test-gated and used |
+| [`XMPP_INCOMING_ATTACHMENT.md`](proposals/XMPP_INCOMING_ATTACHMENT.md) | Superseded | Obsolete compiler-warning capture; inbound OOB/aesgcm handling now uses the source-verified download pipeline |
 | [`XMPP_LUNARVISION_INTEGRATION.md`](proposals/XMPP_LUNARVISION_INTEGRATION.md) | Implemented | Automatic OCR/VL enrichment uses host-side auth when configured and preserves multimodal fallback |
 | [`XMPP_OMEMO_AESGCM_URL_LEAK_FIX.md`](proposals/XMPP_OMEMO_AESGCM_URL_LEAK_FIX.md) | Implemented | Embedded and URL-only `aesgcm://` stripping regressions are present |
 | [`XMPP_WASM_ATTACHMENT_TRAP.md`](proposals/XMPP_WASM_ATTACHMENT_TRAP.md) | Partial / verification pending | Memory/decode fixes landed; large-attachment regression and live PNG gate remain |

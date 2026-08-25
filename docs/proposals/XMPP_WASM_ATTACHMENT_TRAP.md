@@ -1,10 +1,12 @@
 # XMPP WASM Attachment Trap Investigation
 
-> **Current status (2026-07-20, rev `50c8f99`): PARTIAL / VERIFICATION-PENDING.**
-> Attachment decode-lifetime changes and a 128 MiB channel
-> limit landed. No dedicated large-attachment regression was found, and the live
-> PNG/cursor-advance gate remains incomplete; the historical 70-test count below
-> is not a current-tree test count.
+> **Current status (reverified 2026-08-25): PARTIAL /
+> VERIFICATION-PENDING.** Attachment decode-lifetime changes and the 128 MiB
+> channel limit remain in source. No dedicated inbound large-base64 `on_poll`
+> regression was found, and the live PNG/cursor-advance gate remains incomplete;
+> the historical 70-test count below is not a current-tree count. The newer
+> XMPP bridge regression for a ~3 MiB outbound `/v1/messages/send` body verifies
+> the separate 70 MiB route-scoped body limit, not this inbound WASM trap.
 
 ## Status
 
@@ -156,30 +158,23 @@ The test should verify:
 
 ## Verification Plan
 
-All Rust verification should follow the Arch VM constraints:
+Run from the repository's `ic/` directory under the current 12-thread limit:
 
 ```bash
-cd /home/dame/lunarwing/ic
-taskset -c 0-5 cargo test -j6 -- --test-threads=6
+taskset -c 0-11 cargo test -j12 xmpp -- --nocapture --test-threads=12
 ```
-
-Targeted steps:
 
 ### Rebuild XMPP WASM channel
 
 ```bash
-cd /home/dame/lunarwing/ic
 ./channels-src/xmpp/build.sh
 ```
 
-### Run targeted tests
-
-```bash
-cd /home/dame/lunarwing/ic
-taskset -c 0-5 cargo test -j6 xmpp -- --nocapture
-```
-
-If a dedicated regression test is added in WASM/channel wrapper coverage, run that exact test as well.
+The existing native XMPP tests and the bridge's outbound body-limit tests are
+useful adjacent coverage, but completion still requires a dedicated WASM-channel
+fixture that executes `on_poll()` with an empty-content, ~1 MiB base64 image,
+asserts the emitted attachment bytes, and observes the persisted cursor. Follow
+that with the real PNG live check below.
 
 ### Live verification
 

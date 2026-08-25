@@ -1,9 +1,11 @@
 # MT Legacy Upgrade: Live QA Plan (v1.0.3-era → v1.1.2/3)
 
-> **Current status (2026-07-20, rev `50c8f99`): VERIFICATION-PENDING.** The
+> **Current status (reverified 2026-08-25): VERIFICATION-PENDING.** The
 > scripts are present and hardened, but this checklist has not been completed
-> end-to-end against a real v1.0.3-era tenant. Keep its acceptance boxes unchecked
-> until evidence is captured.
+> end-to-end against a real v1.0.3-era tenant. Current mt-admin is the
+> fourteen-module composition and its `doctor` command now detects duplicate
+> registry port assignments; the checklist uses that contract below. Keep its
+> acceptance boxes unchecked until evidence is captured.
 
 **Status:** Reviewed + hardened — live validation pending (open risk: old v1.0.x code may not build on the current toolchain)  
 **Date:** 2026-06-21  
@@ -155,11 +157,20 @@ mkdir -p "$LOGDIR"
     - Confirm the recipient sees expected decrypted content.
     - Record pass/fail and timestamp in operator notes.
 
-16. **Confirm tenant port metadata still looks sane.**
+16. **Confirm tenant port metadata and registry-wide uniqueness.**
     ```bash
-    sudo jq ".tenants[\"$TENANT\"]" /etc/lunarwing/ports.json | tee "$LOGDIR/tenant-ports.json"
+    sudo jq ".tenants[\"$TENANT\"]" /etc/lunarwing/ports.json \
+      | tee "$LOGDIR/tenant-ports.json"
+    sudo ic/scripts/lunarwing-mt-admin.sh doctor \
+      | tee "$LOGDIR/mt-doctor.txt"
     ```
-    The canonical registry is `/etc/lunarwing/ports.json` (override with `LUNARWING_PORTS_REGISTRY`); there is no per-tenant `ports.json`. Expect valid JSON and no obvious collisions or broken values.
+    The canonical registry is `/etc/lunarwing/ports.json` (override with
+    `LUNARWING_PORTS_REGISTRY`); there is no per-tenant `ports.json`. Expect valid
+    tenant metadata and `[PASS] no duplicate ports in registry`. That doctor
+    check catches registry-internal duplicate assignments. It cannot prove that
+    every assigned port is free from an untracked host listener; fresh
+    `ports_allocate` calls separately warn, without failing, when their new block
+    is already bound on loopback.
 
 17. **Exercise the rehearsal path if using a synthetic tenant.**
     ```bash

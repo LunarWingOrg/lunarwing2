@@ -539,7 +539,7 @@ Max Concurrent: 3 (Waves 1, 2, 4)
   - `ic/src/orchestrator/external_worker.rs:272-283` — `run_external_task()` signature to extend
   - `ic/src/orchestrator/external_worker.rs:403-412` — Current `task_request` with `"context": {}` to replace
   - `ic/src/orchestrator/auth.rs` — `CredentialGrant` struct definition
-  - `ic/src/context.rs` — `ContextManager`, `JobContext` for extracting conversation history
+  - `ic/src/context/manager.rs` and `ic/src/context/state.rs` — `ContextManager` and `JobContext` (re-exported by `context/mod.rs`)
   - `ic/src/secrets/mod.rs` — `SecretsStore` trait for resolving secret values
   - `ic/src/tools/builtin/job.rs:204-267` — Existing `parse_credentials()` pattern to follow for credential resolution
 
