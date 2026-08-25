@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-07-20)
+**Status:** As-built (revalidated against source 2026-08-25)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -17,20 +17,31 @@ verification, see the operator guide linked above.
 ## 1. What it is
 
 The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, and
-Kimi Code), routines, and git operations the ability to authenticate to remote SSH
-hosts **without ever exposing raw private-key bytes to those consumers**.
+Kimi Code) a signing socket and gives interactive chat the built-in `ssh`,
+`ssh_git`, and WASM `ssh` delivery paths. `ssh`, `ssh_git`, and `create_job` are
+excluded from autonomous jobs and routines; the harness does not make direct SSH
+an autonomous routine capability.
 
-It does this by splitting SSH state into two halves:
+Runtime state is split between non-sensitive host configuration and encrypted
+credentials:
 
 | Half | Where it lives | Sensitivity |
 |------|----------------|-------------|
-| **Host config** — hostname, port, user, key type, host-key policy, timeouts | `config.toml` `[ssh]` / `[[ssh.hosts]]` | Non-sensitive |
-| **Private keys + passphrases** | Encrypted secrets store (AES-256-GCM) | Sensitive — never on disk in plaintext |
+| **Host config** — hostname, port, user, key type, host-key policy, timeouts | startup `config.toml` `[ssh]` / `[[ssh.hosts]]`; API CRUD mutates only the live map | Non-sensitive |
+| **Private keys + passphrases** | Encrypted secrets store (AES-256-GCM) | Sensitive persistent runtime credential |
 
-At startup the daemon decrypts the keys into memory and runs an **in-process
-ssh-agent** on a per-tenant Unix domain socket. Workers receive **only the
-socket path** via `SSH_AUTH_SOCK`. All signing happens inside the daemon; key
-bytes never touch disk and never cross the container boundary.
+At startup the daemon decrypts keys for configured hosts into memory and runs an
+**in-process ssh-agent** on a per-tenant Unix domain socket. Workers receive the
+socket path via `SSH_AUTH_SOCK`; signing happens in the daemon and raw key bytes
+do not cross the container boundary.
+
+This does **not** mean plaintext keys never exist on the host filesystem.
+mt-admin's default bootstrap creates
+`/home/<tenant>/.ssh/id_ed25519_lunarwing`, copies it to the mode-0600
+`env/ssh_key_staged` upload file, then deletes only the staging copy after a
+successful encrypted-store upload. The original private key remains in
+`~/.ssh/`; on upload failure the staging copy also remains for retry. Manual/API
+provisioning may have different disk behavior.
 
 ```text
 ┌──────────────────────── LunarWing daemon (per tenant) ─────────────────────────┐
@@ -61,13 +72,13 @@ intentionally omitted because they drift as adjacent code changes.
 
 | File | Responsibility |
 |------|----------------|
-| `bridge/ssh.rs` | **Core coordination + type definitions.** Owns `SSHBridge`, defines all public config/credential/error/audit types, host CRUD, and the load-bearing `start_agent_server()`. Pure orchestration — delegates crypto to `secrets` and the wire protocol to `ssh_agent`. |
+| `bridge/ssh.rs` | **Core coordination + type definitions.** Owns `SSHBridge`, defines public config/credential/error/audit types, live-map host CRUD, and the load-bearing `start_agent_server()`. Pure orchestration — delegates crypto to `secrets` and the wire protocol to `ssh_agent`. |
 | `bridge/ssh_agent.rs` | **In-process ssh-agent server.** `SshAgentServer` binds the Unix socket, parses keys with `russh::keys::decode_secret_key`, runs `russh::keys::agent::server::serve`, and self-connects to `add_identity` each key into russh's internal keystore. |
 | `bridge/ssh_secrets.rs` | **Key ↔ secrets-store adapter.** `SshSecretsManager` derives secret names, stores/loads/deletes keys and passphrases, and heuristically classifies key format. |
-| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts (in memory).** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection. **Live** for the in-process `ssh` and `ssh_git` tool paths (see §7). |
-| `bridge/ssh_api.rs` | **HTTP REST management surface (axum).** CRUD over hosts, key upload/delete/status, agent status/keys. |
-| `bridge/ssh_client.rs` | **In-process russh client.** `connect_and_exec` used by the `ssh` and WASM `ssh` tools. Wires `HostKeyVerifier` via russh's `Handler::check_server_key`. |
-| `config/ssh.rs` | **Config deserialization.** `SshConfig` / `SshHostEntry` map `[ssh]` / `[[ssh.hosts]]` TOML into typed config; `to_host_map()` flattens global defaults against per-host overrides. |
+| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts (in memory).** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection. Used directly by built-in/WASM russh execution; `ssh_git` materializes its pins into an OpenSSH `known_hosts`. |
+| `bridge/ssh_api.rs` | **HTTP REST management surface (axum).** Process-local host CRUD, persistent encrypted-key upload/delete/status, and agent status/keys. |
+| `bridge/ssh_client.rs` | **In-process russh client.** `connect_and_exec` used by the built-in and WASM `ssh` tools. Wires `HostKeyVerifier` via russh's `Handler::check_server_key`. |
+| `config/ssh.rs` | **Startup config deserialization.** `SshConfig` / `SshHostEntry` map `[ssh]` / `[[ssh.hosts]]` TOML into typed config; `to_host_map()` flattens global defaults against per-host overrides. |
 
 Module registration: `bridge/mod.rs` declares all six submodules (no feature
 gate); public types are re-exported from `lib.rs`.
@@ -81,7 +92,7 @@ gate); public types are re-exported from `lib.rs`.
 | `host` | `String` | — | hostname or IP |
 | `port` | `u16` | `22` | |
 | `user` | `String` | — | |
-| `key_type` | `SSHKeyType` | — | `ed25519` / `ecdsa` / `rsa` (serialized lowercase) — identification/logging only |
+| `key_type` | `SSHKeyType` | — | `ed25519` / `ecdsa` / `rsa` (serialized lowercase); built-in/WASM russh execution rejects `rsa`, while `ssh_git` delegates algorithm negotiation to agent/OpenSSH |
 | `host_key_mode` | `HostKeyMode` | `Strict` | `Strict` / `AcceptFirst` (serialized PascalCase) |
 | `known_host_key` | `Option<String>` | `None` | pinned OpenSSH-format host public key |
 | `connect_timeout_secs` | `u64` | `10` | |
@@ -203,11 +214,16 @@ socket pre-creation and daemon-first ordering live in
 `mt-admin-lib/07-units-systemd.sh` / `08-units-openrc.sh`):
 
 1. **Pre-create** the socket path as a touch-file before the daemon starts, so
-   podman doesn't materialize it as a directory.
+   podman does not materialize it as a directory.
 2. **Start the daemon first** — it removes the touch-file and binds the real
    socket.
-3. **Start workers after**, each with the socket bind-mounted and
-   `SSH_AUTH_SOCK` set (including generated container service definitions):
+3. If `add-tenant` left `env/ssh_key_staged`, upload it to the local SSH API.
+   A successful upload deletes that staging copy, then mt-admin restarts the
+   daemon and waits for its gateway so `start_agent_server()` loads the key into
+   russh's signing keystore.
+4. **Start workers only after that restart**, each with the current socket inode
+   bind-mounted and `SSH_AUTH_SOCK` set (including generated container service
+   definitions):
 
    ```
    -v <run_dir>/ssh-agent.sock:/tmp/ssh-agent.sock:z -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock
@@ -215,14 +231,17 @@ socket pre-creation and daemon-first ordering live in
 
 Inside the container, ordinary `git` and `ssh` read `SSH_AUTH_SOCK` and talk the
 agent protocol back to the daemon. `<run_dir>` resolves to
-`/home/<tenant>/lunarwing/run` (`mt-admin` `tenant_run_dir`).
+`/home/<tenant>/lunarwing/run` (`mt-admin` `tenant_run_dir`). The agent protocol
+provides a generic signing capability, not a destination-bound one: worker SSH
+does not consult the daemon's configured host map, so container network policy
+and the worker's own host-key policy must constrain destinations.
 
 > The bridge does not export a process-wide `SSH_AUTH_SOCK` into the daemon's
 > environment. Generic in-daemon shell/git code therefore sees an agent only if
 > the daemon inherited one. The built-in `ssh_git` tool is the exception: it
 > explicitly sets `SSH_AUTH_SOCK` to `SSHBridge::get_agent_socket_path()` for its
-> scrubbed child process. The built-in `ssh` and WASM `ssh` paths use russh and
-> decrypted bridge credentials directly rather than an inherited environment.
+> scrubbed child process. The built-in and WASM `ssh` paths use russh and decrypted
+> bridge credentials directly rather than an inherited environment.
 
 ### 4.4 HTTP management API (`ssh_api.rs`, mounted in `main.rs`)
 
@@ -231,46 +250,56 @@ and `secrets_store` exist. `ssh_api::create_router()` registers these routes:
 
 | Method + path | Handler | Notes |
 |---|---|---|
-| `GET /hosts` | `list_hosts` | per-host `has_key` looked up from the secrets store |
-| `POST /hosts` | `add_host` | hardcodes timeouts (10/30/60/3) on the created config |
-| `GET /hosts/{host}` | `get_host` | |
-| `DELETE /hosts/{host}` | `remove_host` | removes **config only, not the key** → the secret is orphaned |
-| `POST /hosts/{host}/key` | `upload_key` | stores the encrypted key; live-adds to a running agent (status only — see below) |
-| `DELETE /hosts/{host}/key` | `delete_key` | |
-| `GET /hosts/{host}/key/status` | `key_status` | |
-| `GET /agent/status` | `agent_status` | `running` / `socket_path` / `keys_loaded` |
-| `GET /agent/keys` | `agent_keys` | |
+| `GET /hosts` | `list_hosts` | live-map hosts; per-host `has_key` comes from the secrets store |
+| `POST /hosts` | `add_host` | adds to the live map only; hardcodes timeouts (10/30/60/3) |
+| `GET /hosts/{host}` | `get_host` | live map only |
+| `DELETE /hosts/{host}` | `remove_host` | removes from the live map only; leaves the encrypted key and startup config |
+| `POST /hosts/{host}/key` | `upload_key` | stores the encrypted key; updates only the agent's status map |
+| `DELETE /hosts/{host}/key` | `delete_key` | deletes the encrypted secret; updates only the agent's status map |
+| `GET /hosts/{host}/key/status` | `key_status` | encrypted-secret existence |
+| `GET /agent/status` | `agent_status` | `running` / `socket_path` / status-map `keys_loaded` |
+| `GET /agent/keys` | `agent_keys` | status-map host names, not a query of russh's signing keystore |
 
 `SSHKeyType` serializes lowercase (`"ed25519"`); `HostKeyMode` serializes
 PascalCase (`"Strict"`) — clients must match the casing.
 
-> **Runtime upload caveat.** `upload_key` stores the key in the encrypted
-> secrets store **and** calls `agent.add_key` on the running agent. Because
-> `add_key` updates only the status map (§4.2), the key does not become usable
-> for signing until the **next daemon restart**, when `start_agent_server`
-> reloads it from the secrets store into russh's keystore. This is why the
-> `mt-admin` provisioning flow (which uploads after startup) yields a working
-> key on the following restart cycle.
+> **Host CRUD is not durable.** `add_host` and `remove_host` mutate only
+> `SSHBridge.hosts`; they do not rewrite `config.toml`. A daemon restart rebuilds
+> the map from startup configuration, discarding API-added hosts and restoring
+> API-removed hosts still present in the file. Durable changes require editing
+> `[[ssh.hosts]]` through the operator-controlled config path.
+>
+> **Runtime key-mutation caveat.** Upload/delete persists the encrypted secret
+> immediately, but `SshAgentServer::add_key` and `remove_key` modify only its
+> reporting map, not russh's separate signing keystore. Built-in/WASM `ssh`
+> reload credentials from the secrets store per call, so they see upload/delete
+> immediately. `ssh_git` and workers use the agent socket: an uploaded key is not
+> signable there until daemon restart, and a deleted key may remain signable
+> there until restart. mt-admin therefore restarts the daemon after a successful
+> staged-key upload and starts workers only after that bounce.
 
 ## 5. Security model
 
-- **Keys at rest.** Only as AES-256-GCM ciphertext in the secrets store
-  (`nonce || ciphertext || tag` + a per-secret 32-byte salt; per-secret key via
-  HKDF-SHA256 of the master key). The master key comes from
-  `SECRETS_MASTER_KEY` (hex env) or the OS keychain. "Never on disk" precisely
-  means "never on disk **in plaintext**."
-- **Keys at runtime.** Decrypted only inside the daemon, held in `Zeroizing`
-  (bytes) and `SecretString` (passphrase), both zeroed on drop. Workers receive
-  **signing capability only** through the bind-mounted socket; key bytes never
-  cross the container boundary.
+- **Runtime credential store.** Persistent credentials consumed by the bridge
+  are AES-256-GCM ciphertext in the secrets store (`nonce || ciphertext || tag`
+  plus a per-secret salt; per-secret key via HKDF-SHA256). The master key comes
+  from `SECRETS_MASTER_KEY` or the OS keychain. This guarantee does not erase
+  external provisioning copies: default mt-admin bootstrap leaves the generated
+  mode-0600 private key in the tenant's `~/.ssh/` and temporarily creates a
+  second staged copy for API upload.
+- **Keys in the daemon.** Secret-store loads use `Zeroizing<Vec<u8>>` and
+  passphrases use `SecretString`; workers receive signing capability through the
+  bind-mounted socket and raw key bytes do not cross into the container. Some
+  intermediate parse/API buffers are not zeroizing (listed below).
 - **Per-tenant isolation.** `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)` is a
   stable internal bridge/audit identifier. Secret-store operations are scoped
   by the string `owner_id` (`tenant_name` in the bridge), and the socket lives
-  in the tenant-owned run directory.
-- **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + pin). No
-  `AcceptAny`. **Note:** the verifier is live for the in-process `ssh` and
-  `ssh_git` tool paths (§7); the worker-mode path still relies on the worker's
-  own `ssh` client and its container-local `known_hosts`.
+  in the tenant-owned run directory. The socket grants signing, not a
+  destination-bound capability; worker egress must be constrained separately.
+- **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + in-memory pin).
+  No `AcceptAny`. Built-in/WASM russh execution checks the live server key;
+  `ssh_git` materializes a verifier/config pin into an ephemeral `known_hosts`;
+  worker mode relies on its own client and container-local `known_hosts`.
 
 ### Hardening notes / current sharp edges
 
@@ -278,33 +307,37 @@ PascalCase (`"Strict"`) — clients must match the casing.
   on the parent run directory being tenant-owned and on rootless-podman UID
   mapping. If the run-dir permissions are ever wrong, any local user could sign
   with the tenant's keys. The `set_permissions` error is intentionally ignored.
-- **No per-signature confirmation.** `confirm` / `confirm_request` are hardcoded
-  to `true` and `add_identity` is called with empty
-  constraints. Anyone who can open the socket can request arbitrary signatures.
-- **`parse_key` makes a non-zeroized copy** of the key bytes
-  (`String::from_utf8_lossy(...).to_string()`) that drops
-  without wiping — a small window that partially defeats the `Zeroizing`
-  wrapper.
-- **The HTTP API has no auth middleware**. It is merged into
-  the webhook server (which binds `0.0.0.0` by default), so exposure depends
-  entirely on the surrounding network/deployment. In the `mt-admin` model it is
-  reached only over `127.0.0.1:<tenant-http-port>`.
+- **No per-signature confirmation or destination constraint.** `confirm` /
+  `confirm_request` are hardcoded to `true` and `add_identity` uses empty
+  constraints. Anyone who can open the socket can request arbitrary signatures,
+  and the ssh-agent protocol does not bind them to a configured host.
+- **Some plaintext buffers are not zeroized.** `parse_key` creates a normal
+  `String` through `String::from_utf8_lossy(...).to_string()`. The key-upload API
+  accepts a normal `String`, then creates and clones ordinary `Vec<u8>` buffers
+  before wrapping the status-map copy. These allocations drop without an
+  explicit wipe.
+- **The HTTP API has no auth middleware.** It is merged into the unified webhook
+  server, whose fallback bind is `0.0.0.0:8080`; exposure depends on surrounding
+  listener/network configuration. mt-admin writes `HTTP_HOST=127.0.0.1`, so its
+  normal tenant path reaches the API only on loopback.
 - **Audit logging is a no-op in production** (`NullAuditLogger`). The `SshEvent`
-  variants are defined but not persisted.
+  variants are defined but not persisted, and only host add/remove and agent
+  start currently call the logger.
 
 ## 6. Design decisions
 
-- **Split sensitive/non-sensitive.** Host topology is not a secret and lives in
-  `config.toml` where it is easy to review; only key material goes to the
-  encrypted store. This keeps `config.toml` diffable and auditable.
-- **Agent socket over key hand-off.** Handing workers an `SSH_AUTH_SOCK`
-  (capability) instead of a key file (bearer secret) means keys never leave the
-  daemon and are never written to a container filesystem. It also means standard
-  `git`/`ssh` "just work" with zero SSH-specific code in the worker.
+- **Split runtime topology/credentials.** Host topology is not a secret and
+  starts in `config.toml`; bridge-consumed persistent credentials go to the
+  encrypted store. This does not promise that external provisioning creates no
+  plaintext copies (mt-admin's self-host bootstrap deliberately does).
+- **Agent socket over key hand-off.** Handing workers an `SSH_AUTH_SOCK` means raw
+  keys do not enter the container and standard `git`/`ssh` work without
+  SSH-specific worker code. The trade-off is a broad signing capability rather
+  than the alias/host-policy checks applied by built-in tools.
 - **`russh::keys` in-process agent, not the OpenSSH `ssh-agent` binary.** Avoids
-  spawning/managing an external process and keeps key material inside the
-  daemon's address space. (`russh` 0.62; `russh-keys` is now a module within the
-  `russh` crate, not a separate dependency.)
+  spawning/managing an external agent and keeps the live signing keystore in the
+  daemon. (`russh` 0.62; `russh-keys` is now a module within the `russh` crate,
+  not a separate dependency.)
 - **Run-dir socket, not `/tmp`.** Required because the daemon runs with
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
 - **No `AcceptAny` host-key mode.** Refuses to offer a footgun; the strictest
@@ -316,41 +349,42 @@ PascalCase (`"Strict"`) — clients must match the casing.
 
 Built and working:
 
-- `SSHBridge` + all types, host CRUD, validation.
-- `SshAgentServer` — real `russh::keys` agent, socket lifecycle, key loading at
-  startup, chmod, self-`add_identity`.
-- `SshSecretsManager` — store/load/delete keys + passphrases against the
-  encrypted secrets store.
-- `config/ssh.rs` — `[ssh]` / `[[ssh.hosts]]` parsing + `to_host_map()`.
-- `ssh_api.rs` — full CRUD HTTP surface, mounted in the webhook server.
-- `mt-admin` provisioning + bind-mount wiring for supported workers.
+- `SSHBridge` + all types, process-local host CRUD, validation.
+- `SshAgentServer` — real `russh::keys` agent, socket lifecycle, startup key
+  loading, chmod, self-`add_identity`.
+- `SshSecretsManager` — persistent encrypted key/passphrase store operations.
+- `config/ssh.rs` — startup `[ssh]` / `[[ssh.hosts]]` parsing + `to_host_map()`.
+- `ssh_api.rs` — live host management, persistent key management, and agent
+  status HTTP surface, mounted in the unified webhook server.
+- mt-admin plaintext key bootstrap, encrypted upload + daemon bounce, and
+  bind-mount wiring for supported workers.
 
 Now wired into live paths (via the delivery mechanisms — see
 [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)):
 
-- **`HostKeyVerifier` (`ssh_hostkeys.rs`)** is a live consumer as of the
-  delivery tools: the built-in `ssh` tool feeds live server keys into
-  `verify_from_config` through russh's `check_server_key`
-  (`ic/src/bridge/ssh_client.rs`), and the `ssh_git` tool materializes a
-  `known_hosts` from its pins. The in-process **russh 0.62 client**
-  (`ssh_client.rs`) is likewise now live (the harness previously used only the
-  `russh::keys` agent server). Host-key pinning **is** enforced for the in-process
-  tools; the worker-mode path (Option 1) still relies on the worker's own `ssh`
-  client + `known_hosts`.
+- Built-in and WASM `ssh` feed the live server key through
+  `HostKeyVerifier::verify_from_config` in `ssh_client.rs`; `ssh_git` materializes
+  a verifier/config pin into an ephemeral OpenSSH `known_hosts`. Worker mode is
+  outside these checks and relies on its own SSH client and `known_hosts`.
 
 Known limitations / follow-ups:
 
-- **Runtime key add is status-only.** A key uploaded to a *running* agent is not
-  signable until the next daemon restart (§4.2, §4.4). If online key rotation is
-  desired, `SshAgentServer::add_key`/`remove_key` must also drive the agent
-  protocol (`add_identity`/`remove_identity`) against russh's keystore.
+- **Runtime agent-key mutation is status-only.** Upload does not make a key
+  signable through the socket, and delete does not revoke a key already in
+  russh's signing keystore, until daemon restart. Online rotation requires
+  `add_identity`/`remove_identity` against that keystore.
+- **API host CRUD is not persisted.** Restart restores `config.toml`, so a
+  removed configured host returns and an API-added host disappears.
 - **No production `AuditLogger`.** Replace `NullAuditLogger` with a persistent
-  implementation to realize the "auditable access" goal.
-- **`DELETE /hosts/{host}` orphans the key secret** — it removes config but not
-  `ssh_key_<host>`.
-- **`from_utf8_lossy` on key bytes** (`ssh_secrets.rs`, `ssh_agent.rs`)
-  assumes UTF-8 key material — fine for PEM/OpenSSH text, but binary key blobs
-  would be corrupted.
+  implementation and emit the currently unused connection/command/key/stop
+  events to realize the "auditable access" goal.
+- **`DELETE /hosts/{host}` leaves the encrypted key secret** and removes only the
+  live map entry; it may also return after restart if still in `config.toml`.
+- **Default mt-admin provisioning retains a plaintext source key** in the
+  tenant's `~/.ssh/`; failed upload also retains the staging copy.
+- **`from_utf8_lossy` on key bytes** (`ssh_secrets.rs`, `ssh_agent.rs`) assumes
+  UTF-8 key material — fine for PEM/OpenSSH text, but binary key blobs would be
+  corrupted — and creates a non-zeroized copy.
 
 ## 8. Test coverage
 

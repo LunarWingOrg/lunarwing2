@@ -176,7 +176,7 @@ designated pager/operations rooms rather than all traffic.
   and before transport rate limiting. It has queue, delivery, merge, size, and
   shutdown bounds; `ALERT:` bypasses coalescing.
 - Follow-up review fixed all fourteen issues in
-  [`UNVERIFIED_ISSUES.MD`](docs/ops/UNVERIFIED_ISSUES.MD), including production
+  [`UNVERIFIED_ISSUES.MD`](../ops/history/v2.0.4.0/BRANCH_REVIEW_ISSUES.md), including production
   gate registration, WASM-channel coverage, room isolation, authentication,
   violation attribution, stale timers, registry races, and tag-only panic paths.
 

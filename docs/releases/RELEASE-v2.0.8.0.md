@@ -356,7 +356,7 @@ previous compatibility baseline.
   oneshot). Covered by the new `test-watchdog-openrc.sh` suite (28
   assertions) plus new `test-health-openrc.sh` and chaos-harness cases —
   691/691 green across 14 suites; write-up in
-  `docs/ops/v2.0.8.0_GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
+  `docs/ops/history/v2.0.8.0/GOAL27_HEALTH_SYSTEMS_OPENRC.md`.
 
 ### WASM Channel Tool Activity
 
@@ -404,7 +404,7 @@ previous compatibility baseline.
   entire hyper 0.14 / h2 0.3 tree. The one remaining h2 0.3.27 copy
   (reachable only through the legacy libsql → tonic → hyper 0.14 chain, with
   no 0.3-line patch) was accepted with reason, bringing the accepted-findings
-  count to eight. Details in `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
+  count to eight. Details in `docs/ops/history/v2.0.8.0/CRATE_SECURITY_AUDIT.md`.
 - Version bump: all LunarWing crates and WASM channels 2.0.7 → 2.0.8,
   channel registry patch bumps (darkirc 0.1.5, multica 0.1.7, weechat 0.2.6,
   xmpp 0.1.10), full `cargo update` on the main lockfile (MSRV
@@ -432,7 +432,7 @@ previous compatibility baseline.
 - Repo hygiene: root branding assets moved to owned, descriptive paths (README
   and onboarding references updated), stale root `PEBBLE.md` archived, empty
   `.codex` markers and a stale resume artifact removed. Full ledger in
-  `docs/ops/v2.0.8.0_REPO_HYGIENE.md`.
+  `docs/ops/history/v2.0.8.0/REPO_HYGIENE.md`.
 - CI now runs the full master job set on `aragents/kimil00p/*` branches.
 - Worker container images are now published under the moving `v2.0.8.0` and
   `latest` tags plus an immutable `$CI_COMMIT_SHORT_SHA` tag per build, so
@@ -512,7 +512,7 @@ previous compatibility baseline.
   libSQL's legacy TLS stack, the vendored Signal wrapper, and the unpatchable
   h2 0.3 line in libSQL's legacy chain; the v2.0.8.0 re-audit fixed
   `RUSTSEC-2026-0258` everywhere an upgrade exists and found no other newly
-  fixable advisories. See `docs/ops/CRATE_SECURITY_AUDIT_v2.0.8.0.md`.
+  fixable advisories. See `docs/ops/history/v2.0.8.0/CRATE_SECURITY_AUDIT.md`.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   delivery remain disabled; Stage A live-host release acceptance remains a
   release/deployment gate rather than proof of activated contact security.
@@ -585,7 +585,7 @@ previous compatibility baseline.
   axum's 2 MiB default, scoped to the send route so every other route keeps
   the default bound, and authorization now runs before the body is buffered
   — closing the pre-auth memory-amplification window from
-  `docs/ops/MEDIUM.MD`. A regression test proves large attachment sends
+  `docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`. A regression test proves large attachment sends
   reach the handler (work item #42).
 - WASM channels silently dropping tool-activity status events: the global
   `tool_activity` flag now routes ToolStarted / ToolCompleted / ToolResult to

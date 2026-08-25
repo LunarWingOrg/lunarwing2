@@ -1081,6 +1081,41 @@ impl WasmToolSchemas {
         Self::is_permissive_schema(&self.advertised)
     }
 
+    /// Whether the compact advertised schema omits fields that discovery
+    /// combinator variants require.
+    ///
+    /// Discriminated-union tools (oneOf/anyOf with a const discriminator,
+    /// e.g. the gitlab tool's internally-tagged action enum) compact to
+    /// just the discriminator property: variant-level required fields
+    /// (`project`, `title`, …) are intentionally dropped from the
+    /// advertised schema. Because the compact schema still has a typed
+    /// property it is not "permissive", so without this check no
+    /// tool_info hint is shown and the LLM emits discriminator-only
+    /// calls the guest then rejects ("missing field `project`" —
+    /// work item #73).
+    fn advertised_omits_variant_required(&self) -> bool {
+        let advertised_props = self
+            .advertised
+            .get("properties")
+            .and_then(|p| p.as_object());
+        for key in ["oneOf", "anyOf", "allOf"] {
+            let Some(variants) = self.discovery.get(key).and_then(|v| v.as_array()) else {
+                continue;
+            };
+            for variant in variants {
+                let Some(required) = variant.get("required").and_then(|r| r.as_array()) else {
+                    continue;
+                };
+                for name in required.iter().filter_map(|n| n.as_str()) {
+                    if advertised_props.is_none_or(|props| !props.contains_key(name)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn advertised(&self) -> serde_json::Value {
         self.advertised.clone()
     }
@@ -1435,12 +1470,16 @@ impl Tool for WasmToolWrapper {
 
     /// Compose the tool schema for LLM function calling.
     ///
-    /// When the advertised schema is permissive (no typed properties), appends
-    /// a hint to the description directing the LLM to call `tool_info` for the
-    /// full parameter schema. This keeps the raw description clean while still
-    /// guiding the LLM.
+    /// When the advertised schema is permissive (no typed properties), or when
+    /// it omits fields that discovery combinator variants require (e.g. a
+    /// discriminated-union tool compacted to just its `action` discriminator),
+    /// appends a hint to the description directing the LLM to call `tool_info`
+    /// for the full parameter schema. This keeps the raw description clean
+    /// while still guiding the LLM.
     fn schema(&self) -> crate::tools::tool::ToolSchema {
-        let description = if self.schemas.is_advertised_permissive() {
+        let needs_schema_hint = self.schemas.is_advertised_permissive()
+            || self.schemas.advertised_omits_variant_required();
+        let description = if needs_schema_hint {
             format!(
                 "{} (call tool_info(name: \"{}\", include_schema: true) for parameter schema)",
                 self.description, self.prepared.name
@@ -2665,6 +2704,91 @@ mod tests {
         assert!(!props.contains_key("repo"), "repo should be dropped");
         assert_eq!(compacted["additionalProperties"], true);
         assert_eq!(compacted["required"], serde_json::json!(["action"]));
+    }
+
+    /// Regression for work item #73 (gitlab tool): a discriminated-union
+    /// discovery schema compacts to just the `action` discriminator. The
+    /// advertised schema then under-describes the real payload, so the LLM
+    /// must be told to fetch the full schema via tool_info — otherwise it
+    /// emits action-only calls that the guest rejects ("missing field
+    /// `project`").
+    #[tokio::test]
+    async fn test_discriminated_union_schema_gets_tool_info_hint() {
+        let discovery_schema = serde_json::json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {
+                        "action": { "const": "list_issues" },
+                        "project": { "type": "string" }
+                    },
+                    "required": ["action", "project"]
+                },
+                {
+                    "properties": {
+                        "action": { "const": "create_issue" },
+                        "project": { "type": "string" },
+                        "title": { "type": "string" }
+                    },
+                    "required": ["action", "project", "title"]
+                }
+            ]
+        });
+
+        let schemas = super::WasmToolSchemas::new(discovery_schema.clone());
+        // Compact advertised schema keeps only the discriminator.
+        let advertised = schemas.advertised();
+        let props = advertised["properties"].as_object().unwrap();
+        assert!(props.contains_key("action"));
+        assert!(!props.contains_key("project"));
+        // ...and is not permissive, yet still omits variant-required fields.
+        assert!(!schemas.is_advertised_permissive());
+        assert!(schemas.advertised_omits_variant_required());
+
+        // The composed LLM-facing schema must carry the tool_info hint.
+        let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::for_testing()).unwrap());
+        let prepared = runtime
+            .prepare("gitlab", b"\0asm\x0d\0\x01\0", None)
+            .await
+            .unwrap();
+        let mut wrapper =
+            super::WasmToolWrapper::new(Arc::clone(&runtime), prepared, Capabilities::default());
+        wrapper.schemas = super::WasmToolSchemas::new(discovery_schema);
+        wrapper.description = "Manage GitLab".to_string();
+
+        let schema = wrapper.schema();
+        assert!(
+            schema.description.contains("tool_info"),
+            "discriminated-union tools must advertise the tool_info hint: {}",
+            schema.description
+        );
+    }
+
+    #[test]
+    fn test_advertised_omits_variant_required_false_when_complete() {
+        // Variant-required fields that survive compaction → no omission.
+        let schemas = super::WasmToolSchemas::new(serde_json::json!({
+            "type": "object",
+            "required": ["action"],
+            "oneOf": [
+                {
+                    "properties": {
+                        "action": { "const": "list" },
+                        "state": { "type": "string", "enum": ["open", "closed"] }
+                    },
+                    "required": ["action", "state"]
+                }
+            ]
+        }));
+        assert!(!schemas.advertised_omits_variant_required());
+
+        // No combinators at all → no omission.
+        let plain = super::WasmToolSchemas::new(serde_json::json!({
+            "type": "object",
+            "properties": { "query": { "type": "string" } },
+            "required": ["query"]
+        }));
+        assert!(!plain.advertised_omits_variant_required());
     }
 
     #[test]

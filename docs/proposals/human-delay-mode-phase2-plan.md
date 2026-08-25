@@ -1,142 +1,201 @@
 # Human Delay Mode - Phase 2 Plan
 
-> **Current status (2026-07-20, rev `50c8f99`): OPEN / PLANNED.** Phase 1 is
-> verified, so the stated blocker is cleared. Timeout expiry, primary gate-pipeline
-> integration, parameter modification, supervision levels, and their tests have
-> not landed.
+> **Current status (source-reverified 2026-08-25): OPEN / PARTIALLY OVERTAKEN.**
+> Phase 1 is usable and has focused adapter regressions: supervised mode gates
+> `Never` tools, overrides auto-approve, and a resolved approval bypasses it once.
+> `PendingGate` persistence and a background expiry sweep also landed, with a
+> DB-backed global `settings.agent.pending_gate_expiry_secs` default of 1,800
+> seconds. However, the per-thread `supervised_timeout_secs` field (default 300)
+> is only propagated through `ThreadConfig`, `ThreadExecutionContext`, and
+> `GateContext`; pending-gate creation still ignores it and uses the global
+> expiry. The host `ApprovalGate` and engine `GatePipeline` exist but production
+> approval remains inline in `ic/src/bridge/effect_adapter.rs`. Parameter
+> modification and supervision levels have not landed.
 
-**Status**: Planned; Phase 1 verification is complete. *(As of v1.1.9, Phase 1 supervised mode `--supervised` is shipped and live. Phase 2 remains planned.)*
-**Goal**: Complete the supervised mode experience with timeout integration, UI options, and robust testing.
+**Status:** Phase 2 remains planned; Phase 1 `--supervised`/`AGENT_SUPERVISED_MODE`
+is shipped.
+**Goal:** Complete supervised mode with per-thread expiry semantics, one
+production gate path, parameter modification, and current-path tests.
 
 ## Phase 2 Scope
 
-Phase 1 introduced the data model and basic approval gating. Phase 2 makes it actually *usable* — timeouts, UI options, and full pipeline integration.
+Phase 1 introduced the data model and basic inline approval gating. Phase 2
+removes the split-brain timeout/gate implementation and adds a safe modification
+flow rather than inventing standalone CLI commands that do not exist.
 
 ## 1. Wire `supervised_timeout_secs` to Pending Gate Expiration
 
 ### Problem
-Currently `supervised_timeout_secs` flows through the context but is never used to set when a pending gate expires. Approval gates timeout at a hardcoded value or never.
+
+`PendingGate` already has `expires_at`, persistence, fail-closed expiry, and a
+background sweep. The mismatch is at creation: both pending-gate construction
+sites in `ic/src/bridge/router.rs` use `EngineState::pending_gate_expiry`, loaded
+from `settings.agent.pending_gate_expiry_secs` (default 1,800 seconds).
+`ThreadExecutionContext.supervised_timeout_secs` reaches the effect adapter but
+is not included in `EngineError::GatePaused`, so the router cannot choose the
+thread's 300-second value.
 
 ### Implementation
 
-**Target**: `ic/crates/lunarwing_engine/src/bridge/effect_adapter.rs` and/or `ic/crates/lunarwing_engine/src/gate/approval.rs`
+Define the precedence explicitly:
 
-```rust
-// In execute_action_internal() when creating PendingGate:
-let expires_at = context.supervised_mode
-    .then_some(SystemTime::now() + Duration::from_secs(context.supervised_timeout_secs))
-    .or_else(|| default_expiry());
-```
+- supervised approval pause → validated per-thread `supervised_timeout_secs`;
+- ordinary approval/authentication pause → configured global pending-gate expiry;
+- zero or invalid values → fail closed to a documented bounded default, never an
+  unbounded gate.
+
+Carry the selected expiry or timeout through the typed pause result rather than
+re-reading mutable thread state after the effect returns. Use one helper for both
+initial and resumed-action pending-gate construction.
 
 ### Files to modify
-- `ic/crates/lunarwing_engine/src/bridge/effect_adapter.rs` — pass timeout to `PendingGate`
-- `ic/crates/lunarwing_engine/src/gate/mod.rs` — `PendingGate` struct may need `expires_at` field (verify exists)
+
+- `ic/crates/lunarwing_engine/src/types/error.rs` / resume metadata — carry the
+  typed timeout selected by the execution context.
+- `ic/src/bridge/effect_adapter.rs` — attach the supervised timeout when pausing.
+- `ic/src/bridge/router.rs` — compute `PendingGate.expires_at` through one helper.
+- `ic/src/gate/pending.rs`, `store.rs`, and persistence tests — verify expiry
+  round-trips and sweep behavior.
 
 ## 2. Gate Pipeline Full Integration
 
 ### Problem
-Currently the approval gate works via the inline check in `effect_adapter.rs`, but the structured `ApprovalGate` pipeline isn't actually being called in production execution path.
+
+The reusable pipeline lives in `ic/crates/lunarwing_engine/src/gate/pipeline.rs`
+and host `ApprovalGate` in `ic/src/gate/approval.rs`, but production does not
+construct/evaluate that pipeline. `EffectBridgeAdapter::execute_action_internal`
+still performs coordination, shared-room approval, supervision, normal approval,
+authentication, rate-limit, and hook checks inline.
 
 ### Implementation
 
-**Goal**: Make `ApprovalGate::evaluate()` the primary approval path, with inline check as fallback.
-
-**Target**: `ic/crates/lunarwing_engine/src/executor/orchestrator.rs`
-
-- Find where the gate pipeline should be invoked before tool execution
-- Wire `ApprovalGate` into the execution flow
-- Ensure `GateContext` with supervised fields is properly passed through
-- Inline check in `effect_adapter.rs` becomes fallback/safety net
+Make one production pre-execution pipeline authoritative. Do **not** retain a
+second inline approval path as an indefinitely divergent fallback: either migrate
+one check at a time behind parity tests or keep a single audited safety check with
+clearly narrower purpose. Preserve ordering (authorization/coordination before
+side effects, approval before execution, auth without double execution),
+one-shot resumed approval, lease refunds, shared-room restrictions, and
+parameter-sensitive `allow_always` behavior.
 
 ### Files to modify
-- `ic/crates/lunarwing_engine/src/executor/orchestrator.rs`
-- `ic/crates/lunarwing_engine/src/gate/approval.rs`
-- `ic/crates/lunarwing_engine/src/bridge/effect_adapter.rs` (potentially reduce inline check scope)
+
+- `ic/src/bridge/effect_adapter.rs` — production execution boundary.
+- `ic/src/gate/approval.rs` and other host gates — parity with current inline
+  semantics.
+- `ic/crates/lunarwing_engine/src/gate/pipeline.rs` / `gate/mod.rs` — only if
+  typed context or decisions need extension.
+- focused adapter and router regressions for ordering, resume, auth, shared
+  conversations, and supervised mode.
 
 ## 3. UI "Modify" Option for Supervised Threads
 
 ### Problem
-In supervised mode, humans approve or reject tool requests. Sometimes the human wants to *modify* the tool parameters (e.g., change URL, file path, command) rather than blindly approve or reject.
+
+Current HTTP and WebSocket approval surfaces accept only `approve`, `always`, or
+`deny` and submit `Submission::ExecApproval`. There is no standalone
+`lunarwing gate ...` CLI command. A modification feature must not turn approval
+into a parameter-tampering bypass.
 
 ### Implementation
 
-**Goal**: Add "modify" as a third option to the approval UI.
+**Goal:** add a typed `modify` resolution to the existing authenticated web/WS
+approval surfaces (and channel submission path if parity is required).
 
-**Flow**:
-1. Tool request pauses → `GatePaused(PendingGate { action: ..., params: ... })`
-2. Human chooses "modify" → UI shows editable parameters
-3. Human edits → submits modified parameters
-4. System executes with modified params (not original)
-
-**CLI interface**:
-```bash
-# Existing
-lunarwing gate approve <gate_id>
-lunarwing gate reject <gate_id>
-
-# New
-lunarwing gate modify <gate_id> --params '{"url": "new_url"}'
-```
+1. Load the pending gate by request ID plus authenticated user/thread/source
+   constraints; reject missing, expired, already-consumed, or wrong-owner gates.
+2. Accept a bounded JSON object of replacement parameters. Keep action name,
+   call ID, lease/thread identity, and resume kind server-owned.
+3. Re-run canonical parameter preparation/schema checks, sensitive-field
+   redaction, policy/lease checks, rate limiting, hooks, authentication, and the
+   tool's parameter-sensitive approval requirement. A change that becomes more
+   dangerous must pause again or be denied; `modify` is never equivalent to an
+   unqualified one-shot approval.
+4. Atomically consume/replace the pending gate so concurrent approve/deny/modify
+   requests cannot execute twice. Persist only redacted before/after parameters
+   in history/logs.
+5. Execute the validated modified call once, then resume the thread through the
+   same result/event path as ordinary approval.
 
 ### Files to modify
-- `ic/crates/lunarwing_engine/src/gate/approval.rs` — add modify variant
-- `ic/crates/lunarwing_engine/src/bridge/effect_adapter.rs` — handle modified execution
-- `ic/crates/lunarwing_router/src/lib.rs` — add CLI modify command
-- `ic/crates/lunarwing_cli/src/commands/` — add CLI command handler
+
+- `ic/src/agent/submission.rs` — typed modified-approval payload.
+- `ic/src/channels/web/handlers/chat.rs`, `server.rs`, `ws.rs`, static UI —
+  authenticated request and editable JSON surface.
+- `ic/src/bridge/router.rs` and `ic/src/gate/{pending,store,persistence}.rs` —
+  ownership, expiry, atomic consume/replace, and resume.
+- `ic/src/bridge/effect_adapter.rs` — re-evaluate modified parameters without a
+  blanket `approval_already_granted` bypass.
+
+A CLI command is separate scope: none exists today, so do not document
+`lunarwing gate modify` unless a complete pending-gate CLI surface is added.
 
 ## 4. Supervised Mode Configuration Per-Thread
 
 ### Problem
-Currently supervised mode is a binary flag (on/off). In practice, different threads may need different levels of supervision.
+
+`ThreadConfig` already persists a per-thread boolean and timeout, but the normal
+operator surface enables the boolean globally for newly created foreground
+threads through `--supervised` / `AGENT_SUPERVISED_MODE`. There is no typed
+supervision level or per-thread management UI.
 
 ### Enhancement (optional, may be Phase 3)
 
-- `supervised_mode: Always | Tools | Commands | Disabled`
-- Different supervision levels for different tool types
-- Configurable per-thread via `ThreadConfig`
+Replace—not overload—the boolean with a serde-compatible level after defining
+migration/default behavior:
 
-### Implementation (if included)
 ```rust
 pub enum SupervisionLevel {
-    Disabled,      // No supervision
-    Tools,         // Only tool execution requires approval
-    Commands,      // Only command execution requires approval
-    Always,        // All actions require approval (current behavior)
+    Disabled,
+    Tools,       // all tool actions
+    Commands,    // explicitly classified command-execution tools
+    Always,      // every effect that can be paused
 }
 ```
 
+Define classification centrally; unknown/new actions must fail toward more
+supervision, not silently bypass it. Preserve old `supervised_mode=true` as
+`Always` during deserialization and pending-thread restore.
+
 ## 5. Testing
 
-### Unit Tests
+### Existing coverage (do not duplicate)
 
-**New tests needed**:
-- `test_supervised_mode_blocks_all_tools()` — verify all tools require approval
-- `test_supervised_mode_overrides_auto_approve()` — verify override behavior
-- `test_supervised_timeout_expires_gate()` — verify timeout causes auto-reject
-- `test_supervised_mode_with_modify()` — verify modify flow works
-- `test_supervised_mode_thread_config_propagation()` — verify context fields flow through
+- `ic/src/bridge/effect_adapter.rs`: supervised mode gates a `Never` tool,
+  overrides auto-approve, preserves disabled behavior, and lets one resolved
+  approval execute once.
+- `ic/src/gate/approval.rs`: gate-level supervised and normal approval policy.
+- `ic/src/gate/pending.rs`, `store.rs`, and router tests: expiry/storage and
+  pending-gate lifecycle foundations.
+- CLI snapshots cover `--supervised`; web/WS tests cover approve/always/deny.
 
-### Integration Tests
+### New regressions required
 
-- **CLI + Router flow**: Start with `--supervised` flag → create thread → request tool → verify pause
-- **Approval + Reject flow**: Verify gate approval/reject behavior
-- **Timeout flow**: Verify gate expires after `supervised_timeout_secs`
+- per-thread 300-second supervised expiry versus the independently configured
+  ordinary 1,800-second expiry, including zero/overflow validation;
+- restart persistence and background sweep auto-denial at the exact boundary;
+- gate-pipeline/inline parity for every `ApprovalRequirement`, shared rooms,
+  auto-approve, auth pause, and one-shot resume;
+- modify happy path, invalid JSON/schema, sensitive redaction, increased-risk
+  re-pause, expired/wrong-owner request, and concurrent resolution executes at
+  most once;
+- backward-compatible deserialization if supervision levels replace the bool.
 
-### Files to modify
-- `ic/crates/lunarwing_engine/src/bridge/tests/`
-- `ic/crates/lunarwing_engine/src/gate/tests/`
-- `ic/crates/lunarwing_router/src/tests/`
-- New test file: `ic/crates/lunarwing_engine/src/gate/tests/supervised.rs`
+### Current test locations
+
+- `ic/src/bridge/effect_adapter.rs` and `router.rs`
+- `ic/src/gate/{approval,pending,store,persistence}.rs`
+- `ic/src/channels/web/{handlers/chat,ws}.rs` and web tests
+- `ic/crates/lunarwing_engine/src/{gate,types,executor}/` unit tests
 
 ## Phase 2 Timeline (Estimated)
 
 | Task | Effort | Dependencies |
 |------|--------|-------------|
-| 1. Timeout wiring | Small | Phase 1 verified |
-| 2. Gate pipeline integration | Medium | Task 1 complete |
-| 3. Modify UI option | Medium | Task 2 complete |
-| 4. Supervision levels | Medium | Tasks 1-3 complete |
-| 5. Tests | Medium | All above complete |
+| 1. Timeout wiring | Medium | Typed pause metadata + both pending creation paths |
+| 2. Gate pipeline integration | Medium-Large | Parity/ordering tests before removing inline checks |
+| 3. Modify UI option | Medium-Large | Atomic resolution + full policy re-evaluation |
+| 4. Supervision levels | Medium | Serde migration and centralized classification |
+| 5. Tests | Medium-Large | Crosses engine, host gate, router, persistence, HTTP, and WS |
 
 ## Phase 3 (Future)
 

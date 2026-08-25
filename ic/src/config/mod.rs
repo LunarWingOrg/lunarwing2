@@ -48,7 +48,7 @@ pub use self::database::{DatabaseBackend, DatabaseConfig, SslMode, default_libsq
 pub use self::embeddings::{DEFAULT_EMBEDDING_CACHE_SIZE, EmbeddingsConfig};
 pub use self::heartbeat::HeartbeatConfig;
 pub use self::hygiene::HygieneConfig;
-pub use self::knowledge::KnowledgeSweepConfig;
+pub use self::knowledge::{KnowledgeSeedConfig, KnowledgeSweepConfig};
 pub use self::llm::default_session_path;
 pub use self::oauth::OAuthConfig;
 pub use self::routines::RoutineConfig;
@@ -111,6 +111,7 @@ pub struct Config {
     pub heartbeat: HeartbeatConfig,
     pub hygiene: HygieneConfig,
     pub knowledge_sweep: KnowledgeSweepConfig,
+    pub knowledge_seed: KnowledgeSeedConfig,
     pub routines: RoutineConfig,
     pub sandbox: SandboxModeConfig,
     pub acp: AcpModeConfig,
@@ -185,6 +186,7 @@ impl Config {
             heartbeat: HeartbeatConfig::default(),
             hygiene: HygieneConfig::default(),
             knowledge_sweep: KnowledgeSweepConfig::default(),
+            knowledge_seed: KnowledgeSeedConfig::default(),
             routines: RoutineConfig {
                 enabled: false,
                 ..RoutineConfig::default()
@@ -369,6 +371,7 @@ impl Config {
             heartbeat: HeartbeatConfig::resolve(settings)?,
             hygiene: HygieneConfig::resolve()?,
             knowledge_sweep: KnowledgeSweepConfig::resolve()?,
+            knowledge_seed: KnowledgeSeedConfig::resolve()?,
             routines: RoutineConfig::resolve()?,
             sandbox: SandboxModeConfig::resolve(settings)?,
             acp: AcpModeConfig::resolve(settings)?,

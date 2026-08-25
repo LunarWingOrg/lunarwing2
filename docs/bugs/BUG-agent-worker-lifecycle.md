@@ -1,7 +1,7 @@
 # Agent and worker lifecycle bugs
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-20).** The fire-and-forget completion race is fixed, one earlier
+> 2026-08-25).** The fire-and-forget completion race is fixed, one earlier
 > notification-task report is invalidated, and priority interrupts are now
 > handled during active turns. A synchronous `wait=true` worker call still
 > occupies the originating turn and serializes ordinary message handling.
@@ -28,12 +28,12 @@ with their distinct reproducers and current evidence.
 
 The old report's claim that no parallel tool work is possible is too broad: the
 dispatcher can run independent tools already emitted in one turn in a `JoinSet`
-(`ic/src/agent/dispatcher.rs:720-841`). Its stronger claim that the merged
+(`ic/src/agent/dispatcher.rs:783-846`). Its stronger claim that the merged
 channel stream stops being polled is also stale. `Agent::run` now spawns the
 active message task and continues selecting from `message_stream`; exact
 interrupt submissions are dispatched immediately, while ordinary messages are
 held in a 256-entry FIFO and replayed after the active task ends
-(`ic/src/agent/agent_loop.rs:1078-1188`, `ic/src/agent/dispatch.rs:6-51`). Queue
+(`ic/src/agent/agent_loop.rs:1106-1213`, `ic/src/agent/dispatch.rs:6-51`). Queue
 overflow receives an explicit busy response. This removes the former
 daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
 
@@ -48,7 +48,7 @@ daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
   external path (`execute_external`, `job.rs:872-1119`) awaits the worker
   result directly (`:994-1055`).
   The active task remains the current turn until completion, timeout, or
-  interruption (`ic/src/agent/agent_loop.rs:1126-1188`).
+  interruption (`ic/src/agent/agent_loop.rs:1144-1213`).
 - The default agent message timeout is 630 seconds
   (`ic/src/settings.rs:660-662,723-725`), so a long worker can consume most of a turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
@@ -120,15 +120,15 @@ The old report treated every `while let Some(response) = recv().await` as an
 unbounded leak. In the current tree the channels are bounded and normal Tokio
 `mpsc` semantics end the loop when all senders are dropped:
 
-- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:769-770`
-  and the forwarder receive loop is at `:784`.
+- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:798`
+  and the forwarder receive loop is at `:812`.
 - Routine notifications use `mpsc::channel(32)` at
-  `ic/src/agent/agent_loop.rs:924-925` and the forwarder receive loop is at
-  `:952`.
+  `ic/src/agent/agent_loop.rs:953` and the forwarder receive loop is at
+  `:980`.
 - The owning heartbeat/routine tasks retain the sender while active
   (`ic/src/agent/heartbeat.rs:217`,
   `ic/src/agent/routine_engine.rs:115,146-158`) and the agent aborts their
-  handles during shutdown (`ic/src/agent/agent_loop.rs:1190-1208`).
+  handles during shutdown (`ic/src/agent/agent_loop.rs:1216-1236`).
 - The previously cited relay channel no longer exists in v2.
 
 Waiting while a live producer remains active is expected notification-forwarder
@@ -149,3 +149,12 @@ references refreshed after post-2026-08-03 churn in `agent_loop.rs`,
 the cited regions; no behavior described here changed). Re-verified on
 2026-08-20 (revision `2d10832a`): no status changed; the only drift was the
 630-second timeout default moving to `settings.rs:660-662,723-725`.
+Re-verified on 2026-08-25 (revision `57e8a36f`): no status changed; line
+references refreshed after the work-item #73 self-repair changes inserted
+~28 lines into `agent_loop.rs` (repair-counter reset and terminal
+`ManualRequired` surfacing) and ~13 lines into `dispatcher.rs` (skill
+attenuation info logging). The cited regions moved to
+`agent_loop.rs:1106-1213` (deferred FIFO loop), `:1144-1213` (active task),
+`:798`/`:812` (heartbeat channel/forwarder), `:953`/`:980` (routine
+channel/forwarder), `:1216-1236` (shutdown aborts), and
+`dispatcher.rs:783-846` (tool `JoinSet`).

@@ -131,6 +131,27 @@ principal; the WASM wrapper then resolves that scope through the persisted full 
 [`IRC-SENDER-IDENTITY.md`](IRC-SENDER-IDENTITY.md) for principal formats, threat boundaries, and
 migration behavior.
 
+### Status delivery
+
+The host can call the guest's `on_status` callback independently of normal
+`on_respond` delivery. WeeChat renders actionable updates as a single,
+IRC-sanitized `[status] ...` line addressed through the original message
+metadata. Approval prompts, authentication state, external waits, job starts,
+and routed tool activity are actionable; generic status text, thinking updates,
+and stream chunks are ignored by this guest.
+
+`ToolStarted`, `ToolCompleted`, and `ToolResult` are high-volume and are dropped
+by the WASM host unless the global `channels.tool_activity` setting is enabled
+(or `TOOL_ACTIVITY=true` overrides it). The flag defaults to false and applies to
+both channels loaded at startup and channels activated later. It is a host-level
+routing switch, not a WeeChat capability/setup field.
+
+Before any relay send, the guest suppresses `AuthRequired`, `AuthCompleted`, and
+`ExternalWaiting` in group buffers so setup instructions, OAuth URLs, or external
+wait details do not leak into a shared room. Those statuses remain deliverable in
+DMs; approval, job-start, and enabled tool-activity lines may be delivered to
+groups.
+
 ### Watermarks & new buffers
 
 In the polling fallback, `do_poll` seeds a per-buffer watermark the **first time** it sees a

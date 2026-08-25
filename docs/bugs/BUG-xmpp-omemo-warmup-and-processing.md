@@ -1,6 +1,6 @@
 # XMPP OMEMO fallback spam and processing stall
 
-> **Status: UNVERIFIED (checked against current source on 2026-08-20).** The
+> **Status: UNVERIFIED (checked against current source on 2026-08-25).** The
 > historical fallback-spam symptom has not been reproduced against the current
 > bridge and no current source path proves that it is resolved. The separate
 > stuck `Processing`-thread failure has a current static fix and is recorded
@@ -63,7 +63,7 @@ turn` followed by no reply. The documented root cause was cancellation of
 agent loop runs `handle_message` in a spawned task, keeps it alive through the
 soft timeout, and uses a hard-kill recovery that calls `fail_turn` while
 preserving queued messages (the queue-clearing `fail_turn_hard` no longer
-exists) (`ic/src/agent/agent_loop.rs:1118-1156,1393,1471`). The
+exists) (`ic/src/agent/agent_loop.rs:1146-1184,1421,1499`). The
 regression tests cover resetting a stuck thread and draining its queued
 messages (`ic/src/agent/session.rs:1669-1697`).
 
@@ -82,4 +82,11 @@ refreshed line references after post-2026-08-03 churn in `agent_loop.rs` and
 (`ic/src/channels/xmpp/mod.rs:3593-3662`) are unchanged. Re-verified on
 2026-08-20 (revision `2d10832a`): all cited references still match,
 `fail_turn_hard` remains absent, and no live bridge capture has appeared;
-statuses unchanged.
+statuses unchanged. Re-verified on 2026-08-25 (revision `57e8a36f`): statuses
+unchanged. The `allow_plaintext_fallback` default/forwarding
+(`channels-src/xmpp/src/lib.rs:291,314`), the DM-fallback unit tests
+(`ic/src/channels/xmpp/mod.rs:3593-3662`), and the stuck-thread regression
+tests (`session.rs:1669-1697`) are unchanged; the only drift is the work-item
+#73 `agent_loop.rs` insertions moving the spawned-task/hard-kill region to
+`:1146-1184` and the two `fail_turn` call sites to `:1421` and `:1499`. No live
+bridge capture has appeared.

@@ -1,7 +1,7 @@
 # E2E test bugs and retired fixtures
 
 > **Overall status: PARTIALLY-FIXED / one item UNVERIFIED (verified against
-> current source on 2026-08-20).** The tool-execution failure is resolved in
+> current source on 2026-08-25).** The tool-execution failure is resolved in
 > the current test/code paths. The old Gmail OAuth fixture was retired. The
 > bootstrap greeting production path is fixed, but both E2E assertions are
 > currently `#[ignore]`'d due to a harness timing race. The clipboard test
@@ -34,10 +34,10 @@ race; the current explicit gateway broadcast resolves that divergence.
 ### Current path and evidence
 
 - `Agent::run` takes `Arc<Self>` and persists the greeting before channel start
-  (`ic/src/agent/agent_loop.rs:562-580`).
+  (`ic/src/agent/agent_loop.rs:562-586`).
 - After startup it registers the gateway thread, constructs an
   `OutgoingResponse`, sets `thread_id`, and broadcasts to the gateway
-  (`ic/src/agent/agent_loop.rs:1066-1072`).
+  (`ic/src/agent/agent_loop.rs:1093-1099`).
 - `TestRigBuilder::with_bootstrap()` preserves the pending flag and installs a
   gateway-named test channel
   (`ic/tests/support/test_rig.rs:559-563,726-730,920-927`).
@@ -169,4 +169,8 @@ Re-verified on 2026-08-13 (revision `7e813db4`); the bootstrap tests'
 churn in `agent_loop.rs` and `app.js`. Re-verified on 2026-08-20 (revision
 `2d10832a`): all cited paths and line references still match; no status
 changed. Playwright/Pytest remain unavailable in this environment, so the
-clipboard item stays UNVERIFIED.
+clipboard item stays UNVERIFIED. Re-verified on 2026-08-25 (revision
+`57e8a36f`): no status changed; `ic/tests/` and `app.js` are untouched since
+the previous pass, and the only drift was the work-item #73 self-repair
+insertions in `agent_loop.rs` moving the greeting-broadcast region to
+`:1093-1099` (the persist region now reads most accurately as `:562-586`).

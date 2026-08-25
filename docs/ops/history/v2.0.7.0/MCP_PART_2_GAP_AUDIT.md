@@ -61,9 +61,9 @@ This audit treated the following as the Part 2 delivery contract:
   v2.0.6.0 MCP Part 2 work.
 
 The primary architecture source was
-[`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](../proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md).
-The audit also reconciled [`MCP_ADDITIONS.md`](MCP_ADDITIONS.md),
-[`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md), and the v2.0.6.0 release notes against
+[`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](../../../proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md).
+The audit also reconciled [`MCP_ADDITIONS.md`](../../MCP_ADDITIONS.md),
+[`MCP_OVERALL_STATUS.md`](../../MCP_OVERALL_STATUS.md), and the v2.0.6.0 release notes against
 current source. The shared Study Notes topic `mcp-host-local-crash-recovery`
 (`applejack-kimi/mcp-host-local-crash-recovery.md`, source commit `a5fc90b`) was used as
 an initial map, then reverified because its source commit predates this audit.

@@ -99,7 +99,7 @@ BUT: [CHARACTER_SPECIFIC_MEMORY_GUIDANCE — how this character's relationship t
 
 ### Memory Files
 
-- `memory/YYYY-MM-DD.md` — daily logs ([character-specific note about what gets logged])
+- `daily/YYYY-MM-DD.md` — daily logs ([character-specific note about what gets logged])
 - `MEMORY.md` — curated learnings [character-specific descriptor]
 - `HEARTBEAT.md` — periodic checks ([character-specific cadence note])
 

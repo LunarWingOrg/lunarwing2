@@ -94,4 +94,27 @@ impl ToolFailureStore for LibSqlBackend {
         .map_err(|e| DatabaseError::Query(e.to_string()))?;
         Ok(())
     }
+
+    async fn record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError> {
+        let conn = self.connect().await?;
+        conn.execute(
+            "UPDATE tool_failures SET error_count = 0, repair_attempts = 0 WHERE tool_name = ?1",
+            params![tool_name],
+        )
+        .await
+        .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError> {
+        let conn = self.connect().await?;
+        let rows = conn
+            .execute(
+                "UPDATE tool_failures SET repair_attempts = 0 WHERE repair_attempts > 0",
+                (),
+            )
+            .await
+            .map_err(|e| DatabaseError::Query(e.to_string()))?;
+        Ok(rows)
+    }
 }

@@ -797,6 +797,21 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                         "output": truncate_for_preview(&sanitized.content, 500),
                     }),
                 );
+
+                // Last-known-good gate for self-repair: a tool that just
+                // succeeded is demonstrably not broken, so clear any
+                // accumulated failure state instead of letting the watchdog
+                // burn repair cycles on a functional tool (work item #73).
+                if let Some(store) = self.store() {
+                    let store = store.clone();
+                    let tool_name = selection.tool_name.clone();
+                    tokio::spawn(async move {
+                        if let Err(db_err) = store.record_tool_success(&tool_name).await {
+                            tracing::warn!("Failed to record tool success: {}", db_err);
+                        }
+                    });
+                }
+
                 Ok(())
             }
             Err(e) => {

@@ -1,4 +1,4 @@
-> **Resolved 2026-07-29:** See [`SIS_FIX_PROPOSAL.md`](SIS_FIX_PROPOSAL.md) for
+> **Resolved 2026-07-29:** See [`SIS_FIX_PROPOSAL.md`](../SIS_FIX_PROPOSAL.md) for
 > source findings, implementation, tests, and remaining limits. A summary is at
 > the end of this file.
 

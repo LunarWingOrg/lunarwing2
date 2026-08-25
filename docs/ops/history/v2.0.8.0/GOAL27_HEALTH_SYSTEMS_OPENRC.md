@@ -4,8 +4,8 @@ Date: 2026-08-22 · Branch: `rarity/kimi-27-20260822-0901`
 
 Scope: thoroughly test and improve the health systems' **OpenRC/Gentoo**
 surface, transferring the applicable item-28 (systemd pass) findings — see
-`docs/ops/ajsystemdhealthpass.md` for the transfer list and
-`docs/ops/v2.0.8.0_GOAL28_HEALTH_SYSTEMS_SYSTEMD.md` for the systemd side.
+`docs/ops/history/v2.0.8.0/GOAL28_SYSTEMD_HEALTH_HANDOFF.md` for the transfer list and
+`docs/ops/history/v2.0.8.0/GOAL28_HEALTH_SYSTEMS_SYSTEMD.md` for the systemd side.
 All work verified on the dev host via the mock-based harnesses (no real OpenRC
 is ever touched by the suites).
 

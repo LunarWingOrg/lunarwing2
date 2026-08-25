@@ -1,24 +1,25 @@
 # Bug tracker
 
-Reconciled against current source (revision `2d10832a`) on **2026-08-20**
-(prior passes against revision `7e813db4` on 2026-08-13, `94dfd58` on
-2026-08-03, on 2026-07-28, and against revision `51ae5a8` on 2026-07-20). The
-2026-08-20 pass re-verified every active canonical report against code: no
-status changed. Line references were refreshed where source drifted since
-2026-08-13 — most notably the v2.0.8.0 split of `lunarwing-mt-admin.sh` into
-`ic/scripts/mt-admin-lib/NN-*.sh` modules (external-worker provisioning refs
-now name the owning module), plus churn in `wasm/wrapper.rs` (`start_polling`,
-`health_check`, queue creation, `dispatch_emitted_messages`, poll tests),
-`channels/manager.rs` (`health_check_all`), `settings.rs` (timeout default and
-token re-injection regions), `orchestrator/external_worker.rs`, and
-`lunarwing_weechat_wss/weechat_relay/src/lib.rs` (`rand_check` moved to
-`:2243-2251`). The SSH-Git bare-HEAD reproduction was re-run live again (same
-exit-0/empty-checkout result), and the OpenCode path self-check was re-run
-under Node (passed). All 38 Markdown documents in this tracker (36
-report/pointer files plus two README files) were checked against current source,
-scripts, tests, and reachable Git history. Closely related reports remain
-grouped; their original filenames and technical evidence are named in the
-canonical documents.
+Reconciled against current source (revision `57e8a36f`) on **2026-08-25**
+(prior passes against revision `2d10832a` on 2026-08-20, `7e813db4` on
+2026-08-13, `94dfd58` on 2026-08-03, on 2026-07-28, and against revision
+`51ae5a8` on 2026-07-20). The 2026-08-25 pass re-verified every active
+canonical report against code: no status changed. Line references were
+refreshed where source drifted since 2026-08-20 — the work-item #73
+self-repair changes inserted lines into `agent_loop.rs` (moving the deferred
+FIFO loop, greeting broadcast, heartbeat/routine notification channels,
+shutdown aborts, and `fail_turn` call sites) and `dispatcher.rs` (moving the
+tool `JoinSet`); the work-item #65 port-collision work shifted the `patch-env`
+retrofit calls and `add-tenant` `--with-*` parsing arms; XMPP bridge
+attachment/upload growth moved `messages_handler`/`enqueue_message`; and
+watchdog additions moved the deep channel-health check regions.
+`import-tenant.sh`, `ssh_git.rs`, `weechat_relay/src/lib.rs`,
+`opencode4lunarwing/`, `pebble4lunarwing/`, `external_worker.rs`, and all of
+`ic/tests/` were unchanged, so their cited references still match exactly. All
+38 Markdown documents in this tracker (36 report/pointer files plus two README
+files) were checked against current source, scripts, tests, and reachable Git
+history. Closely related reports remain grouped; their original filenames and
+technical evidence are named in the canonical documents.
 
 **Status vocabulary:** `FIXED` means the current tree contains the stated fix;
 `OPEN` means the issue remains; `PARTIAL` means a fix covers only part of the

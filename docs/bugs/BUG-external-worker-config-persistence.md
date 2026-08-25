@@ -1,7 +1,7 @@
 # Multi-tenant external-worker configuration
 
 > **Status: FIXED in source and unit tests (verified against current source on
-> 2026-08-20); live runtime re-check not yet run.** Tenant provisioning
+> 2026-08-25); live runtime re-check not yet run.** Tenant provisioning
 > generates Pebble, OpenCode, and Kimi endpoint blocks, in-memory settings
 > merges preserve their bearer tokens, and `Settings::save_toml` now re-injects
 > worker and endpoint `auth_token` values into every full TOML rewrite, with
@@ -28,7 +28,7 @@ selected supported worker's per-tenant WSS URL, timeout, and gateway token:
 - `add-tenant` calls it for Pebble, OpenCode, and Kimi
   (`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:513-515`)
 - retrofit calls are present in `patch-env`
-  (`ic/scripts/mt-admin-lib/06-env-generation.sh:1938-1940`)
+  (`ic/scripts/mt-admin-lib/06-env-generation.sh:1944-1946`)
 - TOML shape is covered by `ic/src/config/sandbox.rs:146-158,168-176`
 
 The generated shape remains:
@@ -53,7 +53,7 @@ and written by `ports_allocate` at
 gates workers on that selection (`tenant_worker_enabled`,
 `ic/scripts/mt-admin-lib/00-common.sh:294-299`, applied in the start loop at
 `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:899-910`; `--with-*` parsing at
-`ic/scripts/lunarwing-mt-admin.sh:494-496`; build selection at
+`ic/scripts/lunarwing-mt-admin.sh:498-500`; build selection at
 `ic/scripts/mt-admin-lib/05-tenant-build.sh:421-427,484-500`). An endpoint
 block alone does not build or start a worker.
 
@@ -108,4 +108,13 @@ v2.0.8.0, so all provisioning references were re-mapped to the owning modules
 (`00-common.sh`, `03-ports-registry.sh`, `04-tenant-lifecycle.sh`,
 `05-tenant-build.sh`, `06-env-generation.sh`, `09-worker-config.sh`); the
 `settings.rs` references shifted by a few lines and were refreshed. No status
-changed.
+changed. Re-verified on 2026-08-25 (revision `57e8a36f`): no status changed.
+The work-item #65 port-collision work grew `03-ports-registry.sh`
+(`ports_warn_block_in_use`, `ports_registry_duplicate_ports`) and shifted two
+cited regions — the `patch-env` retrofit calls now sit at
+`06-env-generation.sh:1944-1946` and the `add-tenant` `--with-*` parsing arms
+at `lunarwing-mt-admin.sh:498-500`; every other reference (including the
+`ports_allocate` jq write at `03-ports-registry.sh:649-667` and
+`ensure_external_worker_config` at `09-worker-config.sh:213-292`) still matches
+exactly. The `settings.rs` re-injection path and its round-trip tests are
+unchanged.

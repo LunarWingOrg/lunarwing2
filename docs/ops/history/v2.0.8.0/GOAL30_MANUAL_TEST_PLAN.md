@@ -439,7 +439,7 @@ listed so nobody re-spends effort:
   cargo-deny/RustSec posture, Kaniko push retries, and CI branch-scope
   changes — CI-verified or ops-side only.
 - Repo-hygiene moves and documentation refreshes — reviewable in diffs
-  (`docs/ops/v2.0.8.0_REPO_HYGIENE.md`).
+  (`docs/ops/history/v2.0.8.0/REPO_HYGIENE.md`).
 
 ## Sign-off
 

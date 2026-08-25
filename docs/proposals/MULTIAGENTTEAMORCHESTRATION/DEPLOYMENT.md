@@ -158,7 +158,7 @@ channel, native and installable WASM XMPP channels coalesce identically.
 - Agent shutdown flushes all pending messages before channels close and waits
   for timer/early-flush callbacks already in flight.
 - Coalesced flushes pass through the existing XMPP hourly rate limiter
-  (`OutboundRateLimiter`, see also `scripts/xmpp-rate-limit.sh` for the
+  (`OutboundRateLimiter`, see also `ic/scripts/xmpp-rate-limit.sh` for the
   bridge-level control) — coalescing reduces volume, it doesn't bypass limits.
 
 ## Cross-tenant knowledge propagation (`KNOW:`)
@@ -360,7 +360,7 @@ topic lookup, and cleanup. It skips cleanly when no test database is configured.
    `COORD_MAX_MESSAGES` per hour *in coordination channels*, pre-send.
 2. **Transport rate limit** (existing): the XMPP adapter's
    `OutboundRateLimiter` caps total outbound stanzas per hour; manage the
-   bridge-level limit with `scripts/xmpp-rate-limit.sh`
+   bridge-level limit with `ic/scripts/xmpp-rate-limit.sh`
    (`status` / `set <n>` / `off` / `reset`, requires `XMPP_BRIDGE_TOKEN`).
 
 Both apply to coordination traffic; the stricter one wins.

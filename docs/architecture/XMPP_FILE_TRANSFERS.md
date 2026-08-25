@@ -98,7 +98,16 @@ The last URL path segment is used, with any query/fragment stripped. A missing e
 
 ### WASM channel processing
 
-The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attachments during `on_poll()`: base64-decodes each `BridgeIncomingAttachment`, stores bytes via `store_attachment_data()`, and emits `InboundAttachment` records the host merges into `IncomingAttachment.data`.
+The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound
+attachments during `on_poll()`: it base64-decodes each
+`BridgeIncomingAttachment`, stages bytes via `store_attachment_data()`, and emits
+`InboundAttachment` records that the host merges into `IncomingAttachment.data`.
+The staging store permits 20 MiB per attachment and 50 MiB across the callback,
+but that is not the final message budget: `emit_message()` independently applies
+`MAX_ATTACHMENT_TOTAL_SIZE` and retains only the in-order attachment prefix whose
+cumulative declared-or-actual bytes fit within 20 MiB. The effective aggregate
+that reaches the agent is therefore 20 MiB, even though temporary callback
+staging is allowed up to 50 MiB.
 
 ## Limits
 
@@ -110,8 +119,9 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
 | Download DNS resolution timeout | 5 seconds (`OOB_DNS_TIMEOUT_SECS`) | XmppChannel (egress guard) |
 | Attachment extraction timeout | 60 seconds (`OOB_EXTRACTION_TIMEOUT_SECS`) | XmppChannel |
-| Per-attachment store | 20 MB | WASM host (`store_attachment_data`) |
-| Total attachment store per callback | 50 MB | WASM host |
+| Per-attachment staging store | 20 MB | WASM host (`store_attachment_data`) |
+| Total attachment staging per callback | 50 MB | WASM host (`store_attachment_data`) |
+| Total attachments emitted to the agent | 20 MB cumulative in-order prefix | WASM host (`emit_message` / `validate_attachments`) |
 | Decoded image size for LunarVision enrichment | 10 MB | VisionEnrichmentMiddleware + OCR sidecar |
 | Concurrent LunarVision analyses | 2 | VisionEnrichmentMiddleware |
 | LunarVision request timeout | 45 seconds | VisionEnrichmentMiddleware |
@@ -172,7 +182,7 @@ Encrypted file shares are handled end-to-end:
 
 - Inbound downloads fetch sender-supplied URLs through an egress guard (`policy_checked_download_client`): https-only by default (plain http only when `ALLOW_PRIVATE_IPS=1`), embedded credentials rejected, DNS resolved up front with non-public addresses (private/loopback/link-local/CGNAT/ULA/unspecified/broadcast/multicast) blocked unless `ALLOW_PRIVATE_IPS=1` opts out, the client pinned to the validated addresses (anti-rebind), and redirects plus environment proxies disabled. Both download paths (`download_oob_file`, `download_aesgcm_file`) use it.
 - Size limits are enforced during streaming, and the per-stanza URL count and download concurrency are bounded, so a crafted stanza cannot exhaust memory or stall the connection.
-- The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations. Both checks run as middleware (`authorize_middleware`) **before** any request body is buffered, so unauthenticated or non-loopback requests are rejected with 401/403 without the `Json` extractor reading the body. `/v1/messages/send` bodies are bounded at 70 MiB (`MAX_SEND_BODY_BYTES`) — sized to the host's 50 MB outbound attachment cap plus base64 inflation — so a photo-sized send is never rejected by axum's 2 MiB default body limit while a runaway client still cannot exhaust bridge memory. The raised limit is scoped to the send route only; every other bridge route keeps the 2 MiB default, closing the pre-auth memory-amplification window from `docs/ops/MEDIUM.MD` (concurrent unauthenticated 70 MiB POSTs to control routes).
+- The local bridge HTTP surface rejects non-loopback clients. When `XMPP_BRIDGE_TOKEN` is configured, it also requires Bearer authentication before configure, poll, and send operations. Both checks run as middleware (`authorize_middleware`) **before** any request body is buffered, so unauthenticated or non-loopback requests are rejected with 401/403 without the `Json` extractor reading the body. `/v1/messages/send` bodies are bounded at 70 MiB (`MAX_SEND_BODY_BYTES`) — sized to the host's 50 MB outbound attachment cap plus base64 inflation — so a photo-sized send is never rejected by axum's 2 MiB default body limit while a runaway client still cannot exhaust bridge memory. The raised limit is scoped to the send route only; every other bridge route keeps the 2 MiB default, closing the pre-auth memory-amplification window from `docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md` (concurrent unauthenticated 70 MiB POSTs to control routes).
 - Automatic LunarVision requests accept only `http://localhost` or loopback-IP base URLs, disable redirects and environment proxies, inject configured `VISION_AUTH_TOKEN` from `SecretString`, and cap both sidecar response and model-visible extraction sizes. An incompatible URL disables this automatic path without aborting daemon startup. The accepted message's text is never forwarded to the sidecar; a fixed prompt drives analysis. Enrichment runs inside normal message timeout supervision after inbound hooks.
 - Explicit `vision-analyze` WASM calls receive that token only inside the host HTTP boundary, scoped to the configured sidecar origin and `/v1/` path; the credential is not serialized into WASM context or sent through an environment proxy.
 - LunarVision failures are fail-open only for enrichment: original image bytes remain on the existing multimodal path, while credentials and source URLs remain excluded from model-visible text.
@@ -186,6 +196,6 @@ Implemented and unit-tested (`cargo test channels::xmpp`); the standalone `xmpp-
 3. **Encrypted media** — `aesgcm://` (XEP-0454) download + AES-256-GCM decrypt; decrypted-body URL re-parsing.
 4. **Filename robustness** — `filename_from_url` (no longer drops extensionless/opaque names).
 5. **Automatic LunarVision enrichment** — bounded OCR/VL preprocessing with optional host-side Bearer auth, shared by legacy and Engine V2 while preserving original multimodal image input.
-6. **Outbound body limit fix** (work item #42) — `/v1/messages/send` gained an explicit 70 MiB `DefaultBodyLimit`; photo-sized base64 attachments previously exceeded axum's 2 MiB default and failed with HTTP 413 before the send handler ran, so agents could not attach and send ordinary images. The limit is layered on the send route only (other routes keep the 2 MiB default) and authorization was moved into pre-body middleware (`docs/ops/MEDIUM.MD` follow-up).
+6. **Outbound body limit fix** (work item #42) — `/v1/messages/send` gained an explicit 70 MiB `DefaultBodyLimit`; photo-sized base64 attachments previously exceeded axum's 2 MiB default and failed with HTTP 413 before the send handler ran, so agents could not attach and send ordinary images. The limit is layered on the send route only (other routes keep the 2 MiB default) and authorization was moved into pre-body middleware (`docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md` follow-up).
 
 **Remaining:** live end-to-end validation against a real server (e.g. Conversations/Gajim → agent over a working XEP-0363 host). This remains file-transfer hardening work, not a gap in LunarVision routing.

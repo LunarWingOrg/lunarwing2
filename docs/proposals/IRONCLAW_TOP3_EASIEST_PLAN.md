@@ -1,8 +1,9 @@
 # IronClaw Port: Top 3 Easiest Additions — Implementation Plan
 
-> **Current status (2026-07-22): OPEN / PLANNED.** None of the three items
-> below have been implemented. All three are confirmed gaps against the
-> current LunarWing tree. This document complements
+> **Current status (reverified 2026-08-25): OPEN / PLANNED.** None of the
+> three items below has been implemented. The five unsafe display slices remain,
+> application SSE errors still use the reserved `error` event, and the built-in
+> HTTP path still performs the post-injection scan. This document complements
 > `IRONCLAW_TOP2_PRIORITY_PLAN.md` (which covers the two highest-priority
 > security items) by selecting the three **easiest** candidates — smallest
 > scope, fewest dependencies, most confined changes.
@@ -110,10 +111,10 @@ CLI modules already use char-based truncation helpers correctly.
 From `ic/`:
 
 ```bash
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6
-taskset -c 0-5 cargo test -j6 truncate_for_display -- --test-threads=6
-taskset -c 0-5 cargo test -j6 cli -- --test-threads=6
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo test -j12 truncate_for_display -- --test-threads=12
+taskset -c 0-11 cargo test -j12 cli -- --test-threads=12
 ```
 
 Key regression test: a multi-byte string whose byte length exceeds the
@@ -199,9 +200,9 @@ The serde rename is at `ic/src/channels/web/types.rs:207`
 From `ic/`:
 
 ```bash
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6
-taskset -c 0-5 cargo test -j6 sse -- --test-threads=6
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo test -j12 sse -- --test-threads=12
 ```
 
 Key regression test: an `SseEvent::Error` frame serializes with event name
@@ -290,9 +291,9 @@ while this concerns the built-in `http` tool path.
 From `ic/`:
 
 ```bash
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6
-taskset -c 0-5 cargo test -j6 http_tool -- --test-threads=6
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo test -j12 http_tool -- --test-threads=12
 ```
 
 Key regression test: a `ghp_`-shaped secret injected as an http credential
@@ -334,10 +335,10 @@ All three items are documentation-only in this plan. Implementation PRs
 should run from `ic/`:
 
 ```bash
-taskset -c 0-5 cargo fmt --all -- --check
-taskset -c 0-5 cargo check -j6 --no-default-features --features postgres
-taskset -c 0-5 cargo check -j6 --no-default-features --features libsql
-taskset -c 0-5 cargo test -j6 -- --test-threads=6
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12 --no-default-features --features postgres
+taskset -c 0-11 cargo check -j12 --no-default-features --features libsql
+taskset -c 0-11 cargo test -j12 -- --test-threads=12
 ```
 
 Each fix needs a regression test proving the specific bug is fixed.

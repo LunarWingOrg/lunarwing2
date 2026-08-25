@@ -162,9 +162,9 @@ Or via the gateway UI's extension install flow. The auth step stores `multica_ap
 
 - `ic/tools-src/multica-bridge/` — WASM tool crate
 - `ic/tools-src/multica-bridge/multica-bridge.capabilities.json` — capabilities
-- `ic/skills/multica-poll.md` — SKILL.md for the polling routine
+- `ic/skills/multica-poll/SKILL.md` — polling workflow skill
 - Workspace config schema for `config/multica.json`
-- Build integration in `scripts/build-wasm-extensions.sh`
+- Build integration in `ic/scripts/build-wasm-extensions.sh`
 
 ### Validation
 

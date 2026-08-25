@@ -91,11 +91,21 @@ pub trait EffectExecutor: Send + Sync {
 
     /// List available actions given the current set of active leases.
     ///
-    /// Used to build the action definitions sent to the LLM.
+    /// Used to build the action definitions sent to the LLM. Implementations
+    /// must not return actions that none of the supplied leases covers.
     async fn available_actions(
         &self,
         leases: &[CapabilityLease],
     ) -> Result<Vec<ActionDef>, EngineError>;
+
+    /// List every action currently registered with the executor.
+    ///
+    /// This unscoped catalog is used only to provision leases for actions that
+    /// were registered after a thread was created. Execution prompts must use
+    /// [`EffectExecutor::available_actions`] instead.
+    async fn registered_actions(&self) -> Result<Vec<ActionDef>, EngineError> {
+        self.available_actions(&[]).await
+    }
 }
 
 #[cfg(test)]

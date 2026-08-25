@@ -1,10 +1,16 @@
 # WASM Functionality Expansion Proposal
 
-> **Status (2026-08-09): RESEARCH COMPLETE / PROPOSAL OPEN.** Written for
-> release-goals item #10 in `docs/ops/AGENT_GOALS_2.0.6.0.md`. All "current
-> state" claims below were verified against the tree at commit `fc01dc30`
-> (branch `aj/kimi-10-20260809-1802`). Items marked *(verify)* were inferred
-> from prior analyses and should be re-confirmed before implementation.
+> **Status (reverified 2026-08-25): RESEARCH COMPLETE / PROPOSAL PARTIALLY
+> OVERTAKEN, PHASE PLAN OPEN.** Originally written for a retired v2.0.6.0
+> release-goals item #10. The baseline below now includes later `ssh-exec`,
+> stateful MCP-over-WASM, and marketplace-trust-library work. Those additions do
+> not complete the proposed phases: current source still has no shared WASM
+> admission semaphore, per-extension execution metrics, tool workspace-write,
+> extension KV API, channel timers, WASM hooks, or WASM routines. Generic WASM
+> `TrustLevel` still does not attenuate requested capabilities, and channel HTTP
+> egress still lacks the tool runtime's redirect/DNS-pinning parity. Claims were
+> rechecked against revision `57e8a36f`; items marked *(verify)* still require
+> version-specific library research before implementation.
 
 ## Goal
 
@@ -13,9 +19,10 @@ expansion directions (new host capabilities, new WASM extension kinds,
 runtime/observability upgrades, guest developer experience), and propose a
 phased plan that sequences security debt before feature growth.
 
-This is a research + direction document. Nothing here is implemented yet;
-each phase names the files it would touch so follow-up work items can be
-scoped directly from it.
+This is a research + direction document. Most of its Phase 1–4 roadmap remains
+open; later releases independently added some capabilities and trust primitives
+that are now reflected in the current-state sections. Each remaining phase names
+the files it would touch so follow-up work items can be scoped directly.
 
 ## Current State (verified)
 

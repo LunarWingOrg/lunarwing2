@@ -1,15 +1,24 @@
 # Session Audit — MT Admin, DarkIRC, External Worker Enhancements (2026-06-23)
 
-> **Current status (rechecked 2026-08-04): HISTORICAL AUDIT WITH OPEN ITEMS.**
-> H1-H3, M3-M8, T1/T2/T4/T5/T6/T7, and the worker-health port work landed.
-> M9 is partial: connection-failure failover works for both strategies, but
-> protocol errors and timeouts are not retried. M1/M2, L2/L5-L8, and T3 remain
-> open; L4 is partial because the guide was corrected but the legacy
-> `BRIDGE_SOCKET` line remains. Worker names,
-> line numbers, and v8 port examples capture the June baseline: Codex was removed
-> and Nanocode was later retired; supported persistent workers are now Pebble,
-> OpenCode, and Kimi Code. Current DarkIRC Stage A security work is documented in
-> `DARKIRC_SECURE_KEY_EXCHANGE.md`, not in this session record.
+> **Current status (reverified 2026-08-25): HISTORICAL AUDIT WITH OPEN
+> ITEMS.** H1-H3, M3-M8, T1/T2/T4/T5/T6/T7, and the worker-health port work
+> landed. M9 is partial: connection-failure failover works for both strategies,
+> but protocol errors and timeouts are not retried. M1/M2, L2/L5/L6/L8, and T3
+> remain open. L4 remains partial because the guide was corrected but the legacy
+> `BRIDGE_SOCKET` line remains. L7 is now partial: startup warns loudly for
+> non-loopback cleartext `ws://` endpoints, but does not reject them. Worker
+> names, line numbers, and v8 port examples capture the June baseline: Codex was
+> removed and Nanocode was later retired; supported persistent workers are now
+> Pebble, OpenCode, and Kimi Code. Current DarkIRC Stage A security work is
+> documented in `DARKIRC_SECURE_KEY_EXCHANGE.md`, not in this session record.
+>
+> **Current mt-admin addendum:** the root script is now a 1,268-line composition
+> root over fourteen `mt-admin-lib/` modules. Ports registry schema v16 includes
+> later voice/metrics slots. Fresh allocation probes every assigned loopback port
+> and warns non-fatally when an untracked listener is already bound; `doctor`
+> separately fails its `no duplicate ports in registry` check when two registry
+> slots share a number. These are post-audit safeguards, not revisions to the
+> June v8 evidence below.
 
 > Tracking document for the dev session on branch `1.1.6-OCS-A-4DIRCandEWE`.
 > Covers three in-development feature areas. Use the Work Tracker below to record
@@ -61,7 +70,7 @@ Status legend: `TODO` · `IN PROGRESS` · `DONE` · `WONTFIX` · `DEFERRED`
 | L4 | Guide now documents stdlib HTTP and inline contact keys; legacy `darkirc.env` still carries an unused Unix-socket comment/value | DarkIRC | `DARKIRC_MT_ADAPTER.md`, `darkirc.env:17-18` | PARTIAL |
 | L5 | `LoadBalancer::new` `assert!` + `lb.unwrap()` are production panics | EWE | `external_worker.rs:433,265` | TODO |
 | L6 | No backpressure / concurrency cap on external worker tasks | EWE | `external_worker.rs` (max_idle_per_endpoint bounds only idle) | TODO |
-| L7 | `ws://` cleartext default; no enforcement/warning for remote workers | EWE | `config/sandbox.rs:564-568` | TODO |
+| L7 | `ws://` cleartext remains permitted; non-loopback endpoints now emit a startup warning naming the worker/host and recommending `wss://` | EWE | `orchestrator/external_worker.rs` (`extract_host`, `is_loopback`, manager startup) | PARTIAL |
 | L8 | `FEATURE_PARITY.md` has no rows for MT admin, DarkIRC, or external workers | All | `ic/FEATURE_PARITY.md` | TODO |
 
 ### Test gaps
