@@ -1,6 +1,6 @@
 # Kawarimi import `--with-wasm` flag parity
 
-> **Status: STILL-OPEN (source-verified against current source on 2026-08-20).**
+> **Status: STILL-OPEN (source-verified against current source on 2026-08-25).**
 > `import-tenant.sh` always adds `--with-wasm` internally but rejects an
 > operator-supplied `--with-wasm`, unlike `build-tenant`.
 
@@ -48,4 +48,7 @@ was run. Re-verified on 2026-08-13 (revision `7e813db4`): the parser
 are all unchanged since the previous pass. Re-verified on 2026-08-20 (revision
 `2d10832a`): parser arms, reject arm, unconditional `--with-wasm` build
 argument, and `--with-kimi`/`--with-vision`/`--with-nanocode` arms are all
-unchanged; the defect remains exactly as described.
+unchanged; the defect remains exactly as described. Re-verified on 2026-08-25:
+`import-tenant.sh` is unchanged since `2d10832a`, so every cited line still
+matches; the Kawarimi flag harness was re-run and passed all cases. The defect
+remains open.

@@ -1,6 +1,6 @@
 # WeeChat relay `rand_check` stub
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-20).** The
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-25).** The
 > stale `HttpEndpointConfig` import warning is gone; `rand_check` still ignores
 > its probability argument and always returns `false`.
 
@@ -38,3 +38,7 @@ the import block at `:44-51` remains free of unused imports. Re-verified on
 2026-08-20 (revision `2d10832a`): `rand_check` moved to `lib.rs:2243-2251`
 (file growth below it) but is byte-identical in behavior, still has no call
 sites, and the import block at `:44-50` remains free of unused imports.
+Re-verified on 2026-08-25: `lib.rs` is unchanged since `2d10832a` (only the
+crate `Cargo.toml`/`Cargo.lock` version bumped), so `rand_check` at
+`:2243-2251` and the import block at `:46-50` still match; a fresh
+`rand_check` call-site search still finds none.
