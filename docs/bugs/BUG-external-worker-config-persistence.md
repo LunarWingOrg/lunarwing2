@@ -1,7 +1,7 @@
 # Multi-tenant external-worker configuration
 
 > **Status: FIXED in source and unit tests (verified against current source on
-> 2026-08-20); live runtime re-check not yet run.** Tenant provisioning
+> 2026-08-25); live runtime re-check not yet run.** Tenant provisioning
 > generates Pebble, OpenCode, and Kimi endpoint blocks, in-memory settings
 > merges preserve their bearer tokens, and `Settings::save_toml` now re-injects
 > worker and endpoint `auth_token` values into every full TOML rewrite, with
@@ -28,7 +28,7 @@ selected supported worker's per-tenant WSS URL, timeout, and gateway token:
 - `add-tenant` calls it for Pebble, OpenCode, and Kimi
   (`ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:513-515`)
 - retrofit calls are present in `patch-env`
-  (`ic/scripts/mt-admin-lib/06-env-generation.sh:1938-1940`)
+  (`ic/scripts/mt-admin-lib/06-env-generation.sh:1944-1946`)
 - TOML shape is covered by `ic/src/config/sandbox.rs:146-158,168-176`
 
 The generated shape remains:
@@ -47,7 +47,7 @@ that value as `AGENT_AUTH_TOKEN`.
 
 Worker selection is separate from config generation: `--with-*` flags persist
 selection into the ports registry (`.tenants[<name>].workers.<worker>`; the
-JSON object is built at `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:478-480`
+JSON object is built at `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh:478-479`
 and written by `ports_allocate` at
 `ic/scripts/mt-admin-lib/03-ports-registry.sh:649-667`) and the start path
 gates workers on that selection (`tenant_worker_enabled`,
@@ -108,4 +108,12 @@ v2.0.8.0, so all provisioning references were re-mapped to the owning modules
 (`00-common.sh`, `03-ports-registry.sh`, `04-tenant-lifecycle.sh`,
 `05-tenant-build.sh`, `06-env-generation.sh`, `09-worker-config.sh`); the
 `settings.rs` references shifted by a few lines and were refreshed. No status
-changed.
+changed. Re-verified on 2026-08-25: the work-item-#65 port-collision additions
+grew `03-ports-registry.sh` and `04-tenant-lifecycle.sh` but did not move the
+cited regions (`ports_allocate`'s registry write still at
+`03-ports-registry.sh:649-667`, add-tenant calls still at
+`04-tenant-lifecycle.sh:513-515`, start-loop gate still at `:899-910`); only
+the `patch-env` retrofit calls moved to `06-env-generation.sh:1944-1946` and
+the workers JSON literal ref was tightened to
+`04-tenant-lifecycle.sh:478-479`. `settings.rs` is unchanged since `2d10832a`.
+No status changed.
