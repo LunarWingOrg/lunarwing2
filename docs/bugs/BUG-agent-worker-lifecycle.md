@@ -1,7 +1,7 @@
 # Agent and worker lifecycle bugs
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-20).** The fire-and-forget completion race is fixed, one earlier
+> 2026-08-25).** The fire-and-forget completion race is fixed, one earlier
 > notification-task report is invalidated, and priority interrupts are now
 > handled during active turns. A synchronous `wait=true` worker call still
 > occupies the originating turn and serializes ordinary message handling.
@@ -33,7 +33,7 @@ channel stream stops being polled is also stale. `Agent::run` now spawns the
 active message task and continues selecting from `message_stream`; exact
 interrupt submissions are dispatched immediately, while ordinary messages are
 held in a 256-entry FIFO and replayed after the active task ends
-(`ic/src/agent/agent_loop.rs:1078-1188`, `ic/src/agent/dispatch.rs:6-51`). Queue
+(`ic/src/agent/agent_loop.rs:1106-1216`, `ic/src/agent/dispatch.rs:6-51`). Queue
 overflow receives an explicit busy response. This removes the former
 daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
 
@@ -48,7 +48,7 @@ daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
   external path (`execute_external`, `job.rs:872-1119`) awaits the worker
   result directly (`:994-1055`).
   The active task remains the current turn until completion, timeout, or
-  interruption (`ic/src/agent/agent_loop.rs:1126-1188`).
+  interruption (`ic/src/agent/agent_loop.rs:1154-1216`).
 - The default agent message timeout is 630 seconds
   (`ic/src/settings.rs:660-662,723-725`), so a long worker can consume most of a turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
@@ -120,15 +120,15 @@ The old report treated every `while let Some(response) = recv().await` as an
 unbounded leak. In the current tree the channels are bounded and normal Tokio
 `mpsc` semantics end the loop when all senders are dropped:
 
-- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:769-770`
-  and the forwarder receive loop is at `:784`.
+- Heartbeat uses `mpsc::channel(16)` at `ic/src/agent/agent_loop.rs:797-798`
+  and the forwarder receive loop is at `:812`.
 - Routine notifications use `mpsc::channel(32)` at
-  `ic/src/agent/agent_loop.rs:924-925` and the forwarder receive loop is at
-  `:952`.
+  `ic/src/agent/agent_loop.rs:952-953` and the forwarder receive loop is at
+  `:980`.
 - The owning heartbeat/routine tasks retain the sender while active
   (`ic/src/agent/heartbeat.rs:217`,
   `ic/src/agent/routine_engine.rs:115,146-158`) and the agent aborts their
-  handles during shutdown (`ic/src/agent/agent_loop.rs:1190-1208`).
+  handles during shutdown (`ic/src/agent/agent_loop.rs:1220-1236`).
 - The previously cited relay channel no longer exists in v2.
 
 Waiting while a live producer remains active is expected notification-forwarder
@@ -149,3 +149,8 @@ references refreshed after post-2026-08-03 churn in `agent_loop.rs`,
 the cited regions; no behavior described here changed). Re-verified on
 2026-08-20 (revision `2d10832a`): no status changed; the only drift was the
 630-second timeout default moving to `settings.rs:660-662,723-725`.
+Re-verified on 2026-08-25: no status changed; the only drift was
+`agent_loop.rs` gaining 28 lines from the work-item-#73 self-repair changes
+(boot-time repair-counter reset at `:606-617` and terminal `ManualRequired`
+owner alert at `:726-741`), which shifted every cited region at or after the
+deferred-message loop by +28 lines.
