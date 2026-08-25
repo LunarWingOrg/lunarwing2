@@ -23,7 +23,7 @@
 9. [x] (S) reserved for ci/cd fixes
 10. [x] update any architecture docs in docs/architecture that may contain outdated information. verify against code rather than docs — DONE 100% 2026-08-25 (`aj/kimi-10-20260825-0001`): audited all 10 files in `docs/architecture` against current source rather than cross-document claims; updated 9 and confirmed `IRC-SENDER-IDENTITY.md` remains accurate. Corrections cover Engine V2's 33-method Store contract and lease-filtered action advertisement; the 14-suite self-heal harness, launchd watchdog, and new-tenant Study Notes seed wiring; seven native knowledge tools, lifecycle/seed configuration, and installed-skill memory-write attenuation; WeeChat tool-activity/status routing; XMPP's 50 MiB callback staging versus 20 MiB emitted aggregate; the actual incomplete legacy/approval/Engine V2 timeout-suppression boundary; and SSH worker signing, RSA behavior, plaintext mt-admin bootstrap copies, live-only host CRUD, agent-keystore mutation, and unauthenticated API boundaries. Verified all 11 local Markdown links, `git diff --check`, `taskset -c 0-11 cargo check -j12`, and 76/76 targeted `metrics-unit`, systemd watchdog, and OpenRC watchdog assertions.
 11. [ ] update any bugs docs in docs/bugs that may contain outdated information. verify against code rather than docs
-12. [ ] update anything outdated in docs/proposals - verify against code rather than docs
+12. [x] update anything outdated in docs/proposals - verify against code rather than docs
 13. [ ] look into updating default system prompt
 14. [x] (S) update release notes draft in root of repo with anything might have missed that may be relevant and update README.md in repo root
 
