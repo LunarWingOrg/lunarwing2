@@ -90,7 +90,7 @@ user-added variables like `HTTP_HOST` across re-onboarding.
 **Fresh-instance defaults:** On first onboarding against a new
 base directory (`LUNARWING_BASE_DIR`, or legacy `IRONCLAW_BASE_DIR`), the wizard seeds:
 - `config.toml`
-- `workspace-template/*.md` (including `SOUL.md`, `IDENTITY.md`, `BOOTSTRAP.md`)
+- `workspace-template/*.md` (including `SOUL.md`, `IDENTITY.md`, `AGENTS.md`)
 
 The runtime automatically imports `workspace-template/*.md` on first boot when
 `WORKSPACE_IMPORT_DIR` is not set. This gives fresh installs an editable,
@@ -113,9 +113,12 @@ seeded `selected_model`, `openai_compatible_base_url`, or other TOML values.
 - `$LUNARWING_BASE_DIR/config.toml`
 - `$LUNARWING_BASE_DIR/workspace-template/`
 
-That means `SOUL.md`, `IDENTITY.md`, `BOOTSTRAP.md`, `TOOLS.md`, `MEMORY.md`,
+That means `SOUL.md`, `IDENTITY.md`, `TOOLS.md`, `MEMORY.md`,
 `USER.md`, `AGENTS.md`, `HEARTBEAT.md`, and `README.md` all come from
 `deploy/workspace-template/` and can be edited per instance after seeding.
+`BOOTSTRAP.md` is not part of the on-disk template — the runtime seeds it
+from built-in defaults (`src/workspace/seeds/BOOTSTRAP.md`) on first boot of
+a truly fresh workspace, and the agent clears it once onboarding completes.
 
 The full 9-step wizard remains available via `lunarwing onboard`.
 

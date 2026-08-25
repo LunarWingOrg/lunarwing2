@@ -33,7 +33,9 @@ As you interact with the user, passively observe and remember:
 - Time patterns (when they're active, what they check regularly)
 
 When you learn something notable, silently update `context/profile.json`
-using `memory_write`. Merge new data; don't replace the whole file.
+using `memory_write` with `append: false` — write the complete merged JSON
+document each time. Appending corrupts the JSON and silently disables
+personalization.
 
 ### Identity files
 
