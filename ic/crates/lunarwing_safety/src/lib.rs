@@ -179,6 +179,7 @@ impl SafetyLayer {
     ///   tool output can never be re-materialized as real role markers by
     ///   backends that flatten messages into a raw text template (work
     ///   item #75).
+    ///
     /// All other content (including JSON with `<`, `>`, `&`) passes through
     /// unchanged.
     pub fn wrap_for_llm(&self, tool_name: &str, content: &str) -> String {
