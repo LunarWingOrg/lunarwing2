@@ -1,12 +1,12 @@
 # Native Study-Notes Knowledge Layer
 
-> **Status (2026-08-07): IMPLEMENTED — Phase 1 (core store) and Phase 2
-> (lifecycle integration) are both in tree.** This document records the
-> as-built design referenced by release-goals items #1 and #2 in
-> `docs/ops/AGENT_GOALS_2.0.6.0.md`. It was written retroactively: the
-> implementation landed first (branches `rarity/kimi-1-20260806-1802` and
-> `aj/kimi-2-20260807-0001`), so everything below describes verified tree
-> state, not planned work.
+> **Status (reverified 2026-08-25): IMPLEMENTED — Phase 1 (core store),
+> Phase 2 (lifecycle integration), and the Phase 3 new-tenant bootstrap are in
+> tree.** This document records the as-built design referenced by release-goals
+> items #1 and #2 in `docs/ops/history/AGENT_GOALS_2.0.6.0.md`. It was written
+> retroactively: the implementation landed first (branches
+> `rarity/kimi-1-20260806-1802` and `aj/kimi-2-20260807-0001`), so everything
+> below describes verified tree state, not planned work.
 >
 > **v2.0.8.0 addendum (item #14):** the optional coordination hook in
 > `ic/src/hooks/coordination_knowledge.rs` propagates one-line
@@ -27,6 +27,15 @@
 > configured limit still overrides). `knowledge_search` gained a
 > `min_confidence` filter, and the tags filter is now canonical
 > require-every-tag on both backends (Postgres `?&`, libSQL all-of).
+>
+> **v2.0.9.0 addendum (items #3–4, 2026-08-24):** a newly provisioned
+> multi-tenant instance using `add-tenant --with-study-mcp` now imports the
+> synced checkout into its private native store once on first startup. The
+> opt-in flag is written only by that new-tenant path; `configure-study-mcp`,
+> env regeneration, and `upgrade-tenant` never introduce it. Existing note
+> paths are not overwritten, `coord-*` wire notes are excluded, malformed
+> notes are recorded without making startup fail, and a completion marker
+> prevents repopulation on later boots.
 
 ## Goal
 
@@ -154,6 +163,36 @@ id), so shared-herd notes keep attribution beyond the self-declared `agent`
 slug. Metadata roundtrips through JSON; notes written before Phase 2 parse
 with the new fields defaulting to absent (serde defaults, covered by tests).
 
+## Phase 3: New-tenant checkout seed (v2.0.9.0)
+
+`ic/src/workspace/knowledge_seed.rs` imports canonical Markdown and metadata
+from `$LW2STUDYMCP_HOME/agent-notes-by-agent/<agent>/<topic>.md` when both the
+checkout path and `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` are present. `AppBuilder`
+starts the pass in a background task after the workspace is available.
+
+The seed is deliberately narrower than routine MCP configuration:
+
+- `provision_tenant_study_mcp()` syncs the checkout, configures it, and then
+  calls `arm_tenant_knowledge_seed()` only during a successful new-tenant
+  `add-tenant --with-study-mcp` flow.
+- `configure-study-mcp` does not arm existing tenants. Environment regeneration
+  preserves an existing flag but never invents one, and `upgrade-tenant` does
+  not add it.
+- Existing workspace paths are skipped. Only exact stranded rows created by a
+  crashed prior seed may have missing content or provenance repaired; arbitrary
+  operator content is never replaced.
+- Invalid files increment the failure count but do not abort startup. Once all
+  discovered notes have been walked, `knowledge_seed_state.json` records the
+  pass, including failures, so later boots do not rescan. A missing checkout has
+  no marker and can retry on a later boot.
+- Agent/topic slugs and metadata are bounded with the native knowledge limits,
+  pass order is deterministic, and the reserved `coord-*` wire namespace is
+  excluded.
+
+The external MCP remains independently configurable for agent tooling. The
+one-shot seed uses its checkout only as import input; native notes remain normal
+workspace documents afterward.
+
 ## Verification
 
 - Phase 1: 19 tests (15 unit + 4 libSQL integration over real migrated DBs),
@@ -163,6 +202,12 @@ with the new fields defaulting to absent (serde defaults, covered by tests).
   marking, non-active statuses untouched, cadence skip), bundled-skill test
   asserting the native write path and the dropped env gate, kawarimi shell
   harness assertions, provenance roundtrip + legacy-parse tests.
+- Phase 3: 16 Rust seed tests cover metadata preservation, existing-path and
+  stranded-row behavior, malformed files, marker/retry semantics, deterministic
+  discovery, and reserved wire namespaces. `test-study-mcp-sync.sh` pins the
+  add-only arm, explicit opt-out preservation, non-arming configure path, and
+  env-regeneration contract. Live systemd and OpenRC tenant exercises verified
+  new-tenant population, restart stability, and upgrade exclusion.
 
 ## Trust model
 
