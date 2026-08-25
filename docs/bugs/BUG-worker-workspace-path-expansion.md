@@ -1,6 +1,6 @@
 # Worker workspace path expansion
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-20).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-25).**
 > Structured worker project directories now normalize `~`; prompt text and the
 > Pebble executor still pass user-supplied paths without that normalization.
 
@@ -69,3 +69,7 @@ line references (`:184-189`, `:230`) were re-confirmed after the v1.18.18 bump
 and again on 2026-08-20. The daemon-side reference was widened to
 `external_worker.rs:100-114` so it covers the whole `build_task_context`
 forwarding body; the `project_dir` field is still mapped verbatim.
+Re-verified on 2026-08-25: `opencode4lunarwing/`, `pebble4lunarwing/`, and
+`ic/src/orchestrator/external_worker.rs` are all unchanged since `2d10832a`,
+so every cited reference still matches; the five-assertion Node port of
+`workspace_path.ts` was re-run and passed again. No status changed.
