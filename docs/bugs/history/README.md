@@ -5,7 +5,12 @@ Resolved reports and compatibility pointers kept for provenance. The active inde
 document directly under `docs/bugs/`. The two pointer rows marked below remain
 here only so old paths continue to resolve.
 
-Current-source cross-checks were refreshed against current source on 2026-07-28.
+Current-source cross-checks were refreshed against current source on 2026-07-28
+and re-confirmed as historical/resolved on 2026-08-25 (revision `57e8a36f`):
+the archived fixes remain in the tree (e.g. `import-tenant.sh` still accepts
+`--with-opencode` at `:93` and rejects retired `--with-nanocode` at `:91`), and
+no archived report needs reactivation — every residual piece is tracked as an
+active follow-up in [`../README.md`](../README.md).
 
 | Document | Current status / resolution |
 |---|---|
