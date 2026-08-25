@@ -98,7 +98,16 @@ The last URL path segment is used, with any query/fragment stripped. A missing e
 
 ### WASM channel processing
 
-The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attachments during `on_poll()`: base64-decodes each `BridgeIncomingAttachment`, stores bytes via `store_attachment_data()`, and emits `InboundAttachment` records the host merges into `IncomingAttachment.data`.
+The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound
+attachments during `on_poll()`: it base64-decodes each
+`BridgeIncomingAttachment`, stages bytes via `store_attachment_data()`, and emits
+`InboundAttachment` records that the host merges into `IncomingAttachment.data`.
+The staging store permits 20 MiB per attachment and 50 MiB across the callback,
+but that is not the final message budget: `emit_message()` independently applies
+`MAX_ATTACHMENT_TOTAL_SIZE` and retains only the in-order attachment prefix whose
+cumulative declared-or-actual bytes fit within 20 MiB. The effective aggregate
+that reaches the agent is therefore 20 MiB, even though temporary callback
+staging is allowed up to 50 MiB.
 
 ## Limits
 
@@ -110,8 +119,9 @@ The WASM XMPP channel (`ic/channels-src/xmpp/src/lib.rs`) decodes inbound attach
 | Download timeout | 30 seconds | XmppChannel (reqwest client) |
 | Download DNS resolution timeout | 5 seconds (`OOB_DNS_TIMEOUT_SECS`) | XmppChannel (egress guard) |
 | Attachment extraction timeout | 60 seconds (`OOB_EXTRACTION_TIMEOUT_SECS`) | XmppChannel |
-| Per-attachment store | 20 MB | WASM host (`store_attachment_data`) |
-| Total attachment store per callback | 50 MB | WASM host |
+| Per-attachment staging store | 20 MB | WASM host (`store_attachment_data`) |
+| Total attachment staging per callback | 50 MB | WASM host (`store_attachment_data`) |
+| Total attachments emitted to the agent | 20 MB cumulative in-order prefix | WASM host (`emit_message` / `validate_attachments`) |
 | Decoded image size for LunarVision enrichment | 10 MB | VisionEnrichmentMiddleware + OCR sidecar |
 | Concurrent LunarVision analyses | 2 | VisionEnrichmentMiddleware |
 | LunarVision request timeout | 45 seconds | VisionEnrichmentMiddleware |
