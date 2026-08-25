@@ -265,13 +265,15 @@ ssh-exec: func(host: string, command: string) -> result<ssh-result, string>;
 
 record ssh-result { exit-code: s32, stdout: list<u8>, stderr: list<u8> }
 ```
-This is a **breaking interface bump** — every guest tool and the sibling `channel.wit` world regenerate bindings.
+This landed as an **additive tool-host import** under WIT package `@0.3.0`.
+Existing guests that do not import `ssh-exec` remain compatible and do not need
+rebuilding; `channel.wit` is a separate world and did not gain this import.
 
 **Host impl — `ic/src/tools/wasm/wrapper.rs`, `impl lunarwing::agent::host::Host for StoreData`** (follow the `http_request` pattern at `wrapper.rs:326-563`): validate `host` against a new SSH allowlist capability (mirror `http_request`'s `check_http_allowed` → `AllowlistValidator`, `host.rs:255`), then run the SSH exchange on a dedicated current-thread runtime inside `spawn_blocking` (as `http_request` does, `wrapper.rs:475-563`), calling `ssh_client::connect_and_exec`. **Leak-scan `stdout`/`stderr`** before returning (same as HTTP responses, `wrapper.rs:551-556`).
 
 **Plumbing:** thread an `Arc<tokio::sync::RwLock<SSHBridge>>` into `StoreData`/`HostState` at instantiation (analogous to how `host_credentials`/secrets are threaded today), plus a new `SshCapability` in `Capabilities`, populated from a `capabilities.json` `ssh` block by the loader (`loader.rs:221-266`). The allowlist should reuse the `[[ssh.hosts]]` aliases as the reachable set.
 
-**Guest — `ic/tools-src/ssh/`:** `Cargo.toml` (`crate-type=cdylib`, deps `serde`/`serde_json`/`wit-bindgen`), `src/lib.rs` with `wit_bindgen::generate!({ world: "sandboxed-tool", path: "../../wit/tool.wit" })` implementing `Guest for SshTool` (`execute`/`schema`/`description`), plus `ssh-tool.capabilities.json` declaring the `ssh` allowlist and `registry/tools/ssh.json` (`source.dir`/`crate_name`). Built with `cargo component build --release --target wasm32-wasip2` (`scripts/build-wasm-extensions.sh:46-59`); loader picks up `<name>.wasm` + `<name>.capabilities.json` sidecars.
+**Guest — `ic/tools-src/ssh/`:** `Cargo.toml` (`crate-type=cdylib`, deps `serde`/`serde_json`/`wit-bindgen`), `src/lib.rs` with `wit_bindgen::generate!({ world: "sandboxed-tool", path: "../../wit/tool.wit" })` implementing `Guest for SshTool` (`execute`/`schema`/`description`), plus `ssh-tool.capabilities.json` declaring the `ssh` allowlist and `registry/tools/ssh.json` (`source.dir`/`crate_name`). Built with `cargo component build --release --target wasm32-wasip2` (`ic/scripts/build-wasm-extensions.sh`); loader picks up `<name>.wasm` + `<name>.capabilities.json` sidecars.
 
 ### 3. Files, data flow, security, config
 
