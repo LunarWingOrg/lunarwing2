@@ -1,8 +1,15 @@
 # SSH Operations for the LunarWing Agent — Options 2 & 3 Implementation Plans
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL DESIGN RECORD.**
-> Both options landed. Version-specific examples below target russh
-> 0.45 and old line numbers; current source uses russh 0.62 and is authoritative.
+> **Current status (reverified 2026-08-25): IMPLEMENTED / HISTORICAL DESIGN
+> RECORD.** Both options landed, but the body is pre-implementation guidance,
+> not an as-built security contract. Version-specific examples target russh
+> 0.45; current source uses russh 0.62. In current behavior, built-in/WASM russh
+> rejects RSA while `ssh_git` delegates algorithm negotiation to agent/OpenSSH;
+> WASM SSH is a thin guest over a host-side russh function; runtime host CRUD is
+> process-local; socket-key uploads/deletes need a daemon restart to change the
+> signing keystore; and default mt-admin bootstrap leaves its generated private
+> key in the tenant's mode-0600 `~/.ssh/` path after the temporary staging copy
+> is uploaded. Use the linked architecture documents as authoritative.
 
 **Date:** 2026-07-01 (implemented)
 **Status:** ✅ **Implemented.** Kept as the design record (written before
