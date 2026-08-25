@@ -1,9 +1,23 @@
 # Bug tracker
 
-Reconciled against current source (revision `2d10832a`) on **2026-08-20**
-(prior passes against revision `7e813db4` on 2026-08-13, `94dfd58` on
-2026-08-03, on 2026-07-28, and against revision `51ae5a8` on 2026-07-20). The
-2026-08-20 pass re-verified every active canonical report against code: no
+Reconciled against current source (revision `2a2f1c34`) on **2026-08-25**
+(prior passes against revision `2d10832a` on 2026-08-20, `7e813db4` on
+2026-08-13, `94dfd58` on 2026-08-03, on 2026-07-28, and against revision
+`51ae5a8` on 2026-07-20). The 2026-08-25 pass re-verified every active
+canonical report against code: no status changed. The drift since `2d10832a`
+came from three landed work items: #73 added 28 lines to
+`ic/src/agent/agent_loop.rs` (boot-time repair-counter reset, terminal
+`ManualRequired` alert), shifting every cited region after line ~723 by +28
+(worker-lifecycle, E2E, XMPP polling, and OMEMO reports refreshed); #42
+reworked `ic/bridges/xmpp-bridge/src/main.rs` (`messages_handler` now at
+`:446-463`, `enqueue_message` — now with base64 attachment encoding — at
+`:515-546`) and touched both watchdog scripts (deep channel-health checks now
+at `lunarwing-watchdog.sh:82-104` and `lunarwing-watchdog-openrc.sh:74-99`);
+#65 grew `ic/scripts/mt-admin-lib/` but only moved the `patch-env` retrofit
+calls to `06-env-generation.sh:1944-1946`. The SSH-Git bare-HEAD reproduction
+was re-run live again (same exit-0/empty-checkout result), the Kawarimi flag
+harness and the OpenCode path self-check Node port were re-run (both passed).
+The 2026-08-20 pass re-verified every active canonical report against code: no
 status changed. Line references were refreshed where source drifted since
 2026-08-13 — most notably the v2.0.8.0 split of `lunarwing-mt-admin.sh` into
 `ic/scripts/mt-admin-lib/NN-*.sh` modules (external-worker provisioning refs
