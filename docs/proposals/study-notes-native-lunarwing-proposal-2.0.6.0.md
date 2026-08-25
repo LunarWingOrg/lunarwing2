@@ -2,9 +2,10 @@
 
 > **Status (reverified 2026-08-25): IMPLEMENTED — Phase 1 (core store),
 > Phase 2 (lifecycle integration), and the Phase 3 new-tenant bootstrap are in
-> tree.** This document records the as-built design referenced by release-goals
-> items #1 and #2 in `docs/ops/history/AGENT_GOALS_2.0.6.0.md`. It was written
-> retroactively: the implementation landed first (branches
+> tree.** This document records the as-built design originally tracked as
+> v2.0.6.0 release-goals items #1 and #2; that working checklist was retired
+> during later operations-doc cleanup. It was written retroactively: the
+> implementation landed first (branches
 > `rarity/kimi-1-20260806-1802` and `aj/kimi-2-20260807-0001`), so everything
 > below describes verified tree state, not planned work.
 >
