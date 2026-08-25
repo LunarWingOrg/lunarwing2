@@ -20,29 +20,28 @@
 
 ## Overview
 
-The infrastructure health pipeline (`ic-infrastructure-health-check/`) is
-**reactive** today: eleven parallel healthpoint scripts aggregate into a JSON
-report, the self-heal watchdog restarts unhealthy services, and a Gotify
-notification goes out when recovery fails or a component degrades. The data
-already exists — every healthpoint emits structured metrics — but it is only
-ever reduced to a three-state status (`healthy` / `degraded` / `critical`) and
-a file on disk that is rotated away after 7 days.
-
-This proposal adds a **dedicated metrics exporter for every healthpoint** so
-the pipeline becomes **proactive**: per-healthpoint time series in Prometheus
-text exposition format, plus a configurable early-warning layer that fires
-graduated signals (e.g. "tensorzero p95 rising for 3 consecutive runs") long
+The infrastructure health pipeline (`ic-infrastructure-health-check/`) now has
+both reactive and proactive layers. Eleven parallel healthpoint scripts
+aggregate into a JSON report; self-heal restarts unhealthy services and can page
+through Gotify; `health-metrics-exporter.sh` then converts the newest report and
+self-heal state into Prometheus text exposition. Configurable threshold rules
+emit graduated early-warning series and optional deduplicated Gotify warnings
 before a hard failure forces a restart-and-page cycle.
 
-Why now (post-2.0.7.0):
+This began as the proposal for a **dedicated metrics exporter for every
+healthpoint**. Phases 1–3 are now implemented. The default remains a listenerless
+atomic textfile export; the optional Rust listener serves that file from loopback
+and can require a bearer token.
+
+Why it was added after v2.0.7.0:
 
 - v2.0.7.0 shipped the sidecar rework — LunarVision (goal #7) and LunarVoice
   (goal #9) both gained dedicated health listeners, launch contracts, and
-  cross-init supervision. LTX is the next sidecar target. Each new sidecar
-  adds another healthpoint; exporter coverage grows for free because it reads
-  the aggregated report rather than probing services itself.
-- The health JSON schema has been stable across the 2.0.x line, so an
-  exporter built on the report contract is low-risk.
+  cross-init supervision. Each new healthpoint can contribute numeric and
+  boolean fields without a new exporter probe because export reads the
+  aggregated report.
+- The health JSON schema was already stable across the 2.0.x line, making the
+  report contract the low-risk integration boundary.
 - Third-party integration (Grafana, Alertmanager, VictoriaMetrics, uptime
   dashboards) is part of the stated vision for the health services.
 
@@ -74,10 +73,11 @@ Why now (post-2.0.7.0):
 - LTX instrumentation (tracked separately; the exporter picks it up
   automatically once `health-ltx.sh` exists).
 
-## Current state (verified 2026-08-13)
+## Current state (verified 2026-08-25)
 
-`infrastructure-health-check.sh` runs these healthpoints in parallel, each
-emitting one JSON object (`component`, `status`, `metrics{...}`), exit 0/1/2:
+`infrastructure-health-check.sh` runs these eleven healthpoints in parallel,
+each emitting one JSON object (`component`, `status`, `metrics{...}`), exit
+0/1/2:
 
 | Healthpoint | Script | Exportable metrics already emitted |
 |-------------|--------|------------------------------------|
@@ -94,11 +94,12 @@ emitting one JSON object (`component`, `status`, `metrics{...}`), exit 0/1/2:
 | svcmgr | `health-{systemd,openrc,launchd}.sh` | per-unit/service/agent state (incl. per-tenant user units) |
 
 The orchestrator writes `$LUNARWING_BASE_DIR/workspace/reports/health/<ISO>.json`
-(plus a `-summary.md`), rotates both after 7 days, and logs per-check duration
-to `health.log` (duration is **not** currently in the report — see Phase 1,
-step 4). `lunarwing-self-heal.sh` keeps remediation state in
-`../self-heal/state.json` (restart history, backoff `next_attempt_at`,
-escalation flags).
+(plus a `-summary.md`), rotates both after 7 days, and stamps each component's
+measured wall time as `duration_seconds`. `cron-wrapper.sh` runs the exporter
+against that fresh report before self-heal. `lunarwing-self-heal.sh` keeps
+remediation state in the adjacent `self-heal/state.json` (restart history,
+backoff `next_attempt_at`, and escalation flags), which the exporter also reads
+when `HEALTH_METRICS_INCLUDE_SELFHEAL=true`.
 
 ## Design
 
