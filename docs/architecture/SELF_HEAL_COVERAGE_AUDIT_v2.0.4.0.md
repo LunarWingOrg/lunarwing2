@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; content re-verified, 435/435 assertions green)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-08-25)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -81,16 +81,25 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > OpenRC, health-gated starts, drifted-container recreation); the audit's
 > coverage table otherwise still reflects the pipeline's structure.
 
-> **Update (2026-08-19, v2.0.8.0):** `run-all.sh` now also registers an
-> eleventh suite, `metrics-exporter` (`test-health-metrics-exporter.sh`), for
-> the healthpoint metrics exporter landed in this cycle:
+> **Update (2026-08-19, v2.0.8.0):** `metrics-exporter`
+> (`test-health-metrics-exporter.sh`) became the eleventh registered suite for
+> the healthpoint metrics exporter landed in that cycle.
 > `health-metrics-exporter.sh` runs from `cron-wrapper.sh` after each check
 > and flattens the newest aggregated report plus self-heal `state.json` into
-> Prometheus textfile exposition (per-check `duration_seconds` is now stamped
-> by `infrastructure-health-check.sh`). A graduated `THRESHOLD_<metric>`
+> Prometheus textfile exposition (per-check `duration_seconds` is stamped by
+> `infrastructure-health-check.sh`). A graduated `THRESHOLD_<metric>`
 > early-warning layer with a deduplicated Gotify path and an optional
 > loopback-only listener crate (`ic/crates/lunarwing_health_metrics`,
 > installed by `ic/scripts/install-health-metrics-listener.sh` behind the
 > ports-registry v16 `health_metrics` slot) accompany it. Design:
-> `docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`. The audit's detection /
-> remedy coverage table still describes the self-heal pipeline itself.
+> `docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`.
+>
+> **Update (2026-08-25, v2.0.9.0):** the canonical aggregate now registers 14
+> suites. In addition to the eleven above, `metrics-unit` validates the
+> loopback listener's hardened systemd unit, `watchdog` covers the systemd
+> service watchdog (including user-manager routing), and `watchdog-openrc`
+> covers the OpenRC wrapper and bounded `rc-service` probes. The ordered,
+> authoritative list is the `SUITES`/`ORDER` pair in `tests/run-all.sh`; use
+> `bash tests/run-all.sh --list` rather than copying a suite count into tooling.
+> The audit's detection/remedy table still describes the self-heal pipeline
+> itself.
