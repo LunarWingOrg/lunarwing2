@@ -1,11 +1,11 @@
 
 # SSH Harness — Delivery Options
 
-> **Current status (updated 2026-08-04): IMPLEMENTED.** All three delivery
-> mechanisms are in tree. Worker mode now uses supported Pebble, OpenCode, or
-> Kimi Code containers; the Nanocode example below is historical. The older
-> recommendation table's description of the WASM option as future/exploratory is
-> retained as design history, not its present implementation status.
+> **Current status (reverified 2026-08-25): IMPLEMENTED.** All three delivery
+> mechanisms are in tree. `mode="worker"` now means LunarWing's Docker sandbox;
+> persistent external workers use their configured names (`pebble`, `opencode`,
+> or `kimi`). Nanocode is retired. The mechanism and security summaries below
+> were reconciled with the current implementation.
 
 **Date:** 2026-06-25 (updated 2026-07-01)  
 **Status:** ✅ **All three options implemented.** This is the original options
@@ -20,27 +20,29 @@ Three delivery mechanisms for SSH operations in LunarWing:
 
 ---
 
-## Option 1: `create_job` in Worker Mode ✅ IMPLEMENTED
+## Option 1: `create_job` in a Worker Container ✅ IMPLEMENTED
 
 ```
-Agent → create_job(mode="worker") → Nanocode container
-  ├── SSH_AUTH_SOCK mounted from gateway
-  ├── Worker runs git clone / ssh commands
-  └── Keys stay in gateway memory (never touch worker disk)
+Agent → create_job(mode="worker" | "pebble" | "opencode" | "kimi")
+  ├── mode="worker": ephemeral Docker sandbox when enabled
+  ├── named mode: configured persistent external worker
+  ├── SSH_AUTH_SOCK mounted from the gateway
+  └── worker git/ssh chooses its destination and asks the socket to sign
 ```
 
 **Pros:**
-- Already working and tested
-- Strong isolation (separate container)
-- Keys never touch worker disk
-- Leverages existing worker infrastructure
+- Strong process/filesystem isolation (separate container)
+- Raw key bytes never enter the worker container
+- Leverages existing sandbox and external-worker infrastructure
 
 **Cons:**
-- Requires external worker infrastructure (nanocode/pebble)
-- Latency overhead from container spin-up
-- More resource usage per operation
+- Requires the Docker sandbox or a configured named worker
+- Latency and resource overhead from container execution
+- The socket is a generic signing capability, not a configured-host allowlist;
+  worker network policy and `known_hosts` must constrain destination and trust
 
-**Status:** ✅ Working on test VM (confirmed from within nanocode)
+**Status:** ✅ Implemented for the Docker worker and supported Pebble, OpenCode,
+and Kimi Code external workers.
 
 ---
 
@@ -78,31 +80,26 @@ Agent → SSH tool (compiled into lunarwing binary)
 ## Option 3: WASM SSH Tool
 
 ```
-Agent → WASM tool (sandboxed via WASI)
-  ├── SSH operations in WASM sandbox
-  ├── Limited by WASM/WASI capabilities
-  └── Sandboxed by design
+Agent → WASM guest (sandboxed via WASI) → ssh-exec host function
+  ├── guest is limited by WASM/WASI capabilities and an allowed-hosts grant
+  ├── host function resolves the configured alias and runs russh in the gateway
+  └── key material and network sockets never enter the guest
 ```
 
 **Pros:**
-- Sandboxed execution (WASI limits)
-- Portable across platforms
-- Safe by construction (memory safety)
+- Sandboxes the guest logic and exposes only a narrow `ssh-exec` interface
+- Adds a per-tool `ssh.allowed_hosts` capability ceiling
+- Portable guest component; host reuses the built-in russh implementation
 
 **Cons:**
-- WASM can't do raw socket operations easily
-- Would need custom host functions for SSH
-- Most complex to implement
-- Performance overhead from WASM boundary
+- The SSH operation itself is not isolated from the gateway process
+- One-shot command execution only; no PTY or interactive stream
+- More plumbing than the equivalent built-in `ssh` call
 
-**Status:** ✅ Implemented — the WASM `ssh` tool: a guest shim
-(`ic/tools-src/ssh/`) that calls an `ssh-exec` host function reusing the
-in-process russh client (`ic/src/tools/wasm/wrapper.rs`, `wit/tool.wit`).
-
-**Requirements:**
-- WASI socket extensions or custom host functions
-- russh compiled to WASM (may need forks/patches)
-- SSH agent protocol over WASM boundary
+**Status:** ✅ Implemented — the WASM `ssh` guest (`ic/tools-src/ssh/`) calls an
+`ssh-exec` host function in `ic/src/tools/wasm/wrapper.rs`, defined by
+`ic/wit/tool.wit`. It does not compile russh into WASM or expose the ssh-agent
+protocol to the guest.
 
 ---
 
@@ -110,11 +107,14 @@ in-process russh client (`ic/src/tools/wasm/wrapper.rs`, `wit/tool.wit`).
 
 | Priority | Option | When |
 |----------|--------|------|
-| 1 | Worker Mode (Option 1) | Default for all SSH operations |
-| 2 | Rust Tool (Option 2) | Quick ops, no worker infra available |
-| 3 | WASM Tool (Option 3) | Future: maximum isolation needs |
+| 1 | Worker container (Option 1) | Multi-step/long work where process isolation matters |
+| 2 | Rust tools (Option 2) | Quick remote command or git operation without a worker |
+| 3 | WASM tool (Option 3) | A plugin needs a narrow per-tool host capability |
 
-**Rationale:** Option 1 is working and provides the right balance of isolation and simplicity. Option 2 is a useful optimization for specific cases. Option 3 is exploratory.
+**Rationale:** worker mode provides the strongest isolation but a broad signing
+socket. Built-in tools are the direct low-latency path with configured-host and
+host-key checks. The WASM option narrows which guest may invoke which alias, but
+it does not sandbox the host-side SSH exchange.
 
 ---
 
@@ -123,4 +123,8 @@ in-process russh client (`ic/src/tools/wasm/wrapper.rs`, `wit/tool.wit`).
 - **Socket location:** Tenant run directory (`/home/<tenant>/lunarwing/run/ssh-agent.sock`)
 - **Why not /tmp:** Daemon runs with `PrivateTmp=true`
 - **Mounting:** Socket mounted into worker containers via `SSH_AUTH_SOCK` env var
-- **Key storage:** Encrypted in secrets store, loaded into agent memory on startup
+- **Runtime key store:** encrypted secrets are loaded into the daemon/agent; raw
+  key bytes are not passed to workers or WASM guests
+- **Provisioning caveat:** default mt-admin setup also leaves its generated
+  mode-0600 key at `/home/<tenant>/.ssh/id_ed25519_lunarwing`; the temporary
+  `env/ssh_key_staged` copy is removed only after a successful API upload
