@@ -5,7 +5,8 @@ Resolved reports and compatibility pointers kept for provenance. The active inde
 document directly under `docs/bugs/`. The two pointer rows marked below remain
 here only so old paths continue to resolve.
 
-Current-source cross-checks were refreshed against current source on 2026-07-28.
+Current-source cross-checks were refreshed against current source on 2026-08-25
+(prior passes on 2026-08-20 and 2026-07-28); no disposition below changed.
 
 | Document | Current status / resolution |
 |---|---|
