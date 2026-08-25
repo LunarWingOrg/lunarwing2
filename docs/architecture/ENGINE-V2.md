@@ -420,11 +420,22 @@ Wraps `LlmProvider` as `LlmBackend`:
 Wraps tool execution and safety layer as `EffectExecutor`:
 - Maps engine action calls to tool registry execution
 - Applies safety checks, timeout, serialization
+- Keeps action discovery split by purpose: `registered_actions()` returns the
+  unscoped live tool catalog only for late-tool lease planning, while
+  `available_actions(leases)` advertises only actions covered by a supplied,
+  currently valid lease. Execution prompts therefore cannot expose a tool that
+  the thread is not allowed to call.
+- The thread-type-aware `LeasePlanner` still decides which registered actions a
+  resumed thread may gain. In particular, mission leases exclude administrative
+  and autonomous-denylisted actions such as `create_job`; foreground leases keep
+  them behind their normal interactive gates.
 
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 30 Store-trait methods for threads, steps, events, projects, docs, leases, missions, conversations
+- 33 Store-trait methods for threads, steps, events, projects, docs, leases,
+  missions, and conversations (28 overridden by `HybridStore`; five shared-scope
+  and global-list helpers use trait defaults)
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`

@@ -1,68 +1,84 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design Note - Not Implemented (revalidated 2026-07-20)
+**Status:** Design Note - Not Implemented (revalidated 2026-08-25)
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (revalidated 2026-07-20)
+## Current State (revalidated 2026-08-25)
 
-The `Arc<AtomicBool>` suppression flag is threaded from `agent_loop.rs::run()` down through:
+`agent_loop.rs::run()` creates one `Arc<AtomicBool>` for the active inbound
+message and passes it to `handle_message()`. On the legacy ordinary-user-input
+path, `handle_message()` passes a reference into `process_user_input()` and into
+subsequent turns drained from that same message queue.
 
-- `handle_message()` — top-level entry
-- `process_user_input()` — turn processing
-- Status delivery points in `thread_ops.rs`:
-  - `Thinking` status
-  - `Done` status
-  - `Suggestions`
-  - `TurnCost`
-  - `ApprovalNeeded`
-  - `Interrupted` status
-- Drain loop in `agent_loop.rs` — breaks early if suppressed
+The flag currently guards only selected legacy-path behavior:
 
-**The flag boundary stops at `process_user_input()`**. It does NOT propagate into:
+- the initial `Thinking("Processing...")` status immediately before the legacy
+  agentic loop;
+- the normal-result `Interrupted`, `Done`, `Suggestions`, `TurnCost`, and
+  `ApprovalNeeded` statuses in `process_user_input()`;
+- the drain loop, which discards already-drained and remaining queued text after
+  suppression instead of starting another turn.
 
-- `run_agentic_loop()`
-- `ChatDelegate`
-- Tool execution layer
-- SSE event emission from tools
+The outer message loop also stops waiting at the soft timeout, sends the timeout
+reply itself, and never delivers the eventual top-level return value. That is why
+the final conversational response is suppressed even if the inner task finishes
+before the hard abort.
 
-The soft-timeout path also starts a hard-kill task. After
-`HARD_KILL_GRACE_SECS` (30 seconds), it aborts the still-running user-input task
-and resets the thread's processing state. Deeper suppression is therefore still
-not implemented, but ghost output is bounded to that grace window.
+**The flag boundary still stops at `process_user_input()` and is incomplete even
+inside that function.** Current unguarded paths include:
+
+- the auto-compaction status sent before the legacy loop;
+- `run_agentic_loop()` and `ChatDelegate`, including per-iteration thinking,
+  tool reasoning/activity/result, authentication, and generated-image statuses;
+- `process_approval()` and its resumed-loop completion helpers;
+- the Engine V2 router/event-delivery path, which branches before legacy
+  `process_user_input()` and never receives the suppression flag;
+- tool implementations or other components that call channel status delivery
+  directly.
+
+The soft-timeout path starts a hard-kill task. After
+`HARD_KILL_GRACE_SECS` (30 seconds), it aborts the top-level `handle_message`
+task and marks a still-`Processing` legacy thread failed. This bounds emissions
+owned by that task, but it is not cooperative cancellation: remote effects,
+subprocesses, jobs, missions, or Engine work already spawned into independent
+tasks may have their own lifetime.
 
 ## The Problem
 
-When a soft timeout fires, the user is notified and the suppression flag is set. During the 30-second hard-kill grace window, the background task can continue to run, including:
-
-1. The full agentic loop (LLM calls, tool dispatch)
-2. Individual tool executions
-3. Any SSE events those tools emit (progress, status, intermediate results)
-4. Sub-delegate calls and their associated channel emissions
+When a soft timeout fires, the user is notified and the suppression flag is set.
+During the 30-second hard-kill grace window, unguarded code in the still-running
+task can continue to emit. Independently spawned effects may also continue after
+the wrapper task is aborted.
 
 **Concrete scenarios where ghost output can leak:**
 
-- Tool emits `"🔧 Running web_search..."` SSE event mid-execution
-- ChatDelegate emits intermediate "thinking" tokens to the streaming endpoint
-- A long-running tool (e.g. browser automation) sends progress updates
-- Sub-agent dispatch fires `"Spawning sub-agent..."` notifications
-- Any custom tool that calls `channels.send_status()` directly
+- `ChatDelegate` emits a later-step thinking or tool-reasoning status;
+- tool execution emits `ToolStarted`, `ToolCompleted`, or `ToolResult`;
+- authentication handling emits setup instructions after the timeout reply;
+- Engine V2 forwards a response delta or action event while its waiter is still
+  alive;
+- a long-running/custom tool calls `channels.send_status()` directly;
+- approval-resume processing completes and emits `Done` or another approval.
 
-After the user has already received the timeout message, these stray notifications can be confusing.
+After the user has already received the timeout message, these stray
+notifications can be confusing and an authentication status may be more than
+merely diagnostic.
 
 ## Proposed Solution: Deep AtomicBool Propagation
 
 ### Option A: Thread the flag all the way through
 
-Pass `&AtomicBool` (or `Arc<AtomicBool>`) through every function in the call chain that touches channels or emits status updates:
+Pass `&AtomicBool` (or `Arc<AtomicBool>`) through every turn-owned path that
+touches channels or emits status updates:
 
 ```
-process_user_input(&AtomicBool)
-  └─ run_agentic_loop(&AtomicBool)
-       ├─ ChatDelegate::stream(&AtomicBool)
-       │    └─ checks before each token/event emission
-       └─ Tool::execute(&AtomicBool)
-            └─ checks before each progress event
+handle_message(&AtomicBool)
+  ├─ process_user_input(&AtomicBool)
+  │    └─ run_agentic_loop / ChatDelegate callbacks / tool execution
+  ├─ process_approval(&AtomicBool)
+  │    └─ resumed tool execution and agentic loop
+  └─ Engine V2 handle/await/event delivery(&AtomicBool)
 ```
 
 **Pros:**
@@ -121,22 +137,31 @@ channels.send_status_tagged(turn_token, status); // silently drops if invalidate
 **Cons:**
 - New abstraction layer (turn tokens)
 - Channels need to track valid tokens (memory cost, but bounded)
-- Requires plumbing tokens through tool call interfaces anyway
+- Requires plumbing tokens through tool and Engine execution contexts anyway
+- The timeout notification itself must use an unsuppressed control path (or be
+  sent before invalidation) so the token does not suppress the only reply the
+  user should receive
 
 ## Recommendation
 
-**Defer until there's empirical evidence of confusion from ghost notifications.**
+**The original decision remains to defer until there is empirical evidence of
+confusing ghost notifications.** The factual scope is broader than the previous
+version of this note stated: not all `process_user_input` statuses are guarded,
+and unguarded output includes authentication and approval flows as well as
+lower-priority tool progress.
 
-The current implementation suppresses the user-visible response and status updates from `handle_message`/`process_user_input` paths. The remaining unsuppressed paths emit lower-priority events (tool progress, intermediate thinking) that are diagnostic rather than conversational.
+When users report behavior such as "I got 'timed out' but then saw 'Running
+search tool...'" or a late authentication prompt, revisit this boundary.
 
-When you start seeing real user feedback like "I got 'timed out' but then saw 'Running search tool...' during the grace window" — that's the signal to revisit.
-
-If/when you do revisit, **Option C (Channel-Layer Token)** is probably the cleanest path forward:
+If/when you do, **Option C (Channel-Layer Token)** remains the cleanest delivery
+boundary, provided it is paired with explicit cancellation for independently
+spawned work:
 
 - Centralizes suppression logic in one place
-- Doesn't require invasive trait changes
-- Scales to future "turn cancelled" scenarios (user hit interrupt, panic recovery, etc.)
-- Tool implementations stay clean
+- Avoids changing every tool implementation merely to add a boolean check
+- Scales to future "turn cancelled" scenarios (user interrupt, panic recovery,
+  channel disconnect)
+- Keeps the timeout/error control response outside the invalidated turn
 
 ## Open Questions
 
@@ -150,17 +175,23 @@ If/when you do revisit, **Option C (Channel-Layer Token)** is probably the clean
 
 ## Files Likely Affected (if Option C is chosen)
 
-- `ic/src/channels/mod.rs` — turn token management
-- `ic/src/channels/web/sse.rs` — SSE event filtering
-- `ic/src/agent/dispatcher.rs` — pass turn token through the agentic loop and
-  `ChatDelegate` emission paths
-- `ic/src/tools/mod.rs` — tool execution context
+- `ic/src/agent/agent_loop.rs` — create/invalidate the turn token while keeping
+  timeout delivery on a control path
+- `ic/src/agent/thread_ops.rs` — legacy input and approval-resume propagation
+- `ic/src/agent/dispatcher.rs` — `ChatDelegate` and tool-status propagation
+- `ic/src/bridge/router.rs` — Engine V2 event/status propagation and cancellation
+- `ic/src/channels/mod.rs` — token-aware delivery boundary
+- `ic/src/channels/web/sse.rs` and WASM/native channel implementations — verify
+  that every status/stream route uses the shared boundary
+- tool/job/mission execution contexts — carry cancellation ownership for work
+  that can outlive `handle_message`
 
 ## Decision Log
 
 - **2026-05-18:** Initial AtomicBool implementation, boundary at `process_user_input`
 - **2026-05-19:** Decision to defer deeper propagation, document for future revisit
-- **By 2026-07-28:** A 30-second hard-abort fallback bounds the ghost-task window; deeper propagation remains deferred
+- **By 2026-07-28:** A 30-second hard-abort fallback bounds the top-level task's ghost-output window; deeper propagation remains deferred
+- **2026-08-25:** Re-audit found unguarded auto-compaction, `ChatDelegate`, approval-resume, and Engine V2 status paths; corrected this note without changing the defer decision
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---

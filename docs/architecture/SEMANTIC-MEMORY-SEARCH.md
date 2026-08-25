@@ -2,7 +2,11 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
-The system lives in `ic/src/workspace/` and is exposed to agents via the `memory_search`, `memory_write`, `memory_read`, and `memory_tree` tools in `ic/src/tools/builtin/memory.rs`.
+The system lives in `ic/src/workspace/`. General memory is exposed through
+`memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
+`ic/src/tools/builtin/memory.rs`; source-verified codebase knowledge is an
+indexed workspace layer exposed through seven native `knowledge_*` tools in
+`ic/src/tools/builtin/knowledge.rs`.
 
 ## Architecture Overview
 
@@ -247,6 +251,53 @@ at the selected root; page two and later require the prior root-list `revision`
 so inserts or deletes cannot shift pagination silently. Query a returned
 subdirectory directly for a truncated nested subtree.
 
+Memory tools register whenever the database-backed workspace exists; no
+`TOOL_*` environment variable gates them. Their seeded baseline permission is
+`AlwaysAllow`. A separate security boundary can still remove tools before the
+LLM sees them: if an active registry-installed skill has `Installed` trust,
+`skills/attenuation.rs` limits the advertised set to its conservative read-only
+allowlist. `memory_search`, `memory_read`, and `memory_tree` remain visible, but
+`memory_write` is intentionally absent until only trusted skills are active.
+
+### Step 6: Study-Notes Knowledge Layer
+
+Study notes are ordinary indexed workspace documents at
+`study-notes/<agent>/<topic>.md`. Their document metadata carries canonical topic
+and agent slugs, title, lifecycle status, confidence, `studied_at`, source commit,
+tags, staleness policy, replacement/status reason, and caller/session
+attribution. Migration V26 adds a partial PostgreSQL index for the provenance and
+topic filters; it does not create a separate note table. Because the body remains
+a normal `memory_document`, normal chunking and backend FTS apply without a
+second search store.
+
+Seven native tools in `ic/src/tools/builtin/knowledge.rs` mirror the canonical
+lw2studymcp surface:
+
+| Tool | Purpose |
+|------|---------|
+| `knowledge_search` | FTS with topic, agent, lifecycle, tag, and confidence filters |
+| `knowledge_get_topic` | Return every per-agent version of one canonical topic |
+| `knowledge_list_topics` | Summarize topic coverage, versions, scopes, agents, statuses, and tags |
+| `knowledge_submit_note` | Validate and write a new note or replace the caller's own version |
+| `knowledge_update_status` | Patch lifecycle/provenance metadata without changing note content |
+| `knowledge_list_stale` | Find status-, age-, or source-commit-stale notes |
+| `knowledge_stats` | Count documents, topics, statuses, and scopes |
+
+Reads default to the caller's private scope plus the `shared` herd scope and can
+be narrowed to `private` or `shared`; writes default private and may explicitly
+target shared. A cadence-guarded background sweep marks aging active notes stale
+and also reaps stranded coordination-wire notes after their grace period.
+
+New tenants provisioned with `add-tenant --with-study-mcp` have a separate,
+one-shot bootstrap. mt-admin syncs the external checkout, configures
+`LW2STUDYMCP_HOME`, and appends `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` only on that
+new-tenant path. At first startup a background task imports
+`agent-notes-by-agent/<agent>/<topic>.md` into the private scope, preserves
+canonical metadata, skips the reserved `coord-*` wire namespace, and never
+overwrites an existing path. `knowledge_seed_state.json` records a completed
+pass (including per-note failures), so later restarts do not repopulate the
+store. `configure-study-mcp` and `upgrade-tenant` do not arm this seed.
+
 ## Database Schema
 
 ### PostgreSQL
@@ -279,9 +330,8 @@ Key migrations:
   equal for path uniqueness
 - `V23__exclude_engine_runtime_from_search.sql`: removes legacy search chunks
   for persisted Engine runtime state
-- `V26__study_notes_knowledge.sql`: study-notes knowledge layer metadata
-  (durable codebase-study findings stored as ordinary workspace documents
-  under `study-notes/<agent>/<topic>.md`)
+- `V26__study_notes_knowledge.sql`: partial PostgreSQL index for study-note
+  provenance/topic metadata filters
 
 ### libSQL
 
@@ -360,14 +410,21 @@ SearchConfig {
 | `EMBEDDING_DIMENSION` | Auto-inferred | Override embedding dimension |
 | `EMBEDDING_CACHE_SIZE` | `10000` | LRU cache capacity (min 1) |
 | `EMBEDDING_BASE_URL` | None | Custom OpenAI-compatible endpoint |
-| `OPENAI_API_KEY` | None | API key for OpenAI provider |
+| `OPENAI_API_KEY` | None | API key for OpenAI/OpenAI-compatible providers |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
 | `SEARCH_FUSION_STRATEGY` | `rrf` | `rrf` or `weighted` |
 | `SEARCH_RRF_K` | `60` | RRF ranking constant |
 | `SEARCH_FTS_WEIGHT` | `0.5` (RRF), `0.3` (weighted) | FTS weight |
 | `SEARCH_VECTOR_WEIGHT` | `0.5` (RRF), `0.7` (weighted) | Vector weight |
+| `KNOWLEDGE_SWEEP_ENABLED` | `true` | Run the background Study Notes lifecycle sweep |
+| `KNOWLEDGE_STALE_AFTER_DAYS` | `30` | Fallback age before an active note is marked stale |
+| `KNOWLEDGE_SWEEP_CADENCE_HOURS` | `24` | Minimum interval between sweeps |
+| `KNOWLEDGE_SWEEP_INCLUDE_SHARED` | `true` | Sweep the shared herd scope as well as private scope |
+| `KNOWLEDGE_SEED_FROM_STUDY_MCP` | `false` | Arm the one-shot new-tenant checkout import |
+| `LW2STUDYMCP_HOME` | None | Checkout source required by the one-shot seed |
 
-Sources: `ic/src/config/embeddings.rs`, `ic/src/config/search.rs`
+Sources: `ic/src/config/embeddings.rs`, `ic/src/config/search.rs`,
+`ic/src/config/knowledge.rs`
 
 ## Graceful Degradation
 
@@ -377,37 +434,52 @@ The system is designed to work at multiple capability levels:
 2. **FTS only** (embeddings disabled): `use_vector` remains configured, but no
    query embedding is generated, so the vector arm returns no results and FTS
    continues normally
-3. **No database**: no `Workspace` or memory tools are registered; this
-   database-backed subsystem has no local-filesystem persistence fallback
+3. **No database**: no `Workspace`, memory tools, or native knowledge tools are
+   registered; this database-backed subsystem has no local-filesystem
+   persistence fallback
 
 When `EMBEDDING_ENABLED=false` (the default), documents are still chunked and
 FTS-indexed. Only vector embeddings are skipped. After enabling a provider,
 `Workspace::backfill_embeddings()` embeds up to 100 missing-vector chunks per
 call; callers can repeat it until no chunks remain.
 
+The knowledge seed is independently fail-soft. It does nothing unless both its
+flag and checkout path are present, retries a missing checkout on a later boot,
+records individual malformed-note failures without aborting startup, and writes
+the completion marker after walking the available notes.
+
 ## V2 Engine Integration
 
-The v2 engine (`ic/crates/lunarwing_engine/`) has its own memory layer (`memory/retrieval.rs`) that provides keyword-based context retrieval from project-scoped `MemoryDoc` objects. This is separate from the workspace semantic search:
+The v2 engine (`ic/crates/lunarwing_engine/`) has its own retrieval layer
+(`memory/retrieval.rs`) for project-scoped `MemoryDoc` objects. `HybridStore`
+persists those objects through the workspace, but Engine context selection does
+not call the workspace hybrid-search pipeline:
 
 | System | Scope | Search method | Used by |
 |--------|-------|---------------|---------|
-| Workspace (`src/workspace/`) | User-scoped, cross-tenant capable | Hybrid FTS + vector with RRF fusion | v1 agent, memory tools, system prompt |
-| Engine memory (`crates/lunarwing_engine/src/memory/`) | Project-scoped | Keyword-based retrieval from MemoryDocs | v2 engine execution context |
+| Workspace (`src/workspace/`) | User scope plus configured read scopes | Hybrid FTS + vector with RRF fusion | v1 agent, memory/knowledge tools, system prompt |
+| Engine memory (`crates/lunarwing_engine/src/memory/`) | Project + user scope | Keyword retrieval from MemoryDocs | v2 engine execution context |
 
-The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves relevant MemoryDocs (summaries, lessons, skills) to inject into the execution context. The workspace's full hybrid search remains the primary memory tool for agent-facing search.
+The Engine `RetrievalEngine` selects summaries, lessons, skills, and other
+MemoryDocs for execution context. Agent-facing semantic search remains the
+workspace tool path; Study Notes use a specialized backend FTS query over the
+same document/chunk store.
 
 ## Performance Characteristics
 
-- **Embedding cache hit**: ~0ms (in-memory LRU lookup)
-- **Embedding cache miss**: ~50-100ms (OpenAI API round-trip)
-- **Chunking**: ~1ms per 10KB document
-- **FTS search**: sub-second for <100K chunks (GIN/FTS5 index scan)
-- **Vector search (PostgreSQL)**: O(N x D) brute-force cosine after V9,
-  typically <1s for 10K chunks
-- **Vector search (libSQL)**: `libsql_vector_idx` / `vector_top_k` when startup
+Wall-clock timings depend on database size, provider, network, and hardware; the
+code guarantees these structural properties rather than fixed latency targets:
+
+- **Embedding cache hit:** in-memory LRU lookup; no provider call
+- **Embedding cache miss:** one provider request (or batch request during writes/backfill)
+- **Chunking:** linear in document size
+- **FTS search:** indexed GIN scan in PostgreSQL or FTS5 in libSQL
+- **Vector search (PostgreSQL):** O(N x D) brute-force cosine after V9
+- **Vector search (libSQL):** `libsql_vector_idx` / `vector_top_k` when startup
   created the dimension-specific index
-- **RRF fusion**: O(N log N) sort after combining two ranked lists
-- **Cache memory**: ~58 MB for 10,000 x 1,536-dim embeddings (payload only)
+- **RRF fusion:** O(N log N) sort after combining the bounded ranked lists
+- **Cache payload:** about 58 MB for 10,000 x 1,536-dimensional `f32` vectors,
+  excluding map/vector overhead
 
 ## File Reference
 
@@ -415,19 +487,23 @@ The v2 engine's `RetrievalEngine` is a lighter-weight system that retrieves rele
 |------|---------|
 | `ic/src/workspace/mod.rs` | Workspace API, document/chunk CRUD, search orchestration |
 | `ic/src/workspace/repository.rs` | PostgreSQL FTS + vector search implementation |
-| `ic/src/workspace/embeddings.rs` | EmbeddingProvider trait, 4 struct implementations (`openai_compatible` reuses the OpenAI implementation) |
+| `ic/src/workspace/embeddings.rs` | EmbeddingProvider trait, four implementations (`openai_compatible` reuses OpenAI) |
 | `ic/src/workspace/embedding_cache.rs` | LRU caching wrapper |
 | `ic/src/workspace/search.rs` | RRF + WeightedScore fusion algorithms |
 | `ic/src/workspace/chunker.rs` | Document chunking with overlap |
 | `ic/src/workspace/document.rs` | Core types (MemoryDocument, MemoryChunk, well-known paths) |
 | `ic/src/workspace/hygiene.rs` | Workspace cleanup/maintenance |
-| `ic/src/workspace/knowledge.rs` | Study-notes knowledge layer types (private/shared scopes) |
-| `ic/src/workspace/knowledge_sweep.rs` | Background sweep marking aging study notes stale (configured `stale_after_days`, default 30) and reaping stranded coordination wire notes after a 24h grace period |
+| `ic/src/workspace/knowledge.rs` | Study-notes metadata, queries, private/shared scopes |
+| `ic/src/workspace/knowledge_sweep.rs` | Aging-note lifecycle sweep and stranded wire-note reap |
+| `ic/src/workspace/knowledge_seed.rs` | One-shot import from a synced lw2studymcp checkout |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
-| `ic/src/tools/builtin/memory.rs` | Agent-facing tools (search, read, write, tree) |
-| `ic/src/config/embeddings.rs` | Configuration resolver |
+| `ic/src/tools/builtin/memory.rs` | Agent-facing memory search/read/write/tree tools |
+| `ic/src/tools/builtin/knowledge.rs` | Seven native Study Notes tools |
+| `ic/src/skills/attenuation.rs` | Installed-skill read-only tool ceiling |
+| `ic/src/config/embeddings.rs` | Embedding provider configuration |
 | `ic/src/config/search.rs` | Fusion strategy and search weight configuration |
+| `ic/src/config/knowledge.rs` | Knowledge sweep and one-shot seed configuration |
 | `ic/src/db/mod.rs` | Backend-neutral workspace storage trait |
 | `ic/src/db/libsql/workspace.rs` | libSQL FTS5 + vector search |
 | `ic/migrations/V1__initial.sql` | PostgreSQL base schema |
