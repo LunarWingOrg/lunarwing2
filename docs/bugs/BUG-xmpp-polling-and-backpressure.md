@@ -1,6 +1,6 @@
 # XMPP/WASM polling can stop delivering messages
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-20).**
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-25).**
 > Poll-loop crashes and stalls now have supervision and health reporting. A
 > bounded queue can still leave a poll task awaiting delivery if downstream
 > consumption stalls or sustained ingress exceeds its drain rate; that
@@ -41,7 +41,7 @@ messages were observed as consumed, and that restarting a tenant restored
 delivery. Those observations are not, by themselves, proof of an undelivered
 message: the XMPP bridge exposes a replay buffer. `messages_handler` reads by
 cursor and `enqueue_message` appends/trims the buffer; it does not remove
-entries on client consumption (`ic/bridges/xmpp-bridge/src/main.rs:414-435,489-519`).
+entries on client consumption (`ic/bridges/xmpp-bridge/src/main.rs:446-463,515-546`).
 The live outage is therefore **unverified** from the recorded fields alone.
 The old proposed-fix section is no longer a plan: most of its implementation is
 present below.
@@ -66,8 +66,8 @@ a failure criterion.
   (`ic/src/channels/manager.rs:345-354`) and exposed by the gateway
   (`ic/src/channels/web/server.rs:2929-2971`).
 - The watchdog has optional deep channel-health checks on systemd and OpenRC
-  (`ic/scripts/lunarwing-watchdog.sh:60-88` and
-  `ic/scripts/lunarwing-watchdog-openrc.sh:60-88`).
+  (`ic/scripts/lunarwing-watchdog.sh:83-102` and
+  `ic/scripts/lunarwing-watchdog-openrc.sh:75-94`).
 
 These changes resolve the original silent-exit failure mode. Older references
 to the polling block near line 2285 no longer match the current wrapper layout
@@ -89,7 +89,7 @@ and trips the stall detector once `max(3 x poll interval, 30s)` elapses.
 The earlier direct coupling to a synchronous worker turn is no longer current:
 the active-turn loop continues polling the merged channel stream, defers
 ordinary messages in a bounded FIFO, and rejects overflow explicitly
-(`ic/src/agent/agent_loop.rs:1078-1156`, `ic/src/agent/dispatch.rs:6-51`). That
+(`ic/src/agent/agent_loop.rs:1106-1184`, `ic/src/agent/dispatch.rs:6-51`). That
 prevents `wait=true` by itself from halting downstream reads. The residual is
 the unbounded queue-send await under an independently stalled or overloaded
 consumer, not evidence that crash supervision is absent.
@@ -127,4 +127,12 @@ await at `:2639-2645` — and line references were refreshed again for
 `wrapper.rs` (`start_polling` `:2311-2476`, `health_check` `:2933-2975`, queue
 creation `:985,2770`, `dispatch_emitted_messages` `:2595-2678`, poll tests
 `:5719-5783`), `manager.rs` (`health_check_all` `:345-354`), and `server.rs`
-(`:2929-2971`) churn. No status changed.
+(`:2929-2971`) churn. No status changed. Re-verified on 2026-08-25 (revision
+`57e8a36f`): no status changed. `channels/wasm/wrapper.rs`, `manager.rs`, and
+`server.rs` are unchanged, so every wrapper/manager/server reference still
+matches exactly. The XMPP bridge grew (attachment/upload work), moving
+`messages_handler` to `main.rs:446-463` and `enqueue_message` to `:515-546`;
+the watchdog scripts gained checks, moving the deep channel-health regions to
+`lunarwing-watchdog.sh:83-102` and `lunarwing-watchdog-openrc.sh:75-94`; and
+the work-item #73 `agent_loop.rs` insertions moved the FIFO/deferral region to
+`:1106-1184`. The residual queue-backpressure path is unchanged.
