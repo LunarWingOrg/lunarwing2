@@ -995,7 +995,21 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                                 .safety()
                                 .wrap_for_llm(&tc.name, &sanitized.content)
                         }
-                        Err(e) => format!("Tool '{}' failed: {}", tc.name, e),
+                        Err(e) => {
+                            // Work item #75: tool error text is guest/upstream
+                            // controlled (WASM guest messages can embed server
+                            // responses or echoed params) and must go through
+                            // the same sanitize+wrap pipeline as successes —
+                            // matches the routine engine path.
+                            let error_msg = format!("Tool '{}' failed: {}", tc.name, e);
+                            let sanitized = self
+                                .agent
+                                .safety()
+                                .sanitize_tool_output(&tc.name, &error_msg);
+                            self.agent
+                                .safety()
+                                .wrap_for_llm(&tc.name, &sanitized.content)
+                        }
                     };
 
                     // Record sanitized result in thread
