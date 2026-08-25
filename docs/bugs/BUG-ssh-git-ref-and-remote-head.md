@@ -1,7 +1,7 @@
 # SSH Git ref handling and bare-remote HEAD diagnostics
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-20).** Null-like `ref` values are normalized. A bare repository whose
+> 2026-08-25).** Null-like `ref` values are normalized. A bare repository whose
 > remote HEAD points at a missing branch still produces an empty/unborn checkout
 > that `ssh_git` marks successful, with only Git's raw stderr warning.
 
@@ -84,3 +84,9 @@ empty checkout). No Cargo command or SSH service was run. The only source
 change since the previous pass is an added `allows_autonomous_execution() ->
 false` override (`ssh_git.rs:267-271`), which does not affect either finding.
 All cited line references were re-confirmed unchanged on 2026-08-20.
+Re-verified on 2026-08-25 (revision `57e8a36f`): `ssh_git.rs` is unchanged
+since the previous pass — `optional_git_ref` normalization (`:68-74`, used at
+`:140`), optional-`ref` schema (`:111-122`), `code == 0` success reporting
+(`:255` within `:246-258`), `--branch` argv construction (`:363-378`), the
+null-ref regression cases (`:646-667`), and the autonomous-execution override
+(`:267-271`) all still match. The bare-HEAD diagnostic gap remains open.
