@@ -122,7 +122,7 @@ Reuse the MCP marketplace trust stack already in-repo:
   populated).
 - `channels::wasm::signature` — existing ed25519 signature verification for
   WASM channels.
-- `docs/ops/v2.0.8.0_ITEM_8_MCP_TENANT_TEST.md` — Python `gen_fixtures.py`
+- `docs/ops/history/v2.0.8.0/ITEM8_MCP_TENANT_TEST.md` — Python `gen_fixtures.py`
   generator, precedent for cross-language signing fixtures.
 
 Requirements specific to the backbone:
@@ -305,5 +305,5 @@ before Phase A is considered complete. Grouped, numbered for referral.
 - [`../ops/ROADMAP_2026.md`](../ops/ROADMAP_2026.md) — marketplace rows (v2.1.4.0, v2.1.5.0).
 - [`../ops/IRONCLAW_IDEAS_TAKEAWAYS.md`](../ops/IRONCLAW_IDEAS_TAKEAWAYS.md) — earlier analysis corrected by the research doc.
 - `ic/src/tools/mcp/marketplace.rs`, `ic/src/tools/mcp/config.rs` — trust stack to reuse.
-- `docs/ops/v2.0.8.0_ITEM_8_MCP_TENANT_TEST.md` — ed25519 fixture generation precedent.
+- `docs/ops/history/v2.0.8.0/ITEM8_MCP_TENANT_TEST.md` — ed25519 fixture generation precedent.
 - [`wasm-expansion-proposal-2.0.6.0.md`](wasm-expansion-proposal-2.0.6.0.md) — WASM expansion context citing the research doc.
