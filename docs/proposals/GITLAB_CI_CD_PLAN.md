@@ -1,19 +1,23 @@
 # GitLab CI/CD Plan for LunarWing
 
-> **Current status (reverified 2026-08-04): PHASE 1 ACTIVE AND VERIFIED;
-> PHASE 2 PARTIAL.** This document completes item #12 in
-> `docs/ops/AGENT_GOALS_2.0.2.0.md`. Item #13 added the root pipeline and
-> `.gitlab/` implementation. Public GitLab evidence now proves activation:
+> **Current status (source-reverified 2026-08-25): PHASE 1 ACTIVE AND
+> VERIFIED; PHASE 2 PARTIAL.** This document originated as items #12–13 in the
+> retired v2.0.2.0 working checklist. The root pipeline and `.gitlab/`
+> implementation remain active. Public GitLab evidence proves activation:
 > default-branch pipeline [1093](https://git.lunarwing.org/lunarwing/lunarwing2/-/pipelines/1093)
 > passed on 2026-08-03 with every required job green, all four Rust check shapes,
 > libSQL tests, cargo-deny, Cavepony/WASM coverage, and all three manual worker
 > image builds; merge-request pipeline
 > [1118](https://git.lunarwing.org/lunarwing/lunarwing2/-/pipelines/1118) also
-> passed on 2026-08-04. Full Phase 2 exit criteria remain open: PostgreSQL
-> service tests, general browser tests consuming one prebuilt binary,
-> standalone-crate coverage, and measured coverage are absent. Package, release,
-> and deployment automation (Phases 3–4) also remain absent. Project and runner
-> configuration guidance lives in `.gitlab/README.md`.
+> passed on 2026-08-04. Manual Kaniko jobs now build the Pebble, OpenCode, and
+> Kimi Code images, force HTTP/1.1 for the GitLab registry proxy, retry pushes,
+> and publish both moving version/`latest` tags and an immutable short-SHA tag;
+> this is image publication, not the still-missing worker smoke-test matrix.
+> Full Phase 2 exit criteria remain open: PostgreSQL service tests, general
+> browser tests consuming one prebuilt binary, standalone-crate coverage, and
+> measured coverage are absent. Package, release, and deployment automation
+> (Phases 3–4) also remain absent. Project and runner configuration guidance
+> lives in `.gitlab/README.md`.
 
 **Repository audited:** `lunarwing/lunarwing2`
 **Primary project:** `ic/`
@@ -72,14 +76,16 @@ not the artifact tested by CI.
 - Core manifests, Docker builders, root README, `ic/rust-toolchain.toml`, and CI
   images are reconciled on Rust 1.96.1. Historical release notes retain their
   original toolchain claims.
-- Every Cargo command must run with CPU affinity `taskset -c 0-5`; compile,
-  test, and Clippy commands must use at most `-j6`, and tests must use at most
-  six test threads.
+- GitLab's `rust-x86_64` runner is intentionally limited to CPUs `0-5`:
+  `.gitlab/scripts/cargo-ci.sh` enforces that affinity, while individual jobs
+  use `-j1`/`-j2` to stay inside the 16 GiB runner. The `taskset -c 0-5`
+  examples below are therefore CI contracts, not the current local development
+  limit; repository-local Cargo work uses `taskset -c 0-11` and at most `-j12`.
 - Compile verification uses `cargo check`, never a full debug build.
 - A recorded native release build compiled 769 crates, used about 2.8 GB of
-  target data, and took about 11 minutes on the six-CPU-limited development
-  host. CI runners need enough RAM and disk for Wasmtime, libSQL, C/C++
-  dependencies, and test linking.
+  target data, and took about 11 minutes under the historical six-CPU limit.
+  CI runners need enough RAM and disk for Wasmtime, libSQL, C/C++ dependencies,
+  and test linking.
 - PostgreSQL is primary. libSQL parity checks remain required.
 - `ic/Cargo.toml` has explicit heavy targets behind the `integration` feature.
 - `ic/tests/workspace_integration.rs` currently gates PostgreSQL behavior only
