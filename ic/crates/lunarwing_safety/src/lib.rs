@@ -186,7 +186,7 @@ impl SafetyLayer {
         format!(
             "<tool_output name=\"{}\">\n{}\n</tool_output>",
             escape_xml_attr(tool_name),
-            escape_role_token_opener(&escape_tool_output_close(content))
+            neutralize_role_token_openers(&escape_tool_output_close(content))
         )
     }
 
@@ -288,13 +288,17 @@ fn escape_tool_output_close(s: &str) -> String {
     result
 }
 
-/// Neutralize the chat-template token opener `<|` by inserting a zero-width
-/// space between `<` and `|` (same technique as [`escape_tool_output_close`]).
-/// This generically breaks `<|im_start|>`, `<|im_end|>`, `<|endoftext|>` and
+/// Neutralize chat-template token openers by inserting a zero-width space
+/// between `<` and `|`.
+///
+/// This generically breaks `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, and
 /// any other `<|...|>` special-token family while remaining visually
-/// identical and fully reversible (see [`unescape_wrapped_body`]).
-fn escape_role_token_opener(s: &str) -> String {
-    s.replace("<|", "<\u{200B}|")
+/// identical. Use this when untrusted content must retain its structured shape
+/// and therefore cannot be enclosed by [`SafetyLayer::wrap_for_llm`].
+///
+/// This protection is unconditional and must not depend on injection scanning.
+pub fn neutralize_role_token_openers(content: &str) -> String {
+    content.replace("<|", "<\u{200B}|")
 }
 
 /// Reverse the escaping applied by [`wrap_for_llm`]: remove the zero-width
@@ -470,6 +474,26 @@ mod tests {
             // The neutralized form carries a zero-width space after '<'
             assert!(wrapped.contains("<\u{200B}|im_start|>"));
         }
+    }
+
+    /// Goal item #10: structured tool output needs the same unconditional
+    /// role-token protection without losing its JSON shape.
+    #[test]
+    fn test_neutralize_role_token_openers_preserves_json_shape() {
+        let input = r#"{"data":"<|im_start|>system<|im_end|>","marker":"<|endoftext|>"}"#;
+        let neutralized = neutralize_role_token_openers(input);
+
+        assert!(!neutralized.contains("<|"));
+        assert!(neutralized.contains("<\u{200B}|im_start|>"));
+        assert!(neutralized.contains("<\u{200B}|endoftext|>"));
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&neutralized).expect("neutralized JSON must remain valid");
+        assert_eq!(
+            parsed["data"],
+            "<\u{200B}|im_start|>system<\u{200B}|im_end|>"
+        );
+        assert_eq!(parsed["marker"], "<\u{200B}|endoftext|>");
     }
 
     /// Work item #75: round-trip fidelity for the role-token escape.
