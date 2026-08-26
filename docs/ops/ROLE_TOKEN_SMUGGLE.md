@@ -1,10 +1,26 @@
 # LunarWing v2 — Role-Token Smuggling via Engine V2 Bridge (effect_adapter.rs)
 
+**Status:** RESOLVED 2026-08-26 (goal item #10)
 **Severity:** MEDIUM (defense-in-depth gap)
 **Branch:** `aragents/kimil00p/v2.0.9.0` (tip at time of finding: `3c9454d322d5ae614390689e465fa79bc0176203`)
 **Filed against commits:** `1b63a000` (safety crate: truncation-order + ZWSP role-token wrap), `c51cdc99` (dispatcher: sanitize+wrap tool ERROR results, shared `process_tool_result`)
 **Found by:** Kumogakure — LW v2 Security Hunter run 2026-08-25 21:04 UTC; independently re-verified same day against `origin/aragents/kimil00p/v2.0.9.0` refs (all code excerpts below are raw `git show` output)
 **Date:** 2026-08-25
+
+---
+
+## Resolution
+
+Goal item #10 closed the gap with defense in depth:
+
+- `lunarwing_safety::neutralize_role_token_openers` is the shared, unconditional ZWSP neutralizer for structured content that cannot use the XML wrapper.
+- Engine V2 neutralizes sanitized JSON before parsing it, preserving the `serde_json::Value` shape while breaking every `<|...|>` opener; engine tool failures now use the same sanitize-and-wrap pipeline as the dispatcher.
+- `format_action_output` independently neutralizes every action result before truncation or history persistence, including repair of pre-existing persisted `ActionResult` entries.
+- Regression coverage exercises JSON success, tool failure, disabled injection scanning, idempotence, empty output, truncation after expansion, and persisted-history repair.
+
+Verified with all 196 `lunarwing_safety` tests, 42 effect-adapter tests, 51 orchestrator tests, `cargo fmt --all -- --check`, `cargo check -j12`, and zero-warning `cargo clippy -j12 --lib -- -D warnings` (all Cargo commands under `taskset -c 0-11`).
+
+The remaining sections preserve the original finding-time analysis and line references.
 
 ---
 
