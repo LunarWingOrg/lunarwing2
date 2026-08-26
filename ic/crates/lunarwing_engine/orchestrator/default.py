@@ -587,7 +587,9 @@ def format_skills(skills):
                      "these domains — use the http tool instead, which will " +
                      "automatically inject the required credentials.\n")
 
-    return "\n".join(parts)
+    # Skill documents and metadata may be learned from user-controlled thread
+    # content. Neutralize the complete rendered section before system injection.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def ensure_working_messages(state, context):
