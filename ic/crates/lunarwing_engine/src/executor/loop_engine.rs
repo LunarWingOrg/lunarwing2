@@ -316,6 +316,15 @@ impl ExecutionLoop {
             // Skill selection and injection happens in the Python orchestrator
             // via __list_skills__() host function — not here in Rust.
 
+            // The identity preamble (workspace IDENTITY/SOUL/AGENTS/MEMORY —
+            // MEMORY.md carries conversation-derived, attacker-influenceable
+            // content) and channel context are concatenated after the CodeAct
+            // builder's own neutralization. Break role-token openers across the
+            // fully assembled system prompt so no field can forge a role
+            // boundary when history is re-tokenized. Idempotent: the already
+            // neutralized CodeAct body contains no intact `<|`.
+            let system_prompt = lunarwing_safety::neutralize_role_token_openers(&system_prompt);
+
             self.thread
                 .messages
                 .insert(0, ThreadMessage::system(system_prompt));
