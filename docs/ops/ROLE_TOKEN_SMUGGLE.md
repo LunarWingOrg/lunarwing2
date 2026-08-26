@@ -1,24 +1,26 @@
-# LunarWing v2 — Role-Token Smuggling via Engine V2 Bridge (effect_adapter.rs)
+# LunarWing v2 — Role-Token Smuggling Across Engine V2 Context Boundaries
 
-**Status:** RESOLVED 2026-08-26 (goal item #10)
+**Status:** RESOLVED 2026-08-26 (goal item #10, including work item #79 follow-up)
 **Severity:** MEDIUM (defense-in-depth gap)
 **Branch:** `aragents/kimil00p/v2.0.9.0` (tip at time of finding: `3c9454d322d5ae614390689e465fa79bc0176203`)
 **Filed against commits:** `1b63a000` (safety crate: truncation-order + ZWSP role-token wrap), `c51cdc99` (dispatcher: sanitize+wrap tool ERROR results, shared `process_tool_result`)
-**Found by:** Kumogakure — LW v2 Security Hunter run 2026-08-25 21:04 UTC; independently re-verified same day against `origin/aragents/kimil00p/v2.0.9.0` refs (all code excerpts below are raw `git show` output)
-**Date:** 2026-08-25
+**Found by:** Kumogakure — LW v2 Security Hunter runs on 2026-08-25 and 2026-08-26
+**Date:** 2026-08-25; follow-up resolved 2026-08-26
 
 ---
 
 ## Resolution
 
-Goal item #10 closed the gap with defense in depth:
+Goal item #10 now closes both the original bridge gap and the follow-up findings from [work item #79](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/79):
 
 - `lunarwing_safety::neutralize_role_token_openers` is the shared, unconditional ZWSP neutralizer for structured content that cannot use the XML wrapper.
-- Engine V2 neutralizes sanitized JSON before parsing it, preserving the `serde_json::Value` shape while breaking every `<|...|>` opener; engine tool failures now use the same sanitize-and-wrap pipeline as the dispatcher.
+- Engine V2 neutralizes sanitized JSON before parsing it, preserving the `serde_json::Value` shape while breaking every `<|...|>` opener; engine tool failures use the same sanitize-and-wrap pipeline as the dispatcher.
 - `format_action_output` independently neutralizes every action result before truncation or history persistence, including repair of pre-existing persisted `ActionResult` entries.
-- Regression coverage exercises JSON success, tool failure, disabled injection scanning, idempotence, empty output, truncation after expansion, and persisted-history repair.
+- Both memory-document prompt builders now neutralize the complete rendered prior-knowledge section before it is appended to a system message. The Rust executor uses the shared safety primitive, while the compiled Python orchestrator uses an equivalent shared helper. Applying the protection after rendering covers document type, title, content, and future rendered fields without changing persistence.
+- `wrap_external_content` now neutralizes the complete returned wrapper, including its untrusted source label and body, while retaining its existing closing-delimiter protection.
+- Regression coverage exercises JSON success, tool failure, disabled injection scanning, idempotence, empty output, truncation after expansion, persisted-history repair, memory-document type/title/content, and external-content source/body fields.
 
-Verified with all 196 `lunarwing_safety` tests, 42 effect-adapter tests, 51 orchestrator tests, `cargo fmt --all -- --check`, `cargo check -j12`, and zero-warning `cargo clippy -j12 --lib -- -D warnings` (all Cargo commands under `taskset -c 0-11`).
+The original bridge fix was verified with all 196 then-existing `lunarwing_safety` tests, 42 effect-adapter tests, and 51 orchestrator tests. The work item #79 follow-up was verified with all 197 `lunarwing_safety` tests and all 509 `lunarwing_engine` library tests, plus `cargo fmt --all -- --check`, workspace `cargo check -j12`, and zero-warning `cargo clippy -j12 -p lunarwing_safety -p lunarwing_engine --lib -- -D warnings`. All Cargo commands ran under `taskset -c 0-11`.
 
 The remaining sections preserve the original finding-time analysis and line references.
 
