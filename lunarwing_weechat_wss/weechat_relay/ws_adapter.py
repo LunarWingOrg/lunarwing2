@@ -13,6 +13,16 @@ Architecture:
     this adapter <--> WebSocket <--> WeeChat relay
     WASM (send response) --> HTTP POST /api/input --> WeeChat (direct)
 
+Reconnect behavior (v0.3.0):
+    - aiohttp WSMsgType.ERROR frames are logged at WARNING with the exception
+      payload and surfaced via /api/health (last_disconnect, reconnect_count)
+      instead of looking like a routine disconnect.
+    - After every (re)connect, recover_after_connect() backfills lines the
+      relay accepted while the WS was down (WeeChat does not replay sync
+      events); per-buffer line-id watermarks dedupe against live events.
+    - Outbound /api/input proxy failures are queued in a bounded outbox and
+      retried, in order, after the next successful connect.
+
 Usage:
     python3 ws_adapter.py [--relay-url URL] [--relay-password PW] [--port PORT]
                          [--message-delay SECONDS]
@@ -315,6 +325,9 @@ async def recover_after_connect(session: ClientSession, is_reconnect: bool):
     are silently lost). Buffers without a watermark — e.g. a query buffer
     opened during the outage — have their recent lines recorded in full.
     """
+    # Relay is reachable again — retry any outbound messages queued during
+    # the outage before recovering inbound lines.
+    await flush_outbox()
     recovered = 0
     for buf in list(state.buffer_list):
         full_name = buf.get("full_name") or buf.get("name")
@@ -465,6 +478,9 @@ async def handle_health(request: web.Request) -> web.Response:
         # relay failure from a routine reconnect.
         "last_disconnect": state.last_disconnect,
         "reconnect_count": state.reconnect_count,
+        # Outbound messages buffered while the relay was unreachable.
+        "outbox_depth": len(state.outbox),
+        "outbox_dropped": state.outbox_dropped,
         "buffered_buffers": len(state.line_buffer),
         "buffer_list_count": len(state.buffer_list),
         # Current global event cursor. Its presence also tells the WASM channel
@@ -586,11 +602,66 @@ async def handle_buffer_lines(request: web.Request) -> web.Response:
     return web.json_response(lines_newest_first)
 
 
+def enqueue_outbox(body: dict) -> int:
+    """Buffer an outbound /api/input body for retry after the relay recovers.
+
+    Bounded at MAX_OUTBOX; when full the oldest entry is dropped (newer
+    messages are more valuable) and the drop is counted for /api/health.
+    Returns the resulting queue depth.
+    """
+    if len(state.outbox) >= MAX_OUTBOX:
+        state.outbox.popleft()
+        state.outbox_dropped += 1
+        log.warning(f"Outbox full ({MAX_OUTBOX}) — dropped oldest queued message")
+    state.outbox.append(body)
+    return len(state.outbox)
+
+
+async def flush_outbox():
+    """Best-effort ordered flush of outbound messages queued while the relay
+    was unreachable. Stops at the first connection failure, preserving order
+    for the next attempt; entries that get a definitive HTTP response (even an
+    error status, which retrying would never fix) are dropped from the queue.
+    """
+    if not state.outbox:
+        return
+    target_url = f"{state.relay_url.rstrip('/')}/api/input"
+    auth = make_auth_header(state.relay_password)
+    flushed = 0
+    async with ClientSession() as session:
+        while state.outbox:
+            body = state.outbox[0]
+            try:
+                async with session.post(
+                    target_url,
+                    headers={"Authorization": auth, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    await resp.read()
+                    state.outbox.popleft()
+                    flushed += 1
+                    if resp.status >= 400:
+                        log.warning(
+                            f"Outbox flush: relay answered {resp.status} for a queued "
+                            "message — not retryable, dropping it"
+                        )
+            except Exception as e:
+                log.warning(f"Outbox flush stopped after {flushed} message(s): {e}")
+                break
+    if flushed:
+        log.info(f"Flushed {flushed} queued outbound message(s)")
+
+
 async def handle_input(request: web.Request) -> web.Response:
     """
     Proxy POST /api/input to WeeChat's HTTP API.
     The WASM calls relay_url directly for sends, but this endpoint exists
     so the WASM can optionally route everything through the adapter.
+
+    If the relay is unreachable the body is queued in a bounded outbox and
+    retried, in order, after the next successful connect — a relay outage
+    must not silently drop outbound messages. Queued sends return 202.
     """
     if not check_auth(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -606,6 +677,14 @@ async def handle_input(request: web.Request) -> web.Response:
     if state.message_delay_s > 0:
         log.debug(f"Delaying outbound message by {state.message_delay_s}s")
         await asyncio.sleep(state.message_delay_s)
+
+    # Preserve ordering: anything still queued must go out before this send,
+    # so if the flush didn't fully drain we queue this one behind them.
+    if state.outbox:
+        await flush_outbox()
+        if state.outbox:
+            depth = enqueue_outbox(body)
+            return web.json_response({"status": "queued", "outbox_depth": depth}, status=202)
 
     try:
         async with ClientSession() as session:
@@ -623,8 +702,9 @@ async def handle_input(request: web.Request) -> web.Response:
                     content_type="application/json",
                 )
     except Exception as e:
-        log.warning(f"Failed to proxy /api/input: {e}")
-        return web.json_response({"error": str(e)}, status=502)
+        depth = enqueue_outbox(body)
+        log.warning(f"Failed to proxy /api/input ({e}) — queued for retry (outbox depth {depth})")
+        return web.json_response({"status": "queued", "outbox_depth": depth}, status=202)
 
 
 # ---------------------------------------------------------------------------
