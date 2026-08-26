@@ -11,11 +11,12 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use support::engine_v2_env::EngineV2EnvGuard;
+use support::engine_v2_env::{ENGINE_V2_ENV_LOCK, EngineV2EnvGuard};
 use support::test_rig::TestRigBuilder;
 
 #[tokio::test]
 async fn engine_v2_initializes_without_any_message() {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
     let env = EngineV2EnvGuard::enable(None);
     let rig = TestRigBuilder::new().build().await;
 
