@@ -116,7 +116,7 @@ impl DefaultSelfRepair {
         self
     }
 
-    /// Split out tools whose repair attempts are exhausted.
+    /// Split out tools in a terminal repair state.
     ///
     /// ManualRequired is terminal (work items #73/#76): a terminal tool is
     /// surfaced exactly once per boot so the caller logs and alerts on it,
