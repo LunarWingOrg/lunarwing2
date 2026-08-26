@@ -73,8 +73,11 @@ pub struct DefaultSelfRepair {
     builder: Option<Arc<dyn SoftwareBuilder>>,
     tools: Option<Arc<ToolRegistry>>,
     /// Tools that already surfaced a terminal `ManualRequired` alert this
-    /// boot. ManualRequired is terminal (work item #73): log/alert once,
-    /// then stop retrying instead of retrying every check interval.
+    /// boot. ManualRequired is terminal (work items #73/#76): log/alert once,
+    /// then stop retrying instead of retrying every check interval. This
+    /// covers both exhaustion (`repair_attempts >= max`) and outcomes that
+    /// do not consume an attempt (e.g. builder disabled), which would
+    /// otherwise loop forever (work item #76).
     manual_alerts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
@@ -115,10 +118,13 @@ impl DefaultSelfRepair {
 
     /// Split out tools whose repair attempts are exhausted.
     ///
-    /// ManualRequired is terminal (work item #73): an exhausted tool is
+    /// ManualRequired is terminal (work items #73/#76): a terminal tool is
     /// surfaced exactly once per boot so the caller logs and alerts on it,
     /// then it is filtered out of every subsequent detection cycle instead
-    /// of being retried (and logged) every check interval forever.
+    /// of being retried (and logged) every check interval forever. A tool
+    /// is terminal when its attempts are exhausted OR when a repair already
+    /// returned `ManualRequired` this boot without consuming an attempt
+    /// (e.g. builder disabled — see `note_manual_required`).
     fn filter_terminal_tools(&self, tools: Vec<BrokenTool>) -> Vec<BrokenTool> {
         let mut detected = Vec::with_capacity(tools.len());
         let mut alerts = self
@@ -126,7 +132,9 @@ impl DefaultSelfRepair {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for tool in tools {
-            if tool.repair_attempts < self.max_repair_attempts {
+            let terminal =
+                tool.repair_attempts >= self.max_repair_attempts || alerts.contains(&tool.name);
+            if !terminal {
                 detected.push(tool);
                 continue;
             }
@@ -141,6 +149,20 @@ impl DefaultSelfRepair {
             }
         }
         detected
+    }
+
+    /// Record a terminal `ManualRequired` outcome for a tool this boot
+    /// (work item #76). Outcomes that do not consume a repair attempt —
+    /// builder/store unavailable — would otherwise be retried every check
+    /// interval forever, because `filter_terminal_tools` keys terminal
+    /// state on the attempt counter. Marking here makes every
+    /// `ManualRequired` terminal per boot regardless of cause.
+    fn note_manual_required(&self, tool_name: &str) {
+        let mut alerts = self
+            .manual_alerts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alerts.insert(tool_name.to_string());
     }
 }
 
@@ -300,12 +322,14 @@ impl SelfRepair for DefaultSelfRepair {
 
     async fn repair_broken_tool(&self, tool: &BrokenTool) -> Result<RepairResult, RepairError> {
         let Some(ref builder) = self.builder else {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: format!("Builder not available for repairing tool '{}'", tool.name),
             });
         };
 
         let Some(ref store) = self.store else {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: "Store not available for tracking repair".to_string(),
             });
@@ -313,6 +337,7 @@ impl SelfRepair for DefaultSelfRepair {
 
         // Check repair attempt limit
         if tool.repair_attempts >= self.max_repair_attempts {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: format!(
                     "Tool '{}' exceeded max repair attempts ({})",
@@ -1026,6 +1051,42 @@ mod tests {
         assert!(
             second.is_empty(),
             "exhausted tool must be filtered out after the one-time alert"
+        );
+    }
+
+    /// Work item #76: a `ManualRequired` outcome that does not consume a
+    /// repair attempt (builder disabled/unavailable) must also be terminal
+    /// per boot. Otherwise the attempt counter never reaches the max, the
+    /// terminal filter never engages, and the watchdog retries + alerts
+    /// every check interval forever.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn manual_required_without_builder_suppresses_future_cycles() {
+        let cm = Arc::new(ContextManager::new(10));
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        for _ in 0..5 {
+            db.record_tool_failure("wasm-tool", "boom").await.unwrap();
+        }
+
+        // Store but NO builder: repair_broken_tool returns ManualRequired
+        // without incrementing the attempt counter.
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 3).with_store(db);
+
+        let detected = repair.detect_broken_tools().await;
+        assert_eq!(detected.len(), 1, "broken tool should be detected");
+        assert_eq!(detected[0].repair_attempts, 0);
+
+        let result = repair.repair_broken_tool(&detected[0]).await.unwrap();
+        assert!(
+            matches!(result, RepairResult::ManualRequired { .. }),
+            "no builder should yield ManualRequired, got: {:?}",
+            result
+        );
+
+        assert!(
+            repair.detect_broken_tools().await.is_empty(),
+            "ManualRequired must be terminal: tool suppressed after the alert"
         );
     }
 
