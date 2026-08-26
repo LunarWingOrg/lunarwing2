@@ -164,7 +164,11 @@ fn build_codeact_system_prompt_inner(
     }
 
     prompt.push_str(CODEACT_POSTAMBLE);
-    prompt
+
+    // Prompt overlays, platform metadata, and action definitions can originate
+    // outside the engine. Break role-token openers after rendering so every
+    // dynamic field is covered without changing its persisted representation.
+    lunarwing_safety::neutralize_role_token_openers(&prompt)
 }
 
 /// Load the prompt overlay from the Store, if one exists for this project.
