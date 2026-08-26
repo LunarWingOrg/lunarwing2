@@ -288,8 +288,12 @@ def format_output(result, max_chars=8000):
 
 
 def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
-    """Bound structured action output before storing it in LLM history."""
-    text = str(output)
+    """Neutralize role tokens and bound output before storing LLM history."""
+    # Action output is untrusted even when it retains a structured host shape.
+    # Break every ChatML-family token opener before persistence so re-tokenizing
+    # history cannot turn tool data into a forged role boundary. This is
+    # idempotent and deliberately independent of optional injection scanning.
+    text = str(output).replace("<|", "<\u200b|")
     marker = "\n... (tool output truncated)"
     if len(text) <= max_chars:
         return text
@@ -299,7 +303,7 @@ def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
 
 
 def sanitize_action_results(messages):
-    """Repair oversized action results already present in persisted state."""
+    """Repair unsafe or oversized action results in persisted state."""
     for msg in messages:
         if msg.get("role") in ("ActionResult", "action_result"):
             msg["content"] = format_action_output(msg.get("content", ""))
