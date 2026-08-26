@@ -1,0 +1,17 @@
+2026-08-24 20:18:24,069 INFO weechat_ws: WS disconnected — reconnecting in 5s (258)
+2026-08-24 20:18:24,071 INFO weechat_ws: Connecting to WS at ws://127.0.0.1:10035/api (attempt 33386)
+2026-08-24 20:18:24,076 INFO weechat_ws: WS connected — relay 4.7.2, API v0.4.1
+2026-08-24 20:18:24,077 INFO weechat_ws: Sync subscription acknowledged: code=204 full={'code': 204, 'message': 'No Content', 'request': 'POST /api/sync', 'request_body': {'sync': {'nicks': False, 'input': False, 'colors': False, 'buffers': True, 'lines': True}}, 'request_id': 'lunarwing-sync', 'body_type': None, 'body': None}
+2026-08-25 18:24:02,078 INFO weechat_ws: WS disconnected — reconnecting in 5s (258)
+2026-08-25 18:24:02,080 INFO weechat_ws: Connecting to WS at ws://127.0.0.1:10035/api (attempt 35410)
+2026-08-25 18:24:02,088 INFO weechat_ws: WS connected — relay 4.7.2, API v0.4.1
+2026-08-25 18:24:02,089 INFO weechat_ws: Sync subscription acknowledged: code=204 full={'code': 204, 'message': 'No Content', 'request': 'POST /api/sync', 'request_body': {'sync': {'nicks': False, 'input': False, 'colors': False, 'buffers': True, 'lines': True}}, 'request_id': 'lunarwing-sync', 'body_type': None, 'body': None}
+2026-08-25 18:24:11,422 INFO aiohttp.access: 127.0.0.1 [25/Aug/2026:18:23:51 -0400] "GET /api/wait?cursor=1518&timeout=20 HTTP/1.1" 200 189 "-" "-"
+2026-08-25 18:24:21,406 INFO aiohttp.access: 127.0.0.1 [25/Aug/2026:18:24:21 -0400] "GET /api/config HTTP/1.1" 200 160 "-" "-"
+2026-08-25 18:24:41,080 INFO weechat_ws: WS disconnected — reconnecting in 5s (258)
+2026-08-25 18:24:41,082 INFO weechat_ws: Connecting to WS at ws://127.0.0.1:10035/api (attempt 35411)
+2026-08-25 18:24:41,086 INFO weechat_ws: WS connected — relay 4.7.2, API v0.4.1
+2026-08-25 18:24:41,088 INFO weechat_ws: Sync subscription acknowledged: code=204 full={'code': 204, 'message': 'No Content', 'request': 'POST /api/sync', 'request_body': {'sync': {'nicks': False, 'input': False, 'colors': False, 'buffers': True, 'lines': True}}, 'request_id': 'lunarwing-sync', 'body_type': None, 'body': None}
+2026-08-25 18:24:41,418 INFO aiohttp.access: 127.0.0.1 [25/Aug/2026:18:24:21 -0400] "GET /api/wait?cursor=1518&timeout=20 HTTP/1.1" 200 189 "-" "-"
+2026-08-25 18:24:51,409 INFO aiohttp.access: 127.0.0.1 [25/Aug/2026:18:24:51 -0400] "GET /api/config HTTP/1.1" 200 160 "-" "-"
+2026-08-25 18:24:51,418 INFO aiohttp.access: 127.0.0.1 [25/Aug/2026:18:24:51 -0400] "GET /api/wait?cursor=1518&timeout=20 HTTP/1.1" 200 979 "-" "-"
