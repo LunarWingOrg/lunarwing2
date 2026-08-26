@@ -13,6 +13,16 @@ Architecture:
     this adapter <--> WebSocket <--> WeeChat relay
     WASM (send response) --> HTTP POST /api/input --> WeeChat (direct)
 
+Reconnect behavior (v0.3.0):
+    - aiohttp WSMsgType.ERROR frames are logged at WARNING with the exception
+      payload and surfaced via /api/health (last_disconnect, reconnect_count)
+      instead of looking like a routine disconnect.
+    - After every (re)connect, recover_after_connect() backfills lines the
+      relay accepted while the WS was down (WeeChat does not replay sync
+      events); per-buffer line-id watermarks dedupe against live events.
+    - Outbound /api/input proxy failures are queued in a bounded outbox and
+      retried, in order, after the next successful connect.
+
 Usage:
     python3 ws_adapter.py [--relay-url URL] [--relay-password PW] [--port PORT]
                          [--message-delay SECONDS]
@@ -38,9 +48,10 @@ import logging
 import os
 import sys
 from collections import defaultdict, deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 try:
     import aiohttp
@@ -51,8 +62,11 @@ except ImportError:
 
 log = logging.getLogger("weechat_ws")
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_LINES_PER_BUFFER = 500  # Max buffered lines per IRC buffer
+RECONNECT_DELAY_S = 5  # Backoff between WebSocket reconnect attempts
+BACKFILL_LIMIT = 100  # Lines fetched per buffer when recovering after a reconnect
+MAX_OUTBOX = 100  # Max queued outbound /api/input bodies awaiting retry
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +82,20 @@ class AdapterState:
         # WebSocket connection status
         self.ws_connected: bool = False
         self.ws_error: Optional[str] = None
+        # Last disconnect (type/reason/timestamp) + counters, for /api/health.
+        # Lets the host/health system see WHY the adapter is reconnecting instead
+        # of a bare connected/disconnected flap.
+        self.last_disconnect: Optional[dict] = None
+        self.reconnect_count: int = 0
+        self.ever_connected: bool = False
+        # Per-buffer high-water mark of WeeChat line ids we have recorded.
+        # Used to dedupe WS events against the reconnect backfill and to fetch
+        # only lines newer than what we've already seen.
+        self.last_line_id: dict[str, int] = {}
+        # Outbound /api/input bodies buffered while the relay was unreachable,
+        # flushed (in order) after the next successful connect.
+        self.outbox: deque = deque()
+        self.outbox_dropped: int = 0
         # WeeChat version info (from /api/version)
         self.weechat_version: str = "unknown"
         self.relay_api_version: str = "unknown"
@@ -149,6 +177,16 @@ async def refresh_buffer_list(session: ClientSession):
 # WebSocket client loop
 # ---------------------------------------------------------------------------
 
+def note_disconnect(kind: str, reason: str):
+    """Record why the WS dropped so /api/health can surface the real cause."""
+    state.last_disconnect = {
+        "type": kind,
+        "reason": reason,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    state.reconnect_count += 1
+
+
 async def ws_client_loop():
     """
     Connect to WeeChat's WebSocket relay, subscribe to buffer events, and
@@ -158,9 +196,11 @@ async def ws_client_loop():
     ws_url = relay_url.replace("http://", "ws://").replace("https://", "wss://") + "/api"
     auth = make_auth_header(state.relay_password)
     attempt = 0
+    backfill_task: Optional[asyncio.Task] = None
 
     while True:
         attempt += 1
+        backfill_task = None
         try:
             async with ClientSession() as session:
                 log.info(f"Connecting to WS at {ws_url} (attempt {attempt})")
@@ -194,25 +234,54 @@ async def ws_client_loop():
                     await ws.send_str(json.dumps(subscribe))
                     log.debug("Sent sync subscription")
 
+                    # Recover lines that arrived while we were disconnected (and
+                    # flush any queued outbound messages). Runs concurrently with
+                    # the read loop; record_line dedupes the overlap by line id.
+                    is_reconnect = state.ever_connected
+                    state.ever_connected = True
+                    backfill_task = asyncio.create_task(recover_after_connect(session, is_reconnect))
+
                     async for msg in ws:
                         if msg.type == WSMsgType.TEXT:
                             await handle_ws_event(msg.data, session)
                         elif msg.type == WSMsgType.BINARY:
                             log.debug("Ignoring binary WS message")
-                        elif msg.type in (WSMsgType.ERROR, WSMsgType.CLOSED):
-                            log.info(f"WS disconnected — reconnecting in 5s ({msg.type})")
+                        elif msg.type == WSMsgType.ERROR:
+                            # An ERROR frame means the connection FAILED — it is
+                            # not a clean close. Log the actual exception/payload
+                            # at WARNING so the failure is visible, and expose it
+                            # via /api/health (previously this was logged at INFO
+                            # with no payload and looked like a normal disconnect).
+                            err = ws.exception()
+                            reason = str(err or msg.data)
+                            state.ws_error = reason
+                            note_disconnect("error", reason)
+                            log.warning(
+                                f"WS error frame from relay — reconnecting in "
+                                f"{RECONNECT_DELAY_S}s ({reason})"
+                            )
+                            break
+                        elif msg.type == WSMsgType.CLOSED:
+                            note_disconnect("closed", str(msg.data))
+                            log.info(f"WS closed by peer — reconnecting in {RECONNECT_DELAY_S}s")
                             break
 
                     state.ws_connected = False
 
         except asyncio.CancelledError:
             log.info("WebSocket loop cancelled")
+            if backfill_task is not None and not backfill_task.done():
+                backfill_task.cancel()
             return
         except Exception as e:
             state.ws_connected = False
             state.ws_error = str(e)
-            log.warning(f"WS disconnected — reconnecting in 5s ({e})")
-            await asyncio.sleep(5)
+            note_disconnect("exception", str(e))
+            log.warning(f"WS disconnected — reconnecting in {RECONNECT_DELAY_S}s ({e})")
+
+        if backfill_task is not None and not backfill_task.done():
+            backfill_task.cancel()
+        await asyncio.sleep(RECONNECT_DELAY_S)
 
 
 def record_event(full_name: str, line: dict):
@@ -221,6 +290,74 @@ def record_event(full_name: str, line: dict):
     state.event_log.append({"seq": state.event_seq, "full_name": full_name, "line": line})
     if state.new_event is not None:
         state.new_event.set()
+
+
+def record_line(full_name: str, line_info: dict) -> bool:
+    """Append a line to the buffer cache and event log, deduping by line id.
+
+    WeeChat line ids increase monotonically within a buffer, so a per-buffer
+    high-water mark both dedupes live WS events against the reconnect backfill
+    and tells the backfill which lines are new. Lines without an id cannot be
+    deduped and are always recorded (the pre-watermark behavior).
+
+    Returns True if the line was recorded, False if it was a duplicate.
+    """
+    line_id = line_info.get("id")
+    if isinstance(line_id, int):
+        last = state.last_line_id.get(full_name)
+        if last is not None and line_id <= last:
+            return False
+        state.last_line_id[full_name] = line_id
+    state.line_buffer[full_name].append(line_info)
+    record_event(full_name, line_info)
+    return True
+
+
+async def recover_after_connect(session: ClientSession, is_reconnect: bool):
+    """Post-connect recovery: seed line-id watermarks and backfill missed lines.
+
+    On the FIRST connect after adapter start, only seed each buffer's
+    high-water mark from the relay's newest line — recording history here
+    would replay old lines to the agent. On RECONNECTS, fetch recent lines
+    per buffer and record only those newer than the watermark, recovering the
+    lines the relay accepted while the WebSocket was down (sync events are
+    NOT replayed by WeeChat after a reconnect, so without this those lines
+    are silently lost). Buffers without a watermark — e.g. a query buffer
+    opened during the outage — have their recent lines recorded in full.
+    """
+    # Relay is reachable again — retry any outbound messages queued during
+    # the outage before recovering inbound lines.
+    await flush_outbox()
+    recovered = 0
+    for buf in list(state.buffer_list):
+        full_name = buf.get("full_name") or buf.get("name")
+        if not full_name:
+            continue
+        path = f"/api/buffers/{quote(full_name, safe='')}/lines?limit={BACKFILL_LIMIT}"
+        status, body = await weechat_get(session, path)
+        if status != 200:
+            log.debug(f"backfill: GET {path} → status {status} (skipping buffer)")
+            continue
+        try:
+            lines = json.loads(body)
+        except json.JSONDecodeError:
+            log.debug(f"backfill: unparseable lines response for {full_name}")
+            continue
+        if not isinstance(lines, list):
+            continue
+        # WeeChat returns newest-first; process oldest-first, id-bearing only.
+        id_lines = [l for l in lines if isinstance(l, dict) and isinstance(l.get("id"), int)]
+        id_lines.sort(key=lambda l: l["id"])
+        if not id_lines:
+            continue
+        if not is_reconnect:
+            state.last_line_id[full_name] = id_lines[-1]["id"]
+            continue
+        for line in id_lines:
+            if record_line(full_name, line):
+                recovered += 1
+    if is_reconnect and recovered:
+        log.info(f"Recovered {recovered} line(s) missed during the disconnect window")
 
 
 async def handle_ws_event(raw: str, session: ClientSession):
@@ -253,8 +390,7 @@ async def handle_ws_event(raw: str, session: ClientSession):
             log.debug(f"buffer_line_added: buffer={full_name} nick={nick} msg={preview!r}")
             if state.message_delay_s > 0:
                 await asyncio.sleep(state.message_delay_s)
-            state.line_buffer[full_name].append(line_info)
-            record_event(full_name, line_info)
+            record_line(full_name, line_info)
         else:
             # Unknown buffer — almost always a brand-new query/DM buffer that isn't
             # in our cached buffer_list yet. Refresh SYNCHRONOUSLY and retry the
@@ -267,8 +403,7 @@ async def handle_ws_event(raw: str, session: ClientSession):
             buf = next((b for b in state.buffer_list if b.get("id") == buffer_id), None)
             full_name = (buf.get("full_name") or buf.get("name")) if buf else None
             if full_name and line_info:
-                state.line_buffer[full_name].append(line_info)
-                record_event(full_name, line_info)
+                record_line(full_name, line_info)
                 log.info(f"buffer_line_added: captured first line for new buffer {full_name}")
             else:
                 log.warning(f"buffer_line_added: buffer_id={buffer_id!r} still unknown after refresh — dropping line")
@@ -293,6 +428,8 @@ async def handle_ws_event(raw: str, session: ClientSession):
         full_name = data.get("full_name") or data.get("name")
         if full_name and full_name in state.line_buffer:
             del state.line_buffer[full_name]
+        if full_name:
+            state.last_line_id.pop(full_name, None)
         asyncio.create_task(refresh_buffer_list(session))
 
     elif msg.get("request_id") == "lunarwing-sync":
@@ -336,6 +473,14 @@ async def handle_health(request: web.Request) -> web.Response:
         "status": "ok" if state.ws_connected else "degraded",
         "ws_connected": state.ws_connected,
         "ws_error": state.ws_error,
+        # Why the last disconnect happened (WSMsgType.ERROR payload, clean close,
+        # or exception) and how often — lets the health system distinguish a real
+        # relay failure from a routine reconnect.
+        "last_disconnect": state.last_disconnect,
+        "reconnect_count": state.reconnect_count,
+        # Outbound messages buffered while the relay was unreachable.
+        "outbox_depth": len(state.outbox),
+        "outbox_dropped": state.outbox_dropped,
         "buffered_buffers": len(state.line_buffer),
         "buffer_list_count": len(state.buffer_list),
         # Current global event cursor. Its presence also tells the WASM channel
@@ -457,11 +602,66 @@ async def handle_buffer_lines(request: web.Request) -> web.Response:
     return web.json_response(lines_newest_first)
 
 
+def enqueue_outbox(body: dict) -> int:
+    """Buffer an outbound /api/input body for retry after the relay recovers.
+
+    Bounded at MAX_OUTBOX; when full the oldest entry is dropped (newer
+    messages are more valuable) and the drop is counted for /api/health.
+    Returns the resulting queue depth.
+    """
+    if len(state.outbox) >= MAX_OUTBOX:
+        state.outbox.popleft()
+        state.outbox_dropped += 1
+        log.warning(f"Outbox full ({MAX_OUTBOX}) — dropped oldest queued message")
+    state.outbox.append(body)
+    return len(state.outbox)
+
+
+async def flush_outbox():
+    """Best-effort ordered flush of outbound messages queued while the relay
+    was unreachable. Stops at the first connection failure, preserving order
+    for the next attempt; entries that get a definitive HTTP response (even an
+    error status, which retrying would never fix) are dropped from the queue.
+    """
+    if not state.outbox:
+        return
+    target_url = f"{state.relay_url.rstrip('/')}/api/input"
+    auth = make_auth_header(state.relay_password)
+    flushed = 0
+    async with ClientSession() as session:
+        while state.outbox:
+            body = state.outbox[0]
+            try:
+                async with session.post(
+                    target_url,
+                    headers={"Authorization": auth, "Content-Type": "application/json"},
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    await resp.read()
+                    state.outbox.popleft()
+                    flushed += 1
+                    if resp.status >= 400:
+                        log.warning(
+                            f"Outbox flush: relay answered {resp.status} for a queued "
+                            "message — not retryable, dropping it"
+                        )
+            except Exception as e:
+                log.warning(f"Outbox flush stopped after {flushed} message(s): {e}")
+                break
+    if flushed:
+        log.info(f"Flushed {flushed} queued outbound message(s)")
+
+
 async def handle_input(request: web.Request) -> web.Response:
     """
     Proxy POST /api/input to WeeChat's HTTP API.
     The WASM calls relay_url directly for sends, but this endpoint exists
     so the WASM can optionally route everything through the adapter.
+
+    If the relay is unreachable the body is queued in a bounded outbox and
+    retried, in order, after the next successful connect — a relay outage
+    must not silently drop outbound messages. Queued sends return 202.
     """
     if not check_auth(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
@@ -477,6 +677,14 @@ async def handle_input(request: web.Request) -> web.Response:
     if state.message_delay_s > 0:
         log.debug(f"Delaying outbound message by {state.message_delay_s}s")
         await asyncio.sleep(state.message_delay_s)
+
+    # Preserve ordering: anything still queued must go out before this send,
+    # so if the flush didn't fully drain we queue this one behind them.
+    if state.outbox:
+        await flush_outbox()
+        if state.outbox:
+            depth = enqueue_outbox(body)
+            return web.json_response({"status": "queued", "outbox_depth": depth}, status=202)
 
     try:
         async with ClientSession() as session:
@@ -494,8 +702,9 @@ async def handle_input(request: web.Request) -> web.Response:
                     content_type="application/json",
                 )
     except Exception as e:
-        log.warning(f"Failed to proxy /api/input: {e}")
-        return web.json_response({"error": str(e)}, status=502)
+        depth = enqueue_outbox(body)
+        log.warning(f"Failed to proxy /api/input ({e}) — queued for retry (outbox depth {depth})")
+        return web.json_response({"status": "queued", "outbox_depth": depth}, status=202)
 
 
 # ---------------------------------------------------------------------------

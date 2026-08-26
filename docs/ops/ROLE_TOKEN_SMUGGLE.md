@@ -1,24 +1,34 @@
-# LunarWing v2 — Role-Token Smuggling via Engine V2 Bridge (effect_adapter.rs)
+# LunarWing v2 — Role-Token Smuggling Across Engine V2 Context Boundaries
 
-**Status:** RESOLVED 2026-08-26 (goal item #10)
+**Status:** RESOLVED 2026-08-26 (goal item #10, including work item #79 follow-up; mission meta-prompt sink closed by goal item #23)
 **Severity:** MEDIUM (defense-in-depth gap)
 **Branch:** `aragents/kimil00p/v2.0.9.0` (tip at time of finding: `3c9454d322d5ae614390689e465fa79bc0176203`)
 **Filed against commits:** `1b63a000` (safety crate: truncation-order + ZWSP role-token wrap), `c51cdc99` (dispatcher: sanitize+wrap tool ERROR results, shared `process_tool_result`)
-**Found by:** Kumogakure — LW v2 Security Hunter run 2026-08-25 21:04 UTC; independently re-verified same day against `origin/aragents/kimil00p/v2.0.9.0` refs (all code excerpts below are raw `git show` output)
-**Date:** 2026-08-25
+**Found by:** Kumogakure — LW v2 Security Hunter runs on 2026-08-25 and 2026-08-26
+**Date:** 2026-08-25; follow-up resolved 2026-08-26
 
 ---
 
 ## Resolution
 
-Goal item #10 closed the gap with defense in depth:
+Goal item #10 now closes both the original bridge gap and the follow-up findings from [work item #79](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/79):
 
 - `lunarwing_safety::neutralize_role_token_openers` is the shared, unconditional ZWSP neutralizer for structured content that cannot use the XML wrapper.
-- Engine V2 neutralizes sanitized JSON before parsing it, preserving the `serde_json::Value` shape while breaking every `<|...|>` opener; engine tool failures now use the same sanitize-and-wrap pipeline as the dispatcher.
+- Engine V2 neutralizes sanitized JSON before parsing it, preserving the `serde_json::Value` shape while breaking every `<|...|>` opener; engine tool failures use the same sanitize-and-wrap pipeline as the dispatcher.
 - `format_action_output` independently neutralizes every action result before truncation or history persistence, including repair of pre-existing persisted `ActionResult` entries.
-- Regression coverage exercises JSON success, tool failure, disabled injection scanning, idempotence, empty output, truncation after expansion, and persisted-history repair.
+- Both memory-document prompt builders now neutralize the complete rendered prior-knowledge section before it is appended to a system message. The Rust executor uses the shared safety primitive, while the compiled Python orchestrator uses an equivalent shared helper. Applying the protection after rendering covers document type, title, content, and future rendered fields without changing persistence.
+- A final audit of adjacent persisted system-prompt sources extended the same invariant to active skill documents and the complete CodeAct prompt. This covers learned prompt overlays, skill content and metadata, platform fields, and action names, descriptions, and parameter names.
+- The assembled system prompt in `loop_engine.rs::run()` is neutralized as a single chokepoint before it becomes the system message. The tenant identity preamble (workspace `IDENTITY`/`SOUL`/`AGENTS`/`MEMORY` — `MEMORY.md` carries conversation-derived, attacker-influenceable content) and the channel context are concatenated *after* the CodeAct builder's own neutralization, so re-applying the shared primitive over the fully assembled string is the only place that covers those two fields. The pass is idempotent because the already-neutralized CodeAct body contains no intact `<|`.
+- `wrap_external_content` now neutralizes the complete returned wrapper, including its untrusted source label and body, while retaining its existing closing-delimiter protection.
+- Mission meta prompts (`build_meta_prompt` in `mission.rs`) now neutralize the complete rendered prompt before it becomes the spawned thread's initial message (goal item #23). The meta prompt embeds retrieved memory docs, prior LLM-authored focus/approach notes, and external trigger payloads — the same attacker-influenceable source classes as the step-0 system-prompt sinks — so mission-thread history can no longer carry intact role-token openers from them either.
+- Regression coverage exercises JSON success, tool failure, disabled injection scanning, idempotence, empty output, truncation after expansion, persisted-history repair, memory-document type/title/content, active-skill content and metadata, learned overlays and dynamic CodeAct fields, the assembled identity/channel system prompt, and external-content source/body fields.
 
-Verified with all 196 `lunarwing_safety` tests, 42 effect-adapter tests, 51 orchestrator tests, `cargo fmt --all -- --check`, `cargo check -j12`, and zero-warning `cargo clippy -j12 --lib -- -D warnings` (all Cargo commands under `taskset -c 0-11`).
+The original bridge fix was verified with all 196 then-existing `lunarwing_safety` tests, 42 effect-adapter tests, and 51 orchestrator tests. The work item #79 follow-up was verified with all 197 `lunarwing_safety` tests and all 512 `lunarwing_engine` library tests, plus `cargo fmt --all -- --check`, workspace `cargo check -j12`, and zero-warning `cargo clippy -j12 -p lunarwing_safety -p lunarwing_engine --lib --tests -- -D warnings`. The goal item #23 mission meta-prompt neutralizer was verified with all 513 `lunarwing_engine` library tests (including the new meta-prompt regression test), all 197 `lunarwing_safety` tests, `cargo fmt --all -- --check`, and zero-warning `cargo clippy -p lunarwing_engine --lib --tests -- -D warnings`. All Cargo commands ran under `taskset`.
+
+### Deliberately out of scope
+
+- `llm_query` / `llm_query_batched` sub-agent `context`: the argument is authored by the model's own generated code, seeds a fresh sub-agent context rather than the main thread's role boundary, and is never persisted. Neutralizing it adds no defense against the #79 threat, so it is left unchanged.
+- Legacy `sanitizer.rs` backslash escape (`\<|`): pre-existing, severity-gated, and flagged in §7 as optional hardening warranting its own review because it changes bytes for non-tool-output consumers. Not part of #79; unchanged.
 
 The remaining sections preserve the original finding-time analysis and line references.
 

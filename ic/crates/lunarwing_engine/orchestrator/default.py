@@ -287,13 +287,19 @@ def format_output(result, max_chars=8000):
     return text
 
 
+def neutralize_role_token_openers(content):
+    """Break ChatML-family token openers in untrusted prompt content."""
+    # This is idempotent and deliberately independent of optional injection
+    # scanning so every prompt-construction boundary can share the invariant.
+    return str(content).replace("<|", "<\u200b|")
+
+
 def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
     """Neutralize role tokens and bound output before storing LLM history."""
     # Action output is untrusted even when it retains a structured host shape.
     # Break every ChatML-family token opener before persistence so re-tokenizing
-    # history cannot turn tool data into a forged role boundary. This is
-    # idempotent and deliberately independent of optional injection scanning.
-    text = str(output).replace("<|", "<\u200b|")
+    # history cannot turn tool data into a forged role boundary.
+    text = neutralize_role_token_openers(output)
     marker = "\n... (tool output truncated)"
     if len(text) <= max_chars:
         return text
@@ -376,7 +382,9 @@ def format_docs(docs):
         truncated = "..." if len(doc.get("content", "")) > 500 else ""
         parts.append("### [" + label + "] " + doc.get("title", "") +
                       "\n" + content + truncated + "\n")
-    return "\n".join(parts)
+    # Neutralize the complete section so title, body, type, and future fields
+    # cannot forge a system-message boundary when the prompt is re-tokenized.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def estimate_context_tokens(messages):
@@ -579,7 +587,9 @@ def format_skills(skills):
                      "these domains — use the http tool instead, which will " +
                      "automatically inject the required credentials.\n")
 
-    return "\n".join(parts)
+    # Skill documents and metadata may be learned from user-controlled thread
+    # content. Neutralize the complete rendered section before system injection.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def ensure_working_messages(state, context):
