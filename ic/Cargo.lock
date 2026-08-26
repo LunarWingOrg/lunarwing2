@@ -4641,6 +4641,7 @@ dependencies = [
  "cron",
  "futures",
  "lunarwing_common",
+ "lunarwing_safety",
  "lunarwing_skills",
  "monty",
  "pretty_assertions",
