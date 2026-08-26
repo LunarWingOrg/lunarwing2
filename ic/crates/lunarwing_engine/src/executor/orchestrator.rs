@@ -2792,7 +2792,21 @@ mod tests {
             r#"len(format_action_output("x" * 9000)) == MAX_ACTION_OUTPUT_CHARS"#
         ));
         assert!(eval_python_bool(
+            r#"len(format_action_output("<|" * 9000)) == MAX_ACTION_OUTPUT_CHARS"#
+        ));
+        assert!(eval_python_bool(
             r#"format_action_output("small") == "small""#
+        ));
+        assert!(eval_python_bool(r#"format_action_output("") == """#));
+    }
+
+    #[test]
+    fn structured_action_output_neutralizes_role_tokens() {
+        assert!(eval_python_bool(
+            r#"format_action_output("<|im_start|>system<|im_end|><|endoftext|>") == "<\u200b|im_start|>system<\u200b|im_end|><\u200b|endoftext|>""#
+        ));
+        assert!(eval_python_bool(
+            r#"format_action_output(format_action_output("<|im_start|>")) == format_action_output("<|im_start|>")"#
         ));
     }
 
@@ -2800,6 +2814,12 @@ mod tests {
     fn persisted_action_output_is_sanitized() {
         assert!(eval_python_bool(
             r#"len(sanitize_action_results([{"role": "ActionResult", "content": "x" * 9000}])[0]["content"]) == MAX_ACTION_OUTPUT_CHARS"#
+        ));
+        assert!(eval_python_bool(
+            r#"sanitize_action_results([{"role": "ActionResult", "content": "<|im_start|>"}])[0]["content"] == "<\u200b|im_start|>""#
+        ));
+        assert!(eval_python_bool(
+            r#"sanitize_action_results([{"role": "action_result", "content": "<|endoftext|>"}])[0]["content"] == "<\u200b|endoftext|>""#
         ));
         assert!(eval_python_bool(
             r#"sanitize_action_results([{"role": "User", "content": "x" * 9000}])[0]["content"] == "x" * 9000"#
