@@ -589,6 +589,25 @@ impl Agent {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
+        // Engine V2: initialize the engine eagerly at startup. Initialization
+        // was previously lazy-only (first engine-routed message), which left
+        // cron/webhook/event-driven missions dead after a restart until a chat
+        // message happened to arrive — the mission webhook endpoint even 500s
+        // (work item #69). Runs in the background so a slow engine bootstrap
+        // does not delay channel readiness; handlers keep their lazy fallback
+        // and `init_engine` is idempotent.
+        if crate::bridge::is_engine_v2_enabled() {
+            let agent = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = crate::bridge::init_engine(&agent).await {
+                    tracing::warn!(
+                        %error,
+                        "engine v2: eager initialization failed; engine handlers will retry lazily"
+                    );
+                }
+            });
+        }
+
         // Start self-repair task with notification forwarding
         let mut self_repair = DefaultSelfRepair::new(
             self.context_manager.clone(),
