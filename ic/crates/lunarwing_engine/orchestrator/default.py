@@ -382,7 +382,9 @@ def format_docs(docs):
         truncated = "..." if len(doc.get("content", "")) > 500 else ""
         parts.append("### [" + label + "] " + doc.get("title", "") +
                       "\n" + content + truncated + "\n")
-    return "\n".join(parts)
+    # Neutralize the complete section so title, body, type, and future fields
+    # cannot forge a system-message boundary when the prompt is re-tokenized.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def estimate_context_tokens(messages):
