@@ -96,7 +96,10 @@ fn format_docs_as_context(docs: &[MemoryDoc]) -> String {
         ));
     }
 
-    parts.join("\n")
+    // Memory docs and their metadata are untrusted persisted content. Apply the
+    // role-token defense to the complete section so current and future fields
+    // cannot forge a system-message boundary when the prompt is re-tokenized.
+    lunarwing_safety::neutralize_role_token_openers(&parts.join("\n"))
 }
 
 #[cfg(test)]
