@@ -2217,24 +2217,23 @@ impl Workspace {
     }
 }
 
-/// Normalize a file path (remove leading/trailing slashes, collapse //).
+/// Normalize a virtual file path.
+///
+/// Leading/trailing and repeated slashes are removed, `.` segments are skipped,
+/// and `..` segments are resolved without allowing traversal above the virtual
+/// workspace root.
 pub(crate) fn normalize_path(path: &str) -> String {
-    let path = path.trim().trim_matches('/');
-    // Collapse multiple slashes
-    let mut result = String::new();
-    let mut last_was_slash = false;
-    for c in path.chars() {
-        if c == '/' {
-            if !last_was_slash {
-                result.push(c);
+    let mut segments = Vec::new();
+    for segment in path.trim().split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                let _ = segments.pop();
             }
-            last_was_slash = true;
-        } else {
-            result.push(c);
-            last_was_slash = false;
+            _ => segments.push(segment),
         }
     }
-    result
+    segments.join("/")
 }
 
 /// Normalize a directory path (ensure no trailing slash for consistency).
@@ -2254,6 +2253,11 @@ mod tests {
         assert_eq!(normalize_path("foo//bar"), "foo/bar");
         assert_eq!(normalize_path("  /foo/  "), "foo");
         assert_eq!(normalize_path("README.md"), "README.md");
+        assert_eq!(normalize_path("foo/./bar"), "foo/bar");
+        assert_eq!(normalize_path("foo/baz/../bar"), "foo/bar");
+        assert_eq!(normalize_path("../escape.md"), "escape.md");
+        assert_eq!(normalize_path("foo/../../bar"), "bar");
+        assert_eq!(normalize_path(".."), "");
     }
 
     #[test]

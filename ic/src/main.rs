@@ -1358,6 +1358,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Notify user if sandbox is unavailable (Docker missing/not running)
     if let Some(warning) = docker_user_warning {
         let channels_ref = Arc::clone(&channels_for_warnings);
+        let owner_id = config.owner_id.clone();
         tokio::spawn(async move {
             // Delay to let channels finish connecting before sending the warning.
             // 5s is generous but avoids the message being lost on slow startups.
@@ -1372,7 +1373,9 @@ async fn async_main() -> anyhow::Result<()> {
                     "type": "warning",
                 }),
             };
-            let _ = channels_ref.broadcast_all("default", response).await;
+            // The real owner scope lets WASM channels resolve a persisted,
+            // channel-qualified target before invoking their broadcast callback.
+            let _ = channels_ref.broadcast_all(&owner_id, response).await;
         });
     }
 
