@@ -76,7 +76,7 @@ turn. Set `wait: true` only for short tasks that must return synchronously.
 ## Health Endpoints
 
 - `GET /health` — Worker status, uptime, version, and `opencode_ref` (the pinned
-  upstream opencode tag the image was built from, e.g. `v1.18.18`)
+  upstream opencode tag the image was built from, e.g. `v1.18.23`)
 - `GET /ready` — WebSocket readiness and connection count
 
 ## Protocol

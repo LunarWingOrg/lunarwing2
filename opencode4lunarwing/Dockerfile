@@ -1,9 +1,9 @@
 # Pin opencode to a release tag for reproducible builds.
-# Override with: docker build --build-arg OPENCODE_REF=v1.18.18 ...
+# Override with: docker build --build-arg OPENCODE_REF=v1.18.23 ...
 # Bump this default when upgrading the worker to a newer opencode release.
 # Declared in global scope so both stages share one default; each stage
 # re-declares `ARG OPENCODE_REF` (no default) to consume it.
-ARG OPENCODE_REF=v1.18.18
+ARG OPENCODE_REF=v1.18.23
 
 # ──────────────────────
 # Stage 1: build opencode from source
