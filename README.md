@@ -48,7 +48,7 @@ Architecture details: [Engine V2](docs/architecture/ENGINE-V2.md).
 - Browser gateway, CLI, and HTTP interfaces
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica
 - XMPP file attachments via XEP-0363 HTTP File Upload
-- WeeChat buffer restoration across service restarts and clean reboots
+- WeeChat buffer restoration across service restarts and clean reboots, plus relay reconnect recovery: a bounded outbound queue during disconnects and post-reconnect backfill of lines accepted while the socket was down
 - MCP runtimes for HTTP/HTTPS, Unix sockets, host-local stdio, persistent WASM components, separately deployed dedicated/shared gateways, explicitly selected core Docker job workers, and operator-described external runtimes
 - MCP artifact pinning for host stdio/WASM, optional OS sandboxing for host stdio, bounded stdio/WASM crash recovery, and owner- or job-scoped credential grants
 - MCP marketplace trust stack: ed25519 publisher signatures, signed dependency lockfiles, and signed revocation lists, enforced fail-closed on config load and activation once configured
@@ -74,7 +74,7 @@ Automatic npm/pip package installation remains disabled by design. The provenanc
 
 LunarWing workspace memory provides durable file-like documents and hybrid full-text and vector search on PostgreSQL and libSQL. Vector search activates when an embedding provider is configured; keyword search remains available without one. See [Semantic memory search](docs/architecture/SEMANTIC-MEMORY-SEARCH.md).
 
-The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) gives agents provenance-aware tools to search, compare, submit, and identify stale source-verified findings. All seven canonical tools ship natively with per-note staleness thresholds and lifecycle metadata, per-agent versions remain distinct, and notes migrate with the tenant workspace. Multi-tenant hosts can auto-provision every new tenant with a read-only, always-current study-notes MCP server via `add-tenant --with-study-mcp`.
+The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) gives agents provenance-aware tools to search, compare, submit, and identify stale source-verified findings. All seven canonical tools ship natively with per-note staleness thresholds and lifecycle metadata, per-agent versions remain distinct, and notes migrate with the tenant workspace. Multi-tenant hosts can auto-provision every new tenant with a read-only, always-current study-notes MCP server via `add-tenant --with-study-mcp`. The same flag also arms a one-shot first-boot import of the synced note corpus into the tenant's own private knowledge store — it never overwrites existing notes, and upgrading an existing tenant never arms it.
 
 Bounded [lorebooks](docs/proposals/LOREBOOKS.md) load a supported subset of SillyTavern World Info JSON and inject only entries activated by the current conversation. Lorebooks are disabled by default (`LOREBOOK_ENABLED=true` opts in) because activation scanning is computationally expensive. Prompt-injection checks run when lorebooks are written and loaded, and activation in group chats is disabled by default.
 
