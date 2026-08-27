@@ -1,0 +1,566 @@
+2026-08-26T16:40:42.903128Z 00O [0KRunning with gitlab-runner 19.2.2 (343288f1)[0;m
+2026-08-26T16:40:42.903138Z 00O [0K  on cablemanagement H-rrnTLuI, system ID: s_ecc3469ddc95[0;m
+2026-08-26T16:40:42.903141Z 00O [0K  feature flags: FF_NETWORK_PER_BUILD:true[0;m
+2026-08-26T16:40:42.903165Z 00O section_start:1787762442:prepare_executor
+[0K
+2026-08-26T16:40:42.903168Z 00O+[0K[36;1mPreparing the "docker" executor[0;m[0;m
+2026-08-26T16:40:43.045015Z 00O [0KUsing Docker executor with image docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b ...[0;m
+2026-08-26T16:40:44.213215Z 00O [0KUsing effective pull policy of [always] for container docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b[0;m
+2026-08-26T16:40:44.215658Z 00O [0KPulling docker image docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b ...[0;m
+2026-08-26T16:40:44.532273Z 00O [0KUsing docker image sha256:a1e028236d55ab8a2ec45d7c693137b5adb5d230baecdbae4f9f75cf51b6ce66 for docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b with digest docker.io/library/python@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d ...[0;m
+2026-08-26T16:40:44.532288Z 00O section_end:1787762444:prepare_executor
+[0K
+2026-08-26T16:40:44.532379Z 00O+section_start:1787762444:prepare_script
+[0K
+2026-08-26T16:40:44.532383Z 00O+[0K[36;1mPreparing environment[0;m[0;m
+2026-08-26T16:40:44.534266Z 00O [0KUsing effective pull policy of [always] for container sha256:2c4571abc11106edf0629e52900446c6708594ae342be140f489a3488c47f836[0;m
+2026-08-26T16:40:44.691786Z 01O Running on runner-h-rrntlui-project-35-concurrent-0 via cablemanagement...
+2026-08-26T16:40:44.706845Z 00O section_end:1787762444:prepare_script
+[0K
+2026-08-26T16:40:44.707265Z 00O+section_start:1787762444:get_sources
+[0K
+2026-08-26T16:40:44.707272Z 00O+[0K[36;1mGetting source from Git repository[0;m[0;m
+2026-08-26T16:40:44.950954Z 01O [32;1mGitaly correlation ID: 01M0ZF3ZA5V0CA3F54R5RGRAQQ[0;m
+2026-08-26T16:40:44.955065Z 01O [32;1mFetching changes...[0;m
+2026-08-26T16:40:44.957474Z 01O Reinitialized existing Git repository in /builds/lunarwing/lunarwing2/.git/
+2026-08-26T16:40:44.959169Z 01O [32;1mCreated fresh repository.[0;m
+2026-08-26T16:40:45.620158Z 01O [32;1mChecking out 38fbebb7 as detached HEAD (ref is master)...[0;m
+2026-08-26T16:40:45.667840Z 01O 
+2026-08-26T16:40:45.667850Z 01O [32;1mSkipping Git submodules setup[0;m
+2026-08-26T16:40:45.676756Z 00O section_end:1787762445:get_sources
+[0K
+2026-08-26T16:40:45.677526Z 00O+section_start:1787762445:step_script
+[0K
+2026-08-26T16:40:45.677535Z 00O+[0K[36;1mExecuting "step_script" stage of the job script[0;m[0;m
+2026-08-26T16:40:45.677545Z 00O [0KUsing effective pull policy of [always] for container docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b[0;m
+2026-08-26T16:40:45.680602Z 00O [0KUsing docker image sha256:a1e028236d55ab8a2ec45d7c693137b5adb5d230baecdbae4f9f75cf51b6ce66 for docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b with digest docker.io/library/python@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d ...[0;m
+2026-08-26T16:40:45.990729Z 01O [32;1m$ bash .gitlab/scripts/bootstrap-shell.sh[0;m
+2026-08-26T16:40:46.021010Z 01O Get:1 http://deb.debian.org/debian bookworm InRelease [151 kB]
+2026-08-26T16:40:46.039458Z 01O Get:2 http://deb.debian.org/debian bookworm-updates InRelease [55.4 kB]
+2026-08-26T16:40:46.046792Z 01O Get:3 http://deb.debian.org/debian-security bookworm-security InRelease [34.8 kB]
+2026-08-26T16:40:46.099292Z 01O Get:4 http://deb.debian.org/debian bookworm/main amd64 Packages [8790 kB]
+2026-08-26T16:40:46.161395Z 01O Get:5 http://deb.debian.org/debian bookworm-updates/main amd64 Packages [6924 B]
+2026-08-26T16:40:46.180195Z 01O Get:6 http://deb.debian.org/debian-security bookworm-security/main amd64 Packages [335 kB]
+2026-08-26T16:40:46.678822Z 01O Fetched 9374 kB in 1s (14.0 MB/s)
+2026-08-26T16:40:46.678830Z 01O Reading package lists...
+2026-08-26T16:40:47.017925Z 01O Reading package lists...
+2026-08-26T16:40:47.330185Z 01O Building dependency tree...
+2026-08-26T16:40:47.431442Z 01O Reading state information...
+2026-08-26T16:40:47.503498Z 01O bash is already the newest version (5.2.15-2+b13).
+2026-08-26T16:40:47.503505Z 01O bash set to manually installed.
+2026-08-26T16:40:47.503507Z 01O coreutils is already the newest version (9.1-1).
+2026-08-26T16:40:47.503508Z 01O coreutils set to manually installed.
+2026-08-26T16:40:47.503509Z 01O gzip is already the newest version (1.12-1).
+2026-08-26T16:40:47.503509Z 01O gzip set to manually installed.
+2026-08-26T16:40:47.503510Z 01O tar is already the newest version (1.34+dfsg-1.2+deb12u1).
+2026-08-26T16:40:47.503511Z 01O tar set to manually installed.
+2026-08-26T16:40:47.503511Z 01O util-linux is already the newest version (2.38.1-5+deb12u3).
+2026-08-26T16:40:47.503512Z 01O util-linux set to manually installed.
+2026-08-26T16:40:47.503512Z 01O The following additional packages will be installed:
+2026-08-26T16:40:47.503519Z 01O   git-man libbrotli1 libcurl3-gnutls libcurl4 liberror-perl
+2026-08-26T16:40:47.503615Z 01O   libevent-core-2.1-7 libexpat1 libgdbm-compat4 libjq1 libldap-2.5-0
+2026-08-26T16:40:47.503733Z 01O   libnghttp2-14 libonig5 libperl5.36 libproc2-0 libpsl5 librtmp1 libsasl2-2
+2026-08-26T16:40:47.503940Z 01O   libsasl2-modules-db libssh2-1 libutempter0 p7zip perl perl-modules-5.36
+2026-08-26T16:40:47.504364Z 01O Suggested packages:
+2026-08-26T16:40:47.504365Z 01O   gettext-base git-daemon-run | git-daemon-sysvinit git-doc git-email git-gui
+2026-08-26T16:40:47.504366Z 01O   gitk gitweb git-cvs git-mediawiki git-svn sensible-utils p7zip-rar perl-doc
+2026-08-26T16:40:47.504366Z 01O   libterm-readline-gnu-perl | libterm-readline-perl-perl make
+2026-08-26T16:40:47.504367Z 01O   libtap-harness-archive-perl
+2026-08-26T16:40:47.504367Z 01O Recommended packages:
+2026-08-26T16:40:47.504367Z 01O   patch less ssh-client libldap-common publicsuffix libsasl2-modules psmisc
+2026-08-26T16:40:47.593598Z 01O The following NEW packages will be installed:
+2026-08-26T16:40:47.593647Z 01O   curl git git-man jq libbrotli1 libcurl3-gnutls libcurl4 liberror-perl
+2026-08-26T16:40:47.593728Z 01O   libevent-core-2.1-7 libexpat1 libgdbm-compat4 libjq1 libldap-2.5-0
+2026-08-26T16:40:47.593864Z 01O   libnghttp2-14 libonig5 libperl5.36 libproc2-0 libpsl5 librtmp1 libsasl2-2
+2026-08-26T16:40:47.593963Z 01O   libsasl2-modules-db libssh2-1 libutempter0 p7zip p7zip-full perl
+2026-08-26T16:40:47.594100Z 01O   perl-modules-5.36 procps shellcheck tmux
+2026-08-26T16:40:47.594330Z 01O The following packages will be upgraded:
+2026-08-26T16:40:47.594680Z 01O   ca-certificates
+2026-08-26T16:40:47.621763Z 01O 1 upgraded, 30 newly installed, 0 to remove and 0 not upgraded.
+2026-08-26T16:40:47.621770Z 01O Need to get 25.2 MB of archives.
+2026-08-26T16:40:47.621771Z 01O After this operation, 133 MB of additional disk space will be used.
+2026-08-26T16:40:47.621772Z 01O Get:1 http://deb.debian.org/debian bookworm/main amd64 perl-modules-5.36 all 5.36.0-7+deb12u3 [2815 kB]
+2026-08-26T16:40:47.665436Z 01O Get:2 http://deb.debian.org/debian bookworm/main amd64 libgdbm-compat4 amd64 1.23-3 [48.2 kB]
+2026-08-26T16:40:47.665920Z 01O Get:3 http://deb.debian.org/debian bookworm/main amd64 libperl5.36 amd64 5.36.0-7+deb12u3 [4196 kB]
+2026-08-26T16:40:47.686353Z 01O Get:4 http://deb.debian.org/debian bookworm/main amd64 perl amd64 5.36.0-7+deb12u3 [239 kB]
+2026-08-26T16:40:47.686995Z 01O Get:5 http://deb.debian.org/debian bookworm/main amd64 libproc2-0 amd64 2:4.0.2-3 [62.8 kB]
+2026-08-26T16:40:47.687188Z 01O Get:6 http://deb.debian.org/debian bookworm/main amd64 procps amd64 2:4.0.2-3 [709 kB]
+2026-08-26T16:40:47.688821Z 01O Get:7 http://deb.debian.org/debian-security bookworm-security/main amd64 ca-certificates all 20250419~deb12u1 [162 kB]
+2026-08-26T16:40:47.689074Z 01O Get:8 http://deb.debian.org/debian bookworm/main amd64 libbrotli1 amd64 1.0.9-2+b6 [275 kB]
+2026-08-26T16:40:47.689780Z 01O Get:9 http://deb.debian.org/debian bookworm/main amd64 libsasl2-modules-db amd64 2.1.28+dfsg-10 [20.3 kB]
+2026-08-26T16:40:47.689999Z 01O Get:10 http://deb.debian.org/debian bookworm/main amd64 libsasl2-2 amd64 2.1.28+dfsg-10 [59.7 kB]
+2026-08-26T16:40:47.690226Z 01O Get:11 http://deb.debian.org/debian bookworm/main amd64 libldap-2.5-0 amd64 2.5.13+dfsg-5 [183 kB]
+2026-08-26T16:40:47.690692Z 01O Get:12 http://deb.debian.org/debian bookworm/main amd64 libnghttp2-14 amd64 1.52.0-1+deb12u3 [72.4 kB]
+2026-08-26T16:40:47.693054Z 01O Get:13 http://deb.debian.org/debian bookworm/main amd64 libpsl5 amd64 0.21.2-1 [58.7 kB]
+2026-08-26T16:40:47.702301Z 01O Get:14 http://deb.debian.org/debian bookworm/main amd64 librtmp1 amd64 2.4+20151223.gitfa8646d.1-2+b2 [60.8 kB]
+2026-08-26T16:40:47.703134Z 01O Get:15 http://deb.debian.org/debian bookworm/main amd64 libssh2-1 amd64 1.10.0-3+b1 [179 kB]
+2026-08-26T16:40:47.704495Z 01O Get:16 http://deb.debian.org/debian bookworm/main amd64 libcurl4 amd64 7.88.1-10+deb12u15 [392 kB]
+2026-08-26T16:40:47.706050Z 01O Get:17 http://deb.debian.org/debian bookworm/main amd64 curl amd64 7.88.1-10+deb12u15 [316 kB]
+2026-08-26T16:40:47.707045Z 01O Get:18 http://deb.debian.org/debian bookworm/main amd64 libcurl3-gnutls amd64 7.88.1-10+deb12u15 [386 kB]
+2026-08-26T16:40:47.708525Z 01O Get:19 http://deb.debian.org/debian bookworm/main amd64 libexpat1 amd64 2.5.0-1+deb12u2 [99.9 kB]
+2026-08-26T16:40:47.708878Z 01O Get:20 http://deb.debian.org/debian bookworm/main amd64 liberror-perl all 0.17029-2 [29.0 kB]
+2026-08-26T16:40:47.709080Z 01O Get:21 http://deb.debian.org/debian bookworm/main amd64 git-man all 1:2.39.5-0+deb12u3 [2053 kB]
+2026-08-26T16:40:47.724120Z 01O Get:22 http://deb.debian.org/debian bookworm/main amd64 git amd64 1:2.39.5-0+deb12u3 [7264 kB]
+2026-08-26T16:40:47.741909Z 01O Get:23 http://deb.debian.org/debian bookworm/main amd64 libonig5 amd64 6.9.8-1 [188 kB]
+2026-08-26T16:40:47.742409Z 01O Get:24 http://deb.debian.org/debian bookworm/main amd64 libjq1 amd64 1.6-2.1+deb12u2 [136 kB]
+2026-08-26T16:40:47.742732Z 01O Get:25 http://deb.debian.org/debian bookworm/main amd64 jq amd64 1.6-2.1+deb12u2 [64.0 kB]
+2026-08-26T16:40:47.743185Z 01O Get:26 http://deb.debian.org/debian bookworm/main amd64 libevent-core-2.1-7 amd64 2.1.12-stable-8 [131 kB]
+2026-08-26T16:40:47.744054Z 01O Get:27 http://deb.debian.org/debian bookworm/main amd64 libutempter0 amd64 1.2.1-3 [8960 B]
+2026-08-26T16:40:47.747601Z 01O Get:28 http://deb.debian.org/debian-security bookworm-security/main amd64 p7zip amd64 16.02+really26.02+dfsg-0+deb12u1 [453 kB]
+2026-08-26T16:40:47.749037Z 01O Get:29 http://deb.debian.org/debian-security bookworm-security/main amd64 p7zip-full amd64 16.02+really26.02+dfsg-0+deb12u1 [1423 kB]
+2026-08-26T16:40:47.753989Z 01O Get:30 http://deb.debian.org/debian bookworm/main amd64 shellcheck amd64 0.9.0-1 [2621 kB]
+2026-08-26T16:40:47.763181Z 01O Get:31 http://deb.debian.org/debian bookworm/main amd64 tmux amd64 3.3a-3 [455 kB]
+2026-08-26T16:40:47.839593Z 01E debconf: delaying package configuration, since apt-utils is not installed
+2026-08-26T16:40:47.865593Z 01O Fetched 25.2 MB in 0s (152 MB/s)
+2026-08-26T16:40:47.910037Z 01O Selecting previously unselected package perl-modules-5.36.
+2026-08-26T16:40:47.910045Z 01O (Reading database ... 
+2026-08-26T16:40:47.911748Z 01O+(Reading database ... 5%
+2026-08-26T16:40:47.911754Z 01O+(Reading database ... 10%
+2026-08-26T16:40:47.911862Z 01O+(Reading database ... 15%
+2026-08-26T16:40:47.911867Z 01O+(Reading database ... 20%
+2026-08-26T16:40:47.912051Z 01O+(Reading database ... 25%
+2026-08-26T16:40:47.912320Z 01O+(Reading database ... 30%
+2026-08-26T16:40:47.912511Z 01O+(Reading database ... 35%
+2026-08-26T16:40:47.912576Z 01O+(Reading database ... 40%
+2026-08-26T16:40:47.912689Z 01O+(Reading database ... 45%
+2026-08-26T16:40:47.912753Z 01O+(Reading database ... 50%
+2026-08-26T16:40:47.912795Z 01O+(Reading database ... 55%
+2026-08-26T16:40:47.912849Z 01O+(Reading database ... 60%
+2026-08-26T16:40:47.912895Z 01O+(Reading database ... 65%
+2026-08-26T16:40:47.912939Z 01O+(Reading database ... 70%
+2026-08-26T16:40:47.913019Z 01O+(Reading database ... 75%
+2026-08-26T16:40:47.913107Z 01O+(Reading database ... 80%
+2026-08-26T16:40:47.913151Z 01O+(Reading database ... 85%
+2026-08-26T16:40:47.913224Z 01O+(Reading database ... 90%
+2026-08-26T16:40:47.913375Z 01O+(Reading database ... 95%
+2026-08-26T16:40:47.914588Z 01O+(Reading database ... 100%
+(Reading database ... 6695 files and directories currently installed.)
+2026-08-26T16:40:47.915103Z 01O Preparing to unpack .../00-perl-modules-5.36_5.36.0-7+deb12u3_all.deb ...
+2026-08-26T16:40:48.034756Z 01O Unpacking perl-modules-5.36 (5.36.0-7+deb12u3) ...
+2026-08-26T16:40:48.696626Z 01O Selecting previously unselected package libgdbm-compat4:amd64.
+2026-08-26T16:40:48.698528Z 01O Preparing to unpack .../01-libgdbm-compat4_1.23-3_amd64.deb ...
+2026-08-26T16:40:48.775556Z 01O Unpacking libgdbm-compat4:amd64 (1.23-3) ...
+2026-08-26T16:40:49.015384Z 01O Selecting previously unselected package libperl5.36:amd64.
+2026-08-26T16:40:49.017149Z 01O Preparing to unpack .../02-libperl5.36_5.36.0-7+deb12u3_amd64.deb ...
+2026-08-26T16:40:49.054337Z 01O Unpacking libperl5.36:amd64 (5.36.0-7+deb12u3) ...
+2026-08-26T16:40:49.585945Z 01O Selecting previously unselected package perl.
+2026-08-26T16:40:49.587845Z 01O Preparing to unpack .../03-perl_5.36.0-7+deb12u3_amd64.deb ...
+2026-08-26T16:40:49.620506Z 01O Unpacking perl (5.36.0-7+deb12u3) ...
+2026-08-26T16:40:49.832980Z 01O Selecting previously unselected package libproc2-0:amd64.
+2026-08-26T16:40:49.834871Z 01O Preparing to unpack .../04-libproc2-0_2%3a4.0.2-3_amd64.deb ...
+2026-08-26T16:40:49.870878Z 01O Unpacking libproc2-0:amd64 (2:4.0.2-3) ...
+2026-08-26T16:40:50.152679Z 01O Selecting previously unselected package procps.
+2026-08-26T16:40:50.154555Z 01O Preparing to unpack .../05-procps_2%3a4.0.2-3_amd64.deb ...
+2026-08-26T16:40:50.186853Z 01O Unpacking procps (2:4.0.2-3) ...
+2026-08-26T16:40:50.493418Z 01O Preparing to unpack .../06-ca-certificates_20250419~deb12u1_all.deb ...
+2026-08-26T16:40:50.634482Z 01O Unpacking ca-certificates (20250419~deb12u1) over (20230311+deb12u1) ...
+2026-08-26T16:40:51.124936Z 01O Selecting previously unselected package libbrotli1:amd64.
+2026-08-26T16:40:51.126755Z 01O Preparing to unpack .../07-libbrotli1_1.0.9-2+b6_amd64.deb ...
+2026-08-26T16:40:51.160773Z 01O Unpacking libbrotli1:amd64 (1.0.9-2+b6) ...
+2026-08-26T16:40:51.336273Z 01O Selecting previously unselected package libsasl2-modules-db:amd64.
+2026-08-26T16:40:51.338070Z 01O Preparing to unpack .../08-libsasl2-modules-db_2.1.28+dfsg-10_amd64.deb ...
+2026-08-26T16:40:51.367789Z 01O Unpacking libsasl2-modules-db:amd64 (2.1.28+dfsg-10) ...
+2026-08-26T16:40:51.599822Z 01O Selecting previously unselected package libsasl2-2:amd64.
+2026-08-26T16:40:51.601738Z 01O Preparing to unpack .../09-libsasl2-2_2.1.28+dfsg-10_amd64.deb ...
+2026-08-26T16:40:51.639498Z 01O Unpacking libsasl2-2:amd64 (2.1.28+dfsg-10) ...
+2026-08-26T16:40:51.877154Z 01O Selecting previously unselected package libldap-2.5-0:amd64.
+2026-08-26T16:40:51.879072Z 01O Preparing to unpack .../10-libldap-2.5-0_2.5.13+dfsg-5_amd64.deb ...
+2026-08-26T16:40:51.913314Z 01O Unpacking libldap-2.5-0:amd64 (2.5.13+dfsg-5) ...
+2026-08-26T16:40:52.137769Z 01O Selecting previously unselected package libnghttp2-14:amd64.
+2026-08-26T16:40:52.139642Z 01O Preparing to unpack .../11-libnghttp2-14_1.52.0-1+deb12u3_amd64.deb ...
+2026-08-26T16:40:52.175623Z 01O Unpacking libnghttp2-14:amd64 (1.52.0-1+deb12u3) ...
+2026-08-26T16:40:52.415362Z 01O Selecting previously unselected package libpsl5:amd64.
+2026-08-26T16:40:52.417358Z 01O Preparing to unpack .../12-libpsl5_0.21.2-1_amd64.deb ...
+2026-08-26T16:40:52.451751Z 01O Unpacking libpsl5:amd64 (0.21.2-1) ...
+2026-08-26T16:40:52.701633Z 01O Selecting previously unselected package librtmp1:amd64.
+2026-08-26T16:40:52.703579Z 01O Preparing to unpack .../13-librtmp1_2.4+20151223.gitfa8646d.1-2+b2_amd64.deb ...
+2026-08-26T16:40:52.735520Z 01O Unpacking librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2+b2) ...
+2026-08-26T16:40:52.952308Z 01O Selecting previously unselected package libssh2-1:amd64.
+2026-08-26T16:40:52.954185Z 01O Preparing to unpack .../14-libssh2-1_1.10.0-3+b1_amd64.deb ...
+2026-08-26T16:40:52.989247Z 01O Unpacking libssh2-1:amd64 (1.10.0-3+b1) ...
+2026-08-26T16:40:53.228194Z 01O Selecting previously unselected package libcurl4:amd64.
+2026-08-26T16:40:53.229880Z 01O Preparing to unpack .../15-libcurl4_7.88.1-10+deb12u15_amd64.deb ...
+2026-08-26T16:40:53.266024Z 01O Unpacking libcurl4:amd64 (7.88.1-10+deb12u15) ...
+2026-08-26T16:40:53.461550Z 01O Selecting previously unselected package curl.
+2026-08-26T16:40:53.463270Z 01O Preparing to unpack .../16-curl_7.88.1-10+deb12u15_amd64.deb ...
+2026-08-26T16:40:53.497767Z 01O Unpacking curl (7.88.1-10+deb12u15) ...
+2026-08-26T16:40:53.739844Z 01O Selecting previously unselected package libcurl3-gnutls:amd64.
+2026-08-26T16:40:53.741821Z 01O Preparing to unpack .../17-libcurl3-gnutls_7.88.1-10+deb12u15_amd64.deb ...
+2026-08-26T16:40:53.778294Z 01O Unpacking libcurl3-gnutls:amd64 (7.88.1-10+deb12u15) ...
+2026-08-26T16:40:54.033469Z 01O Selecting previously unselected package libexpat1:amd64.
+2026-08-26T16:40:54.035254Z 01O Preparing to unpack .../18-libexpat1_2.5.0-1+deb12u2_amd64.deb ...
+2026-08-26T16:40:54.072025Z 01O Unpacking libexpat1:amd64 (2.5.0-1+deb12u2) ...
+2026-08-26T16:40:54.263867Z 01O Selecting previously unselected package liberror-perl.
+2026-08-26T16:40:54.265937Z 01O Preparing to unpack .../19-liberror-perl_0.17029-2_all.deb ...
+2026-08-26T16:40:54.302659Z 01O Unpacking liberror-perl (0.17029-2) ...
+2026-08-26T16:40:54.483630Z 01O Selecting previously unselected package git-man.
+2026-08-26T16:40:54.485977Z 01O Preparing to unpack .../20-git-man_1%3a2.39.5-0+deb12u3_all.deb ...
+2026-08-26T16:40:54.521942Z 01O Unpacking git-man (1:2.39.5-0+deb12u3) ...
+2026-08-26T16:40:54.833060Z 01O Selecting previously unselected package git.
+2026-08-26T16:40:54.834725Z 01O Preparing to unpack .../21-git_1%3a2.39.5-0+deb12u3_amd64.deb ...
+2026-08-26T16:40:54.875128Z 01O Unpacking git (1:2.39.5-0+deb12u3) ...
+2026-08-26T16:40:55.287357Z 01O Selecting previously unselected package libonig5:amd64.
+2026-08-26T16:40:55.289668Z 01O Preparing to unpack .../22-libonig5_6.9.8-1_amd64.deb ...
+2026-08-26T16:40:55.323880Z 01O Unpacking libonig5:amd64 (6.9.8-1) ...
+2026-08-26T16:40:55.551948Z 01O Selecting previously unselected package libjq1:amd64.
+2026-08-26T16:40:55.554086Z 01O Preparing to unpack .../23-libjq1_1.6-2.1+deb12u2_amd64.deb ...
+2026-08-26T16:40:55.590135Z 01O Unpacking libjq1:amd64 (1.6-2.1+deb12u2) ...
+2026-08-26T16:40:55.777856Z 01O Selecting previously unselected package jq.
+2026-08-26T16:40:55.779711Z 01O Preparing to unpack .../24-jq_1.6-2.1+deb12u2_amd64.deb ...
+2026-08-26T16:40:55.811573Z 01O Unpacking jq (1.6-2.1+deb12u2) ...
+2026-08-26T16:40:55.990734Z 01O Selecting previously unselected package libevent-core-2.1-7:amd64.
+2026-08-26T16:40:55.992901Z 01O Preparing to unpack .../25-libevent-core-2.1-7_2.1.12-stable-8_amd64.deb ...
+2026-08-26T16:40:56.024281Z 01O Unpacking libevent-core-2.1-7:amd64 (2.1.12-stable-8) ...
+2026-08-26T16:40:56.271994Z 01O Selecting previously unselected package libutempter0:amd64.
+2026-08-26T16:40:56.274216Z 01O Preparing to unpack .../26-libutempter0_1.2.1-3_amd64.deb ...
+2026-08-26T16:40:56.310583Z 01O Unpacking libutempter0:amd64 (1.2.1-3) ...
+2026-08-26T16:40:56.508614Z 01O Selecting previously unselected package p7zip.
+2026-08-26T16:40:56.510860Z 01O Preparing to unpack .../27-p7zip_16.02+really26.02+dfsg-0+deb12u1_amd64.deb ...
+2026-08-26T16:40:56.546006Z 01O Unpacking p7zip (16.02+really26.02+dfsg-0+deb12u1) ...
+2026-08-26T16:40:56.853905Z 01O Selecting previously unselected package p7zip-full.
+2026-08-26T16:40:56.857211Z 01O Preparing to unpack .../28-p7zip-full_16.02+really26.02+dfsg-0+deb12u1_amd64.deb ...
+2026-08-26T16:40:56.896188Z 01O Unpacking p7zip-full (16.02+really26.02+dfsg-0+deb12u1) ...
+2026-08-26T16:40:57.126294Z 01O Selecting previously unselected package shellcheck.
+2026-08-26T16:40:57.129203Z 01O Preparing to unpack .../29-shellcheck_0.9.0-1_amd64.deb ...
+2026-08-26T16:40:57.158182Z 01O Unpacking shellcheck (0.9.0-1) ...
+2026-08-26T16:40:57.512427Z 01O Selecting previously unselected package tmux.
+2026-08-26T16:40:57.514665Z 01O Preparing to unpack .../30-tmux_3.3a-3_amd64.deb ...
+2026-08-26T16:40:57.547368Z 01O Unpacking tmux (3.3a-3) ...
+2026-08-26T16:40:57.753523Z 01O Setting up libexpat1:amd64 (2.5.0-1+deb12u2) ...
+2026-08-26T16:40:57.828959Z 01O Setting up libpsl5:amd64 (0.21.2-1) ...
+2026-08-26T16:40:57.940908Z 01O Setting up libbrotli1:amd64 (1.0.9-2+b6) ...
+2026-08-26T16:40:58.039722Z 01O Setting up libnghttp2-14:amd64 (1.52.0-1+deb12u3) ...
+2026-08-26T16:40:58.151555Z 01O Setting up shellcheck (0.9.0-1) ...
+2026-08-26T16:40:58.257704Z 01O Setting up libsasl2-modules-db:amd64 (2.1.28+dfsg-10) ...
+2026-08-26T16:40:58.349108Z 01O Setting up ca-certificates (20250419~deb12u1) ...
+2026-08-26T16:40:59.743255Z 01O Updating certificates in /etc/ssl/certs...
+2026-08-26T16:41:00.577172Z 01O rehash: warning: skipping ca-certificates.crt,it does not contain exactly one certificate or CRL
+2026-08-26T16:41:00.582271Z 01O 21 added, 13 removed; done.
+2026-08-26T16:41:00.727561Z 01O Setting up perl-modules-5.36 (5.36.0-7+deb12u3) ...
+2026-08-26T16:41:00.807310Z 01O Setting up librtmp1:amd64 (2.4+20151223.gitfa8646d.1-2+b2) ...
+2026-08-26T16:41:00.916698Z 01O Setting up libproc2-0:amd64 (2:4.0.2-3) ...
+2026-08-26T16:41:01.028334Z 01O Setting up libevent-core-2.1-7:amd64 (2.1.12-stable-8) ...
+2026-08-26T16:41:01.138768Z 01O Setting up libgdbm-compat4:amd64 (1.23-3) ...
+2026-08-26T16:41:01.249489Z 01O Setting up libsasl2-2:amd64 (2.1.28+dfsg-10) ...
+2026-08-26T16:41:01.359939Z 01O Setting up libutempter0:amd64 (1.2.1-3) ...
+2026-08-26T16:41:01.434261Z 01O Setting up procps (2:4.0.2-3) ...
+2026-08-26T16:41:01.692118Z 01O Setting up git-man (1:2.39.5-0+deb12u3) ...
+2026-08-26T16:41:01.803223Z 01O Setting up libssh2-1:amd64 (1.10.0-3+b1) ...
+2026-08-26T16:41:01.914292Z 01O Setting up tmux (3.3a-3) ...
+2026-08-26T16:41:02.026097Z 01O Setting up libperl5.36:amd64 (5.36.0-7+deb12u3) ...
+2026-08-26T16:41:02.126567Z 01O Setting up libonig5:amd64 (6.9.8-1) ...
+2026-08-26T16:41:02.239369Z 01O Setting up p7zip (16.02+really26.02+dfsg-0+deb12u1) ...
+2026-08-26T16:41:02.350704Z 01O Setting up libjq1:amd64 (1.6-2.1+deb12u2) ...
+2026-08-26T16:41:02.461573Z 01O Setting up p7zip-full (16.02+really26.02+dfsg-0+deb12u1) ...
+2026-08-26T16:41:02.575146Z 01O Setting up libldap-2.5-0:amd64 (2.5.13+dfsg-5) ...
+2026-08-26T16:41:02.719469Z 01O Setting up perl (5.36.0-7+deb12u3) ...
+2026-08-26T16:41:02.876397Z 01O Setting up jq (1.6-2.1+deb12u2) ...
+2026-08-26T16:41:02.968720Z 01O Setting up libcurl4:amd64 (7.88.1-10+deb12u15) ...
+2026-08-26T16:41:03.081156Z 01O Setting up curl (7.88.1-10+deb12u15) ...
+2026-08-26T16:41:03.191383Z 01O Setting up libcurl3-gnutls:amd64 (7.88.1-10+deb12u15) ...
+2026-08-26T16:41:03.294674Z 01O Setting up liberror-perl (0.17029-2) ...
+2026-08-26T16:41:03.405743Z 01O Setting up git (1:2.39.5-0+deb12u3) ...
+2026-08-26T16:41:03.518975Z 01O Processing triggers for libc-bin (2.36-9+deb12u14) ...
+2026-08-26T16:41:03.567806Z 01O Processing triggers for ca-certificates (20250419~deb12u1) ...
+2026-08-26T16:41:03.590283Z 01O Updating certificates in /etc/ssl/certs...
+2026-08-26T16:41:04.114193Z 01O 0 added, 0 removed; done.
+2026-08-26T16:41:04.114201Z 01O Running hooks in /etc/ca-certificates/update.d...
+2026-08-26T16:41:04.115200Z 01O done.
+2026-08-26T16:41:04.174100Z 01O [32;1m$ bash ic/scripts/check-boundaries.sh[0;m
+2026-08-26T16:41:04.178802Z 01O === Architecture Boundary Checks ===
+2026-08-26T16:41:04.178809Z 01O 
+2026-08-26T16:41:04.178809Z 01O --- Check 1: Direct database driver usage outside db layer ---
+2026-08-26T16:41:04.205624Z 01O WARNING: Direct database driver usage found outside db layer:
+2026-08-26T16:41:04.205662Z 01O src/agent/compaction.rs:365:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205663Z 01O src/agent/reflex.rs:1286:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205663Z 01O src/agent/reflex.rs:1800:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205664Z 01O src/agent/reflex.rs:1836:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205664Z 01O src/agent/reflex.rs:1898:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205664Z 01O src/agent/reflex.rs:1957:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205665Z 01O src/agent/reflex.rs:1999:        use crate::db::libsql::{LibSqlBackend, fmt_ts};
+2026-08-26T16:41:04.205665Z 01O src/agent/reflex.rs:2001:        use libsql::params;
+2026-08-26T16:41:04.205666Z 01O src/agent/reflex.rs:2038:        use crate::db::libsql::{LibSqlBackend, fmt_ts};
+2026-08-26T16:41:04.205666Z 01O src/agent/reflex.rs:2040:        use libsql::params;
+2026-08-26T16:41:04.205666Z 01O src/agent/reflex.rs:2106:        use crate::db::libsql::{LibSqlBackend, fmt_ts};
+2026-08-26T16:41:04.205666Z 01O src/agent/reflex.rs:2108:        use libsql::params;
+2026-08-26T16:41:04.205667Z 01O src/agent/reflex.rs:2143:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205667Z 01O src/bridge/store_adapter.rs:1986:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205667Z 01O src/bridge/store_adapter.rs:2054:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205667Z 01O src/bridge/store_adapter.rs:2175:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205668Z 01O src/bridge/store_adapter.rs:2264:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205668Z 01O src/bridge/store_adapter.rs:2354:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205668Z 01O src/bridge/store_adapter.rs:2459:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205668Z 01O src/bridge/store_adapter.rs:2534:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205669Z 01O src/bridge/store_adapter.rs:2641:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205669Z 01O src/channels/wasm/storage.rs:322:    row: &tokio_postgres::Row,
+2026-08-26T16:41:04.205669Z 01O src/channels/wasm/storage.rs:346:    db: std::sync::Arc<libsql::Database>,
+2026-08-26T16:41:04.205670Z 01O src/channels/wasm/storage.rs:351:    pub fn new(db: std::sync::Arc<libsql::Database>) -> Self {
+2026-08-26T16:41:04.205670Z 01O src/channels/wasm/storage.rs:355:    async fn connect(&self) -> Result<libsql::Connection, WasmChannelStoreError> {
+2026-08-26T16:41:04.205670Z 01O src/channels/wasm/storage.rs:389:            libsql::params![params.user_id.as_str(), params.name.as_str()],
+2026-08-26T16:41:04.205671Z 01O src/channels/wasm/storage.rs:402:            libsql::params![
+2026-08-26T16:41:04.205671Z 01O src/channels/wasm/storage.rs:409:                libsql::Value::Blob(params.wasm_binary),
+2026-08-26T16:41:04.205671Z 01O src/channels/wasm/storage.rs:410:                libsql::Value::Blob(binary_hash),
+2026-08-26T16:41:04.205671Z 01O src/channels/wasm/storage.rs:427:                libsql::params![params.user_id.as_str(), params.name.as_str()],
+2026-08-26T16:41:04.205672Z 01O src/channels/wasm/storage.rs:463:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205672Z 01O src/channels/wasm/storage.rs:493:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205684Z 01O src/channels/wasm/storage.rs:543:                libsql::params![user_id],
+2026-08-26T16:41:04.205684Z 01O src/channels/wasm/storage.rs:564:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205685Z 01O src/channels/wasm/storage.rs:575:fn libsql_channel_opt_text(s: Option<&str>) -> libsql::Value {
+2026-08-26T16:41:04.205685Z 01O src/channels/wasm/storage.rs:577:        Some(s) => libsql::Value::Text(s.to_string()),
+2026-08-26T16:41:04.205685Z 01O src/channels/wasm/storage.rs:578:        None => libsql::Value::Null,
+2026-08-26T16:41:04.205686Z 01O src/channels/wasm/storage.rs:603:fn libsql_row_to_channel(row: &libsql::Row) -> Result<StoredWasmChannel, WasmChannelStoreError> {
+2026-08-26T16:41:04.205686Z 01O src/channels/wasm/storage.rs:650:    row: &libsql::Row,
+2026-08-26T16:41:04.205686Z 01O src/channels/wasm/wrapper.rs:5620:            crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("owner-route.db"))
+2026-08-26T16:41:04.205687Z 01O src/channels/web/tests/multi_tenant.rs:141:    let backend = crate::db::libsql::LibSqlBackend::new_local(&path)
+2026-08-26T16:41:04.205687Z 01O src/extensions/manager.rs:9341:            crate::db::libsql::LibSqlBackend::new_local(&db_path)
+2026-08-26T16:41:04.205687Z 01O src/extensions/manager.rs:9433:            crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("owner-actor.db"))
+2026-08-26T16:41:04.205688Z 01O src/history/store.rs:1522:fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
+2026-08-26T16:41:04.205688Z 01O src/history/store.rs:1573:fn row_to_routine_run(row: &tokio_postgres::Row) -> Result<RoutineRun, DatabaseError> {
+2026-08-26T16:41:04.205688Z 01O src/history/store.rs:2928:fn row_to_user(row: &tokio_postgres::Row) -> UserRecord {
+2026-08-26T16:41:04.205689Z 01O src/history/store.rs:2944:fn row_to_api_token(row: &tokio_postgres::Row) -> ApiTokenRecord {
+2026-08-26T16:41:04.205689Z 01O src/import/openclaw/reader.rs:85:async fn open_sqlite(db_path: &Path) -> Result<libsql::Connection, ImportError> {
+2026-08-26T16:41:04.205689Z 01O src/import/openclaw/reader.rs:86:    let db = libsql::Builder::new_local(db_path)
+2026-08-26T16:41:04.205690Z 01O src/import/openclaw/reader.rs:325:                    libsql::params![id.as_str()],
+2026-08-26T16:41:04.205690Z 01O src/secrets/store.rs:296:fn row_to_secret(row: &tokio_postgres::Row) -> Secret {
+2026-08-26T16:41:04.205690Z 01O src/secrets/store.rs:320:    db: Arc<libsql::Database>,
+2026-08-26T16:41:04.205690Z 01O src/secrets/store.rs:327:    pub fn new(db: Arc<libsql::Database>, crypto: Arc<SecretsCrypto>) -> Self {
+2026-08-26T16:41:04.205691Z 01O src/secrets/store.rs:331:    async fn connect(&self) -> Result<libsql::Connection, SecretError> {
+2026-08-26T16:41:04.205691Z 01O src/secrets/store.rs:379:                libsql::params![
+2026-08-26T16:41:04.205691Z 01O src/secrets/store.rs:383:                    libsql::Value::Blob(encrypted_value.clone()),
+2026-08-26T16:41:04.205691Z 01O src/secrets/store.rs:384:                    libsql::Value::Blob(key_salt.clone()),
+2026-08-26T16:41:04.205692Z 01O src/secrets/store.rs:402:                libsql::params![user_id, params.name.as_str()],
+2026-08-26T16:41:04.205692Z 01O src/secrets/store.rs:433:                libsql::params![user_id, name.as_str()],
+2026-08-26T16:41:04.205692Z 01O src/secrets/store.rs:474:                libsql::params![user_id, name.as_str()],
+2026-08-26T16:41:04.205693Z 01O src/secrets/store.rs:491:                libsql::params![user_id],
+2026-08-26T16:41:04.205693Z 01O src/secrets/store.rs:516:                libsql::params![user_id, name.as_str()],
+2026-08-26T16:41:04.205693Z 01O src/secrets/store.rs:534:            libsql::params![now.as_str(), secret_id.to_string()],
+2026-08-26T16:41:04.205693Z 01O src/secrets/store.rs:571:fn libsql_opt_text(s: Option<&str>) -> libsql::Value {
+2026-08-26T16:41:04.205694Z 01O src/secrets/store.rs:573:        Some(s) => libsql::Value::Text(s.to_string()),
+2026-08-26T16:41:04.205697Z 01O src/secrets/store.rs:574:        None => libsql::Value::Null,
+2026-08-26T16:41:04.205697Z 01O src/secrets/store.rs:596:fn libsql_row_to_secret(row: &libsql::Row) -> Result<Secret, SecretError> {
+2026-08-26T16:41:04.205698Z 01O src/testing/mod.rs:51:    use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205698Z 01O src/tools/builtin/memory.rs:1252:                    tokio_postgres::Config::new(),
+2026-08-26T16:41:04.205698Z 01O src/tools/builtin/memory.rs:1253:                    tokio_postgres::NoTls,
+2026-08-26T16:41:04.205698Z 01O src/tools/builtin/memory.rs:1363:                    tokio_postgres::Config::new(),
+2026-08-26T16:41:04.205699Z 01O src/tools/builtin/memory.rs:1364:                    tokio_postgres::NoTls,
+2026-08-26T16:41:04.205699Z 01O src/tools/builtin/memory.rs:1466:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205699Z 01O src/tools/builtin/memory.rs:1823:            use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205700Z 01O src/tools/mcp/config.rs:3298:        let backend = crate::db::libsql::LibSqlBackend::new_local(&dir.path().join("t.db"))
+2026-08-26T16:41:04.205700Z 01O src/tools/wasm/storage.rs:566:fn row_to_tool(row: &tokio_postgres::Row) -> Result<StoredWasmTool, WasmStorageError> {
+2026-08-26T16:41:04.205700Z 01O src/tools/wasm/storage.rs:596:    db: std::sync::Arc<libsql::Database>,
+2026-08-26T16:41:04.205700Z 01O src/tools/wasm/storage.rs:601:    pub fn new(db: std::sync::Arc<libsql::Database>) -> Self {
+2026-08-26T16:41:04.205701Z 01O src/tools/wasm/storage.rs:605:    async fn connect(&self) -> Result<libsql::Connection, WasmStorageError> {
+2026-08-26T16:41:04.205701Z 01O src/tools/wasm/storage.rs:639:            libsql::params![params.user_id.as_str(), params.name.as_str()],
+2026-08-26T16:41:04.205701Z 01O src/tools/wasm/storage.rs:652:            libsql::params![
+2026-08-26T16:41:04.205702Z 01O src/tools/wasm/storage.rs:659:                libsql::Value::Blob(params.wasm_binary),
+2026-08-26T16:41:04.205702Z 01O src/tools/wasm/storage.rs:660:                libsql::Value::Blob(binary_hash),
+2026-08-26T16:41:04.205702Z 01O src/tools/wasm/storage.rs:679:                libsql::params![params.user_id.as_str(), params.name.as_str()],
+2026-08-26T16:41:04.205703Z 01O src/tools/wasm/storage.rs:711:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205703Z 01O src/tools/wasm/storage.rs:747:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205703Z 01O src/tools/wasm/storage.rs:805:                libsql::params![tool_id.to_string()],
+2026-08-26T16:41:04.205703Z 01O src/tools/wasm/storage.rs:880:                libsql::params![user_id],
+2026-08-26T16:41:04.205704Z 01O src/tools/wasm/storage.rs:908:                libsql::params![status.to_string(), now.as_str(), user_id, name],
+2026-08-26T16:41:04.205704Z 01O src/tools/wasm/storage.rs:925:                libsql::params![user_id, name],
+2026-08-26T16:41:04.205704Z 01O src/tools/wasm/storage.rs:935:fn libsql_wasm_opt_text(s: Option<&str>) -> libsql::Value {
+2026-08-26T16:41:04.205705Z 01O src/tools/wasm/storage.rs:937:        Some(s) => libsql::Value::Text(s.to_string()),
+2026-08-26T16:41:04.205705Z 01O src/tools/wasm/storage.rs:938:        None => libsql::Value::Null,
+2026-08-26T16:41:04.205705Z 01O src/tools/wasm/storage.rs:964:fn libsql_row_to_tool(row: &libsql::Row) -> Result<StoredWasmTool, WasmStorageError> {
+2026-08-26T16:41:04.205705Z 01O src/tools/wasm/storage.rs:974:fn libsql_row_to_tool_with_offset(row: &libsql::Row) -> Result<StoredWasmTool, WasmStorageError> {
+2026-08-26T16:41:04.205706Z 01O src/tools/wasm/storage.rs:981:    row: &libsql::Row,
+2026-08-26T16:41:04.205706Z 01O src/workspace/hygiene.rs:538:            use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205707Z 01O src/workspace/mod.rs:2469:    use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205708Z 01O src/workspace/mod.rs:2884:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205708Z 01O src/workspace/mod.rs:3039:        use crate::db::libsql::LibSqlBackend;
+2026-08-26T16:41:04.205711Z 01O 
+2026-08-26T16:41:04.207008Z 01O (100 occurrence(s) -- these modules should use the Database trait)
+2026-08-26T16:41:04.211868Z 01O 
+2026-08-26T16:41:04.211870Z 01O --- Check 2: .unwrap() / .expect() / assert!() in production code ---
+2026-08-26T16:41:04.287434Z 01O WARNING: ~17358 .unwrap()/.expect()/assert!() calls found in src/ (excluding main/testing/setup).
+2026-08-26T16:41:04.287441Z 01O Many are in test modules; a per-file breakdown helps triage:
+2026-08-26T16:41:04.287442Z 01O 
+2026-08-26T16:41:04.303912Z 01O     701 src/darkirc_key_manager.rs
+2026-08-26T16:41:04.303920Z 01O     469 src/extensions/manager.rs
+2026-08-26T16:41:04.303920Z 01O     308 src/bridge/router.rs
+2026-08-26T16:41:04.303921Z 01O     307 src/tools/mcp/config.rs
+2026-08-26T16:41:04.303921Z 01O     278 src/channels/xmpp/mod.rs
+2026-08-26T16:41:04.303922Z 01O     274 src/llm/reasoning.rs
+2026-08-26T16:41:04.303922Z 01O     269 src/settings.rs
+2026-08-26T16:41:04.303922Z 01O     255 src/agent/session.rs
+2026-08-26T16:41:04.303923Z 01O     245 src/agent/reflex.rs
+2026-08-26T16:41:04.303923Z 01O     232 src/testing/mod.rs
+2026-08-26T16:41:04.303923Z 01O     228 src/channels/wasm/wrapper.rs
+2026-08-26T16:41:04.303923Z 01O     209 src/llm/lunarwing_cloud_chat.rs
+2026-08-26T16:41:04.303924Z 01O     207 src/tools/mcp/gateway_control.rs
+2026-08-26T16:41:04.303924Z 01O     207 src/channels/signal.rs
+2026-08-26T16:41:04.303924Z 01O     190 src/context/manager.rs
+2026-08-26T16:41:04.306271Z 01O     ... and 305 more files
+2026-08-26T16:41:04.306273Z 01O 
+2026-08-26T16:41:04.306273Z 01O (This is a warning for gradual cleanup, not a blocking violation.)
+2026-08-26T16:41:04.306274Z 01O (Many of these are inside #[cfg(test)] modules which is acceptable.)
+2026-08-26T16:41:04.306278Z 01O 
+2026-08-26T16:41:04.306278Z 01O --- Check 3: Direct env var reads outside config layer ---
+2026-08-26T16:41:04.319937Z 01O WARNING: Direct env var reads found outside config layer (107 occurrences):
+2026-08-26T16:41:04.319975Z 01O src/bridge/store_adapter.rs:1569:            let allow = std::env::var("ORCHESTRATOR_SELF_MODIFY")
+2026-08-26T16:41:04.319976Z 01O src/bridge/auth_manager.rs:572:        let original = std::env::var(key).ok();
+2026-08-26T16:41:04.319976Z 01O src/bridge/router.rs:34:    std::env::var("ENGINE_V2")
+2026-08-26T16:41:04.319977Z 01O src/bridge/router.rs:80:    let configured = std::env::var("ENGINE_V2_CHANNELS").ok();
+2026-08-26T16:41:04.319978Z 01O src/bridge/router.rs:2992:        if std::env::var("AGENT_SUPERVISED_MODE")
+2026-08-26T16:41:04.319978Z 01O src/bridge/router.rs:4932:    let token = std::env::var("CLAWHUB_TOKEN").map_err(|_| {
+2026-08-26T16:41:04.319978Z 01O src/channels/wasm/bundled.rs:39:        std::env::var("LUNARWING_CHANNELS_SRC").or_else(|_| std::env::var("IRONCLAW_CHANNELS_SRC"))
+2026-08-26T16:41:04.319979Z 01O src/channels/wasm/setup.rs:372:            if let Ok(env_value) = std::env::var(&placeholder)
+2026-08-26T16:41:04.319979Z 01O src/channels/wasm/setup.rs:443:            && let Ok(value) = std::env::var(env_var)
+2026-08-26T16:41:04.319979Z 01O src/channels/wasm/setup.rs:521:        if let Ok(val) = std::env::var(env_var)
+2026-08-26T16:41:04.319980Z 01O src/channels/wasm/wrapper.rs:3669:                if std::env::var("CI").is_ok() {
+2026-08-26T16:41:04.319980Z 01O src/channels/wasm/wrapper.rs:3685:                if std::env::var("CI").is_ok() {
+2026-08-26T16:41:04.319980Z 01O src/channels/wasm/wrapper.rs:3712:        if let Some(home) = std::env::var_os("HOME") {
+2026-08-26T16:41:04.319980Z 01O src/channels/web/handlers/coord.rs:224:    std::env::var("COORD_ADMIN_PORT")
+2026-08-26T16:41:04.319981Z 01O src/channels/web/handlers/coord.rs:235:    std::env::var(COORD_ADMIN_TOKEN_ENV)
+2026-08-26T16:41:04.319981Z 01O src/channels/web/log_layer.rs:179:        std::env::var("RUST_LOG").unwrap_or_else(|_| "lunarwing=info,tower_http=warn".to_string());
+2026-08-26T16:41:04.319981Z 01O src/channels/xmpp/mod.rs:3168:    std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() == Some("1")
+2026-08-26T16:41:04.319992Z 01O src/channels/coalesce.rs:107:        if let Ok(v) = std::env::var("COALESCE_ENABLED") {
+2026-08-26T16:41:04.319992Z 01O src/channels/coalesce.rs:110:        if let Some(window) = std::env::var("COALESCE_WINDOW_SEC")
+2026-08-26T16:41:04.319992Z 01O src/channels/coalesce.rs:117:        if let Some(n) = std::env::var("COALESCE_MAX_MERGES")
+2026-08-26T16:41:04.319993Z 01O src/channels/coalesce.rs:124:        if let Ok(v) = std::env::var("COORD_CHANNELS") {
+2026-08-26T16:41:04.319993Z 01O src/channels/manager.rs:34:            coordination_channels: std::env::var(COORD_CHANNELS_ENV)
+2026-08-26T16:41:04.319993Z 01O src/channels/manager.rs:81:    std::env::var(name)
+2026-08-26T16:41:04.319993Z 01O src/context/state.rs:28:    std::env::var("VISION_SERVICE_URL")
+2026-08-26T16:41:04.319994Z 01O src/db/libsql/workspace.rs:34:    let enabled = std::env::var("EMBEDDING_ENABLED")
+2026-08-26T16:41:04.319994Z 01O src/db/libsql/workspace.rs:43:    if let Ok(dim_str) = std::env::var("EMBEDDING_DIMENSION")
+2026-08-26T16:41:04.319994Z 01O src/db/libsql/workspace.rs:51:        std::env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-small".to_string());
+2026-08-26T16:41:04.319995Z 01O src/extensions/manager.rs:423:            gateway_token: std::env::var("GATEWAY_AUTH_TOKEN").ok(),
+2026-08-26T16:41:04.319995Z 01O src/extensions/manager.rs:991:                    .is_some_and(|v| std::env::var(v).is_ok());
+2026-08-26T16:41:04.319995Z 01O src/extensions/manager.rs:3742:            && let Ok(value) = std::env::var(env_var)
+2026-08-26T16:41:04.319995Z 01O src/extensions/manager.rs:4057:            && let Ok(val) = std::env::var(env)
+2026-08-26T16:41:04.319996Z 01O src/extensions/manager.rs:4359:                    .is_some_and(|e| std::env::var(e).is_ok())
+2026-08-26T16:41:04.319996Z 01O src/extensions/manager.rs:4366:                    .is_some_and(|e| std::env::var(e).is_ok())
+2026-08-26T16:41:04.319996Z 01O src/extensions/manager.rs:4429:                    .is_some_and(|v| std::env::var(v).is_ok());
+2026-08-26T16:41:04.319997Z 01O src/extensions/manager.rs:6342:        if let Ok(value) = std::env::var(placeholder)
+2026-08-26T16:41:04.319997Z 01O src/extensions/manager.rs:9893:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319997Z 01O src/extensions/manager.rs:9915:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319997Z 01O src/extensions/manager.rs:9936:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319998Z 01O src/extensions/manager.rs:9962:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319998Z 01O src/extensions/manager.rs:9990:            let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319998Z 01O src/extensions/manager.rs:10048:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319999Z 01O src/extensions/manager.rs:10074:        let original = std::env::var("IRONCLAW_OAUTH_CALLBACK_URL").ok();
+2026-08-26T16:41:04.319999Z 01O src/gate/coordination.rs:42:        let permissive = std::env::var("COORD_PERMISSIVE")
+2026-08-26T16:41:04.319999Z 01O src/gate/violation_store.rs:122:    std::env::var(name).ok()?.trim().parse().ok()
+2026-08-26T16:41:04.320000Z 01O src/hooks/coordination.rs:259:        if let Ok(v) = std::env::var("COORD_AGENT_ID") {
+2026-08-26T16:41:04.320000Z 01O src/hooks/coordination.rs:381:    std::env::var(name)
+2026-08-26T16:41:04.320000Z 01O src/hooks/coordination.rs:387:    std::env::var(name)
+2026-08-26T16:41:04.320000Z 01O src/hooks/coordination.rs:398:    std::env::var(name).ok()?.trim().parse().ok()
+2026-08-26T16:41:04.320001Z 01O src/hooks/coordination_knowledge.rs:117:        if let Ok(raw) = std::env::var("COORD_KNOWLEDGE_PUBLISHERS") {
+2026-08-26T16:41:04.320001Z 01O src/hooks/coordination_knowledge.rs:156:    let Ok(raw) = std::env::var(name) else {
+2026-08-26T16:41:04.320001Z 01O src/import/openclaw/mod.rs:45:        if let Ok(home) = std::env::var("HOME") {
+2026-08-26T16:41:04.320003Z 01O src/llm/lunarwing_cloud_chat.rs:205:        if let Ok(key) = std::env::var("LUNARWING_CLOUD_API_KEY")
+2026-08-26T16:41:04.320004Z 01O src/llm/oauth_helpers.rs:395:        let original = std::env::var("OAUTH_CALLBACK_HOST").ok();
+2026-08-26T16:41:04.320004Z 01O src/llm/oauth_helpers.rs:419:        let original = std::env::var("OAUTH_CALLBACK_HOST").ok();
+2026-08-26T16:41:04.320004Z 01O src/llm/recording.rs:574:        let enabled = std::env::var("LUNARWING_RECORD_TRACE")
+2026-08-26T16:41:04.320005Z 01O src/llm/recording.rs:575:            .or_else(|_| std::env::var("IRONCLAW_RECORD_TRACE"))
+2026-08-26T16:41:04.320005Z 01O src/llm/recording.rs:580:        let output_path = std::env::var("LUNARWING_TRACE_OUTPUT")
+2026-08-26T16:41:04.320005Z 01O src/llm/recording.rs:581:            .or_else(|_| std::env::var("IRONCLAW_TRACE_OUTPUT"))
+2026-08-26T16:41:04.320006Z 01O src/llm/recording.rs:590:        let model_name = std::env::var("LUNARWING_TRACE_MODEL_NAME")
+2026-08-26T16:41:04.320006Z 01O src/llm/recording.rs:591:            .or_else(|_| std::env::var("IRONCLAW_TRACE_MODEL_NAME"))
+2026-08-26T16:41:04.320006Z 01O src/llm/session.rs:619:    if let Ok(token) = std::env::var("LUNARWING_CLOUD_SESSION_TOKEN")
+2026-08-26T16:41:04.320006Z 01O src/orchestrator/reaper.rs:676:            std::env::var("LUNARWING_E2E_DOCKER_TESTS").is_ok()
+2026-08-26T16:41:04.320007Z 01O src/orchestrator/mod.rs:61:    std::env::var("ORCHESTRATOR_PORT")
+2026-08-26T16:41:04.320007Z 01O src/registry/artifacts.rs:34:    if let Ok(dir) = std::env::var("CARGO_TARGET_DIR") {
+2026-08-26T16:41:04.320007Z 01O src/sandbox/container.rs:541:        std::env::var_os("HOME").map(PathBuf::from),
+2026-08-26T16:41:04.320007Z 01O src/sandbox/container.rs:542:        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+2026-08-26T16:41:04.320008Z 01O src/sandbox/container.rs:543:        std::env::var("UID").ok(),
+2026-08-26T16:41:04.320008Z 01O src/sandbox/proxy/http.rs:58:        std::env::var(name).ok()
+2026-08-26T16:41:04.320008Z 01O src/secrets/mod.rs:122:    if let Ok(env_key) = std::env::var("SECRETS_MASTER_KEY")
+2026-08-26T16:41:04.320009Z 01O src/service.rs:637:    if let Ok(explicit) = std::env::var("XMPP_BRIDGE_EXECUTABLE") {
+2026-08-26T16:41:04.320009Z 01O src/service.rs:945:    let user = std::env::var("SUDO_USER")
+2026-08-26T16:41:04.320009Z 01O src/service.rs:947:        .or_else(|| std::env::var("USER").ok())
+2026-08-26T16:41:04.320009Z 01O src/service.rs:969:    std::env::var_os("PATH")
+2026-08-26T16:41:04.320009Z 01O src/skills/catalog.rs:165:        let registry_url = std::env::var("CLAWHUB_REGISTRY")
+2026-08-26T16:41:04.320010Z 01O src/skills/catalog.rs:166:            .or_else(|_| std::env::var("CLAWDHUB_REGISTRY"))
+2026-08-26T16:41:04.320010Z 01O src/skills/gating.rs:60:        if std::env::var(var).is_err() {
+2026-08-26T16:41:04.320010Z 01O src/tools/builtin/shell.rs:688:            if let Ok(val) = std::env::var(var) {
+2026-08-26T16:41:04.320011Z 01O src/tools/builtin/ssh_git.rs:461:        if let Ok(val) = std::env::var(var) {
+2026-08-26T16:41:04.320011Z 01O src/tools/mcp/provenance.rs:500:    let Some(path_var) = std::env::var_os("PATH") else {
+2026-08-26T16:41:04.320011Z 01O src/tools/mcp/stdio_transport.rs:204:    std::env::vars_os()
+2026-08-26T16:41:04.320011Z 01O src/tools/mcp/gateway_control.rs:367:            std::env::var(GATEWAY_CONTROL_BIND_ENV).ok(),
+2026-08-26T16:41:04.320012Z 01O src/tools/mcp/gateway_control.rs:368:            std::env::var(GATEWAY_CONTROL_ADMIN_TOKEN_ENV).ok(),
+2026-08-26T16:41:04.320012Z 01O src/tools/mcp/gateway_control.rs:369:            std::env::var(GATEWAY_CONTROL_ROUTES_PATH_ENV).ok(),
+2026-08-26T16:41:04.320012Z 01O src/tools/mcp/gateway_control.rs:370:            std::env::var(GATEWAY_CONTROL_ALLOW_NON_LOOPBACK_ENV).ok(),
+2026-08-26T16:41:04.320013Z 01O src/tools/mcp/config.rs:1024:        parse_study_notes_allow_write(std::env::var_os(STUDY_NOTES_ALLOW_WRITE_ENV).as_deref())?;
+2026-08-26T16:41:04.320013Z 01O src/tools/mcp/config.rs:1025:    let home = std::env::var_os(STUDY_NOTES_HOME_ENV);
+2026-08-26T16:41:04.320015Z 01O src/tools/mcp/config.rs:1026:    let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
+2026-08-26T16:41:04.320015Z 01O src/tools/process.rs:132:    if let Ok(slice) = std::env::var("LUNARWING_WORKLOAD_SLICE")
+2026-08-26T16:41:04.320016Z 01O src/tools/process.rs:137:    spawner.memory_max = std::env::var("LUNARWING_WORKLOAD_MEMORY_MAX")
+2026-08-26T16:41:04.320016Z 01O src/tools/process.rs:167:    std::env::var("LUNARWING_WORKLOAD_ISOLATION")
+2026-08-26T16:41:04.320016Z 01O src/tools/process.rs:181:        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+2026-08-26T16:41:04.320017Z 01O src/tools/wasm/loader.rs:475:                .and_then(|env| std::env::var(env).ok())
+2026-08-26T16:41:04.320017Z 01O src/tools/wasm/loader.rs:486:                .and_then(|env| std::env::var(env).ok())
+2026-08-26T16:41:04.320017Z 01O src/tools/wasm/loader.rs:572:        std::env::var("LUNARWING_TOOLS_SRC").or_else(|_| std::env::var("IRONCLAW_TOOLS_SRC"))
+2026-08-26T16:41:04.320021Z 01O src/tools/wasm/loader.rs:814:        let previous = std::env::var(key).ok();
+2026-08-26T16:41:04.320021Z 01O src/tools/wasm/wrapper.rs:542:        if std::env::var("ALLOW_PRIVATE_IPS").ok().as_deref() != Some("1") {
+2026-08-26T16:41:04.320022Z 01O src/tunnel/netbird.rs:438:        let Ok(pid_path) = std::env::var("LUNARWING_PDEATHSIG_HELPER") else {
+2026-08-26T16:41:04.320022Z 01O src/worker/api.rs:143:        let token = std::env::var("LUNARWING_WORKER_TOKEN")
+2026-08-26T16:41:04.320022Z 01O src/worker/api.rs:144:            .or_else(|_| std::env::var("IRONCLAW_WORKER_TOKEN"))
+2026-08-26T16:41:04.320022Z 01O src/worker/mod.rs:50:    let agent_command = std::env::var("ACP_AGENT_COMMAND").map_err(|_| {
+2026-08-26T16:41:04.320023Z 01O src/worker/mod.rs:54:    let agent_args: Vec<String> = match std::env::var("ACP_AGENT_ARGS") {
+2026-08-26T16:41:04.320023Z 01O src/worker/mod.rs:62:    let agent_env: std::collections::HashMap<String, String> = match std::env::var("ACP_AGENT_ENV")
+2026-08-26T16:41:04.320023Z 01O src/app.rs:635:                        if let Some(home) = std::env::var_os(STUDY_NOTES_HOME_ENV) {
+2026-08-26T16:41:04.320024Z 01O src/app.rs:636:                            let state_home = std::env::var_os(STUDY_NOTES_STATE_HOME_ENV);
+2026-08-26T16:41:04.320024Z 01O src/app.rs:638:                                std::env::var_os(STUDY_NOTES_ALLOW_WRITE_ENV).as_deref(),
+2026-08-26T16:41:04.320024Z 01O src/app.rs:1135:            let onboard_env = std::env::var("ONBOARD_COMPLETED")
+2026-08-26T16:41:04.320024Z 01O src/app.rs:1161:            let import_dir = std::env::var("WORKSPACE_IMPORT_DIR")
+2026-08-26T16:41:04.320025Z 01O 
+2026-08-26T16:41:04.320025Z 01O (Review these -- secrets/config should come through Config or the secrets module)
+2026-08-26T16:41:04.320025Z 01O 
+2026-08-26T16:41:04.320025Z 01O --- Check 4: Test tier gating for integration tests ---
+2026-08-26T16:41:04.324535Z 01O OK
+2026-08-26T16:41:04.324535Z 01O 
+2026-08-26T16:41:04.324536Z 01O --- Check 5: No silent test-skip patterns ---
+2026-08-26T16:41:04.326117Z 01O OK
+2026-08-26T16:41:04.326119Z 01O 
+2026-08-26T16:41:04.326120Z 01O --- Check 6: LLM module isolation ---
+2026-08-26T16:41:04.330388Z 01O WARNING: src/llm/ has 28 reference(s) to modules outside crate::llm:
+2026-08-26T16:41:04.330410Z 01O src/llm/config.rs:159:        let api_key = crate::config::helpers::env_or_override("LUNARWING_CLOUD_API_KEY")
+2026-08-26T16:41:04.330411Z 01O src/llm/config.rs:168:        let base_url = crate::config::helpers::env_or_override("LUNARWING_CLOUD_BASE_URL")
+2026-08-26T16:41:04.330412Z 01O src/llm/lunarwing_cloud_chat.rs:310:            let truncated = crate::agent::truncate_for_preview(&response_text, 512);
+2026-08-26T16:41:04.330412Z 01O src/llm/lunarwing_cloud_chat.rs:318:            let truncated = crate::agent::truncate_for_preview(&response_text, 512);
+2026-08-26T16:41:04.330413Z 01O src/llm/lunarwing_cloud_chat.rs:370:            let truncated = crate::agent::truncate_for_preview(&response_text, 512);
+2026-08-26T16:41:04.330424Z 01O src/llm/lunarwing_cloud_chat.rs:665:    fn set_model(&self, model: &str) -> Result<(), crate::error::LlmError> {
+2026-08-26T16:41:04.330424Z 01O src/llm/models.rs:109:pub(crate) fn build_lunarwing_cloud_model_fetch_config() -> crate::config::LlmConfig {
+2026-08-26T16:41:04.330425Z 01O src/llm/models.rs:110:    let auth_base_url = crate::config::helpers::env_or_override("LUNARWING_CLOUD_AUTH_URL")
+2026-08-26T16:41:04.330425Z 01O src/llm/models.rs:113:    let lunarwing_cloud = crate::config::LunarWingCloudConfig::for_model_discovery();
+2026-08-26T16:41:04.330426Z 01O src/llm/models.rs:114:    crate::config::LlmConfig {
+2026-08-26T16:41:04.330426Z 01O src/llm/models.rs:118:            session_path: crate::config::llm::default_session_path(),
+2026-08-26T16:41:04.330427Z 01O src/llm/oauth_helpers.rs:43:    crate::config::helpers::env_or_override("LUNARWING_OAUTH_CALLBACK_URL")
+2026-08-26T16:41:04.330427Z 01O src/llm/oauth_helpers.rs:59:    crate::config::helpers::env_or_override("OAUTH_CALLBACK_HOST")
+2026-08-26T16:41:04.330428Z 01O src/llm/oauth_helpers.rs:365:    use crate::config::helpers::lock_env;
+2026-08-26T16:41:04.330428Z 01O src/llm/reasoning.rs:2001:        other => crate::channels::budget::budget_for_channel(other)
+2026-08-26T16:41:04.330428Z 01O src/llm/recording.rs:616:    pub async fn snapshot_memory(&self, workspace: &crate::workspace::Workspace) {
+2026-08-26T16:41:04.330429Z 01O src/llm/registry.rs:316:    Some(crate::bootstrap::lunarwing_base_dir().join("providers.json"))
+2026-08-26T16:41:04.330429Z 01O src/llm/session.rs:58:    store: RwLock<Option<Arc<dyn crate::db::Database>>>,
+2026-08-26T16:41:04.330429Z 01O src/llm/session.rs:121:    pub async fn attach_store(&self, store: Arc<dyn crate::db::Database>, user_id: &str) {
+2026-08-26T16:41:04.330430Z 01O src/llm/session.rs:199:        let preview = crate::agent::truncate_for_preview(&body, 200);
+2026-08-26T16:41:04.330430Z 01O src/llm/session.rs:398:            crate::setup::secret_input("API key").map_err(|e| LlmError::SessionRenewalFailed {
+2026-08-26T16:41:04.330431Z 01O src/llm/session.rs:416:        crate::config::helpers::set_runtime_env("LUNARWING_CLOUD_API_KEY", &key);
+2026-08-26T16:41:04.330431Z 01O src/llm/session.rs:421:        if let Err(e) = crate::bootstrap::upsert_bootstrap_var("LUNARWING_CLOUD_API_KEY", &key) {
+2026-08-26T16:41:04.330431Z 01O src/llm/session.rs:426:        crate::setup::print_success("LunarWing Cloud Cloud API key saved.");
+2026-08-26T16:41:04.330432Z 01O src/llm/transcription/mod.rs:103:    pub async fn process(&self, msg: &mut crate::channels::IncomingMessage) {
+2026-08-26T16:41:04.330432Z 01O src/llm/transcription/mod.rs:104:        use crate::channels::AttachmentKind;
+2026-08-26T16:41:04.330432Z 01O src/llm/transcription/mod.rs:169:    use crate::channels::{AttachmentKind, IncomingAttachment, IncomingMessage};
+2026-08-26T16:41:04.330433Z 01O src/llm/provider.rs:10:use crate::safety::neutralize_role_token_openers;
+2026-08-26T16:41:04.330433Z 01O 
+2026-08-26T16:41:04.330433Z 01O (These are pre-existing; fix them before extracting the crate.)
+2026-08-26T16:41:04.330437Z 01O (New 'use crate::' imports are hard violations — see below.)
+2026-08-26T16:41:04.330438Z 01O 
+2026-08-26T16:41:04.334212Z 01O HARD VIOLATION: new 'use crate::' imports in src/llm/:
+2026-08-26T16:41:04.334213Z 01O src/llm/provider.rs:10:use crate::safety::neutralize_role_token_openers;
+2026-08-26T16:41:04.334214Z 01O 
+2026-08-26T16:41:04.334214Z 01O === Summary ===
+2026-08-26T16:41:04.334223Z 01O FAILED: 1 hard violation(s) found
+2026-08-26T16:41:04.369897Z 00O section_end:1787762464:step_script
+[0K
+2026-08-26T16:41:04.370392Z 00O+section_start:1787762464:cleanup_file_variables
+[0K
+2026-08-26T16:41:04.370400Z 00O+[0K[36;1mCleaning up project directory and file based variables[0;m[0;m
+2026-08-26T16:41:04.775541Z 00O section_end:1787762464:cleanup_file_variables
+[0K
+2026-08-26T16:41:05.492704Z 00O [31;1mERROR: Job failed: exit code 1[0;m
+

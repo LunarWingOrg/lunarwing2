@@ -3,11 +3,11 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
+use lunarwing_safety::neutralize_role_token_openers;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::llm::error::LlmError;
-use crate::safety::neutralize_role_token_openers;
 
 /// Role in a conversation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
