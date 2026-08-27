@@ -530,3 +530,90 @@ def test_restart_backfills_lines_accepted_while_adapter_was_down(monkeypatch):
     got_ids = [e["line"]["id"] for e in state.event_log]
     assert got_ids == [31, 32]  # recovered, not swallowed
     assert state.last_line_id["irc.libera.#a"] == 32
+
+
+# ---------------------------------------------------------------------------
+# Inbound event journal across process restarts (goal-25 F3, second window)
+# ---------------------------------------------------------------------------
+
+def _journal_of(monkeypatch=None) -> ws_adapter.Path:
+    """Resolve the per-test journal path, ensuring its parent dir exists."""
+    p = ws_adapter.Path(ws_adapter.journal_path_for(ws_adapter.resolve_state_file()))
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def test_record_line_journals_event_with_original_seq():
+    state.state_file = ws_adapter.resolve_state_file()
+    state.journal_file = ws_adapter.journal_path_for(state.state_file)
+
+    ws_adapter.record_line("irc.libera.#a", make_line(10))
+    ws_adapter.record_line("irc.libera.#a", make_line(11))
+
+    entries = [json.loads(l) for l in
+               ws_adapter.Path(state.journal_file).read_text().splitlines()]
+    assert [e["seq"] for e in entries] == [1, 2]
+    assert [e["line"]["id"] for e in entries] == [10, 11]
+
+
+def test_journal_restore_preserves_seq_and_log():
+    state.state_file = ws_adapter.resolve_state_file()
+    state.journal_file = ws_adapter.journal_path_for(state.state_file)
+    # A previous process journalled seqs 5 and 6; the poller's cursor is 5.
+    _journal_of().write_text("\n".join([
+        json.dumps({"seq": 5, "full_name": "irc.libera.#a", "line": make_line(30)}),
+        json.dumps({"seq": 6, "full_name": "irc.libera.#a", "line": make_line(31)}),
+    ]) + "\n")
+
+    restored = ws_adapter.load_event_journal()
+
+    assert restored == 2
+    assert state.event_seq == 6  # original seq preserved (not renumbered)
+    assert [e["seq"] for e in state.event_log] == [5, 6]
+
+
+def test_journal_restore_skips_corrupt_lines():
+    state.state_file = ws_adapter.resolve_state_file()
+    state.journal_file = ws_adapter.journal_path_for(state.state_file)
+    _journal_of().write_text("\n".join([
+        "{not json",
+        json.dumps({"seq": 9, "full_name": "irc.libera.#a", "line": make_line(40)}),
+        json.dumps({"seq": "bad", "full_name": "x", "line": {}}),
+    ]) + "\n")
+
+    restored = ws_adapter.load_event_journal()
+
+    assert restored == 1  # only the well-formed entry survives
+    assert state.event_seq == 9
+
+
+def test_journal_disabled_without_state_file(monkeypatch):
+    monkeypatch.setenv("WS_ADAPTER_STATE_FILE", "none")
+    assert ws_adapter.load_persisted_state() is False
+    # Startup order: journal resolution happens in load_event_journal().
+    state.journal_file = ws_adapter.journal_path_for(state.state_file)
+    assert state.journal_file == ""
+    ws_adapter.append_journal({"seq": 1, "full_name": "x", "line": {}})  # no-op
+    assert ws_adapter.load_event_journal() == 0
+
+
+def test_wait_cursor_alignment_with_restored_journal():
+    # Poller cursor ahead of a journal-restored seq (journal compacted or
+    # persistence lagged): seq must align forward, NOT reset the poller's
+    # cursor — resetting would re-deliver already-polled events.
+    state.state_file = ws_adapter.resolve_state_file()
+    state.journal_file = ws_adapter.journal_path_for(state.state_file)
+
+    class FakeURL:
+        query = {"cursor": "10", "timeout": "0"}
+
+    class FakeReq:
+        rel_url = FakeURL()
+        headers = {}
+
+    state.new_event = asyncio.Event()
+    resp = asyncio.run(ws_adapter.handle_wait(FakeReq()))
+    payload = json.loads(resp.text)
+
+    assert payload["events"] == []  # nothing newer than the poller's cursor
+    assert state.event_seq == 10    # aligned forward for future records
