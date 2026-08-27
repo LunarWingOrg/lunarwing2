@@ -1,8 +1,15 @@
 # SSH Operations for the LunarWing Agent — Options 2 & 3 Implementation Plans
 
-> **Current status (2026-07-20, rev `50c8f99`): IMPLEMENTED / HISTORICAL DESIGN RECORD.**
-> Both options landed. Version-specific examples below target russh
-> 0.45 and old line numbers; current source uses russh 0.62 and is authoritative.
+> **Current status (reverified 2026-08-25): IMPLEMENTED / HISTORICAL DESIGN
+> RECORD.** Both options landed, but the body is pre-implementation guidance,
+> not an as-built security contract. Version-specific examples target russh
+> 0.45; current source uses russh 0.62. In current behavior, built-in/WASM russh
+> rejects RSA while `ssh_git` delegates algorithm negotiation to agent/OpenSSH;
+> WASM SSH is a thin guest over a host-side russh function; runtime host CRUD is
+> process-local; socket-key uploads/deletes need a daemon restart to change the
+> signing keystore; and default mt-admin bootstrap leaves its generated private
+> key in the tenant's mode-0600 `~/.ssh/` path after the temporary staging copy
+> is uploaded. Use the linked architecture documents as authoritative.
 
 **Date:** 2026-07-01 (implemented)
 **Status:** ✅ **Implemented.** Kept as the design record (written before
@@ -258,13 +265,15 @@ ssh-exec: func(host: string, command: string) -> result<ssh-result, string>;
 
 record ssh-result { exit-code: s32, stdout: list<u8>, stderr: list<u8> }
 ```
-This is a **breaking interface bump** — every guest tool and the sibling `channel.wit` world regenerate bindings.
+This landed as an **additive tool-host import** under WIT package `@0.3.0`.
+Existing guests that do not import `ssh-exec` remain compatible and do not need
+rebuilding; `channel.wit` is a separate world and did not gain this import.
 
 **Host impl — `ic/src/tools/wasm/wrapper.rs`, `impl lunarwing::agent::host::Host for StoreData`** (follow the `http_request` pattern at `wrapper.rs:326-563`): validate `host` against a new SSH allowlist capability (mirror `http_request`'s `check_http_allowed` → `AllowlistValidator`, `host.rs:255`), then run the SSH exchange on a dedicated current-thread runtime inside `spawn_blocking` (as `http_request` does, `wrapper.rs:475-563`), calling `ssh_client::connect_and_exec`. **Leak-scan `stdout`/`stderr`** before returning (same as HTTP responses, `wrapper.rs:551-556`).
 
 **Plumbing:** thread an `Arc<tokio::sync::RwLock<SSHBridge>>` into `StoreData`/`HostState` at instantiation (analogous to how `host_credentials`/secrets are threaded today), plus a new `SshCapability` in `Capabilities`, populated from a `capabilities.json` `ssh` block by the loader (`loader.rs:221-266`). The allowlist should reuse the `[[ssh.hosts]]` aliases as the reachable set.
 
-**Guest — `ic/tools-src/ssh/`:** `Cargo.toml` (`crate-type=cdylib`, deps `serde`/`serde_json`/`wit-bindgen`), `src/lib.rs` with `wit_bindgen::generate!({ world: "sandboxed-tool", path: "../../wit/tool.wit" })` implementing `Guest for SshTool` (`execute`/`schema`/`description`), plus `ssh-tool.capabilities.json` declaring the `ssh` allowlist and `registry/tools/ssh.json` (`source.dir`/`crate_name`). Built with `cargo component build --release --target wasm32-wasip2` (`scripts/build-wasm-extensions.sh:46-59`); loader picks up `<name>.wasm` + `<name>.capabilities.json` sidecars.
+**Guest — `ic/tools-src/ssh/`:** `Cargo.toml` (`crate-type=cdylib`, deps `serde`/`serde_json`/`wit-bindgen`), `src/lib.rs` with `wit_bindgen::generate!({ world: "sandboxed-tool", path: "../../wit/tool.wit" })` implementing `Guest for SshTool` (`execute`/`schema`/`description`), plus `ssh-tool.capabilities.json` declaring the `ssh` allowlist and `registry/tools/ssh.json` (`source.dir`/`crate_name`). Built with `cargo component build --release --target wasm32-wasip2` (`ic/scripts/build-wasm-extensions.sh`); loader picks up `<name>.wasm` + `<name>.capabilities.json` sidecars.
 
 ### 3. Files, data flow, security, config
 

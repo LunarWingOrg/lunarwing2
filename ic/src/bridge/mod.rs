@@ -34,6 +34,7 @@ pub use router::{
     clear_engine_pending_auth,
     // Query functions
     fire_engine_mission,
+    fire_engine_webhook_mission,
     get_engine_mission,
     get_engine_pending_auth,
     get_engine_pending_gate,

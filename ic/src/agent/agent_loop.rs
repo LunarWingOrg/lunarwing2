@@ -589,6 +589,25 @@ impl Agent {
         // Start channels
         let mut message_stream = self.channels.start_all().await?;
 
+        // Engine V2: initialize the engine eagerly at startup. Initialization
+        // was previously lazy-only (first engine-routed message), which left
+        // cron/webhook/event-driven missions dead after a restart until a chat
+        // message happened to arrive — the mission webhook endpoint even 500s
+        // (work item #69). Runs in the background so a slow engine bootstrap
+        // does not delay channel readiness; handlers keep their lazy fallback
+        // and `init_engine` is idempotent.
+        if crate::bridge::is_engine_v2_enabled() {
+            let agent = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = crate::bridge::init_engine(&agent).await {
+                    tracing::warn!(
+                        %error,
+                        "engine v2: eager initialization failed; engine handlers will retry lazily"
+                    );
+                }
+            });
+        }
+
         // Start self-repair task with notification forwarding
         let mut self_repair = DefaultSelfRepair::new(
             self.context_manager.clone(),
@@ -602,6 +621,18 @@ impl Agent {
             self_repair = self_repair.with_builder(Arc::clone(builder), Arc::clone(self.tools()));
         }
         let repair = Arc::new(self_repair);
+
+        // Fresh repair cycle per boot (work item #73): tool repair-attempt
+        // counters persist in the DB, so without a reset a tool that
+        // exhausted repairs before a restart would stay ManualRequired
+        // forever instead of getting a fresh cycle.
+        if let Some(ref store) = self.deps.store {
+            match store.reset_tool_repair_attempts().await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("Reset tool repair-attempt counters for {} tool(s)", n),
+                Err(e) => tracing::warn!("Failed to reset tool repair-attempt counters: {}", e),
+            }
+        }
         let repair_interval = self.config.repair_check_interval;
         let repair_channels = self.channels.clone();
         let repair_op_timeout = self.config.self_repair_op_timeout;
@@ -705,6 +736,22 @@ impl Agent {
                         Ok(Ok(RepairResult::Success { message })) => {
                             let response = OutgoingResponse::text(format!(
                                 "Self-Repair: Tool '{}' repaired: {}",
+                                tool.name, message
+                            ));
+                            let _ = repair_channels
+                                .broadcast_all(&repair_owner_id, response)
+                                .await;
+                        }
+                        Ok(Ok(RepairResult::ManualRequired { message })) => {
+                            // Terminal state: surfaced once per boot by
+                            // detect_broken_tools; alert the owner.
+                            tracing::warn!(
+                                "Tool '{}' repair requires manual intervention: {}",
+                                tool.name,
+                                message
+                            );
+                            let response = OutgoingResponse::text(format!(
+                                "Self-Repair: Tool '{}' needs manual intervention: {}",
                                 tool.name, message
                             ));
                             let _ = repair_channels

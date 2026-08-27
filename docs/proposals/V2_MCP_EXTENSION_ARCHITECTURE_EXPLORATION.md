@@ -1,17 +1,24 @@
 # V2 MCP and Extension Runtime Architecture Exploration
 
-> **Current status (2026-08-15): PARTIAL / IMPLEMENTED INCREMENTALLY.** Host-local
-> stdio lifecycle, an internal built-in runtime-dispatch registry, stateful
-> MCP-over-WASM, dedicated/shared gateway client placement, and an optional bundled
-> gateway control/data plane are implemented. Core Docker job workers also support
-> explicit worker-local stdio placement with immutable owner snapshots, separate
-> credential grants, and bounded lifecycle. The runtime-neutral package model,
-> persistent-worker MCP delivery, a marketplace install/upgrade flow, automatic
-> package installation, and cross-daemon gateway HA remain open.
+> **Current status (source-reverified 2026-08-25): PARTIAL / IMPLEMENTED
+> INCREMENTALLY.** Host-local stdio lifecycle, an internal runtime-adapter
+> registry, stateful MCP-over-WASM, dedicated/shared gateway client placement,
+> and an optional bundled gateway control/data plane are implemented. Core Docker
+> jobs support explicit `job_worker` stdio placement with immutable owner
+> snapshots, separate credential grants, bounded lifecycle, and child restart
+> supervision. `external_worker` placement now has a persisted/validated config,
+> CLI label, and doctor check, but no daemon consumer delivers or activates those
+> server definitions on a named persistent worker; actual persistent-worker MCP
+> delivery remains open. Marketplace trust has advanced from library-only to
+> optional fail-closed trust-store parsing plus signed revocation cache/fetch and
+> pre-activation revocation enforcement. A signed package install/upgrade flow,
+> publisher-signature binding to configured server activation, automatic package
+> installation, and cross-daemon gateway HA remain open.
 
-**Status:** Exploratory V2 architecture with implemented runtime slices; host-local
-stdio landed on 2026-07-09, lifecycle/recovery hardening landed through 2026-08-03,
-and the adapter/WASM/gateway runtime work landed on 2026-08-09.
+**Status:** Exploratory V2 architecture with implemented runtime slices;
+host-local stdio landed on 2026-07-09, lifecycle/recovery hardening through
+2026-08-03, adapter/WASM/gateway runtime work on 2026-08-09, and placement/trust
+configuration through 2026-08-21.
 **Date:** 2026-07-09  
 **Scope:** Possible V2 extension packaging, MCP compatibility, execution placement,
 and tenant policy
@@ -142,8 +149,13 @@ re-fetch grants. Linux worker activation
 also requires Yama `kernel.yama.ptrace_scope >= 1` so same-UID MCP and shell sibling
 processes cannot inspect each other's credential environments after `execve`.
 
-Some persistent external workers can independently configure their own MCP clients
-or servers. They do not receive this core Docker job-worker placement contract.
+Persistent external workers remain a distinct path. `McpPlacement::ExternalWorker`
+and its required worker name are now serialized, validated (stdio-only, no OAuth),
+shown by the CLI, and checked by `doctor` against configured workers. The host
+factory refuses to activate them. No production caller consumes
+`external_worker_servers()` to transmit definitions/grants or synchronize tools
+through `lunarwing-agent-v1`, so this is placement intent/scaffolding rather than
+delivery. A worker's independently baked MCP clients are not that contract.
 
 ### The native WASM tool ABI remains invocation-scoped; MCP uses an actor ABI
 
@@ -182,25 +194,29 @@ annotation support in negotiated revision `2024-11-05`.
 The separate actor does not change the preferred format for small tools: native WASM
 tools keep their narrower capability-scoped ABI and fresh-instance isolation.
 
-### Package integrity exists, but publisher authenticity is incomplete
+### Package integrity and revocation enforcement exist; signed install is incomplete
 
 The registry installer requires SHA-256 checksums for downloaded WASM artifacts
 and validates supported artifact locations. This protects against corrupted or
-unexpected bytes relative to a trusted manifest.
+unexpected bytes relative to a trusted manifest, but a checksum alone does not
+authenticate its publisher.
 
-It does not by itself establish who published the extension, whether that
-publisher remains trusted, or whether a compromised registry entry should be
-revoked. A V2 marketplace needs package signatures and publisher trust metadata in
-addition to checksums.
+`ic/src/tools/mcp/marketplace.rs` now provides ed25519 `verify_strict`
+signatures over canonical manifests, `PublisherTrustStore`, signed lockfiles,
+`ManifestDiff`, and signed monotonic revocation lists with atomic
+`RevocationStore` persistence. `McpServersFile.marketplace` is no longer
+library-only: it can load a bounded trust-store file fail-closed, validate a
+signed revocation cache, optionally fetch a newer list over HTTPS before startup,
+and reject/skip enabled servers whose configured provenance is revoked. The DB
+write path validates the same whole-file rules.
 
-> **Update (2026-08-21, v2.0.8.0):** the trust primitives now exist as a library in
-> `ic/src/tools/mcp/marketplace.rs` — ed25519 `verify_strict` publisher signatures
-> over canonical manifests, a `PublisherTrustStore`, signed lockfiles pinning exact
-> version+sha256, `ManifestDiff` upgrade diffs, and signed revocation lists with
-> monotonic sequence + atomic `RevocationStore` persistence (fail-closed corrupt
-> cache, bounded fetch). They are **not yet wired into any activation path** (zero
-> callers outside tests; no trust-store/revocation-URL config or CLI surface), so
-> this section's gap statement still stands at the integration level.
+The remaining authenticity gap is package lifecycle integration. No install or
+upgrade command verifies a `SignedPackageManifest`/signed lockfile and then binds
+that verified package identity to the persisted server configuration. A trust
+store may validate structurally without requiring every enabled legacy server to
+carry signed provenance. Thus revocation enforcement is real when configured,
+but LunarWing still lacks an end-to-end signed marketplace publication,
+install, capability-diff approval, upgrade, and rollback flow.
 
 ### Automatic npm/pip MCP installation is not implemented
 
@@ -450,8 +466,14 @@ runtime protocol.
 
 **Assessment**
 
-This is a valid placement, not merely a fallback for failed WASM ports. It is the
-preferred option for stateful, heavy, native, or independently scalable servers.
+This remains the preferred conceptual placement for stateful, heavy, native, or
+independently scalable servers. Current source has the validated
+`external_worker` placement enum/name, config persistence, CLI label, doctor
+check, and host-factory refusal, but no delivery/control protocol consumer.
+Implementation still needs an authenticated synchronization contract, immutable
+server/provenance snapshot, credential-grant path, worker acknowledgement and
+tool-descriptor return, update/removal semantics, restart reconciliation, and
+bounded failure handling across daemon/worker reconnects.
 
 ### 6. Dedicated MCP gateway
 

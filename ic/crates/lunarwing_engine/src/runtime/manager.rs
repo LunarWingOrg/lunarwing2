@@ -541,10 +541,9 @@ impl ThreadManager {
         &self,
         thread: &mut Thread,
     ) -> Result<Vec<LeaseId>, EngineError> {
-        let active_leases = self.leases.active_for_thread(thread.id).await;
-        let available_actions = self.effects.available_actions(&active_leases).await?;
+        let registered_actions = self.effects.registered_actions().await?;
         let mut missing_actions = Vec::new();
-        for action in available_actions {
+        for action in registered_actions {
             if self
                 .leases
                 .find_lease_for_action(thread.id, &action.name)

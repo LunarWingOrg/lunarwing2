@@ -33,6 +33,8 @@ Fourth-pass fix (2026-08-02): attaching an embedding provider no longer implicit
 
 Verification for the fourth pass includes semantic no-provider-call regressions, accumulator cap/requeue/backoff tests, libSQL additive batch/empty/duplicate/final-flush coverage, both backend compile surfaces, and the scoped full checks recorded with release item 7.
 
+Fifth-pass fix (2026-08-03, commit `20890027`): a hit buffered in the write-behind accumulator can land after the eviction transaction swept its pattern. Such a hit proves the cached pattern was live, so the additive `bump_reflex_pattern_match` now reactivates an `evicted` row back to `active` instead of leaving it evicted; covered by a late-hit-after-eviction regression in both backends.
+
 ---
 
 ## 1. What the Reflex Compiler Does

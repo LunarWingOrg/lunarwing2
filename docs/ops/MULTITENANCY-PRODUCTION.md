@@ -326,6 +326,16 @@ Kimi block (30000-39999):
 | ruffles | 10000 | 10000 | 10001 | 10002 | 10003 | 10004 | 10006 | 10007 | 10008 | 30000 |
 | miyuki | 10010 | 10010 | 10011 | 10012 | 10013 | 10014 | 10016 | 10017 | 10018 | 30010 |
 
+### Port collision warnings
+
+The registry only tracks what mt-admin itself allocated, so a freshly allocated block can still collide with a listener mt-admin does not know about — a stale container from a removed tenant, a dev server, or any hand-started process bound to `127.0.0.1`. Since v2.0.9.0, `add-tenant` probes every freshly assigned port (primary, extended, Kimi, and Voice blocks) after allocation and prints a non-fatal `WARNING: port collision ...` naming the affected `slot=port` pairs. Heed it: the tenant's units will otherwise fail later with `EADDRINUSE`.
+
+Independently, `doctor` fails the `no duplicate ports in registry` check when any port number is assigned to more than one slot across the registry (including the host-global `health_metrics` slot), which catches hand-edited or badly migrated registries. The duplicate list is also available directly:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh doctor    # includes the duplicate-port check
+```
+
 ### Registry schema
 
 The current schema is v14. In addition to ports and feature selections, it gives

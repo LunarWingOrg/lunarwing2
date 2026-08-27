@@ -39,7 +39,7 @@ const DEFAULT_MAX_MESSAGES: usize = 2048;
 /// The raised limit is scoped to the send route only (see
 /// `build_router_with_body_limit`); every other route keeps axum's 2 MiB
 /// default, and authorization runs as middleware before any body is buffered
-/// (`docs/ops/MEDIUM.MD`).
+/// (`docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`).
 const MAX_SEND_BODY_BYTES: usize = 70 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +155,7 @@ fn build_router_with_body_limit(state: AppState, max_body_bytes: usize) -> Route
 /// `authorize` needs only the peer address and headers, so as middleware it
 /// rejects unauthorized clients before the `Json` extractor buffers the
 /// request body (up to [`MAX_SEND_BODY_BYTES`] on the send route) — closing
-/// the pre-auth memory-amplification window from `docs/ops/MEDIUM.MD`.
+/// the pre-auth memory-amplification window from `docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`.
 async fn authorize_middleware(
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
@@ -820,7 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_send_routes_keep_default_body_limit() {
-        // docs/ops/MEDIUM.MD: the raised limit must be scoped to
+        // docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md: the raised limit must be scoped to
         // /v1/messages/send; every other route keeps axum's 2 MiB default so
         // a local sprayer cannot make the bridge buffer huge bodies on cheap
         // control routes.
@@ -838,7 +838,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthorized_over_limit_body_rejected_before_buffering() {
-        // docs/ops/MEDIUM.MD: authorize runs as middleware before the Json
+        // docs/ops/XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md: authorize runs as middleware before the Json
         // extractor, so an unauthenticated over-limit body gets 401 (not
         // 413) and the bridge never buffers it.
         let status = post_status(

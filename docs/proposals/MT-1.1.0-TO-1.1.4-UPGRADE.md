@@ -45,7 +45,7 @@ flow precisely against the real verb contracts, plus the tooling to automate it
 safely.
 
 **This exact scenario (in-place upgrade of a >v1.1.0 production tenant via the rootful → rootless flip) is flagged
-by the team's own checklist (`docs/ops/GOALS_1.1.4.md` #11) as not yet validated.**
+by the team's own checklist (`docs/ops/history/GOALS_1.1.4.md` #11) as not yet validated.**
 Only fresh-tenant provisioning has 8/8 green QA. Treat the first tenant as a
 canary, with full backups, before touching the fleet.
 
@@ -159,7 +159,7 @@ tenant's encrypted DB secrets.** Always invoke the v1.1.4 script.
 
 ### ⚪ Validation gap (not a code blocker)
 
-`docs/ops/GOALS_1.1.4.md` #11 + the RELEASE "Testing" section flag the live in-place
+`docs/ops/history/GOALS_1.1.4.md` #11 + the RELEASE "Testing" section flag the live in-place
 upgrade of a >v1.1.0 production tenant **via the rootful → rootless flip** as **still
 open**. (The separate same-host v1.0.9 → v1.1.2 path via `upgrade-tenant-version.sh` is
 already live-validated — see *Status* at the top.) You are first to run *this* flip →

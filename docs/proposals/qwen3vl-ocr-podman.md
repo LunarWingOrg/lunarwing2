@@ -1,9 +1,17 @@
 # Qwen3-VL + Tesseract OCR on rootless Podman (quadlets)
 
-> **Current status (2026-07-20, rev `50c8f99`): OPEN / EXTERNAL OPS RUNBOOK.**
-> The described OCR service, Containerfile, and Quadlets are not in this repo.
-> LunarWing integrates with an independently deployed service through
-> `VISION_SERVICE_URL`.
+> **Current status (reverified 2026-08-26): EXTERNAL OPS RUNBOOK — SUPERSEDED
+> AS THE DEFAULT DEPLOYMENT.** The maintained implementation is the in-repo
+> Rust sidecar at [`projects/ocr-sidecar/`](../../projects/ocr-sidecar/) (crate
+> `lunarwing-ocr-sidecar`), which serves Tesseract OCR at `/ocr` and folds the
+> grounded Tesseract → Qwen3-VL extraction role into the versioned
+> `/v1/vision/analyze` endpoint; mt-admin builds it from source as the tenant
+> LunarVision service. This
+> document's Python/FastAPI + Containerfile + Quadlet layout remains a valid
+> standalone external variant for GPU hosts, but its specific artifacts
+> (`ocr_pipeline.py`, `Containerfile.ocr`, `*.container`) are not in this repo.
+> Either way the daemon integrates through `VISION_SERVICE_URL` (plus optional
+> `VISION_AUTH_TOKEN`) and never embeds the service.
 
 Two containers on a shared Podman network:
 

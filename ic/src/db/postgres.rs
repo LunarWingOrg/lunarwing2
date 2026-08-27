@@ -617,6 +617,14 @@ impl ToolFailureStore for PgBackend {
     async fn increment_repair_attempts(&self, tool_name: &str) -> Result<(), DatabaseError> {
         self.store.increment_repair_attempts(tool_name).await
     }
+
+    async fn record_tool_success(&self, tool_name: &str) -> Result<(), DatabaseError> {
+        self.store.record_tool_success(tool_name).await
+    }
+
+    async fn reset_tool_repair_attempts(&self) -> Result<u64, DatabaseError> {
+        self.store.reset_tool_repair_attempts().await
+    }
 }
 
 // ==================== SettingsStore ====================

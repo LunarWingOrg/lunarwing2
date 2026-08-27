@@ -276,7 +276,19 @@ impl Agent {
             .tool_definitions_for_user(&message.user_id)
             .await;
         let initial_tool_defs = if !active_skills.is_empty() {
-            crate::skills::attenuate_tools(&initial_tool_defs, &active_skills).tools
+            let attenuation = crate::skills::attenuate_tools(&initial_tool_defs, &active_skills);
+            if !attenuation.removed_tools.is_empty() {
+                // Surface once per turn at info level so operators can tell why a
+                // tool (e.g. memory_write) is unavailable without enabling debug
+                // logs. The per-iteration refresh below stays at debug level.
+                tracing::info!(
+                    min_trust = %attenuation.min_trust,
+                    removed = ?attenuation.removed_tools,
+                    "Tool attenuation removed tools for this turn: {}",
+                    attenuation.explanation
+                );
+            }
+            attenuation.tools
         } else {
             initial_tool_defs
         };
@@ -983,7 +995,21 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                                 .safety()
                                 .wrap_for_llm(&tc.name, &sanitized.content)
                         }
-                        Err(e) => format!("Tool '{}' failed: {}", tc.name, e),
+                        Err(e) => {
+                            // Work item #75: tool error text is guest/upstream
+                            // controlled (WASM guest messages can embed server
+                            // responses or echoed params) and must go through
+                            // the same sanitize+wrap pipeline as successes —
+                            // matches the routine engine path.
+                            let error_msg = format!("Tool '{}' failed: {}", tc.name, e);
+                            let sanitized = self
+                                .agent
+                                .safety()
+                                .sanitize_tool_output(&tc.name, &error_msg);
+                            self.agent
+                                .safety()
+                                .wrap_for_llm(&tc.name, &sanitized.content)
+                        }
                     };
 
                     // Record sanitized result in thread

@@ -34,7 +34,7 @@ message you there too?"
 After the first few turns, complete these writes:
 
 1. `memory_write` with `target: "memory"` — summary of the conversation and key facts
-2. `memory_write` with `target: "context/profile.json"` — the psychographic profile as JSON
+2. `memory_write` with `target: "context/profile.json"` and `append: false` — the psychographic profile as one complete JSON document
 3. `memory_write` with `target: "IDENTITY.md"` — keep the name `LunarWing` unless the user explicitly asks for a different name; refine the vibe and voice as needed
 4. `memory_write` with `target: "bootstrap"` — clears this file so first-run never repeats
 

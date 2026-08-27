@@ -1197,6 +1197,27 @@ impl AppBuilder {
                 }
             }
 
+            // One-shot knowledge seed for newly provisioned tenants. mt-admin
+            // writes KNOWLEDGE_SEED_FROM_STUDY_MCP=1 only on the add-tenant
+            // path, so existing tenants are never (re)populated and existing
+            // notes are never overwritten. Runs in the background like the
+            // embeddings backfill; a state file makes it run at most once.
+            if let Some(seed) = self.config.knowledge_seed.to_workspace_config() {
+                let ws_seed = Arc::clone(ws);
+                tokio::spawn(async move {
+                    let report =
+                        crate::workspace::knowledge_seed::run_knowledge_seed_once(&ws_seed, &seed)
+                            .await;
+                    if report.had_work() {
+                        tracing::info!(
+                            seeded = report.notes_seeded,
+                            skipped_existing = report.notes_skipped_existing,
+                            "Seeded tenant knowledge store from lw2studymcp checkout"
+                        );
+                    }
+                });
+            }
+
             if embeddings.is_some() {
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {

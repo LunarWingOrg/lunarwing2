@@ -1539,6 +1539,21 @@ doctor() {
   fi
 
   _check "port registry exists" test -f "$PORTS_REGISTRY"
+  # ISSUE-65: surface registry-internal port collisions (a hand-edited or
+  # migrated registry assigning one port to two slots). The migration scripts
+  # abort on collisions they would create, but nothing flagged pre-existing
+  # duplicates until now.
+  if [[ -f "$PORTS_REGISTRY" ]]; then
+    local _port_dups
+    _port_dups="$(ports_registry_duplicate_ports)"
+    if [[ -n "$_port_dups" ]]; then
+      printf '[FAIL] no duplicate ports in registry (colliding: %s)\n' "$_port_dups"
+      fail=$((fail + 1))
+    else
+      printf '[PASS] no duplicate ports in registry\n'
+      pass=$((pass + 1))
+    fi
+  fi
   _check "source repo exists" test -d "$SOURCE_REPO/ic"
   _check "proxy script exists" test -f "$SOURCE_REPO/tensorzero-proxy-configurations/lunarwing-proxy.py"
   _check "health-check orchestrator present" test -x "$HEALTH_SRC_DIR/infrastructure-health-check.sh"

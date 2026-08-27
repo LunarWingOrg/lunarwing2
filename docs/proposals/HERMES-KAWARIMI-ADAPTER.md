@@ -143,7 +143,7 @@ runtime), `lunarwing_mt_onboard.provisioner` (mt-admin wrappers, `PhaseResult`),
 - **Phase 1 — DONE:** package scaffold, extractor, mapper, loader, `ImportPlan`,
   CLI (`inspect` + dry-run/apply `import`), unit tests, docs.
 - **Phase 1 review hardening (v0.2.0) — DONE:** addressed all 6 concerns from
-  `KUMOGAKURE_RECENT_REV_T.md`:
+  `docs/ops/history/v2.0.3.0/KUMOGAKURE_REVIEW.md`:
   1. Documented the agent_id=NULL upsert assumption in `_populate` (comment).
   2. Verified `secrets_ops.insert_secret` is already an upsert (ON CONFLICT
      DO UPDATE) — no code change needed, added clarifying docstring.

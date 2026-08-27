@@ -709,8 +709,76 @@ ports_allocate() {
   mv "$tmp" "$PORTS_REGISTRY"
 
   say "allocated port block $base-$((base + PORT_BLOCK_SIZE - 1)) for tenant '$name'" >&2
+  # ISSUE-65: the registry only tracks what mt-admin itself allocated, so a
+  # fresh block can still collide with a live listener mt-admin does not know
+  # about (stale container from a removed tenant, dev server, hand-started
+  # service). Surface that now, as a warning, instead of later as an opaque
+  # EADDRINUSE unit failure. Non-fatal by design.
+  ports_warn_block_in_use "$name"
   printf '%s' "$base"
   release_ports_lock
+}
+
+# True if a process is accepting TCP connections on 127.0.0.1:<port>. Same
+# /dev/tcp idiom as doctor's sshd check; on loopback a closed port refuses
+# instantly, so the 2s timeout is only a defensive bound.
+_port_in_use() {
+  local port="$1"
+  timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/$port" 2>/dev/null
+}
+
+# Warn (stderr, non-fatal) for every port assigned to tenant '$name' in the
+# registry that is already accepting connections on 127.0.0.1. Reads all four
+# per-tenant port maps so extended/kimi/voice slots are covered too. Only
+# meaningful right after a fresh ports_allocate() — on a running tenant its own
+# services legitimately hold its ports, so callers must not probe those.
+ports_warn_block_in_use() {
+  local name="$1"
+  require_cmd jq
+  [[ -f "$PORTS_REGISTRY" ]] || return 0
+  local entry port in_use=""
+  while IFS=$'\t' read -r entry port; do
+    # Skip blank and non-numeric values (hand-edited registry): the port is
+    # interpolated into a bash -c probe command line, so validate first.
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    if _port_in_use "$port"; then
+      in_use+="${in_use:+, }$entry=$port"
+    fi
+  done < <(jq -r --arg name "$name" '
+    .tenants[$name] // {}
+    | [ ((.ports // {}) | to_entries[]),
+        ((.extended_ports // {}) | to_entries[]),
+        ((.kimi_ports // {}) | to_entries[]),
+        ((.voice_ports // {}) | to_entries[]) ]
+    | sort_by(.value)[]
+    | "\(.key)\t\(.value)"' "$PORTS_REGISTRY" 2>/dev/null)
+  if [[ -n "$in_use" ]]; then
+    say "WARNING: port collision for tenant '$name': freshly allocated port(s) already in use on 127.0.0.1: $in_use" >&2
+    say "         another process is listening there (stale container, dev server, or a removed tenant's leftover);" >&2
+    say "         units for '$name' will fail to bind until those ports are freed or the registry is repaired." >&2
+  fi
+  return 0
+}
+
+# List port numbers assigned to more than one slot across the whole registry
+# (all per-tenant port maps plus the host-global health_metrics slot). Empty
+# output means no collisions. Pure read — used by doctor; also handy for
+# operators debugging a hand-edited or migrated registry.
+ports_registry_duplicate_ports() {
+  require_cmd jq
+  [[ -f "$PORTS_REGISTRY" ]] || return 0
+  jq -r '
+    [ .tenants[]
+      | ((.ports // {}) | to_entries[] | .value),
+        ((.extended_ports // {}) | to_entries[] | .value),
+        ((.kimi_ports // {}) | to_entries[] | .value),
+        ((.voice_ports // {}) | to_entries[] | .value)
+    ] + [(.health_metrics_port // empty)]
+    | map(select(type == "number"))
+    | group_by(.)
+    | map(select(length > 1) | .[0] | tostring)
+    | join(", ")
+  ' "$PORTS_REGISTRY" 2>/dev/null
 }
 
 # Mark darkirc enabled for a tenant in the registry (one-directional: false -> true).

@@ -72,6 +72,13 @@ pub struct DefaultSelfRepair {
     store: Option<Arc<dyn Database>>,
     builder: Option<Arc<dyn SoftwareBuilder>>,
     tools: Option<Arc<ToolRegistry>>,
+    /// Tools that already surfaced a terminal `ManualRequired` alert this
+    /// boot. ManualRequired is terminal (work items #73/#76): log/alert once,
+    /// then stop retrying instead of retrying every check interval. This
+    /// covers both exhaustion (`repair_attempts >= max`) and outcomes that
+    /// do not consume an attempt (e.g. builder disabled), which would
+    /// otherwise loop forever (work item #76).
+    manual_alerts: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl DefaultSelfRepair {
@@ -88,6 +95,7 @@ impl DefaultSelfRepair {
             store: None,
             builder: None,
             tools: None,
+            manual_alerts: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -106,6 +114,55 @@ impl DefaultSelfRepair {
         self.builder = Some(builder);
         self.tools = Some(tools);
         self
+    }
+
+    /// Split out tools in a terminal repair state.
+    ///
+    /// ManualRequired is terminal (work items #73/#76): a terminal tool is
+    /// surfaced exactly once per boot so the caller logs and alerts on it,
+    /// then it is filtered out of every subsequent detection cycle instead
+    /// of being retried (and logged) every check interval forever. A tool
+    /// is terminal when its attempts are exhausted OR when a repair already
+    /// returned `ManualRequired` this boot without consuming an attempt
+    /// (e.g. builder disabled — see `note_manual_required`).
+    fn filter_terminal_tools(&self, tools: Vec<BrokenTool>) -> Vec<BrokenTool> {
+        let mut detected = Vec::with_capacity(tools.len());
+        let mut alerts = self
+            .manual_alerts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for tool in tools {
+            let terminal =
+                tool.repair_attempts >= self.max_repair_attempts || alerts.contains(&tool.name);
+            if !terminal {
+                detected.push(tool);
+                continue;
+            }
+            if alerts.insert(tool.name.clone()) {
+                tracing::warn!(
+                    tool = %tool.name,
+                    repair_attempts = tool.repair_attempts,
+                    "Tool repair attempts exhausted; manual intervention required \
+                     (suppressing further repair attempts this boot)"
+                );
+                detected.push(tool);
+            }
+        }
+        detected
+    }
+
+    /// Record a terminal `ManualRequired` outcome for a tool this boot
+    /// (work item #76). Outcomes that do not consume a repair attempt —
+    /// builder/store unavailable — would otherwise be retried every check
+    /// interval forever, because `filter_terminal_tools` keys terminal
+    /// state on the attempt counter. Marking here makes every
+    /// `ManualRequired` terminal per boot regardless of cause.
+    fn note_manual_required(&self, tool_name: &str) {
+        let mut alerts = self
+            .manual_alerts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        alerts.insert(tool_name.to_string());
     }
 }
 
@@ -254,7 +311,7 @@ impl SelfRepair for DefaultSelfRepair {
                 if !tools.is_empty() {
                     tracing::info!("Detected {} broken tools needing repair", tools.len());
                 }
-                tools
+                self.filter_terminal_tools(tools)
             }
             Err(e) => {
                 tracing::warn!("Failed to detect broken tools: {}", e);
@@ -265,12 +322,14 @@ impl SelfRepair for DefaultSelfRepair {
 
     async fn repair_broken_tool(&self, tool: &BrokenTool) -> Result<RepairResult, RepairError> {
         let Some(ref builder) = self.builder else {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: format!("Builder not available for repairing tool '{}'", tool.name),
             });
         };
 
         let Some(ref store) = self.store else {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: "Store not available for tracking repair".to_string(),
             });
@@ -278,10 +337,32 @@ impl SelfRepair for DefaultSelfRepair {
 
         // Check repair attempt limit
         if tool.repair_attempts >= self.max_repair_attempts {
+            self.note_manual_required(&tool.name);
             return Ok(RepairResult::ManualRequired {
                 message: format!(
                     "Tool '{}' exceeded max repair attempts ({})",
                     tool.name, self.max_repair_attempts
+                ),
+            });
+        }
+
+        // Self-verify before burning a repair cycle (work item #73): a
+        // builtin Rust tool ships inside the daemon binary, so a WASM
+        // rebuild can never "repair" it — the recorded failures were
+        // runtime/parameter errors, not a missing artifact. When the tool
+        // is registered and loadable, clear its broken flag instead of
+        // rebuilding (memory_read was flagged broken while fully functional).
+        if let Some(ref tools) = self.tools
+            && let Some(registered) = tools.get(&tool.name).await
+            && !registered.is_wasm_tool()
+        {
+            if let Err(e) = store.mark_tool_repaired(&tool.name).await {
+                tracing::warn!("Failed to clear broken flag for builtin tool: {}", e);
+            }
+            return Ok(RepairResult::Success {
+                message: format!(
+                    "Tool '{}' is a registered builtin (not rebuildable); broken flag cleared",
+                    tool.name
                 ),
             });
         }
@@ -852,5 +933,218 @@ mod tests {
 
         // Verify builder was actually invoked
         assert_eq!(builder.builds(), 1, "Builder should have been called once");
+    }
+
+    /// A minimal builtin (non-WASM) tool for self-verify tests.
+    #[derive(Debug)]
+    struct MockBuiltinTool;
+
+    #[async_trait]
+    impl crate::tools::Tool for MockBuiltinTool {
+        fn name(&self) -> &str {
+            "memory_read"
+        }
+
+        fn description(&self) -> &str {
+            "mock builtin"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &crate::context::JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            Ok(crate::tools::ToolOutput::text(
+                "ok",
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
+    /// Work item #73.3: a registered builtin tool flagged "broken" must not
+    /// be rebuilt (a WASM rebuild can never repair a Rust builtin). The
+    /// watchdog self-verifies — the tool is loadable — and clears the flag
+    /// without burning a repair cycle.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn repair_broken_tool_clears_flag_for_registered_builtin() {
+        let cm = Arc::new(ContextManager::new(10));
+        let builder = Arc::new(MockBuilder::new());
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(MockBuiltinTool)).await;
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        // Seed a broken-looking row for the builtin.
+        for _ in 0..5 {
+            db.record_tool_failure("memory_read", "transient error")
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.get_broken_tools(5).await.unwrap().len(), 1);
+
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 3)
+            .with_store(Arc::clone(&db))
+            .with_builder(
+                Arc::clone(&builder) as Arc<dyn crate::tools::SoftwareBuilder>,
+                tools,
+            );
+
+        let broken = BrokenTool {
+            name: "memory_read".to_string(),
+            failure_count: 5,
+            last_error: Some("transient error".to_string()),
+            first_failure: Utc::now(),
+            last_failure: Utc::now(),
+            last_build_result: None,
+            repair_attempts: 0,
+        };
+
+        let result = repair.repair_broken_tool(&broken).await.unwrap();
+        assert!(
+            matches!(result, RepairResult::Success { .. }),
+            "builtin self-verify should report Success, got: {:?}",
+            result
+        );
+        assert_eq!(
+            builder.builds(),
+            0,
+            "builder must not run for registered builtin tools"
+        );
+        assert!(
+            db.get_broken_tools(5).await.unwrap().is_empty(),
+            "broken flag should be cleared after self-verify"
+        );
+    }
+
+    /// Work item #73.1: ManualRequired is terminal. A tool that exhausted
+    /// its repair attempts is surfaced exactly once per boot (so the alert
+    /// fires), then filtered out of subsequent detection cycles instead of
+    /// being retried every interval forever.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn detect_broken_tools_surfaces_exhausted_tool_once_per_boot() {
+        let cm = Arc::new(ContextManager::new(10));
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        for _ in 0..5 {
+            db.record_tool_failure("flaky-tool", "boom").await.unwrap();
+        }
+        for _ in 0..3 {
+            db.increment_repair_attempts("flaky-tool").await.unwrap();
+        }
+
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 3).with_store(db);
+
+        let first = repair.detect_broken_tools().await;
+        assert_eq!(
+            first.len(),
+            1,
+            "exhausted tool should surface once for the terminal alert"
+        );
+        assert_eq!(first[0].name, "flaky-tool");
+
+        let second = repair.detect_broken_tools().await;
+        assert!(
+            second.is_empty(),
+            "exhausted tool must be filtered out after the one-time alert"
+        );
+    }
+
+    /// Work item #76: a `ManualRequired` outcome that does not consume a
+    /// repair attempt (builder disabled/unavailable) must also be terminal
+    /// per boot. Otherwise the attempt counter never reaches the max, the
+    /// terminal filter never engages, and the watchdog retries + alerts
+    /// every check interval forever.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn manual_required_without_builder_suppresses_future_cycles() {
+        let cm = Arc::new(ContextManager::new(10));
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        for _ in 0..5 {
+            db.record_tool_failure("wasm-tool", "boom").await.unwrap();
+        }
+
+        // Store but NO builder: repair_broken_tool returns ManualRequired
+        // without incrementing the attempt counter.
+        let repair = DefaultSelfRepair::new(cm, Duration::from_secs(0), 3).with_store(db);
+
+        let detected = repair.detect_broken_tools().await;
+        assert_eq!(detected.len(), 1, "broken tool should be detected");
+        assert_eq!(detected[0].repair_attempts, 0);
+
+        let result = repair.repair_broken_tool(&detected[0]).await.unwrap();
+        assert!(
+            matches!(result, RepairResult::ManualRequired { .. }),
+            "no builder should yield ManualRequired, got: {:?}",
+            result
+        );
+
+        assert!(
+            repair.detect_broken_tools().await.is_empty(),
+            "ManualRequired must be terminal: tool suppressed after the alert"
+        );
+    }
+
+    /// Work item #73.3: last-known-good gate — a successful execution clears
+    /// the accumulated failure state so functional tools are not flagged.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn record_tool_success_clears_failure_state() {
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        for _ in 0..5 {
+            db.record_tool_failure("noisy-tool", "boom").await.unwrap();
+        }
+        db.increment_repair_attempts("noisy-tool").await.unwrap();
+        assert_eq!(db.get_broken_tools(5).await.unwrap().len(), 1);
+
+        db.record_tool_success("noisy-tool").await.unwrap();
+        assert!(
+            db.get_broken_tools(5).await.unwrap().is_empty(),
+            "success should clear the broken flag"
+        );
+
+        // Failure history can re-accumulate after success, and the repair
+        // counter must have been reset too.
+        for _ in 0..5 {
+            db.record_tool_failure("noisy-tool", "boom").await.unwrap();
+        }
+        let tools = db.get_broken_tools(5).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].repair_attempts, 0,
+            "success should also reset repair attempts"
+        );
+    }
+
+    /// Work item #73.2: repair-attempt counters persist in the DB; the
+    /// engine resets them at startup so each boot gets a fresh cycle.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn reset_tool_repair_attempts_gives_fresh_cycle() {
+        let (db, _tmp_dir) = crate::testing::test_db().await;
+
+        for _ in 0..5 {
+            db.record_tool_failure("tired-tool", "boom").await.unwrap();
+        }
+        for _ in 0..3 {
+            db.increment_repair_attempts("tired-tool").await.unwrap();
+        }
+
+        let reset = db.reset_tool_repair_attempts().await.unwrap();
+        assert_eq!(reset, 1, "one tool had a non-zero counter");
+
+        let tools = db.get_broken_tools(5).await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].repair_attempts, 0);
+
+        // Idempotent: nothing left to reset.
+        let again = db.reset_tool_repair_attempts().await.unwrap();
+        assert_eq!(again, 0);
     }
 }

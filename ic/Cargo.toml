@@ -263,6 +263,10 @@ name = "e2e_thread_scheduling"
 required-features = ["libsql", "integration"]
 
 [[test]]
+name = "engine_v2_eager_init"
+required-features = ["libsql", "integration"]
+
+[[test]]
 name = "engine_v2_interrupt_ingress"
 required-features = ["libsql", "integration"]
 

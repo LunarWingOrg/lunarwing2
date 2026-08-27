@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-08-05.
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-08-25.
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
@@ -11,11 +11,13 @@ foundation there are **three ways the agent actually runs SSH work**. This doc
 covers all three as-built: what each is, when to use it, its security posture,
 and how to enable it.
 
-> **Shared invariant across all three:** the `host` is always a **configured
-> alias** in `[[ssh.hosts]]`. That map is the hard egress allowlist — the agent
-> can never target an arbitrary host. Private keys live only in the encrypted
-> secrets store and are decrypted only inside the daemon; no mechanism ever
-> hands key bytes to the model or to a worker container.
+> **Shared key-handling invariant:** private keys live only in the encrypted
+> secrets store and are decrypted only inside the daemon; no mechanism hands raw
+> key bytes to the model or a worker container. Host targeting differs by
+> mechanism. Built-in `ssh`, `ssh_git`, and WASM `ssh` require a configured
+> `[[ssh.hosts]]` alias (and WASM narrows it again per tool). Worker mode receives
+> a generic signing socket: its ordinary SSH client chooses the destination, so
+> the configured host map is **not** an egress allowlist for that path.
 
 ---
 
@@ -31,7 +33,7 @@ and how to enable it.
 | Filesystem writes | worker's own FS | `ssh_git` only, confined to `<base_dir>/ssh-git/` | none (one-shot exec) |
 | Host-key verification | worker's own `known_hosts` | **`HostKeyVerifier`** (live) | `HostKeyVerifier` (live, host-side) |
 | Approval | per the job/tool policy | `ssh`: prompt with explicit **Always** option; `ssh_git`: every call | **Every call** |
-| Key algorithms | anything the worker's ssh supports | **Ed25519 / ECDSA** (RSA rejected) | Ed25519 / ECDSA |
+| Key algorithms | anything the worker's ssh supports | `ssh`: Ed25519/ECDSA (RSA rejected); `ssh_git`: whatever the loaded agent key and OpenSSH negotiate | Ed25519/ECDSA (RSA rejected host-side) |
 | Enable | `mt-admin` bind-mounts the socket | on when `[[ssh.hosts]]` + secrets store exist | build the guest wasm + grant the `ssh` capability |
 | Best for | heavy/long jobs, strong isolation | quick remote command / git ops, no container | capability-scoped per-tool host allowlist; WASM extensibility |
 
@@ -61,10 +63,13 @@ SSH_AUTH_SOCK=/tmp/ssh-agent.sock`. `<run_dir>` is
 `/home/<tenant>/lunarwing/run`. Nothing for the operator to do beyond
 provisioning the host + key (see the ops guide).
 
-**Security.** Highest isolation — the SSH operation runs in a separate
-container. Host-key verification is whatever the worker's own `ssh` client does
-with its container-local `known_hosts` (the harness `HostKeyVerifier` is **not**
-in this path). Keys never enter the container.
+**Security.** Highest process/filesystem isolation — the SSH operation runs in a
+separate container. Host-key verification is whatever the worker's own `ssh`
+client does with its container-local `known_hosts` (the harness
+`HostKeyVerifier` is **not** in this path). Raw keys never enter the container,
+but the mounted agent socket is a broad signing capability: it is not bound to a
+configured host alias or remote destination. Container network policy and the
+worker's own command/host-key policy must provide the egress boundary.
 
 **When to use.** Multi-step or long-running remote work, or anything that
 benefits from container isolation and the worker's toolchain. The cost is
@@ -154,11 +159,16 @@ key). Keys never leave the agent.
 - **Safety extras:** env-scrubbed subprocess (no gateway secrets leak to git),
   `GIT_TERMINAL_PROMPT=0`, `pull --ff-only`, **force-push (`+ref`) blocked**,
   option-injection guards, 64 KiB output cap, timeout + child kill.
+- **Key algorithms:** unlike the russh command path, `ssh_git` does not inspect
+  `SSHHostConfig.key_type` or reject RSA. Authentication is delegated to the
+  loaded agent key and the host's OpenSSH binary, so the algorithms actually
+  usable depend on that pair's negotiation and policy.
 - **Approval:** every invocation requires approval; no **Always** option.
 
 **When to use.** Any git operation over SSH from a chat turn, without a worker.
 
-> **Known limitation (both tools):** RSA is unsupported (Ed25519/ECDSA only).
+> **Known limitations:** the built-in `ssh` command tool rejects configured RSA
+> keys and accepts only Ed25519/ECDSA. `ssh_git` has no corresponding RSA guard.
 > For `ssh_git`, AcceptFirst is best-effort — it re-trusts per run rather than
 > persisting the pin (use Strict + a pinned `known_host_key` for anything
 > sensitive; see the ops guide).
@@ -221,12 +231,16 @@ plumbing.
 All three mechanisms sit on the same harness (see
 [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md)):
 
-- **Host config** in `config.toml` `[[ssh.hosts]]` — the egress allowlist.
+- **Host config** in `config.toml` `[[ssh.hosts]]` — the hard target allowlist
+  for built-in `ssh`, `ssh_git`, and WASM `ssh`; worker-mode OpenSSH does not
+  consult this map.
 - **Private keys** in the AES-256-GCM secrets store; decrypted only inside the
-  daemon; workers/guests never receive key bytes.
+  daemon; workers/guests never receive raw key bytes.
 - **In-process ssh-agent** at `/home/<tenant>/lunarwing/run/ssh-agent.sock`.
-- **`HostKeyVerifier`** — used live by the `ssh` and WASM tools; the worker path
-  uses the worker's own `known_hosts`.
+- **`HostKeyVerifier`** — consulted directly by the built-in/WASM russh paths;
+  `ssh_git` uses its stored pin (or configured `known_host_key`) to materialize
+  an ephemeral OpenSSH `known_hosts`. The worker path uses the worker's own
+  `known_hosts`.
 - **Per-tenant isolation** — the bridge derives an internal
   `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)`; secret-store lookups are scoped
   by the string `owner_id`, and the socket lives in the tenant-owned run dir.
@@ -234,13 +248,17 @@ All three mechanisms sit on the same harness (see
 Security posture by mechanism:
 - **Worker mode** — best isolation (container), but host-key checking is the
   worker's responsibility.
-- **`ssh` / `ssh_git`** — run in the gateway process (lower isolation), but with
-  live host-key verification, Always-approval, Ed25519/ECDSA-only, output
-  sanitization, and (for `ssh_git`) a filesystem sandbox + force-push block. The
-  `ssh` tool's credential path (a) briefly holds decoded key bytes in the
-  gateway process.
-- **WASM `ssh`** — same host-side surface as the `ssh` tool plus a per-tool host
-  allowlist; the sandbox does not contain the SSH op itself.
+- **Built-in `ssh`** — runs in the gateway process, requires explicit approval,
+  supports a persistent user grant only in interactive foreground use, accepts
+  Ed25519/ECDSA, verifies the live host key, rate-limits, and sanitizes output.
+  Its credential path briefly holds a decoded private key in process memory.
+- **`ssh_git`** — also runs in the gateway process and requires approval on every
+  call. It delegates key-algorithm negotiation to agent/OpenSSH, verifies through
+  an ephemeral `known_hosts`, sanitizes output, confines local paths, scrubs the
+  child environment, and blocks a leading-`+` force-push refspec.
+- **WASM `ssh`** — same host-side russh surface and Ed25519/ECDSA restriction as
+  built-in `ssh`, plus a per-tool host allowlist; the sandbox does not contain
+  the SSH operation itself.
 
 **Recommended host-key posture for all mechanisms:** pin `known_host_key` per
 host and use `host_key_mode = "Strict"`. AcceptFirst is a convenience.

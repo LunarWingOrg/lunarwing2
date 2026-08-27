@@ -254,6 +254,15 @@ def signals_leaked_roleplay_or_meta(text):
     return any(pattern in lower_text for pattern in roleplay_patterns)
 
 
+def neutralize_role_token_openers(content):
+    """Break ChatML-family token openers in untrusted prompt content."""
+    # This is idempotent and deliberately independent of optional injection
+    # scanning so every prompt-construction boundary can share the invariant.
+    # NOTE: keep this def above every helper that calls it — Monty binds
+    # module-level names in definition order.
+    return str(content).replace("<|", "<\u200b|")
+
+
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
     parts = []
@@ -277,6 +286,13 @@ def format_output(result, max_chars=8000):
 
     text = "\n\n".join(parts)
 
+    # CodeAct step output is untrusted: nested-VM stdout, action previews,
+    # and return values can all carry attacker-influenced bytes. Break every
+    # ChatML-family token opener before bounding (mirrors format_action_output)
+    # so re-tokenizing history cannot forge a role boundary, and so truncation
+    # can never cut an intact opener back out of a neutralized marker.
+    text = neutralize_role_token_openers(text)
+
     # Truncate from the front (keep the tail with most recent results)
     if len(text) > max_chars:
         text = "... (truncated) ...\n" + text[-max_chars:]
@@ -288,8 +304,11 @@ def format_output(result, max_chars=8000):
 
 
 def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
-    """Bound structured action output before storing it in LLM history."""
-    text = str(output)
+    """Neutralize role tokens and bound output before storing LLM history."""
+    # Action output is untrusted even when it retains a structured host shape.
+    # Break every ChatML-family token opener before persistence so re-tokenizing
+    # history cannot turn tool data into a forged role boundary.
+    text = neutralize_role_token_openers(output)
     marker = "\n... (tool output truncated)"
     if len(text) <= max_chars:
         return text
@@ -299,10 +318,17 @@ def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
 
 
 def sanitize_action_results(messages):
-    """Repair oversized action results already present in persisted state."""
+    """Repair unsafe or oversized messages in persisted state."""
     for msg in messages:
-        if msg.get("role") in ("ActionResult", "action_result"):
+        role = msg.get("role")
+        if role in ("ActionResult", "action_result"):
             msg["content"] = format_action_output(msg.get("content", ""))
+        elif role in ("User", "user"):
+            # Repair CodeAct step blobs ("[stdout]", "[name]", "[return]")
+            # persisted before format_output neutralized role tokens. No
+            # truncation here: User blobs are already bounded at creation,
+            # and neutralization is idempotent for fresh history.
+            msg["content"] = neutralize_role_token_openers(msg.get("content", ""))
     return messages
 
 
@@ -372,7 +398,9 @@ def format_docs(docs):
         truncated = "..." if len(doc.get("content", "")) > 500 else ""
         parts.append("### [" + label + "] " + doc.get("title", "") +
                       "\n" + content + truncated + "\n")
-    return "\n".join(parts)
+    # Neutralize the complete section so title, body, type, and future fields
+    # cannot forge a system-message boundary when the prompt is re-tokenized.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def estimate_context_tokens(messages):
@@ -575,7 +603,9 @@ def format_skills(skills):
                      "these domains — use the http tool instead, which will " +
                      "automatically inject the required credentials.\n")
 
-    return "\n".join(parts)
+    # Skill documents and metadata may be learned from user-controlled thread
+    # content. Neutralize the complete rendered section before system injection.
+    return neutralize_role_token_openers("\n".join(parts))
 
 
 def ensure_working_messages(state, context):

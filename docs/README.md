@@ -68,78 +68,19 @@ How-to guides, build instructions, and setup walkthroughs.
 
 ### 🛠️ [`ops/`](ops/)
 
-Deployment, operations, multitenancy, and production guides.
+Deployment, operations, multitenancy, and release procedures. Use the
+[`ops/README.md`](ops/README.md) index to distinguish maintained runbooks from
+point-in-time reports.
 
-| File | Description |
-|------|-------------|
-| [`MULTITENANCY-PRODUCTION.md`](ops/MULTITENANCY-PRODUCTION.md) | Production multi-tenancy walkthrough |
-| [`DARKIRC-MULTITENANT.md`](ops/DARKIRC-MULTITENANT.md) | DarkIRC multitenant operations: port migration, provisioning, lifecycle, health, troubleshooting |
-| [`DARKIRC-MULTITENANT-CHANGES-JUN23-FLAG-INFO.md`](ops/DARKIRC-MULTITENANT-CHANGES-JUN23-FLAG-INFO.md) | `--enable-darkirc` flag changes for mt-admin (June 2023 snapshot) |
-| [`TENANT-CONFIGURATION.md`](ops/TENANT-CONFIGURATION.md) | Per-tenant configuration reference (env, LLM, XMPP, ports) |
-| [`TENANT-RENAME-MIGRATION-1.1.9.md`](ops/TENANT-RENAME-MIGRATION-1.1.9.md) | Upgrading 1.1.7/1.1.8 tenants across the 1.1.9 directory renames (render-units flow, compat-symlink window, v2.0.0 deadline) |
-| [`TEST-PLAN-UPGRADED-TENANT-1.1.9.md`](ops/TEST-PLAN-UPGRADED-TENANT-1.1.9.md) | Validated test plan for the upgraded-tenant path: synthesize a v1.1.8 tenant, upgrade, assert compat symlinks/protocol/render-units (OpenRC) |
-| [`MULTITENANCY-HARNESS.md`](ops/MULTITENANCY-HARNESS.md) | Multi-tenant test harness guide |
-| [`HARNESS-SINGLE-TENANT.md`](ops/HARNESS-SINGLE-TENANT.md) | Single-tenant test harness guide |
-| [`SSH-HARNESS-SETUP.md`](ops/SSH-HARNESS-SETUP.md) | SSH harness setup & ops: config, key provisioning (mt-admin + manual), verifying in a worker, troubleshooting |
-| [`WORKER-CONTAINERS.md`](ops/WORKER-CONTAINERS.md) | Supported worker container images (Pebble, OpenCode, Kimi Code) |
-| [`PEBBLE-WORKER.md`](ops/PEBBLE-WORKER.md) | Pebble external worker operational guide |
-| [`NANOCODE-REMOVAL.md`](ops/NANOCODE-REMOVAL.md) | Nanocode retirement behavior, verification, preserved data, and rollback |
-| [`WEECHAT-SERVICES.md`](ops/WEECHAT-SERVICES.md) | WeeChat services, ports, env vars, day-to-day ops |
-| [`XMPP_KNOWN_ISSUES.md`](ops/XMPP_KNOWN_ISSUES.md) | XMPP/OMEMO known issues |
-| [`XMPP_TRANSFERS.md`](ops/XMPP_TRANSFERS.md) | XMPP file-transfer methods quick-reference |
-| [`RELEASE_COMMANDS.md`](ops/RELEASE_COMMANDS.md) | GitLab release commands and asset-publishing workflow |
-| [`RELEASE_CADENCE.md`](ops/RELEASE_CADENCE.md) | Release cadence policy |
-| [`PRE-RELEASE-TESTING.md`](ops/PRE-RELEASE-TESTING.md) | Current resource-bounded pre-release test checklist |
-| [`MT-MACHINE-MIGRATION.md`](ops/MT-MACHINE-MIGRATION.md) | Migrating a multi-tenant host to a new machine |
-| [`MT-GENTOO-SETUP-AND-CHANGES-MADE.md`](ops/MT-GENTOO-SETUP-AND-CHANGES-MADE.md) | Gentoo/OpenRC multi-tenant setup notes |
-| [`guide-for-spin-up-gentoo-tenants.md`](ops/guide-for-spin-up-gentoo-tenants.md) | Step-by-step guide for spinning up a Gentoo/OpenRC tenant |
-| [`MT-LEGACY-UPGRADE-NOTES.md`](ops/MT-LEGACY-UPGRADE-NOTES.md) | Legacy same-host version upgrade runbook (v1.0.3–v1.0.8 → v1.1.x) |
-| [`SELF_REPAIR_IMPROVEMENTS_GENTOO.md`](ops/SELF_REPAIR_IMPROVEMENTS_GENTOO.md) | Self-heal fd-leak fix found on a live OpenRC MT host |
-| [`ROADMAP_2026.md`](ops/ROADMAP_2026.md) | 2026 roadmap |
-| [`GITHOOKS_HOW_TO.md`](ops/GITHOOKS_HOW_TO.md) | How to install githooks |
-| [`GITLAB_CONTAINER_REGISTRY.md`](ops/GITLAB_CONTAINER_REGISTRY.md) | Enabling GitLab's built-in container registry and building/pulling worker images from CI |
-| [`IMPORT_EXPORT_EXAMPLE.txt`](ops/IMPORT_EXPORT_EXAMPLE.txt) | Worker import/export example |
-| [`KUMOGAKURE_INSTRUCT.md`](ops/KUMOGAKURE_INSTRUCT.md) | Pointer to the external Notes vault |
-| [`AGENT_GOALS_2.0.5.0.md`](ops/AGENT_GOALS_2.0.5.0.md) | Current agent-assigned pre-release checklist for LunarWing v2.0.5.0 |
-| [`history/AGENT_GOALS_2.0.3.0.md`](ops/history/AGENT_GOALS_2.0.3.0.md) | Archived v2.0.3.0 pre-release checklist |
-| [`CICD_LOGIC_REVIEW.md`](ops/CICD_LOGIC_REVIEW.md) | GitLab CI/CD logic review, resolved priority findings, and remaining hardening suggestions |
-| [`CODENAME_IDEAS_v2.0.3.0.md`](ops/CODENAME_IDEAS_v2.0.3.0.md) | Release codename candidates for v2.0.3.0 with English context and top picks |
-| [`CRATE_AUDIT_v2.0.4.0.md`](ops/CRATE_AUDIT_v2.0.4.0.md) | Current v2.0.4.0 dependency, workspace-version, and toolchain audit |
-| [`CRATE_AUDIT_STATUS.md`](ops/CRATE_AUDIT_STATUS.md) | Superseded v2.0.2.0 crate-audit snapshot retained for history |
-| [`CRATE_AUDIT_v2.0.3.0.md`](ops/CRATE_AUDIT_v2.0.3.0.md) | v2.0.3.0 dependency audit, applied updates, and deferred major-version upgrades |
-| [`CRL.MD`](ops/CRL.MD) | CRL 4.1.1.6 reference stub |
-| [`DARKIRC-KEYEXCHANGE.md`](ops/DARKIRC-KEYEXCHANGE.md) | Task note for secure DarkIRC key-exchange automation and follow-up work |
-| [`DARKIRC-KEYEXCHANGE-STATUS.md`](ops/DARKIRC-KEYEXCHANGE-STATUS.md) | Current Phase 0/1 and Stage A acceptance ledger, validation, and live-test gates |
-| [`GOAL_GAP_SUGGESTIONS.md`](ops/GOAL_GAP_SUGGESTIONS.md) | Source-verified release work missing from the v2.0.3.0 goals checklist |
-| [`HUMAN_GOALS_2.0.1.0.md`](ops/HUMAN_GOALS_2.0.1.0.md) | Human pre-release checklist for v2.0.1.0, including Kawarimi encryption work |
-| [`ISSUE_STATUS_REPORT.md`](ops/ISSUE_STATUS_REPORT.md) | Historical 2026-07-09 GitHub issue-status snapshot; not the current GitLab tracker |
-| [`UI_FIX_SUGGESTIONS.md`](ops/UI_FIX_SUGGESTIONS.md) | Web gateway UI fix suggestions: source-verified findings with priorities and implementation order |
-| [`KUMOGAKURE_RECENT_REV_T.md`](ops/KUMOGAKURE_RECENT_REV_T.md) | v2 branch sentinel with Hermes adapter and mt-admin decomposition review notes |
-| [`MCP_ADDITIONS.md`](ops/MCP_ADDITIONS.md) | Current MCP implementation matrix, host-local lifecycle and secret handling, deferred package/worker/runtime work, and security rationale |
-| [`LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md`](ops/LUNARHUB_IRONHUB_MARKETPLACE_RESEARCH.md) | Source-pinned IronHub/IronClaw marketplace review, LunarWing readiness gaps, security requirements, and phased LunarHub roadmap |
-| [`MEMORY_IMPL.md`](ops/MEMORY_IMPL.md) | Planning stub for importing or integrating memory cleanup, de-duplication, and correction routines |
-| [`meta5.md`](ops/meta5.md) | `sun/meta5/v2.0.0.0` branch pointer |
-| [`NEAR_REMOVAL_COMPLETION_AUDIT.md`](ops/NEAR_REMOVAL_COMPLETION_AUDIT.md) | Completion audit of the Near/IronClaw naming migration and its unresolved compatibility work |
-| [`_OLD_AGENT_GOALS_2.0.0.0.md`](ops/_OLD_AGENT_GOALS_2.0.0.0.md) | Older agent pre-release checklist for v2.0.0.0 |
-| [`OLDROADMAP_2026.md`](ops/OLDROADMAP_2026.md) | Older LunarWing v2 roadmap snapshot |
-| [`_OUTDATED_CRATE_AUDIT_STATUS.md`](ops/_OUTDATED_CRATE_AUDIT_STATUS.md) | Outdated v2.0.0.0 crate-audit status retained for reference |
-| [`P1_GAP_FINDINGS_v2.0.3.0.md`](ops/P1_GAP_FINDINGS_v2.0.3.0.md) | Verified v2.0.3.0 P1 gap findings across backends, workers, security, and operations |
-| [`questions.md`](ops/questions.md) | Notes on migrating the development loop from GitHub to Codeberg |
-| [`REVIEW_2.0.2.0_CHANGES.md`](ops/REVIEW_2.0.2.0_CHANGES.md) | Review of source changes and findings between v2.0.1.0 and v2.0.2.0 |
-| [`SIS.md`](ops/SIS.md) | Field notes from the 2026-07-28/29 self-improving-skills mission test runs |
-| [`SIS_FIX_PROPOSAL.md`](ops/SIS_FIX_PROPOSAL.md) | Self-improving-skills fix proposal (item 41): four source-verified root causes and implemented fixes for terminal event propagation, trigger-payload seeding, capability-lease leak, and the missing mission write path for skill docs |
-| [`SUBMODULEGIT.md`](ops/SUBMODULEGIT.md) | Pebble submodule reference stub |
-| [`TEST-SCRIPTS-STATUS.md`](ops/TEST-SCRIPTS-STATUS.md) | Automated test-script inventory, fixes, coverage gaps, and follow-up recommendations |
-| [`v2GOALS.md`](ops/v2GOALS.md) | LunarWing v2 roadmap snapshot with feature targets through v2.0.8 |
-| [`VAULT_DUMP.md`](ops/VAULT_DUMP.md) | Working list of v2 pre-release tasks and follow-up ideas |
-| [`WEECHAT_GENTOO_PACKAGE_RELAY_SUPPORT.md`](ops/WEECHAT_GENTOO_PACKAGE_RELAY_SUPPORT.md) | Gentoo WeeChat `relay-api` and cJSON package-verification task note |
-| [`WEECHAT_SERVICES_FOR_MT_INFODUMP.md`](ops/WEECHAT_SERVICES_FOR_MT_INFODUMP.md) | Historical WeeChat multi-tenant services infodump superseded by the active operations guide |
-| [`WEECHAT_SERVICES_VERIFICATION.md`](ops/WEECHAT_SERVICES_VERIFICATION.md) | Verification report for the historical WeeChat services infodump and resolved discrepancies |
-| [`XMPP_FT_REVIEW_A.md`](ops/XMPP_FT_REVIEW_A.md) | XMPP file-transfer and LunarVision review covering verified behavior and security findings |
-| [`XMPP_FT_REVIEW_R.md`](ops/XMPP_FT_REVIEW_R.md) | Independent XMPP file-transfer hardening review with severity-ranked findings |
+| Entry point | Description |
+|---|---|
+| [`MULTITENANCY-PRODUCTION.md`](ops/MULTITENANCY-PRODUCTION.md) | Production multi-tenant deployment and lifecycle |
+| [`TENANT-CONFIGURATION.md`](ops/TENANT-CONFIGURATION.md) | Per-tenant settings, services, environment, and ports |
+| [`PRE-RELEASE-TESTING.md`](ops/PRE-RELEASE-TESTING.md) | Resource-bounded release verification |
+| [`RELEASE_COMMANDS.md`](ops/RELEASE_COMMANDS.md) | GitLab release and asset-publishing workflow |
+| [`history/`](ops/history/README.md) | Superseded checklists, audits, and release-specific evidence |
 
-Versioned release notes live in [`releases/`](releases/). Shipped per-release prep checklists are
-archived in [`ops/history/`](ops/history/).
+Versioned release notes live in [`releases/`](releases/).
 
 ---
 
@@ -159,7 +100,7 @@ Standalone specifications for specific features or patterns.
 
 | File | Description |
 |------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
+| [`Near-Removal.md`](specs/history/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
 | [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait-babysitter pattern spec |
 | [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
 
@@ -188,7 +129,7 @@ Active implementation plans, execution backlogs, and delivery-status records.
 | [`e2e-skill-feedback.md`](plans/e2e-skill-feedback.md) | Live-tenant Engine V2 skill-feedback validation plan |
 | [`SELF_IMPROVING_SKILLS_B2_B3.md`](plans/SELF_IMPROVING_SKILLS_B2_B3.md) | B-2/B-3 self-improving skills implementation plan and delivered status |
 | [`WeeChat-Bootstrap.md`](plans/WeeChat-Bootstrap.md) | Secure tenant WeeChat relay provisioning plan |
-| [`Near-Removal.md`](plans/Near-Removal.md) | Provider and WIT ABI naming migration plan |
+| [`Near-Removal.md`](plans/history/Near-Removal.md) | Provider and WIT ABI naming migration plan |
 | [`PHASE5PLANSTATUSTODAYWED.md`](plans/PHASE5PLANSTATUSTODAYWED.md) | Engine V2 local compatibility phase status record |
 | [`SKILLb1b2b3STATUSTODAYWED.md`](plans/SKILLb1b2b3STATUSTODAYWED.md) | Self-improving skills implementation and verification status record |
 
@@ -207,10 +148,11 @@ Agent-driven plan and spec documents produced by the superpowers workflow.
 
 ### 💡 [`proposals/`](proposals/)
 
-The directory contains active proposals plus retained implementation, verification,
-superseded, and historical records. Statuses were reconciled against current
-source on 2026-08-04 at revision `be798a9`; point-in-time design and audit records
-retain their original evidence dates. Shipped or superseded records may later move to
+The directory contains active proposals plus retained implementation,
+verification, superseded, and historical records. All 102 tracked entries were
+reconciled against source on 2026-08-25 at revision `57e8a36f`; point-in-time
+design and audit records retain their original evidence dates. Shipped or
+superseded records may later move to
 [`internal/history/proposals/`](internal/history/proposals/), but remain indexed
 here while they are still present in `proposals/`.
 
@@ -234,23 +176,26 @@ here while they are still present in `proposals/`.
 | [`EXTWORKERCONVERSATIONHIST.md`](proposals/EXTWORKERCONVERSATIONHIST.md) | Implemented | Concise `context_scope=recent` and local/Docker iteration-budget usage note |
 | [`GITLAB_CI_CD_PLAN.md`](proposals/GITLAB_CI_CD_PLAN.md) | Phase 1 active / Phase 2 partial | Green default-branch and MR pipelines verify the required CI; PostgreSQL/browser/coverage/standalone integration plus package and deployment phases remain |
 | [`GITWASM/README.md`](proposals/GITWASM/README.md) | Open | Gitoxide-based Git/Markdown WASM tool proposal |
+| [`HEALTHPOINT_METRICS_EXPORTER.md`](proposals/HEALTHPOINT_METRICS_EXPORTER.md) | Implemented | Textfile metrics export, optional loopback listener, thresholds, and deduplicated warning path shipped in v2.0.8.0 |
 | [`HERMES-KAWARIMI-ADAPTER.md`](proposals/HERMES-KAWARIMI-ADAPTER.md) | Implemented (Phase 1) | Live-validated provision-then-populate Hermes import with owner-scope checks, encrypted secrets, explicit PG-only window, and failure cleanup |
 | [`HTTP_TOOL_SSRF_PROTECTIONS.md`](proposals/HTTP_TOOL_SSRF_PROTECTIONS.md) | Implemented / historical | Investigation record for the active HTTP-tool SSRF controls |
 | [`human-delay-mode-phase1-test-checklist.md`](proposals/human-delay-mode-phase1-test-checklist.md) | Implemented | Verified Phase 1 supervised-mode checklist |
 | [`human-delay-mode-phase1-verification-handoff.md`](proposals/human-delay-mode-phase1-verification-handoff.md) | Superseded | Fulfilled Phase 1 verification handoff |
 | [`human-delay-mode-phase2-plan.md`](proposals/human-delay-mode-phase2-plan.md) | Open | Timeout, gate-pipeline, modify-flow, and testing plan |
 | [`human-delay-mode-testing-guide.md`](proposals/human-delay-mode-testing-guide.md) | Superseded | Stale guide with nonexistent standalone gate/thread CLI examples |
-| [`IC_REPAIR_FOLLOWUPS.md`](proposals/IC_REPAIR_FOLLOWUPS.md) | Partial | Core self-heal fixes landed; escalation cooldown and deep tenant health remain |
+| [`IC_REPAIR_FOLLOWUPS.md`](proposals/IC_REPAIR_FOLLOWUPS.md) | Partial | Core cross-init fixes, escalation cooldown, bounded probes, and tenant user-bus remediation landed; authenticated per-tenant channel health remains deferred |
 | [`IRONCLAW_ADDITION_CANDIDATES.md`](proposals/IRONCLAW_ADDITION_CANDIDATES.md) | Open | Filtered current LunarWing port and hardening backlog |
 | [`IRONCLAW_TOP2_PRIORITY_PLAN.md`](proposals/IRONCLAW_TOP2_PRIORITY_PLAN.md) | Open | Implementation plan for the two highest-priority IronClaw-derived SSRF and egress hardening gaps |
 | [`IRONCLAW_TOP3_EASIEST_PLAN.md`](proposals/IRONCLAW_TOP3_EASIEST_PLAN.md) | Open | Implementation plan for three small, independent IronClaw-derived correctness fixes |
 | [`JINGLE_IBB_FEASIBILITY.md`](proposals/JINGLE_IBB_FEASIBILITY.md) | Historical | Deferred Jingle/IBB feasibility decision |
 | [`KAWARIMI-OWNER-SCOPE-CONTINUITY.md`](proposals/KAWARIMI-OWNER-SCOPE-CONTINUITY.md) | Partial | Core import reconciliation landed; Phase 2 export/FK work remains |
 | [`LOREBOOKS.md`](proposals/LOREBOOKS.md) | Implemented (v1) | Bounded SillyTavern World Info import subset with deterministic activation and prompt-write hardening |
+| [`LUNARHUB_ARTIFACT_BACKBONE.md`](proposals/LUNARHUB_ARTIFACT_BACKBONE.md) | Open | Fleet-private signed artifact and prebuilt-daemon backbone proposal |
 | [`LUNARVISION_POLISHING.md`](proposals/LUNARVISION_POLISHING.md) | Superseded | Health wiring and `vision_health` allocation landed elsewhere |
+| [`lunarvoice-onnx-proposal-2.0.6.0.md`](proposals/lunarvoice-onnx-proposal-2.0.6.0.md) | Implemented | Local sherpa-onnx voice sidecar, verified models, per-tenant lifecycle, and health wiring |
 | [`MEMORY_MAINTENANCE_ROUTINES.md`](proposals/MEMORY_MAINTENANCE_ROUTINES.md) | Open | Routine-pack and reviewed memory-maintenance proposal/apply design |
 | [`MT-1.1.0-TO-1.1.4-UPGRADE.md`](proposals/MT-1.1.0-TO-1.1.4-UPGRADE.md) | Implemented / verification pending | Rootless-flip tooling shipped; exact production flip remains unvalidated |
-| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Superseded | Rejected split plan; item #24 chose the `mtadminrefactor/meta4/v2.0.3.0` mt-admin-lib decomposition instead |
+| [`MT-ADMIN-DECOMPOSITION.md`](proposals/MT-ADMIN-DECOMPOSITION.md) | Implemented / historical | A fourteen-module `mt-admin-lib` decomposition landed in v2.0.8.0; the body retains the earlier rejected six-part design record |
 | [`MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md`](proposals/MT-LEGACY-UPGRADE-CHERRYPICK-PLAN.md) | Implemented / historical | Executed legacy-upgrade fix plan; production run remained operator-gated |
 | [`MT-LEGACY-UPGRADE-QA-PLAN.md`](proposals/MT-LEGACY-UPGRADE-QA-PLAN.md) | Verification pending | Live legacy-upgrade operator checklist |
 | [`MT-LEGACY-UPGRADE-VERIFICATION.md`](proposals/MT-LEGACY-UPGRADE-VERIFICATION.md) | Verification pending | Legacy harness canary, rollback, soak, and sign-off plan |
@@ -276,7 +221,7 @@ here while they are still present in `proposals/`.
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-1.0.0-rc.1-port-analysis.md) | Analysis complete / selective backlog | Release-range audit recommending selective mechanism ports rather than an IronClaw architecture cutover |
 | [`OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md`](proposals/OLDPROJECT_PORT_ANALYSES/ironclaw-reborn-port-analysis.md) | Open | Selective Reborn mechanism backlog; no wholesale adoption |
 | [`OPENCODE-WORKER-SINGLE-TARGET-BUILD.md`](proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md) | Implemented | OpenCode worker now builds only its native target |
-| [`OPENRC_ACCURATE_REPORT_16_JUNE_2026.md`](proposals/OPENRC_ACCURATE_REPORT_16_JUNE_2026.md) | Partial / historical | Curative fixes landed; broader OpenRC hardening remains open |
+| [`OPENRC_ACCURATE_REPORT_16_JUNE_2026.md`](proposals/OPENRC_ACCURATE_REPORT_16_JUNE_2026.md) | Partial / historical | Major OpenRC timeout, accuracy, supervision, scheduler, watchdog, and test gaps landed; residual recommendations remain |
 | [`PASEO.MD`](proposals/PASEO.MD) | Open | Unscoped Paseo support link stub |
 | [`PAST.MD`](proposals/PAST.MD) | Open | Unscoped PAST+SS streaming idea |
 | [`PER_TENANT_WORKER_GATING.md`](proposals/PER_TENANT_WORKER_GATING.md) | Implemented | Per-tenant worker selection persistence and start gating landed |
@@ -296,18 +241,20 @@ here while they are still present in `proposals/`.
 | [`ROUTINE_ENGINE_IMPROVEMENTS.md`](proposals/ROUTINE_ENGINE_IMPROVEMENTS.md) | Partial | Items 1-3 landed; items 4-8 remain deprioritized |
 | [`SELF_IMPROVING_SKILLS_B1.md`](proposals/SELF_IMPROVING_SKILLS_B1.md) | Implemented | End-to-end reviewed skill-patching proposal flow |
 | [`SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md`](proposals/SESSION-AUDIT-MT-DARKIRC-EWE-2026-06-23.md) | Partial | Major fixes landed; remaining tracker items stay open |
-| [`SSH_HARNESS_DELIVERY_OPTIONS.md`](proposals/SSH_HARNESS_DELIVERY_OPTIONS.md) | Implemented | All three SSH delivery mechanisms shipped |
+| [`SSH_HARNESS_DELIVERY_OPTIONS.md`](proposals/SSH_HARNESS_DELIVERY_OPTIONS.md) | Implemented | Worker, built-in, and WASM SSH paths shipped with distinct isolation and host-targeting boundaries |
 | [`SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md`](proposals/SSH_HARNESS_OPTION_2_3_IMPLEMENTATION.md) | Implemented / historical | Pre-implementation design record for shipped options 2 and 3 |
 | [`SUPERGATEWAY_MCP.md`](proposals/SUPERGATEWAY_MCP.md) | Superseded | Native stdio MCP support made the workaround optional |
+| [`study-notes-native-lunarwing-proposal-2.0.6.0.md`](proposals/study-notes-native-lunarwing-proposal-2.0.6.0.md) | Implemented | Seven native knowledge tools, lifecycle sweep, coordination ingest, and one-shot new-tenant checkout seed |
 | [`TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md`](proposals/TEST_IN_PLACE_UPGRADE_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without a test plan |
 | [`TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md`](proposals/TEST_KAWARIMI_IMPORT_AND_EXPORT_IN_NEW_WEB_GUI.md) | Open stub | Placeholder without web-GUI acceptance criteria |
 | [`UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md`](proposals/UPGRADE_AND_MIGRATION_ISSUES_TO_FIX.md) | Partial / mostly superseded | Owner-scope risk closed; remaining operational cautions retained |
-| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / implemented incrementally | Host-local lifecycle, operator-pinned provenance, OS sandboxing, general MCP runtime adapters, stateful MCP-over-WASM, dedicated/shared gateway client placement, and core Docker worker-local stdio placement landed; marketplace trust, automatic package install, persistent-worker placement, and a bundled gateway service remain open |
+| [`V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md`](proposals/V2_MCP_EXTENSION_ARCHITECTURE_EXPLORATION.md) | Partial / implemented incrementally | Host-local lifecycle, runtime adapters, stateful MCP-over-WASM, job-worker placement, gateway client plus bundled control/data plane, and optional revocation enforcement landed; signed install/upgrade, automatic packages, persistent-worker delivery, and gateway HA remain open |
+| [`wasm-expansion-proposal-2.0.6.0.md`](proposals/wasm-expansion-proposal-2.0.6.0.md) | Open / partially overtaken | WASM expansion research; later releases added MCP runtime slices, marketplace trust primitives, and SSH capability support |
 | [`WEECHAT_CLIENT_RELAY_API_AUTOMATION.md`](proposals/WEECHAT_CLIENT_RELAY_API_AUTOMATION.md) | Partial | Relay bootstrap shipped; full client provisioning remains open |
 | [`WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md`](proposals/WEECHAT_WS_ADAPTER_MISSING_DEPENDENCY_AND_AUTOMATION.md) | Partial | Service and port automation landed; dependency install remains warn-only |
 | [`WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md`](proposals/WEECHAT_WS_ADAPTER_SYNC_PROTOCOL.md) | Superseded | `ironclaw-sync` was renamed to `lunarwing-sync` |
 | [`WORK_ON_LUNAR_SPRITE.md`](proposals/WORK_ON_LUNAR_SPRITE.md) | Open stub | Placeholder without a proposal or implementation |
-| [`XMPP_INCOMING_ATTACHMENT.md`](proposals/XMPP_INCOMING_ATTACHMENT.md) | Superseded | Stale compiler-warning capture; helper is test-gated and used |
+| [`XMPP_INCOMING_ATTACHMENT.md`](proposals/XMPP_INCOMING_ATTACHMENT.md) | Superseded | Obsolete compiler-warning capture; inbound OOB/aesgcm handling now uses the source-verified download pipeline |
 | [`XMPP_LUNARVISION_INTEGRATION.md`](proposals/XMPP_LUNARVISION_INTEGRATION.md) | Implemented | Automatic OCR/VL enrichment uses host-side auth when configured and preserves multimodal fallback |
 | [`XMPP_OMEMO_AESGCM_URL_LEAK_FIX.md`](proposals/XMPP_OMEMO_AESGCM_URL_LEAK_FIX.md) | Implemented | Embedded and URL-only `aesgcm://` stripping regressions are present |
 | [`XMPP_WASM_ATTACHMENT_TRAP.md`](proposals/XMPP_WASM_ATTACHMENT_TRAP.md) | Partial / verification pending | Memory/decode fixes landed; large-attachment regression and live PNG gate remain |
@@ -333,7 +280,7 @@ Technical specifications for specific subsystems and patterns.
 
 | File | Description |
 |------|-------------|
-| [`Near-Removal.md`](specs/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
+| [`Near-Removal.md`](specs/history/Near-Removal.md) | Near/IronClaw provider and WIT naming-removal requirements, compatibility policy, and verification |
 | [`podman-wait-babysitter.md`](specs/podman-wait-babysitter.md) | Podman wait babysitter pattern: OpenRC crash recovery for rootless Podman containers via `supervise-daemon` |
 | [`WeeChat-Relay.md`](specs/WeeChat-Relay.md) | WeeChat relay auto-bootstrap requirements, managed-session preservation, security, and platform behavior |
 
