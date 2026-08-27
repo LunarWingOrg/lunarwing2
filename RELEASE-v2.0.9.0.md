@@ -15,6 +15,8 @@
 > remaining items in `docs/ops/AGENT_GOALS_2.0.9.0.md` before tagging the
 > release. It is intentionally not a claim that v2.0.9.0 is release-ready.
 
+> **TODO** add the real intro from SB
+
 ## Overview
 
 LunarWing v2.0.9.0 is a tool-output security, self-repair reliability,
