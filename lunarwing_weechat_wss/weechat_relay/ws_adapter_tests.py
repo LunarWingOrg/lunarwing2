@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for ws_adapter.py reconnect resilience (work item #78):
+Tests for ws_adapter.py reconnect resilience (work item #78 + goal-25 F3):
 
 - WSMsgType.ERROR is distinguished from CLOSED, logged with its payload,
   and surfaced via /api/health (last_disconnect, reconnect_count).
@@ -8,6 +8,9 @@ Tests for ws_adapter.py reconnect resilience (work item #78):
   reconnect, deduped against live events by per-buffer line-id watermarks.
 - Outbound /api/input proxy failures are queued in a bounded outbox and
   flushed, in order, after the next successful connect.
+- Per-buffer watermarks persist across PROCESS restarts (state file), so a
+  restart backfills lines accepted while the adapter was down instead of
+  reseeding and classifying them as history.
 
 Run from this directory:  python3 -m pytest ws_adapter_tests.py -v
 """
@@ -28,7 +31,7 @@ from ws_adapter import state
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(tmp_path, monkeypatch):
     state.line_buffer.clear()
     state.buffer_list = []
     state.ws_connected = False
@@ -47,7 +50,16 @@ def reset_state():
     state.last_line_id = {}
     state.outbox = deque()
     state.outbox_dropped = 0
+    state.state_file = ""
+    state.restarted = False
+    # Isolate every test from the operator's real environment/tenant state dir
+    # so persist_state()/load_persisted_state() only touch a temp sandbox.
+    state_dir = tmp_path / "state"
+    monkeypatch.setenv("LUNARWING_BASE_DIR", str(state_dir))
+    monkeypatch.delenv("WS_ADAPTER_STATE_FILE", raising=False)
     yield
+    for leftover in state_dir.parent.glob("*.json"):
+        leftover.unlink(missing_ok=True)
 
 
 class FakeResp:
@@ -418,3 +430,103 @@ def test_health_exposes_disconnect_and_outbox_state():
     assert payload["outbox_depth"] == 1
     assert payload["outbox_dropped"] == 2
     assert "event_cursor" in payload  # long-poll support marker preserved
+
+
+# ---------------------------------------------------------------------------
+# Persisted watermark state across process restarts (goal-25 finding F3)
+# ---------------------------------------------------------------------------
+
+def test_record_line_persists_watermark_advance():
+    state.state_file = ws_adapter.resolve_state_file()  # enabled via env fixture
+    assert state.state_file != ""
+
+    ws_adapter.record_line("irc.libera.#a", make_line(10))
+    saved = json.loads((ws_adapter.Path(state.state_file)).read_text())
+
+    assert saved["last_line_id"] == {"irc.libera.#a": 10}
+    assert "saved_at" in saved
+
+
+def test_load_persisted_state_marks_restart_and_restores_watermarks():
+    path = ws_adapter.Path(ws_adapter.resolve_state_file())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "version": 1,
+        "saved_at": ws_adapter.datetime.now(ws_adapter.timezone.utc).isoformat(),
+        "last_line_id": {"irc.libera.#a": 30, "irc.libera.alice": 5},
+    }))
+
+    assert ws_adapter.load_persisted_state() is True
+
+    assert state.restarted is True
+    assert state.last_line_id == {"irc.libera.#a": 30, "irc.libera.alice": 5}
+
+
+def test_load_without_state_file_is_fresh_start():
+    assert ws_adapter.load_persisted_state() is False
+    assert state.restarted is False
+    assert state.last_line_id == {}
+
+
+def test_load_discards_stale_state_file():
+    from datetime import timedelta
+
+    path = ws_adapter.Path(ws_adapter.resolve_state_file())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ancient = ws_adapter.datetime.now(ws_adapter.timezone.utc) - timedelta(
+        days=ws_adapter.WATERMARK_MAX_AGE_DAYS + 1
+    )
+    path.write_text(json.dumps({
+        "version": 1,
+        "saved_at": ancient.isoformat(),
+        "last_line_id": {"irc.libera.#a": 30},
+    }))
+
+    assert ws_adapter.load_persisted_state() is False
+    assert state.last_line_id == {}  # line ids are not stable across WeeChat restarts
+
+
+def test_load_discards_corrupt_state_file():
+    path = ws_adapter.Path(ws_adapter.resolve_state_file())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json")
+
+    assert ws_adapter.load_persisted_state() is False
+    assert state.last_line_id == {}
+
+
+def test_state_file_env_none_disables_persistence(monkeypatch):
+    monkeypatch.setenv("WS_ADAPTER_STATE_FILE", "none")
+
+    assert ws_adapter.resolve_state_file() == ""
+    state.state_file = ""
+    state.last_line_id["irc.libera.#a"] = 10
+    ws_adapter.persist_state()  # must be a no-op, not a crash
+
+    assert not (ws_adapter.Path(ws_adapter.resolve_state_file() or "/nonexistent/x.json")).exists()
+
+
+def test_restart_backfills_lines_accepted_while_adapter_was_down(monkeypatch):
+    # Goal-25 H4 replay: adapter restarts mid-stream; lines the relay accepted
+    # during the outage must now be recovered instead of classified as history.
+    state.state_file = ws_adapter.resolve_state_file()
+    ws_adapter.record_line("irc.libera.#a", make_line(30))  # persists watermark 30
+
+    # Simulate a new process: fresh in-memory state, then load from disk.
+    state.line_buffer.clear()
+    state.event_log.clear()
+    state.event_seq = 0
+    state.last_line_id = {}
+    state.ever_connected = False
+    assert ws_adapter.load_persisted_state() is True
+
+    # Lines 31/32 arrived while the (new) adapter process was down.
+    state.buffer_list = [{"id": 1, "full_name": "irc.libera.#a"}]
+    lines = [make_line(i) for i in (32, 31, 30, 29)]
+    _patch_backfill_io(monkeypatch, {"irc.libera.#a": lines}, [])
+
+    asyncio.run(ws_adapter.recover_after_connect(None, is_reconnect=True))
+
+    got_ids = [e["line"]["id"] for e in state.event_log]
+    assert got_ids == [31, 32]  # recovered, not swallowed
+    assert state.last_line_id["irc.libera.#a"] == 32
