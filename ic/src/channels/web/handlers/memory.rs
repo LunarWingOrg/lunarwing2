@@ -199,6 +199,14 @@ pub async fn memory_write_handler(
     }))
 }
 
+fn search_result_to_hit(result: &crate::workspace::SearchResult) -> SearchHit {
+    SearchHit {
+        path: result.document_path.clone(),
+        content: result.content.clone(),
+        score: result.score as f64,
+    }
+}
+
 pub async fn memory_search_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -213,18 +221,36 @@ pub async fn memory_search_handler(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     let total_matches = results.len();
-    let hits: Vec<SearchHit> = results
-        .iter()
-        .map(|r| SearchHit {
-            path: r.document_id.to_string(),
-            content: r.content.clone(),
-            score: r.score as f64,
-        })
-        .collect();
+    let hits = results.iter().map(search_result_to_hit).collect();
 
     Ok(Json(MemorySearchResponse {
         results: hits,
         total_matches,
         truncated: false,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn search_hit_uses_readable_document_path() {
+        let result = crate::workspace::SearchResult {
+            document_id: Uuid::new_v4(),
+            document_path: "memory/ledger.md".to_string(),
+            chunk_id: Uuid::new_v4(),
+            content: "ledger entry".to_string(),
+            score: 0.75,
+            fts_rank: Some(1),
+            vector_rank: None,
+        };
+
+        let hit = search_result_to_hit(&result);
+
+        assert_eq!(hit.path, "memory/ledger.md");
+        assert_eq!(hit.content, "ledger entry");
+        assert_eq!(hit.score, 0.75);
+    }
 }
