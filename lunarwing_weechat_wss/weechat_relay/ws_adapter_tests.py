@@ -57,9 +57,25 @@ def reset_state(tmp_path, monkeypatch):
     state_dir = tmp_path / "state"
     monkeypatch.setenv("LUNARWING_BASE_DIR", str(state_dir))
     monkeypatch.delenv("WS_ADAPTER_STATE_FILE", raising=False)
+    monkeypatch.delenv("WS_ADAPTER_HEARTBEAT_SECONDS", raising=False)
     yield
     for leftover in state_dir.parent.glob("*.json"):
         leftover.unlink(missing_ok=True)
+
+
+def test_ws_heartbeat_disabled_by_default():
+    assert ws_adapter.resolve_ws_heartbeat() is None
+
+
+def test_ws_heartbeat_positive_override(monkeypatch):
+    monkeypatch.setenv("WS_ADAPTER_HEARTBEAT_SECONDS", "30")
+    assert ws_adapter.resolve_ws_heartbeat() == 30.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "invalid"])
+def test_ws_heartbeat_rejects_invalid_override(monkeypatch, value):
+    monkeypatch.setenv("WS_ADAPTER_HEARTBEAT_SECONDS", value)
+    assert ws_adapter.resolve_ws_heartbeat() is None
 
 
 class FakeResp:
@@ -237,6 +253,7 @@ class FakeWSSession:
 
     connects = 0
     scripted_ws = None
+    heartbeat = "unset"
 
     async def __aenter__(self):
         return self
@@ -246,6 +263,7 @@ class FakeWSSession:
 
     def ws_connect(self, url, headers=None, heartbeat=None, max_msg_size=None):
         FakeWSSession.connects += 1
+        FakeWSSession.heartbeat = heartbeat
         if FakeWSSession.connects > 1:
             raise asyncio.CancelledError
         return FakeWSConnectCM(FakeWSSession.scripted_ws)
@@ -254,6 +272,7 @@ class FakeWSSession:
 def _run_loop_with_messages(monkeypatch, messages, exc=None):
     FakeWSSession.connects = 0
     FakeWSSession.scripted_ws = FakeWS(messages, exc=exc)
+    FakeWSSession.heartbeat = "unset"
     sleeps = []
 
     async def fake_sleep(delay):
@@ -272,6 +291,13 @@ def _run_loop_with_messages(monkeypatch, messages, exc=None):
 
     asyncio.run(ws_adapter.ws_client_loop())
     return sleeps
+
+
+def test_ws_loop_disables_protocol_heartbeat_by_default(monkeypatch):
+    messages = [SimpleNamespace(type=WSMsgType.CLOSED, data=None)]
+    _run_loop_with_messages(monkeypatch, messages)
+
+    assert FakeWSSession.heartbeat is None
 
 
 def test_error_frame_logged_with_payload_and_backoff(monkeypatch, caplog):
