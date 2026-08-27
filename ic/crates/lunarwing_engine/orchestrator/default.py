@@ -277,6 +277,13 @@ def format_output(result, max_chars=8000):
 
     text = "\n\n".join(parts)
 
+    # CodeAct step output is untrusted: nested-VM stdout, action previews,
+    # and return values can all carry attacker-influenced bytes. Break every
+    # ChatML-family token opener before bounding (mirrors format_action_output)
+    # so re-tokenizing history cannot forge a role boundary, and so truncation
+    # can never cut an intact opener back out of a neutralized marker.
+    text = neutralize_role_token_openers(text)
+
     # Truncate from the front (keep the tail with most recent results)
     if len(text) > max_chars:
         text = "... (truncated) ...\n" + text[-max_chars:]
@@ -309,10 +316,17 @@ def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
 
 
 def sanitize_action_results(messages):
-    """Repair unsafe or oversized action results in persisted state."""
+    """Repair unsafe or oversized messages in persisted state."""
     for msg in messages:
-        if msg.get("role") in ("ActionResult", "action_result"):
+        role = msg.get("role")
+        if role in ("ActionResult", "action_result"):
             msg["content"] = format_action_output(msg.get("content", ""))
+        elif role in ("User", "user"):
+            # Repair CodeAct step blobs ("[stdout]", "[name]", "[return]")
+            # persisted before format_output neutralized role tokens. No
+            # truncation here: User blobs are already bounded at creation,
+            # and neutralization is idempotent for fresh history.
+            msg["content"] = neutralize_role_token_openers(msg.get("content", ""))
     return messages
 
 
