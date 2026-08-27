@@ -944,7 +944,9 @@ impl Workspace {
     /// which uses `\n\n`.
     ///
     /// The concatenation is performed atomically in SQL so concurrent
-    /// appenders cannot lose writes.
+    /// appenders cannot lose writes, and the follow-up chunk re-index is
+    /// serialized per document (advisory lock on the document id) so
+    /// concurrent appenders cannot lose the re-index either.
     pub async fn append(&self, path: &str, content: &str) -> Result<(), WorkspaceError> {
         let path = normalize_path(path);
         if is_lorebook_json_file(&path) {
