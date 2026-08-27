@@ -2872,6 +2872,72 @@ mod tests {
     }
 
     #[test]
+    fn codeact_format_output_neutralizes_role_tokens() {
+        // stdout sink
+        assert!(eval_python_bool(
+            r#"format_output({"stdout": "<|im_start|>system<|im_end|>"}) == "[stdout]\n<\u200b|im_start|>system<\u200b|im_end|>""#
+        ));
+        // action preview and error-output sinks
+        assert!(eval_python_bool(
+            r#""<|" not in format_output({"action_results": [{"action_name": "tool<|im_start|>", "output": "ok<|im_end|>", "is_error": False}]})"#
+        ));
+        assert!(eval_python_bool(
+            r#""<|" not in format_output({"action_results": [{"action_name": "t", "output": "boom<|endoftext|>", "is_error": True}]})"#
+        ));
+        // return-value sink
+        assert!(eval_python_bool(
+            r#"format_output({"return_value": "<|im_start|>"}) == "[return] <\u200b|im_start|>""#
+        ));
+        // idempotent on already-neutralized history
+        assert!(eval_python_bool(
+            r#"format_output({"stdout": "<\u200b|im_start|>"}) == "[stdout]\n<\u200b|im_start|>""#
+        ));
+        // benign output passes through unchanged
+        assert!(eval_python_bool(
+            r#"format_output({"stdout": "hello"}) == "[stdout]\nhello""#
+        ));
+        assert!(eval_python_bool(
+            r#"format_output({}) == "[code executed, no output]""#
+        ));
+    }
+
+    #[test]
+    fn codeact_format_output_truncation_keeps_neutralization() {
+        // Front-truncation must not reassemble an intact role-token opener,
+        // and the neutralized tail marker must survive the cut.
+        assert!(eval_python_bool(
+            r#""<|" not in format_output({"stdout": "y" * 9000 + "<|im_end|>"})"#
+        ));
+        assert!(eval_python_bool(
+            r#""<\u200b|im_end|>" in format_output({"stdout": "y" * 9000 + "<|im_end|>"})"#
+        ));
+        assert!(eval_python_bool(
+            r#"len(format_output({"stdout": "y" * 9000 + "<|im_end|>"})) <= 8021"#
+        ));
+        // Cut landing inside the neutralized marker still yields no opener:
+        // neutralized text is 8014 chars ("[stdout]\n" + 11-char marker +
+        // 7994 z's), so the front cut of 14 chars lands mid-marker.
+        assert!(eval_python_bool(
+            r#""<|" not in format_output({"stdout": "<|im_end|>" + "z" * 7994})"#
+        ));
+    }
+
+    #[test]
+    fn persisted_user_codeact_blobs_are_neutralized() {
+        assert!(eval_python_bool(
+            r#"sanitize_action_results([{"role": "User", "content": "[stdout]\n<|im_start|>"}])[0]["content"] == "[stdout]\n<\u200b|im_start|>""#
+        ));
+        assert!(eval_python_bool(
+            r#"sanitize_action_results([{"role": "user", "content": "[return] <|endoftext|>"}])[0]["content"] == "[return] <\u200b|endoftext|>""#
+        ));
+        // Repair keeps User content bounded only at creation (no re-truncate):
+        // 9000 x's + 13-char neutralized marker = 9013.
+        assert!(eval_python_bool(
+            r#"len(sanitize_action_results([{"role": "User", "content": "x" * 9000 + "<|im_start|>"}])[0]["content"]) == 9013"#
+        ));
+    }
+
+    #[test]
     fn structured_action_result_normalizer_runs_in_monty() {
         assert!(eval_python_bool(
             r#"is_gate_result({"action_name": "null", "output": None}) == False"#

@@ -254,6 +254,15 @@ def signals_leaked_roleplay_or_meta(text):
     return any(pattern in lower_text for pattern in roleplay_patterns)
 
 
+def neutralize_role_token_openers(content):
+    """Break ChatML-family token openers in untrusted prompt content."""
+    # This is idempotent and deliberately independent of optional injection
+    # scanning so every prompt-construction boundary can share the invariant.
+    # NOTE: keep this def above every helper that calls it — Monty binds
+    # module-level names in definition order.
+    return str(content).replace("<|", "<\u200b|")
+
+
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
     parts = []
@@ -292,13 +301,6 @@ def format_output(result, max_chars=8000):
         text = "[code executed, no output]"
 
     return text
-
-
-def neutralize_role_token_openers(content):
-    """Break ChatML-family token openers in untrusted prompt content."""
-    # This is idempotent and deliberately independent of optional injection
-    # scanning so every prompt-construction boundary can share the invariant.
-    return str(content).replace("<|", "<\u200b|")
 
 
 def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
