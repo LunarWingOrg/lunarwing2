@@ -23,14 +23,32 @@ Reconnect behavior (v0.3.0):
     - Outbound /api/input proxy failures are queued in a bounded outbox and
       retried, in order, after the next successful connect.
 
+Restart behavior (v0.4.1, goal-25 finding F3):
+    - Per-buffer line-id watermarks persist to a state file (default
+      $LUNARWING_BASE_DIR/weechat-adapter-state.json, override
+      WS_ADAPTER_STATE_FILE) so a PROCESS restart backfills from the
+      persisted watermark instead of reseeding and silently classifying
+      lines accepted while the adapter was down as history. A start with
+      no state file keeps the first-connect seeding (no history replay).
+      Set WS_ADAPTER_STATE_FILE=none to opt out and restore the old
+      restart behavior.
+    - Inbound events also persist to an append-only journal
+      (<state-stem>-journal.jsonl) and are restored on startup with their
+      ORIGINAL sequence numbers. This closes the second loss window:
+      lines the dying process had accepted from the WS but the WASM
+      poller (30s cadence) had not yet picked up. The poller persists its
+      own cursor, so resumed seqs deliver exactly the unpolled events,
+      never duplicates.
+
 Usage:
     python3 ws_adapter.py [--relay-url URL] [--relay-password PW] [--port PORT]
-                         [--message-delay SECONDS]
+                         [--message-delay SECONDS] [--state-file PATH]
 
     Or via environment variables:
     RELAY_URL=http://127.0.0.1:9001 RELAY_PASSWORD=secret python3 ws_adapter.py
     WEECHAT_ADAPTER_PORT=10009 python3 ws_adapter.py
     MESSAGE_DELAY_SECONDS=3 python3 ws_adapter.py  # add 3s delay to all messages
+    WS_ADAPTER_STATE_FILE=/path/state.json python3 ws_adapter.py  # or 'none' to disable
 
 Dependencies:
     pip install aiohttp
@@ -62,11 +80,23 @@ except ImportError:
 
 log = logging.getLogger("weechat_ws")
 
-VERSION = "0.3.0"
+VERSION = "0.4.1"
 MAX_LINES_PER_BUFFER = 500  # Max buffered lines per IRC buffer
 RECONNECT_DELAY_S = 5  # Backoff between WebSocket reconnect attempts
 BACKFILL_LIMIT = 100  # Lines fetched per buffer when recovering after a reconnect
 MAX_OUTBOX = 100  # Max queued outbound /api/input bodies awaiting retry
+# Persisted-state deprecation bound: watermarks older than this many days are
+# considered stale (buffer ids are per-WeeChat-process and not meaningful
+# across a WeeChat restart), and the adapter falls back to first-connect
+# seeding instead of replaying from an unmapped watermark.
+WATERMARK_MAX_AGE_DAYS = 7
+# Inbound event journal: append-only JSONL next to the state file. Restored on
+# startup so lines the dying process had accepted from the WS but the WASM
+# poller had not yet picked up (poll cadence is ~30s) still get delivered —
+# watermark persistence alone covers only lines accepted while the process
+# was DOWN. Seq numbers resume monotonically, so the poller's persisted
+# cursor yields exactly the unpolled events and nothing twice.
+JOURNAL_MAX_EVENTS = 2000  # matches the in-memory event_log bound
 
 
 # ---------------------------------------------------------------------------
@@ -110,9 +140,215 @@ class AdapterState:
         self.event_log: deque = deque(maxlen=2000)
         # asyncio.Event signalling new lines; created in run() (needs a loop).
         self.new_event = None
+        # Path of the persisted watermark state file ("" = persistence disabled).
+        # Set at startup from WS_ADAPTER_STATE_FILE / LUNARWING_BASE_DIR.
+        self.state_file: str = ""
+        # Append-only inbound event journal path ("" = disabled). Derived from
+        # state_file; restored into event_log/event_seq on startup.
+        self.journal_file: str = ""
+        # True once watermarks have been loaded from (or written to) the state
+        # file this process. A file found at startup means this is a RESTART,
+        # not a first-ever start — the first connect backfills from the
+        # persisted watermarks instead of seeding (goal-25 finding F3).
+        self.restarted: bool = False
 
 #ii
 state = AdapterState()
+
+
+# ---------------------------------------------------------------------------
+# Persisted watermark state (goal-25 finding F3)
+# ---------------------------------------------------------------------------
+
+def resolve_state_file() -> str:
+    """Resolve the watermark persistence path from the environment.
+
+    Priority: WS_ADAPTER_STATE_FILE (literal 'none'/'disabled' disables
+    persistence), then $LUNARWING_BASE_DIR/weechat-adapter-state.json (set by
+    every mt-admin tenant unit to the tenant state dir), then no persistence
+    (in-memory only, the pre-v0.4.0 behavior).
+    """
+    explicit = os.environ.get("WS_ADAPTER_STATE_FILE", "").strip()
+    if explicit:
+        if explicit.lower() in ("none", "disabled", "off"):
+            return ""
+        return explicit
+    base = os.environ.get("LUNARWING_BASE_DIR", "").strip()
+    if base:
+        return str(Path(base) / "weechat-adapter-state.json")
+    return ""
+
+
+def load_persisted_state() -> bool:
+    """Load per-buffer watermarks from the state file if it exists.
+
+    Returns True when persisted state was found (this process is therefore a
+    RESTART of a previous adapter), False when starting fresh; the same value
+    is recorded on `state.restarted` for ws_client_loop. Damaged or stale
+    files are discarded: watermarks are only meaningful for the same WeeChat
+    process, so entries older than WATERMARK_MAX_AGE_DAYS are ignored and a
+    fully-stale file counts as fresh.
+    """
+    state.state_file = resolve_state_file()
+    state.restarted = False
+    if not state.state_file:
+        return False
+    path = Path(state.state_file)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        log.warning(f"Cannot read adapter state file {path} ({e}) — starting fresh")
+        return False
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        log.warning(f"Corrupt adapter state file {path} ({e}) — starting fresh")
+        return False
+    if not isinstance(data, dict):
+        log.warning(f"Malformed adapter state file {path} — starting fresh")
+        return False
+    saved_at = data.get("saved_at")
+    try:
+        saved_dt = datetime.fromisoformat(saved_at) if saved_at else None
+    except ValueError:
+        saved_dt = None
+    if saved_dt is not None:
+        age_days = (datetime.now(timezone.utc) - saved_dt).total_seconds() / 86400.0
+        if age_days > WATERMARK_MAX_AGE_DAYS:
+            log.info(
+                f"Adapter state file is {age_days:.1f} days old (> {WATERMARK_MAX_AGE_DAYS}) "
+                "— WeeChat line ids are not stable across restarts; starting fresh"
+            )
+            return False
+    watermarks = data.get("last_line_id")
+    if isinstance(watermarks, dict):
+        loaded = 0
+        for full_name, value in watermarks.items():
+            if isinstance(full_name, str) and isinstance(value, int):
+                state.last_line_id[full_name] = value
+                loaded += 1
+        log.info(f"Restored {loaded} persisted line watermark(s) from {path}")
+        state.restarted = loaded > 0
+        return state.restarted
+    return False
+
+
+def persist_state():
+    """Best-effort atomic write of the per-buffer watermarks.
+
+    Failures are logged and swallowed: persistence is a recovery aid, never a
+    reason to drop a live line. The write is atomic (tmp + rename) so a crash
+    mid-write can never leave a torn file behind.
+    """
+    if not state.state_file:
+        return
+    path = Path(state.state_file)
+    payload = {
+        "version": 1,
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "last_line_id": dict(state.last_line_id),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        log.warning(f"Failed to persist adapter state to {path}: {e}")
+
+
+def journal_path_for(state_file: str) -> str:
+    """Journal lives next to the state file: <stem>-journal.jsonl.
+
+    Empty state_file (persistence disabled) yields "" — the journal is
+    disabled with it.
+    """
+    if not state_file:
+        return ""
+    p = Path(state_file)
+    return str(p.with_name(p.stem + "-journal.jsonl"))
+
+
+def append_journal(entry: dict):
+    """Append one event to the inbound journal (best-effort, one line).
+
+    Append-only JSONL keeps the per-line cost trivial. When the journal grows
+    past 2× the in-memory bound it is compacted back to the newest
+    JOURNAL_MAX_EVENTS entries so a long-running adapter cannot grow it
+    without limit.
+    """
+    if not state.journal_file:
+        return
+    path = Path(state.journal_file)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+        if path.stat().st_size > 4_000_000:  # ~2x bound; compact
+            compact_journal(path)
+    except OSError as e:
+        log.warning(f"Failed to append adapter journal {path}: {e}")
+
+
+def compact_journal(path: Path):
+    """Rewrite the journal keeping only the newest JOURNAL_MAX_EVENTS lines."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        keep = lines[-JOURNAL_MAX_EVENTS:]
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as e:
+        log.warning(f"Failed to compact adapter journal {path}: {e}")
+
+
+def load_event_journal() -> int:
+    """Restore event_log/event_seq from the journal. Returns events restored.
+
+    Restoring the ORIGINAL seq numbers (not renumbering from 0) is what makes
+    replay duplicate-free: the WASM poller persists its own cursor across
+    daemon restarts, so after an adapter restart its cursor selects exactly
+    the events it had not yet consumed. Lines already in the journal are NOT
+    re-recorded by the reconnect backfill because the persisted watermarks
+    already mark them seen.
+    """
+    state.journal_file = journal_path_for(state.state_file) if state.state_file else ""
+    if not state.journal_file:
+        return 0
+    path = Path(state.journal_file)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return 0
+    except OSError as e:
+        log.warning(f"Cannot read adapter journal {path} ({e}) — starting with an empty event log")
+        return 0
+    restored = 0
+    max_seq = 0
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+            seq = entry.get("seq")
+            full_name = entry.get("full_name")
+            record = entry.get("line")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(seq, int) or not isinstance(full_name, str) or not isinstance(record, dict):
+            continue
+        state.event_log.append({"seq": seq, "full_name": full_name, "line": record})
+        max_seq = max(max_seq, seq)
+        restored += 1
+    if restored:
+        state.event_seq = max_seq
+        # The restored log may exceed the in-memory bound if the journal was
+        # compacted late; the deque already dropped the oldest for serving.
+        log.info(f"Restored {restored} journal event(s) from {path} (event_seq={max_seq})")
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -237,8 +473,13 @@ async def ws_client_loop():
                     # Recover lines that arrived while we were disconnected (and
                     # flush any queued outbound messages). Runs concurrently with
                     # the read loop; record_line dedupes the overlap by line id.
-                    is_reconnect = state.ever_connected
+                    # A process start with persisted watermarks is a RESTART:
+                    # backfill from the persisted watermark instead of seeding,
+                    # so lines accepted while the adapter process was down are
+                    # delivered instead of being classified as history (F3).
+                    is_reconnect = state.ever_connected or state.restarted
                     state.ever_connected = True
+                    state.restarted = False
                     backfill_task = asyncio.create_task(recover_after_connect(session, is_reconnect))
 
                     async for msg in ws:
@@ -287,7 +528,9 @@ async def ws_client_loop():
 def record_event(full_name: str, line: dict):
     """Append a line to the global event log and wake any /api/wait waiter."""
     state.event_seq += 1
-    state.event_log.append({"seq": state.event_seq, "full_name": full_name, "line": line})
+    entry = {"seq": state.event_seq, "full_name": full_name, "line": line}
+    state.event_log.append(entry)
+    append_journal(entry)
     if state.new_event is not None:
         state.new_event.set()
 
@@ -308,6 +551,7 @@ def record_line(full_name: str, line_info: dict) -> bool:
         if last is not None and line_id <= last:
             return False
         state.last_line_id[full_name] = line_id
+        persist_state()
     state.line_buffer[full_name].append(line_info)
     record_event(full_name, line_info)
     return True
@@ -329,6 +573,7 @@ async def recover_after_connect(session: ClientSession, is_reconnect: bool):
     # the outage before recovering inbound lines.
     await flush_outbox()
     recovered = 0
+    seeded = 0
     for buf in list(state.buffer_list):
         full_name = buf.get("full_name") or buf.get("name")
         if not full_name:
@@ -352,10 +597,16 @@ async def recover_after_connect(session: ClientSession, is_reconnect: bool):
             continue
         if not is_reconnect:
             state.last_line_id[full_name] = id_lines[-1]["id"]
+            seeded += 1
             continue
         for line in id_lines:
             if record_line(full_name, line):
                 recovered += 1
+    if not is_reconnect and seeded:
+        # First-ever connect: persist the seeded watermarks so the NEXT
+        # process start is recognized as a restart and backfills.
+        persist_state()
+        log.debug(f"Seeded watermarks for {seeded} buffer(s) and persisted state")
     if is_reconnect and recovered:
         log.info(f"Recovered {recovered} line(s) missed during the disconnect window")
 
@@ -430,6 +681,7 @@ async def handle_ws_event(raw: str, session: ClientSession):
             del state.line_buffer[full_name]
         if full_name:
             state.last_line_id.pop(full_name, None)
+            persist_state()
         asyncio.create_task(refresh_buffer_list(session))
 
     elif msg.get("request_id") == "lunarwing-sync":
@@ -483,6 +735,13 @@ async def handle_health(request: web.Request) -> web.Response:
         "outbox_dropped": state.outbox_dropped,
         "buffered_buffers": len(state.line_buffer),
         "buffer_list_count": len(state.buffer_list),
+        # Watermark persistence (v0.4.0): whether restart recovery is armed
+        # and how many per-buffer watermarks are tracked/persisted.
+        "state_file": state.state_file or None,
+        "persisted_watermarks": len(state.last_line_id),
+        # Inbound event journal (v0.4.1): survives process restarts so lines
+        # accepted-but-unpolled are still delivered.
+        "journal_file": state.journal_file or None,
         # Current global event cursor. Its presence also tells the WASM channel
         # that this adapter supports the /api/wait long-poll path.
         "event_cursor": state.event_seq,
@@ -508,16 +767,24 @@ async def handle_wait(request: web.Request) -> web.Response:
         wait_s = 20.0
     wait_s = max(0.0, min(wait_s, 20.0))  # cap below the host's 30s callback timeout
 
-    # Stale cursor (cursor > our seq) means the adapter restarted and its in-memory
-    # event_seq reset below the client's saved cursor. Don't tell the client it's
-    # already caught up — that would skip every line recorded since the restart
-    # (e.g. the first DM after a setup restart). Replay from 0 instead; the
-    # post-restart event_log only holds lines the client hasn't seen, so this can't
-    # double-deliver. (Falls through to the normal collect/wait logic below.)
+    # Stale cursor (cursor > our seq) means the adapter restarted and its
+    # event_seq fell below the client's saved cursor. With the journal
+    # restored, seqs continue from where they left off, so a still-ahead
+    # cursor means the poller consumed MORE than the journal retained
+    # (journal compaction or persistence disabled mid-flight): align seq to
+    # the cursor so new lines get fresh, strictly-increasing ids. Without a
+    # journal (persistence off, fresh log) replay from 0 — the post-restart
+    # event_log only holds lines the client hasn't seen, so that can't
+    # double-deliver.
     if cursor > state.event_seq:
-        log.info(f"/api/wait: client cursor {cursor} > event_seq {state.event_seq} "
-                 f"(adapter restarted?) — replaying post-restart backlog")
-        cursor = 0
+        if state.journal_file:
+            log.info(f"/api/wait: client cursor {cursor} > event_seq {state.event_seq} "
+                     f"— journal-restored; aligning seq forward")
+            state.event_seq = cursor
+        else:
+            log.info(f"/api/wait: client cursor {cursor} > event_seq {state.event_seq} "
+                     f"(adapter restarted?) — replaying post-restart backlog")
+            cursor = 0
 
     def collect():
         return [e for e in state.event_log if e["seq"] > cursor]
@@ -730,6 +997,19 @@ async def run(relay_url: str, password: str, port: int, message_delay: float = 0
     state.message_delay_s = message_delay
     state.new_event = asyncio.Event()  # must be created inside the running loop
 
+    # Load persisted watermarks BEFORE the first connect so ws_client_loop can
+    # tell a restart (state file present → backfill) from a first-ever start
+    # (no state file → seed). Persistence can be disabled via env.
+    state.restarted = load_persisted_state()
+    if state.state_file:
+        log.info(
+            f"Watermark persistence enabled: {state.state_file}"
+            + (" (restored from previous run)" if state.restarted else "")
+        )
+    # Restore the inbound event journal so lines the previous process had
+    # accepted but the poller had not yet picked up survive the restart.
+    load_event_journal()
+
     app = make_app()
 
     # Start WebSocket client in background
@@ -780,6 +1060,17 @@ def main():
         help="Delay applied to both inbound and outbound messages (default: 0)",
     )
     parser.add_argument(
+        "--state-file",
+        default=os.environ.get("WS_ADAPTER_STATE_FILE", ""),
+        metavar="PATH",
+        help=(
+            "Persist per-buffer line watermarks to PATH so a process restart "
+            "backfills lines accepted while down (default: "
+            "$LUNARWING_BASE_DIR/weechat-adapter-state.json when LUNARWING_BASE_DIR "
+            "is set, else in-memory only; 'none' disables persistence)"
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         default=os.environ.get("DEBUG", "") != "",
@@ -791,6 +1082,9 @@ def main():
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    if args.state_file.strip():
+        os.environ["WS_ADAPTER_STATE_FILE"] = args.state_file.strip()
 
     if not args.relay_password:
         log.warning("No relay password set — adapter will accept unauthenticated requests")

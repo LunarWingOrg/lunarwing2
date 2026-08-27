@@ -254,6 +254,15 @@ def signals_leaked_roleplay_or_meta(text):
     return any(pattern in lower_text for pattern in roleplay_patterns)
 
 
+def neutralize_role_token_openers(content):
+    """Break ChatML-family token openers in untrusted prompt content."""
+    # This is idempotent and deliberately independent of optional injection
+    # scanning so every prompt-construction boundary can share the invariant.
+    # NOTE: keep this def above every helper that calls it — Monty binds
+    # module-level names in definition order.
+    return str(content).replace("<|", "<\u200b|")
+
+
 def format_output(result, max_chars=8000):
     """Format code execution result for the next LLM context message."""
     parts = []
@@ -277,6 +286,13 @@ def format_output(result, max_chars=8000):
 
     text = "\n\n".join(parts)
 
+    # CodeAct step output is untrusted: nested-VM stdout, action previews,
+    # and return values can all carry attacker-influenced bytes. Break every
+    # ChatML-family token opener before bounding (mirrors format_action_output)
+    # so re-tokenizing history cannot forge a role boundary, and so truncation
+    # can never cut an intact opener back out of a neutralized marker.
+    text = neutralize_role_token_openers(text)
+
     # Truncate from the front (keep the tail with most recent results)
     if len(text) > max_chars:
         text = "... (truncated) ...\n" + text[-max_chars:]
@@ -285,13 +301,6 @@ def format_output(result, max_chars=8000):
         text = "[code executed, no output]"
 
     return text
-
-
-def neutralize_role_token_openers(content):
-    """Break ChatML-family token openers in untrusted prompt content."""
-    # This is idempotent and deliberately independent of optional injection
-    # scanning so every prompt-construction boundary can share the invariant.
-    return str(content).replace("<|", "<\u200b|")
 
 
 def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
@@ -309,10 +318,17 @@ def format_action_output(output, max_chars=MAX_ACTION_OUTPUT_CHARS):
 
 
 def sanitize_action_results(messages):
-    """Repair unsafe or oversized action results in persisted state."""
+    """Repair unsafe or oversized messages in persisted state."""
     for msg in messages:
-        if msg.get("role") in ("ActionResult", "action_result"):
+        role = msg.get("role")
+        if role in ("ActionResult", "action_result"):
             msg["content"] = format_action_output(msg.get("content", ""))
+        elif role in ("User", "user"):
+            # Repair CodeAct step blobs ("[stdout]", "[name]", "[return]")
+            # persisted before format_output neutralized role tokens. No
+            # truncation here: User blobs are already bounded at creation,
+            # and neutralization is idempotent for fresh history.
+            msg["content"] = neutralize_role_token_openers(msg.get("content", ""))
     return messages
 
 

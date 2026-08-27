@@ -483,6 +483,8 @@ impl Repository {
                 reason: format!("Failed to start transaction: {e}"),
             })?;
 
+        lock_document_chunks(&tx, id).await?;
+
         tx.execute(
             "UPDATE memory_documents SET content = $2, updated_at = NOW() WHERE id = $1",
             &[&id, &content],
@@ -543,6 +545,8 @@ impl Repository {
             .map_err(|e| WorkspaceError::ChunkingFailed {
                 reason: format!("Failed to start transaction: {e}"),
             })?;
+
+        lock_document_chunks(&tx, document_id).await?;
 
         tx.execute(
             "DELETE FROM memory_chunks WHERE document_id = $1",
@@ -1340,4 +1344,31 @@ impl Repository {
             })?;
         Ok(result)
     }
+}
+
+/// Serialize per-document chunk replacement for the life of a transaction.
+///
+/// Two writers racing a DELETE+INSERT chunk replacement for the same
+/// `document_id` (e.g. concurrent `append()` calls that both reindex) would
+/// otherwise interleave and lose on the `unique_chunk_per_doc` index with a
+/// 500 surfaced to the caller (goal-25 stress finding F1). The advisory lock
+/// is keyed on a hash of the document id, so only writers touching the SAME
+/// document wait for each other; unrelated documents proceed in parallel.
+/// Locks taken this way are released automatically at transaction end.
+///
+/// libSQL note: the libSQL backend relies on SQLite's single-writer
+/// serialization instead; this helper is PostgreSQL-only.
+async fn lock_document_chunks(
+    tx: &tokio_postgres::Transaction<'_>,
+    document_id: Uuid,
+) -> Result<(), WorkspaceError> {
+    tx.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+        &[&document_id.to_string()],
+    )
+    .await
+    .map_err(|e| WorkspaceError::ChunkingFailed {
+        reason: format!("Failed to lock document chunks: {e}"),
+    })?;
+    Ok(())
 }
