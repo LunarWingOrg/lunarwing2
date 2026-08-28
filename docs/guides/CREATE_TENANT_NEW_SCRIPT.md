@@ -37,6 +37,14 @@ The default full flow calls MT admin to add the tenant, ensures the WASM toolcha
 
 Do not use retired Nanocode flags. The script rejects `--nanocode`, `--with-nanocode`, and `--no-nanocode`; Pebble is the supported external worker.
 
+This wrapper does not accept `--with-study-mcp` (unknown flags are rejected). To seed the new tenant's knowledge store with the full shared lw2studymcp study-notes base, arm it through MT admin afterwards (the seed never overwrites existing notes and runs at most once, so re-arming before or after first boot is safe):
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant acme --with-study-mcp
+```
+
+See [`TENANT_KNOWLEDGE_SEED.md`](TENANT_KNOWLEDGE_SEED.md) for what that does and its one-shot safety invariants.
+
 ## After Provisioning
 
 Use the init-agnostic MT admin interface rather than calling tenant services directly:
