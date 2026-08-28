@@ -1250,6 +1250,25 @@ upgrade_tenant_locked() {
   say "verify with: $0 status $name"
 }
 
+openrc_service_state() {
+  local svc="$1" output state
+
+  if output="$(rc-service "$svc" status 2>/dev/null)"; then
+    state="$(grep -oE 'started|stopped|crashed' <<<"$output" | head -n 1 || true)"
+    printf '%s\n' "${state:-started}"
+    return 0
+  fi
+
+  state="$(grep -oE 'started|stopped|crashed' <<<"$output" | head -n 1 || true)"
+  if [[ -n "$state" ]]; then
+    printf '%s\n' "$state"
+  elif [[ "$output" == *"session is not running"* ]]; then
+    printf 'stopped\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
 status_tenant() {
   local name="$1"
   name="$(sanitize_name "$name")"
@@ -1381,7 +1400,7 @@ status_tenant() {
     tenant_voice_enabled "$name" && rc_svcs+=("lunarwing-voice-${name}")
     local svc state
     for svc in "${rc_svcs[@]}"; do
-      state="$(rc-service "$svc" status 2>/dev/null | grep -oE 'started|stopped|crashed' || echo "unknown")"
+      state="$(openrc_service_state "$svc")"
       say "  $svc: $state"
     done
   fi
