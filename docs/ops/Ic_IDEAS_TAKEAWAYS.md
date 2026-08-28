@@ -1,4 +1,4 @@
-# Ironclaw 1.0 / 1.1 Analysis — Ideas & Takeaways for LunarWing
+# Ideas & Takeaways for LunarWing
 
 **Researched:** 2026-08-07
 **Source:** [nearai/ironclaw](https://github.com/nearai/ironclaw) CHANGELOG.md, releases page
