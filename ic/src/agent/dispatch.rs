@@ -197,38 +197,6 @@ impl MessageScheduler {
     }
 }
 
-// Temporary compatibility adapter while Agent::run is migrated to
-// MessageScheduler in the following incremental change.
-pub(super) struct DeferredMessages {
-    queue: VecDeque<IncomingMessage>,
-    capacity: usize,
-}
-
-impl DeferredMessages {
-    pub(super) fn new() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            capacity: DEFERRED_MESSAGE_LIMIT,
-        }
-    }
-
-    pub(super) fn defer(&mut self, message: IncomingMessage) -> Option<IncomingMessage> {
-        if self.queue.len() >= self.capacity {
-            return Some(message);
-        }
-        self.queue.push_back(message);
-        None
-    }
-
-    pub(super) fn pop_front(&mut self) -> Option<IncomingMessage> {
-        self.queue.pop_front()
-    }
-
-    pub(super) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::channels::IncomingMessage;
