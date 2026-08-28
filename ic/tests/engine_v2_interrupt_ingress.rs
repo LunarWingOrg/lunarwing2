@@ -220,7 +220,7 @@ async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
 }
 
 #[tokio::test]
-async fn queued_ordinary_message_starts_after_interrupt_acknowledgement() {
+async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let _env = EngineV2EnvGuard::enable();
     lunarwing::bridge::reset_engine_state().await;
@@ -233,17 +233,22 @@ async fn queued_ordinary_message_starts_after_interrupt_acknowledgement() {
         .with_llm(llm)
         .build()
         .await;
-    let active_thread_id = Uuid::new_v4();
-    let deferred_thread_id = Uuid::new_v4();
+    let thread_id = Uuid::new_v4();
 
-    rig.send_incoming(gateway_message(active_thread_id, "first"))
+    rig.send_incoming(gateway_message(thread_id, "first"))
         .await;
     tokio::time::timeout(Duration::from_secs(2), provider.first_started.notified())
         .await
         .expect("first provider call should start");
-    rig.send_incoming(gateway_message(deferred_thread_id, "second"))
+    rig.send_incoming(gateway_message(thread_id, "second"))
         .await;
-    rig.send_incoming(gateway_message(active_thread_id, "/interrupt"))
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), provider.later_started.notified())
+            .await
+            .is_err(),
+        "same-thread follow-up must remain queued"
+    );
+    rig.send_incoming(gateway_message(thread_id, "/interrupt"))
         .await;
 
     tokio::time::timeout(Duration::from_secs(2), provider.later_started.notified())
@@ -260,6 +265,48 @@ async fn queued_ordinary_message_starts_after_interrupt_acknowledgement() {
 
     let responses = rig.wait_for_responses(2, Duration::from_secs(2)).await;
     assert_eq!(responses[1].content, "response-1");
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+
+    rig.shutdown_and_wait().await;
+    lunarwing::bridge::reset_engine_state().await;
+}
+
+#[tokio::test]
+async fn distinct_gateway_threads_do_not_head_of_line_block() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let _env = EngineV2EnvGuard::enable();
+    lunarwing::bridge::reset_engine_state().await;
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(FirstPendingThenReplyLlm::new(Arc::clone(&dropped)));
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(llm)
+        .build()
+        .await;
+    let first_thread_id = Uuid::new_v4();
+    let second_thread_id = Uuid::new_v4();
+
+    rig.send_incoming(gateway_message(first_thread_id, "first"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), provider.first_started.notified())
+        .await
+        .expect("first provider call should start");
+    rig.send_incoming(gateway_message(second_thread_id, "second"))
+        .await;
+
+    tokio::time::timeout(Duration::from_secs(2), provider.later_started.notified())
+        .await
+        .expect("an independent gateway thread should start without waiting for the first");
+    let responses = rig.wait_for_responses(1, Duration::from_secs(2)).await;
+    assert_eq!(responses[0].content, "response-1");
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+
+    rig.send_incoming(gateway_message(first_thread_id, "/interrupt"))
+        .await;
+    let responses = rig.wait_for_responses(2, Duration::from_secs(2)).await;
+    assert_eq!(responses[1].content, "Interrupted.");
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 
     rig.shutdown_and_wait().await;
