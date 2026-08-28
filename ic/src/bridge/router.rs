@@ -3047,6 +3047,61 @@ struct EngineMessageRequest<'a> {
     preferred_thread_id: Option<lunarwing_engine::ThreadId>,
 }
 
+struct AwaitThreadCancellationGuard {
+    thread_manager: Arc<ThreadManager>,
+    thread_id: lunarwing_engine::ThreadId,
+    user_id: String,
+    armed: bool,
+}
+
+impl AwaitThreadCancellationGuard {
+    fn new(
+        thread_manager: Arc<ThreadManager>,
+        thread_id: lunarwing_engine::ThreadId,
+        user_id: String,
+    ) -> Self {
+        Self {
+            thread_manager,
+            thread_id,
+            user_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AwaitThreadCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                thread_id = %self.thread_id,
+                "cannot cancel abandoned Engine V2 thread without a Tokio runtime"
+            );
+            return;
+        };
+        let thread_manager = Arc::clone(&self.thread_manager);
+        let thread_id = self.thread_id;
+        let user_id = self.user_id.clone();
+        runtime.spawn(async move {
+            if let Err(error) = thread_manager.stop_thread(thread_id, &user_id).await
+                && !matches!(error, lunarwing_engine::EngineError::ThreadNotFound(_))
+            {
+                tracing::warn!(
+                    %thread_id,
+                    %error,
+                    "failed to cancel abandoned Engine V2 thread"
+                );
+            }
+        });
+    }
+}
+
 async fn handle_user_message_with_event_receiver(
     state: &EngineState,
     request: EngineMessageRequest<'_>,
@@ -3086,6 +3141,11 @@ async fn await_thread_outcome(
         lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
 
     let tid_str = thread_id.to_string();
+    let mut cancellation_guard = AwaitThreadCancellationGuard::new(
+        Arc::clone(&state.thread_manager),
+        thread_id,
+        message.user_id.clone(),
+    );
 
     // Allow the orchestrator's full runtime plus cleanup/event delivery grace.
     let deadline =
@@ -3133,6 +3193,7 @@ async fn await_thread_outcome(
         .join_thread(thread_id)
         .await
         .map_err(|e| engine_err("join error", e))?;
+    cancellation_guard.disarm();
 
     let is_auth_fallback = matches!(
         &outcome,
