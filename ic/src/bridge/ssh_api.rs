@@ -71,11 +71,23 @@ impl From<HostRequest> for SSHHostConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KeyUploadRequest {
     pub key_data: String,
     #[serde(default)]
     pub passphrase: Option<String>,
+}
+
+// Manual Debug: the derived impl would render the raw private key and
+// passphrase into any span or log that formats the request. Nothing in
+// this struct is safe to print.
+impl std::fmt::Debug for KeyUploadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyUploadRequest")
+            .field("key_data", &"[REDACTED]")
+            .field("passphrase", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +207,7 @@ async fn remove_host(
     Ok(Json(ApiResponse::success(format!("Host {} removed", host))))
 }
 
-#[instrument(skip(state))]
+#[instrument(skip_all, fields(host = %host))]
 async fn upload_key(
     State(state): State<Arc<SshApiState>>,
     Path(host): Path<String>,
@@ -336,6 +348,12 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::ssh::NullAuditLogger;
+    use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+    use secrecy::SecretString as MasterKey;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
     #[test]
     fn test_host_request_conversion() {
         let request = HostRequest {
@@ -348,5 +366,75 @@ mod tests {
         };
         let config: SSHHostConfig = request.into();
         assert_eq!(config.host, "example.com");
+    }
+
+    #[test]
+    fn key_upload_request_debug_is_redacted() {
+        let request = KeyUploadRequest {
+            key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\nsecret\n".into(), // no-secret-scan: test fixture
+            passphrase: Some("p4ssphr4se-marker".into()),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("p4ssphr4se-marker"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    async fn make_test_state() -> SshApiState {
+        let store: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(Arc::new(
+                SecretsCrypto::new(MasterKey::from(
+                    "test-master-key-that-is-at-least-32-bytes-long!",
+                ))
+                .unwrap(),
+            )));
+        let secrets = Arc::new(SshSecretsManager::new(store.clone(), "test-tenant"));
+        let bridge = SSHBridge::new(
+            Uuid::new_v4(),
+            "test-tenant".into(),
+            HashMap::new(),
+            store,
+            Arc::new(NullAuditLogger),
+        )
+        .await;
+        SshApiState {
+            bridge: Arc::new(RwLock::new(bridge.unwrap())),
+            secrets,
+            agent: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upload_key_span_and_logs_keep_key_material_out() {
+        let state = make_test_state().await;
+        let request = KeyUploadRequest {
+            key_data: "-----BEGIN OPENSSH PRIVATE KEY-----\nleak-marker\n".into(), // no-secret-scan: test fixture
+            passphrase: Some("p4ssphr4se-marker".into()),
+        };
+
+        let response = upload_key(
+            State(Arc::new(state)),
+            Path("example.com".to_string()),
+            Json(request),
+        )
+        .await
+        .expect("upload should succeed");
+        assert!(response.0.success);
+
+        assert!(
+            !logs_contain("BEGIN OPENSSH PRIVATE KEY"),
+            "private key material leaked into tracing output"
+        );
+        assert!(
+            !logs_contain("leak-marker"),
+            "private key body leaked into tracing output"
+        );
+        assert!(
+            !logs_contain("p4ssphr4se-marker"),
+            "passphrase leaked into tracing output"
+        );
+        assert!(logs_contain("example.com"), "host field should be recorded");
     }
 }
