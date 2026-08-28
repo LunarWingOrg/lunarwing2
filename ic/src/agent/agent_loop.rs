@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::dispatch::{
-    DEFERRED_QUEUE_FULL_RESPONSE, DeferredMessages, is_priority_interrupt,
+    DEFERRED_QUEUE_FULL_RESPONSE, DispatchTicket, MessageScheduler, allows_parallel_dispatch,
+    is_priority_interrupt,
 };
 use crate::agent::heartbeat::spawn_heartbeat_with_sweep;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
@@ -56,12 +57,7 @@ enum MessageLoopControl {
 enum ActiveMessageResult {
     Completed(Result<Result<Option<String>, Error>, tokio::task::JoinError>),
     TimedOut,
-    Shutdown(ShutdownSignal),
-}
-
-enum ShutdownSignal {
-    CtrlC,
-    Sigterm,
+    Cancelled,
 }
 
 #[cfg(unix)]
@@ -1122,117 +1118,82 @@ impl Agent {
         tracing::info!("Agent {} ready and listening", self.config.name);
 
         let mut sigterm = register_sigterm();
-        let mut deferred_messages = DeferredMessages::new();
+        let mut scheduler = MessageScheduler::new();
+        let mut active_tasks = tokio::task::JoinSet::new();
+        let mut active_tickets = std::collections::HashMap::new();
+        let message_shutdown = tokio_util::sync::CancellationToken::new();
         let mut channels_open = true;
 
         'message_loop: loop {
-            if !channels_open && deferred_messages.is_empty() {
+            self.spawn_ready_messages(
+                &mut scheduler,
+                &mut active_tasks,
+                &mut active_tickets,
+                &message_shutdown,
+            )
+            .await;
+
+            if !channels_open && scheduler.is_drained() {
                 tracing::warn!("All channel streams ended, shutting down...");
                 break;
             }
 
-            let message = if let Some(message) = deferred_messages.pop_front() {
-                message
-            } else {
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => {
-                        tracing::info!("Ctrl+C received, shutting down...");
-                        break 'message_loop;
-                    }
-                    _ = recv_sigterm(&mut sigterm) => {
-                        tracing::warn!("SIGTERM received, shutting down gracefully...");
-                        break 'message_loop;
-                    }
-                    incoming = message_stream.next() => {
-                        match incoming {
-                            Some(message) => message,
-                            None => {
-                                channels_open = false;
-                                continue 'message_loop;
-                            }
-                        }
-                    }
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("Ctrl+C received, shutting down...");
+                    break 'message_loop;
                 }
-            };
-
-            let message = self.prepare_message(message).await;
-            let suppressed = Arc::new(AtomicBool::new(false));
-            let agent = Arc::clone(&self);
-            let task_message = message.clone();
-            let task_suppressed = Arc::clone(&suppressed);
-            let mut handle =
-                tokio::spawn(
-                    async move { agent.handle_message(&task_message, &task_suppressed).await },
-                );
-            let abort_handle = handle.abort_handle();
-            let soft_timeout = self.config.handle_message_timeout;
-            let deadline = tokio::time::sleep(soft_timeout);
-            tokio::pin!(deadline);
-
-            let active_result = loop {
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => {
-                        break ActiveMessageResult::Shutdown(ShutdownSignal::CtrlC);
-                    }
-                    _ = recv_sigterm(&mut sigterm) => {
-                        break ActiveMessageResult::Shutdown(ShutdownSignal::Sigterm);
-                    }
-                    result = &mut handle => {
-                        break ActiveMessageResult::Completed(result);
-                    }
-                    _ = &mut deadline => {
-                        break ActiveMessageResult::TimedOut;
-                    }
-                    incoming = message_stream.next(), if channels_open => {
-                        match incoming {
-                            Some(incoming) if is_priority_interrupt(&incoming) => {
-                                self.handle_priority_interrupt(incoming).await;
-                            }
-                            Some(incoming) => {
-                                if let Some(rejected) = deferred_messages.defer(incoming) {
-                                    let result = Ok(Some(DEFERRED_QUEUE_FULL_RESPONSE.to_string()));
-                                    let _ = self.deliver_message_result(&rejected, result).await;
-                                }
-                            }
-                            None => channels_open = false,
-                        }
-                    }
+                _ = recv_sigterm(&mut sigterm) => {
+                    tracing::warn!("SIGTERM received, shutting down gracefully...");
+                    break 'message_loop;
                 }
-            };
-
-            match active_result {
-                ActiveMessageResult::Completed(Ok(result)) => {
-                    if matches!(
-                        self.deliver_message_result(&message, result).await,
-                        MessageLoopControl::Shutdown
-                    ) {
+                completed = active_tasks.join_next_with_id(), if !active_tasks.is_empty() => {
+                    let Some(completed) = completed else {
+                        continue 'message_loop;
+                    };
+                    let (task_id, control) = match completed {
+                        Ok(completed) => completed,
+                        Err(join_error) => {
+                            let task_id = join_error.id();
+                            tracing::error!(
+                                %task_id,
+                                error = %join_error,
+                                "supervised message task panicked"
+                            );
+                            (task_id, MessageLoopControl::Continue)
+                        }
+                    };
+                    if let Some(ticket) = active_tickets.remove(&task_id) {
+                        scheduler.complete(&ticket);
+                    } else {
+                        tracing::error!(%task_id, "missing dispatch ticket for completed message");
+                    }
+                    if matches!(control, MessageLoopControl::Shutdown) {
                         tracing::info!("Shutdown command received, exiting...");
-                        break;
+                        break 'message_loop;
                     }
                 }
-                ActiveMessageResult::Completed(Err(join_error)) => {
-                    self.handle_message_panic(&message, &join_error).await;
-                }
-                ActiveMessageResult::TimedOut => {
-                    self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
-                        .await;
-                }
-                ActiveMessageResult::Shutdown(signal) => {
-                    abort_and_wait(&mut handle).await;
-                    match signal {
-                        ShutdownSignal::CtrlC => {
-                            tracing::info!("Ctrl+C received, shutting down...");
+                incoming = message_stream.next(), if channels_open => {
+                    match incoming {
+                        Some(incoming) if is_priority_interrupt(&incoming) => {
+                            self.handle_priority_interrupt(incoming).await;
                         }
-                        ShutdownSignal::Sigterm => {
-                            tracing::warn!("SIGTERM received, shutting down gracefully...");
+                        Some(incoming) => {
+                            let allow_parallel = allows_parallel_dispatch(&incoming);
+                            if let Some(rejected) = scheduler.defer(incoming, allow_parallel) {
+                                let result = Ok(Some(DEFERRED_QUEUE_FULL_RESPONSE.to_string()));
+                                let _ = self.deliver_message_result(&rejected, result).await;
+                            }
                         }
+                        None => channels_open = false,
                     }
-                    break;
                 }
             }
         }
+
+        message_shutdown.cancel();
+        while active_tasks.join_next().await.is_some() {}
 
         // Cleanup
         tracing::info!("Agent shutting down...");
@@ -1269,6 +1230,68 @@ impl Agent {
         self.channels.shutdown_all().await?;
 
         Ok(())
+    }
+
+    async fn spawn_ready_messages(
+        self: &Arc<Self>,
+        scheduler: &mut MessageScheduler,
+        active_tasks: &mut tokio::task::JoinSet<MessageLoopControl>,
+        active_tickets: &mut std::collections::HashMap<tokio::task::Id, DispatchTicket>,
+        shutdown: &tokio_util::sync::CancellationToken,
+    ) {
+        while let Some(scheduled) = scheduler.next_ready() {
+            let message = self.prepare_message(scheduled.message).await;
+            let agent = Arc::clone(self);
+            let task_shutdown = shutdown.clone();
+            let task = active_tasks
+                .spawn(async move { agent.supervise_message(message, task_shutdown).await });
+            active_tickets.insert(task.id(), scheduled.ticket);
+        }
+    }
+
+    async fn supervise_message(
+        self: Arc<Self>,
+        message: IncomingMessage,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) -> MessageLoopControl {
+        let suppressed = Arc::new(AtomicBool::new(false));
+        let agent = Arc::clone(&self);
+        let task_message = message.clone();
+        let task_suppressed = Arc::clone(&suppressed);
+        let mut handle =
+            tokio::spawn(
+                async move { agent.handle_message(&task_message, &task_suppressed).await },
+            );
+        let abort_handle = handle.abort_handle();
+        let soft_timeout = self.config.handle_message_timeout;
+        let deadline = tokio::time::sleep(soft_timeout);
+        tokio::pin!(deadline);
+
+        let active_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => ActiveMessageResult::Cancelled,
+            result = &mut handle => ActiveMessageResult::Completed(result),
+            _ = &mut deadline => ActiveMessageResult::TimedOut,
+        };
+
+        match active_result {
+            ActiveMessageResult::Completed(Ok(result)) => {
+                self.deliver_message_result(&message, result).await
+            }
+            ActiveMessageResult::Completed(Err(join_error)) => {
+                self.handle_message_panic(&message, &join_error).await;
+                MessageLoopControl::Continue
+            }
+            ActiveMessageResult::TimedOut => {
+                self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
+                    .await;
+                MessageLoopControl::Continue
+            }
+            ActiveMessageResult::Cancelled => {
+                abort_and_wait(&mut handle).await;
+                MessageLoopControl::Continue
+            }
+        }
     }
 
     async fn prepare_message(&self, mut message: IncomingMessage) -> IncomingMessage {
