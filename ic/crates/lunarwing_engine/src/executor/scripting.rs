@@ -3893,11 +3893,8 @@ await asyncio.gather(
             .await
             .unwrap();
         let code = r#"
-try:
-    await hang_tool()
-except Exception as e:
-    print("caught", str(e))
-FINAL("done")
+await hang_tool()
+FINAL("must not reach normally")
 "#;
 
         let result = tokio::time::timeout(
@@ -3908,8 +3905,17 @@ FINAL("done")
         .expect("a hanging tool must not hang the ResolveFutures round forever")
         .unwrap();
 
-        assert_eq!(result.final_answer.as_deref(), Some("done"));
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(result.had_error, "stdout: {}", result.stdout);
+        assert!(
+            result.stdout.contains("timed out after 1s"),
+            "stdout: {}",
+            result.stdout
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "wedged task must be aborted"
+        );
         assert!(
             result.action_results.iter().any(|result| result.is_error
                 && result.output.to_string().contains("timed out after 1s")),
@@ -3960,11 +3966,8 @@ FINAL("done")
             .await
             .unwrap();
         let code = r#"
-try:
-    llm_query("hang")
-except Exception as e:
-    print("caught", str(e))
-FINAL("done")
+await llm_query("hang")
+FINAL("must not reach normally")
 "#;
 
         let result = tokio::time::timeout(
@@ -3975,10 +3978,14 @@ FINAL("done")
         .expect("a hanging llm_query must not hang the ResolveFutures round forever")
         .unwrap();
 
-        assert_eq!(result.final_answer.as_deref(), Some("done"));
-        assert!(dropped.load(Ordering::SeqCst));
+        assert!(result.had_error, "stdout: {}", result.stdout);
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            result.stdout.contains("timed out after 1s"),
+            dropped.load(Ordering::SeqCst),
+            "wedged task must be aborted"
+        );
+        assert!(
+            result.stdout.contains("llm_query() timed out after 1s"),
             "stdout: {}",
             result.stdout
         );
