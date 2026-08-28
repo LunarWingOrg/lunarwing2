@@ -60,6 +60,26 @@ enum ActiveMessageResult {
     Cancelled,
 }
 
+struct ActiveTaskAbortGuard(Option<tokio::task::AbortHandle>);
+
+impl ActiveTaskAbortGuard {
+    fn new(handle: tokio::task::AbortHandle) -> Self {
+        Self(Some(handle))
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ActiveTaskAbortGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(unix)]
 type SigtermReceiver = Option<tokio::signal::unix::Signal>;
 
@@ -1262,6 +1282,7 @@ impl Agent {
             tokio::spawn(
                 async move { agent.handle_message(&task_message, &task_suppressed).await },
             );
+        let mut abort_guard = ActiveTaskAbortGuard::new(handle.abort_handle());
         let abort_handle = handle.abort_handle();
         let soft_timeout = self.config.handle_message_timeout;
         let deadline = tokio::time::sleep(soft_timeout);
@@ -1285,6 +1306,7 @@ impl Agent {
             ActiveMessageResult::TimedOut => {
                 self.handle_soft_timeout(&message, &suppressed, soft_timeout, abort_handle)
                     .await;
+                abort_guard.disarm();
                 MessageLoopControl::Continue
             }
             ActiveMessageResult::Cancelled => {
