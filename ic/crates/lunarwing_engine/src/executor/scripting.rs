@@ -27,7 +27,7 @@ use monty::{
     ExcType, ExtFunctionResult, LimitedTracker, MontyException, MontyObject, MontyRun,
     NameLookupResult, PrintWriter, ResourceLimits, RunProgress,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::capability::lease::LeaseManager;
 use crate::capability::policy::{PolicyDecision, PolicyEngine};
@@ -459,6 +459,7 @@ async fn execute_code_with_skills_and_action_limit(
                     action_results: &mut action_results,
                     events: &mut events,
                     recursive_tokens: &mut recursive_tokens,
+                    tool_async_timeout: Duration::from_secs(thread.config.tool_async_timeout_secs),
                 },
             )
             .await
@@ -797,6 +798,9 @@ async fn execute_code_with_skills_and_action_limit(
                         action_results: &mut action_results,
                         events: &mut events,
                         recursive_tokens: &mut recursive_tokens,
+                        tool_async_timeout: Duration::from_secs(
+                            thread.config.tool_async_timeout_secs,
+                        ),
                     },
                 )
                 .await;
@@ -995,9 +999,18 @@ enum PendingFutureCompletion {
 }
 
 impl PendingFuture {
+    /// Convert into an abort handle plus a completion future.
+    ///
+    /// The join is wrapped in `tool_async_timeout`: a never-resolving tool
+    /// or LLM task must not suspend a `ResolveFutures` round forever, since
+    /// the suspended/host time is deliberately outside the Monty resource
+    /// limits (work item #88). On expiry the join is dropped — dropping the
+    /// `AbortOnDropJoinHandle` aborts the task — and the deferred call
+    /// resolves as a normal error that flows back to the model.
     fn into_completion(
         self,
         monty_call_id: u32,
+        tool_async_timeout: Duration,
     ) -> (
         tokio::task::AbortHandle,
         BoxFuture<'static, PendingFutureCompletion>,
@@ -1012,9 +1025,28 @@ impl PendingFuture {
             } => {
                 let abort_handle = handle.abort_handle();
                 let completion = async move {
+                    let result = match tokio::time::timeout(tool_async_timeout, handle.join()).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                timeout_type = "tool",
+                                action_name = %action_name,
+                                call_id = %call_id,
+                                timeout_secs = tool_async_timeout.as_secs(),
+                                "async tool future timed out; aborting wedged task"
+                            );
+                            Ok(Err(EngineError::Effect {
+                                reason: format!(
+                                    "tool '{action_name}' timed out after {}s",
+                                    tool_async_timeout.as_secs()
+                                ),
+                            }))
+                        }
+                    };
                     PendingFutureCompletion::Tool {
                         monty_call_id,
-                        result: handle.join().await,
+                        result,
                         action_name,
                         call_id,
                         lease_id,
@@ -1027,9 +1059,31 @@ impl PendingFuture {
             Self::Llm { handle } => {
                 let abort_handle = handle.abort_handle();
                 let completion = async move {
+                    let result = match tokio::time::timeout(tool_async_timeout, handle.join()).await
+                    {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(
+                                timeout_type = "llm",
+                                monty_call_id,
+                                timeout_secs = tool_async_timeout.as_secs(),
+                                "async LLM future timed out; aborting wedged task"
+                            );
+                            Ok((
+                                ExtFunctionResult::Error(MontyException::new(
+                                    ExcType::RuntimeError,
+                                    Some(format!(
+                                        "llm_query() timed out after {}s",
+                                        tool_async_timeout.as_secs()
+                                    )),
+                                )),
+                                TokenUsage::default(),
+                            ))
+                        }
+                    };
                     PendingFutureCompletion::Llm {
                         monty_call_id,
-                        result: handle.join().await,
+                        result,
                     }
                 }
                 .boxed();
@@ -1091,6 +1145,7 @@ struct PendingResolutionState<'a> {
     action_results: &'a mut Vec<ActionResult>,
     events: &'a mut Vec<EventKind>,
     recursive_tokens: &'a mut TokenUsage,
+    tool_async_timeout: Duration,
 }
 
 enum ToolFutureResolution {
@@ -1102,6 +1157,7 @@ enum ToolFutureResolution {
 async fn collect_pending_futures(
     pending_ids: &[u32],
     pending_futures: &mut HashMap<u32, PendingFuture>,
+    tool_async_timeout: Duration,
 ) -> CollectedPendingFutures {
     let mut futures: FuturesUnordered<BoxFuture<'static, PendingFutureCompletion>> =
         FuturesUnordered::new();
@@ -1110,7 +1166,7 @@ async fn collect_pending_futures(
 
     for &mid in pending_ids {
         if let Some(pending) = pending_futures.remove(&mid) {
-            let (abort_handle, completion) = pending.into_completion(mid);
+            let (abort_handle, completion) = pending.into_completion(mid, tool_async_timeout);
             abort_handles.insert(mid, abort_handle);
             futures.push(completion);
         } else {
@@ -1130,7 +1186,8 @@ async fn collect_pending_futures(
                 abort_handle.abort();
             }
             for (pending_mid, pending) in pending_futures.drain() {
-                let (abort_handle, completion) = pending.into_completion(pending_mid);
+                let (abort_handle, completion) =
+                    pending.into_completion(pending_mid, tool_async_timeout);
                 abort_handle.abort();
                 futures.push(completion);
             }
@@ -1149,10 +1206,11 @@ async fn abort_and_settle_pending_futures(
     pending_futures: &mut HashMap<u32, PendingFuture>,
     mut state: PendingResolutionState<'_>,
 ) {
+    let tool_async_timeout = state.tool_async_timeout;
     let mut completions: FuturesUnordered<BoxFuture<'static, PendingFutureCompletion>> =
         FuturesUnordered::new();
     for (monty_call_id, pending) in pending_futures.drain() {
-        let (abort_handle, completion) = pending.into_completion(monty_call_id);
+        let (abort_handle, completion) = pending.into_completion(monty_call_id, tool_async_timeout);
         abort_handle.abort();
         completions.push(completion);
     }
@@ -1177,7 +1235,9 @@ async fn resolve_pending_futures(
     pending_futures: &mut HashMap<u32, PendingFuture>,
     mut state: PendingResolutionState<'_>,
 ) -> PendingResolution {
-    let mut collected = collect_pending_futures(pending_ids, pending_futures).await;
+    let tool_async_timeout = state.tool_async_timeout;
+    let mut collected =
+        collect_pending_futures(pending_ids, pending_futures, tool_async_timeout).await;
     if collected.execution_stopped {
         for completion in collected.completions.into_values() {
             settle_completion_after_stop(completion, state.leases, state.recursive_tokens).await;
@@ -3776,6 +3836,151 @@ await asyncio.gather(
             by_name["memory_search"]["query"], "beta",
             "memory_search params: {}",
             by_name["memory_search"]
+        );
+    }
+
+    // ── Async future timeout (work item #88) ─────────────────
+
+    struct AlwaysHangEffects {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for AlwaysHangEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _params: serde_json::Value,
+            _lease: &CapabilityLease,
+            _ctx: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            assert_eq!(action_name, "hang_tool");
+            let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+            std::future::pending().await
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action("hang_tool")])
+        }
+    }
+
+    fn make_timeout_thread(timeout_secs: u64) -> Thread {
+        Thread::new(
+            "test goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig {
+                tool_async_timeout_secs: timeout_secs,
+                ..ThreadConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn hanging_tool_future_times_out_resolve_futures() {
+        let thread = make_timeout_thread(1);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let effects: Arc<dyn EffectExecutor> = Arc::new(AlwaysHangEffects {
+            dropped: Arc::clone(&dropped),
+        });
+        let leases = LeaseManager::new();
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let code = r#"
+try:
+    await hang_tool()
+except Exception as e:
+    print("caught", str(e))
+FINAL("done")
+"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_code_with_leases(code, effects, &thread, &leases),
+        )
+        .await
+        .expect("a hanging tool must not hang the ResolveFutures round forever")
+        .unwrap();
+
+        assert_eq!(result.final_answer.as_deref(), Some("done"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            result.action_results.iter().any(|result| result.is_error
+                && result.output.to_string().contains("timed out after 1s")),
+            "action_results: {:?}",
+            result.action_results
+        );
+        assert!(
+            result.events.iter().any(
+                |event| matches!(event, EventKind::ActionFailed { error, .. } if error.contains("timed out after 1s"))
+            ),
+            "events: {:?}",
+            result.events
+        );
+    }
+
+    struct AlwaysHangLlm {
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::traits::llm::LlmBackend for AlwaysHangLlm {
+        fn model_name(&self) -> &str {
+            "always-hang"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[crate::types::message::ThreadMessage],
+            _actions: &[ActionDef],
+            _config: &crate::traits::llm::LlmCallConfig,
+        ) -> Result<crate::traits::llm::LlmOutput, EngineError> {
+            let _drop_flag = DropFlag(Arc::clone(&self.dropped));
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_llm_future_times_out_resolve_futures() {
+        let thread = make_timeout_thread(1);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let llm: Arc<dyn crate::traits::llm::LlmBackend> = Arc::new(AlwaysHangLlm {
+            dropped: Arc::clone(&dropped),
+        });
+        let leases = LeaseManager::new();
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(1))
+            .await
+            .unwrap();
+        let code = r#"
+try:
+    llm_query("hang")
+except Exception as e:
+    print("caught", str(e))
+FINAL("done")
+"#;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_code_with_runtime(code, effects, llm, &thread, &leases),
+        )
+        .await
+        .expect("a hanging llm_query must not hang the ResolveFutures round forever")
+        .unwrap();
+
+        assert_eq!(result.final_answer.as_deref(), Some("done"));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(
+            result.stdout.contains("timed out after 1s"),
+            "stdout: {}",
+            result.stdout
         );
     }
 }
