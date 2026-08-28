@@ -2812,6 +2812,14 @@ fn append_channel_constraint(context: &mut Option<String>, constraint: &str) {
     });
 }
 
+fn foreground_thread_config(max_iterations: usize, shared_conversation: bool) -> ThreadConfig {
+    ThreadConfig {
+        max_iterations,
+        shared_conversation,
+        ..Default::default()
+    }
+}
+
 async fn handle_with_engine_inner(
     agent: &Agent,
     message: &IncomingMessage,
@@ -2959,10 +2967,10 @@ async fn handle_with_engine_inner(
         resolve_user_project(&state.store, &message.user_id, state.default_project_id).await?;
 
     let thread_config = {
-        let mut config = ThreadConfig {
-            shared_conversation: message.is_shared_conversation(),
-            ..Default::default()
-        };
+        let mut config = foreground_thread_config(
+            agent.max_tool_iterations(),
+            message.is_shared_conversation(),
+        );
         if crate::llm::user_signals_execution_intent(content) {
             config.require_action_attempt = true;
         }
@@ -5413,6 +5421,14 @@ mod tests {
             context.as_deref(),
             Some("transport limit\n\ncoordination schema")
         );
+    }
+
+    #[test]
+    fn foreground_thread_config_uses_resolved_agent_iteration_limit() {
+        let config = foreground_thread_config(979, true);
+
+        assert_eq!(config.max_iterations, 979);
+        assert!(config.shared_conversation);
     }
 
     struct TestStore {
