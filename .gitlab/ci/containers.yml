@@ -83,7 +83,7 @@ worker-kimi-image:
   extends: .container-job
   variables:
     WORKER_IMAGE_NAME: worker-kimi
-    KIMI_CODE_VERSION: "0.38.0"
+    KIMI_CODE_VERSION: "0.39.0"
     # Keep parity with OpenCode: slim default, opt-in toolchain image.
     WITH_TOOLCHAINS: "false"
   script:

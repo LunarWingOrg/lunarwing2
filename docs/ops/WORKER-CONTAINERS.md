@@ -93,7 +93,7 @@ Compose rejects a missing value before container launch. `KIMI_API_KEY` remains
 optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI is installed from npm at
-build time and pinned via the `KIMI_CODE_VERSION` build arg (default `0.38.0`);
+build time and pinned via the `KIMI_CODE_VERSION` build arg (default `0.39.0`);
 override with `podman build --build-arg KIMI_CODE_VERSION=<version>` or
 mt-admin's `build-kimi-worker --kimi-code-version <version>`. The pinned
 version is baked into the image as `KIMI_CODE_IMAGE_VERSION` and reported on
