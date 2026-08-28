@@ -1,12 +1,13 @@
 # Agent and worker lifecycle bugs
 
 > **Overall status: PARTIALLY-FIXED (verified against current source on
-> 2026-08-25).** The fire-and-forget completion race is fixed, one earlier
-> notification-task report is invalidated, and priority interrupts are now
-> handled during active turns. A synchronous `wait=true` worker call still
-> occupies the originating turn and serializes ordinary message handling.
-> `wait=true` remains the default only for the built-in Docker sandbox;
-> external workers have defaulted to `wait=false` since 2026-07-27.
+> 2026-08-28).** The fire-and-forget completion race is fixed, one earlier
+> notification-task report is invalidated, priority interrupts are handled
+> during active turns, and distinct scoped Engine V2 gateway threads no longer
+> head-of-line block each other. A synchronous `wait=true` worker call still
+> occupies its originating thread. `wait=true` remains the default only for the
+> built-in Docker sandbox; external workers have defaulted to `wait=false` since
+> 2026-07-27.
 
 This document consolidates `BUG-agent-loop-blocks-on-worker-jobs.md`,
 `BUG-subagent-worker-hang.md`, and `BUG-unbounded-mpsc-recv-in-spawned-tasks.md`.
@@ -23,19 +24,21 @@ with their distinct reproducers and current evidence.
    or an external worker (`opencode`, `kimi`, or `pebble`) and `wait=true`.
 2. Use a task that takes several minutes, such as a repository analysis.
 3. The originating turn does not return until the worker result is available.
-   Exact `/interrupt` and `/stop` submissions are handled while it is active;
-   ordinary later messages are deferred rather than handled concurrently.
+   Exact `/interrupt` and `/stop` submissions are handled while it is active.
+   A later message on that same thread remains deferred; a distinct scoped
+   Engine V2 gateway thread for the same authenticated user may run in parallel.
 
 The old report's claim that no parallel tool work is possible is too broad: the
 dispatcher can run independent tools already emitted in one turn in a `JoinSet`
 (`ic/src/agent/dispatcher.rs:783-846`). Its stronger claim that the merged
-channel stream stops being polled is also stale. `Agent::run` now spawns the
-active message task and continues selecting from `message_stream`; exact
-interrupt submissions are dispatched immediately, while ordinary messages are
-held in a 256-entry FIFO and replayed after the active task ends
-(`ic/src/agent/agent_loop.rs:1106-1213`, `ic/src/agent/dispatch.rs:6-51`). Queue
-overflow receives an explicit busy response. This removes the former
-daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
+channel stream stops being polled is also stale. `Agent::run` continuously
+selects from `message_stream` and a supervised task set; exact interrupts are
+dispatched immediately (`ic/src/agent/agent_loop.rs:1137-1216`). The bounded
+scheduler permits up to four distinct scoped Engine V2 gateway threads for one
+`(channel, user)` group while serializing the same thread and all non-gateway or
+control paths (`ic/src/agent/dispatch.rs:6-198`). Queue overflow receives an
+explicit busy response. This removes daemon-wide ingestion stalls and the
+cross-thread head-of-line blocking observed in v2.0.9.0 stress finding F3.
 
 ### Current implementation evidence
 
@@ -46,33 +49,35 @@ daemon-wide ingestion stall, but it does not provide concurrent ordinary turns.
 - The built-in sandbox path (`execute_sandbox`, `job.rs:557-871`) waits for
   the container/polling result when `wait` is true (`job.rs:705-870`); the
   external path (`execute_external`, `job.rs:872-1119`) awaits the worker
-  result directly (`:994-1055`).
-  The active task remains the current turn until completion, timeout, or
-  interruption (`ic/src/agent/agent_loop.rs:1144-1213`).
+  result directly (`:994-1055`). The originating scheduling lane remains active
+  until completion, timeout, or interruption.
 - The default agent message timeout is 630 seconds
-  (`ic/src/settings.rs:660-662,723-725`), so a long worker can consume most of a turn.
+  (`ic/src/settings.rs:660-662,723-725`), so a long worker can consume most of
+  its originating turn.
 - The `wait=false` path dispatches immediately and starts a completion monitor
   (`ic/src/tools/builtin/job.rs:672-702` for the sandbox path, `:1086-1105`
   for external workers).
-- Regression tests cover active-turn interrupts, FIFO replay, scoped interrupt
-  rejection, bounded-queue overflow, and soft-timeout detach
-  (`ic/tests/engine_v2_interrupt_ingress.rs:180-398`).
+- Regression tests cover cross-thread progress, same-thread FIFO replay,
+  active-turn interrupts, scoped interrupt rejection, bounded-queue overflow,
+  soft-timeout detach, and shutdown cancellation
+  (`ic/tests/engine_v2_interrupt_ingress.rs:156-459`).
 
 ### Impact
 
-The user receives no result from the originating turn until completion unless
-they interrupt it. The agent continues ingesting messages, but ordinary work is
-serialized behind that turn; after 256 deferred messages, further messages are
-rejected with a busy response. This is a throughput and interaction limitation,
-not evidence that the worker protocol itself is broken.
+The user receives no result on the originating thread until completion unless
+they interrupt it. The agent keeps ingesting messages; same-thread and exclusive
+work remains serialized, while eligible independent gateway threads can use the
+other bounded lanes. After 256 waiting messages, further messages receive a busy
+response. This is now a thread-local interaction limitation, not a daemon-wide
+throughput stall or evidence that the worker protocol itself is broken.
 
 ### Existing workaround and possible fix
 
-Use `wait=false`, then inspect `job_events`/job status from a later turn. The
-priority-interrupt path can cancel a matching active thread, but it does not
-make ordinary turns concurrent. A full fix would add per-session scheduling or
-an asynchronous job registry that surfaces completion/progress without holding
-the originating turn open. The default remains `wait=true` for the built-in
+Use `wait=false`, then inspect `job_events` or job status from a later turn. The
+priority-interrupt path can cancel a matching active thread, and an independent
+Engine V2 gateway thread can proceed concurrently. Same-thread progress still
+requires an asynchronous job or a future steer mechanism that injects new input
+at a safe execution boundary. The default remains `wait=true` for the built-in
 Docker sandbox only; external workers default to `wait=false`.
 
 ## 2. Fire-and-forget worker completion race

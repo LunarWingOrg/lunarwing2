@@ -743,7 +743,7 @@ async fn full_server_chat_send_accepted_for_alice() {
         .post(format!("http://{}/api/chat/send", addr))
         .header("Authorization", format!("Bearer {}", ALICE_TOKEN))
         .header("Content-Type", "application/json")
-        .body(r#"{"content":"hello from alice"}"#)
+        .body(r#"{"content":"hello from alice","thread_id":"alice-thread"}"#)
         .send()
         .await
         .unwrap();
@@ -770,7 +770,7 @@ async fn full_server_chat_send_rewrites_sender_only_for_owner_scope_rebind() {
         .post(format!("http://{}/api/chat/send", addr))
         .header("Authorization", format!("Bearer {}", OWNER_TOKEN))
         .header("Content-Type", "application/json")
-        .body(r#"{"content":"hello from owner"}"#)
+        .body(r#"{"content":"hello from owner","thread_id":"owner-thread"}"#)
         .send()
         .await
         .unwrap();
@@ -788,7 +788,7 @@ async fn full_server_chat_send_rewrites_sender_only_for_owner_scope_rebind() {
         .post(format!("http://{}/api/chat/send", addr))
         .header("Authorization", format!("Bearer {}", BOB_TOKEN))
         .header("Content-Type", "application/json")
-        .body(r#"{"content":"hello from bob"}"#)
+        .body(r#"{"content":"hello from bob","thread_id":"bob-thread"}"#)
         .send()
         .await
         .unwrap();

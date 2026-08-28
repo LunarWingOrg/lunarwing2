@@ -62,9 +62,17 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-proxy
 # Enable the per-tenant DarkIRC daemon and adapter
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --enable-darkirc
 
+# Seed the tenant's knowledge store with the full shared lw2studymcp
+# study-notes base (one-shot, first boot only; read-only shared MCP included)
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --with-study-mcp
+
 # Skip automatic WeeChat relay bootstrap
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant ruffles --no-weechat-bootstrap
 ```
+
+For knowledge-store seeding details (what is imported, the one-shot safety
+invariants, opt-outs, and verification), see
+[`TENANT_KNOWLEDGE_SEED.md`](TENANT_KNOWLEDGE_SEED.md).
 
 Combine required flags in one reviewed command; examples above are illustrative, not instructions to create the same tenant repeatedly. Use `ic/scripts/create-tenant.sh` when the full convenience flow is desired; see [`CREATE_TENANT_NEW_SCRIPT.md`](CREATE_TENANT_NEW_SCRIPT.md).
 

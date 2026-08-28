@@ -40,6 +40,13 @@ Restart behavior (v0.4.1, goal-25 finding F3):
       own cursor, so resumed seqs deliver exactly the unpolled events,
       never duplicates.
 
+WebSocket heartbeat behavior (v0.4.2, goal-26 finding 2):
+    - Automatic protocol PINGs are disabled by default because WeeChat 4.7.x
+      and 4.10.x API relays do not answer them with PONG frames; aiohttp's old
+      25-second heartbeat therefore forced healthy connections to reconnect.
+    - Set WS_ADAPTER_HEARTBEAT_SECONDS to a positive number only when the relay
+      endpoint is known to answer protocol PINGs.
+
 Usage:
     python3 ws_adapter.py [--relay-url URL] [--relay-password PW] [--port PORT]
                          [--message-delay SECONDS] [--state-file PATH]
@@ -49,6 +56,7 @@ Usage:
     WEECHAT_ADAPTER_PORT=10009 python3 ws_adapter.py
     MESSAGE_DELAY_SECONDS=3 python3 ws_adapter.py  # add 3s delay to all messages
     WS_ADAPTER_STATE_FILE=/path/state.json python3 ws_adapter.py  # or 'none' to disable
+    WS_ADAPTER_HEARTBEAT_SECONDS=30 python3 ws_adapter.py  # opt in only for PONG-capable relays
 
 Dependencies:
     pip install aiohttp
@@ -63,6 +71,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import sys
 from collections import defaultdict, deque
@@ -80,7 +89,7 @@ except ImportError:
 
 log = logging.getLogger("weechat_ws")
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 MAX_LINES_PER_BUFFER = 500  # Max buffered lines per IRC buffer
 RECONNECT_DELAY_S = 5  # Backoff between WebSocket reconnect attempts
 BACKFILL_LIMIT = 100  # Lines fetched per buffer when recovering after a reconnect
@@ -97,6 +106,22 @@ WATERMARK_MAX_AGE_DAYS = 7
 # was DOWN. Seq numbers resume monotonically, so the poller's persisted
 # cursor yields exactly the unpolled events and nothing twice.
 JOURNAL_MAX_EVENTS = 2000  # matches the in-memory event_log bound
+
+
+def resolve_ws_heartbeat() -> Optional[float]:
+    """Return the opt-in aiohttp heartbeat interval, or None when disabled."""
+    raw = os.environ.get("WS_ADAPTER_HEARTBEAT_SECONDS", "").strip()
+    if not raw:
+        return None
+    try:
+        interval = float(raw)
+    except ValueError:
+        log.warning("Ignoring invalid WS_ADAPTER_HEARTBEAT_SECONDS=%r", raw)
+        return None
+    if not math.isfinite(interval) or interval <= 0:
+        log.warning("Ignoring non-positive WS_ADAPTER_HEARTBEAT_SECONDS=%r", raw)
+        return None
+    return interval
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +456,11 @@ async def ws_client_loop():
     relay_url = state.relay_url.rstrip("/")
     ws_url = relay_url.replace("http://", "ws://").replace("https://", "wss://") + "/api"
     auth = make_auth_header(state.relay_password)
+    heartbeat = resolve_ws_heartbeat()
+    if heartbeat is None:
+        log.info("WebSocket protocol heartbeat disabled for WeeChat relay compatibility")
+    else:
+        log.info(f"WebSocket protocol heartbeat enabled at {heartbeat:g}s")
     attempt = 0
     backfill_task: Optional[asyncio.Task] = None
 
@@ -443,7 +473,7 @@ async def ws_client_loop():
                 async with session.ws_connect(
                     ws_url,
                     headers={"Authorization": auth},
-                    heartbeat=25,  # send WS pings so silent/half-open drops are detected
+                    heartbeat=heartbeat,
                     max_msg_size=0,  # No size limit
                 ) as ws:
                     state.ws_connected = True

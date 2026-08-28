@@ -286,6 +286,25 @@ If a Gotify server is available, configure it in `env/gotify.json`:
 
 The Gotify WASM tool reads this file at runtime. You can set the URL and title during tenant creation with `--gotify-url` and `--gotify-title`.
 
+## Study Notes / Knowledge Seeding
+
+Two env keys in `env/lunarwing.env` control self-knowledge wiring:
+
+```bash
+LW2STUDYMCP_HOME=/var/cache/lunarwing/lw2studymcp   # Shared study-notes MCP checkout (read-only by default)
+KNOWLEDGE_SEED_FROM_STUDY_MCP=1                     # One-shot first-boot import of the ENTIRE shared base
+                                                # into this tenant's private knowledge store
+```
+
+Both are set by `add-tenant <name> --with-study-mcp`. The seed flag is written
+only on that provisioning path: `configure-study-mcp` never re-arms it and
+`upgrade-tenant` never touches it, so existing tenants are never populated or
+re-populated. The completed pass is recorded in
+`state/knowledge_seed_state.json`; deleting that file forces a safe re-seed
+(existing notes are never overwritten). Set the flag to `0` before first boot
+to opt out. Full guide:
+[`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
+
 ## Runtime Behavior
 
 ```bash

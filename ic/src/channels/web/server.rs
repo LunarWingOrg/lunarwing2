@@ -1244,6 +1244,13 @@ fn mime_to_ext(mime: &str) -> &str {
     }
 }
 
+fn require_chat_thread_id(thread_id: Option<&str>) -> Result<&str, (StatusCode, String)> {
+    thread_id.filter(|value| !value.trim().is_empty()).ok_or((
+        StatusCode::BAD_REQUEST,
+        "thread_id is required for /api/chat/send".to_string(),
+    ))
+}
+
 async fn chat_send_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -1255,6 +1262,8 @@ async fn chat_send_handler(
         req.content.len(),
         req.thread_id
     );
+
+    let thread_id = require_chat_thread_id(req.thread_id.as_deref())?;
 
     if !state.chat_rate_limiter.check(&user.user_id) {
         return Err((
@@ -1278,10 +1287,8 @@ async fn chat_send_handler(
 
     // Always include user_id in metadata so downstream SSE broadcasts can scope events.
     let mut meta = serde_json::json!({"user_id": &user.user_id});
-    if let Some(ref thread_id) = req.thread_id {
-        msg = msg.with_thread(thread_id);
-        meta["thread_id"] = serde_json::json!(thread_id);
-    }
+    msg = msg.with_thread(thread_id);
+    meta["thread_id"] = serde_json::json!(thread_id);
     msg = msg.with_metadata(meta);
 
     // Convert uploaded images to IncomingAttachments
@@ -3018,6 +3025,25 @@ mod tests {
     use crate::cli::oauth_defaults;
     use crate::extensions::{ExtensionKind, InstalledExtension};
     use crate::testing::credentials::TEST_GATEWAY_CRYPTO_KEY;
+
+    #[test]
+    fn chat_send_requires_thread_id() {
+        for thread_id in [None, Some(""), Some("   ")] {
+            let error = require_chat_thread_id(thread_id)
+                .expect_err("missing or blank thread id must be rejected");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST);
+            assert!(error.1.contains("thread_id is required"));
+        }
+    }
+
+    #[test]
+    fn chat_send_accepts_nonempty_thread_id() {
+        let thread_id = Uuid::new_v4().to_string();
+        assert_eq!(
+            require_chat_thread_id(Some(&thread_id)),
+            Ok(thread_id.as_str())
+        );
+    }
 
     fn pending_gate_view(
         resume_kind: lunarwing_engine::ResumeKind,
