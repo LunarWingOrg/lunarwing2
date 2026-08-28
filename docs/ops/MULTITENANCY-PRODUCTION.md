@@ -58,6 +58,14 @@ sudo ic/scripts/lunarwing-mt-admin.sh add-tenants "Ruffles,Miyuki,Sparkie,Starfo
 > omitting a flag never disables an already-selected service. Selection is
 > persisted in `/etc/lunarwing/ports.json`.
 
+> **Knowledge seeding is a provisioning-time choice.** Add
+> `--with-study-mcp` to wire the shared lw2studymcp Study Notes MCP read-only
+> and arm the one-shot import of the entire shared study-notes base into each
+> new tenant's private knowledge store (`KNOWLEDGE_SEED_FROM_STUDY_MCP=1`,
+> first boot only). Tenants already running are never seeded or re-seeded,
+> and `upgrade-tenant` never arms the flag. See
+> [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
+
 This creates OS users, allocates port blocks, clones the repo, generates env files, starts PostgreSQL containers, and renders service units for each tenant.
 
 ### Step 3: Build binaries
