@@ -235,17 +235,19 @@ async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
         .await;
     let thread_id = Uuid::new_v4();
 
-    rig.send_incoming(gateway_message(thread_id, "first"))
-        .await;
+    rig.send_incoming(gateway_message(thread_id, "first")).await;
     tokio::time::timeout(Duration::from_secs(2), provider.first_started.notified())
         .await
         .expect("first provider call should start");
     rig.send_incoming(gateway_message(thread_id, "second"))
         .await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), provider.later_started.notified())
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            provider.later_started.notified()
+        )
+        .await
+        .is_err(),
         "same-thread follow-up must remain queued"
     );
     rig.send_incoming(gateway_message(thread_id, "/interrupt"))
