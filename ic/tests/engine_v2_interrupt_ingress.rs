@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use lunarwing::channels::IncomingMessage;
@@ -17,9 +17,8 @@ use lunarwing::llm::{
     ToolCompletionResponse,
 };
 
+use support::engine_v2_env::{ENGINE_V2_ENV_LOCK, EngineV2EnvGuard};
 use support::test_rig::TestRigBuilder;
-
-static ENGINE_V2_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct DropProbe(Arc<AtomicUsize>);
 
@@ -141,46 +140,23 @@ impl LlmProvider for PendingLlm {
     }
 }
 
-struct EngineV2EnvGuard {
-    original: Option<String>,
-}
-
-impl EngineV2EnvGuard {
-    fn enable() -> Self {
-        let original = std::env::var("ENGINE_V2").ok();
-        // SAFETY: every test in this dedicated binary holds ENGINE_V2_ENV_LOCK
-        // until its background agent is stopped.
-        unsafe { std::env::set_var("ENGINE_V2", "true") };
-        Self { original }
-    }
-}
-
-impl Drop for EngineV2EnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: the caller still holds ENGINE_V2_ENV_LOCK and has stopped its
-        // background agent before this guard is dropped.
-        unsafe {
-            match &self.original {
-                Some(value) => std::env::set_var("ENGINE_V2", value),
-                None => std::env::remove_var("ENGINE_V2"),
-            }
-        }
-    }
-}
-
-fn gateway_message(thread_id: Uuid, content: &str) -> IncomingMessage {
-    IncomingMessage::new("gateway", "test-user", content)
+fn gateway_message_for_user(user_id: &str, thread_id: Uuid, content: &str) -> IncomingMessage {
+    IncomingMessage::new("gateway", user_id, content)
         .with_thread(thread_id.to_string())
         .with_metadata(serde_json::json!({
             "thread_id": thread_id,
-            "user_id": "test-user",
+            "user_id": user_id,
         }))
+}
+
+fn gateway_message(thread_id: Uuid, content: &str) -> IncomingMessage {
+    gateway_message_for_user("test-user", thread_id, content)
 }
 
 #[tokio::test]
 async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -216,13 +192,13 @@ async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
     assert_eq!(rig.captured_responses().len(), 1);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
 
 #[tokio::test]
 async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -270,13 +246,13 @@ async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
 
 #[tokio::test]
 async fn distinct_gateway_threads_do_not_head_of_line_block() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -312,13 +288,13 @@ async fn distinct_gateway_threads_do_not_head_of_line_block() {
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
 
 #[tokio::test]
 async fn unmatched_scoped_interrupt_falls_back_without_stopping_the_active_engine_thread() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -354,13 +330,13 @@ async fn unmatched_scoped_interrupt_falls_back_without_stopping_the_active_engin
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
 
 #[tokio::test]
 async fn deferred_queue_overflow_gets_one_explicit_busy_response() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -403,13 +379,13 @@ async fn deferred_queue_overflow_gets_one_explicit_busy_response() {
     assert_eq!(responses.len(), 258);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
 
 #[tokio::test]
 async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
-    let _env = EngineV2EnvGuard::enable();
+    let env = EngineV2EnvGuard::enable(None);
     lunarwing::bridge::reset_engine_state().await;
 
     let dropped = Arc::new(AtomicUsize::new(0));
@@ -427,8 +403,12 @@ async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
     tokio::time::timeout(Duration::from_secs(2), provider.first_started.notified())
         .await
         .expect("first provider call should start");
-    rig.send_incoming(gateway_message(Uuid::new_v4(), "second"))
-        .await;
+    rig.send_incoming(gateway_message_for_user(
+        "other-user",
+        Uuid::new_v4(),
+        "second",
+    ))
+    .await;
 
     let responses = rig.wait_for_responses(2, Duration::from_secs(6)).await;
     assert_eq!(
@@ -443,5 +423,5 @@ async fn soft_timeout_detaches_and_suppresses_the_original_handler() {
     assert_eq!(rig.captured_responses().len(), 2);
 
     rig.shutdown_and_wait().await;
-    lunarwing::bridge::reset_engine_state().await;
+    env.cleanup().await;
 }
