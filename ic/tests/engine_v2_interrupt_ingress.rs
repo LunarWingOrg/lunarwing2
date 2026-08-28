@@ -196,6 +196,38 @@ async fn gateway_interrupt_is_dispatched_while_llm_acquisition_is_pending() {
 }
 
 #[tokio::test]
+async fn aborting_agent_task_cancels_the_active_handler() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(None);
+    lunarwing::bridge::reset_engine_state().await;
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let pending = Arc::new(PendingLlm::new(Arc::clone(&dropped)));
+    let llm: Arc<dyn LlmProvider> = pending.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(llm)
+        .build()
+        .await;
+
+    rig.send_incoming(gateway_message(Uuid::new_v4(), "stay pending"))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), pending.started.notified())
+        .await
+        .expect("LLM acquisition should start");
+
+    rig.shutdown_and_wait().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while dropped.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("aborting the agent task should drop the active LLM future");
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let env = EngineV2EnvGuard::enable(None);
