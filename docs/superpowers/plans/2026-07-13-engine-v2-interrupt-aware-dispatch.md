@@ -1,5 +1,11 @@
 # Engine V2 Interrupt-Aware Dispatch Implementation Plan
 
+> **Historical implementation record.** The one-active-handler design below was
+> implemented in July 2026, then superseded for scoped Engine V2 gateway input
+> by the bounded per-thread scheduler from v2.0.9.0 item #2 (2026-08-28). See
+> `../specs/2026-07-13-engine-v2-interrupt-aware-dispatch-design.md` for the
+> current contract. Do not reapply the embedded code snippets to current source.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make exact `/interrupt` and `/stop` controls reach the existing scoped Engine V2 cancellation route while an ordinary message handler is active, without making ordinary messages concurrent.

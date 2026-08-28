@@ -1,5 +1,11 @@
 # Engine LLM Streaming Phase 4 Implementation Plan
 
+> **Historical scheduling note.** The cancellation implementation remains
+> current, but live-gate statements below that all ordinary messages are
+> globally serialized describe the July 2026 dispatcher. Since v2.0.9.0 item #2
+> (2026-08-28), distinct scoped Engine V2 gateway threads have bounded parallel
+> lanes; same-thread and non-gateway paths remain serialized.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make an Engine V2 interrupt promptly cancel an in-flight provider
