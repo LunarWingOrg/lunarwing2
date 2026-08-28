@@ -15,7 +15,7 @@
 > remaining items in `docs/ops/AGENT_GOALS_2.0.9.0.md` before tagging the
 > release. It is intentionally not a claim that v2.0.9.0 is release-ready.
 
-> **TODO** add the real intro from SB
+> INAZUMA. The sky cracks white and we move as one. Kiyome washed the blade clean; now the storm arrives to strike where polishing never could — one flash of consolidation across the codebase - The storm after the cleansing. Lightning. ⚡"
 
 ## Overview
 
