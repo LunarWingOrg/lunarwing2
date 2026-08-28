@@ -1,0 +1,8 @@
+The lunarwing-agent-v1 protocol                                                                                                                                                  
+                                                                                                                                                                                    
+   • WS subprotocol lunarwing-agent-v1, with legacy ironclaw-agent-v1 still offered for pre-rename workers (external_worker.rs:30–34).                                              
+   • Wire format: an Envelope { id, type, timestamp, payload } with type serdes-renamed to msg_type. Payload families: ready, task_request, task_progress (deltas streamed back as  
+     SSE job events), task_result (success/error/cancelled).                                                                                                                        
+   • Handshake (connect_and_handshake, :890): manual HTTP upgrade with subprotocol + bearer auth, 15s connect timeout, then waits ≤10s for the worker's ready envelope.             
+   • One serialization quirk worth remembering: TaskContext.project_dir uses skip_serializing_if because the Kimi TS bridge explicitly rejects project_dir: null while accepting an 
+     absent key.            
