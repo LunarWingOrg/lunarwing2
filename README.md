@@ -85,7 +85,7 @@ Moving a v1 tenant to v2 uses a staged Kawarimi export/import: rehearse on a sep
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). On a resource-constrained host, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds:
+The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). On a resource-constrained host with an adequate number of CPU cores, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds:
 
 ```bash
 cd ic
