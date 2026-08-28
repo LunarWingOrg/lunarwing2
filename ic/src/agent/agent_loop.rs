@@ -324,6 +324,11 @@ impl Agent {
         &self.deps.owner_id
     }
 
+    /// Resolved foreground iteration limit shared by both execution engines.
+    pub(crate) fn max_tool_iterations(&self) -> usize {
+        self.config.max_tool_iterations
+    }
+
     /// Create a new agent.
     ///
     /// Optionally accepts pre-created `ContextManager` and `SessionManager` for sharing
