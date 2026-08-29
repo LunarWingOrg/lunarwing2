@@ -1181,6 +1181,24 @@ def run_loop(context, goal, actions, state, config):
             # Check for FINAL()
             final_answer = extract_final(text)
             if final_answer is not None:
+                available_actions = __get_actions__()
+                if (available_actions
+                        and not ran_tool_this_turn
+                        and fabricated_claim_nudges < max_obligation_nudges
+                        and not has_action_results_since_last_user(working_messages)
+                        and signals_claimed_tool_success(final_answer)):
+                    fabricated_claim_nudges += 1
+                    append_message(
+                        working_messages,
+                        "User",
+                        "You claimed to have completed memory/tool actions, but no tool "
+                        "calls were made in this turn — those actions did NOT actually "
+                        "run and nothing was written, read, or searched.\n"
+                        "Do NOT fabricate tool results. Call the actual tools now "
+                        "(structured tool calls or a ```repl code block), then report "
+                        "their real outputs. If you cannot perform them, say so plainly.",
+                    )
+                    continue
                 __transition_to__("completed", "FINAL() in text")
                 return complete_result(state, "completed", final_answer)
 

@@ -142,13 +142,14 @@ impl LlmResponse {
                 .first()
                 .and_then(final_answer_of)
                 .filter(|answer| !answer.is_empty())
-                .or_else(|| content.clone().filter(|text| !text.is_empty()))
-                .unwrap_or_else(|| "Task completed.".to_string());
+                .or_else(|| content.clone().filter(|text| !text.is_empty()));
             let mut text = content.unwrap_or_default();
-            if !text.is_empty() {
-                text.push('\n');
+            if let Some(answer) = answer {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&format_final_call(&answer));
             }
-            text.push_str(&format_final_call(&answer));
             return Self::from_text(text);
         }
 
@@ -461,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn from_action_calls_falls_back_to_content_then_default() {
+    fn from_action_calls_falls_back_to_content() {
         let response = LlmResponse::from_action_calls(
             vec![call("finAL(", serde_json::json!({}))],
             Some("the claimed answer".to_string()),
@@ -473,16 +474,13 @@ mod tests {
             extract_final_answer(&text).as_deref(),
             Some("the claimed answer")
         );
+    }
 
+    #[test]
+    fn from_action_calls_empty_final_does_not_invent_success() {
         let response =
             LlmResponse::from_action_calls(vec![call("FINAL", serde_json::json!({}))], None);
-        let LlmResponse::Text(text) = response else {
-            panic!("FINAL-only batch must become text");
-        };
-        assert_eq!(
-            extract_final_answer(&text).as_deref(),
-            Some("Task completed.")
-        );
+        assert!(matches!(response, LlmResponse::Text(text) if text.is_empty()));
     }
 
     #[test]

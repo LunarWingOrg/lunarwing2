@@ -4217,22 +4217,28 @@ FINAL("unreached")
     /// a plain follow-up after the recovery nudge (F4 recovery case).
     struct FabricatedClaimLlm {
         tool_call_first: bool,
+        final_pseudo_action_first: bool,
         calls: AtomicUsize,
         nudge_deliveries: AtomicUsize,
     }
 
     impl FabricatedClaimLlm {
         fn claiming_first() -> Self {
-            Self::new(false)
+            Self::new(false, false)
         }
 
         fn calling_first() -> Self {
-            Self::new(true)
+            Self::new(true, false)
         }
 
-        fn new(tool_call_first: bool) -> Self {
+        fn final_pseudo_action_first() -> Self {
+            Self::new(false, true)
+        }
+
+        fn new(tool_call_first: bool, final_pseudo_action_first: bool) -> Self {
             Self {
                 tool_call_first,
+                final_pseudo_action_first,
                 calls: AtomicUsize::new(0),
                 nudge_deliveries: AtomicUsize::new(0),
             }
@@ -4267,7 +4273,16 @@ FINAL("unreached")
             }
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             let mut chunks: Vec<Result<LlmStreamChunk, EngineError>> = Vec::new();
-            if index == 0 && self.tool_call_first {
+            if index == 0 && self.final_pseudo_action_first {
+                chunks.push(Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-final".into()),
+                    name: Some(
+                        "FINAL(All steps completed successfully: memory_write status: ok)".into(),
+                    ),
+                    args_delta: "{}".into(),
+                }));
+            } else if index == 0 && self.tool_call_first {
                 chunks.push(Ok(LlmStreamChunk::ToolCallDelta {
                     index: 0,
                     id: Some("call-1".into()),
@@ -4338,6 +4353,25 @@ FINAL("unreached")
         // dispatched. The orchestrator must reject the fabrication and nudge
         // once instead of accepting the invented success as the answer.
         let llm = Arc::new(FabricatedClaimLlm::claiming_first());
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("memory_write")],
+            executions: AtomicUsize::new(0),
+        });
+
+        let result = run_fabricated_claim_case(llm.clone(), effects.clone()).await;
+
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(llm.nudge_deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        let ThreadOutcome::Completed { response } = result.outcome else {
+            panic!("expected completed outcome");
+        };
+        assert_eq!(response.as_deref(), Some(RECOVERY_REPLY));
+    }
+
+    #[tokio::test]
+    async fn fabricated_final_pseudo_action_triggers_one_recovery_nudge() {
+        let llm = Arc::new(FabricatedClaimLlm::final_pseudo_action_first());
         let effects = Arc::new(CountingEffects {
             actions: vec![test_action_def("memory_write")],
             executions: AtomicUsize::new(0),
