@@ -1,24 +1,16 @@
-# Release Notes for LunarWing v2.0.9.0 — FIRST DRAFT
+# Release Notes for LunarWing v2.0.9.0
 
 ## Codename: Inazuma (稲妻)
 
 **Release date:** TBD
 
-> *Inazuma* (稲妻) means lightning. LunarWing v2.0.9.0 concentrates on fast,
-> decisive containment: untrusted tool output is neutralized before it can cross
-> an LLM role boundary, restricted mission threads see only the actions their
-> leases permit, self-repair reaches a terminal state instead of cycling, and
-> multi-tenant operators get earlier warnings when ports are already occupied.
-
-> **Draft status (2026-08-29):** Second pass. The first draft (2026-08-26)
-> covered the changes present after `v2.0.8.0` as of that date; this pass
-> reconciles the notes with every commit since, including the WeeChat relay
-> resilience work, Engine V2 startup/scheduling/timeout changes, SSH API
-> hardening, and gateway/workspace fixes. Reconcile it with all commits and
-> remaining items in `docs/ops/AGENT_GOALS_2.0.9.0.md` before tagging the
-> release. It is intentionally not a claim that v2.0.9.0 is release-ready.
-
-> INAZUMA. The sky cracks white and we move as one. Kiyome washed the blade clean; now the storm arrives to strike where polishing never could — one flash of consolidation across the codebase - The storm after the cleansing. Lightning. ⚡"
+>The sky cracks white and we move as one. 
+>Kiyome washed the blade clean
+>Now the storm arrives to strike where polishing never could
+>One flash of consolidation across the codebase
+>The storm after the cleansing
+>Lightning
+>⚡
 
 ## Overview
 
