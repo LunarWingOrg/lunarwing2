@@ -1613,6 +1613,43 @@ impl WasmChannel {
         }
     }
 
+    async fn finish_poll_callback(
+        &self,
+        channel_name: &str,
+        mut host_state: ChannelHostState,
+    ) -> Result<(), WasmChannelError> {
+        let degraded = self.log_callback_host_state(&mut host_state);
+        let emitted = host_state.take_emitted_messages();
+        if !emitted.is_empty() {
+            tracing::debug!(
+                channel = %channel_name,
+                count = emitted.len(),
+                "WASM on_poll emitted {} message(s)",
+                emitted.len(),
+            );
+        }
+        let pending_writes = host_state.take_pending_writes();
+        if host_state.emits_dropped() > 0 {
+            self.set_callback_health(WasmChannelHealthState::PollFailed);
+            return Err(WasmChannelError::CallbackFailed {
+                name: channel_name.to_string(),
+                reason: "on_poll exceeded the per-callback emit limit".to_string(),
+            });
+        }
+        if let Err(error) = self.process_emitted_messages(emitted).await {
+            self.set_callback_health(WasmChannelHealthState::PollDispatchFailed);
+            return Err(error);
+        }
+        self.workspace_store.commit_writes(&pending_writes);
+        self.set_callback_health(if degraded {
+            WasmChannelHealthState::PollDegraded
+        } else {
+            WasmChannelHealthState::Healthy
+        });
+        tracing::debug!(channel = %channel_name, "WASM channel on_poll completed");
+        Ok(())
+    }
+
     /// Execute the on_poll callback.
     ///
     /// Called periodically if polling is configured.
@@ -1675,42 +1712,7 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), mut host_state))) => {
-                let degraded = self.log_callback_host_state(&mut host_state);
-                let emitted = host_state.take_emitted_messages();
-                if !emitted.is_empty() {
-                    tracing::debug!(
-                        channel = %channel_name,
-                        count = emitted.len(),
-                        "WASM on_poll emitted {} message(s)",
-                        emitted.len(),
-                    );
-                }
-                let pending_writes = host_state.take_pending_writes();
-                if host_state.emits_dropped() > 0 {
-                    self.set_callback_health(WasmChannelHealthState::PollFailed);
-                    return Err(WasmChannelError::CallbackFailed {
-                        name: channel_name,
-                        reason: "on_poll exceeded the per-callback emit limit".to_string(),
-                    });
-                }
-                if let Err(error) = self.process_emitted_messages(emitted).await {
-                    self.set_callback_health(WasmChannelHealthState::PollDispatchFailed);
-                    return Err(error);
-                }
-                self.workspace_store.commit_writes(&pending_writes);
-                self.set_callback_health(if degraded {
-                    WasmChannelHealthState::PollDegraded
-                } else {
-                    WasmChannelHealthState::Healthy
-                });
-
-                tracing::debug!(
-                    channel = %channel_name,
-                    "WASM channel on_poll completed"
-                );
-                Ok(())
-            }
+            Ok(Ok(((), host_state))) => self.finish_poll_callback(&channel_name, host_state).await,
             Ok(Err(error)) => {
                 self.set_callback_health(WasmChannelHealthState::PollFailed);
                 Err(error)
