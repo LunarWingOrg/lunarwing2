@@ -60,9 +60,9 @@ interface channel-host {
     /// Emit a log message.
     ///
     /// Messages are collected and emitted after execution completes.
-    /// A warn or error entry marks the channel callback unhealthy until a later
-    /// callback completes without warn/error entries. Use those levels for
-    /// operational degradation; use info/debug for routine status.
+    /// A warn or error entry from on-start or on-poll marks the channel unhealthy
+    /// until a later startup/poll callback completes without warn/error entries.
+    /// Use those levels for operational degradation; use info/debug for routine status.
     /// Rate-limited to 1000 entries per execution, 4KB per message.
     log: func(level: log-level, message: string);
 
