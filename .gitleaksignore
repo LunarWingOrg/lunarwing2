@@ -34,5 +34,3 @@ ic/tests/test-pages/cnn/source.html:generic-api-key:2468
 docs/proposals/MULTIAGENTTEAMORCHESTRATION/coordination-phase1-plan.md:generic-api-key:176
 ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:31
 ic/scripts/tests/test_darkirc_h3_analyzer.py:generic-api-key:32
-ic/src/bridge/ssh_api.rs:private-key:374
-ic/src/bridge/ssh_api.rs:private-key:413
