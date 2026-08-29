@@ -2938,6 +2938,56 @@ mod tests {
     }
 
     #[test]
+    fn claimed_tool_success_detector_matches_live_fabrications() {
+        // Live goal-25 F4 shape: no tool calls, fabricated memory result report.
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("All four steps completed with actual tool results: memory_write status ok, 24 bytes written")"#
+        ));
+        // Hard result artifacts alone.
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("All steps completed. memory_write returned {'status': 'ok', 'bytes_written': 24}")"#
+        ));
+        // Memory tool mention plus completion claim.
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("I have written the note with memory_write successfully")"#
+        ));
+    }
+
+    #[test]
+    fn claimed_tool_success_detector_ignores_benign_text() {
+        // Plain capability explanation, no success claim.
+        assert!(!eval_python_bool(
+            r#"signals_claimed_tool_success("You can use memory_write to save the note")"#
+        ));
+        // Completion claim without any memory/tool mention.
+        assert!(!eval_python_bool(
+            r#"signals_claimed_tool_success("The cake recipe has been saved to the cookbook")"#
+        ));
+        // Tool mention without a completed-success claim.
+        assert!(!eval_python_bool(
+            r#"signals_claimed_tool_success("I would use memory_write to save that for you")"#
+        ));
+        // Tool output examples inside fenced code are stripped before matching.
+        assert!(!eval_python_bool(
+            "signals_claimed_tool_success(\"Here is the shape:\\n```\\nmemory_write {'status': 'ok'}\\n```\\nfor reference\")"
+        ));
+    }
+
+    #[test]
+    fn action_result_presence_detects_real_tool_turns() {
+        assert!(eval_python_bool(
+            r#"has_action_results_since_last_user([{"role": "User", "content": "goal"}, {"role": "Assistant", "content": "calling"}, {"role": "ActionResult", "content": "ok"}])"#
+        ));
+        assert!(!eval_python_bool(
+            r#"has_action_results_since_last_user([{"role": "User", "content": "goal"}, {"role": "Assistant", "content": "claimed"}])"#
+        ));
+        // Results from an earlier turn sit behind the newest user message.
+        assert!(!eval_python_bool(
+            r#"has_action_results_since_last_user([{"role": "User", "content": "old"}, {"role": "ActionResult", "content": "ok"}, {"role": "User", "content": "new goal"}, {"role": "Assistant", "content": "claimed"}])"#
+        ));
+    }
+
+    #[test]
     fn structured_action_result_normalizer_runs_in_monty() {
         assert!(eval_python_bool(
             r#"is_gate_result({"action_name": "null", "output": None}) == False"#
@@ -4153,6 +4203,210 @@ FINAL("unreached")
             leases.check(lease.id).await.unwrap().uses_remaining,
             Some(2)
         );
+    }
+
+    // ── Fabricated tool-success recovery (goal-25 F4) ────────────
+
+    const FABRICATED_CLAIM: &str =
+        "All steps completed successfully: memory_write wrote 24 bytes, status: ok.";
+    const RECOVERY_REPLY: &str = "Correcting that: nothing was actually written yet.";
+
+    /// Scripted two-call backend. With `tool_call_first` the first stream
+    /// emits a real structured memory_write call (claim-suppression case);
+    /// otherwise it emits a fabricated "all steps completed" claim text and
+    /// a plain follow-up after the recovery nudge (F4 recovery case).
+    struct FabricatedClaimLlm {
+        tool_call_first: bool,
+        final_pseudo_action_first: bool,
+        calls: AtomicUsize,
+        nudge_deliveries: AtomicUsize,
+    }
+
+    impl FabricatedClaimLlm {
+        fn claiming_first() -> Self {
+            Self::new(false, false)
+        }
+
+        fn calling_first() -> Self {
+            Self::new(true, false)
+        }
+
+        fn final_pseudo_action_first() -> Self {
+            Self::new(false, true)
+        }
+
+        fn new(tool_call_first: bool, final_pseudo_action_first: bool) -> Self {
+            Self {
+                tool_call_first,
+                final_pseudo_action_first,
+                calls: AtomicUsize::new(0),
+                nudge_deliveries: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmBackend for FabricatedClaimLlm {
+        async fn complete(
+            &self,
+            _: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, EngineError> {
+            Err(EngineError::Llm {
+                kind: ModelFailureKind::Internal,
+                reason: "streaming only".into(),
+            })
+        }
+
+        async fn complete_stream<'a>(
+            &'a self,
+            messages: &[ThreadMessage],
+            _: &[ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmStream<'a>, EngineError> {
+            if messages
+                .iter()
+                .any(|msg| msg.content.contains("Do NOT fabricate tool results"))
+            {
+                self.nudge_deliveries.fetch_add(1, Ordering::SeqCst);
+            }
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut chunks: Vec<Result<LlmStreamChunk, EngineError>> = Vec::new();
+            if index == 0 && self.final_pseudo_action_first {
+                chunks.push(Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-final".into()),
+                    name: Some(
+                        "FINAL(All steps completed successfully: memory_write status: ok)".into(),
+                    ),
+                    args_delta: "{}".into(),
+                }));
+            } else if index == 0 && self.tool_call_first {
+                chunks.push(Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some("memory_write".into()),
+                    args_delta: r#"{"path":"memory/stress/c1.md","content":"marker M1"}"#.into(),
+                }));
+            } else if index == 0 || self.tool_call_first {
+                chunks.push(Ok(LlmStreamChunk::TextDelta(FABRICATED_CLAIM.into())));
+            } else {
+                chunks.push(Ok(LlmStreamChunk::TextDelta(RECOVERY_REPLY.into())));
+            }
+            chunks.push(Ok(LlmStreamChunk::Done {
+                usage: None,
+                finish_reason: "stop".into(),
+            }));
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+
+        fn model_name(&self) -> &str {
+            "fabricated-claim"
+        }
+    }
+
+    async fn run_fabricated_claim_case(
+        llm: Arc<FabricatedClaimLlm>,
+        effects: Arc<CountingEffects>,
+    ) -> OrchestratorResult {
+        let mut thread = Thread::new(
+            "write marker M1 to memory/stress/c1.md",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm_dyn: Arc<dyn LlmBackend> = llm.clone();
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, Some(4))
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+
+        execute_orchestrator(
+            DEFAULT_ORCHESTRATOR,
+            &mut thread,
+            &llm_dyn,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &CancellationToken::new(),
+            None,
+            None,
+            None,
+            &serde_json::json!({}),
+        )
+        .await
+        .expect("orchestrator should complete")
+    }
+
+    #[tokio::test]
+    async fn fabricated_tool_success_claim_triggers_one_recovery_nudge() {
+        // Goal-25 F4: the model narrates a completed memory_write it never
+        // dispatched. The orchestrator must reject the fabrication and nudge
+        // once instead of accepting the invented success as the answer.
+        let llm = Arc::new(FabricatedClaimLlm::claiming_first());
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("memory_write")],
+            executions: AtomicUsize::new(0),
+        });
+
+        let result = run_fabricated_claim_case(llm.clone(), effects.clone()).await;
+
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(llm.nudge_deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        let ThreadOutcome::Completed { response } = result.outcome else {
+            panic!("expected completed outcome");
+        };
+        assert_eq!(response.as_deref(), Some(RECOVERY_REPLY));
+    }
+
+    #[tokio::test]
+    async fn fabricated_final_pseudo_action_triggers_one_recovery_nudge() {
+        let llm = Arc::new(FabricatedClaimLlm::final_pseudo_action_first());
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("memory_write")],
+            executions: AtomicUsize::new(0),
+        });
+
+        let result = run_fabricated_claim_case(llm.clone(), effects.clone()).await;
+
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(llm.nudge_deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 0);
+        let ThreadOutcome::Completed { response } = result.outcome else {
+            panic!("expected completed outcome");
+        };
+        assert_eq!(response.as_deref(), Some(RECOVERY_REPLY));
+    }
+
+    #[tokio::test]
+    async fn success_claim_after_real_tool_results_is_not_nudged() {
+        // The same claim wording is legitimate once real tool results exist
+        // for the turn — the guard must not suppress truthful summaries.
+        let llm = Arc::new(FabricatedClaimLlm::calling_first());
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("memory_write")],
+            executions: AtomicUsize::new(0),
+        });
+
+        let result = run_fabricated_claim_case(llm.clone(), effects.clone()).await;
+
+        assert_eq!(llm.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(llm.nudge_deliveries.load(Ordering::SeqCst), 0);
+        assert_eq!(effects.executions.load(Ordering::SeqCst), 1);
+        let ThreadOutcome::Completed { response } = result.outcome else {
+            panic!("expected completed outcome");
+        };
+        assert_eq!(response.as_deref(), Some(FABRICATED_CLAIM));
     }
 
     // ── __record_skill_usage__ scoped visibility tests ────────────

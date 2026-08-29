@@ -1113,6 +1113,8 @@ main() {
       [[ -n "$ssh_host" ]] || ssh_host="127.0.0.1"
       [[ -n "$ssh_user" ]] || ssh_user="$name"
       ensure_ssh_config "$name" "$ssh_host" "$ssh_user"
+      ensure_ssh_api_token "$name" \
+        || die "failed to provision SSH API credential for tenant '$name'"
       provision_tenant_ssh_key "$name" "$ssh_host" "$ssh_user"
       patch_ssh_tool_allowlist "$name"
       say ""

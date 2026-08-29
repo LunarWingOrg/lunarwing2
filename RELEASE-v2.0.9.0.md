@@ -88,6 +88,10 @@ previous compatibility baseline.
   Engine V2 now initializes eagerly at agent startup so scheduled missions,
   routines, thread recovery, and the mission webhook endpoint work immediately
   after a daemon restart.
+- **Orchestrator rejects invented tool success.** Text and provider-mangled
+  `FINAL(...)` responses that claim completed memory/tool work without a real
+  call are rejected and retried, and empty `FINAL` pseudo-actions can no longer
+  synthesize a successful "Task completed" response.
 - **WeeChat relay stops losing messages around reconnects.** WebSocket ERROR
   frames no longer masquerade as clean disconnects, outbound operator input is
   buffered in a bounded outbox during relay outages, lines the relay accepted
@@ -97,6 +101,10 @@ previous compatibility baseline.
   key-management route now requires `Authorization: Bearer <SSH_API_TOKEN>` and
   is not mounted at all when the token is unset, and the webhook server's
   fallback bind changed from `0.0.0.0` to `127.0.0.1`.
+- **SSH key rotation now fails closed.** `configure-ssh` backfills the dedicated
+  SSH API token for older tenants, reloads already-running daemons before upload,
+  and retains staged keys while stopping startup on any upload failure instead
+  of silently continuing with the old signing key.
 - **Safer default workspace guidance.** Profile updates now explicitly require
   `memory_write` with `append: false` and a complete merged JSON document, daily
   logs point to `daily/YYYY-MM-DD.md`, and the memory tool warns that appending
@@ -293,6 +301,29 @@ runtime behavior:
   with a structured warning and the deferred call resolves as a normal
   failure instead of hanging the engine thread forever.
 
+### Orchestrator Tool-Result Integrity
+
+OpenRC stress findings F4/F5 exposed two related model-output failures: models
+occasionally narrated memory operations that were never dispatched, and some
+OpenAI-compatible providers surfaced CodeAct `FINAL(...)` syntax as structured
+tool calls that then failed lease checks.
+
+- The compiled orchestrator detects high-confidence fabricated memory/tool
+  success reports when no action ran in the current user turn. It appends a
+  bounded recovery instruction requiring real structured or CodeAct calls rather
+  than accepting the self-report.
+- Structured `FINAL`, `FINAL_VAR`, and observed provider-mangled forms are
+  consumed before action history. Real calls in mixed batches remain intact;
+  pseudo-actions no longer create `No lease for action 'FINAL'` failures.
+- Normalized `FINAL(...)` answers pass through the same fabricated-success guard
+  before terminal completion, closing the bypass where provider normalization
+  could otherwise turn an invented result into an accepted final answer.
+- Bare or empty `FINAL` calls no longer invent `Task completed.`. They become an
+  empty text response and follow normal action-obligation/recovery handling.
+
+This is guardrail hardening, not proof that an LLM will always dispatch requested
+work. Workflows that require durable writes should still read the target back.
+
 ### WeeChat Relay Resilience
 
 Work item #78 and stress-finding follow-ups take the Python relay adapter
@@ -340,6 +371,17 @@ closed the last unauthenticated route family on the shared webhook server:
 - mt-admin generates and persists `SSH_API_TOKEN` in each tenant's
   `lunarwing.env` and sends it on the staged SSH-key upload and its readiness
   probe.
+- `configure-ssh` and staged-key startup preserve or atomically backfill a
+  missing token for older tenants. If the daemon is already active, mt-admin
+  reloads it before upload so the fail-closed router sees the new credential.
+- Missing/empty credentials, readiness failures, transport failures, and rejected
+  upload responses now return nonzero, retain the staged key, and stop tenant
+  startup before workers continue with an old signing key.
+- The bearer token is supplied through an anonymous curl config FD, private-key
+  JSON is built with `jq --rawfile`, and endpoint failure bodies are suppressed,
+  keeping token/key material out of process argv and operator logs.
+- Empty configured tokens now leave the SSH API router unmounted, matching the
+  absent-token fail-closed behavior.
 - SSH key-upload secrets no longer appear in tracing spans or logs. See
   [`docs/ops/SSH_KEY_LOG_EXPOSURE_KAGEHO.md`](docs/ops/SSH_KEY_LOG_EXPOSURE_KAGEHO.md).
 
@@ -580,13 +622,18 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
 - Foreground Engine V2 threads honor `AGENT_MAX_TOOL_ITERATIONS`, and wedged
   deferred tool/LLM futures are aborted by `tool_async_timeout_secs` instead
   of hanging a thread forever.
+- Fabricated memory/tool success reports and normalized `FINAL(...)` pseudo-calls
+  no longer bypass action execution, enter leased action history, or synthesize
+  successful completion from an empty answer.
 - The WeeChat relay no longer drops lines accepted during socket outages or
   adapter restarts, no longer retries instantly after ERROR frames, and no
   longer churns reconnects against WeeChat versions that ignore WebSocket
   PINGs.
 - The SSH host/key API is bearer-authenticated and fail-closed, key-upload
-  secrets no longer reach logs, and the webhook server defaults to a loopback
-  bind.
+  secrets no longer reach argv/logs, key rotation failures retain staged keys
+  and stop startup instead of silently keeping the old key, older tenants
+  backfill the dedicated token safely, and the webhook server defaults to a
+  loopback bind.
 - `memory_write` no longer intermittently returns 500 when two updates reach
   the same workspace document concurrently, workspace paths containing `..`
   no longer create traversal-shaped database entries, `/api/memory/search`

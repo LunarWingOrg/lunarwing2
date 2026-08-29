@@ -1638,6 +1638,32 @@ provision_tenant_ssh_key() {
   say "staged SSH private key for upload to secrets store"
 }
 
+# Ensure existing tenants have the dedicated SSH API credential before a staged
+# key causes the fail-closed SSH router to be needed. Existing tokens are never
+# rotated; _env_set preserves lunarwing.env ownership and mode atomically.
+ensure_ssh_api_token() {
+  local name="$1" env_path ssh_api_token
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || { say "ERROR: tenant environment missing or unsafe: $env_path" >&2; return 1; }
+
+  ssh_api_token="$(_read_env_value "$env_path" SSH_API_TOKEN)"
+  if [[ -n "$ssh_api_token" ]]; then
+    return 0
+  fi
+
+  ssh_api_token="$(generate_token)"
+  [[ -n "$ssh_api_token" ]] \
+    || { say "ERROR: failed to generate SSH API token for tenant '$name'" >&2; return 1; }
+  _env_set "$env_path" SSH_API_TOKEN "$ssh_api_token"
+  say "generated missing SSH API credential for tenant '$name'"
+}
+
+tenant_ssh_api_token_present() {
+  local name="$1"
+  [[ -n "$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)" ]]
+}
+
 # Upload the staged SSH private key to the secrets store via the gateway's SSH
 # API. Called AFTER the daemon starts (the API is served by the gateway on the
 # HTTP port). Deletes the staged key after upload so no key material persists
@@ -1653,24 +1679,36 @@ upload_tenant_ssh_key() {
   ssh_api_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"
 
   [[ -f "$staged_key" ]] || { say "no staged SSH key for $name (skipping upload)"; return 0; }
+  if [[ -z "$ssh_api_token" ]]; then
+    say "ERROR: SSH_API_TOKEN missing for tenant '$name'; staged key not uploaded" >&2
+    return 1
+  fi
+
+  # Keep the credential out of argv and process listings. curl reads this
+  # anonymous config FD for both readiness and upload requests.
+  local auth_header="Authorization: Bearer ${ssh_api_token}"
 
   # Wait for the gateway to be reachable (it may still be starting up).
   local i=0
-  while ! curl -sf --max-time 2 -H "Authorization: Bearer $ssh_api_token" \
+  while ! curl -sf --max-time 2 \
+      -K <(printf 'header = "%s"\n' "$auth_header") \
       "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
     i=$((i + 1))
-    [[ $i -lt 15 ]] || { say "WARNING: gateway not reachable on port $http_port after 30s; SSH key not uploaded (upload manually via the API)" >&2; return 1; }
+    [[ $i -lt 15 ]] || { say "WARNING: authenticated SSH API not reachable on port $http_port after repeated probes; SSH key not uploaded" >&2; return 1; }
     sleep 2
   done
 
   # Upload the key via the SSH API. The key data is sent as a JSON string
   # (base64 not needed — the API accepts raw PEM/OpenSSH format).
-  local key_data upload_result
-  key_data="$(cat "$staged_key")"
-  upload_result="$(jq -n --arg key "$key_data" '{key_data: $key}' | \
+  local upload_result
+  if ! upload_result="$(jq -n --rawfile key "$staged_key" '{key_data: $key}' | \
     curl -sf -X POST "http://127.0.0.1:${http_port}/hosts/${ssh_host}/key" \
       -H "Content-Type: application/json" \
-      -H "Authorization: Bearer $ssh_api_token" -d @- 2>&1)" || true
+      -K <(printf 'header = "%s"\n' "$auth_header") \
+      -d @- 2>/dev/null)"; then
+    say "ERROR: SSH key upload request failed; staged key remains at $staged_key" >&2
+    return 1
+  fi
 
   if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
     say "SSH key uploaded to secrets store for host $ssh_host"
@@ -1678,8 +1716,9 @@ upload_tenant_ssh_key() {
     rm -f "$staged_key"
     say "staged SSH key deleted (key material now only in secrets store)"
   else
-    say "WARNING: SSH key upload failed: $upload_result" >&2
-    say "         staged key remains at $staged_key (upload manually or re-run)" >&2
+    # Never echo the response: a faulty endpoint may reflect key material.
+    say "ERROR: SSH key upload was rejected; staged key remains at $staged_key" >&2
+    return 1
   fi
 }
 

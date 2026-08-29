@@ -76,12 +76,12 @@ pub fn create_router(state: Arc<SshApiState>) -> Router {
         .route("/agent/keys", get(agent_keys));
 
     match &state.auth_token {
-        Some(_) => routes
+        Some(token) if !token.expose_secret().is_empty() => routes
             .route_layer(from_fn_with_state(state.clone(), ssh_api_auth))
             .with_state(state),
-        None => {
+        None | Some(_) => {
             warn!(
-                "SSH API routes disabled: {} is not set; SSH host/key management will 404",
+                "SSH API routes disabled: {} is not set or empty; SSH host/key management will 404",
                 SSH_API_TOKEN_ENV
             );
             Router::new()
@@ -524,6 +524,24 @@ mod tests {
             resp.status(),
             404,
             "no SSH_API_TOKEN configured -> SSH API must fail closed (not served)"
+        );
+    }
+
+    #[tokio::test]
+    async fn ssh_api_unmounted_with_empty_token() {
+        let state = Arc::new(make_test_state_with_token(Some("")).await);
+        let addr = serve_router(create_router(state)).await;
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://{addr}/agent/keys"))
+            .header("Authorization", "Bearer ")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "empty SSH_API_TOKEN must leave SSH API unmounted"
         );
     }
 
