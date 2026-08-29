@@ -57,6 +57,8 @@ system-bus `systemctl` or duplicate OpenRC lifecycle logic in wrappers.
   [`XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md`](XMPP_MESSAGE_BODY_LIMIT_SECURITY_REVIEW.md).
 - MCP: [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md) and
   [`MCP_ADDITIONS.md`](MCP_ADDITIONS.md).
+- SSH: [`SSH_KEY_LOG_EXPOSURE_KAGEHO.md`](SSH_KEY_LOG_EXPOSURE_KAGEHO.md)
+  (key-upload log-leak finding, fix, and rotation guidance).
 
 ## Planning and active ledgers
 

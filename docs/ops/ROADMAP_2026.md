@@ -20,5 +20,6 @@
 - BENCHMARKING_MODE — opt-in system-prompt addendum for unattended evaluation runs; adopt once automated eval infrastructure becomes a priority (`docs/ops/IRONCLAW_IDEAS_TAKEAWAYS.md`)
 - Interrupt/steer — mid-turn steering (inject guidance into an in-flight turn at the next model-call boundary instead of only queuing for the next turn) plus an interrupt mode that preserves queued follow-ups; cancellation plumbing already exists on both paths (v1 `/interrupt`, Engine V2 interrupt-aware dispatch) (`docs/ops/IRONCLAW_IDEAS_TAKEAWAYS.md`)
 - LTX sidecar healthpoint — the next sidecar target; the metrics exporter picks it up automatically once `health-ltx.sh` exists (`docs/proposals/HEALTHPOINT_METRICS_EXPORTER.md`)
-
+- Add the emoting mascot widget (web-gateway animated avatar mirroring agent roleplay phrases) to the 2.1 roadmap. Details: study-note topic emoting-mascot-2-1 / fact 206
+- desktop app
 ---

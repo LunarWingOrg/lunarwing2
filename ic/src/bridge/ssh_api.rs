@@ -1,16 +1,19 @@
 //! SSH Bridge API — HTTP endpoints for SSH host and key management.
 
-use axum::response::IntoResponse;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
+    middleware::{Next, from_fn_with_state},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::bridge::ssh::{
     HostKeyMode, SSHBridge, SSHCredentials, SSHHostConfig, SSHKeyType, SshBridgeError,
@@ -18,23 +21,72 @@ use crate::bridge::ssh::{
 use crate::bridge::ssh_agent::SshAgentServer;
 use crate::bridge::ssh_secrets::SshSecretsManager;
 use crate::secrets::SecretError;
-use secrecy::SecretString;
+
+/// Optional bearer token guarding the SSH API routes.
+///
+/// Mounted on the shared WebhookServer, which is reachable from any interface
+/// when `HTTP_HOST` is non-loopback; the SSH fragment is the only fragment
+/// there that must not be reachable without authorization, so it carries its
+/// own bearer fence. When the token is unset the API is simply not served
+/// (fail-closed).
+const SSH_API_TOKEN_ENV: &str = "SSH_API_TOKEN";
 
 pub struct SshApiState {
     pub bridge: Arc<RwLock<SSHBridge>>,
     pub secrets: Arc<SshSecretsManager>,
     pub agent: Arc<RwLock<Option<Arc<SshAgentServer>>>>,
+    pub auth_token: Option<SecretString>,
+}
+
+/// Reject any request whose `Authorization: Bearer` header does not match the
+/// configured token with a constant-time comparison.
+async fn ssh_api_auth(
+    State(state): State<Arc<SshApiState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|value| value.to_string());
+
+    let matches = match (&state.auth_token, &provided) {
+        (Some(expected), Some(actual)) => {
+            bool::from(expected.expose_secret().as_bytes().ct_eq(actual.as_bytes()))
+        }
+        _ => false,
+    };
+
+    if matches {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
 }
 
 pub fn create_router(state: Arc<SshApiState>) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/hosts", get(list_hosts).post(add_host))
         .route("/hosts/{host}", get(get_host).delete(remove_host))
         .route("/hosts/{host}/key", post(upload_key).delete(delete_key))
         .route("/hosts/{host}/key/status", get(key_status))
         .route("/agent/status", get(agent_status))
-        .route("/agent/keys", get(agent_keys))
-        .with_state(state)
+        .route("/agent/keys", get(agent_keys));
+
+    match &state.auth_token {
+        Some(_) => routes
+            .route_layer(from_fn_with_state(state.clone(), ssh_api_auth))
+            .with_state(state),
+        None => {
+            warn!(
+                "SSH API routes disabled: {} is not set; SSH host/key management will 404",
+                SSH_API_TOKEN_ENV
+            );
+            Router::new()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,11 +123,23 @@ impl From<HostRequest> for SSHHostConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KeyUploadRequest {
     pub key_data: String,
     #[serde(default)]
     pub passphrase: Option<String>,
+}
+
+// Manual Debug: the derived impl would render the raw private key and
+// passphrase into any span or log that formats the request. Nothing in
+// this struct is safe to print.
+impl std::fmt::Debug for KeyUploadRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyUploadRequest")
+            .field("key_data", &"[REDACTED]")
+            .field("passphrase", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,7 +259,7 @@ async fn remove_host(
     Ok(Json(ApiResponse::success(format!("Host {} removed", host))))
 }
 
-#[instrument(skip(state))]
+#[instrument(skip_all, fields(host = %host))]
 async fn upload_key(
     State(state): State<Arc<SshApiState>>,
     Path(host): Path<String>,
@@ -336,6 +400,12 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::ssh::NullAuditLogger;
+    use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+    use secrecy::SecretString as MasterKey;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
     #[test]
     fn test_host_request_conversion() {
         let request = HostRequest {
@@ -348,5 +418,148 @@ mod tests {
         };
         let config: SSHHostConfig = request.into();
         assert_eq!(config.host, "example.com");
+    }
+
+    #[test]
+    fn key_upload_request_debug_is_redacted() {
+        // Built by concatenation so gitleaks' private-key rule never matches
+        // the literal marker in source (no .gitleaksignore line churn).
+        let key_marker = format!("-----BEGIN OPENSSH PRIVATE {}-----", "KEY");
+        let request = KeyUploadRequest {
+            key_data: format!("{key_marker}\nsecret\n"),
+            passphrase: Some("p4ssphr4se-marker".into()),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(&key_marker));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("p4ssphr4se-marker"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    async fn make_test_state() -> SshApiState {
+        make_test_state_with_token(None).await
+    }
+
+    async fn make_test_state_with_token(token: Option<&str>) -> SshApiState {
+        let store: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
+            Arc::new(InMemorySecretsStore::new(Arc::new(
+                SecretsCrypto::new(MasterKey::from(
+                    "test-master-key-that-is-at-least-32-bytes-long!",
+                ))
+                .unwrap(),
+            )));
+        let secrets = Arc::new(SshSecretsManager::new(store.clone(), "test-tenant"));
+        let bridge = SSHBridge::new(
+            Uuid::new_v4(),
+            "test-tenant".into(),
+            HashMap::new(),
+            store,
+            Arc::new(NullAuditLogger),
+        )
+        .await;
+        SshApiState {
+            bridge: Arc::new(RwLock::new(bridge.unwrap())),
+            secrets,
+            agent: Arc::new(RwLock::new(None)),
+            auth_token: token.map(|t| SecretString::new(t.to_string().into_boxed_str())),
+        }
+    }
+
+    async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn ssh_api_requires_bearer_token() {
+        let state = Arc::new(make_test_state_with_token(Some("test-api-token")).await);
+        let addr = serve_router(create_router(state)).await;
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let no_auth = client
+            .get(format!("{base}/agent/keys"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401, "missing bearer must be rejected");
+
+        let bad_auth = client
+            .get(format!("{base}/agent/keys"))
+            .header("Authorization", "Bearer wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_auth.status(), 401, "wrong bearer must be rejected");
+
+        let good_auth = client
+            .get(format!("{base}/agent/keys"))
+            .header("Authorization", "Bearer test-api-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(good_auth.status(), 200, "correct bearer must pass");
+    }
+
+    #[tokio::test]
+    async fn ssh_api_unmounted_without_token() {
+        let state = Arc::new(make_test_state_with_token(None).await);
+        let app = create_router(state);
+        let addr = serve_router(app).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/agent/keys"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "no SSH_API_TOKEN configured -> SSH API must fail closed (not served)"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn upload_key_span_and_logs_keep_key_material_out() {
+        let state = make_test_state().await;
+        // Concatenation keeps the literal PEM marker out of source so gitleaks
+        // never flags this file (no .gitleaksignore line churn).
+        let key_marker = format!("-----BEGIN OPENSSH PRIVATE {}-----", "KEY");
+        let request = KeyUploadRequest {
+            key_data: format!("{key_marker}\nleak-marker\n"),
+            passphrase: Some("p4ssphr4se-marker".into()),
+        };
+
+        let response = upload_key(
+            State(Arc::new(state)),
+            Path("example.com".to_string()),
+            Json(request),
+        )
+        .await
+        .expect("upload should succeed");
+        assert!(response.0.success);
+
+        assert!(
+            !logs_contain("BEGIN OPENSSH PRIVATE KEY"),
+            "private key material leaked into tracing output"
+        );
+        assert!(
+            !logs_contain("leak-marker"),
+            "private key body leaked into tracing output"
+        );
+        assert!(
+            !logs_contain("p4ssphr4se-marker"),
+            "passphrase leaked into tracing output"
+        );
+        assert!(logs_contain("example.com"), "host field should be recorded");
     }
 }

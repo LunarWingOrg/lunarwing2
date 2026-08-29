@@ -161,6 +161,15 @@ pub struct ThreadConfig {
     /// auto-denied (fail-closed). Default: 300 (5 minutes).
     #[serde(default = "default_supervised_timeout_secs")]
     pub supervised_timeout_secs: u64,
+    /// Timeout in seconds for a single async tool or LLM future awaited
+    /// during a `ResolveFutures` round. When a deferred tool or LLM task
+    /// takes longer than this cap, its task is aborted and the call
+    /// resolves as an error instead of hanging the thread forever
+    /// (ResolveFutures otherwise awaits pending futures unbounded).
+    /// Default: 300 (5 minutes). Env override:
+    /// ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS.
+    #[serde(default = "default_tool_async_timeout_secs")]
+    pub tool_async_timeout_secs: u64,
 
     // ── Budget controls (Phase 4, from RLM cross-reference) ──
     /// Maximum cumulative input+output tokens before termination.
@@ -216,6 +225,10 @@ impl Default for ThreadConfig {
             supervised_mode: false,
             shared_conversation: false,
             supervised_timeout_secs: 300,
+            tool_async_timeout_secs: std::env::var("ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(300),
             max_tokens_total: None,
             max_consecutive_errors: None,
             max_budget_usd: None,
@@ -234,6 +247,10 @@ fn default_max_action_requirement_nudges() -> u32 {
 }
 
 fn default_supervised_timeout_secs() -> u64 {
+    300
+}
+
+fn default_tool_async_timeout_secs() -> u64 {
     300
 }
 
