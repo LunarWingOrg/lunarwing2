@@ -841,6 +841,17 @@ start_tenant() {
     sudo -u "$name" touch "$ssh_socket_path" 2>/dev/null || true
   fi
 
+  # Existing tenants may predate SSH_API_TOKEN. Backfill before daemon start so
+  # the fail-closed SSH API router is mounted when a staged key needs upload.
+  local staged_key
+  staged_key="$(tenant_env_dir "$name")/ssh_key_staged"
+  local ssh_token_backfilled="false"
+  if [[ -f "$staged_key" ]]; then
+    tenant_ssh_api_token_present "$name" || ssh_token_backfilled="true"
+    ensure_ssh_api_token "$name" \
+      || die "failed to provision SSH API credential for tenant '$name'"
+  fi
+
   # Start the daemon BEFORE the workers so the SSH agent socket exists when
   # the worker containers are created (podman bind-mounts the file at creation
   # time; if the socket doesn't exist yet, the mount is a stale touch-file).
@@ -853,16 +864,23 @@ start_tenant() {
   with_tenant_lifecycle_lock "$name" _start_tenant_init_services "$name" \
     || die "failed to start init services for tenant '$name'"
 
+  # `start` is a no-op for an already-running service. If this invocation added
+  # the token, restart once so the daemon mounts the authenticated SSH router.
+  if [[ "$ssh_token_backfilled" == "true" ]]; then
+    say "restarting lunarwing-${name} to load the new SSH API credential ..."
+    _restart_tenant_daemon "$name" \
+      || die "failed to restart tenant '$name' after SSH API credential backfill"
+  fi
+
   # Upload the staged SSH key to the secrets store (if one was provisioned by
   # add-tenant but not yet uploaded), BEFORE the workers start. If a key was
   # actually ingested, bounce the daemon once so the agent loads it (keys are
   # only read from the secrets store at startup); the workers then bind-mount
   # the post-bounce socket inode, so they are never left on a stale socket.
-  local staged_key
-  staged_key="$(tenant_env_dir "$name")/ssh_key_staged"
   warn_if_sshd_unreachable "$name"
   if [[ -f "$staged_key" ]]; then
-    upload_tenant_ssh_key "$name" || true
+    upload_tenant_ssh_key "$name" \
+      || die "SSH key upload failed for tenant '$name'; staged key retained"
     if [[ ! -f "$staged_key" ]]; then
       # Upload succeeded (upload_tenant_ssh_key deletes the staged file).
       say "restarting lunarwing-${name} so the SSH agent loads the new key ..."

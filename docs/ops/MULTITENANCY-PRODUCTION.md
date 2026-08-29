@@ -564,6 +564,14 @@ sudo scripts/lunarwing-mt-admin.sh build-kimi-worker
 
 ## Environment Variables
 
+### Tenant `lunarwing.env`
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SSH_API_TOKEN` | random per-tenant token | Dedicated bearer credential for every SSH host/key API route. Missing values leave the SSH API unmounted. `add-tenant` writes it; `configure-ssh` and staged-key startup backfill it atomically for older tenants without rotating an existing token. |
+
+### Host/operator environment
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LUNARWING_SERVICE_MANAGER` | auto-detect | Force `systemd` or `openrc` |

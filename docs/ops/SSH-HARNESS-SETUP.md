@@ -53,19 +53,23 @@ sudo ic/scripts/lunarwing-mt-admin.sh configure-ssh <name> \
   [--host <host-or-ip>] [--user <ssh-user>]
 ```
 
-`configure-ssh` runs two steps (`mt-admin`: `ensure_ssh_config` +
-`provision_tenant_ssh_key`):
+`configure-ssh` runs three steps (`mt-admin`: `ensure_ssh_config` +
+`ensure_ssh_api_token` + `provision_tenant_ssh_key`):
 
 1. **`ensure_ssh_config`** appends a `[[ssh.hosts]]` block to the tenant's
    `config.toml` (idempotent, append-only — never overwrites existing config).
-2. **`provision_tenant_ssh_key`** generates
+2. **`ensure_ssh_api_token`** preserves an existing `SSH_API_TOKEN` or adds a
+   dedicated token to `lunarwing.env` atomically for older tenants.
+3. **`provision_tenant_ssh_key`** generates
    `/home/<name>/.ssh/id_ed25519_lunarwing`, adds the public key to
    `authorized_keys`, and stages the private key at
    `<env_dir>/ssh_key_staged` (mode 0600).
 
 The staged private key is uploaded to the secrets store and then deleted on the
 next `up`/start of the tenant (`mt-admin`: `upload_tenant_ssh_key`, which POSTs
-to the SSH API and removes the staged file on success).
+to the SSH API and removes the staged file on success). Upload failures stop the
+tenant start before workers launch, print a clear error, and retain the staged
+key for retry; they are never treated as successful rotation.
 
 ### How the socket reaches the worker
 
@@ -269,6 +273,10 @@ In dev mode the tool is auto-discovered from `tools-src/ssh/`; the registry entr
 
 Base URL is the daemon's HTTP port (no prefix). All responses are
 `{"success": bool, "data": ..., "error": ...}`.
+
+Every route requires `Authorization: Bearer <SSH_API_TOKEN>`. The dedicated
+token lives in the tenant's mode-0600 `lunarwing.env`; mt-admin generates it for
+new tenants and backfills it before staging/uploading keys for older tenants.
 
 | Method + path | Purpose |
 |---|---|

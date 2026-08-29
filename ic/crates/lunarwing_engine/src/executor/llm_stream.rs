@@ -83,10 +83,9 @@ impl StreamAccumulator {
             for (index, call) in self.tool_calls {
                 calls.push(call.finish(index)?);
             }
-            LlmResponse::ActionCalls {
-                calls,
-                content: (!self.text.is_empty()).then_some(self.text),
-            }
+            // Consume FINAL pseudo-actions (provider-mangled CodeAct syntax)
+            // before they can enter tool history as unleasable actions.
+            LlmResponse::from_action_calls(calls, (!self.text.is_empty()).then_some(self.text))
         };
 
         Ok(LlmOutput {
