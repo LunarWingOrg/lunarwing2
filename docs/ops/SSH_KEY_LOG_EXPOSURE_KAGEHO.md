@@ -1,16 +1,24 @@
-# SSH Key Upload Log Exposure — Finding, Fix, and Operations
+# SSH Key API Exposure — Log Leak, Unauthenticated Router, and Operations
 
-**Status:** Fixed (commit `09b0f507`, plus CI allowlist `d89ceff8`)
-**Severity:** HIGH (secret retention in logs)
-**Found by:** goal-26 systemd stress rerun (`aj/kimi-26-20260828-2023`, finding F2)
+**Status:** Both findings fixed (log leak: `09b0f507`; router fence: `8c323c43`; CI allowlist: `d89ceff8`)
+**Severity:** HIGH (secret retention in logs) + MEDIUM (unauthenticated key management)
+**Found by:** goal-26 systemd stress rerun (`aj/kimi-26-20260828-2023`, finding F2) and wrench's post-fix review (finding #2)
 
 ## TL;DR
 
-Uploading an SSH key to a tenant through the gateway API wrote the **raw private
-key and optional passphrase into logs** on any host that used the feature. The
-code defect is fixed; **any host that already performed a key upload must rotate
-those keys and clean its log sinks** — no code change undoes what journald or a
-log file already retained.
+Two related defects on the tenant SSH key-management surface:
+
+1. **Log leak (HIGH)** — uploading an SSH key through the gateway API wrote the
+   **raw private key and optional passphrase into logs** on any host that used
+   the feature. Fixed; **any host that already performed a key upload must
+   rotate those keys and clean its log sinks** — no code change undoes what
+   journald or a log file already retained.
+2. **Unauthenticated router (MEDIUM)** — the SSH API fragment on the shared
+   WebhookServer carried no authentication, so anyone who could reach the
+   webhook port could enumerate hosts, register arbitrary ones, overwrite
+   stored keys (hot-loaded into the agent), or delete them. Fixed: all SSH API
+   routes now require a bearer token, and the webhook server no longer
+   defaults to a non-loopback bind.
 
 ## What happened
 
@@ -90,7 +98,7 @@ longer carries the request at all.
 
 ## Regression coverage
 
-`ic/src/bridge/ssh_api.rs` tests (3/3 pass):
+`ic/src/bridge/ssh_api.rs` tests (5/5 pass):
 
 - `key_upload_request_debug_is_redacted` — `format!("{request:?}")` contains no
   key marker, key body, or passphrase.
@@ -98,6 +106,10 @@ longer carries the request at all.
   (in-memory secrets store, real `SSHBridge`, agent `None`) under a captured
   tracing subscriber and asserts the key marker, key body, and passphrase are
   absent from captured output while the host field is present.
+- `ssh_api_requires_bearer_token` — over a real bound listener: 401 without a
+  token, 401 with a wrong token, 200 with the correct token.
+- `ssh_api_unmounted_without_token` — no `SSH_API_TOKEN` configured → the
+  routes are not served at all (fail-closed 404).
 
 CI's gitleaks `secret-detection` job initially flagged the test fixtures
 themselves; they are allowlisted by fingerprint in `.gitleaksignore`
@@ -112,13 +124,22 @@ themselves; they are allowlisted by fingerprint in `.gitleaksignore`
    any central log sink the daemons shipped to.
 3. Hosts that never used the key-upload endpoint are unaffected.
 
+## Migration note for the router fence
+
+Tenants running the new daemon before their `lunarwing.env` is regenerated
+will have the SSH API **unmounted** (fail-closed) until `SSH_API_TOKEN` lands
+in their env — mt-admin's `add-tenant`, `start-tenant`, and `upgrade-tenant`
+flows regenerate it. After an upgrade, verify the tenant env contains
+`SSH_API_TOKEN=` before relying on staged-key uploads; the mt-admin upload
+path reads the token from the env file automatically.
+
 ## Related hardening — the router itself is now fenced
 
 Review of the same surface (wrench, finding #2, MEDIUM) showed the SSH API
 fragment on the shared WebhookServer carried **no authentication at all**:
 anyone able to reach the webhook port could enumerate hosts, register
-arbitrary ones, overwrite stored keys, or delete them. The same change fences
-that surface:
+arbitrary ones, overwrite stored keys, or delete them. Commit `8c323c43`
+fences that surface:
 
 - `Authorization: Bearer <SSH_API_TOKEN>` is now required on every SSH API
   route (constant-time comparison). Fail-closed: without the token configured
@@ -132,7 +153,8 @@ that surface:
 
 ## References
 
-- Fix: `09b0f507` ("fix(ssh): keep key upload secrets out of tracing spans and logs")
+- Log-leak fix: `09b0f507` ("fix(ssh): keep key upload secrets out of tracing spans and logs")
+- Router fence: `8c323c43` ("fix(ssh): require bearer auth on SSH API and default webhook bind to loopback")
 - CI allowlist: `d89ceff8`
 - Finding source: `docs/ops/v2.0.9.0_GOAL25_STRESS_TEST_FINDINGS_SYSTEMD.md` (F2)
 - Repo invariant: `secrecy` types for sensitive values; never log or expose secrets
