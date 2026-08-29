@@ -116,6 +116,121 @@ impl LlmResponse {
             None => Self::Text(text),
         }
     }
+
+    /// Build a response from provider-supplied structured action calls,
+    /// consuming CodeAct final-answer pseudo-actions.
+    ///
+    /// Some OpenAI-compatible endpoints surface the model's CodeAct
+    /// `FINAL(answer)` syntax as structured tool calls (`FINAL`,
+    /// `FINAL()`, `FINAL(answer...</arg_value>`). Those names have no
+    /// capability lease, so executing them only records junk
+    /// `No lease for action` failures in thread history. Consume
+    /// final-answer syntax here instead (mirroring the orchestrator's
+    /// `extract_final` handling): an all-FINAL batch becomes a text
+    /// response carrying a parseable `FINAL(...)`, while FINAL-shaped junk
+    /// mixed with real capability calls is dropped.
+    pub fn from_action_calls(calls: Vec<ActionCall>, content: Option<String>) -> Self {
+        let (finals, real_calls): (Vec<ActionCall>, Vec<ActionCall>) = calls
+            .into_iter()
+            .partition(|call| is_final_pseudo_action(&call.action_name));
+
+        if real_calls.is_empty() {
+            if finals.is_empty() {
+                return Self::from_text(content.unwrap_or_default());
+            }
+            let answer = finals
+                .first()
+                .and_then(final_answer_of)
+                .filter(|answer| !answer.is_empty())
+                .or_else(|| content.clone().filter(|text| !text.is_empty()))
+                .unwrap_or_else(|| "Task completed.".to_string());
+            let mut text = content.unwrap_or_default();
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format_final_call(&answer));
+            return Self::from_text(text);
+        }
+
+        if !finals.is_empty() {
+            tracing::warn!(
+                dropped = finals.len(),
+                "dropped FINAL pseudo-action(s) mixed into structured tool calls"
+            );
+        }
+        Self::ActionCalls {
+            calls: real_calls,
+            content,
+        }
+    }
+}
+
+/// Detect a CodeAct final-answer pseudo-action surfaced as a tool call name.
+fn is_final_pseudo_action(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    lower == "final"
+        || lower.starts_with("final(")
+        || lower == "final_var"
+        || lower.starts_with("final_var(")
+}
+
+/// Best-effort extraction of the intended final answer from a bogus call.
+fn final_answer_of(call: &ActionCall) -> Option<String> {
+    final_answer_from_parameters(&call.parameters)
+        .or_else(|| final_answer_from_name(&call.action_name))
+}
+
+/// Read a human-readable answer out of common parameter shapes.
+fn final_answer_from_parameters(params: &serde_json::Value) -> Option<String> {
+    match params {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) => {
+            for key in [
+                "answer",
+                "final_answer",
+                "text",
+                "content",
+                "result",
+                "response",
+                "message",
+                "output",
+            ] {
+                if let Some(value) = map.get(key).and_then(|v| v.as_str())
+                    && !value.is_empty()
+                {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Recover an answer embedded in a malformed name such as
+/// `FINAL("All steps completed")</arg_value>`.
+fn final_answer_from_name(name: &str) -> Option<String> {
+    let open = name.find('(')?;
+    let inner = &name[open + 1..];
+    let end = inner.find("</").unwrap_or(inner.len());
+    let inner = inner[..end].trim();
+    let inner = inner.strip_suffix(')').unwrap_or(inner).trim();
+    let unquoted = inner
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .unwrap_or(inner)
+        .trim();
+    (!unquoted.is_empty()).then(|| unquoted.to_string())
+}
+
+/// Render an answer as a `FINAL(...)` call the orchestrator can parse.
+fn format_final_call(answer: &str) -> String {
+    if answer.contains("\"\"\"") {
+        format!("FINAL({answer})")
+    } else {
+        format!("FINAL(\"\"\"{answer}\"\"\")")
+    }
 }
 
 /// Extract Python code from fenced code blocks in an LLM response.
@@ -225,7 +340,161 @@ mod duration_millis {
 
 #[cfg(test)]
 mod tests {
-    use super::LlmResponse;
+    use super::{ActionCall, LlmResponse};
+
+    fn call(name: &str, parameters: serde_json::Value) -> ActionCall {
+        ActionCall {
+            id: "call-1".to_string(),
+            action_name: name.to_string(),
+            parameters,
+        }
+    }
+
+    fn extract_final_answer(text: &str) -> Option<String> {
+        // Mirror extract_final() in orchestrator/default.py: FINAL("""...""").
+        let idx = text.find("FINAL(")?;
+        let after = &text[idx + 6..];
+        let after = after.strip_prefix("\"\"\"")?;
+        let end = after.find("\"\"\"")?;
+        Some(after[..end].to_string())
+    }
+
+    #[test]
+    fn from_action_calls_passes_real_calls_through() {
+        let response = LlmResponse::from_action_calls(
+            vec![call("memory_write", serde_json::json!({"path": "a.md"}))],
+            Some("reasoning".to_string()),
+        );
+        let LlmResponse::ActionCalls { calls, content } = response else {
+            panic!("real calls must stay structured");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].action_name, "memory_write");
+        assert_eq!(content.as_deref(), Some("reasoning"));
+    }
+
+    #[test]
+    fn from_action_calls_consumes_bare_final_with_answer_params() {
+        let response = LlmResponse::from_action_calls(
+            vec![call("FINAL", serde_json::json!({"answer": "done: 24 bytes"}))],
+            None,
+        );
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL-only batch must become text");
+        };
+        assert_eq!(extract_final_answer(&text).as_deref(), Some("done: 24 bytes"));
+    }
+
+    #[test]
+    fn from_action_calls_consumes_final_junk_with_xml_suffix() {
+        // Observed live: name `FINAL()</arg_value>` carrying the answer only in
+        // the provider's argument payload.
+        let response = LlmResponse::from_action_calls(
+            vec![call(
+                "FINAL()</arg_value>",
+                serde_json::json!({"answer": "All four steps completed"}),
+            )],
+            Some("report".to_string()),
+        );
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL junk call must become text");
+        };
+        assert!(text.starts_with("report\n"));
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("All four steps completed")
+        );
+    }
+
+    #[test]
+    fn from_action_calls_recovers_answer_embedded_in_malformed_name() {
+        // Observed live: `FINAL(answer...</arg_value>` with the answer inside
+        // the fabricated tool name itself.
+        let response = LlmResponse::from_action_calls(
+            vec![call(
+                "FINAL(All four steps completed with actual tool results)</arg_value>",
+                serde_json::json!({}),
+            )],
+            None,
+        );
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL-only batch must become text");
+        };
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("All four steps completed with actual tool results")
+        );
+    }
+
+    #[test]
+    fn from_action_calls_consumes_final_var() {
+        let response = LlmResponse::from_action_calls(
+            vec![call("FINAL_VAR", serde_json::json!({"result": "summary text"}))],
+            None,
+        );
+        assert!(matches!(response, LlmResponse::Text(_)));
+    }
+
+    #[test]
+    fn from_action_calls_drops_final_mixed_with_real_calls() {
+        let response = LlmResponse::from_action_calls(
+            vec![
+                call("memory_write", serde_json::json!({"path": "a.md"})),
+                call("FINAL", serde_json::json!({"answer": "junk"})),
+            ],
+            None,
+        );
+        let LlmResponse::ActionCalls { calls, .. } = response else {
+            panic!("mixed batch must keep the real call structured");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].action_name, "memory_write");
+    }
+
+    #[test]
+    fn from_action_calls_falls_back_to_content_then_default() {
+        let response = LlmResponse::from_action_calls(
+            vec![call("finAL(", serde_json::json!({}))],
+            Some("the claimed answer".to_string()),
+        );
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL-only batch must become text");
+        };
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("the claimed answer")
+        );
+
+        let response =
+            LlmResponse::from_action_calls(vec![call("FINAL", serde_json::json!({}))], None);
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL-only batch must become text");
+        };
+        assert_eq!(extract_final_answer(&text).as_deref(), Some("Task completed."));
+    }
+
+    #[test]
+    fn from_action_calls_empty_batch_becomes_text() {
+        let response = LlmResponse::from_action_calls(vec![], Some("plain".to_string()));
+        assert!(matches!(response, LlmResponse::Text(text) if text == "plain"));
+    }
+
+    #[test]
+    fn from_action_calls_final_answer_survives_triple_quotes() {
+        let response = LlmResponse::from_action_calls(
+            vec![call(
+                "FINAL",
+                serde_json::json!({"answer": "quoted \"\"\" inside"}),
+            )],
+            None,
+        );
+        // Unquoted fallback keeps FINAL(...) shape for balanced-paren parsing.
+        let LlmResponse::Text(text) = response else {
+            panic!("FINAL-only batch must become text");
+        };
+        assert!(text.ends_with(")"));
+        assert!(text.contains("quoted \"\"\" inside"));
+    }
 
     fn extracted_code(text: &str) -> Option<String> {
         match LlmResponse::from_text(text.to_string()) {

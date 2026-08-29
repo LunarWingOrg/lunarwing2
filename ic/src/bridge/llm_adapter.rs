@@ -190,8 +190,10 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
     let llm_response = if response.tool_calls.is_empty() {
         LlmResponse::from_text(response.content.unwrap_or_default())
     } else {
-        LlmResponse::ActionCalls {
-            calls: response
+        // Consume FINAL pseudo-actions (provider-mangled CodeAct syntax)
+        // before they can enter tool history as unleasable actions.
+        LlmResponse::from_action_calls(
+            response
                 .tool_calls
                 .into_iter()
                 .map(|call| lunarwing_engine::ActionCall {
@@ -200,8 +202,8 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
                     parameters: call.arguments,
                 })
                 .collect(),
-            content: response.content,
-        }
+            response.content,
+        )
     };
 
     LlmOutput {
