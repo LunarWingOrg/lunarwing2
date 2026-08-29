@@ -426,7 +426,21 @@ attenuating `memory_write`. LunarWing now logs this per-turn tool attenuation at
   registry patches moved to darkirc 0.1.6, multica 0.1.8, weechat 0.2.7, and
   xmpp 0.1.11.
 - Container CI's moving worker tag is now `v2.0.9.0`; `latest` and immutable
-  commit-SHA tags remain in use.
+  commit-SHA tags remain in use. Worker image tool pins moved to opencode
+  v1.18.23 and kimi-code 0.39.0.
+- The root README was rewritten for clarity and now documents the WeeChat
+  relay's reconnect recovery (outbox, backfill, health fields) and the
+  `--with-study-mcp` one-shot knowledge seed. A new operator guide,
+  [`docs/guides/TENANT_KNOWLEDGE_SEED.md`](docs/guides/TENANT_KNOWLEDGE_SEED.md),
+  walks through seeding a new tenant from the synced lw2studymcp base and the
+  correct re-arm path.
+- New `docs/ops/v2.0.9.0_OPEN_WORK_ITEMS_STATUS.md` tracks each open GitLab
+  work item's addressed/unaddressed state, and the OpenRC and systemd stress
+  plans plus dated findings live under `docs/ops/v2.0.9.0_GOAL25_*` and
+  `docs/ops/v2.0.9.0_GOAL26_*`.
+- The CI architecture-boundary check passes again: the LLM module now imports
+  the role-token neutralizer from the `lunarwing_safety` workspace crate
+  directly rather than through the `crate::safety` re-export shim.
 
 ## Upgrade Notes
 
@@ -454,6 +468,21 @@ attenuating `memory_write`. LunarWing now logs this per-turn tool attenuation at
 8. No operator action is needed for the mission lease correction or self-repair
    counter reset. After the first v2.0.9.0 restart, repair attempts begin a new
    bounded boot cycle and restricted threads receive the corrected action list.
+9. The SSH host/key API now requires `Authorization: Bearer <SSH_API_TOKEN>`.
+   mt-admin provisions and persists the token in each tenant's `lunarwing.env`;
+   any custom integration calling those routes must send it. When the token is
+   unset the SSH routes are not mounted at all.
+10. The webhook server now binds `127.0.0.1` by default. If external machines
+    legitimately post webhooks to it, set `HTTP_HOST` explicitly — the previous
+    implicit `0.0.0.0` exposure is gone.
+11. Redeploy the WeeChat relay adapter (0.4.2) alongside the daemon so
+    reconnect fixes, the outbound queue, and reconnect backfill take effect.
+    Leave `WS_ADAPTER_HEARTBEAT_SECONDS` unset unless the relay is known to
+    answer WebSocket PINGs.
+12. Engine V2 deferred tool/LLM calls now time out after
+    `tool_async_timeout_secs` (default 300). Tune
+    `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS` only if legitimate tool calls can
+    exceed five minutes.
 
 ## Known Issues
 
@@ -464,11 +493,13 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
 
 ### Active Runtime and Integration Follow-ups
 
-- **Synchronous worker calls still serialize ordinary turns.** A built-in Docker
-  `create_job` call with the default `wait=true` occupies its originating turn;
-  priority interrupts work and ordinary messages enter a bounded FIFO, but
-  ordinary turns do not execute concurrently. External workers default to
-  `wait=false`. See
+- **Synchronous worker calls still occupy their originating thread.** A
+  built-in Docker `create_job` call with the default `wait=true` holds its
+  originating turn until the worker result, timeout, or an interrupt;
+  distinct scoped Engine V2 gateway threads for the same user now run in
+  parallel (bounded to four, with an explicit busy response on overflow), but
+  a later message on the same thread remains deferred. External workers
+  default to `wait=false`. See
   [`BUG-agent-worker-lifecycle.md`](docs/bugs/BUG-agent-worker-lifecycle.md).
 - **Some E2E coverage remains incomplete.** Bootstrap E2E scenarios are ignored
   because of a harness race, and clipboard runtime behavior remains unverified.
@@ -546,6 +577,9 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
   longer bypasses sanitize-and-wrap handling in the chat/shared execution paths.
 - Engine V2 structured JSON and action history no longer preserve intact
   ChatML-family role-token openers from tool output.
+- Retrieved memory documents, external-content wrappers, active skills,
+  CodeAct and assembled system prompts, and mission meta prompts no longer
+  carry intact role tokens into LLM-bound prompts (work items #79/#80).
 - Terminal `ManualRequired` repairs no longer retry forever, repair counters no
   longer remain exhausted across daemon restarts, and healthy built-in tools are
   no longer sent to the WASM repair builder.
@@ -555,3 +589,23 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
   it.
 - The reported environment-variable dependency for `memory_write` was ruled
   out; intentional installed-skill attenuation is now visible at info level.
+- Engine V2 no longer starts dormant: missions, routines, thread recovery, and
+  the mission webhook endpoint are live immediately after a daemon restart,
+  and independent gateway threads no longer head-of-line block each other.
+- Foreground Engine V2 threads honor `AGENT_MAX_TOOL_ITERATIONS`, and wedged
+  deferred tool/LLM futures are aborted by `tool_async_timeout_secs` instead
+  of hanging a thread forever.
+- The WeeChat relay no longer drops lines accepted during socket outages or
+  adapter restarts, no longer retries instantly after ERROR frames, and no
+  longer churns reconnects against WeeChat versions that ignore WebSocket
+  PINGs.
+- The SSH host/key API is bearer-authenticated and fail-closed, key-upload
+  secrets no longer reach logs, and the webhook server defaults to a loopback
+  bind.
+- `memory_write` no longer intermittently returns 500 when two updates reach
+  the same workspace document concurrently, workspace paths containing `..`
+  no longer create traversal-shaped database entries, `/api/memory/search`
+  returns usable document paths, and blank-`thread_id` chat sends are
+  rejected with 400 instead of being silently unroutable.
+- mt-admin reports live custom OpenRC services as `started` instead of
+  `unknown`.
