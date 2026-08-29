@@ -523,29 +523,10 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
   [`BUG-ssh-git-ref-and-remote-head.md`](docs/bugs/BUG-ssh-git-ref-and-remote-head.md).
 - **WeeChat's `rand_check` is still a stub.** The unused import was fixed, but
   the function always returns false and should be implemented or removed. See
-  [`BUG-weechat-relay-rand-check.md`](docs/bugs/BUG-weechat-relay-rand-check.md).
-- **Worker workspace path normalization is partial.** Structured OpenCode paths
-  expand `~`; prompt-generated paths and Pebble paths remain open. See
-  [`BUG-worker-workspace-path-expansion.md`](docs/bugs/BUG-worker-workspace-path-expansion.md).
-- **XMPP/WASM delivery retains a bounded-queue backpressure risk.** Poll-loop
-  crashes, stalls, callback failures, and completed dispatch failures are
-  supervised and health-visible, but a full downstream queue can leave dispatch
-  awaiting capacity indefinitely before a failure can be recorded. Health
-  reporting exposes completed failures; it does not automatically cancel or
-  restart a merely blocked dispatch. See
-  [`BUG-xmpp-polling-and-backpressure.md`](docs/bugs/BUG-xmpp-polling-and-backpressure.md).
-- **Historical OMEMO MUC fallback spam is still unverified.** Generic stuck
-  `Processing` recovery is fixed, but the cross-JID/plaintext-fallback symptom
-  still needs a current live reproduction or closure. See
-  [`BUG-xmpp-omemo-warmup-and-processing.md`](docs/bugs/BUG-xmpp-omemo-warmup-and-processing.md).
+  [`BUG-weechat-relay-rand-check.md`](docs/bugs/BUG-weechat-relay-rand-check.md)
 
 ### Security, Deployment, and Release Limitations
 
-- Eight accepted RustSec advisories remain in `ic/deny.toml`: libSQL's legacy
-  TLS/tonic/h2 chain, the vendored Signal/failure dependencies, and RSA's
-  unpatched timing advisory block removal or upgrades. The h2 0.4 line is
-  patched; the accepted h2 0.3.27 copy is reachable through libSQL's legacy
-  chain.
 - DarkIRC Secure Key Exchange Stages B-D and automated QR/web/trusted-channel
   key delivery remain disabled. Stage A acceptance does not imply that contact
   security is fully activated.
@@ -563,14 +544,12 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
   bounding rather than hard memory, CPU, and task ceilings. mt-admin reports
   the fallback reason.
 - `ALLOW_PRIVATE_IPS=1` weakens public-address SSRF protections. Enable it only
-  for an intentionally trusted private-network deployment.
+  for an intentionally trusted private-network deployment
 - `cargo check --tests --no-default-features --features postgres` retains the
   pre-existing cfg(test) failures described in the v2.0.8.0 notes; CI does not
   run that exact feature/test shape. PostgreSQL production check coverage and
   default/libSQL test coverage are separate jobs.
 - Kawarimi remains PostgreSQL-only.
-- Full release-test aggregation still depends on real channel WASM artifacts and
-  environment-specific skill-selection/TensorZero streaming expectations.
 - GitLab CI verifies source but does not publish release packages or deploy
   tenants automatically.
 - Large worker-image pushes can still fail with registry `499 Client Closed
