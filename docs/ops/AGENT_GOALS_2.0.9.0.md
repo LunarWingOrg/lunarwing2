@@ -39,7 +39,7 @@
     - (context only, do not re-analyze) Prior evidence: stress25r2 run of 2026-08-28 embedded in git history at `d612acff`; original findings F1-F4 + rerun findings F5-F8 in the findings doc. Item #3's OpenRC status fix landed after the prior run — verify F6 now shows `started`.
 26. [ ] Re-run the systemd stress test exactly per `docs/ops/v2.0.9.0_GOAL26_STRESS_TEST_PLAN_SYSTEMD.md` — unchanged harness, unchanged scales, against current HEAD. Fresh tenant (full spin-up), run the full gauntlet, destroy the tenant when done. Append a dated results section to `docs/ops/v2.0.9.0_GOAL25_STRESS_TEST_FINDINGS_SYSTEMD.md`. No planning or analysis of prior runs is needed — the plan is final; execute and record. Note in the results which prior findings are confirmed fixed vs still present on this HEAD.
     - (context only, do not re-analyze) Prior evidence: goal26sd run of 2026-08-28 on branch `aj/kimi-26-20260828-0001` (salvage-documented); its findings are already in the findings doc.
-27. [ ] Refer to item 7. Proper documentation is needed. All new Environment Variables which live in the tenant .env must be documented
+27. [x] Refer to item 7. Proper documentation is needed. All new Environment Variables which live in the tenant .env must be documented
 28. [x] (S) reserved for CI/CD fixes
 29. [ ] update release notes draft at root of repo to reflect all changes not currently reflected currently. do not rely on the commit hash of the last edit of this document
 
