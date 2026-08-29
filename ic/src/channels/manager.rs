@@ -1,6 +1,6 @@
 //! Channel manager for coordinating multiple input channels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use futures::stream;
@@ -109,8 +109,8 @@ fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
 /// push messages into the agent loop without being a full `Channel` impl.
 pub struct ChannelManager {
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
-    /// Most recent startup failure for channels that remain registered.
-    start_failures: RwLock<HashMap<String, String>>,
+    /// Channels whose latest startup attempt failed while they remain registered.
+    start_failures: RwLock<HashSet<String>>,
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
@@ -129,7 +129,7 @@ impl ChannelManager {
         let (inject_tx, inject_rx) = mpsc::channel(64);
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
-            start_failures: RwLock::new(HashMap::new()),
+            start_failures: RwLock::new(HashSet::new()),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
@@ -179,10 +179,7 @@ impl ChannelManager {
                 stream
             }
             Err(error) => {
-                self.start_failures
-                    .write()
-                    .await
-                    .insert(name, error.to_string());
+                self.start_failures.write().await.insert(name);
                 return Err(error);
             }
         };
@@ -226,10 +223,7 @@ impl ChannelManager {
                     streams.push(stream);
                 }
                 Err(error) => {
-                    self.start_failures
-                        .write()
-                        .await
-                        .insert(name.clone(), error.to_string());
+                    self.start_failures.write().await.insert(name.clone());
                     tracing::error!("Failed to start channel {}: {}", name, error);
                     // Continue with other channels, don't fail completely
                 }
@@ -369,10 +363,10 @@ impl ChannelManager {
         let mut results = HashMap::new();
 
         for (name, channel) in channels.iter() {
-            let result = if let Some(reason) = start_failures.get(name) {
+            let result = if start_failures.contains(name) {
                 Err(ChannelError::HealthCheckFailed {
                     name: name.clone(),
-                    reason: format!("channel failed to start: {reason}"),
+                    reason: "channel failed to start; see daemon logs".to_string(),
                 })
             } else {
                 channel.health_check().await
@@ -618,6 +612,7 @@ mod tests {
             .expect_err("failed startup must make channel unhealthy")
             .to_string();
         assert!(error.contains("channel failed to start"), "{error}");
+        assert!(!error.contains("already called"), "{error}");
 
         let (replacement, _) = StubChannel::new("optional");
         manager.add(Box::new(replacement)).await;
