@@ -645,6 +645,42 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum WasmChannelHealthState {
+    Healthy,
+    StartupFailed,
+    StartupDegraded,
+    PollFailed,
+    PollDispatchFailed,
+}
+
+const CALLBACK_HEALTH_PREFIX: &str = "[health]";
+const POLL_FAILURE_HEALTH_THRESHOLD: u32 = 3;
+
+impl WasmChannelHealthState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Healthy as u8 => Self::Healthy,
+            value if value == Self::StartupFailed as u8 => Self::StartupFailed,
+            value if value == Self::StartupDegraded as u8 => Self::StartupDegraded,
+            value if value == Self::PollFailed as u8 => Self::PollFailed,
+            value if value == Self::PollDispatchFailed as u8 => Self::PollDispatchFailed,
+            _ => Self::StartupFailed,
+        }
+    }
+
+    fn failure_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Healthy => None,
+            Self::StartupFailed => Some("startup callback failed"),
+            Self::StartupDegraded => Some("startup callback reported a warning or error"),
+            Self::PollFailed => Some("polling callback persistently failing"),
+            Self::PollDispatchFailed => Some("polling callback output could not be delivered"),
+        }
+    }
+}
+
 /// A WASM-based channel implementing the Channel trait.
 #[allow(dead_code)]
 pub struct WasmChannel {
@@ -692,6 +728,13 @@ pub struct WasmChannel {
 
     /// If no poll tick occurs within this duration, the channel is considered stalled.
     poll_stall_threshold_ms: std::sync::atomic::AtomicU64,
+
+    /// Latest callback-level health state, shared with the polling supervisor.
+    callback_health: Arc<std::sync::atomic::AtomicU8>,
+
+    /// Consecutive poll callback/dispatch health failures. Transient failures
+    /// below the threshold do not flap externally reported health.
+    consecutive_poll_failures: Arc<std::sync::atomic::AtomicU32>,
 
     /// Registered HTTP endpoints.
     endpoints: RwLock<Vec<RegisteredEndpoint>>,
@@ -932,6 +975,10 @@ impl WasmChannel {
             poll_task: RwLock::new(None),
             last_poll_epoch_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             poll_stall_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            callback_health: Arc::new(std::sync::atomic::AtomicU8::new(
+                WasmChannelHealthState::Healthy as u8,
+            )),
+            consecutive_poll_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
@@ -1043,7 +1090,7 @@ impl WasmChannel {
         }
 
         let (start_result, mut host_state) = self.execute_on_start_with_state().await?;
-        self.log_on_start_host_state(&mut host_state);
+        self.log_callback_host_state(&mut host_state);
 
         match start_result {
             Ok(_) => Ok(()),
@@ -1277,26 +1324,64 @@ impl WasmChannel {
         )
     }
 
-    fn log_on_start_host_state(&self, host_state: &mut ChannelHostState) {
-        for entry in host_state.take_logs() {
+    fn set_callback_health(&self, state: WasmChannelHealthState) {
+        self.callback_health
+            .store(state as u8, std::sync::atomic::Ordering::Release);
+    }
+
+    fn reset_poll_health(&self) {
+        self.consecutive_poll_failures
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.set_callback_health(WasmChannelHealthState::Healthy);
+    }
+
+    fn record_poll_failure(&self, state: WasmChannelHealthState) {
+        Self::record_poll_failure_shared(
+            &self.consecutive_poll_failures,
+            &self.callback_health,
+            state,
+        );
+    }
+
+    fn record_poll_failure_shared(
+        failures: &std::sync::atomic::AtomicU32,
+        health: &std::sync::atomic::AtomicU8,
+        state: WasmChannelHealthState,
+    ) {
+        let count = failures.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        if count >= POLL_FAILURE_HEALTH_THRESHOLD {
+            health.store(state as u8, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn callback_health(&self) -> WasmChannelHealthState {
+        WasmChannelHealthState::from_raw(
+            self.callback_health
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    fn log_callback_entries(
+        channel_name: &str,
+        entries: Vec<crate::tools::wasm::LogEntry>,
+    ) -> bool {
+        let mut degraded = false;
+        for entry in entries {
+            degraded |= matches!(entry.level, LogLevel::Warn | LogLevel::Error)
+                && entry.message.starts_with(CALLBACK_HEALTH_PREFIX);
             match entry.level {
-                crate::tools::wasm::LogLevel::Error => {
-                    tracing::error!(channel = %self.name, "{}", entry.message);
-                }
-                crate::tools::wasm::LogLevel::Warn => {
-                    tracing::warn!(channel = %self.name, "{}", entry.message);
-                }
-                crate::tools::wasm::LogLevel::Info => {
-                    tracing::info!(channel = %self.name, "{}", entry.message);
-                }
-                crate::tools::wasm::LogLevel::Trace => {
-                    tracing::trace!(channel = %self.name, "{}", entry.message);
-                }
-                _ => {
-                    tracing::debug!(channel = %self.name, "{}", entry.message);
-                }
+                LogLevel::Error => tracing::error!(channel = %channel_name, "{}", entry.message),
+                LogLevel::Warn => tracing::warn!(channel = %channel_name, "{}", entry.message),
+                LogLevel::Info => tracing::info!(channel = %channel_name, "{}", entry.message),
+                LogLevel::Trace => tracing::trace!(channel = %channel_name, "{}", entry.message),
+                LogLevel::Debug => tracing::debug!(channel = %channel_name, "{}", entry.message),
             }
         }
+        degraded
+    }
+
+    fn log_callback_host_state(&self, host_state: &mut ChannelHostState) -> bool {
+        Self::log_callback_entries(&self.name, host_state.take_logs())
     }
 
     async fn execute_on_start_with_state(
@@ -1373,6 +1458,7 @@ impl WasmChannel {
     pub async fn call_on_start(&self) -> Result<ChannelConfig, WasmChannelError> {
         // If no WASM bytes, return default config (for testing)
         if self.prepared.component().is_none() {
+            self.reset_poll_health();
             tracing::info!(
                 channel = %self.name,
                 "WASM channel on_start called (no WASM module, returning defaults)"
@@ -1384,10 +1470,27 @@ impl WasmChannel {
             });
         }
 
-        let (config_result, mut host_state) = self.execute_on_start_with_state().await?;
-        self.log_on_start_host_state(&mut host_state);
+        let (config_result, mut host_state) = match self.execute_on_start_with_state().await {
+            Ok(result) => result,
+            Err(error) => {
+                self.set_callback_health(WasmChannelHealthState::StartupFailed);
+                return Err(error);
+            }
+        };
+        let degraded = self.log_callback_host_state(&mut host_state);
 
-        let config = config_result?;
+        let config = match config_result {
+            Ok(config) => config,
+            Err(error) => {
+                self.set_callback_health(WasmChannelHealthState::StartupFailed);
+                return Err(error);
+            }
+        };
+        self.set_callback_health(if degraded {
+            WasmChannelHealthState::StartupDegraded
+        } else {
+            WasmChannelHealthState::Healthy
+        });
         tracing::info!(
             channel = %self.name,
             display_name = %config.display_name,
@@ -1541,12 +1644,50 @@ impl WasmChannel {
         }
     }
 
+    async fn finish_poll_callback(
+        &self,
+        channel_name: &str,
+        mut host_state: ChannelHostState,
+    ) -> Result<(), WasmChannelError> {
+        let degraded = self.log_callback_host_state(&mut host_state);
+        let emitted = host_state.take_emitted_messages();
+        if !emitted.is_empty() {
+            tracing::debug!(
+                channel = %channel_name,
+                count = emitted.len(),
+                "WASM on_poll emitted {} message(s)",
+                emitted.len(),
+            );
+        }
+        let pending_writes = host_state.take_pending_writes();
+        if host_state.emits_dropped() > 0 {
+            self.record_poll_failure(WasmChannelHealthState::PollFailed);
+            return Err(WasmChannelError::CallbackFailed {
+                name: channel_name.to_string(),
+                reason: "on_poll exceeded the per-callback emit limit".to_string(),
+            });
+        }
+        if let Err(error) = self.process_emitted_messages(emitted).await {
+            self.record_poll_failure(WasmChannelHealthState::PollDispatchFailed);
+            return Err(error);
+        }
+        self.workspace_store.commit_writes(&pending_writes);
+        if degraded {
+            self.record_poll_failure(WasmChannelHealthState::PollFailed);
+        } else {
+            self.reset_poll_health();
+        }
+        tracing::debug!(channel = %channel_name, "WASM channel on_poll completed");
+        Ok(())
+    }
+
     /// Execute the on_poll callback.
     ///
     /// Called periodically if polling is configured.
     pub async fn call_on_poll(&self) -> Result<(), WasmChannelError> {
         // If no WASM bytes, do nothing (for testing)
         if self.prepared.component().is_none() {
+            self.reset_poll_health();
             tracing::debug!(
                 channel = %self.name,
                 "WASM channel on_poll called (no WASM module)"
@@ -1602,39 +1743,18 @@ impl WasmChannel {
 
         let channel_name = self.name.clone();
         match result {
-            Ok(Ok(((), mut host_state))) => {
-                self.log_on_start_host_state(&mut host_state);
-
-                let emitted = host_state.take_emitted_messages();
-                if !emitted.is_empty() {
-                    tracing::debug!(
-                        channel = %channel_name,
-                        count = emitted.len(),
-                        "WASM on_poll emitted {} message(s)",
-                        emitted.len(),
-                    );
-                }
-                let pending_writes = host_state.take_pending_writes();
-                if host_state.emits_dropped() > 0 {
-                    return Err(WasmChannelError::CallbackFailed {
-                        name: channel_name,
-                        reason: "on_poll exceeded the per-callback emit limit".to_string(),
-                    });
-                }
-                self.process_emitted_messages(emitted).await?;
-                self.workspace_store.commit_writes(&pending_writes);
-
-                tracing::debug!(
-                    channel = %channel_name,
-                    "WASM channel on_poll completed"
-                );
-                Ok(())
+            Ok(Ok(((), host_state))) => self.finish_poll_callback(&channel_name, host_state).await,
+            Ok(Err(error)) => {
+                self.record_poll_failure(WasmChannelHealthState::PollFailed);
+                Err(error)
             }
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(WasmChannelError::Timeout {
-                name: channel_name,
-                callback: "on_poll".to_string(),
-            }),
+            Err(_) => {
+                self.record_poll_failure(WasmChannelHealthState::PollFailed);
+                Err(WasmChannelError::Timeout {
+                    name: channel_name,
+                    callback: "on_poll".to_string(),
+                })
+            }
         }
     }
 
@@ -2326,6 +2446,8 @@ impl WasmChannel {
         let owner_scope_id = self.owner_scope_id.clone();
         let owner_actor_id = self.owner_actor_id.clone();
         let last_poll_epoch_ms = Arc::clone(&self.last_poll_epoch_ms);
+        let callback_health = Arc::clone(&self.callback_health);
+        let consecutive_poll_failures = Arc::clone(&self.consecutive_poll_failures);
 
         let handle = tokio::spawn(async move {
             let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -2349,6 +2471,8 @@ impl WasmChannel {
                     let osi = owner_scope_id.clone();
                     let oai = owner_actor_id.clone();
                     let lpe = Arc::clone(&last_poll_epoch_ms);
+                    let health = Arc::clone(&callback_health);
+                    let poll_failures = Arc::clone(&consecutive_poll_failures);
 
                     tokio::spawn(async move {
                         let mut interval_timer = tokio::time::interval(interval);
@@ -2385,6 +2509,7 @@ impl WasmChannel {
                                     let PollExecution {
                                         emitted_messages,
                                         pending_writes,
+                                        degraded,
                                     } = execution;
                                     let dispatch_result = if emitted_messages.is_empty() {
                                         Ok(())
@@ -2406,24 +2531,50 @@ impl WasmChannel {
                                     match dispatch_result {
                                         Ok(()) => {
                                             ws.commit_writes(&pending_writes);
-                                            lpe.store(
-                                                std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_millis()
-                                                    as u64,
-                                                std::sync::atomic::Ordering::Release,
+                                            if degraded {
+                                                Self::record_poll_failure_shared(
+                                                    &poll_failures,
+                                                    &health,
+                                                    WasmChannelHealthState::PollFailed,
+                                                );
+                                            } else {
+                                                poll_failures
+                                                    .store(0, std::sync::atomic::Ordering::Release);
+                                                lpe.store(
+                                                    std::time::SystemTime::now()
+                                                        .duration_since(std::time::UNIX_EPOCH)
+                                                        .unwrap_or_default()
+                                                        .as_millis()
+                                                        as u64,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                health.store(
+                                                    WasmChannelHealthState::Healthy as u8,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            Self::record_poll_failure_shared(
+                                                &poll_failures,
+                                                &health,
+                                                WasmChannelHealthState::PollDispatchFailed,
+                                            );
+                                            tracing::warn!(
+                                                channel = %cn, error = %error,
+                                                "Failed to dispatch emitted messages from poll; workspace writes not committed"
                                             );
                                         }
-                                        Err(e) => tracing::warn!(
-                                            channel = %cn, error = %e,
-                                            "Failed to dispatch emitted messages from poll; workspace writes not committed"
-                                        ),
                                     }
                                 }
-                                Err(e) => {
+                                Err(error) => {
+                                    Self::record_poll_failure_shared(
+                                        &poll_failures,
+                                        &health,
+                                        WasmChannelHealthState::PollFailed,
+                                    );
                                     tracing::warn!(
-                                        channel = %cn, error = %e,
+                                        channel = %cn, error = %error,
                                         "Polling callback failed"
                                     );
                                 }
@@ -2449,6 +2600,10 @@ impl WasmChannel {
                                 );
                             }
                         }
+                        callback_health.store(
+                            WasmChannelHealthState::PollFailed as u8,
+                            std::sync::atomic::Ordering::Release,
+                        );
                         consecutive_failures += 1;
                         let backoff_secs = 2u64
                             .saturating_pow(consecutive_failures.min(6))
@@ -2541,26 +2696,7 @@ impl WasmChannel {
 
         match result {
             Ok(Ok(mut host_state)) => {
-                // Flush WASM-internal logs
-                for entry in host_state.take_logs() {
-                    match entry.level {
-                        crate::tools::wasm::LogLevel::Error => {
-                            tracing::error!(channel = %channel_name, "{}", entry.message);
-                        }
-                        crate::tools::wasm::LogLevel::Warn => {
-                            tracing::warn!(channel = %channel_name, "{}", entry.message);
-                        }
-                        crate::tools::wasm::LogLevel::Info => {
-                            tracing::info!(channel = %channel_name, "{}", entry.message);
-                        }
-                        crate::tools::wasm::LogLevel::Trace => {
-                            tracing::trace!(channel = %channel_name, "{}", entry.message);
-                        }
-                        _ => {
-                            tracing::debug!(channel = %channel_name, "{}", entry.message);
-                        }
-                    }
-                }
+                let degraded = Self::log_callback_entries(channel_name, host_state.take_logs());
 
                 if host_state.emits_dropped() > 0 {
                     return Err(WasmChannelError::CallbackFailed {
@@ -2578,6 +2714,7 @@ impl WasmChannel {
                 Ok(PollExecution {
                     emitted_messages: emitted,
                     pending_writes,
+                    degraded,
                 })
             }
             Ok(Err(e)) => Err(e),
@@ -2754,6 +2891,7 @@ struct EmitDispatchContext<'a> {
 struct PollExecution {
     emitted_messages: Vec<EmittedMessage>,
     pending_writes: Vec<PendingWorkspaceWrite>,
+    degraded: bool,
 }
 
 #[async_trait]
@@ -2812,13 +2950,19 @@ impl Channel for WasmChannel {
         if let Some(poll_config) = &config.poll
             && poll_config.enabled
         {
-            let interval = self
+            let interval = match self
                 .capabilities
                 .validate_poll_interval(poll_config.interval_ms)
-                .map_err(|e| ChannelError::StartupFailed {
-                    name: self.name.clone(),
-                    reason: e,
-                })?;
+            {
+                Ok(interval) => interval,
+                Err(reason) => {
+                    self.set_callback_health(WasmChannelHealthState::StartupFailed);
+                    return Err(ChannelError::StartupFailed {
+                        name: self.name.clone(),
+                        reason,
+                    });
+                }
+            };
 
             let poll_interval = Duration::from_millis(interval as u64);
             self.poll_stall_threshold_ms.store(
@@ -2931,6 +3075,13 @@ impl Channel for WasmChannel {
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
+        if let Some(reason) = self.callback_health().failure_reason() {
+            return Err(ChannelError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: reason.to_string(),
+            });
+        }
+
         if self.message_tx.read().await.is_none() {
             return Err(ChannelError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -3591,8 +3742,9 @@ mod tests {
     };
     use crate::channels::wasm::schema::ChannelCapabilitiesFile;
     use crate::channels::wasm::wrapper::{
-        EmitDispatchContext, HttpResponse, WasmChannel, resolve_owner_broadcast_target,
-        status_to_wit, uses_owner_broadcast_target,
+        EmitDispatchContext, HttpResponse, POLL_FAILURE_HEALTH_THRESHOLD, WasmChannel,
+        WasmChannelHealthState, resolve_owner_broadcast_target, status_to_wit,
+        uses_owner_broadcast_target,
     };
     use crate::pairing::PairingStore;
     use crate::testing::credentials::TEST_COLON_FORMAT_TOKEN;
@@ -5714,6 +5866,70 @@ mod tests {
         let msg = rx.try_recv().expect("Should receive message"); // safety: test-only assertion
         assert_eq!(msg.content, "Just text, no attachments"); // safety: test-only assertion
         assert!(msg.attachments.is_empty()); // safety: test-only assertion
+    }
+
+    #[test]
+    fn callback_health_signal_is_explicit() {
+        use crate::tools::wasm::{LogEntry, LogLevel};
+
+        let entry = |level, message: &str| LogEntry {
+            level,
+            message: message.to_string(),
+            timestamp_millis: 0,
+        };
+
+        assert!(!WasmChannel::log_callback_entries(
+            "test",
+            vec![
+                entry(LogLevel::Info, "callback status"),
+                entry(LogLevel::Warn, "non-health retry warning"),
+            ],
+        ));
+        assert!(WasmChannel::log_callback_entries(
+            "test",
+            vec![entry(LogLevel::Warn, "[health] upstream unavailable")],
+        ));
+        assert!(WasmChannel::log_callback_entries(
+            "test",
+            vec![entry(LogLevel::Error, "[health] invalid upstream response")],
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_health_requires_threshold_and_clean_poll_recovers() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        channel.record_poll_failure(WasmChannelHealthState::PollFailed);
+        channel.record_poll_failure(WasmChannelHealthState::PollFailed);
+        assert!(channel.health_check().await.is_ok());
+
+        channel.record_poll_failure(WasmChannelHealthState::PollFailed);
+        let error = channel
+            .health_check()
+            .await
+            .expect_err("persistent callback failures must fail health")
+            .to_string();
+        assert!(error.contains("persistently failing"), "{error}");
+
+        channel.reset_poll_health();
+        assert!(channel.health_check().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn poll_dispatch_failure_uses_same_health_threshold() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        for _ in 0..POLL_FAILURE_HEALTH_THRESHOLD {
+            channel.record_poll_failure(WasmChannelHealthState::PollDispatchFailed);
+        }
+        let error = channel
+            .health_check()
+            .await
+            .expect_err("persistent dispatch failures must fail health")
+            .to_string();
+        assert!(error.contains("could not be delivered"), "{error}");
     }
 
     #[tokio::test]
