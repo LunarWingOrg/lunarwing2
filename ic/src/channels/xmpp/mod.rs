@@ -4393,10 +4393,7 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::Release);
         assert!(channel.health_check().await.is_ok());
 
-        channel
-            .shutdown()
-            .await
-            .expect("shutdown succeeds");
+        channel.shutdown().await.expect("shutdown succeeds");
         assert!(channel.health_check().await.is_err());
     }
 
