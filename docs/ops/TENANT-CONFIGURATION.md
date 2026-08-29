@@ -247,6 +247,35 @@ for every channel without a database migration or state restore. Back up the
 tenant env file before editing it; do not replace the rest of `env/` or
 anything under `state/`.
 
+### Engine V2 timeouts and model recovery
+
+These optional overrides go in `env/lunarwing.env`. None of them are written
+by provisioning; the daemon reads them from its process environment at
+startup, so restart the tenant after adding or changing them.
+
+```bash
+ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future cap for a deferred tool or LLM call
+                                        # awaited during an Engine V2 ResolveFutures round.
+                                        # When the task exceeds this timeout it is aborted
+                                        # (warn logged with timeout_type/call_id/action) and the
+                                        # call resolves as an error instead of hanging the
+                                        # thread forever. Default: 300 (5 minutes).
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Per-step model failure recovery attempts.
+                                        # Default: 1 (legacy one-attempt behavior); clamped to 0-3.
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4  # Total engine-level recovery attempts allowed
+                                        # per thread lifetime. Bounds cumulative recovery
+                                        # time. Default: 4; clamped to 16.
+```
+
+The defaults are correct for normal operation. Raise
+`ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS` only if you observe delayed tool calls
+(e.g. slow long-running builds invoked through tools) timing out at 5 minutes;
+lower it if wedged tool futures should fail faster. Raise the recovery
+attempts only if brief upstream model errors should be retried more
+aggressively; note that supervised approval prompts are separately bounded by
+the fixed 300s `supervised_timeout_secs` fail-closed auto-deny, which has no
+env override.
+
 ## WASM Extensions
 
 ```bash
