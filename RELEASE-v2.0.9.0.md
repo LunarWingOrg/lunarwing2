@@ -377,6 +377,19 @@ code as `started`, an explicit not-running response maps to `stopped`, and
 only unrecognized failures remain `unknown` — so post-provision verification
 and health checks see real state on OpenRC hosts.
 
+Channel health now also reflects the daemon's real delivery state instead of
+the mere presence of a registered wrapper:
+
+- failed channel startup remains unhealthy until the channel is replaced or
+  starts successfully;
+- WASM guests explicitly mark operational callback failures with a `[health]`
+  warning/error prefix (ordinary diagnostic warnings do not flap health);
+- three consecutive poll or dispatch health failures mark a channel unhealthy,
+  and a clean poll restores it;
+- DarkIRC adapter connectivity/protocol failures use that explicit signal; and
+- native XMPP health tracks its bound-session state, with an exit guard that
+  clears stale connected state whenever the background task ends.
+
 ### Workspace Prompt and Memory Guidance
 
 The default system-prompt stack was checked against the current workspace
@@ -523,10 +536,11 @@ v2.0.9.0 draft. The canonical status and reproduction details live in
   expand `~`; prompt-generated paths and Pebble paths remain open. See
   [`BUG-worker-workspace-path-expansion.md`](docs/bugs/BUG-worker-workspace-path-expansion.md).
 - **XMPP/WASM delivery retains a bounded-queue backpressure risk.** Poll-loop
-  crashes and stalls are supervised and health-visible, but a full downstream
-  queue can leave dispatch awaiting capacity indefinitely. The stale-poll health
-  detector exposes the condition; it does not automatically restart a merely
-  blocked task. See
+  crashes, stalls, callback failures, and completed dispatch failures are
+  supervised and health-visible, but a full downstream queue can leave dispatch
+  awaiting capacity indefinitely before a failure can be recorded. Health
+  reporting exposes completed failures; it does not automatically cancel or
+  restart a merely blocked dispatch. See
   [`BUG-xmpp-polling-and-backpressure.md`](docs/bugs/BUG-xmpp-polling-and-backpressure.md).
 - **Historical OMEMO MUC fallback spam is still unverified.** Generic stuck
   `Processing` recovery is fixed, but the cross-JID/plaintext-fallback symptom
