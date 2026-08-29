@@ -206,6 +206,10 @@ pub struct XmppChannel {
     /// Cached JID of the discovered XEP-0363 HTTP upload service (per-server,
     /// stable for the connection lifetime). `None` until first discovery.
     http_upload_service: Arc<RwLock<Option<String>>>,
+    /// Whether the client currently holds a bound session (`Event::Online`).
+    /// Health must reflect bridge connection failures instead of reporting
+    /// unconditional success while retries spam the log.
+    connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl XmppChannel {
@@ -237,6 +241,7 @@ impl XmppChannel {
             outbound_rate_limiter,
             outbound_rx: Arc::new(tokio::sync::Mutex::new(Some(outbound_rx))),
             http_upload_service: Arc::new(RwLock::new(None)),
+            connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -876,6 +881,7 @@ impl Channel for XmppChannel {
         let encrypted_room_states = Arc::clone(&self.encrypted_room_states);
         let outbound_tx = self.outbound_tx.clone();
         let http_upload_service = Arc::clone(&self.http_upload_service);
+        let connected = Arc::clone(&self.connected);
         let pairing_store = PairingStore::new();
         let (inbound_attachment_tx, inbound_attachment_rx) =
             mpsc::channel(INBOUND_ATTACHMENT_QUEUE_CAPACITY);
@@ -892,6 +898,7 @@ impl Channel for XmppChannel {
                         match event {
                             Some(tokio_xmpp::Event::Online { bound_jid, .. }) => {
                                 tracing::info!(jid = %bound_jid, "XMPP connected");
+                                connected.store(true, std::sync::atomic::Ordering::Release);
                                 if let Err(err) = client
                                     .send_stanza(tokio_xmpp::Stanza::Presence(build_initial_presence()))
                                     .await
@@ -962,6 +969,7 @@ impl Channel for XmppChannel {
                             }
                             Some(tokio_xmpp::Event::Disconnected(reason)) => {
                                 tracing::warn!("XMPP disconnected: {:?}", reason);
+                                connected.store(false, std::sync::atomic::Ordering::Release);
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                                 let jid_str2 = config.jid.clone();
                                 let password2 = config.password.expose_secret().to_string();
@@ -977,6 +985,7 @@ impl Channel for XmppChannel {
                             }
                             None => {
                                 tracing::warn!("XMPP stream ended");
+                                connected.store(false, std::sync::atomic::Ordering::Release);
                                 break;
                             }
                         }
@@ -1284,12 +1293,25 @@ impl Channel for XmppChannel {
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
-        Ok(())
+        // Previously unconditional `Ok(())`, so a channel flapping against an
+        // unreachable/unconfigured bridge still reported healthy (goal-26
+        // stress finding F3). Surface sustained disconnection instead: a
+        // channel that cannot hold a bound session is not delivering traffic.
+        if self.connected.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(ChannelError::HealthCheckFailed {
+                name: "xmpp".into(),
+                reason: "no bound XMPP session (disconnected or reconnecting)".into(),
+            })
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
         // Coalesced flushes are owned by the agent-level shared buffer,
         // which the agent run loop flushes before channel shutdown.
+        self.connected
+            .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -4347,6 +4369,35 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let store = PairingStore::with_base_dir(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    #[tokio::test]
+    async fn health_check_reflects_connection_state() {
+        // Goal-26 stress finding F3: native XMPP health was unconditional
+        // `Ok(())`, so a channel failing to reach its bridge still reported
+        // healthy. Health must track the bound-session state.
+        let channel = XmppChannel::new(test_config())
+            .await
+            .expect("channel initializes");
+
+        let result = channel.health_check().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("no bound XMPP session"),
+            "expected disconnected health error, got: {err}"
+        );
+
+        channel
+            .connected
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(channel.health_check().await.is_ok());
+
+        channel
+            .shutdown()
+            .await
+            .expect("shutdown succeeds");
+        assert!(channel.health_check().await.is_err());
     }
 
     #[tokio::test]
