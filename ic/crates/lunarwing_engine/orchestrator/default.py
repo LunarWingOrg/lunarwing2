@@ -185,6 +185,62 @@ def signals_execution_intent(text):
     return any(phrase in lower for phrase in exec_phrases)
 
 
+def signals_claimed_tool_success(text):
+    """Detect prose that claims tool/memory results without any real tool call.
+
+    Models sometimes skip tool calls entirely and narrate fabricated results
+    ("all steps completed: memory_write status ok, 24 bytes written"). The data
+    plane is fine — nothing ran. High-precision patterns only: hard tool-output
+    artifacts alone, or a memory tool mention plus a completion claim.
+    """
+    stripped = strip_code_blocks(text)
+    lower = stripped.lower()
+
+    HARD_ARTIFACTS = [
+        '"status": "ok"', "'status': 'ok'", "status: ok",
+        '"status": "success"', "'status': 'success'", "status: success",
+        "status: completed", "status: complete",
+        "bytes written", "bytes_written", "output_chars",
+        "revision:", "search returned", "documents_found",
+    ]
+    for marker in HARD_ARTIFACTS:
+        if marker in lower:
+            return True
+
+    TOOL_MENTIONS = [
+        "memory_write", "memory_read", "memory_search",
+        "memory_list", "memory_tree", "memory_delete",
+    ]
+    COMPLETION_CLAIMS = [
+        "all steps completed", "all four steps", "all three steps",
+        "all requested steps", "steps completed",
+        "task completed successfully", "completed successfully",
+        "successfully wrote", "successfully written", "successfully saved",
+        "successfully created", "successfully added", "successfully updated",
+        "successfully read", "successfully retrieved", "successfully searched",
+        "i've written", "i have written", "i've saved", "i have saved",
+        "i've created", "i have created", "i've added", "i have added",
+        "i've updated", "i have updated", "i've read", "i have read",
+        "i've written", "wrote the document", "saved the document",
+        "has been written", "has been saved", "has been created",
+    ]
+    has_tool = any(mention in lower for mention in TOOL_MENTIONS)
+    if not has_tool:
+        return False
+    return any(claim in lower for claim in COMPLETION_CLAIMS)
+
+
+def has_action_results_since_last_user(messages):
+    """True when structured tool results exist for the current user turn."""
+    for msg in reversed(messages):
+        role = msg.get("role")
+        if role in ("ActionResult", "action_result"):
+            return True
+        if role in ("User", "user"):
+            return False
+    return False
+
+
 def strip_stage_directions(text):
     """Remove paired *roleplay directions* before classifying prose."""
     parts = []
@@ -958,6 +1014,8 @@ def run_loop(context, goal, actions, state, config):
     max_obligation_nudges = config.get("max_action_requirement_nudges", 2)
     consecutive_nudges = 0
     consecutive_errors = 0
+    ran_tool_this_turn = False
+    fabricated_claim_nudges = 0
     step_count = config.get("step_count", 0)
     if not isinstance(state, dict):
         state = {}
@@ -1171,6 +1229,28 @@ def run_loop(context, goal, actions, state, config):
                 )
                 continue
 
+            # Fabricated-success guard: a reply claiming completed memory/tool
+            # actions with zero tool calls this turn means the model invented
+            # the results (goal-25 F4). Nudge it to actually run the tools
+            # instead of trusting self-reports (bounded, then accept text).
+            if (available_actions
+                    and not ran_tool_this_turn
+                    and fabricated_claim_nudges < max_obligation_nudges
+                    and not has_action_results_since_last_user(working_messages)
+                    and signals_claimed_tool_success(text)):
+                fabricated_claim_nudges += 1
+                append_message(
+                    working_messages,
+                    "User",
+                    "You claimed to have completed memory/tool actions, but no tool "
+                    "calls were made in this turn — those actions did NOT actually "
+                    "run and nothing was written, read, or searched.\n"
+                    "Do NOT fabricate tool results. Call the actual tools now "
+                    "(structured tool calls or a ```repl code block), then report "
+                    "their real outputs. If you cannot perform them, say so plainly.",
+                )
+                continue
+
             # Non-intent text response — reset nudge counter and finish
             if not signals_tool_intent(text):
                 consecutive_nudges = 0
@@ -1193,6 +1273,8 @@ def run_loop(context, goal, actions, state, config):
 
             # Execute code in nested Monty VM
             result = __execute_code_step__(code, state)
+            if result.get("action_results"):
+                ran_tool_this_turn = True
 
             # Update persisted state with results
             if result.get("return_value") is not None:
@@ -1310,6 +1392,8 @@ def run_loop(context, goal, actions, state, config):
             # Structured calls do not reset the counter; successful CodeAct
             # execution and accepted non-intent text do.
             calls = response.get("calls", [])
+            if calls:
+                ran_tool_this_turn = True
             append_message(
                 working_messages,
                 "Assistant",
