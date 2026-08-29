@@ -220,7 +220,9 @@ socket pre-creation and daemon-first ordering live in
 3. If `add-tenant` left `env/ssh_key_staged`, upload it to the local SSH API.
    A successful upload deletes that staging copy, then mt-admin restarts the
    daemon and waits for its gateway so `start_agent_server()` loads the key into
-   russh's signing keystore.
+   russh's signing keystore. Before daemon start, mt-admin preserves or
+   atomically backfills the tenant's dedicated `SSH_API_TOKEN`; an upload
+   failure retains the staged key and stops startup before workers launch.
 4. **Start workers only after that restart**, each with the current socket inode
    bind-mounted and `SSH_AUTH_SOCK` set (including generated container service
    definitions):
@@ -245,8 +247,10 @@ and the worker's own host-key policy must constrain destinations.
 
 ### 4.4 HTTP management API (`ssh_api.rs`, mounted in `main.rs`)
 
-The API is mounted into the unified webhook server **only if** both `ssh_bridge`
-and `secrets_store` exist. `ssh_api::create_router()` registers these routes:
+The API is mounted into the unified webhook server **only if** `ssh_bridge`,
+`secrets_store`, and a non-empty `SSH_API_TOKEN` exist. Every route requires a
+constant-time-validated `Authorization: Bearer <SSH_API_TOKEN>` header.
+`ssh_api::create_router()` registers these routes:
 
 | Method + path | Handler | Notes |
 |---|---|---|
@@ -316,10 +320,11 @@ PascalCase (`"Strict"`) — clients must match the casing.
   accepts a normal `String`, then creates and clones ordinary `Vec<u8>` buffers
   before wrapping the status-map copy. These allocations drop without an
   explicit wipe.
-- **The HTTP API has no auth middleware.** It is merged into the unified webhook
-  server, whose fallback bind is `0.0.0.0:8080`; exposure depends on surrounding
-  listener/network configuration. mt-admin writes `HTTP_HOST=127.0.0.1`, so its
-  normal tenant path reaches the API only on loopback.
+- **The HTTP API uses one tenant-wide bearer token.** `SSH_API_TOKEN` protects
+  every SSH management route and missing configuration leaves the router
+  unmounted. The webhook server defaults to `127.0.0.1`; operators can still
+  configure a non-loopback bind, so token secrecy and network policy remain
+  required.
 - **Audit logging is a no-op in production** (`NullAuditLogger`). The `SshEvent`
   variants are defined but not persisted, and only host add/remove and agent
   start currently call the logger.
