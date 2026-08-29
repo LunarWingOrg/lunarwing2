@@ -264,13 +264,13 @@ impl Guest for DarkircChannel {
             Ok(false) => {
                 channel_host::log(
                     channel_host::LogLevel::Warn,
-                    "Adapter reachable but IRC not connected yet (will retry on poll)",
+                    "[health] Adapter reachable but IRC not connected yet (will retry on poll)",
                 );
             }
             Err(e) => {
                 channel_host::log(
                     channel_host::LogLevel::Warn,
-                    &format!("Adapter not reachable (will retry): {}", e),
+                    &format!("[health] Adapter not reachable (will retry): {}", e),
                 );
             }
         }
@@ -330,7 +330,7 @@ impl Guest for DarkircChannel {
                 Err(error) => {
                     channel_host::log(
                         channel_host::LogLevel::Warn,
-                        &format!("Adapter /ack failed (will retry next poll): {error}"),
+                        &format!("[health] Adapter /ack failed (will retry next poll): {error}"),
                     );
                     return;
                 }
@@ -342,8 +342,8 @@ impl Guest for DarkircChannel {
                 Ok(r) => r,
                 Err(e) => {
                     channel_host::log(
-                        channel_host::LogLevel::Debug,
-                        &format!("Adapter poll failed: {}", e),
+                        channel_host::LogLevel::Warn,
+                        &format!("[health] Adapter poll failed: {}", e),
                     );
                     return;
                 }
@@ -352,7 +352,7 @@ impl Guest for DarkircChannel {
         if response.status != 200 {
             channel_host::log(
                 channel_host::LogLevel::Warn,
-                &format!("Adapter /poll returned HTTP {}", response.status),
+                &format!("[health] Adapter /poll returned HTTP {}", response.status),
             );
             return;
         }
@@ -362,7 +362,7 @@ impl Guest for DarkircChannel {
             Err(e) => {
                 channel_host::log(
                     channel_host::LogLevel::Error,
-                    &format!("Failed to parse poll response: {}", e),
+                    &format!("[health] Failed to parse poll response: {}", e),
                 );
                 return;
             }
@@ -375,7 +375,7 @@ impl Guest for DarkircChannel {
         let Some(batch_id) = poll_response.batch_id.as_deref() else {
             channel_host::log(
                 channel_host::LogLevel::Warn,
-                "Adapter poll response omitted batch_id; batch left unprocessed",
+                "[health] Adapter poll response omitted batch_id; batch left unprocessed",
             );
             return;
         };
@@ -383,7 +383,7 @@ impl Guest for DarkircChannel {
             channel_host::log(
                 channel_host::LogLevel::Error,
                 &format!(
-                    "Adapter returned {} messages; host limit is {}. Batch left unacked",
+                    "[health] Adapter returned {} messages; host limit is {}. Batch left unacked",
                     poll_response.messages.len(),
                     MAX_POLL_BATCH
                 ),
@@ -393,7 +393,7 @@ impl Guest for DarkircChannel {
         if let Err(error) = channel_host::workspace_write(&pending_ack_path, batch_id) {
             channel_host::log(
                 channel_host::LogLevel::Error,
-                &format!("Failed to stage adapter ACK token: {error}"),
+                &format!("[health] Failed to stage adapter ACK token: {error}"),
             );
             return;
         }
