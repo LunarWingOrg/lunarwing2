@@ -1,16 +1,19 @@
 //! SSH Bridge API — HTTP endpoints for SSH host and key management.
 
-use axum::response::IntoResponse;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::StatusCode,
+    middleware::{Next, from_fn_with_state},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 use crate::bridge::ssh::{
     HostKeyMode, SSHBridge, SSHCredentials, SSHHostConfig, SSHKeyType, SshBridgeError,
@@ -18,23 +21,72 @@ use crate::bridge::ssh::{
 use crate::bridge::ssh_agent::SshAgentServer;
 use crate::bridge::ssh_secrets::SshSecretsManager;
 use crate::secrets::SecretError;
-use secrecy::SecretString;
+
+/// Optional bearer token guarding the SSH API routes.
+///
+/// Mounted on the shared WebhookServer, which is reachable from any interface
+/// when `HTTP_HOST` is non-loopback; the SSH fragment is the only fragment
+/// there that must not be reachable without authorization, so it carries its
+/// own bearer fence. When the token is unset the API is simply not served
+/// (fail-closed).
+const SSH_API_TOKEN_ENV: &str = "SSH_API_TOKEN";
 
 pub struct SshApiState {
     pub bridge: Arc<RwLock<SSHBridge>>,
     pub secrets: Arc<SshSecretsManager>,
     pub agent: Arc<RwLock<Option<Arc<SshAgentServer>>>>,
+    pub auth_token: Option<SecretString>,
+}
+
+/// Reject any request whose `Authorization: Bearer` header does not match the
+/// configured token with a constant-time comparison.
+async fn ssh_api_auth(
+    State(state): State<Arc<SshApiState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let provided = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(|value| value.to_string());
+
+    let matches = match (&state.auth_token, &provided) {
+        (Some(expected), Some(actual)) => {
+            bool::from(expected.expose_secret().as_bytes().ct_eq(actual.as_bytes()))
+        }
+        _ => false,
+    };
+
+    if matches {
+        next.run(request).await
+    } else {
+        (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+    }
 }
 
 pub fn create_router(state: Arc<SshApiState>) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/hosts", get(list_hosts).post(add_host))
         .route("/hosts/{host}", get(get_host).delete(remove_host))
         .route("/hosts/{host}/key", post(upload_key).delete(delete_key))
         .route("/hosts/{host}/key/status", get(key_status))
         .route("/agent/status", get(agent_status))
-        .route("/agent/keys", get(agent_keys))
-        .with_state(state)
+        .route("/agent/keys", get(agent_keys));
+
+    match &state.auth_token {
+        Some(_) => routes
+            .route_layer(from_fn_with_state(state.clone(), ssh_api_auth))
+            .with_state(state),
+        None => {
+            warn!(
+                "SSH API routes disabled: {} is not set; SSH host/key management will 404",
+                SSH_API_TOKEN_ENV
+            );
+            Router::new()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,6 +434,10 @@ mod tests {
     }
 
     async fn make_test_state() -> SshApiState {
+        make_test_state_with_token(None).await
+    }
+
+    async fn make_test_state_with_token(token: Option<&str>) -> SshApiState {
         let store: Arc<dyn crate::secrets::SecretsStore + Send + Sync> =
             Arc::new(InMemorySecretsStore::new(Arc::new(
                 SecretsCrypto::new(MasterKey::from(
@@ -402,7 +458,70 @@ mod tests {
             bridge: Arc::new(RwLock::new(bridge.unwrap())),
             secrets,
             agent: Arc::new(RwLock::new(None)),
+            auth_token: token.map(|t| SecretString::new(t.to_string().into_boxed_str())),
         }
+    }
+
+    async fn serve_router(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn ssh_api_requires_bearer_token() {
+        let state = Arc::new(make_test_state_with_token(Some("test-api-token")).await);
+        let addr = serve_router(create_router(state)).await;
+
+        let client = reqwest::Client::new();
+        let base = format!("http://{addr}");
+
+        let no_auth = client
+            .get(format!("{base}/agent/keys"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), 401, "missing bearer must be rejected");
+
+        let bad_auth = client
+            .get(format!("{base}/agent/keys"))
+            .header("Authorization", "Bearer wrong-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_auth.status(), 401, "wrong bearer must be rejected");
+
+        let good_auth = client
+            .get(format!("{base}/agent/keys"))
+            .header("Authorization", "Bearer test-api-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(good_auth.status(), 200, "correct bearer must pass");
+    }
+
+    #[tokio::test]
+    async fn ssh_api_unmounted_without_token() {
+        let state = Arc::new(make_test_state_with_token(None).await);
+        let app = create_router(state);
+        let addr = serve_router(app).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{addr}/agent/keys"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            404,
+            "no SSH_API_TOKEN configured -> SSH API must fail closed (not served)"
+        );
     }
 
     #[tokio::test]

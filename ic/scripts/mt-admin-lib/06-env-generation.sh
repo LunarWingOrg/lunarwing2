@@ -575,6 +575,7 @@ write_tenant_lunarwing_env() {
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
   secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
   webhook_secret="$(_env_existing "$path" HTTP_WEBHOOK_SECRET)"; webhook_secret="${webhook_secret:-$(generate_token)}"
+  ssh_api_token="$(_env_existing "$path" SSH_API_TOKEN)";       ssh_api_token="${ssh_api_token:-$(generate_token)}"
   coord_enabled="$(_env_existing "$path" COORD_ENABLED)"; coord_enabled="${coord_enabled:-false}"
   coord_agent_id="$(_env_existing "$path" COORD_AGENT_ID)"; coord_agent_id="${coord_agent_id:-$name}"
   coord_agent_aliases="$(_env_existing "$path" COORD_AGENT_ALIASES)"
@@ -752,6 +753,9 @@ GATEWAY_AUTH_TOKEN=$gateway_token
 HTTP_HOST=127.0.0.1
 HTTP_PORT=$http_port
 HTTP_WEBHOOK_SECRET=$webhook_secret
+
+# SSH API (host/key management on the webhook server; bearer-protected)
+SSH_API_TOKEN=$ssh_api_token
 
 # Orchestrator (sandbox container callback)
 ORCHESTRATOR_PORT=$orchestrator_port
@@ -1642,16 +1646,18 @@ upload_tenant_ssh_key() {
   local name="$1"
   local ssh_host="${2:-127.0.0.1}"
   local ssh_user="${3:-$name}"
-  local http_port staged_key
+  local http_port staged_key ssh_api_token
 
   http_port="$(ports_get "$name" http)"
   staged_key="$(tenant_env_dir "$name")/ssh_key_staged"
+  ssh_api_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" SSH_API_TOKEN)"
 
   [[ -f "$staged_key" ]] || { say "no staged SSH key for $name (skipping upload)"; return 0; }
 
   # Wait for the gateway to be reachable (it may still be starting up).
   local i=0
-  while ! curl -sf --max-time 2 "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
+  while ! curl -sf --max-time 2 -H "Authorization: Bearer $ssh_api_token" \
+      "http://127.0.0.1:${http_port}/agent/status" >/dev/null 2>&1; do
     i=$((i + 1))
     [[ $i -lt 15 ]] || { say "WARNING: gateway not reachable on port $http_port after 30s; SSH key not uploaded (upload manually via the API)" >&2; return 1; }
     sleep 2
@@ -1663,7 +1669,8 @@ upload_tenant_ssh_key() {
   key_data="$(cat "$staged_key")"
   upload_result="$(jq -n --arg key "$key_data" '{key_data: $key}' | \
     curl -sf -X POST "http://127.0.0.1:${http_port}/hosts/${ssh_host}/key" \
-      -H "Content-Type: application/json" -d @- 2>&1)" || true
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $ssh_api_token" -d @- 2>&1)" || true
 
   if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
     say "SSH key uploaded to secrets store for host $ssh_host"

@@ -112,6 +112,24 @@ themselves; they are allowlisted by fingerprint in `.gitleaksignore`
    any central log sink the daemons shipped to.
 3. Hosts that never used the key-upload endpoint are unaffected.
 
+## Related hardening — the router itself is now fenced
+
+Review of the same surface (wrench, finding #2, MEDIUM) showed the SSH API
+fragment on the shared WebhookServer carried **no authentication at all**:
+anyone able to reach the webhook port could enumerate hosts, register
+arbitrary ones, overwrite stored keys, or delete them. The same change fences
+that surface:
+
+- `Authorization: Bearer <SSH_API_TOKEN>` is now required on every SSH API
+  route (constant-time comparison). Fail-closed: without the token configured
+  the routes are not served at all.
+- The WebhookServer's fallback bind changed from `0.0.0.0:8080` to
+  `127.0.0.1:8080`; a non-loopback bind now only happens when an operator sets
+  `HTTP_HOST` explicitly (warned at startup as before).
+- mt-admin generates and persists `SSH_API_TOKEN` in each tenant's
+  `lunarwing.env` and sends it on the staged-key upload (and its readiness
+  probe).
+
 ## References
 
 - Fix: `09b0f507` ("fix(ssh): keep key upload secrets out of tracing spans and logs")
