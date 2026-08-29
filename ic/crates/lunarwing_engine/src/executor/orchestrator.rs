@@ -4272,8 +4272,7 @@ FINAL("unreached")
                     index: 0,
                     id: Some("call-1".into()),
                     name: Some("memory_write".into()),
-                    args_delta: r#"{"path":"memory/stress/c1.md","content":"marker M1"}"#
-                        .into(),
+                    args_delta: r#"{"path":"memory/stress/c1.md","content":"marker M1"}"#.into(),
                 }));
             } else if index == 0 || self.tool_call_first {
                 chunks.push(Ok(LlmStreamChunk::TextDelta(FABRICATED_CLAIM.into())));

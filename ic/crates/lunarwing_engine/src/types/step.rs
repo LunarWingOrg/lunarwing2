@@ -376,13 +376,19 @@ mod tests {
     #[test]
     fn from_action_calls_consumes_bare_final_with_answer_params() {
         let response = LlmResponse::from_action_calls(
-            vec![call("FINAL", serde_json::json!({"answer": "done: 24 bytes"}))],
+            vec![call(
+                "FINAL",
+                serde_json::json!({"answer": "done: 24 bytes"}),
+            )],
             None,
         );
         let LlmResponse::Text(text) = response else {
             panic!("FINAL-only batch must become text");
         };
-        assert_eq!(extract_final_answer(&text).as_deref(), Some("done: 24 bytes"));
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("done: 24 bytes")
+        );
     }
 
     #[test]
@@ -429,7 +435,10 @@ mod tests {
     #[test]
     fn from_action_calls_consumes_final_var() {
         let response = LlmResponse::from_action_calls(
-            vec![call("FINAL_VAR", serde_json::json!({"result": "summary text"}))],
+            vec![call(
+                "FINAL_VAR",
+                serde_json::json!({"result": "summary text"}),
+            )],
             None,
         );
         assert!(matches!(response, LlmResponse::Text(_)));
@@ -470,7 +479,10 @@ mod tests {
         let LlmResponse::Text(text) = response else {
             panic!("FINAL-only batch must become text");
         };
-        assert_eq!(extract_final_answer(&text).as_deref(), Some("Task completed."));
+        assert_eq!(
+            extract_final_answer(&text).as_deref(),
+            Some("Task completed.")
+        );
     }
 
     #[test]
