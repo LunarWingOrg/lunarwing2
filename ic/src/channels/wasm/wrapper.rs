@@ -645,6 +645,12 @@ impl lunarwing::agent::channel_host::Host for ChannelStoreData {
     }
 }
 
+/// Consecutive poll callback failures after which a polling channel is
+/// considered unhealthy. A wrapper whose upstream is persistently dead
+/// (e.g. an unconfigured local adapter) keeps its poll task alive forever,
+/// so task liveness alone cannot surface that failure state.
+const POLL_FAILURE_HEALTH_THRESHOLD: u32 = 3;
+
 /// A WASM-based channel implementing the Channel trait.
 #[allow(dead_code)]
 pub struct WasmChannel {
@@ -692,6 +698,14 @@ pub struct WasmChannel {
 
     /// If no poll tick occurs within this duration, the channel is considered stalled.
     poll_stall_threshold_ms: std::sync::atomic::AtomicU64,
+
+    /// The most recent `start()` failure. A channel whose start failed must
+    /// not appear healthy merely because its wrapper is still registered.
+    last_start_error: std::sync::RwLock<Option<String>>,
+
+    /// Consecutive poll callback failures since the last successful poll
+    /// dispatch (or since start). Shared with the polling task.
+    consecutive_poll_failures: Arc<std::sync::atomic::AtomicU32>,
 
     /// Registered HTTP endpoints.
     endpoints: RwLock<Vec<RegisteredEndpoint>>,
@@ -932,6 +946,8 @@ impl WasmChannel {
             poll_task: RwLock::new(None),
             last_poll_epoch_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             poll_stall_threshold_ms: std::sync::atomic::AtomicU64::new(0),
+            last_start_error: std::sync::RwLock::new(None),
+            consecutive_poll_failures: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             endpoints: RwLock::new(Vec::new()),
             credentials: Arc::new(RwLock::new(HashMap::new())),
             typing_task: RwLock::new(None),
@@ -2302,6 +2318,35 @@ impl WasmChannel {
         .await
     }
 
+    /// Record a start failure so `health_check()` reports the channel as
+    /// unhealthy instead of surfacing success merely because the wrapper is
+    /// still registered (goal-26 stress finding F3).
+    fn note_start_failure(&self, error: String) {
+        if let Ok(mut guard) = self.last_start_error.write() {
+            *guard = Some(error);
+        } else {
+            tracing::warn!(
+                channel = %self.name,
+                "last_start_error lock poisoned; start failure not recorded for health"
+            );
+        }
+    }
+
+    /// Clear recorded failure state after a successful start. A recovered
+    /// channel must return to healthy once startup succeeds again.
+    fn clear_failure_state(&self) {
+        if let Ok(mut guard) = self.last_start_error.write() {
+            *guard = None;
+        } else {
+            tracing::warn!(
+                channel = %self.name,
+                "last_start_error lock poisoned; stale failure may persist in health"
+            );
+        }
+        self.consecutive_poll_failures
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
     /// Start the supervised polling loop.
     ///
     /// Spawns an outer supervision task that monitors an inner polling loop.
@@ -2326,6 +2371,7 @@ impl WasmChannel {
         let owner_scope_id = self.owner_scope_id.clone();
         let owner_actor_id = self.owner_actor_id.clone();
         let last_poll_epoch_ms = Arc::clone(&self.last_poll_epoch_ms);
+        let consecutive_poll_failures = Arc::clone(&self.consecutive_poll_failures);
 
         let handle = tokio::spawn(async move {
             let mut shutdown = std::pin::pin!(shutdown_rx);
@@ -2349,6 +2395,7 @@ impl WasmChannel {
                     let osi = owner_scope_id.clone();
                     let oai = owner_actor_id.clone();
                     let lpe = Arc::clone(&last_poll_epoch_ms);
+                    let cpf = Arc::clone(&consecutive_poll_failures);
 
                     tokio::spawn(async move {
                         let mut interval_timer = tokio::time::interval(interval);
@@ -2406,6 +2453,7 @@ impl WasmChannel {
                                     match dispatch_result {
                                         Ok(()) => {
                                             ws.commit_writes(&pending_writes);
+                                            cpf.store(0, std::sync::atomic::Ordering::Release);
                                             lpe.store(
                                                 std::time::SystemTime::now()
                                                     .duration_since(std::time::UNIX_EPOCH)
@@ -2422,6 +2470,7 @@ impl WasmChannel {
                                     }
                                 }
                                 Err(e) => {
+                                    cpf.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                                     tracing::warn!(
                                         channel = %cn, error = %e,
                                         "Polling callback failed"
@@ -2775,13 +2824,21 @@ impl Channel for WasmChannel {
         *self.shutdown_tx.write().await = Some(shutdown_tx);
 
         // Call on_start to get configuration
-        let config = self
-            .call_on_start()
-            .await
-            .map_err(|e| ChannelError::StartupFailed {
-                name: self.name.clone(),
-                reason: e.to_string(),
-            })?;
+        let config = match self.call_on_start().await {
+            Ok(config) => {
+                self.clear_failure_state();
+                config
+            }
+            Err(error) => {
+                // A failed start must not later appear healthy solely because
+                // the wrapper remains registered (goal-26 stress finding F3).
+                self.note_start_failure(error.to_string());
+                return Err(ChannelError::StartupFailed {
+                    name: self.name.clone(),
+                    reason: error.to_string(),
+                });
+            }
+        };
 
         // Store the config
         *self.channel_config.write().await = Some(config.clone());
@@ -2931,6 +2988,20 @@ impl Channel for WasmChannel {
     }
 
     async fn health_check(&self) -> Result<(), ChannelError> {
+        // A failed start/configuration (e.g. an unconfigured optional channel
+        // left registered) must surface here, not hide behind a live wrapper.
+        let start_error = self
+            .last_start_error
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(error) = start_error {
+            return Err(ChannelError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: format!("channel start failed: {error}"),
+            });
+        }
+
         if self.message_tx.read().await.is_none() {
             return Err(ChannelError::HealthCheckFailed {
                 name: self.name.clone(),
@@ -2944,6 +3015,20 @@ impl Channel for WasmChannel {
             return Err(ChannelError::HealthCheckFailed {
                 name: self.name.clone(),
                 reason: "polling task exited".to_string(),
+            });
+        }
+
+        // A persistently failing poll callback (e.g. an unconfigured local
+        // adapter on a dead port) keeps its task alive, so liveness alone
+        // cannot surface the upstream failure. Report after a few
+        // consecutive failures so transient errors do not flap health.
+        let failures = self
+            .consecutive_poll_failures
+            .load(std::sync::atomic::Ordering::Acquire);
+        if failures >= POLL_FAILURE_HEALTH_THRESHOLD {
+            return Err(ChannelError::HealthCheckFailed {
+                name: self.name.clone(),
+                reason: format!("polling callback failing ({failures} consecutive failures)"),
             });
         }
 
@@ -5762,6 +5847,52 @@ mod tests {
         assert!(
             err_msg.contains("polling stalled"),
             "Expected 'polling stalled', got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_reports_poll_callback_failures_below_threshold() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        channel
+            .consecutive_poll_failures
+            .store(2, std::sync::atomic::Ordering::Release);
+        assert!(
+            channel.health_check().await.is_ok(),
+            "transient poll failures below threshold must not flap health"
+        );
+
+        channel
+            .consecutive_poll_failures
+            .store(3, std::sync::atomic::Ordering::Release);
+        let result = channel.health_check().await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("polling callback failing (3 consecutive failures)"),
+            "Expected consecutive-failure health error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_check_reports_recorded_start_failure() {
+        let channel = create_test_channel();
+        let _stream = channel.start().await.expect("Channel should start");
+
+        channel.note_start_failure("on_start rejected config".to_string());
+        let result = channel.health_check().await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("channel start failed: on_start rejected config"),
+            "Expected start-failure health error, got: {err_msg}"
+        );
+
+        channel.clear_failure_state();
+        assert!(
+            channel.health_check().await.is_ok(),
+            "successful recovery must clear the start failure"
         );
     }
 
