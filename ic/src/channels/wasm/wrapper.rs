@@ -2869,13 +2869,21 @@ impl Channel for WasmChannel {
         if let Some(poll_config) = &config.poll
             && poll_config.enabled
         {
-            let interval = self
+            let interval = match self
                 .capabilities
                 .validate_poll_interval(poll_config.interval_ms)
-                .map_err(|e| ChannelError::StartupFailed {
-                    name: self.name.clone(),
-                    reason: e,
-                })?;
+            {
+                Ok(interval) => interval,
+                Err(reason) => {
+                    // Same health invariant as the on_start failure path: do
+                    // not let a rejected poll config later read as healthy.
+                    self.note_start_failure(reason.clone());
+                    return Err(ChannelError::StartupFailed {
+                        name: self.name.clone(),
+                        reason,
+                    });
+                }
+            };
 
             let poll_interval = Duration::from_millis(interval as u64);
             self.poll_stall_threshold_ms.store(
