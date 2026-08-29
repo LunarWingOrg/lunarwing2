@@ -342,7 +342,7 @@ impl Guest for DarkircChannel {
                 Ok(r) => r,
                 Err(e) => {
                     channel_host::log(
-                        channel_host::LogLevel::Debug,
+                        channel_host::LogLevel::Warn,
                         &format!("Adapter poll failed: {}", e),
                     );
                     return;
