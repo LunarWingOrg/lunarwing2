@@ -109,6 +109,8 @@ fn knowledge_publish_blocked(channel_name: &str) -> ChannelError {
 /// push messages into the agent loop without being a full `Channel` impl.
 pub struct ChannelManager {
     channels: Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>,
+    /// Most recent startup failure for channels that remain registered.
+    start_failures: RwLock<HashMap<String, String>>,
     inject_tx: mpsc::Sender<IncomingMessage>,
     /// Taken once in `start_all()` and merged into the stream.
     inject_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingMessage>>>,
@@ -127,6 +129,7 @@ impl ChannelManager {
         let (inject_tx, inject_rx) = mpsc::channel(64);
         Self {
             channels: Arc::new(RwLock::new(HashMap::new())),
+            start_failures: RwLock::new(HashMap::new()),
             inject_tx,
             inject_rx: tokio::sync::Mutex::new(Some(inject_rx)),
             coordination_status_policy,
@@ -144,6 +147,7 @@ impl ChannelManager {
     /// Add a channel to the manager.
     pub async fn add(&self, channel: Box<dyn Channel>) {
         let name = channel.name().to_string();
+        self.start_failures.write().await.remove(&name);
         self.channels
             .write()
             .await
@@ -169,7 +173,19 @@ impl ChannelManager {
             }
         }
 
-        let stream = channel.start().await?;
+        let stream = match channel.start().await {
+            Ok(stream) => {
+                self.start_failures.write().await.remove(&name);
+                stream
+            }
+            Err(error) => {
+                self.start_failures
+                    .write()
+                    .await
+                    .insert(name, error.to_string());
+                return Err(error);
+            }
+        };
 
         // Register for respond/broadcast/send_status
         self.channels
@@ -205,11 +221,16 @@ impl ChannelManager {
         for (name, channel) in channels.iter() {
             match channel.start().await {
                 Ok(stream) => {
+                    self.start_failures.write().await.remove(name);
                     tracing::debug!("Started channel: {}", name);
                     streams.push(stream);
                 }
-                Err(e) => {
-                    tracing::error!("Failed to start channel {}: {}", name, e);
+                Err(error) => {
+                    self.start_failures
+                        .write()
+                        .await
+                        .insert(name.clone(), error.to_string());
+                    tracing::error!("Failed to start channel {}: {}", name, error);
                     // Continue with other channels, don't fail completely
                 }
             }
@@ -344,10 +365,19 @@ impl ChannelManager {
     /// Check health of all channels.
     pub async fn health_check_all(&self) -> HashMap<String, Result<(), ChannelError>> {
         let channels = self.channels.read().await;
+        let start_failures = self.start_failures.read().await.clone();
         let mut results = HashMap::new();
 
         for (name, channel) in channels.iter() {
-            results.insert(name.clone(), channel.health_check().await);
+            let result = if let Some(reason) = start_failures.get(name) {
+                Err(ChannelError::HealthCheckFailed {
+                    name: name.clone(),
+                    reason: format!("channel failed to start: {reason}"),
+                })
+            } else {
+                channel.health_check().await
+            };
+            results.insert(name.clone(), result);
         }
 
         results
@@ -376,6 +406,7 @@ impl ChannelManager {
 
     /// Remove a channel from the manager.
     pub async fn remove(&self, name: &str) -> Option<Arc<dyn Channel>> {
+        self.start_failures.write().await.remove(name);
         self.channels.write().await.remove(name)
     }
 }
@@ -569,6 +600,28 @@ mod tests {
         let results = manager.health_check_all().await;
         assert!(results["healthy"].is_ok());
         assert!(results["sick"].is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_failure_overrides_optimistic_channel_health_until_replaced() {
+        let manager = ChannelManager::new();
+        let (stub, _) = StubChannel::new("optional");
+        manager.add(Box::new(stub)).await;
+
+        let _stream = manager.start_all().await.expect("initial start");
+        let second_start = manager.start_all().await;
+        assert!(second_start.is_err());
+
+        let results = manager.health_check_all().await;
+        let error = results["optional"]
+            .as_ref()
+            .expect_err("failed startup must make channel unhealthy")
+            .to_string();
+        assert!(error.contains("channel failed to start"), "{error}");
+
+        let (replacement, _) = StubChannel::new("optional");
+        manager.add(Box::new(replacement)).await;
+        assert!(manager.health_check_all().await["optional"].is_ok());
     }
 
     #[tokio::test]
