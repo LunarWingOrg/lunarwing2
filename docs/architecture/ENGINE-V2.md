@@ -572,9 +572,19 @@ SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and t
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
 ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
+
+# ThreadConfig env overrides (read at thread spawn):
+ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM
+                                        # calls awaited in a ResolveFutures round; on
+                                        # expiry the task is aborted and the call
+                                        # resolves as an error. Default: 300
+ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=1     # Model failure recovery attempts per step.
+                                        # Default: 1; clamped to 0-3
+ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread lifetime.
+                                        # Default: 4; clamped to 16
 ```
 
-The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time.
+The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
 ## Build & Test
 
