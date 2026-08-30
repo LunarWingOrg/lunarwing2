@@ -2,7 +2,7 @@
 
 ## Codename: Inazuma (稲妻)
 
-**Release date:** TBD
+**Release date:** 2026-08-29
 
 >The sky cracks white and we move as one. 
 >Kiyome washed the blade clean
