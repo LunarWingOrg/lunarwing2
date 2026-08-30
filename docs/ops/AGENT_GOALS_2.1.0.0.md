@@ -24,7 +24,7 @@
 6. [ ] F4 hardening — port the passive-voice false-claim detector extension. The kept stash (`stash@{0}` on the 2.0.9 dev branch, `default.py`) adds passive-voice completion claims ("was written", "was saved", "was stored", "was persisted", "was retrieved") and space-separated tool mentions ("memory write", "memory/") to `signals_claimed_tool_success()`. Re-port against current release code (do NOT pop the stale stash blindly — its base predates the shipped F4/F5 rework). Exit criteria: patterns merged into the shipped detector, regression tests for passive-voice claims, no false-positive regressions on the existing test suite.
 7. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95
 8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/94
-9. [x] (S) reserved
+9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/96
 10. [ ] use your browser tool to work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/93
 
 ## Phase 2 — Release hygiene
