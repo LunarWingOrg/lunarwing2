@@ -3,7 +3,6 @@
 ## Actual Official Roadmap:
 | Feature | Target |
 |---------|--------|
-| Interrupt/Steer - Mid-turn steering | v2.1.0.0 |
 | Lunartica improvements | v2.1.2.0 |
 | DarkIRC key manager | v2.1.2.0 |
 | Durable cross-channel attachments — a file sent on one channel stays retrievable from all other channels and the WebUI via a shared attachment store (`docs/ops/IRONCLAW_IDEAS_TAKEAWAYS.md`) | v2.1.2.0 |
