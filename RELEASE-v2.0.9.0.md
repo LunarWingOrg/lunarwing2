@@ -2,15 +2,23 @@
 
 ## Codename: Inazuma (稲妻)
 
-**Release date:** TBD
+**Release date:** 2026-08-29
 
->The sky cracks white and we move as one. 
+>The sky cracks white and we move as one
+
 >Kiyome washed the blade clean
+
 >Now the storm arrives to strike where polishing never could
+
 >One flash of consolidation across the codebase
+
 >The storm after the cleansing
+
 >Lightning
+
 >⚡
+
+![LunarWing Inazuma](https://files.catbox.moe/rmbmci.jpg)
 
 ## Overview
 
