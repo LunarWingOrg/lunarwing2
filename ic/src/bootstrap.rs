@@ -620,7 +620,6 @@ impl PidLock {
 
     /// Acquire at a specific path (for testing).
     fn acquire_at(path: PathBuf) -> Result<Self, PidLockError> {
-        use fs4::FileExt;
         use std::fs::OpenOptions;
         use std::io::Write;
 
@@ -639,8 +638,9 @@ impl PidLock {
 
         // Try non-blocking exclusive lock — if another process holds it,
         // this fails immediately instead of blocking.
-        if let Err(e) = file.try_lock_exclusive() {
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
                 // Lock held by another process — read its PID for the error message
                 let pid = std::fs::read_to_string(&path)
                     .ok()
@@ -649,7 +649,7 @@ impl PidLock {
                 return Err(PidLockError::AlreadyRunning { pid });
             }
             // Other errors (permissions, unsupported filesystem, etc.)
-            return Err(PidLockError::Io(e));
+            Err(std::fs::TryLockError::Error(e)) => return Err(PidLockError::Io(e)),
         }
 
         // We hold the exclusive lock — write our PID
