@@ -14,7 +14,7 @@ const WHISPER_LANGUAGE_CODES: &[&str] = &[
     "et", "mk", "br", "eu", "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si",
     "km", "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo",
     "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln",
-    "ha", "ba", "jw", "su", "yue",
+    "ha", "ba", "jw", "su",
 ];
 
 pub(crate) fn normalize_stt_language(value: &str) -> Result<String, ConfigError> {
@@ -443,7 +443,6 @@ mod tests {
     fn stt_language_normalizes_auto_and_accepts_whisper_codes() {
         assert_eq!(normalize_stt_language("auto").ok(), Some(String::new()));
         assert_eq!(normalize_stt_language(" EN ").ok(), Some("en".into()));
-        assert_eq!(normalize_stt_language("yue").ok(), Some("yue".into()));
         assert!(matches!(
             normalize_stt_language("english"),
             Err(ConfigError::InvalidSttLanguage)
