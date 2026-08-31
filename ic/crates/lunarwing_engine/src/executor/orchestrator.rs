@@ -2951,6 +2951,23 @@ mod tests {
         assert!(eval_python_bool(
             r#"signals_claimed_tool_success("I have written the note with memory_write successfully")"#
         ));
+        // Passive-voice claims must be caught with the space-separated tool
+        // name form as well as the memory path form.
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("The note was written using memory write")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("The note was saved in memory/")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("The note was stored using memory write")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("The note was persisted in memory/")"#
+        ));
+        assert!(eval_python_bool(
+            r#"signals_claimed_tool_success("The note was retrieved from memory/")"#
+        ));
     }
 
     #[test]
@@ -2963,9 +2980,15 @@ mod tests {
         assert!(!eval_python_bool(
             r#"signals_claimed_tool_success("The cake recipe has been saved to the cookbook")"#
         ));
+        assert!(!eval_python_bool(
+            r#"signals_claimed_tool_success("The cake recipe was saved to the cookbook")"#
+        ));
         // Tool mention without a completed-success claim.
         assert!(!eval_python_bool(
             r#"signals_claimed_tool_success("I would use memory_write to save that for you")"#
+        ));
+        assert!(!eval_python_bool(
+            r#"signals_claimed_tool_success("Use memory write or memory/ when ready")"#
         ));
         // Tool output examples inside fenced code are stripped before matching.
         assert!(!eval_python_bool(
