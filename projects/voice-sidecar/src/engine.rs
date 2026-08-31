@@ -13,6 +13,8 @@ use crate::audio::AudioData;
 #[cfg(feature = "onnx")]
 use crate::audio::TARGET_SAMPLE_RATE;
 use crate::config::Config;
+#[cfg(feature = "onnx")]
+use crate::config::normalize_stt_language;
 
 #[cfg(feature = "onnx")]
 const STT_CHUNK_SECS: usize = 30;
@@ -250,11 +252,9 @@ impl VoiceEngine for SherpaVoiceEngine {
         if !model.is_empty() && model != self.model_name {
             return Err(EngineError::ModelMismatch);
         }
-        if !language.is_empty()
-            && language != "auto"
-            && !self.language.is_empty()
-            && language != self.language
-        {
+        let language =
+            normalize_stt_language(language).map_err(|_| EngineError::LanguageMismatch)?;
+        if !language.is_empty() && !self.language.is_empty() && language != self.language {
             return Err(EngineError::LanguageMismatch);
         }
         let fallback_language = self.language.clone();
