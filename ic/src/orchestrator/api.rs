@@ -641,14 +641,10 @@ async fn get_mcp_credentials_handler(
     ))
 }
 
+/// One finish-reason spelling everywhere: the canonical protocol strings
+/// shared with streamed terminal metadata (`LlmStreamChunk::Done`).
 fn format_finish_reason(reason: crate::llm::FinishReason) -> String {
-    match reason {
-        crate::llm::FinishReason::Stop => "stop".to_string(),
-        crate::llm::FinishReason::Length => "length".to_string(),
-        crate::llm::FinishReason::ToolUse => "tool_use".to_string(),
-        crate::llm::FinishReason::ContentFilter => "content_filter".to_string(),
-        crate::llm::FinishReason::Unknown => "unknown".to_string(),
-    }
+    reason.as_str().to_string()
 }
 
 #[cfg(test)]
@@ -665,6 +661,29 @@ mod tests {
     use crate::testing::StubLlm;
 
     use super::*;
+
+    #[test]
+    fn format_finish_reason_uses_canonical_stream_spellings() {
+        // The proxy must spell finish reasons exactly like streamed terminal
+        // metadata, so workers and streaming consumers parse one vocabulary.
+        assert_eq!(format_finish_reason(crate::llm::FinishReason::Stop), "stop");
+        assert_eq!(
+            format_finish_reason(crate::llm::FinishReason::Length),
+            "length"
+        );
+        assert_eq!(
+            format_finish_reason(crate::llm::FinishReason::ToolUse),
+            "tool_calls"
+        );
+        assert_eq!(
+            format_finish_reason(crate::llm::FinishReason::ContentFilter),
+            "content_filter"
+        );
+        assert_eq!(
+            format_finish_reason(crate::llm::FinishReason::Unknown),
+            "unknown"
+        );
+    }
 
     fn test_state() -> OrchestratorState {
         let token_store = TokenStore::new();
