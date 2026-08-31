@@ -337,6 +337,9 @@ Commands:
 
   install-wasm <name>             Install built WASM tools/channels into tenant state dir
   install-wasm-all                Install WASM for all tenants
+                                   (darkirc channel installs only for tenants
+                                   provisioned with --enable-darkirc; use
+                                   install-wasm to drop a stale darkirc channel)
 
   start-tenant <name>             Start all services for a tenant
   stop-tenant <name>              Stop all services for a tenant
