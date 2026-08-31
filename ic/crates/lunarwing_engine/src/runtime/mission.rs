@@ -11,6 +11,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -914,10 +915,20 @@ impl MissionManager {
 
     /// Start a background cron ticker that fires due missions every 60 seconds.
     pub async fn start_cron_ticker(self: &Arc<Self>, user_id: String) {
+        const STARTUP_WARMUP_DELAY: Duration = Duration::from_secs(30);
+
         let mgr = Arc::clone(self);
         let cancel = self.task_cancel.clone();
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            // The provider watchdog and the mission scheduler start concurrently.
+            // Do not let an immediately-ready interval wake due missions while the
+            // provider is still completing its startup health check (work item #94).
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(STARTUP_WARMUP_DELAY) => {}
+            }
+
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -3588,6 +3599,61 @@ mod tests {
             result.is_none(),
             "firing a terminal mission should return None"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cron_ticker_waits_for_provider_warmup() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "startup cron",
+                "wait for provider health",
+                MissionCadence::Cron {
+                    expression: "0 * * * *".into(),
+                    timezone: None,
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        store
+            .missions
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .next_fire_at = Some(Utc::now() - chrono::Duration::minutes(1));
+
+        mgr.start_cron_ticker("test-user".into()).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_history
+                .is_empty(),
+            "startup warmup must suppress scheduled mission wakeups"
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .thread_history
+                .len(),
+            1,
+            "due mission should fire once warmup completes"
+        );
+        mgr.shutdown().await;
     }
 
     #[tokio::test]
