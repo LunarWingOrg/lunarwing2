@@ -154,10 +154,19 @@ checks can instead be **disabled** so they report `healthy` with
 | `HEALTH_LUNARVISION_REQUIRE_VL` | health-lunarvision.sh | `false` | Degrade if the VL backend is not confirmed available |
 | `HEALTH_LUNARVISION_LATENCY_DEGRADED_MS` | health-lunarvision.sh | `2000` | Health-endpoint latency threshold for `degraded` |
 | `HEALTH_LUNARVISION_LATENCY_CRITICAL_MS` | health-lunarvision.sh | `5000` | Health-endpoint latency threshold for `critical` |
-| `HEALTH_LUNARVOICE_ENABLED` | health-lunarvoice.sh | `auto` | Auto-probes enabled registry tenants or explicit URL; `true` forces single-node 8091 fallback; other values disable |
-| `HEALTH_LUNARVOICE_URL` | health-lunarvoice.sh | _(unset)_ → enabled registry `voice_health` ports, else `http://127.0.0.1:8091` | Optional single-node override; leave unset on multi-tenant hosts |
-| `HEALTH_LUNARVOICE_TIMEOUT` | health-lunarvoice.sh | `5` | curl timeout for health/readiness/metrics probes |
-| `HEALTH_LUNARVOICE_FETCH_METRICS` | health-lunarvoice.sh | `true` | Fetch bounded operational counters from `/metrics` |
+| `HEALTH_LUNARVOICE_ENABLED` | health-lunarvoice.sh | `auto` | Auto-probes every enabled registry tenant or an explicit URL; `true` forces single-node 8091 fallback when no registry exists; other values disable |
+| `HEALTH_LUNARVOICE_URL` | health-lunarvoice.sh | _(unset)_ → enabled registry `voice_health` ports, else `http://127.0.0.1:8091` | Optional single-node override; leave unset on multi-tenant hosts so no tenant is skipped |
+| `HEALTH_LUNARVOICE_TIMEOUT` | health-lunarvoice.sh | `5` | Per-request curl timeout for `/health`, `/ready`, and `/metrics` |
+| `HEALTH_LUNARVOICE_FETCH_METRICS` | health-lunarvoice.sh | `true` | Fetch bounded operational counters from `/metrics`; disabling this does not bypass liveness/readiness |
+
+LunarVoice health is strict: an enabled instance must return `status=ok` from
+`/health` and HTTP 200 with `ready=true` from `/ready`. Malformed tenant JSON,
+non-boolean `enable_voice`, missing or duplicate enabled `voice_health` ports,
+an unreachable instance, or an unready STT model makes the component critical.
+All enabled instances remain visible in `metrics.instances`, so one healthy
+tenant cannot mask a failing peer. LunarVoice is monitor-only in self-heal; the
+pipeline alerts and escalates but does not automatically restart optional model
+workloads.
 | `HEALTH_NETBIRD_ENABLED` | health-netbird.sh | `false` | Opt in to host NetBird readiness monitoring |
 | `HEALTH_NETBIRD_TIMEOUT` | health-netbird.sh | `5` | Readiness probe timeout (seconds) |
 | `NETBIRD_BINARY` | health-netbird.sh | `netbird` | NetBird CLI name or path |
