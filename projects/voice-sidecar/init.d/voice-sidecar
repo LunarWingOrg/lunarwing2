@@ -44,14 +44,19 @@ start_pre() {
     set +a
 }
 
+voice_ready() {
+    local base="http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}"
+    curl --fail --silent --output /dev/null --max-time 3 "${base}/health" 2>/dev/null \
+        && curl --fail --silent --output /dev/null --max-time 3 "${base}/ready" 2>/dev/null
+}
+
 start_post() {
     local waited=0
-    ebegin "Waiting for LunarVoice health endpoint"
-    while ! curl --fail --silent --output /dev/null --max-time 3 \
-        "http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}/health" 2>/dev/null; do
+    ebegin "Waiting for LunarVoice STT readiness"
+    while ! voice_ready; do
         waited=$((waited + 1))
         if [ "${waited}" -ge "${voice_wait}" ]; then
-            eend 1 "not healthy after ${voice_wait}s"
+            eend 1 "not ready after ${voice_wait}s"
             return 1
         fi
         sleep 1
