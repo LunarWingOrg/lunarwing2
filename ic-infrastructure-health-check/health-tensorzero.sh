@@ -6,13 +6,23 @@
 
 set -euo pipefail
 
-# Thresholds
-P95_DEGRADED_MS=5000
-P95_CRITICAL_MS=15000
-ERROR_DEGRADED_PCT=1
-ERROR_CRITICAL_PCT=5
-QUEUE_DEGRADED=5
-QUEUE_CRITICAL=20
+# Thresholds (env-configurable; operator typos reset to the defaults instead
+# of breaking the numeric comparisons below — health-netbird.sh discipline).
+# ERROR_* are floats (error_rate is a percent) so they validate as decimals.
+P95_DEGRADED_MS="${HEALTH_TENSORZERO_P95_DEGRADED_MS:-5000}"
+[[ "$P95_DEGRADED_MS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || P95_DEGRADED_MS=5000
+P95_CRITICAL_MS="${HEALTH_TENSORZERO_P95_CRITICAL_MS:-15000}"
+[[ "$P95_CRITICAL_MS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || P95_CRITICAL_MS=15000
+ERROR_DEGRADED_PCT="${HEALTH_TENSORZERO_ERROR_DEGRADED_PCT:-1}"
+[[ "$ERROR_DEGRADED_PCT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ERROR_DEGRADED_PCT=1
+ERROR_CRITICAL_PCT="${HEALTH_TENSORZERO_ERROR_CRITICAL_PCT:-5}"
+[[ "$ERROR_CRITICAL_PCT" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ERROR_CRITICAL_PCT=5
+QUEUE_DEGRADED="${HEALTH_TENSORZERO_QUEUE_DEGRADED:-5}"
+[[ "$QUEUE_DEGRADED" =~ ^[0-9]+$ ]] || QUEUE_DEGRADED=5
+QUEUE_CRITICAL="${HEALTH_TENSORZERO_QUEUE_CRITICAL:-20}"
+[[ "$QUEUE_CRITICAL" =~ ^[0-9]+$ ]] || QUEUE_CRITICAL=20
+GPU_UTIL_WARN_PCT="${HEALTH_TENSORZERO_GPU_UTIL_WARN_PCT:-90}"
+[[ "$GPU_UTIL_WARN_PCT" =~ ^[0-9]+$ ]] || GPU_UTIL_WARN_PCT=90
 
 # Initialize
 p50_ms=0
@@ -97,7 +107,7 @@ elif [ $queue_depth -gt $QUEUE_DEGRADED ]; then
 fi
 
 # GPU utilization warning (if high but not necessarily critical)
-if [ $gpu_util -gt 90 ]; then
+if float_gt "$gpu_util" "$GPU_UTIL_WARN_PCT"; then
     issues+=("GPU utilization high: ${gpu_util}%")
 fi
 
