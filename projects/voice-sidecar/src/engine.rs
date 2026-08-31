@@ -245,7 +245,7 @@ impl VoiceEngine for SherpaVoiceEngine {
         }
         if !language.is_empty()
             && language != "auto"
-            && self.language != "auto"
+            && !self.language.is_empty()
             && language != self.language
         {
             return Err(EngineError::LanguageMismatch);
