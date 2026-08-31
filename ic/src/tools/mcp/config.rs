@@ -7,7 +7,6 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
@@ -1523,7 +1522,7 @@ pub(crate) struct McpConfigWriteGuard(std::fs::File);
 
 impl Drop for McpConfigWriteGuard {
     fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -1540,7 +1539,7 @@ pub(crate) async fn acquire_mcp_config_write_guard() -> Result<McpConfigWriteGua
             .read(true)
             .write(true)
             .open(lock_path)?;
-        file.lock_exclusive()?;
+        file.lock()?;
         Ok(McpConfigWriteGuard(file))
     })
     .await

@@ -3,8 +3,6 @@
 ## Actual Official Roadmap:
 | Feature | Target |
 |---------|--------|
-| Interrupt/Steer - Mid-turn steering | v2.1.0.0 |
-| Lunarvision support for multimodal models | v2.1.1.0 |
 | Lunartica improvements | v2.1.2.0 |
 | DarkIRC key manager | v2.1.2.0 |
 | Durable cross-channel attachments — a file sent on one channel stays retrievable from all other channels and the WebUI via a shared attachment store (`docs/ops/IRONCLAW_IDEAS_TAKEAWAYS.md`) | v2.1.2.0 |
@@ -13,6 +11,7 @@
 | LunarVoice Two Way Voice Communication Completion | v2.1.8.0 |
 | Memory as a capability-declaring extension — memory/knowledge providers advertise declared capabilities (search, get, submit, list-stale, stats) so providers are swappable | v2.1.8.0 |
 | TPM 2.0 Decryption Integration via Clevis | v2.2.0.0 |
+| Lunarvision support for multimodal models | v2.2.0.0 |
 | LTX integration via sidecar | v2.2.2.0 |
 
 ### Unscoped discussed ideas (no release target yet)
