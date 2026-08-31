@@ -47,29 +47,29 @@
     - Bridge (039217f9): `map_completion_response` / `map_tool_response` in `ic/src/bridge/llm_adapter.rs` no longer drop the field — `FinishReason::as_str()` → canonical string into `LlmOutput.finish_reason`; regression tests assert `"length"` / `"tool_calls"` pass through both blocking surfaces; two host mocks updated.
     - Proxy shape (306a64f7): the orchestrator proxy previously emitted `"tool_use"` while streamed terminal metadata used `"tool_calls"`; `format_finish_reason` now delegates to `FinishReason::as_str()` and worker `parse_finish_reason` delegates to `from_stream_reason()` (extended with the `"tool_use"` legacy alias for rolling-upgrade interop) — one serializer + one parser across proxy, stream, and engine surfaces.
     - Verified (taskset -c 0-17, -j16): `cargo check` clean (engine lib+tests, host lib+tests); `cargo clippy --lib -D warnings` clean on both crates; `cargo fmt --all -- --check` clean; full engine lib suite 535/535 green; targeted host suites green — bridge::llm_adapter 12/12 (incl. new pass-through tests), llm::provider 15/15, orchestrator::api 19/19 (incl. canonical-spelling test), worker::api 5/5 (incl. legacy-alias parse test).
-9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/96
+8. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/96
+9. [x] (S) reserved
 10. [ ] use your browser tool to work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/93
-11. [ ] LunarVision: support external instances so you can use it on machines that do not have powerful GPUs
 11. [ ] Vendor all crates.io dependencies into the LunarWing repo as a committed source-replacement directory. Run `cargo vendor` against the current workspace lockfiles into `ic/vendor/`, add `.cargo/config.toml` with `[source.crates-io] replace-with = "vendored-sources"` and `[source.vendored-sources] directory = "vendor/"`, and commit both. All subsequent builds resolve exclusively from the vendor dir — no `cargo update` or `cargo build` touches crates.io directly.
     - (context) Current dep closure: 892 unique crates.io crates across 81 lockfiles. Estimated vendor dir size 300–800MB. The `cargo vendor` command downloads `.crate` files + builds a local sparse index; checksums are verified by cargo automatically.
         - (context) Precedent: container registry migration already done — same isolation pattern, same "trust nothing you don't control" posture (Kageho's analysis, 2026-08-31).
             - (context) Motivating incident: 2026-08-20 DPRK supply-chain attack on crates.io (arrayref 0.3.10, internment 0.8.7, append-only-vec 0.1.9 + proc-macro1 typosquat dropper). Herd scanned clean (81 locks, 0 hits, fact 221) but the attack vector is now demonstrated. Vendor dir gates which crates enter the tree — new deps require an explicit `cargo vendor` refresh + diff review.
                 - (context) Advisory scanning is unaffected: `cargo deny check advisories` and `cargo audit` cross-reference Cargo.lock against the RustSec advisory-db (a separate git repo, not crates.io). Wire `cargo deny check advisories` into the vendor-refresh script so new-advisory hits surface before merging refreshed crates.
                     - Exit criteria: `taskset -c 0-11 cargo check -j12` succeeds with no network access to crates.io (disconnect test or `CARGO_NET_OFFLINE=true`), vendor dir is committed, and `cargo deny check advisories` passes against the vendored set.
-12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 - the comment/note from Ruffles is the correct analysis
-13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/98
+12. [ ] LunarVision: support external instances so you can use it on machines that do not have powerful GPUs
+13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 - the comment/note from Ruffles is the correct analysis
+14. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/98
 
 ## Phase 2 — Release hygiene
 
-14. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
+15. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
     - (context) Kageho's review of the #88 fix: "I can give this a 4+ if you unblock the double-timeout knob (or document it as deferred)." Christopher decided: intentional, not deferred.
-15. [ ] fix ci/cd issues for opencode ext worker
-16. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
-17. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
+16. [ ] fix ci/cd issues for opencode ext worker
+17. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
+18. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
 
 ## Phase 3 — Surfaces & delight (the 2.1 identity)
 
-18. [x] (S) reserved
 19. [ ] Emoting mascot in the web gateway. An animated avatar widget that mirrors the agent's expressed emotions: parse the agent's outgoing roleplay action phrases ("*stamps hooves*", "*ears perk*") on the gateway's outgoing-message path and map them to sprite animation frame sets. Build gateway-first — the desktop app inherits it. Exit criteria: emote-parser hook live in `src/channels/web/`, phrase→enum→sprite state machine working, a first sprite pack (pony/unicorn) rendering in the GUI as a draggable corner widget - you may search the repo for existing sprites for an example, idle/working fallback animations. Details: study-note topic emoting-mascot-2-1 / fact 206 - also see: desktop app
     - (context) Full implementation sketch in the study-notes knowledge base, topic `emoting-mascot-2-1` (also fact 206). Origin: user suggestion. Christopher has sprite-animation experience and plans to make the art. petdex (192×208 frame convention) is prior art. Presentation layer only — zero core-path risk.
 20. [ ] Android app — POINTER ITEM. Same treatment as item 12: own repo, own goals file, mascot widget + voice + gateway features. THIS item tracks only repo creation + goals seeding + buildable scaffold (repo created in gitlab now; no goals file yet; may append more details later) 
