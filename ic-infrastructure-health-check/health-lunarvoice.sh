@@ -33,6 +33,15 @@ resolve_registry() {
   return 1
 }
 
+discovery_error() {
+  local issue="$1"
+  jq -n \
+    --arg timestamp "$TIMESTAMP" --arg issue "$issue" \
+    '{component:"lunarvoice",status:"critical",timestamp:$timestamp,
+      metrics:{enabled:true,discovery:"ports-registry",target_count:0,instances:[]},issues:[$issue]}'
+  exit 2
+}
+
 targets=()
 discovery=single
 if [[ -n "${HEALTH_LUNARVOICE_URL:-}" ]]; then
@@ -42,16 +51,41 @@ else
   registry=""
   if registry="$(resolve_registry)"; then
     discovery=ports-registry
+    jq -e 'type == "object" and ((.tenants // {}) | type == "object")' \
+      "$registry" >/dev/null 2>&1 \
+      || discovery_error "ports registry is not valid tenant JSON"
+    invalid_tenants="$(jq -r '
+      def valid_port:
+        type == "number" and . == floor and . >= 1 and . <= 65535;
+      (.tenants // {}) | to_entries[]
+      | select(.value.enable_voice == true)
+      | select((.value.voice_ports.voice_health | valid_port) | not)
+      | .key
+    ' "$registry" 2>/dev/null)" \
+      || discovery_error "failed to inspect LunarVoice ports registry"
+    if [[ -n "$invalid_tenants" ]]; then
+      invalid_tenants="$(paste -sd, <<<"$invalid_tenants")"
+      discovery_error "enabled tenant has no valid voice_health port: $invalid_tenants"
+    fi
+    duplicate_ports="$(jq -r '
+      [(.tenants // {}) | to_entries[]
+        | select(.value.enable_voice == true)
+        | .value.voice_ports.voice_health]
+      | group_by(.)[] | select(length > 1) | .[0]
+    ' "$registry" 2>/dev/null)" \
+      || discovery_error "failed to inspect LunarVoice port uniqueness"
+    if [[ -n "$duplicate_ports" ]]; then
+      duplicate_ports="$(paste -sd, <<<"$duplicate_ports")"
+      discovery_error "enabled tenants share voice_health port(s): $duplicate_ports"
+    fi
     while IFS=$'\t' read -r tenant port; do
       [[ -n "$tenant" && "$port" =~ ^[0-9]+$ ]] || continue
       targets+=("$tenant|http://127.0.0.1:$port")
     done < <(jq -r '
       (.tenants // {}) | to_entries[]
       | select(.value.enable_voice == true)
-      | (.value.voice_ports.voice_health // empty) as $port
-      | select($port != "")
-      | "\(.key)\t\($port)"
-    ' "$registry" 2>/dev/null)
+      | "\(.key)\t\(.value.voice_ports.voice_health)"
+    ' "$registry")
     if [[ ${#targets[@]} -eq 0 ]]; then
       jq -n \
         --arg timestamp "$TIMESTAMP" \
