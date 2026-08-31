@@ -91,9 +91,9 @@ static WARNED_EXPLICIT_DEFAULT_OWNER_ID: Once = Once::new();
 #[derive(Debug, Clone)]
 pub struct Config {
     pub owner_id: String,
-    /// Per-tenant vision/OCR sidecar URL the agent's vision-analyze WASM tool should call.
-    /// Populated from the `VISION_SERVICE_URL` env var (written per-tenant by the MT admin
-    /// script). `None` on deployments without a sidecar; the tool falls back to its default.
+    /// Per-tenant local or external LunarVision URL used by automatic enrichment and WASM.
+    /// Populated from `VISION_SERVICE_URL` (written by mt-admin). Remote instances must use
+    /// HTTPS. `None` falls back to the bundled tool's local single-node default.
     pub vision_service_url: Option<String>,
     /// Bearer token for authenticated LunarVision sidecar requests.
     pub vision_auth_token: Option<SecretString>,
@@ -336,8 +336,8 @@ impl Config {
     async fn build(settings: &Settings) -> Result<Self, ConfigError> {
         let owner_id = resolve_owner_id(settings)?;
 
-        // Per-tenant vision/OCR sidecar URL (set by the MT admin script via env).
-        // Empty/unset = None; the vision-analyze WASM tool falls back to its default.
+        // Per-tenant local or external LunarVision URL, set by mt-admin via env.
+        // Empty/unset = None; the vision-analyze WASM tool uses its local default.
         let vision_service_url = self::helpers::optional_env("VISION_SERVICE_URL")?
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
