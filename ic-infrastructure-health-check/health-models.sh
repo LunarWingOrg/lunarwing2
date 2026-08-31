@@ -6,9 +6,13 @@
 
 set -uo pipefail
 
-# Thresholds
-LATENCY_DEGRADED_MS=3000
-LATENCY_CRITICAL_MS=10000
+# Thresholds (env-configurable; follow the HEALTH_* override pattern).
+# Operator typos in the env file must not break the integer comparisons
+# below — reset to the default instead (same discipline as health-netbird.sh).
+LATENCY_DEGRADED_MS="${HEALTH_MODELS_LATENCY_DEGRADED_MS:-3000}"
+[[ "$LATENCY_DEGRADED_MS" =~ ^[0-9]+$ ]] || LATENCY_DEGRADED_MS=3000
+LATENCY_CRITICAL_MS="${HEALTH_MODELS_LATENCY_CRITICAL_MS:-10000}"
+[[ "$LATENCY_CRITICAL_MS" =~ ^[0-9]+$ ]] || LATENCY_CRITICAL_MS=10000
 
 # Initialize
 overall_status="healthy"
@@ -162,6 +166,13 @@ done
 providers_json=$(printf '%s\n' "${provider_results[@]}" | jq -s '[.[] | del(.exit_code)]')
 
 # Output final JSON
+#
+# metrics.providers must be a real object (not a list) because the Prometheus
+# exporter (health-metrics-exporter.sh) recursively flattens numeric/boolean
+# leaves of the `metrics` object into lunarwing_health_models_<key>_<name>
+# series and drops strings. Per-provider status codes are numeric (same
+# 0/1/2/3 mapping the exporter uses for component status) so every provider
+# gets a series; last_error stays string-only and is therefore never exposed.
 jq -n \
     --arg status "$overall_status" \
     --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
@@ -170,7 +181,24 @@ jq -n \
         component: "models",
         status: $status,
         timestamp: $timestamp,
-        providers: $providers
+        providers: $providers,
+        metrics: (
+            ($providers | map({key: .name, value: .latency_ms}) | from_entries) as $lat |
+            ($providers | map(select(.latency_ms >= 0))) as $ok |
+            {
+                enabled: true,
+                provider_count: ($providers | length),
+                providers_healthy: ([$providers[] | select(.status == "healthy")] | length),
+                providers_degraded: ([$providers[] | select(.status == "degraded")] | length),
+                providers_critical: ([$providers[] | select(.status == "critical")] | length),
+                latency_max_ms: ([$ok[] | .latency_ms] | max // 0),
+                provider_latency_ms: $lat,
+                provider_status: (
+                    {"healthy": 0, "degraded": 1, "critical": 2} as $map |
+                    $providers | map({key: .name, value: ($map[.status] // 3)}) | from_entries
+                )
+            }
+        )
     }'
 
 exit $overall_exit_code

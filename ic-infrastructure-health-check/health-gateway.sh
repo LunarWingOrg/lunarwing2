@@ -7,9 +7,18 @@
 set -euo pipefail
 
 SESSIONS_DIR="${LUNARWING_BASE_DIR:-${IRONCLAW_BASE_DIR:-$HOME/.lunarwing}}/agents"
-STALE_LOCK_MINUTES=10
-ORPHAN_THRESHOLD_DEGRADED=10
-ORPHAN_THRESHOLD_CRITICAL=50
+# Thresholds (env-configurable; operator typos reset to the defaults instead
+# of breaking the integer comparisons below — health-netbird.sh discipline).
+STALE_LOCK_MINUTES="${HEALTH_GATEWAY_STALE_LOCK_MINUTES:-10}"
+[[ "$STALE_LOCK_MINUTES" =~ ^[0-9]+$ ]] || STALE_LOCK_MINUTES=10
+STALE_LOCKS_CRITICAL="${HEALTH_GATEWAY_STALE_LOCKS_CRITICAL:-3}"
+[[ "$STALE_LOCKS_CRITICAL" =~ ^[0-9]+$ ]] || STALE_LOCKS_CRITICAL=3
+ORPHAN_THRESHOLD_DEGRADED="${HEALTH_GATEWAY_ORPHAN_DEGRADED:-10}"
+[[ "$ORPHAN_THRESHOLD_DEGRADED" =~ ^[0-9]+$ ]] || ORPHAN_THRESHOLD_DEGRADED=10
+ORPHAN_THRESHOLD_CRITICAL="${HEALTH_GATEWAY_ORPHAN_CRITICAL:-50}"
+[[ "$ORPHAN_THRESHOLD_CRITICAL" =~ ^[0-9]+$ ]] || ORPHAN_THRESHOLD_CRITICAL=50
+OVERSIZED_DEGRADED="${HEALTH_GATEWAY_OVERSIZED_DEGRADED:-0}"
+[[ "$OVERSIZED_DEGRADED" =~ ^[0-9]+$ ]] || OVERSIZED_DEGRADED=0
 
 # Initialize results
 active_sessions=0
@@ -90,10 +99,10 @@ oversized=$(check_oversized_sessions)
 status="healthy"
 exit_code=0
 
-if [ $stale_locks -gt 3 ] || [ $orphan_count -gt $ORPHAN_THRESHOLD_CRITICAL ]; then
+if [ $stale_locks -gt $STALE_LOCKS_CRITICAL ] || [ $orphan_count -gt $ORPHAN_THRESHOLD_CRITICAL ]; then
     status="critical"
     exit_code=2
-elif [ $stale_locks -gt 0 ] || [ $orphan_count -gt $ORPHAN_THRESHOLD_DEGRADED ] || [ $oversized -gt 0 ]; then
+elif [ $stale_locks -gt 0 ] || [ $orphan_count -gt $ORPHAN_THRESHOLD_DEGRADED ] || [ $oversized -gt $OVERSIZED_DEGRADED ]; then
     status="degraded"
     exit_code=1
 fi

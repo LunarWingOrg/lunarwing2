@@ -12,10 +12,16 @@ set -euo pipefail
 # server) — reported healthy/disabled instead of a false critical.
 XMPP_SERVER="${HEALTH_XMPP_SERVER-xmpp.sobe.world}"
 XMPP_PORT="${HEALTH_XMPP_PORT:-5222}"
-LATENCY_DEGRADED_MS=500
-LATENCY_CRITICAL_MS=2000
-ERROR_DEGRADED=1
-ERROR_CRITICAL=5
+# Thresholds (env-configurable; operator typos reset to the defaults instead
+# of breaking the integer comparisons below — health-netbird.sh discipline).
+LATENCY_DEGRADED_MS="${HEALTH_XMPP_LATENCY_DEGRADED_MS:-500}"
+[[ "$LATENCY_DEGRADED_MS" =~ ^[0-9]+$ ]] || LATENCY_DEGRADED_MS=500
+LATENCY_CRITICAL_MS="${HEALTH_XMPP_LATENCY_CRITICAL_MS:-2000}"
+[[ "$LATENCY_CRITICAL_MS" =~ ^[0-9]+$ ]] || LATENCY_CRITICAL_MS=2000
+ERROR_DEGRADED="${HEALTH_XMPP_ERROR_DEGRADED:-1}"
+[[ "$ERROR_DEGRADED" =~ ^[0-9]+$ ]] || ERROR_DEGRADED=1
+ERROR_CRITICAL="${HEALTH_XMPP_ERROR_CRITICAL:-5}"
+[[ "$ERROR_CRITICAL" =~ ^[0-9]+$ ]] || ERROR_CRITICAL=5
 
 # Initialize
 connected=false

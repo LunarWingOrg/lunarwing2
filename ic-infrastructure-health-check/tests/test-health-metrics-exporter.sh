@@ -290,6 +290,39 @@ sb="$(mksb)"
 run "$sb"
 assert_ne "$RC" "0" "no report at all -> non-zero exit"
 
+# ── 11. Models per-provider metrics flatten to bounded series ────────────────
+sb="$(mksb)"
+mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
+{"timestamp":"2026-08-15T10:00:00Z","overall_status":"degraded","components":[
+  {"component":"models","status":"degraded","providers":[
+     {"name":"openrouter","status":"unknown","latency_ms":0,"last_error":"API key not set"},
+     {"name":"local","status":"healthy","latency_ms":18,"last_error":""}],
+   "metrics":{"enabled":true,"provider_count":2,"providers_healthy":1,
+     "providers_degraded":0,"providers_critical":0,"latency_max_ms":18,
+     "provider_latency_ms":{"openrouter":0,"local":18},
+     "provider_status":{"openrouter":3,"local":0}}}],
+ "alerts":[]}
+EOF
+run "$sb"
+assert_contains "$PROM" 'lunarwing_health_models_provider_count 2' "models provider count exported"
+assert_contains "$PROM" 'lunarwing_health_models_providers_healthy 1' "models healthy count exported"
+assert_contains "$PROM" 'lunarwing_health_models_latency_max_ms 18' "models latency_max_ms exported"
+assert_contains "$PROM" 'lunarwing_health_models_provider_latency_ms_openrouter 0' "per-provider latency flattened"
+assert_contains "$PROM" 'lunarwing_health_models_provider_latency_ms_local 18' "per-provider latency local"
+assert_contains "$PROM" 'lunarwing_health_models_provider_status_openrouter 3' "per-provider status unknown -> 3"
+# String leaves (names, last_error) must never leak into the exposition.
+assert_absent "$PROM" 'API key not set' "models last_error string dropped"
+assert_absent "$PROM" 'lunarwing_health_models_providers{' "raw providers array not exported"
+
+# Threshold evaluation against a per-provider flattened series.
+cat > "$ROOT/th-models.conf" <<'EOF'
+THRESHOLD_lunarwing_health_models_latency_max_ms="warn:>10"
+THRESHOLD_lunarwing_health_models_provider_latency_ms_local="crit:>15"
+EOF
+run "$sb" HEALTH_METRICS_THRESHOLDS_FILE="$ROOT/th-models.conf" HEALTH_METRICS_EARLY_WARNING_NOTIFY=false
+assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_models_latency_max_ms",severity="warn"} 1' "models rollup threshold crossing"
+assert_contains "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_models_provider_latency_ms_local",severity="crit"} 1' "per-provider threshold crossing"
+
 # ── 10. Newest report wins over older ones ──────────────────────────────────
 sb="$(mksb)"
 mkreport "$sb" "2026-08-15T09:00:00Z.json" <<'EOF'
