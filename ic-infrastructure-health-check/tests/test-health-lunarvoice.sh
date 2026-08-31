@@ -63,6 +63,28 @@ assert_eq "$(jq -r '.metrics.target_count' <<<"$out")" 1 "disabled tenant omitte
 assert_has "$(cat "$calls")" "41001" "enabled tenant probed"
 if grep -q 42001 "$calls"; then bad "disabled tenant not probed" "found 42001"; else ok "disabled tenant not probed"; fi
 
+cat >"$registry" <<'JSON'
+{"version":16,"tenants":{"missing":{"enable_voice":true,"voice_ports":{}}}}
+JSON
+out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
+assert_eq "$rc" 2 "enabled tenant without health port exits critical"
+assert_has "$(jq -r '.issues[]' <<<"$out")" "missing" "missing-port issue names tenant"
+
+cat >"$registry" <<'JSON'
+{"version":16,"tenants":{"one":{"enable_voice":true,"voice_ports":{"voice_health":41001}},"two":{"enable_voice":true,"voice_ports":{"voice_health":41001}}}}
+JSON
+out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
+assert_eq "$rc" 2 "duplicate enabled health ports exit critical"
+assert_has "$(jq -r '.issues[]' <<<"$out")" "41001" "duplicate-port issue names port"
+
+printf '{not-json\n' >"$registry"
+out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
+assert_eq "$rc" 2 "malformed registry exits critical"
+assert_has "$(jq -r '.issues[]' <<<"$out")" "valid tenant JSON" "malformed registry issue is explicit"
+
+cat >"$registry" <<'JSON'
+{"version":16,"tenants":{"on":{"enable_voice":true,"voice_ports":{"voice_health":41001}},"off":{"enable_voice":false,"voice_ports":{"voice_health":42001}}}}
+JSON
 jq '.tenants.on.enable_voice=false' "$registry" >"$registry.tmp" && mv "$registry.tmp" "$registry"
 : >"$calls"
 out="$(MOCK_CALLS="$calls" SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
