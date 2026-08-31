@@ -2,7 +2,7 @@
   "name": "vision-analyze",
   "display_name": "Vision Analyze",
   "kind": "tool",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "wit_version": "0.3.0",
   "description": "Analyze images using OCR and vision-language models. Extract text, describe scenes, or get answers about image content. Supports smart auto-routing between OCR and vision backends.",
   "keywords": [
