@@ -1373,8 +1373,10 @@ status_tenant() {
   fi
 
   local voice_container="lunarwing-voice-$name"
-  if _ctr "$name" inspect -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
-    say "LunarVoice: running ($voice_container, API port $(ports_get "$name" voice_service))"
+  if _voice_container_healthy "$name" "$voice_container"; then
+    say "LunarVoice: ready ($voice_container, API/health ports $(ports_get "$name" voice_service)/$(ports_get "$name" voice_health))"
+  elif _ctr "$name" inspect -f '{{.State.Running}}' "$voice_container" 2>/dev/null | grep -q true; then
+    say "LunarVoice: running but unready ($voice_container)"
   elif _ctr "$name" inspect "$voice_container" &>/dev/null; then
     say "LunarVoice: stopped ($voice_container)"
   else
