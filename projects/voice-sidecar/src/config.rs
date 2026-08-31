@@ -23,6 +23,8 @@ pub enum ConfigError {
     InvalidVoiceMap,
     #[error("VOICE_STT_ENGINE must be one of: whisper, parakeet")]
     InvalidSttEngine,
+    #[error("VOICE_STT_MODEL must be a safe model name compatible with VOICE_STT_ENGINE")]
+    InvalidSttModel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +103,7 @@ impl Config {
         let tts_voice_ids = parse_voice_map()?;
         let model_name = env_string("VOICE_STT_MODEL", "whisper-tiny");
         let stt_engine = env_stt_engine()?;
-        let stt_paths = SttPathDefaults::new(&model_name, stt_engine);
+        let stt_paths = SttPathDefaults::new(&model_name, stt_engine)?;
         Ok(Self {
             bind_host,
             port,
@@ -237,25 +239,43 @@ struct SttPathDefaults {
 }
 
 impl SttPathDefaults {
-    fn new(model_name: &str, engine: SttEngineKind) -> Self {
+    fn new(model_name: &str, engine: SttEngineKind) -> Result<Self, ConfigError> {
+        if !valid_model_name(model_name) {
+            return Err(ConfigError::InvalidSttModel);
+        }
         match engine {
-            SttEngineKind::Whisper => Self {
-                encoder: "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx".into(),
-                decoder: "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx".into(),
-                joiner: "sherpa-onnx-whisper-tiny/tiny-tokens.txt".into(),
-                tokens: "sherpa-onnx-whisper-tiny/tiny-tokens.txt".into(),
-            },
+            SttEngineKind::Whisper => {
+                let size = model_name
+                    .strip_prefix("whisper-")
+                    .filter(|size| !size.is_empty())
+                    .ok_or(ConfigError::InvalidSttModel)?;
+                let root = format!("sherpa-onnx-{model_name}");
+                Ok(Self {
+                    encoder: format!("{root}/{size}-encoder.int8.onnx"),
+                    decoder: format!("{root}/{size}-decoder.int8.onnx"),
+                    joiner: format!("{root}/{size}-tokens.txt"),
+                    tokens: format!("{root}/{size}-tokens.txt"),
+                })
+            }
             SttEngineKind::Parakeet => {
                 let root = format!("sherpa-onnx-nemo-{model_name}");
-                Self {
+                Ok(Self {
                     encoder: format!("{root}/encoder.int8.onnx"),
                     decoder: format!("{root}/decoder.int8.onnx"),
                     joiner: format!("{root}/joiner.int8.onnx"),
                     tokens: format!("{root}/tokens.txt"),
-                }
+                })
             }
         }
     }
+}
+
+fn valid_model_name(model_name: &str) -> bool {
+    !model_name.is_empty()
+        && model_name.len() <= 128
+        && model_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn parse_voice_map() -> Result<HashMap<String, i32>, ConfigError> {
@@ -287,7 +307,8 @@ mod tests {
 
     #[test]
     fn parakeet_defaults_follow_model_name() {
-        let paths = SttPathDefaults::new("parakeet-tdt-0.6b-v3-int8", SttEngineKind::Parakeet);
+        let paths = SttPathDefaults::new("parakeet-tdt-0.6b-v3-int8", SttEngineKind::Parakeet)
+            .unwrap_or_else(|error| panic!("valid Parakeet model rejected: {error}"));
         let root = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
         assert_eq!(paths.encoder, format!("{root}/encoder.int8.onnx"));
         assert_eq!(paths.decoder, format!("{root}/decoder.int8.onnx"));
@@ -296,16 +317,24 @@ mod tests {
     }
 
     #[test]
-    fn whisper_defaults_keep_historical_layout() {
-        let paths = SttPathDefaults::new("whisper-tiny", SttEngineKind::Whisper);
-        assert_eq!(
-            paths.encoder,
-            "sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx"
-        );
-        assert_eq!(
-            paths.decoder,
-            "sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx"
-        );
-        assert_eq!(paths.tokens, "sherpa-onnx-whisper-tiny/tiny-tokens.txt");
+    fn whisper_defaults_follow_model_size() {
+        for size in ["tiny", "base", "small.en"] {
+            let model = format!("whisper-{size}");
+            let paths = SttPathDefaults::new(&model, SttEngineKind::Whisper)
+                .unwrap_or_else(|error| panic!("valid Whisper model rejected: {error}"));
+            let root = format!("sherpa-onnx-{model}");
+            assert_eq!(paths.encoder, format!("{root}/{size}-encoder.int8.onnx"));
+            assert_eq!(paths.decoder, format!("{root}/{size}-decoder.int8.onnx"));
+            assert_eq!(paths.tokens, format!("{root}/{size}-tokens.txt"));
+        }
+    }
+
+    #[test]
+    fn stt_model_names_reject_path_components_and_invalid_whisper_names() {
+        for model in ["", "../whisper-tiny", "whisper/tiny", "whisper tiny"] {
+            assert!(SttPathDefaults::new(model, SttEngineKind::Whisper).is_err());
+        }
+        assert!(SttPathDefaults::new("tiny", SttEngineKind::Whisper).is_err());
+        assert!(SttPathDefaults::new("whisper-", SttEngineKind::Whisper).is_err());
     }
 }
