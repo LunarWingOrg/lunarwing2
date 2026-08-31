@@ -116,11 +116,14 @@
 #HEALTH_LUNARVOICE_ENABLED=auto
 
 # Single-node health-listener override. Leave unset on multi-tenant hosts so
-# enabled tenants are discovered from voice_health in ports registry. When
-# registry exists but no tenant enables voice, check reports healthy/disabled.
+# every enabled tenant is discovered from voice_health in the ports registry.
+# No enabled tenants reports healthy/disabled. Invalid enablement, missing or
+# duplicate ports, unreachable listeners, and unready STT report critical.
 #HEALTH_LUNARVOICE_URL="http://127.0.0.1:8091"
 
+# Per-request timeout for /health, /ready, and /metrics.
 #HEALTH_LUNARVOICE_TIMEOUT=5
+# Metrics are optional; /health and /ready always remain mandatory.
 #HEALTH_LUNARVOICE_FETCH_METRICS=true
 
 # ═════════════════════════════════════════════════════════════════════════════
