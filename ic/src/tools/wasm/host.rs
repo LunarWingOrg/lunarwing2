@@ -259,15 +259,23 @@ impl HostState {
             .as_ref()
             .ok_or_else(|| "HTTP capability not granted".to_string())?;
 
-        // Use the allowlist validator
+        // Use the allowlist validator. Plain HTTP is decided from the request
+        // target, not merely from the presence of any local allowlist entry;
+        // otherwise a mixed local/remote capability would permit remote HTTP.
         use crate::tools::wasm::allowlist::AllowlistValidator;
         let validator = AllowlistValidator::new(capability.allowlist.clone());
-        // Allow plain HTTP for localhost/loopback endpoints
-        let validator = if capability
-            .allowlist
-            .iter()
-            .any(|p| p.host == "127.0.0.1" || p.host == "localhost" || p.host == "::1")
-        {
+        let local_request = url::Url::parse(url)
+            .ok()
+            .is_some_and(|parsed| match parsed.host() {
+                Some(url::Host::Domain(host)) => {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host.eq_ignore_ascii_case("host.containers.internal")
+                }
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                None => false,
+            });
+        let validator = if local_request {
             validator.allow_http()
         } else {
             validator
@@ -408,7 +416,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::tools::wasm::capabilities::{
-        Capabilities, SecretsCapability, WorkspaceCapability, WorkspaceReader,
+        Capabilities, EndpointPattern, HttpCapability, SecretsCapability, WorkspaceCapability,
+        WorkspaceReader,
     };
     use crate::tools::wasm::host::{
         HostState, LogLevel, MAX_LOG_ENTRIES, MAX_LOG_MESSAGE_BYTES, validate_workspace_path,
@@ -434,6 +443,31 @@ mod tests {
         let state = HostState::new(Capabilities::none().with_ssh(vec!["prod".to_string()]));
         assert!(state.check_ssh_allowed("prod").is_ok());
         assert!(state.check_ssh_allowed("dev").is_err());
+    }
+
+    #[test]
+    fn http_is_allowed_only_for_local_request_targets() {
+        let patterns = vec![
+            EndpointPattern::host("host.containers.internal"),
+            EndpointPattern::host("vision.example.com"),
+        ];
+        let state = HostState::new(Capabilities::none().with_http(HttpCapability::new(patterns)));
+
+        assert!(
+            state
+                .check_http_allowed("http://host.containers.internal:8088/v1/ocr", "POST")
+                .is_ok()
+        );
+        assert!(
+            state
+                .check_http_allowed("https://vision.example.com/v1/ocr", "POST")
+                .is_ok()
+        );
+        assert!(
+            state
+                .check_http_allowed("http://vision.example.com/v1/ocr", "POST")
+                .is_err()
+        );
     }
 
     #[test]
