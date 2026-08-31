@@ -212,7 +212,7 @@ else
 fi
 
 quadlet="$ROOT/quadlets/lunarwing-voice-alpha.container"
-assert_eq "$(grep -c '^HealthCmd=curl -sf http://127.0.0.1:8091/health || exit 1$' "$quadlet")" 1 "quadlet health-checks dedicated listener"
+assert_eq "$(grep -c '^HealthCmd=curl -sf http://127.0.0.1:8091/health && curl -sf http://127.0.0.1:8091/ready || exit 1$' "$quadlet")" 1 "quadlet health-checks liveness and readiness"
 assert_eq "$(grep -c '^PodmanArgs=--security-opt=no-new-privileges$' "$quadlet")" 1 "quadlet sets no-new-privileges"
 assert_eq "$(grep -c '^PublishPort=127.0.0.1:40000:8090$' "$quadlet")" 1 "quadlet publishes API port on loopback"
 assert_eq "$(grep -c '^PublishPort=127.0.0.1:40001:8091$' "$quadlet")" 1 "quadlet publishes health port on loopback"
