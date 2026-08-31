@@ -407,6 +407,82 @@ voice_models_ready() {
   _voice_models_ready_env "$(tenant_env_dir "$1")/voice.env"
 }
 
+_normalize_external_vision_url() {
+  local url="${1%/}" authority host port=""
+  [[ "$url" == https://* && "$url" != *[[:space:]]* ]] || return 1
+  authority="${url#https://}"
+  [[ -n "$authority" && "$authority" != *['/?#@']* ]] || return 1
+
+  if [[ "$authority" == \[* ]]; then
+    [[ "$authority" =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]] || return 1
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[3]:-}"
+    [[ "$host" == *:* ]] || return 1
+  else
+    [[ "$authority" != *:*:* ]] || return 1
+    if [[ "$authority" == *:* ]]; then
+      host="${authority%:*}"
+      port="${authority##*:}"
+    else
+      host="$authority"
+    fi
+    [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+    [[ "$host" != *..* ]] || return 1
+  fi
+  [[ -z "$port" ]] || _vision_port_valid "$port" || return 1
+  printf '%s' "$url"
+}
+
+_external_vision_endpoint_healthy() {
+  local base_url="$1" response
+  response="$(curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+    --connect-timeout 5 --max-time 10 "${base_url}/health" 2>/dev/null)" || return 1
+  jq -e '.status == "ok"' <<<"$response" >/dev/null 2>&1
+}
+
+_wait_external_vision_healthy() {
+  local base_url="$1" attempts="${2:-6}" attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    _external_vision_endpoint_healthy "$base_url" && return 0
+    (( attempt < attempts )) && sleep 2
+  done
+  return 1
+}
+
+_vision_daemon_running() {
+  local name="$1"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" >/dev/null 2>&1
+  else
+    rc-service "lunarwing-${name}" status >/dev/null 2>&1
+  fi
+}
+
+_reload_vision_consumer_if_running() {
+  local name="$1"
+  if _vision_daemon_running "$name"; then
+    _restart_tenant_daemon "$name" || {
+      say "ERROR: failed to restart LunarWing after vision configuration change" >&2
+      return 1
+    }
+    say "LunarWing restarted; vision configuration is active for $name"
+  else
+    say "LunarWing is stopped; vision configuration applies on its next start"
+  fi
+}
+
+_set_vision_daemon_endpoint() {
+  local name="$1" service_url="$2" token="$3"
+  local env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || { say "ERROR: tenant LunarWing environment missing or unsafe" >&2; return 1; }
+  [[ -n "$token" && "$token" != *$'\n'* && "$token" != *$'\r'* ]] \
+    || { say "ERROR: LunarVision token must contain exactly one non-empty line" >&2; return 1; }
+  _env_set "$env_path" VISION_SERVICE_URL "$service_url"
+  _env_set "$env_path" VISION_AUTH_TOKEN "$(_quote_env_value "$token")"
+}
+
 _vision_port_valid() {
   local port="${1:-}"
   [[ "$port" =~ ^[0-9]+$ ]] && (( 10#$port > 0 && 10#$port <= 65535 ))
@@ -528,7 +604,21 @@ _reconcile_vision_container() {
 }
 
 start_tenant_vision() {
-  local name="$1" vision_port health_port env_path container contract quadlet_file
+  local name="$1" vision_port health_port env_path container contract quadlet_file external_url
+  if tenant_vision_external "$name"; then
+    external_url="$(tenant_vision_external_url "$name")"
+    external_url="$(_normalize_external_vision_url "$external_url")" || {
+      say "ERROR: invalid external LunarVision URL for $name" >&2
+      return 1
+    }
+    if ! _wait_external_vision_healthy "$external_url"; then
+      say "ERROR: external LunarVision did not become healthy: $external_url" >&2
+      return 1
+    fi
+    say "external LunarVision ready for $name ($external_url)"
+    return 0
+  fi
+
   ensure_container_runtime
   ensure_init_system
   vision_port="$(ports_get "$name" vision_service)" || true
@@ -583,6 +673,10 @@ start_tenant_vision() {
 
 stop_tenant_vision() {
   local name="$1" container="lunarwing-vision-${1}" running
+  if tenant_vision_external "$name"; then
+    say "external LunarVision remains operator-managed for $name"
+    return 0
+  fi
   ensure_container_runtime
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "openrc" ]]; then
@@ -602,6 +696,113 @@ stop_tenant_vision() {
     fi
   fi
   say "vision sidecar stopped ($container)"
+}
+
+_retire_local_vision_runtime() {
+  local name="$1" container="lunarwing-vision-${1}"
+  ensure_container_runtime
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    remove_vision_systemd_assets "$name" || return 1
+  else
+    remove_vision_openrc_assets "$name" || return 1
+  fi
+  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    _ctr "$name" stop --time 30 "$container" >/dev/null 2>&1 || true
+    _ctr "$name" rm -f "$container" >/dev/null || return 1
+  fi
+}
+
+_restore_vision_configuration() {
+  local name="$1" backup="$2" previous_mode="$3" previous_url="$4"
+  local env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  mv -T -- "$backup" "$env_path" || return 1
+  ports_set_vision_mode "$name" "$previous_mode" "$previous_url"
+  if [[ "$previous_mode" == local ]]; then
+    start_tenant_vision "$name" || return 1
+  fi
+  _reload_vision_consumer_if_running "$name"
+}
+
+configure_tenant_vision_external() {
+  local name="$1" requested_url="$2" token="$3" external_url
+  local env_path backup previous_mode previous_url result=0
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  external_url="$(_normalize_external_vision_url "$requested_url")" \
+    || die "external LunarVision URL must be an HTTPS origin without credentials, path, query, or fragment"
+  [[ -n "$token" && "$token" != *$'\n'* && "$token" != *$'\r'* ]] \
+    || die "external LunarVision token must contain exactly one non-empty line"
+  _wait_external_vision_healthy "$external_url" \
+    || die "external LunarVision health check failed: $external_url/health"
+
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || die "tenant LunarWing environment missing or unsafe"
+  backup="$(mktemp "$(dirname "$env_path")/.vision-rollback.XXXXXX")"
+  cp --preserve=mode,ownership -- "$env_path" "$backup" \
+    || { rm -f -- "$backup"; return 1; }
+  previous_mode="$(tenant_vision_mode "$name")"
+  previous_url="$(tenant_vision_external_url "$name")"
+
+  _retire_local_vision_runtime "$name" || result=$?
+  if [[ "$result" -eq 0 ]]; then
+    _set_vision_daemon_endpoint "$name" "$external_url" "$token" || result=$?
+  fi
+  if [[ "$result" -eq 0 ]]; then
+    ports_set_vision_mode "$name" external "$external_url"
+    _reload_vision_consumer_if_running "$name" || result=$?
+  fi
+  if [[ "$result" -eq 0 ]]; then
+    rm -f -- "$backup"
+    say "LunarVision for $name now uses external instance $external_url"
+    return 0
+  fi
+
+  say "ERROR: external LunarVision configuration failed; restoring previous settings" >&2
+  _restore_vision_configuration "$name" "$backup" "$previous_mode" "$previous_url" \
+    || say "WARNING: restart tenant '$name' to restore its prior LunarVision settings" >&2
+  return "$result"
+}
+
+configure_tenant_vision_local() {
+  local name="$1" env_path vision_env backup previous_mode previous_url token vision_port result=0
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  ensure_container_runtime
+  if ! "$CONTAINER_RT" image inspect "$VISION_SIDECAR_IMAGE" >/dev/null 2>&1; then
+    build_vision_sidecar_image || die "failed to build local LunarVision image"
+  fi
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  vision_env="$(tenant_env_dir "$name")/vision.env"
+  [[ -f "$env_path" && ! -L "$env_path" ]] \
+    || die "tenant LunarWing environment missing or unsafe"
+  [[ -f "$vision_env" && ! -L "$vision_env" ]] || write_tenant_vision_env "$name" >/dev/null
+  token="$(_env_existing "$vision_env" LUNARWING_AUTH_TOKEN)"
+  [[ -n "$token" ]] || die "local LunarVision token is missing"
+  vision_port="$(ports_get "$name" vision_service)" || true
+  _vision_port_valid "$vision_port" || die "local LunarVision service port is invalid"
+
+  backup="$(mktemp "$(dirname "$env_path")/.vision-rollback.XXXXXX")"
+  cp --preserve=mode,ownership -- "$env_path" "$backup" \
+    || { rm -f -- "$backup"; return 1; }
+  previous_mode="$(tenant_vision_mode "$name")"
+  previous_url="$(tenant_vision_external_url "$name")"
+  _set_vision_daemon_endpoint "$name" "http://127.0.0.1:$vision_port" "$token"
+  ports_set_vision_mode "$name" local
+  start_tenant_vision "$name" || result=$?
+  if [[ "$result" -eq 0 ]]; then
+    _reload_vision_consumer_if_running "$name" || result=$?
+  fi
+  if [[ "$result" -eq 0 ]]; then
+    rm -f -- "$backup"
+    say "LunarVision for $name now uses its local sidecar"
+    return 0
+  fi
+
+  say "ERROR: local LunarVision configuration failed; restoring previous settings" >&2
+  _retire_local_vision_runtime "$name" || true
+  _restore_vision_configuration "$name" "$backup" "$previous_mode" "$previous_url" \
+    || say "WARNING: restart tenant '$name' to restore its prior LunarVision settings" >&2
+  return "$result"
 }
 
 # ── LunarVoice ONNX sidecar ──────────────────────────────────────────────────
