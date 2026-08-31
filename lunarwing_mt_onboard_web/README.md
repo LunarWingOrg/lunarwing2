@@ -111,10 +111,34 @@ and OpenCode/Kimi Code model and base-URL
 overrides. The XMPP control customizes the identity; leaving it off uses the
 default `<tenant>@xmpp.localhost` bridge rather than disabling XMPP.
 
+## Browser end-to-end tests
+
+The optional Playwright suite drives the rendered GUI in Chromium, including
+client-side validation for all five operations, successful demo jobs and their
+WebSocket event streams, the provision failure path, settings, assets, and
+browser console/network errors. It starts its own safe demo server on a random
+loopback port and makes no system changes.
+
+From the repository root:
+
+```bash
+python3 -m venv lunarwing_mt_onboard_web/.venv
+lunarwing_mt_onboard_web/.venv/bin/pip install \
+  -r lunarwing_mt_onboard_web/requirements-browser-tests.txt
+export PLAYWRIGHT_BROWSERS_PATH="$PWD/lunarwing_mt_onboard_web/.venv/playwright-browsers"
+lunarwing_mt_onboard_web/.venv/bin/playwright install chromium
+lunarwing_mt_onboard_web/.venv/bin/python -m unittest \
+  lunarwing_mt_onboard_web.browser_tests -v
+```
+
+The lighter backend and static-contract suite remains available as
+`python3 -m unittest lunarwing_mt_onboard_web.web_tests -v`.
+
 ## Requirements
 
 Python 3.10+ and a venv with `fastapi`, Pydantic v2, `uvicorn`, `websockets`
 (`run.sh` creates it automatically). Real `secrets` mode also needs
 `cryptography` and `psycopg2-binary`, installed on demand.
-The test suite additionally uses `httpx` through FastAPI's `TestClient`; it is
-included in `requirements.txt`.
+The default test suite additionally uses `httpx` through FastAPI's `TestClient`;
+it is included in `requirements.txt`. Browser dependencies stay isolated in
+`requirements-browser-tests.txt`.
