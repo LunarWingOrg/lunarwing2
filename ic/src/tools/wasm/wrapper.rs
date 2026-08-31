@@ -23,7 +23,7 @@ use crate::llm::recording::{HttpExchangeRequest, HttpExchangeResponse, HttpInter
 use crate::safety::LeakDetector;
 use crate::secrets::{DecryptedSecret, SecretsStore};
 use crate::tools::tool::{Tool, ToolError, ToolOutput};
-use crate::tools::wasm::capabilities::Capabilities;
+use crate::tools::wasm::capabilities::{Capabilities, EndpointPattern};
 use crate::tools::wasm::credential_injector::{
     InjectedCredentials, host_matches_pattern, inject_credential,
 };
@@ -91,11 +91,62 @@ struct ResolvedHostCredential {
     url_prefix: Option<String>,
 }
 
+#[derive(Clone)]
+struct ScopedServiceTarget {
+    host: String,
+    endpoint_prefix: String,
+}
+
+fn is_local_service_url(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => {
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.eq_ignore_ascii_case("host.containers.internal")
+        }
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        None => false,
+    }
+}
+
+fn scoped_service_target(service_url: &str) -> Option<ScopedServiceTarget> {
+    let url = url::Url::parse(service_url).ok()?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return None;
+    }
+    if url.scheme() != "https" && !(url.scheme() == "http" && is_local_service_url(&url)) {
+        return None;
+    }
+
+    Some(ScopedServiceTarget {
+        host: extract_host_from_url(service_url)?,
+        endpoint_prefix: format!("{}/v1/", url.origin().ascii_serialization()),
+    })
+}
+
+fn scope_vision_http_capability(capabilities: &mut Capabilities, service_url: &str) {
+    let Some(target) = scoped_service_target(service_url) else {
+        return;
+    };
+    let Some(http) = capabilities.http.as_mut() else {
+        return;
+    };
+    http.allowlist = vec![
+        EndpointPattern::host(target.host)
+            .with_path_prefix("/v1/")
+            .with_methods(vec!["POST".to_string()]),
+    ];
+}
+
 /// Host-owned Bearer credential scoped to one configured service origin.
 #[derive(Clone)]
 struct ScopedBearerCredential {
-    host: String,
-    endpoint_prefix: String,
+    target: ScopedServiceTarget,
     token: SecretString,
 }
 
@@ -104,37 +155,8 @@ impl ScopedBearerCredential {
         if token.expose_secret().is_empty() {
             return None;
         }
-        let url = url::Url::parse(service_url).ok()?;
-        if url.scheme() != "http"
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || url.path() != "/"
-        {
-            return None;
-        }
-        // Normalize exactly like extract_host_from_url (lowercased, IPv6
-        // brackets stripped) so the stored host pattern matches the request
-        // host at injection time. Url::host_str() keeps IPv6 brackets
-        // ("[::1]") while extract_host_from_url strips them ("::1") — without
-        // this, an IPv6 loopback credential would never inject (fail-closed
-        // but broken).
-        let host = extract_host_from_url(service_url)?;
-        let allowed_host = match url.host()? {
-            url::Host::Domain(domain) => {
-                domain.eq_ignore_ascii_case("localhost")
-                    || domain.eq_ignore_ascii_case("host.containers.internal")
-            }
-            url::Host::Ipv4(address) => address.is_loopback(),
-            url::Host::Ipv6(address) => address.is_loopback(),
-        };
-        if !allowed_host {
-            return None;
-        }
         Some(Self {
-            host,
-            endpoint_prefix: format!("{}/v1/", url.origin().ascii_serialization()),
+            target: scoped_service_target(service_url)?,
             token,
         })
     }
@@ -142,11 +164,11 @@ impl ScopedBearerCredential {
     fn resolve(&self) -> ResolvedHostCredential {
         let token = self.token.expose_secret();
         ResolvedHostCredential {
-            host_patterns: vec![self.host.clone()],
+            host_patterns: vec![self.target.host.clone()],
             headers: HashMap::from([("Authorization".to_string(), format!("Bearer {token}"))]),
             query_params: HashMap::new(),
             secret_value: token.to_string(),
-            url_prefix: Some(self.endpoint_prefix.clone()),
+            url_prefix: Some(self.target.endpoint_prefix.clone()),
         }
     }
 }
@@ -518,11 +540,14 @@ impl lunarwing::agent::host::Host for StoreData {
         if let Some(host) = extract_host_from_url(&url) {
             self.inject_host_credentials(&host, &mut headers, &mut url);
         }
-        let bypass_proxy = self.host_credentials.iter().any(|credential| {
-            credential
-                .url_prefix
-                .as_ref()
-                .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix))
+        let bypass_proxy = url::Url::parse(&url).is_ok_and(|parsed| {
+            is_local_service_url(&parsed)
+                && self.host_credentials.iter().any(|credential| {
+                    credential
+                        .url_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| url_matches_scoped_prefix(&url, prefix))
+                })
         });
 
         // Get the max response size from capabilities (default 10MB).
@@ -1130,25 +1155,33 @@ impl WasmToolWrapper {
     pub fn new(
         runtime: Arc<WasmToolRuntime>,
         prepared: Arc<PreparedModule>,
-        capabilities: Capabilities,
+        mut capabilities: Capabilities,
     ) -> Self {
-        let scoped_bearer_credential = match prepared.name.as_str() {
-            "vision-analyze" | "vision-analyze-tool" => {
-                crate::config::env_or_override("VISION_AUTH_TOKEN").and_then(|token| {
-                    let service_url = crate::config::env_or_override("VISION_SERVICE_URL")
-                        .unwrap_or_else(|| "http://127.0.0.1:8088".to_string());
-                    ScopedBearerCredential::new(&service_url, SecretString::from(token))
-                })
-            }
-            "voice-transcribe" | "voice-transcribe-tool" => {
-                crate::config::env_or_override("VOICE_AUTH_TOKEN").and_then(|token| {
-                    let service_url = crate::config::env_or_override("VOICE_SERVICE_URL")
-                        .unwrap_or_else(|| "http://127.0.0.1:8090".to_string());
-                    ScopedBearerCredential::new(&service_url, SecretString::from(token))
-                })
-            }
+        let service = match prepared.name.as_str() {
+            "vision-analyze" | "vision-analyze-tool" => Some((
+                crate::config::env_or_override("VISION_SERVICE_URL")
+                    .unwrap_or_else(|| "http://127.0.0.1:8088".to_string()),
+                "VISION_AUTH_TOKEN",
+            )),
+            "voice-transcribe" | "voice-transcribe-tool" => Some((
+                crate::config::env_or_override("VOICE_SERVICE_URL")
+                    .unwrap_or_else(|| "http://127.0.0.1:8090".to_string()),
+                "VOICE_AUTH_TOKEN",
+            )),
             _ => None,
         };
+        if matches!(
+            prepared.name.as_str(),
+            "vision-analyze" | "vision-analyze-tool"
+        ) && let Some((service_url, _)) = service.as_ref()
+        {
+            scope_vision_http_capability(&mut capabilities, service_url);
+        }
+        let scoped_bearer_credential = service.and_then(|(service_url, token_var)| {
+            crate::config::env_or_override(token_var).and_then(|token| {
+                ScopedBearerCredential::new(&service_url, SecretString::from(token))
+            })
+        });
 
         Self {
             description: prepared.description.clone(),
@@ -2913,6 +2946,79 @@ mod tests {
             store_data.inject_host_credentials("localhost", &mut denied_headers, &mut denied_url);
             assert!(!denied_headers.contains_key("Authorization"));
         }
+    }
+
+    #[test]
+    fn test_external_vision_target_scopes_egress_and_bearer() {
+        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::host::HostState;
+        use crate::tools::wasm::wrapper::{
+            ScopedBearerCredential, StoreData, scope_vision_http_capability,
+        };
+        use secrecy::SecretString;
+        use std::collections::HashMap;
+
+        let mut capabilities = Capabilities::default().with_http(HttpCapability::default());
+        scope_vision_http_capability(&mut capabilities, "https://Vision.Example.com:8443");
+        let host_state = HostState::new(capabilities.clone());
+        assert!(
+            host_state
+                .check_http_allowed("https://vision.example.com:8443/v1/vision/analyze", "POST",)
+                .is_ok()
+        );
+        assert!(
+            host_state
+                .check_http_allowed("http://vision.example.com:8443/v1/vision/analyze", "POST",)
+                .is_err()
+        );
+        assert!(
+            host_state
+                .check_http_allowed("https://other.example.com/v1/vision/analyze", "POST")
+                .is_err()
+        );
+        assert!(
+            host_state
+                .check_http_allowed("https://vision.example.com:8443/v1/health", "GET")
+                .is_err()
+        );
+
+        let credential = ScopedBearerCredential::new(
+            "https://Vision.Example.com:8443",
+            SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
+        )
+        .expect("valid external vision credential")
+        .resolve();
+        let store_data =
+            StoreData::new(1024 * 1024, capabilities, HashMap::new(), vec![credential]);
+        let mut headers = HashMap::new();
+        let mut url = "https://vision.example.com:8443/v1/vision/analyze".to_string();
+        store_data.inject_host_credentials("vision.example.com", &mut headers, &mut url);
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&format!("Bearer {TEST_BEARER_TOKEN_123}"))
+        );
+
+        for denied_url in [
+            "https://vision.example.com/v1/vision/analyze",
+            "http://vision.example.com:8443/v1/vision/analyze",
+            "https://vision.example.com:8443/vision/analyze",
+        ] {
+            let mut denied_headers = HashMap::new();
+            let mut denied_url = denied_url.to_string();
+            store_data.inject_host_credentials(
+                "vision.example.com",
+                &mut denied_headers,
+                &mut denied_url,
+            );
+            assert!(!denied_headers.contains_key("Authorization"));
+        }
+        assert!(
+            ScopedBearerCredential::new(
+                "http://vision.example.com",
+                SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
+            )
+            .is_none()
+        );
     }
 
     /// IPv6 loopback scoped credentials must actually inject: the credential
