@@ -313,6 +313,10 @@ Commands:
     --kimi-code-version <version>  Override kimi-code package version
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
+  configure-vision-external <name> Use an operator-managed remote LunarVision instance
+    --url <https-origin>             Base origin routing API and health endpoints
+    --token-file <path>             Read its bearer token from a one-line file
+  configure-vision-local <name>    Restore the managed local LunarVision sidecar
   build-voice-sidecar              Build the LunarVoice ONNX sidecar container image
   install-voice <name>             Install LunarVoice image/config without activating it
     [--model-manifest <path>]      Install SHA-256-pinned models from a trusted manifest
@@ -739,6 +743,42 @@ main() {
     build-vision-sidecar)
       require_root
       build_vision_sidecar_image
+      ;;
+
+    configure-vision-external)
+      require_root
+      local _vision_name="" _vision_url="" _vision_token_file="" _vision_token=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --url)
+            [[ $# -ge 2 ]] || die "--url requires an HTTPS origin"
+            _vision_url="$2"; shift 2
+            ;;
+          --token-file)
+            [[ $# -ge 2 ]] || die "--token-file requires a path"
+            _vision_token_file="$2"; shift 2
+            ;;
+          -*) die "unknown flag: $1" ;;
+          *)
+            [[ -z "$_vision_name" ]] || die "unexpected argument: $1"
+            _vision_name="$(sanitize_name "$1")"; shift
+            ;;
+        esac
+      done
+      [[ -n "$_vision_name" && -n "$_vision_url" && -n "$_vision_token_file" ]] \
+        || die "usage: configure-vision-external <name> --url <https-origin> --token-file <path>"
+      _vision_token="$(_read_secret_file "$_vision_token_file" "LunarVision token")"
+      with_tenant_lifecycle_lock "$_vision_name" \
+        configure_tenant_vision_external "$_vision_name" "$_vision_url" "$_vision_token"
+      ;;
+
+    configure-vision-local)
+      require_root
+      local _vision_name=""
+      [[ $# -eq 1 ]] || die "usage: configure-vision-local <name>"
+      _vision_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_vision_name" \
+        configure_tenant_vision_local "$_vision_name"
       ;;
 
     build-voice-sidecar)
