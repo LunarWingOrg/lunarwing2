@@ -555,6 +555,7 @@ mod tests {
                 Ok(LlmOutput {
                     response: LlmResponse::Text("(no more responses)".into()),
                     usage: TokenUsage::default(),
+                    finish_reason: "unknown".to_string(),
                 })
             } else {
                 Ok(responses.remove(0))
@@ -715,6 +716,7 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            finish_reason: "stop".to_string(),
         }
     }
 
@@ -733,6 +735,7 @@ mod tests {
                 output_tokens: 50,
                 ..Default::default()
             },
+            finish_reason: "tool_calls".to_string(),
         }
     }
 
@@ -1782,6 +1785,7 @@ mod tests {
                 output_tokens: 80,
                 ..Default::default()
             },
+            finish_reason: "stop".to_string(),
         }
     }
 
@@ -2219,6 +2223,7 @@ mod tests {
                     content: None,
                 },
                 usage: TokenUsage::default(),
+                finish_reason: "tool_calls".to_string(),
             },
             text_response("FINAL(\"I couldn't access that tool\")"),
         ]));

@@ -493,14 +493,11 @@ fn protect_worker_credentials() -> Result<(), WorkerError> {
     Ok(())
 }
 
+/// Parse the canonical finish-reason spelling (plus the legacy `"tool_use"`
+/// alias older orchestrators may still emit) — the same parser as streamed
+/// terminal metadata, so the proxy and stream surfaces agree.
 fn parse_finish_reason(s: &str) -> FinishReason {
-    match s {
-        "stop" => FinishReason::Stop,
-        "length" => FinishReason::Length,
-        "tool_use" | "tool_calls" => FinishReason::ToolUse,
-        "content_filter" => FinishReason::ContentFilter,
-        _ => FinishReason::Unknown,
-    }
+    FinishReason::from_stream_reason(s)
 }
 
 #[cfg(test)]
@@ -528,6 +525,8 @@ mod tests {
     #[test]
     fn test_parse_finish_reason() {
         assert_eq!(parse_finish_reason("stop"), FinishReason::Stop);
+        assert_eq!(parse_finish_reason("tool_calls"), FinishReason::ToolUse);
+        // Legacy alias emitted by orchestrators older than the spelling fix.
         assert_eq!(parse_finish_reason("tool_use"), FinishReason::ToolUse);
         assert_eq!(parse_finish_reason("unknown"), FinishReason::Unknown);
     }

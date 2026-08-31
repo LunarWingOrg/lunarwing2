@@ -6078,6 +6078,7 @@ mod tests {
                 Ok(lunarwing_engine::LlmOutput {
                     response: lunarwing_engine::LlmResponse::Text("done".into()),
                     usage: lunarwing_engine::TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
                 })
             }
             fn model_name(&self) -> &str {

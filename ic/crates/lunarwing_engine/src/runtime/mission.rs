@@ -2688,6 +2688,7 @@ mod tests {
                 responses: Mutex::new(vec![LlmOutput {
                     response: LlmResponse::Text(msg.into()),
                     usage: TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
                 }]),
             })
         }
@@ -2706,6 +2707,7 @@ mod tests {
                 Ok(LlmOutput {
                     response: LlmResponse::Text("done".into()),
                     usage: TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
                 })
             } else {
                 Ok(r.remove(0))
