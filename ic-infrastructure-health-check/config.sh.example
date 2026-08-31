@@ -36,7 +36,13 @@
 # Component: gateway (agent sessions)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# No tunable env vars — uses LUNARWING_BASE_DIR / IRONCLAW_BASE_DIR.
+# Uses LUNARWING_BASE_DIR / IRONCLAW_BASE_DIR for the sessions directory.
+# Degraded/critical thresholds (defaults shown):
+#HEALTH_GATEWAY_STALE_LOCK_MINUTES=10      # lock older than this is "stale"
+#HEALTH_GATEWAY_STALE_LOCKS_CRITICAL=3     # more than this many stale locks
+#HEALTH_GATEWAY_ORPHAN_DEGRADED=10         # orphan transcripts > N -> degraded
+#HEALTH_GATEWAY_ORPHAN_CRITICAL=50         # orphan transcripts > N -> critical
+#HEALTH_GATEWAY_OVERSIZED_DEGRADED=0       # oversized (>500KB) sessions > N
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: xmpp (XMPP bridge reachability + latency)
@@ -44,6 +50,12 @@
 
 #HEALTH_XMPP_SERVER="xmpp.sobe.world"
 #HEALTH_XMPP_PORT=5222
+
+# Thresholds (defaults shown).
+#HEALTH_XMPP_LATENCY_DEGRADED_MS=500
+#HEALTH_XMPP_LATENCY_CRITICAL_MS=2000
+#HEALTH_XMPP_ERROR_DEGRADED=1
+#HEALTH_XMPP_ERROR_CRITICAL=5
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: omemo (OMEMO encryption store)
@@ -56,19 +68,36 @@
 # Component: ratelimit (rate-limiter state directory)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# Uses RATELIMIT_DIR (see Global section).
+# Uses RATELIMIT_DIR (see Global section). Thresholds (defaults shown):
+#HEALTH_RATELIMIT_THROTTLED_DEGRADED=10  # throttled events/hour -> degraded
+#HEALTH_RATELIMIT_THROTTLED_CRITICAL=50
+#HEALTH_RATELIMIT_QUEUE_DEGRADED=100     # queued messages > N -> degraded
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: clickhouse (ClickHouse analytics DB)
 # ═══════════════════════════════  key engine ═════════════════════════════════
 
-# No tunable env vars — uses LUNARWING_BASE_DIR for connection config.
+# No tunable connection env vars — uses clickhouse-client when available.
+# Thresholds (defaults shown; percent for disk/memory, ms for query time):
+#HEALTH_CLICKHOUSE_DISK_DEGRADED=70
+#HEALTH_CLICKHOUSE_DISK_CRITICAL=85
+#HEALTH_CLICKHOUSE_MEMORY_DEGRADED=80
+#HEALTH_CLICKHOUSE_MEMORY_CRITICAL=95
+#HEALTH_CLICKHOUSE_QUERY_DEGRADED_MS=1000
+#HEALTH_CLICKHOUSE_QUERY_CRITICAL_MS=5000
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: tensorzero (TensorZero gateway / model router)
 # ═════════════════════════════════════════════════════════════════════════════
 
-# No tunable env vars — probes local gateway endpoint.
+# Probes ClickHouse (or GPU fallback). Thresholds (defaults shown):
+#HEALTH_TENSORZERO_P95_DEGRADED_MS=5000
+#HEALTH_TENSORZERO_P95_CRITICAL_MS=15000
+#HEALTH_TENSORZERO_ERROR_DEGRADED_PCT=1   # Floats allowed for ERROR_* only
+#HEALTH_TENSORZERO_ERROR_CRITICAL_PCT=5
+#HEALTH_TENSORZERO_QUEUE_DEGRADED=5
+#HEALTH_TENSORZERO_QUEUE_CRITICAL=20
+#HEALTH_TENSORZERO_GPU_UTIL_WARN_PCT=90   # Advisory issue only; never critical
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: models (LLM provider APIs)
@@ -76,6 +105,10 @@
 
 # Set to non-"true" to disable the LLM-provider probe entirely.
 #HEALTH_MODELS_ENABLED=true
+
+# Latency thresholds applied per provider, milliseconds (defaults shown).
+#HEALTH_MODELS_LATENCY_DEGRADED_MS=3000
+#HEALTH_MODELS_LATENCY_CRITICAL_MS=10000
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Component: lunarvision (OCR + VL sidecar) — Added 2026-06-24
@@ -116,11 +149,14 @@
 #HEALTH_LUNARVOICE_ENABLED=auto
 
 # Single-node health-listener override. Leave unset on multi-tenant hosts so
-# enabled tenants are discovered from voice_health in ports registry. When
-# registry exists but no tenant enables voice, check reports healthy/disabled.
+# every enabled tenant is discovered from voice_health in the ports registry.
+# No enabled tenants reports healthy/disabled. Invalid enablement, missing or
+# duplicate ports, unreachable listeners, and unready STT report critical.
 #HEALTH_LUNARVOICE_URL="http://127.0.0.1:8091"
 
+# Per-request timeout for /health, /ready, and /metrics.
 #HEALTH_LUNARVOICE_TIMEOUT=5
+# Metrics are optional; /health and /ready always remain mandatory.
 #HEALTH_LUNARVOICE_FETCH_METRICS=true
 
 # ═════════════════════════════════════════════════════════════════════════════

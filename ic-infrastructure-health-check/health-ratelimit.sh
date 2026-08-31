@@ -8,8 +8,14 @@ set -euo pipefail
 
 # Config
 RATELIMIT_DIR="${RATELIMIT_DIR:-${LUNARWING_BASE_DIR:-${IRONCLAW_BASE_DIR:-$HOME/.lunarwing}}/ratelimit}"
-THROTTLED_DEGRADED=10
-THROTTLED_CRITICAL=50
+# Thresholds (env-configurable; operator typos reset to the defaults instead
+# of breaking the integer comparisons below — health-netbird.sh discipline).
+THROTTLED_DEGRADED="${HEALTH_RATELIMIT_THROTTLED_DEGRADED:-10}"
+[[ "$THROTTLED_DEGRADED" =~ ^[0-9]+$ ]] || THROTTLED_DEGRADED=10
+THROTTLED_CRITICAL="${HEALTH_RATELIMIT_THROTTLED_CRITICAL:-50}"
+[[ "$THROTTLED_CRITICAL" =~ ^[0-9]+$ ]] || THROTTLED_CRITICAL=50
+QUEUE_DEGRADED="${HEALTH_RATELIMIT_QUEUE_DEGRADED:-100}"
+[[ "$QUEUE_DEGRADED" =~ ^[0-9]+$ ]] || QUEUE_DEGRADED=100
 
 issues=()
 throttled=0
@@ -37,7 +43,7 @@ elif [ $throttled -gt $THROTTLED_DEGRADED ]; then
   exit_code=1
 fi
 
-if [ $queued -gt 100 ]; then
+if [ $queued -gt $QUEUE_DEGRADED ]; then
   issues+=("Rate limit queue deep: $queued messages")
   [ "$status" = "healthy" ] && status="degraded" && exit_code=1
 fi

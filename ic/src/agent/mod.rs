@@ -20,6 +20,7 @@ pub mod cost_guard;
 mod dispatch;
 mod dispatcher;
 mod heartbeat;
+mod interrupt;
 pub mod job_monitor;
 pub mod reflex;
 mod router;

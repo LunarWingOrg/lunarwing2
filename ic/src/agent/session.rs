@@ -232,6 +232,11 @@ pub struct Thread {
     /// Messages queued while the thread was processing a turn.
     #[serde(default, skip_serializing_if = "VecDeque::is_empty")]
     pub pending_messages: VecDeque<String>,
+    /// Mid-turn steer notes injected via `/steer` while a turn is running.
+    /// Drained by the agentic loop after the current tool call completes and
+    /// injected as a user message without breaking role alternation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steer_notes: Vec<String>,
 }
 
 /// Maximum number of messages that can be queued while a thread is processing.
@@ -239,6 +244,11 @@ pub struct Thread {
 /// is acceptable for the personal assistant use case where a single user sends
 /// rapid follow-ups. The drain loop processes them as one newline-delimited turn.
 pub const MAX_PENDING_MESSAGES: usize = 10;
+
+/// Maximum number of unconsumed steer notes held for a running turn. Steer is
+/// an intervention channel, not a conversation queue, so the cap is tight:
+/// notes beyond it are rejected and the sender is told to wait for drain.
+pub const MAX_STEER_NOTES: usize = 4;
 
 impl Thread {
     /// Create a new thread.
@@ -255,6 +265,7 @@ impl Thread {
             pending_approval: None,
             pending_auth: None,
             pending_messages: VecDeque::new(),
+            steer_notes: Vec::new(),
         }
     }
 
@@ -272,6 +283,7 @@ impl Thread {
             pending_approval: None,
             pending_auth: None,
             pending_messages: VecDeque::new(),
+            steer_notes: Vec::new(),
         }
     }
 
@@ -334,6 +346,37 @@ impl Thread {
     pub fn requeue_drained(&mut self, content: String) {
         self.pending_messages.push_front(content);
         self.updated_at = Utc::now();
+    }
+
+    /// Record a mid-turn steer note (Hermes-style `/steer`).
+    ///
+    /// The note is delivered to the running agentic loop after the current
+    /// tool call completes, as a user message injected into the live context.
+    /// Returns `false` when [`MAX_STEER_NOTES`] notes are already waiting.
+    pub fn add_steer_note(&mut self, note: String) -> bool {
+        if self.steer_notes.len() >= MAX_STEER_NOTES {
+            return false;
+        }
+        self.steer_notes.push(note);
+        self.updated_at = Utc::now();
+        true
+    }
+
+    /// Drain all pending steer notes, joined with newlines (mirrors
+    /// [`Self::drain_pending_messages`] so rapid steers arrive as one block).
+    /// Returns `None` when no notes are waiting.
+    pub fn drain_steer_notes(&mut self) -> Option<String> {
+        if self.steer_notes.is_empty() {
+            return None;
+        }
+        let notes: Vec<String> = self.steer_notes.drain(..).collect();
+        self.updated_at = Utc::now();
+        Some(notes.join("\n"))
+    }
+
+    /// Whether any unconsumed steer notes are waiting (diagnostics).
+    pub fn has_steer_notes(&self) -> bool {
+        !self.steer_notes.is_empty()
     }
 
     /// Start a new turn with user input.
@@ -415,12 +458,15 @@ impl Thread {
         self.pending_auth.take()
     }
 
-    /// Interrupt the current turn and discard any queued messages.
+    /// Interrupt the current turn and discard any queued messages and steer
+    /// notes (both are pending input for the running turn, so they must not
+    /// leak into the next turn).
     pub fn interrupt(&mut self) {
         if let Some(turn) = self.turns.last_mut() {
             turn.interrupt();
         }
         self.pending_messages.clear();
+        self.steer_notes.clear();
         self.state = ThreadState::Interrupted;
         self.updated_at = Utc::now();
     }
@@ -1747,5 +1793,60 @@ mod tests {
 
         let merged = thread.drain_pending_messages().unwrap();
         assert_eq!(merged, "queued msg");
+    }
+
+    #[test]
+    fn test_steer_notes_add_drain_and_cap() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        assert!(!thread.has_steer_notes());
+        assert!(thread.drain_steer_notes().is_none());
+
+        for i in 0..MAX_STEER_NOTES {
+            assert!(thread.add_steer_note(format!("note {i}")));
+        }
+        assert!(thread.has_steer_notes());
+        assert!(
+            !thread.add_steer_note("overflow".to_string()),
+            "steer slot must reject notes past MAX_STEER_NOTES"
+        );
+
+        let drained = thread.drain_steer_notes().expect("notes waiting");
+        assert!(drained.contains("note 0"));
+        assert!(drained.contains("note 3"));
+        assert!(drained.contains('\n'), "notes merged newline-delimited");
+        assert!(!thread.has_steer_notes());
+        assert!(thread.drain_steer_notes().is_none());
+    }
+
+    #[test]
+    fn test_interrupt_clears_steer_notes() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        thread.start_turn("long task");
+        assert!(thread.add_steer_note("change direction".to_string()));
+
+        thread.interrupt();
+        assert!(!thread.has_steer_notes());
+        assert!(thread.drain_steer_notes().is_none());
+    }
+
+    #[test]
+    fn test_steer_notes_serde_roundtrip_and_default() {
+        let mut thread = Thread::new(Uuid::new_v4());
+        assert!(thread.add_steer_note("held note".to_string()));
+        let json = serde_json::to_string(&thread).expect("serialize");
+        assert!(json.contains("steer_notes"));
+
+        let restored: Thread = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.steer_notes, vec!["held note".to_string()]);
+
+        // Old serialized data without the field must still deserialize.
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("to value");
+        value
+            .as_object_mut()
+            .expect("thread is an object")
+            .remove("steer_notes");
+        let old_json = serde_json::to_string(&value).expect("re-serialize");
+        let restored: Thread = serde_json::from_str(&old_json).expect("old data deserializes");
+        assert!(restored.steer_notes.is_empty());
     }
 }

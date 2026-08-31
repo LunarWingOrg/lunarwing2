@@ -178,7 +178,8 @@ _voice() {
 
 _voice_healthy() {
     [ "\$(_voice inspect -f '{{.State.Running}}' "\${voice_container}" 2>/dev/null)" = "true" ] || return 1
-    _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/health" 2>/dev/null
+    _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/health" 2>/dev/null \
+        && _voice exec "\${voice_container}" curl -sf -o /dev/null --max-time 3 "http://127.0.0.1:\${voice_health_internal_port}/ready" 2>/dev/null
 }
 
 start() {

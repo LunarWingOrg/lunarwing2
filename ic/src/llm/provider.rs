@@ -263,7 +263,9 @@ impl FinishReason {
         match reason {
             "stop" => Self::Stop,
             "length" => Self::Length,
-            "tool_calls" => Self::ToolUse,
+            // "tool_calls" is the canonical spelling; "tool_use" is the legacy
+            // alias previously emitted by the orchestrator worker proxy.
+            "tool_calls" | "tool_use" => Self::ToolUse,
             "content_filter" => Self::ContentFilter,
             _ => Self::Unknown,
         }

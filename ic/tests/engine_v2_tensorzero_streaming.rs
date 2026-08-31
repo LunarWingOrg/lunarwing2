@@ -503,7 +503,7 @@ async fn fragmented_tool_fields_reconstruct_one_action_and_structured_result() {
     env.cleanup().await;
 }
 
-async fn assert_strict_stream_failure(script: Vec<SseFrame>, expected_error: Option<&str>) {
+async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     let _lock = ENGINE_V2_ENV_LOCK.lock().await;
     let env = EngineV2EnvGuard::enable(Some("gateway"));
     lunarwing::bridge::reset_engine_state().await;
@@ -526,13 +526,11 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>, expected_error: Opt
         "at most one error response should be delivered"
     );
     assert!(responses[0].content.starts_with("Error:"));
-    if let Some(expected_error) = expected_error {
-        assert!(
-            responses[0].content.contains(expected_error),
-            "error response should contain {expected_error:?}: {}",
-            responses[0].content
-        );
-    }
+    assert!(
+        responses[0].content.contains("model provider kept failing"),
+        "provider diagnostics must remain hidden: {}",
+        responses[0].content
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(rig.captured_responses().len(), 1);
     assert_eq!(
@@ -575,14 +573,10 @@ async fn assert_strict_stream_failure(script: Vec<SseFrame>, expected_error: Opt
 
 #[tokio::test]
 async fn midstream_json_error_does_not_commit_a_partial_response() {
-    assert_strict_stream_failure(
-        midstream_error_script(),
-        Some("TensorZero provider failed mid-stream"),
-    )
-    .await;
+    assert_strict_stream_failure(midstream_error_script()).await;
 }
 
 #[tokio::test]
 async fn premature_eof_before_terminal_event_does_not_synthesize_done() {
-    assert_strict_stream_failure(premature_eof_script(), None).await;
+    assert_strict_stream_failure(premature_eof_script()).await;
 }

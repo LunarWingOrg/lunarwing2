@@ -17,13 +17,17 @@ Implementation preserves proposal goals but corrects assumptions found during so
   `8089` conflicted with LunarVision health deployment.
 - Multi-tenant host ports come from registry v15 `voice_service` and
   `voice_health` fields in isolated range `40000-49999`.
-- Voice is provisioned disabled. `lunarwing-mt-admin.sh enable-voice <tenant>`
-  requires verified Whisper artifacts before enabling local transcription.
-- Model downloads are opt-in and require operator-supplied exact SHA-256 values.
-  No unverified first-run download occurs.
-- Health discovery probes only tenants with `enable_voice=true`; LunarVoice is
-  monitor-only in self-heal because restarting optional model workloads
-  automatically is unsafe.
+- Voice is provisioned disabled. The completed lifecycle is
+  `install-voice` → `configure-voice` → `activate-voice` →
+  `deactivate-voice`/`remove-voice`; legacy `enable-voice`/`disable-voice` names
+  remain aliases. Activation requires verified STT artifacts, is health-gated,
+  and rolls back the tenant's prior transcription provider on failure.
+- Model downloads are explicit and require operator-supplied exact SHA-256
+  values. No unverified first-run download occurs.
+- Health discovery probes every tenant with `enable_voice=true`, rejects invalid
+  registry enablement/ports, and requires both liveness and STT readiness.
+  LunarVoice is monitor-only in self-heal because automatically restarting
+  optional model workloads is unsafe.
 - STT engine is selectable via `VOICE_STT_ENGINE`: `whisper` (default) or
   `parakeet`. Parakeet supports `parakeet-tdt-0.6b-v2-int8` and
   `parakeet-tdt-0.6b-v3-int8` through the sherpa-onnx transducer recognizer,
@@ -347,7 +351,7 @@ VAD is negligible on all platforms (~2MB model, <10ms/frame).
 - [x] Existing transcription middleware integration through local provider
 - [x] WASM tool `voice-transcribe` with host-scoped bearer injection
 - [x] Registry-aware health check, mt-admin lifecycle, monitor-only self-heal
-- [x] Per-tenant enable/disable and model configuration
+- [x] Per-tenant install/configure/activate/deactivate/remove with rollback
 
 ### Phase 3: Advanced Features (2.0.8.0+)
 

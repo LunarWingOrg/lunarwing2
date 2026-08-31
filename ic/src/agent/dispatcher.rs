@@ -323,11 +323,17 @@ impl Agent {
                 m
             });
 
+        // Register a mid-turn interrupt token for this thread: `/interrupt`
+        // cancels it, and the shared loop aborts any in-flight LLM stream or
+        // tool batch immediately instead of waiting for the next iteration
+        // boundary. The RAII guard unregisters on all exit paths.
+        let interrupt_registration = self.turn_interrupts.register(thread_id);
         let loop_config = AgenticLoopConfig {
             // Hard ceiling: one past force_text_at (safety net).
             max_iterations: max_tool_iterations + 1,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            interrupt_token: Some(interrupt_registration.token().clone()),
         };
 
         let outcome = crate::agent::agentic_loop::run_agentic_loop(
@@ -395,11 +401,22 @@ struct ChatDelegate<'a> {
 #[async_trait]
 impl<'a> LoopDelegate for ChatDelegate<'a> {
     async fn check_signals(&self) -> LoopSignal {
-        let sess = self.session.lock().await;
-        if let Some(thread) = sess.threads.get(&self.thread_id)
-            && thread.state == ThreadState::Interrupted
-        {
-            return LoopSignal::Stop;
+        let mut sess = self.session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
+            if thread.state == ThreadState::Interrupted {
+                return LoopSignal::Stop;
+            }
+            // Hermes-style steer: notes queued via `/steer` while the turn is
+            // running are injected at the next iteration boundary — landing
+            // after the current tool call's results, so role alternation and
+            // the tool-calling loop stay intact.
+            if let Some(note) = thread.drain_steer_notes() {
+                return LoopSignal::InjectMessage(format!(
+                    "A steer note arrived from the user while you were working \
+                     on this task. Adjust your current course of action \
+                     accordingly; it is not a new turn:\n{note}"
+                ));
+            }
         }
         LoopSignal::Continue
     }
@@ -2287,6 +2304,16 @@ mod tests {
     /// Helper to build a test Agent with a custom LLM provider and
     /// `max_tool_iterations` override.
     fn make_test_agent_with_llm(llm: Arc<dyn LlmProvider>, max_tool_iterations: usize) -> Agent {
+        make_test_agent_with_tools(llm, Arc::new(ToolRegistry::new()), max_tool_iterations)
+    }
+
+    /// Helper to build a test Agent with a custom LLM provider, a pre-seeded
+    /// tool registry, and `max_tool_iterations` override.
+    fn make_test_agent_with_tools(
+        llm: Arc<dyn LlmProvider>,
+        tools: Arc<ToolRegistry>,
+        max_tool_iterations: usize,
+    ) -> Agent {
         let deps = AgentDeps {
             owner_id: "default".to_string(),
             vision_service_url: None,
@@ -2299,7 +2326,7 @@ mod tests {
                 max_output_length: 100_000,
                 injection_check_enabled: false,
             })),
-            tools: Arc::new(ToolRegistry::new()),
+            tools,
             workspace: None,
             extension_manager: None,
             skill_registry: None,
@@ -2735,5 +2762,271 @@ mod tests {
         assert!(result_msg.contains("shell"));
         assert!(result_msg.contains("approval"));
         assert!(result_msg.contains("DM"));
+    }
+
+    // === Mid-turn interrupt + steer wiring tests (item: Hermes-style interrupt) ===
+
+    /// LLM provider that hangs forever — simulates a stalled in-flight stream.
+    struct HangingLlmProvider;
+
+    #[async_trait]
+    impl LlmProvider for HangingLlmProvider {
+        fn model_name(&self) -> &str {
+            "hanging"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            std::future::pending().await
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            std::future::pending().await
+        }
+    }
+
+    /// Regression: cancelling the thread's turn token while the LLM call is
+    /// in flight must abort the loop immediately (it cannot wait for the
+    /// stream to finish — the stream never finishes here).
+    #[tokio::test]
+    async fn interrupt_cancels_in_flight_llm_stream() {
+        use crate::channels::IncomingMessage;
+        use crate::llm::ChatMessage;
+        use tokio::sync::Mutex;
+
+        let agent = make_test_agent_with_llm(Arc::new(HangingLlmProvider), 5);
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            sess.create_thread().id
+        };
+        let message = IncomingMessage::new("test", "test-user", "long task");
+        let initial_messages = vec![ChatMessage::user("long task")];
+
+        let loop_fut = agent.run_agentic_loop(&message, session, thread_id, initial_messages);
+        // Drive the loop and the delayed interrupt concurrently (single-threaded
+        // test runtime, so the loop future only advances while we await too,
+        // but the timer gives it 100ms of poll time to reach the LLM call).
+        let cancel_fut = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            agent.turn_interrupts.cancel(thread_id)
+        };
+
+        let (outcome, cancelled) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(loop_fut, cancel_fut)
+        })
+        .await
+        .expect("mid-turn interrupt must unblock the in-flight LLM call");
+
+        assert!(
+            cancelled,
+            "a live turn token must exist while the loop runs"
+        );
+        match outcome {
+            Ok(_) => panic!("interrupted loop must not complete normally"),
+            Err(err) => assert!(
+                err.to_string().contains("Interrupted"),
+                "unexpected error from interrupted loop: {err}"
+            ),
+        }
+    }
+
+    /// Shared capture between `SteerAwareProvider` and the driving test.
+    struct SteerCapture {
+        calls: std::sync::atomic::AtomicUsize,
+        log: std::sync::Mutex<Vec<Vec<crate::llm::ChatMessage>>>,
+    }
+
+    /// Provider that keeps the tool loop alive (calling the echo tool) until
+    /// the injected steer note is visible in the request context, then
+    /// finishes with text. Every call's message list is captured.
+    ///
+    /// The steer note is planted by the provider during its first call —
+    /// deterministically placing it mid-turn (after iteration 1's
+    /// `check_signals`, before iteration 2's) without a scheduling race.
+    struct SteerAwareProvider {
+        capture: Arc<SteerCapture>,
+        session: Arc<tokio::sync::Mutex<Session>>,
+        thread_id: uuid::Uuid,
+    }
+
+    const STEER_MARKER: &str = "steer-marker-switch-to-plan-b";
+
+    #[async_trait]
+    impl LlmProvider for SteerAwareProvider {
+        fn model_name(&self) -> &str {
+            "steer-aware"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, crate::error::LlmError> {
+            Ok(CompletionResponse {
+                content: "steered response".to_string(),
+                input_tokens: 0,
+                output_tokens: 1,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, crate::error::LlmError> {
+            let call_idx = self
+                .capture
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let steered = request
+                .messages
+                .iter()
+                .any(|m| m.content.contains(STEER_MARKER));
+            if call_idx == 0 && !steered {
+                // Plant the steer note mid-turn while the session lock is
+                // free: iteration 1's check_signals already ran, so the note
+                // is first drained at iteration 2 — after this call's tool
+                // results are recorded. This mirrors /steer arriving during
+                // the first tool batch.
+                let mut sess = self.session.lock().await;
+                let thread = sess
+                    .threads
+                    .get_mut(&self.thread_id)
+                    .expect("thread exists"); // safety: test-only provider in #[cfg(test)] module
+                let accepted = thread.add_steer_note(STEER_MARKER.to_string());
+                assert!(accepted); // safety: test-only assertion in #[cfg(test)] module
+            }
+            {
+                let mut log = self.capture.log.lock().unwrap_or_else(|e| e.into_inner());
+                log.push(request.messages.clone());
+            }
+
+            if request.tools.is_empty() || steered {
+                return Ok(ToolCompletionResponse {
+                    content: Some("steered response".to_string()),
+                    tool_calls: Vec::new(),
+                    input_tokens: 0,
+                    output_tokens: 1,
+                    finish_reason: FinishReason::Stop,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                });
+            }
+
+            // Keep the tool loop alive with a real tool call so every
+            // iteration produces a tool result message.
+            Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: crate::llm::generate_tool_call_id(0, 0),
+                    name: "echo".to_string(),
+                    arguments: serde_json::json!({"message": "ping"}),
+                    reasoning: None,
+                }],
+                input_tokens: 0,
+                output_tokens: 1,
+                finish_reason: FinishReason::ToolUse,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    /// Regression: a steer note queued mid-tool-loop is delivered at the next
+    /// iteration boundary — after the current tool call's results — as a user
+    /// message that does not break role alternation.
+    #[tokio::test]
+    async fn steer_during_tool_loop_lands_after_tool_results() {
+        use crate::channels::IncomingMessage;
+        use crate::llm::{ChatMessage, Role};
+        use tokio::sync::Mutex;
+
+        let capture = Arc::new(SteerCapture {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            log: std::sync::Mutex::new(Vec::new()),
+        });
+        let session = Arc::new(Mutex::new(Session::new("test-user")));
+        let thread_id = {
+            let mut sess = session.lock().await;
+            let thread = sess.create_thread();
+            // A turn must be in progress for the steer slot to be consumed.
+            thread.start_turn("build the thing");
+            thread.id
+        };
+        let provider = SteerAwareProvider {
+            capture: Arc::clone(&capture),
+            session: Arc::clone(&session),
+            thread_id,
+        };
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register_sync(Arc::new(crate::tools::builtin::EchoTool));
+        let agent = make_test_agent_with_tools(Arc::new(provider), tools, 8);
+        let message = IncomingMessage::new("test", "test-user", "build the thing");
+        let initial_messages = vec![ChatMessage::user("build the thing")];
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            agent.run_agentic_loop(&message, session.clone(), thread_id, initial_messages),
+        )
+        .await
+        .expect("steered loop must complete");
+
+        let result = outcome.expect("loop must not error");
+        match result {
+            super::AgenticLoopResult::Response(text) => assert_eq!(
+                text, "steered response",
+                "loop must finish once the steer note is visible"
+            ),
+            super::AgenticLoopResult::NeedApproval { .. } => {
+                panic!("test tools never require approval")
+            }
+        }
+
+        // Find the first request that observed the steer note and assert the
+        // note arrives after at least one assistant(tool_calls) → tool_result
+        // pair, with no alternation break (tool result before the note).
+        let log = capture.log.lock().unwrap_or_else(|e| e.into_inner());
+        let steered_request = log
+            .iter()
+            .find(|msgs| msgs.iter().any(|m| m.content.contains(STEER_MARKER)))
+            .expect("steer note must reach an LLM request");
+        let roles: Vec<Role> = steered_request.iter().map(|m| m.role).collect();
+        let steer_pos = steered_request
+            .iter()
+            .position(|m| m.content.contains(STEER_MARKER))
+            .expect("marker present in this request");
+        let tool_pos = roles
+            .iter()
+            .position(|r| *r == Role::Tool)
+            .expect("a tool result must precede the steer note");
+        let assistant_tc_pos = steered_request
+            .iter()
+            .position(|m| m.role == Role::Assistant && m.tool_calls.is_some())
+            .expect("an assistant tool-call message must precede the tool result");
+
+        assert!(
+            assistant_tc_pos < tool_pos && tool_pos < steer_pos,
+            "steer note must follow assistant(tool_calls) → tool_result, roles: {roles:?}"
+        );
+        assert_eq!(
+            steered_request[steer_pos].role,
+            Role::User,
+            "steer note is injected as a user message"
+        );
     }
 }

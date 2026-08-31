@@ -238,6 +238,9 @@ Work independently to complete this job. Report when done."#,
                 max_iterations: self.config.max_iterations as usize,
                 enable_tool_intent_nudge: true,
                 max_tool_intent_nudges: 2,
+                // Container jobs keep boundary-only cancellation: the delegate's
+                // check_signals already polls the worker's stop channel.
+                interrupt_token: None,
             };
 
             crate::agent::agentic_loop::run_agentic_loop(

@@ -314,9 +314,22 @@ Commands:
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
   build-voice-sidecar              Build the LunarVoice ONNX sidecar container image
-  enable-voice <name>              Configure/start local voice; restart tenant to apply
-                                   (verified models required)
-  disable-voice <name>             Disable/stop local voice; restart tenant to apply
+  install-voice <name>             Install LunarVoice image/config without activating it
+    [--model-manifest <path>]      Install SHA-256-pinned models from a trusted manifest
+  configure-voice <name>          Update validated per-tenant voice settings; an active
+                                   sidecar and daemon are reconciled automatically
+    [--stt-engine whisper|parakeet] [--stt-model <name>] [--stt-language <tag>]
+    [--enable-vad|--disable-vad] [--enable-tts|--disable-tts]
+    [--max-audio-secs <n>] [--max-audio-bytes <n>] [--max-text-chars <n>]
+    [--max-tts-audio-secs <n>] [--request-timeout-secs <n>]
+    [--max-concurrent-inference <n>] [--rate-limit-per-sec <n>]
+    [--cache-ttl-secs <n>] [--cache-max-entries <n>]
+    [--tts-default-voice <name>] [--ort-num-threads <n>]
+  activate-voice <name>           Health-gated start; activates daemon transcription
+  deactivate-voice <name>         Stop sidecar and restore prior transcription provider
+  remove-voice <name>             Deactivate and remove tenant config/container/units
+                                   (shared verified models and image are retained)
+  enable-voice / disable-voice     Compatibility aliases for activate/deactivate
 
   build-darkirc                   Build darkirc daemon from external source
   ensure-darkirc-release <name>   Build the atomic release set when required
@@ -730,18 +743,86 @@ main() {
       build_voice_sidecar_image
       ;;
 
-    enable-voice|disable-voice)
+    install-voice)
+      require_root
+      local _voice_name="" _voice_manifest=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model-manifest)
+            [[ $# -ge 2 ]] || die "--model-manifest requires a path"
+            _voice_manifest="$2"; shift 2
+            ;;
+          -*) die "unknown flag: $1" ;;
+          *)
+            [[ -z "$_voice_name" ]] || die "unexpected argument: $1"
+            _voice_name="$(sanitize_name "$1")"; shift
+            ;;
+        esac
+      done
+      [[ -n "$_voice_name" ]] \
+        || die "usage: install-voice <name> [--model-manifest <path>]"
+      with_tenant_lifecycle_lock "$_voice_name" \
+        install_tenant_voice "$_voice_name" "$_voice_manifest"
+      ;;
+
+    configure-voice)
+      require_root
+      local _voice_name="" _voice_key="" _voice_value=""
+      local -a _voice_settings=()
+      [[ $# -gt 0 ]] || die "usage: configure-voice <name> [settings]"
+      _voice_name="$(sanitize_name "$1")"; shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --enable-vad) _voice_settings+=("VOICE_ENABLE_VAD=true"); shift; continue ;;
+          --disable-vad) _voice_settings+=("VOICE_ENABLE_VAD=false"); shift; continue ;;
+          --enable-tts) _voice_settings+=("VOICE_ENABLE_TTS=true"); shift; continue ;;
+          --disable-tts) _voice_settings+=("VOICE_ENABLE_TTS=false"); shift; continue ;;
+          --stt-engine) _voice_key=VOICE_STT_ENGINE ;;
+          --stt-model) _voice_key=VOICE_STT_MODEL ;;
+          --stt-language) _voice_key=VOICE_STT_LANGUAGE ;;
+          --max-audio-secs) _voice_key=VOICE_MAX_AUDIO_SECS ;;
+          --max-audio-bytes) _voice_key=VOICE_MAX_AUDIO_BYTES ;;
+          --max-text-chars) _voice_key=VOICE_MAX_TEXT_CHARS ;;
+          --max-tts-audio-secs) _voice_key=VOICE_MAX_TTS_AUDIO_SECS ;;
+          --request-timeout-secs) _voice_key=VOICE_REQUEST_TIMEOUT_SECS ;;
+          --max-concurrent-inference) _voice_key=VOICE_MAX_CONCURRENT_INFERENCE ;;
+          --rate-limit-per-sec) _voice_key=VOICE_RATE_LIMIT_PER_SEC ;;
+          --cache-ttl-secs) _voice_key=VOICE_CACHE_TTL_SECS ;;
+          --cache-max-entries) _voice_key=VOICE_CACHE_MAX_ENTRIES ;;
+          --tts-default-voice) _voice_key=VOICE_TTS_DEFAULT_VOICE ;;
+          --ort-num-threads) _voice_key=ORT_NUM_THREADS ;;
+          -*) die "unknown flag: $1" ;;
+          *) die "unexpected argument: $1" ;;
+        esac
+        [[ $# -ge 2 ]] || die "$1 requires a value"
+        _voice_value="$2"
+        _voice_settings+=("${_voice_key}=${_voice_value}")
+        shift 2
+      done
+      [[ ${#_voice_settings[@]} -gt 0 ]] || die "configure-voice requires a setting"
+      with_tenant_lifecycle_lock "$_voice_name" \
+        configure_tenant_voice "$_voice_name" "${_voice_settings[@]}"
+      ;;
+
+    activate-voice|enable-voice)
       require_root
       [[ $# -eq 1 ]] || die "usage: $command_name <name>"
       _voice_name="$(sanitize_name "$1")"
-      if [[ "$command_name" == "enable-voice" ]]; then
-        configure_voice "$_voice_name" true
-        start_tenant_voice "$_voice_name"
-      else
-        configure_voice "$_voice_name" false
-        stop_tenant_voice "$_voice_name"
-        remove_tenant_voice_unit "$_voice_name"
-      fi
+      with_tenant_lifecycle_lock "$_voice_name" activate_tenant_voice "$_voice_name"
+      ;;
+
+    deactivate-voice|disable-voice)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: $command_name <name>"
+      _voice_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_voice_name" deactivate_tenant_voice "$_voice_name"
+      ;;
+
+    remove-voice)
+      require_root
+      [[ $# -eq 1 ]] || die "usage: remove-voice <name>"
+      _voice_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_voice_name" remove_tenant_voice "$_voice_name"
       ;;
 
     install-wasm)

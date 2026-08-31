@@ -2402,6 +2402,7 @@ mod tests {
             Ok(crate::traits::llm::LlmOutput {
                 response: crate::types::step::LlmResponse::Text("stub".into()),
                 usage: crate::types::step::TokenUsage::default(),
+                finish_reason: "stop".to_string(),
             })
         }
     }

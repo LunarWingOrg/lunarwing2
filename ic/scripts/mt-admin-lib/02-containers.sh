@@ -296,80 +296,115 @@ ENVEOF
   printf '%s' "$token"
 }
 
+_voice_env_set_default() {
+  local path="$1" key="$2" value="$3"
+  [[ -n "$(_env_existing "$path" "$key")" ]] || _env_set "$path" "$key" "$value"
+}
+
 write_tenant_voice_env() {
-  local name="$1"
-  local env_dir env_path token enabled stt_engine stt_model stt_language enable_vad enable_tts
+  local name="$1" env_dir env_path token enabled setting key value
   env_dir="$(tenant_env_dir "$name")"
   env_path="$env_dir/voice.env"
+  mkdir -p "$env_dir"
+  if [[ ! -e "$env_path" ]]; then
+    (umask 077; : >"$env_path")
+  elif [[ ! -f "$env_path" || -L "$env_path" ]]; then
+    die "unsafe LunarVoice environment file: $env_path"
+  fi
+
   token="$(_env_existing "$env_path" VOICE_AUTH_TOKEN)"
   token="${token:-$(generate_token)}"
   enabled="$(jq -r --arg name "$name" '.tenants[$name].enable_voice // false' "$PORTS_REGISTRY" 2>/dev/null)"
   [[ "$enabled" == true ]] || enabled=false
-  stt_engine="$(_env_existing "$env_path" VOICE_STT_ENGINE)"; stt_engine="${stt_engine:-whisper}"
-  stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"; stt_model="${stt_model:-whisper-tiny}"
-  stt_language="$(_env_existing "$env_path" VOICE_STT_LANGUAGE)"; stt_language="${stt_language:-auto}"
-  enable_vad="$(_env_existing "$env_path" VOICE_ENABLE_VAD)"; enable_vad="${enable_vad:-true}"
-  enable_tts="$(_env_existing "$env_path" VOICE_ENABLE_TTS)"; enable_tts="${enable_tts:-true}"
-  mkdir -p "$env_dir"
-  (
-    umask 077
-    cat >"$env_path" <<ENVEOF
-VOICE_ENABLED=$enabled
-VOICE_AUTH_TOKEN=$token
-VOICE_BIND_HOST=0.0.0.0
-VOICE_PORT=8090
-VOICE_HEALTH_PORT=8091
-VOICE_MODEL_DIR=/models
-VOICE_STT_ENGINE=$stt_engine
-VOICE_STT_MODEL=$stt_model
-VOICE_STT_LANGUAGE=$stt_language
-VOICE_ENABLE_VAD=$enable_vad
-VOICE_ENABLE_TTS=$enable_tts
-VOICE_REQUIRE_STT=true
-VOICE_MAX_AUDIO_SECS=300
-VOICE_MAX_AUDIO_BYTES=52428800
-VOICE_MAX_TTS_AUDIO_SECS=300
-VOICE_REQUEST_TIMEOUT_SECS=120
-VOICE_MAX_CONCURRENT_INFERENCE=2
-VOICE_RATE_LIMIT_PER_SEC=5
-VOICE_CACHE_TTL_SECS=600
-VOICE_CACHE_MAX_ENTRIES=5000
-ORT_NUM_THREADS=4
-ENVEOF
-  )
+
+  _env_set "$env_path" VOICE_ENABLED "$enabled"
+  _voice_env_set_default "$env_path" VOICE_AUTH_TOKEN "$token"
+  _env_set "$env_path" VOICE_ALLOW_UNAUTHENTICATED false
+  _env_set "$env_path" VOICE_BIND_HOST 0.0.0.0
+  _env_set "$env_path" VOICE_PORT "$VOICE_SIDECAR_INTERNAL_PORT"
+  _env_set "$env_path" VOICE_HEALTH_PORT "$VOICE_SIDECAR_HEALTH_PORT"
+  _env_set "$env_path" VOICE_MODEL_DIR /models
+  _env_set "$env_path" VOICE_AUTO_DOWNLOAD false
+  _env_set "$env_path" VOICE_REQUIRE_STT true
+
+  for setting in \
+    'VOICE_STT_ENGINE|whisper' \
+    'VOICE_STT_MODEL|whisper-tiny' \
+    'VOICE_STT_LANGUAGE|auto' \
+    'VOICE_ENABLE_VAD|true' \
+    'VOICE_ENABLE_TTS|true' \
+    'VOICE_MAX_AUDIO_SECS|300' \
+    'VOICE_MAX_AUDIO_BYTES|52428800' \
+    'VOICE_MAX_TEXT_CHARS|10000' \
+    'VOICE_MAX_TTS_AUDIO_SECS|300' \
+    'VOICE_REQUEST_TIMEOUT_SECS|120' \
+    'VOICE_MAX_CONCURRENT_INFERENCE|2' \
+    'VOICE_RATE_LIMIT_PER_SEC|5' \
+    'VOICE_CACHE_TTL_SECS|600' \
+    'VOICE_CACHE_MAX_ENTRIES|5000' \
+    'VOICE_FFMPEG_PATH|ffmpeg' \
+    'VOICE_TTS_DEFAULT_VOICE|af_heart' \
+    'ORT_NUM_THREADS|4'; do
+    key="${setting%%|*}"
+    value="${setting#*|}"
+    _voice_env_set_default "$env_path" "$key" "$value"
+  done
+  chmod 0600 "$env_path"
   chown "$name:$name" "$env_path"
   printf '%s' "$token"
 }
 
-voice_models_ready() {
-  local name="$1" env_path key value default_path host_path stt_model stt_engine marker_hash
-  env_path="$(tenant_env_dir "$name")/voice.env"
+_voice_model_path_safe() {
+  local value="$1"
+  [[ "$value" == /models/* \
+    && "$value" != *'/../'* && "$value" != */.. \
+    && "$value" != *'/./'* && "$value" != */. ]]
+}
+
+_voice_models_ready_env() {
+  local env_path="$1" key value default_path host_path host_real
+  local stt_model stt_engine marker marker_hash model_paths model_root model_size
   stt_model="$(_env_existing "$env_path" VOICE_STT_MODEL)"
   stt_model="${stt_model:-whisper-tiny}"
   stt_engine="$(_env_existing "$env_path" VOICE_STT_ENGINE)"
   stt_engine="${stt_engine:-whisper}"
   [[ "$stt_model" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
-  [[ -f "$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256" ]] || return 1
-  marker_hash="$(tr -d '\r\n' <"$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256")"
+  marker="$VOICE_MODELS_DIR/.lunarvoice-${stt_model}.sha256"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 1
+  marker_hash="$(tr -d '\r\n' <"$marker")"
   [[ "$marker_hash" =~ ^[0-9a-f]{64}$ ]] || return 1
-  local model_paths
-  if [[ "$stt_engine" == parakeet* ]]; then
-    model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-nemo-${stt_model}/encoder.int8.onnx
+  model_root="$(realpath -e -- "$VOICE_MODELS_DIR" 2>/dev/null)" || return 1
+
+  case "$stt_engine" in
+    whisper)
+      model_size="${stt_model#whisper-}"
+      [[ -n "$model_size" && "$model_size" != "$stt_model" ]] || return 1
+      model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-${stt_model}/${model_size}-encoder.int8.onnx
+VOICE_STT_DECODER|/models/sherpa-onnx-${stt_model}/${model_size}-decoder.int8.onnx
+VOICE_STT_TOKENS|/models/sherpa-onnx-${stt_model}/${model_size}-tokens.txt"
+      ;;
+    parakeet|parakeet-tdt|transducer)
+      model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-nemo-${stt_model}/encoder.int8.onnx
 VOICE_STT_DECODER|/models/sherpa-onnx-nemo-${stt_model}/decoder.int8.onnx
 VOICE_STT_JOINER|/models/sherpa-onnx-nemo-${stt_model}/joiner.int8.onnx
 VOICE_STT_TOKENS|/models/sherpa-onnx-nemo-${stt_model}/tokens.txt"
-  else
-    model_paths="VOICE_STT_ENCODER|/models/sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx
-VOICE_STT_DECODER|/models/sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx
-VOICE_STT_TOKENS|/models/sherpa-onnx-whisper-tiny/tiny-tokens.txt"
-  fi
+      ;;
+    *) return 1 ;;
+  esac
+
   while IFS='|' read -r key default_path; do
     value="$(_env_existing "$env_path" "$key")"
     value="${value:-$default_path}"
-    [[ "$value" == /models/* ]] || return 1
+    _voice_model_path_safe "$value" || return 1
     host_path="$VOICE_MODELS_DIR/${value#/models/}"
-    [[ -f "$host_path" && -r "$host_path" ]] || return 1
+    [[ -f "$host_path" && -r "$host_path" && ! -L "$host_path" ]] || return 1
+    host_real="$(realpath -e -- "$host_path" 2>/dev/null)" || return 1
+    [[ "$host_real" == "$model_root"/* ]] || return 1
   done <<<"$model_paths"
+}
+
+voice_models_ready() {
+  _voice_models_ready_env "$(tenant_env_dir "$1")/voice.env"
 }
 
 _vision_port_valid() {
@@ -606,11 +641,14 @@ _voice_launch_contract() {
 }
 
 _voice_container_healthy() {
-  local name="$1" container="$2" running
+  local name="$1" container="$2" running health_base
   running="$(_ctr "$name" inspect -f '{{.State.Running}}' "$container" 2>/dev/null)" || return 1
   [[ "$running" == "true" ]] || return 1
+  health_base="http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}"
   _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
-    "http://127.0.0.1:${VOICE_SIDECAR_HEALTH_PORT}/health" 2>/dev/null
+    "$health_base/health" 2>/dev/null \
+    && _ctr "$name" exec "$container" curl -sf -o /dev/null --max-time 3 \
+      "$health_base/ready" 2>/dev/null
 }
 
 # STT model load can take a while on a cold box, so the default wait is 60s.
@@ -807,32 +845,264 @@ stop_tenant_voice() {
   say "LunarVoice stopped ($container_name)"
 }
 
+_voice_capture_transcription_config() {
+  local voice_env="$1" lunarwing_env="$2" provider
+  [[ "$(_env_existing "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED)" == true ]] && return 0
+  provider="$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)"
+  [[ "$provider" != lunarvoice ]] || return 0
+  _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_ENABLED \
+    "$(_env_existing "$lunarwing_env" TRANSCRIPTION_ENABLED)"
+  _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_PROVIDER "$provider"
+  _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_MODEL \
+    "$(_env_existing "$lunarwing_env" TRANSCRIPTION_MODEL)"
+  _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED true
+}
+
+_voice_restore_transcription_config() {
+  local voice_env="$1" lunarwing_env="$2" value
+  [[ "$(_env_existing "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED)" == true ]] \
+    || return 1
+  value="$(_env_existing "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_ENABLED)"
+  _env_set "$lunarwing_env" TRANSCRIPTION_ENABLED "${value:-false}"
+  value="$(_env_existing "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_PROVIDER)"
+  _env_set "$lunarwing_env" TRANSCRIPTION_PROVIDER "${value:-openai}"
+  value="$(_env_existing "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_MODEL)"
+  _env_set "$lunarwing_env" TRANSCRIPTION_MODEL "${value:-whisper-1}"
+  _env_set "$voice_env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED false
+}
+
 configure_voice() {
   local name="$1" enabled="$2" voice_env lunarwing_env token voice_port stt_model
   tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  [[ "$enabled" == true || "$enabled" == false ]] || die "invalid LunarVoice state: $enabled"
   voice_env="$(tenant_env_dir "$name")/voice.env"
   lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
-  [[ -f "$voice_env" ]] || write_tenant_voice_env "$name" >/dev/null
-  [[ -f "$lunarwing_env" ]] || die "tenant LunarWing environment missing"
-  if [[ "$enabled" == "true" ]]; then
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] || write_tenant_voice_env "$name" >/dev/null
+  [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
+    || die "tenant LunarWing environment missing or unsafe"
+  if [[ "$enabled" == true ]]; then
     voice_models_ready "$name" || die "verified STT models missing under $VOICE_MODELS_DIR"
   fi
   token="$(_env_existing "$voice_env" VOICE_AUTH_TOKEN)"
+  [[ -n "$token" ]] || die "LunarVoice bearer token is missing"
   stt_model="$(_env_existing "$voice_env" VOICE_STT_MODEL)"
   stt_model="${stt_model:-whisper-tiny}"
   voice_port="$(ports_get "$name" voice_service)"
+  _voice_port_valid "$voice_port" || die "invalid voice_service port for tenant '$name'"
   _env_set "$voice_env" VOICE_ENABLED "$enabled"
   _env_set "$lunarwing_env" VOICE_SERVICE_URL "http://127.0.0.1:${voice_port}"
   _env_set "$lunarwing_env" VOICE_AUTH_TOKEN "$token"
   if [[ "$enabled" == true ]]; then
+    _voice_capture_transcription_config "$voice_env" "$lunarwing_env"
     _env_set "$lunarwing_env" TRANSCRIPTION_PROVIDER lunarvoice
     _env_set "$lunarwing_env" TRANSCRIPTION_MODEL "$stt_model"
     _env_set "$lunarwing_env" TRANSCRIPTION_ENABLED true
-  elif [[ "$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)" == lunarvoice ]]; then
+  elif ! _voice_restore_transcription_config "$voice_env" "$lunarwing_env" \
+      && [[ "$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)" == lunarvoice ]]; then
     _env_set "$lunarwing_env" TRANSCRIPTION_ENABLED false
   fi
   ports_set_voice "$name" "$enabled"
-  say "LunarVoice enabled=$enabled for $name; restart tenant to apply daemon transcription settings"
+  say "LunarVoice enabled=$enabled for $name"
+}
+
+_voice_validate_uint() {
+  local value="$1" minimum="$2" maximum="$3" number
+  [[ "$value" =~ ^[0-9]+$ && ${#value} -le 10 ]] || return 1
+  number=$((10#$value))
+  (( number >= minimum && number <= maximum ))
+}
+
+_voice_validate_stt_language() {
+  local value="${1,,}" codes
+  codes="auto en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro da hu ta no th ur hr bg lt la mi ml cy sk te fa lv bn sr az sl kn et mk br eu is hy ne mn bs kk sq sw gl mr pa si km sn yo so af oc ka be tg sd gu am yi lo uz fo ht ps tk nn mt sa lb my bo tl mg as tt haw ln ha ba jw su"
+  [[ " $codes " == *" $value "* ]]
+}
+
+_voice_validate_setting() {
+  local key="$1" value="$2"
+  case "$key" in
+    VOICE_STT_ENGINE) [[ "$value" == whisper || "$value" == parakeet ]] ;;
+    VOICE_STT_MODEL) [[ "$value" =~ ^[A-Za-z0-9._-]{1,128}$ ]] ;;
+    VOICE_STT_LANGUAGE) _voice_validate_stt_language "$value" ;;
+    VOICE_TTS_DEFAULT_VOICE) [[ "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ;;
+    VOICE_ENABLE_VAD|VOICE_ENABLE_TTS) [[ "$value" == true || "$value" == false ]] ;;
+    VOICE_MAX_AUDIO_SECS|VOICE_MAX_TTS_AUDIO_SECS|VOICE_REQUEST_TIMEOUT_SECS)
+      _voice_validate_uint "$value" 1 3600
+      ;;
+    VOICE_MAX_AUDIO_BYTES) _voice_validate_uint "$value" 1024 1073741824 ;;
+    VOICE_MAX_TEXT_CHARS) _voice_validate_uint "$value" 1 100000 ;;
+    VOICE_MAX_CONCURRENT_INFERENCE) _voice_validate_uint "$value" 1 64 ;;
+    VOICE_RATE_LIMIT_PER_SEC) _voice_validate_uint "$value" 1 10000 ;;
+    VOICE_CACHE_TTL_SECS) _voice_validate_uint "$value" 0 86400 ;;
+    VOICE_CACHE_MAX_ENTRIES) _voice_validate_uint "$value" 1 1000000 ;;
+    ORT_NUM_THREADS) _voice_validate_uint "$value" 1 128 ;;
+    *) return 1 ;;
+  esac
+}
+
+configure_voice_settings() {
+  local name="$1" voice_env lunarwing_env tmp assignment key value
+  shift
+  tenant_exists_in_registry "$name" \
+    || { say "ERROR: tenant '$name' not found" >&2; return 1; }
+  [[ $# -gt 0 ]] \
+    || { say "ERROR: configure-voice requires at least one setting" >&2; return 1; }
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || { say "ERROR: LunarVoice is not installed for $name; run install-voice first" >&2; return 1; }
+  [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
+    || { say "ERROR: tenant LunarWing environment missing or unsafe" >&2; return 1; }
+
+  tmp="$(mktemp "$(dirname "$voice_env")/.voice-config.XXXXXX")" || return 1
+  cp --preserve=mode,ownership -- "$voice_env" "$tmp" \
+    || { rm -f "$tmp"; say "ERROR: failed to stage LunarVoice configuration" >&2; return 1; }
+  for assignment in "$@"; do
+    if [[ "$assignment" != *=* ]]; then
+      rm -f "$tmp"; say "ERROR: invalid voice setting" >&2; return 1
+    fi
+    key="${assignment%%=*}"
+    value="${assignment#*=}"
+    if ! _voice_validate_setting "$key" "$value"; then
+      rm -f "$tmp"; say "ERROR: invalid value for $key" >&2; return 1
+    fi
+    _env_set "$tmp" "$key" "$value"
+  done
+  if tenant_voice_enabled "$name" && ! _voice_models_ready_env "$tmp"; then
+    rm -f "$tmp"
+    say "ERROR: configured STT model is not verified under $VOICE_MODELS_DIR" >&2
+    return 1
+  fi
+  mv -T -- "$tmp" "$voice_env"
+  chmod 0600 "$voice_env"
+  chown "$name:$name" "$voice_env"
+  if [[ "$(_env_existing "$lunarwing_env" TRANSCRIPTION_PROVIDER)" == lunarvoice ]]; then
+    _env_set "$lunarwing_env" TRANSCRIPTION_MODEL \
+      "$(_env_existing "$voice_env" VOICE_STT_MODEL)"
+  fi
+  say "LunarVoice configuration updated for $name"
+}
+
+install_voice_models() {
+  local manifest="$1" installer="$SOURCE_REPO/projects/voice-sidecar/scripts/download-models.sh"
+  [[ -f "$manifest" && -r "$manifest" && ! -L "$manifest" ]] \
+    || die "model manifest must be a readable regular file"
+  [[ -x "$installer" ]] || die "LunarVoice model installer missing: $installer"
+  if [[ -e "$VOICE_MODELS_DIR" && ( ! -d "$VOICE_MODELS_DIR" || -L "$VOICE_MODELS_DIR" ) ]]; then
+    die "unsafe LunarVoice model directory: $VOICE_MODELS_DIR"
+  fi
+  install -d -m 0755 -- "$VOICE_MODELS_DIR"
+  "$installer" "$manifest" "$VOICE_MODELS_DIR"
+}
+
+install_tenant_voice() {
+  local name="$1" manifest="${2:-}"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  ensure_container_runtime
+  [[ -z "$manifest" ]] || install_voice_models "$manifest"
+  if ! "$CONTAINER_RT" image inspect "$VOICE_SIDECAR_IMAGE" >/dev/null 2>&1; then
+    build_voice_sidecar_image || die "failed to build LunarVoice sidecar image"
+  fi
+  _ensure_tenant_image "$name" "$VOICE_SIDECAR_IMAGE" \
+    || die "failed to install LunarVoice image for tenant '$name'"
+  write_tenant_voice_env "$name" >/dev/null
+  say "LunarVoice installed for $name (inactive; run activate-voice when models are ready)"
+}
+
+_voice_daemon_running() {
+  local name="$1"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == systemd ]]; then
+    _systemctl_user "$name" is-active --quiet "lunarwing-${name}.service" >/dev/null 2>&1
+  else
+    rc-service "lunarwing-${name}" status >/dev/null 2>&1
+  fi
+}
+
+_reload_voice_consumer_if_running() {
+  local name="$1"
+  if _voice_daemon_running "$name"; then
+    _restart_tenant_daemon "$name" \
+      || { say "ERROR: failed to restart LunarWing after voice configuration change" >&2; return 1; }
+    say "LunarWing restarted; voice configuration is active for $name"
+  else
+    say "LunarWing is stopped; voice configuration applies on its next start"
+  fi
+}
+
+apply_tenant_voice_configuration() {
+  local name="$1"
+  if tenant_voice_enabled "$name"; then
+    start_tenant_voice "$name" || return 1
+    _reload_voice_consumer_if_running "$name"
+  else
+    say "LunarVoice is inactive for $name; configuration applies on activation"
+  fi
+}
+
+configure_tenant_voice() {
+  local name="$1" voice_env lunarwing_env voice_backup lunarwing_backup result=0
+  shift
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || die "LunarVoice is not installed for $name; run install-voice first"
+  [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
+    || die "tenant LunarWing environment missing or unsafe"
+  voice_backup="$(mktemp "$(dirname "$voice_env")/.voice-rollback.XXXXXX")"
+  lunarwing_backup="$(mktemp "$(dirname "$lunarwing_env")/.lunarwing-rollback.XXXXXX")"
+  cp --preserve=mode,ownership -- "$voice_env" "$voice_backup" \
+    && cp --preserve=mode,ownership -- "$lunarwing_env" "$lunarwing_backup" \
+    || { rm -f -- "$voice_backup" "$lunarwing_backup"; return 1; }
+
+  configure_voice_settings "$name" "$@" || {
+    result=$?
+    rm -f -- "$voice_backup" "$lunarwing_backup"
+    return "$result"
+  }
+  apply_tenant_voice_configuration "$name" || result=$?
+  if [[ "$result" -eq 0 ]]; then
+    rm -f -- "$voice_backup" "$lunarwing_backup"
+    return 0
+  fi
+
+  say "ERROR: LunarVoice configuration failed; restoring previous settings" >&2
+  mv -T -- "$voice_backup" "$voice_env"
+  mv -T -- "$lunarwing_backup" "$lunarwing_env"
+  if tenant_voice_enabled "$name"; then
+    start_tenant_voice "$name" \
+      || say "WARNING: failed to restore the previous LunarVoice runtime" >&2
+    _reload_voice_consumer_if_running "$name" \
+      || say "WARNING: restart tenant '$name' to restore its prior transcription settings" >&2
+  fi
+  return "$result"
+}
+
+_rollback_voice_activation() {
+  local name="$1" container="lunarwing-voice-$1"
+  configure_voice "$name" false
+  stop_tenant_voice "$name" || true
+  remove_tenant_voice_unit "$name" || true
+  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    _ctr "$name" rm -f "$container" >/dev/null 2>&1 || true
+  fi
+  _reload_voice_consumer_if_running "$name" || true
+}
+
+activate_tenant_voice() {
+  local name="$1" voice_env
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || die "LunarVoice is not installed for $name; run install-voice first"
+  ensure_container_runtime
+  _ensure_tenant_image "$name" "$VOICE_SIDECAR_IMAGE" \
+    || die "LunarVoice image unavailable; run install-voice first"
+  configure_voice "$name" true
+  if ! start_tenant_voice "$name" || ! _reload_voice_consumer_if_running "$name"; then
+    _rollback_voice_activation "$name"
+    die "LunarVoice activation failed; previous transcription configuration restored"
+  fi
 }
 
 remove_tenant_voice_unit() {
@@ -851,4 +1121,48 @@ remove_tenant_voice_unit() {
     rm -f "$OPENRC_INITD_DIR/$container_name"
     rm -f "$(_hash_dir "$name")/${container_name}.hash"
   fi
+}
+
+deactivate_tenant_voice() {
+  local name="$1" voice_env
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || die "LunarVoice is not installed for $name; run install-voice first"
+  configure_voice "$name" false
+  stop_tenant_voice "$name" || return 1
+  remove_tenant_voice_unit "$name" || return 1
+  _reload_voice_consumer_if_running "$name"
+}
+
+_voice_remove_daemon_credentials() {
+  local path="$1" tmp
+  [[ -f "$path" && ! -L "$path" ]] || die "tenant LunarWing environment missing or unsafe"
+  tmp="$(mktemp "$(dirname "$path")/.voice-remove.XXXXXX")"
+  awk '!/^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=/' "$path" >"$tmp"
+  chmod --reference="$path" "$tmp"
+  chown --reference="$path" "$tmp"
+  mv -T -- "$tmp" "$path"
+}
+
+remove_tenant_voice() {
+  local name="$1" voice_env container="lunarwing-voice-$1"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  configure_voice "$name" false
+  stop_tenant_voice "$name" || return 1
+  remove_tenant_voice_unit "$name" || return 1
+  _voice_remove_daemon_credentials "$(tenant_env_dir "$name")/lunarwing.env"
+  _reload_voice_consumer_if_running "$name" || return 1
+  ensure_container_runtime
+  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    _ctr "$name" rm -f "$container" >/dev/null \
+      || { say "ERROR: failed to remove LunarVoice container $container" >&2; return 1; }
+  fi
+  if [[ -e "$voice_env" || -L "$voice_env" ]]; then
+    [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+      || die "refusing to remove unsafe LunarVoice environment path: $voice_env"
+    rm -f -- "$voice_env"
+  fi
+  say "LunarVoice removed for $name (shared models and image retained)"
 }

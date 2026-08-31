@@ -36,6 +36,11 @@ pub struct LlmCallConfig {
 pub struct LlmOutput {
     pub response: LlmResponse,
     pub usage: TokenUsage,
+    /// Why the completion finished, in the canonical protocol spelling carried
+    /// by [`LlmStreamChunk::Done`] (`"stop"`, `"length"`, `"tool_calls"`,
+    /// `"content_filter"`, `"unknown"`). Blocking producers that cannot tell
+    /// use `"unknown"`.
+    pub finish_reason: String,
 }
 
 /// Incremental output from an engine LLM completion stream.
@@ -61,16 +66,15 @@ pub enum LlmStreamChunk {
 pub type LlmStream<'a> = BoxStream<'a, Result<LlmStreamChunk, EngineError>>;
 
 fn fallback_stream_chunks(output: LlmOutput) -> Vec<Result<LlmStreamChunk, EngineError>> {
+    let finish_reason = output.finish_reason;
     let mut chunks = Vec::new();
-    let finish_reason = match output.response {
+    match output.response {
         LlmResponse::Text(text) => {
             chunks.push(Ok(LlmStreamChunk::TextDelta(text)));
-            "unknown"
         }
         LlmResponse::Code { code, content } => {
             let text = content.unwrap_or_else(|| format!("```python\n{code}\n```"));
             chunks.push(Ok(LlmStreamChunk::TextDelta(text)));
-            "unknown"
         }
         LlmResponse::ActionCalls { calls, content } => {
             if let Some(content) = content.filter(|content| !content.is_empty()) {
@@ -84,12 +88,11 @@ fn fallback_stream_chunks(output: LlmOutput) -> Vec<Result<LlmStreamChunk, Engin
                     args_delta: call.parameters.to_string(),
                 }));
             }
-            "tool_calls"
         }
-    };
+    }
     chunks.push(Ok(LlmStreamChunk::Done {
         usage: Some(output.usage),
-        finish_reason: finish_reason.to_string(),
+        finish_reason,
     }));
     chunks
 }
@@ -137,11 +140,15 @@ mod tests {
 
     struct NonStreamingBackend {
         response: LlmResponse,
+        finish_reason: String,
     }
 
     impl NonStreamingBackend {
-        fn new(response: LlmResponse) -> Self {
-            Self { response }
+        fn new(response: LlmResponse, finish_reason: &str) -> Self {
+            Self {
+                response,
+                finish_reason: finish_reason.to_string(),
+            }
         }
     }
 
@@ -160,6 +167,7 @@ mod tests {
                     output_tokens: 2,
                     ..TokenUsage::default()
                 },
+                finish_reason: self.finish_reason.clone(),
             })
         }
 
@@ -170,9 +178,10 @@ mod tests {
 
     #[tokio::test]
     async fn non_streaming_backend_falls_back_to_single_text_delta() {
-        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(LlmResponse::Text(
-            "hello".to_string(),
-        )));
+        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(
+            LlmResponse::Text("hello".to_string()),
+            "stop",
+        ));
         let chunks = backend
             .complete_stream(&[], &[], &LlmCallConfig::default())
             .await
@@ -189,7 +198,7 @@ mod tests {
             }) => {
                 assert_eq!(usage.input_tokens, 3);
                 assert_eq!(usage.output_tokens, 2);
-                assert_eq!(finish_reason, "unknown");
+                assert_eq!(finish_reason, "stop");
             }
             other => panic!("expected terminal chunk, got {other:?}"),
         }
@@ -197,10 +206,13 @@ mod tests {
 
     #[tokio::test]
     async fn code_fallback_streams_original_response_text() {
-        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(LlmResponse::Code {
-            code: "print('hello')".to_string(),
-            content: Some("```python\nprint('hello')\n```".to_string()),
-        }));
+        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(
+            LlmResponse::Code {
+                code: "print('hello')".to_string(),
+                content: Some("```python\nprint('hello')\n```".to_string()),
+            },
+            "stop",
+        ));
 
         let chunks = backend
             .complete_stream(&[], &[], &LlmCallConfig::default())
@@ -216,16 +228,19 @@ mod tests {
         ));
         assert!(matches!(
             &chunks[1],
-            Ok(LlmStreamChunk::Done { finish_reason, .. }) if finish_reason == "unknown"
+            Ok(LlmStreamChunk::Done { finish_reason, .. }) if finish_reason == "stop"
         ));
     }
 
     #[tokio::test]
     async fn code_fallback_without_content_preserves_code_fence() {
-        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(LlmResponse::Code {
-            code: "print('hello')".to_string(),
-            content: None,
-        }));
+        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(
+            LlmResponse::Code {
+                code: "print('hello')".to_string(),
+                content: None,
+            },
+            "stop",
+        ));
 
         let chunks = backend
             .complete_stream(&[], &[], &LlmCallConfig::default())
@@ -243,15 +258,17 @@ mod tests {
 
     #[tokio::test]
     async fn action_fallback_streams_content_and_complete_call_deltas() {
-        let backend: Arc<dyn LlmBackend> =
-            Arc::new(NonStreamingBackend::new(LlmResponse::ActionCalls {
+        let backend: Arc<dyn LlmBackend> = Arc::new(NonStreamingBackend::new(
+            LlmResponse::ActionCalls {
                 calls: vec![crate::types::step::ActionCall {
                     id: "call-1".to_string(),
                     action_name: "search".to_string(),
                     parameters: serde_json::json!({"query": "lunarwing"}),
                 }],
                 content: Some("I will search.".to_string()),
-            }));
+            },
+            "tool_calls",
+        ));
 
         let chunks = backend
             .complete_stream(&[], &[], &LlmCallConfig::default())

@@ -63,6 +63,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/compact",
     "/new",
     "/interrupt",
+    "/steer",
     "/version",
     "/tools",
     "/ping",
@@ -471,7 +472,7 @@ fn print_help() {
         "    {d}Conversation{r}  {c}/new{r} {c}/clear{r} {c}/compact{r} {c}/undo{r} {c}/redo{r} {c}/summarize{r} {c}/suggest{r}"
     );
     println!("    {d}Threads{r}       {c}/thread{r} {c}/resume{r} {c}/list{r}");
-    println!("    {d}Execution{r}     {c}/interrupt{r} {d}(esc){r} {c}/cancel{r}");
+    println!("    {d}Execution{r}     {c}/interrupt{r} {d}(esc){r} {c}/cancel{r} {c}/steer{r}");
     println!(
         "    {d}System{r}        {c}/tools{r} {c}/model{r} {c}/version{r} {c}/status{r} {c}/debug{r} {c}/heartbeat{r}"
     );

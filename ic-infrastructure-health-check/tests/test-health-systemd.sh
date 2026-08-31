@@ -348,17 +348,20 @@ oR="$(run_hs_registry "$r" HS_FAIL_UFS_USER=acme)"
 assert_eq "$(oall "$oR")" "critical" "R1: inconclusive enable-state for down unit fails loud"
 assert_contains "$oR" "probe(s) failed" "R2: enable-state probe failure surfaced"
 
-# ── S: LunarVision is a container unit; active+unhealthy must be critical ─────
-echo "=== Section S: LunarVision container health ==="
+# ── S: Sidecar container health drives the generic init verdict ───────────────
+echo "=== Section S: sidecar container health ==="
 s="$(sb)"; mk_hs_mock "$s"
 jq -n '{tenants:{acme:{user:"acme"}}}' > "$s/ports.json"
 unit_set_user "$s" acme lunarwing-acme.service "loaded active running 0 enabled"
 unit_set_user "$s" acme lunarwing-vision-acme.service "loaded active running 0 generated"
-container_health_user "$s" acme lunarwing-vision-acme unhealthy
+unit_set_user "$s" acme lunarwing-voice-acme.service "loaded active running 0 generated"
+container_health_user "$s" acme lunarwing-vision-acme healthy
+container_health_user "$s" acme lunarwing-voice-acme unhealthy
 oS="$(run_hs_registry "$s")"
-assert_eq "$(ustat "$oS" lunarwing-vision-acme.service)" "critical" "S1: active but unhealthy LunarVision container is critical"
-assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-vision-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S2: LunarVision container health exposed"
-assert_eq "$(oall "$oS")" "critical" "S3: LunarVision container failure drives overall status"
+assert_eq "$(ustat "$oS" lunarwing-vision-acme.service)" "healthy" "S1: healthy LunarVision container stays healthy"
+assert_eq "$(ustat "$oS" lunarwing-voice-acme.service)" "critical" "S2: active but unhealthy LunarVoice container is critical"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-voice-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S3: LunarVoice container health exposed"
+assert_eq "$(oall "$oS")" "critical" "S4: LunarVoice container failure drives overall status"
 
 # ── T: single-node user scope probes the same bus remediation targets ────────
 echo "=== Section T: single-node user-manager scope ==="

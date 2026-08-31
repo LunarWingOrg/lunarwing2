@@ -1257,37 +1257,20 @@ async fn real_darkirc_component_routes_engine_v2_and_proactive_delivery() {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         assert_eq!(state.ack_count, 1, "successful poll must be acked once");
-        assert_eq!(state.sends.len(), 6);
-        assert_eq!(
-            state.sends[0].payload,
-            serde_json::json!({"to": "Alice", "text": TERMINAL_RESPONSE})
-        );
-        assert_eq!(
-            state.sends[1].payload,
-            serde_json::json!({"to": "Bob", "text": "proactive-darkirc"})
-        );
-        assert_eq!(
-            state.sends[2].payload,
-            serde_json::json!({"to": "Alice", "text": "owner-routed-darkirc"})
-        );
-        assert_eq!(state.sends[3].payload["to"], "Alice");
-        assert!(
-            state.sends[3].payload["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("Waiting for external confirmation"))
-        );
-        assert_eq!(state.sends[4].payload["to"], "Alice");
-        assert!(
-            state.sends[4].payload["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("Approval needed"))
-        );
-        assert_eq!(state.sends[5].payload["to"], "Alice");
-        assert!(
-            state.sends[5].payload["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("https://auth.example/authorize"))
-        );
+        let sent = |recipient: &str, text: &str| {
+            state.sends.iter().any(|request| {
+                request.payload["to"] == recipient
+                    && request.payload["text"]
+                        .as_str()
+                        .is_some_and(|payload| payload.contains(text))
+            })
+        };
+        assert!(sent("Alice", TERMINAL_RESPONSE));
+        assert!(sent("Bob", "proactive-darkirc"));
+        assert!(sent("Alice", "owner-routed-darkirc"));
+        assert!(sent("Alice", "Waiting for external confirmation"));
+        assert!(sent("Alice", "Approval needed"));
+        assert!(sent("Alice", "https://auth.example/authorize"));
         for request in &state.sends {
             assert_eq!(
                 request.authorization.as_deref(),

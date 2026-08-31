@@ -274,15 +274,19 @@ run_hc "$s" SERVICES=lunarwing-nanocode-ghost
 assert_eq "$(svc_field "$OUT" lunarwing-nanocode-ghost status)" "skipped" "S12: missing retired Nanocode service → skipped"
 assert_eq "$RC" 0 "S12: missing retired Nanocode service keeps exit 0"
 
-# ── S13: Vision role maps to its running tenant, not tenant "vision-<name>" ─
+# ── S13: Sidecar roles map to their tenant, not "voice-/vision-<name>" ──────
 s="$(new_scenario)"
 mk_unit "$s" lunarwing-acme;        fix_set "$s" lunarwing-acme        " * status: started" 0
-mk_unit "$s" lunarwing-vision-acme; fix_set "$s" lunarwing-vision-acme " * status: stopped" 3
+mk_unit "$s" lunarwing-vision-acme; fix_set "$s" lunarwing-vision-acme " * status: started" 0
+mk_unit "$s" lunarwing-voice-acme;  fix_set "$s" lunarwing-voice-acme  " * status: stopped" 3
+mk_unit "$s" lunarwing-voice-acme-sup; fix_set "$s" lunarwing-voice-acme-sup " * status: stopped" 3
 enable_unit "$s" lunarwing-acme
 run_hc "$s"
-assert_eq "$(svc_field "$OUT" lunarwing-vision-acme status)" "critical" "S13: down Vision unit on started tenant is critical"
-assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S13: Vision outage drives overall status"
-assert_eq "$RC" 2 "S13: Vision outage exits 2"
+assert_eq "$(svc_field "$OUT" lunarwing-vision-acme status)" "healthy" "S13: healthy Vision unit remains healthy"
+assert_eq "$(svc_field "$OUT" lunarwing-voice-acme status)" "critical" "S13: down Voice unit on started tenant is critical"
+assert_eq "$(svc_field "$OUT" lunarwing-voice-acme-sup status)" "critical" "S13: down Voice supervisor maps to started tenant"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "critical" "S13: Voice outage drives overall status"
+assert_eq "$RC" 2 "S13: Voice outage exits 2"
 
 # ── S14: operator-stopped worker and babysitter stay skipped ────────────────
 s="$(new_scenario)"

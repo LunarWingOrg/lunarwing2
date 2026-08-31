@@ -390,6 +390,9 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
             max_iterations,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            // Worker jobs keep boundary-only cancellation: JobDelegate's
+            // check_signals polls the stop/cancel channel each iteration.
+            interrupt_token: None,
         };
 
         let outcome = run_agentic_loop(&delegate, reasoning, reason_ctx, &config).await?;
