@@ -195,9 +195,14 @@ proactive broadcasts. Mixed-version fleets therefore stay safe by default.
 Ingestion is additionally restricted to an explicit sender allowlist
 (`COORD_KNOWLEDGE_PUBLISHERS`). Room occupancy is not authentication: any
 occupant can claim any nick the room forwards, so only operator-listed sender
-IDs are stored. Entries match the full inbound sender ID case-insensitively
-(for XMPP MUC that is `room@server/nick`, so the resource is significant). An
-empty allowlist — the default — denies every publisher.
+IDs are stored. Entries match case-insensitively against the full inbound
+sender ID (for XMPP MUC that is `room@server/nick`, so the resource is
+significant) or against the room bare JID (`room@server`) as an explicit
+room-wide opt-in that admits every occupant of that room. A user bare JID
+(`user@server`) never matches a MUC occupant sender, and a full-occupant
+entry pins the publisher to an exact nick — a nick change silently stops
+ingestion until the config follows (WI#97). An empty allowlist — the
+default — denies every publisher.
 
 The one-line wire format is:
 
@@ -339,7 +344,7 @@ topic lookup, and cleanup. It skips cleanly when no test database is configured.
 | `COORD_XMPP_STATUS_UPDATES` | `false` | Allow transient thinking/tool/reasoning status messages in configured XMPP coordination rooms |
 | `COORD_KNOWLEDGE_SHARE` | `false` | Ingest valid `KNOW:` room records into this daemon's shared native knowledge scope; requires a database |
 | `COORD_KNOWLEDGE_PUBLISH` | `false` | Emit `KNOW:` records (teaches the model the wire format); enable only when every room daemon accepts the tag |
-| `COORD_KNOWLEDGE_PUBLISHERS` | (empty) | Comma-separated sender IDs whose `KNOW:` shares are ingested; empty denies all |
+| `COORD_KNOWLEDGE_PUBLISHERS` | (empty) | Comma-separated publisher IDs whose `KNOW:` shares are ingested — full MUC occupant JIDs (`room@server/nick`) or a room bare JID (`room@server`) for room-wide opt-in; empty denies all |
 | `COORD_KNOWLEDGE_MAX_PER_HOUR` | `30` | Per-sender inbound ingest cap; accepted range 1–1000 |
 | `COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR` | `300` | Daemon-wide inbound ingest cap; accepted range 1–10000 |
 | `COORD_KNOWLEDGE_MIN_CHARS` | `12` | Minimum finding characters; accepted range 1–420 |
