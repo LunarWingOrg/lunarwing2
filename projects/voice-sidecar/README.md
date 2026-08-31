@@ -41,15 +41,67 @@ GET /ready    STT readiness; returns 503 until required models load
 GET /metrics  bounded operational counters
 ```
 
+## Multi-Tenant Lifecycle
+
+Use `ic/scripts/lunarwing-mt-admin.sh`; do not hand-create tenant units or
+containers. Lifecycle mutations use the tenant lock, work on both systemd user
+units and OpenRC, and leave the feature disabled until explicit activation.
+
+1. Copy `model-manifest.example.json` and replace required placeholders with
+   exact SHA-256 values obtained through a trusted release channel.
+2. Install the shared image, tenant configuration, and optionally the verified
+   models. Installation does not start the sidecar or alter transcription:
+
+   ```bash
+   sudo ic/scripts/lunarwing-mt-admin.sh install-voice <tenant> \
+     --model-manifest /secure/path/model-manifest.json
+   ```
+
+3. Configure the inactive service, for example:
+
+   ```bash
+   sudo ic/scripts/lunarwing-mt-admin.sh configure-voice <tenant> \
+     --stt-engine whisper --stt-model whisper-tiny \
+     --stt-language auto --enable-vad --enable-tts \
+     --max-audio-secs 300 --max-concurrent-inference 2
+   ```
+
+   Run `lunarwing-mt-admin.sh help` for every managed flag. Active
+   reconfiguration recreates/restarts the sidecar when needed, verifies
+   `/health` and `/ready`, restarts the tenant daemon when it is running, and
+   restores the prior files/runtime if reconciliation fails.
+
+4. Activate and verify:
+
+   ```bash
+   sudo ic/scripts/lunarwing-mt-admin.sh activate-voice <tenant>
+   sudo ic/scripts/lunarwing-mt-admin.sh status <tenant>
+   sudo env SELF_HEAL_TENANTS_FILE=/etc/lunarwing/ports.json \
+     ic-infrastructure-health-check/health-lunarvoice.sh
+   ```
+
+   Activation requires a matching SHA marker and readable, non-symlinked STT
+   artifacts below the shared model root. It selects the local transcription
+   provider only after those checks, starts through the detected init system,
+   and rolls back the provider and runtime on failure.
+
+`deactivate-voice` stops and deregisters the sidecar and restores the
+transcription enabled/provider/model values that were active before
+LunarVoice. `remove-voice` additionally removes the tenant container, unit,
+`voice.env`, and daemon-side voice URL/token. Shared model files and the shared
+image are retained deliberately. `enable-voice` and `disable-voice` remain
+compatibility aliases for activate/deactivate.
+
 ## Models
 
-LunarVoice expects sherpa-onnx model layouts:
+LunarVoice expects sherpa-onnx model layouts. For a Whisper model named
+`whisper-<size>`, derived paths are:
 
 ```text
-/models/sherpa-onnx-whisper-tiny/
-  tiny-encoder.int8.onnx
-  tiny-decoder.int8.onnx
-  tiny-tokens.txt
+/models/sherpa-onnx-whisper-<size>/
+  <size>-encoder.int8.onnx
+  <size>-decoder.int8.onnx
+  <size>-tokens.txt
 /models/silero_vad.onnx
 /models/kokoro-multi-lang-v1_0/
   model.onnx
@@ -61,49 +113,121 @@ LunarVoice expects sherpa-onnx model layouts:
   lexicon-zh.txt
 ```
 
-### STT engines
-
 `VOICE_STT_ENGINE` selects the speech-to-text engine:
 
-- `whisper` (default) — Whisper via sherpa-onnx, multilingual, reports the
-  detected language per chunk. Default model `whisper-tiny`.
-- `parakeet` — NVIDIA Parakeet-TDT via the sherpa-onnx transducer
-  recognizer. Supported models: `parakeet-tdt-0.6b-v2-int8` (English) and
-  `parakeet-tdt-0.6b-v3-int8` (multilingual). Set `VOICE_STT_MODEL` to one of
-  those names; the expected layout is:
+- `whisper` (default) is multilingual and reports the detected language per
+  chunk. The default model is `whisper-tiny`. `auto` (or an empty value) is
+  normalized to sherpa-onnx's auto-detection value; explicit `VOICE_STT_LANGUAGE`
+  values must be supported Whisper ISO codes such as `en` or `ja`.
+- `parakeet` uses NVIDIA Parakeet-TDT through the sherpa-onnx transducer
+  recognizer. The supplied manifest template includes
+  `parakeet-tdt-0.6b-v2-int8` (English) and
+  `parakeet-tdt-0.6b-v3-int8` (multilingual). Its layout is:
 
 ```text
-/models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/
+/models/sherpa-onnx-nemo-<VOICE_STT_MODEL>/
   encoder.int8.onnx
   decoder.int8.onnx
   joiner.int8.onnx
   tokens.txt
 ```
 
-Parakeet does not detect the spoken language; the response language is the
-configured `VOICE_STT_LANGUAGE` (set it explicitly, e.g. `en` for the v2
-model). Explicit `VOICE_STT_ENCODER`/`VOICE_STT_DECODER`/`VOICE_STT_JOINER`/
-`VOICE_STT_TOKENS` paths override the derived locations for either engine.
+Parakeet does not detect language; its response uses
+`VOICE_STT_LANGUAGE`, which should be explicit for a monolingual model.
+Explicit STT path variables override the derived locations.
 
-Models are not committed or silently downloaded. Copy
-`model-manifest.example.json`, replace each placeholder with a SHA-256 obtained
-through a trusted release channel, mount it, then set:
+Models are never committed or downloaded implicitly by mt-admin. The installer
+requires HTTPS, exact SHA-256 values, safe archive members, and an absent or
+previously verified destination. It serializes concurrent installs and writes
+`.lunarvoice-<model>.sha256` markers used by activation. Container-only
+`VOICE_AUTO_DOWNLOAD=true` uses the same verifier, but explicit
+`install-voice --model-manifest` is the production path.
 
-```env
-VOICE_AUTO_DOWNLOAD=true
-VOICE_MODEL_MANIFEST=/models/model-manifest.json
-```
+## Configuration Surface
 
-The downloader refuses HTTP, malformed hashes, unsafe archive paths, and
-replacement of unverified existing model directories.
+`.env.example` is a copyable template. Numeric values outside these inclusive
+ranges fail startup instead of being silently clamped.
+
+| Variable | Default / range | Purpose |
+|---|---|---|
+| `VOICE_AUTH_TOKEN` | required | Bearer token for all three API endpoints |
+| `VOICE_ALLOW_UNAUTHENTICATED` | `false` | Development escape hatch; never use on a network-reachable listener |
+| `VOICE_BIND_HOST` | `127.0.0.1` | IP address for both listeners; containers bind internally to `0.0.0.0` and publish loopback only |
+| `VOICE_PORT` | `8090`, `1..65535` | Authenticated API listener |
+| `VOICE_HEALTH_PORT` | `8091`, `1..65535` | Unauthenticated operational listener; must differ from `VOICE_PORT` |
+| `VOICE_MODEL_DIR` | `/models` | Root for derived model paths |
+| `VOICE_STT_ENGINE` | `whisper` | `whisper` or `parakeet` (`parakeet-tdt`/`transducer` are accepted direct-env aliases) |
+| `VOICE_STT_MODEL` | `whisper-tiny` | Loaded model name and derived artifact directory |
+| `VOICE_STT_LANGUAGE` | `auto` | Whisper request constraint or Parakeet response language |
+| `VOICE_STT_ENCODER` | derived | Absolute encoder override |
+| `VOICE_STT_DECODER` | derived | Absolute decoder override |
+| `VOICE_STT_JOINER` | derived | Parakeet joiner override |
+| `VOICE_STT_TOKENS` | derived | Token-file override |
+| `VOICE_REQUIRE_STT` | `true` | Fail engine startup when STT is absent; production readiness still requires STT |
+| `VOICE_ENABLE_VAD` | `true` | Load Silero VAD when its model exists |
+| `VOICE_VAD_MODEL` | `/models/silero_vad.onnx` | Silero model path |
+| `VOICE_ENABLE_TTS` | `true` | Load Kokoro TTS when all required artifacts exist |
+| `VOICE_TTS_MODEL` | derived | Kokoro ONNX model path |
+| `VOICE_TTS_VOICES` | derived | Kokoro speaker embedding file |
+| `VOICE_TTS_TOKENS` | derived | Kokoro token file |
+| `VOICE_TTS_DATA_DIR` | derived | espeak-ng data directory |
+| `VOICE_TTS_DICT_DIR` | derived | Kokoro dictionary directory |
+| `VOICE_TTS_LEXICON` | two derived lexicons | Comma-separated lexicon paths |
+| `VOICE_TTS_DEFAULT_VOICE` | `af_heart` | Voice used when a request omits `voice` |
+| `VOICE_TTS_VOICES_JSON` | `{"af_heart":0}` | JSON object mapping voice names to integer speaker IDs |
+| `VOICE_MAX_AUDIO_BYTES` | `52428800`, `1024..1073741824` | Maximum decoded upload bytes |
+| `VOICE_MAX_AUDIO_SECS` | `300`, `1..3600` | Maximum decoded input duration |
+| `VOICE_MAX_TEXT_CHARS` | `10000`, `1..100000` | Maximum TTS Unicode scalar count |
+| `VOICE_MAX_TTS_AUDIO_SECS` | `300`, `1..3600` | Maximum synthesized duration |
+| `VOICE_REQUEST_TIMEOUT_SECS` | `120`, `1..3600` | Decode/inference timeout |
+| `VOICE_MAX_CONCURRENT_INFERENCE` | `2`, `1..64` | Shared STT/TTS/VAD inference permits |
+| `VOICE_RATE_LIMIT_PER_SEC` | `5`, `1..10000` | Process-wide API token-bucket rate |
+| `VOICE_CACHE_TTL_SECS` | `600`, `0..86400` | Transcription cache TTL; zero disables cache hits |
+| `VOICE_CACHE_MAX_ENTRIES` | `5000`, `1..1000000` | Cache entry bound |
+| `VOICE_FFMPEG_PATH` | `ffmpeg` | Executable used directly for non-WAV input |
+| `ORT_NUM_THREADS` | `4`, `1..128` | Threads passed to each ONNX component |
+| `VOICE_AUTO_DOWNLOAD` | `false` | Container entrypoint model install switch |
+| `VOICE_MODEL_MANIFEST` | `/models/model-manifest.json` | Verified installer manifest path |
+| `RUST_LOG` | `lunarwing_voice_sidecar=info` | `tracing` filter |
+
+Mt-admin owns `VOICE_ENABLED`, forces authentication, internal container
+addresses/ports, explicit model installation, and required STT. Its
+`configure-voice` command exposes the common model, feature, limit, cache,
+voice, and thread settings; advanced artifact paths and voice maps are direct
+`voice.env` settings for operators who manage custom model layouts.
+
+Daemon integration uses `TRANSCRIPTION_ENABLED`,
+`TRANSCRIPTION_PROVIDER=lunarvoice`, `TRANSCRIPTION_MODEL`, the loopback-only
+`VOICE_SERVICE_URL`, and the dedicated `VOICE_AUTH_TOKEN`. Mt-admin writes those
+values and preserves/restores a pre-existing cloud transcription selection.
+
+## Health And Operations
+
+`/health` is process liveness; `/ready` returns HTTP 200 only when STT is loaded;
+`/metrics` exposes bounded request, cache, rate-limit, and error counters.
+The systemd/OpenRC and mt-admin startup gates require both liveness and
+readiness; Docker and Compose mark the container healthy only after both pass.
+`health-lunarvoice.sh` discovers enabled tenants
+from `voice_health` registry slots, probes all of them, and fails closed on
+malformed enablement, missing/duplicate ports, unreachable instances, or
+unready STT. LunarVoice remains monitor-only in self-heal: failures alert but do
+not automatically restart optional model workloads.
 
 ## Build And Test
 
-Use repository resource limits and tmux:
+Run from `projects/voice-sidecar/`. Use repository resource limits; put longer
+all-feature runs in tmux:
 
 ```bash
-tmux new-session -d -s lunarvoice-test \
-  "taskset -c 0-5 cargo test -j6 2>&1 | tee /tmp/lunarvoice-test.log"
+taskset -c 0-11 cargo fmt --all -- --check
+taskset -c 0-11 cargo check -j12
+taskset -c 0-11 cargo test -j12 -- --test-threads=12
+taskset -c 0-11 cargo clippy -j12 --all-targets --all-features -- -D warnings
+
+# Repository-root lifecycle and health harnesses:
+bash ic/scripts/tests/test-mt-admin-voice.sh
+bash ic-infrastructure-health-check/tests/test-health-lunarvoice.sh
+bash ic-infrastructure-health-check/tests/test-lunarvoice-init-templates.sh
 ```
 
-See `PODMAN_DEPLOYMENT.md` and `.env.example` for deployment.
+See `PODMAN_DEPLOYMENT.md` for standalone deployment details.

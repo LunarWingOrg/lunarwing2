@@ -151,7 +151,10 @@ async fn decode_with_ffmpeg(
         .await
         .map_err(|_| AudioError::ConversionFailed)??;
 
-    let max_secs_arg = max_secs.to_string();
+    // Decode at most one second beyond the configured limit. The extra bounded
+    // sentinel lets us distinguish an exact-limit input from an overlong input
+    // instead of silently truncating it with ffmpeg's `-t` option.
+    let probe_secs_arg = max_secs.saturating_add(1).to_string();
     let mut command = Command::new(PathBuf::from(ffmpeg_path));
     command
         .kill_on_drop(true)
@@ -159,7 +162,7 @@ async fn decode_with_ffmpeg(
         .arg(input.path())
         .args([
             "-t",
-            &max_secs_arg,
+            &probe_secs_arg,
             "-ac",
             "1",
             "-ar",
@@ -178,24 +181,33 @@ async fn decode_with_ffmpeg(
                 AudioError::ConversionFailed
             }
         })?;
-    if !output.status.success() || output.stdout.len() % 4 != 0 {
+    if !output.status.success() {
         return Err(AudioError::ConversionFailed);
     }
-    let max_output = max_secs
-        .saturating_mul(u64::from(TARGET_SAMPLE_RATE))
-        .saturating_mul(4) as usize;
-    if output.stdout.len() > max_output {
-        return Err(AudioError::TooLong(max_secs));
-    }
-    let samples = output
-        .stdout
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let samples = decode_f32le_output(&output.stdout, max_secs)?;
     Ok(AudioData {
         samples,
         sample_rate: TARGET_SAMPLE_RATE,
     })
+}
+
+fn decode_f32le_output(bytes: &[u8], max_secs: u64) -> Result<Vec<f32>, AudioError> {
+    if bytes.is_empty() {
+        return Err(AudioError::Empty);
+    }
+    if !bytes.len().is_multiple_of(4) {
+        return Err(AudioError::ConversionFailed);
+    }
+    let max_bytes = max_secs
+        .saturating_mul(u64::from(TARGET_SAMPLE_RATE))
+        .saturating_mul(4);
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(AudioError::TooLong(max_secs));
+    }
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
 }
 
 fn downmix(samples: &[f32], channels: usize) -> Vec<f32> {
@@ -261,5 +273,29 @@ mod tests {
     fn wav_duration_limit_is_enforced() {
         let wav = encode_wav(&vec![0.0; 32_000], 16_000);
         assert!(matches!(decode_wav(&wav, 1), Err(AudioError::TooLong(1))));
+    }
+
+    #[test]
+    fn ffmpeg_output_rejects_empty_malformed_and_overlong_audio() {
+        assert!(matches!(
+            decode_f32le_output(&[], 1),
+            Err(AudioError::Empty)
+        ));
+        assert!(matches!(
+            decode_f32le_output(&[0, 0, 0], 1),
+            Err(AudioError::ConversionFailed)
+        ));
+        let exact_limit = vec![0; TARGET_SAMPLE_RATE as usize * 4];
+        assert_eq!(
+            decode_f32le_output(&exact_limit, 1)
+                .map(|samples| samples.len())
+                .ok(),
+            Some(TARGET_SAMPLE_RATE as usize)
+        );
+        let over_limit = vec![0; TARGET_SAMPLE_RATE as usize * 4 + 4];
+        assert!(matches!(
+            decode_f32le_output(&over_limit, 1),
+            Err(AudioError::TooLong(1))
+        ));
     }
 }

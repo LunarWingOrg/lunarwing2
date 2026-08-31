@@ -38,7 +38,8 @@ ENV LD_LIBRARY_PATH=/app/lib \
 
 EXPOSE 8090 8091
 VOLUME ["/models"]
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
-    CMD curl -fsS http://127.0.0.1:8091/health >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=60s \
+    CMD curl -fsS http://127.0.0.1:8091/health >/dev/null \
+        && curl -fsS http://127.0.0.1:8091/ready >/dev/null
 
 ENTRYPOINT ["/app/entrypoint.sh"]
