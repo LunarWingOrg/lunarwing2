@@ -133,9 +133,12 @@ assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_MODEL)" whispe
 assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED)" false "disable consumes saved provider state"
 
 if _voice_validate_setting VOICE_STT_ENGINE whisper \
+    && _voice_validate_setting VOICE_STT_LANGUAGE auto \
+    && _voice_validate_setting VOICE_STT_LANGUAGE JA \
     && _voice_validate_setting VOICE_MAX_AUDIO_SECS 1 \
     && _voice_validate_setting VOICE_CACHE_TTL_SECS 0 \
     && ! _voice_validate_setting VOICE_STT_ENGINE sensevoice \
+    && ! _voice_validate_setting VOICE_STT_LANGUAGE english \
     && ! _voice_validate_setting VOICE_STT_MODEL ../escape \
     && ! _voice_validate_setting VOICE_MAX_AUDIO_SECS 0 \
     && ! _voice_validate_setting VOICE_UNKNOWN value; then

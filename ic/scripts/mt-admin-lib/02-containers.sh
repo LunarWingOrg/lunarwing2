@@ -912,14 +912,19 @@ _voice_validate_uint() {
   (( number >= minimum && number <= maximum ))
 }
 
+_voice_validate_stt_language() {
+  local value="${1,,}" codes
+  codes="auto en zh de es ru ko fr ja pt tr pl ca nl ar sv it id hi fi vi he uk el ms cs ro da hu ta no th ur hr bg lt la mi ml cy sk te fa lv bn sr az sl kn et mk br eu is hy ne mn bs kk sq sw gl mr pa si km sn yo so af oc ka be tg sd gu am yi lo uz fo ht ps tk nn mt sa lb my bo tl mg as tt haw ln ha ba jw su"
+  [[ " $codes " == *" $value "* ]]
+}
+
 _voice_validate_setting() {
   local key="$1" value="$2"
   case "$key" in
     VOICE_STT_ENGINE) [[ "$value" == whisper || "$value" == parakeet ]] ;;
     VOICE_STT_MODEL) [[ "$value" =~ ^[A-Za-z0-9._-]{1,128}$ ]] ;;
-    VOICE_STT_LANGUAGE|VOICE_TTS_DEFAULT_VOICE)
-      [[ "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]]
-      ;;
+    VOICE_STT_LANGUAGE) _voice_validate_stt_language "$value" ;;
+    VOICE_TTS_DEFAULT_VOICE) [[ "$value" =~ ^[A-Za-z0-9._-]{1,64}$ ]] ;;
     VOICE_ENABLE_VAD|VOICE_ENABLE_TTS) [[ "$value" == true || "$value" == false ]] ;;
     VOICE_MAX_AUDIO_SECS|VOICE_MAX_TTS_AUDIO_SECS|VOICE_REQUEST_TIMEOUT_SECS)
       _voice_validate_uint "$value" 1 3600
