@@ -9,9 +9,11 @@ StartLimitBurst=5
 Type=simple
 User=lunarvoice
 Group=lunarvoice
-EnvironmentFile=/etc/lunarwing/voice-sidecar.env
 Environment=LD_LIBRARY_PATH=/opt/lunarvoice/lib
+Environment=VOICE_MODEL_DIR=/var/lib/lunarvoice/models
+EnvironmentFile=/etc/lunarwing/voice-sidecar.env
 ExecStart=/opt/lunarvoice/lunarwing-voice-sidecar
+ExecStartPost=/usr/bin/timeout 60 /bin/sh -ec 'until /usr/bin/curl --fail --silent --output /dev/null --max-time 3 "http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}/health" && /usr/bin/curl --fail --silent --output /dev/null --max-time 3 "http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}/ready"; do sleep 1; done'
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
