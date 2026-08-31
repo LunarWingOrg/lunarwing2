@@ -176,6 +176,7 @@ fn map_completion_response(response: CompletionResponse) -> LlmOutput {
             response.cache_read_input_tokens,
             response.cache_creation_input_tokens,
         ),
+        finish_reason: response.finish_reason.as_str().to_string(),
     }
 }
 
@@ -186,6 +187,7 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
         response.cache_read_input_tokens,
         response.cache_creation_input_tokens,
     );
+    let finish_reason = response.finish_reason.as_str().to_string();
 
     let llm_response = if response.tool_calls.is_empty() {
         LlmResponse::from_text(response.content.unwrap_or_default())
@@ -209,6 +211,7 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
     LlmOutput {
         response: llm_response,
         usage,
+        finish_reason,
     }
 }
 
@@ -719,6 +722,101 @@ mod tests {
             requests[0].metadata.get("trace").map(String::as_str),
             Some("abc")
         );
+    }
+
+    /// finish_reason pass-through: blocking and streaming surfaces must agree.
+    struct FinishReasonProvider {
+        plain_reason: FinishReason,
+        tool_reason: FinishReason,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FinishReasonProvider {
+        fn model_name(&self) -> &str {
+            "finish-reason"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            Ok(CompletionResponse {
+                content: "truncated".to_string(),
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: self.plain_reason,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".into(),
+                    name: "search".into(),
+                    arguments: serde_json::json!({}),
+                    reasoning: None,
+                }],
+                input_tokens: 1,
+                output_tokens: 1,
+                finish_reason: self.tool_reason,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_maps_plain_finish_reason_canonically() {
+        let provider = Arc::new(FinishReasonProvider {
+            plain_reason: FinishReason::Length,
+            tool_reason: FinishReason::Stop,
+        });
+        let adapter = LlmBridgeAdapter::new(provider, None);
+
+        let output = adapter
+            .complete(&[ThreadMessage::user("hi")], &[], &LlmCallConfig::default())
+            .await
+            .expect("complete should succeed");
+
+        assert_eq!(output.finish_reason, "length");
+        assert!(matches!(
+            output.response,
+            LlmResponse::Text(text) if text == "truncated"
+        ));
+    }
+
+    #[tokio::test]
+    async fn complete_with_tools_maps_tool_finish_reason_canonically() {
+        let provider = Arc::new(FinishReasonProvider {
+            plain_reason: FinishReason::Stop,
+            tool_reason: FinishReason::ToolUse,
+        });
+        let adapter = LlmBridgeAdapter::new(provider, None);
+
+        let output = adapter
+            .complete(
+                &[ThreadMessage::user("hi")],
+                &[search_action()],
+                &LlmCallConfig::default(),
+            )
+            .await
+            .expect("tool complete should succeed");
+
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert!(matches!(
+            output.response,
+            LlmResponse::ActionCalls { ref calls, .. } if calls.len() == 1
+        ));
     }
 
     #[tokio::test]
