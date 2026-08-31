@@ -33,27 +33,29 @@
 9. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/96
 10. [ ] use your browser tool to work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/93
 11. [ ] LunarVision: support external instances so you can use it on machines that do not have powerful GPUs
+12. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 - the comment/note from Ruffles is the correct analysis
+13. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/98
 
 ## Phase 2 — Release hygiene
 
-12. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
+14. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
     - (context) Kageho's review of the #88 fix: "I can give this a 4+ if you unblock the double-timeout knob (or document it as deferred)." Christopher decided: intentional, not deferred.
-13. [x] Come up with codename candidates for this release cycle - DONE: Ma-ai (間合い)
+15. [x] Come up with codename candidates for this release cycle - DONE: Ma-ai (間合い)
     - (context) 2.0.9.0 shipped as Inazuma (稲妻, lightning); 2.0.8.0 was Sekisho. Prior picks doc: v2.0.5.0/CODENAME_IDEAS.md (Kagi/Chiyu/Hagane — do not reuse).
-14. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
-15. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
+16. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
+17. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
 
 ## Phase 3 — Surfaces & delight (the 2.1 identity)
 
-16. [x] (S) reserved
-17. [ ] Emoting mascot in the web gateway. An animated avatar widget that mirrors the agent's expressed emotions: parse the agent's outgoing roleplay action phrases ("*stamps hooves*", "*ears perk*") on the gateway's outgoing-message path and map them to sprite animation frame sets. Build gateway-first — the desktop app inherits it. Exit criteria: emote-parser hook live in `src/channels/web/`, phrase→enum→sprite state machine working, a first sprite pack (pony/unicorn) rendering in the GUI as a draggable corner widget - you may search the repo for existing sprites for an example, idle/working fallback animations. Details: study-note topic emoting-mascot-2-1 / fact 206 - also see: desktop app
+18. [x] (S) reserved
+19. [ ] Emoting mascot in the web gateway. An animated avatar widget that mirrors the agent's expressed emotions: parse the agent's outgoing roleplay action phrases ("*stamps hooves*", "*ears perk*") on the gateway's outgoing-message path and map them to sprite animation frame sets. Build gateway-first — the desktop app inherits it. Exit criteria: emote-parser hook live in `src/channels/web/`, phrase→enum→sprite state machine working, a first sprite pack (pony/unicorn) rendering in the GUI as a draggable corner widget - you may search the repo for existing sprites for an example, idle/working fallback animations. Details: study-note topic emoting-mascot-2-1 / fact 206 - also see: desktop app
     - (context) Full implementation sketch in the study-notes knowledge base, topic `emoting-mascot-2-1` (also fact 206). Origin: user suggestion. Christopher has sprite-animation experience and plans to make the art. petdex (192×208 frame convention) is prior art. Presentation layer only — zero core-path risk.
-18. [ ] Android app — POINTER ITEM. Same treatment as item 12: own repo, own goals file, mascot widget + voice + gateway features. THIS item tracks only repo creation + goals seeding + buildable scaffold (repo created in gitlab now; no goals file yet; may append more details later) 
+20. [ ] Android app — POINTER ITEM. Same treatment as item 12: own repo, own goals file, mascot widget + voice + gateway features. THIS item tracks only repo creation + goals seeding + buildable scaffold (repo created in gitlab now; no goals file yet; may append more details later) 
 Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
-19. [ ] Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here.
+21. [ ] Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here.
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
-20. [ ] Release-notes accuracy pass on RELEASE-v2.1.0.0.md (the item 14 draft) — verify every claim against the actual shipped changes; known-issues list reconciled against the work-item tracker
+22. [ ] Release-notes accuracy pass on RELEASE-v2.1.0.0.md (the item 14 draft) — verify every claim against the actual shipped changes; known-issues list reconciled against the work-item tracker
 
 ## Deferred (explicitly NOT this release)
 
