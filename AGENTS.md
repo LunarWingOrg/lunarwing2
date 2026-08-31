@@ -83,6 +83,13 @@ Long-running commands (5–20+ minutes) **must use tmux**:
 tmux new-session -d -s build "taskset -c 0-11 cargo build --release -j12 2>&1 | tee /tmp/build.log"
 ```
 
+## Vendored Dependencies
+
+- crates-io is source-replaced by the committed directory `ic/vendor/` via `ic/.cargo/config.toml`. All cargo commands run under `ic/` resolve exclusively from `ic/vendor/` — no crates.io access needed (or permitted) for check/test/build/clippy.
+- After any dependency add/update, refresh the vendor dir with `ic/scripts/refresh-vendor.sh` (runs `cargo vendor` over the ic workspace + satellite lockfile roots under `ic/`, asserts the resulting set matches the committed Cargo.lock pins — it reports drift only, never re-resolves — then runs `cargo deny check advisories`). Review the `ic/vendor/` diff and commit it together with the manifest/lockfile change. Advisory scanning keeps working unchanged (`cargo deny check advisories` reads Cargo.lock vs the RustSec db, not crates.io).
+- Never hand-edit or delete entries under `ic/vendor/`. `ic/vendor/libsignal-protocol{,-sys}` are pre-vendored **path** dependencies (`ic/Cargo.toml`) — keep them, and always vendor with `--no-delete`.
+- `ic/vendor/` is pinned third-party source: repo-wide CI scanners (`scan-secrets.sh`, `shell-syntax.sh`, `python_syntax.py`, `shellcheck.sh`) exclude it. Keep any new repo-wide scanner vendor-aware.
+
 ## Build, Test, and Lint Commands
 
 Run these from the `ic/` directory. Apply `taskset -c 0-11` and `-j12` per the build constraints above.

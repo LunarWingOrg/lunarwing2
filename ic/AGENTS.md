@@ -69,6 +69,12 @@ e. However, in general, storing massive files (over 1GB) to /tmp should not happ
 - **Logging**: Use `tracing` macros (`info!`, `warn!`, `error!`) rather than `println!`.
 - Keep clippy clean with zero warnings.
 
+## Dependency Vendoring
+
+- crates-io is source-replaced by the committed directory `vendor/` (see `.cargo/config.toml`): every cargo command under `ic/` resolves exclusively from `vendor/`, so check/test/build/clippy need no crates.io access.
+- After any dependency add/update, run `scripts/refresh-vendor.sh` (`cargo vendor` over the ic workspace + satellite lockfile roots under `ic/`, asserts the vendored set still matches the committed Cargo.lock pins without re-resolving, then `cargo deny check advisories`), review the `vendor/` diff, and commit it with the manifest/lockfile change.
+- Never hand-edit or delete entries under `vendor/`. `vendor/libsignal-protocol{,-sys}` are pre-vendored **path** dependencies (`Cargo.toml`) — always vendor with `--no-delete` so they survive.
+
 ## Database, Setup, and Config Rules
 
 - PostgreSQL is the primary backend and is far more heavily supported. libSQL support is aspirational — not every feature needs it, but do not regress existing libSQL coverage when possible.
