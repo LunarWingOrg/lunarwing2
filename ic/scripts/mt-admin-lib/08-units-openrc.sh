@@ -1301,7 +1301,10 @@ start_tenant_openrc() {
 
   # Auto-enable on boot whatever is actually running (idempotent, OpenRC only).
   local svc
-  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}" "lunarwing-voice-${name}-sup")
+  local boot_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "xmpp-bridge-${name}" "lunarwing-${name}" "lunarwing-voice-${name}" "lunarwing-voice-${name}-sup")
+  if ! tenant_vision_external "$name"; then
+    boot_svcs+=("lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
+  fi
   if tenant_weechat_enabled "$name"; then
     boot_svcs+=("lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
   fi
