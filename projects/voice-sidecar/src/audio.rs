@@ -195,7 +195,7 @@ fn decode_f32le_output(bytes: &[u8], max_secs: u64) -> Result<Vec<f32>, AudioErr
     if bytes.is_empty() {
         return Err(AudioError::Empty);
     }
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return Err(AudioError::ConversionFailed);
     }
     let max_bytes = max_secs
