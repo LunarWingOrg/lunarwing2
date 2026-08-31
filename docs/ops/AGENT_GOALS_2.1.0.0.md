@@ -59,8 +59,7 @@
 
 14. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
     - (context) Kageho's review of the #88 fix: "I can give this a 4+ if you unblock the double-timeout knob (or document it as deferred)." Christopher decided: intentional, not deferred.
-15. [x] Come up with codename candidates for this release cycle - DONE: Ma-ai (間合い)
-    - (context) 2.0.9.0 shipped as Inazuma (稲妻, lightning); 2.0.8.0 was Sekisho. Prior picks doc: v2.0.5.0/CODENAME_IDEAS.md (Kagi/Chiyu/Hagane — do not reuse).
+15. [ ] fix ci/cd issues for opencode ext worker
 16. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
 17. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
 
