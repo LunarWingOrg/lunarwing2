@@ -1,0 +1,17 @@
+[package]
+name = "rental-impl"
+version = "0.5.5"
+license = "MIT/Apache-2.0"
+authors = ["Jameson Ernst <jameson@jpernst.com>"]
+description = "An implementation detail of rental. Should not be used directly."
+repository = "https://github.com/jpernst/rental"
+documentation = "https://docs.rs/rental"
+homepage = "https://www.jpernst.com"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "1", features = ["full", "fold", "visit", "extra-traits"] }

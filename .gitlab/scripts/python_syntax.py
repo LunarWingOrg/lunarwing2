@@ -12,6 +12,10 @@ EXCLUDED = {
     "tensorzero-proxy-configurations/experimental-ironclaw-proxy-version-with-enhancements-working-copy.py",
 }
 
+# ic/vendor/ is pinned third-party crates.io source (ic/.cargo/config.toml);
+# its scripts (incl. Python-2-era build helpers) are not our lint surface.
+EXCLUDED_PREFIXES = ("ic/vendor/",)
+
 
 def main() -> int:
     output = subprocess.run(
@@ -31,7 +35,12 @@ def main() -> int:
 
     failures: list[str] = []
     checked = 0
-    for relative_path in sorted(tracked - EXCLUDED):
+    candidates = (
+        path
+        for path in sorted(tracked - EXCLUDED)
+        if not path.startswith(EXCLUDED_PREFIXES)
+    )
+    for relative_path in candidates:
         path = ROOT / relative_path
         try:
             ast.parse(path.read_text(encoding="utf-8"), filename=relative_path)
