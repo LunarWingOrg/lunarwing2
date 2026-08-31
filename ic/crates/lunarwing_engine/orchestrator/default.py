@@ -210,6 +210,7 @@ def signals_claimed_tool_success(text):
     TOOL_MENTIONS = [
         "memory_write", "memory_read", "memory_search",
         "memory_list", "memory_tree", "memory_delete",
+        "memory write", "memory/",
     ]
     COMPLETION_CLAIMS = [
         "all steps completed", "all four steps", "all three steps",
@@ -223,6 +224,8 @@ def signals_claimed_tool_success(text):
         "i've updated", "i have updated", "i've read", "i have read",
         "i've written", "wrote the document", "saved the document",
         "has been written", "has been saved", "has been created",
+        "was written", "was saved", "was stored", "was persisted",
+        "was retrieved",
     ]
     has_tool = any(mention in lower for mention in TOOL_MENTIONS)
     if not has_tool:
