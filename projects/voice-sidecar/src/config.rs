@@ -236,6 +236,13 @@ impl Config {
             .saturating_div(3)
             .saturating_add(128 * 1024)
     }
+
+    pub fn max_text_body_bytes(&self) -> usize {
+        // A JSON `\uXXXX` pair can encode one Unicode scalar in 12 bytes.
+        self.max_text_chars
+            .saturating_mul(12)
+            .saturating_add(64 * 1024)
+    }
 }
 
 fn env_string(key: &'static str, default: &str) -> String {
