@@ -57,8 +57,9 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 
 ## Deferred (explicitly NOT this release)
 
-- **LTX** — next major target after LunarVision + LunarVoice are solid; 2.2-era.
-- **DarkIRC Stages B-D** — remain disabled and separately gated behind Stage A acceptance (see item 3 in the 2.0.9.0 list / DARKIRC-KEYEXCHANGE-STATUS.md).
+- **LTX** — next major target after LunarVision + LunarVoice are solid; 2.2-era
+- **DarkIRC Stages B-D** — remain disabled and separately gated behind Stage A acceptance (see item 3 in the 2.0.9.0 list / DARKIRC-KEYEXCHANGE-STATUS.md)
+- **LunarHub** - still in planning
 
 ---
 
