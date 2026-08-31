@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::dispatch::{
     DEFERRED_QUEUE_FULL_RESPONSE, DispatchTicket, MessageScheduler, allows_parallel_dispatch,
-    is_priority_interrupt,
+    is_priority_control,
 };
 use crate::agent::heartbeat::spawn_heartbeat_with_sweep;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
@@ -309,6 +309,8 @@ pub struct Agent {
     pub(super) reflex_router: Arc<crate::agent::reflex::ReflexRouter>,
     /// Non-blocking write-behind counter for successful reflex routes.
     pub(super) reflex_hits: Arc<crate::agent::reflex::ReflexHitAccumulator>,
+    /// Live mid-turn interrupt tokens (per-thread chat turns).
+    pub(super) turn_interrupts: crate::agent::interrupt::TurnInterrupts,
 }
 
 impl Agent {
@@ -406,6 +408,7 @@ impl Agent {
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
             reflex_router,
             reflex_hits: Arc::new(crate::agent::reflex::ReflexHitAccumulator::default()),
+            turn_interrupts: crate::agent::interrupt::TurnInterrupts::default(),
         }
     }
 
@@ -1201,7 +1204,7 @@ impl Agent {
                 }
                 incoming = message_stream.next(), if channels_open => {
                     match incoming {
-                        Some(incoming) if is_priority_interrupt(&incoming) => {
+                        Some(incoming) if is_priority_control(&incoming) => {
                             self.handle_priority_interrupt(incoming).await;
                         }
                         Some(incoming) => {
@@ -2119,6 +2122,7 @@ impl Agent {
             Submission::Undo => self.process_undo(session, thread_id).await,
             Submission::Redo => self.process_redo(session, thread_id).await,
             Submission::Interrupt => self.process_interrupt(session, thread_id).await,
+            Submission::Steer { content } => self.process_steer(session, thread_id, &content).await,
             Submission::Compact => self.process_compact(session, thread_id).await,
             Submission::Clear => self.process_clear(session, thread_id).await,
             Submission::NewThread => self.process_new_thread(message).await,
