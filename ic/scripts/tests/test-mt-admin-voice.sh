@@ -496,6 +496,7 @@ start_tenant_voice() { CALLS+=("start-voice:$*"); [[ "$START_OK" == true ]]; }
 stop_tenant_voice() { CALLS+=("stop-voice:$*"); return 0; }
 remove_tenant_voice_unit() { CALLS+=("remove-unit:$*"); return 0; }
 _reload_voice_consumer_if_running() { CALLS+=("reload-daemon:$*"); return 0; }
+# shellcheck disable=SC2034  # Consumed indirectly by sourced lifecycle helpers.
 CONTAINER_RT=true
 CONTAINER_EXISTS=true
 _ctr() {
