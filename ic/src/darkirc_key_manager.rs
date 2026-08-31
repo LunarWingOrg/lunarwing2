@@ -19,7 +19,6 @@ use std::os::unix::fs::PermissionsExt;
 use cap_fs_ext::{DirExt, FollowSymlinks, MetadataExt, OpenOptionsFollowExt, OpenOptionsSyncExt};
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions, OpenOptionsExt, Permissions};
-use fs4::FileExt;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretString};
@@ -960,9 +959,9 @@ struct FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        let _ = self.file.unlock();
         if let Some(parent) = &self.parent {
-            let _ = FileExt::unlock(parent);
+            let _ = parent.unlock();
         }
     }
 }
@@ -971,19 +970,19 @@ fn lock_with_timeout(file: &File, exclusive: bool) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let result = if exclusive {
-            file.try_lock_exclusive()
+            file.try_lock()
         } else {
-            FileExt::try_lock_shared(file)
+            file.try_lock_shared()
         };
         match result {
             Ok(()) => return Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 if Instant::now() >= deadline {
                     return Err(KeyManagerError::Busy);
                 }
                 thread::sleep(Duration::from_millis(25));
             }
-            Err(error) => return Err(KeyManagerError::Io(error)),
+            Err(std::fs::TryLockError::Error(error)) => return Err(KeyManagerError::Io(error)),
         }
     }
 }

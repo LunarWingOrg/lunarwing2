@@ -1,9 +1,9 @@
 # Pin the Kimi Code CLI to a reviewed npm release for reproducible builds.
-# Override with: docker build --build-arg KIMI_CODE_VERSION=0.39.0 ...
+# Override with: docker build --build-arg KIMI_CODE_VERSION=0.39.1 ...
 # Bump this default when upgrading the worker to a newer kimi-code release.
 # Declared in global scope so both stages share one default; the runtime
 # stage re-declares `ARG KIMI_CODE_VERSION` (no default) to consume it.
-ARG KIMI_CODE_VERSION=0.39.0
+ARG KIMI_CODE_VERSION=0.39.1
 
 # ──────────────────────────────
 # Stage 1: build the bridge + tests

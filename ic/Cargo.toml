@@ -115,7 +115,6 @@ serde_norway = "0.9"
 
 # Filesystem paths
 dirs = "6"
-fs4 = "0.6"
 
 # Semantic versioning
 semver = "1"
@@ -192,7 +191,7 @@ xmpp-parsers = "0.23"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # HTML to Markdown conversion (feature gated)
-html-to-markdown-rs = { version = "2.3", optional = true }
+html-to-markdown-rs = { version = "3", optional = true }
 readabilityrs = { version = "0.1.2", optional = true }
 ed25519-dalek = { version = "2.2.0", features = ["std"] }
 hex = "0.4.3"

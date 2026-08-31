@@ -172,7 +172,7 @@ Details:
 - Variable: `WITH_TOOLCHAINS` for both OpenCode and Kimi jobs (default
   `false`; set `true` on the selected manual job for the full toolchain image —
   mirrors mt-admin's `--with-toolchains`). Kimi also exposes
-  `KIMI_CODE_VERSION` (currently `0.39.0`).
+  `KIMI_CODE_VERSION` (currently `0.39.1`).
 - Tags: a moving `WORKER_IMAGE_TAG` (default `v2.0.9.0`) plus `:latest`, plus
   an immutable `$CI_COMMIT_SHORT_SHA` tag. The moving tags silently retarget
   between builds — consumers that need a stable reference should pull the SHA

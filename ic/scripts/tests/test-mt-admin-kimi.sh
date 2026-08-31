@@ -187,7 +187,7 @@ assert_contains "$BUILD_LIB" 'local source_root="${3:-$LUNARWING_ROOT}"' 'OpenCo
 assert_contains "$BUILD_LIB" 'build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to OpenCode builder'
 assert_contains "$BUILD_LIB" 'build-all refuses dirty worker source in tenant checkout' 'build-all rejects mismatched dirty worker trees'
 KIMI_DOCKERFILE="$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
-assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.39.0' 'Kimi image pins build-arg default'
+assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.39.1' 'Kimi image pins build-arg default'
 assert_contains "$KIMI_DOCKERFILE" 'npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION}' 'Kimi image installs selected package version'
 assert_contains "$KIMI_DOCKERFILE" 'org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"' 'Kimi image records toolchain profile'
 assert_contains "$KIMI_DOCKERFILE" 'libz-dev' 'Kimi toolchain packages match OpenCode zlib development support'
