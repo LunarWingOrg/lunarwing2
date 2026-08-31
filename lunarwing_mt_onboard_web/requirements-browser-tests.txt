@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Optional end-to-end browser suite; Chromium is installed separately.
+playwright>=1.45,<2
