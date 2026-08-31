@@ -7,6 +7,29 @@ use secrecy::SecretString;
 
 const DEFAULT_MODEL_DIR: &str = "/models";
 
+const WHISPER_LANGUAGE_CODES: &[&str] = &[
+    "en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl",
+    "ar", "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro",
+    "da", "hu", "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy",
+    "sk", "te", "fa", "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu",
+    "is", "hy", "ne", "mn", "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km",
+    "sn", "yo", "so", "af", "oc", "ka", "be", "tg", "sd", "gu", "am", "yi", "lo",
+    "uz", "fo", "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl", "mg",
+    "as", "tt", "haw", "ln", "ha", "ba", "jw", "su",
+];
+
+pub(crate) fn normalize_stt_language(value: &str) -> Result<String, ConfigError> {
+    let language = value.trim().to_ascii_lowercase();
+    if language.is_empty() || language == "auto" {
+        return Ok(String::new());
+    }
+    if WHISPER_LANGUAGE_CODES.contains(&language.as_str()) {
+        Ok(language)
+    } else {
+        Err(ConfigError::InvalidSttLanguage)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("VOICE_AUTH_TOKEN is required unless VOICE_ALLOW_UNAUTHENTICATED=true")]
@@ -27,6 +50,8 @@ pub enum ConfigError {
     InvalidSttEngine,
     #[error("VOICE_STT_MODEL must be a safe model name compatible with VOICE_STT_ENGINE")]
     InvalidSttModel,
+    #[error("VOICE_STT_LANGUAGE must be auto or a supported Whisper language code")]
+    InvalidSttLanguage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +187,7 @@ impl Config {
         let model_name = env_string("VOICE_STT_MODEL", "whisper-tiny");
         let stt_engine = env_stt_engine()?;
         let stt_paths = SttPathDefaults::new(&model_name, stt_engine)?;
+        let stt_language = normalize_stt_language(&env_string("VOICE_STT_LANGUAGE", "auto"))?;
         Ok(Self {
             bind_host,
             port,
@@ -183,7 +209,7 @@ impl Config {
             stt_decoder: env_path_or_join("VOICE_STT_DECODER", &model_dir, &stt_paths.decoder),
             stt_joiner: env_path_or_join("VOICE_STT_JOINER", &model_dir, &stt_paths.joiner),
             stt_tokens: env_path_or_join("VOICE_STT_TOKENS", &model_dir, &stt_paths.tokens),
-            stt_language: env_string("VOICE_STT_LANGUAGE", "auto"),
+            stt_language,
             vad_model: env_path_or_join("VOICE_VAD_MODEL", &model_dir, "silero_vad.onnx"),
             tts_model: env_path_or_join(
                 "VOICE_TTS_MODEL",
@@ -412,6 +438,16 @@ mod tests {
         unsafe { env::set_var("VOICE_STT_ENGINE", "sensevoice") };
         assert!(env_stt_engine().is_err());
         unsafe { env::remove_var("VOICE_STT_ENGINE") };
+    }
+
+    #[test]
+    fn stt_language_normalizes_auto_and_accepts_whisper_codes() {
+        assert_eq!(normalize_stt_language("auto").ok(), Some(String::new()));
+        assert_eq!(normalize_stt_language(" EN ").ok(), Some("en".into()));
+        assert!(matches!(
+            normalize_stt_language("english"),
+            Err(ConfigError::InvalidSttLanguage)
+        ));
     }
 
     #[test]
