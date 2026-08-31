@@ -67,6 +67,20 @@ printf '%s\n' "$hash64" >"$VOICE_MODELS_DIR/.lunarvoice-whisper-tiny.sha256"
 if voice_models_ready alpha; then ready=yes; else ready=no; fi
 assert_eq "$ready" yes "whisper readiness passes with verified models"
 
+_env_set "$env_dir/voice.env" VOICE_STT_MODEL whisper-base
+mkdir -p "$VOICE_MODELS_DIR/sherpa-onnx-whisper-base"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-base/base-encoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-base/base-decoder.int8.onnx"
+: >"$VOICE_MODELS_DIR/sherpa-onnx-whisper-base/base-tokens.txt"
+printf '%s\n' "$hash64" >"$VOICE_MODELS_DIR/.lunarvoice-whisper-base.sha256"
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" yes "configured Whisper size resolves matching artifacts"
+_env_set "$env_dir/voice.env" VOICE_STT_ENCODER /models/escape-encoder.onnx
+ln -s /etc/passwd "$VOICE_MODELS_DIR/escape-encoder.onnx"
+if voice_models_ready alpha; then ready=yes; else ready=no; fi
+assert_eq "$ready" no "model readiness rejects symlinked artifacts"
+_env_set "$env_dir/voice.env" VOICE_STT_ENCODER ""
+
 _env_set "$env_dir/voice.env" VOICE_STT_ENGINE parakeet
 _env_set "$env_dir/voice.env" VOICE_STT_MODEL parakeet-tdt-0.6b-v3-int8
 if voice_models_ready alpha; then ready=yes; else ready=no; fi
@@ -85,7 +99,8 @@ assert_eq "$ready" yes "parakeet readiness passes with verified models"
 write_tenant_voice_env alpha >/dev/null
 assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_ENGINE)" parakeet "voice env rewrite preserves parakeet engine"
 assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_STT_MODEL)" parakeet-tdt-0.6b-v3-int8 "voice env rewrite preserves parakeet model"
-unset -f chown
+# Keep ownership operations inert: tenant users do not exist in this harness.
+chown() { :; }
 
 # Restore the original whisper fixture state for the configure_voice checks.
 cat >"$env_dir/voice.env" <<'ENV'
@@ -105,19 +120,48 @@ assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_ENABLED)" true "enable per
 assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" lunarvoice "enable selects local provider"
 assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_ENABLED)" true "enable activates transcription"
 assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_MODEL)" whisper-tiny "enable propagates sidecar model name"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_PREVIOUS_TRANSCRIPTION_PROVIDER)" openai "enable captures prior provider"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_PREVIOUS_TRANSCRIPTION_MODEL)" whisper-1 "enable captures prior model"
 assert_eq "$(grep -c '^TRANSCRIPTION_PROVIDER=' "$env_dir/lunarwing.env")" 1 "env update avoids duplicate keys"
 assert_eq "$(_env_existing "$env_dir/lunarwing.env" PRESERVE_ME)" yes "env update preserves unrelated keys"
 
 configure_voice alpha false >/dev/null
 assert_eq "$(jq -r '.tenants.alpha.enable_voice' "$registry")" false "disable clears registry flag"
-assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_ENABLED)" false "disable deactivates local provider"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_ENABLED)" true "disable restores prior transcription state"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" openai "disable restores prior provider"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_MODEL)" whisper-1 "disable restores prior model"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_PREVIOUS_TRANSCRIPTION_CAPTURED)" false "disable consumes saved provider state"
+
+if _voice_validate_setting VOICE_STT_ENGINE whisper \
+    && _voice_validate_setting VOICE_MAX_AUDIO_SECS 1 \
+    && _voice_validate_setting VOICE_CACHE_TTL_SECS 0 \
+    && ! _voice_validate_setting VOICE_STT_ENGINE sensevoice \
+    && ! _voice_validate_setting VOICE_STT_MODEL ../escape \
+    && ! _voice_validate_setting VOICE_MAX_AUDIO_SECS 0 \
+    && ! _voice_validate_setting VOICE_UNKNOWN value; then
+  ok "managed voice settings enforce names and numeric bounds"
+else
+  bad "managed voice settings enforce names and numeric bounds" "validation mismatch"
+fi
+
+printf 'CUSTOM_KEEP=yes\n' >>"$env_dir/voice.env"
+configure_voice_settings alpha VOICE_MAX_AUDIO_SECS=45 VOICE_ENABLE_TTS=false >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_MAX_AUDIO_SECS)" 45 "inactive configure updates bounded setting"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_ENABLE_TTS)" false "inactive configure updates feature flag"
+assert_eq "$(_env_existing "$env_dir/voice.env" CUSTOM_KEEP)" yes "configure preserves unmanaged settings"
+before_invalid="$(sha256sum "$env_dir/voice.env" | cut -d' ' -f1)"
+if configure_voice_settings alpha VOICE_MAX_AUDIO_SECS=0 >/dev/null 2>&1; then
+  bad "invalid configure is rejected" "zero duration accepted"
+else
+  ok "invalid configure is rejected"
+fi
+assert_eq "$(sha256sum "$env_dir/voice.env" | cut -d' ' -f1)" "$before_invalid" "invalid configure leaves env unchanged"
 
 tenant_quadlet_dir() { printf '%s' "$ROOT/quadlets"; }
 tenant_home() { printf '%s' "$ROOT/home"; }
 OPENRC_INITD_DIR="$ROOT/init.d"
 # shellcheck disable=SC2034  # Mock container runtime consumed by sourced mt-admin functions.
 CONTAINER_RT=true
-chown() { :; }  # Hardened renderers chown like the vision ones; no tenant users here.
 mkdir -p "$OPENRC_INITD_DIR"
 ports_set_voice alpha true
 # Imported above, then replaced with a call-recording mock later in this test.
@@ -255,6 +299,24 @@ assert_call "render-supervisor:alpha voice lunarwing-voice-alpha 1001 $ROOT/home
 assert_call 'rc-update:add lunarwing-voice-alpha-sup default'
 assert_call 'rc-service:lunarwing-voice-alpha-sup start'
 assert_before 'rc-service:lunarwing-voice-alpha start' 'rc-service:lunarwing-voice-alpha-sup start'
+
+# Runtime readiness requires both process liveness and a loaded STT model.
+_ctr() {
+  local name="$1" action="$2"
+  shift 2
+  CALLS+=("ctr:$name $action $*")
+  if [[ "$action" == inspect ]]; then
+    printf 'true\n'
+  fi
+}
+CALLS=()
+if _voice_container_healthy alpha lunarwing-voice-alpha; then
+  ok "voice runtime health requires liveness and readiness"
+else
+  bad "voice runtime health requires liveness and readiness" "probe failed"
+fi
+assert_call 'ctr:alpha exec lunarwing-voice-alpha curl -sf -o /dev/null --max-time 3 http://127.0.0.1:8091/health'
+assert_call 'ctr:alpha exec lunarwing-voice-alpha curl -sf -o /dev/null --max-time 3 http://127.0.0.1:8091/ready'
 
 # Imperative container reconciliation is convergent and health-gated.
 CONTAINER_EXISTS=true
@@ -415,6 +477,103 @@ else
   ok "identical voice ports fail start"
 fi
 assert_no_call_prefix 'ensure-image:'
+
+# Full install/configure/activate/deactivate/remove lifecycle with mocked init.
+ports_get() {
+  case "$2" in
+    voice_service) printf '40000' ;;
+    voice_health) printf '40001' ;;
+    *) return 1 ;;
+  esac
+}
+ensure_container_runtime() { :; }
+_ensure_tenant_image() { CALLS+=("ensure-image:$*"); return 0; }
+START_OK=true
+start_tenant_voice() { CALLS+=("start-voice:$*"); [[ "$START_OK" == true ]]; }
+stop_tenant_voice() { CALLS+=("stop-voice:$*"); return 0; }
+remove_tenant_voice_unit() { CALLS+=("remove-unit:$*"); return 0; }
+_reload_voice_consumer_if_running() { CALLS+=("reload-daemon:$*"); return 0; }
+CONTAINER_RT=true
+CONTAINER_EXISTS=true
+_ctr() {
+  local name="$1" action="$2"
+  shift 2
+  CALLS+=("ctr:$name $action $*")
+  case "$action" in
+    inspect) [[ "$CONTAINER_EXISTS" == true ]] ;;
+    rm) CONTAINER_EXISTS=false ;;
+  esac
+}
+
+ports_set_voice alpha false
+CALLS=()
+install_tenant_voice alpha "" >/dev/null
+assert_call 'ensure-image:alpha lunarwing/voice-service:latest'
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_ALLOW_UNAUTHENTICATED)" false "install enforces authenticated API"
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_AUTO_DOWNLOAD)" false "install disables implicit downloads"
+assert_eq "$(stat -c %a "$env_dir/voice.env")" 600 "install writes owner-only voice env"
+
+CALLS=()
+activate_tenant_voice alpha >/dev/null
+assert_call 'start-voice:alpha'
+assert_call 'reload-daemon:alpha'
+assert_eq "$(jq -r '.tenants.alpha.enable_voice' "$registry")" true "activate persists enabled state"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" lunarvoice "activate switches daemon provider"
+
+old_voice_hash="$(sha256sum "$env_dir/voice.env" | cut -d' ' -f1)"
+START_OK=false
+if configure_tenant_voice alpha VOICE_MAX_AUDIO_SECS=61 >/dev/null 2>&1; then
+  bad "failed active reconfigure reports failure" "runtime failure ignored"
+else
+  ok "failed active reconfigure reports failure"
+fi
+assert_eq "$(sha256sum "$env_dir/voice.env" | cut -d' ' -f1)" "$old_voice_hash" "failed active reconfigure restores voice env"
+START_OK=true
+configure_tenant_voice alpha VOICE_MAX_AUDIO_SECS=60 >/dev/null
+assert_eq "$(_env_existing "$env_dir/voice.env" VOICE_MAX_AUDIO_SECS)" 60 "active configure reconciles validated setting"
+
+CALLS=()
+deactivate_tenant_voice alpha >/dev/null
+assert_call 'stop-voice:alpha'
+assert_call 'remove-unit:alpha'
+assert_call 'reload-daemon:alpha'
+assert_eq "$(jq -r '.tenants.alpha.enable_voice' "$registry")" false "deactivate clears enabled state"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" openai "deactivate restores cloud provider"
+
+START_OK=false
+if (activate_tenant_voice alpha >/dev/null 2>&1); then
+  bad "failed activation reports failure" "health-gated start failure ignored"
+else
+  ok "failed activation reports failure"
+fi
+assert_eq "$(jq -r '.tenants.alpha.enable_voice' "$registry")" false "failed activation rolls back enabled state"
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" openai "failed activation restores provider"
+START_OK=true
+activate_tenant_voice alpha >/dev/null
+
+CALLS=()
+remove_tenant_voice alpha >/dev/null
+assert_call 'stop-voice:alpha'
+assert_call 'remove-unit:alpha'
+assert_call 'ctr:alpha rm -f lunarwing-voice-alpha'
+[[ ! -e "$env_dir/voice.env" ]] && ok "remove deletes tenant voice env" \
+  || bad "remove deletes tenant voice env" "voice.env remains"
+if grep -qE '^(VOICE_SERVICE_URL|VOICE_AUTH_TOKEN)=' "$env_dir/lunarwing.env"; then
+  bad "remove deletes daemon voice credentials" "voice credential remains"
+else
+  ok "remove deletes daemon voice credentials"
+fi
+assert_eq "$(_env_existing "$env_dir/lunarwing.env" TRANSCRIPTION_PROVIDER)" openai "remove retains restored provider"
+
+help_text="$(usage)"
+for command_name in install-voice configure-voice activate-voice deactivate-voice remove-voice; do
+  assert_has="$command_name"
+  if grep -q "$assert_has" <<<"$help_text"; then
+    ok "usage exposes $command_name"
+  else
+    bad "usage exposes $command_name" "command missing"
+  fi
+done
 
 printf '%s passed, %s failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
