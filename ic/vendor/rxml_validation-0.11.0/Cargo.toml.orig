@@ -1,0 +1,17 @@
+[package]
+name = "rxml_validation"
+version = "0.11.0"
+authors = ["Jonas Schäfer <jonas@zombofant.net>"]
+license = "MIT"
+edition = "2018"
+description = "Plumbing crate for rxml and rxml_proc crates."
+repository = "https://codeberg.org/jssfr/rxml"
+keywords = ["xml"]
+readme = true
+
+[dependencies]
+compact_str = { version = "^0.7", optional = true }
+
+[features]
+std = ["compact_str"]
+default = ["std"]

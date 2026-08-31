@@ -1,0 +1,461 @@
+//! Configuration options for Readability parsing.
+//!
+//! This module provides [`ReadabilityOptions`] and [`ReadabilityOptionsBuilder`]
+//! for configuring the behavior of the content extraction algorithm.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use readabilityrs::{Readability, ReadabilityOptions};
+//!
+//! let html = "<html><body><article><p>Content...</p></article></body></html>";
+//!
+//! // Using default options
+//! let readability = Readability::new(html, None, None).unwrap();
+//!
+//! // Using builder for custom options
+//! let options = ReadabilityOptions::builder()
+//!     .char_threshold(300)
+//!     .nb_top_candidates(10)
+//!     .build();
+//!
+//! let readability = Readability::new(html, None, Some(options)).unwrap();
+//! ```
+
+use crate::markdown::MarkdownOptions;
+use regex::Regex;
+
+/// Configuration options for the Readability parser.
+///
+/// Controls various aspects of the content extraction algorithm, including scoring
+/// thresholds, element limits, and metadata extraction behavior.
+///
+/// ## Creating Options
+///
+/// ### Using Default
+///
+/// ```rust
+/// use readabilityrs::ReadabilityOptions;
+///
+/// let options = ReadabilityOptions::default();
+/// ```
+///
+/// ### Using Builder
+///
+/// ```rust
+/// use readabilityrs::ReadabilityOptions;
+///
+/// let options = ReadabilityOptions::builder()
+///     .char_threshold(300)
+///     .nb_top_candidates(10)
+///     .debug(true)
+///     .build();
+/// ```
+///
+/// ## Field Descriptions
+///
+/// See individual field documentation for details on what each option controls.
+#[derive(Debug, Clone)]
+pub struct ReadabilityOptions {
+    /// Enable debug logging to stderr.
+    ///
+    /// When enabled, the parser will output diagnostic messages to stderr
+    /// during extraction. Useful for understanding why extraction failed
+    /// or for debugging extraction behavior.
+    ///
+    /// Default: `false`
+    pub debug: bool,
+
+    /// Maximum number of elements to parse.
+    ///
+    /// Counted on the parsed document before any scoring runs. A document with
+    /// more elements than this is rejected with
+    /// [`ReadabilityError::MaxElementsExceeded`](crate::ReadabilityError::MaxElementsExceeded),
+    /// which [`Readability::parse`](crate::Readability::parse) surfaces as `None`.
+    ///
+    /// This bounds extraction work, not parsing: the document has already been
+    /// parsed by the time the count happens, so it does not protect against a
+    /// document large enough to be a problem to parse at all. Bound the input
+    /// length as well if you accept arbitrary pages.
+    ///
+    /// Default: `0` (unlimited)
+    pub max_elems_to_parse: usize,
+
+    /// Number of top candidates to consider when analyzing content.
+    ///
+    /// The parser scores all potential article containers and considers this many
+    /// of the highest-scoring candidates. Higher values increase accuracy but may
+    /// also increase processing time.
+    ///
+    /// Default: `5`
+    pub nb_top_candidates: usize,
+
+    /// Minimum number of characters required for article content.
+    ///
+    /// If extracted content has fewer characters than this threshold, the parser
+    /// will try alternative extraction strategies. Lower values make extraction
+    /// more permissive but may capture non-article content.
+    ///
+    /// Default: `500`
+    pub char_threshold: usize,
+
+    /// CSS classes to preserve during cleaning.
+    ///
+    /// **Not implemented.** Class attributes are never stripped, so there is
+    /// nothing to preserve and this list is not consulted.
+    ///
+    /// Default: `vec!["page"]`
+    #[deprecated(
+        since = "0.1.4",
+        note = "has no effect: class attributes are never stripped"
+    )]
+    pub classes_to_preserve: Vec<String>,
+
+    /// Keep all CSS classes in the output HTML.
+    ///
+    /// **Not implemented.** Classes are always kept regardless of this setting.
+    ///
+    /// Default: `false`
+    #[deprecated(since = "0.1.4", note = "has no effect: classes are always kept")]
+    pub keep_classes: bool,
+
+    /// Disable JSON-LD metadata extraction.
+    ///
+    /// When `true`, skips parsing of JSON-LD structured data, which can
+    /// improve performance if you don't need metadata like author, publish date, etc.
+    ///
+    /// Default: `false`
+    pub disable_json_ld: bool,
+
+    /// Custom regex for allowed video URLs.
+    ///
+    /// **Not implemented.** Video detection always uses the built-in pattern, so
+    /// overriding it here has no effect.
+    ///
+    /// Default: `None`
+    #[deprecated(
+        since = "0.1.4",
+        note = "has no effect: video detection always uses the built-in pattern"
+    )]
+    pub allowed_video_regex: Option<Regex>,
+
+    /// Modifier for link density scoring.
+    ///
+    /// Adjusts how heavily link density affects content scoring. Positive values
+    /// make the algorithm more tolerant of links, negative values less tolerant.
+    ///
+    /// Default: `0.0`
+    pub link_density_modifier: f64,
+
+    /// Remove the title element from the extracted content.
+    ///
+    /// When `true`, removes the title heading (h1/h2) from the article content HTML
+    /// if it matches the extracted title. This is useful when you want to render
+    /// the title separately from the content for layout consistency.
+    ///
+    /// Default: `false`
+    pub remove_title_from_content: bool,
+
+    /// Remove inline styles from the extracted content.
+    ///
+    /// When `true`, removes the `style` attribute and other presentational attributes
+    /// (align, bgcolor, etc.) from HTML elements. This implements Mozilla Readability's
+    /// `_cleanStyles` function and prevents issues like invisible text (e.g., `color: white`
+    /// on white backgrounds) or unwanted formatting.
+    ///
+    /// Default: `true`
+    pub clean_styles: bool,
+
+    /// Normalize whitespace in the extracted content.
+    ///
+    /// When `true`, removes excessive blank lines, empty paragraphs, and normalizes
+    /// whitespace. This helps produce cleaner output, especially for articles from
+    /// blogs and CMSs that generate verbose HTML.
+    ///
+    /// Default: `true`
+    pub clean_whitespace: bool,
+
+    /// Enable markdown output.
+    ///
+    /// When `true`, the parser will also produce a markdown version of the article
+    /// content in `Article::markdown_content`. The HTML content standardization
+    /// pipeline runs before conversion to normalize vendor-specific HTML.
+    ///
+    /// Default: `false`
+    pub output_markdown: bool,
+
+    /// Options for markdown output formatting.
+    ///
+    /// Only used when `output_markdown` is `true`. Controls heading style,
+    /// bullet character, code fence style, and other markdown formatting details.
+    ///
+    /// Default: `None` (uses `MarkdownOptions::default()`)
+    pub markdown_options: Option<MarkdownOptions>,
+
+    /// Whether to strip high-risk markup during serialization of the
+    /// extracted content:
+    ///
+    /// - `script`, `style`, `iframe`, `object`, `embed`, `form`, `noscript`
+    ///   and `template` elements are dropped whole, children included,
+    /// - event-handler attributes (`on*`) are dropped,
+    /// - `href`/`src` values with `javascript:`, `vbscript:`, or `data:`
+    ///   schemes are dropped (`data:image/*` is allowed),
+    /// - comments are dropped, since a body containing `-->` closes the
+    ///   comment early and turns the remainder into live markup.
+    ///
+    /// Default is `false`, matching Readability.js: the extracted HTML is
+    /// NOT sanitized and must be treated as untrusted input by consumers.
+    /// This option is a harm reducer, not a substitute for a real HTML
+    /// sanitizer. Note the `data:image/*` allowance also permits
+    /// `data:image/svg+xml`, and SVG can carry embedded script in some
+    /// rendering contexts. It also does not apply to `markdown_content`.
+    pub sanitize_content: bool,
+}
+
+impl Default for ReadabilityOptions {
+    // The deprecated fields still have to be populated for the struct to be
+    // constructible; deprecation is a signal to callers, not to this impl.
+    #[allow(deprecated)]
+    fn default() -> Self {
+        Self {
+            debug: false,
+            max_elems_to_parse: 0,
+            nb_top_candidates: 5,
+            char_threshold: 500,
+            classes_to_preserve: vec!["page".to_string()],
+            keep_classes: false,
+            disable_json_ld: false,
+            allowed_video_regex: None,
+            link_density_modifier: 0.0,
+            remove_title_from_content: false,
+            clean_styles: true,
+            clean_whitespace: true,
+            output_markdown: false,
+            markdown_options: None,
+            sanitize_content: false,
+        }
+    }
+}
+
+impl ReadabilityOptions {
+    /// Creates a new builder for ReadabilityOptions
+    pub fn builder() -> ReadabilityOptionsBuilder {
+        ReadabilityOptionsBuilder::default()
+    }
+}
+
+/// Builder for [`ReadabilityOptions`].
+///
+/// Provides a fluent interface for constructing [`ReadabilityOptions`] with custom values.
+///
+/// ## Example
+///
+/// ```rust
+/// use readabilityrs::ReadabilityOptions;
+///
+/// let options = ReadabilityOptions::builder()
+///     .char_threshold(300)
+///     .nb_top_candidates(10)
+///     .debug(true)
+///     .keep_classes(true)
+///     .build();
+/// ```
+#[derive(Default)]
+pub struct ReadabilityOptionsBuilder {
+    debug: Option<bool>,
+    max_elems_to_parse: Option<usize>,
+    nb_top_candidates: Option<usize>,
+    char_threshold: Option<usize>,
+    classes_to_preserve: Option<Vec<String>>,
+    keep_classes: Option<bool>,
+    disable_json_ld: Option<bool>,
+    allowed_video_regex: Option<Regex>,
+    link_density_modifier: Option<f64>,
+    remove_title_from_content: Option<bool>,
+    clean_styles: Option<bool>,
+    clean_whitespace: Option<bool>,
+    output_markdown: Option<bool>,
+    markdown_options: Option<MarkdownOptions>,
+    sanitize_content: Option<bool>,
+}
+
+impl ReadabilityOptionsBuilder {
+    /// Enable or disable debug logging
+    pub fn debug(mut self, debug: bool) -> Self {
+        self.debug = Some(debug);
+        self
+    }
+
+    /// Set maximum number of elements to parse
+    pub fn max_elems_to_parse(mut self, max: usize) -> Self {
+        self.max_elems_to_parse = Some(max);
+        self
+    }
+
+    /// Set number of top candidates to consider
+    pub fn nb_top_candidates(mut self, nb: usize) -> Self {
+        self.nb_top_candidates = Some(nb);
+        self
+    }
+
+    /// Set character threshold
+    pub fn char_threshold(mut self, threshold: usize) -> Self {
+        self.char_threshold = Some(threshold);
+        self
+    }
+
+    /// Set classes to preserve
+    #[deprecated(
+        since = "0.1.4",
+        note = "has no effect: class attributes are never stripped"
+    )]
+    pub fn classes_to_preserve(mut self, classes: Vec<String>) -> Self {
+        self.classes_to_preserve = Some(classes);
+        self
+    }
+
+    /// Keep all CSS classes
+    #[deprecated(since = "0.1.4", note = "has no effect: classes are always kept")]
+    pub fn keep_classes(mut self, keep: bool) -> Self {
+        self.keep_classes = Some(keep);
+        self
+    }
+
+    /// Disable JSON-LD extraction
+    pub fn disable_json_ld(mut self, disable: bool) -> Self {
+        self.disable_json_ld = Some(disable);
+        self
+    }
+
+    /// Set allowed video regex
+    #[deprecated(
+        since = "0.1.4",
+        note = "has no effect: video detection always uses the built-in pattern"
+    )]
+    pub fn allowed_video_regex(mut self, regex: Regex) -> Self {
+        self.allowed_video_regex = Some(regex);
+        self
+    }
+
+    /// Set link density modifier.
+    ///
+    /// Non-finite values (`NaN`, `±inf`) are ignored and the default is kept.
+    /// They would otherwise propagate into every candidate score and make the
+    /// whole ranking meaningless rather than merely skewed.
+    pub fn link_density_modifier(mut self, modifier: f64) -> Self {
+        if modifier.is_finite() {
+            self.link_density_modifier = Some(modifier);
+        }
+        self
+    }
+
+    /// Remove the title element from the extracted content
+    ///
+    /// When enabled, removes the title heading (h1/h2) from the article content
+    /// if it matches the extracted title. Useful for rendering the title separately.
+    pub fn remove_title_from_content(mut self, remove: bool) -> Self {
+        self.remove_title_from_content = Some(remove);
+        self
+    }
+
+    /// Enable or disable inline style cleaning
+    ///
+    /// When enabled, removes the `style` attribute and other presentational attributes
+    /// from HTML elements. This implements Mozilla Readability's `_cleanStyles` function.
+    pub fn clean_styles(mut self, clean: bool) -> Self {
+        self.clean_styles = Some(clean);
+        self
+    }
+
+    /// Enable or disable whitespace normalization
+    ///
+    /// When enabled, removes excessive blank lines, empty paragraphs, and normalizes
+    /// whitespace in the output.
+    pub fn clean_whitespace(mut self, clean: bool) -> Self {
+        self.clean_whitespace = Some(clean);
+        self
+    }
+
+    /// Enable or disable markdown output
+    ///
+    /// When enabled, the parser produces a markdown version of the article in
+    /// `Article::markdown_content`.
+    pub fn output_markdown(mut self, enabled: bool) -> Self {
+        self.output_markdown = Some(enabled);
+        self
+    }
+
+    /// Set markdown formatting options
+    ///
+    /// Controls heading style, bullet character, code fence style, and other
+    /// markdown formatting details. Only used when `output_markdown` is `true`.
+    pub fn markdown_options(mut self, opts: MarkdownOptions) -> Self {
+        self.markdown_options = Some(opts);
+        self
+    }
+
+    /// Enable or disable opt-in sanitization of extracted content
+    ///
+    /// When enabled, strips event-handler attributes (`on*`) and `href`/`src`
+    /// values with `javascript:`, `vbscript:`, or `data:` schemes (except
+    /// `data:image/*`) during serialization. This is a harm reducer, not a
+    /// substitute for a real HTML sanitizer; see the crate-level security note.
+    pub fn sanitize_content(mut self, sanitize: bool) -> Self {
+        self.sanitize_content = Some(sanitize);
+        self
+    }
+
+    /// Build the ReadabilityOptions
+    // Same as `Default`: the deprecated fields must still be carried across.
+    #[allow(deprecated)]
+    pub fn build(self) -> ReadabilityOptions {
+        let defaults = ReadabilityOptions::default();
+        ReadabilityOptions {
+            debug: self.debug.unwrap_or(defaults.debug),
+            max_elems_to_parse: self
+                .max_elems_to_parse
+                .unwrap_or(defaults.max_elems_to_parse),
+            nb_top_candidates: self.nb_top_candidates.unwrap_or(defaults.nb_top_candidates),
+            char_threshold: self.char_threshold.unwrap_or(defaults.char_threshold),
+            classes_to_preserve: self
+                .classes_to_preserve
+                .unwrap_or(defaults.classes_to_preserve),
+            keep_classes: self.keep_classes.unwrap_or(defaults.keep_classes),
+            disable_json_ld: self.disable_json_ld.unwrap_or(defaults.disable_json_ld),
+            allowed_video_regex: self.allowed_video_regex.or(defaults.allowed_video_regex),
+            link_density_modifier: self
+                .link_density_modifier
+                .unwrap_or(defaults.link_density_modifier),
+            remove_title_from_content: self
+                .remove_title_from_content
+                .unwrap_or(defaults.remove_title_from_content),
+            clean_styles: self.clean_styles.unwrap_or(defaults.clean_styles),
+            clean_whitespace: self.clean_whitespace.unwrap_or(defaults.clean_whitespace),
+            output_markdown: self.output_markdown.unwrap_or(defaults.output_markdown),
+            markdown_options: self.markdown_options.or(defaults.markdown_options),
+            sanitize_content: self.sanitize_content.unwrap_or(defaults.sanitize_content),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_link_density_modifier_rejects_non_finite() {
+        let default = ReadabilityOptions::default().link_density_modifier;
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let options = ReadabilityOptions::builder()
+                .link_density_modifier(bad)
+                .build();
+            assert_eq!(options.link_density_modifier, default);
+        }
+
+        let options = ReadabilityOptions::builder()
+            .link_density_modifier(0.25)
+            .build();
+        assert_eq!(options.link_density_modifier, 0.25);
+    }
+}

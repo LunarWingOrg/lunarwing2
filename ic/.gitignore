@@ -39,3 +39,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Vendored crates are committed in full; the global ignores must not eat
+# crate sources under vendor/ (e.g. cc/src/target/*.rs, wit-* .wasm fixtures).
+!vendor/**/target/
+!vendor/**/*.wasm
