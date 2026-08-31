@@ -31,9 +31,43 @@ THRESHOLD_lunarwing_health_tensorzero_error_rate="crit:>0.05"
 THRESHOLD_lunarwing_health_clickhouse_disk_pct="warn:>75 crit:>90"
 THRESHOLD_lunarwing_health_clickhouse_memory_pct="warn:>85 crit:>95"
 
+# ClickHouse query latency (milliseconds).
+THRESHOLD_lunarwing_health_clickhouse_query_time_ms="warn:>1000 crit:>5000"
+
+# Gateway session hygiene: stale locks appear long before sessions wedge.
+THRESHOLD_lunarwing_health_gateway_stale_locks="warn:>0 crit:>3"
+THRESHOLD_lunarwing_health_gateway_orphan_transcripts="warn:>10 crit:>50"
+THRESHOLD_lunarwing_health_gateway_oversized_sessions="warn:>0"
+
+# XMPP bridge reachability and latency.
+THRESHOLD_lunarwing_health_xmpp_connected="crit:<1"
+THRESHOLD_lunarwing_health_xmpp_latency_ms="warn:>500 crit:>2000"
+THRESHOLD_lunarwing_health_xmpp_error_count="warn:>1 crit:>5"
+
+# OMEMO store: a host with no device keys is about to break encrypted DMs.
+THRESHOLD_lunarwing_health_omemo_devices="crit:<1"
+
+# Rate limiter pressure: throttles in the last hour and queue depth.
+THRESHOLD_lunarwing_health_ratelimit_throttled_last_hour="warn:>10 crit:>50"
+THRESHOLD_lunarwing_health_ratelimit_queue_depth="warn:>50 crit:>100"
+
+# Model provider APIs: worst-case latency and any provider gone critical.
+THRESHOLD_lunarwing_health_models_latency_max_ms="warn:>3000 crit:>10000"
+THRESHOLD_lunarwing_health_models_providers_critical="crit:>0"
+
 # LunarVision rollup latency (milliseconds) and cache efficiency.
 THRESHOLD_lunarwing_health_lunarvision_latency_ms="warn:>2000 crit:>5000"
 THRESHOLD_lunarwing_health_lunarvision_cache_hit_rate="warn:<0.5"
+
+# NetBird (opt-in): connected peers that stop being ready.
+THRESHOLD_lunarwing_health_netbird_ready="crit:<1"
+
+# Service-manager units: worst unit status (0=healthy 1=degraded 2=critical
+# 3=unknown). Rules evaluate the LARGEST value across all label sets, so
+# "any unhealthy unit" = max of unit_status > 0. (For 0/1 up-down gauges like
+# unit_up, <1 rules only fire when EVERY unit is down — that is why this
+# example uses unit_status instead of unit_up.)
+THRESHOLD_lunarwing_health_unit_status="warn:>0 crit:>1"
 
 # Self-heal remediation pressure: many restarts for one service in the flap
 # window is the classic precursor to an escalation page.
