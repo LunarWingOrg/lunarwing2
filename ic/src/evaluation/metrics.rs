@@ -133,9 +133,7 @@ impl MetricsCollector {
     pub fn summary(&self) -> MetricsSummary {
         let mut top_errors = self.metrics.error_types.iter().collect::<Vec<_>>();
         top_errors.sort_unstable_by(|(error_a, count_a), (error_b, count_b)| {
-            count_b
-                .cmp(count_a)
-                .then_with(|| error_a.cmp(error_b))
+            count_b.cmp(count_a).then_with(|| error_a.cmp(error_b))
         });
 
         MetricsSummary {
