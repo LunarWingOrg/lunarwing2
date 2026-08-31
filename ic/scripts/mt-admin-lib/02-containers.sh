@@ -938,28 +938,35 @@ _voice_validate_setting() {
 configure_voice_settings() {
   local name="$1" voice_env lunarwing_env tmp assignment key value
   shift
-  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
-  [[ $# -gt 0 ]] || die "configure-voice requires at least one setting"
+  tenant_exists_in_registry "$name" \
+    || { say "ERROR: tenant '$name' not found" >&2; return 1; }
+  [[ $# -gt 0 ]] \
+    || { say "ERROR: configure-voice requires at least one setting" >&2; return 1; }
   voice_env="$(tenant_env_dir "$name")/voice.env"
   lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
-  [[ -f "$voice_env" && ! -L "$voice_env" ]] || write_tenant_voice_env "$name" >/dev/null
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || { say "ERROR: LunarVoice is not installed for $name; run install-voice first" >&2; return 1; }
   [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
-    || die "tenant LunarWing environment missing or unsafe"
+    || { say "ERROR: tenant LunarWing environment missing or unsafe" >&2; return 1; }
 
-  tmp="$(mktemp "$(dirname "$voice_env")/.voice-config.XXXXXX")"
+  tmp="$(mktemp "$(dirname "$voice_env")/.voice-config.XXXXXX")" || return 1
   cp --preserve=mode,ownership -- "$voice_env" "$tmp" \
-    || { rm -f "$tmp"; die "failed to stage LunarVoice configuration"; }
+    || { rm -f "$tmp"; say "ERROR: failed to stage LunarVoice configuration" >&2; return 1; }
   for assignment in "$@"; do
-    [[ "$assignment" == *=* ]] || { rm -f "$tmp"; die "invalid voice setting"; }
+    if [[ "$assignment" != *=* ]]; then
+      rm -f "$tmp"; say "ERROR: invalid voice setting" >&2; return 1
+    fi
     key="${assignment%%=*}"
     value="${assignment#*=}"
-    _voice_validate_setting "$key" "$value" \
-      || { rm -f "$tmp"; die "invalid value for $key"; }
+    if ! _voice_validate_setting "$key" "$value"; then
+      rm -f "$tmp"; say "ERROR: invalid value for $key" >&2; return 1
+    fi
     _env_set "$tmp" "$key" "$value"
   done
   if tenant_voice_enabled "$name" && ! _voice_models_ready_env "$tmp"; then
     rm -f "$tmp"
-    die "configured STT model is not verified under $VOICE_MODELS_DIR"
+    say "ERROR: configured STT model is not verified under $VOICE_MODELS_DIR" >&2
+    return 1
   fi
   mv -T -- "$tmp" "$voice_env"
   chmod 0600 "$voice_env"
@@ -1028,21 +1035,69 @@ apply_tenant_voice_configuration() {
   fi
 }
 
+configure_tenant_voice() {
+  local name="$1" voice_env lunarwing_env voice_backup lunarwing_backup result=0
+  shift
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  lunarwing_env="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || die "LunarVoice is not installed for $name; run install-voice first"
+  [[ -f "$lunarwing_env" && ! -L "$lunarwing_env" ]] \
+    || die "tenant LunarWing environment missing or unsafe"
+  voice_backup="$(mktemp "$(dirname "$voice_env")/.voice-rollback.XXXXXX")"
+  lunarwing_backup="$(mktemp "$(dirname "$lunarwing_env")/.lunarwing-rollback.XXXXXX")"
+  cp --preserve=mode,ownership -- "$voice_env" "$voice_backup" \
+    && cp --preserve=mode,ownership -- "$lunarwing_env" "$lunarwing_backup" \
+    || { rm -f -- "$voice_backup" "$lunarwing_backup"; return 1; }
+
+  configure_voice_settings "$name" "$@" || {
+    result=$?
+    rm -f -- "$voice_backup" "$lunarwing_backup"
+    return "$result"
+  }
+  apply_tenant_voice_configuration "$name" || result=$?
+  if [[ "$result" -eq 0 ]]; then
+    rm -f -- "$voice_backup" "$lunarwing_backup"
+    return 0
+  fi
+
+  say "ERROR: LunarVoice configuration failed; restoring previous settings" >&2
+  mv -T -- "$voice_backup" "$voice_env"
+  mv -T -- "$lunarwing_backup" "$lunarwing_env"
+  if tenant_voice_enabled "$name"; then
+    start_tenant_voice "$name" \
+      || say "WARNING: failed to restore the previous LunarVoice runtime" >&2
+    _reload_voice_consumer_if_running "$name" \
+      || say "WARNING: restart tenant '$name' to restore its prior transcription settings" >&2
+  fi
+  return "$result"
+}
+
+_rollback_voice_activation() {
+  local name="$1" container="lunarwing-voice-$1"
+  configure_voice "$name" false
+  stop_tenant_voice "$name" || true
+  remove_tenant_voice_unit "$name" || true
+  if _ctr "$name" inspect "$container" >/dev/null 2>&1; then
+    _ctr "$name" rm -f "$container" >/dev/null 2>&1 || true
+  fi
+  _reload_voice_consumer_if_running "$name" || true
+}
+
 activate_tenant_voice() {
-  local name="$1"
+  local name="$1" voice_env
   tenant_exists_in_registry "$name" || die "tenant '$name' not found"
-  [[ -f "$(tenant_env_dir "$name")/voice.env" ]] \
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
     || die "LunarVoice is not installed for $name; run install-voice first"
   ensure_container_runtime
   _ensure_tenant_image "$name" "$VOICE_SIDECAR_IMAGE" \
     || die "LunarVoice image unavailable; run install-voice first"
   configure_voice "$name" true
-  if ! start_tenant_voice "$name"; then
-    configure_voice "$name" false
-    remove_tenant_voice_unit "$name" || true
+  if ! start_tenant_voice "$name" || ! _reload_voice_consumer_if_running "$name"; then
+    _rollback_voice_activation "$name"
     die "LunarVoice activation failed; previous transcription configuration restored"
   fi
-  _reload_voice_consumer_if_running "$name"
 }
 
 remove_tenant_voice_unit() {
@@ -1064,7 +1119,11 @@ remove_tenant_voice_unit() {
 }
 
 deactivate_tenant_voice() {
-  local name="$1"
+  local name="$1" voice_env
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found"
+  voice_env="$(tenant_env_dir "$name")/voice.env"
+  [[ -f "$voice_env" && ! -L "$voice_env" ]] \
+    || die "LunarVoice is not installed for $name; run install-voice first"
   configure_voice "$name" false
   stop_tenant_voice "$name" || return 1
   remove_tenant_voice_unit "$name" || return 1
