@@ -412,6 +412,51 @@ out_Q4=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
 assert_eq "$(jq -r '.metrics.discovery' <<<"$out_Q4")" "single" "Q9: empty registry → single discovery"
 assert_contains "$(jq -r '.metrics.url' <<<"$out_Q4")" "8089" "Q10: empty registry falls back to health port 8089"
 
+# Mixed deployments discover the external HTTPS origin instead of the tenant's
+# otherwise-allocated local health port.
+PORTS_EXTERNAL="$ROOT/ports-external.json"
+cat > "$PORTS_EXTERNAL" <<'JSON'
+{
+  "tenants": {
+    "local": {
+      "extended_ports": {"vision_health": 23006}
+    },
+    "remote": {
+      "vision": {
+        "mode": "external",
+        "external_url": "https://vision.example.test:8443"
+      },
+      "extended_ports": {"vision_health": 24006}
+    }
+  }
+}
+JSON
+out_Q5=$(MOCK_HEALTH_BODY="$HEALTH_OK_WITH_VL" MOCK_HEALTH_CODE=200 \
+    SELF_HEAL_TENANTS_FILE="$PORTS_EXTERNAL" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+ec_Q5=$?
+assert_eq "$ec_Q5" "0" "Q11: mixed local/external discovery → exit 0"
+assert_eq "$(jq -r '.metrics.target_count' <<<"$out_Q5")" "2" "Q12: mixed deployment has two targets"
+assert_contains "$(jq -r '.metrics.instances[] | select(.tenant == "local") | .url' <<<"$out_Q5")" \
+    "http://127.0.0.1:23006/health" "Q13: local tenant uses registry health port"
+assert_contains "$(jq -r '.metrics.instances[] | select(.tenant == "remote") | .url' <<<"$out_Q5")" \
+    "https://vision.example.test:8443/health" "Q14: external tenant uses HTTPS origin"
+assert_absent "$(jq -r '.metrics.instances[] | select(.tenant == "remote") | .url' <<<"$out_Q5")" \
+    "24006" "Q15: external tenant ignores local health slot"
+
+jq '.tenants.remote.vision.external_url = "http://vision.example.test:8089"' \
+    "$PORTS_EXTERNAL" >"$PORTS_EXTERNAL.tmp"
+mv "$PORTS_EXTERNAL.tmp" "$PORTS_EXTERNAL"
+out_Q6=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+    SELF_HEAL_TENANTS_FILE="$PORTS_EXTERNAL" \
+    HEALTH_LUNARVISION_FETCH_METRICS=false \
+    run_check)
+ec_Q6=$?
+assert_eq "$ec_Q6" "2" "Q16: external plaintext URL → exit 2"
+assert_contains "$(jq -r '.issues[]' <<<"$out_Q6")" \
+    "Unsafe LunarVision URL" "Q17: external plaintext URL is rejected before curl"
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════════════════════
