@@ -46,6 +46,7 @@ pub use router::{
     handle_expected,
     handle_interrupt,
     handle_new_thread,
+    handle_steer,
     handle_with_engine,
     has_active_engine_thread,
     has_interruptible_engine_state,

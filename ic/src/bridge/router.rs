@@ -2460,6 +2460,90 @@ async fn interrupt_engine_conversation(
     }
 }
 
+/// Handle a steer submission — inject a mid-turn note into the running
+/// engine thread of the message's scoped conversation.
+///
+/// Mirrors the legacy `/steer` semantics for the Engine V2 path: when the
+/// scoped conversation has a running thread, the note is injected as a user
+/// message that the engine consumes at the next iteration boundary (after
+/// the current LLM call completes). Response wording matches the legacy
+/// loop so channels are unaffected by which loop is active.
+pub async fn handle_steer(
+    agent: &Agent,
+    message: &IncomingMessage,
+    note: &str,
+) -> Result<Option<String>, Error> {
+    init_engine(agent).await?;
+
+    let lock = ENGINE_STATE
+        .get()
+        .ok_or_else(|| engine_err("init", "engine state not initialized"))?;
+    let guard = lock.read().await;
+    let state = guard
+        .as_ref()
+        .ok_or_else(|| engine_err("init", "engine state is empty"))?;
+
+    steer_engine_conversation(state, message, note).await
+}
+
+/// Inject a steer note into the running thread of the message's scoped
+/// engine conversation.
+///
+/// Uses [`engine_conversation_key`] so a steer only targets the same
+/// `channel:scope` conversation the user is interacting with. When no
+/// engine thread is running, the note is not delivered and the response
+/// tells the user to send the message directly (same as the legacy loop).
+async fn steer_engine_conversation(
+    state: &EngineState,
+    message: &IncomingMessage,
+    note: &str,
+) -> Result<Option<String>, Error> {
+    let conv_id = state
+        .conversation_manager
+        .get_or_create_conversation(&engine_conversation_key(message), &message.user_id)
+        .await
+        .map_err(|e| engine_err("conversation error", e))?;
+
+    let conv = state.conversation_manager.get_conversation(conv_id).await;
+    let active_threads = conv
+        .as_ref()
+        .map(|c| c.active_threads.clone())
+        .unwrap_or_default();
+
+    // Same wrapping the legacy loop applies (`ChatDelegate::check_signals`)
+    // so the model does not treat the injected note as a brand-new turn.
+    let wrapped = crate::agent::wrap_steer_note(note);
+
+    for tid in &active_threads {
+        if !state.thread_manager.is_running(*tid).await {
+            continue;
+        }
+        match state
+            .thread_manager
+            .inject_message(
+                *tid,
+                &message.user_id,
+                lunarwing_engine::ThreadMessage::user(&wrapped),
+            )
+            .await
+        {
+            Ok(()) => {
+                debug!(thread_id = %tid, "engine v2: steer note injected into running thread");
+                return Ok(Some(
+                    "Steer note queued — the agent will see it after the current step.".into(),
+                ));
+            }
+            Err(error) => {
+                debug!(thread_id = %tid, %error, "engine v2: failed to inject steer note");
+            }
+        }
+    }
+
+    Ok(Some(
+        "Nothing is running right now — send the message directly (no /steer needed).".into(),
+    ))
+}
+
 /// Handle a new-thread submission — clear conversation for a fresh start.
 pub async fn handle_new_thread(
     agent: &Agent,
@@ -7663,6 +7747,95 @@ mod tests {
             state.thread_manager.join_thread(tid_b),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn steer_injects_into_scoped_running_conversation_only() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let project_id = state.default_project_id;
+        let mut events = state.thread_manager.subscribe_events();
+
+        let conv_a = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        let tid_a = state
+            .conversation_manager
+            .handle_user_message(
+                conv_a,
+                "hi a",
+                project_id,
+                "alice",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Wait until the thread's stream is active.
+        let wait = async {
+            while let Ok(evt) = events.recv().await {
+                if matches!(evt.kind, lunarwing_engine::EventKind::ResponseDelta { .. }) {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), wait)
+            .await
+            .expect("stream should start");
+
+        // Steer into the running conversation: queued acknowledgement.
+        let msg = IncomingMessage::new("gateway", "alice", "/steer focus on tests first")
+            .with_conversation_scope("thread-a");
+        let result = steer_engine_conversation(&state, &msg, "focus on tests first")
+            .await
+            .expect("steer should succeed");
+        assert_eq!(
+            result,
+            Some("Steer note queued — the agent will see it after the current step.".to_string())
+        );
+
+        // Steer into a scope with nothing running: the note is not delivered.
+        let idle = IncomingMessage::new("gateway", "alice", "/steer nobody home")
+            .with_conversation_scope("thread-b");
+        let result = steer_engine_conversation(&state, &idle, "nobody home")
+            .await
+            .expect("idle steer should succeed");
+        assert_eq!(
+            result,
+            Some(
+                "Nothing is running right now — send the message directly (no /steer needed)."
+                    .to_string()
+            )
+        );
+
+        // Clean up the running thread.
+        let _ = state.thread_manager.stop_thread(tid_a, "alice").await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.thread_manager.join_thread(tid_a),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn steer_without_any_thread_reports_nothing_running() {
+        let store = Arc::new(TestStore::new());
+        let state = make_interrupt_test_state(store);
+        let msg = IncomingMessage::new("gateway", "alice", "/steer hello");
+        let result = steer_engine_conversation(&state, &msg, "hello")
+            .await
+            .expect("steer should succeed");
+        assert_eq!(
+            result,
+            Some(
+                "Nothing is running right now — send the message directly (no /steer needed)."
+                    .to_string()
+            )
+        );
     }
 
     #[tokio::test]
