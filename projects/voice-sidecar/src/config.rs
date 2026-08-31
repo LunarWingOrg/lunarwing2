@@ -15,9 +15,11 @@ pub enum ConfigError {
     InvalidBool(&'static str),
     #[error("invalid integer for {0}")]
     InvalidInteger(&'static str),
+    #[error("value for {0} is outside the supported range")]
+    OutOfRange(&'static str),
     #[error("VOICE_BIND_HOST must be an IP address")]
     InvalidBindHost,
-    #[error("VOICE_PORT and VOICE_HEALTH_PORT must be different")]
+    #[error("VOICE_PORT and VOICE_HEALTH_PORT must be different non-zero ports")]
     PortConflict,
     #[error("VOICE_TTS_VOICES_JSON must be a JSON object mapping names to integer speaker IDs")]
     InvalidVoiceMap,
@@ -79,6 +81,61 @@ pub struct Config {
     pub num_threads: i32,
 }
 
+struct RuntimeLimits {
+    max_audio_bytes: usize,
+    max_audio_secs: u64,
+    max_text_chars: usize,
+    max_tts_audio_secs: u64,
+    request_timeout_secs: u64,
+    max_concurrent_inference: usize,
+    rate_limit_per_second: u32,
+    cache_ttl_secs: u64,
+    cache_max_entries: usize,
+    num_threads: i32,
+}
+
+impl RuntimeLimits {
+    fn from_env() -> Result<Self, ConfigError> {
+        Ok(Self {
+            max_audio_bytes: env_number_in_range(
+                "VOICE_MAX_AUDIO_BYTES",
+                50 * 1024 * 1024usize,
+                1024,
+                1024 * 1024 * 1024,
+            )?,
+            max_audio_secs: env_number_in_range("VOICE_MAX_AUDIO_SECS", 300u64, 1, 3_600)?,
+            max_text_chars: env_number_in_range("VOICE_MAX_TEXT_CHARS", 10_000usize, 1, 100_000)?,
+            max_tts_audio_secs: env_number_in_range("VOICE_MAX_TTS_AUDIO_SECS", 300u64, 1, 3_600)?,
+            request_timeout_secs: env_number_in_range(
+                "VOICE_REQUEST_TIMEOUT_SECS",
+                120u64,
+                1,
+                3_600,
+            )?,
+            max_concurrent_inference: env_number_in_range(
+                "VOICE_MAX_CONCURRENT_INFERENCE",
+                2usize,
+                1,
+                64,
+            )?,
+            rate_limit_per_second: env_number_in_range(
+                "VOICE_RATE_LIMIT_PER_SEC",
+                5u32,
+                1,
+                10_000,
+            )?,
+            cache_ttl_secs: env_number_in_range("VOICE_CACHE_TTL_SECS", 600u64, 0, 86_400)?,
+            cache_max_entries: env_number_in_range(
+                "VOICE_CACHE_MAX_ENTRIES",
+                5_000usize,
+                1,
+                1_000_000,
+            )?,
+            num_threads: env_number_in_range("ORT_NUM_THREADS", 4i32, 1, 128)?,
+        })
+    }
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let model_dir = env_path("VOICE_MODEL_DIR", DEFAULT_MODEL_DIR);
@@ -94,12 +151,13 @@ impl Config {
         let bind_host = env_string("VOICE_BIND_HOST", "127.0.0.1")
             .parse()
             .map_err(|_| ConfigError::InvalidBindHost)?;
-        let port = env_number("VOICE_PORT", 8090u16)?;
-        let health_port = env_number("VOICE_HEALTH_PORT", 8091u16)?;
+        let port = env_number_in_range("VOICE_PORT", 8090u16, 1, u16::MAX)?;
+        let health_port = env_number_in_range("VOICE_HEALTH_PORT", 8091u16, 1, u16::MAX)?;
         if port == health_port {
             return Err(ConfigError::PortConflict);
         }
 
+        let limits = RuntimeLimits::from_env()?;
         let tts_voice_ids = parse_voice_map()?;
         let model_name = env_string("VOICE_STT_MODEL", "whisper-tiny");
         let stt_engine = env_stt_engine()?;
@@ -109,15 +167,15 @@ impl Config {
             port,
             health_port,
             auth_token,
-            max_audio_bytes: env_number("VOICE_MAX_AUDIO_BYTES", 50 * 1024 * 1024usize)?,
-            max_audio_secs: env_number("VOICE_MAX_AUDIO_SECS", 300u64)?,
-            max_text_chars: env_number("VOICE_MAX_TEXT_CHARS", 10_000usize)?,
-            max_tts_audio_secs: env_number("VOICE_MAX_TTS_AUDIO_SECS", 300u64)?,
-            request_timeout_secs: env_number("VOICE_REQUEST_TIMEOUT_SECS", 120u64)?,
-            max_concurrent_inference: env_number("VOICE_MAX_CONCURRENT_INFERENCE", 2usize)?.max(1),
-            rate_limit_per_second: env_number("VOICE_RATE_LIMIT_PER_SEC", 5u32)?.max(1),
-            cache_ttl_secs: env_number("VOICE_CACHE_TTL_SECS", 600u64)?,
-            cache_max_entries: env_number("VOICE_CACHE_MAX_ENTRIES", 5_000usize)?.max(1),
+            max_audio_bytes: limits.max_audio_bytes,
+            max_audio_secs: limits.max_audio_secs,
+            max_text_chars: limits.max_text_chars,
+            max_tts_audio_secs: limits.max_tts_audio_secs,
+            request_timeout_secs: limits.request_timeout_secs,
+            max_concurrent_inference: limits.max_concurrent_inference,
+            rate_limit_per_second: limits.rate_limit_per_second,
+            cache_ttl_secs: limits.cache_ttl_secs,
+            cache_max_entries: limits.cache_max_entries,
             ffmpeg_path: env_path("VOICE_FFMPEG_PATH", "ffmpeg"),
             model_name,
             stt_engine,
@@ -168,7 +226,7 @@ impl Config {
             enable_vad: env_bool("VOICE_ENABLE_VAD", true)?,
             enable_tts: env_bool("VOICE_ENABLE_TTS", true)?,
             require_stt: env_bool("VOICE_REQUIRE_STT", true)?,
-            num_threads: env_number("ORT_NUM_THREADS", 4i32)?.max(1),
+            num_threads: limits.num_threads,
         })
     }
 
@@ -215,6 +273,22 @@ where
         Ok(value) => value.parse().map_err(|_| ConfigError::InvalidInteger(key)),
         Err(_) => Ok(default),
     }
+}
+
+fn env_number_in_range<T>(
+    key: &'static str,
+    default: T,
+    minimum: T,
+    maximum: T,
+) -> Result<T, ConfigError>
+where
+    T: std::str::FromStr + PartialOrd + Copy,
+{
+    let value = env_number(key, default)?;
+    if value < minimum || value > maximum {
+        return Err(ConfigError::OutOfRange(key));
+    }
+    Ok(value)
 }
 
 fn env_stt_engine() -> Result<SttEngineKind, ConfigError> {
@@ -289,6 +363,34 @@ fn parse_voice_map() -> Result<HashMap<String, i32>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_configuration_enforces_inclusive_bounds() {
+        const KEY: &str = "LUNARVOICE_TEST_RANGE";
+        unsafe { env::set_var(KEY, "0") };
+        assert!(matches!(
+            env_number_in_range(KEY, 5u32, 1, 10),
+            Err(ConfigError::OutOfRange(KEY))
+        ));
+        for value in ["1", "10"] {
+            unsafe { env::set_var(KEY, value) };
+            assert_eq!(
+                env_number_in_range(KEY, 5u32, 1, 10).ok(),
+                value.parse().ok()
+            );
+        }
+        unsafe { env::set_var(KEY, "11") };
+        assert!(matches!(
+            env_number_in_range(KEY, 5u32, 1, 10),
+            Err(ConfigError::OutOfRange(KEY))
+        ));
+        unsafe { env::set_var(KEY, "not-a-number") };
+        assert!(matches!(
+            env_number_in_range(KEY, 5u32, 1, 10),
+            Err(ConfigError::InvalidInteger(KEY))
+        ));
+        unsafe { env::remove_var(KEY) };
+    }
 
     #[test]
     fn stt_engine_env_parsing() {
