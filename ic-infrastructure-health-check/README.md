@@ -112,7 +112,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | ratelimit | health-ratelimit.sh | `$BASE/ratelimit` throttle logs + queue | `throttled_last_hour`, `queue_depth` |
 | clickhouse | health-clickhouse.sh | ClickHouse responsiveness + resources | `query_time_ms`, `disk_pct`, `memory_pct` |
 | tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
-| models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | per-provider `status`, `latency_ms`, `last_error` |
+| models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` (numeric map; `last_error` stays string-only in `providers[]`) |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
 | lunarvoice | health-lunarvoice.sh | Enabled LunarVoice `/health`, `/ready`, and `/metrics` endpoints | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
@@ -164,6 +164,21 @@ checks can instead be **disabled** so they report `healthy` with
 | `OPENROUTER_API_KEY` | health-models.sh | (empty) | OpenRouter key; unset → provider `unknown` (degraded) |
 | `OPENAI_API_KEY` | health-models.sh | (empty) | OpenAI key; unset → provider `unknown` (degraded) |
 | `ANTHROPIC_API_KEY` | health-models.sh | (empty) | Anthropic key; unset → provider `unknown` (degraded) |
+| `HEALTH_MODELS_LATENCY_DEGRADED_MS` / `..._CRITICAL_MS` | health-models.sh | `3000` / `10000` | Per-provider latency thresholds |
+| `HEALTH_GATEWAY_STALE_LOCK_MINUTES` | health-gateway.sh | `10` | Lock age before a session lock counts as stale |
+| `HEALTH_GATEWAY_STALE_LOCKS_CRITICAL` | health-gateway.sh | `3` | More than this many stale locks → critical |
+| `HEALTH_GATEWAY_ORPHAN_DEGRADED` / `..._ORPHAN_CRITICAL` | health-gateway.sh | `10` / `50` | Orphan-transcript count thresholds |
+| `HEALTH_GATEWAY_OVERSIZED_DEGRADED` | health-gateway.sh | `0` | Oversized (>500 KB) session count before degraded |
+| `HEALTH_XMPP_LATENCY_DEGRADED_MS` / `..._CRITICAL_MS` | health-xmpp.sh | `500` / `2000` | XMPP latency thresholds |
+| `HEALTH_XMPP_ERROR_DEGRADED` / `..._ERROR_CRITICAL` | health-xmpp.sh | `1` / `5` | XMPP error-count thresholds |
+| `HEALTH_RATELIMIT_THROTTLED_DEGRADED` / `..._CRITICAL` | health-ratelimit.sh | `10` / `50` | Throttled events in the last hour |
+| `HEALTH_RATELIMIT_QUEUE_DEGRADED` | health-ratelimit.sh | `100` | Queued messages before degraded |
+| `HEALTH_CLICKHOUSE_{DISK,MEMORY}_{DEGRADED,CRITICAL}` | health-clickhouse.sh | `70`/`85`, `80`/`95` | Disk and memory utilization thresholds (percent) |
+| `HEALTH_CLICKHOUSE_QUERY_{DEGRADED,CRITICAL}_MS` | health-clickhouse.sh | `1000` / `5000` | Query latency thresholds |
+| `HEALTH_TENSORZERO_P95_{DEGRADED,CRITICAL}_MS` | health-tensorzero.sh | `5000` / `15000` | Inference p95 latency thresholds |
+| `HEALTH_TENSORZERO_ERROR_{DEGRADED,CRITICAL}_PCT` | health-tensorzero.sh | `1` / `5` | Error-rate thresholds (percent; floats allowed) |
+| `HEALTH_TENSORZERO_QUEUE_{DEGRADED,CRITICAL}` | health-tensorzero.sh | `5` / `20` | Queue-depth thresholds |
+| `HEALTH_TENSORZERO_GPU_UTIL_WARN_PCT` | health-tensorzero.sh | `90` | Advisory high-GPU-utilization issue (never critical) |
 | `UNITS` | health-systemd.sh | `lunarwing.service xmpp-bridge.service tensorzero-gateway.service` | Override the base systemd units to probe |
 | `SERVICES` | health-openrc.sh | auto-discovered | Override the OpenRC services to probe (space-separated) |
 | `INITD_DIR` | health-openrc.sh | `/etc/init.d` | Init-script directory scanned for tenant services |

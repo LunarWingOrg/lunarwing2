@@ -1,5 +1,17 @@
 # Healthpoint Metrics Exporter
 
+> **Status (2026-08-31): v2.1.0.0 goal #5 sweep DONE — models metrics + configurable thresholds.**
+> The models check now emits a numeric `metrics` object (provider counts,
+> `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status`
+> maps) instead of string-only series the exporter dropped, so every
+> healthpoint contributes export series. Degraded/critical thresholds in the
+> six legacy checks (gateway, xmpp, ratelimit, clickhouse, tensorzero, models)
+> are env-configurable (`HEALTH_GATEWAY_*` / `HEALTH_XMPP` / `HEALTH_RATELIMIT` /
+> `HEALTH_CLICKHOUSE` / `HEALTH_TENSORZERO` / `HEALTH_MODELS` knobs,
+> health-netbird-style validation fallback), and
+> `health-metrics-thresholds.conf.example` now carries a sample
+> early-warning rule for every healthpoint.
+>
 > **Status (2026-08-15): IMPLEMENTED (v2.0.8.0 goal #16) — Phases 1–3 landed.**
 > Phase 1: `health-metrics-exporter.sh` (textfile export of the aggregated
 > report + self-heal series), `duration_seconds` in the report, cron-wrapper
@@ -87,7 +99,7 @@ each emitting one JSON object (`component`, `status`, `metrics{...}`), exit
 | ratelimit | `health-ratelimit.sh` | `throttled_last_hour`, `queue_depth` |
 | clickhouse | `health-clickhouse.sh` | `query_time_ms`, `disk_pct`, `memory_pct` |
 | tensorzero | `health-tensorzero.sh` | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
-| models | `health-models.sh` | per-provider `status`, `latency_ms`, `last_error` |
+| models | `health-models.sh` | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` numeric maps (status strings/`last_error` remain in `providers[]` and are dropped on export) |
 | lunarvision | `health-lunarvision.sh` | `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms`, per-tenant `ocr_available`/`vl_available` |
 | lunarvoice | `health-lunarvoice.sh` | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | `health-netbird.sh` | `enabled`, `ready`, `probe_exit` |
