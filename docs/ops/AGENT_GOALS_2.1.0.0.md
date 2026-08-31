@@ -49,8 +49,8 @@
     - Verified (taskset -c 0-17, -j16): `cargo check` clean (engine lib+tests, host lib+tests); `cargo clippy --lib -D warnings` clean on both crates; `cargo fmt --all -- --check` clean; full engine lib suite 535/535 green; targeted host suites green — bridge::llm_adapter 12/12 (incl. new pass-through tests), llm::provider 15/15, orchestrator::api 19/19 (incl. canonical-spelling test), worker::api 5/5 (incl. legacy-alias parse test).
 8. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/96
     - DONE 100% 2026-08-31 (aj/kimi-8-20260831-1502, implementation commits c862e161a + d66ac7342): `MetricsCollector::summary()` now sorts error types by descending frequency before taking three, with an ascending error-name tie-breaker so equal counts remain deterministic.
-    - Regression coverage seeds five categories with counts 1..5 and verifies deterministic cutoff behavior for equal counts. Verified: 2 targeted tests passed; default `cargo check` clean; scoped `cargo clippy --lib -- -D warnings` clean; `cargo fmt --all -- --check` clean (all cargo commands pinned to CPUs 0-11 with `-j12` where supported).
-9. [x] (S) reserved
+    - Regression coverage seeds five categories with counts 1..5 and verifies deterministic cutoff behavior for equal counts. Verified: 2 targeted tests passed; default `cargo check` clean; scoped `cargo clippy --lib -- -D warnings` clean; `cargo fmt --all -- --check` clean (all cargo commands pinned to CPUs 0-11 with `-j12` where supported)
+9. [ ] perform a follow up on item 3. create a new test tenant. enable xmpp and weechat. test steer and interrupt across web gateway, weechat, xmpp. document and fix any issues you run into. mock irc/xmpp server can be used but if you are unable to use irc/xmpp just attempt via web gateway using browser
 10. [x] use your browser tool to work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/93
     - DONE 100% 2026-08-31 (aj/kimi-10-20260831-1801, implementation commits 66eaf9061..5eb88affc): exercised the actual rendered onboarding GUI in headless Chromium against the safe demo backend, then made that coverage repeatable.
     - Browser coverage: picker/assets/settings; client-side validation for provision, secrets, upgrade, export, and import; successful REST + WebSocket completion for all five operations; provision failure/result rendering; generated credential display; zero unexpected browser-console errors or failed requests. A separate authenticated pass verified missing-token rejection, valid-token acceptance, and `sessionStorage` token reuse.
@@ -81,7 +81,7 @@
 
 15. [ ] Document the orchestrator's 2-retry policy as intentional (WI#88 follow-up). One-paragraph note in the relevant docs stating the hardcoded 2-retry `double-timeout` policy is by design — a knob was considered and rejected — so future readers don't re-litigate it. Closes Kageho's review question.
     - (context) Kageho's review of the #88 fix: "I can give this a 4+ if you unblock the double-timeout knob (or document it as deferred)." Christopher decided: intentional, not deferred.
-16. [ ] fix ci/cd issues for opencode ext worker
+16. [x] fix ci/cd issues for opencode ext worker
 17. [ ] First-draft release notes (at root of repo) as RELEASE-v2.1.0.0.md, covering all changes since v2.0.9.0, with an accurate known-issues list. Use docs/releases history for format reference. A second item later in the cycle improves accuracy of this draft
 18. [ ] Update README.md in repo root (if necessary) — reflects 2.1-era reality: new surfaces pointers, no stale 2.0.9-specific detail.
 
