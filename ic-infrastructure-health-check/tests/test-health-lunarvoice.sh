@@ -92,6 +92,13 @@ out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
 assert_eq "$rc" 2 "duplicate enabled health ports exit critical"
 assert_has "$(jq -r '.issues[]' <<<"$out")" "41001" "duplicate-port issue names port"
 
+cat >"$registry" <<'JSON'
+{"version":16,"tenants":{"ambiguous":{"enable_voice":"true","voice_ports":{"voice_health":41001}}}}
+JSON
+out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
+assert_eq "$rc" 2 "non-boolean enablement exits critical"
+assert_has "$(jq -r '.issues[]' <<<"$out")" "ambiguous" "invalid-enablement issue names tenant"
+
 printf '{not-json\n' >"$registry"
 out="$(SELF_HEAL_TENANTS_FILE="$registry" run_check)"; rc=$?
 assert_eq "$rc" 2 "malformed registry exits critical"
