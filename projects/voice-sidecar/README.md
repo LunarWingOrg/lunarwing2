@@ -116,7 +116,9 @@ LunarVoice expects sherpa-onnx model layouts. For a Whisper model named
 `VOICE_STT_ENGINE` selects the speech-to-text engine:
 
 - `whisper` (default) is multilingual and reports the detected language per
-  chunk. The default model is `whisper-tiny`.
+  chunk. The default model is `whisper-tiny`. `auto` (or an empty value) is
+  normalized to sherpa-onnx's auto-detection value; explicit `VOICE_STT_LANGUAGE`
+  values must be supported Whisper ISO codes such as `en` or `ja`.
 - `parakeet` uses NVIDIA Parakeet-TDT through the sherpa-onnx transducer
   recognizer. The supplied manifest template includes
   `parakeet-tdt-0.6b-v2-int8` (English) and
