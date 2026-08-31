@@ -111,8 +111,25 @@ INITEOF
   chmod 0755 "$unit_path"
 }
 
+remove_vision_openrc_assets() {
+  local name="$1" container="lunarwing-vision-${1}" path
+  for path in "$OPENRC_INITD_DIR/${container}-sup" "$OPENRC_INITD_DIR/$container"; do
+    [[ ! -e "$path" && ! -L "$path" ]] && continue
+    [[ -f "$path" && ! -L "$path" ]] \
+      || { say "ERROR: refusing to remove unsafe LunarVision OpenRC unit $path" >&2; return 1; }
+    rc-service "${path##*/}" stop >/dev/null 2>&1 || true
+    rc-update del "${path##*/}" default >/dev/null 2>&1 || true
+    rm -f -- "$path"
+  done
+  rm -f -- "$(_hash_dir "$name")/${container}.hash"
+}
+
 render_vision_openrc_assets() {
   local name="$1" uid home container="lunarwing-vision-${1}" direct supervisor
+  if tenant_vision_external "$name"; then
+    remove_vision_openrc_assets "$name"
+    return
+  fi
   direct="$OPENRC_INITD_DIR/$container"
   supervisor="$OPENRC_INITD_DIR/${container}-sup"
   if [[ ! -e "$direct" && ! -L "$direct" && ! -e "$supervisor" && ! -L "$supervisor" ]] \
