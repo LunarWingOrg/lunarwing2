@@ -784,34 +784,44 @@ and falls back to `http://127.0.0.1:{OAUTH_CALLBACK_PORT}`.
 
 ## Optional Local Audio Transcription
 
-Interactive setup does not enable LunarVoice. Multi-tenant provisioning writes
-sidecar settings and credentials with `VOICE_ENABLED=false`; verified models and
-an explicit operator action are required:
+Interactive setup does not enable LunarVoice. Multi-tenant provisioning reserves
+`voice_service`/`voice_health` ports, but production lifecycle is explicit:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh build-voice-sidecar
-sudo ic/scripts/lunarwing-mt-admin.sh enable-voice <tenant>
-sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
+# Copy model-manifest.example.json and replace hashes from a trusted source.
+sudo ic/scripts/lunarwing-mt-admin.sh install-voice <tenant> \
+  --model-manifest /secure/path/model-manifest.json
+sudo ic/scripts/lunarwing-mt-admin.sh configure-voice <tenant> \
+  --stt-engine whisper --stt-model whisper-tiny --enable-vad --enable-tts
+sudo ic/scripts/lunarwing-mt-admin.sh activate-voice <tenant>
 ```
 
-`enable-voice` sets `TRANSCRIPTION_PROVIDER=lunarvoice`, enables existing audio
-transcription middleware, and uses tenant registry `voice_service` port. It
-fails closed when verified STT model files are absent (Whisper or
-Parakeet-TDT, selected by `VOICE_STT_ENGINE` in `voice.env`). `disable-voice` stops
-sidecar and disables transcription only when current provider remains
-`lunarvoice`; operator-selected cloud transcription config is preserved.
-Per-tenant model name and `/models/...` paths live in protected `voice.env`;
-enablement requires matching readable host files plus downloader SHA marker.
+`install-voice` installs the shared image, optional SHA-256-verified models, and
+a mode-`0600` tenant configuration without starting anything. `configure-voice`
+validates managed values and reconciles an active sidecar transactionally.
+`activate-voice` requires verified, non-symlinked STT artifacts, starts the
+sidecar through the detected systemd-user/OpenRC path, requires both `/health`
+and `/ready`, and then restarts the LunarWing daemon if it is running. A failed
+activation restores the previous transcription provider and removes the failed
+runtime. The legacy `enable-voice` name is an alias.
+
+`deactivate-voice` stops and deregisters the sidecar and restores the
+`TRANSCRIPTION_ENABLED`, `TRANSCRIPTION_PROVIDER`, and `TRANSCRIPTION_MODEL`
+values captured before activation. `remove-voice` additionally deletes the
+tenant container, unit, protected `voice.env`, and daemon-side voice credentials;
+shared verified models and the image remain for other tenants. See
+`projects/voice-sidecar/README.md` for the complete config surface and
+operational checks.
 
 Relevant bootstrap environment:
 
 | Variable | Purpose |
 |----------|---------|
 | `TRANSCRIPTION_ENABLED` | Enables existing inbound audio middleware |
-| `TRANSCRIPTION_PROVIDER` | Set to `lunarvoice` for local sidecar |
+| `TRANSCRIPTION_PROVIDER` | Set to `lunarvoice` while the local sidecar is active |
 | `TRANSCRIPTION_MODEL` | Loaded sidecar model name, default `whisper-tiny` |
-| `VOICE_SERVICE_URL` | Loopback API URL; multi-tenant value comes from ports registry |
-| `VOICE_AUTH_TOKEN` | Per-tenant bearer token; never log or expose it |
+| `VOICE_SERVICE_URL` | Loopback API URL from the tenant ports registry |
+| `VOICE_AUTH_TOKEN` | Dedicated per-tenant bearer token; never log or expose it |
 
 ---
 
