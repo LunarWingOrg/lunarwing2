@@ -250,14 +250,67 @@ podman run -p 127.0.0.1:8088:8088 -p 127.0.0.1:8089:8089 \
   -e LUNARWING_AUTH_TOKEN=secret lunarwing/ocr-sidecar
 ```
 
+### External instance on a GPU host
+
+A LunarWing host can use a LunarVision instance on another machine. The remote
+base URL must be an **HTTPS origin** (no credentials, path, query, or fragment),
+and the remote sidecar must set a strong `LUNARWING_AUTH_TOKEN`. Keep the
+sidecar's HTTP listeners bound to loopback and terminate TLS with a reverse
+proxy or private-network ingress. For example, Caddy can preserve the dedicated
+operational listener while presenting one origin to clients:
+
+```caddyfile
+vision.example.com {
+    handle /health {
+        reverse_proxy 127.0.0.1:8089
+    }
+    handle /vision/metrics {
+        reverse_proxy 127.0.0.1:8089
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8088
+    }
+}
+```
+
+Restrict ingress to trusted LunarWing hosts or a private VPN. `/health` and
+`/vision/metrics` are intentionally unauthenticated; the analysis APIs require
+the bearer token. Use a certificate trusted by the client machine's system
+trust store—there is no insecure TLS bypass.
+
+For a managed tenant, place the matching bearer token in a root-readable,
+one-line file and switch atomically:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-vision-external luna1 \
+  --url https://vision.example.com \
+  --token-file /root/lunarvision-luna1.token
+```
+
+The command health-checks the remote instance before changing configuration,
+removes the tenant's local LunarVision unit/container, stores only the URL in
+the ports registry, updates the mode-`0600` daemon environment, and restarts the
+daemon if it is running. `start-tenant` subsequently verifies the external
+instance without trying to start a local sidecar. Return to local operation with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-vision-local luna1
+```
+
+For an unmanaged single-node daemon, set `VISION_SERVICE_URL` to the HTTPS
+origin and `VISION_AUTH_TOKEN` to the matching token before startup. The
+`vision-analyze` tool receives the URL from the host, permits only that exact
+origin's `/v1/` POST endpoints, and injects the token inside the host boundary.
+
 ### systemd and OpenRC
 
 For production multi-tenant deployments, use `ic/scripts/lunarwing-mt-admin.sh`.
-It renders systemd user Quadlets (with a supervised fallback on older Podman)
-or OpenRC health and crash-supervisor units, publishes registry-assigned API and
-health ports, recreates stale containers when image/env/port contracts change,
-and refuses a start that never becomes healthy. See `PODMAN_DEPLOYMENT.md` for
-the standalone service templates.
+Local mode renders systemd user Quadlets (with a supervised fallback on older
+Podman) or OpenRC health and crash-supervisor units, publishes registry-assigned
+API and health ports, recreates stale containers when image/env/port contracts
+change, and refuses a start that never becomes healthy. External mode uses the
+operator-managed HTTPS lifecycle described above. See `PODMAN_DEPLOYMENT.md`
+for the standalone local-service templates.
 
 ## Architecture
 
