@@ -323,11 +323,17 @@ impl Agent {
                 m
             });
 
+        // Register a mid-turn interrupt token for this thread: `/interrupt`
+        // cancels it, and the shared loop aborts any in-flight LLM stream or
+        // tool batch immediately instead of waiting for the next iteration
+        // boundary. The RAII guard unregisters on all exit paths.
+        let interrupt_registration = self.turn_interrupts.register(thread_id);
         let loop_config = AgenticLoopConfig {
             // Hard ceiling: one past force_text_at (safety net).
             max_iterations: max_tool_iterations + 1,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            interrupt_token: Some(interrupt_registration.token().clone()),
         };
 
         let outcome = crate::agent::agentic_loop::run_agentic_loop(
@@ -395,11 +401,22 @@ struct ChatDelegate<'a> {
 #[async_trait]
 impl<'a> LoopDelegate for ChatDelegate<'a> {
     async fn check_signals(&self) -> LoopSignal {
-        let sess = self.session.lock().await;
-        if let Some(thread) = sess.threads.get(&self.thread_id)
-            && thread.state == ThreadState::Interrupted
-        {
-            return LoopSignal::Stop;
+        let mut sess = self.session.lock().await;
+        if let Some(thread) = sess.threads.get_mut(&self.thread_id) {
+            if thread.state == ThreadState::Interrupted {
+                return LoopSignal::Stop;
+            }
+            // Hermes-style steer: notes queued via `/steer` while the turn is
+            // running are injected at the next iteration boundary — landing
+            // after the current tool call's results, so role alternation and
+            // the tool-calling loop stay intact.
+            if let Some(note) = thread.drain_steer_notes() {
+                return LoopSignal::InjectMessage(format!(
+                    "A steer note arrived from the user while you were working \
+                     on this task. Adjust your current course of action \
+                     accordingly; it is not a new turn:\n{note}"
+                ));
+            }
         }
         LoopSignal::Continue
     }

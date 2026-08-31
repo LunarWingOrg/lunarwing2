@@ -26,6 +26,17 @@ impl SubmissionParser {
         if lower == "/interrupt" || lower == "/stop" {
             return Submission::Interrupt;
         }
+        // Hermes-style steer: `/steer <note>` injects a mid-turn note into the
+        // running turn (delivered after the current tool call completes).
+        // The note text keeps the user's original casing.
+        if let Some(rest) = lower.strip_prefix("/steer") {
+            let note = trimmed["/steer".len()..].trim();
+            if !note.is_empty() && (rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+                return Submission::Steer {
+                    content: note.to_string(),
+                };
+            }
+        }
         if lower == "/compact" {
             return Submission::Compact;
         }
@@ -224,6 +235,14 @@ pub enum Submission {
     /// Interrupt the current turn.
     Interrupt,
 
+    /// Steer the running turn (Hermes-style): inject a mid-turn note that the
+    /// agentic loop delivers after the current tool call completes, without
+    /// starting a new turn or breaking role alternation.
+    Steer {
+        /// The note text (user's original casing).
+        content: String,
+    },
+
     /// Request context compaction.
     Compact,
 
@@ -348,6 +367,7 @@ impl Submission {
         matches!(
             self,
             Self::Interrupt
+                | Self::Steer { .. }
                 | Self::Compact
                 | Self::Undo
                 | Self::Redo
@@ -487,6 +507,35 @@ mod tests {
 
         let submission = SubmissionParser::parse("/stop");
         assert!(matches!(submission, Submission::Interrupt));
+    }
+
+    #[test]
+    fn test_parser_steer() {
+        let submission = SubmissionParser::parse("/steer focus on the tests first");
+        assert!(
+            matches!(submission, Submission::Steer { ref content } if content == "focus on the tests first")
+        );
+
+        // Case-insensitive command, note casing preserved.
+        let submission = SubmissionParser::parse("/STEER switch to Plan B");
+        assert!(
+            matches!(submission, Submission::Steer { ref content } if content == "switch to Plan B")
+        );
+
+        // Extra whitespace around the note is stripped.
+        let submission = SubmissionParser::parse("/steer    hold on  ");
+        assert!(matches!(submission, Submission::Steer { ref content } if content == "hold on"));
+
+        // Bare /steer without a note is NOT a steer submission.
+        let submission = SubmissionParser::parse("/steer");
+        assert!(!matches!(submission, Submission::Steer { .. }));
+
+        // Words that merely start with /steer must not parse as steer.
+        let submission = SubmissionParser::parse("/steering the conversation");
+        assert!(matches!(submission, Submission::UserInput { .. }));
+
+        let submission = SubmissionParser::parse("/steer test");
+        assert!(submission.is_control());
     }
 
     #[test]

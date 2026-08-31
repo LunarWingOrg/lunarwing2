@@ -7,10 +7,13 @@ pub(super) const DEFERRED_MESSAGE_LIMIT: usize = 256;
 pub(super) const MAX_PARALLEL_GATEWAY_TURNS: usize = 4;
 pub(super) const DEFERRED_QUEUE_FULL_RESPONSE: &str = "Agent is busy and its deferred message queue is full. Try again after the active turn finishes.";
 
-pub(super) fn is_priority_interrupt(message: &IncomingMessage) -> bool {
+/// Submissions that must be handled immediately rather than deferred behind
+/// the message scheduler: interrupts (abort the running turn) and steer notes
+/// (must reach the running turn, so they are useless if deferred behind it).
+pub(super) fn is_priority_control(message: &IncomingMessage) -> bool {
     matches!(
         SubmissionParser::parse(&message.content),
-        Submission::Interrupt
+        Submission::Interrupt | Submission::Steer { .. }
     )
 }
 
@@ -201,7 +204,7 @@ impl MessageScheduler {
 mod tests {
     use crate::channels::IncomingMessage;
 
-    use super::{MessageScheduler, is_priority_interrupt};
+    use super::{MessageScheduler, is_priority_control};
 
     fn message(content: &str) -> IncomingMessage {
         IncomingMessage::new("gateway", "user", content)
@@ -213,14 +216,25 @@ mod tests {
 
     #[test]
     fn only_exact_interrupt_submissions_are_priority() {
-        assert!(is_priority_interrupt(&message("/interrupt")));
-        assert!(is_priority_interrupt(&message("/stop")));
-        assert!(is_priority_interrupt(&message(" /STOP ")));
-        assert!(!is_priority_interrupt(&message("please interrupt this")));
-        assert!(!is_priority_interrupt(&message("please /stop after this")));
-        assert!(!is_priority_interrupt(&message("/interrupt later")));
-        assert!(!is_priority_interrupt(&message("/stop now")));
-        assert!(!is_priority_interrupt(&message("/clear")));
+        assert!(is_priority_control(&message("/interrupt")));
+        assert!(is_priority_control(&message("/stop")));
+        assert!(is_priority_control(&message(" /STOP ")));
+        assert!(!is_priority_control(&message("please interrupt this")));
+        assert!(!is_priority_control(&message("please /stop after this")));
+        assert!(!is_priority_control(&message("/interrupt later")));
+        assert!(!is_priority_control(&message("/stop now")));
+        assert!(!is_priority_control(&message("/clear")));
+    }
+
+    #[test]
+    fn steer_submissions_are_priority() {
+        // A steer note deferred behind the running turn would arrive after the
+        // turn ended and find nothing to steer — it must jump the queue.
+        assert!(is_priority_control(&message("/steer use the other API")));
+        assert!(is_priority_control(&message(" /STEER refocus ")));
+        assert!(!is_priority_control(&message("/steer")));
+        assert!(!is_priority_control(&message("/steering the topic")));
+        assert!(!is_priority_control(&message("please steer left")));
     }
 
     #[test]

@@ -1081,10 +1081,65 @@ impl Agent {
         match thread.state {
             ThreadState::Processing | ThreadState::AwaitingApproval => {
                 thread.interrupt();
+                // Cancel the turn's interrupt token so the agentic loop aborts
+                // any in-flight LLM stream or tool batch immediately rather
+                // than noticing the state flag at the next iteration boundary.
+                // When no token is live (e.g. awaiting approval), the state
+                // flag above remains the interrupt path.
+                if self.turn_interrupts.cancel(thread_id) {
+                    tracing::info!(%thread_id, "Mid-turn interrupt: cancelled live turn token");
+                } else {
+                    tracing::debug!(
+                        %thread_id,
+                        "Interrupt: no live turn token; relying on state flag"
+                    );
+                }
                 Ok(SubmissionResult::ok_with_message("Interrupted."))
             }
             _ => Ok(SubmissionResult::ok_with_message("Nothing to interrupt.")),
         }
+    }
+
+    /// Queue a mid-turn steer note for the running turn (Hermes-style).
+    ///
+    /// Notes are delivered by the agentic loop at the next iteration boundary,
+    /// after the current tool call's results, as an injected user message —
+    /// the running tool call is never aborted and the loop continues with the
+    /// note in context. Only meaningful while a turn is processing.
+    pub(super) async fn process_steer(
+        &self,
+        session: Arc<Mutex<Session>>,
+        thread_id: Uuid,
+        content: &str,
+    ) -> Result<SubmissionResult, Error> {
+        let mut sess = session.lock().await;
+        let thread = sess
+            .threads
+            .get_mut(&thread_id)
+            .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
+
+        if thread.state != ThreadState::Processing {
+            return Ok(SubmissionResult::ok_with_message(
+                "Nothing is running right now — send the message directly (no /steer needed).",
+            ));
+        }
+
+        if !thread.add_steer_note(content.to_string()) {
+            return Ok(SubmissionResult::error(format!(
+                "Steer note queue full ({} notes pending). \
+                 Wait for the agent to pick them up.",
+                crate::agent::session::MAX_STEER_NOTES
+            )));
+        }
+
+        tracing::info!(
+            %thread_id,
+            note_len = content.len(),
+            "Steer note queued for mid-turn injection"
+        );
+        Ok(SubmissionResult::ok_with_message(
+            "Steer note queued — the agent will see it after the current step.",
+        ))
     }
 
     pub(super) async fn process_compact(

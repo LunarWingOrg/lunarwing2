@@ -7,6 +7,9 @@
 
 use async_trait::async_trait;
 use std::borrow::Cow;
+use std::future::Future;
+
+use tokio_util::sync::CancellationToken;
 
 use crate::agent::session::PendingApproval;
 use crate::error::Error;
@@ -53,6 +56,12 @@ pub struct AgenticLoopConfig {
     pub max_iterations: usize,
     pub enable_tool_intent_nudge: bool,
     pub max_tool_intent_nudges: u32,
+    /// Optional mid-turn interrupt token. When set, cancelling it aborts an
+    /// in-flight LLM call or an in-flight tool batch immediately (the step's
+    /// future is dropped, aborting the underlying LLM stream or tool tasks)
+    /// and the loop returns [`LoopOutcome::Stopped`] instead of waiting for
+    /// the step to finish. `None` preserves turn-boundary-only interruption.
+    pub interrupt_token: Option<CancellationToken>,
 }
 
 impl Default for AgenticLoopConfig {
@@ -61,6 +70,7 @@ impl Default for AgenticLoopConfig {
             max_iterations: 50,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            interrupt_token: None,
         }
     }
 }
@@ -176,6 +186,29 @@ async fn call_llm_with_recovery(
     }
 }
 
+/// Race a loop step against the mid-turn interrupt token.
+///
+/// Returns `None` when the token is cancelled, in which case the step's
+/// future is dropped — aborting the in-flight LLM stream or tool batch
+/// (dropping a `JoinSet`-based batch aborts its tool tasks). The token branch
+/// is polled first so an already-cancelled token always wins over a step
+/// that happens to be ready in the same poll.
+async fn interruptible<T>(
+    token: Option<&CancellationToken>,
+    step: impl Future<Output = T>,
+) -> Option<T> {
+    match token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                result = step => Some(result),
+            }
+        }
+        None => Some(step.await),
+    }
+}
+
 fn log_llm_output(iteration: usize, result: &RespondResult) {
     match result {
         RespondResult::Text(text) => {
@@ -217,6 +250,18 @@ pub async fn run_agentic_loop(
     let hard_max_iterations = config.max_iterations.saturating_add(1);
 
     for iteration in 1..=hard_max_iterations {
+        // Mid-turn interrupt check at the iteration boundary. The in-flight
+        // selects below cover the LLM call and the tool batch; this covers
+        // any cancellation that landed between them.
+        if config
+            .interrupt_token
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            tracing::info!(iteration, "Turn interrupted before step start");
+            return Ok(LoopOutcome::Stopped);
+        }
+
         match delegate.check_signals().await {
             LoopSignal::Continue => {}
             LoopSignal::Stop => return Ok(LoopOutcome::Stopped),
@@ -235,16 +280,25 @@ pub async fn run_agentic_loop(
             reason_ctx.force_text = true;
         }
 
-        let output = match call_llm_with_recovery(
+        let llm_step = call_llm_with_recovery(
             delegate,
             reasoning,
             reason_ctx,
             iteration,
             iteration < hard_max_iterations,
             &mut provider_recovery_attempted,
-        )
-        .await?
-        {
+        );
+        // Race the LLM call against the mid-turn interrupt token: cancelling
+        // aborts the in-flight stream instead of waiting for it to complete.
+        let Some(llm_result) = interruptible(config.interrupt_token.as_ref(), llm_step).await
+        else {
+            tracing::info!(
+                iteration,
+                "In-flight LLM call aborted by mid-turn interrupt"
+            );
+            return Ok(LoopOutcome::Stopped);
+        };
+        let output = match llm_result? {
             LlmCallOutcome::Output(output) => output,
             LlmCallOutcome::Retry => continue,
             LlmCallOutcome::Failed(message) => return Ok(LoopOutcome::Failed(message)),
@@ -287,10 +341,20 @@ pub async fn run_agentic_loop(
                 content,
             } => {
                 consecutive_tool_intent_nudges = 0;
-                if let Some(outcome) = delegate
-                    .execute_tool_calls(tool_calls, content, reason_ctx)
-                    .await?
-                {
+                // Race the tool batch against the mid-turn interrupt token:
+                // cancelling drops the batch future, aborting in-flight tool
+                // execution instead of waiting for it to finish.
+                let exec_step = delegate.execute_tool_calls(tool_calls, content, reason_ctx);
+                let Some(exec_result) =
+                    interruptible(config.interrupt_token.as_ref(), exec_step).await
+                else {
+                    tracing::info!(
+                        iteration,
+                        "In-flight tool batch aborted by mid-turn interrupt"
+                    );
+                    return Ok(LoopOutcome::Stopped);
+                };
+                if let Some(outcome) = exec_result? {
                     return Ok(outcome);
                 }
             }
@@ -321,7 +385,7 @@ mod tests {
     use crate::llm::{LlmError, RespondOutput, TokenUsage, ToolCall, ToolDefinition};
     use crate::testing::StubLlm;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
     fn stub_reasoning() -> Reasoning {
@@ -357,6 +421,9 @@ mod tests {
     /// Configurable mock delegate for testing run_agentic_loop.
     struct MockDelegate {
         signal: Mutex<LoopSignal>,
+        /// Signal armed while a tool batch executes; `check_signals` picks it
+        /// up at the next iteration, simulating a mid-loop steer/interrupt.
+        signal_after_first_exec: Mutex<Option<LoopSignal>>,
         llm_responses: Mutex<Vec<Result<RespondOutput, Error>>>,
         tool_exec_count: AtomicUsize,
         tool_exec_outcome: Mutex<Option<LoopOutcome>>,
@@ -373,6 +440,7 @@ mod tests {
         fn with_llm_results(responses: Vec<Result<RespondOutput, Error>>) -> Self {
             Self {
                 signal: Mutex::new(LoopSignal::Continue),
+                signal_after_first_exec: Mutex::new(None),
                 llm_responses: Mutex::new(responses),
                 tool_exec_count: AtomicUsize::new(0),
                 tool_exec_outcome: Mutex::new(None),
@@ -447,6 +515,9 @@ mod tests {
             reason_ctx
                 .messages
                 .push(ChatMessage::user("tool result stub"));
+            if let Some(armed) = self.signal_after_first_exec.lock().await.take() {
+                *self.signal.lock().await = armed;
+            }
             let outcome = self.tool_exec_outcome.lock().await.take();
             Ok(outcome)
         }
@@ -706,6 +777,7 @@ mod tests {
             max_iterations: 10,
             enable_tool_intent_nudge: true,
             max_tool_intent_nudges: 2,
+            interrupt_token: None,
         };
 
         let outcome = run_agentic_loop(&delegate, &reasoning, &mut ctx, &config)
@@ -742,6 +814,226 @@ mod tests {
 
         assert!(matches!(outcome, LoopOutcome::Stopped));
         assert!(delegate.iterations_seen.lock().await.is_empty());
+    }
+
+    // --- Mid-turn interrupt (Hermes-style) regression tests ---
+
+    /// Delegate whose LLM call hangs like a stalled stream. The interrupt
+    /// token is cancelled from inside the blocked call to simulate an
+    /// interrupt arriving while the stream is mid-flight.
+    struct HungLlmDelegate {
+        token: CancellationToken,
+        llm_started: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LoopDelegate for HungLlmDelegate {
+        async fn check_signals(&self) -> LoopSignal {
+            LoopSignal::Continue
+        }
+        async fn before_llm_call(&self, _: &mut ReasoningContext, _: usize) -> Option<LoopOutcome> {
+            None
+        }
+        async fn call_llm(
+            &self,
+            _: &Reasoning,
+            _: &mut ReasoningContext,
+            _: usize,
+        ) -> Result<crate::llm::RespondOutput, crate::error::Error> {
+            self.llm_started.store(true, Ordering::SeqCst);
+            // Interrupt arrives while the "stream" is in flight.
+            self.token.cancel();
+            std::future::pending().await
+        }
+        async fn handle_text_response(&self, _: &str, _: &mut ReasoningContext) -> TextAction {
+            TextAction::Continue
+        }
+        async fn execute_tool_calls(
+            &self,
+            _: Vec<ToolCall>,
+            _: Option<String>,
+            _: &mut ReasoningContext,
+        ) -> Result<Option<LoopOutcome>, crate::error::Error> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_token_aborts_in_flight_llm_call() {
+        let token = CancellationToken::new();
+        let delegate = HungLlmDelegate {
+            token: token.clone(),
+            llm_started: AtomicBool::new(false),
+        };
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig {
+            interrupt_token: Some(token),
+            ..Default::default()
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_agentic_loop(&delegate, &reasoning, &mut ctx, &config),
+        )
+        .await
+        .expect("interrupt must unblock the loop from a hung LLM call")
+        .unwrap();
+
+        assert!(delegate.llm_started.load(Ordering::SeqCst));
+        assert!(
+            matches!(outcome, LoopOutcome::Stopped),
+            "mid-stream interrupt must surface as Stopped"
+        );
+    }
+
+    /// Delegate whose tool batch hangs mid-execution. The interrupt token is
+    /// cancelled from inside the batch to simulate an interrupt arriving
+    /// during tool execution.
+    struct HungToolDelegate {
+        token: CancellationToken,
+        tools_started: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LoopDelegate for HungToolDelegate {
+        async fn check_signals(&self) -> LoopSignal {
+            LoopSignal::Continue
+        }
+        async fn before_llm_call(&self, _: &mut ReasoningContext, _: usize) -> Option<LoopOutcome> {
+            None
+        }
+        async fn call_llm(
+            &self,
+            _: &Reasoning,
+            _: &mut ReasoningContext,
+            _: usize,
+        ) -> Result<crate::llm::RespondOutput, crate::error::Error> {
+            Ok(tool_calls_output(vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "slow_tool".to_string(),
+                arguments: serde_json::json!({}),
+                reasoning: None,
+            }]))
+        }
+        async fn handle_text_response(&self, _: &str, _: &mut ReasoningContext) -> TextAction {
+            TextAction::Continue
+        }
+        async fn execute_tool_calls(
+            &self,
+            _: Vec<ToolCall>,
+            _: Option<String>,
+            _: &mut ReasoningContext,
+        ) -> Result<Option<LoopOutcome>, crate::error::Error> {
+            self.tools_started.store(true, Ordering::SeqCst);
+            // Interrupt arrives while the tool batch is in flight.
+            self.token.cancel();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_token_aborts_in_flight_tool_execution() {
+        let token = CancellationToken::new();
+        let delegate = HungToolDelegate {
+            token: token.clone(),
+            tools_started: AtomicBool::new(false),
+        };
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig {
+            interrupt_token: Some(token),
+            ..Default::default()
+        };
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_agentic_loop(&delegate, &reasoning, &mut ctx, &config),
+        )
+        .await
+        .expect("interrupt must unblock the loop from a hung tool batch")
+        .unwrap();
+
+        assert!(delegate.tools_started.load(Ordering::SeqCst));
+        assert!(
+            matches!(outcome, LoopOutcome::Stopped),
+            "mid-tool interrupt must surface as Stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_token_stops_before_llm_call() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let delegate = MockDelegate::new(vec![text_output("unreachable")]);
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig {
+            interrupt_token: Some(token),
+            ..Default::default()
+        };
+
+        let outcome = run_agentic_loop(&delegate, &reasoning, &mut ctx, &config)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, LoopOutcome::Stopped));
+        assert_eq!(
+            delegate.llm_responses.lock().await.len(),
+            1,
+            "LLM must not be called after an already-fired interrupt"
+        );
+    }
+
+    /// A steer-style injected message queued by the delegate while a tool
+    /// batch runs must arrive at the next iteration boundary — after the
+    /// tool results — and preserve message ordering.
+    #[tokio::test]
+    async fn steer_injection_arrives_after_tool_results() {
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+        };
+        let delegate = MockDelegate::new(vec![
+            tool_calls_output(vec![tool_call]),
+            text_output("Steered answer"),
+        ]);
+        // Arm the steer-style injection in MockDelegate::execute_tool_calls:
+        // check_signals takes the held signal each iteration, so seeding an
+        // InjectMessage directly would fire before the first LLM call. Arming
+        // it during the tool batch lands it at the iteration boundary right
+        // after the tool results — the steer contract.
+        *delegate.signal_after_first_exec.lock().await = Some(LoopSignal::InjectMessage(
+            "steer: switch to plan B".to_string(),
+        ));
+        let reasoning = stub_reasoning();
+        let mut ctx = ReasoningContext::new();
+        let config = AgenticLoopConfig::default();
+
+        let outcome = run_agentic_loop(&delegate, &reasoning, &mut ctx, &config)
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, LoopOutcome::Response(ref t) if t == "Steered answer"));
+        let roles: Vec<(&crate::llm::Role, &str)> = ctx
+            .messages
+            .iter()
+            .map(|m| (&m.role, m.content.as_str()))
+            .collect();
+        let tool_result_pos = roles
+            .iter()
+            .position(|(_, c)| c.contains("tool result stub"))
+            .expect("tool result recorded");
+        let steer_pos = roles
+            .iter()
+            .position(|(_, c)| c.contains("steer: switch to plan B"))
+            .expect("steer note injected");
+        assert!(
+            steer_pos > tool_result_pos,
+            "steer note must arrive after the current tool call completes"
+        );
     }
 
     #[test]
