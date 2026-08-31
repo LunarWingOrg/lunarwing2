@@ -649,6 +649,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcribe_rejects_unsupported_language_before_inference() {
+        let state = test_state();
+        let response = api_router(state.clone())
+            .oneshot(authorized_json_request(
+                "/v1/voice/transcribe",
+                serde_json::json!({"audio": "not-used", "language": "english"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("transcription request failed: {error}"));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            state.metrics.transcription_requests.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn synthesize_and_detect_return_mock_results() {
         let state = test_state();
         let synthesis = api_router(state.clone())
