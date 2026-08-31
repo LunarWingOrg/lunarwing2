@@ -2907,11 +2907,9 @@ mod tests {
                 let thread = sess
                     .threads
                     .get_mut(&self.thread_id)
-                    .expect("thread exists");
-                assert!(
-                    thread.add_steer_note(STEER_MARKER.to_string()),
-                    "steer slot must accept the note"
-                );
+                    .expect("thread exists"); // safety: test-only provider in #[cfg(test)] module
+                let accepted = thread.add_steer_note(STEER_MARKER.to_string());
+                assert!(accepted); // safety: test-only assertion in #[cfg(test)] module
             }
             {
                 let mut log = self.capture.log.lock().unwrap_or_else(|e| e.into_inner());

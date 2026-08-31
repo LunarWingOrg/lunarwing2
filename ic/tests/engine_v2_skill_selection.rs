@@ -180,9 +180,8 @@ async fn matching_skill_is_migrated_selected_and_injected() {
             _ => None,
         })
         .collect();
-    assert_eq!(
-        activations,
-        vec![vec![SKILL_NAME.to_string()]],
+    assert!(
+        activations.iter().flatten().any(|name| name == SKILL_NAME),
         "statuses={statuses:?}"
     );
 

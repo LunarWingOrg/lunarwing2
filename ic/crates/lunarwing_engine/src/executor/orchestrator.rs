@@ -739,8 +739,13 @@ async fn handle_llm_complete(
     // open provider stream. Do not fabricate an `LlmStreamChunk::Done`.
     let stream_result = cancellation
         .run_until_cancelled(async {
-            let stream = llm.complete_stream(&messages, &actions, &config).await?;
-            collect_llm_stream(stream, |content| {
+            let stream = match llm.complete_stream(&messages, &actions, &config).await {
+                Ok(stream) => stream,
+                Err(error) => return (Err(error), false),
+            };
+            let mut emitted_text = false;
+            let result = collect_llm_stream(stream, |content| {
+                emitted_text = true;
                 let Some(tx) = event_tx else {
                     return;
                 };
@@ -752,13 +757,18 @@ async fn handle_llm_complete(
                 );
                 let _ = tx.send(event);
             })
-            .await
+            .await;
+            (result, emitted_text)
         })
         .await;
 
     match stream_result {
-        Some(Ok(output)) => LlmHostCallOutcome::Finished(llm_output_result(output, total_tokens)),
-        Some(Err(error)) => LlmHostCallOutcome::Finished(llm_error_result(error)),
+        Some((Ok(output), _)) => {
+            LlmHostCallOutcome::Finished(llm_output_result(output, total_tokens))
+        }
+        Some((Err(error), emitted_text)) => {
+            LlmHostCallOutcome::Finished(llm_error_result(error, !emitted_text))
+        }
         None => LlmHostCallOutcome::Cancelled,
     }
 }
@@ -802,7 +812,7 @@ fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFun
     ExtFunctionResult::Return(json_to_monty(&result))
 }
 
-fn llm_error_result(error: EngineError) -> ExtFunctionResult {
+fn llm_error_result(error: EngineError, retry_safe: bool) -> ExtFunctionResult {
     let kind = match error {
         EngineError::Llm { kind, .. } => kind,
         _ => ModelFailureKind::Internal,
@@ -811,7 +821,7 @@ fn llm_error_result(error: EngineError) -> ExtFunctionResult {
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
         "type": "model_error",
         "kind": kind.as_str(),
-        "recoverable": kind.is_recoverable(),
+        "recoverable": retry_safe && kind.is_recoverable(),
         "instruction": kind.recovery_instruction(),
         "terminal_message": kind.terminal_message(),
     })))
