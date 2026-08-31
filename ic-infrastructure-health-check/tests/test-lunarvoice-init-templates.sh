@@ -6,6 +6,7 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SYSTEMD_DIRECT="$ROOT_DIR/projects/voice-sidecar/systemd/voice-sidecar.service"
 OPENRC="$ROOT_DIR/projects/voice-sidecar/init.d/voice-sidecar"
 COMPOSE="$ROOT_DIR/projects/voice-sidecar/compose.yaml"
+DOCKERFILE="$ROOT_DIR/projects/voice-sidecar/Dockerfile"
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/lunarvoice-init-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -49,6 +50,12 @@ assert_contains "$SYSTEMD_DIRECT" 'ProtectSystem=strict' \
     "direct systemd unit keeps the filesystem read-only"
 assert_contains "$SYSTEMD_DIRECT" 'ReadOnlyPaths=/var/lib/lunarvoice/models' \
     "direct systemd unit mounts the model store read-only"
+assert_contains "$SYSTEMD_DIRECT" 'Environment=VOICE_MODEL_DIR=/var/lib/lunarvoice/models' \
+    "direct systemd unit points LunarVoice at its model store"
+assert_contains "$SYSTEMD_DIRECT" '/health" && /usr/bin/curl' \
+    "direct systemd startup checks liveness before readiness"
+assert_contains "$SYSTEMD_DIRECT" '/ready"; do sleep 1; done' \
+    "direct systemd startup waits for STT readiness"
 assert_contains "$SYSTEMD_DIRECT" 'Restart=on-failure' \
     "direct systemd unit restarts on failure"
 assert_contains "$SYSTEMD_DIRECT" 'StartLimitIntervalSec=300' \
@@ -93,8 +100,18 @@ assert_contains "$COMPOSE" 'no-new-privileges:true' \
     "compose enables no-new-privileges"
 assert_contains "$COMPOSE" 'http://127.0.0.1:8091/health' \
     "compose health-checks the dedicated listener"
+assert_contains "$COMPOSE" 'http://127.0.0.1:8091/ready' \
+    "compose health-checks STT readiness"
+assert_contains "$COMPOSE" 'start_period: 60s' \
+    "compose allows cold model startup"
 assert_absent "$COMPOSE" 'VOICE_AUTH_TOKEN=' \
     "compose embeds no auth token"
+assert_contains "$DOCKERFILE" 'http://127.0.0.1:8091/health' \
+    "image health-checks process liveness"
+assert_contains "$DOCKERFILE" 'http://127.0.0.1:8091/ready' \
+    "image health-checks STT readiness"
+assert_contains "$DOCKERFILE" '--start-period=60s' \
+    "image allows cold model startup"
 
 # OpenRC static contract.
 assert_contains "$OPENRC" 'supervisor="supervise-daemon"' \
@@ -103,8 +120,12 @@ assert_contains "$OPENRC" 'command_user="${voice_user}:${voice_group}"' \
     "OpenRC runs the daemon as the service account"
 assert_contains "$OPENRC" 'environment file must have mode 0600' \
     "OpenRC validates secret env mode"
-assert_contains "$OPENRC" 'http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}/health' \
-    "OpenRC startup gates on the dedicated health listener"
+assert_contains "$OPENRC" 'http://127.0.0.1:${VOICE_HEALTH_PORT:-8091}' \
+    "OpenRC startup uses the configured health listener"
+assert_contains "$OPENRC" '"${base}/health"' \
+    "OpenRC startup gates on process liveness"
+assert_contains "$OPENRC" '"${base}/ready"' \
+    "OpenRC startup gates on STT readiness"
 assert_absent "$OPENRC" 'VOICE_AUTH_TOKEN=' \
     "OpenRC unit embeds no auth token"
 
@@ -132,7 +153,11 @@ checkpath() { printf 'checkpath:%s\n' "$*" >>"$CALL_LOG"; }
 eerror() { printf 'eerror:%s\n' "$*" >>"$CALL_LOG"; }
 ebegin() { printf 'ebegin:%s\n' "$*" >>"$CALL_LOG"; }
 eend() { printf 'eend:%s\n' "$*" >>"$CALL_LOG"; return "${1:-0}"; }
-curl() { printf 'curl:%s\n' "$*" >>"$CALL_LOG"; [[ "${MOCK_CURL_FAIL:-false}" != true ]]; }
+curl() {
+    printf 'curl:%s\n' "$*" >>"$CALL_LOG"
+    [[ "${MOCK_CURL_FAIL:-false}" != true ]] || return 1
+    [[ "${MOCK_READY_FAIL:-false}" != true || "${*: -1}" != */ready ]]
+}
 
 if start_pre; then
     ok "OpenRC start_pre accepts valid mode-0600 env"
@@ -149,15 +174,17 @@ else
 fi
 assert_log_contains 'curl:--fail --silent --output /dev/null --max-time 3 http://127.0.0.1:9999/health' \
     "OpenRC post-start probes the env-configured health port"
+assert_log_contains 'curl:--fail --silent --output /dev/null --max-time 3 http://127.0.0.1:9999/ready' \
+    "OpenRC post-start probes STT readiness"
 
 : >"$CALL_LOG"
-if MOCK_CURL_FAIL=true start_post >/dev/null 2>&1; then
-    bad "OpenRC start_post fails when sidecar never healthy" "unhealthy sidecar accepted"
+if MOCK_READY_FAIL=true start_post >/dev/null 2>&1; then
+    bad "OpenRC start_post fails when STT remains unready" "unready sidecar accepted"
 else
-    ok "OpenRC start_post fails when sidecar never healthy"
+    ok "OpenRC start_post fails when STT remains unready"
 fi
-assert_log_contains "eend:1 not healthy after 2s" \
-    "OpenRC post-start explains the health failure"
+assert_log_contains "eend:1 not ready after 2s" \
+    "OpenRC post-start explains the readiness failure"
 
 chmod 0644 "$ENV_FILE"
 : >"$CALL_LOG"
