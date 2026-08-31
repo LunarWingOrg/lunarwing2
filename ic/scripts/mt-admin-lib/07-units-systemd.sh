@@ -33,6 +33,20 @@ _remove_vision_systemd_fallback() {
   rm -f -- "$path"
 }
 
+remove_vision_systemd_assets() {
+  local name="$1" container="lunarwing-vision-${1}" qfile
+  qfile="$(tenant_quadlet_dir "$name")/${container}.container"
+  _systemctl_user "$name" stop "${container}.service" >/dev/null 2>&1 || true
+  _remove_vision_systemd_fallback "$name" || return 1
+  if [[ -e "$qfile" || -L "$qfile" ]]; then
+    [[ -f "$qfile" && ! -L "$qfile" ]] \
+      || { say "ERROR: refusing to remove unsafe LunarVision Quadlet $qfile" >&2; return 1; }
+    rm -f -- "$qfile"
+  fi
+  rm -f -- "$(_hash_dir "$name")/${container}.hash"
+  _systemctl_user "$name" daemon-reload >/dev/null 2>&1 || true
+}
+
 render_vision_systemd_fallback_unit() {
   local name="$1" container="lunarwing-vision-${1}" unit_dir path tmp runtime_bin babysitter home uid
   unit_dir="$(tenant_home "$name")/.config/systemd/user"
@@ -154,6 +168,10 @@ EOF
 
 render_vision_systemd_assets() {
   local name="$1" container qfile fallback has_quadlet=false has_fallback=false
+  if tenant_vision_external "$name"; then
+    remove_vision_systemd_assets "$name"
+    return
+  fi
   ensure_container_runtime
   [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] || return 0
   container="lunarwing-vision-${name}"
