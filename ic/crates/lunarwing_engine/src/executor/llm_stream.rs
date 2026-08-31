@@ -11,6 +11,7 @@ struct StreamAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     usage: TokenUsage,
+    finish_reason: String,
     saw_done: bool,
 }
 
@@ -62,9 +63,10 @@ impl StreamAccumulator {
             }
             LlmStreamChunk::Done {
                 usage,
-                finish_reason: _,
+                finish_reason,
             } => {
                 self.usage = usage.unwrap_or_default();
+                self.finish_reason = finish_reason;
                 self.saw_done = true;
             }
         }
@@ -91,6 +93,7 @@ impl StreamAccumulator {
         Ok(LlmOutput {
             response,
             usage: self.usage,
+            finish_reason: self.finish_reason,
         })
     }
 }
@@ -199,6 +202,7 @@ mod tests {
         let output = result.expect("valid text stream should collect");
         assert_eq!(deltas, vec!["hel", "lo"]);
         assert_eq!(output.usage, usage);
+        assert_eq!(output.finish_reason, "stop");
         assert!(matches!(output.response, LlmResponse::Text(text) if text == "hello"));
     }
 
@@ -384,6 +388,7 @@ mod tests {
                     output_tokens: 2,
                     ..TokenUsage::default()
                 },
+                finish_reason: "stop".to_string(),
             })
         }
 
@@ -407,6 +412,7 @@ mod tests {
         assert_eq!(deltas, vec!["fallback text"]);
         assert_eq!(output.usage.input_tokens, 5);
         assert_eq!(output.usage.output_tokens, 2);
+        assert_eq!(output.finish_reason, "stop");
         assert!(matches!(
             output.response,
             LlmResponse::Text(text) if text == "fallback text"
