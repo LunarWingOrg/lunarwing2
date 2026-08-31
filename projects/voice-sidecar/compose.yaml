@@ -14,11 +14,11 @@ services:
     volumes:
       - voice_models:/models
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8091/health"]
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8091/health >/dev/null && curl -fsS http://127.0.0.1:8091/ready >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 60s
     restart: unless-stopped
 
 volumes:
