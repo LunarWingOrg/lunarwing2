@@ -1,0 +1,22 @@
+[package]
+name = "rental"
+version = "0.5.6"
+license = "MIT/Apache-2.0"
+authors = ["Jameson Ernst <jameson@jpernst.com>"]
+description = "A macro to generate safe self-referential structs, plus premade types for common use cases."
+readme = "README.md"
+keywords = ["lifetime", "ownership", "borrowing", "self", "reference"]
+categories = ["rust-patterns", "no-std"]
+repository = "https://github.com/jpernst/rental"
+documentation = "https://docs.rs/rental"
+
+[workspace]
+members = ["rental-impl"]
+
+[features]
+default = ["std"]
+std = ["stable_deref_trait/std"]
+
+[dependencies]
+rental-impl = { version = "=0.5.5", path = "rental-impl" }
+stable_deref_trait = { version = "1.0.0", default-features = false }

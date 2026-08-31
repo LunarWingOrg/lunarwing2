@@ -1,0 +1,29 @@
+[package]
+name = "kuchikikiki"
+version = "0.9.1"
+authors = [
+  "mwbot-rs Authors",
+  "xtex <xtex@cnuser.wiki>",
+  "Brave Authors",
+  "Ralph Giles <rgiles@brave.com>",
+  "Simon Sapin <simon.sapin@exyr.org>",
+]
+license = "MIT"
+description = "HTML tree manipulation library"
+repository = "https://github.com/xtexx/kuchikikiki"
+edition = "2024"
+
+[lib]
+name = "kuchikikiki"
+
+[dependencies]
+cssparser = "0.36.0"
+html5ever = "0.36.1"
+selectors = "0.33"
+indexmap = "2.12.1"
+precomputed-hash = "0.1.1"
+crc = "3.3.0"
+bitflags = "2.10.0"
+
+[dev-dependencies]
+tempfile = "=3.23.0"

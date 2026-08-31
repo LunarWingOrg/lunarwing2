@@ -1,0 +1,10 @@
+# Offline builds: all crates.io dependencies are vendored into ic/vendor/.
+# After this replacement, cargo resolves crates.io exclusively from the local
+# vendor directory — `cargo update`/`cargo build`/`cargo check` no longer
+# touch crates.io for the ic workspace (or any satellite manifest under ic/).
+# Regenerate the vendor dir with ic/scripts/refresh-vendor.sh.
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor/"

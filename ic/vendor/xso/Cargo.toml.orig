@@ -1,0 +1,39 @@
+[package]
+name = "xso"
+version = "0.4.0"
+edition = "2021"
+description = "XML Streamed Objects: similar to serde, but XML-native."
+homepage = "https://xmpp.rs"
+repository = "https://gitlab.com/xmpp-rs/xmpp-rs"
+keywords = ["xmpp", "xml", "serialization"]
+categories = ["encoding"]
+license = "MPL-2.0"
+
+[dependencies]
+bytes = { version = "1" }
+rxml = { version = "0.14.0", default-features = false }
+minidom = { version = "0.19", path = "../minidom" }
+xso_proc = { version = "0.3", path = "../xso-proc", optional = true }
+
+# optional dependencies to provide text conversion to/from types from/using
+# these crates
+# NOTE: because we don't have public/private dependencies yet and cargo
+# defaults to picking the highest matching version by default, the only
+# sensible thing we can do here is to depend on the least version of the most
+# recent semver of each crate.
+jid = { version = "0.12", path = "../jid", optional = true }
+uuid = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+serde_json = { version = "1.0", optional = true, default-features = false, features = ["alloc"] }
+
+[features]
+default = [ "std" ]
+macros = [ "dep:xso_proc", "rxml/macros" ]
+minidom = [ "xso_proc/minidom"]
+panicking-into-impl = ["xso_proc/panicking-into-impl"]
+pedantic = []
+std = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
