@@ -1203,6 +1203,17 @@ install_wasm_tenant() {
       continue
     fi
 
+    # Honor the enable_darkirc tenant flag: without --enable-darkirc the
+    # tenant has no darkirc adapter, and installing the channel anyway starts
+    # a 3s poll loop against a nonexistent default adapter (log-flooding
+    # connect errors). Skip installing it and drop stale artifacts.
+    if [[ "$ch_name" == "darkirc" ]] && ! tenant_darkirc_enabled "$name"; then
+      rm -f "$dest_wasm" "$caps_dest"
+      skipped=$((skipped + 1))
+      say "  skipping channel: darkirc (tenant darkirc disabled)"
+      continue
+    fi
+
     if [[ "$has_wasm_tools" == "true" ]]; then
       "$wasm_tools" component new "$src_wasm" -o "$dest_wasm" 2>/dev/null \
         || cp "$src_wasm" "$dest_wasm"
