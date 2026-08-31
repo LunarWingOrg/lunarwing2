@@ -54,6 +54,23 @@ else
     jq -e 'type == "object" and ((.tenants // {}) | type == "object")' \
       "$registry" >/dev/null 2>&1 \
       || discovery_error "ports registry is not valid tenant JSON"
+    invalid_flags="$(jq -r '
+      (.tenants // {}) | to_entries[]
+      | select(
+          (.value | type) != "object"
+          or (
+            (.value | type) == "object"
+            and (.value | has("enable_voice"))
+            and (.value.enable_voice | type) != "boolean"
+          )
+        )
+      | .key
+    ' "$registry" 2>/dev/null)" \
+      || discovery_error "failed to inspect LunarVoice enablement flags"
+    if [[ -n "$invalid_flags" ]]; then
+      invalid_flags="$(paste -sd, <<<"$invalid_flags")"
+      discovery_error "tenant has invalid enable_voice state: $invalid_flags"
+    fi
     invalid_tenants="$(jq -r '
       def valid_port:
         type == "number" and . == floor and . >= 1 and . <= 65535;
