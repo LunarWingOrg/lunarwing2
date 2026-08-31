@@ -188,12 +188,21 @@ impl IntoResponse for ApiError {
 }
 
 pub fn api_router(state: AppState) -> Router {
-    let body_limit = state.config.max_body_bytes();
+    let audio_body_limit = state.config.max_body_bytes();
+    let text_body_limit = state.config.max_text_body_bytes();
     Router::new()
-        .route("/v1/voice/transcribe", post(transcribe))
-        .route("/v1/voice/synthesize", post(synthesize))
-        .route("/v1/voice/detect", post(detect))
-        .layer(DefaultBodyLimit::max(body_limit))
+        .route(
+            "/v1/voice/transcribe",
+            post(transcribe).layer(DefaultBodyLimit::max(audio_body_limit)),
+        )
+        .route(
+            "/v1/voice/synthesize",
+            post(synthesize).layer(DefaultBodyLimit::max(text_body_limit)),
+        )
+        .route(
+            "/v1/voice/detect",
+            post(detect).layer(DefaultBodyLimit::max(audio_body_limit)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             authorize_api_request,
@@ -359,9 +368,14 @@ async fn authorize_api_request(
     }
     if state.limiter.check().is_err() {
         state.metrics.rate_limited.fetch_add(1, Ordering::Relaxed);
+        state.metrics.errors.fetch_add(1, Ordering::Relaxed);
         return Err(ApiError::RateLimited);
     }
-    Ok(next.run(request).await)
+    let response = next.run(request).await;
+    if response.status().is_client_error() || response.status().is_server_error() {
+        state.metrics.errors.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(response)
 }
 
 fn authorized(headers: &HeaderMap, expected: Option<&SecretString>) -> bool {
@@ -532,8 +546,8 @@ mod tests {
         }
     }
 
-    fn test_state() -> AppState {
-        let config = Config {
+    fn test_config() -> Config {
+        Config {
             bind_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 8090,
             health_port: 8091,
@@ -568,8 +582,30 @@ mod tests {
             enable_tts: true,
             require_stt: true,
             num_threads: 1,
-        };
-        AppState::new(Arc::new(config), Arc::new(MockEngine))
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::new(Arc::new(test_config()), Arc::new(MockEngine))
+    }
+
+    fn authorized_json_request(path: &str, body: impl Into<Body>) -> Request<Body> {
+        Request::post(path)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-token")
+            .body(body.into())
+            .unwrap_or_else(|error| panic!("failed to construct test request: {error}"))
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("failed to collect response body: {error}"))
+            .to_bytes();
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|error| panic!("response was not JSON: {error}"))
     }
 
     #[tokio::test]
@@ -608,6 +644,139 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["text"], "hello herd");
         assert_eq!(body["model"], "mock");
+    }
+
+    #[tokio::test]
+    async fn synthesize_and_detect_return_mock_results() {
+        let state = test_state();
+        let synthesis = api_router(state.clone())
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                serde_json::json!({"text": "hello herd"}).to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("synthesis request failed: {error}"));
+        assert_eq!(synthesis.status(), StatusCode::OK);
+        let synthesis = response_json(synthesis).await;
+        assert_eq!(synthesis["format"], "wav");
+        assert_eq!(synthesis["voice"], "af_heart");
+        assert_eq!(synthesis["duration_ms"], 10);
+
+        let wav = encode_wav(&vec![0.0; 160], 16_000);
+        let detection = api_router(state)
+            .oneshot(authorized_json_request(
+                "/v1/voice/detect",
+                serde_json::json!({
+                    "audio": base64::engine::general_purpose::STANDARD.encode(wav),
+                    "format": "wav"
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("detection request failed: {error}"));
+        assert_eq!(detection.status(), StatusCode::OK);
+        let detection = response_json(detection).await;
+        assert_eq!(detection["has_speech"], true);
+        assert_eq!(detection["segments"][0]["end_ms"], 10);
+    }
+
+    #[tokio::test]
+    async fn api_metrics_count_auth_parse_and_cache_outcomes() {
+        let state = test_state();
+        let router = api_router(state.clone());
+        let unauthorized = router
+            .clone()
+            .oneshot(
+                Request::post("/v1/voice/transcribe")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap_or_else(|error| panic!("failed to construct test request: {error}")),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("unauthorized request failed: {error}"));
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let malformed = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/transcribe",
+                Body::from("{"),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("malformed request failed: {error}"));
+        assert!(malformed.status().is_client_error());
+
+        let wav = encode_wav(&vec![0.0; 160], 16_000);
+        let body = serde_json::json!({
+            "audio": base64::engine::general_purpose::STANDARD.encode(wav),
+            "format": "wav"
+        })
+        .to_string();
+        for _ in 0..2 {
+            let response = router
+                .clone()
+                .oneshot(authorized_json_request(
+                    "/v1/voice/transcribe",
+                    body.clone(),
+                ))
+                .await
+                .unwrap_or_else(|error| panic!("transcription request failed: {error}"));
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(state.metrics.total_requests.load(Ordering::Relaxed), 4);
+        assert_eq!(state.metrics.errors.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            state.metrics.transcription_requests.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(state.metrics.cache_hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn synthesis_body_limit_is_route_specific_and_observable() {
+        let state = test_state();
+        let text = "x".repeat(state.config.max_text_body_bytes());
+        let body = serde_json::json!({"text": text}).to_string();
+        assert!(body.len() > state.config.max_text_body_bytes());
+        assert!(body.len() < state.config.max_body_bytes());
+
+        let response = api_router(state.clone())
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                Body::from(body),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("oversized synthesis request failed: {error}"));
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(state.metrics.total_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_rejections_update_operational_metrics() {
+        let mut config = test_config();
+        config.rate_limit_per_second = 1;
+        let state = AppState::new(Arc::new(config), Arc::new(MockEngine));
+        let router = api_router(state.clone());
+        let body = serde_json::json!({"text": "hello"}).to_string();
+        let first = router
+            .clone()
+            .oneshot(authorized_json_request(
+                "/v1/voice/synthesize",
+                body.clone(),
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("first synthesis request failed: {error}"));
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = router
+            .oneshot(authorized_json_request("/v1/voice/synthesize", body))
+            .await
+            .unwrap_or_else(|error| panic!("second synthesis request failed: {error}"));
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(state.metrics.total_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(state.metrics.rate_limited.load(Ordering::Relaxed), 1);
+        assert_eq!(state.metrics.errors.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
