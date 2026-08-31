@@ -129,18 +129,18 @@ fn scoped_service_target(service_url: &str) -> Option<ScopedServiceTarget> {
     })
 }
 
-fn scope_vision_http_capability(capabilities: &mut Capabilities, service_url: &str) {
-    let Some(target) = scoped_service_target(service_url) else {
-        return;
-    };
-    let Some(http) = capabilities.http.as_mut() else {
-        return;
-    };
+fn scope_vision_http_capability(
+    capabilities: &mut Capabilities,
+    service_url: &str,
+) -> Option<ScopedServiceTarget> {
+    let target = scoped_service_target(service_url)?;
+    let http = capabilities.http.as_mut()?;
     http.allowlist = vec![
-        EndpointPattern::host(target.host)
+        EndpointPattern::host(target.host.clone())
             .with_path_prefix("/v1/")
             .with_methods(vec!["POST".to_string()]),
     ];
+    Some(target)
 }
 
 /// Host-owned Bearer credential scoped to one configured service origin.
@@ -181,6 +181,17 @@ fn url_matches_scoped_prefix(request_url: &str, allowed_prefix: &str) -> bool {
         return false;
     };
     request.origin() == allowed.origin() && request.path().starts_with(allowed.path())
+}
+
+fn enforce_scoped_http_target(
+    request_url: &str,
+    allowed_prefix: Option<&str>,
+) -> Result<(), String> {
+    if allowed_prefix.is_none_or(|prefix| url_matches_scoped_prefix(request_url, prefix)) {
+        Ok(())
+    } else {
+        Err("HTTP request does not match the host-configured service origin".to_string())
+    }
 }
 
 const GITLAB_CONFIG_PATH: &str = "config/gitlab.json";
@@ -270,6 +281,8 @@ struct StoreData {
     /// Pre-resolved credentials for automatic host-based injection.
     /// Applied by matching URL host against each credential's host_patterns.
     host_credentials: Vec<ResolvedHostCredential>,
+    /// Exact host-configured origin/path scope for built-in service clients.
+    scoped_http_prefix: Option<String>,
     /// Dedicated tokio runtime for HTTP requests, lazily initialized.
     /// Reused across multiple `http_request` calls within one execution.
     http_runtime: Option<tokio::runtime::Runtime>,
@@ -299,6 +312,7 @@ impl StoreData {
             table: ResourceTable::new(),
             credentials,
             host_credentials,
+            scoped_http_prefix: None,
             http_runtime: None,
             http_interceptor: None,
             ssh_bridge: Arc::new(std::sync::OnceLock::new()),
@@ -487,6 +501,7 @@ impl lunarwing::agent::host::Host for StoreData {
     ) -> Result<lunarwing::agent::host::HttpResponse, String> {
         // Inject credentials into URL (e.g., replace {XMPP_PASSWORD})
         let injected_url = self.inject_credentials(&url, "url");
+        enforce_scoped_http_target(&injected_url, self.scoped_http_prefix.as_deref())?;
 
         // Check HTTP allowlist
         self.host_state
@@ -888,6 +903,8 @@ pub struct WasmToolWrapper {
     /// Host-owned credential for canonical local sidecars. Never serialized
     /// into WASM context; converted to request headers inside host boundary.
     scoped_bearer_credential: Option<ScopedBearerCredential>,
+    /// Exact origin and versioned path selected by host configuration.
+    scoped_http_prefix: Option<String>,
     /// Secrets store for resolving host-based credential injection.
     /// Used in execute() to pre-decrypt secrets before WASM runs.
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
@@ -1170,13 +1187,19 @@ impl WasmToolWrapper {
             )),
             _ => None,
         };
-        if matches!(
+        let scoped_http_prefix = if matches!(
             prepared.name.as_str(),
             "vision-analyze" | "vision-analyze-tool"
-        ) && let Some((service_url, _)) = service.as_ref()
-        {
-            scope_vision_http_capability(&mut capabilities, service_url);
-        }
+        ) {
+            service
+                .as_ref()
+                .and_then(|(service_url, _)| {
+                    scope_vision_http_capability(&mut capabilities, service_url)
+                })
+                .map(|target| target.endpoint_prefix)
+        } else {
+            None
+        };
         let scoped_bearer_credential = service.and_then(|(service_url, token_var)| {
             crate::config::env_or_override(token_var).and_then(|token| {
                 ScopedBearerCredential::new(&service_url, SecretString::from(token))
@@ -1191,6 +1214,7 @@ impl WasmToolWrapper {
             capabilities,
             credentials: HashMap::new(),
             scoped_bearer_credential,
+            scoped_http_prefix,
             secrets_store: None,
             oauth_refresh: None,
             http_interceptor: None,
@@ -1325,6 +1349,7 @@ impl WasmToolWrapper {
             self.credentials.clone(),
             host_credentials,
         );
+        store_data.scoped_http_prefix = self.scoped_http_prefix.clone();
         store_data.http_interceptor = self.http_interceptor.clone();
         store_data.ssh_bridge = Arc::clone(&self.ssh_bridge);
         let mut store = Store::new(engine, store_data);
@@ -1597,6 +1622,7 @@ impl Tool for WasmToolWrapper {
         let description = self.description.clone();
         let schemas = self.schemas.clone();
         let credentials = self.credentials.clone();
+        let scoped_http_prefix = self.scoped_http_prefix.clone();
         // Arc<OnceLock> — clone into the blocking task (do NOT null it like
         // secrets_store); by run time the daemon has populated the slot.
         let ssh_bridge = Arc::clone(&self.ssh_bridge);
@@ -1611,6 +1637,7 @@ impl Tool for WasmToolWrapper {
                 schemas,
                 credentials,
                 scoped_bearer_credential: None,
+                scoped_http_prefix,
                 secrets_store: None, // Not needed in blocking task
                 oauth_refresh: None, // Already used above for pre-refresh
                 http_interceptor: self.http_interceptor.clone(),
@@ -2953,13 +2980,33 @@ mod tests {
         use crate::tools::wasm::capabilities::HttpCapability;
         use crate::tools::wasm::host::HostState;
         use crate::tools::wasm::wrapper::{
-            ScopedBearerCredential, StoreData, scope_vision_http_capability,
+            ScopedBearerCredential, StoreData, enforce_scoped_http_target,
+            scope_vision_http_capability,
         };
         use secrecy::SecretString;
         use std::collections::HashMap;
 
         let mut capabilities = Capabilities::default().with_http(HttpCapability::default());
-        scope_vision_http_capability(&mut capabilities, "https://Vision.Example.com:8443");
+        let target =
+            scope_vision_http_capability(&mut capabilities, "https://Vision.Example.com:8443")
+                .expect("valid external vision target");
+        assert!(
+            enforce_scoped_http_target(
+                "https://vision.example.com:8443/v1/vision/analyze",
+                Some(&target.endpoint_prefix),
+            )
+            .is_ok()
+        );
+        for denied_url in [
+            "https://vision.example.com/v1/vision/analyze",
+            "http://vision.example.com:8443/v1/vision/analyze",
+            "https://vision.example.com:8443/vision/analyze",
+        ] {
+            assert!(
+                enforce_scoped_http_target(denied_url, Some(&target.endpoint_prefix)).is_err(),
+                "should reject {denied_url}",
+            );
+        }
         let host_state = HostState::new(capabilities.clone());
         assert!(
             host_state
