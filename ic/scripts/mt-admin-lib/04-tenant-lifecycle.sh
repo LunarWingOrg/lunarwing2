@@ -236,8 +236,10 @@ tenant_writer_services() {
   if tenant_darkirc_enabled "$name"; then
     printf '%s\n' "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}"
   fi
-  [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-vision-${name}-sup"
-  printf '%s\n' "lunarwing-vision-${name}"
+  if ! tenant_vision_external "$name"; then
+    [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-vision-${name}-sup"
+    printf '%s\n' "lunarwing-vision-${name}"
+  fi
   local worker
   for worker in pebble opencode kimi; do
     if tenant_worker_enabled "$name" "$worker"; then
@@ -249,9 +251,10 @@ tenant_writer_services() {
 
 tenant_writer_containers() {
   local name="$1" worker
-  for worker in pebble opencode kimi vision; do
+  for worker in pebble opencode kimi; do
     printf 'lunarwing-%s-%s\n' "$worker" "$name"
   done
+  tenant_vision_external "$name" || printf 'lunarwing-vision-%s\n' "$name"
 }
 
 container_name_list_has() {
@@ -564,7 +567,8 @@ add_tenant() {
     say ""
   fi
 
-  if ! "$CONTAINER_RT" image inspect "$VISION_SIDECAR_IMAGE" &>/dev/null; then
+  if ! tenant_vision_external "$name" \
+      && ! "$CONTAINER_RT" image inspect "$VISION_SIDECAR_IMAGE" &>/dev/null; then
     build_vision_sidecar_image || true
   fi
   say ""
@@ -1362,7 +1366,15 @@ status_tenant() {
   fi
 
   local vision_container="lunarwing-vision-$name"
-  if _vision_container_healthy "$name" "$vision_container"; then
+  if tenant_vision_external "$name"; then
+    local external_vision_url
+    external_vision_url="$(tenant_vision_external_url "$name")"
+    if _external_vision_endpoint_healthy "$external_vision_url"; then
+      say "LunarVision: healthy external instance ($external_vision_url)"
+    else
+      say "LunarVision: external instance unhealthy ($external_vision_url)"
+    fi
+  elif _vision_container_healthy "$name" "$vision_container"; then
     say "LunarVision: healthy ($vision_container, API/health ports $(ports_get "$name" vision_service)/$(ports_get "$name" vision_health))"
   elif _ctr "$name" inspect -f '{{.State.Running}}' "$vision_container" 2>/dev/null | grep -q true; then
     say "LunarVision: running but unhealthy ($vision_container)"
@@ -1395,7 +1407,7 @@ status_tenant() {
     # Sidecars are supervised for every rootless Podman systemd deployment:
     # Quadlet where supported, otherwise a managed podman-wait fallback unit.
     if [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]]; then
-      svcs+=("lunarwing-vision-${name}")
+      tenant_vision_external "$name" || svcs+=("lunarwing-vision-${name}")
       tenant_voice_enabled "$name" && svcs+=("lunarwing-voice-${name}")
     fi
     # PostgreSQL and workers use Quadlet only when the Podman version supports it.
@@ -1409,8 +1421,10 @@ status_tenant() {
     done
   else
     local rc_svcs=("lunarwing-pg-${name}" "lunarwing-pg-${name}-sup" "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" \
-                   "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}" \
-                   "lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
+                   "lunarwing-weechat-${name}" "lunarwing-weechat-adapter-${name}")
+    if ! tenant_vision_external "$name"; then
+      rc_svcs+=("lunarwing-vision-${name}" "lunarwing-vision-${name}-sup")
+    fi
     if tenant_darkirc_enabled "$name"; then
       rc_svcs+=("lunarwing-darkirc-${name}" "lunarwing-darkirc-adapter-${name}")
     fi
