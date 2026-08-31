@@ -65,8 +65,9 @@
   }
 
   async function init() {
-    if (!token) $('token-error').classList.remove('hidden');
     try {
+      // An empty token is valid when the launcher uses --no-token. Only the
+      // backend can distinguish that mode from a missing required token.
       const r = await fetch(withToken('/api/config'));
       if (r.status === 401) {
         $('token-error').classList.remove('hidden');
