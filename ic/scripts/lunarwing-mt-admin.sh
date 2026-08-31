@@ -801,9 +801,7 @@ main() {
       done
       [[ ${#_voice_settings[@]} -gt 0 ]] || die "configure-voice requires a setting"
       with_tenant_lifecycle_lock "$_voice_name" \
-        configure_voice_settings "$_voice_name" "${_voice_settings[@]}"
-      with_tenant_lifecycle_lock "$_voice_name" \
-        apply_tenant_voice_configuration "$_voice_name"
+        configure_tenant_voice "$_voice_name" "${_voice_settings[@]}"
       ;;
 
     activate-voice|enable-voice)
