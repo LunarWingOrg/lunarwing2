@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::audio::{AudioFormat, decode_audio, encode_wav};
-use crate::config::Config;
+use crate::config::{Config, normalize_stt_language};
 use crate::engine::{EngineError, SpeechSegment, TranscriptSegment, VoiceEngine};
 
 type DirectRateLimiter = governor::RateLimiter<
@@ -220,12 +220,14 @@ pub fn health_router(state: AppState) -> Router {
 
 async fn transcribe(
     State(state): State<AppState>,
-    Json(request): Json<TranscribeRequest>,
+    Json(mut request): Json<TranscribeRequest>,
 ) -> Result<Json<TranscribeResponse>, ApiError> {
     state
         .metrics
         .transcription_requests
         .fetch_add(1, Ordering::Relaxed);
+    request.language = normalize_stt_language(&request.language)
+        .map_err(|error| ApiError::InvalidRequest(error.to_string()))?;
     let key = transcription_cache_key(&request);
     if let Some(response) = cached_transcription(&state, &key) {
         state.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
