@@ -321,6 +321,140 @@ else
 fi
 assert_no_call_prefix 'ensure-image:'
 
+# ── External instances: validation, lifecycle, and rollback ──────────────────
+
+for external_url in \
+  https://vision.example.test \
+  https://vision.example.test:8443/ \
+  'https://[2001:db8::1]:8443'; do
+  if normalized="$(_normalize_external_vision_url "$external_url")" \
+      && [[ "$normalized" == "${external_url%/}" ]]; then
+    pass "accept external LunarVision origin: $external_url"
+  else
+    fail "rejected external LunarVision origin: $external_url"
+  fi
+done
+for invalid_url in \
+  http://vision.example.test \
+  https://user@vision.example.test \
+  https://vision.example.test/v1 \
+  https://vision.example.test:0 \
+  'https://vision example.test'; do
+  if _normalize_external_vision_url "$invalid_url" >/dev/null; then
+    fail "accepted unsafe external LunarVision URL: $invalid_url"
+  else
+    pass "reject unsafe external LunarVision URL: $invalid_url"
+  fi
+done
+
+ports_set_vision_mode alpha external https://vision.example.test
+[[ "$(tenant_vision_mode alpha)" == external ]] \
+  && pass "external mode persists in registry" || fail "external mode registry persistence"
+[[ "$(tenant_vision_external_url alpha)" == https://vision.example.test ]] \
+  && pass "external URL persists in registry" || fail "external URL registry persistence"
+
+EXTERNAL_HEALTHY=true
+_wait_external_vision_healthy() {
+  CALLS+=("wait-external:$1")
+  [[ "$EXTERNAL_HEALTHY" == true ]]
+}
+ensure_container_runtime() { CALLS+=("ensure-runtime"); }
+CALLS=()
+start_tenant_vision alpha >/dev/null
+assert_call 'wait-external:https://vision.example.test'
+assert_no_call_prefix 'ensure-runtime'
+CALLS=()
+stop_tenant_vision alpha >/dev/null
+assert_no_call_prefix 'ensure-runtime'
+
+EXTERNAL_HEALTHY=false
+if start_tenant_vision alpha >/dev/null 2>&1; then
+  fail "unhealthy external LunarVision accepted"
+else
+  pass "unhealthy external LunarVision blocks tenant start"
+fi
+EXTERNAL_HEALTHY=true
+
+remove_vision_systemd_assets() { CALLS+=("remove-systemd:$1"); }
+remove_vision_openrc_assets() { CALLS+=("remove-openrc:$1"); }
+CALLS=()
+render_vision_systemd_assets alpha
+assert_call 'remove-systemd:alpha'
+assert_no_call_prefix 'render-quadlet:'
+assert_no_call_prefix 'render-fallback:'
+CALLS=()
+render_vision_openrc_assets alpha
+assert_call 'remove-openrc:alpha'
+assert_no_call_prefix 'render-openrc:'
+assert_no_call_prefix 'render-supervisor:'
+
+INIT_SYSTEM=openrc
+mapfile -t external_writer_services < <(tenant_writer_services alpha)
+if printf '%s\n' "${external_writer_services[@]}" | grep -q 'lunarwing-vision-alpha'; then
+  fail "external LunarVision appears in writer service set"
+else
+  pass "external LunarVision is absent from writer service set"
+fi
+
+lunarwing_env="$(tenant_env_dir alpha)/lunarwing.env"
+cat >"$lunarwing_env" <<'ENV'
+VISION_SERVICE_URL=http://127.0.0.1:20005
+VISION_AUTH_TOKEN=local-token
+KEEP_ME=yes
+ENV
+chmod 0600 "$lunarwing_env"
+_retire_local_vision_runtime() { CALLS+=("retire-local:$1"); }
+RELOAD_OK=true
+_reload_vision_consumer_if_running() {
+  CALLS+=("reload:$1")
+  [[ "$RELOAD_OK" == true ]]
+}
+CALLS=()
+external_output="$ROOT/external-output"
+configure_tenant_vision_external alpha https://vision.example.test:8443 external-token \
+  >"$external_output"
+assert_call 'retire-local:alpha'
+assert_call 'reload:alpha'
+[[ "$(_env_existing "$lunarwing_env" VISION_SERVICE_URL)" == https://vision.example.test:8443 ]] \
+  && pass "external transition writes daemon URL" || fail "external transition daemon URL"
+[[ "$(_env_existing "$lunarwing_env" VISION_AUTH_TOKEN)" == external-token ]] \
+  && pass "external transition writes daemon token" || fail "external transition daemon token"
+[[ "$(_env_existing "$lunarwing_env" KEEP_ME)" == yes ]] \
+  && pass "external transition preserves unrelated env" || fail "external transition env preservation"
+if grep -qF external-token "$external_output"; then
+  fail "external transition leaked bearer token"
+else
+  pass "external transition does not print bearer token"
+fi
+
+CONTAINER_RT=true
+start_tenant_vision() { CALLS+=("start-local:$1"); return 0; }
+CALLS=()
+configure_tenant_vision_local alpha >/dev/null
+assert_call 'start-local:alpha'
+assert_call 'reload:alpha'
+[[ "$(tenant_vision_mode alpha)" == local ]] \
+  && pass "local transition persists mode" || fail "local transition mode persistence"
+[[ "$(_env_existing "$lunarwing_env" VISION_SERVICE_URL)" == http://127.0.0.1:20005 ]] \
+  && pass "local transition restores loopback URL" || fail "local transition loopback URL"
+[[ "$(_env_existing "$lunarwing_env" VISION_AUTH_TOKEN)" == test-only-token ]] \
+  && pass "local transition restores local token" || fail "local transition token"
+
+RELOAD_OK=false
+if configure_tenant_vision_external alpha https://vision.example.test rollback-token \
+    >/dev/null 2>&1; then
+  fail "failed daemon reload reported external transition success"
+else
+  pass "failed daemon reload reports external transition failure"
+fi
+[[ "$(tenant_vision_mode alpha)" == local ]] \
+  && pass "failed external transition restores local mode" || fail "failed external mode rollback"
+[[ "$(_env_existing "$lunarwing_env" VISION_SERVICE_URL)" == http://127.0.0.1:20005 ]] \
+  && pass "failed external transition restores local URL" || fail "failed external URL rollback"
+[[ "$(_env_existing "$lunarwing_env" VISION_AUTH_TOKEN)" == test-only-token ]] \
+  && pass "failed external transition restores local token" || fail "failed external token rollback"
+RELOAD_OK=true
+
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
   exit 1
