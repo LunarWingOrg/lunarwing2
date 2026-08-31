@@ -309,6 +309,8 @@ pub struct Agent {
     pub(super) reflex_router: Arc<crate::agent::reflex::ReflexRouter>,
     /// Non-blocking write-behind counter for successful reflex routes.
     pub(super) reflex_hits: Arc<crate::agent::reflex::ReflexHitAccumulator>,
+    /// Live mid-turn interrupt tokens (per-thread chat turns).
+    pub(super) turn_interrupts: crate::agent::interrupt::TurnInterrupts,
 }
 
 impl Agent {
@@ -406,6 +408,7 @@ impl Agent {
             mission_manager_slot: Arc::new(tokio::sync::RwLock::new(None)),
             reflex_router,
             reflex_hits: Arc::new(crate::agent::reflex::ReflexHitAccumulator::default()),
+            turn_interrupts: crate::agent::interrupt::TurnInterrupts::default(),
         }
     }
 
