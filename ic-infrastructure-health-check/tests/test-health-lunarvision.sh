@@ -457,6 +457,29 @@ assert_eq "$ec_Q6" "2" "Q16: external plaintext URL → exit 2"
 assert_contains "$(jq -r '.issues[]' <<<"$out_Q6")" \
     "Unsafe LunarVision URL" "Q17: external plaintext URL is rejected before curl"
 
+# Origin-only validation must reject userinfo confusion, paths, query/fragment,
+# invalid ports, and whitespace before curl sees an operator override.
+unsafe_index=0
+for unsafe_url in \
+    'http://127.0.0.1:8089@vision.example.test' \
+    'https://user@vision.example.test' \
+    'https://vision.example.test/tenant' \
+    'https://vision.example.test?tenant=one' \
+    'https://vision.example.test#fragment' \
+    'https://vision.example.test:0' \
+    'https://vision.example.test:65536' \
+    'https://vision example.test'; do
+    unsafe_index=$((unsafe_index + 1))
+    out_R=$(MOCK_HEALTH_BODY="$HEALTH_OK" MOCK_HEALTH_CODE=200 \
+        HEALTH_LUNARVISION_URL="$unsafe_url" \
+        HEALTH_LUNARVISION_FETCH_METRICS=false \
+        run_check)
+    ec_R=$?
+    assert_eq "$ec_R" "2" "R${unsafe_index}a: unsafe origin exits critical"
+    assert_contains "$(jq -r '.issues[]' <<<"$out_R")" \
+        "Unsafe LunarVision URL" "R${unsafe_index}b: unsafe origin rejected before curl"
+done
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Summary
 # ═════════════════════════════════════════════════════════════════════════════
