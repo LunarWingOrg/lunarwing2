@@ -474,7 +474,8 @@ _reload_vision_consumer_if_running() {
 
 _set_vision_daemon_endpoint() {
   local name="$1" service_url="$2" token="$3"
-  local env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" && ! -L "$env_path" ]] \
     || { say "ERROR: tenant LunarWing environment missing or unsafe" >&2; return 1; }
   [[ -n "$token" && "$token" != *$'\n'* && "$token" != *$'\r'* ]] \
@@ -715,7 +716,8 @@ _retire_local_vision_runtime() {
 
 _restore_vision_configuration() {
   local name="$1" backup="$2" previous_mode="$3" previous_url="$4"
-  local env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
   mv -T -- "$backup" "$env_path" || return 1
   ports_set_vision_mode "$name" "$previous_mode" "$previous_url"
   if [[ "$previous_mode" == local ]]; then
