@@ -39,6 +39,15 @@ WASM SSH, autonomous jobs, or supervised mode.
 
 The built-in tool runs the SSH client in the LunarWing process and verifies the server key through the configured host-key policy.
 
+For an isolated AcceptFirst validation, use a disposable SSH server whose host
+key you can rotate. Make one approved connection, restart LunarWing, and repeat
+the harmless command: it must succeed without relearning trust. Then stop the
+server, replace only its host key, and retry the same configured host/port. The
+built-in `ssh` and WASM `ssh` paths must report a host-key mismatch. `ssh_git`
+must fail its host-key check before Git authentication or repository mutation.
+Restore the original server key after the test. Do not rotate a production
+server merely to exercise this case.
+
 ## 2. Built-in `ssh_git`
 
 Use a disposable repository that the configured SSH identity can read. Prefer a read-only clone test before testing writes:
@@ -52,7 +61,10 @@ Expected behavior:
 - the action requires approval;
 - `path` is resolved below `<base_dir>/ssh-git/`;
 - absolute paths, `..`, symlink escapes, and option-injection inputs are rejected;
-- authentication uses the harness agent socket and the clone completes without an interactive prompt.
+- authentication uses the harness agent socket and the clone completes without an interactive prompt;
+- on the first unpinned AcceptFirst call, logs show a russh host-key preflight
+  before Git; subsequent calls and calls after a daemon restart reuse the
+  encrypted pin, while OpenSSH always runs with strict host-key checking.
 
 Only test `push` against an explicitly disposable remote. Force-push refs are rejected, and `pull` is fast-forward only.
 

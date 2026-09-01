@@ -108,8 +108,10 @@ client (the first live use of the client half — the harness otherwise only use
 - **Auth:** loads the key from the secrets store (`SSHBridge::load_key`) and
   decodes it (`russh::keys::decode_secret_key`) — **credential path (a)**.
 - **Host-key verification:** wired into russh's `Handler::check_server_key`,
-  delegating to `HostKeyVerifier::verify_from_config` (Strict / AcceptFirst,
-  byte-exact comparison of the wire key).
+  delegating to `HostKeyVerifier::verify_from_config_with_key_type` (Strict /
+  AcceptFirst, byte-exact comparison of the wire key). AcceptFirst stores the
+  algorithm and wire key in the tenant's encrypted pin set before accepting the
+  handshake.
 - **Key algorithms:** **Ed25519 and ECDSA only.** RSA is rejected up front
   (RSA key support is not implemented; only Ed25519 and ECDSA are accepted).
 - **Limits:** connect/operation timeouts from the host config; stdout/stderr
@@ -141,11 +143,13 @@ key). Keys never leave the agent.
 
 - **Auth:** sets `SSH_AUTH_SOCK` to `SSHBridge::get_agent_socket_path()` — the
   in-process agent signs; git/ssh only ever see the socket.
-- **Host-key verification:** materializes an ephemeral `known_hosts` from
-  `HostKeyVerifier` pins (else the configured `known_host_key`) and sets
-  `GIT_SSH_COMMAND` with `StrictHostKeyChecking` keyed to the host's
-  `host_key_mode` (`yes` for Strict, `accept-new` for AcceptFirst). A Strict
-  host with no known key is refused.
+- **Host-key verification:** an explicit configured `known_host_key` is
+  authoritative. Otherwise it materializes an ephemeral `known_hosts` from the
+  verifier's encrypted persistent pin. For an unpinned AcceptFirst host it first
+  completes a russh key-exchange-only preflight, persists the presented key,
+  then launches Git with `StrictHostKeyChecking=yes` against that exact key. A
+  Strict host with no known key is refused. This extra connection occurs only
+  while learning the first pin.
 - **Hermetic SSH config:** invokes `ssh -F /dev/null`, so it ignores the host's
   `/etc/ssh/ssh_config` (and its `ssh_config.d/*` includes) and the user's
   `~/.ssh/config` — everything it needs comes from `[[ssh.hosts]]` + the agent
@@ -167,11 +171,8 @@ key). Keys never leave the agent.
 
 **When to use.** Any git operation over SSH from a chat turn, without a worker.
 
-> **Known limitations:** the built-in `ssh` command tool rejects configured RSA
+> **Known limitation:** the built-in `ssh` command tool rejects configured RSA
 > keys and accepts only Ed25519/ECDSA. `ssh_git` has no corresponding RSA guard.
-> For `ssh_git`, AcceptFirst is best-effort — it re-trusts per run rather than
-> persisting the pin (use Strict + a pinned `known_host_key` for anything
-> sensitive; see the ops guide).
 
 ---
 
@@ -238,9 +239,11 @@ All three mechanisms sit on the same harness (see
   daemon; workers/guests never receive raw key bytes.
 - **In-process ssh-agent** at `/home/<tenant>/lunarwing/run/ssh-agent.sock`.
 - **`HostKeyVerifier`** — consulted directly by the built-in/WASM russh paths;
-  `ssh_git` uses its stored pin (or configured `known_host_key`) to materialize
-  an ephemeral OpenSSH `known_hosts`. The worker path uses the worker's own
-  `known_hosts`.
+  AcceptFirst pins are tenant-scoped in the encrypted secrets store and loaded
+  when `SSHBridge` starts. `ssh_git` preflights through the same verifier when it
+  must learn a pin, then uses the stored pin (or authoritative configured
+  `known_host_key`) to materialize an ephemeral OpenSSH `known_hosts`. The
+  worker path uses the worker's own `known_hosts`.
 - **Per-tenant isolation** — the bridge derives an internal
   `tenant_id = UUIDv5(NAMESPACE_DNS, owner_id)`; secret-store lookups are scoped
   by the string `owner_id`, and the socket lives in the tenant-owned run dir.
@@ -253,15 +256,18 @@ Security posture by mechanism:
   Ed25519/ECDSA, verifies the live host key, rate-limits, and sanitizes output.
   Its credential path briefly holds a decoded private key in process memory.
 - **`ssh_git`** — also runs in the gateway process and requires approval on every
-  call. It delegates key-algorithm negotiation to agent/OpenSSH, verifies through
+  call. It delegates authentication algorithm negotiation to agent/OpenSSH,
+  learns first-use host keys through russh, enforces the persisted pin through
   an ephemeral `known_hosts`, sanitizes output, confines local paths, scrubs the
   child environment, and blocks a leading-`+` force-push refspec.
 - **WASM `ssh`** — same host-side russh surface and Ed25519/ECDSA restriction as
   built-in `ssh`, plus a per-tool host allowlist; the sandbox does not contain
   the SSH operation itself.
 
-**Recommended host-key posture for all mechanisms:** pin `known_host_key` per
-host and use `host_key_mode = "Strict"`. AcceptFirst is a convenience.
+**Recommended host-key posture for all mechanisms:** obtain the host key through
+a trusted channel, pin `known_host_key`, and use `host_key_mode = "Strict"`.
+AcceptFirst is durable across restarts but cannot authenticate its initial
+connection.
 
 ---
 
