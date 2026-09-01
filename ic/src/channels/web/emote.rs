@@ -51,8 +51,16 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
     (
         Emote::Greet,
         &[
-            "wave", "greet", "hello", "hi there", "bows", "bow ", "welcome", "good morning",
-            "good evening", "salute",
+            "wave",
+            "greet",
+            "hello",
+            "hi there",
+            "bows",
+            "bow ",
+            "welcome",
+            "good morning",
+            "good evening",
+            "salute",
         ],
     ),
     (
@@ -102,8 +110,7 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
     (
         Emote::Rage,
         &[
-            "rage", "glare", "fume", "snarl", "growl", "angry", "furious", "stomp", "scowl",
-            "grr",
+            "rage", "glare", "fume", "snarl", "growl", "angry", "furious", "stomp", "scowl", "grr",
         ],
     ),
     (
@@ -133,8 +140,17 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
     (
         Emote::Sleep,
         &[
-            "sleep", "yawn", "doze", "nap", "snore", "sleepy", "tired", "rests her eyes",
-            "rests his eyes", "curls up", "drowsy",
+            "sleep",
+            "yawn",
+            "doze",
+            "nap",
+            "snore",
+            "sleepy",
+            "tired",
+            "rests her eyes",
+            "rests his eyes",
+            "curls up",
+            "drowsy",
         ],
     ),
     (
@@ -198,10 +214,10 @@ impl Emote {
 pub fn parse_emotes(message: &str) -> Vec<Emote> {
     let mut emotes: Vec<Emote> = Vec::new();
     for phrase in action_phrases(message) {
-        if let Some(emote) = classify_phrase(phrase) {
-            if !emotes.contains(&emote) {
-                emotes.push(emote);
-            }
+        if let Some(emote) = classify_phrase(phrase)
+            && !emotes.contains(&emote)
+        {
+            emotes.push(emote);
         }
         if emotes.len() >= MAX_EMOTES_PER_MESSAGE {
             break;

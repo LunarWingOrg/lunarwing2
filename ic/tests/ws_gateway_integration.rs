@@ -174,6 +174,7 @@ async fn test_ws_broadcast_event_received() {
     state.sse.broadcast(SseEvent::Response {
         content: "agent says hi".to_string(),
         thread_id: "t1".to_string(),
+        emotes: Vec::new(),
     });
 
     // The WS client should receive it
@@ -335,6 +336,7 @@ async fn test_ws_multiple_events_in_sequence() {
     state.sse.broadcast(SseEvent::Response {
         content: "done".to_string(),
         thread_id: "t1".to_string(),
+        emotes: Vec::new(),
     });
 
     // Receive all 4 in order
