@@ -118,9 +118,11 @@
 20. [ ] Android app — POINTER ITEM. Same treatment as item 12: own repo, own goals file, mascot widget + voice + gateway features. THIS item tracks only repo creation + goals seeding + buildable scaffold (repo created in gitlab now; no goals file yet; may append more details later) 
 Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
-21. [ ] Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here.
+21. [x] Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here.
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
 22. [ ] Release-notes accuracy pass on RELEASE-v2.1.0.0.md (the item 14 draft) — verify every claim against the actual shipped changes; known-issues list reconciled against the work-item tracker
+23. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings. 
+24. [x] (S) reserved
 
 ## Deferred (explicitly NOT this release)
 
