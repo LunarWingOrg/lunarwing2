@@ -133,7 +133,16 @@ fn scope_vision_http_capability(
     capabilities: &mut Capabilities,
     service_url: &str,
 ) -> Option<ScopedServiceTarget> {
-    let target = scoped_service_target(service_url)?;
+    let target = match scoped_service_target(service_url) {
+        Some(target) => target,
+        None => {
+            if let Some(http) = capabilities.http.as_mut() {
+                http.allowlist.clear();
+            }
+            tracing::warn!("invalid VISION_SERVICE_URL; denying vision tool HTTP egress");
+            return None;
+        }
+    };
     let http = capabilities.http.as_mut()?;
     http.allowlist = vec![
         EndpointPattern::host(target.host.clone())
@@ -2977,7 +2986,7 @@ mod tests {
 
     #[test]
     fn test_external_vision_target_scopes_egress_and_bearer() {
-        use crate::tools::wasm::capabilities::HttpCapability;
+        use crate::tools::wasm::capabilities::{EndpointPattern, HttpCapability};
         use crate::tools::wasm::host::HostState;
         use crate::tools::wasm::wrapper::{
             ScopedBearerCredential, StoreData, enforce_scoped_http_target,
@@ -3065,6 +3074,26 @@ mod tests {
                 SecretString::from(TEST_BEARER_TOKEN_123.to_string()),
             )
             .is_none()
+        );
+
+        let mut invalid_capabilities =
+            Capabilities::default().with_http(HttpCapability::new(vec![
+                EndpointPattern::host("localhost").with_methods(vec!["POST".to_string()]),
+            ]));
+        assert!(
+            scope_vision_http_capability(
+                &mut invalid_capabilities,
+                "https://vision.example.com/path",
+            )
+            .is_none()
+        );
+        assert!(
+            invalid_capabilities
+                .http
+                .expect("HTTP capability remains present")
+                .allowlist
+                .is_empty(),
+            "invalid configured origin must fail closed instead of retaining registry egress",
         );
     }
 

@@ -162,10 +162,26 @@ Item 3 of the v2.1.0.0 cycle, with live verification and fixes from item 9:
   into the scoped running engine thread with the same wrap framing as the
   classic loop.
 
+### External LunarVision Instances
+
+Tenants can now use an operator-managed LunarVision instance on another machine
+instead of requiring a local GPU sidecar:
+
+- `mt-admin configure-vision-external` stores an HTTPS origin and token,
+  retires managed local systemd/OpenRC units, and rolls back failed
+  reconfiguration. `configure-vision-local` restores managed local mode.
+- Automatic enrichment, the `vision-analyze` WASM tool, and host health checks
+  use the configured external origin. Plaintext remote HTTP, URL credentials,
+  paths, queries, fragments, and cross-origin bearer forwarding are rejected.
+- WASM egress is narrowed to POST requests under the configured origin's
+  `/v1/` prefix. Invalid configured origins fail closed with no HTTP allowlist.
+- Ports-registry discovery and documentation cover mixed local/external fleets
+  on both systemd and OpenRC hosts.
+
 ### LunarVoice Production Completion
 
-The Whisper speech-to-text sidecar (started in the 2.0.7 era) is finished to
-production quality:
+The Whisper speech-to-text sidecar (introduced in 2.0.6.0 and health-hardened
+in 2.0.7.0) is finished to production quality:
 
 - mt-admin exposes voice install/configure/activate/deactivate/remove with
   transactional reconfiguration (atomic lock, rollback on failure), Whisper
@@ -329,7 +345,7 @@ All crates.io dependencies are now vendored into the repository:
    registry v16 remain the current formats.
 3. Rebuild the daemon, WASM channels, and selected worker images through the
    normal deployment path. The multica (0.1.9) and xmpp (0.1.12) channel
-   registry versions changed; darkirc and weechat are rebuild-only updates.
+   registry versions changed; darkirc and weechat are unchanged.
 4. All cargo operations under `ic/` now resolve from `ic/vendor/`. If you add
    or update a dependency, run `ic/scripts/refresh-vendor.sh`, review the
    `vendor/` diff, and commit it with the manifest/lockfile change. Fresh
@@ -442,9 +458,6 @@ release.
 - Vendoring gates which crates enter the tree: new dependencies require an
   explicit `refresh-vendor.sh` run plus diff review (this is intended
   behavior, but it is a workflow change for contributors).
-- LunarVision external (non-local GPU) instance support was attempted during
-  the cycle but is **not** part of this release; it remains an open checklist
-  item.
 
 ### Resolved Since v2.0.9.0
 
