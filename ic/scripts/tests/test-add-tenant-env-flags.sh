@@ -97,6 +97,10 @@ ports_get() {  # <name> <service>
 tenant_pg_password()      { echo "pgpass-fixture"; }
 DARKIRC_FIXTURE_ENABLED=false
 tenant_darkirc_enabled()  { [[ "$DARKIRC_FIXTURE_ENABLED" == "true" ]]; }
+VISION_MODE_FIXTURE=local
+VISION_EXTERNAL_URL_FIXTURE=""
+tenant_vision_mode() { printf '%s\n' "$VISION_MODE_FIXTURE"; }
+tenant_vision_external_url() { printf '%s\n' "$VISION_EXTERNAL_URL_FIXTURE"; }
 generate_token()          { echo "token-fixture-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; }
 say()                     { :; }          # silence
 chown()                   { :; }          # no-op (running as non-root in tests)
@@ -220,6 +224,20 @@ write_tenant_lunarwing_env fixture-tenant
 assert_eq "upgrade adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
 assert_eq "upgrade adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+
+# Case 3c: external LunarVision mode must survive every full env re-render.
+VISION_MODE_FIXTURE=external
+VISION_EXTERNAL_URL_FIXTURE=https://vision.example.test:8443
+_env_set "$MT_FIXTURE/env/lunarwing.env" VISION_AUTH_TOKEN 'external-fixture-token'
+write_tenant_lunarwing_env fixture-tenant
+assert_eq "rerun preserves external LunarVision URL" \
+  "$(_env_existing "$MT_FIXTURE/env/lunarwing.env" VISION_SERVICE_URL)" \
+  "https://vision.example.test:8443"
+assert_eq "rerun preserves external LunarVision token" \
+  "$(_env_existing "$MT_FIXTURE/env/lunarwing.env" VISION_AUTH_TOKEN)" \
+  "external-fixture-token"
+VISION_MODE_FIXTURE=local
+VISION_EXTERNAL_URL_FIXTURE=""
 
 # Case 4: a DarkIRC-enabled re-render must preserve the existing adapter secret.
 DARKIRC_FIXTURE_ENABLED=true

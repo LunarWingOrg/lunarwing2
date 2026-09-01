@@ -877,6 +877,54 @@ ports_set_voice() {
   release_ports_lock
 }
 
+tenant_vision_mode() {
+  jq -r --arg name "$1" '.tenants[$name].vision.mode // "local"' \
+    "$PORTS_REGISTRY" 2>/dev/null
+}
+
+tenant_vision_external() {
+  [[ "$(tenant_vision_mode "$1")" == "external" ]]
+}
+
+tenant_vision_external_url() {
+  jq -r --arg name "$1" '.tenants[$name].vision.external_url // empty' \
+    "$PORTS_REGISTRY" 2>/dev/null
+}
+
+# Select the tenant's LunarVision deployment. The external URL is operational
+# metadata, not a credential; health tooling reads it from the registry while
+# the bearer token remains only in the tenant's mode-0600 environment files.
+# An absent vision object means local, preserving older registries.
+ports_set_vision_mode() {
+  local name="$1" mode="$2" external_url="${3:-}" tmp
+  require_cmd jq
+  case "$mode" in
+    local) external_url="" ;;
+    external) [[ -n "$external_url" ]] || die "external LunarVision URL is required" ;;
+    *) die "ports_set_vision_mode: mode must be local or external" ;;
+  esac
+  acquire_ports_lock
+  if ! jq -e --arg name "$name" '.tenants[$name]' "$PORTS_REGISTRY" >/dev/null 2>&1; then
+    release_ports_lock
+    die "tenant '$name' not in port registry"
+  fi
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  if ! jq --arg name "$name" --arg mode "$mode" --arg url "$external_url" '
+      .tenants[$name].vision = if $mode == "external" then
+        {mode: "external", external_url: $url}
+      else
+        {mode: "local"}
+      end
+    ' "$PORTS_REGISTRY" >"$tmp"; then
+    rm -f "$tmp"
+    release_ports_lock
+    die "failed to set LunarVision mode for tenant '$name'"
+  fi
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  release_ports_lock
+}
+
 # Set the per-tenant WeeChat health-gate flag in the registry (bidirectional).
 # enable_weechat=false tells the infrastructure health checks (health-openrc.sh /
 # health-systemd.sh) to classify the tenant's OPTIONAL lunarwing-weechat-<t> and

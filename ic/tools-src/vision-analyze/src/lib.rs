@@ -9,7 +9,7 @@
 //! - No `std::thread::sleep()` — WASM sandbox has no threads
 //! - No auth logic — host injects credentials at HTTP boundary
 //! - No retry — fail fast; retries belong in the host/agent layer
-//! - Strict URL allowlist — localhost sidecar only
+//! - Strict URL policy — local HTTP or operator-configured remote HTTPS
 
 wit_bindgen::generate!({
     world: "sandboxed-tool",
@@ -23,17 +23,9 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_VISION_URL: &str = "http://127.0.0.1:8088";
 const MAX_IMAGE_SIZE: usize = 10 * 1024 * 1024; // 10MB
 
-/// Allowed loopback hosts for the vision service URL (host portion, sans port).
-/// Any port is accepted — per-tenant sidecars bind distinct loopback ports.
-/// External/LAN hosts are rejected; the loopback-only security property is preserved.
-/// IPv6 literals are stored without brackets to match the daemon's capabilities
-/// normalization (allowlist.rs strips [] before matching).
-const ALLOWED_HOSTS: &[&str] = &[
-    "127.0.0.1",
-    "localhost",
-    "host.containers.internal",
-    "::1",
-];
+/// Hosts allowed to use plaintext HTTP. Remote instances require HTTPS; the host
+/// runtime separately narrows the WASM capability to the configured hostname.
+const LOCAL_HTTP_HOSTS: &[&str] = &["127.0.0.1", "localhost", "host.containers.internal", "::1"];
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -55,15 +47,23 @@ struct VisionRequest {
     /// Detail level for VL: "low", "medium", "high".
     #[serde(default = "default_detail")]
     detail_level: String,
-    /// Vision service URL (must be on the localhost allowlist).
+    /// Vision service URL. Host configuration wins; remote instances require HTTPS.
     #[serde(default = "default_url")]
     service_url: String,
 }
 
-fn default_mode() -> String { "auto".to_string() }
-fn default_lang() -> String { "eng".to_string() }
-fn default_detail() -> String { "medium".to_string() }
-fn default_url() -> String { DEFAULT_VISION_URL.to_string() }
+fn default_mode() -> String {
+    "auto".to_string()
+}
+fn default_lang() -> String {
+    "eng".to_string()
+}
+fn default_detail() -> String {
+    "medium".to_string()
+}
+fn default_url() -> String {
+    DEFAULT_VISION_URL.to_string()
+}
 
 #[derive(Debug, Serialize)]
 struct SidecarRequest {
@@ -94,7 +94,9 @@ struct ToolOutput {
 struct VisionAnalyzeTool;
 
 impl exports::lunarwing::agent::tool::Guest for VisionAnalyzeTool {
-    fn execute(req: exports::lunarwing::agent::tool::Request) -> exports::lunarwing::agent::tool::Response {
+    fn execute(
+        req: exports::lunarwing::agent::tool::Request,
+    ) -> exports::lunarwing::agent::tool::Response {
         match execute_inner(&req.params, req.context.as_deref()) {
             Ok(output) => exports::lunarwing::agent::tool::Response {
                 output: Some(output),
@@ -120,8 +122,8 @@ impl exports::lunarwing::agent::tool::Guest for VisionAnalyzeTool {
 }
 
 fn execute_inner(params_json: &str, context_json: Option<&str>) -> Result<String, String> {
-    let req: VisionRequest = serde_json::from_str(params_json)
-        .map_err(|e| format!("Invalid parameters: {e}"))?;
+    let req: VisionRequest =
+        serde_json::from_str(params_json).map_err(|e| format!("Invalid parameters: {e}"))?;
 
     // Resolve the effective service URL with host-wins precedence:
     //   1. host-injected via Request.context (JobContext.vision_service_url) — trusted,
@@ -130,7 +132,11 @@ fn execute_inner(params_json: &str, context_json: Option<&str>) -> Result<String
     //   3. default_url() (http://127.0.0.1:8088) — single-tenant fallback.
     let host_url: Option<String> = context_json
         .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
-        .and_then(|v| v.get("vision_service_url").and_then(|s| s.as_str()).map(|s| s.to_string()))
+        .and_then(|v| {
+            v.get("vision_service_url")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
         .filter(|s| !s.is_empty());
 
     let effective_url: String = if let Some(h) = host_url.as_deref() {
@@ -212,8 +218,7 @@ fn execute_inner(params_json: &str, context_json: Option<&str>) -> Result<String
             data,
         };
 
-        serde_json::to_string(&output)
-            .map_err(|e| format!("Serialize output error: {e}"))
+        serde_json::to_string(&output).map_err(|e| format!("Serialize output error: {e}"))
     } else {
         let body_str = String::from_utf8(response.body).unwrap_or_default();
         Err(format!(
@@ -225,34 +230,69 @@ fn execute_inner(params_json: &str, context_json: Option<&str>) -> Result<String
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Validate that the service URL points to a localhost-only sidecar.
-/// Accepts any port on the allowed loopback hosts; rejects external/LAN hosts.
-fn validate_service_url(url: &str) -> Result<String, String> {
-    let url = url.trim_end_matches('/');
-
-    let host_port = url
-        .strip_prefix("http://")
-        .ok_or_else(|| format!("Service URL must use http://, got: {url}"))?;
-
-    // Take the authority portion (before any path) and split host from port.
-    let authority = host_port.split('/').next().unwrap_or(host_port);
-    // Strip the port: IPv6 literal `[::1]:8088` -> `::1` (brackets removed to match
-    // the daemon's capabilities normalization); otherwise split on the last ':'.
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        // IPv6 literal: everything up to ']', brackets removed
-        rest.split(']').next().map(|h| h.to_string()).unwrap_or_else(|| authority.to_string())
+/// Validate a base URL before endpoint paths are appended. Plain HTTP remains
+/// available for local sidecars; external instances must use HTTPS.
+fn validate_service_url(input: &str) -> Result<String, String> {
+    let url = input.trim().trim_end_matches('/');
+    let (scheme, authority) = if let Some(authority) = url.strip_prefix("https://") {
+        ("https", authority)
+    } else if let Some(authority) = url.strip_prefix("http://") {
+        ("http", authority)
     } else {
-        authority.rsplit_once(':').map(|(h, _)| h.to_string()).unwrap_or_else(|| authority.to_string())
+        return Err("Service URL must use https:// (or http:// for a local sidecar)".to_string());
     };
-
-    if !ALLOWED_HOSTS.contains(&host.as_str()) {
-        return Err(format!(
-            "Service URL host '{host}' not in allowlist (loopback-only). Allowed: {}",
-            ALLOWED_HOSTS.join(", ")
-        ));
+    if authority.contains(['/', '?', '#', '@']) {
+        return Err(
+            "Service URL must be an origin without credentials, path, query, or fragment"
+                .to_string(),
+        );
     }
 
+    let host = authority_host(authority)?;
+    let local_http = LOCAL_HTTP_HOSTS
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed));
+    if scheme == "http" && !local_http {
+        return Err("Remote vision service URLs must use HTTPS".to_string());
+    }
     Ok(url.to_string())
+}
+
+fn authority_host(authority: &str) -> Result<&str, String> {
+    let (host, port) = if let Some(ipv6) = authority.strip_prefix('[') {
+        let (host, suffix) = ipv6
+            .split_once(']')
+            .ok_or_else(|| "Service URL contains an invalid IPv6 authority".to_string())?;
+        let port = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .strip_prefix(':')
+                    .ok_or_else(|| "Service URL contains an invalid IPv6 authority".to_string())?,
+            )
+        };
+        (host, port)
+    } else if authority.matches(':').count() > 1 {
+        return Err("IPv6 service URL hosts must use brackets".to_string());
+    } else if let Some((host, port)) = authority.rsplit_once(':') {
+        (host, Some(port))
+    } else {
+        (authority, None)
+    };
+
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return Err("Service URL must contain a valid host".to_string());
+    }
+    if let Some(port) = port {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| "Service URL port must be between 1 and 65535".to_string())?;
+        if port == 0 {
+            return Err("Service URL port must be between 1 and 65535".to_string());
+        }
+    }
+    Ok(host)
 }
 
 /// Get base64-encoded image data from either direct input or workspace file.
@@ -273,9 +313,7 @@ fn get_image_data(req: &VisionRequest) -> Result<String, String> {
             }
             Ok(content.trim().to_string())
         }
-        (Some(_), Some(_)) => {
-            Err("Provide either 'image' or 'file_path', not both".to_string())
-        }
+        (Some(_), Some(_)) => Err("Provide either 'image' or 'file_path', not both".to_string()),
         (None, None) => {
             Err("Provide either 'image' (base64) or 'file_path' (workspace path)".to_string())
         }
@@ -318,7 +356,7 @@ const SCHEMA: &str = r#"{
     "service_url": {
       "type": "string",
       "default": "http://127.0.0.1:8088",
-      "description": "Vision service base URL. Must point at a loopback sidecar on the allowlist (127.0.0.1, localhost, host.containers.internal, or [::1]). Override the port to reach a per-tenant sidecar (e.g. 'http://127.0.0.1:20015')."
+      "description": "Vision service base URL. The host-configured URL takes precedence. Local sidecars may use HTTP; external instances must use HTTPS."
     }
   }
 }"#;
@@ -328,43 +366,36 @@ mod tests {
     use super::validate_service_url;
 
     #[test]
-    fn allowlist_accepts_any_loopback_port() {
-        // Per-tenant ports (the whole point of this change)
-        assert!(validate_service_url("http://127.0.0.1:20015").is_ok());
-        assert!(validate_service_url("http://127.0.0.1:20005").is_ok());
-        // Original default port still works
-        assert!(validate_service_url("http://127.0.0.1:8088").is_ok());
-        // Other loopback hosts, any port
-        assert!(validate_service_url("http://localhost:30000").is_ok());
-        assert!(validate_service_url("http://host.containers.internal:8088").is_ok());
-        assert!(validate_service_url("http://[::1]:8088").is_ok());
-        // Trailing slash tolerated
-        assert!(validate_service_url("http://127.0.0.1:20015/").is_ok());
+    fn accepts_local_http_and_remote_https_origins() {
+        for url in [
+            "http://127.0.0.1:20015",
+            "http://localhost:30000",
+            "http://host.containers.internal:8088",
+            "http://[::1]:8088",
+            "https://vision.example.com",
+            "https://vision.example.com:8443/",
+            "https://192.0.2.10:8443",
+        ] {
+            assert!(validate_service_url(url).is_ok(), "should accept {url}");
+        }
     }
 
     #[test]
-    fn allowlist_rejects_non_loopback() {
-        // LAN IP (even the host's own LAN address) must be rejected
-        assert!(validate_service_url("http://192.168.1.187:8080").is_err());
-        // External host
-        assert!(validate_service_url("http://example.com:8088").is_err());
-        // Link-local multicast (not loopback)
-        assert!(validate_service_url("http://224.0.0.1:8088").is_err());
-    }
-
-    #[test]
-    fn allowlist_rejects_https_and_no_scheme() {
-        // https:// not allowed (sidecar is plain http on loopback)
-        assert!(validate_service_url("https://127.0.0.1:8088").is_err());
-        // Missing scheme
-        assert!(validate_service_url("127.0.0.1:8088").is_err());
-    }
-
-    #[test]
-    fn allowlist_rejects_path_only_traversal() {
-        // A URL whose host portion is not loopback must be rejected even with a path
-        assert!(validate_service_url("http://example.com/v1/ocr").is_err());
-        // Loopback with a path is fine
-        assert!(validate_service_url("http://127.0.0.1:20015/v1/ocr").is_ok());
+    fn rejects_remote_http_and_non_origins() {
+        for url in [
+            "http://192.168.1.187:8080",
+            "http://example.com:8088",
+            "127.0.0.1:8088",
+            "ftp://vision.example.com",
+            "https://user:secret@vision.example.com",
+            "https://vision.example.com/v1",
+            "https://vision.example.com?tenant=one",
+            "https://vision.example.com#fragment",
+            "https://vision.example.com:0",
+            "https://vision.example.com:65536",
+            "https://[2001:db8::1",
+        ] {
+            assert!(validate_service_url(url).is_err(), "should reject {url}");
+        }
     }
 }

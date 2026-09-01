@@ -611,6 +611,17 @@ write_tenant_lunarwing_env() {
   # One-shot knowledge seed: carry the flag only when it already exists (set
   # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
   knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
+  local vision_mode vision_external_url vision_token_existing
+  vision_mode="$(tenant_vision_mode "$name")"
+  vision_external_url="$(tenant_vision_external_url "$name")"
+  vision_token_existing="$(_env_existing "$path" VISION_AUTH_TOKEN)"
+  if [[ "$vision_mode" == external ]]; then
+    vision_external_url="$(_normalize_external_vision_url "$vision_external_url")" \
+      || die "stored external LunarVision URL is invalid for tenant '$name'"
+    [[ -n "$vision_token_existing" ]] \
+      || die "external LunarVision token is missing for tenant '$name'"
+  fi
+
   local transcription_enabled transcription_provider transcription_model voice_enabled
   voice_enabled="$(_env_existing "$(tenant_env_dir "$name")/voice.env" VOICE_ENABLED)"
   voice_enabled="${voice_enabled:-false}"
@@ -802,14 +813,21 @@ ENVEOF
       "$darkirc_adapter_port" "$darkirc_adapter_secret" >> "$path"
   fi
 
-  # LunarVision OCR/vision sidecar
-  local vision_port vision_token
+  # LunarVision: preserve an operator-selected external HTTPS instance across
+  # re-renders; older tenants without mode metadata continue using local ports.
+  local vision_port vision_token vision_service_url
   vision_port="$(ports_get "$name" vision_service)" || true
-  if [[ -n "$vision_port" ]]; then
+  if [[ "$vision_mode" == external ]]; then
+    vision_service_url="$vision_external_url"
+    vision_token="$vision_token_existing"
+  else
+    vision_service_url="http://127.0.0.1:${vision_port}"
     vision_token="$(_env_existing "$(tenant_env_dir "$name")/vision.env" LUNARWING_AUTH_TOKEN)"
     vision_token="${vision_token:-$(generate_token)}"
-    printf '\nVISION_SERVICE_URL=http://127.0.0.1:%s\nVISION_AUTH_TOKEN=%s\n' \
-      "$vision_port" "$vision_token" >> "$path"
+  fi
+  if [[ -n "$vision_port" ]]; then
+    printf '\nVISION_SERVICE_URL=%s\nVISION_AUTH_TOKEN=%s\n' \
+      "$vision_service_url" "$(_quote_env_value "$vision_token")" >> "$path"
   fi
   # LunarVoice is provisioned but disabled until explicitly enabled. Preserve
   # any operator-selected cloud transcription provider on re-render.

@@ -25,11 +25,11 @@ const TRUNCATION_SUFFIX: &str = "\n\n[... LunarVision output truncated ...]";
 pub enum VisionEnrichmentConfigError {
     #[error("VISION_SERVICE_URL is not a valid URL")]
     InvalidUrl,
-    #[error("VISION_SERVICE_URL must use http://")]
+    #[error("VISION_SERVICE_URL must use HTTPS, or HTTP for a local sidecar")]
     InvalidScheme,
     #[error("VISION_SERVICE_URL must not contain credentials, query parameters, or a fragment")]
     InvalidComponents,
-    #[error("VISION_SERVICE_URL must point to localhost or a loopback IP address")]
+    #[error("remote VISION_SERVICE_URL values must use HTTPS")]
     NonLoopbackHost,
     #[error("VISION_SERVICE_URL must not contain a path")]
     InvalidPath,
@@ -60,7 +60,7 @@ pub struct VisionEnrichmentMiddleware {
 }
 
 impl VisionEnrichmentMiddleware {
-    /// Build middleware for a trusted, loopback-only LunarVision sidecar.
+    /// Build middleware for a local HTTP or operator-configured HTTPS LunarVision instance.
     pub fn new(
         service_url: &str,
         auth_token: Option<SecretString>,
@@ -175,9 +175,6 @@ impl VisionEnrichmentMiddleware {
 
 fn vision_endpoint(service_url: &str) -> Result<Url, VisionEnrichmentConfigError> {
     let mut url = Url::parse(service_url).map_err(|_| VisionEnrichmentConfigError::InvalidUrl)?;
-    if url.scheme() != "http" {
-        return Err(VisionEnrichmentConfigError::InvalidScheme);
-    }
     if !url.username().is_empty()
         || url.password().is_some()
         || url.query().is_some()
@@ -185,14 +182,20 @@ fn vision_endpoint(service_url: &str) -> Result<Url, VisionEnrichmentConfigError
     {
         return Err(VisionEnrichmentConfigError::InvalidComponents);
     }
-    let is_loopback = match url.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+    let is_local = match url.host() {
+        Some(Host::Domain(host)) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.eq_ignore_ascii_case("host.containers.internal")
+        }
         Some(Host::Ipv4(address)) => address.is_loopback(),
         Some(Host::Ipv6(address)) => address.is_loopback(),
         None => false,
     };
-    if !is_loopback {
-        return Err(VisionEnrichmentConfigError::NonLoopbackHost);
+    match url.scheme() {
+        "https" => {}
+        "http" if is_local => {}
+        "http" => return Err(VisionEnrichmentConfigError::NonLoopbackHost),
+        _ => return Err(VisionEnrichmentConfigError::InvalidScheme),
     }
     if url.path() != "/" {
         return Err(VisionEnrichmentConfigError::InvalidPath);
@@ -554,24 +557,36 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_rejects_non_loopback_and_paths() {
+    fn endpoint_requires_https_for_remote_instances() {
+        assert_eq!(
+            vision_endpoint("https://vision.example.com")
+                .expect("remote HTTPS should be accepted")
+                .as_str(),
+            "https://vision.example.com/v1/vision/analyze"
+        );
         assert!(matches!(
-            vision_endpoint("http://example.com:8088"),
+            vision_endpoint("http://vision.example.com:8088"),
             Err(VisionEnrichmentConfigError::NonLoopbackHost)
         ));
         assert!(matches!(
-            vision_endpoint("https://127.0.0.1:8088"),
-            Err(VisionEnrichmentConfigError::InvalidScheme)
+            vision_endpoint("https://vision.example.com/custom"),
+            Err(VisionEnrichmentConfigError::InvalidPath)
         ));
         assert!(matches!(
-            vision_endpoint("http://127.0.0.1:8088/custom"),
-            Err(VisionEnrichmentConfigError::InvalidPath)
+            vision_endpoint("https://user:secret@vision.example.com"),
+            Err(VisionEnrichmentConfigError::InvalidComponents)
         ));
         assert_eq!(
             vision_endpoint("http://[::1]:8088")
                 .expect("IPv6 loopback should be accepted")
                 .as_str(),
             "http://[::1]:8088/v1/vision/analyze"
+        );
+        assert_eq!(
+            vision_endpoint("http://host.containers.internal:8088")
+                .expect("the container host bridge should be accepted")
+                .as_str(),
+            "http://host.containers.internal:8088/v1/vision/analyze"
         );
     }
 

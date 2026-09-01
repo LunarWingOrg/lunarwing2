@@ -116,6 +116,48 @@ TENSORZERO_URL=http://192.168.1.157:3000/openai/v1
 Change it through `--tensorzero-url` or `LUNARWING_MT_TENSORZERO_URL`, then
 re-render/restart the tenant as appropriate.
 
+## LunarVision Configuration
+
+LunarVision defaults to a per-tenant local sidecar. Its local container settings
+and stable local token live in `env/vision.env`; the daemon consumes
+`VISION_SERVICE_URL` and `VISION_AUTH_TOKEN` from the mode-`0600`
+`env/lunarwing.env`.
+
+To move inference and OCR to a more capable machine, deploy LunarVision behind
+an HTTPS reverse proxy, prepare a root-readable one-line file containing the
+remote sidecar's `LUNARWING_AUTH_TOKEN`, then run:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-vision-external <tenant> \
+  --url https://vision.example.com \
+  --token-file /root/lunarvision.token
+```
+
+Remote URLs must be origins only: `https://host[:port]`, with no userinfo, path,
+query, or fragment. The command verifies `/health` before switching, stops and
+removes local LunarVision supervision, persists `vision.mode=external` and the
+non-secret URL in `/etc/lunarwing/ports.json`, updates the daemon credentials,
+and restarts the daemon when it is active. Both systemd-user and OpenRC tenant
+lifecycles then treat the external instance as operator-managed. Host health
+checks discover mixed local/external deployments directly from the registry.
+
+Return to the local sidecar with:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh configure-vision-local <tenant>
+```
+
+That command restores the local URL/token, recreates the health-gated container
+and init supervision, and reloads the daemon. Do not hand-edit only one of the
+environment files or the registry; use these commands so mode, credentials,
+health discovery, and units change transactionally.
+
+The external endpoint/token are deployment-specific and are deliberately not
+carried by `export-tenant.sh`. After importing a tenant on another host, run
+`configure-vision-external` again if that host should use the remote instance.
+See [`../guides/VISION_OCR_SIDECAR.md`](../guides/VISION_OCR_SIDECAR.md) for the
+remote ingress and endpoint contract.
+
 ## XMPP Configuration
 
 XMPP settings in `lunarwing.env` control how the tenant connects to the XMPP network:

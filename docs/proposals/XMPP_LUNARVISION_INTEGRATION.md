@@ -1,8 +1,9 @@
 # XMPP to LunarVision Integration
 
-> **Current status (2026-07-25): IMPLEMENTED.** Inbound XMPP images are
+> **Current status (updated 2026-08-31): IMPLEMENTED.** Inbound XMPP images are
 > automatically enriched through the configured per-tenant LunarVision
-> sidecar before either legacy agent handling or Engine V2 attachment routing.
+> instance—local or external HTTPS—before either legacy agent handling or
+> Engine V2 attachment routing.
 
 ## Implemented flow
 
@@ -11,8 +12,9 @@
 2. After inbound hooks accept ordinary user input, the supervised message task
    invokes `VisionEnrichmentMiddleware` when `VISION_SERVICE_URL` is configured.
 3. Middleware accepts only XMPP image attachments, posts at most two requests
-   concurrently to the loopback-only `/v1/vision/analyze` endpoint, and applies
-   `VISION_AUTH_TOKEN` as a host-side Bearer credential when configured.
+   concurrently to the configured `/v1/vision/analyze` endpoint, and applies
+   `VISION_AUTH_TOKEN` as a host-side Bearer credential when configured. Local
+   instances may use HTTP; remote instances require HTTPS.
 4. Bounded OCR/VL output is stored in `IncomingAttachment.extracted_text` and
    rendered as explicitly untrusted attachment content for both agent engines.
 5. Original image bytes remain unchanged and still reach a vision-capable LLM
@@ -33,17 +35,19 @@ the existing XMPP attachment path.
 
 ## Security properties
 
-- Service URLs must use plain HTTP on `localhost` or a loopback IP. Paths,
-  credentials, query strings, fragments, non-loopback hosts, redirects, and
-  environment proxies are rejected or disabled. An incompatible URL disables
-  automatic enrichment without preventing daemon startup or the separately
-  sandboxed explicit vision tool from loading.
+- Service URLs must be origins without credentials, paths, query strings, or
+  fragments. HTTP is accepted only for loopback and `host.containers.internal`;
+  remote instances require HTTPS. Redirects and environment proxies remain
+  disabled. An incompatible URL disables automatic enrichment without
+  preventing daemon startup or the separately sandboxed explicit vision tool
+  from loading.
 - Bearer credentials use `SecretString`, are injected only on the host request,
   and never enter attachment text, LLM parameters, or logs.
 - The explicit `vision-analyze` WASM tool receives the same host-managed token
-  only for the configured sidecar origin and `/v1/` path. The token is never
-  serialized into WASM context, redirects and proxies are disabled for that
-  scoped request, and another local port cannot receive it.
+  only for the exact configured origin and `/v1/` path. The token is never
+  serialized into WASM context; host capability and request-time checks both
+  reject a different scheme, host, port, or path. Proxies are bypassed only for
+  local service origins, while external HTTPS can use normal proxy policy.
 - User message text is not sent to LunarVision. The accepted attachment is
   analyzed with a fixed prompt; normal message text continues through inbound
   safety checks and the selected agent engine.
@@ -55,9 +59,10 @@ the existing XMPP attachment path.
 
 Focused tests cover authenticated request construction, fixed-prompt isolation,
 direct and cached sidecar response shapes, non-XMPP exclusion, fail-open
-fallback, loopback URL enforcement, XML escaping, decoded image limits, and VL
-data-URL construction. Host credential tests also cover exact-origin scoping for
-the explicit WASM vision tool.
+fallback, local-HTTP/remote-HTTPS URL enforcement, XML escaping, decoded image
+limits, and VL data-URL construction. Host credential tests cover exact-origin
+scoping for the explicit WASM vision tool, including scheme, host, port, and
+versioned-path rejection.
 
 Live Conversations/Gajim/Dino transfer validation remains tracked by XMPP
 file-transfer item 15. Inbound-download SSRF hardening (formerly deferred to
@@ -68,6 +73,8 @@ pinned to validated addresses, `ALLOW_PRIVATE_IPS=1` local-dev opt-in), and
 recognized attachment URLs are stripped from message content and logs even
 when a download fails (2026-08-01, branch `rarity/kimi-27-20260801-0000`).
 
-Kawarimi migration carries `VL_URL`/`VL_MODEL` but deliberately regenerates the
-host-local vision auth token. Imports of older bundles ignore their carried
-sidecar token, preserving the target's matching sidecar/daemon credential pair.
+Kawarimi migration carries local-sidecar `VL_URL`/`VL_MODEL` settings but not an
+external instance URL/token or deployment mode. Imports therefore retain the
+target's matching local sidecar/daemon credential pair. Operators re-run
+`configure-vision-external` after migration when the destination should use the
+remote service.
