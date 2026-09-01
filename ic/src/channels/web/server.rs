@@ -600,6 +600,8 @@ pub async fn start_server(
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
         .route("/i18n-app.js", get(i18n_app_handler))
+        .route("/mascot.js", get(mascot_js_handler))
+        .route("/mascot/{name}", get(mascot_sprite_handler))
         .route("/vendor/purify.min.js", get(vendor_purify_handler))
         .route("/vendor/marked.umd.min.js", get(vendor_marked_handler))
         .layer(CompressionLayer::new().gzip(true));
@@ -850,6 +852,47 @@ async fn i18n_app_handler() -> impl IntoResponse {
         ],
         include_str!("static/i18n-app.js"),
     )
+}
+
+// Emoting-mascot widget (item #19 in the 2.1.0 goals): the widget JS and
+// the animated 64x64 pony/unicorn sprite pack, embedded in the binary.
+async fn mascot_js_handler() -> impl IntoResponse {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("static/mascot.js"),
+    )
+}
+
+/// Serve one sprite from the mascot pack. The allowlist mirrors
+/// [`crate::channels::web::emote::Emote::ALL_SPRITES`]; unknown names get a
+/// 404 instead of arbitrary embedded-content access. Long cache lifetime
+/// because the files are pinned content of this binary.
+async fn mascot_sprite_handler(Path(name): Path<String>) -> impl IntoResponse {
+    let bytes: Option<&'static [u8]> = match name.as_str() {
+        "lunar_fiery.gif" => Some(include_bytes!("static/mascot/lunar_fiery.gif").as_slice()),
+        "lunar_greet.gif" => Some(include_bytes!("static/mascot/lunar_greet.gif").as_slice()),
+        "lunar_jump.gif" => Some(include_bytes!("static/mascot/lunar_jump.gif").as_slice()),
+        "lunar_love.gif" => Some(include_bytes!("static/mascot/lunar_love.gif").as_slice()),
+        "lunar_rage.gif" => Some(include_bytes!("static/mascot/lunar_rage.gif").as_slice()),
+        "lunar_sleep.gif" => Some(include_bytes!("static/mascot/lunar_sleep.gif").as_slice()),
+        "lunar_sup.gif" => Some(include_bytes!("static/mascot/lunar_sup.gif").as_slice()),
+        "lunar_walk.gif" => Some(include_bytes!("static/mascot/lunar_walk.gif").as_slice()),
+        _ => None,
+    };
+    match bytes {
+        Some(bytes) => (
+            [
+                (header::CONTENT_TYPE, "image/gif"),
+                (header::CACHE_CONTROL, "public, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 // Vendored frontend libraries (embedded in the binary). Content is pinned to a
