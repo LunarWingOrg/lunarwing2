@@ -9,9 +9,10 @@
 #   HEALTH_LUNARVISION_URL           (optional)        — single base URL override
 #                                                        (e.g. http://127.0.0.1:8089).
 #                                                        When unset, multi-tenant hosts
-#                                                        auto-discover vision_health ports
-#                                                        from the ports registry; single-node
-#                                                        falls back to http://127.0.0.1:8089.
+#                                                        auto-discover local health ports or
+#                                                        external HTTPS origins from the ports
+#                                                        registry; single-node falls back to
+#                                                        http://127.0.0.1:8089.
 #   SELF_HEAL_TENANTS_FILE / LUNARWING_TENANTS_FILE    — ports registry path
 #                                                        (default: /etc/lunarwing/ports.json)
 #   HEALTH_LUNARVISION_TIMEOUT       (default: 5)      — curl timeout in seconds
@@ -43,9 +44,8 @@ fi
 
 # ── Target resolution (MT-aware) ─────────────────────────────────────────────
 # Explicit HEALTH_LUNARVISION_URL always wins (operator override).
-# Otherwise discover every tenant's vision_health port from the ports registry
-# so multi-tenant hosts never false-fail against the single-node 8089 default.
-# If no registry / no vision ports, fall back to single-node 8089.
+# Otherwise discover each tenant's configured target: an external HTTPS origin,
+# or its local vision_health port. If no target exists, fall back to 8089.
 
 _resolve_tenants_file() {
     if [ -n "${SELF_HEAL_TENANTS_FILE:-}" ] && [ -f "${SELF_HEAL_TENANTS_FILE}" ]; then
@@ -68,7 +68,7 @@ _resolve_tenants_file() {
     return 1
 }
 
-# Populate TARGETS as lines: "tenant_or_host|http://127.0.0.1:PORT"
+# Populate TARGETS as lines: "tenant_or_host|base_url".
 TARGETS=()
 if [ -n "${HEALTH_LUNARVISION_URL:-}" ]; then
     TARGETS+=("override|${HEALTH_LUNARVISION_URL%/}")
@@ -76,23 +76,26 @@ else
     tenants_file=""
     if tenants_file="$(_resolve_tenants_file)"; then
         if command -v jq >/dev/null 2>&1; then
-            # Prefer the dedicated field, then its pre-v10 reserved name. The
-            # API-port fallback supports truly old registries without slot 6.
-            while IFS=$'\t' read -r tname port; do
-                [ -n "$tname" ] && [ -n "$port" ] && [ "$port" != "null" ] || continue
-                TARGETS+=("${tname}|http://127.0.0.1:${port}")
+            while IFS=$'\t' read -r tname base_url; do
+                [ -n "$tname" ] && [ -n "$base_url" ] && [ "$base_url" != "null" ] || continue
+                TARGETS+=("${tname}|${base_url%/}")
             done < <(jq -r '
                 .tenants // {}
                 | to_entries[]
                 | . as $e
-                | (
-                    $e.value.extended_ports.vision_health
-                    // $e.value.extended_ports.reserved_6
-                    // $e.value.extended_ports.vision_service
-                    // empty
-                  ) as $p
-                | select($p != null and $p != "")
-                | "\($e.key)\t\($p)"
+                | if (($e.value.vision.mode // "local") == "external") then
+                    ($e.value.vision.external_url // "invalid://missing-external-url") as $url
+                    | "\($e.key)\t\($url)"
+                  else
+                    (
+                      $e.value.extended_ports.vision_health
+                      // $e.value.extended_ports.reserved_6
+                      // $e.value.extended_ports.vision_service
+                      // empty
+                    ) as $port
+                    | select($port != null and $port != "")
+                    | "\($e.key)\thttp://127.0.0.1:\($port)"
+                  end
             ' "$tenants_file" 2>/dev/null)
         fi
     fi
@@ -102,6 +105,48 @@ else
 fi
 
 # ── Probe one URL ────────────────────────────────────────────────────────────
+
+# Validate an origin before passing it to curl. In particular, do not classify
+# `http://127.0.0.1:PORT@remote` as loopback based on its string prefix.
+_lunarvision_origin_protocol() {
+    local url="$1" scheme authority host port=""
+    [[ "$url" != *[[:space:]]* ]] || return 1
+    case "$url" in
+        https://*) scheme="https"; authority="${url#https://}" ;;
+        http://*) scheme="http"; authority="${url#http://}" ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$authority" && "$authority" != *['/?#@']* ]] || return 1
+
+    if [[ "$authority" == \[* ]]; then
+        [[ "$authority" =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]] || return 1
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]:-}"
+        [[ "$host" == *:* ]] || return 1
+    else
+        [[ "$authority" != *:*:* ]] || return 1
+        if [[ "$authority" == *:* ]]; then
+            host="${authority%:*}"
+            port="${authority##*:}"
+            [[ -n "$port" ]] || return 1
+        else
+            host="$authority"
+        fi
+        [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+        [[ "$host" != *..* ]] || return 1
+    fi
+    if [[ -n "$port" ]]; then
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+        (( 10#$port > 0 && 10#$port <= 65535 )) || return 1
+    fi
+    if [[ "$scheme" == "http" ]]; then
+        case "${host,,}" in
+            127.0.0.1|localhost|host.containers.internal|::1) ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf '%s\n' "$scheme"
+}
 
 # Sets globals: p_status p_exit p_issues p_latency p_svc_status p_tesseract
 # p_uptime p_vl p_total p_ocr p_vision p_hits p_misses p_rate p_hit_rate p_avg
@@ -124,20 +169,37 @@ _probe_one() {
     p_hit_rate=0.0
     p_avg=0
 
-    local health_raw http_code health_body curl_exit start_ns end_ns
+    local health_raw http_code health_body curl_exit start_ns end_ns protocol safe_target=true
+    local -a curl_protocol=()
+    if protocol="$(_lunarvision_origin_protocol "$base_url")"; then
+        case "$protocol" in
+            https) curl_protocol=(--proto '=https' --tlsv1.2) ;;
+            http) curl_protocol=(--proto '=http') ;;
+        esac
+    else
+        safe_target=false
+    fi
     health_raw=""
     http_code="000"
     curl_exit=0
     start_ns=$(date +%s%N)
-    health_raw=$(curl -s --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
-        -w "\n%{http_code}" \
-        "${base_url}/health" 2>/dev/null) || curl_exit=$?
+    if [ "$safe_target" = "true" ]; then
+        health_raw=$(curl "${curl_protocol[@]}" -s \
+            --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
+            -w "\n%{http_code}" "${base_url}/health" 2>/dev/null) || curl_exit=$?
+    else
+        curl_exit=2
+    fi
     end_ns=$(date +%s%N)
     p_latency=$(( (end_ns - start_ns) / 1000000 ))
     http_code=$(printf '%s' "$health_raw" | tail -1)
     health_body=$(printf '%s' "$health_raw" | sed '$d')
 
-    if [ "$http_code" = "000" ] || [ "$curl_exit" -ne 0 ]; then
+    if [ "$safe_target" != "true" ]; then
+        p_status="critical"
+        p_exit=2
+        p_issues+=("Unsafe LunarVision URL; use HTTPS externally or loopback HTTP")
+    elif [ "$http_code" = "000" ] || [ "$curl_exit" -ne 0 ]; then
         p_status="critical"
         p_exit=2
         p_issues+=("Service unreachable at ${base_url}/health")
@@ -186,7 +248,8 @@ _probe_one() {
 
     if [ "$FETCH_METRICS" = "true" ] && [ "$http_code" = "200" ]; then
         local metrics_raw
-        metrics_raw=$(curl -s --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
+        metrics_raw=$(curl "${curl_protocol[@]}" -s \
+            --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
             "${base_url}/vision/metrics" 2>/dev/null) || true
         if printf '%s' "$metrics_raw" | jq . >/dev/null 2>&1; then
             p_total=$(printf '%s' "$metrics_raw" | jq -r '.total_requests // 0')

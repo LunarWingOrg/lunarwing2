@@ -405,6 +405,27 @@ WASM tools execute HTTP requests through the host runtime, subject to:
    - Uses Aho-Corasick for fast multi-pattern matching
    - **Reference:** `src/safety/leak_detector.rs`
 
+### LunarVision Service Clients
+
+`VISION_SERVICE_URL` is operator-controlled. Both the automatic XMPP enrichment
+client and bundled `vision-analyze` WASM tool accept plaintext HTTP only for
+loopback or `host.containers.internal`; external instances must use HTTPS. Base
+URLs cannot contain userinfo, a path, query, or fragment.
+
+The automatic client disables redirects and environment proxies, uses bounded
+connect/request timeouts, caps responses at 1 MiB, and holds
+`VISION_AUTH_TOKEN` in `SecretString`. The WASM host rewrites the tool's HTTP
+capability to the configured host and `/v1/` POST path, then applies an additional
+request-time exact-origin check covering scheme, host, and port. Its bearer token
+is injected only after leak scanning and only for that exact origin/path. Local
+service calls bypass proxies; external HTTPS calls retain normal outbound proxy
+support. The managed external lifecycle accepts bearer tokens only through a
+one-line file, health-gates the remote endpoint, and stores only its non-secret
+URL/mode in the ports registry.
+
+**References:** `src/vision_enrichment.rs`, `src/tools/wasm/wrapper.rs`,
+`scripts/mt-admin-lib/02-containers.sh`
+
 ### Built-in HTTP Tool
 
 The `http` tool (`src/tools/builtin/http.rs`) has its own SSRF protections:
