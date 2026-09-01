@@ -360,6 +360,8 @@ _wait_external_vision_healthy() {
 }
 ensure_container_runtime() { CALLS+=("ensure-runtime"); }
 CALLS=()
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 start_tenant_vision alpha >/dev/null
 assert_call 'wait-external:https://vision.example.test'
 assert_no_call_prefix 'ensure-runtime'
