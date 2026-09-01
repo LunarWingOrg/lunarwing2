@@ -298,7 +298,8 @@ impl HostKeyVerifier {
         info!(
             host = %full_host,
             key_type = %remote_key_type,
-            "Host key accepted and durably pinned (AcceptFirst mode)"
+            persistent = self.persistence.is_some(),
+            "Host key accepted and pinned (AcceptFirst mode)"
         );
         Ok(VerifyResult::Accepted)
     }
