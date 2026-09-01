@@ -397,11 +397,15 @@ impl Channel for GatewayChannel {
             }
         };
 
+        // Emoting-mascot hook: classify roleplay action phrases in the
+        // outgoing reply so clients can mirror them in the mascot widget.
+        let emotes = emote::emote_names(&response.content);
         self.state.sse.broadcast_for_user(
             &msg.user_id,
             AppEvent::Response {
                 content: response.content,
                 thread_id,
+                emotes,
             },
         );
 
@@ -564,11 +568,14 @@ impl Channel for GatewayChannel {
                 });
             }
         };
+        // Emoting-mascot hook: see `respond()`.
+        let emotes = emote::emote_names(&response.content);
         self.state.sse.broadcast_for_user(
             user_id,
             AppEvent::Response {
                 content: response.content,
                 thread_id,
+                emotes,
             },
         );
         Ok(())
