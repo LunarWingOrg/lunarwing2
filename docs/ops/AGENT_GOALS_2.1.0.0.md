@@ -125,8 +125,8 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
 21. [x] Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals file, to be created): native app wrapping the web gateway experience with the emoting mascot widget and LunarVoice integration as headline features. THIS item tracks only: repo created, goals file seeded (mascot + voice + gateway-integration items), build scaffold green. Implementation happens in that repo's own goals cycle, not here.
     - (context) Hermes desktop app (Electron) is feature reference: HUD mode, worktrees, Memory Graph, remote backends. Create the repo when Phase 1 voice work is far enough along to integrate. (repo created in gitlab; no goals file yet; may append more details later)
-22. [ ] Release-notes accuracy pass on RELEASE-v2.1.0.0.md (the item 14 draft) — verify every claim against the actual shipped changes; known-issues list reconciled against the work-item tracker
-23. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings. 
+22. [ ] Release-notes accuracy pass on RELEASE-v2.1.0.0.md (the item 14 draft) — verify every claim against the actual shipped changes; known-issues list reconciled against the work-item tracker. current release notes file are from an aborted earlier attempt to catch up the release notes changes, but was fundamentally incomplete. the commit hash has also advanced since that attempt but some of that info could be used as reference
+23. [ ] ( last attempt was on: rarity/kimi-23-20260901-1801 and does address any of the actual issues found ) - one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
 24. [x] (S) reserved
 
 ## Deferred (explicitly NOT this release)
@@ -136,5 +136,3 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 - **LunarHub** - still in planning
 
 ---
-
-*(Rebuilt 2026-08-30 from the v2.1 planning session: foundation → hygiene → surfaces. Sub-bullet DONE-trail convention adopted file-wide per the 2.0.9 lessons — inline evidence walls caused agent confusion and one planning-death.)*
