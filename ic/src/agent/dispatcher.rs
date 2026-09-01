@@ -398,6 +398,18 @@ struct ChatDelegate<'a> {
     user_tz: chrono_tz::Tz,
 }
 
+/// Render a queued `/steer` note as the user message injected mid-turn.
+///
+/// Shared between the legacy agentic loop (`ChatDelegate::check_signals`)
+/// and the Engine V2 bridge (`bridge::handle_steer`) so the model sees the
+/// exact same steer framing no matter which loop is active.
+pub(crate) fn wrap_steer_note(note: &str) -> String {
+    format!(
+        "A steer note arrived from the user while you were working on this task. \
+         Adjust your current course of action accordingly; it is not a new turn:\n{note}"
+    )
+}
+
 #[async_trait]
 impl<'a> LoopDelegate for ChatDelegate<'a> {
     async fn check_signals(&self) -> LoopSignal {
@@ -411,11 +423,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             // after the current tool call's results, so role alternation and
             // the tool-calling loop stay intact.
             if let Some(note) = thread.drain_steer_notes() {
-                return LoopSignal::InjectMessage(format!(
-                    "A steer note arrived from the user while you were working \
-                     on this task. Adjust your current course of action \
-                     accordingly; it is not a new turn:\n{note}"
-                ));
+                return LoopSignal::InjectMessage(wrap_steer_note(&note));
             }
         }
         LoopSignal::Continue

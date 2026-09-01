@@ -1,0 +1,8 @@
+Version NEXT:
+0000-00-00 Jonas Schäfer <jonas@zombofant.net>
+    * Please see the `xso` crate for the changelog of `xso-proc`.
+      For discoverability, the changes to the derive macros are listed there.
+
+Version 0.1.0:
+2024-07-25 Jonas Schäfer <jonas@zombofant.net>
+    * Initial release of this crate

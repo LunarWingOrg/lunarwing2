@@ -272,16 +272,27 @@ clone_tenant_repo() {
 
   say "cloning repo from $SOURCE_REPO to $dest ..."
   local -a safedir=(-c "safe.directory=$dest" -c "safe.directory=$SOURCE_REPO")
+  # A shallow SOURCE_REPO (scratch/harness checkouts prepared with
+  # `git fetch --depth`/`--shallow-since`) cannot serve plain fetches:
+  # upload-pack aborts with "did not send all necessary objects", and the
+  # checkout below then fails pathspec, leaving an unusable half-clone.
+  # A depth-bounded fetch negotiates the source's shallow boundary instead.
+  # Full-depth sources keep the historical full-clone behavior.
+  local -a depth_args=()
+  if [[ "$(git "${safedir[@]}" -C "$SOURCE_REPO" rev-parse --is-shallow-repository 2>/dev/null)" == "true" ]]; then
+    say "source repo is shallow — tenant clone bounded with --depth=10000"
+    depth_args=(--depth=10000)
+  fi
   if [[ -d "$dest" ]] && [[ -n "$(ls -A "$dest")" ]]; then
     # Directory already has content (env/, state/, etc.) — init in place
     git "${safedir[@]}" init "$dest" >/dev/null
     git "${safedir[@]}" -C "$dest" remote add origin "$SOURCE_REPO"
-    git "${safedir[@]}" -C "$dest" fetch origin --quiet
+    git "${safedir[@]}" -C "$dest" fetch "${depth_args[@]}" origin --quiet
     local branch
     branch="$(git "${safedir[@]}" -C "$SOURCE_REPO" symbolic-ref --short HEAD 2>/dev/null || echo staging)"
     git "${safedir[@]}" -C "$dest" checkout -b "$branch" "origin/$branch" 2>&1 | tail -1
   else
-    git "${safedir[@]}" clone --single-branch "$SOURCE_REPO" "$dest" 2>&1 | tail -1
+    git "${safedir[@]}" clone --single-branch "${depth_args[@]}" "$SOURCE_REPO" "$dest" 2>&1 | tail -1
   fi
   chown -R "$name:$name" "$dest"
   say "repo cloned for $name"
@@ -1189,6 +1200,17 @@ install_wasm_tenant() {
 
     if [[ ! -f "$src_wasm" ]]; then
       skipped=$((skipped + 1))
+      continue
+    fi
+
+    # Honor the enable_darkirc tenant flag: without --enable-darkirc the
+    # tenant has no darkirc adapter, and installing the channel anyway starts
+    # a 3s poll loop against a nonexistent default adapter (log-flooding
+    # connect errors). Skip installing it and drop stale artifacts.
+    if [[ "$ch_name" == "darkirc" ]] && ! tenant_darkirc_enabled "$name"; then
+      rm -f "$dest_wasm" "$caps_dest"
+      skipped=$((skipped + 1))
+      say "  skipping channel: darkirc (tenant darkirc disabled)"
       continue
     fi
 

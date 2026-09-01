@@ -4,7 +4,9 @@ set -euo pipefail
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
-mapfile -d '' candidates < <(git ls-files -z --cached --others --exclude-standard -- '*.sh')
+# ic/vendor/ is pinned third-party crates.io source (ic/.cargo/config.toml) —
+# its scripts are not our lint surface, so exclude it from the scan.
+mapfile -d '' candidates < <(git ls-files -z --cached --others --exclude-standard -- '*.sh' | grep -zv '^ic/vendor/')
 scripts=()
 for script in "${candidates[@]}"; do
     [[ -f "$script" ]] && scripts+=("$script")

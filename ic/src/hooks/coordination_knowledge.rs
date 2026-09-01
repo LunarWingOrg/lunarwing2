@@ -82,9 +82,13 @@ pub struct KnowledgeShareLimits {
     ///
     /// Room occupancy is not authentication: any occupant can claim any
     /// sender identity the room forwards. Ingestion therefore only accepts
-    /// senders an operator explicitly listed. Entries match the full inbound
-    /// sender ID case-insensitively (for XMPP MUC that is
-    /// `room@server/nick`, so the resource/nick is significant).
+    /// senders an operator explicitly listed. Entries match case-insensitively
+    /// against the full inbound sender ID (for XMPP MUC that is
+    /// `room@server/nick`, so the resource/nick is significant) or against the
+    /// room bare JID (`room@server`) as an explicit room-wide opt-in. A user
+    /// bare JID (`user@server`) never matches a MUC occupant sender, and a
+    /// full-occupant entry silently stops matching when the publisher's nick
+    /// changes — nick changes are config changes.
     pub publishers: Vec<String>,
 }
 
@@ -140,10 +144,22 @@ impl KnowledgeShareLimits {
     }
 
     /// Whether a validated inbound sender may publish knowledge shares.
+    ///
+    /// An entry matches either the full inbound sender ID or, when the sender
+    /// carries an XMPP MUC occupant nick (`room@server/nick`), the room bare
+    /// JID with the nick stripped. The room-level form admits every occupant
+    /// the room forwards, so listing a room bare JID is an explicit room-wide
+    /// trust decision; listing the full occupant JID pins the publisher to
+    /// that exact nick.
     pub fn is_allowed_publisher(&self, sender: &str) -> bool {
         self.publishers
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(sender))
+            || sender.split_once('/').is_some_and(|(room, _nick)| {
+                self.publishers
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(room))
+            })
     }
 }
 
@@ -714,6 +730,45 @@ mod tests {
         assert!(!limits.is_allowed_publisher("bad sender"));
     }
 
+    /// WI#97: an allowlist entry must match either the full MUC occupant JID
+    /// (`room@server/nick`) or the room bare JID (`room@server`) as an
+    /// explicit room-wide opt-in. A user bare JID (`user@server`) never
+    /// matches a MUC occupant sender — that was the misconfiguration behind
+    /// the silent cross-tenant ingestion failure.
+    #[test]
+    fn publisher_allowlist_matches_full_occupant_jid_or_room_bare_jid() {
+        let limits = KnowledgeShareLimits {
+            publishers: vec![
+                "mepuhiy@conference.xmpp.sobe.world".to_string(),
+                "other@conference.example/sunburst".to_string(),
+            ],
+            ..KnowledgeShareLimits::default()
+        };
+        // Full occupant JID entries keep exact occupant-only semantics.
+        assert!(limits.is_allowed_publisher("other@conference.example/Sunburst"));
+        assert!(!limits.is_allowed_publisher("other@conference.example/impostor"));
+        // A room bare JID entry admits any occupant of that room, and no
+        // occupant of a different room.
+        assert!(limits.is_allowed_publisher("mepuhiy@conference.xmpp.sobe.world/ruffles"));
+        assert!(limits.is_allowed_publisher("mepuhiy@conference.xmpp.sobe.world/SUNBURST"));
+        assert!(!limits.is_allowed_publisher("elsewhere@conference.xmpp.sobe.world/ruffles"));
+        // Different room, same server: no match.
+        assert!(!limits.is_allowed_publisher("ruffles@conference.xmpp.sobe.world/x"));
+        // Senders without an occupant nick only match an exact entry; the
+        // fallback never strips anything when there is no nick to strip.
+        assert!(!limits.is_allowed_publisher("conference.xmpp.sobe.world"));
+        assert!(!limits.is_allowed_publisher("other@conference.example"));
+
+        // A user bare JID entry matches a DM-style sender but never a MUC
+        // occupant sender carrying a room JID.
+        let user_bare = KnowledgeShareLimits {
+            publishers: vec!["ruffles@xmpp.sobe.world".to_string()],
+            ..KnowledgeShareLimits::default()
+        };
+        assert!(user_bare.is_allowed_publisher("ruffles@xmpp.sobe.world"));
+        assert!(!user_bare.is_allowed_publisher("mepuhiy@conference.xmpp.sobe.world/ruffles"));
+    }
+
     #[cfg(feature = "libsql")]
     mod integration {
         use super::*;
@@ -959,6 +1014,61 @@ mod tests {
             assert!(limits.is_allowed_publisher("Rarity"));
             assert!(!limits.is_allowed_publisher("applejack@conf.example/other"));
             assert!(!limits.is_allowed_publisher("stranger"));
+        }
+
+        /// WI#97 regression: a room bare JID entry is a room-wide opt-in, so
+        /// a `KNOW:` share from an occupant of the coordination room ingests
+        /// even though the allowlist names no full occupant JID. Raw sender
+        /// provenance keeps the full occupant JID either way.
+        #[tokio::test]
+        async fn room_bare_entry_ingests_room_occupant_share() {
+            let (db, _dir) = test_db().await;
+            let workspace = Arc::new(Workspace::new_with_db("shared", db));
+            let sender = "coord@conference.example/sunburst";
+            let room_hook = hook(
+                Arc::clone(&workspace),
+                limits_for(&["coord@conference.example"]),
+            );
+
+            room_hook
+                .execute(
+                    &inbound(
+                        "KNOW: topic-w | a cross-tenant finding long enough to ingest",
+                        Some(sender),
+                    ),
+                    &Default::default(),
+                )
+                .await
+                .expect("fail-open hook");
+
+            let meta = await_ingest(&workspace, sender, "topic-w")
+                .await
+                .expect("room occupant share ingested via room-bare entry");
+            assert_eq!(meta.submitted_by.as_deref(), Some(sender));
+
+            // An occupant of a different, unlisted room stays ignored.
+            hook(
+                Arc::clone(&workspace),
+                limits_for(&["coord@conference.example"]),
+            )
+            .execute(
+                &inbound(
+                    "KNOW: topic-v | another finding long enough to ingest",
+                    Some("elsewhere@conference.example/sunburst"),
+                ),
+                &Default::default(),
+            )
+            .await
+            .expect("fail-open hook");
+            assert!(
+                shared_note(
+                    &workspace,
+                    "elsewhere@conference.example/sunburst",
+                    "topic-v"
+                )
+                .await
+                .is_none()
+            );
         }
 
         #[tokio::test]

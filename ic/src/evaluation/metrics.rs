@@ -131,6 +131,11 @@ impl MetricsCollector {
 
     /// Generate a summary report.
     pub fn summary(&self) -> MetricsSummary {
+        let mut top_errors = self.metrics.error_types.iter().collect::<Vec<_>>();
+        top_errors.sort_unstable_by(|(error_a, count_a), (error_b, count_b)| {
+            count_b.cmp(count_a).then_with(|| error_a.cmp(error_b))
+        });
+
         MetricsSummary {
             total_actions: self.metrics.total_actions,
             success_rate: self.success_rate(),
@@ -148,12 +153,10 @@ impl MetricsCollector {
                 .iter()
                 .max_by_key(|(_, m)| m.failures)
                 .map(|(name, _)| name.clone()),
-            top_errors: self
-                .metrics
-                .error_types
-                .iter()
+            top_errors: top_errors
+                .into_iter()
                 .take(3)
-                .map(|(e, c)| (e.clone(), *c))
+                .map(|(error, count)| (error.clone(), *count))
                 .collect(),
         }
     }
@@ -446,12 +449,47 @@ mod tests {
     }
 
     #[test]
-    fn test_summary_top_errors_populated() {
+    fn test_summary_top_errors_ranked_by_frequency() {
         let mut c = MetricsCollector::new();
-        c.record_failure("t", "timeout", Duration::from_secs(1));
-        c.record_failure("t", "auth error", Duration::from_secs(1));
-        let s = c.summary();
-        assert!(!s.top_errors.is_empty());
-        assert!(s.top_errors.len() <= 3);
+        for (error, count) in [
+            ("timeout", 1),
+            ("rate limit", 2),
+            ("auth error", 3),
+            ("not found", 4),
+            ("network error", 5),
+        ] {
+            for _ in 0..count {
+                c.record_failure("t", error, Duration::from_secs(1));
+            }
+        }
+
+        assert_eq!(
+            c.summary().top_errors,
+            vec![
+                ("network".to_string(), 5),
+                ("not_found".to_string(), 4),
+                ("auth".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_summary_top_errors_breaks_ties_by_name() {
+        let mut c = MetricsCollector::new();
+        c.metrics.error_types.extend([
+            ("zeta".to_string(), 2),
+            ("alpha".to_string(), 2),
+            ("gamma".to_string(), 2),
+            ("beta".to_string(), 2),
+        ]);
+
+        assert_eq!(
+            c.summary().top_errors,
+            vec![
+                ("alpha".to_string(), 2),
+                ("beta".to_string(), 2),
+                ("gamma".to_string(), 2),
+            ]
+        );
     }
 }

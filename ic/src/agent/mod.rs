@@ -39,6 +39,7 @@ pub use agent_loop::{Agent, AgentDeps};
 pub(crate) use agent_loop::{HARD_KILL_GRACE_SECS, truncate_for_preview};
 pub use compaction::{CompactionResult, ContextCompactor};
 pub use context_monitor::{CompactionStrategy, ContextBreakdown, ContextMonitor};
+pub(crate) use dispatcher::wrap_steer_note;
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatResult, HeartbeatRunner, spawn_heartbeat, spawn_heartbeat_with_sweep,
 };

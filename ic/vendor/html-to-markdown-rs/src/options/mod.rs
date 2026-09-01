@@ -1,0 +1,17 @@
+//! Configuration options for HTML to Markdown conversion.
+//!
+//! This module provides comprehensive configuration options for customizing
+//! HTML to Markdown conversion behavior, including output formatting, preprocessing,
+//! and metadata extraction options.
+
+pub mod conversion;
+pub mod inline_image;
+pub mod preprocessing;
+pub mod validation;
+
+pub use conversion::{ConversionOptions, ConversionOptionsBuilder, ConversionOptionsUpdate, TierStrategy};
+pub use preprocessing::{PreprocessingOptions, PreprocessingOptionsUpdate, PreprocessingPreset};
+pub use validation::{
+    CodeBlockStyle, HeadingStyle, HighlightStyle, LinkStyle, ListIndentType, NewlineStyle, OutputFormat,
+    UrlEscapeStyle, WhitespaceMode,
+};
