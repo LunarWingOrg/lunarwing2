@@ -9,9 +9,10 @@
 #   HEALTH_LUNARVISION_URL           (optional)        — single base URL override
 #                                                        (e.g. http://127.0.0.1:8089).
 #                                                        When unset, multi-tenant hosts
-#                                                        auto-discover vision_health ports
-#                                                        from the ports registry; single-node
-#                                                        falls back to http://127.0.0.1:8089.
+#                                                        auto-discover local health ports or
+#                                                        external HTTPS origins from the ports
+#                                                        registry; single-node falls back to
+#                                                        http://127.0.0.1:8089.
 #   SELF_HEAL_TENANTS_FILE / LUNARWING_TENANTS_FILE    — ports registry path
 #                                                        (default: /etc/lunarwing/ports.json)
 #   HEALTH_LUNARVISION_TIMEOUT       (default: 5)      — curl timeout in seconds
@@ -105,6 +106,48 @@ fi
 
 # ── Probe one URL ────────────────────────────────────────────────────────────
 
+# Validate an origin before passing it to curl. In particular, do not classify
+# `http://127.0.0.1:PORT@remote` as loopback based on its string prefix.
+_lunarvision_origin_protocol() {
+    local url="$1" scheme authority host port=""
+    [[ "$url" != *[[:space:]]* ]] || return 1
+    case "$url" in
+        https://*) scheme="https"; authority="${url#https://}" ;;
+        http://*) scheme="http"; authority="${url#http://}" ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$authority" && "$authority" != *['/?#@']* ]] || return 1
+
+    if [[ "$authority" == \[* ]]; then
+        [[ "$authority" =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]] || return 1
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[3]:-}"
+        [[ "$host" == *:* ]] || return 1
+    else
+        [[ "$authority" != *:*:* ]] || return 1
+        if [[ "$authority" == *:* ]]; then
+            host="${authority%:*}"
+            port="${authority##*:}"
+            [[ -n "$port" ]] || return 1
+        else
+            host="$authority"
+        fi
+        [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || return 1
+        [[ "$host" != *..* ]] || return 1
+    fi
+    if [[ -n "$port" ]]; then
+        [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+        (( 10#$port > 0 && 10#$port <= 65535 )) || return 1
+    fi
+    if [[ "$scheme" == "http" ]]; then
+        case "${host,,}" in
+            127.0.0.1|localhost|host.containers.internal|::1) ;;
+            *) return 1 ;;
+        esac
+    fi
+    printf '%s\n' "$scheme"
+}
+
 # Sets globals: p_status p_exit p_issues p_latency p_svc_status p_tesseract
 # p_uptime p_vl p_total p_ocr p_vision p_hits p_misses p_rate p_hit_rate p_avg
 _probe_one() {
@@ -126,14 +169,16 @@ _probe_one() {
     p_hit_rate=0.0
     p_avg=0
 
-    local health_raw http_code health_body curl_exit start_ns end_ns safe_target=true
+    local health_raw http_code health_body curl_exit start_ns end_ns protocol safe_target=true
     local -a curl_protocol=()
-    case "$base_url" in
-        https://*) curl_protocol=(--proto '=https' --tlsv1.2) ;;
-        http://127.0.0.1|http://127.0.0.1:*|http://localhost|http://localhost:*|http://\[::1\]|http://\[::1\]:*)
-            curl_protocol=(--proto '=http') ;;
-        *) safe_target=false ;;
-    esac
+    if protocol="$(_lunarvision_origin_protocol "$base_url")"; then
+        case "$protocol" in
+            https) curl_protocol=(--proto '=https' --tlsv1.2) ;;
+            http) curl_protocol=(--proto '=http') ;;
+        esac
+    else
+        safe_target=false
+    fi
     health_raw=""
     http_code="000"
     curl_exit=0
