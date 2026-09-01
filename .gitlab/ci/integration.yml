@@ -46,12 +46,11 @@ architecture-boundaries:
   script:
     - bash ic/scripts/check-boundaries.sh
 
-# Owner: operations maintainers. Block after existing warning baseline reaches zero.
+# Owner: operations maintainers. The repository warning baseline is zero, so
+# shellcheck is a blocking validation gate on every pipeline.
 shellcheck:
-  extends:
-    - .shell-job
-    - .observational-job
-  stage: observe
+  extends: .shell-job
+  stage: validate
   needs: []
   script:
     - bash .gitlab/scripts/shellcheck.sh
