@@ -582,6 +582,7 @@ function connectSSE() {
       loadHistory();
     }
     sseHasConnectedBefore = true;
+    window.LunarMascot?.onAgentEvent?.('open', {});
   };
 
   eventSource.onerror = () => {
@@ -619,6 +620,8 @@ function connectSSE() {
 
   eventSource.addEventListener('response', (e) => {
     const data = JSON.parse(e.data);
+    // Emoting mascot: play the emotes parsed server-side from this reply.
+    window.LunarMascot?.onAgentEvent?.('response', { emotes: data.emotes || [] });
     if (!isCurrentThread(data.thread_id)) {
       clearStreamingSnapshot(data.thread_id);
       if (data.thread_id) {
@@ -643,6 +646,7 @@ function connectSSE() {
 
   eventSource.addEventListener('thinking', (e) => {
     const data = JSON.parse(e.data);
+    window.LunarMascot?.onAgentEvent?.('working', {});
     if (!isCurrentThread(data.thread_id)) {
       if (data.thread_id) debouncedLoadThreads();
       return;
@@ -667,6 +671,7 @@ function connectSSE() {
 
   eventSource.addEventListener('tool_started', (e) => {
     const data = JSON.parse(e.data);
+    window.LunarMascot?.onAgentEvent?.('working', {});
     if (!isCurrentThread(data.thread_id)) return;
     addToolCard(data.name);
   });
@@ -690,6 +695,7 @@ function connectSSE() {
 
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
+    window.LunarMascot?.onAgentEvent?.('working', {});
     if (!isCurrentThread(data.thread_id)) return;
     getOrCreateStreamingMessage(data.thread_id);
     _streamBuffer += data.content || '';
@@ -760,6 +766,7 @@ function connectSSE() {
   eventSource.addEventListener('error', (e) => {
     if (e.data) {
       const data = JSON.parse(e.data);
+      window.LunarMascot?.onAgentEvent?.('error', {});
       if (!isCurrentThread(data.thread_id)) {
         clearStreamingSnapshot(data.thread_id);
         return;
