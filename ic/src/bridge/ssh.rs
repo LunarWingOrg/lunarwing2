@@ -115,6 +115,9 @@ pub enum SshBridgeError {
     #[error("Unknown host key (strict mode): fingerprint {fingerprint}")]
     UnknownHostKey { fingerprint: String },
 
+    #[error("Host key persistence failed: {0}")]
+    HostKeyPersistence(String),
+
     // Connection errors
     #[error("Connection timeout after {0}s")]
     ConnectionTimeout(u64),
