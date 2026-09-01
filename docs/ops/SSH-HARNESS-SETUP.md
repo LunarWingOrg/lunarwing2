@@ -322,6 +322,21 @@ new tenants and backfills it before staging/uploading keys for older tenants.
 only updates status reporting, not the signing keystore. See the architecture
 doc §7.)
 
+### Re-pin an AcceptFirst server host key
+
+`AcceptFirst` rejects a changed server host key. Verify the replacement key
+fingerprint through a trusted out-of-band channel before resetting trust. Then:
+
+1. `DELETE /hosts/{host}` to remove the runtime host config and its learned pin.
+2. `POST /hosts` with the same host configuration to add it again.
+3. Reconnect once to learn and persist the verified replacement key.
+
+For hosts declared in `config.toml`, restart after step 1 instead of posting the
+host; startup restores the static config while leaving the old learned pin
+deleted. Removing a configured `known_host_key` later can expose an older learned
+pin, so use this reset procedure whenever switching from an explicit pin back to
+`AcceptFirst`.
+
 ---
 
 ## Troubleshooting

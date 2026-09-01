@@ -38,6 +38,7 @@
   var ERROR_MS = 4000; // error flash display time
   var IDLE_AFTER_MS = 30000; // inactivity before the idle fallback
   var DRAG_THRESHOLD_PX = 5;
+  var MAX_EMOTE_QUEUE = 8;
 
   var POS_KEY = 'lunar.mascot.pos';
   var HIDDEN_KEY = 'lunar.mascot.hidden';
@@ -129,6 +130,7 @@
     var added = false;
     for (var i = 0; i < emotes.length; i++) {
       if (spriteFor(emotes[i])) {
+        if (emoteQueue.length >= MAX_EMOTE_QUEUE) emoteQueue.shift();
         emoteQueue.push(emotes[i]);
         added = true;
       }
@@ -248,6 +250,8 @@
     var moved = false;
     var grabOffsetX = 0;
     var grabOffsetY = 0;
+    var dragStartX = 0;
+    var dragStartY = 0;
 
     widget.addEventListener('pointerdown', function (e) {
       if (e.target.closest('.mascot-close')) return;
@@ -256,13 +260,20 @@
       var rect = widget.getBoundingClientRect();
       grabOffsetX = e.clientX - rect.left;
       grabOffsetY = e.clientY - rect.top;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
       widget.setPointerCapture(e.pointerId);
       e.preventDefault();
     });
 
     widget.addEventListener('pointermove', function (e) {
       if (!dragging) return;
-      if (Math.abs(e.movementX) + Math.abs(e.movementY) > 0) moved = true;
+      if (
+        Math.abs(e.clientX - dragStartX) + Math.abs(e.clientY - dragStartY) >
+        DRAG_THRESHOLD_PX
+      ) {
+        moved = true;
+      }
       applyPosition(e.clientX - grabOffsetX, e.clientY - grabOffsetY);
     });
 
@@ -281,6 +292,7 @@
     });
 
     window.addEventListener('resize', function () {
+      if (isHidden()) return;
       var rect = widget.getBoundingClientRect();
       if (widget.style.right === 'auto') applyPosition(rect.left, rect.top);
     });

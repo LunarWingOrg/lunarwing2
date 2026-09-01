@@ -382,29 +382,13 @@ impl SSHBridge {
         }
 
         for (hostname, config) in hosts.iter() {
-            // Validate hostname
-            if hostname.is_empty() || !is_valid_hostname(hostname) {
+            if hostname != &config.host {
                 return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Invalid hostname: {}",
-                    hostname
+                    "Host map key {hostname} does not match configured host {}",
+                    config.host
                 )));
             }
-
-            // Validate port
-            if config.port == 0 {
-                return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Invalid port for {}: 0",
-                    hostname
-                )));
-            }
-
-            // Validate user
-            if config.user.is_empty() {
-                return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Empty user for {}",
-                    hostname
-                )));
-            }
+            validate_host_config(config)?;
 
             // Note: We don't check secret existence here because secrets might be added later
             // TODO: Add secrets_store.exists() method if not present
@@ -430,6 +414,7 @@ impl SSHBridge {
 
     /// Add a new host configuration
     pub async fn add_host(&self, config: SSHHostConfig) -> Result<()> {
+        validate_host_config(&config)?;
         let mut hosts = self.hosts.write().await;
         let hostname = config.host.clone();
 
@@ -603,16 +588,46 @@ impl SSHBridge {
 
 /// Validate hostname format
 fn is_valid_hostname(hostname: &str) -> bool {
-    // Basic validation: not empty, no whitespace, valid characters
-    if hostname.is_empty() || hostname.contains(char::is_whitespace) {
+    if hostname.is_empty()
+        || hostname.contains(char::is_whitespace)
+        || hostname.chars().any(char::is_control)
+    {
         return false;
     }
 
-    // Allow IP addresses and hostnames
-    // This is a simplified check; production should use a proper DNS library
+    let ip_candidate = hostname
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(hostname);
+    if ip_candidate.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
     hostname
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == ':')
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+}
+
+fn validate_host_config(config: &SSHHostConfig) -> Result<()> {
+    if !is_valid_hostname(&config.host) {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Invalid hostname: {}",
+            config.host
+        )));
+    }
+    if config.port == 0 {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Invalid port for {}: 0",
+            config.host
+        )));
+    }
+    if config.user.is_empty() {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Empty user for {}",
+            config.host
+        )));
+    }
+    Ok(())
 }
 
 /// Sanitize hostname for use in secret names
@@ -637,10 +652,14 @@ mod tests {
     fn test_valid_hostname() {
         assert!(is_valid_hostname("example.com"));
         assert!(is_valid_hostname("192.168.1.1"));
+        assert!(is_valid_hostname("2001:db8::1"));
+        assert!(is_valid_hostname("[::1]"));
         assert!(is_valid_hostname("ssh-server-01"));
         assert!(!is_valid_hostname(""));
         assert!(!is_valid_hostname("invalid host"));
         assert!(!is_valid_hostname("host@name"));
+        assert!(!is_valid_hostname("host:22"));
+        assert!(!is_valid_hostname("host\nattacker"));
     }
 
     #[test]
@@ -715,6 +734,15 @@ mod tests {
         let hosts = bridge.list_hosts().await;
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].host, "example.com");
+
+        let invalid = SSHHostConfig {
+            host: "example.com\nattacker".to_string(),
+            ..hosts[0].clone()
+        };
+        assert!(matches!(
+            bridge.add_host(invalid).await,
+            Err(SshBridgeError::InvalidHostConfig(_))
+        ));
     }
 
     #[tokio::test]
