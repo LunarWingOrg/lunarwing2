@@ -31,7 +31,9 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 
 ## What's inside
 
-**Engine and gateway.** Engine V2 is the channel-neutral execution path behind the browser gateway: streamed events, interrupts, approval gates, and rich tool results. Multi-tenant setups enable it by default; single instances opt in. Details: [Engine V2](docs/architecture/ENGINE-V2.md).
+**Engine and gateway.** Engine V2 is the channel-neutral execution path used by the browser gateway and eligible bridged channels: streamed events, approval gates, and rich tool results. Multi-tenant setups enable it and route XMPP, WeeChat, and DarkIRC through it by default; single instances opt in. Details: [Engine V2](docs/architecture/ENGINE-V2.md).
+
+**Live interaction.** `/interrupt` can stop an in-flight LLM stream or tool batch, while `/steer <note>` redirects a running turn after its current tool call completes. Both controls are available through the browser gateway, XMPP, WeeChat, and the REPL; see the [cross-channel live verification](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md). The browser gateway also includes a [draggable emoting mascot](docs/guides/EMOTING_MASCOT.md) with working, idle, and response-driven animation states.
 
 **Channels, tools, and workers.**
 
@@ -39,7 +41,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica; XMPP file attachments via XEP-0363
 - MCP servers over HTTP(S), Unix sockets, host stdio, persistent sandboxed WASM components, and dedicated or shared gateways
 - Persistent Pebble, OpenCode, and Kimi Code worker containers
-- Optional [LunarVoice](projects/voice-sidecar/README.md) speech, LunarVision OCR, Gotify notifications, GitLab and SSH tooling, and NetBird tunnels
+- Optional [LunarVoice](projects/voice-sidecar/README.md) speech-to-text, text-to-speech, and voice activity detection; local or [external LunarVision](docs/guides/VISION_OCR_SIDECAR.md) OCR and vision-language analysis; Gotify notifications; GitLab and SSH tooling; and NetBird tunnels
 
 DarkIRC is opt-in: it is not built for a tenant unless the operator enables it.
 
@@ -87,7 +89,7 @@ Moving a v1 tenant to v2 uses a staged Kawarimi export/import: rehearse on a sep
 
 ## Development and testing
 
-The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). On a resource-constrained host with an adequate number of CPU cores, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds:
+The Rust workspace lives under `ic/` (Rust 1.96.1, edition 2024). Its crates.io dependency closure is committed under `ic/vendor/` and source-replaced through Cargo; review the [vendoring rules](AGENTS.md#vendored-dependencies) before changing dependencies. On a resource-constrained host with an adequate number of CPU cores, cap Cargo at twelve CPUs/jobs and prefer `cargo check` over full debug builds:
 
 ```bash
 cd ic

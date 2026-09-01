@@ -360,6 +360,8 @@ _wait_external_vision_healthy() {
 }
 ensure_container_runtime() { CALLS+=("ensure-runtime"); }
 CALLS=()
+# Imported above, then replaced with a call-recording mock later in this test.
+# shellcheck disable=SC2218
 start_tenant_vision alpha >/dev/null
 assert_call 'wait-external:https://vision.example.test'
 assert_no_call_prefix 'ensure-runtime'
@@ -388,7 +390,6 @@ assert_call 'remove-openrc:alpha'
 assert_no_call_prefix 'render-openrc:'
 assert_no_call_prefix 'render-supervisor:'
 
-INIT_SYSTEM=openrc
 mapfile -t external_writer_services < <(tenant_writer_services alpha)
 if printf '%s\n' "${external_writer_services[@]}" | grep -q 'lunarwing-vision-alpha'; then
   fail "external LunarVision appears in writer service set"
@@ -427,6 +428,7 @@ else
   pass "external transition does not print bearer token"
 fi
 
+# shellcheck disable=SC2034  # Consumed by sourced helper after mocked runtime detection.
 CONTAINER_RT=true
 start_tenant_vision() { CALLS+=("start-local:$1"); return 0; }
 CALLS=()

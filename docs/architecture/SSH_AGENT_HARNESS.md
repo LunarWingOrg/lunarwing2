@@ -75,7 +75,7 @@ intentionally omitted because they drift as adjacent code changes.
 | `bridge/ssh.rs` | **Core coordination + type definitions.** Owns `SSHBridge`, defines public config/credential/error/audit types, live-map host CRUD, and the load-bearing `start_agent_server()`. Pure orchestration — delegates crypto to `secrets` and the wire protocol to `ssh_agent`. |
 | `bridge/ssh_agent.rs` | **In-process ssh-agent server.** `SshAgentServer` binds the Unix socket, parses keys with `russh::keys::decode_secret_key`, runs `russh::keys::agent::server::serve`, and self-connects to `add_identity` each key into russh's internal keystore. |
 | `bridge/ssh_secrets.rs` | **Key ↔ secrets-store adapter.** `SshSecretsManager` derives secret names, stores/loads/deletes keys and passphrases, and heuristically classifies key format. |
-| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts (in memory).** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection. Used directly by built-in/WASM russh execution; `ssh_git` materializes its pins into an OpenSSH `known_hosts`. |
+| `bridge/ssh_hostkeys.rs` | **Host-key verification / known_hosts persistence.** `HostKeyVerifier` — Strict / AcceptFirst (TOFU), SHA256 fingerprints, mismatch detection, and tenant-scoped encrypted pin-set persistence. Used directly by built-in/WASM russh execution; `ssh_git` learns through the same verifier and materializes its pins into an ephemeral OpenSSH `known_hosts`. |
 | `bridge/ssh_api.rs` | **HTTP REST management surface (axum).** Process-local host CRUD, persistent encrypted-key upload/delete/status, and agent status/keys. |
 | `bridge/ssh_client.rs` | **In-process russh client.** `connect_and_exec` used by the built-in and WASM `ssh` tools. Wires `HostKeyVerifier` via russh's `Handler::check_server_key`. |
 | `config/ssh.rs` | **Startup config deserialization.** `SshConfig` / `SshHostEntry` map `[ssh]` / `[[ssh.hosts]]` TOML into typed config; `to_host_map()` flattens global defaults against per-host overrides. |
@@ -284,8 +284,9 @@ PascalCase (`"Strict"`) — clients must match the casing.
 
 ## 5. Security model
 
-- **Runtime credential store.** Persistent credentials consumed by the bridge
-  are AES-256-GCM ciphertext in the secrets store (`nonce || ciphertext || tag`
+- **Runtime credential and host-pin store.** Persistent credentials and the
+  versioned AcceptFirst host-key pin set consumed by the bridge are AES-256-GCM
+  ciphertext in the tenant-scoped secrets store (`nonce || ciphertext || tag`
   plus a per-secret salt; per-secret key via HKDF-SHA256). The master key comes
   from `SECRETS_MASTER_KEY` or the OS keychain. This guarantee does not erase
   external provisioning copies: default mt-admin bootstrap leaves the generated
@@ -300,10 +301,13 @@ PascalCase (`"Strict"`) — clients must match the casing.
   by the string `owner_id` (`tenant_name` in the bridge), and the socket lives
   in the tenant-owned run directory. The socket grants signing, not a
   destination-bound capability; worker egress must be constrained separately.
-- **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + in-memory pin).
-  No `AcceptAny`. Built-in/WASM russh execution checks the live server key;
-  `ssh_git` materializes a verifier/config pin into an ephemeral `known_hosts`;
-  worker mode relies on its own client and container-local `known_hosts`.
+- **Host-key trust.** `Strict` (default) or `AcceptFirst` (TOFU + encrypted,
+  tenant-scoped persistent pin). No `AcceptAny`. Built-in/WASM russh execution
+  checks the live server key. `ssh_git` uses a russh host-key preflight to learn
+  a missing AcceptFirst pin, then enforces the configured/persisted key through
+  an ephemeral OpenSSH `known_hosts`. A pin mismatch, storage failure, or
+  malformed persisted pin set fails closed; worker mode relies on its own client
+  and container-local `known_hosts`.
 
 ### Hardening notes / current sharp edges
 
@@ -347,17 +351,25 @@ PascalCase (`"Strict"`) — clients must match the casing.
   `PrivateTmp=true`; a `/tmp` socket would be invisible to bind-mounted workers.
 - **No `AcceptAny` host-key mode.** Refuses to offer a footgun; the strictest
   useful default (`Strict`) is the default.
-- **Fail-soft everywhere.** A broken SSH config degrades SSH only; it never
-  takes down the daemon.
+- **Durable TOFU is transactional and fail-closed.** AcceptFirst writes the
+  updated encrypted pin set before publishing the key in memory or accepting
+  the handshake. Concurrent first connects re-check under the write lock. A
+  load, decode, or write failure never falls back to an empty verifier.
+- **Fail-soft at the daemon boundary.** A broken SSH config or pin store disables
+  the SSH bridge; it never takes down unrelated LunarWing surfaces.
 
 ## 7. Implementation status & gaps
 
 Built and working:
 
-- `SSHBridge` + all types, process-local host CRUD, validation.
+- `SSHBridge` + all types, process-local host CRUD, validation, and startup load
+  of the tenant-scoped persistent host-key verifier.
 - `SshAgentServer` — real `russh::keys` agent, socket lifecycle, startup key
   loading, chmod, self-`add_identity`.
 - `SshSecretsManager` — persistent encrypted key/passphrase store operations.
+- `HostKeyVerifier` — versioned encrypted AcceptFirst pin persistence, reload,
+  mismatch rejection, per-port isolation, and persistent pin revocation when a
+  live host is removed.
 - `config/ssh.rs` — startup `[ssh]` / `[[ssh.hosts]]` parsing + `to_host_map()`.
 - `ssh_api.rs` — live host management, persistent key management, and agent
   status HTTP surface, mounted in the unified webhook server.
@@ -367,10 +379,12 @@ Built and working:
 Now wired into live paths (via the delivery mechanisms — see
 [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)):
 
-- Built-in and WASM `ssh` feed the live server key through
-  `HostKeyVerifier::verify_from_config` in `ssh_client.rs`; `ssh_git` materializes
-  a verifier/config pin into an ephemeral OpenSSH `known_hosts`. Worker mode is
-  outside these checks and relies on its own SSH client and `known_hosts`.
+- Built-in and WASM `ssh` feed the live server algorithm and wire key through
+  `HostKeyVerifier::verify_from_config_with_key_type` in `ssh_client.rs`.
+  `ssh_git` learns a missing AcceptFirst pin through a russh host-key-only
+  preflight, then materializes the configured/persisted key into an ephemeral
+  OpenSSH `known_hosts` and enforces it strictly. Worker mode is outside these
+  checks and relies on its own SSH client and `known_hosts`.
 
 Known limitations / follow-ups:
 
@@ -383,8 +397,9 @@ Known limitations / follow-ups:
 - **No production `AuditLogger`.** Replace `NullAuditLogger` with a persistent
   implementation and emit the currently unused connection/command/key/stop
   events to realize the "auditable access" goal.
-- **`DELETE /hosts/{host}` leaves the encrypted key secret** and removes only the
-  live map entry; it may also return after restart if still in `config.toml`.
+- **`DELETE /hosts/{host}` leaves the encrypted private-key secret.** It removes
+  the live map entry and revokes the learned host-key pin, but the configured
+  host itself returns after restart if it remains in `config.toml`.
 - **Default mt-admin provisioning retains a plaintext source key** in the
   tenant's `~/.ssh/`; failed upload also retains the staging copy.
 - **`from_utf8_lossy` on key bytes** (`ssh_secrets.rs`, `ssh_agent.rs`) assumes
@@ -393,22 +408,24 @@ Known limitations / follow-ups:
 
 ## 8. Test coverage
 
-26 unit tests, all in-module (`#[cfg(test)]`), none in `ic/tests/`:
+37 unit tests across the harness modules, all in-module (`#[cfg(test)]`), none in
+`ic/tests/` (tool-specific `ssh` / `ssh_git` tests are additional):
 
 | File | Tests |
 |------|-------|
-| `ssh.rs` | 4 — hostname validation, secret-name sanitization, bridge create, add host |
+| `ssh.rs` | 5 — hostname and secret-name helpers, bridge create/add, bridge restart + persistent pin revocation |
 | `ssh_agent.rs` | 1 — start/stop with an **empty** key map |
 | `ssh_secrets.rs` | 6 — store/load, passphrase, missing key, delete, format detection (ed25519/rsa) |
-| `ssh_hostkeys.rs` | 9 — fingerprint, parse, add/verify, strict reject, AcceptFirst pin, mismatch, remove, per-port |
-| `ssh_api.rs` | 1 — `HostRequest` → `SSHHostConfig` conversion |
+| `ssh_hostkeys.rs` | 14 — fingerprint/parse, add/verify/remove, strict/mismatch/ports, encrypted restart persistence, tenant isolation, corruption failure, concurrent-first-key race |
+| `ssh_api.rs` | 6 — conversion, secret-safe debug/logging, bearer authentication, disabled-router behavior |
 | `ssh_client.rs` | 3 — `append_capped` under-limit, crossing-limit, and already-full output behavior |
 | `config/ssh.rs` | 2 — parse config, `to_host_map` defaults/overrides |
 
-Notable gaps: the agent server is never tested with a **real** key (the sole
-test uses an empty map); there are no HTTP-handler tests; and `HostKeyVerifier`
-is unit-tested and wired into the in-process client path, though live-server
-integration test coverage remains an open gap.
+Notable gaps: the agent server is never tested with a **real** key (the sole test
+uses an empty map), and no test performs the full host-key preflight and command
+flow against a live SSH server. Persistent-pin tests exercise the encrypted
+in-memory secrets backend; normal database-backed stores share the same trait
+surface and their own CRUD coverage.
 
 > The `config/ssh.rs` tests parse a **bare** `SshConfig`, so their TOML uses
 > top-level `[[hosts]]` (no `ssh.` prefix). Do **not** copy that shape into a

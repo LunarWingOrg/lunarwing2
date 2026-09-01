@@ -115,6 +115,9 @@ pub enum SshBridgeError {
     #[error("Unknown host key (strict mode): fingerprint {fingerprint}")]
     UnknownHostKey { fingerprint: String },
 
+    #[error("Host key persistence failed: {0}")]
+    HostKeyPersistence(String),
+
     // Connection errors
     #[error("Connection timeout after {0}s")]
     ConnectionTimeout(u64),
@@ -326,8 +329,8 @@ pub struct SSHBridge {
     audit_logger: Arc<dyn AuditLogger + Send + Sync>,
     /// SSH agent server (if running)
     agent_server: Option<Arc<SshAgentServer>>,
-    /// Host-key verifier (shared, long-lived so AcceptFirst pins persist across
-    /// tool calls). Consumed by the in-process SSH client (`ssh_client.rs`).
+    /// Host-key verifier shared across adapters and backed by the encrypted
+    /// tenant secrets store, so AcceptFirst pins survive daemon restarts.
     host_key_verifier: Arc<HostKeyVerifier>,
 }
 
@@ -348,6 +351,10 @@ impl SSHBridge {
         audit_logger: Arc<dyn AuditLogger + Send + Sync>,
     ) -> Result<Self> {
         info!(tenant_id = %tenant_id, tenant_name = %tenant_name, hosts_count = hosts.len(), "Creating SSH bridge");
+        let host_key_verifier = Arc::new(
+            HostKeyVerifier::new_persistent(tenant_name.clone(), Arc::clone(&secrets_store))
+                .await?,
+        );
 
         Ok(Self {
             tenant_id,
@@ -356,7 +363,7 @@ impl SSHBridge {
             secrets_store,
             audit_logger,
             agent_server: None,
-            host_key_verifier: Arc::new(HostKeyVerifier::new()),
+            host_key_verifier,
         })
     }
 
@@ -375,29 +382,13 @@ impl SSHBridge {
         }
 
         for (hostname, config) in hosts.iter() {
-            // Validate hostname
-            if hostname.is_empty() || !is_valid_hostname(hostname) {
+            if hostname != &config.host {
                 return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Invalid hostname: {}",
-                    hostname
+                    "Host map key {hostname} does not match configured host {}",
+                    config.host
                 )));
             }
-
-            // Validate port
-            if config.port == 0 {
-                return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Invalid port for {}: 0",
-                    hostname
-                )));
-            }
-
-            // Validate user
-            if config.user.is_empty() {
-                return Err(SshBridgeError::InvalidHostConfig(format!(
-                    "Empty user for {}",
-                    hostname
-                )));
-            }
+            validate_host_config(config)?;
 
             // Note: We don't check secret existence here because secrets might be added later
             // TODO: Add secrets_store.exists() method if not present
@@ -423,6 +414,7 @@ impl SSHBridge {
 
     /// Add a new host configuration
     pub async fn add_host(&self, config: SSHHostConfig) -> Result<()> {
+        validate_host_config(&config)?;
         let mut hosts = self.hosts.write().await;
         let hostname = config.host.clone();
 
@@ -440,12 +432,17 @@ impl SSHBridge {
         Ok(())
     }
 
-    /// Remove a host configuration
+    /// Remove a host configuration and any learned host-key pin.
     pub async fn remove_host(&self, hostname: &str) -> Result<()> {
         let mut hosts = self.hosts.write().await;
-        hosts
-            .remove(hostname)
+        let config = hosts
+            .get(hostname)
+            .cloned()
             .ok_or_else(|| SshBridgeError::HostNotFound(hostname.to_string()))?;
+        self.host_key_verifier
+            .remove_host(&config.host, config.port)
+            .await?;
+        hosts.remove(hostname);
 
         self.audit_logger
             .log(SshEvent::HostRemoved {
@@ -591,16 +588,46 @@ impl SSHBridge {
 
 /// Validate hostname format
 fn is_valid_hostname(hostname: &str) -> bool {
-    // Basic validation: not empty, no whitespace, valid characters
-    if hostname.is_empty() || hostname.contains(char::is_whitespace) {
+    if hostname.is_empty()
+        || hostname.contains(char::is_whitespace)
+        || hostname.chars().any(char::is_control)
+    {
         return false;
     }
 
-    // Allow IP addresses and hostnames
-    // This is a simplified check; production should use a proper DNS library
+    let ip_candidate = hostname
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(hostname);
+    if ip_candidate.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+
     hostname
         .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == ':')
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '-')
+}
+
+fn validate_host_config(config: &SSHHostConfig) -> Result<()> {
+    if !is_valid_hostname(&config.host) {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Invalid hostname: {}",
+            config.host
+        )));
+    }
+    if config.port == 0 {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Invalid port for {}: 0",
+            config.host
+        )));
+    }
+    if config.user.is_empty() {
+        return Err(SshBridgeError::InvalidHostConfig(format!(
+            "Empty user for {}",
+            config.host
+        )));
+    }
+    Ok(())
 }
 
 /// Sanitize hostname for use in secret names
@@ -625,10 +652,14 @@ mod tests {
     fn test_valid_hostname() {
         assert!(is_valid_hostname("example.com"));
         assert!(is_valid_hostname("192.168.1.1"));
+        assert!(is_valid_hostname("2001:db8::1"));
+        assert!(is_valid_hostname("[::1]"));
         assert!(is_valid_hostname("ssh-server-01"));
         assert!(!is_valid_hostname(""));
         assert!(!is_valid_hostname("invalid host"));
         assert!(!is_valid_hostname("host@name"));
+        assert!(!is_valid_hostname("host:22"));
+        assert!(!is_valid_hostname("host\nattacker"));
     }
 
     #[test]
@@ -703,5 +734,107 @@ mod tests {
         let hosts = bridge.list_hosts().await;
         assert_eq!(hosts.len(), 1);
         assert_eq!(hosts[0].host, "example.com");
+
+        let invalid = SSHHostConfig {
+            host: "example.com\nattacker".to_string(),
+            ..hosts[0].clone()
+        };
+        assert!(matches!(
+            bridge.add_host(invalid).await,
+            Err(SshBridgeError::InvalidHostConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_reloads_and_removes_persistent_host_key_pin() {
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> =
+            Arc::new(crate::secrets::InMemorySecretsStore::new(Arc::new(
+                crate::secrets::SecretsCrypto::new(secrecy::SecretString::from(
+                    "test-master-key-that-is-at-least-32-bytes-long!",
+                ))
+                .unwrap(),
+            )));
+        let config = SSHHostConfig {
+            host: "durable.example.com".to_string(),
+            port: 2222,
+            user: "admin".to_string(),
+            key_type: SSHKeyType::Ed25519,
+            host_key_mode: HostKeyMode::AcceptFirst,
+            known_host_key: None,
+            connect_timeout_secs: 10,
+            operation_timeout_secs: 30,
+            keepalive_interval_secs: 60,
+            keepalive_max_misses: 3,
+        };
+        let host_map = HashMap::from([(config.host.clone(), config)]);
+        let bridge = SSHBridge::new(
+            Uuid::new_v4(),
+            "test-tenant".to_string(),
+            host_map.clone(),
+            Arc::clone(&secrets_store),
+            Arc::new(NullAuditLogger),
+        )
+        .await
+        .unwrap();
+        bridge
+            .host_key_verifier()
+            .verify_host_key(
+                "durable.example.com",
+                2222,
+                "ssh-ed25519",
+                b"original host key",
+                HostKeyMode::AcceptFirst,
+            )
+            .await
+            .unwrap();
+        drop(bridge);
+
+        let restarted = SSHBridge::new(
+            Uuid::new_v4(),
+            "test-tenant".to_string(),
+            host_map.clone(),
+            Arc::clone(&secrets_store),
+            Arc::new(NullAuditLogger),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            restarted
+                .host_key_verifier()
+                .verify_host_key(
+                    "durable.example.com",
+                    2222,
+                    "ssh-ed25519",
+                    b"substituted host key",
+                    HostKeyMode::AcceptFirst,
+                )
+                .await,
+            Err(SshBridgeError::HostKeyMismatch { .. })
+        ));
+        restarted.remove_host("durable.example.com").await.unwrap();
+        drop(restarted);
+
+        let after_removal = SSHBridge::new(
+            Uuid::new_v4(),
+            "test-tenant".to_string(),
+            host_map,
+            secrets_store,
+            Arc::new(NullAuditLogger),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            after_removal
+                .host_key_verifier()
+                .verify_host_key(
+                    "durable.example.com",
+                    2222,
+                    "ssh-ed25519",
+                    b"original host key",
+                    HostKeyMode::Strict,
+                )
+                .await,
+            Err(SshBridgeError::UnknownHostKey { .. })
+        ));
     }
 }

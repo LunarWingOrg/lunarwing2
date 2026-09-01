@@ -41,8 +41,8 @@ pub struct CommandResult {
 struct ClientHandler {
     verifier: Arc<HostKeyVerifier>,
     host: SSHHostConfig,
-    /// Set when `check_server_key` rejects a key, so `connect_and_exec` can
-    /// surface the precise reason instead of a generic connection error.
+    /// Set when `check_server_key` rejects a key, so callers can surface the
+    /// precise reason instead of a generic connection error.
     reject_reason: Arc<std::sync::Mutex<Option<SshBridgeError>>>,
 }
 
@@ -57,24 +57,78 @@ impl Handler for ClientHandler {
         // representation `HostKeyVerifier` compares against (it byte-compares,
         // not fingerprint strings, so no base64-padding mismatch).
         let key_bytes = server_public_key.public_key_bytes();
+        let key_type = server_public_key.algorithm().to_string();
         let verifier = Arc::clone(&self.verifier);
         let host = self.host.clone();
         let reject_reason = Arc::clone(&self.reject_reason);
 
         async move {
-            match verifier.verify_from_config(&host, &key_bytes).await {
+            match verifier
+                .verify_from_config_with_key_type(&host, &key_type, &key_bytes)
+                .await
+            {
                 Ok(_) => Ok(true),
                 Err(e) => {
                     if let Ok(mut slot) = reject_reason.lock() {
                         *slot = Some(e);
                     }
                     // Returning Ok(false) aborts the handshake; the precise
-                    // reason was stashed above for connect_and_exec to report.
+                    // reason was stashed above for the caller to report.
                     Ok(false)
                 }
             }
         }
     }
+}
+
+async fn connect_verified(
+    host: &SSHHostConfig,
+    verifier: Arc<HostKeyVerifier>,
+) -> Result<Handle<ClientHandler>, SshBridgeError> {
+    let reject_reason = Arc::new(std::sync::Mutex::new(None));
+    let handler = ClientHandler {
+        verifier,
+        host: host.clone(),
+        reject_reason: Arc::clone(&reject_reason),
+    };
+    let connect_secs = host.connect_timeout_secs.max(1);
+    let connect_res = tokio::time::timeout(
+        Duration::from_secs(connect_secs),
+        client::connect(
+            Arc::new(client::Config::default()),
+            (host.host.as_str(), host.port),
+            handler,
+        ),
+    )
+    .await;
+
+    match connect_res {
+        Err(_) => Err(SshBridgeError::ConnectionTimeout(connect_secs)),
+        Ok(Err(error)) => {
+            if let Some(reason) = reject_reason.lock().ok().and_then(|mut slot| slot.take()) {
+                Err(reason)
+            } else {
+                Err(SshBridgeError::ConnectionRefused(error.to_string()))
+            }
+        }
+        Ok(Ok(session)) => Ok(session),
+    }
+}
+
+/// Complete SSH key exchange and host-key verification without authenticating.
+///
+/// The `ssh_git` adapter uses this before launching OpenSSH. AcceptFirst pins
+/// therefore reach encrypted persistence before any Git operation runs, and
+/// the Git connection can enforce that newly materialized key strictly.
+pub async fn connect_and_verify_host_key(
+    host: &SSHHostConfig,
+    verifier: Arc<HostKeyVerifier>,
+) -> Result<(), SshBridgeError> {
+    let session = connect_verified(host, verifier).await?;
+    let _ = session
+        .disconnect(Disconnect::ByApplication, "host key verified", "")
+        .await;
+    Ok(())
 }
 
 /// Connect to `host`, verify the server key, authenticate with `creds`, run
@@ -86,33 +140,7 @@ pub async fn connect_and_exec(
     verifier: Arc<HostKeyVerifier>,
     command: &str,
 ) -> Result<CommandResult, SshBridgeError> {
-    let reject_reason = Arc::new(std::sync::Mutex::new(None));
-    let handler = ClientHandler {
-        verifier,
-        host: host.clone(),
-        reject_reason: Arc::clone(&reject_reason),
-    };
-
-    let config = Arc::new(client::Config::default());
-    let connect_secs = host.connect_timeout_secs.max(1);
-
-    let connect_res = tokio::time::timeout(
-        Duration::from_secs(connect_secs),
-        client::connect(config, (host.host.as_str(), host.port), handler),
-    )
-    .await;
-
-    let mut session = match connect_res {
-        Err(_) => return Err(SshBridgeError::ConnectionTimeout(connect_secs)),
-        Ok(Err(e)) => {
-            // Prefer a precise host-key rejection reason if the handler recorded one.
-            if let Some(reason) = reject_reason.lock().ok().and_then(|mut s| s.take()) {
-                return Err(reason);
-            }
-            return Err(SshBridgeError::ConnectionRefused(e.to_string()));
-        }
-        Ok(Ok(session)) => session,
-    };
+    let mut session = connect_verified(host, verifier).await?;
 
     // Authenticate with the decoded private key (Ed25519/ECDSA).
     let key = parse_key(creds)?;

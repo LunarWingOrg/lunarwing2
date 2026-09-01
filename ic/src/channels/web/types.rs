@@ -136,7 +136,15 @@ pub type AppEvent = SseEvent;
 #[serde(tag = "type")]
 pub enum SseEvent {
     #[serde(rename = "response")]
-    Response { content: String, thread_id: String },
+    Response {
+        content: String,
+        thread_id: String,
+        /// Emotes parsed from the agent's roleplay action phrases by
+        /// [`crate::channels::web::emote`]; drives the mascot widget's sprite
+        /// state machine. Skipped when the reply carries no action phrases.
+        #[serde(skip_serializing_if = "Vec::is_empty", default)]
+        emotes: Vec<String>,
+    },
     #[serde(rename = "thinking")]
     Thinking {
         message: String,
@@ -354,7 +362,16 @@ impl From<lunarwing_common::AppEvent> for SseEvent {
     fn from(ev: lunarwing_common::AppEvent) -> Self {
         use lunarwing_common::AppEvent as AE;
         match ev {
-            AE::Response { content, thread_id } => SseEvent::Response { content, thread_id },
+            AE::Response { content, thread_id } => {
+                // Gateway outgoing-message hook: parse roleplay action phrases
+                // (`*stamps hooves*`) so the mascot widget can mirror them.
+                let emotes = crate::channels::web::emote::emote_names(&content);
+                SseEvent::Response {
+                    content,
+                    thread_id,
+                    emotes,
+                }
+            }
             AE::Thinking { message, thread_id } => SseEvent::Thinking { message, thread_id },
             AE::ToolStarted { name, thread_id } => SseEvent::ToolStarted { name, thread_id },
             AE::ToolCompleted {
@@ -1667,6 +1684,7 @@ mod tests {
         let sse = SseEvent::Response {
             content: "hello".to_string(),
             thread_id: "t1".to_string(),
+            emotes: Vec::new(),
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
@@ -1676,6 +1694,49 @@ mod tests {
                 assert_eq!(data["thread_id"], "t1");
             }
             _ => panic!("Expected Event variant"),
+        }
+    }
+
+    #[test]
+    fn test_sse_response_omits_empty_emotes() {
+        let sse = SseEvent::Response {
+            content: "plain reply".to_string(),
+            thread_id: "t1".to_string(),
+            emotes: Vec::new(),
+        };
+        let json = serde_json::to_string(&sse).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("emotes").is_none());
+    }
+
+    #[test]
+    fn test_response_conversion_populates_emotes() {
+        let event = lunarwing_common::AppEvent::Response {
+            content: "*stamps hooves* All set, and *ears perk up*.".to_string(),
+            thread_id: "t1".to_string(),
+        };
+        match SseEvent::from(event) {
+            SseEvent::Response { emotes, .. } => {
+                assert_eq!(emotes, vec!["jump".to_string(), "alert".to_string()]);
+                let json = serde_json::to_string(&SseEvent::Response {
+                    content: String::new(),
+                    thread_id: "t1".to_string(),
+                    emotes,
+                })
+                .unwrap();
+                let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(parsed["emotes"][0], "jump");
+            }
+            other => panic!("Expected Response, got {other:?}"),
+        }
+
+        let plain = lunarwing_common::AppEvent::Response {
+            content: "No actions here.".to_string(),
+            thread_id: "t1".to_string(),
+        };
+        match SseEvent::from(plain) {
+            SseEvent::Response { emotes, .. } => assert!(emotes.is_empty()),
+            other => panic!("Expected Response, got {other:?}"),
         }
     }
 

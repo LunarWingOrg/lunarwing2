@@ -115,8 +115,8 @@ registry paths to the allowlist when adopting option 2.
 
 ## Required jobs
 
-- CI composition, shell syntax, Python syntax, registry JSON, version policy,
-  changed-line panic policy, rustfmt, and locked Cargo metadata.
+- CI composition, shell syntax, shellcheck, Python syntax, registry JSON, version
+  policy, changed-line panic policy, rustfmt, and locked Cargo metadata.
 - Protected release-tag syntax, release-note codename, and four-part to
   three-part Cargo version mapping.
 - Default, PostgreSQL-only, libSQL-only, and all-feature `cargo check` jobs.
@@ -149,7 +149,6 @@ These run on default-branch and scheduled pipelines with `allow_failure: true`:
 - `rust-clippy-all`: becomes blocking after a clean-runner baseline passes.
 - `architecture-boundaries`: becomes blocking after current heuristic and real
   violations are fixed.
-- `shellcheck`: becomes blocking after current warnings reach zero.
 - `secret-history`: scheduled only; becomes blocking after historical findings
   are reviewed.
 
@@ -311,9 +310,9 @@ Open **Build > Pipeline schedules > New schedule**:
 - Variables: none.
 - Owner: a maintained service/operator account, not a departing individual.
 
-Run it once manually. Confirm `rust-clippy-all`, `architecture-boundaries`,
-`shellcheck`, and `secret-history` appear as observational jobs. This schedule
-must not receive production secrets or use deployment runners.
+Run it once manually. Confirm `rust-clippy-all`, `architecture-boundaries`, and
+`secret-history` appear as observational jobs. This schedule must not receive
+production secrets or use deployment runners.
 
 ### 6. Activation evidence
 
@@ -341,6 +340,7 @@ Phase 1 scope and exit criteria are defined in
 ```bash
 python3 .gitlab/scripts/validate_config.py
 bash .gitlab/scripts/shell-syntax.sh
+bash .gitlab/scripts/shellcheck.sh
 python3 .gitlab/scripts/python_syntax.py
 python3 .gitlab/scripts/registry_json.py
 taskset -c 0-5 cargo fmt --manifest-path ic/Cargo.toml --all -- --check

@@ -41,15 +41,41 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, instrument, warn};
 
 use crate::bridge::ssh::{HostKeyMode, Result, SSHHostConfig, SshBridgeError};
+use crate::secrets::{CreateSecretParams, SecretError, SecretsStore};
+
+const PERSISTED_HOST_KEYS_SECRET: &str = "__lunarwing_ssh_known_hosts_v1";
+const PERSISTED_HOST_KEYS_PROVIDER: &str = "lunarwing:ssh-hostkeys";
+const PERSISTED_HOST_KEYS_VERSION: u8 = 1;
 
 /// SSH host key verifier — manages known_hosts per tenant.
 pub struct HostKeyVerifier {
-    /// Known hosts (hostname -> stored public key)
+    /// Known hosts (`hostname:port` -> stored public key).
     known_hosts: Arc<tokio::sync::RwLock<HashMap<String, StoredHostKey>>>,
+    /// Encrypted tenant-scoped persistence. `None` is reserved for isolated tests.
+    persistence: Option<HostKeyPersistence>,
+}
+
+#[derive(Clone)]
+struct HostKeyPersistence {
+    secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+    tenant_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedKnownHosts {
+    version: u8,
+    hosts: HashMap<String, PersistedHostKey>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedHostKey {
+    public_key: String,
+    key_type: String,
 }
 
 /// A stored host public key with metadata.
@@ -63,19 +89,125 @@ pub struct StoredHostKey {
     pub fingerprint: String,
 }
 
-impl HostKeyVerifier {
-    /// Create a new host key verifier.
-    pub fn new() -> Self {
-        Self {
-            known_hosts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+fn persistence_error(action: &str, error: impl std::fmt::Display) -> SshBridgeError {
+    SshBridgeError::HostKeyPersistence(format!("{action}: {error}"))
+}
+
+impl HostKeyPersistence {
+    async fn load(&self) -> Result<HashMap<String, StoredHostKey>> {
+        let encoded = match self
+            .secrets_store
+            .get_decrypted(&self.tenant_name, PERSISTED_HOST_KEYS_SECRET)
+            .await
+        {
+            Ok(secret) => secret,
+            Err(SecretError::NotFound(_)) => return Ok(HashMap::new()),
+            Err(error) => return Err(persistence_error("load encrypted pin set", error)),
+        };
+        let persisted: PersistedKnownHosts = serde_json::from_str(encoded.expose())
+            .map_err(|error| persistence_error("decode encrypted pin set", error))?;
+        if persisted.version != PERSISTED_HOST_KEYS_VERSION {
+            return Err(SshBridgeError::HostKeyPersistence(format!(
+                "unsupported pin-set version {}",
+                persisted.version
+            )));
         }
+
+        let mut hosts = HashMap::with_capacity(persisted.hosts.len());
+        for (host, persisted_key) in persisted.hosts {
+            if host.is_empty() || persisted_key.key_type.trim().is_empty() {
+                return Err(SshBridgeError::HostKeyPersistence(
+                    "pin set contains an empty host or key type".to_string(),
+                ));
+            }
+            let public_key = BASE64
+                .decode(&persisted_key.public_key)
+                .map_err(|error| persistence_error("decode persisted host key", error))?;
+            if public_key.is_empty() {
+                return Err(SshBridgeError::HostKeyPersistence(format!(
+                    "persisted host key for {host} is empty"
+                )));
+            }
+            hosts.insert(
+                host,
+                StoredHostKey {
+                    fingerprint: HostKeyVerifier::compute_fingerprint(&public_key),
+                    public_key,
+                    key_type: persisted_key.key_type,
+                },
+            );
+        }
+        Ok(hosts)
     }
 
-    /// Create a verifier with pre-loaded known hosts.
+    async fn save(&self, hosts: &HashMap<String, StoredHostKey>) -> Result<()> {
+        if hosts.is_empty() {
+            self.secrets_store
+                .delete(&self.tenant_name, PERSISTED_HOST_KEYS_SECRET)
+                .await
+                .map_err(|error| persistence_error("delete encrypted pin set", error))?;
+            return Ok(());
+        }
+
+        let persisted = PersistedKnownHosts {
+            version: PERSISTED_HOST_KEYS_VERSION,
+            hosts: hosts
+                .iter()
+                .map(|(host, key)| {
+                    (
+                        host.clone(),
+                        PersistedHostKey {
+                            public_key: BASE64.encode(&key.public_key),
+                            key_type: key.key_type.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let encoded = serde_json::to_string(&persisted)
+            .map_err(|error| persistence_error("encode pin set", error))?;
+        let params = CreateSecretParams::new(PERSISTED_HOST_KEYS_SECRET, encoded)
+            .with_provider(PERSISTED_HOST_KEYS_PROVIDER);
+        self.secrets_store
+            .create(&self.tenant_name, params)
+            .await
+            .map_err(|error| persistence_error("store encrypted pin set", error))?;
+        Ok(())
+    }
+}
+
+impl HostKeyVerifier {
+    /// Create an in-memory host key verifier.
+    pub fn new() -> Self {
+        Self::with_hosts(HashMap::new())
+    }
+
+    /// Create an in-memory verifier with pre-loaded known hosts.
     pub fn with_hosts(hosts: HashMap<String, StoredHostKey>) -> Self {
         Self {
             known_hosts: Arc::new(tokio::sync::RwLock::new(hosts)),
+            persistence: None,
         }
+    }
+
+    /// Create a verifier backed by the tenant's encrypted secrets store.
+    ///
+    /// Loading or decoding an existing pin set fails closed: callers must not
+    /// replace it with an empty verifier, because that would reopen the TOFU
+    /// window after a storage failure or corrupted record.
+    pub async fn new_persistent(
+        tenant_name: String,
+        secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+    ) -> Result<Self> {
+        let persistence = HostKeyPersistence {
+            secrets_store,
+            tenant_name,
+        };
+        let hosts = persistence.load().await?;
+        Ok(Self {
+            known_hosts: Arc::new(tokio::sync::RwLock::new(hosts)),
+            persistence: Some(persistence),
+        })
     }
 
     /// Compute SHA256 fingerprint of a public key.
@@ -102,12 +234,81 @@ impl HostKeyVerifier {
         Some((key_type, key_data, comment))
     }
 
+    fn verify_stored_key(
+        full_host: &str,
+        stored: &StoredHostKey,
+        remote_key_data: &[u8],
+        remote_fingerprint: &str,
+    ) -> Result<VerifyResult> {
+        if remote_key_data == stored.public_key {
+            info!(
+                host = %full_host,
+                fingerprint = %remote_fingerprint,
+                "Host key verified"
+            );
+            Ok(VerifyResult::Verified)
+        } else {
+            warn!(
+                host = %full_host,
+                expected_fingerprint = %stored.fingerprint,
+                actual_fingerprint = %remote_fingerprint,
+                "Host key mismatch"
+            );
+            Err(SshBridgeError::HostKeyMismatch {
+                expected: stored.fingerprint.clone(),
+                actual: remote_fingerprint.to_string(),
+            })
+        }
+    }
+
+    async fn persist_hosts(&self, hosts: &HashMap<String, StoredHostKey>) -> Result<()> {
+        match &self.persistence {
+            Some(persistence) => persistence.save(hosts).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn accept_first_key(
+        &self,
+        full_host: String,
+        remote_key_type: &str,
+        remote_key_data: &[u8],
+        remote_fingerprint: String,
+    ) -> Result<VerifyResult> {
+        let mut hosts = self.known_hosts.write().await;
+        if let Some(stored) = hosts.get(&full_host) {
+            return Self::verify_stored_key(
+                &full_host,
+                stored,
+                remote_key_data,
+                &remote_fingerprint,
+            );
+        }
+
+        let stored = StoredHostKey {
+            public_key: remote_key_data.to_vec(),
+            key_type: remote_key_type.to_string(),
+            fingerprint: remote_fingerprint,
+        };
+        let mut updated = hosts.clone();
+        updated.insert(full_host.clone(), stored);
+        self.persist_hosts(&updated).await?;
+        *hosts = updated;
+
+        info!(
+            host = %full_host,
+            key_type = %remote_key_type,
+            persistent = self.persistence.is_some(),
+            "Host key accepted and pinned (AcceptFirst mode)"
+        );
+        Ok(VerifyResult::Accepted)
+    }
+
     /// Verify a host's public key against stored keys.
     ///
-    /// # Returns
-    /// - `Ok(true)` if key matches stored key
-    /// - `Ok(false)` if key doesn't match (Strict mode)
-    /// - `Ok(StoredHostKey)` if key was accepted (AcceptFirst mode, first time)
+    /// A first-seen key is accepted only after its updated pin set has been
+    /// stored successfully. Concurrent first connections re-check under the
+    /// write lock, so two different keys cannot both win the TOFU race.
     #[instrument(skip(self, remote_key_data))]
     pub async fn verify_host_key(
         &self,
@@ -117,73 +318,49 @@ impl HostKeyVerifier {
         remote_key_data: &[u8],
         mode: HostKeyMode,
     ) -> Result<VerifyResult> {
+        if remote_key_data.is_empty() || remote_key_type.trim().is_empty() {
+            return Err(SshBridgeError::InvalidKeyFormat(
+                "Host key data and type must not be empty".to_string(),
+            ));
+        }
+
         let full_host = format!("{}:{}", hostname, port);
         let remote_fingerprint = Self::compute_fingerprint(remote_key_data);
-
         let known_hosts = self.known_hosts.read().await;
+        if let Some(stored) = known_hosts.get(&full_host) {
+            return Self::verify_stored_key(
+                &full_host,
+                stored,
+                remote_key_data,
+                &remote_fingerprint,
+            );
+        }
 
-        match known_hosts.get(&full_host) {
-            Some(stored) => {
-                // Key already stored — verify it matches
-                if remote_key_data == &stored.public_key[..] {
-                    info!(
-                        host = %full_host,
-                        fingerprint = %remote_fingerprint,
-                        "Host key verified"
-                    );
-                    Ok(VerifyResult::Verified)
-                } else {
-                    warn!(
-                        host = %full_host,
-                        expected_fingerprint = %stored.fingerprint,
-                        actual_fingerprint = %remote_fingerprint,
-                        "Host key mismatch"
-                    );
-                    Err(SshBridgeError::HostKeyMismatch {
-                        expected: stored.fingerprint.clone(),
-                        actual: remote_fingerprint,
-                    })
-                }
+        match mode {
+            HostKeyMode::Strict => {
+                warn!(
+                    host = %full_host,
+                    fingerprint = %remote_fingerprint,
+                    "Unknown host key (strict mode)"
+                );
+                Err(SshBridgeError::UnknownHostKey {
+                    fingerprint: remote_fingerprint,
+                })
             }
-            None => {
-                // Key not stored — depends on mode
-                match mode {
-                    HostKeyMode::Strict => {
-                        warn!(
-                            host = %full_host,
-                            fingerprint = %remote_fingerprint,
-                            "Unknown host key (strict mode)"
-                        );
-                        Err(SshBridgeError::UnknownHostKey {
-                            fingerprint: remote_fingerprint,
-                        })
-                    }
-                    HostKeyMode::AcceptFirst => {
-                        let stored = StoredHostKey {
-                            public_key: remote_key_data.to_vec(),
-                            key_type: remote_key_type.to_string(),
-                            fingerprint: remote_fingerprint,
-                        };
-
-                        drop(known_hosts); // Release read lock before writing
-
-                        let mut hosts = self.known_hosts.write().await;
-                        hosts.insert(full_host.clone(), stored);
-
-                        info!(
-                            host = %full_host,
-                            key_type = %remote_key_type,
-                            "Host key accepted and pinned (AcceptFirst mode)"
-                        );
-
-                        Ok(VerifyResult::Accepted)
-                    }
-                }
+            HostKeyMode::AcceptFirst => {
+                drop(known_hosts);
+                self.accept_first_key(
+                    full_host,
+                    remote_key_type,
+                    remote_key_data,
+                    remote_fingerprint,
+                )
+                .await
             }
         }
     }
 
-    /// Add a host key to known_hosts.
+    /// Add a host key to known_hosts and its persistent backing store.
     #[instrument(skip(self, public_key))]
     pub async fn add_host_key(
         &self,
@@ -192,9 +369,14 @@ impl HostKeyVerifier {
         public_key: Vec<u8>,
         key_type: String,
     ) -> Result<()> {
+        if public_key.is_empty() || key_type.trim().is_empty() {
+            return Err(SshBridgeError::InvalidKeyFormat(
+                "Host key data and type must not be empty".to_string(),
+            ));
+        }
+
         let full_host = format!("{}:{}", hostname, port);
         let fingerprint = Self::compute_fingerprint(&public_key);
-
         let stored = StoredHostKey {
             public_key,
             key_type,
@@ -202,14 +384,16 @@ impl HostKeyVerifier {
         };
 
         let mut hosts = self.known_hosts.write().await;
-        hosts.insert(full_host.clone(), stored);
+        let mut updated = hosts.clone();
+        updated.insert(full_host.clone(), stored);
+        self.persist_hosts(&updated).await?;
+        *hosts = updated;
 
         info!(
             host = %full_host,
             fingerprint = %fingerprint,
             "Host key added to known_hosts"
         );
-
         Ok(())
     }
 
@@ -231,19 +415,21 @@ impl HostKeyVerifier {
         self.add_host_key(hostname, port, key_data, key_type).await
     }
 
-    /// Remove a host from known_hosts.
+    /// Remove a host from known_hosts and its persistent backing store.
     #[instrument(skip(self))]
     pub async fn remove_host(&self, hostname: &str, port: u16) -> Result<bool> {
         let full_host = format!("{}:{}", hostname, port);
-
         let mut hosts = self.known_hosts.write().await;
-        let removed = hosts.remove(&full_host).is_some();
-
-        if removed {
-            info!(host = %full_host, "Host removed from known_hosts");
+        if !hosts.contains_key(&full_host) {
+            return Ok(false);
         }
 
-        Ok(removed)
+        let mut updated = hosts.clone();
+        updated.remove(&full_host);
+        self.persist_hosts(&updated).await?;
+        *hosts = updated;
+        info!(host = %full_host, "Host removed from known_hosts");
+        Ok(true)
     }
 
     /// Get the stored key for a host (if any).
@@ -259,19 +445,31 @@ impl HostKeyVerifier {
         hosts.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
-    /// Verify a host's key from its config.
-    ///
-    /// If the config has a known_host_key, verify against it.
-    /// If not, use the verifier's mode to decide.
-    #[instrument(skip(self, remote_key_data))]
+    /// Verify a host's key from its config when the caller cannot supply the
+    /// SSH algorithm name. Production adapters should prefer
+    /// [`Self::verify_from_config_with_key_type`] so persisted pins can also be
+    /// materialized for OpenSSH consumers.
     pub async fn verify_from_config(
         &self,
         config: &SSHHostConfig,
         remote_key_data: &[u8],
     ) -> Result<VerifyResult> {
-        let full_host = format!("{}:{}", config.host, config.port);
+        self.verify_from_config_with_key_type(config, "unknown", remote_key_data)
+            .await
+    }
 
-        // If config has a known_host_key, verify against it directly
+    /// Verify a host's key from its config and preserve the SSH algorithm name.
+    ///
+    /// An explicit `known_host_key` remains authoritative. Otherwise the
+    /// verifier applies the configured Strict or AcceptFirst policy.
+    #[instrument(skip(self, remote_key_data))]
+    pub async fn verify_from_config_with_key_type(
+        &self,
+        config: &SSHHostConfig,
+        remote_key_type: &str,
+        remote_key_data: &[u8],
+    ) -> Result<VerifyResult> {
+        let full_host = format!("{}:{}", config.host, config.port);
         if let Some(known_key_str) = &config.known_host_key {
             let (_, known_key_data, _) =
                 Self::parse_openssh_public_key(known_key_str).ok_or_else(|| {
@@ -295,11 +493,10 @@ impl HostKeyVerifier {
                 })
             }
         } else {
-            // Use the verifier's mode
             self.verify_host_key(
                 &config.host,
                 config.port,
-                "unknown", // We don't know the key type until we verify
+                remote_key_type,
                 remote_key_data,
                 config.host_key_mode.clone(),
             )
@@ -326,6 +523,17 @@ impl Default for HostKeyVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::{InMemorySecretsStore, SecretsCrypto};
+    use secrecy::SecretString;
+
+    fn test_store() -> Arc<dyn SecretsStore + Send + Sync> {
+        Arc::new(InMemorySecretsStore::new(Arc::new(
+            SecretsCrypto::new(SecretString::from(
+                "test-master-key-that-is-at-least-32-bytes-long!",
+            ))
+            .unwrap(),
+        )))
+    }
 
     #[test]
     fn test_compute_fingerprint() {
@@ -513,5 +721,173 @@ mod tests {
 
         let hosts = verifier.list_hosts().await;
         assert_eq!(hosts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn accept_first_pin_survives_verifier_restart() {
+        let store = test_store();
+        let key_data = b"durable host key";
+        let verifier = HostKeyVerifier::new_persistent("tenant-a".into(), Arc::clone(&store))
+            .await
+            .unwrap();
+        let result = verifier
+            .verify_host_key(
+                "durable.example.com",
+                2222,
+                "ssh-ed25519",
+                key_data,
+                HostKeyMode::AcceptFirst,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, VerifyResult::Accepted));
+        drop(verifier);
+
+        let restarted = HostKeyVerifier::new_persistent("tenant-a".into(), store)
+            .await
+            .unwrap();
+        let result = restarted
+            .verify_host_key(
+                "durable.example.com",
+                2222,
+                "ssh-ed25519",
+                key_data,
+                HostKeyMode::Strict,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(result, VerifyResult::Verified));
+        assert!(matches!(
+            restarted
+                .verify_host_key(
+                    "durable.example.com",
+                    2222,
+                    "ssh-ed25519",
+                    b"substituted host key",
+                    HostKeyMode::AcceptFirst,
+                )
+                .await,
+            Err(SshBridgeError::HostKeyMismatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remove_host_key_survives_verifier_restart() {
+        let store = test_store();
+        let verifier = HostKeyVerifier::new_persistent("tenant-a".into(), Arc::clone(&store))
+            .await
+            .unwrap();
+        verifier
+            .add_host_key(
+                "removed.example.com",
+                22,
+                b"removed host key".to_vec(),
+                "ssh-ed25519".into(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            verifier
+                .remove_host("removed.example.com", 22)
+                .await
+                .unwrap()
+        );
+        drop(verifier);
+
+        let restarted = HostKeyVerifier::new_persistent("tenant-a".into(), store)
+            .await
+            .unwrap();
+        assert!(matches!(
+            restarted
+                .verify_host_key(
+                    "removed.example.com",
+                    22,
+                    "ssh-ed25519",
+                    b"removed host key",
+                    HostKeyMode::Strict,
+                )
+                .await,
+            Err(SshBridgeError::UnknownHostKey { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn persistent_pins_are_tenant_scoped() {
+        let store = test_store();
+        let tenant_a = HostKeyVerifier::new_persistent("tenant-a".into(), Arc::clone(&store))
+            .await
+            .unwrap();
+        tenant_a
+            .add_host_key(
+                "shared.example.com",
+                22,
+                b"tenant a key".to_vec(),
+                "ssh-ed25519".into(),
+            )
+            .await
+            .unwrap();
+
+        let tenant_b = HostKeyVerifier::new_persistent("tenant-b".into(), store)
+            .await
+            .unwrap();
+        assert!(
+            tenant_b
+                .get_host_key("shared.example.com", 22)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_persistent_pin_set_fails_closed() {
+        let store = test_store();
+        store
+            .create(
+                "tenant-a",
+                CreateSecretParams::new(PERSISTED_HOST_KEYS_SECRET, "not-json"),
+            )
+            .await
+            .unwrap();
+
+        let result = HostKeyVerifier::new_persistent("tenant-a".into(), store).await;
+        assert!(matches!(result, Err(SshBridgeError::HostKeyPersistence(_))));
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_keys_cannot_both_be_accepted() {
+        let verifier = Arc::new(
+            HostKeyVerifier::new_persistent("tenant-a".into(), test_store())
+                .await
+                .unwrap(),
+        );
+        let first = Arc::clone(&verifier);
+        let second = Arc::clone(&verifier);
+        let (first_result, second_result) = tokio::join!(
+            first.verify_host_key(
+                "race.example.com",
+                22,
+                "ssh-ed25519",
+                b"first key",
+                HostKeyMode::AcceptFirst,
+            ),
+            second.verify_host_key(
+                "race.example.com",
+                22,
+                "ssh-ed25519",
+                b"second key",
+                HostKeyMode::AcceptFirst,
+            )
+        );
+
+        let accepted = [&first_result, &second_result]
+            .into_iter()
+            .filter(|result| matches!(result, Ok(VerifyResult::Accepted)))
+            .count();
+        let mismatched = [&first_result, &second_result]
+            .into_iter()
+            .filter(|result| matches!(result, Err(SshBridgeError::HostKeyMismatch { .. })))
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(mismatched, 1);
     }
 }

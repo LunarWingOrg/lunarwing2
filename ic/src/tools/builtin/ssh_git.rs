@@ -29,8 +29,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
-use crate::bridge::ssh::{HostKeyMode, SSHBridge, SSHHostConfig};
-use crate::bridge::ssh_hostkeys::StoredHostKey;
+use crate::bridge::ssh::{HostKeyMode, SSHBridge, SSHHostConfig, SshBridgeError};
+use crate::bridge::ssh_client;
+use crate::bridge::ssh_hostkeys::{HostKeyVerifier, StoredHostKey};
 use crate::context::JobContext;
 use crate::tools::builtin::path_utils::validate_path;
 use crate::tools::builtin::shell::SAFE_ENV_VARS;
@@ -205,17 +206,15 @@ impl Tool for SshGitTool {
         }
 
         // --- materialize an ephemeral known_hosts for host-key verification ---
-        let pin = verifier.get_host_key(&host_cfg.host, host_cfg.port).await;
-        let known_line = known_hosts_line(&host_cfg, pin.as_ref());
-        if known_line.is_none() && host_cfg.host_key_mode == HostKeyMode::Strict {
-            return Err(ToolError::NotAuthorized(format!(
-                "no known host key for '{host}' (strict mode); cannot verify host identity"
-            )));
-        }
+        // AcceptFirst performs a russh key-exchange preflight that stores the pin
+        // before Git runs. OpenSSH then verifies that exact pin in strict mode,
+        // closing both the restart window and the preflight-to-Git substitution
+        // window.
+        let known_line = resolve_known_hosts_line(&host_cfg, &verifier).await?;
         let known_hosts_path = self
             .sandbox_root
             .join(format!(".known_hosts-{}", uuid::Uuid::new_v4()));
-        std::fs::write(&known_hosts_path, known_line.unwrap_or_default())
+        std::fs::write(&known_hosts_path, known_line)
             .map_err(|e| ToolError::ExecutionFailed(format!("cannot write known_hosts: {e}")))?;
         // Keep alive until run_git returns; dropped (file removed) at fn end.
         let _known_hosts_guard = FileGuard(known_hosts_path.clone());
@@ -312,42 +311,74 @@ fn host_spec(cfg: &SSHHostConfig) -> String {
     }
 }
 
-/// Build a single known_hosts line, preferring a live verifier pin (raw wire
-/// bytes → base64) over the config's OpenSSH `known_host_key` string. Returns
-/// `None` if no host key material is available.
+/// Build a single known_hosts line. An explicit config pin is authoritative;
+/// otherwise use the verifier's persisted wire key. Returns `None` if neither
+/// source has host key material.
 fn known_hosts_line(cfg: &SSHHostConfig, pin: Option<&StoredHostKey>) -> Option<String> {
     let spec = host_spec(cfg);
-    if let Some(pin) = pin {
-        Some(format!(
-            "{} {} {}\n",
-            spec,
-            pin.key_type,
-            BASE64.encode(&pin.public_key)
-        ))
+    if let Some(configured) = cfg.known_host_key.as_deref() {
+        Some(format!("{} {}\n", spec, configured.trim()))
     } else {
-        cfg.known_host_key
-            .as_deref()
-            .map(|k| format!("{} {}\n", spec, k.trim()))
+        pin.map(|pin| {
+            format!(
+                "{} {} {}\n",
+                spec,
+                pin.key_type,
+                BASE64.encode(&pin.public_key)
+            )
+        })
     }
 }
 
-/// Build the GIT_SSH_COMMAND. StrictHostKeyChecking is keyed to the host's
-/// `host_key_mode` (`yes` for Strict, `accept-new` for AcceptFirst TOFU). The
-/// known_hosts path is quoted (GIT_SSH_COMMAND is shell-parsed).
+async fn resolve_known_hosts_line(
+    cfg: &SSHHostConfig,
+    verifier: &Arc<HostKeyVerifier>,
+) -> Result<String, ToolError> {
+    let mut pin = verifier.get_host_key(&cfg.host, cfg.port).await;
+    if cfg.known_host_key.is_none() && pin.is_none() {
+        if cfg.host_key_mode == HostKeyMode::Strict {
+            return Err(ToolError::NotAuthorized(format!(
+                "no known host key for '{}' (strict mode); cannot verify host identity",
+                cfg.host
+            )));
+        }
+        ssh_client::connect_and_verify_host_key(cfg, Arc::clone(verifier))
+            .await
+            .map_err(map_host_key_preflight_error)?;
+        pin = verifier.get_host_key(&cfg.host, cfg.port).await;
+    }
+
+    known_hosts_line(cfg, pin.as_ref()).ok_or_else(|| {
+        ToolError::ExecutionFailed(format!(
+            "host-key verification for '{}' completed without a stored pin",
+            cfg.host
+        ))
+    })
+}
+
+fn map_host_key_preflight_error(error: SshBridgeError) -> ToolError {
+    match error {
+        SshBridgeError::ConnectionTimeout(secs) => ToolError::Timeout(Duration::from_secs(secs)),
+        SshBridgeError::HostKeyMismatch { .. }
+        | SshBridgeError::UnknownHostKey { .. }
+        | SshBridgeError::PermissionDenied(_) => ToolError::NotAuthorized(error.to_string()),
+        other => ToolError::ExecutionFailed(other.to_string()),
+    }
+}
+
+/// Build a GIT_SSH_COMMAND that strictly checks the already-materialized pin.
+/// AcceptFirst trust is resolved and persisted by `resolve_known_hosts_line`
+/// before OpenSSH starts. The known_hosts path is quoted because
+/// GIT_SSH_COMMAND is shell-parsed.
 fn build_git_ssh_command(cfg: &SSHHostConfig, known_hosts_path: &Path) -> String {
-    let strict = match cfg.host_key_mode {
-        HostKeyMode::Strict => "yes",
-        HostKeyMode::AcceptFirst => "accept-new",
-    };
     // `-F /dev/null` makes ssh ignore the system-wide /etc/ssh/ssh_config (and its
     // Include of ssh_config.d/*) as well as the user's ~/.ssh/config, so this tool is
     // hermetic: it uses only the options set here plus the agent via SSH_AUTH_SOCK, and
     // is immune to host-side ssh_config breakage (e.g. a drop-in with bad owner/perms,
     // which ssh treats as fatal). Everything ssh_git needs comes from [[ssh.hosts]].
     format!(
-        "ssh -F /dev/null -o StrictHostKeyChecking={strict} -o UserKnownHostsFile=\"{ukhf}\" \
+        "ssh -F /dev/null -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"{ukhf}\" \
          -o GlobalKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout={ct} -p {port}",
-        strict = strict,
         ukhf = known_hosts_path.display(),
         ct = cfg.connect_timeout_secs,
         port = cfg.port,
@@ -597,30 +628,28 @@ mod tests {
 
     #[test]
     fn test_build_git_ssh_command() {
-        let accept = build_git_ssh_command(
+        let command = build_git_ssh_command(
             &cfg("h", 2222, HostKeyMode::AcceptFirst, None),
             Path::new("/root/kh"),
         );
-        assert!(accept.contains("StrictHostKeyChecking=accept-new"));
+        // AcceptFirst is completed by the russh preflight. The Git connection
+        // must enforce the materialized pin instead of opening another TOFU race.
+        assert!(command.contains("StrictHostKeyChecking=yes"));
+        assert!(!command.contains("accept-new"));
         // Hermetic: ignore host/user ssh_config so a broken /etc/ssh drop-in can't
         // fail the connection (the ssh/WASM tools use russh and never read /etc/ssh).
-        assert!(accept.contains("-F /dev/null"));
-        assert!(accept.contains("BatchMode=yes"));
-        assert!(accept.contains("ConnectTimeout=10"));
-        assert!(accept.contains("-p 2222"));
-        assert!(accept.contains("UserKnownHostsFile=\"/root/kh\""));
-        let strict = build_git_ssh_command(
-            &cfg("h", 22, HostKeyMode::Strict, None),
-            Path::new("/root/kh"),
-        );
-        assert!(strict.contains("StrictHostKeyChecking=yes"));
+        assert!(command.contains("-F /dev/null"));
+        assert!(command.contains("BatchMode=yes"));
+        assert!(command.contains("ConnectTimeout=10"));
+        assert!(command.contains("-p 2222"));
+        assert!(command.contains("UserKnownHostsFile=\"/root/kh\""));
     }
 
     #[test]
     fn test_known_hosts_line() {
-        let c = cfg("h", 22, HostKeyMode::Strict, Some("ssh-ed25519 AAAAKEY"));
+        let configured = cfg("h", 22, HostKeyMode::Strict, Some("ssh-ed25519 AAAAKEY"));
         assert_eq!(
-            known_hosts_line(&c, None),
+            known_hosts_line(&configured, None),
             Some("h ssh-ed25519 AAAAKEY\n".to_string())
         );
         let pin = StoredHostKey {
@@ -628,7 +657,13 @@ mod tests {
             key_type: "ssh-ed25519".into(),
             fingerprint: String::new(),
         };
-        let line = known_hosts_line(&c, Some(&pin)).unwrap();
+        assert_eq!(
+            known_hosts_line(&configured, Some(&pin)),
+            Some("h ssh-ed25519 AAAAKEY\n".to_string()),
+            "the explicit config pin must remain authoritative"
+        );
+        let learned = cfg("h", 22, HostKeyMode::AcceptFirst, None);
+        let line = known_hosts_line(&learned, Some(&pin)).unwrap();
         assert!(line.starts_with("h ssh-ed25519 "));
         assert!(line.contains(&BASE64.encode(b"rawbytes")));
         let bracketed = cfg("h", 2222, HostKeyMode::Strict, Some("ssh-ed25519 K"));
@@ -640,6 +675,32 @@ mod tests {
             known_hosts_line(&cfg("h", 22, HostKeyMode::Strict, None), None),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_known_hosts_line_uses_existing_pin_without_preflight() {
+        let verifier = Arc::new(HostKeyVerifier::new());
+        verifier
+            .add_host_key("h", 22, b"learned key".to_vec(), "ssh-ed25519".into())
+            .await
+            .unwrap();
+
+        let line =
+            resolve_known_hosts_line(&cfg("h", 22, HostKeyMode::AcceptFirst, None), &verifier)
+                .await
+                .unwrap();
+        assert!(line.contains(&BASE64.encode(b"learned key")));
+    }
+
+    #[tokio::test]
+    async fn resolve_known_hosts_line_rejects_unpinned_strict_host() {
+        let error = resolve_known_hosts_line(
+            &cfg("h", 22, HostKeyMode::Strict, None),
+            &Arc::new(HostKeyVerifier::new()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ToolError::NotAuthorized(_)));
     }
 
     #[test]

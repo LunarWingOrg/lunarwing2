@@ -138,10 +138,15 @@ checked:
   record the server's identity in the config up front, and every connection is
   checked against it. No first-time guessing. Use this for anything important.
 - **`host_key_mode = "AcceptFirst"` (convenience).** Trusts whatever identity
-  the server shows on the first connection. Note: for the **`ssh_git` tool** this
-  is **best-effort** — it re-trusts on each run rather than remembering, so it
-  will **not** catch a changed server key between runs. Prefer Strict for
-  repeated or sensitive use.
+  the server shows on the first connection, then stores that pin in the
+  tenant-scoped encrypted secrets store. The built-in `ssh`, WASM `ssh`, and
+  `ssh_git` adapters share the pin across tool calls and daemon restarts;
+  `ssh_git` performs a host-key-only preflight for a first connection and then
+  runs Git with strict checking against the learned key. A mismatch, corrupt
+  pin record, or persistence failure is rejected rather than reopening TOFU.
+  Strict with a key obtained through a trusted channel remains the preferred
+  posture for sensitive systems because AcceptFirst cannot authenticate the
+  initial connection.
 
 To get a server's `known_host_key`, run this from a machine you trust and copy
 the `ssh-ed25519 AAAA...` part into the config:
@@ -316,6 +321,21 @@ new tenants and backfills it before staging/uploading keys for older tenants.
 (Online rotation without a restart is a known limitation — the runtime add path
 only updates status reporting, not the signing keystore. See the architecture
 doc §7.)
+
+### Re-pin an AcceptFirst server host key
+
+`AcceptFirst` rejects a changed server host key. Verify the replacement key
+fingerprint through a trusted out-of-band channel before resetting trust. Then:
+
+1. `DELETE /hosts/{host}` to remove the runtime host config and its learned pin.
+2. `POST /hosts` with the same host configuration to add it again.
+3. Reconnect once to learn and persist the verified replacement key.
+
+For hosts declared in `config.toml`, restart after step 1 instead of posting the
+host; startup restores the static config while leaving the old learned pin
+deleted. Removing a configured `known_host_key` later can expose an older learned
+pin, so use this reset procedure whenever switching from an explicit pin back to
+`AcceptFirst`.
 
 ---
 

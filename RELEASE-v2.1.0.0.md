@@ -271,6 +271,24 @@ allowlist could never match either a room bare JID or a user bare JID.
 - Docs spell out both entry forms and warn that an empty
   `XMPP_ALLOW_ROOMS_JSON` means join-no-rooms + drop-all-groupchat.
 
+### Durable SSH AcceptFirst Pins (work item #98)
+
+The SSH bridge no longer forgets trust-on-first-use host keys when LunarWing
+restarts:
+
+- `HostKeyVerifier` loads and stores a versioned, tenant-scoped pin set through
+  the AES-256-GCM secrets store. First acceptance writes the new pin before
+  publishing it in memory or accepting the handshake; malformed records and
+  storage failures fail closed instead of silently starting empty.
+- Concurrent first connections are serialized and rechecked so different keys
+  cannot both win the TOFU race. Removing a live host also revokes its learned
+  pin persistently.
+- Built-in and WASM SSH preserve the server key's algorithm in the shared pin.
+  `ssh_git` learns an unpinned AcceptFirst key through a russh key-exchange-only
+  preflight, then runs Git with strict checking against that exact materialized
+  key. Explicit `known_host_key` config remains authoritative, and `Strict`
+  remains the default and recommended posture for sensitive hosts.
+
 ### Onboarding Web GUI Browser Testing
 
 The multi-tenant onboarding web console gains executable end-to-end coverage:
@@ -370,6 +388,11 @@ All crates.io dependencies are now vendored into the repository:
    all groupchat.
 9. Worker pins moved to opencode `v1.18.25` and kimi-code `0.39.1`; rebuild
    worker images through the normal CI path to pick them up.
+10. Existing AcceptFirst hosts have no durable pin to migrate from earlier
+    releases. Their first successful connection after upgrade establishes the
+    encrypted pin used on later calls and restarts. If that initial network path
+    cannot be trusted, set `known_host_key` from a trusted source and use
+    `host_key_mode = "Strict"` before reconnecting.
 
 ## Known Issues
 

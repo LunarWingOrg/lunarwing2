@@ -401,6 +401,7 @@ async fn sse_user_b_event_not_visible_to_user_a() {
         SseEvent::Response {
             content: "bob's secret".to_string(),
             thread_id: "t1".to_string(),
+            emotes: Vec::new(),
         },
     );
 
