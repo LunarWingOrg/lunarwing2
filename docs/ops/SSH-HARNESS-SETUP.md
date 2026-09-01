@@ -138,10 +138,15 @@ checked:
   record the server's identity in the config up front, and every connection is
   checked against it. No first-time guessing. Use this for anything important.
 - **`host_key_mode = "AcceptFirst"` (convenience).** Trusts whatever identity
-  the server shows on the first connection. Note: for the **`ssh_git` tool** this
-  is **best-effort** — it re-trusts on each run rather than remembering, so it
-  will **not** catch a changed server key between runs. Prefer Strict for
-  repeated or sensitive use.
+  the server shows on the first connection, then stores that pin in the
+  tenant-scoped encrypted secrets store. The built-in `ssh`, WASM `ssh`, and
+  `ssh_git` adapters share the pin across tool calls and daemon restarts;
+  `ssh_git` performs a host-key-only preflight for a first connection and then
+  runs Git with strict checking against the learned key. A mismatch, corrupt
+  pin record, or persistence failure is rejected rather than reopening TOFU.
+  Strict with a key obtained through a trusted channel remains the preferred
+  posture for sensitive systems because AcceptFirst cannot authenticate the
+  initial connection.
 
 To get a server's `known_host_key`, run this from a machine you trust and copy
 the `ssh-ed25519 AAAA...` part into the config:
