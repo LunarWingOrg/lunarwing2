@@ -88,8 +88,8 @@ pub fn build_turns_from_db_messages(
             // Check if next message is a tool_calls record
             if let Some(next) = iter.peek()
                 && next.role == "tool_calls"
+                && let Some(tc_msg) = iter.next()
             {
-                let tc_msg = iter.next().expect("peeked");
                 match serde_json::from_str::<Vec<serde_json::Value>>(&tc_msg.content) {
                     Ok(calls) => {
                         turn.tool_calls = calls
@@ -115,8 +115,8 @@ pub fn build_turns_from_db_messages(
             // Check if next message is an assistant response
             if let Some(next) = iter.peek()
                 && next.role == "assistant"
+                && let Some(assistant_msg) = iter.next()
             {
-                let assistant_msg = iter.next().expect("peeked");
                 turn.response = Some(assistant_msg.content.clone());
                 turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
             }
@@ -127,8 +127,8 @@ pub fn build_turns_from_db_messages(
             if turn.response.is_none()
                 && let Some(next) = iter.peek()
                 && next.role == INTERRUPTED_ROLE
+                && let Some(marker) = iter.next()
             {
-                let marker = iter.next().expect("peeked");
                 turn.state = "Interrupted".to_string();
                 turn.completed_at = Some(marker.created_at.to_rfc3339());
 
@@ -138,9 +138,10 @@ pub fn build_turns_from_db_messages(
                 // state still stands.
                 if let Some(next) = iter.peek()
                     && next.role == "assistant"
+                    && let Some(assistant_msg) = iter.next()
                 {
-                    let assistant_msg = iter.next().expect("peeked");
                     turn.response = Some(assistant_msg.content.clone());
+                    turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
                 }
             }
 

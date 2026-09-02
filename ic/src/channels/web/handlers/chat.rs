@@ -823,6 +823,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_turns_assistant_after_interrupt_uses_assistant_timestamp() {
+        let now = chrono::Utc::now();
+        let marker_at = now + chrono::TimeDelta::seconds(2);
+        let assistant_at = now + chrono::TimeDelta::seconds(3);
+        let messages = vec![
+            msg("user", "Stop near completion", now),
+            msg("interrupted", "", marker_at),
+            msg(
+                "assistant",
+                "Final response raced cancellation",
+                assistant_at,
+            ),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Interrupted");
+        assert_eq!(
+            turns[0].response.as_deref(),
+            Some("Final response raced cancellation")
+        );
+        assert_eq!(turns[0].completed_at, Some(assistant_at.to_rfc3339()));
+    }
+
+    #[test]
     fn test_build_turns_completed_turn_beats_stray_marker() {
         // A marker must not mark a turn that already persisted its assistant
         // response (completed wins; a stray marker is skipped silently).
