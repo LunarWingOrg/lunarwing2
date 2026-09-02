@@ -4,10 +4,11 @@
 
 **Status: PRE-RELEASE ** Release date TBD
 Claims below were rechecked against release-integration revision
-`cc59a9a89`, the `v2.0.9.0..cc59a9a89` history, current source/manifests/locks,
+`96c951785`, the `v2.0.9.0..96c951785` history, current source/manifests/locks,
 in-tree regression evidence, the canonical bug reports, and the public work-item
-tracker. This file remains at the repository root until the release process moves
-it into `docs/releases/`.
+tracker (2026-09-01 accuracy pass followed by a 2026-09-02 re-verification at
+`96c951785`). This file remains at the repository root until the release process
+moves it into `docs/releases/`.
 
 >Distance is a decision
 >
@@ -393,7 +394,9 @@ committed:
   tick without delaying channel readiness.
 - The repository ShellCheck warning baseline was cleared, and the CI job moved
   from an allowed-failure observation to a blocking `validate` gate on every
-  pipeline.
+  pipeline. A vision-harness emulation that ShellCheck 0.9 (CI Bookworm)
+  reported as SC2218 carries a targeted in-source suppression, so the blocking
+  gate passes under both ShellCheck 0.9 (CI) and 0.11.
 - `docs/architecture/ENGINE-V2.md` now records that one 300-second default
   `tool_async_timeout_secs` deadline intentionally bounds both deferred tool and
   deferred LLM joins in a `ResolveFutures` round. Separate per-surface knobs and
@@ -453,11 +456,12 @@ committed:
 ## Known Issues
 
 The accuracy pass reconciled two separate tracking surfaces against revision
-`cc59a9a89`: the nine active canonical reports in
+`96c951785`: the nine active canonical reports in
 [`docs/bugs/README.md`](docs/bugs/README.md), and the public GitLab work-item
-state on 2026-09-01. GitLab had six open items (#86, #87, #94, #95, #97, #98);
-#96 was closed. An open tracker state is not treated as proof that its source
-fix is absent, so the source disposition is stated explicitly below.
+state re-queried on 2026-09-02 (unchanged from the 2026-09-01 pass). GitLab has
+six open items (#86, #87, #94, #95, #97, #98); #96 is closed. An open tracker
+state is not treated as proof that its source fix is absent, so the source
+disposition is stated explicitly below.
 
 ### Public Work-Item Tracker Reconciliation
 
