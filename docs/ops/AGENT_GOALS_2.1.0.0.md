@@ -137,6 +137,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/102
 27. [ ] verify that https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 was fixed.  you can create 2-3 temporary test tenants to verify fix.  document findings. 
 28. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+29. [x] (S) update release notes at root of repo again
 
 ## Deferred (explicitly NOT this release)
 
