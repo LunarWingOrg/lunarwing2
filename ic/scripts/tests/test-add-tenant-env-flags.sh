@@ -97,6 +97,8 @@ ports_get() {  # <name> <service>
 tenant_pg_password()      { echo "pgpass-fixture"; }
 DARKIRC_FIXTURE_ENABLED=false
 tenant_darkirc_enabled()  { [[ "$DARKIRC_FIXTURE_ENABLED" == "true" ]]; }
+PROXY_FIXTURE_ENABLED=false
+tenant_proxy_enabled()    { [[ "$PROXY_FIXTURE_ENABLED" == "true" ]]; }
 VISION_MODE_FIXTURE=local
 VISION_EXTERNAL_URL_FIXTURE=""
 tenant_vision_mode() { printf '%s\n' "$VISION_MODE_FIXTURE"; }
@@ -246,6 +248,62 @@ write_tenant_lunarwing_env fixture-tenant
 assert_eq "rerun preserves DARKIRC_ADAPTER_SECRET" \
   "$(envval DARKIRC_ADAPTER_SECRET)" "preserved-darkirc-fixture"
 DARKIRC_FIXTURE_ENABLED=false
+
+# Case 5: LLM_BASE_URL derivation (v2.1.0.0 item-23 rerun finding 1).
+# Regression: a proxy-disabled tenant provisioned with a bare TensorZero root
+# (--tensorzero-url http://host:3000) used to get LLM_BASE_URL=<bare root>, and
+# the daemon's openai_compatible client then 404'd every turn on
+# POST /chat/completions while /api/health stayed healthy. The derivation must
+# append TensorZero's OpenAI-compatible surface (/openai/v1).
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "" \
+  "glm-5-air" "0.0.0.0" "admin@xmpp.org,bob@xmpp.org")"
+assert_eq "bare tensorzero root gains /openai/v1" \
+  "$(envval LLM_BASE_URL)" "http://tz:3030/openai/v1"
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030/" "")"
+assert_eq "trailing slash stripped before suffix" \
+  "$(envval LLM_BASE_URL)" "http://tz:3030/openai/v1"
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://192.168.1.157:3000/openai/v1" "")"
+assert_eq "already-suffixed tensorzero URL unchanged" \
+  "$(envval LLM_BASE_URL)" "http://192.168.1.157:3000/openai/v1"
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "https://gw.example.test/tz" "")"
+assert_eq "reverse-proxy prefix kept" \
+  "$(envval LLM_BASE_URL)" "https://gw.example.test/tz/openai/v1"
+# An explicit --llm-base-url is an operator contract: passed through verbatim,
+# never suffixed (non-TensorZero providers use their own path shapes).
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://custom:9000/v1")"
+assert_eq "explicit llm-base-url preserved verbatim" \
+  "$(envval LLM_BASE_URL)" "http://custom:9000/v1"
+# Proxy enabled: the tenant dials its own loopback proxy on /v1; the upstream
+# TensorZero URL is not consulted for LLM_BASE_URL.
+PROXY_FIXTURE_ENABLED=true
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "")"
+assert_eq "proxy enabled dials local proxy /v1" \
+  "$(envval LLM_BASE_URL)" "http://127.0.0.1:10004/v1"
+out="$(run_writer fixture-tenant \
+  "fixture-tenant@xmpp.localhost" "" "http://tz:3030" "" "http://custom:9000/v2")"
+assert_eq "proxy enabled + explicit llm-base-url wins" \
+  "$(envval LLM_BASE_URL)" "http://custom:9000/v2"
+PROXY_FIXTURE_ENABLED=false
+
+echo "=== tensorzero_openai_base unit tests ==="
+assert_eq "unit bare root suffixed" \
+  "$(tensorzero_openai_base "http://tz:3030")" "http://tz:3030/openai/v1"
+assert_eq "unit trailing slash stripped" \
+  "$(tensorzero_openai_base "http://tz:3030/")" "http://tz:3030/openai/v1"
+assert_eq "unit multi trailing slashes stripped" \
+  "$(tensorzero_openai_base "http://tz:3030//")" "http://tz:3030/openai/v1"
+assert_eq "unit already suffixed unchanged" \
+  "$(tensorzero_openai_base "http://tz:3030/openai/v1")" "http://tz:3030/openai/v1"
+assert_eq "unit /openai completed to /openai/v1" \
+  "$(tensorzero_openai_base "http://tz:3030/openai")" "http://tz:3030/openai/v1"
+assert_eq "unit path prefix preserved" \
+  "$(tensorzero_openai_base "https://gw.example.test/tz")" "https://gw.example.test/tz/openai/v1"
 
 echo "=== coordination env backfill tests ==="
 cat >"$MT_FIXTURE/env/lunarwing.env" <<'EOF'

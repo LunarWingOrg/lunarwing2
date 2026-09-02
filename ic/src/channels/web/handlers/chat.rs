@@ -768,6 +768,99 @@ mod tests {
         assert_eq!(turns[0].response.as_deref(), Some("Done"));
     }
 
+    fn msg(
+        role: &str,
+        content: &str,
+        ts: chrono::DateTime<chrono::Utc>,
+    ) -> crate::history::ConversationMessage {
+        crate::history::ConversationMessage {
+            id: Uuid::new_v4(),
+            role: role.to_string(),
+            content: content.to_string(),
+            created_at: ts,
+        }
+    }
+
+    // Interrupted turns persisted an `interrupted` marker row in place of an
+    // assistant response (v2.1.0.0 item-23). History must render such turns as
+    // `Interrupted`, never as the misleading `Failed`.
+    #[test]
+    fn test_build_turns_interrupted_turn() {
+        let now = chrono::Utc::now();
+        let messages = vec![
+            msg("user", "Write ten notes", now),
+            msg("interrupted", "", now + chrono::TimeDelta::seconds(6)),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Interrupted");
+        assert!(turns[0].response.is_none());
+        let marker_ts = (now + chrono::TimeDelta::seconds(6)).to_rfc3339();
+        assert_eq!(turns[0].completed_at.as_deref(), Some(marker_ts.as_str()));
+    }
+
+    #[test]
+    fn test_build_turns_interrupted_after_tool_calls() {
+        let now = chrono::Utc::now();
+        let tool_calls_json =
+            serde_json::json!([{"name": "memory_write", "result_preview": "note 1"}]);
+        let messages = vec![
+            msg("user", "Write ten notes", now),
+            msg(
+                "tool_calls",
+                &tool_calls_json.to_string(),
+                now + chrono::TimeDelta::seconds(2),
+            ),
+            msg("interrupted", "", now + chrono::TimeDelta::seconds(39)),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Interrupted");
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert!(turns[0].response.is_none());
+    }
+
+    #[test]
+    fn test_build_turns_completed_turn_beats_stray_marker() {
+        // A marker must not mark a turn that already persisted its assistant
+        // response (completed wins; a stray marker is skipped silently).
+        let now = chrono::Utc::now();
+        let messages = vec![
+            msg("user", "Hello", now),
+            msg("assistant", "Hi!", now + chrono::TimeDelta::seconds(1)),
+            msg("interrupted", "", now + chrono::TimeDelta::seconds(2)),
+            msg("user", "Next", now + chrono::TimeDelta::seconds(3)),
+            msg(
+                "assistant",
+                "Next answer",
+                now + chrono::TimeDelta::seconds(4),
+            ),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].state, "Completed");
+        assert_eq!(turns[1].state, "Completed");
+    }
+
+    #[test]
+    fn test_build_turns_standalone_marker_ignored() {
+        // A marker with no owning user turn must not render a phantom turn.
+        let now = chrono::Utc::now();
+        let messages = vec![
+            msg("interrupted", "", now),
+            msg("user", "Hello", now + chrono::TimeDelta::seconds(1)),
+            msg("assistant", "Hi!", now + chrono::TimeDelta::seconds(2)),
+        ];
+
+        let turns = build_turns_from_db_messages(&messages);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].state, "Completed");
+        assert_eq!(turns[0].response.as_deref(), Some("Hi!"));
+    }
+
     #[test]
     fn test_build_turns_backward_compatible_no_tool_calls() {
         // Old threads without tool_calls messages still work
