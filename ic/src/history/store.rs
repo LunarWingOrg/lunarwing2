@@ -1989,7 +1989,9 @@ impl Store {
         limit: i64,
     ) -> Result<(Vec<ConversationMessage>, bool), DatabaseError> {
         let conn = self.conn().await?;
-        let fetch_limit = limit + 1; // Fetch one extra to determine has_more
+        // A persisted turn can span user/tool_calls/interrupted/assistant rows.
+        // Fetch enough look-behind to avoid splitting its oldest boundary.
+        let fetch_limit = limit + 4;
 
         let rows = if let Some(before_ts) = before {
             conn.query(
@@ -2017,8 +2019,15 @@ impl Store {
             .await?
         };
 
-        let has_more = rows.len() as i64 > limit;
-        let take_count = (rows.len() as i64).min(limit) as usize;
+        let mut take_count = (rows.len() as i64).min(limit) as usize;
+        while take_count > 0 && take_count < rows.len() {
+            let oldest_role: String = rows[take_count - 1].get("role");
+            if oldest_role == "user" {
+                break;
+            }
+            take_count += 1;
+        }
+        let has_more = rows.len() > take_count;
 
         // Rows come newest-first from DB; reverse so caller gets oldest-first
         let mut messages: Vec<ConversationMessage> = rows

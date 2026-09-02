@@ -524,6 +524,26 @@ _write_weechat_env() {  # <tenant> <relay_password>
   )
 }
 
+# TensorZero's OpenAI-compatible surface lives under /openai/v1. The daemon's
+# openai_compatible client appends /chat/completions to LLM_BASE_URL, so a bare
+# gateway root (http://host:3000) 404s every LLM turn while every health check
+# stays green (v2.1.0.0 item-23 rerun finding 1: a fresh proxy-disabled tenant
+# whose --tensorzero-url was the bare root could not answer a single prompt
+# until an operator hand-appended /openai/v1). Derive the path-aware base a
+# tenant needs when it dials TENSORZERO_URL directly (proxy disabled).
+# Idempotent: an already-suffixed URL is returned unchanged, and a
+# reverse-proxy path prefix is kept (http://host/tz -> http://host/tz/openai/v1).
+tensorzero_openai_base() {
+  local url="$1"
+  [[ -n "$url" ]] || die "tensorzero_openai_base: empty TensorZero URL"
+  url="${url%"${url##*[!/]}"}" # strip trailing slashes
+  case "$url" in
+    */openai/v1) printf '%s\n' "$url" ;;
+    */openai)    printf '%s/v1\n' "$url" ;;
+    *)           printf '%s/openai/v1\n' "$url" ;;
+  esac
+}
+
 write_tenant_lunarwing_env() {
   local name="$1"
   # Empty $2 means "caller supplied none" -> preserve an existing JID (see
@@ -643,13 +663,15 @@ write_tenant_lunarwing_env() {
 
   # LLM endpoint the daemon's OpenAI-compatible client dials. When the proxy is
   # enabled, defaults to this tenant's local TensorZero proxy. When disabled,
-  # defaults to the upstream TENSORZERO_URL directly. An explicit value (from
-  # --llm-base-url or LUNARWING_MT_LLM_BASE_URL) always overrides.
+  # defaults to the upstream TENSORZERO_URL's OpenAI-compatible surface
+  # (tensorzero_openai_base appends /openai/v1 to a bare gateway root — see the
+  # helper for the 404 regression this prevents). An explicit value (from
+  # --llm-base-url or LUNARWING_MT_LLM_BASE_URL) always overrides as-is.
   local llm_base_url_effective
   if tenant_proxy_enabled "$name"; then
     llm_base_url_effective="${llm_base_url:-http://127.0.0.1:${proxy_port}/v1}"
   else
-    llm_base_url_effective="${llm_base_url:-$tensorzero_url}"
+    llm_base_url_effective="${llm_base_url:-$(tensorzero_openai_base "$tensorzero_url")}"
   fi
 
   # Idempotent overrides for the configurable flags (--llm-model,

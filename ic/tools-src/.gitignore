@@ -1,2 +1,3 @@
-Cargo.lock
+# WASM tools are deployed binaries. Keep lockfiles committed so offline tenant
+# builds resolve exactly the dependency versions present in ic/vendor/.
 target/

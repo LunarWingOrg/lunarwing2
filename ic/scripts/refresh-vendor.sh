@@ -14,8 +14,6 @@
 #     (vendor/libsignal-protocol, vendor/libsignal-protocol-sys) which the ic
 #     manifest path-depends on (ic/Cargo.toml); cargo vendor never rewrites
 #     path dependencies, and without --no-delete it would delete them.
-#   - tools-src/gitlab/Cargo.toml is deliberately not synced: its lockfile is
-#     untracked and stale, so it would fail --locked.
 #   - The post-vendor set check compares vendor/ against the committed
 #     Cargo.lock files (the approved pins). It must only report drift, never
 #     re-resolve versions: any stray means the lockfiles drifted, so fix the
@@ -35,7 +33,15 @@ SYNC_MANIFESTS=(
   lunarwing-gotify-tool/Cargo.toml
   openclaw-ports/xmpp/bridge/Cargo.toml
   tests/fixtures/test-echo-tool/Cargo.toml
+  tools-src/cavepony/Cargo.toml
+  tools-src/gitlab/Cargo.toml
   tools-src/gotify/Cargo.toml
+  tools-src/llm-context/Cargo.toml
+  tools-src/multica-bridge/Cargo.toml
+  tools-src/ssh/Cargo.toml
+  tools-src/vision-analyze/Cargo.toml
+  tools-src/voice-transcribe/Cargo.toml
+  tools-src/web-search/Cargo.toml
   unix-socket-client/Cargo.toml
 )
 

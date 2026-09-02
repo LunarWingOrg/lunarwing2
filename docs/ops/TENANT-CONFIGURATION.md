@@ -36,7 +36,10 @@ After changing any env file, restart the affected service for changes to take ef
 
 ## LLM Provider Configuration
 
-The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorZero proxy is opt-in; without `--enable-proxy`, provisioning points `LLM_BASE_URL` directly at `LUNARWING_MT_TENSORZERO_URL` (or an explicit `--llm-base-url`).
+The LLM backend is configured in `env/lunarwing.env`. The per-tenant TensorZero
+proxy is opt-in. Without `--enable-proxy`, provisioning derives TensorZero's
+OpenAI-compatible `/openai/v1` surface from `LUNARWING_MT_TENSORZERO_URL`, or
+uses an explicit `--llm-base-url` unchanged.
 
 ### Setting your API key
 
@@ -58,7 +61,8 @@ LLM_BASE_URL=http://192.168.1.157:3000/openai/v1
 LLM_MODEL=tensorzero::function_name::lunarwing
 ```
 
-Set the upstream with `LUNARWING_MT_TENSORZERO_URL`, or set `LLM_BASE_URL`
+Set the upstream root or `/openai/v1` URL with `LUNARWING_MT_TENSORZERO_URL`;
+mt-admin adds `/openai/v1` when absent. Alternatively, set `LLM_BASE_URL`
 directly at provisioning time with `add-tenant --llm-base-url <url>` (fleet-wide:
 `LUNARWING_MT_LLM_BASE_URL`). When `--enable-proxy` is selected and no explicit
 LLM base URL is supplied, mt-admin instead writes

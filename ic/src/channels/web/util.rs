@@ -3,6 +3,16 @@
 use crate::channels::StatusUpdate;
 use crate::channels::web::types::{ReasoningSummary, ToolCallInfo, ToolDecisionDto, TurnInfo};
 
+/// Conversation-history role written when a turn is stopped by `/interrupt`.
+///
+/// The classic loop (agent/thread_ops.rs) and the Engine V2 bridge
+/// (bridge/router.rs) append one row with this role after the interrupted
+/// turn's user message. Without it, an interrupted turn has its user message
+/// persisted but no assistant response, and was rendered as `Failed` —
+/// operator-misleading, since no error occurred. `rebuild_chat_messages_from_db`
+/// skips unknown roles, so markers never leak into restored LLM context.
+const INTERRUPTED_ROLE: &str = "interrupted";
+
 pub fn reasoning_summary(tool_calls: &[ToolCallInfo]) -> Option<ReasoningSummary> {
     let names: Vec<String> = tool_calls.iter().map(|call| call.name.clone()).collect();
     let StatusUpdate::ReasoningUpdate {
@@ -50,9 +60,10 @@ pub fn truncate_preview(s: &str, max_bytes: usize) -> String {
 
 /// Build TurnInfo pairs from flat DB messages (user/tool_calls/assistant triples).
 ///
-/// Handles three message patterns:
+/// Handles four message patterns:
 /// - `user → assistant` (legacy, no tool calls)
 /// - `user → tool_calls → assistant` (with persisted tool call summaries)
+/// - `user → [tool_calls] → interrupted` (turn stopped by `/interrupt`)
 /// - `user` alone (incomplete turn)
 pub fn build_turns_from_db_messages(
     messages: &[crate::history::ConversationMessage],
@@ -77,8 +88,8 @@ pub fn build_turns_from_db_messages(
             // Check if next message is a tool_calls record
             if let Some(next) = iter.peek()
                 && next.role == "tool_calls"
+                && let Some(tc_msg) = iter.next()
             {
-                let tc_msg = iter.next().expect("peeked");
                 match serde_json::from_str::<Vec<serde_json::Value>>(&tc_msg.content) {
                     Ok(calls) => {
                         turn.tool_calls = calls
@@ -104,14 +115,38 @@ pub fn build_turns_from_db_messages(
             // Check if next message is an assistant response
             if let Some(next) = iter.peek()
                 && next.role == "assistant"
+                && let Some(assistant_msg) = iter.next()
             {
-                let assistant_msg = iter.next().expect("peeked");
                 turn.response = Some(assistant_msg.content.clone());
                 turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
             }
 
+            // Check if the turn was stopped by `/interrupt` (marker row written
+            // where the assistant response would have landed). A completed turn
+            // wins over a stray marker; an interrupted turn's marker is ignored.
+            if turn.response.is_none()
+                && let Some(next) = iter.peek()
+                && next.role == INTERRUPTED_ROLE
+                && let Some(marker) = iter.next()
+            {
+                turn.state = "Interrupted".to_string();
+                turn.completed_at = Some(marker.created_at.to_rfc3339());
+
+                // Race window: on rare ordering the engine dual-writes its
+                // final assistant row after the marker. Attach it so it does
+                // not render as a separate empty-input turn; the interrupted
+                // state still stands.
+                if let Some(next) = iter.peek()
+                    && next.role == "assistant"
+                    && let Some(assistant_msg) = iter.next()
+                {
+                    turn.response = Some(assistant_msg.content.clone());
+                    turn.completed_at = Some(assistant_msg.created_at.to_rfc3339());
+                }
+            }
+
             // Incomplete turn (user message without response)
-            if turn.response.is_none() {
+            if turn.response.is_none() && turn.state == "Completed" {
                 turn.state = "Failed".to_string();
             }
 

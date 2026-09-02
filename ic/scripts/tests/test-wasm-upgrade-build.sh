@@ -29,6 +29,7 @@ cat >"$fixture/build/ic/registry/tools/demo-tool.json" <<'JSON'
 JSON
 printf '[package]\nname = "demo-tool"\nversion = "0.1.0"\n' \
   >"$fixture/build/ic/tools-src/demo/Cargo.toml"
+touch "$fixture/build/ic/tools-src/demo/Cargo.lock"
 
 cat >"$fixture/bin/rustup" <<'SH'
 #!/usr/bin/env bash
@@ -64,7 +65,7 @@ if PATH="$fixture/bin:$PATH" bash "$fixture/build/ic/scripts/build-wasm-extensio
 else
   fail 'WASM builder should succeed with expected artifact'
 fi
-if grep -Fq 'build --release --target wasm32-wasip2 --manifest-path tools-src/demo/Cargo.toml' "$CARGO_CALLS" \
+if grep -Fq 'build --locked --release --target wasm32-wasip2 --manifest-path tools-src/demo/Cargo.toml' "$CARGO_CALLS" \
   && ! grep -Fq 'component build' "$CARGO_CALLS"; then
   pass 'WASM builder uses cargo build for wasm32-wasip2'
 else
