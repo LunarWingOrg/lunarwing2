@@ -131,13 +131,13 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Reproduced the tools-src/gitlab known issue live at `96c951785`; follow-up MR !768 resolved it by committing every registered tool lockfile, syncing all 18 satellite roots, vendoring `serde_ignored`, and bumping GitLab to 0.1.4.
     - Known-issues reconciled: docs/bugs/README.md still carries exactly the nine active canonical reports the notes enumerate; live GitLab API re-query (2026-09-02) confirmed the same six open items (#86, #87, #94, #95, #97, #98) and #96 closed, no newer items.
     - Edits applied: header/known-issues revision stamp `cc59a9a89` → `96c951785` with 2026-09-02 re-verification + tracker re-query date; added the post-stamp ShellCheck 0.9 compatibility change. Integration follow-up then reconciled the draft after MRs !767 and !768: interrupted history and the GitLab vendoring gap moved from Known Issues to Resolved, vendor/tool counts updated, and direct TensorZero URL derivation documented.
-23. [x] chk ( last attempt was on: rarity/kimi-23-20260901-1801 and does address any of the actual issues found ) - one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
-24. [x] (S) reserved
-25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/100 - feel free to create new test tenant and use the web browser to address concerns. should be some stuff in facts store as well for it
+23. [x] (S) chk again later ( last attempt was on: rarity/kimi-23-20260901-1801 and does address any of the actual issues found ) - one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
+24. [x] (S) reserved for CI/CD fixes
+25. [x] (S) work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/100 - feel free to create new test tenant and use the web browser to address concerns. should be some stuff in facts store as well for it
 26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/102
 27. [ ] verify that https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 was fixed.  you can create 2-3 temporary test tenants to verify fix.  document findings. 
 28. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
-29. [x] (S) update release notes at root of repo again
+29. [x] (S) update release notes at root of repo again l8r
 
 ## Deferred (explicitly NOT this release)
 
