@@ -672,6 +672,11 @@ impl Agent {
                     )
                     .await;
             }
+            // Persist the interrupted-turn marker so the gateway turns-history
+            // renders this turn as `Interrupted` (not `Failed`): the user
+            // message is durable but no assistant row will ever land.
+            self.persist_turn_interrupted(thread_id, &message.channel, &message.user_id)
+                .await;
             return Ok(SubmissionResult::Interrupted);
         }
 
@@ -921,6 +926,42 @@ impl Agent {
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
+        }
+    }
+
+    /// Persist an interrupted-turn marker to the DB as a `role="interrupted"`.
+    ///
+    /// Written when a `/interrupt` stops a turn: the user message is already
+    /// persisted (see [`persist_user_message`]) but no assistant response is,
+    /// which the gateway turns-history builder otherwise renders as `Failed`
+    /// — operator-misleading since no failure occurred. The marker lets
+    /// `build_turns_from_db_messages` render the turn as `Interrupted` instead.
+    /// `rebuild_chat_messages_from_db` skips unknown roles, so markers never
+    /// leak into restored LLM context. Content is empty; the row carries
+    /// thread and timestamp only.
+    pub(super) async fn persist_turn_interrupted(
+        &self,
+        thread_id: Uuid,
+        channel: &str,
+        user_id: &str,
+    ) {
+        let store = match self.store() {
+            Some(s) => Arc::clone(s),
+            None => return,
+        };
+
+        if !self
+            .ensure_writable_conversation(&store, thread_id, channel, user_id)
+            .await
+        {
+            return;
+        }
+
+        if let Err(e) = store
+            .add_conversation_message(thread_id, "interrupted", "")
+            .await
+        {
+            tracing::warn!("Failed to persist interrupted-turn marker: {}", e);
         }
     }
 

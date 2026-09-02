@@ -2453,6 +2453,17 @@ async fn interrupt_engine_conversation(
     let discarded = discard_scoped_pending_gates(state, message, conv_id).await;
 
     if stopped > 0 || discarded > 0 {
+        // Persist the interrupted-turn marker (role "interrupted") so the
+        // gateway turns-history renders this turn as `Interrupted` instead of
+        // the misleading `Failed` (user row durable, no assistant row lands
+        // for a stopped engine thread). Unknown roles are skipped by the
+        // classic rebuild path, so markers never reach restored LLM context.
+        if let Some(ref db) = state.db
+            && let Some(cid) = resolve_v1_conversation_for_message(db.as_ref(), message).await
+            && let Err(error) = db.add_conversation_message(cid, "interrupted", "").await
+        {
+            debug!(%error, "engine v2: failed to persist interrupted-turn marker");
+        }
         debug!(stopped, discarded, "engine v2: interrupted scoped state");
         Ok(Some("Interrupted.".into()))
     } else {
