@@ -99,7 +99,7 @@ previous compatibility baseline.
 - **The `ic/` dependency supply chain is vendored.** `ic/.cargo/config.toml`
   source-replaces crates.io with `ic/vendor/`; locked `ic/` builds pass with
   `CARGO_NET_OFFLINE=true`. `ic/scripts/refresh-vendor.sh` re-vendors the
-  workspace plus ten tracked satellite lockfile roots, checks the resulting set,
+  workspace plus 18 tracked satellite lockfile roots, checks the resulting set,
   and runs `cargo deny check advisories`.
 - **LLM `finish_reason` is no longer dropped.** Engine V2 `LlmOutput`, blocking
   bridge adapters, stream aggregation, and the worker proxy carry canonical
@@ -140,7 +140,7 @@ previous compatibility baseline.
 | New SQL migration | None; `V26__study_notes_knowledge.sql` remains latest |
 | Multi-tenant port registry | v16; no schema change from v2.0.9.0 |
 | Channel registry patches | darkirc 0.1.6 (no change), multica 0.1.9, weechat 0.2.7 (no change), xmpp 0.1.12 |
-| Tool registry patches | `vision-analyze` 0.1.2 (was 0.1.1); all others unchanged, including GitLab 0.1.3 |
+| Tool registry patches | `vision-analyze` 0.1.2 (was 0.1.1); GitLab 0.1.4 (was 0.1.3); other tools unchanged |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
 | Worker image tool pins | opencode `v1.18.25`, kimi-code `0.39.1` |
@@ -345,16 +345,15 @@ The multi-tenant onboarding web console gains executable browser coverage:
 The approved dependency closure for Rust manifests rooted under `ic/` is now
 committed:
 
-- `cargo vendor` covers the `ic/` workspace plus ten tracked satellite lockfile
-  roots under `ic/`. The tree has 1,050 directories total: 1,048 registry/git
-  dependency directories over 842 unique package names, plus the two pre-vendored
-  `libsignal-protocol{,-sys}` path dependencies. Root-level satellites outside
-  `ic/` are intentionally not source-replaced. The ignored, stale
-  `tools-src/gitlab/Cargo.lock` is also excluded (see Known Issues).
+- `cargo vendor` covers the `ic/` workspace plus 18 tracked satellite lockfile
+  roots under `ic/`, including every registered WASM tool. The tree has 1,050
+  directories total over 843 unique package names, including the two
+  pre-vendored `libsignal-protocol{,-sys}` path dependencies. Root-level
+  satellites outside `ic/` are intentionally not source-replaced.
 - `ic/.cargo/config.toml` source-replaces crates.io with `ic/vendor/`. Locked
   workspace checks and metadata pass with `CARGO_NET_OFFLINE=true`.
 - `ic/scripts/refresh-vendor.sh` uses `--locked --no-delete`, regenerates missing
-  libsignal checksums, checks the directory set against all eleven tracked
+  libsignal checksums, checks the directory set against all 19 tracked
   lockfiles without re-resolving, and then runs `cargo deny check advisories`.
 - Repo-wide secret, shell-syntax, ShellCheck, and Python-syntax scanners exclude
   the pinned third-party tree. Advisory matching still evaluates Cargo.lock
@@ -364,8 +363,8 @@ committed:
 
 - LunarWing-owned release crates and channel packages moved from 2.0.9 to 2.1.0.
   Channel registry patches are multica 0.1.9 and xmpp 0.1.12; darkirc 0.1.6 and
-  weechat 0.2.7 are unchanged. The only tool registry bump is
-  `vision-analyze` 0.1.1 → 0.1.2.
+  weechat 0.2.7 are unchanged. Tool registry bumps are `vision-analyze`
+  0.1.1 → 0.1.2 and GitLab 0.1.3 → 0.1.4.
 - fs4 0.6.6 was removed in favor of standard-library `File::lock` /
   `try_lock` (available before the 1.96.1 MSRV), preserving
   `TryLockError::WouldBlock` behavior across bootstrap, gate persistence,
@@ -535,17 +534,6 @@ disposition is stated explicitly below.
 
 ### Additional 2.1 Limitations
 
-- **Interrupted Engine V2 turns render as `Failed` in gateway v1 history.** A
-  stopped turn can intentionally suppress its terminal assistant row;
-  `build_turns_from_db_messages` maps every user row without an assistant row to
-  `Failed` and has no Interrupted state. Runtime cancellation works; the label
-  is misleading. See
-  [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
-- **The GitLab WASM tool is not in the successful vendored build set.** Its
-  ignored `tools-src/gitlab/Cargo.lock` is stale. The all-tools build loop still
-  attempts it, but `cargo check --locked --offline --manifest-path
-  tools-src/gitlab/Cargo.toml` currently fails because `serde_ignored` is absent
-  from `ic/vendor/`. The registry remains 0.1.3.
 - **Direct edits to generated WeeChat capabilities are not durable.** A test-time
   `dm_policy` edit in `weechat.capabilities.json` is overwritten by rebuild or
   `install-wasm`. Persist policy through `extensions.weechat.setup_fields` (or
@@ -589,6 +577,11 @@ disposition is stated explicitly below.
 - Mid-turn interrupt aborts classic-loop LLM streams and tool batches, while
   bridge-owned Engine V2 interrupt/steer targets scoped running threads. Live
   gateway, WeeChat, and XMPP checks passed 6/6.
+- Interrupted classic and Engine V2 turns persist a history marker and render
+  as `Interrupted`, including paginated history boundaries, instead of being
+  mislabeled `Failed` when no assistant row lands.
+- Proxy-disabled tenant generation derives TensorZero's `/openai/v1` surface
+  from a bare upstream URL while preserving explicit `--llm-base-url` values.
 - LunarVoice has the complete mt-admin lifecycle and registry-aware readiness
   checks on systemd and OpenRC; external LunarVision can replace a local GPU
   sidecar with a constrained HTTPS origin.
@@ -600,8 +593,9 @@ disposition is stated explicitly below.
 - Models now contribute numeric exporter series, and six legacy health checks
   expose configurable degraded/critical thresholds.
 - The scoped `ic/` dependency closure is committed under `ic/vendor/`; locked
-  offline workspace checks pass, and the refresh script includes advisory
-  verification.
+  offline workspace checks pass, every registered WASM tool has a committed
+  lockfile, and the refresh script includes advisory verification. GitLab's
+  formerly missing `serde_ignored` dependency is included.
 - LLM `finish_reason` survives blocking completions, stream aggregation, bridge,
   and proxy paths (#95 source fix; tracker still open). A partially emitted
   Engine V2 stream is no longer advertised as safely retryable.
