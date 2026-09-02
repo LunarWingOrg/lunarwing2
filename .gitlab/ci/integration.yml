@@ -19,7 +19,7 @@ cavepony-wasm:
   extends: .rust-job
   stage: test
   variables:
-    CAVEPONY_EXPECTED_VERSION: "0.4.0"
+    CAVEPONY_EXPECTED_VERSION: "0.4.1"
     CAVEPONY_WASM_REQUIRED: "1"
   needs:
     - rust-check-default
