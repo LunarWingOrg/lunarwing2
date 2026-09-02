@@ -80,7 +80,7 @@ build_extension() {
 
     echo "  BUILD $name ($crate_name) from $source_dir"
     rm -f "$artifact"
-    if ! cargo build --release --target wasm32-wasip2 --manifest-path "$source_dir/Cargo.toml" 2>&1; then
+    if ! cargo build --locked --release --target wasm32-wasip2 --manifest-path "$source_dir/Cargo.toml" 2>&1; then
         echo "  FAIL $name"
         FAILED+=("$name")
         return 1

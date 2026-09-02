@@ -6,12 +6,22 @@ script="$repo_root/ic/scripts/build-wasm-extensions.sh"
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 
+for manifest in "$repo_root"/ic/registry/{tools,channels}/*.json; do
+    source_dir=$(jq -r '.source.dir' "$manifest")
+    if [[ ! -f "$repo_root/ic/$source_dir/Cargo.lock" ]]; then
+        echo "FAIL: registered extension has no lockfile: $source_dir/Cargo.lock" >&2
+        exit 1
+    fi
+done
+
 mkdir -p "$fixture/ic/scripts" "$fixture/ic/registry/tools" \
     "$fixture/ic/registry/channels" "$fixture/ic/tools-src/valid" \
     "$fixture/ic/channels-src/valid" "$fixture/bin"
 cp "$script" "$fixture/ic/scripts/build-wasm-extensions.sh"
 touch "$fixture/ic/tools-src/valid/tool.capabilities.json"
 touch "$fixture/ic/channels-src/valid/channel.capabilities.json"
+touch "$fixture/ic/tools-src/valid/Cargo.lock"
+touch "$fixture/ic/channels-src/valid/Cargo.lock"
 
 cat >"$fixture/ic/registry/tools/valid-tool.json" <<'JSON'
 {"source":{"dir":"tools-src/valid","capabilities":"tool.capabilities.json","crate_name":"valid-tool"}}
@@ -32,6 +42,7 @@ cat >"$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 manifest=""
+[[ " $* " == *' --locked '* ]] || exit 3
 while (($#)); do
     if [[ "$1" == "--manifest-path" ]]; then
         manifest="$2"
