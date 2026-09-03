@@ -2,13 +2,16 @@
 
 ## Codename: Ma-ai (間合い)
 
-**Status: PRE-RELEASE ** Release date TBD
+**Status: PRE-RELEASE DRAFT ** Release date TBD
 Claims below were rechecked against release-integration revision
-`96c951785`, the `v2.0.9.0..96c951785` history, current source/manifests/locks,
-in-tree regression evidence, the canonical bug reports, and the public work-item
-tracker (2026-09-01 accuracy pass followed by a 2026-09-02 re-verification at
-`96c951785`). This file remains at the repository root until the release process
-moves it into `docs/releases/`.
+`d316097e5` (the tip of the `aragents/kimil00p/v2.1.0.0` lineage reviewed at
+that commit), the `v2.0.9.0..d316097e5` history, current source/manifests/locks,
+in-tree regression evidence, the canonical bug reports, and the public
+work-item tracker (2026-09-01 accuracy pass, a 2026-09-02 re-verification at
+`96c951785`, a 2026-09-03 re-verification at `a67fee21c`, and a second
+2026-09-03 pass at `d316097e5` covering the subsequently merged mascot-dialect
+and gate-expiry-resume work). This file remains at the repository root until
+the release process moves it into `docs/releases/`.
 
 >Distance is a decision
 >
@@ -62,14 +65,21 @@ previous compatibility baseline.
   `CancellationToken` from `agent::interrupt::TurnInterrupts`. Every LLM call
   and tool batch in that agentic loop races against the token via
   `tokio::select!`, so `/interrupt` cancels an in-flight provider stream or
-  running tool batch mid-poll instead of waiting for a step boundary. Existing
-  turn-boundary state and queue handling remain in place.
+  running tool batch mid-poll instead of waiting for a step boundary. Engine V2
+  runs apply their per-run token to in-flight CodeAct, direct, and parallel
+  tool host calls as well, so interrupting drops a long-running tool future
+  promptly. Existing turn-boundary state and queue handling remain in place.
 - **Hermes-style steer.** `/steer <note>` uses priority dispatch and a capped
   four-note buffer on the classic loop, draining notes into one user message at
-  the next safe iteration boundary. Engine V2 routes steer through the bridge
-  into the scoped running engine thread. Live verification on a throwaway
-  tenant passed 6/6 checks (web gateway, WeeChat, and XMPP × interrupt and
-  steer). Evidence:
+  the next safe iteration boundary. Steer is accepted while a conversation is
+  idle, interrupted, processing, or approval-paused, and queued notes are never
+  silently dropped: the engine persists a bounded four-note durable queue that
+  clears with the conversation, and pending notes are delivered on the next
+  foreground turn and on running-thread, suspended, and approval/auth resumes.
+  Engine V2 routes steer through the bridge into the scoped running thread when
+  one exists and acknowledges the queued note otherwise. Live verification on a
+  throwaway tenant passed 6/6 checks (web gateway, WeeChat, and XMPP ×
+  interrupt and steer). Evidence:
   [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
 - **LunarVoice production lifecycle.** mt-admin now provides
   install/configure/activate/deactivate/remove for the voice sidecar with
@@ -140,7 +150,7 @@ previous compatibility baseline.
 | New SQL migration | None; `V26__study_notes_knowledge.sql` remains latest |
 | Multi-tenant port registry | v16; no schema change from v2.0.9.0 |
 | Channel registry patches | darkirc 0.1.6 (no change), multica 0.1.9, weechat 0.2.7 (no change), xmpp 0.1.12 |
-| Tool registry patches | `vision-analyze` 0.1.2 (was 0.1.1); GitLab 0.1.4 (was 0.1.3); other tools unchanged |
+| Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
 | Worker image tool pins | opencode `v1.18.25`, kimi-code `0.39.1` |
@@ -179,6 +189,55 @@ Item 3 of the v2.1.0.0 cycle, with live verification and fixes from item 9:
   injects the wrapped note into the scoped running engine thread and returns the
   same acknowledgement as the classic path.
 
+The follow-up engine work — work items #103 and #104, plus the interrupt half
+of work item #105 — hardened both controls against the idle and interrupt
+races that the live pass could not cover:
+
+- Steer is no longer dropped while a conversation is idle, interrupted, or
+  approval-paused. Engine conversations persist a serde-default queue of at
+  most four pending steer notes that is cleared with the conversation. Routed
+  steer acknowledges as soon as it is queued, injects into a running scoped
+  thread when one exists, and otherwise persists across the
+  idle/thread-completion race; pending notes are consumed by the next
+  foreground turn and also delivered on running-thread injection, suspended
+  resume, and approval/auth resume. The legacy loop accepts idle, interrupted,
+  processing, and approval-paused steer with the same four-note bound, and
+  serde defaults keep existing conversation records compatible.
+- Failed runtime steer injection no longer acknowledges a dropped signal: when
+  the destination run is closed or already cancelled, the note falls back to
+  the durable conversation queue and the caller is told the queue was accepted.
+- The Engine V2 per-run cancellation token now wraps in-flight CodeAct, direct,
+  and parallel tool host calls as well as LLM streams, so `/interrupt` drops a
+  long-running tool future promptly and returns a normal stopped outcome.
+- Engine documentation now pins the contract: steer injects at the next
+  model-call boundary, after the current step or tool result, and deliberately
+  never cancels the running tool. These fixes close the source side of work
+  items #103 and #104 and the interrupt half of #105; regression coverage
+  passed, and the fresh cross-channel live pass remains on the release
+  checklist.
+
+### Expired-Gate Turn Resume (work item #108)
+
+Previously, a pending approval gate that expired through the background sweep
+was treated as a failure: the paused thread was finalized as `Failed` with no
+resume, no channel notification, and no reply, so the conversation was left
+permanently unanswered. Expiry now resumes the paused turn:
+
+- The expired gate is injected into the resumed thread as an expired-gate
+  action result with the same shape as a denial, the model wraps the turn up,
+  and the wrap-up reply is delivered to the gate's source channel through the
+  normal broadcast, SSE response, and v1 history paths, including outbound
+  hooks.
+- The gateway also receives a `GateResolved` event with an `expired` resolution
+  so any open approval prompt clears.
+- Resume is defensive: a conversation missing from the in-memory map (for
+  example, gates restored after a daemon restart) no longer blocks the resume;
+  a thread that cannot be resumed still fails closed but the channel is told;
+  and a wrap-up that requests another gate is not re-armed, ending the turn
+  with an explanatory notice instead of looping. `/interrupt` and `/steer`
+  still observe the wrap-up because the thread stays in the running map until
+  terminal.
+
 ### External LunarVision Instances
 
 Tenants can now use an operator-managed LunarVision instance on another machine
@@ -196,7 +255,7 @@ instead of requiring a local GPU sidecar:
   `/v1/` prefix. Bearer credentials are host-owned and constrained to that same
   origin and path; invalid configuration clears the tool's HTTP allowlist.
 - Ports-registry discovery and docs cover mixed local/external fleets on both
-  systemd and OpenRC hosts. The `vision-analyze` tool registry version is 0.1.2.
+  systemd and OpenRC hosts. The `vision-analyze` tool registry version is 0.1.3.
 
 ### Emoting Gateway Mascot
 
@@ -206,6 +265,15 @@ The gateway now includes a presentation-only mascot pipeline:
   case-insensitive keywords to eight `Emote` variants, deduplicates in order,
   and caps each response at four emotes. The requested examples are pinned by
   tests: `*stamps hooves*` maps to `jump`, and `*ears perk*` maps to `alert`.
+- After the live mascot defect was double-detected and triaged (work item
+  #107), the keyword table was extended by roughly fifty entries covering the
+  herd's equine dialect (`nicker`, `whinny`, `snort`, tail flicks, pawing,
+  pinned ears) and common live roleplay verbs (`smile`, `grin`, `giggle`,
+  `laugh`, `nod`, `sigh`), with stem forms matching inflections
+  (`whinn` catches both `whinny` and `whinnies`). The triage confirmed the
+  parser gap was the live defect and that the wiring, event shapes, and widget
+  paths were intact; the full record is in
+  [`docs/ops/v2.1.0.0_GOAL33_WI107_MASCOT_TRIAGE.md`](docs/ops/v2.1.0.0_GOAL33_WI107_MASCOT_TRIAGE.md).
 - Final assistant response events from direct gateway responses, broadcasts,
   and bridged `AppEvent` conversions carry `emotes` only when non-empty. Parsing
   never changes assistant text.
@@ -358,13 +426,20 @@ committed:
 - Repo-wide secret, shell-syntax, ShellCheck, and Python-syntax scanners exclude
   the pinned third-party tree. Advisory matching still evaluates Cargo.lock
   against the separate RustSec advisory database.
+- Every built-from-source tool gains a committed `Cargo.lock` plus a matching
+  registry patch-version bump, with a strict build-harness test, so installed
+  tenants rebuild vendor-consistent WASM artifacts instead of resolving from
+  crates.io ad hoc.
 
 ### Dependency, Version, and Worker Updates
 
 - LunarWing-owned release crates and channel packages moved from 2.0.9 to 2.1.0.
   Channel registry patches are multica 0.1.9 and xmpp 0.1.12; darkirc 0.1.6 and
-  weechat 0.2.7 are unchanged. Tool registry bumps are `vision-analyze`
-  0.1.1 → 0.1.2 and GitLab 0.1.3 → 0.1.4.
+  weechat 0.2.7 are unchanged. Tool registry bumps are cavepony 0.4.0 → 0.4.2,
+  GitLab 0.1.3 → 0.1.4, llm-context 0.1.0 → 0.1.1, multica-bridge
+  0.1.1 → 0.1.2, ssh 0.1.0 → 0.1.1, `vision-analyze` 0.1.1 → 0.1.3,
+  voice-transcribe 0.1.0 → 0.1.1, and web-search 0.2.1 → 0.2.2 (registry-level
+  patch versions; of the crate versions, only cavepony moved, 0.4.0 → 0.4.2).
 - fs4 0.6.6 was removed in favor of standard-library `File::lock` /
   `try_lock` (available before the 1.96.1 MSRV), preserving
   `TryLockError::WouldBlock` behavior across bootstrap, gate persistence,
@@ -419,16 +494,22 @@ committed:
    remain current.
 3. Rebuild the daemon and installed WASM extensions through the normal deployment
    path. Channel registry versions multica 0.1.9 and xmpp 0.1.12 changed;
-   darkirc 0.1.6 and weechat 0.2.7 did not. Rebuild/reinstall
-   `vision-analyze` for its tool-registry bump to 0.1.2.
+   darkirc 0.1.6 and weechat 0.2.7 did not. Rebuild/reinstall `vision-analyze`
+   for its tool-registry bump to 0.1.3; rebuilt tools carry vendor-consistent
+   committed lockfiles with matching registry patch versions (ssh 0.1.1,
+   llm-context 0.1.1, multica-bridge 0.1.2, voice-transcribe 0.1.1, web-search
+   0.2.2, GitLab 0.1.4, cavepony 0.4.2), so installed tenants rebuild
+   vendor-consistent WASM artifacts.
 4. Cargo manifests rooted under `ic/` now resolve crates.io through
    `ic/vendor/`. For a dependency change, run `ic/scripts/refresh-vendor.sh`,
    review the vendor diff, and commit it with the manifests/locks. Root-level
    satellite projects remain outside this source replacement.
 5. `/interrupt` and `/steer` are available through the web gateway, WeeChat,
    XMPP, and REPL. Engine V2-routed controls target the scoped running engine
-   thread. A control that races ahead of a queued-but-not-running turn can still
-   return "Nothing to interrupt." or the corresponding idle steer response.
+   thread when one exists; steer that arrives while a conversation is idle,
+   interrupted, or approval-paused is acknowledged as queued and delivered on
+   the next turn or resume instead of returning an idle response. Interrupting
+   a queued-but-not-running turn still returns "Nothing to interrupt."
 6. Manage LunarVoice through `install-voice`, `configure-voice`,
    `activate-voice`, `deactivate-voice`, and `remove-voice`. Reconcile any
    manually deployed sidecar to mt-admin's rendered units and registry ports.
@@ -455,12 +536,16 @@ committed:
 ## Known Issues
 
 The accuracy pass reconciled two separate tracking surfaces against revision
-`96c951785`: the nine active canonical reports in
+`d316097e5`: the nine active canonical reports in
 [`docs/bugs/README.md`](docs/bugs/README.md), and the public GitLab work-item
-state re-queried on 2026-09-02 (unchanged from the 2026-09-01 pass). GitLab has
-six open items (#86, #87, #94, #95, #97, #98); #96 is closed. An open tracker
-state is not treated as proof that its source fix is absent, so the source
-disposition is stated explicitly below.
+state re-queried on 2026-09-03 (full reconciliation in
+[`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)).
+GitLab now has eleven open items: #86, #87, #95, #97, #100, #101, #103, #104,
+#105, #107, and #108 — the last two opened after the earlier 2026-09-03
+reconciliation, for the live-broken mascot and the paused-turn gate-expiry
+resume respectively. The closed set is #94, #96, #98, #99, and #102. An open
+tracker state is not treated as proof that its source fix is absent, so the
+source disposition is stated explicitly below.
 
 ### Public Work-Item Tracker Reconciliation
 
@@ -473,23 +558,67 @@ disposition is stated explicitly below.
   and `lv` description provide no failure, scope, or acceptance criterion. No
   specific release defect can be inferred; the item needs clarification before
   it can be verified or closed.
-- **#94 — mission warmup race is mitigated, not health-synchronized (open).**
-  Source now delays the first cron check by 30 seconds and tests that boundary,
-  but it does not wait for an explicit watchdog-ready signal. Providers taking
-  longer than the fixed delay can still overlap the first mission check.
-- **#95 — `finish_reason` source fix ships, tracker remains open.** Blocking,
-  streaming, bridge, and proxy paths now carry the canonical value and have
-  regression coverage. The remaining action is tracker closure, not a known
-  source gap found in this pass.
-- **#97 — source fallback ships; live operator work remains (open).** Room-bare
-  publisher matching is implemented, but the sunburst/ruffles deployment still
-  needs both room-join allowlists, publisher configuration, restarts, and a live
-  KNOW-path retest.
-- **#98 — durable AcceptFirst source fix ships, tracker remains open.** The
-  encrypted persistent-pin implementation and its restart/concurrency/failure
-  tests are present. The remaining action is tracker closure.
+- **#94 — mission warmup race is mitigated, not health-synchronized (closed).**
+  Source now delays the first mission check by a fixed 30-second warmup; it does
+  not wait for an explicit watchdog-ready signal. Providers taking longer than
+  the fixed delay can still overlap the first mission check. The tracker closed
+  the item with the shipped fixed warmup on 2026-09-02.
+- **#95 — `finish_reason` source fix ships and re-verified (open).** Blocking,
+  streaming, bridge, and proxy paths carry the canonical value and have
+  regression coverage; the 2026-09-03 independent re-verification
+  ([`docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md))
+  re-passed every surface and found no repository defect. The remaining action
+  is reporter acceptance and tracker closure.
 - **#96 — deterministic top-error ranking is implemented and closed.** Its
   source and tracker dispositions agree.
+- **#97 — room-bare publisher fallback live-verified on isolated tenants
+  (open).** The live 4/4 matrix over a real Prosody MUC with fresh OpenRC
+  tenants (positive full-occupant and room-bare cases; negative user-bare and
+  same-room-impostor cases) is recorded in
+  [`docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md).
+  The sunburst/ruffles production rollout and live KNOW-path retest remain
+  operator actions; the tracker remains open.
+- **#98 — durable AcceptFirst pins ship (closed).** The encrypted persistent
+  pins and their restart/concurrency/failure coverage are present; the tracker
+  closed the item on 2026-09-02.
+- **#99 — closed.** The terse mascot item was closed on 2026-09-02.
+- **#100 — mascot refinement item is not actionable (open).** No specified
+  refinement, repro, or acceptance criteria are recorded.
+- **#101 — Pebble testing item is not actionable (open).** The referenced study
+  findings are not linked and no scope or acceptance matrix is recorded.
+- **#102 — closed.** The desktop and Android companion application repository
+  links landed in the README and documentation index.
+- **#103 — idle `/steer` drop fixed in source and regressions (open).** A
+  bounded four-note durable queue, queued acknowledgment, and next-turn and
+  resume delivery are in place; the fresh-tenant idle/approval/overflow live
+  pass (release-checklist item 43) remains the final acceptance step.
+- **#104 — XMPP steer routing fixed in source and regressions (open).** A fresh
+  live XMPP interrupt→steer pass remains the final acceptance step.
+- **#105 — interrupt fixed; steer-preemption premise needs clarification
+  (open).** `/interrupt` now cancels in-flight tool host calls promptly. The
+  "steer did not affect a running 120-second tool" observation matches the
+  documented contract — steer injects at the next model-call boundary after the
+  current step completes and never cancels the running tool; whether
+  steer-as-tool-preemption is wanted needs tracker clarification.
+- **#107 — live-broken mascot triaged; parser dialect gap fixed (open).** The
+  mascot was confirmed broken live by two independent parties on 2026-09-02.
+  The triage (item 33) disproved the event-shape and wiring hypotheses
+  (H1/H4), confirmed the keyword-table gap as the live defect (H2), and
+  extended the parser with the herd dialect and common roleplay verbs (27
+  parser tests). The item's own verification plan still requires a human live
+  animation check on a fresh tenant before closure. One residual is recorded
+  for a tracker decision: Engine V2 interrupted turns emit no terminal
+  `response` event by design, so the mascot lingers in its working state up to
+  the 30-second idle fallback instead of the legacy loop's immediate
+  `Interrupted.` emote path.
+- **#108 — paused-turn gate-expiry resume fixed in source (open).** The
+  reported symptom (a conversation whose pending gate auto-cleared never got a
+  reply) is root-caused and fixed: expiry now resumes the thread with an
+  injected expired-gate result, the model wraps the turn up, and the reply is
+  delivered to the source channel with the gateway approval prompt cleared.
+  Regression tests cover the resume, delivery order, and resume-failure
+  fallback; live verification on a rebuilt tenant is pending the item-43
+  fresh-tenant pass, and the tracker remains open until then.
 
 ### Active Canonical Runtime and Integration Follow-ups
 
@@ -586,10 +715,11 @@ disposition is stated explicitly below.
   checks on systemd and OpenRC; external LunarVision can replace a local GPU
   sidecar with a constrained HTTPS origin.
 - The gateway mascot parses and renders eight emote states without changing chat
-  content.
+  content, and its keyword table now covers the herd's live roleplay dialect
+  after the work-item #107 triage (human live animation check still owed).
 - SSH AcceptFirst pins persist across restart, fail closed on storage errors,
-  and are shared with strict `ssh_git` host-key materialization (#98 source fix;
-  tracker still open).
+  and are shared with strict `ssh_git` host-key materialization (#98; closed
+  2026-09-02).
 - Models now contribute numeric exporter series, and six legacy health checks
   expose configurable degraded/critical thresholds.
 - The scoped `ic/` dependency closure is committed under `ic/vendor/`; locked
@@ -597,13 +727,27 @@ disposition is stated explicitly below.
   lockfile, and the refresh script includes advisory verification. GitLab's
   formerly missing `serde_ignored` dependency is included.
 - LLM `finish_reason` survives blocking completions, stream aggregation, bridge,
-  and proxy paths (#95 source fix; tracker still open). A partially emitted
-  Engine V2 stream is no longer advertised as safely retryable.
+  and proxy paths (#95; repository-complete and re-verified 2026-09-03, tracker
+  closure pending). A partially emitted Engine V2 stream is no longer
+  advertised as safely retryable.
 - Mission cron startup waits 30 seconds before its first due check (#94
-  mitigation; tracker still open), and evaluation top-error ranking is
-  deterministic (#96, closed).
+  mitigation, closed), and evaluation top-error ranking is deterministic
+  (#96, closed).
 - Room-bare JIDs can authorize all occupants in a coordination-knowledge room;
-  live tenant configuration/retest remains outstanding (#97).
+  the fix is live-verified on isolated XMPP tenants (4/4, including the
+  user-bare negative), and the sunburst/ruffles production retest remains an
+  operator action (#97, open).
+- Idle, interrupted, and approval-paused steer now queues and acknowledges
+  instead of dropping (#103, #104, fixed in source and regressions), and
+  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#105's
+  interrupt half). The fresh-tenant live acceptance pass remains on the
+  release checklist.
+- An expired approval gate now resumes the paused turn and delivers the
+  wrap-up reply to the source channel instead of silently finalizing the
+  thread as `Failed` (#108; fixed in source and regressions, live check
+  pending the item-43 fresh-tenant pass).
+- The desktop and Android companion application repositories are linked from
+  the root README and the documentation index (#102, closed).
 - Passive fabricated-result phrases are detected and challenged with a bounded
   tool-use correction rather than accepted as execution evidence.
 - The onboarding console no longer shows a false token warning in `--no-token`
