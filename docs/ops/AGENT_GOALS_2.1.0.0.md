@@ -145,7 +145,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 28. [x] (S) reserved
 29. [x] (S) update release notes at root of repo again l8r
 30. [x] (S) reserved
-31. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+31. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed - you may create a new temporary testing tenant for this verification process
 32. [x] (S) reserved
 33. [x] (S) reserved
 34. [x] (S) reserved
@@ -155,7 +155,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 38. [x] (S) reserved
 39. [x] (S) reserved
 40. [ ] fix steer and interrupt. data hints on: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/105 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/104 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 - does not work on XMPP currently
-41. [ ] ensure https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+41. [ ] document current state of work items in a fresh doc in docs/ops
 42. [x] (S) reserved
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
 44. [x] (S) reserved
