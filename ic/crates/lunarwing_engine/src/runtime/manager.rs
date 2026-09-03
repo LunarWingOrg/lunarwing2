@@ -1009,10 +1009,13 @@ impl ThreadManager {
     ) -> Result<(), EngineError> {
         let signal_tx = {
             let running = self.running.read().await;
-            running
+            let thread = running
                 .get(&thread_id)
-                .map(|thread| thread.signal_tx.clone())
-                .ok_or(EngineError::ThreadNotFound(thread_id))?
+                .ok_or(EngineError::ThreadNotFound(thread_id))?;
+            if thread.cancellation.is_cancelled() {
+                return Err(EngineError::ThreadNotFound(thread_id));
+            }
+            thread.signal_tx.clone()
         };
         signal_tx
             .send(ThreadSignal::InjectMessage(message))
@@ -1648,6 +1651,35 @@ mod tests {
         mgr.end_resolving(tid).await;
         assert!(!mgr.is_resolving(tid).await);
         assert!(!mgr.cancel_resolving(tid).await);
+    }
+
+    #[tokio::test]
+    async fn inject_message_rejects_thread_after_stop_requested() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let thread_id = ThreadId::new();
+        let (signal_tx, _signal_rx) = messaging::signal_channel(1);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let handle = tokio::spawn(async {
+            std::future::pending::<Result<ThreadOutcome, EngineError>>().await
+        });
+        mgr.running.write().await.insert(
+            thread_id,
+            RunningThread {
+                signal_tx,
+                cancellation,
+                handle,
+            },
+        );
+
+        let result = mgr
+            .inject_message_system(thread_id, ThreadMessage::user("steer"))
+            .await;
+        assert!(matches!(result, Err(EngineError::ThreadNotFound(id)) if id == thread_id));
+
+        if let Some(running) = mgr.running.write().await.remove(&thread_id) {
+            running.handle.abort();
+        }
     }
 
     #[tokio::test]
