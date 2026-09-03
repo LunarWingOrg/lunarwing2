@@ -123,12 +123,15 @@ impl ConversationEntry {
     }
 }
 
+/// Maximum steer notes retained for the next foreground turn.
+pub const MAX_PENDING_STEER_NOTES: usize = 4;
+
 /// A conversation surface — the UI-facing view of a chat.
 ///
 /// Conversations are NOT execution boundaries. They are streams of entries
 /// that may come from multiple concurrent threads. A user can start a new
-/// thread while another is still running, and both produce entries in the
-/// same conversation.
+/// thread while another is still running, and both produce entries that
+/// appear in the same conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSurface {
     pub id: ConversationId,
@@ -140,6 +143,9 @@ pub struct ConversationSurface {
     pub entries: Vec<ConversationEntry>,
     /// Currently active (non-terminal) thread IDs.
     pub active_threads: Vec<ThreadId>,
+    /// Steer notes waiting to be injected when the next foreground turn starts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_steer_notes: Vec<String>,
     /// Metadata (channel-specific state, external thread IDs, etc.).
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
@@ -155,6 +161,7 @@ impl ConversationSurface {
             user_id: user_id.into(),
             entries: Vec::new(),
             active_threads: Vec::new(),
+            pending_steer_notes: Vec::new(),
             metadata: serde_json::Value::Null,
             created_at: now,
             updated_at: now,
@@ -177,6 +184,25 @@ impl ConversationSurface {
     /// Remove a thread from the active list (it completed or failed).
     pub fn untrack_thread(&mut self, thread_id: ThreadId) {
         self.active_threads.retain(|id| *id != thread_id);
+    }
+
+    /// Queue a steer note for the next foreground turn.
+    pub fn queue_steer_note(&mut self, note: String) -> bool {
+        if self.pending_steer_notes.len() >= MAX_PENDING_STEER_NOTES {
+            return false;
+        }
+        self.pending_steer_notes.push(note);
+        self.updated_at = Utc::now();
+        true
+    }
+
+    /// Take all steer notes queued for the next foreground turn.
+    pub fn take_steer_notes(&mut self) -> Vec<String> {
+        let notes = std::mem::take(&mut self.pending_steer_notes);
+        if !notes.is_empty() {
+            self.updated_at = Utc::now();
+        }
+        notes
     }
 
     /// Get the most recent entry, if any.
@@ -259,5 +285,31 @@ mod tests {
         conv.track_thread(tid);
         conv.track_thread(tid);
         assert_eq!(conv.active_threads.len(), 1);
+    }
+
+    #[test]
+    fn pending_steer_notes_are_bounded_and_drained_in_order() {
+        let mut conv = ConversationSurface::new("xmpp", "user");
+        for index in 0..MAX_PENDING_STEER_NOTES {
+            assert!(conv.queue_steer_note(format!("note {index}")));
+        }
+        assert!(!conv.queue_steer_note("overflow".to_string()));
+
+        assert_eq!(
+            conv.take_steer_notes(),
+            vec!["note 0", "note 1", "note 2", "note 3"]
+        );
+        assert!(conv.pending_steer_notes.is_empty());
+    }
+
+    #[test]
+    fn empty_pending_steer_queue_is_backward_compatible() {
+        let conv = ConversationSurface::new("xmpp", "user");
+        let serialized = serde_json::to_value(&conv).expect("conversation should serialize");
+        assert!(serialized.get("pending_steer_notes").is_none());
+
+        let restored: ConversationSurface =
+            serde_json::from_value(serialized).expect("legacy conversation should deserialize");
+        assert!(restored.pending_steer_notes.is_empty());
     }
 }
