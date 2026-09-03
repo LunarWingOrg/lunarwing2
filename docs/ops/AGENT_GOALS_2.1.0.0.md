@@ -168,7 +168,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Live unified Work Items + REST queries returned exactly nine open issues with no next page: #86, #87, #95, #97, #100, #101, #103, #104, and #105. Read every description and all 22 discussion notes. Since the 2026-09-02 release-notes snapshot, #94/#98/#99/#102 closed and #100/#101/#103/#104/#105 opened.
     - Findings: #95 and #97 are repository-complete (the latter live-verified on isolated XMPP tenants); #103/#104 are source- and regression-complete but await item 43's fresh tenant pass; #105's interrupt path is fixed while steer-as-tool-preemption is outside the documented after-current-step contract and needs tracker clarification; #86's legacy worker protocol removal is unaddressed; #87/#100/#101 are not actionable as written.
     - Verified on CPUs 0-17 / max 18 jobs: focused in-flight tool cancellation 1/1, pending-steer compatibility/bounds 3/3, queued next-turn/resume delivery 2/2, and LunarWing steer-filtered tests 10/10. Report `git diff --check` clean; all three local Markdown links resolve.
-42. [x] (S) reserved
+42. [x] (S) reserved4gatewayfix
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
 44. [ ] update release notes draft (at root of repo)
 
