@@ -4164,6 +4164,7 @@ mod tests {
                 token.cancel();
             }
         };
+        let state = serde_json::json!({});
         let run = execute_orchestrator(
             code,
             &mut thread,
@@ -4176,7 +4177,7 @@ mod tests {
             None,
             None,
             None,
-            &serde_json::json!({}),
+            &state,
         );
 
         let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
