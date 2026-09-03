@@ -152,7 +152,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - DONE 100% 2026-09-03 (`aj/kimi-32-20260903-1200`, findings commit `d14dfc6d3`): review-only audit completed with no CI, build, release, deployment, runtime, or runner-configuration changes. Fresh detailed report: `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`.
     - Highest priorities: restrict worker-image publication and split immutable build from protected promotion; replace archived Kaniko and pin every worker-build input; make protected release tags run the complete gate; repair and gate the currently failing PostgreSQL-only test-target shape; reconcile the 80 GB sccache limit with the documented 25 GB runner after pipeline #2604 exhausted disk. Follow-ons cover blocking Clippy/architecture ratchets, pinned CI tool images, reports/telemetry, classified standalone-crate and WASM matrices, one-artifact browser tests, and artifact-safe mt-admin prerequisites before any production CD.
     - Verified: `python3 .gitlab/scripts/validate_config.py` passes; document structure, local links, scope statement, and 26-lockfile inventory pass; `git diff --check` is clean; bounded locked/offline default `cargo check` passes under `taskset -c 0-11` / `-j12`. The report separately records the reproduced PostgreSQL-only `--tests` compile failure as an actionable CI blind spot.
-33. [x] (S) reserved
+33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/107
 34. [x] (S) reserved
 35. [x] (S) reserved
 36. [x] (S) reserved
@@ -170,7 +170,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Verified on CPUs 0-17 / max 18 jobs: focused in-flight tool cancellation 1/1, pending-steer compatibility/bounds 3/3, queued next-turn/resume delivery 2/2, and LunarWing steer-filtered tests 10/10. Report `git diff --check` clean; all three local Markdown links resolve.
 42. [x] (S) reserved4gatewayfix
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
-44. [ ] update release notes draft (at root of repo)
+44. [ ] update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
 
 ## Deferred (explicitly NOT this release)
 
