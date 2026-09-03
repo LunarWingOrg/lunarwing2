@@ -144,7 +144,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Verified: `taskset -c 0-17 cargo test -j18 --lib coordination_knowledge -- --test-threads=18` — 23 passed, 0 failed. Full record: `docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`. Teardown verified: tenants/services/users/homes/ports/DB+vision containers, standalone impostor bridge, Prosody, and temporary credentials/TLS material removed; pre-existing `kestrel` and `item23b-prosody` left untouched.
 28. [x] (S) reserved
 29. [x] (S) update release notes at root of repo again l8r
-30. [x] (S) reserved
+30. [ ] look into issue of missions not saving output properly into memory and fix if possible. you may use live tenant to run full test and document results
 31. [x] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed - you may create a new temporary testing tenant for this verification process
     - DONE 100% 2026-09-03 (rarity/kimi-31-20260903-0600, evidence commit `3f891924` + final): WI#95's three implementation commits (`355a8eb51`, `039217f9a`, `306a64f77`) are ancestors of the tested revision, and current source retains `finish_reason` across provider → blocking bridge / native stream → engine `LlmOutput`, with one canonical proxy vocabulary (`stop`, `length`, `tool_calls`, `content_filter`, `unknown`) and the legacy `tool_use` input alias for rolling upgrades. The public tracker remains open, but no repository defect was found.
     - Verified (taskset -c 0-17, -j18): engine fallback 4/4, engine stream collector 13/13, bridge adapter 12/12, and cross-surface finish-reason regressions 6/6 passed. No temporary tenant was created: this is an in-process conversion contract, and the committed fake provider deterministically injects non-default terminal reasons that a live provider cannot reliably produce. Full record: `docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`.
@@ -161,7 +161,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 35. [x] (S) reserved
 36. [x] (S) reserved
 37. [x] (S) reserved
-38. [x] (S) reserved
+38. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/108
 39. [x] (S) reserved
 40. [x] fix steer and interrupt. data hints on: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/105 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/104 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 - does not work on XMPP currently
     - DONE 2026-09-03 (aj/kimi-40-20260903-0600): Engine V2 now applies its per-run cancellation token to in-flight CodeAct, direct, and parallel tool host calls as well as LLM streams, so `/interrupt` drops a long-running shell/tool future promptly instead of waiting for completion. Runtime steer injection now reports closed or already-cancelled runs rather than acknowledging a dropped signal.
@@ -174,7 +174,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Verified on CPUs 0-17 / max 18 jobs: focused in-flight tool cancellation 1/1, pending-steer compatibility/bounds 3/3, queued next-turn/resume delivery 2/2, and LunarWing steer-filtered tests 10/10. Report `git diff --check` clean; all three local Markdown links resolve.
 42. [x] (S) reserved4gatewayfix
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
-44. [ ] update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
+44. [ ] ( last attempt: aj/kimi-44-20260903-1800 - nothing wrong with it, just forgot to merge; will need further updates anyway ) update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
 
 ## Deferred (explicitly NOT this release)
 
