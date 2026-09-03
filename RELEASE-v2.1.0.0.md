@@ -499,12 +499,14 @@ committed:
 ## Known Issues
 
 The accuracy pass reconciled two separate tracking surfaces against revision
-`96c951785`: the nine active canonical reports in
+`a67fee21c`: the nine active canonical reports in
 [`docs/bugs/README.md`](docs/bugs/README.md), and the public GitLab work-item
-state re-queried on 2026-09-02 (unchanged from the 2026-09-01 pass). GitLab has
-six open items (#86, #87, #94, #95, #97, #98); #96 is closed. An open tracker
-state is not treated as proof that its source fix is absent, so the source
-disposition is stated explicitly below.
+state re-queried on 2026-09-03 (full reconciliation in
+[`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)).
+GitLab now has nine open items (#86, #87, #95, #97, #100, #101, #103, #104,
+#105); #94, #96, #98, #99, and #102 are closed. An open tracker state is not
+treated as proof that its source fix is absent, so the source disposition is
+stated explicitly below.
 
 ### Public Work-Item Tracker Reconciliation
 
@@ -517,23 +519,48 @@ disposition is stated explicitly below.
   and `lv` description provide no failure, scope, or acceptance criterion. No
   specific release defect can be inferred; the item needs clarification before
   it can be verified or closed.
-- **#94 — mission warmup race is mitigated, not health-synchronized (open).**
-  Source now delays the first cron check by 30 seconds and tests that boundary,
-  but it does not wait for an explicit watchdog-ready signal. Providers taking
-  longer than the fixed delay can still overlap the first mission check.
-- **#95 — `finish_reason` source fix ships, tracker remains open.** Blocking,
-  streaming, bridge, and proxy paths now carry the canonical value and have
-  regression coverage. The remaining action is tracker closure, not a known
-  source gap found in this pass.
-- **#97 — source fallback ships; live operator work remains (open).** Room-bare
-  publisher matching is implemented, but the sunburst/ruffles deployment still
-  needs both room-join allowlists, publisher configuration, restarts, and a live
-  KNOW-path retest.
-- **#98 — durable AcceptFirst source fix ships, tracker remains open.** The
-  encrypted persistent-pin implementation and its restart/concurrency/failure
-  tests are present. The remaining action is tracker closure.
+- **#94 — mission warmup race is mitigated, not health-synchronized (closed).**
+  Source now delays the first mission check by a fixed 30-second warmup; it does
+  not wait for an explicit watchdog-ready signal. Providers taking longer than
+  the fixed delay can still overlap the first mission check. The tracker closed
+  the item with the shipped fixed warmup on 2026-09-02.
+- **#95 — `finish_reason` source fix ships and re-verified (open).** Blocking,
+  streaming, bridge, and proxy paths carry the canonical value and have
+  regression coverage; the 2026-09-03 independent re-verification
+  ([`docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md))
+  re-passed every surface and found no repository defect. The remaining action
+  is reporter acceptance and tracker closure.
 - **#96 — deterministic top-error ranking is implemented and closed.** Its
   source and tracker dispositions agree.
+- **#97 — room-bare publisher fallback live-verified on isolated tenants
+  (open).** The live 4/4 matrix over a real Prosody MUC with fresh OpenRC
+  tenants (positive full-occupant and room-bare cases; negative user-bare and
+  same-room-impostor cases) is recorded in
+  [`docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md).
+  The sunburst/ruffles production rollout and live KNOW-path retest remain
+  operator actions; the tracker remains open.
+- **#98 — durable AcceptFirst pins ship (closed).** The encrypted persistent
+  pins and their restart/concurrency/failure coverage are present; the tracker
+  closed the item on 2026-09-02.
+- **#99 — closed.** The terse mascot item was closed on 2026-09-02.
+- **#100 — mascot refinement item is not actionable (open).** No specified
+  refinement, repro, or acceptance criteria are recorded.
+- **#101 — Pebble testing item is not actionable (open).** The referenced study
+  findings are not linked and no scope or acceptance matrix is recorded.
+- **#102 — closed.** The desktop and Android companion application repository
+  links landed in the README and documentation index.
+- **#103 — idle `/steer` drop fixed in source and regressions (open).** A
+  bounded four-note durable queue, queued acknowledgment, and next-turn and
+  resume delivery are in place; the fresh-tenant idle/approval/overflow live
+  pass (release-checklist item 43) remains the final acceptance step.
+- **#104 — XMPP steer routing fixed in source and regressions (open).** A fresh
+  live XMPP interrupt→steer pass remains the final acceptance step.
+- **#105 — interrupt fixed; steer-preemption premise needs clarification
+  (open).** `/interrupt` now cancels in-flight tool host calls promptly. The
+  "steer did not affect a running 120-second tool" observation matches the
+  documented contract — steer injects at the next model-call boundary after the
+  current step completes and never cancels the running tool; whether
+  steer-as-tool-preemption is wanted needs tracker clarification.
 
 ### Active Canonical Runtime and Integration Follow-ups
 
