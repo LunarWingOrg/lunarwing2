@@ -33,7 +33,7 @@ use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadTy
 /// Handle to a running thread for checking results.
 struct RunningThread {
     signal_tx: SignalSender,
-    /// Cancels this run's in-flight provider stream. A fresh token is created
+    /// Cancels this run's in-flight LLM or tool work. A fresh token is created
     /// for every `start_thread` call (including resumes) and never reused.
     cancellation: CancellationToken,
     handle: tokio::task::JoinHandle<Result<ThreadOutcome, EngineError>>,
@@ -639,9 +639,8 @@ impl ThreadManager {
         let (tx, rx) = messaging::signal_channel(32);
 
         // Create a fresh cancellation token for this run. Resumes and new turns
-        // never reuse a cancelled token. A clone drives stream cancellation
-        // inside the execution loop; the original stays here so stop requests
-        // can cancel it.
+        // never reuse a cancelled token. A clone cancels in-flight LLM and tool
+        // work inside the execution loop; the original stays here for stop requests.
         let cancellation = CancellationToken::new();
 
         // Build execution loop
@@ -814,12 +813,11 @@ impl ThreadManager {
         Ok(thread_id)
     }
 
-    /// Cancel a running thread's in-flight stream and request a stop.
+    /// Cancel a running thread's in-flight work and request a stop.
     ///
-    /// Cancels the run's `CancellationToken` first so any active provider
-    /// stream (acquisition or collection) is dropped immediately, then sends
-    /// the between-step `ThreadSignal::Stop` for stops observed outside an LLM
-    /// call. The map lock is released before awaiting the signal send.
+    /// Cancels the run's `CancellationToken` first so any active provider stream
+    /// or tool future is dropped immediately, then sends the between-step
+    /// `ThreadSignal::Stop`. The map lock is released before awaiting the signal.
     async fn request_stop(&self, thread_id: ThreadId) -> Result<(), EngineError> {
         let (signal_tx, cancellation) = {
             let running = self.running.read().await;
@@ -837,7 +835,7 @@ impl ThreadManager {
         Ok(())
     }
 
-    /// Stop a running thread (cancel its stream and signal stop).
+    /// Stop a running thread (cancel in-flight work and signal stop).
     pub async fn stop_thread(&self, thread_id: ThreadId, user_id: &str) -> Result<(), EngineError> {
         // Validate ownership before allowing stop.
         if let Some(thread) = self.store.load_thread(thread_id).await?
