@@ -142,8 +142,23 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Live matrix 4/4: room-bare allowlist accepted `.../tern` and wrote exactly one `needs-verification`/`coordination`/sentinel note on `wren`; full-occupant `.../wren` accepted and wrote exactly one equivalent note on `tern`; user-bare `wren@item27...` was delivered to `tern` but logged non-allowlisted and wrote zero rows; same-room `.../impostor` was likewise delivered, rejected by the exact nick-pinned entry, and wrote zero rows. Full occupant provenance was preserved in `submitted_by`; self-echo rows remained absent by design.
     - Ruffles' tracker analysis is confirmed. Valid MUC publisher entries are full occupant JIDs (`room@server/nick`) or, after commit `d3ea2ebe6`, a room bare JID (`room@server`) as explicit room-wide trust. The issue body's/final Sunburst comment's user-bare recommendation is stale and was live-disproved. `XMPP_ALLOW_ROOMS_JSON` plus the daemon/installable-channel room list remain mandatory; empty means no join and inbound groupchat denial by design.
     - Verified: `taskset -c 0-17 cargo test -j18 --lib coordination_knowledge -- --test-threads=18` — 23 passed, 0 failed. Full record: `docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`. Teardown verified: tenants/services/users/homes/ports/DB+vision containers, standalone impostor bridge, Prosody, and temporary credentials/TLS material removed; pre-existing `kestrel` and `item23b-prosody` left untouched.
-28. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+28. [x] (S) reserved
 29. [x] (S) update release notes at root of repo again l8r
+30. [x] (S) reserved
+31. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+32. [x] (S) reserved
+33. [x] (S) reserved
+34. [x] (S) reserved
+35. [x] (S) reserved
+36. [x] (S) reserved
+37. [x] (S) reserved
+38. [x] (S) reserved
+39. [x] (S) reserved
+40. [ ] fix steer and interrupt. data hints on: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/105 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/104 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 - does not work on XMPP currently
+41. [ ] ensure https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
+42. [x] (S) reserved
+43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
+44. [x] (S) reserved
 
 ## Deferred (explicitly NOT this release)
 
