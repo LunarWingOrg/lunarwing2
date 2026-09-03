@@ -381,10 +381,10 @@ impl ConversationManager {
         Ok(())
     }
 
-    /// Clear a conversation's entries and active threads.
+    /// Clear a conversation's entries, active threads, and pending steer notes.
     ///
-    /// Stops tracking all threads and removes conversation history so the next
-    /// user message spawns a fresh thread with no prior context.
+    /// Stops tracking all threads and removes conversation history and controls
+    /// so the next user message spawns a fresh thread with no prior context.
     pub async fn clear_conversation(
         &self,
         conversation_id: ConversationId,
@@ -401,6 +401,7 @@ impl ConversationManager {
             }
             conv.active_threads.clear();
             conv.entries.clear();
+            conv.pending_steer_notes.clear();
             conv.updated_at = chrono::Utc::now();
             self.store.save_conversation(conv).await?;
             debug!(conversation_id = %conversation_id, "cleared conversation");
@@ -1134,6 +1135,11 @@ mod tests {
 
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(!conv.entries.is_empty());
+        assert!(
+            cm.queue_steer_note(conv_id, "user1", "discard me".to_string())
+                .await
+                .unwrap()
+        );
 
         // Clear the conversation
         cm.clear_conversation(conv_id, "user1").await.unwrap();
@@ -1141,5 +1147,6 @@ mod tests {
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(conv.entries.is_empty());
         assert!(conv.active_threads.is_empty());
+        assert!(conv.pending_steer_notes.is_empty());
     }
 }
