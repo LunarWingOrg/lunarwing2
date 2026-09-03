@@ -1141,12 +1141,11 @@ impl Agent {
         }
     }
 
-    /// Queue a mid-turn steer note for the running turn (Hermes-style).
+    /// Queue a steer note for the current or next turn (Hermes-style).
     ///
-    /// Notes are delivered by the agentic loop at the next iteration boundary,
-    /// after the current tool call's results, as an injected user message —
-    /// the running tool call is never aborted and the loop continues with the
-    /// note in context. Only meaningful while a turn is processing.
+    /// A processing or approval-paused turn receives the note at its next
+    /// iteration boundary, after the current tool call. An idle or interrupted
+    /// thread retains it until the next turn starts.
     pub(super) async fn process_steer(
         &self,
         session: Arc<Mutex<Session>>,
@@ -1159,11 +1158,19 @@ impl Agent {
             .get_mut(&thread_id)
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
 
-        if thread.state != ThreadState::Processing {
-            return Ok(SubmissionResult::ok_with_message(
-                "Nothing is running right now — send the message directly (no /steer needed).",
-            ));
-        }
+        let response = match thread.state {
+            ThreadState::Processing | ThreadState::AwaitingApproval => {
+                "Steer note queued — the agent will see it after the current step."
+            }
+            ThreadState::Idle | ThreadState::Interrupted => {
+                "Steer note queued — the agent will see it when the next turn starts."
+            }
+            ThreadState::Completed => {
+                return Ok(SubmissionResult::ok_with_message(
+                    "Thread completed. Start a new thread and send the message directly.",
+                ));
+            }
+        };
 
         if !thread.add_steer_note(content.to_string()) {
             return Ok(SubmissionResult::error(format!(
@@ -1176,11 +1183,10 @@ impl Agent {
         tracing::info!(
             %thread_id,
             note_len = content.len(),
-            "Steer note queued for mid-turn injection"
+            state = ?thread.state,
+            "Steer note queued for turn injection"
         );
-        Ok(SubmissionResult::ok_with_message(
-            "Steer note queued — the agent will see it after the current step.",
-        ))
+        Ok(SubmissionResult::ok_with_message(response))
     }
 
     pub(super) async fn process_compact(
@@ -1234,6 +1240,7 @@ impl Agent {
             .ok_or_else(|| Error::from(crate::error::JobError::NotFound { id: thread_id }))?;
         thread.turns.clear();
         thread.pending_messages.clear();
+        thread.steer_notes.clear();
         thread.state = ThreadState::Idle;
 
         // Clear undo history too
@@ -2280,6 +2287,38 @@ mod tests {
             None,
         );
         (agent, db, temp_dir)
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn legacy_idle_steer_queues_until_next_turn_and_clear_discards_it() {
+        let (agent, _db, _temp_dir) = tool_approval_test_agent().await;
+        let session = Arc::new(Mutex::new(Session::new("alice")));
+        let thread_id = session.lock().await.create_thread().id;
+
+        let result = agent
+            .process_steer(Arc::clone(&session), thread_id, "focus on tests")
+            .await
+            .expect("idle steer should succeed");
+        assert!(matches!(
+            result,
+            SubmissionResult::Ok { message: Some(message) }
+                if message.contains("when the next turn starts")
+        ));
+        assert_eq!(
+            session.lock().await.threads[&thread_id].steer_notes,
+            vec!["focus on tests"]
+        );
+
+        agent
+            .process_clear(Arc::clone(&session), thread_id)
+            .await
+            .expect("clear should succeed");
+        assert!(
+            session.lock().await.threads[&thread_id]
+                .steer_notes
+                .is_empty()
+        );
     }
 
     #[cfg(feature = "libsql")]

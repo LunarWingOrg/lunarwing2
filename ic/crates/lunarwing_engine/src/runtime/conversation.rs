@@ -113,6 +113,147 @@ impl ConversationManager {
         Ok(conv_id)
     }
 
+    /// Persist a steer note until the conversation's next foreground turn.
+    ///
+    /// Returns `false` when the bounded pending-note queue is full.
+    pub async fn queue_steer_note(
+        &self,
+        conversation_id: ConversationId,
+        user_id: &str,
+        note: String,
+    ) -> Result<bool, EngineError> {
+        let mut convs = self.conversations.write().await;
+        let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
+            reason: format!("conversation {conversation_id} not found"),
+        })?;
+        if conv.user_id != user_id {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("conversation {conversation_id}"),
+            });
+        }
+
+        let previous = conv.clone();
+        if !conv.queue_steer_note(note) {
+            return Ok(false);
+        }
+        if let Err(error) = self.store.save_conversation(conv).await {
+            *conv = previous;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
+    /// Drain queued steer notes onto `thread_id` before resume or injection.
+    pub async fn drain_pending_steer_notes(
+        &self,
+        conversation_id: ConversationId,
+        user_id: &str,
+        thread_id: ThreadId,
+    ) -> Result<(), EngineError> {
+        let mut convs = self.conversations.write().await;
+        let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
+            reason: format!("conversation {conversation_id} not found"),
+        })?;
+        if conv.user_id != user_id {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("conversation {conversation_id}"),
+            });
+        }
+        let running = self.thread_manager.is_running(thread_id).await;
+        self.deliver_pending_steer_notes(conv, thread_id, user_id, running)
+            .await?;
+        self.store.save_conversation(conv).await?;
+        Ok(())
+    }
+
+    async fn deliver_pending_steer_notes(
+        &self,
+        conv: &mut ConversationSurface,
+        thread_id: ThreadId,
+        user_id: &str,
+        running: bool,
+    ) -> Result<(), EngineError> {
+        if conv.pending_steer_notes.is_empty() {
+            return Ok(());
+        }
+        if running {
+            self.inject_pending_steer_notes(conv, thread_id, user_id)
+                .await
+        } else {
+            self.prepend_pending_steer_notes(conv, thread_id, user_id)
+                .await
+        }
+    }
+
+    async fn inject_pending_steer_notes(
+        &self,
+        conv: &mut ConversationSurface,
+        thread_id: ThreadId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let notes = conv.take_steer_notes();
+        for (index, note) in notes.iter().enumerate() {
+            if let Err(error) = self
+                .thread_manager
+                .inject_message(thread_id, user_id, ThreadMessage::user(note))
+                .await
+            {
+                restore_steer_notes(conv, notes.into_iter().skip(index));
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepend_pending_steer_notes(
+        &self,
+        conv: &mut ConversationSurface,
+        thread_id: ThreadId,
+        user_id: &str,
+    ) -> Result<(), EngineError> {
+        let notes = conv.take_steer_notes();
+        if notes.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .write_steer_notes_to_thread(thread_id, user_id, &notes)
+            .await
+        {
+            restore_steer_notes(conv, notes);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn write_steer_notes_to_thread(
+        &self,
+        thread_id: ThreadId,
+        user_id: &str,
+        notes: &[String],
+    ) -> Result<(), EngineError> {
+        let mut thread = self
+            .store
+            .load_thread(thread_id)
+            .await?
+            .ok_or(EngineError::ThreadNotFound(thread_id))?;
+        if !thread.is_owned_by(user_id) {
+            return Err(EngineError::AccessDenied {
+                user_id: user_id.to_string(),
+                entity: format!("thread {thread_id}"),
+            });
+        }
+        for note in notes {
+            let message = ThreadMessage::user(note.clone());
+            if !thread.internal_messages.is_empty() {
+                thread.add_internal_message(message.clone());
+            }
+            thread.add_message(message);
+        }
+        self.store.save_thread(&thread).await
+    }
+
     /// Handle an incoming user message.
     ///
     /// If the conversation has an active foreground thread, the message is
@@ -195,6 +336,8 @@ impl ConversationManager {
                     thread_id = %thread_id,
                     "injecting message into active thread"
                 );
+                self.deliver_pending_steer_notes(conv, thread_id, user_id, true)
+                    .await?;
                 self.thread_manager
                     .inject_message(thread_id, user_id, user_message)
                     .await?;
@@ -211,6 +354,8 @@ impl ConversationManager {
                     thread_id = %thread_id,
                     "resuming suspended foreground thread"
                 );
+                self.deliver_pending_steer_notes(conv, thread_id, user_id, false)
+                    .await?;
                 self.thread_manager
                     .resume_thread(thread_id, user_id, Some(user_message), None, None)
                     .await?;
@@ -223,8 +368,10 @@ impl ConversationManager {
             }
             None => {
                 conv.add_entry(ConversationEntry::user(&user_message.content));
-                // Build conversation history from prior entries for context continuity
-                let history = build_history_from_entries(&conv.entries);
+                // Build conversation history from prior entries, followed by any
+                // steer notes that arrived while no foreground thread was running.
+                let mut history = build_history_from_entries(&conv.entries);
+                history.extend(conv.pending_steer_notes.iter().map(ThreadMessage::user));
 
                 // Spawn new foreground thread with conversation history
                 let thread_id = self
@@ -255,6 +402,7 @@ impl ConversationManager {
                     .set_thread_metadata(thread_id, "source_channel", &base_channel)
                     .await;
 
+                conv.take_steer_notes();
                 conv.track_thread(thread_id);
                 conv.add_entry(ConversationEntry::system_for_thread(
                     thread_id,
@@ -347,10 +495,10 @@ impl ConversationManager {
         Ok(())
     }
 
-    /// Clear a conversation's entries and active threads.
+    /// Clear a conversation's entries, active threads, and pending steer notes.
     ///
-    /// Stops tracking all threads and removes conversation history so the next
-    /// user message spawns a fresh thread with no prior context.
+    /// Stops tracking all threads and removes conversation history and controls
+    /// so the next user message spawns a fresh thread with no prior context.
     pub async fn clear_conversation(
         &self,
         conversation_id: ConversationId,
@@ -367,6 +515,7 @@ impl ConversationManager {
             }
             conv.active_threads.clear();
             conv.entries.clear();
+            conv.pending_steer_notes.clear();
             conv.updated_at = chrono::Utc::now();
             self.store.save_conversation(conv).await?;
             debug!(conversation_id = %conversation_id, "cleared conversation");
@@ -410,6 +559,12 @@ impl ConversationManager {
             }
         }
         None
+    }
+}
+
+fn restore_steer_notes(conv: &mut ConversationSurface, notes: impl IntoIterator<Item = String>) {
+    for note in notes {
+        conv.queue_steer_note(note);
     }
 }
 
@@ -740,6 +895,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_steer_note_is_persisted_and_injected_into_next_thread() {
+        let (tm, cm) = make_conv_manager();
+        let conv_id = cm
+            .get_or_create_conversation("xmpp:alice@example.org", "user1")
+            .await
+            .unwrap();
+        assert!(
+            cm.queue_steer_note(conv_id, "user1", "wrapped steer".to_string())
+                .await
+                .unwrap()
+        );
+        let queued = cm.store.load_conversation(conv_id).await.unwrap().unwrap();
+        assert_eq!(queued.pending_steer_notes, vec!["wrapped steer"]);
+
+        let thread_id = cm
+            .handle_user_message(
+                conv_id,
+                "next request",
+                ProjectId::new(),
+                "user1",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        let _ = tm.join_thread(thread_id).await.unwrap();
+
+        let thread = cm.store.load_thread(thread_id).await.unwrap().unwrap();
+        let user_messages: Vec<&str> = thread
+            .messages
+            .iter()
+            .filter(|message| message.role == crate::types::message::MessageRole::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(user_messages, vec!["wrapped steer", "next request"]);
+        assert!(
+            cm.store
+                .load_conversation(conv_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending_steer_notes
+                .is_empty()
+        );
+    }
+
+    fn user_message_contents(thread: &crate::types::thread::Thread) -> Vec<&str> {
+        thread
+            .messages
+            .iter()
+            .filter(|message| message.role == crate::types::message::MessageRole::User)
+            .map(|message| message.content.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn queued_steer_note_is_injected_when_resuming_suspended_thread() {
+        let store = Arc::new(MockStore::new());
+        let tm = Arc::new(ThreadManager::new(
+            Arc::new(MockLlm(Mutex::new(vec![LlmOutput {
+                response: LlmResponse::Text("Recovered".into()),
+                usage: TokenUsage::default(),
+                finish_reason: "stop".to_string(),
+            }]))),
+            Arc::new(MockEffects),
+            store.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let cm = ConversationManager::new(Arc::clone(&tm), store.clone());
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
+        let project = ProjectId::new();
+        let mut thread = crate::types::thread::Thread::new(
+            "resume",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.add_message(ThreadMessage::user("earlier"));
+        thread
+            .transition_to(
+                ThreadState::Suspended,
+                Some("engine restart; resumable from checkpoint".into()),
+            )
+            .unwrap();
+        store.save_thread(&thread).await.unwrap();
+        {
+            let mut convs = cm.conversations.write().await;
+            convs.get_mut(&conv_id).unwrap().track_thread(thread.id);
+        }
+        assert!(
+            cm.queue_steer_note(conv_id, "user1", "wrapped steer".to_string())
+                .await
+                .unwrap()
+        );
+
+        let resumed = cm
+            .handle_user_message(
+                conv_id,
+                "continue from there",
+                project,
+                "user1",
+                ThreadConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resumed, thread.id);
+        let _ = tm.join_thread(thread.id).await.unwrap();
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(
+            user_message_contents(&saved),
+            vec!["earlier", "wrapped steer", "continue from there"]
+        );
+        assert!(
+            cm.get_conversation(conv_id)
+                .await
+                .unwrap()
+                .pending_steer_notes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_pending_steer_notes_writes_onto_waiting_thread() {
+        let (tm, cm) = make_conv_manager();
+        let conv_id = cm
+            .get_or_create_conversation("xmpp", "user1")
+            .await
+            .unwrap();
+        let project = ProjectId::new();
+        let mut thread = crate::types::thread::Thread::new(
+            "wait",
+            ThreadType::Foreground,
+            project,
+            "user1",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+        thread.add_message(ThreadMessage::user("earlier"));
+        thread
+            .transition_to(ThreadState::Waiting, Some("approval".into()))
+            .unwrap();
+        cm.store.save_thread(&thread).await.unwrap();
+        {
+            let mut convs = cm.conversations.write().await;
+            convs.get_mut(&conv_id).unwrap().track_thread(thread.id);
+        }
+        assert!(
+            cm.queue_steer_note(conv_id, "user1", "wrapped steer".to_string())
+                .await
+                .unwrap()
+        );
+
+        cm.drain_pending_steer_notes(conv_id, "user1", thread.id)
+            .await
+            .unwrap();
+        tm.resume_thread(
+            thread.id,
+            "user1",
+            Some(ThreadMessage::user("approved")),
+            Some(("call-1".into(), true)),
+            None,
+        )
+        .await
+        .unwrap();
+        let _ = tm.join_thread(thread.id).await.unwrap();
+        let saved = cm.store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(
+            user_message_contents(&saved),
+            vec!["earlier", "wrapped steer", "approved"]
+        );
+        assert!(
+            cm.get_conversation(conv_id)
+                .await
+                .unwrap()
+                .pending_steer_notes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn handle_message_resumes_suspended_thread() {
         let store = Arc::new(MockStore::new());
         let tm = Arc::new(ThreadManager::new(
@@ -1053,6 +1393,11 @@ mod tests {
 
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(!conv.entries.is_empty());
+        assert!(
+            cm.queue_steer_note(conv_id, "user1", "discard me".to_string())
+                .await
+                .unwrap()
+        );
 
         // Clear the conversation
         cm.clear_conversation(conv_id, "user1").await.unwrap();
@@ -1060,5 +1405,6 @@ mod tests {
         let conv = cm.get_conversation(conv_id).await.unwrap();
         assert!(conv.entries.is_empty());
         assert!(conv.active_threads.is_empty());
+        assert!(conv.pending_steer_notes.is_empty());
     }
 }

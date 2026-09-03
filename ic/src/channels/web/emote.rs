@@ -46,7 +46,11 @@ const MAX_PHRASE_LEN: usize = 120;
 
 /// Keyword table: first emote whose keywords substring-match the normalized
 /// phrase wins. Keep more specific entries before broader ones (e.g. the
-/// excitement `Jump` keywords before the anger keyword `stomps`).
+/// excitement `Jump` keywords before the anger keyword `stomps`). Beyond the
+/// generic roleplay vocabulary the table covers the herd's equine dialect
+/// (nicker, whinny, tail flicks, pawing the ground) and the common action
+/// verbs live transcripts actually use (smile, nod, sigh, giggle), which the
+/// original table missed wholesale — see WI#107 / hypothesis H2.
 const KEYWORDS: &[(Emote, &[&str])] = &[
     (
         Emote::Greet,
@@ -61,12 +65,23 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
             "good morning",
             "good evening",
             "salute",
+            // Equine greeting sounds and warm acknowledgment smiles.
+            "nicker",
+            // Stem form: covers "whinny", "whinnies", "whinnying" alike.
+            "whinn",
+            "neigh",
+            "brohoof",
+            "hoof bump",
+            "smile",
+            "grin",
+            "beam",
         ],
     ),
     (
         Emote::Love,
         &[
             "love", "heart", "hug", "nuzzle", "cuddle", "adore", "blush", "snuggle", "kiss",
+            "boop", "headbutt", "purr",
         ],
     ),
     (
@@ -89,6 +104,17 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
             "pumps his hoof",
             "pumps a hoof",
             "fist pump",
+            // Happy vocalizations and spirited motion heard live.
+            "chortle",
+            "giggle",
+            "laugh",
+            "wrr",
+            "paws the ground",
+            "pawing the ground",
+            "tosses her mane",
+            "tosses his mane",
+            "rears up",
+            "flutter",
         ],
     ),
     (
@@ -110,7 +136,27 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
     (
         Emote::Rage,
         &[
-            "rage", "glare", "fume", "snarl", "growl", "angry", "furious", "stomp", "scowl", "grr",
+            "rage",
+            "glare",
+            "fume",
+            "snarl",
+            "growl",
+            "angry",
+            "furious",
+            "stomp",
+            "scowl",
+            "grr",
+            // Pinned/flattened ears are equine anger or annoyance.
+            "ears pin",
+            "pins her ears",
+            "pins his ears",
+            "pins their ears",
+            "flattens her ears",
+            "flattens his ears",
+            "flattens its ears",
+            "flattens their ears",
+            "ears flat",
+            "pout",
         ],
     ),
     (
@@ -135,6 +181,17 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
             "blink",
             "peers",
             "hmm",
+            // Attentive equine ears, snorts, and acknowledgment nods.
+            "perks her ears",
+            "perks his ears",
+            "perks their ears",
+            "pricks her ears",
+            "pricks his ears",
+            "pricks their ears",
+            "ear flick",
+            "flicks an ear",
+            "snort",
+            "nods",
         ],
     ),
     (
@@ -151,12 +208,37 @@ const KEYWORDS: &[(Emote, &[&str])] = &[
             "rests his eyes",
             "curls up",
             "drowsy",
+            // A sigh visually deflates; the sleep sprite is the closest fit.
+            "sigh",
         ],
     ),
     (
         Emote::Walk,
         &[
-            "trot", "walk", "pace", "stroll", "wander", "march", "gallop", "saunter",
+            "trot",
+            "walk",
+            "pace",
+            "stroll",
+            "wander",
+            "march",
+            "gallop",
+            "saunter",
+            // Tail flicks/swishes and weight shifts are neutral in-place motion.
+            "flicks her tail",
+            "flicks his tail",
+            "flicks its tail",
+            "flicks their tail",
+            "flicks tail",
+            "tail flick",
+            "swishes her tail",
+            "swishes his tail",
+            "swishes its tail",
+            "swishes their tail",
+            "wags her tail",
+            "wags his tail",
+            "shifts her weight",
+            "shifts his weight",
+            "scamper",
         ],
     ),
 ];
@@ -305,6 +387,40 @@ mod tests {
         assert_eq!(kinds("*yawns widely*"), vec!["sleep"]);
         assert_eq!(kinds("*tilts her head, curious*"), vec!["alert"]);
         assert_eq!(kinds("*horn glows brightly*"), vec!["fiery"]);
+    }
+
+    #[test]
+    fn parses_herd_dialect_phrases() {
+        // WI#107 / H2: the exact dialect samples the mascot missed live.
+        assert_eq!(kinds("*wrrrrrs*"), vec!["jump"]);
+        assert_eq!(kinds("*chortles*"), vec!["jump"]);
+        assert_eq!(kinds("*nickers*"), vec!["greet"]);
+        assert_eq!(kinds("*nickers softly*"), vec!["greet"]);
+        assert_eq!(kinds("*flicks tail*"), vec!["walk"]);
+        assert_eq!(kinds("*flicks her tail*"), vec!["walk"]);
+        assert_eq!(kinds("*whinnies happily*"), vec!["greet"]);
+        assert_eq!(kinds("*stamps a hoof*"), vec!["jump"]);
+        // Common roleplay actions the original table lacked entirely.
+        assert_eq!(kinds("*smiles widely*"), vec!["greet"]);
+        assert_eq!(kinds("*nods slowly*"), vec!["alert"]);
+        assert_eq!(kinds("*sighs contentedly*"), vec!["sleep"]);
+        assert_eq!(kinds("*giggles*"), vec!["jump"]);
+        assert_eq!(kinds("*boops your nose*"), vec!["love"]);
+        assert_eq!(kinds("*paws the ground*"), vec!["jump"]);
+        // Anger/attention ear postures.
+        assert_eq!(kinds("*ears pin back*"), vec!["rage"]);
+        assert_eq!(kinds("*perks her ears*"), vec!["alert"]);
+        assert_eq!(kinds("*snorts*"), vec!["alert"]);
+    }
+
+    #[test]
+    fn herd_message_emotes_flow_end_to_end() {
+        // A realistic live reply with mixed phrases keeps order and caps.
+        let parsed = emote_names(
+            "Oh! *ears perk up* Let me look... *flicks her tail* \
+             found it — *stamps hooves excitedly* all fixed!",
+        );
+        assert_eq!(parsed, vec!["alert", "walk", "jump"]);
     }
 
     #[test]

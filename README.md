@@ -21,40 +21,39 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 ## Why LunarWing
 
 - **Operator controlled** — the agent, database, providers, workers, and bridges run on infrastructure you control.
-- **Open communication** — XMPP first, IRC through WeeChat, DarkIRC, and other open or self-hostable paths.
+- **Open communication** — XMPP with OMEMO end to end encryption support, IRC through WeeChat, DarkIRC, and other open or self-hostable paths.
 - **Extensible** — sandboxed WASM tools and channels, external MCP servers, and worker containers, without folding every integration into the core.
 - **Secret-aware** — encrypted secret storage and tenant-scoped operational tooling are built in.
 - **Multi-tenant ready** — tenants get their own OS users, services, databases, ports, and optional workers.
 - **Reliable automation** — routines, retries, health checks, and self-healing for unattended operation.
-- **Free software** — the core and bundled extensions are AGPL-3.0-or-later.
+- **Free software** — the core and bundled extensions are all AGPL-3.0.
 
 ## What's inside
 
 **Engine and gateway.** Engine V2 is the channel-neutral execution path used by the browser gateway and eligible bridged channels: streamed events, approval gates, and rich tool results. Multi-tenant setups enable it and route XMPP, WeeChat, and DarkIRC through it by default; single instances opt in. Details: [Engine V2](docs/architecture/ENGINE-V2.md).
 
-**Live interaction.** `/interrupt` can stop an in-flight LLM stream or tool batch, while `/steer <note>` redirects a running turn after its current tool call completes. Both controls are available through the browser gateway, XMPP, WeeChat, and the REPL; see the [cross-channel live verification](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md). The browser gateway also includes a [draggable emoting mascot](docs/guides/EMOTING_MASCOT.md) with working, idle, and response-driven animation states.
+**Live interaction.** `/interrupt` can stop an in-flight LLM stream or tool batch, while `/steer <note>` redirects a running turn after its current tool call completes. Both controls are available through the browser gateway, XMPP, WeeChat, and the REPL; see the [cross-channel live verification](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
 
 **Channels, tools, and workers.**
 
 - Browser gateway, CLI, and HTTP interfaces
 - WASM channels for XMPP, WeeChat, DarkIRC, and Multica; XMPP file attachments via XEP-0363
 - MCP servers over HTTP(S), Unix sockets, host stdio, persistent sandboxed WASM components, and dedicated or shared gateways
-- Persistent Pebble, OpenCode, and Kimi Code worker containers
+- Persistent Pebble, OpenCode, and Kimi Code worker containers. LunarWing supports an extensible ACP for wiring up your own open source harnesses.
 - Optional [LunarVoice](projects/voice-sidecar/README.md) speech-to-text, text-to-speech, and voice activity detection; local or [external LunarVision](docs/guides/VISION_OCR_SIDECAR.md) OCR and vision-language analysis; Gotify notifications; GitLab and SSH tooling; and NetBird tunnels
-
-DarkIRC is opt-in: it is not built for a tenant unless the operator enables it.
+- Optional Lunarvision: self-hosted dual layer vision service utilizing vision models and tesseract for OCR
 
 **A real security model for tools.** MCP-over-WASM servers run as sandboxed component actors with no ambient filesystem, network, or process access, bounded by memory, fuel, and time limits. Host stdio servers can be sandboxed with seccomp, Landlock, and network isolation, and pinned artifacts are verified before execution. An optional marketplace trust stack adds signed manifests, dependency lockfiles, and revocation lists. Automatic npm/pip package installation stays disabled by design. Details: [MCP overall status](docs/ops/MCP_OVERALL_STATUS.md).
 
 **Memory and learning.** Workspace memory gives agents durable, file-like documents with hybrid keyword and vector search on PostgreSQL or libSQL. The native [Study-Notes knowledge store](ic/src/workspace/README.md#study-notes-knowledge-store) adds provenance-aware notes with staleness tracking. [Lorebooks](docs/proposals/LOREBOOKS.md) load a SillyTavern World Info subset (off by default — activation scanning is expensive). Skills provide reusable prompt-driven capabilities, with optional self-improvement missions that stay proposals until a user approves them.
 
-**Automation and health.** An optional reflex compiler turns recurring prompts into WASM fast paths. An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds policy, secret detection, and rate limiting for designated rooms. The bundled [infrastructure health system](ic-infrastructure-health-check/README.md) checks and can remediate services with backoff and flapping protection, and exports Prometheus metrics — on both systemd and OpenRC.
+**Automation and health.** An optional experimental reflex compiler turns recurring prompts into WASM fast paths. An opt-in [multi-agent coordination pipeline](docs/proposals/MULTIAGENTTEAMORCHESTRATION/DEPLOYMENT.md) adds policy, secret detection, and rate limiting for designated rooms. The bundled [infrastructure health system](ic-infrastructure-health-check/README.md) checks and can remediate services with backoff and flapping protection, and exports Prometheus metrics — on both systemd and OpenRC.
 
 **Model providers.** Local Ollama and OpenAI-compatible endpoints (including gateways like TensorZero). Operators can add or override providers declaratively, without touching Rust.
 
 ## Getting started
 
-The browser-based onboarding console is the recommended setup path. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root:
+The browser-based onboarding console is the recommended setup path for beginners. It wraps the multi-tenant admin scripts and shows configuration, output, validation, and recovery guidance in one local interface. Run from the repository root:
 
 ```bash
 # 1. Look around safely — no tenants, no host changes
@@ -74,7 +73,7 @@ You will need Python 3.10+, a Linux host running systemd or OpenRC, root or sudo
 Worth knowing before you provision:
 
 - The gateway binds to `127.0.0.1` by default.
-- New tenants enable Engine V2, SSH support, health checks, build, and start. DarkIRC, Gotify, external workers, and optional toolchains stay off until selected.
+- New tenants enable Engine V2, SSH support, health checks, build, and start. DarkIRC, Gotify, external workers, and optional toolchains stay off until selected. More advanced setup mechanisms can be done by utilizing the other agent setup methods.
 - Blank XMPP fields assign `<tenant>@xmpp.localhost` and provision the bridge automatically.
 - The onboarding server is a privileged local console for one trusted operator: no user accounts, no TLS. Keep it on loopback with token auth (real mode refuses non-loopback binding unless you pass `--allow-insecure-remote`), use an SSH tunnel for remote admin, and treat session URLs and audit files as credentials. Also note that membership in the rootful Docker group is effectively root-equivalent.
 
@@ -115,4 +114,4 @@ LunarWing focuses on user freedom, self-hostable infrastructure, and open protoc
 
 [![Chat on IRC](https://img.shields.io/badge/IRC-%23lunarwing-00b0aa?style=for-the-badge&labelColor=000000)](https://web.libera.chat/?channel=#lunarwing)
 
-LunarWing is self-funded and maintained by volunteers, licensed under [AGPL-3.0-or-later](LICENSE).
+LunarWing is entirely self-funded and maintained by a thriving community of volunteers, ranging from indiviuals to small organizations. Everything is licensed under [AGPL-3.0-or-later](LICENSE).

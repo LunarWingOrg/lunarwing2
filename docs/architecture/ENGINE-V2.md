@@ -471,11 +471,17 @@ channel-neutral), and the bundled `BeforeOutbound` hook
 (`builtin.channel_message_budget`) truncates over-budget terminal responses at
 a UTF-8-safe boundary with an explicit continuation marker before delivery.
 
-Approval, authentication, interrupt, clear, and new-thread controls use the
-same user and engine-conversation scope as ordinary input. This includes
-non-UUID DarkIRC and WeeChat scope keys. Approval and auth prompts are statuses;
-gate pauses, auth pauses, and stopped turns return an empty no-reply sentinel so
-the outer handler does not send or persist a duplicate terminal response.
+Approval, authentication, interrupt, steer, clear, and new-thread controls use
+the same user and engine-conversation scope as ordinary input. This includes
+non-UUID XMPP, DarkIRC, and WeeChat scope keys. `/interrupt` cancels in-flight
+provider streams and tool futures before signaling the next loop boundary.
+`/steer <note>` injects into a running thread at its next model-call boundary;
+when the conversation is idle or completing an interrupt, up to four notes are
+persisted on the conversation and injected into its next foreground turn,
+including resume from a waiting or suspended thread.
+Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
+turns return an empty no-reply sentinel so the outer handler does not send or
+persist a duplicate terminal response.
 
 ### Attachment Input
 
