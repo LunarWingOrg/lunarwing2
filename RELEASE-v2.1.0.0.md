@@ -508,9 +508,9 @@ The accuracy pass reconciled two separate tracking surfaces against revision
 state re-queried on 2026-09-03 (full reconciliation in
 [`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)).
 GitLab now has nine open items: #86, #87, #95, #97, #100, #101, #103, #104,
-and #105. Closed since the previous snapshot are #94, #96, #98, #99, and #102.
-An open tracker state is not treated as proof that its source fix is absent,
-so the source disposition is stated explicitly below.
+and #105. The closed set is #94, #96, #98, #99, and #102. An open tracker
+state is not treated as proof that its source fix is absent, so the source
+disposition is stated explicitly below.
 
 ### Public Work-Item Tracker Reconciliation
 
