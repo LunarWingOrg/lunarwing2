@@ -148,7 +148,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 31. [x] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed - you may create a new temporary testing tenant for this verification process
     - DONE 100% 2026-09-03 (rarity/kimi-31-20260903-0600, evidence commit `3f891924` + final): WI#95's three implementation commits (`355a8eb51`, `039217f9a`, `306a64f77`) are ancestors of the tested revision, and current source retains `finish_reason` across provider → blocking bridge / native stream → engine `LlmOutput`, with one canonical proxy vocabulary (`stop`, `length`, `tool_calls`, `content_filter`, `unknown`) and the legacy `tool_use` input alias for rolling upgrades. The public tracker remains open, but no repository defect was found.
     - Verified (taskset -c 0-17, -j18): engine fallback 4/4, engine stream collector 13/13, bridge adapter 12/12, and cross-surface finish-reason regressions 6/6 passed. No temporary tenant was created: this is an in-process conversion contract, and the committed fake provider deterministically injects non-default terminal reasons that a live provider cannot reliably produce. Full record: `docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`.
-32. [x] (S) reserved
+32. [ ] look into making CI/CD improvements. dont do any actual changes, but create a fresh document in docs/ops containing your detailed findings/suggestions
 33. [x] (S) reserved
 34. [x] (S) reserved
 35. [x] (S) reserved
@@ -163,7 +163,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 41. [ ] document current state of work items in a fresh doc in docs/ops
 42. [x] (S) reserved
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
-44. [x] (S) reserved
+44. [ ] update release notes draft (at root of repo)
 
 ## Deferred (explicitly NOT this release)
 
