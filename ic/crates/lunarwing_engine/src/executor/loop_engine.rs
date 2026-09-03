@@ -59,9 +59,9 @@ pub struct ExecutionLoop {
     /// (bridge) reads these files and supplies the assembled text here. Without
     /// it, the engine uses only the generic CodeAct persona.
     identity_preamble: Option<String>,
-    /// Cancels an in-flight provider stream when the thread is stopped. The
-    /// manager supplies the running thread's token; direct unit-test
-    /// construction gets a fresh, never-cancelled token.
+    /// Cancels in-flight provider or tool work when the thread is stopped. The
+    /// manager supplies the running thread's token; direct unit-test construction
+    /// gets a fresh, never-cancelled token.
     cancellation: CancellationToken,
 }
 
@@ -93,8 +93,7 @@ impl ExecutionLoop {
         }
     }
 
-    /// Set the cancellation token used to drop an in-flight provider stream
-    /// when the thread is stopped.
+    /// Set the cancellation token used to drop in-flight provider or tool work.
     pub fn with_cancellation_token(mut self, cancellation: CancellationToken) -> Self {
         self.cancellation = cancellation;
         self
