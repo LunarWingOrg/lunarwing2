@@ -187,9 +187,9 @@ Item 3 of the v2.1.0.0 cycle, with live verification and fixes from item 9:
   injects the wrapped note into the scoped running engine thread and returns the
   same acknowledgement as the classic path.
 
-The follow-up engine work (work items #103, #104, and the interrupt half of
-#105) hardened both controls against the idle and interrupt races the live pass
-could not cover:
+The follow-up engine work — work items #103 and #104, plus the interrupt half
+of work item #105 — hardened both controls against the idle and interrupt
+races that the live pass could not cover:
 
 - Steer is no longer dropped while a conversation is idle, interrupted, or
   approval-paused. Engine conversations persist a serde-default queue of at
@@ -231,7 +231,7 @@ instead of requiring a local GPU sidecar:
   `/v1/` prefix. Bearer credentials are host-owned and constrained to that same
   origin and path; invalid configuration clears the tool's HTTP allowlist.
 - Ports-registry discovery and docs cover mixed local/external fleets on both
-  systemd and OpenRC hosts. The `vision-analyze` tool registry version is 0.1.2.
+  systemd and OpenRC hosts. The `vision-analyze` tool registry version is 0.1.3.
 
 ### Emoting Gateway Mascot
 
@@ -507,10 +507,10 @@ The accuracy pass reconciled two separate tracking surfaces against revision
 [`docs/bugs/README.md`](docs/bugs/README.md), and the public GitLab work-item
 state re-queried on 2026-09-03 (full reconciliation in
 [`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)).
-GitLab now has nine open items (#86, #87, #95, #97, #100, #101, #103, #104,
-#105); #94, #96, #98, #99, and #102 are closed. An open tracker state is not
-treated as proof that its source fix is absent, so the source disposition is
-stated explicitly below.
+GitLab now has nine open items: #86, #87, #95, #97, #100, #101, #103, #104,
+and #105. Closed since the previous snapshot are #94, #96, #98, #99, and #102.
+An open tracker state is not treated as proof that its source fix is absent,
+so the source disposition is stated explicitly below.
 
 ### Public Work-Item Tracker Reconciliation
 
