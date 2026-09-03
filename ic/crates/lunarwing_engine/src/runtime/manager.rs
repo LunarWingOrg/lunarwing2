@@ -990,16 +990,7 @@ impl ThreadManager {
                 entity: format!("thread {thread_id}"),
             });
         }
-        let running = self.running.read().await;
-        if let Some(rt) = running.get(&thread_id) {
-            let _ = rt
-                .signal_tx
-                .send(ThreadSignal::InjectMessage(message))
-                .await;
-            Ok(())
-        } else {
-            Err(EngineError::ThreadNotFound(thread_id))
-        }
+        self.send_injected_message(thread_id, message).await
     }
 
     /// Inject a message without ownership check (system operations).
@@ -1008,16 +999,25 @@ impl ThreadManager {
         thread_id: ThreadId,
         message: ThreadMessage,
     ) -> Result<(), EngineError> {
-        let running = self.running.read().await;
-        if let Some(rt) = running.get(&thread_id) {
-            let _ = rt
-                .signal_tx
-                .send(ThreadSignal::InjectMessage(message))
-                .await;
-            Ok(())
-        } else {
-            Err(EngineError::ThreadNotFound(thread_id))
-        }
+        self.send_injected_message(thread_id, message).await
+    }
+
+    async fn send_injected_message(
+        &self,
+        thread_id: ThreadId,
+        message: ThreadMessage,
+    ) -> Result<(), EngineError> {
+        let signal_tx = {
+            let running = self.running.read().await;
+            running
+                .get(&thread_id)
+                .map(|thread| thread.signal_tx.clone())
+                .ok_or(EngineError::ThreadNotFound(thread_id))?
+        };
+        signal_tx
+            .send(ThreadSignal::InjectMessage(message))
+            .await
+            .map_err(|_| EngineError::ThreadNotFound(thread_id))
     }
 
     /// Set a metadata key on a thread (best-effort, for tagging).
@@ -1648,6 +1648,34 @@ mod tests {
         mgr.end_resolving(tid).await;
         assert!(!mgr.is_resolving(tid).await);
         assert!(!mgr.cancel_resolving(tid).await);
+    }
+
+    #[tokio::test]
+    async fn inject_message_reports_closed_signal_channel() {
+        let mgr = make_manager(MockLlm::text("done"));
+        let thread_id = ThreadId::new();
+        let (signal_tx, signal_rx) = messaging::signal_channel(1);
+        drop(signal_rx);
+        let handle = tokio::spawn(async {
+            std::future::pending::<Result<ThreadOutcome, EngineError>>().await
+        });
+        mgr.running.write().await.insert(
+            thread_id,
+            RunningThread {
+                signal_tx,
+                cancellation: CancellationToken::new(),
+                handle,
+            },
+        );
+
+        let result = mgr
+            .inject_message_system(thread_id, ThreadMessage::user("steer"))
+            .await;
+        assert!(matches!(result, Err(EngineError::ThreadNotFound(id)) if id == thread_id));
+
+        if let Some(running) = mgr.running.write().await.remove(&thread_id) {
+            running.handle.abort();
+        }
     }
 
     #[tokio::test]
