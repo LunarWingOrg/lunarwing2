@@ -393,6 +393,10 @@ committed:
 - Repo-wide secret, shell-syntax, ShellCheck, and Python-syntax scanners exclude
   the pinned third-party tree. Advisory matching still evaluates Cargo.lock
   against the separate RustSec advisory database.
+- Every built-from-source tool gains a committed `Cargo.lock` plus a matching
+  registry patch-version bump, with a strict build-harness test, so installed
+  tenants rebuild vendor-consistent WASM artifacts instead of resolving from
+  crates.io ad hoc.
 
 ### Dependency, Version, and Worker Updates
 
@@ -659,8 +663,8 @@ stated explicitly below.
 - The gateway mascot parses and renders eight emote states without changing chat
   content.
 - SSH AcceptFirst pins persist across restart, fail closed on storage errors,
-  and are shared with strict `ssh_git` host-key materialization (#98 source fix;
-  tracker still open).
+  and are shared with strict `ssh_git` host-key materialization (#98; closed
+  2026-09-02).
 - Models now contribute numeric exporter series, and six legacy health checks
   expose configurable degraded/critical thresholds.
 - The scoped `ic/` dependency closure is committed under `ic/vendor/`; locked
@@ -668,13 +672,23 @@ stated explicitly below.
   lockfile, and the refresh script includes advisory verification. GitLab's
   formerly missing `serde_ignored` dependency is included.
 - LLM `finish_reason` survives blocking completions, stream aggregation, bridge,
-  and proxy paths (#95 source fix; tracker still open). A partially emitted
-  Engine V2 stream is no longer advertised as safely retryable.
+  and proxy paths (#95; repository-complete and re-verified 2026-09-03, tracker
+  closure pending). A partially emitted Engine V2 stream is no longer
+  advertised as safely retryable.
 - Mission cron startup waits 30 seconds before its first due check (#94
-  mitigation; tracker still open), and evaluation top-error ranking is
-  deterministic (#96, closed).
+  mitigation, closed), and evaluation top-error ranking is deterministic
+  (#96, closed).
 - Room-bare JIDs can authorize all occupants in a coordination-knowledge room;
-  live tenant configuration/retest remains outstanding (#97).
+  the fix is live-verified on isolated XMPP tenants (4/4, including the
+  user-bare negative), and the sunburst/ruffles production retest remains an
+  operator action (#97, open).
+- Idle, interrupted, and approval-paused steer now queues and acknowledges
+  instead of dropping (#103, #104, fixed in source and regressions), and
+  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#105's
+  interrupt half). The fresh-tenant live acceptance pass remains on the
+  release checklist.
+- The desktop and Android companion application repositories are linked from
+  the root README and the documentation index (#102, closed).
 - Passive fabricated-result phrases are detected and challenged with a bounded
   tool-use correction rather than accepted as execution evidence.
 - The onboarding console no longer shows a false token warning in `--no-token`
