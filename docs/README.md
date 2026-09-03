@@ -11,6 +11,13 @@ every **active** file is listed below. Archived material lives under
 * Updated on July 28th, 2026 to reconcile this index with the current documentation tree.*
 * Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
 
+## Companion applications
+
+The user-facing companion clients are maintained in separate repositories:
+
+- [LunarWing Desktop](https://git.lunarwing.org/lunarwing/lunarwing2desktop)
+- [LunarWing Android](https://git.lunarwing.org/lunarwing/lunarwing2droid)
+
 ## Directory Structure
 
 ### 📐 [`architecture/`](architecture/)
