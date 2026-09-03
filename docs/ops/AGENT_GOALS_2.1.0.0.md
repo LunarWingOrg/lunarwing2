@@ -134,7 +134,9 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 23. [x] (S) chk again later ( last attempt was on: rarity/kimi-23-20260901-1801 and does address any of the actual issues found ) - one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
 24. [x] (S) reserved for CI/CD fixes
 25. [x] (S) work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/100 - feel free to create new test tenant and use the web browser to address concerns. should be some stuff in facts store as well for it
-26. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/102
+26. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/102
+    - DONE 100% 2026-09-03 (aj/kimi-26-20260903-0000, commits a360ffeb1 + aba509cbe): added canonical links for the separately maintained LunarWing Desktop (`lunarwing2desktop`) and LunarWing Android (`lunarwing2droid`) repositories to the root README quick links and the documentation index.
+    - Verified both repository paths with live SSH `git ls-remote` probes and confirmed `git diff --check HEAD~2..HEAD` is clean. Documentation-only change; no Cargo run required.
 27. [ ] verify that https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/97 was fixed.  you can create 2-3 temporary test tenants to verify fix.  document findings. 
 28. [ ] verify https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/95 was fixed
 29. [x] (S) update release notes at root of repo again l8r
