@@ -684,6 +684,12 @@ impl Repository {
     }
 
     /// Full-text search using PostgreSQL ts_rank_cd.
+    ///
+    /// `plainto_tsquery` ANDs every query term, so one unusual word in an
+    /// agent-formed query returns zero rows even when strong partial matches
+    /// exist. When the strict pass is empty, a relaxed OR pass over the same
+    /// terms runs once before giving up — recall degrades to weaker ranking
+    /// instead of an empty result that reads as "the data does not exist".
     async fn fts_search(
         &self,
         user_id: &str,
@@ -711,6 +717,32 @@ impl Repository {
             .map_err(|e| WorkspaceError::SearchFailed {
                 reason: format!("FTS query failed: {}", e),
             })?;
+
+        let rows = if rows.is_empty() {
+            match fts_or_query(query) {
+                Some(or_expr) => conn
+                    .query(
+                        r#"
+                        SELECT c.id as chunk_id, c.document_id, d.path as document_path, c.content,
+                               ts_rank_cd(c.content_tsv, to_tsquery('english', $3)) as rank
+                        FROM memory_chunks c
+                        JOIN memory_documents d ON d.id = c.document_id
+                        WHERE d.user_id = $1 AND d.agent_id IS NOT DISTINCT FROM $2
+                          AND c.content_tsv @@ to_tsquery('english', $3)
+                        ORDER BY rank DESC
+                        LIMIT $4
+                        "#,
+                        &[&user_id, &agent_id, &or_expr, &(limit as i64)],
+                    )
+                    .await
+                    .map_err(|e| WorkspaceError::SearchFailed {
+                        reason: format!("FTS relaxed query failed: {}", e),
+                    })?,
+                None => rows,
+            }
+        } else {
+            rows
+        };
 
         Ok(rows
             .iter()
@@ -803,6 +835,10 @@ impl Repository {
     }
 
     /// FTS search across multiple user scopes.
+    ///
+    /// Same strict-then-relaxed shape as [`Self::fts_search`]: the AND pass
+    /// runs first, and an empty result falls back to one OR pass over the
+    /// query terms across all scopes.
     async fn fts_search_multi(
         &self,
         user_ids: &[String],
@@ -831,6 +867,33 @@ impl Repository {
             .map_err(|e| WorkspaceError::SearchFailed {
                 reason: format!("FTS multi-scope query failed: {}", e),
             })?;
+
+        let rows = if rows.is_empty() {
+            match fts_or_query(query) {
+                Some(or_expr) => conn
+                    .query(
+                        r#"
+                        SELECT c.id as chunk_id, c.document_id, d.path as document_path,
+                               c.content,
+                               ts_rank_cd(c.content_tsv, to_tsquery('english', $3)) as rank
+                        FROM memory_chunks c
+                        JOIN memory_documents d ON d.id = c.document_id
+                        WHERE d.user_id = ANY($1::text[]) AND d.agent_id IS NOT DISTINCT FROM $2
+                          AND c.content_tsv @@ to_tsquery('english', $3)
+                        ORDER BY rank DESC
+                        LIMIT $4
+                        "#,
+                        &[&user_ids, &agent_id, &or_expr, &(limit as i64)],
+                    )
+                    .await
+                    .map_err(|e| WorkspaceError::SearchFailed {
+                        reason: format!("FTS relaxed multi-scope query failed: {}", e),
+                    })?,
+                None => rows,
+            }
+        } else {
+            rows
+        };
 
         Ok(rows
             .iter()
@@ -1371,4 +1434,74 @@ async fn lock_document_chunks(
         reason: format!("Failed to lock document chunks: {e}"),
     })?;
     Ok(())
+}
+
+/// Build a relaxed `to_tsquery` OR-expression from a query's alphanumeric
+/// terms for the FTS second pass.
+///
+/// Only `[a-z0-9]+` terms reach `to_tsquery`, so no query-operator syntax
+/// (`&`, `|`, `!`, `(`, `"`, ...) can be injected through user text. Terms
+/// are deduplicated and capped to bound the expression. Returns `None` when
+/// the query has no usable terms, in which case the strict pass result
+/// stands.
+fn fts_or_query(query: &str) -> Option<String> {
+    let terms: std::collections::BTreeSet<String> = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.len() >= 2)
+        .map(|term| term.to_lowercase())
+        .collect();
+    if terms.is_empty() {
+        return None;
+    }
+    Some(terms.into_iter().take(24).collect::<Vec<_>>().join(" | "))
+}
+
+#[cfg(test)]
+mod fts_or_query_tests {
+    use super::*;
+
+    #[test]
+    fn builds_or_expression_from_terms() {
+        assert_eq!(
+            fts_or_query("scheduler dispatch audit"),
+            Some("audit | dispatch | scheduler".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitizes_operator_characters() {
+        // tsquery operator syntax in user text must not survive: the `&`,
+        // `|`, `!`, and parens are split away as non-alphanumeric.
+        assert_eq!(
+            fts_or_query("foo & (bar) !baz | qux"),
+            Some("bar | baz | foo | qux".to_string())
+        );
+    }
+
+    #[test]
+    fn drops_single_character_terms() {
+        assert_eq!(fts_or_query("a b cd"), Some("cd".to_string()));
+    }
+
+    #[test]
+    fn empty_for_no_usable_terms() {
+        assert_eq!(fts_or_query(""), None);
+        assert_eq!(fts_or_query("... !!! ---"), None);
+        assert_eq!(fts_or_query("x y z"), None);
+    }
+
+    #[test]
+    fn deduplicates_and_caps_terms() {
+        let query = "alpha beta gamma delta epsilon zeta";
+        assert_eq!(
+            fts_or_query(query),
+            Some("alpha | beta | delta | epsilon | gamma | zeta".to_string())
+        );
+        let many = (0..60)
+            .map(|i| format!("term{i:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let built = fts_or_query(&many).expect("terms exist");
+        assert_eq!(built.split(" | ").count(), 24);
+    }
 }
