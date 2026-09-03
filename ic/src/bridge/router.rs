@@ -981,7 +981,47 @@ async fn reconcile_pending_gate_state(
     Ok(())
 }
 
-async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[PendingGate]) {
+/// How an expired gate was disposed of inside its key reservation.
+enum ExpiredGateDisposition {
+    /// The paused thread was resumed with an injected expiry result; a
+    /// watcher must await its outcome and deliver the reply.
+    Resumed,
+    /// Resume was impossible; the thread was finalized as failed and the
+    /// source channel was notified.
+    Finalized,
+    /// Nothing was done (thread vanished, changed state, or a replacement
+    /// gate won the race).
+    Skipped,
+}
+
+/// Result message injected when a pending gate expires unresolved, so the
+/// resumed model turn can wrap up instead of retrying the action.
+fn expired_gate_action_result_message(gate: &PendingGate) -> lunarwing_engine::ThreadMessage {
+    let waited_minutes = (gate.expires_at - gate.created_at).num_minutes().max(1);
+    lunarwing_engine::ThreadMessage::action_result(
+        &gate.call_id,
+        &gate.action_name,
+        format!(
+            "The {} request for this action expired after {waited_minutes} minute(s) without a user response. The action was NOT executed. Do not retry it and do not call other tools that need approval; briefly tell the user the request expired and wrap up with what you have.",
+            gate.resume_kind.kind_name()
+        ),
+    )
+}
+
+/// Handle gates that expired without resolution.
+///
+/// Work item #108: expiry used to finalize the paused thread as failed with
+/// no resume and no channel notification, leaving the conversation without a
+/// reply. Now the thread is resumed with an injected expired-gate action
+/// result — the same shape as a denial — so the model wraps the turn up and
+/// the reply reaches the gate's source channel. Threads that cannot be
+/// resumed still fail closed, but the channel is always told what happened.
+async fn handle_expired_gates(
+    state: &EngineState,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
+    expired_gates: &[PendingGate],
+) {
     for gate in expired_gates {
         let key = gate.key();
         // Load + state checks happen BEFORE taking the per-key reservation: a
@@ -996,36 +1036,372 @@ async fn fail_threads_for_expired_gates(state: &EngineState, expired_gates: &[Pe
         {
             continue;
         }
+        let mut resumed = false;
         state
             .pending_gates
-            .run_if_absent(&key, || async {
-                // Route through the ThreadManager so expiry finalizes like any
-                // other terminal path: terminal transition, lease revocation,
-                // events — then untrack from conversation state.
-                match state
-                    .thread_manager
-                    .finalize_waiting_thread_as_failed(
-                        gate.thread_id,
-                        &gate.user_id,
-                        "pending gate expired",
-                    )
-                    .await
-                {
-                    Ok(true) => {
-                        state
-                            .conversation_manager
-                            .untrack_thread(gate.conversation_id, gate.thread_id)
-                            .await;
-                        true
-                    }
-                    Ok(false) => false,
-                    Err(error) => {
-                        debug!(thread_id = %gate.thread_id, %error, "failed to expire waiting thread");
-                        false
+            .run_if_absent(&key, || {
+                let resumed = &mut resumed;
+                async move {
+                    match begin_expired_gate_resume(state, channels, hooks, gate).await {
+                        ExpiredGateDisposition::Resumed => {
+                            *resumed = true;
+                            true
+                        }
+                        ExpiredGateDisposition::Finalized => true,
+                        ExpiredGateDisposition::Skipped => false,
                     }
                 }
             })
             .await;
+        if resumed {
+            spawn_expired_gate_outcome_watcher(
+                gate.clone(),
+                std::sync::Arc::clone(channels),
+                Arc::clone(hooks),
+            );
+        }
+    }
+}
+
+/// Resume the thread paused on an expired gate, falling back to fail-closed
+/// finalization (with a channel notice) when resume is impossible.
+///
+/// Runs inside the gate key reservation: only the resume *initiation* happens
+/// here; awaiting the resumed thread's outcome is the watcher's job so the
+/// reservation and the caller (ingress or sweep) are not held for the run.
+async fn begin_expired_gate_resume(
+    state: &EngineState,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
+    gate: &PendingGate,
+) -> ExpiredGateDisposition {
+    // Tell the gateway the request is gone so any open approval prompt clears.
+    if let Some(ref sse) = state.sse {
+        sse.broadcast_for_user(
+            &gate.user_id,
+            AppEvent::GateResolved {
+                request_id: gate.request_id.to_string(),
+                gate_name: gate.gate_name.clone(),
+                tool_name: gate.action_name.clone(),
+                resolution: "expired".into(),
+                message: "Approval request expired. Resuming the paused turn.".into(),
+                thread_id: Some(gate.thread_id.to_string()),
+            },
+        );
+    }
+
+    // Steer notes are a best-effort extra here: a conversation that is not in
+    // the in-memory map (e.g. gates restored from persistence after a daemon
+    // restart, before the user's conversations are bootstrapped) must not
+    // block the resume itself.
+    if let Err(error) = state
+        .conversation_manager
+        .drain_pending_steer_notes(gate.conversation_id, &gate.user_id, gate.thread_id)
+        .await
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            %error,
+            "skipping steer-note drain for expired-gate resume"
+        );
+    }
+
+    match state
+        .thread_manager
+        .resume_thread(
+            gate.thread_id,
+            gate.user_id.clone(),
+            Some(expired_gate_action_result_message(gate)),
+            Some((gate.call_id.clone(), false)),
+            Some(gate.call_id.clone()),
+        )
+        .await
+    {
+        Ok(()) => ExpiredGateDisposition::Resumed,
+        Err(error) => {
+            debug!(
+                thread_id = %gate.thread_id,
+                %error,
+                "expired-gate resume failed; finalizing thread as failed"
+            );
+            // Route through the ThreadManager so expiry finalizes like any
+            // other terminal path: terminal transition, lease revocation,
+            // events — then untrack from conversation state.
+            match state
+                .thread_manager
+                .finalize_waiting_thread_as_failed(
+                    gate.thread_id,
+                    &gate.user_id,
+                    "pending gate expired",
+                )
+                .await
+            {
+                Ok(true) => {
+                    state
+                        .conversation_manager
+                        .untrack_thread(gate.conversation_id, gate.thread_id)
+                        .await;
+                    deliver_expired_gate_text(
+                        state,
+                        channels,
+                        hooks,
+                        gate,
+                        format!(
+                            "The {} request for tool '{}' expired, and the paused turn could not be resumed. Send your request again to retry.",
+                            gate.resume_kind.kind_name(),
+                            gate.action_name
+                        ),
+                    )
+                    .await;
+                    ExpiredGateDisposition::Finalized
+                }
+                Ok(false) => ExpiredGateDisposition::Skipped,
+                Err(error) => {
+                    debug!(thread_id = %gate.thread_id, %error, "failed to expire waiting thread");
+                    ExpiredGateDisposition::Skipped
+                }
+            }
+        }
+    }
+}
+
+/// Detached watcher for a thread resumed by gate expiry: waits for the
+/// terminal outcome, records it, and delivers the reply to the source
+/// channel. Runs against the global engine state because the caller's
+/// borrow cannot enter a spawned task.
+fn spawn_expired_gate_outcome_watcher(
+    gate: PendingGate,
+    channels: std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: Arc<crate::hooks::HookRegistry>,
+) {
+    tokio::spawn(async move {
+        let Some(lock) = ENGINE_STATE.get() else {
+            return;
+        };
+        let guard = lock.read().await;
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+        await_expired_gate_resume_outcome(state, &channels, &hooks, &gate).await;
+    });
+}
+
+/// Wait for a thread resumed after gate expiry to finish, then record the
+/// outcome and deliver the reply to the gate's source channel.
+async fn await_expired_gate_resume_outcome(
+    state: &EngineState,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
+    gate: &PendingGate,
+) {
+    const OUTCOME_TIMEOUT_SECS: u64 =
+        lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
+    let deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(OUTCOME_TIMEOUT_SECS);
+
+    // Poll-then-join like `await_thread_outcome`: joining a live thread would
+    // remove it from the running map and hide it from /interrupt and /steer.
+    while state.thread_manager.is_running(gate.thread_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                thread_id = %gate.thread_id,
+                timeout_secs = OUTCOME_TIMEOUT_SECS,
+                "expired-gate resume watcher timed out — joining to avoid a leak"
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    let outcome = match state.thread_manager.join_thread(gate.thread_id).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            debug!(
+                thread_id = %gate.thread_id,
+                %error,
+                "failed to join thread resumed after gate expiry"
+            );
+            return;
+        }
+    };
+
+    if let ThreadOutcome::GatePaused {
+        ref action_name, ..
+    } = outcome
+    {
+        // The wrap-up asked for another gate despite the injected do-not-retry
+        // result. Re-arming with no user in the loop risks an expire/resume
+        // loop, so end the turn instead and say so.
+        let new_action = action_name.clone();
+        if let Err(error) = finalize_silently_stopped_thread(
+            state,
+            gate.conversation_id,
+            gate.thread_id,
+            &gate.user_id,
+        )
+        .await
+        {
+            debug!(
+                thread_id = %gate.thread_id,
+                %error,
+                "failed to finalize re-gated thread after expiry resume"
+            );
+        }
+        deliver_expired_gate_text(
+            state,
+            channels,
+            hooks,
+            gate,
+            format!(
+                "The {} request for tool '{}' expired, so that action was skipped. While wrapping up, the agent requested another approval ('{new_action}'), so the turn was ended. Send your request again to retry.",
+                gate.resume_kind.kind_name(),
+                gate.action_name
+            ),
+        )
+        .await;
+        return;
+    }
+
+    if let Err(error) = state
+        .conversation_manager
+        .record_thread_outcome(gate.conversation_id, gate.thread_id, &outcome)
+        .await
+    {
+        debug!(
+            thread_id = %gate.thread_id,
+            %error,
+            "failed to record expired-gate resume outcome"
+        );
+    }
+
+    let text = match &outcome {
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } if !text.is_empty() => text.clone(),
+        // An operator stopped the wrap-up (e.g. /interrupt); that control
+        // path already answered the user.
+        ThreadOutcome::Stopped => return,
+        ThreadOutcome::GatePaused { .. } => return,
+        ThreadOutcome::Completed { .. }
+        | ThreadOutcome::MaxIterations
+        | ThreadOutcome::Failed { .. } => format!(
+            "The {} request for tool '{}' expired, so that action was skipped and the paused turn was ended. Send your request again to retry.",
+            gate.resume_kind.kind_name(),
+            gate.action_name
+        ),
+    };
+    deliver_expired_gate_text(state, channels, hooks, gate, text).await;
+}
+
+/// Recover the v1 conversation scope from the engine conversation key
+/// (`channel:scope`), if the gate's conversation is known and scoped.
+async fn expired_gate_v1_scope(state: &EngineState, gate: &PendingGate) -> Option<String> {
+    let conversation = state
+        .conversation_manager
+        .get_conversation(gate.conversation_id)
+        .await?;
+    conversation
+        .channel
+        .strip_prefix(&format!("{}:", gate.source_channel))
+        .map(str::to_string)
+}
+
+/// Deliver expiry-related text to the gate's source channel with the same
+/// hook, SSE, and v1-history treatment as mission notifications.
+async fn deliver_expired_gate_text(
+    state: &EngineState,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
+    gate: &PendingGate,
+    text: String,
+) {
+    let thread_id = gate.thread_id.to_string();
+    let transform_event = crate::hooks::HookEvent::ResponseTransform {
+        user_id: gate.user_id.clone(),
+        thread_id: thread_id.clone(),
+        response: text.clone(),
+        channel: Some(gate.source_channel.clone()),
+        policy_scope: Some(gate.user_id.clone()),
+    };
+    let transformed = match hooks.run(&transform_event).await {
+        Err(error) => {
+            tracing::warn!(
+                channel = %gate.source_channel,
+                %error,
+                "TransformResponse hook blocked expired-gate reply"
+            );
+            return;
+        }
+        Ok(crate::hooks::HookOutcome::Continue {
+            modified: Some(content),
+        }) => content,
+        _ => text,
+    };
+    let outbound_event = crate::hooks::HookEvent::Outbound {
+        user_id: gate.user_id.clone(),
+        channel: gate.source_channel.clone(),
+        content: transformed.clone(),
+        thread_id: Some(thread_id.clone()),
+        policy_scope: Some(gate.user_id.clone()),
+    };
+    let outbound = match hooks.run(&outbound_event).await {
+        Err(error) => {
+            tracing::warn!(
+                channel = %gate.source_channel,
+                %error,
+                "BeforeOutbound hook blocked expired-gate reply"
+            );
+            return;
+        }
+        Ok(crate::hooks::HookOutcome::Continue {
+            modified: Some(content),
+        }) => content,
+        _ => transformed,
+    };
+
+    if let Err(error) = channels
+        .broadcast(
+            &gate.source_channel,
+            &gate.user_id,
+            OutgoingResponse::text(outbound.clone()),
+        )
+        .await
+    {
+        debug!(
+            channel = %gate.source_channel,
+            %error,
+            "failed to deliver expired-gate reply"
+        );
+    }
+
+    if let Some(ref sse) = state.sse {
+        sse.broadcast_for_user(
+            &gate.user_id,
+            AppEvent::Response {
+                content: outbound.clone(),
+                thread_id,
+            },
+        );
+    }
+
+    if let Some(ref db) = state.db {
+        let v1_conv_id = match expired_gate_v1_scope(state, gate).await {
+            Some(scope) => db
+                .get_or_create_scoped_conversation(&gate.source_channel, &gate.user_id, &scope)
+                .await
+                .ok(),
+            None => db
+                .get_or_create_assistant_conversation(&gate.user_id, &gate.source_channel)
+                .await
+                .ok(),
+        };
+        if let Some(cid) = v1_conv_id
+            && let Err(error) = db
+                .add_conversation_message(cid, "assistant", &outbound)
+                .await
+        {
+            tracing::warn!(%error, "failed to persist expired-gate reply to v1 history");
+        }
     }
 }
 
@@ -1522,7 +1898,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         start_skill_update_sweep(owner_id.clone());
     }
 
-    start_pending_gate_sweep(sweep_gates);
+    start_pending_gate_sweep(
+        sweep_gates,
+        std::sync::Arc::clone(&agent.channels),
+        Arc::clone(agent.hooks()),
+    );
 
     Ok(())
 }
@@ -2969,7 +3349,7 @@ async fn handle_with_engine_inner(
             expired_gates = expired_gates.len(),
             "engine v2: removed expired pending gates"
         );
-        fail_threads_for_expired_gates(state, &expired_gates).await;
+        handle_expired_gates(state, &agent.channels, agent.hooks(), &expired_gates).await;
     }
 
     debug!(
@@ -5220,7 +5600,11 @@ fn start_skill_update_sweep(user_id: String) {
 ///
 /// Without this, a thread waiting on an expired gate blocks until
 /// the next ingress triggers cleanup via `drain_expired()`.
-fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateStore>) {
+fn start_pending_gate_sweep(
+    pending_gates: Arc<crate::gate::store::PendingGateStore>,
+    channels: std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: Arc<crate::hooks::HookRegistry>,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PENDING_GATE_SWEEP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5239,7 +5623,7 @@ fn start_pending_gate_sweep(pending_gates: Arc<crate::gate::store::PendingGateSt
                 let Some(state) = guard.as_ref() else {
                     continue;
                 };
-                fail_threads_for_expired_gates(state, &expired).await;
+                handle_expired_gates(state, &channels, &hooks, &expired).await;
             }
         }
     });
@@ -5558,6 +5942,7 @@ mod tests {
         block_next_thread_load: AtomicBool,
         thread_load_started: Notify,
         continue_thread_load: Notify,
+        fail_next_thread_save: AtomicBool,
     }
 
     impl TestStore {
@@ -5569,6 +5954,7 @@ mod tests {
                 block_next_thread_load: AtomicBool::new(false),
                 thread_load_started: Notify::new(),
                 continue_thread_load: Notify::new(),
+                fail_next_thread_save: AtomicBool::new(false),
             }
         }
     }
@@ -5579,6 +5965,11 @@ mod tests {
             &self,
             thread: &lunarwing_engine::Thread,
         ) -> Result<(), lunarwing_engine::EngineError> {
+            if self.fail_next_thread_save.swap(false, Ordering::SeqCst) {
+                return Err(lunarwing_engine::EngineError::Store {
+                    reason: "injected thread save failure".into(),
+                });
+            }
             self.threads.write().await.insert(thread.id, thread.clone());
             Ok(())
         }
@@ -5852,19 +6243,20 @@ mod tests {
         assert_eq!(gate.thread_id, thread_b);
     }
 
-    #[tokio::test]
-    async fn expired_gate_sweep_fails_waiting_thread_without_ingress() {
-        let store = Arc::new(TestStore::new());
-        let state = make_expected_test_state(store.clone());
-        let gates = crate::gate::store::PendingGateStore::in_memory();
-        let project_id = lunarwing_engine::ProjectId::new();
+    /// Build a Waiting thread parked as if paused on a gate.
+    async fn save_waiting_thread(
+        store: &TestStore,
+        project_id: lunarwing_engine::ProjectId,
+        user_id: &str,
+    ) -> lunarwing_engine::Thread {
         let mut thread = lunarwing_engine::Thread::new(
             "waiting",
             lunarwing_engine::ThreadType::Foreground,
             project_id,
-            "alice",
+            user_id,
             ThreadConfig::default(),
         );
+        thread.add_message(lunarwing_engine::ThreadMessage::user("please run the tool"));
         thread
             .transition_to(lunarwing_engine::ThreadState::Running, None)
             .unwrap();
@@ -5872,7 +6264,132 @@ mod tests {
             .transition_to(lunarwing_engine::ThreadState::Waiting, None)
             .unwrap();
         store.save_thread(&thread).await.unwrap();
+        thread
+    }
 
+    /// Work item #108 regression: an expired gate must resume the paused
+    /// thread with an injected expiry result and deliver the wrap-up reply to
+    /// the gate's source channel — not silently fail the thread.
+    #[tokio::test]
+    async fn expired_gate_resumes_waiting_thread_and_delivers_reply() {
+        use crate::testing::RecordingBroadcastChannel;
+        use futures::StreamExt;
+
+        let store = Arc::new(TestStore::new());
+        let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
+        let mut state = make_expected_test_state(store.clone());
+        state.pending_gates = Arc::clone(&gates);
+        let sse = Arc::new(SseManager::new());
+        let mut sse_events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (recorder, broadcasts) = RecordingBroadcastChannel::new("web");
+        channels.add(Box::new(recorder)).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+
+        let conv_id = state
+            .conversation_manager
+            .get_or_create_conversation("web:scope-108", "alice")
+            .await
+            .unwrap();
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+
+        let mut gate = sample_pending_gate(
+            "alice",
+            thread.id,
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        gate.conversation_id = conv_id;
+        gate.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        gates.insert(gate).await.unwrap();
+        let expired = gates.drain_expired().await;
+        assert_eq!(expired.len(), 1);
+
+        handle_expired_gates(&state, &channels, &hooks, &expired).await;
+        // Drive the watcher body directly: the spawned watcher reads the
+        // global engine state, which unit tests do not install.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            await_expired_gate_resume_outcome(&state, &channels, &hooks, &expired[0]),
+        )
+        .await
+        .expect("resumed thread should reach a terminal outcome promptly");
+
+        // The thread resumed and finished instead of being failed.
+        let saved = store.load_thread(thread.id).await.unwrap().unwrap();
+        assert_eq!(saved.state, lunarwing_engine::ThreadState::Done);
+        assert!(
+            saved
+                .messages
+                .iter()
+                .any(|message| message.content.contains("request for this action expired")),
+            "expiry action result should be injected into the transcript"
+        );
+
+        // The wrap-up reply (NoopLlm says "done") reached the source channel.
+        let delivered = broadcasts.lock().await;
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "alice");
+        assert_eq!(delivered[0].1.content, "done");
+        drop(delivered);
+
+        // The reply is recorded on the engine conversation.
+        let conversation = state
+            .conversation_manager
+            .get_conversation(conv_id)
+            .await
+            .unwrap();
+        assert!(
+            conversation
+                .entries
+                .iter()
+                .any(|entry| entry.content == "done")
+        );
+
+        // The gateway saw the gate clear, then the reply.
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), sse_events.next())
+            .await
+            .expect("GateResolved should be broadcast")
+            .expect("SSE stream should remain open");
+        assert!(matches!(
+            first,
+            crate::channels::web::types::SseEvent::GateResolved {
+                ref resolution,
+                ..
+            } if resolution == "expired"
+        ));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), sse_events.next())
+            .await
+            .expect("Response should be broadcast")
+            .expect("SSE stream should remain open");
+        assert!(matches!(
+            second,
+            crate::channels::web::types::SseEvent::Response { ref content, .. } if content == "done"
+        ));
+    }
+
+    /// When the paused thread cannot be resumed, expiry still fails closed —
+    /// but the source channel must be told instead of going silent.
+    #[tokio::test]
+    async fn expired_gate_resume_failure_fails_thread_and_notifies_channel() {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let store = Arc::new(TestStore::new());
+        let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
+        let mut state = make_expected_test_state(store.clone());
+        state.pending_gates = Arc::clone(&gates);
+
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (recorder, broadcasts) = RecordingBroadcastChannel::new("web");
+        channels.add(Box::new(recorder)).await;
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
         let mut gate = sample_pending_gate(
             "alice",
             thread.id,
@@ -5884,10 +6401,19 @@ mod tests {
         gates.insert(gate).await.unwrap();
         let expired = gates.drain_expired().await;
         assert_eq!(expired.len(), 1);
-        fail_threads_for_expired_gates(&state, &expired).await;
+
+        // The resume's thread save fails; the fallback finalization's save
+        // succeeds (the flag is one-shot).
+        store.fail_next_thread_save.store(true, Ordering::SeqCst);
+        handle_expired_gates(&state, &channels, &hooks, &expired).await;
 
         let saved = store.load_thread(thread.id).await.unwrap().unwrap();
         assert_eq!(saved.state, lunarwing_engine::ThreadState::Failed);
+
+        let delivered = broadcasts.lock().await;
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, "alice");
+        assert!(delivered[0].1.content.contains("could not be resumed"));
     }
 
     #[tokio::test]
@@ -5940,7 +6466,9 @@ mod tests {
             .unwrap();
 
         let expired = gates.drain_expired().await;
-        fail_threads_for_expired_gates(&state, &expired).await;
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+        handle_expired_gates(&state, &channels, &hooks, &expired).await;
 
         assert_eq!(
             store
@@ -5996,7 +6524,9 @@ mod tests {
         let mut state = make_expected_test_state(store.clone());
         state.pending_gates = Arc::clone(&gates);
         let sweep = tokio::spawn(async move {
-            fail_threads_for_expired_gates(&state, &expired).await;
+            let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+            let hooks = Arc::new(crate::hooks::HookRegistry::default());
+            handle_expired_gates(&state, &channels, &hooks, &expired).await;
         });
         store.thread_load_started.notified().await;
         let replacement = sample_pending_gate(
