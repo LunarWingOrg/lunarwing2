@@ -477,7 +477,8 @@ non-UUID XMPP, DarkIRC, and WeeChat scope keys. `/interrupt` cancels in-flight
 provider streams and tool futures before signaling the next loop boundary.
 `/steer <note>` injects into a running thread at its next model-call boundary;
 when the conversation is idle or completing an interrupt, up to four notes are
-persisted on the conversation and injected into its next foreground turn.
+persisted on the conversation and injected into its next foreground turn,
+including resume from a waiting or suspended thread.
 Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
 persist a duplicate terminal response.

@@ -609,6 +609,32 @@ async fn finalize_silently_stopped_pending_thread(
     .await
 }
 
+async fn resume_engine_thread(
+    state: &EngineState,
+    pending: &PendingGate,
+    user_id: &str,
+    injected_message: Option<lunarwing_engine::ThreadMessage>,
+    approval_event: Option<(String, bool)>,
+    resolved_call_id: Option<String>,
+) -> Result<(), Error> {
+    state
+        .conversation_manager
+        .drain_pending_steer_notes(pending.conversation_id, user_id, pending.thread_id)
+        .await
+        .map_err(|error| engine_err("drain steer notes", error))?;
+    state
+        .thread_manager
+        .resume_thread(
+            pending.thread_id,
+            user_id.to_string(),
+            injected_message,
+            approval_event,
+            resolved_call_id,
+        )
+        .await
+        .map_err(|error| engine_err("resume error", error))
+}
+
 async fn execute_pending_gate_action(
     agent: &Agent,
     state: &EngineState,
@@ -704,22 +730,20 @@ async fn execute_pending_gate_action(
                 )
                 .await
                 .map_err(|error| engine_err("record approved action", error))?;
-            state
-                .thread_manager
-                .resume_thread(
-                    pending.thread_id,
-                    message.user_id.clone(),
-                    Some(resumed_action_result_message(
-                        &pending.call_id,
-                        &pending.action_name,
-                        &result.output,
-                        approval.already_granted,
-                    )),
-                    approval.event,
-                    Some(pending.call_id.clone()),
-                )
-                .await
-                .map_err(|e| engine_err("resume error", e))?;
+            resume_engine_thread(
+                state,
+                pending,
+                &message.user_id,
+                Some(resumed_action_result_message(
+                    &pending.call_id,
+                    &pending.action_name,
+                    &result.output,
+                    approval.already_granted,
+                )),
+                approval.event,
+                Some(pending.call_id.clone()),
+            )
+            .await?;
             await_thread_outcome(
                 agent,
                 state,
@@ -1623,24 +1647,22 @@ pub async fn resolve_engine_auth_callback(
         );
     }
 
-    state
-        .thread_manager
-        .resume_thread(
-            pending.thread_id,
-            user_id.to_string(),
-            pending.resume_output.as_ref().map(|resume_output| {
-                resumed_action_result_message(
-                    &pending.call_id,
-                    &pending.action_name,
-                    resume_output,
-                    false,
-                )
-            }),
-            None,
-            Some(pending.call_id.clone()),
-        )
-        .await
-        .map_err(|e| engine_err("resume oauth callback", e))?;
+    resume_engine_thread(
+        state,
+        &pending,
+        user_id,
+        pending.resume_output.as_ref().map(|resume_output| {
+            resumed_action_result_message(
+                &pending.call_id,
+                &pending.action_name,
+                resume_output,
+                false,
+            )
+        }),
+        None,
+        Some(pending.call_id.clone()),
+    )
+    .await?;
 
     Ok(true)
 }
@@ -2164,17 +2186,15 @@ pub async fn resolve_gate(
             );
 
             let event_rx = state.thread_manager.subscribe_events();
-            state
-                .thread_manager
-                .resume_thread(
-                    pending.thread_id,
-                    message.user_id.clone(),
-                    Some(deny_result),
-                    Some((pending.call_id.clone(), false)),
-                    Some(pending.call_id.clone()),
-                )
-                .await
-                .map_err(|e| engine_err("resume error", e))?;
+            resume_engine_thread(
+                state,
+                &pending,
+                &message.user_id,
+                Some(deny_result),
+                Some((pending.call_id.clone(), false)),
+                Some(pending.call_id.clone()),
+            )
+            .await?;
             event_rx
         }
 
@@ -2271,22 +2291,20 @@ pub async fn resolve_gate(
 
                 if let Some(resume_output) = pending.resume_output.clone() {
                     let event_rx = state.thread_manager.subscribe_events();
-                    state
-                        .thread_manager
-                        .resume_thread(
-                            pending.thread_id,
-                            message.user_id.clone(),
-                            Some(resumed_action_result_message(
-                                &pending.call_id,
-                                &pending.action_name,
-                                &resume_output,
-                                false,
-                            )),
-                            None,
-                            Some(pending.call_id.clone()),
-                        )
-                        .await
-                        .map_err(|e| engine_err("resume error", e))?;
+                    resume_engine_thread(
+                        state,
+                        &pending,
+                        &message.user_id,
+                        Some(resumed_action_result_message(
+                            &pending.call_id,
+                            &pending.action_name,
+                            &resume_output,
+                            false,
+                        )),
+                        None,
+                        Some(pending.call_id.clone()),
+                    )
+                    .await?;
                     event_rx
                 } else {
                     return execute_pending_gate_action(
@@ -2327,22 +2345,20 @@ pub async fn resolve_gate(
             }
             if let Some(resume_output) = pending.resume_output.clone() {
                 let event_rx = state.thread_manager.subscribe_events();
-                state
-                    .thread_manager
-                    .resume_thread(
-                        pending.thread_id,
-                        message.user_id.clone(),
-                        Some(resumed_action_result_message(
-                            &pending.call_id,
-                            &pending.action_name,
-                            &resume_output,
-                            false,
-                        )),
-                        None,
-                        Some(pending.call_id.clone()),
-                    )
-                    .await
-                    .map_err(|e| engine_err("resume error", e))?;
+                resume_engine_thread(
+                    state,
+                    &pending,
+                    &message.user_id,
+                    Some(resumed_action_result_message(
+                        &pending.call_id,
+                        &pending.action_name,
+                        &resume_output,
+                        false,
+                    )),
+                    None,
+                    Some(pending.call_id.clone()),
+                )
+                .await?;
                 event_rx
             } else {
                 return execute_pending_gate_action(
