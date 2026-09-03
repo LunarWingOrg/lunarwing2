@@ -187,6 +187,33 @@ Item 3 of the v2.1.0.0 cycle, with live verification and fixes from item 9:
   injects the wrapped note into the scoped running engine thread and returns the
   same acknowledgement as the classic path.
 
+The follow-up engine work (work items #103, #104, and the interrupt half of
+#105) hardened both controls against the idle and interrupt races the live pass
+could not cover:
+
+- Steer is no longer dropped while a conversation is idle, interrupted, or
+  approval-paused. Engine conversations persist a serde-default queue of at
+  most four pending steer notes that is cleared with the conversation. Routed
+  steer acknowledges as soon as it is queued, injects into a running scoped
+  thread when one exists, and otherwise persists across the
+  idle/thread-completion race; pending notes are consumed by the next
+  foreground turn and also delivered on running-thread injection, suspended
+  resume, and approval/auth resume. The legacy loop accepts idle, interrupted,
+  processing, and approval-paused steer with the same four-note bound, and
+  serde defaults keep existing conversation records compatible.
+- Failed runtime steer injection no longer acknowledges a dropped signal: when
+  the destination run is closed or already cancelled, the note falls back to
+  the durable conversation queue and the caller is told the queue was accepted.
+- The Engine V2 per-run cancellation token now wraps in-flight CodeAct, direct,
+  and parallel tool host calls as well as LLM streams, so `/interrupt` drops a
+  long-running tool future promptly and returns a normal stopped outcome.
+- Engine documentation now pins the contract: steer injects at the next
+  model-call boundary, after the current step or tool result, and deliberately
+  never cancels the running tool. These fixes close the source side of work
+  items #103 and #104 and the interrupt half of #105; regression coverage
+  passed, and the fresh cross-channel live pass remains on the release
+  checklist.
+
 ### External LunarVision Instances
 
 Tenants can now use an operator-managed LunarVision instance on another machine
