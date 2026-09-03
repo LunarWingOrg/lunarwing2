@@ -156,7 +156,10 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 37. [x] (S) reserved
 38. [x] (S) reserved
 39. [x] (S) reserved
-40. [ ] fix steer and interrupt. data hints on: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/105 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/104 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 - does not work on XMPP currently
+40. [x] fix steer and interrupt. data hints on: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/105 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/104 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 - does not work on XMPP currently
+    - DONE 2026-09-03 (aj/kimi-40-20260903-0600): Engine V2 now applies its per-run cancellation token to in-flight CodeAct, direct, and parallel tool host calls as well as LLM streams, so `/interrupt` drops a long-running shell/tool future promptly instead of waiting for completion. Runtime steer injection now reports closed or already-cancelled runs rather than acknowledging a dropped signal.
+    - Routed XMPP `/steer` now persists wrapped notes when a conversation is idle or an interrupt is completing, acknowledges the queue immediately, injects the notes into the next foreground turn, bounds the durable queue at four, and clears it with the conversation. The legacy loop now provides the same idle/approval-paused queue behavior. Serde defaults preserve compatibility with existing conversation records.
+    - Verified on CPUs 0-11 / max 12 jobs: focused Engine tool-cancellation test, Engine conversation persistence/injection tests, all steer-filtered LunarWing tests (10), all interrupt-filtered LunarWing tests (24), scoped XMPP interrupt-to-steer regression, clear-queue regression, `cargo fmt --all -- --check`, `cargo check -p lunarwing_engine`, `cargo check -p lunarwing`, and zero-warning lib clippy for both crates. No live tenant was deployed in this run; XMPP behavior is covered through production bridge routing with in-memory channel/engine fixtures.
 41. [ ] document current state of work items in a fresh doc in docs/ops
 42. [x] (S) reserved
 43. [ ] one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings

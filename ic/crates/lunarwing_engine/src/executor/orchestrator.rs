@@ -475,20 +475,24 @@ pub async fn execute_orchestrator(
 
                     // __execute_code_step__(code, state)
                     "__execute_code_step__" => {
-                        match handle_execute_code_step(
-                            args,
-                            kwargs,
-                            thread,
-                            llm,
-                            effects,
-                            leases,
-                            policy,
-                            &mut actions_this_step,
-                            event_tx,
-                            store,
-                        )
-                        .await
-                        {
+                        let result = cancellation
+                            .run_until_cancelled(handle_execute_code_step(
+                                args,
+                                kwargs,
+                                thread,
+                                llm,
+                                effects,
+                                leases,
+                                policy,
+                                &mut actions_this_step,
+                                event_tx,
+                                store,
+                            ))
+                            .await;
+                        let Some(result) = result else {
+                            return stopped_orchestrator_result(thread, total_tokens);
+                        };
+                        match result {
                             Ok(result) => result,
                             Err(EngineError::ExecutionStopped) => {
                                 return stopped_orchestrator_result(thread, total_tokens);
@@ -499,17 +503,21 @@ pub async fn execute_orchestrator(
 
                     // __execute_action__(name, params, call_id=...)
                     "__execute_action__" => {
-                        match handle_execute_action(
-                            HostCallArguments { args, kwargs },
-                            thread,
-                            effects,
-                            leases,
-                            policy,
-                            &mut actions_this_step,
-                            event_tx,
-                        )
-                        .await
-                        {
+                        let result = cancellation
+                            .run_until_cancelled(handle_execute_action(
+                                HostCallArguments { args, kwargs },
+                                thread,
+                                effects,
+                                leases,
+                                policy,
+                                &mut actions_this_step,
+                                event_tx,
+                            ))
+                            .await;
+                        let Some(result) = result else {
+                            return stopped_orchestrator_result(thread, total_tokens);
+                        };
+                        match result {
                             Ok(result) => result,
                             Err(EngineError::ExecutionStopped) => {
                                 return stopped_orchestrator_result(thread, total_tokens);
@@ -520,17 +528,21 @@ pub async fn execute_orchestrator(
 
                     // __execute_actions_parallel__(calls)
                     "__execute_actions_parallel__" => {
-                        match handle_execute_actions_parallel(
-                            args,
-                            thread,
-                            effects,
-                            leases,
-                            policy,
-                            &mut actions_this_step,
-                            event_tx,
-                        )
-                        .await
-                        {
+                        let result = cancellation
+                            .run_until_cancelled(handle_execute_actions_parallel(
+                                args,
+                                thread,
+                                effects,
+                                leases,
+                                policy,
+                                &mut actions_this_step,
+                                event_tx,
+                            ))
+                            .await;
+                        let Some(result) = result else {
+                            return stopped_orchestrator_result(thread, total_tokens);
+                        };
+                        match result {
                             Ok(result) => result,
                             Err(EngineError::ExecutionStopped) => {
                                 return stopped_orchestrator_result(thread, total_tokens);
@@ -3608,7 +3620,7 @@ mod tests {
         assert!(!interrupted_result_needs_refund(&ok));
     }
 
-    // ── Streaming cancellation ──────────────────────────────────
+    // ── In-flight LLM and tool cancellation ─────────────────────
 
     /// Backend whose stream emits one delta then stays pending, so a
     /// cancellation during collection is the only way it ends.
@@ -4118,6 +4130,71 @@ mod tests {
                 .iter()
                 .any(|message| message.role == MessageRole::Assistant)
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_code_step_aborts_in_flight_tool() {
+        let code = "__execute_code_step__('result = await hang_tool()', {})\nFINAL('unreached')";
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects = Arc::new(StopAndHangEffects::new());
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (_signal_tx, mut signal_rx) = signal_channel(16);
+        let token = CancellationToken::new();
+
+        let canceller = {
+            let effects = Arc::clone(&effects);
+            let token = token.clone();
+            async move {
+                effects.started.wait().await;
+                token.cancel();
+            }
+        };
+        let state = serde_json::json!({});
+        let run = execute_orchestrator(
+            code,
+            &mut thread,
+            &llm,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &token,
+            None,
+            None,
+            None,
+            &state,
+        );
+
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect("cancelled tool call should finish promptly");
+
+        let result = result.expect("orchestrator should return Ok");
+        assert!(matches!(result.outcome, ThreadOutcome::Stopped));
+        assert_eq!(thread.state, ThreadState::Completed);
+        assert!(thread.events.iter().all(|event| {
+            !matches!(
+                event.kind,
+                EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
+            )
+        }));
     }
 
     #[tokio::test]
