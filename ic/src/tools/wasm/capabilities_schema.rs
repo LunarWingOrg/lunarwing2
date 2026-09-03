@@ -814,7 +814,7 @@ mod tests {
         let json = include_str!("../../../tools-src/cavepony/cavepony-tool.capabilities.json");
         let caps = CapabilitiesFile::from_json(json).expect("Cavepony sidecar should parse");
 
-        assert_eq!(caps.version.as_deref(), Some("0.4.0"));
+        assert_eq!(caps.version.as_deref(), Some("0.4.2"));
         assert_eq!(caps.wit_version.as_deref(), Some("0.3.0"));
         assert!(caps.http.is_none());
         assert!(caps.secrets.is_none());
