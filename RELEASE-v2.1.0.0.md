@@ -148,7 +148,7 @@ previous compatibility baseline.
 | New SQL migration | None; `V26__study_notes_knowledge.sql` remains latest |
 | Multi-tenant port registry | v16; no schema change from v2.0.9.0 |
 | Channel registry patches | darkirc 0.1.6 (no change), multica 0.1.9, weechat 0.2.7 (no change), xmpp 0.1.12 |
-| Tool registry patches | `vision-analyze` 0.1.2 (was 0.1.1); GitLab 0.1.4 (was 0.1.3); other tools unchanged |
+| Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
 | Worker image tool pins | opencode `v1.18.25`, kimi-code `0.39.1` |
@@ -398,8 +398,11 @@ committed:
 
 - LunarWing-owned release crates and channel packages moved from 2.0.9 to 2.1.0.
   Channel registry patches are multica 0.1.9 and xmpp 0.1.12; darkirc 0.1.6 and
-  weechat 0.2.7 are unchanged. Tool registry bumps are `vision-analyze`
-  0.1.1 → 0.1.2 and GitLab 0.1.3 → 0.1.4.
+  weechat 0.2.7 are unchanged. Tool registry bumps are cavepony 0.4.0 → 0.4.2,
+  GitLab 0.1.3 → 0.1.4, llm-context 0.1.0 → 0.1.1, multica-bridge
+  0.1.1 → 0.1.2, ssh 0.1.0 → 0.1.1, `vision-analyze` 0.1.1 → 0.1.3,
+  voice-transcribe 0.1.0 → 0.1.1, and web-search 0.2.1 → 0.2.2 (registry-level
+  patch versions; of the crate versions, only cavepony moved, 0.4.0 → 0.4.2).
 - fs4 0.6.6 was removed in favor of standard-library `File::lock` /
   `try_lock` (available before the 1.96.1 MSRV), preserving
   `TryLockError::WouldBlock` behavior across bootstrap, gate persistence,
@@ -454,16 +457,22 @@ committed:
    remain current.
 3. Rebuild the daemon and installed WASM extensions through the normal deployment
    path. Channel registry versions multica 0.1.9 and xmpp 0.1.12 changed;
-   darkirc 0.1.6 and weechat 0.2.7 did not. Rebuild/reinstall
-   `vision-analyze` for its tool-registry bump to 0.1.2.
+   darkirc 0.1.6 and weechat 0.2.7 did not. Rebuild/reinstall `vision-analyze`
+   for its tool-registry bump to 0.1.3; rebuilt tools carry vendor-consistent
+   committed lockfiles with matching registry patch versions (ssh 0.1.1,
+   llm-context 0.1.1, multica-bridge 0.1.2, voice-transcribe 0.1.1, web-search
+   0.2.2, GitLab 0.1.4, cavepony 0.4.2), so installed tenants rebuild
+   vendor-consistent WASM artifacts.
 4. Cargo manifests rooted under `ic/` now resolve crates.io through
    `ic/vendor/`. For a dependency change, run `ic/scripts/refresh-vendor.sh`,
    review the vendor diff, and commit it with the manifests/locks. Root-level
    satellite projects remain outside this source replacement.
 5. `/interrupt` and `/steer` are available through the web gateway, WeeChat,
    XMPP, and REPL. Engine V2-routed controls target the scoped running engine
-   thread. A control that races ahead of a queued-but-not-running turn can still
-   return "Nothing to interrupt." or the corresponding idle steer response.
+   thread when one exists; steer that arrives while a conversation is idle,
+   interrupted, or approval-paused is acknowledged as queued and delivered on
+   the next turn or resume instead of returning an idle response. Interrupting
+   a queued-but-not-running turn still returns "Nothing to interrupt."
 6. Manage LunarVoice through `install-voice`, `configure-voice`,
    `activate-voice`, `deactivate-voice`, and `remove-voice`. Reconcile any
    manually deployed sidecar to mt-admin's rendered units and registry ports.
