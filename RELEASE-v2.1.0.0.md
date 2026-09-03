@@ -4,11 +4,12 @@
 
 **Status: PRE-RELEASE ** Release date TBD
 Claims below were rechecked against release-integration revision
-`96c951785`, the `v2.0.9.0..96c951785` history, current source/manifests/locks,
-in-tree regression evidence, the canonical bug reports, and the public work-item
-tracker (2026-09-01 accuracy pass followed by a 2026-09-02 re-verification at
-`96c951785`). This file remains at the repository root until the release process
-moves it into `docs/releases/`.
+`a67fee21c` (the `aragents/kimil00p/v2.1.0.0` branch reviewed at that commit),
+the `v2.0.9.0..a67fee21c` history, current source/manifests/locks, in-tree
+regression evidence, the canonical bug reports, and the public work-item
+tracker (2026-09-01 accuracy pass, a 2026-09-02 re-verification at `96c951785`,
+and a 2026-09-03 re-verification at `a67fee21c`). This file remains at the
+repository root until the release process moves it into `docs/releases/`.
 
 >Distance is a decision
 >
@@ -62,14 +63,21 @@ previous compatibility baseline.
   `CancellationToken` from `agent::interrupt::TurnInterrupts`. Every LLM call
   and tool batch in that agentic loop races against the token via
   `tokio::select!`, so `/interrupt` cancels an in-flight provider stream or
-  running tool batch mid-poll instead of waiting for a step boundary. Existing
-  turn-boundary state and queue handling remain in place.
+  running tool batch mid-poll instead of waiting for a step boundary. Engine V2
+  runs apply their per-run token to in-flight CodeAct, direct, and parallel
+  tool host calls as well, so interrupting drops a long-running tool future
+  promptly. Existing turn-boundary state and queue handling remain in place.
 - **Hermes-style steer.** `/steer <note>` uses priority dispatch and a capped
   four-note buffer on the classic loop, draining notes into one user message at
-  the next safe iteration boundary. Engine V2 routes steer through the bridge
-  into the scoped running engine thread. Live verification on a throwaway
-  tenant passed 6/6 checks (web gateway, WeeChat, and XMPP × interrupt and
-  steer). Evidence:
+  the next safe iteration boundary. Steer is accepted while a conversation is
+  idle, interrupted, processing, or approval-paused, and queued notes are never
+  silently dropped: the engine persists a bounded four-note durable queue that
+  clears with the conversation, and pending notes are delivered on the next
+  foreground turn and on running-thread, suspended, and approval/auth resumes.
+  Engine V2 routes steer through the bridge into the scoped running thread when
+  one exists and acknowledges the queued note otherwise. Live verification on a
+  throwaway tenant passed 6/6 checks (web gateway, WeeChat, and XMPP ×
+  interrupt and steer). Evidence:
   [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
 - **LunarVoice production lifecycle.** mt-admin now provides
   install/configure/activate/deactivate/remove for the voice sidecar with
