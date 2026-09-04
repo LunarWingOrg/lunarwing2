@@ -5902,7 +5902,10 @@ input[type="checkbox"]:focus-visible {
 #lunar-mascot {
   position: fixed;
   right: 18px;
-  bottom: 18px;
+  /* Default anchor sits above the chat input bar (~66px tall + margin) so the
+     drag container never occludes #send-btn in fresh browser contexts. Users
+     can still drag it anywhere; mascot.js persists the custom position. */
+  bottom: 120px;
   width: 96px;
   height: 96px;
   z-index: 950;

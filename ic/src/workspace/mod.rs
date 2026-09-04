@@ -1826,16 +1826,22 @@ impl Workspace {
         query: &str,
         config: SearchConfig,
     ) -> Result<Vec<SearchResult>, WorkspaceError> {
-        // Generate embedding for semantic search if provider available
+        // Generate embedding for semantic search if provider available. A
+        // provider failure degrades to keyword-only search instead of failing
+        // the whole query: recall failing closed to an empty result reads to
+        // the agent as "the data does not exist", which is worse than a
+        // keyword-only answer.
         let embedding = if let Some(ref provider) = self.embeddings {
-            Some(
-                provider
-                    .embed(query)
-                    .await
-                    .map_err(|e| WorkspaceError::EmbeddingFailed {
-                        reason: e.to_string(),
-                    })?,
-            )
+            match provider.embed(query).await {
+                Ok(embedding) => Some(embedding),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "embedding provider failed; degrading memory search to keyword-only"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };

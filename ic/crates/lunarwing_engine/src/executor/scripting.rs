@@ -381,10 +381,13 @@ async fn execute_code_with_skills_and_action_limit(
         known_actions.insert(name.clone());
     }
 
-    // Mission threads get a host-level memory-doc writer (for skill extraction,
-    // fix patterns, orchestrator versions). Registered only for missions so
-    // ordinary threads cannot mint `trust: "trusted"` skill docs.
-    if thread.thread_type == crate::types::thread::ThreadType::Mission {
+    // Mission threads (and rlm children running on a mission's behalf) get a
+    // host-level memory-doc writer (for skill extraction, fix patterns,
+    // orchestrator versions). Registered only for missions so ordinary
+    // threads cannot mint `trust: "trusted"` skill docs.
+    let is_mission_authorized = thread.thread_type == crate::types::thread::ThreadType::Mission
+        || thread.config.mission_child;
+    if is_mission_authorized {
         known_actions.insert("__save_memory_doc__".into());
     }
 
@@ -1638,6 +1641,12 @@ async fn handle_rlm_query(
         child_config,
     )
     .with_parent(parent_thread.id);
+    // A mission's rlm child executes on the mission's behalf: keep the
+    // mission-only `__save_memory_doc__` host function resolvable in the
+    // child's sandbox. Without this the child raises NameError and the model
+    // pivots to a plain workspace write, losing doc_type/tags metadata.
+    child_thread.config.mission_child =
+        parent_thread.thread_type == crate::types::thread::ThreadType::Mission;
 
     // Add the prompt as a user message
     child_thread.add_message(ThreadMessage::user(&prompt));
@@ -1927,10 +1936,12 @@ async fn settle_completion_after_stop(
 /// Handle `__save_memory_doc__(title, content, doc_type, tags=None, metadata=None, shared=False)`.
 ///
 /// Creates a MemoryDoc (e.g. an extracted Skill, a fix-pattern update, or an
-/// orchestrator version) from a **Mission thread** and returns the new doc id.
-/// Refusal and persistence failures raise an exception instead of returning a
-/// falsey value that mission code could silently mistake for success. Ordinary
-/// threads remain unable to mint `trust: "trusted"` skill docs.
+/// orchestrator version) from a **Mission thread** (or an rlm child running
+/// on a mission's behalf — `config.mission_child`) and returns the new doc
+/// id. Refusal and persistence failures raise an exception instead of
+/// returning a falsey value that mission code could silently mistake for
+/// success. Ordinary threads remain unable to mint `trust: "trusted"` skill
+/// docs.
 ///
 /// With `shared=True` the doc is written under the shared owner — required for
 /// docs the engine loads from the shared space (prompt overlay, orchestrator
@@ -1942,7 +1953,9 @@ async fn handle_save_memory_doc(
     thread: &Thread,
     store: Option<&Arc<dyn crate::traits::store::Store>>,
 ) -> ExtFunctionResult {
-    if thread.thread_type != crate::types::thread::ThreadType::Mission {
+    let is_mission_authorized = thread.thread_type == crate::types::thread::ThreadType::Mission
+        || thread.config.mission_child;
+    if !is_mission_authorized {
         debug!("__save_memory_doc__: refused for non-mission thread");
         return memory_doc_error(
             ExcType::RuntimeError,
@@ -2684,6 +2697,58 @@ FINAL(doc_id)
                 .is_empty(),
             "non-mission thread must not create memory docs"
         );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_available_for_mission_rlm_child() {
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        // rlm_query children are typed Research even when the parent is a
+        // Mission; config.mission_child marks them so the host function stays
+        // resolvable in the child sandbox (goal-30 live finding: without this
+        // the child raised NameError and the mission pivoted to a plain
+        // workspace write, losing doc_type/tags metadata).
+        let mut thread = make_test_thread(); // Foreground type, but flagged
+        thread.config.mission_child = true;
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let code = r#"
+doc_id = __save_memory_doc__(
+    "goal30:mission-child-proof",
+    "sentinel GOAL30-CHILD-OK",
+    "note",
+    ["goal30"],
+    {},
+)
+FINAL(doc_id)
+"#;
+        let result = execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !result.had_error,
+            "mission-child thread must resolve __save_memory_doc__"
+        );
+        let docs = store
+            .list_memory_docs(thread.project_id, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1, "doc persisted from mission-child sandbox");
+        assert_eq!(docs[0].title, "goal30:mission-child-proof");
     }
 
     #[tokio::test]
