@@ -193,6 +193,16 @@ pub struct ThreadConfig {
     pub depth: u32,
     /// Maximum recursion depth for rlm_query() sub-calls.
     pub max_depth: u32,
+    /// True for rlm_query() child threads whose parent is a Mission thread.
+    ///
+    /// rlm children are typed [`ThreadType::Research`] for lease and
+    /// anti-recursion purposes, but they execute on behalf of a mission and
+    /// must keep the mission-only `__save_memory_doc__` host function.
+    /// Without this flag the child's name lookup raises NameError and the
+    /// model concludes the function "is not callable from this sandbox" and
+    /// pivots to a plain workspace write — losing doc_type/tags metadata.
+    #[serde(default)]
+    pub mission_child: bool,
 
     // ── Channel delivery constraints ──
     /// Delivery-constraint guidance appended to the system prompt at thread
@@ -237,6 +247,7 @@ impl Default for ThreadConfig {
             compaction_threshold: 0.85,
             depth: 0,
             max_depth: 1,
+            mission_child: false,
             channel_context: None,
         }
     }

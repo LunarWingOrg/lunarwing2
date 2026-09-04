@@ -25,7 +25,11 @@ impl RetrievalEngine {
     /// Retrieve relevant memory docs for the given query within a project.
     ///
     /// Loads all docs for the project, scores them by keyword relevance and
-    /// doc-type priority, and returns the top `max_docs` results.
+    /// doc-type priority, and returns the top `max_docs` results. When no
+    /// keyword matches any document, the result degrades to type-priority +
+    /// recency ordering instead of returning empty: an empty retrieval reads
+    /// to the model as "the data does not exist", which has produced
+    /// confabulated failure narratives from otherwise-correct agents.
     pub async fn retrieve_context(
         &self,
         project_id: ProjectId,
@@ -64,16 +68,34 @@ impl RetrievalEngine {
         }
 
         let mut scored: Vec<(f64, MemoryDoc)> = all_docs
-            .into_iter()
-            .map(|doc| {
-                let keyword_score = keyword_match_score(&doc, &keywords);
-                let type_weight = doc_type_weight(doc.doc_type);
-                // Combined score: keyword relevance (0.0-1.0) + type priority bonus
-                let score = keyword_score + type_weight;
-                (score, doc)
+            .iter()
+            .filter_map(|doc| {
+                let keyword_score = keyword_match_score(doc, &keywords);
+                // Zero-relevance docs must not ride the type-priority bonus:
+                // the bonus ranks matching docs among themselves, it does not
+                // turn unrelated docs into matches. (Filtering on the combined
+                // score was a no-op — every doc type weighs above zero.)
+                if keyword_score <= 0.0 {
+                    return None;
+                }
+                Some((keyword_score + doc_type_weight(doc.doc_type), doc.clone()))
             })
-            .filter(|(score, _)| *score > 0.0)
             .collect();
+
+        if scored.is_empty() {
+            // Zero keyword overlap across the whole corpus. Degrade to the
+            // no-keywords ordering (doc-type priority, then recency) rather
+            // than returning nothing — weak context beats a false "not found".
+            let mut fallback = all_docs;
+            fallback.sort_by(|a, b| {
+                let weight = doc_type_weight(b.doc_type)
+                    .partial_cmp(&doc_type_weight(a.doc_type))
+                    .unwrap_or(std::cmp::Ordering::Equal);
+                weight.then(b.updated_at.cmp(&a.updated_at))
+            });
+            fallback.truncate(max_docs);
+            return Ok(fallback);
+        }
 
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(max_docs);
@@ -303,6 +325,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(docs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn retrieve_zero_keyword_overlap_returns_recent_fallback() {
+        let project = ProjectId::new();
+        let mut old_note = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Note,
+            "Audit: scheduler dispatch subsystem",
+            "Trust boundary map for scheduler dispatch. NEXT FOCUS: web gateway.",
+        );
+        old_note.updated_at = chrono::Utc::now() - chrono::Duration::hours(5);
+        let mut recent_note = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Note,
+            "Audit: web-gateway auth",
+            "Entry points and trust boundaries of the gateway auth surface.",
+        );
+        recent_note.updated_at = chrono::Utc::now();
+        let store = make_store(vec![old_note, recent_note]);
+        let engine = RetrievalEngine::new(store);
+
+        // Vocabulary completely disjoint from every stored doc.
+        let docs = engine
+            .retrieve_context(project, "test-user", "quantum flute repair", 5)
+            .await
+            .unwrap();
+
+        // Recall must degrade to recency-ordered fallback, not empty.
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].title, "Audit: web-gateway auth");
+        assert_eq!(docs[1].title, "Audit: scheduler dispatch subsystem");
+    }
+
+    #[tokio::test]
+    async fn retrieve_fallback_prefers_higher_priority_doc_types() {
+        let project = ProjectId::new();
+        let mut summary = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Summary,
+            "Thread summary",
+            "Did thread things.",
+        );
+        summary.updated_at = chrono::Utc::now();
+        let lesson = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Lesson,
+            "Lesson about tooling",
+            "Verify against source systems.",
+        );
+        let store = make_store(vec![summary, lesson]);
+        let engine = RetrievalEngine::new(store);
+
+        let docs = engine
+            .retrieve_context(project, "test-user", "unrelated vocabulary here", 5)
+            .await
+            .unwrap();
+
+        // Lesson outranks Summary in the fallback ordering even though the
+        // Summary is more recent.
+        assert_eq!(docs[0].doc_type, DocType::Lesson);
+    }
+
+    #[tokio::test]
+    async fn retrieve_keyword_match_beats_fallback() {
+        let project = ProjectId::new();
+        let mut recent_unrelated = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Note,
+            "Totally different topic",
+            "Quantum flutes and their repair history.",
+        );
+        recent_unrelated.updated_at = chrono::Utc::now();
+        let matching = MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Note,
+            "Audit: scheduler dispatch",
+            "The scheduler dispatch boundary.",
+        );
+        let store = make_store(vec![recent_unrelated, matching]);
+        let engine = RetrievalEngine::new(store);
+
+        let docs = engine
+            .retrieve_context(project, "test-user", "scheduler dispatch", 5)
+            .await
+            .unwrap();
+
+        // When a keyword match exists it must win over fallback ordering.
+        assert_eq!(docs[0].title, "Audit: scheduler dispatch");
     }
 
     #[tokio::test]

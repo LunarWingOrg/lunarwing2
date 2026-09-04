@@ -288,11 +288,30 @@ impl ExecutionLoop {
                 }
             };
             // Build prompt using pre-fetched docs (no extra Store query)
-            let codeact_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
+            let mut codeact_prompt = crate::executor::prompt::build_codeact_system_prompt_with_docs(
                 &actions,
                 &system_docs,
                 self.platform_info.as_ref(),
             );
+
+            // Mission threads (and their rlm children via config.mission_child
+            // at execution time) can persist engine memory docs, but the
+            // function is a host function — not a leased action — so it never
+            // appears in the action list. Name it explicitly, otherwise the
+            // model cannot discover it and either fabricates a workaround or
+            // reports the write as impossible.
+            if self.thread.thread_type == crate::types::thread::ThreadType::Mission
+                || self.thread.config.mission_child
+            {
+                codeact_prompt.push_str(
+                    "\n## Mission memory persistence\n\n\
+                     You may call the host function `__save_memory_doc__(title, content, \
+                     doc_type, tags=None, metadata=None, shared=False)` from a repl code \
+                     block. `doc_type` is one of: summary, lesson, issue, spec, note, skill, \
+                     plan. It returns the new doc id and raises on failure — never report a \
+                     write as saved unless the call returned. Do not redefine or shadow it.\n",
+                );
+            }
 
             // Prepend the tenant identity/persona (if the host supplied it) so
             // the agent speaks in its own voice rather than the generic CodeAct
