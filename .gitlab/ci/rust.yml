@@ -7,71 +7,68 @@ rust-check-default:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked
 
 rust-check-postgres:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: check
   needs:
     - cargo-metadata
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*), which merge
-    # multiple agent work branches and need full pre-merge validation.
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features postgres
 
 rust-check-libsql:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: check
   needs:
     - cargo-metadata
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*).
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features libsql
 
 rust-check-all-features:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: check
   needs:
     - cargo-metadata
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*).
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
-wasm-channel-test-artifacts:
+# P0.4: compile every test target in the single-backend shapes. rust-check-*
+# above only type-checks non-test code, so the 64 integration-test targets
+# were never compiled in the postgres-only shape (and several were broken).
+rust-check-tests-postgres:
   extends: .rust-job
-  stage: check
+  stage: test
   needs:
-    - cargo-metadata
-  timeout: 30m
+    - job: rust-check-postgres
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
   script:
-    - rustup target add --toolchain 1.96.1 wasm32-wasip2
-    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path channels-src/xmpp/Cargo.toml
-    - cp ic/channels-src/xmpp/target/wasm32-wasip2/release/xmpp_channel.wasm ic/channels-src/xmpp/xmpp.wasm
-    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path ../lunarwing_weechat_wss/weechat_relay/Cargo.toml
-  artifacts:
-    expire_in: 1 day
-    paths:
-      - ic/channels-src/xmpp/xmpp.wasm
-      - lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --tests --no-default-features --features postgres
 
-# Owner: core maintainers. Block after MSRV (1.96.1) is confirmed green and the
-# plan §15.5 reconciliation is closed. Removing this job reopens the
-# Cargo.toml rust-version vs CI toolchain drift gap.
+rust-check-tests-libsql:
+  extends: .rust-job
+  stage: test
+  needs:
+    - job: rust-check-libsql
+      artifacts: false
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
+    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --tests --no-default-features --features libsql
+
 rust-msrv-check:
   extends:
     - .rust-msrv-job
@@ -113,7 +110,9 @@ rust-test-lib:
     - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --workspace --lib -- --test-threads=1
 
 rust-test-libsql:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: test
   needs:
     - job: rust-check-libsql
@@ -121,13 +120,6 @@ rust-test-libsql:
     - job: wasm-channel-test-artifacts
       artifacts: true
   timeout: 60m
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*).
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
   variables:
     LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
     LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
@@ -135,3 +127,20 @@ rust-test-libsql:
   script:
     # libSQL's full test link approaches the 16 GB runner limit; serialize rustc and omit debug info.
     - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+
+wasm-channel-test-artifacts:
+  extends: .rust-job
+  stage: check
+  needs:
+    - cargo-metadata
+  timeout: 30m
+  script:
+    - rustup target add --toolchain 1.96.1 wasm32-wasip2
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path channels-src/xmpp/Cargo.toml
+    - cp ic/channels-src/xmpp/target/wasm32-wasip2/release/xmpp_channel.wasm ic/channels-src/xmpp/xmpp.wasm
+    - bash .gitlab/scripts/cargo-ci.sh build -j2 --locked --release --target wasm32-wasip2 --manifest-path ../lunarwing_weechat_wss/weechat_relay/Cargo.toml
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - ic/channels-src/xmpp/xmpp.wasm
+      - lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm

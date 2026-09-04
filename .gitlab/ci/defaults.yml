@@ -147,6 +147,22 @@ variables:
   tags:
     - "$CI_LINT_RUNNER_TAG"
 
+# One reusable "full validation context" predicate (P0.3): every heavy gate —
+# single-backend checks, full test suites, cargo-deny, WASM, future package
+# prerequisites — must run in exactly the contexts where a release can depend
+# on them. Previously these jobs only matched the default branch, MRs into it,
+# and aragents/kimil00p/*, so a protected release tag pipeline skipped the
+# entire quality matrix. The tag condition pins the version policy's own
+# release/RC pattern so arbitrary tags still get the slim MR-tier pipeline.
+.full-validation-context:
+  rules:
+    - if: "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH"
+    - if: "$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//"
+    - if: "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH"
+    - if: '$CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - when: never
+
 .observational-job:
   allow_failure: true
   rules:
