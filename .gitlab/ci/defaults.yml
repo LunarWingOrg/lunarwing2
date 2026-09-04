@@ -35,12 +35,16 @@ variables:
   CI_RUST_IMAGE: "docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
   CI_GITLEAKS_IMAGE: "docker.io/zricethezav/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
   # sccache: shared compile-artifact cache across the Rust jobs (installed by
-  # bootstrap-sccache.sh; nothing required on the runner host). The 80G value
-  # is only the eviction cap — actual usage tracks what the workspace needs.
-  # Note: GitLab zips SCCACHE_DIR into the job cache, so real size matters.
+  # bootstrap-sccache.sh; nothing required on the runner host).
+  # P0.5 disk contract: the Rust runner documents a 40 GiB disk budget (see
+  # .gitlab/README.md "GitLab setup runbook"). After checkout (~1.5 GiB),
+  # target/ during test builds, and the cargo registry cache, ~20 GiB of warm
+  # space remains; this cap must stay below 40% of it. 10 GiB is the eviction
+  # cap, not live usage — sccache evicts LRU entries at the cap. Note: GitLab
+  # zips SCCACHE_DIR into the job cache, so real size matters.
   RUSTC_WRAPPER: "$CI_PROJECT_DIR/.ci-cache/bin/sccache"
   SCCACHE_DIR: "$CI_PROJECT_DIR/.ci-cache/sccache"
-  SCCACHE_CACHE_SIZE: "80G"
+  SCCACHE_CACHE_SIZE: "10G"
 
 .lint-job:
   image:
@@ -75,6 +79,14 @@ variables:
   before_script:
     - bash .gitlab/scripts/bootstrap-rust.sh
     - bash .gitlab/scripts/bootstrap-sccache.sh
+    # P0.5 telemetry: baseline disk state before the build starts.
+    - df -h "$CI_PROJECT_DIR" || true
+  after_script:
+    # P0.5 telemetry: disk high-water + sccache effectiveness per job. These
+    # logs feed runner health review; telemetry must never mask test results.
+    - df -h "$CI_PROJECT_DIR" || true
+    - du -sh "$CI_PROJECT_DIR/ic/target" 2>/dev/null || true
+    - "$CI_PROJECT_DIR/.ci-cache/bin/sccache" --show-stats || true
   cache:
     # Downloaded crates: keyed on Cargo.lock (new deps re-fetch on change).
     - key:
@@ -88,7 +100,7 @@ variables:
       policy: pull-push
     # sccache + its binary: static key — one self-overwriting archive, so
     # lockfile changes neither reset the artifact cache nor pile up stale
-    # zips on the runner host. 80G live cap enforced by sccache itself.
+    # zips on the runner host. 10G live cap enforced by sccache itself (P0.5).
     - key: "rust-1.96.1-sccache"
       paths:
         - .ci-cache/bin/
@@ -107,6 +119,11 @@ variables:
     - bash .gitlab/scripts/bootstrap-msrv.sh
     - bash .gitlab/scripts/bootstrap-sccache.sh
     - mv ic/rust-toolchain.toml ic/rust-toolchain.toml.disabled
+    - df -h "$CI_PROJECT_DIR" || true
+  after_script:
+    - df -h "$CI_PROJECT_DIR" || true
+    - du -sh "$CI_PROJECT_DIR/ic/target" 2>/dev/null || true
+    - "$CI_PROJECT_DIR/.ci-cache/bin/sccache" --show-stats || true
   cache:
     - key:
         prefix: "rust-1.96.1-msrv"

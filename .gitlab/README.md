@@ -25,7 +25,7 @@ Create unprotected, unprivileged runners with these tags:
 | Tag | Required capacity | Access |
 |---|---|---|
 | `lint` | Isolated Docker/Kubernetes executor; 2-4 CPUs, 4-8 GB RAM | Public package mirrors only; no protected variables or Docker socket |
-| `rust-x86_64` | Isolated Docker/Kubernetes executor; 6 CPUs numbered `0-5`, 16 GB RAM, 25 GB free disk | Public Cargo/Git/package mirrors only; no protected variables or Docker socket |
+| `rust-x86_64` | Isolated Docker/Kubernetes executor; 6 CPUs numbered `0-5`, 16 GB RAM, 40 GiB free disk (budget below) | Public Cargo/Git/package mirrors only; no protected variables or Docker socket |
 
 Override `CI_LINT_RUNNER_TAG` or `CI_RUST_RUNNER_TAG` at project level if local
 runner tags differ. Do not map either variable to protected or privileged
@@ -183,8 +183,14 @@ Create the Rust runner with:
 - **Run untagged jobs**: disabled.
 - **Protected**: disabled.
 - Executor: isolated Docker or Kubernetes, never shell executor.
-- Capacity: six available CPUs numbered `0-5`, 16 GB RAM, and at least 25 GB
-  free disk.
+- Capacity: six available CPUs numbered `0-5`, 16 GB RAM, and at least 40 GiB
+  free disk. Budget (P0.5): fresh checkout ~1.5 GiB (incl. `ic/vendor/`), Rust
+  `target/` during a full test-shape build ~6-10 GiB, cargo registry cache
+  ~2 GiB, sccache eviction cap 10 GiB, plus ~10 GiB safety headroom sums to
+  ~35-40 GiB of warm space. 40 GiB keeps sccache at or under ~25% of the warm
+  budget and the whole contract at or under 40 GiB of free space; the previous
+  80 GiB sccache cap against a 25 GiB runner was unfundable (pipeline #2604
+  runbook note: `No space left on device`).
 - Per-host job limit: one. Every Cargo job pins itself to CPUs `0-5`; parallel
   Rust jobs therefore require separate runner hosts or VMs, not overlapping
   jobs on one host.
