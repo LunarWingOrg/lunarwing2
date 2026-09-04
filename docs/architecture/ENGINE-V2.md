@@ -590,6 +590,14 @@ ENGINE_V2_MODEL_RECOVERY_TOTAL_ATTEMPTS=4 # Total recovery attempts per thread l
                                         # Default: 4; clamped to 16
 ```
 
+**Pending-gate expiry (host daemon knob, WI#111).** How long a pending
+approval/auth gate waits before the background sweep expires it and resumes
+the paused turn (WI#108) is configured on the daemon, not in `ThreadConfig`:
+`AGENT_PENDING_GATE_EXPIRY_SECS` env (read via `AgentConfig::resolve`) takes
+precedence over the DB-backed setting `agent.pending_gate_expiry_secs`;
+default **1800s (30 minutes)**. Values below 30s fall back to the default —
+the gate sweep ticks every 60s, so shorter windows cannot be observed.
+
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 
 **WI#88 timeout policy — intentional, not deferred (closes Kageho's "double-timeout" review question).** The orchestrator's hardcoded policy for the two timeout surfaces that work item #88 exposed is by design: every deferred tool join and every deferred LLM join awaited in a `ResolveFutures` round is bounded by the *same* hardcoded deadline — `tool_async_timeout_secs` (default 300s, env escape hatch `ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS`) — so the round's two suspended surfaces, deferred tool joins and deferred LLM joins (the two hang shapes #88 reported), share one fixed "double-applied" deadline. On expiry the wedged task is aborted and the call resolves back to the model as an ordinary tool/LLM error; the orchestrator does not retry the future, re-arm it with a larger deadline, or split the deadline per surface. Christopher's answer to Kageho's "unblock the double-timeout knob (or document it as deferred)" review question is that this single fixed deadline covering both suspended surfaces is **intentional, not deferred** — a split knob (separate tool-vs-LLM deadlines) or a retry/re-arm-with-larger-deadline policy was considered and deliberately rejected — so future readers should treat the hardcoded 2-surface/one-deadline policy as a settled decision and not re-litigate it without fresh evidence that the 300s default causes real user harm.

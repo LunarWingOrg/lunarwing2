@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use chrono::Duration as ChronoDuration;
 use futures::StreamExt;
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ use crate::agent::session_manager::SessionManager;
 use crate::agent::submission::{Submission, SubmissionParser, SubmissionResult};
 use crate::agent::{HeartbeatConfig as AgentHeartbeatConfig, Router, Scheduler, SchedulerDeps};
 use crate::channels::{ChannelManager, IncomingMessage, OutgoingResponse};
+use crate::config::clamp_pending_gate_expiry_secs;
 use crate::config::{AgentConfig, HeartbeatConfig, RoutineConfig, SkillsConfig};
 use crate::context::ContextManager;
 use crate::db::Database;
@@ -329,6 +331,16 @@ impl Agent {
     /// Resolved foreground iteration limit shared by both execution engines.
     pub(crate) fn max_tool_iterations(&self) -> usize {
         self.config.max_tool_iterations
+    }
+
+    /// Pending-gate expiry (WI#111): resolved from
+    /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
+    /// settings via `AgentConfig::resolve`, with the config-layer floor
+    /// applied (see `clamp_pending_gate_expiry_secs`).
+    pub(crate) fn pending_gate_expiry(&self) -> ChronoDuration {
+        ChronoDuration::seconds(
+            clamp_pending_gate_expiry_secs(self.config.pending_gate_expiry_secs) as i64,
+        )
     }
 
     /// Create a new agent.
