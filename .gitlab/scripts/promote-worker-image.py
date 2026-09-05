@@ -85,6 +85,10 @@ class RegistryClient:
         realm = fields.get("realm")
         if not realm:
             raise RuntimeError("registry authentication challenge has no realm")
+        realm_url = urllib.parse.urlparse(realm)
+        registry_host = urllib.parse.urlparse(self.base).hostname
+        if realm_url.scheme != "https" or realm_url.hostname != registry_host:
+            raise RuntimeError("registry authentication realm is not same-origin HTTPS")
         query = urllib.parse.urlencode(
             {
                 "service": fields.get("service", "container_registry"),
