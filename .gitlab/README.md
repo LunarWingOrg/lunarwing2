@@ -265,8 +265,9 @@ Open **Settings > CI/CD** and apply:
 
 Runner cache credentials, if a shared cache backend is used, stay in runner
 `config.toml`. Never expose them as merge-request CI variables. Merge requests,
-tags, schedules, and manually started pipelines use pull-only caches; only a
-trusted default-branch push publishes refreshed cache state. Rust jobs report
+tags, schedules, and manually started pipelines use pull-only caches; only the
+`rust-cache-refresh` job on a protected default-branch push publishes compiler
+cache state. Rust jobs report
 before/after disk use, target/cache sizes, and sccache statistics. Cache only
 the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
 data, environment files, or credentials.
