@@ -275,6 +275,9 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         promotion_job = merged.get(promotion_name, {})
         if not isinstance(promotion_job, dict) or not promotion_job.get("resource_group"):
             errors.append(f"{promotion_name} must serialize moving-tag publication")
+        expected_tag = f"$CI_COMMIT_TAG-{worker}"
+        if promotion_job.get("variables", {}).get("WORKER_PROMOTION_TAG") != expected_tag:
+            errors.append(f"{promotion_name} must use unique tag {expected_tag}")
         needs = promotion_job.get("needs", []) if isinstance(promotion_job, dict) else []
         needed_jobs = {need.get("job") for need in needs if isinstance(need, dict)}
         if needed_jobs != {candidate_name, scan_name}:
