@@ -100,6 +100,7 @@ fn gateway_config() -> GatewayConfig {
         workspace_read_scopes: Vec::new(),
         memory_layers: Vec::new(),
         user_tokens: None,
+        mascot_enabled: false,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
     }
