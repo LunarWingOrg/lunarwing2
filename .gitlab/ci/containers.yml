@@ -99,6 +99,8 @@ worker-pebble-scan:
 
 worker-pebble-promote:
   extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-pebble"
   resource_group: worker-pebble-promotion
   needs:
     - job: worker-pebble-candidate
@@ -119,6 +121,8 @@ worker-opencode-scan:
 
 worker-opencode-promote:
   extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-opencode"
   resource_group: worker-opencode-promotion
   needs:
     - job: worker-opencode-candidate
@@ -139,6 +143,8 @@ worker-kimi-scan:
 
 worker-kimi-promote:
   extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-kimi"
   resource_group: worker-kimi-promotion
   needs:
     - job: worker-kimi-candidate
