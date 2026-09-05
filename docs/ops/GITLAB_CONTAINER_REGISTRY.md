@@ -126,13 +126,13 @@ realm `https://git.lunarwing.org/jwt/auth`.)
   `docker exec gitlab grep '^registry' /etc/gitlab/gitlab.rb`. If the
   registry lines are missing, the `GITLAB_OMNIBUS_CONFIG` env didn't render —
   it must be a block scalar (`|`) in compose, not list syntax.
-- **502 on Kaniko `PATCH .../blobs/uploads`:** not a missing backend — HTTP/2
-  blob streaming through Traefik/nginx. CI forces `GODEBUG=http2client=0`
-  and `--push-retry=5`. See section 4.
-- **499 Client Closed Request on Kaniko `PATCH .../blobs/uploads`:** a proxy
-  timeout firing mid-upload on multi-GB blobs (observed on the opencode/pebble
-  worker images). Needs Traefik/omnibus timeout changes on this host — full
-  diagnosis and exact config in `REGISTRY_PUSH_499.md`.
+- **502 on `PATCH .../blobs/uploads`:** not a missing backend — inspect the
+  Traefik/nginx HTTP/2 path and registry logs. Rootless BuildKit replaced the
+  archived Kaniko client, so old Kaniko-specific retry advice no longer applies.
+- **499 Client Closed Request on `PATCH .../blobs/uploads`:** a proxy timeout
+  firing mid-upload on multi-GB worker images. Needs Traefik/omnibus timeout
+  changes on this host — full diagnosis and exact config in
+  `REGISTRY_PUSH_499.md`.
 - **Wrong token realm / scheme mismatch on `docker login`:** the
   `registry_nginx['proxy_set_headers']` block is missing.
 
@@ -147,46 +147,37 @@ Leave request buffering off.
 
 ## 2. CI: build and push worker images
 
-`.gitlab/ci/containers.yml` adds supported worker-image jobs to the `containers` stage:
+`.gitlab/ci/containers.yml` defines three jobs per worker:
 
-| Job | Context | Image pushed |
+| Step | Jobs | Contract |
 |---|---|---|
-| `worker-pebble-image` | repo root (Dockerfile in `pebble4lunarwing/`) | `$CI_REGISTRY_IMAGE/worker-pebble:{v2.0.8.0,latest,<short-sha>}` |
-| `worker-opencode-image` | `opencode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-opencode:{v2.0.8.0,latest,<short-sha>}` |
-| `worker-kimi-image` | `kimicode4lunarwing/` | `$CI_REGISTRY_IMAGE/worker-kimi:{v2.0.8.0,latest,<short-sha>}` |
+| Candidate | `worker-{pebble,opencode,kimi}-candidate` | Rootless BuildKit pushes one unique `<full-sha>-<pipeline>-<job>` tag |
+| Verify | `worker-*-scan` | Trivy scans that exact digest for critical findings and emits a CycloneDX SBOM |
+| Promote | `worker-*-promote` | A serialized, non-interruptible job copies the tested manifest to the protected release tag without rebuilding |
 
 Details:
 
-- `$CI_REGISTRY` / `$CI_REGISTRY_IMAGE` resolve automatically from
-  `registry_external_url` once section 1 is live — no CI variable changes.
-- Builds use **Kaniko** (`gcr.io/kaniko-project/executor`, pinned by sha256
-  digest per repo convention) — unprivileged, works on any docker-executor
-  runner, produces docker-format images so the Dockerfiles' `HEALTHCHECK`s
-  survive (matches the mt-admin `--format docker` convention).
-- Auth uses the automatic `$CI_REGISTRY_USER` / `$CI_REGISTRY_PASSWORD`
-  per-job credentials — nothing to configure.
-- All three image jobs are **manual-only on every pipeline** and
-  `allow_failure: true`; multi-GB worker builds never start automatically. Run
-  the pipeline and explicitly trigger only the image jobs needed for the
-  release.
-- Variable: `WITH_TOOLCHAINS` for both OpenCode and Kimi jobs (default
-  `false`; set `true` on the selected manual job for the full toolchain image —
-  mirrors mt-admin's `--with-toolchains`). Kimi also exposes
-  `KIMI_CODE_VERSION` (currently `0.39.1`).
-- Tags: a moving `WORKER_IMAGE_TAG` (default `v2.0.9.0`) plus `:latest`, plus
-  an immutable `$CI_COMMIT_SHORT_SHA` tag. The moving tags silently retarget
-  between builds — consumers that need a stable reference should pull the SHA
-  tag (or pin the digest it resolves to). SHA tags accumulate, so the
-  server-side cleanup policy (section 4) should be enabled to prune them; this
-  registry's tag-delete UI has 502ed while trying to clear tags manually.
-  When playing a job, override `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME`
-  to retarget a wedged tag or repository (e.g. `WORKER_IMAGE_NAME=worker-pebble-2080`).
-- Kaniko jobs set `GODEBUG=http2client=0` and `--push-retry=5`. HTTP/2 blob
-  PATCH through Traefik/nginx in front of GitLab's registry is a known 502
-  source; forcing HTTP/1.1 is GitLab's documented workaround.
-- If gcr.io is unreachable from the runners, pull the executor image
-  elsewhere, push it into our registry once section 1 is done, and update
-  `.container-job`'s `image:name`.
+- Registry-writing jobs exist only for a protected default-branch push or a
+  protected push-created tag matching `vX.Y.Z.W[-rcN]`. They never exist in an
+  MR, ordinary branch, web/API/trigger pipeline, schedule, or unprotected tag.
+- Candidate and promotion jobs are non-interruptible and have retries disabled,
+  so redundant-pipeline cancellation or automatic timeout retries cannot hide a
+  partial registry operation.
+- The digest-pinned `moby/buildkit:v0.25.1-rootless` image runs without a Docker
+  daemon or privileged container. The protected `container-build` runner must
+  allow the narrow user-namespace/mount syscall set BuildKit needs; never mount
+  a Docker socket or disable seccomp wholesale.
+- Worker source revisions, base images, npm/Bun/Cargo locks, Debian snapshots,
+  and optional Rust/Go downloads are fixed in source. Build arguments are
+  hard-coded in `.gitlab/scripts/build-worker-image.sh`, not pipeline variables.
+- `worker-image.env`, BuildKit metadata, and `worker-inputs.sha256` bind the
+  verification jobs to the candidate. Promotion re-reads the registry manifest,
+  checks its digest and source revision label, validates the health check and
+  entrypoint, and refuses to retarget an existing release tag to another digest.
+- The retained `worker-image-evidence.json` records full source SHA, source/input
+  hashes, image digest, SBOM/scan hashes, configuration proof, and pipeline URL.
+  Tenant configuration should consume `repository@sha256:...`; `latest` and
+  short-SHA tags are no longer published.
 
 ## 3. Using the images on MT hosts
 
@@ -198,17 +189,18 @@ One-time login on the host (rootful runtime that mt-admin builds with):
 podman login registry.git.lunarwing.org    # or docker login; use a read_registry PAT
 ```
 
-Then, instead of building locally during upgrades:
+Then pull the digest from `worker-image-evidence.json`, not a moving tag:
 
 ```bash
-podman pull registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode:latest
-podman tag  registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode:latest \
+podman pull registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode@sha256:<digest>
+podman tag  registry.git.lunarwing.org/lunarwing/lunarwing2/worker-opencode@sha256:<digest> \
             lunarwing-worker-opencode:latest
 ```
 
 Tenant distribution is unchanged: mt-admin's existing save|load path pushes
-the host-local `lunarwing-worker-*:latest` image into each tenant's rootless
-store (`_ensure_tenant_image`), so pulling once on the host is enough.
+the verified host-local image into each tenant's rootless store
+(`_ensure_tenant_image`). `latest` here is only a host-local compatibility name;
+CI never publishes it.
 
 Follow-up idea (not implemented here): teach `lunarwing-mt-admin.sh` a
 `--pull-worker-images` mode that pulls from the registry instead of building,
@@ -217,18 +209,14 @@ plus an integrity check (digest pin per release).
 ## 4. Housekeeping
 
 - **Cleanup policy**: project → Settings → Packages and registries → Cleanup
-  policy for container repositories — e.g. keep 10 tags per repo, remove tags
-  older than 30 days matching `.*` except `latest` and `v2.0.8.0`. CI pushes a
-  new immutable short-SHA tag per build (for pinning), so this policy is what
-  keeps them from accumulating — enable it if it is not already on. The
-  tag-delete UI has 502ed on manual clears, so do not rely on it.
+  policy for container repositories. Preserve release tags and prune unique
+  `<full-sha>-<pipeline>-<job>` candidate tags after retained evidence no longer
+  needs them. Never protect `latest`; CI does not create it.
 - Registry-side garbage collection runs via omnibus defaults; no action
   needed unless storage grows.
-- **`502 Bad Gateway` on `PATCH .../blobs/uploads/...`:** Kaniko hitting
-  Traefik/registry over HTTP/2. Confirm the job has `GODEBUG=http2client=0`.
-  If a specific tag/repo is wedged after a failed delete, replay the manual
-  job with `WORKER_IMAGE_TAG` and/or `WORKER_IMAGE_NAME` set to a fresh
-  value rather than retrying the same destination.
+- **`502 Bad Gateway` on `PATCH .../blobs/uploads/...`:** inspect BuildKit and
+  proxy logs. Re-running creates a fresh candidate tag, so it cannot mutate the
+  candidate already referenced by verification evidence.
 - **`499 Client Closed Request` on `PATCH .../blobs/uploads/...`:** proxy
   timeout on large blobs, not fixable from CI — see `REGISTRY_PUSH_499.md`
   for the GitLab-host Traefik/omnibus changes.
