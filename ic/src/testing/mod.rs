@@ -62,24 +62,6 @@ pub async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
     (Arc::new(backend) as Arc<dyn Database>, dir)
 }
 
-#[cfg(all(feature = "postgres", not(feature = "libsql")))]
-pub async fn test_db() -> (Arc<dyn Database>, tempfile::TempDir) {
-    use crate::config::DatabaseConfig;
-    use crate::db::postgres::PgBackend;
-
-    let dir = tempfile::tempdir().expect("failed to create temp dir");
-    let url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/lunarwing_test".to_string());
-    let backend = PgBackend::new(&DatabaseConfig::from_postgres_url(&url, 4))
-        .await
-        .expect("failed to create test PgBackend");
-    backend
-        .run_migrations()
-        .await
-        .expect("failed to run migrations");
-    (Arc::new(backend) as Arc<dyn Database>, dir)
-}
-
 /// What kind of error the stub should produce when failing.
 #[derive(Clone, Copy, Debug)]
 pub enum StubErrorKind {
