@@ -67,7 +67,9 @@ pub use types::thread::{Thread, ThreadConfig, ThreadId, ThreadState, ThreadType}
 pub use traits::effect::{
     EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
 };
-pub use traits::llm::{LlmBackend, LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk};
+pub use traits::llm::{
+    LlmBackend, LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk, ProviderStreamObservation,
+};
 pub use traits::store::Store;
 
 // ── Re-exports: capability ────────────────────────────────────
