@@ -504,7 +504,7 @@ impl StreamTraceAccumulator {
                 }
                 tool_call.arguments.push_str(args_delta);
             }
-            LlmStreamChunk::Done { .. } => {}
+            LlmStreamChunk::Observation(_) | LlmStreamChunk::Done { .. } => {}
         }
     }
 
