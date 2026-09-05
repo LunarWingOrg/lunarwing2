@@ -282,6 +282,8 @@ def promote() -> None:
 
 
 def self_test() -> None:
+    import tempfile
+
     assert split_image_ref("registry.example", "registry.example/group/image:tag") == (
         "group/image",
         "tag",
@@ -290,6 +292,26 @@ def self_test() -> None:
         assert RELEASE_TAG_RE.fullmatch(valid)
     for invalid in ("v2.1.0", "v2.1.0.0-rc0", "latest", "v2.1.0.0-beta1"):
         assert not RELEASE_TAG_RE.fullmatch(invalid)
+
+    metadata = {
+        "WORKER_CANDIDATE_TAG": "a" * 40 + "-1-1",
+        "WORKER_IMAGE_DIGEST": "sha256:" + "b" * 64,
+        "WORKER_IMAGE_NAME": "worker-kimi",
+        "WORKER_IMAGE_REF": "registry.example/group/worker-kimi:tag",
+        "WORKER_REBUILD_DIGEST": "sha256:" + "b" * 64,
+        "WORKER_REBUILD_REF": "registry.example/group/worker-kimi:tag-rebuild",
+    }
+    previous_directory = pathlib.Path.cwd()
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            os.chdir(directory)
+            pathlib.Path("worker-image.env").write_text(
+                "".join(f"{key}={value}\n" for key, value in metadata.items()),
+                encoding="utf-8",
+            )
+            assert candidate_metadata() == metadata
+        finally:
+            os.chdir(previous_directory)
     print("worker image promotion self-tests passed")
 
 
