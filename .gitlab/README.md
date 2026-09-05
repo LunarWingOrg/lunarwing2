@@ -301,7 +301,8 @@ Create a protected `container-build` runner. Keep `privileged = false`, do not
 mount a Docker socket, and permit only the user-namespace/mount syscalls required
 by rootless BuildKit through a reviewed seccomp profile. Do not use
 `seccomp:unconfined`. The runner must be unable to route to production or tenant
-networks and must have at least a four-hour maximum timeout for large candidates.
+networks and must have at least an eight-hour maximum timeout: each candidate is
+rebuilt once with `--no-cache` and promotion requires identical digests.
 
 ### 4. Validate and activate
 
@@ -324,7 +325,8 @@ Local includes cannot be fully linted until this branch exists on GitLab.
    default-branch pipeline starts.
 9. Create a protected RC tag on that exact SHA. Confirm the complete feature,
    test, Cavepony, source-policy, secret, and cargo-deny gates appear. Trigger
-   one worker candidate, then verify its digest scan and SBOM before promotion.
+   one worker candidate. It must finish an uncached second build with the same
+   digest before its scan, SBOM, and promotion become reachable.
 10. Confirm an ordinary branch, MR, web/API/trigger pipeline, and an unprotected
     tag receive no registry-writing jobs. Confirm re-running a candidate creates
     a new full-SHA/pipeline/job tag and cannot replace the first candidate.
