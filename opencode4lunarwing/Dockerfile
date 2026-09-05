@@ -219,7 +219,8 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # `docker build` and only surfaces as a module-resolution error when the bridge
 # starts inside the running container.
 RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2/client").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2/client resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2/client —", e.message); process.exit(1) })'
-RUN cd /app \
+RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
+    && cd /app \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && python3 scripts/study_notes_config_test.py
