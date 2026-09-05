@@ -2,6 +2,7 @@
 # committed npm lock, and package indexes come from one Debian snapshot.
 ARG KIMI_CODE_VERSION=0.39.1
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG SOURCE_REVISION=unknown
 
 # ──────────────────────────────
 # Stage 1: build the bridge + tests
@@ -41,6 +42,7 @@ RUN npm ci --ignore-scripts && \
 FROM docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
 
 ARG DEBIAN_SNAPSHOT
+ARG SOURCE_REVISION
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # Pass --build-arg WITH_TOOLCHAINS=true for the fat image (CI, dev tenants).
 ARG WITH_TOOLCHAINS=false
@@ -48,6 +50,7 @@ ARG WITH_TOOLCHAINS=false
 LABEL org.opencontainers.image.title="LunarWing Kimi Code Worker" \
       org.opencontainers.image.description="Persistent Kimi Code CLI worker with WebSocket agent communication" \
       org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
 RUN set -eu; \
