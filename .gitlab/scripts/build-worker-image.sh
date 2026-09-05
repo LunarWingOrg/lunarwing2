@@ -77,7 +77,7 @@ set -- buildctl-daemonless.sh build \
     --local "dockerfile=$CI_PROJECT_DIR/$dockerfile_dir" \
     --opt filename=Dockerfile \
     --metadata-file "$metadata_file" \
-    --output "type=image,name=$candidate_ref,push=true"
+    --output "type=image,name=$candidate_ref,push=true,oci-mediatypes=false"
 
 printf '%s\n' "$build_args" > "$CI_PROJECT_DIR/worker-build-args.txt"
 while IFS= read -r build_arg; do
