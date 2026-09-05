@@ -35,6 +35,7 @@ impl StreamIntegrityProvider {
         result: Result<T, LlmError>,
         content: impl Fn(&T) -> Option<&str>,
     ) -> Result<(T, Vec<OutputCorruptionKind>), LlmError> {
+        self.telemetry.record_started(provider).await;
         match result {
             Ok(response) => {
                 let corruptions = content(&response)
@@ -62,7 +63,14 @@ impl StreamIntegrityProvider {
         result: Result<LlmStream<'a>, LlmError>,
         started_at: Instant,
     ) -> Result<LlmStream<'a>, LlmError> {
-        let provider = self.inner.active_model_name();
+        let fallback_provider = self.inner.active_model_name();
+        let provider = result
+            .as_ref()
+            .err()
+            .and_then(error_provider)
+            .unwrap_or(&fallback_provider)
+            .to_string();
+        self.telemetry.record_started(&provider).await;
         let stream = match result {
             Ok(stream) => stream,
             Err(error) => {
@@ -72,13 +80,28 @@ impl StreamIntegrityProvider {
                 return Err(error);
             }
         };
-        self.telemetry.record_started(&provider).await;
         Ok(integrity_stream(
             stream,
             Arc::clone(&self.telemetry),
             provider,
             started_at,
         ))
+    }
+}
+
+fn error_provider(error: &LlmError) -> Option<&str> {
+    match error {
+        LlmError::RequestFailed { provider, .. }
+        | LlmError::RateLimited { provider, .. }
+        | LlmError::InvalidResponse { provider, .. }
+        | LlmError::ModelNotAvailable { provider, .. }
+        | LlmError::AuthFailed { provider }
+        | LlmError::SessionExpired { provider }
+        | LlmError::SessionRenewalFailed { provider, .. } => Some(provider),
+        LlmError::ContextLengthExceeded { .. }
+        | LlmError::Http(_)
+        | LlmError::Json(_)
+        | LlmError::Io(_) => None,
     }
 }
 
@@ -102,15 +125,18 @@ impl LlmProvider for StreamIntegrityProvider {
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse, LlmError> {
         let started_at = Instant::now();
-        let provider = self.inner.active_model_name();
-        self.telemetry.record_started(&provider).await;
+        let result = self.inner.complete(request).await;
+        let fallback_provider = self.inner.active_model_name();
+        let provider = result
+            .as_ref()
+            .err()
+            .and_then(error_provider)
+            .unwrap_or(&fallback_provider)
+            .to_string();
         let (mut response, corruptions) = self
-            .record_blocking_result(
-                &provider,
-                started_at,
-                self.inner.complete(request).await,
-                |response| Some(response.content.as_str()),
-            )
+            .record_blocking_result(&provider, started_at, result, |response| {
+                Some(response.content.as_str())
+            })
             .await?;
         mark_blocking_output(&mut response.content, &corruptions);
         Ok(response)
@@ -127,15 +153,18 @@ impl LlmProvider for StreamIntegrityProvider {
         request: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
         let started_at = Instant::now();
-        let provider = self.inner.active_model_name();
-        self.telemetry.record_started(&provider).await;
+        let result = self.inner.complete_with_tools(request).await;
+        let fallback_provider = self.inner.active_model_name();
+        let provider = result
+            .as_ref()
+            .err()
+            .and_then(error_provider)
+            .unwrap_or(&fallback_provider)
+            .to_string();
         let (mut response, corruptions) = self
-            .record_blocking_result(
-                &provider,
-                started_at,
-                self.inner.complete_with_tools(request).await,
-                |response| response.content.as_deref(),
-            )
+            .record_blocking_result(&provider, started_at, result, |response| {
+                response.content.as_deref()
+            })
             .await?;
         if let Some(content) = response.content.as_mut() {
             mark_blocking_output(content, &corruptions);
