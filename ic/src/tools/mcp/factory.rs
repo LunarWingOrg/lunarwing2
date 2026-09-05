@@ -202,9 +202,26 @@ impl McpRuntimeAdapter for HttpRuntimeAdapter {
     }
 
     async fn connect(&self, request: McpRuntimeRequest<'_>) -> Result<McpClient, McpFactoryError> {
-        let (server, context) = request.into_parts();
+        let (mut server, context) = request.into_parts();
         let server_name = server.name.clone();
-        if let Some(secrets) = context.secrets() {
+        let resolved_header_secrets = resolve_http_header_secrets(
+            &server_name,
+            &server,
+            context.secrets().as_deref(),
+            context.user_id(),
+        )
+        .await?;
+        for (header_name, value) in &resolved_header_secrets {
+            server
+                .headers
+                .insert(header_name.clone(), value.expose_secret().to_string());
+        }
+        // A configured header secret is the server's static credential: skip
+        // the OAuth path entirely so stored tokens (including stale ones from
+        // earlier auth attempts) cannot override the resolved header.
+        if server.header_secrets.is_empty()
+            && let Some(secrets) = context.secrets()
+        {
             let has_tokens =
                 crate::tools::mcp::is_authenticated(&server, &secrets, context.user_id()).await;
             if has_tokens || server.requires_auth() {
@@ -628,6 +645,43 @@ async fn verify_wasm_provenance(
     })
 }
 
+/// Resolve owner-scoped HTTP header secret references for one activation.
+///
+/// The secret value replaces the header value entirely (store `Bearer
+/// lwst_…` as the secret for an `Authorization` header). Fails closed when
+/// the store is unavailable or a secret is missing for the activating owner.
+async fn resolve_http_header_secrets(
+    server_name: &str,
+    server: &McpServerConfig,
+    secrets: Option<&(dyn SecretsStore + Send + Sync)>,
+    user_id: &str,
+) -> Result<Vec<(String, SecretString)>, McpFactoryError> {
+    let mut resolved = Vec::new();
+    if server.header_secrets.is_empty() {
+        return Ok(resolved);
+    }
+    let secrets = secrets.ok_or_else(|| McpFactoryError::InvalidConfig {
+        name: server_name.to_string(),
+        reason: "HTTP header secret references require an available secrets store".to_string(),
+    })?;
+    for (header_name, secret_name) in &server.header_secrets {
+        let secret = secrets
+            .get_decrypted(user_id, secret_name)
+            .await
+            .map_err(|error| McpFactoryError::InvalidConfig {
+                name: server_name.to_string(),
+                reason: format!(
+                    "failed to resolve secret '{secret_name}' for HTTP header '{header_name}': {error}"
+                ),
+            })?;
+        resolved.push((
+            header_name.clone(),
+            SecretString::from(secret.expose().to_string()),
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Resolve configured values and owner-scoped secret references for one spawn.
 /// Resolver-owned secret strings are zeroized when client creation finishes.
 async fn resolve_stdio_env(
@@ -921,6 +975,166 @@ mod tests {
         .await
         .expect_err("missing owner secret must fail");
         assert!(wrong_owner.to_string().contains("api_token"));
+    }
+
+    #[tokio::test]
+    async fn resolves_owner_scoped_http_header_secrets() {
+        let store = test_secrets_store();
+        store
+            .create(
+                "kageho",
+                crate::secrets::CreateSecretParams::new(
+                    "lw2study_hosted_token",
+                    "Bearer lwst_value",
+                ),
+            )
+            .await
+            .expect("create secret");
+
+        let server = McpServerConfig::new("study-notes", "http://127.0.0.1:1").with_header_secrets(
+            HashMap::from([(
+                "Authorization".to_string(),
+                "lw2study_hosted_token".to_string(),
+            )]),
+        );
+        let resolved =
+            resolve_http_header_secrets("study-notes", &server, Some(store.as_ref()), "kageho")
+                .await
+                .expect("resolve header secrets");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, "Authorization");
+        assert_eq!(resolved[0].1.expose_secret(), "Bearer lwst_value");
+    }
+
+    #[tokio::test]
+    async fn http_header_secrets_fail_closed() {
+        let server = McpServerConfig::new("study-notes", "http://127.0.0.1:1").with_header_secrets(
+            HashMap::from([(
+                "Authorization".to_string(),
+                "lw2study_hosted_token".to_string(),
+            )]),
+        );
+
+        let no_store = resolve_http_header_secrets("study-notes", &server, None, "kageho")
+            .await
+            .expect_err("missing store must fail");
+        assert!(no_store.to_string().contains("secrets store"));
+
+        let store = test_secrets_store();
+        let missing =
+            resolve_http_header_secrets("study-notes", &server, Some(store.as_ref()), "kageho")
+                .await
+                .expect_err("missing secret must fail");
+        assert!(missing.to_string().contains("lw2study_hosted_token"));
+
+        store
+            .create(
+                "other-owner",
+                crate::secrets::CreateSecretParams::new(
+                    "lw2study_hosted_token",
+                    "Bearer lwst_other",
+                ),
+            )
+            .await
+            .expect("create other-owner secret");
+        let wrong_owner =
+            resolve_http_header_secrets("study-notes", &server, Some(store.as_ref()), "kageho")
+                .await
+                .expect_err("wrong-owner secret must fail");
+        assert!(wrong_owner.to_string().contains("lw2study_hosted_token"));
+    }
+
+    #[tokio::test]
+    async fn http_header_secret_reaches_wire_and_skips_stored_auth() {
+        use axum::{Router, extract::Request, routing::post};
+        use std::sync::Mutex as StdMutex;
+        use tokio::net::TcpListener;
+
+        let captured: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let captured_for_handler = Arc::clone(&captured);
+        let app = Router::new().route(
+            "/",
+            post(move |req: Request| {
+                let captured = Arc::clone(&captured_for_handler);
+                async move {
+                    *captured.lock().unwrap() = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string);
+                    let body_value = axum::body::to_bytes(req.into_body(), 1 << 20)
+                        .await
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+                    let id = body_value
+                        .as_ref()
+                        .and_then(|body| body.get("id").cloned())
+                        .unwrap_or(serde_json::Value::Null);
+                    let method = body_value
+                        .as_ref()
+                        .and_then(|body| body.get("method"))
+                        .and_then(|method| method.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let result = if method == "tools/list" {
+                        serde_json::json!({"tools": []})
+                    } else {
+                        serde_json::json!({
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "serverInfo": {"name": "echo", "version": "0"},
+                        })
+                    };
+                    axum::response::Json(serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let store = test_secrets_store();
+        store
+            .create(
+                "kageho",
+                crate::secrets::CreateSecretParams::new(
+                    "lw2study_hosted_token",
+                    "Bearer lwst_value",
+                ),
+            )
+            .await
+            .expect("create secret");
+
+        let server = McpServerConfig::new("study-notes", format!("http://{address}"))
+            .with_header_secrets(HashMap::from([(
+                "Authorization".to_string(),
+                "lw2study_hosted_token".to_string(),
+            )]));
+        let sessions = Arc::new(McpSessionManager::new());
+        let processes = Arc::new(McpProcessManager::new());
+        let client = create_client_from_config(
+            server,
+            &sessions,
+            &processes,
+            Some(Arc::clone(&store) as Arc<dyn SecretsStore + Send + Sync>),
+            "kageho",
+        )
+        .await
+        .expect("activation with header secrets succeeds");
+        client.test_connection().await.expect("connection succeeds");
+
+        let captured_value = captured.lock().unwrap().clone();
+        assert_eq!(
+            captured_value.as_deref(),
+            Some("Bearer lwst_value"),
+            "resolved secret must reach the wire as the Authorization header"
+        );
+        client.shutdown().await.expect("shutdown client");
+        server_handle.abort();
     }
 
     #[cfg(target_os = "linux")]

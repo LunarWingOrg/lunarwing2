@@ -371,7 +371,7 @@ impl KnowledgeShareHook {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "libsql"))]
     fn with_global_max_per_hour(mut self, limit: usize) -> Self {
         self.global_max_per_hour = limit.max(1);
         self

@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use lunarwing::db::DatabaseHandles;
-use lunarwing::secrets::{CreateSecretParams, SecretsCrypto, SecretsStore};
+#[cfg(feature = "libsql")]
+use lunarwing::secrets::CreateSecretParams;
+use lunarwing::secrets::{SecretsCrypto, SecretsStore};
 
 // ---------------------------------------------------------------------------
 // Helpers

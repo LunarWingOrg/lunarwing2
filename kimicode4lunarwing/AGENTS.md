@@ -18,7 +18,7 @@ The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1`
 
 ## Build Notes
 
-The Dockerfile installs the official Kimi Code CLI from npm (`@moonshot-ai/kimi-code@<KIMI_CODE_VERSION>`). For reproducible builds, pin a specific version by changing the `KIMI_CODE_VERSION` build arg (default `0.39.1`). The bridge itself compiles from TypeScript at build time.
+The Dockerfile installs the official Kimi Code CLI with `npm ci` from `kimi-cli/package-lock.json`; update that lock and the `KIMI_CODE_VERSION` default together. The bridge uses `scripts/package-lock.json`. Base images, Debian package indexes, rustup, and Go archives are pinned, so refresh their recorded digests/checksums deliberately rather than restoring unlocked installers.
 
 ## Do Not
 

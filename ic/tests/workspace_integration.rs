@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+#![cfg(all(feature = "postgres", feature = "integration"))]
 //! Integration tests for the workspace module.
 //!
 //! Requires a running PostgreSQL with pgvector extension.
@@ -6,31 +6,22 @@
 
 use std::sync::Arc;
 
+use lunarwing::config::DatabaseConfig;
+use lunarwing::db::Database;
+use lunarwing::db::postgres::PgBackend;
 use lunarwing::workspace::{MockEmbeddings, SearchConfig, Workspace, paths};
 
-fn get_pool() -> deadpool_postgres::Pool {
+async fn get_pool() -> deadpool_postgres::Pool {
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://localhost/lunarwing_test".to_string());
-
-    let config: tokio_postgres::Config = database_url.parse().expect("Invalid DATABASE_URL");
-
-    let mgr = deadpool_postgres::Manager::new(config, tokio_postgres::NoTls);
-    deadpool_postgres::Pool::builder(mgr)
-        .max_size(4)
-        .build()
-        .expect("Failed to create pool")
-}
-
-/// Try to get a connection, returning None if Postgres is unreachable.
-/// Tests call this to skip gracefully in CI where no database is available.
-async fn try_connect(pool: &deadpool_postgres::Pool) -> Option<()> {
-    match pool.get().await {
-        Ok(_) => Some(()),
-        Err(e) => {
-            eprintln!("skipping: database unavailable ({e})");
-            None
-        }
-    }
+    let backend = PgBackend::new(&DatabaseConfig::from_postgres_url(&database_url, 4))
+        .await
+        .expect("failed to connect to PostgreSQL test service");
+    backend
+        .run_migrations()
+        .await
+        .expect("failed to run PostgreSQL test migrations");
+    backend.pool()
 }
 
 async fn cleanup_user(pool: &deadpool_postgres::Pool, user_id: &str) {
@@ -45,10 +36,7 @@ async fn cleanup_user(pool: &deadpool_postgres::Pool, user_id: &str) {
 
 #[tokio::test]
 async fn test_workspace_write_and_read() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_write_read";
     cleanup_user(&pool, user_id).await;
 
@@ -73,10 +61,7 @@ async fn test_workspace_write_and_read() {
 
 #[tokio::test]
 async fn test_workspace_append() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_append";
     cleanup_user(&pool, user_id).await;
 
@@ -103,10 +88,7 @@ async fn test_workspace_append() {
 
 #[tokio::test]
 async fn test_workspace_nested_paths() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_nested";
     cleanup_user(&pool, user_id).await;
 
@@ -151,10 +133,7 @@ async fn test_workspace_nested_paths() {
 
 #[tokio::test]
 async fn test_workspace_delete() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_delete";
     cleanup_user(&pool, user_id).await;
 
@@ -178,10 +157,7 @@ async fn test_workspace_delete() {
 
 #[tokio::test]
 async fn test_workspace_memory_operations() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_memory_ops";
     cleanup_user(&pool, user_id).await;
 
@@ -209,10 +185,7 @@ async fn test_workspace_memory_operations() {
 
 #[tokio::test]
 async fn test_workspace_daily_log() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_daily_log";
     cleanup_user(&pool, user_id).await;
 
@@ -238,10 +211,7 @@ async fn test_workspace_daily_log() {
 
 #[tokio::test]
 async fn test_workspace_fts_search() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_fts_search";
     cleanup_user(&pool, user_id).await;
 
@@ -299,10 +269,7 @@ async fn test_workspace_fts_search() {
 
 #[tokio::test]
 async fn test_workspace_hybrid_search_with_mock_embeddings() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_hybrid_search";
     cleanup_user(&pool, user_id).await;
 
@@ -341,10 +308,7 @@ async fn test_workspace_hybrid_search_with_mock_embeddings() {
 
 #[tokio::test]
 async fn test_workspace_list_all() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_list_all";
     cleanup_user(&pool, user_id).await;
 
@@ -369,10 +333,7 @@ async fn test_workspace_list_all() {
 
 #[tokio::test]
 async fn test_workspace_system_prompt() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let user_id = "test_system_prompt";
     cleanup_user(&pool, user_id).await;
 
@@ -415,10 +376,7 @@ async fn test_workspace_system_prompt() {
 
 #[tokio::test]
 async fn test_multi_scope_read_across_scopes() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_read";
     let alice_id = "ms_alice_read";
     cleanup_user(&pool, shared_id).await;
@@ -447,10 +405,7 @@ async fn test_multi_scope_read_across_scopes() {
 
 #[tokio::test]
 async fn test_multi_scope_write_stays_in_primary() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_write";
     let alice_id = "ms_alice_write";
     cleanup_user(&pool, shared_id).await;
@@ -475,10 +430,7 @@ async fn test_multi_scope_write_stays_in_primary() {
 
 #[tokio::test]
 async fn test_multi_scope_list_all_merges() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_list";
     let alice_id = "ms_alice_list";
     cleanup_user(&pool, shared_id).await;
@@ -520,10 +472,7 @@ async fn test_multi_scope_list_all_merges() {
 
 #[tokio::test]
 async fn test_multi_scope_list_directory_merges() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_dir";
     let alice_id = "ms_alice_dir";
     cleanup_user(&pool, shared_id).await;
@@ -563,10 +512,7 @@ async fn test_multi_scope_list_directory_merges() {
 
 #[tokio::test]
 async fn test_multi_scope_read_priority_primary_first() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_prio";
     let alice_id = "ms_alice_prio";
     cleanup_user(&pool, shared_id).await;
@@ -604,10 +550,7 @@ async fn test_multi_scope_read_priority_primary_first() {
 
 #[tokio::test]
 async fn test_multi_scope_exists_spans_scopes() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_exists";
     let alice_id = "ms_alice_exists";
     cleanup_user(&pool, shared_id).await;
@@ -646,10 +589,7 @@ async fn test_multi_scope_exists_spans_scopes() {
 
 #[tokio::test]
 async fn test_multi_scope_search_spans_scopes() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_search";
     let alice_id = "ms_alice_search";
     cleanup_user(&pool, shared_id).await;
@@ -689,10 +629,7 @@ async fn test_multi_scope_search_spans_scopes() {
 
 #[tokio::test]
 async fn test_multi_scope_append_stays_in_primary() {
-    let pool = get_pool();
-    if try_connect(&pool).await.is_none() {
-        return;
-    }
+    let pool = get_pool().await;
     let shared_id = "ms_shared_append";
     let alice_id = "ms_alice_append";
     cleanup_user(&pool, shared_id).await;

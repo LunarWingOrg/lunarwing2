@@ -17,6 +17,10 @@ Implemented scope includes:
 - Explicit install, activate, deactivate, update, remove, auth, and diagnostics paths.
 - Owner-scoped secret references with restricted child environment inheritance.
 - Whole-runtime stdio and trapped-WASM recovery with fresh config and secret resolution.
+- Owner-scoped secret references with restricted child environment inheritance.
+- HTTP header secret references (`header_secrets` / `--secret-header`): owner-scoped
+  resolution at activation for static-credential HTTP servers, with explicit
+  OAuth suppression while configured.
 - Per-server cancellable recovery tasks, bounded jittered retries, a 30-second
   stability window, and a five-attempt circuit breaker.
 - Generation-safe lifecycle serialization and all-or-none tool registration.

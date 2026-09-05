@@ -678,7 +678,7 @@ write_tenant_lunarwing_env() {
   # --gateway-host, --xmpp-allow-from). An explicit flag value wins; else an
   # existing file value is preserved on re-run; else the hardcoded default
   # (LLM_MODEL, GATEWAY_HOST) or the owner JID alone (XMPP_ALLOW_FROM).
-  local llm_model_effective gateway_host_effective xmpp_allow_from_effective
+  local llm_model_effective gateway_host_effective mascot_enabled xmpp_allow_from_effective
   if [[ -n "$llm_model" ]]; then
     llm_model_effective="$llm_model"
   else
@@ -691,6 +691,8 @@ write_tenant_lunarwing_env() {
     gateway_host_effective="$(_env_existing "$path" GATEWAY_HOST)"
     gateway_host_effective="${gateway_host_effective:-127.0.0.1}"
   fi
+  mascot_enabled="$(_env_existing "$path" MASCOT_ENABLED)"
+  mascot_enabled="${mascot_enabled:-false}"
   if [[ -n "$xmpp_allow_from" ]]; then
     xmpp_allow_from_effective="$(build_xmpp_allow_from "$xmpp_jid" "$xmpp_allow_from")"
   else
@@ -781,6 +783,7 @@ GATEWAY_ENABLED=true
 GATEWAY_HOST=$gateway_host_effective
 GATEWAY_PORT=$gateway_port
 GATEWAY_AUTH_TOKEN=$gateway_token
+MASCOT_ENABLED=$mascot_enabled
 
 # HTTP webhook (bound to localhost only; secret-protected)
 HTTP_HOST=127.0.0.1

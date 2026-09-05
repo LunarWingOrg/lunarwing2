@@ -121,6 +121,42 @@ fn requests_secret_environment(params: &serde_json::Value) -> bool {
     })
 }
 
+fn requests_secret_headers(params: &serde_json::Value) -> bool {
+    params.get("header_secrets").is_some_and(|value| {
+        value
+            .as_object()
+            .is_none_or(|mappings| !mappings.is_empty())
+    })
+}
+
+fn http_mcp_config(
+    params: &serde_json::Value,
+    name: &str,
+) -> Result<Option<McpServerConfig>, ToolError> {
+    let headers = string_map_param(params, "headers", "MCP HTTP headers")?;
+    let header_secrets = string_map_param(
+        params,
+        "header_secrets",
+        "MCP HTTP header secret references",
+    )?;
+    if headers.is_none() && header_secrets.is_none() {
+        return Ok(None);
+    }
+    let url = params.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+        ToolError::InvalidParameters(
+            "MCP server URL is required for HTTP transport with headers".to_string(),
+        )
+    })?;
+    let mut config = McpServerConfig::new(name, url);
+    if let Some(headers) = headers {
+        config = config.with_headers(headers);
+    }
+    if let Some(header_secrets) = header_secrets {
+        config = config.with_header_secrets(header_secrets);
+    }
+    Ok(Some(config))
+}
+
 fn placement_param(params: &serde_json::Value) -> Result<Option<McpPlacement>, ToolError> {
     let Some(value) = params.get("placement") else {
         return Ok(None);
@@ -256,17 +292,12 @@ impl ToolInstallTool {
                 McpServerConfig::new_stdio_with_secrets(name, command, args, env, env_secrets)
             }
             Some("http") => {
-                if params.get("url").and_then(|v| v.as_str()).is_none() {
-                    return Err(ToolError::InvalidParameters(
-                        "MCP server URL is required for HTTP transport".to_string(),
-                    ));
-                }
                 if placement == McpPlacement::JobWorker {
                     return Err(ToolError::InvalidParameters(
                         "Job-worker MCP servers only support stdio transport".to_string(),
                     ));
                 }
-                return Ok(None);
+                return http_mcp_config(params, name);
             }
             Some("wasm") => wasm_mcp_config(params, name)?,
             Some("gateway") => gateway_mcp_config(params, name)?,
@@ -274,6 +305,24 @@ impl ToolInstallTool {
                 return Err(ToolError::InvalidParameters(format!(
                     "Unsupported MCP transport '{other}'"
                 )));
+            }
+            None if params.get("url").is_some()
+                && (params.get("headers").is_some() || params.get("header_secrets").is_some()) =>
+            {
+                // Headers default the transport to http when a url is present.
+                if placement == McpPlacement::JobWorker {
+                    return Err(ToolError::InvalidParameters(
+                        "Job-worker MCP servers only support stdio transport".to_string(),
+                    ));
+                }
+                match http_mcp_config(params, name)? {
+                    Some(config) => return Ok(Some(config)),
+                    None => {
+                        return Err(ToolError::InvalidParameters(
+                            "MCP transport is required when headers are provided".to_string(),
+                        ));
+                    }
+                }
             }
             None if params.get("command").is_some()
                 || params.get("args").is_some()
@@ -357,6 +406,16 @@ impl Tool for ToolInstallTool {
                     "additionalProperties": {"type": "string"},
                     "description": "Environment variable names mapped to owner-scoped LunarWing secret names. Raw values are exposed only to selected host or job-local stdio MCP process."
                 },
+                "headers": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Custom HTTP headers for an http-transport MCP server. Values are stored as provided; prefer header_secrets for credentials."
+                },
+                "header_secrets": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "HTTP header names mapped to owner-scoped LunarWing secret names (http transport). The secret value replaces the header value at activation; for bearer auth store the full value including the scheme prefix."
+                },
                 "component_path": {
                     "type": "string",
                     "description": "Absolute component path for MCP-over-WASM"
@@ -426,7 +485,7 @@ impl Tool for ToolInstallTool {
     }
 
     fn requires_approval(&self, params: &serde_json::Value) -> ApprovalRequirement {
-        if requests_secret_environment(params) {
+        if requests_secret_environment(params) || requests_secret_headers(params) {
             ApprovalRequirement::Always
         } else {
             ApprovalRequirement::UnlessAutoApproved

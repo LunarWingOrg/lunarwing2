@@ -1089,6 +1089,7 @@ mod tests {
         assert!(!deleted);
     }
 
+    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_harness_with_channel() {
         let harness = TestHarnessBuilder::new().with_stub_channel().build().await;

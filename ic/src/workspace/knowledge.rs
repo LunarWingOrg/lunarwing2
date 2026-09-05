@@ -719,6 +719,7 @@ mod tests {
     fn needs_verification_rules() {
         let mut meta = sample_meta();
         let now = Utc::now();
+        meta.studied_at = Some(now);
         // Active, fresh, matching commit.
         assert!(!meta.needs_verification(now, Some(30), Some("abc123")));
         // Status alone triggers.
