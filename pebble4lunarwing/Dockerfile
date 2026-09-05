@@ -1,5 +1,6 @@
 ARG PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG SOURCE_REVISION=unknown
 
 FROM docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
 
@@ -34,12 +35,14 @@ RUN cd pebble && cargo build --release --locked --bin pebble
 FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ARG DEBIAN_SNAPSHOT
+ARG SOURCE_REVISION
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # Pass --build-arg WITH_TOOLCHAINS=true for the fat image (dev containers that
 # must compile native code), matching the opencode/kimi toolchain profile.
 ARG WITH_TOOLCHAINS=false
 
-LABEL org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
+LABEL org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
 RUN set -eu; \
     rm -f /etc/apt/sources.list.d/debian.sources; \
