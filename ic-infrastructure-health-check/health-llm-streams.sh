@@ -17,7 +17,9 @@ malformed=0
 add_snapshot() {
     local tenant="$1" file="$2" snapshot recent=0
     [[ -f "$file" ]] || return 0
-    if ! snapshot="$(jq -c . "$file" 2>/dev/null)"; then
+    if ! snapshot="$(jq -ce \
+        'select(.schema_version == 1 and (.providers | type == "object"))' \
+        "$file" 2>/dev/null)"; then
         issues="$(jq -c --arg tenant "$tenant" --arg file "$file" \
             '. + ["invalid stream telemetry snapshot for " + $tenant + ": " + $file]' <<<"$issues")"
         malformed=1
