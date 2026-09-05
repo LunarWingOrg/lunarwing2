@@ -55,6 +55,8 @@ pub enum LlmStreamChunk {
         name: Option<String>,
         args_delta: String,
     },
+    /// Provider recovery or integrity fact, kept separate from assistant text.
+    ProviderObservation(String),
     /// Terminal stream metadata. The stream ends after this chunk.
     Done {
         usage: Option<TokenUsage>,
