@@ -24,6 +24,7 @@ variables:
     reports:
       dotenv: worker-image.env
     paths:
+      - worker-image.env
       - worker-image-metadata.json
       - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
