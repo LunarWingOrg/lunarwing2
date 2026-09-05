@@ -1,39 +1,36 @@
-# Pin the Kimi Code CLI to a reviewed npm release for reproducible builds.
-# Override with: docker build --build-arg KIMI_CODE_VERSION=0.39.1 ...
-# Bump this default when upgrading the worker to a newer kimi-code release.
-# Declared in global scope so both stages share one default; the runtime
-# stage re-declares `ARG KIMI_CODE_VERSION` (no default) to consume it.
+# Keep release inputs immutable: the CLI version is cross-checked against the
+# committed npm lock, and package indexes come from one Debian snapshot.
 ARG KIMI_CODE_VERSION=0.39.1
+ARG DEBIAN_SNAPSHOT=20260901T000000Z
 
 # ──────────────────────────────
 # Stage 1: build the bridge + tests
 # ──────────────────────────────
-FROM docker.io/library/node:22-bookworm-slim AS builder
+FROM docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS builder
 
+ARG DEBIAN_SNAPSHOT
 WORKDIR /build
 
-# Snapshot fallback helper — tries live mirror first, falls back to
-# snapshot.debian.org if live mirror has an invalid signature.
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update; \
-    }) && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
-      python3 make g++ ca-certificates && \
+      python3 make g++ ca-certificates; \
     rm -rf /var/lib/apt/lists/*
 
-# Install ws (WebSocket library) and typescript. package.json pins a reviewed release.
-COPY scripts/package.json scripts/tsconfig.json ./scripts/
+COPY scripts/package.json scripts/package-lock.json scripts/tsconfig.json ./scripts/
 COPY scripts/*.ts ./scripts/
 # entrypoint_config_test.js reads ../entrypoint.sh — ship it in the build
 # stage so the in-build test gate validates the actual shipped entrypoint.
 COPY entrypoint.sh /build/entrypoint.sh
 
 WORKDIR /build/scripts
-RUN npm install --omit=dev --ignore-scripts && \
-    npm install --no-save typescript@5.9.3 @types/node@22.20.1 @types/ws@8.18.1 && \
+RUN npm ci --ignore-scripts && \
     npx tsc -p tsconfig.json && \
     npm test && \
     rm -rf node_modules/.cache
@@ -41,8 +38,9 @@ RUN npm install --omit=dev --ignore-scripts && \
 # ──────────────────────────────
 # Stage 2: runtime image
 # ──────────────────────────────
-FROM docker.io/library/node:22-bookworm-slim AS runtime
+FROM docker.io/library/node:22-bookworm-slim@sha256:83f487e0a63425e5b4d146fb5e5be574bcbe1b7b843d3ebafdd95eaf7767a7e5 AS runtime
 
+ARG DEBIAN_SNAPSHOT
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # Pass --build-arg WITH_TOOLCHAINS=true for the fat image (CI, dev tenants).
 ARG WITH_TOOLCHAINS=false
@@ -52,36 +50,34 @@ LABEL org.opencontainers.image.title="LunarWing Kimi Code Worker" \
       org.opencontainers.image.version="1.0.0" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-# Runtime packages: always installed (needed by the worker itself).
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update; \
-    }) && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
       tini \
       python3 \
       python3-pip \
       python3-venv \
       git \
+      gh \
       ripgrep \
       curl \
       wget \
       ca-certificates \
       openssh-client \
       jq \
-      neovim \
-    && rm -rf /var/lib/apt/lists/*
+      neovim; \
+    rm -rf /var/lib/apt/lists/*
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      set -e; \
-      (apt-get update 2>/dev/null || { \
-        echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-        sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update; \
-      }) && \
+      set -eu; \
+      apt-get -o Acquire::Check-Valid-Until=false update; \
       apt-get install -y --no-install-recommends \
         python3-dev \
         build-essential \
@@ -114,33 +110,43 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         libtool \
         meson \
         nodejs \
-        npm \
-      && rm -rf /var/lib/apt/lists/*; \
+        npm; \
+      rm -rf /var/lib/apt/lists/*; \
     fi
-
-# ── GitHub CLI ─────────────────
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────────────
 ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | CARGO_HOME=/usr/local/cargo sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) RUST_TARGET=x86_64-unknown-linux-gnu; RUSTUP_SHA=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;; \
+        arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
+        *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
+      echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
+      chmod +x /tmp/rustup-init; \
+      CARGO_HOME=/usr/local/cargo /tmp/rustup-init -y --no-modify-path \
+        --profile minimal --default-toolchain 1.96.1; \
+      rm /tmp/rustup-init; \
+      chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────────────
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      ARCH=$(dpkg --print-architecture) \
-      && curl -fsSL "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz" \
-        | tar -C /usr/local -xz; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) GO_SHA=3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8 ;; \
+        arm64) GO_SHA=a463cb59382bd7ae7d8f4c68846e73c4d589f223c589ac76871b66811ded7836 ;; \
+        *) echo "unsupported Go architecture" >&2; exit 1 ;; \
+      esac; \
+      ARCH=$(dpkg --print-architecture); \
+      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
+      tar -C /usr/local -xzf /tmp/go.tgz; \
+      rm /tmp/go.tgz; \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/kimi/go \
@@ -164,13 +170,14 @@ COPY --chown=kimi:kimi config/ ./config/
 RUN chmod +x /app/entrypoint.sh /app/health_server.py
 
 # ── Kimi Code CLI ─────────────────────────────────────────────────────────────
-# Install the official Kimi Code CLI from npm. Pinned to a known-good release.
-# Consume the global pin and record it in the runtime image so operators can
-# tell which upstream kimi-code release a running worker was built from
-# (surfaced on the /health endpoint as `kimi_code_version`).
+# npm ci verifies every bridge and CLI dependency against committed integrity
+# hashes. An override that disagrees with the lock fails instead of re-resolving.
 ARG KIMI_CODE_VERSION
 ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
-RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} && \
+COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
+RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
+    npm ci --omit=dev --prefix /opt/kimi-cli && \
+    ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
     npm cache clean --force
 
