@@ -151,7 +151,7 @@ Leave request buffering off.
 
 | Step | Jobs | Contract |
 |---|---|---|
-| Candidate | `worker-{pebble,opencode,kimi}-candidate` | Rootless BuildKit pushes one unique `<full-sha>-<pipeline>-<job>` tag |
+| Candidate | `worker-{pebble,opencode,kimi}-candidate` | Rootless BuildKit pushes a unique `<full-sha>-<pipeline>-<job>` tag, then performs one uncached rebuild and requires the same digest |
 | Verify | `worker-*-scan` | Trivy scans that exact digest for critical findings and emits a CycloneDX SBOM |
 | Promote | `worker-*-promote` | A serialized, non-interruptible job copies the tested manifest to the protected release tag without rebuilding |
 
@@ -170,8 +170,12 @@ Details:
 - Worker source revisions, base images, npm/Bun/Cargo locks, Debian snapshots,
   and optional Rust/Go downloads are fixed in source. Build arguments are
   hard-coded in `.gitlab/scripts/build-worker-image.sh`, not pipeline variables.
-- `worker-image.env`, BuildKit metadata, and `worker-inputs.sha256` bind the
-  verification jobs to the candidate. Promotion re-reads the registry manifest,
+  `SOURCE_DATE_EPOCH` comes from the source commit and BuildKit rewrites layer
+  timestamps. A second `--no-cache` build is pushed under a sibling tag; any
+  digest mismatch blocks scanning and promotion.
+- `worker-image.env`, both BuildKit metadata records, and
+  `worker-inputs.sha256` bind the verification jobs to the candidate. Promotion
+  also requires the recorded rebuild digest, re-reads the registry manifest,
   checks its digest and source revision label, validates the health check and
   entrypoint, and refuses to retarget an existing release tag to another digest.
 - The retained `worker-image-evidence.json` records full source SHA, source/input
