@@ -334,10 +334,10 @@ Local includes cannot be fully linted until this branch exists on GitLab.
 10. Confirm an ordinary branch, MR, web/API/trigger pipeline, and an unprotected
     tag receive no registry-writing jobs. Confirm re-running a candidate creates
     a new full-SHA/pipeline/job tag and cannot replace the first candidate.
-11. Promote once and retain `worker-image-evidence.json`. A second promotion to
-    an already-used release tag must be idempotent for the same digest and fail
-    if the tag points to different bytes. Tenant configuration must use the
-    recorded digest, never `latest`.
+11. Promote once and retain `worker-image-evidence.json`. Promotion writes a
+    worker-specific tag such as `v2.1.0.0-rc1-kimi`; a second promotion to that
+    tag must be idempotent for the same digest and fail if it points to different
+    bytes. Tenant configuration must use the recorded digest, never `latest`.
 
 ### 5. Add the nightly observation schedule
 
