@@ -221,6 +221,14 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         errors.append("worker candidate and promotion templates must be non-interruptible")
     if candidate.get("retry") != 0 or promotion.get("retry") != 0:
         errors.append("worker publication must not retry after a timeout or partial push")
+    scan_script = "\n".join(merged.get(".worker-scan", {}).get("script", []))
+    if ". ./worker-image.env" not in scan_script:
+        errors.append("worker scan must reload candidate values from its artifact")
+    promotion_helper = ROOT / ".gitlab/scripts/promote-worker-image.py"
+    if not promotion_helper.is_file() or "candidate_metadata()" not in promotion_helper.read_text(
+        encoding="utf-8"
+    ):
+        errors.append("worker promotion must load candidate values from its artifact")
     build_helper = ROOT / ".gitlab/scripts/build-worker-image.sh"
     if not build_helper.is_file():
         errors.append("worker candidate helper is missing")
@@ -251,9 +259,10 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         ]
         if not active_rules or any(
             "CI_COMMIT_REF_PROTECTED" not in str(rule.get("if", ""))
+            or 'CI_PIPELINE_SOURCE == "push"' not in str(rule.get("if", ""))
             for rule in active_rules
         ):
-            errors.append(f"{template_name} exposes a rule without protected-ref gating")
+            errors.append(f"{template_name} exposes a non-push or unprotected rule")
 
     for worker in WORKER_NAMES:
         candidate_name = f"worker-{worker}-candidate"
