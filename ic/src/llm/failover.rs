@@ -20,11 +20,13 @@ use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, ModelMetadata,
-    ToolCompletionRequest, ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk,
+    LlmStreamObservation, ModelMetadata, StreamFailureReason, ToolCompletionRequest,
+    ToolCompletionResponse,
 };
 
 use crate::llm::retry::is_retryable;
+use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
 use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
 
 /// Configuration for per-provider cooldown behavior.
@@ -120,6 +122,7 @@ pub struct FailoverProvider {
     epoch: Instant,
     /// Cooldown configuration.
     cooldown_config: CooldownConfig,
+    telemetry: Option<Arc<StreamTelemetry>>,
     /// Request-scoped provider index keyed by Tokio task ID.
     ///
     /// This allows `effective_model_name()` to report the provider that handled
@@ -158,8 +161,14 @@ impl FailoverProvider {
             cooldowns,
             epoch: Instant::now(),
             cooldown_config,
+            telemetry: None,
             provider_for_task: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<StreamTelemetry>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Nanoseconds elapsed since `self.epoch`.
@@ -312,6 +321,9 @@ impl FailoverProvider {
     ) -> Result<(usize, LlmStream<'a>), LlmError> {
         let available = self.available_provider_indexes()?;
         let mut last_error = None;
+        let mut retries = 0;
+        let mut last_reason = StreamFailureReason::Unknown;
+        let mut last_failed_provider = String::new();
 
         for (position, provider_index) in available.iter().copied().enumerate() {
             let provider = self.providers[provider_index].as_ref();
@@ -327,11 +339,32 @@ impl FailoverProvider {
                 FirstStreamItem::Chunk { first, rest } => {
                     self.last_used.store(provider_index, Ordering::Relaxed);
                     self.cooldowns[provider_index].reset();
-                    return Ok((provider_index, replay_first(first, rest)));
+                    let stream = if retries == 0 {
+                        replay_first(first, rest)
+                    } else {
+                        replay_failover_observation(
+                            first,
+                            rest,
+                            LlmStreamObservation::Retried {
+                                provider: last_failed_provider,
+                                attempts: retries,
+                                reason: last_reason,
+                            },
+                        )
+                    };
+                    return Ok((provider_index, stream));
                 }
                 FirstStreamItem::Error(error) if !is_retryable(&error) => return Err(error),
                 FirstStreamItem::Error(error) => {
                     self.record_provider_failure(provider_index);
+                    last_reason = classify_stream_failure(&error);
+                    last_failed_provider = provider.model_name().to_string();
+                    retries += 1;
+                    if let Some(telemetry) = &self.telemetry {
+                        telemetry
+                            .record_retry(&last_failed_provider, last_reason)
+                            .await;
+                    }
                     self.log_next_provider(
                         position,
                         &available,
@@ -349,6 +382,20 @@ impl FailoverProvider {
             reason: "all available providers failed before the first stream chunk".to_string(),
         }))
     }
+}
+
+fn replay_failover_observation<'a>(
+    first: LlmStreamChunk,
+    rest: LlmStream<'a>,
+    observation: LlmStreamObservation,
+) -> LlmStream<'a> {
+    let observation = LlmStreamChunk::Observation(observation);
+    let prefix = if matches!(first, LlmStreamChunk::Done { .. }) {
+        vec![Ok(observation), Ok(first)]
+    } else {
+        vec![Ok(first), Ok(observation)]
+    };
+    futures::stream::iter(prefix).chain(rest).boxed()
 }
 
 #[async_trait]
@@ -678,6 +725,11 @@ mod tests {
             chunks,
             vec![
                 LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Transport,
+                }),
                 LlmStreamChunk::Done {
                     usage: None,
                     finish_reason: "stop".to_string(),
