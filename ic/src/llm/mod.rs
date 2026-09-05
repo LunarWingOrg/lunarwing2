@@ -425,10 +425,10 @@ pub async fn build_provider_chain(
                 ),
                 failure_threshold: config.lunarwing_cloud.failover_cooldown_threshold,
             };
-            Arc::new(FailoverProvider::with_cooldown(
-                vec![llm, fallback],
-                cooldown_config,
-            )?)
+            Arc::new(
+                FailoverProvider::with_cooldown(vec![llm, fallback], cooldown_config)?
+                    .with_telemetry(Arc::clone(&telemetry)),
+            )
         } else {
             llm
         };
