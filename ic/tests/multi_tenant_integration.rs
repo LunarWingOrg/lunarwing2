@@ -29,7 +29,9 @@ use lunarwing::channels::web::server::{
 use lunarwing::channels::web::sse::SseManager;
 use lunarwing::channels::web::test_helpers::TestGatewayBuilder;
 use lunarwing::channels::web::ws::WsConnectionTracker;
+#[cfg(feature = "libsql")]
 use lunarwing::context::JobContext;
+#[cfg(feature = "libsql")]
 use lunarwing::db::Database;
 
 // ---------------------------------------------------------------------------
