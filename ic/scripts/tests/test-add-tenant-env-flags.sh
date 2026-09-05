@@ -120,6 +120,7 @@ envval() {  # <key> — extract value from the last-written fixture env
 out="$(run_writer fixture-tenant)"
 assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensorzero::function_name::lunarwing"
 assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
+assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
 assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
@@ -174,6 +175,7 @@ sed -i \
   -e 's/^COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=.*/COORD_KNOWLEDGE_GLOBAL_MAX_PER_HOUR=777/' \
   -e 's/^COORD_KNOWLEDGE_MIN_CHARS=.*/COORD_KNOWLEDGE_MIN_CHARS=24/' \
   -e 's/^COORD_ADMIN_TOKEN=.*/COORD_ADMIN_TOKEN=preserved-coord-token/' \
+  -e 's/^MASCOT_ENABLED=.*/MASCOT_ENABLED=true/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
   "$MT_FIXTURE/env/lunarwing.env"
@@ -188,6 +190,7 @@ write_tenant_lunarwing_env fixture-tenant \
   "" "" ""
 assert_eq "rerun preserves LLM_MODEL" "$(envval LLM_MODEL)" "glm-5-air"
 assert_eq "rerun preserves GATEWAY_HOST" "$(envval GATEWAY_HOST)" "0.0.0.0"
+assert_eq "rerun preserves MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "true"
 assert_eq "rerun preserves XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost,admin@xmpp.org"
 assert_eq "rerun preserves COORD_ENABLED" "$(envval COORD_ENABLED)" "true"
 assert_eq "rerun preserves COORD_AGENT_ID" "$(envval COORD_AGENT_ID)" "custom-agent"
@@ -216,13 +219,15 @@ assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
 assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
 assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
 
-# Case 3b: upgrade path — an env written by an older version (no ENGINE_V2
-# keys at all) gains the on-by-default values on re-render.
+# Case 3b: upgrade path — an env written by an older version gains defaults
+# for settings introduced after it was provisioned.
 sed -i \
+  -e '/^MASCOT_ENABLED=/d' \
   -e '/^ENGINE_V2=/d' \
   -e '/^ENGINE_V2_CHANNELS=/d' \
   "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
+assert_eq "upgrade adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
 assert_eq "upgrade adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
 assert_eq "upgrade adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"

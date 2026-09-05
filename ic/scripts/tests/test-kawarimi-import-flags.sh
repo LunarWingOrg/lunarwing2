@@ -79,6 +79,7 @@ META
 SECRETS_MASTER_KEY="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 XMPP_JID=kawarimi@example.test
 GATEWAY_HOST=0.0.0.0
+MASCOT_ENABLED=true
 NANOCODE_MODEL=test-nanocode-model
 NANOCODE_BASE_URL=https://nanocode.example.test/openai/v1
 KIMI_API_KEY=kimi-manifest-secret
@@ -299,6 +300,7 @@ assert_file_contains "import keeps target sidecar token" "$tmp/home/kawarimi/lun
 assert_file_contains "import keeps matching daemon token" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "VISION_AUTH_TOKEN=target-vision-token"
 assert_file_not_contains "import ignores carried sidecar token" "$tmp/home/kawarimi/lunarwing/env/vision.env" "LUNARWING_AUTH_TOKEN=vision-token"
 assert_file_contains "import injects Kimi key after provisioning" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "KIMI_API_KEY=kimi-manifest-secret"
+assert_file_contains "import restores mascot preference" "$tmp/home/kawarimi/lunarwing/env/lunarwing.env" "MASCOT_ENABLED=true"
 assert_file_not_contains "import keeps Kimi key out of mt-admin argv" "$tmp/mt-admin.log" "kimi-manifest-secret"
 if [[ "$auto_output" == *"kimi-manifest-secret"* ]]; then
   fail "import keeps Kimi key out of logs"
@@ -306,7 +308,8 @@ else
   pass "import keeps Kimi key out of logs"
 fi
 
-echo "=== export-tenant vision manifest coverage ==="
+echo "=== export-tenant manifest coverage ==="
+assert_file_contains "export carries mascot preference" "$EXPORT_SRC" "GATEWAY_HOST MASCOT_ENABLED HTTP_HOST"
 assert_file_contains "export writes a vision manifest" "$EXPORT_SRC" "manifest-vision.env"
 assert_file_contains "export carries VL_URL" "$EXPORT_SRC" "VL_URL"
 assert_file_contains "export carries VL_MODEL" "$EXPORT_SRC" "VL_MODEL"
