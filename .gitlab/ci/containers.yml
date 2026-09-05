@@ -50,6 +50,7 @@ variables:
     TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
     TRIVY_USERNAME: "$CI_REGISTRY_USER"
   script:
+    - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
     - trivy image --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
