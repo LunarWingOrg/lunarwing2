@@ -3,7 +3,7 @@
 _Last updated: 2026-08-08 — LunarVoice readiness monitoring added._
 
 Automated health monitoring and self-healing for LunarWing infrastructure.
-Eleven parallel component checks aggregate into a JSON report; a separate
+Twelve parallel component checks aggregate into a JSON report; a separate
 watchdog reads that report and auto-remediates unhealthy services with a grace
 period, exponential backoff, a flapping guard, post-restart verification, and
 multi-tenant awareness.
@@ -20,6 +20,7 @@ cron-wrapper.sh
   │     ├── health-clickhouse.sh       (query time, disk, memory)
   │     ├── health-tensorzero.sh       (proxy p50/p95, error rate, queue, GPU)
   │     ├── health-models.sh           (LLM provider APIs)
+  │     ├── health-llm-streams.sh      (provider stream retries, aborts, corruption, TTFC)
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
   │     ├── health-lunarvoice.sh       (enabled local voice sidecars: health + STT readiness)
   │     ├── health-netbird.sh          (opt-in host tunnel readiness)
@@ -113,6 +114,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | clickhouse | health-clickhouse.sh | ClickHouse responsiveness + resources | `query_time_ms`, `disk_pct`, `memory_pct` |
 | tensorzero | health-tensorzero.sh | Proxy latency/errors (from ClickHouse) + GPU | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | health-models.sh | OpenRouter / OpenAI / Anthropic / local LLM APIs | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` (numeric map; `last_error` stays string-only in `providers[]`) |
+| llm_streams | health-llm-streams.sh | Daemon snapshots at `$BASE/runtime/llm-stream-metrics.json`; all registry tenants on MT hosts | Per-provider stream starts/completions, retries by reason, aborts, decode failures, corruption signatures, and time-to-first-chunk samples/max/last; provider and tenant are bounded Prometheus labels |
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
 | lunarvoice | health-lunarvoice.sh | Enabled LunarVoice `/health`, `/ready`, and `/metrics` endpoints | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
@@ -147,6 +149,8 @@ checks can instead be **disabled** so they report `healthy` with
 | `OMEMO_STORE` | health-omemo.sh | `$BASE/omemo` | OMEMO key/bundle/session store |
 | `RATELIMIT_DIR` | health-ratelimit.sh | `$BASE/ratelimit` | Rate-limit state directory |
 | `HEALTH_MODELS_ENABLED` | health-models.sh | `true` | Non-`true` disables (reports healthy/disabled) |
+| `HEALTH_LLM_STREAMS_ISSUE_WINDOW_SECS` | health-llm-streams.sh | `900` | A retry, abort, decode failure, or corruption observed this many seconds ago makes the monitor-only component degraded |
+| `HEALTH_LLM_STREAMS_FILE` | health-llm-streams.sh | _(unset)_ | Test/single-target snapshot override; normal MT operation discovers tenant state paths from `SELF_HEAL_TENANTS_FILE` |
 | `HEALTH_LUNARVISION_ENABLED` | health-lunarvision.sh | `true` | Non-`true` disables (reports healthy/disabled) |
 | `HEALTH_LUNARVISION_URL` | health-lunarvision.sh | _(unset)_ → each registry tenant's external HTTPS origin or local `vision_health` port, else `http://127.0.0.1:8089` | Optional single-URL override targeting a listener that serves `/health` and `/vision/metrics`. On multi-tenant hosts leave unset so mixed local/external targets are discovered from the ports registry. |
 | `HEALTH_LUNARVISION_TIMEOUT` | health-lunarvision.sh | `5` | curl timeout (seconds) for `/health` and `/vision/metrics` |
@@ -164,7 +168,9 @@ LunarVoice health is strict: an enabled instance must return `status=ok` from
 non-boolean `enable_voice`, missing or duplicate enabled `voice_health` ports,
 an unreachable instance, or an unready STT model makes the component critical.
 All enabled instances remain visible in `metrics.instances`, so one healthy
-tenant cannot mask a failing peer. LunarVoice is monitor-only in self-heal; the
+tenant cannot mask a failing peer. LLM stream integrity is also monitor-only:
+recent retry/abort/corruption counters should trigger provider/TensorZero
+investigation, not an automatic tenant restart. LunarVoice is monitor-only in self-heal; the
 pipeline alerts and escalates but does not automatically restart optional model
 workloads.
 | `HEALTH_NETBIRD_ENABLED` | health-netbird.sh | `false` | Opt in to host NetBird readiness monitoring |
