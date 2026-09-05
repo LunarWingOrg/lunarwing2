@@ -281,6 +281,12 @@ async fn handle_stream_chunk<'a>(
                 .telemetry
                 .record_completed(&state.provider, state.first_chunk_at, &corruptions)
                 .await;
+            if !corruptions.is_empty() {
+                let marker = format!("\n\n{OUTPUT_MARKER}");
+                state
+                    .pending
+                    .push_back(Ok(LlmStreamChunk::TextDelta(marker)));
+            }
             for kind in corruptions {
                 state.pending.push_back(Ok(LlmStreamChunk::Observation(
                     LlmStreamObservation::Corrupted {
@@ -627,6 +633,10 @@ mod tests {
             .collect::<Vec<_>>()
             .await;
 
+        assert!(matches!(
+            chunks.get(chunks.len() - 3),
+            Some(Ok(LlmStreamChunk::TextDelta(marker))) if marker.contains("integrity warning")
+        ));
         assert!(matches!(
             chunks.get(chunks.len() - 2),
             Some(Ok(LlmStreamChunk::Observation(
