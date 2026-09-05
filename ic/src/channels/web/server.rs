@@ -405,6 +405,14 @@ pub async fn start_server(
     addr: SocketAddr,
     state: Arc<GatewayState>,
     auth: crate::channels::web::auth::CombinedAuthState,
+) -> Result<SocketAddr, crate::error::ChannelError> {
+    start_server_with_mascot(addr, state, auth, false).await
+}
+
+pub(super) async fn start_server_with_mascot(
+    addr: SocketAddr,
+    state: Arc<GatewayState>,
+    auth: crate::channels::web::auth::CombinedAuthState,
     mascot_enabled: bool,
 ) -> Result<SocketAddr, crate::error::ChannelError> {
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
@@ -3592,7 +3600,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let auth = MultiAuthState::single("test-token".to_string(), "test".to_string());
-        let bound = start_server(addr, state.clone(), auth.into(), false)
+        let bound = start_server_with_mascot(addr, state.clone(), auth.into(), false)
             .await
             .expect("server should start");
 
@@ -3657,7 +3665,7 @@ mod tests {
             let state = test_gateway_state(None);
             let addr: SocketAddr = "127.0.0.1:0".parse().expect("test address");
             let auth = MultiAuthState::single("test-token".to_string(), "test".to_string());
-            let bound = start_server(addr, state.clone(), auth.into(), mascot_enabled)
+            let bound = start_server_with_mascot(addr, state.clone(), auth.into(), mascot_enabled)
                 .await
                 .expect("server should start");
 
