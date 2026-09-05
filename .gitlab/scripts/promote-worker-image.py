@@ -139,16 +139,20 @@ class RegistryClient:
         )
 
 
-def validate_pipeline_context() -> tuple[str, str]:
+def validate_pipeline_context() -> tuple[str, str, str]:
     source_sha = required_env("CI_COMMIT_SHA")
     release_tag = required_env("CI_COMMIT_TAG")
+    promotion_tag = required_env("WORKER_PROMOTION_TAG")
     if os.environ.get("CI_PIPELINE_SOURCE") != "push":
         raise RuntimeError("promotion requires a push-created tag pipeline")
     if os.environ.get("CI_COMMIT_REF_PROTECTED") != "true":
         raise RuntimeError("promotion requires a protected ref")
     if not RELEASE_TAG_RE.fullmatch(release_tag):
         raise RuntimeError(f"release tag {release_tag!r} does not match release policy")
-    return source_sha, release_tag
+    worker = promotion_tag.removeprefix(f"{release_tag}-")
+    if worker not in {"pebble", "opencode", "kimi"}:
+        raise RuntimeError("worker promotion tag does not match the release tag")
+    return source_sha, release_tag, promotion_tag
 
 
 def verify_inputs(source_sha: str) -> list[str]:
@@ -200,7 +204,7 @@ def verify_image_config(config: dict, source_sha: str) -> dict:
 
 
 def promote() -> None:
-    source_sha, release_tag = validate_pipeline_context()
+    source_sha, release_tag, promotion_tag = validate_pipeline_context()
     registry = required_env("CI_REGISTRY")
     metadata = candidate_metadata()
     candidate_ref = metadata["WORKER_IMAGE_REF"]
@@ -246,18 +250,18 @@ def promote() -> None:
     input_lines = verify_inputs(source_sha)
     scan_summary = verify_scan(f"{candidate_ref}@{expected_digest}")
 
-    existing = client.manifest(release_tag, missing_ok=True)
+    existing = client.manifest(promotion_tag, missing_ok=True)
     if existing is not None:
         existing_digest = existing[1].get("Docker-Content-Digest")
         if existing_digest != expected_digest:
             raise RuntimeError(
-                f"refusing to retarget existing {release_tag}: "
+                f"refusing to retarget existing {promotion_tag}: "
                 f"{existing_digest} != {expected_digest}"
             )
     else:
         content_type = manifest_headers.get("Content-Type", MANIFEST_ACCEPT.split(", ")[0])
         response = client.request(
-            f"manifests/{urllib.parse.quote(release_tag)}",
+            f"manifests/{urllib.parse.quote(promotion_tag)}",
             method="PUT",
             data=manifest_body,
             headers={"Content-Type": content_type},
@@ -268,12 +272,13 @@ def promote() -> None:
     evidence = {
         "candidate": candidate_ref,
         "digest": expected_digest,
-        "image": f"{registry}/{repository}:{release_tag}",
+        "image": f"{registry}/{repository}:{promotion_tag}",
         "inputs": input_lines,
         "pipeline_id": required_env("CI_PIPELINE_ID"),
         "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
         "promoted_at": datetime.now(timezone.utc).isoformat(),
         "release_tag": release_tag,
+        "promotion_tag": promotion_tag,
         "rebuild_digest": rebuild_digest,
         "source_sha": source_sha,
         "config": config_summary,
@@ -282,7 +287,7 @@ def promote() -> None:
     pathlib.Path("worker-image-evidence.json").write_text(
         json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(f"Promoted {candidate_ref}@{expected_digest} to immutable tag {release_tag}")
+    print(f"Promoted {candidate_ref}@{expected_digest} to immutable tag {promotion_tag}")
 
 
 def self_test() -> None:
