@@ -4,8 +4,8 @@
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use axum::{
     Json, Router,
@@ -405,6 +405,7 @@ pub async fn start_server(
     addr: SocketAddr,
     state: Arc<GatewayState>,
     auth: crate::channels::web::auth::CombinedAuthState,
+    mascot_enabled: bool,
 ) -> Result<SocketAddr, crate::error::ChannelError> {
     let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
         crate::error::ChannelError::StartupFailed {
@@ -577,7 +578,7 @@ pub async fn start_server(
 
     // Static file routes (no auth, served from embedded strings)
     let statics = Router::new()
-        .route("/", get(index_handler))
+        .route("/", get(move || index_handler(mascot_enabled)))
         .route("/style.css", get(css_handler))
         .route("/app.js", get(js_handler))
         .route("/theme-init.js", get(theme_init_handler))
@@ -600,11 +601,16 @@ pub async fn start_server(
         .route("/i18n/en.js", get(i18n_en_handler))
         .route("/i18n/zh-CN.js", get(i18n_zh_handler))
         .route("/i18n-app.js", get(i18n_app_handler))
-        .route("/mascot.js", get(mascot_js_handler))
-        .route("/mascot/{name}", get(mascot_sprite_handler))
         .route("/vendor/purify.min.js", get(vendor_purify_handler))
-        .route("/vendor/marked.umd.min.js", get(vendor_marked_handler))
-        .layer(CompressionLayer::new().gzip(true));
+        .route("/vendor/marked.umd.min.js", get(vendor_marked_handler));
+    let statics = if mascot_enabled {
+        statics
+            .route("/mascot.js", get(mascot_js_handler))
+            .route("/mascot/{name}", get(mascot_sprite_handler))
+    } else {
+        statics
+    };
+    let statics = statics.layer(CompressionLayer::new().gzip(true));
 
     // Project file serving (behind auth to prevent unauthorized file access).
     let projects = Router::new()
@@ -712,13 +718,27 @@ pub async fn start_server(
 
 // --- Static file handlers ---
 
-async fn index_handler() -> impl IntoResponse {
+const INDEX_HTML: &str = include_str!("static/index.html");
+const MASCOT_SCRIPT_AND_BODY_END: &str =
+    "  <script src=\"/mascot.js\" defer></script>\n</body>";
+static MASCOT_INDEX_HTML: LazyLock<String> =
+    LazyLock::new(|| INDEX_HTML.replacen("</body>", MASCOT_SCRIPT_AND_BODY_END, 1));
+
+fn index_html(mascot_enabled: bool) -> &'static str {
+    if mascot_enabled {
+        MASCOT_INDEX_HTML.as_str()
+    } else {
+        INDEX_HTML
+    }
+}
+
+async fn index_handler(mascot_enabled: bool) -> impl IntoResponse {
     (
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        include_str!("static/index.html"),
+        index_html(mascot_enabled),
     )
 }
 
@@ -855,7 +875,7 @@ async fn i18n_app_handler() -> impl IntoResponse {
 }
 
 // Emoting-mascot widget (item #19 in the 2.1.0 goals): the widget JS and
-// the animated 64x64 pony/unicorn sprite pack, embedded in the binary.
+// animated sprite pack are only routed when MASCOT_ENABLED is true.
 async fn mascot_js_handler() -> impl IntoResponse {
     (
         [
@@ -3070,6 +3090,14 @@ mod tests {
     use crate::testing::credentials::TEST_GATEWAY_CRYPTO_KEY;
 
     #[test]
+    fn mascot_script_is_only_injected_when_enabled() {
+        let script = r#"<script src="/mascot.js" defer></script>"#;
+
+        assert!(!index_html(false).contains(script));
+        assert_eq!(index_html(true).matches(script).count(), 1);
+    }
+
+    #[test]
     fn chat_send_requires_thread_id() {
         for thread_id in [None, Some(""), Some("   ")] {
             let error = require_chat_thread_id(thread_id)
@@ -3565,7 +3593,7 @@ mod tests {
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let auth = MultiAuthState::single("test-token".to_string(), "test".to_string());
-        let bound = start_server(addr, state.clone(), auth.into())
+        let bound = start_server(addr, state.clone(), auth.into(), false)
             .await
             .expect("server should start");
 
@@ -3617,6 +3645,44 @@ mod tests {
 
         if let Some(tx) = state.shutdown_tx.write().await.take() {
             let _ = tx.send(());
+        }
+    }
+
+    #[tokio::test]
+    async fn mascot_routes_follow_enabled_flag() {
+        use crate::channels::web::auth::MultiAuthState;
+
+        let client = reqwest::Client::new();
+        let script = r#"<script src="/mascot.js" defer></script>"#;
+        for mascot_enabled in [false, true] {
+            let state = test_gateway_state(None);
+            let addr: SocketAddr = "127.0.0.1:0".parse().expect("test address");
+            let auth = MultiAuthState::single("test-token".to_string(), "test".to_string());
+            let bound = start_server(addr, state.clone(), auth.into(), mascot_enabled)
+                .await
+                .expect("server should start");
+
+            let index = client
+                .get(format!("http://{bound}/"))
+                .send()
+                .await
+                .expect("index request")
+                .text()
+                .await
+                .expect("index body");
+            assert_eq!(index.contains(script), mascot_enabled);
+
+            let mascot_status = client
+                .get(format!("http://{bound}/mascot.js"))
+                .send()
+                .await
+                .expect("mascot request")
+                .status();
+            assert_eq!(mascot_status.as_u16(), if mascot_enabled { 200 } else { 404 });
+
+            if let Some(tx) = state.shutdown_tx.write().await.take() {
+                let _ = tx.send(());
+            }
         }
     }
 
