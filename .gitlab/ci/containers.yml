@@ -15,7 +15,7 @@ variables:
   stage: containers
   interruptible: false
   retry: 0
-  timeout: 4h
+  timeout: 8h
   variables:
     BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
   artifacts:
@@ -25,6 +25,7 @@ variables:
       dotenv: worker-image.env
     paths:
       - worker-image-metadata.json
+      - worker-image-rebuild-metadata.json
       - worker-inputs.sha256
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
