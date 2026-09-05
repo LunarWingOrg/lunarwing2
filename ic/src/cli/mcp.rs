@@ -135,6 +135,12 @@ pub struct McpAddArgs {
     #[arg(long = "header", value_parser = parse_header)]
     pub headers: Vec<(String, String)>,
 
+    /// HTTP header names mapped to owner-scoped secret names (KEY=SECRET_NAME
+    /// format, can be repeated). The secret value replaces the header value
+    /// entirely; http transport only.
+    #[arg(long = "secret-header", value_parser = parse_secret_env_ref)]
+    pub secret_header: Vec<(String, String)>,
+
     /// OAuth client ID (if authentication is required)
     #[arg(long)]
     pub client_id: Option<String>,
@@ -508,6 +514,14 @@ fn validate_add_runtime_options(
     if transport != "stdio" && !args.secret_env.is_empty() {
         anyhow::bail!("--secret-env is only supported with stdio transport");
     }
+    if transport != "http" && !args.secret_header.is_empty() {
+        anyhow::bail!("--secret-header is only supported with http transport");
+    }
+    if args.client_id.is_some() && !args.secret_header.is_empty() {
+        anyhow::bail!(
+            "--secret-header and --client-id are mutually exclusive: header secrets are a static credential, OAuth flows manage their own Authorization"
+        );
+    }
     if sandbox.is_some() && !matches!(transport.as_str(), "stdio" | "external") {
         anyhow::bail!("sandbox options are only supported with stdio or external transport");
     }
@@ -616,6 +630,9 @@ fn apply_add_metadata(
     if !args.headers.is_empty() {
         config = config.with_headers(args.headers.iter().cloned().collect());
     }
+    if !args.secret_header.is_empty() {
+        config = config.with_header_secrets(args.secret_header.iter().cloned().collect());
+    }
     if let Some(description) = &args.description {
         config = config.with_description(description);
     }
@@ -664,6 +681,14 @@ fn print_add_summary(args: &McpAddArgs, sandbox_summary: Option<&str>) {
             args.url.as_deref().unwrap_or("")
         ),
         _ => println!("    URL: {}", args.url.as_deref().unwrap_or("")),
+    }
+    if !args.secret_header.is_empty() {
+        let names: Vec<&str> = args
+            .secret_header
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        println!("    Header secrets: {}", names.join(", "));
     }
     if args.client_id.is_some() {
         println!(
@@ -1274,6 +1299,7 @@ fn build_update_config(
     config.placement = args.placement.unwrap_or(existing.placement);
     config.oauth = existing.oauth.clone();
     config.headers = existing.headers.clone();
+    config.header_secrets = existing.header_secrets.clone();
     config.description = existing.description.clone();
     config.always_require_approval = existing.always_require_approval.clone();
     // Retain only the pin associated with the selected local runtime.

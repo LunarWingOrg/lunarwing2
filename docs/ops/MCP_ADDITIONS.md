@@ -94,6 +94,25 @@ see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).
 - `mcp test --user` resolves secrets for the selected owner and explicitly cleans
   its temporary runtime.
 
+### Owner-scoped secret HTTP header references
+
+- `McpServerConfig.header_secrets` maps HTTP header names to owner-scoped
+  LunarWing secret names. Only names are persisted; values are resolved at
+  activation and replace the header value entirely (store the full
+  `Bearer lwst_…` string for an `Authorization` header).
+- CLI uses `--secret-header KEY=SECRET_NAME` (http transport only, mutually
+  exclusive with `--client-id`); web and conversational installation use a
+  `header_secrets` object. Header fields default the transport to `http` when
+  a url is provided.
+- Resolution runs through the activating owner's secrets store and fails
+  closed on a missing store, missing secret, or wrong owner. Configured
+  header secrets suppress the OAuth path entirely — stored tokens cannot
+  override the resolved header.
+- Validation rejects non-http transports, invalid or duplicate header names
+  (RFC 9110, case-insensitive, including against plain `headers`), managed
+  client headers, and secret-bearing conversational installs follow the same
+  forced-approval rule as secret-bearing stdio installs.
+
 ### Package provenance (operator-pinned)
 
 - `McpServerConfig` carries an optional provenance record: canonical package
