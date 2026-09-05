@@ -880,6 +880,13 @@ impl McpServerConfig {
     ///
     /// Non-network transports (stdio, unix, WASM) never require auth.
     pub fn requires_auth(&self) -> bool {
+        // Static header credentials satisfy auth themselves: the factory
+        // resolves them at activation and gates must not demand OAuth or
+        // trigger discovery for such servers.
+        if !self.header_secrets.is_empty() {
+            return false;
+        }
+
         // Only direct HTTP and gateway transports use HTTP authentication.
         if !matches!(
             self.effective_transport(),
@@ -2960,6 +2967,66 @@ mod tests {
         let config =
             McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn header_secrets_satisfy_auth_requirement() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        assert!(
+            config.requires_auth(),
+            "remote https requires auth by default"
+        );
+
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        assert!(
+            !config.requires_auth(),
+            "static header credentials must suppress the OAuth requirement"
+        );
+    }
+
+    #[test]
+    fn header_secrets_rejected_off_http_transport() {
+        let mut config = McpServerConfig::new_stdio("server", "cat", Vec::new(), HashMap::new());
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("only supported with the http transport"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_secret_conflicting_with_plain_header_rejected() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        config
+            .headers
+            .insert("Authorization".to_string(), "Bearer plain".to_string());
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("both a plain value and a secret reference"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_secret_managed_header_rejected() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        config.header_secrets.insert(
+            "Mcp-Session-Id".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("managed by the MCP client"), "got: {err}");
     }
 
     #[test]
