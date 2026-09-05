@@ -2,14 +2,20 @@ use std::collections::BTreeMap;
 
 use futures::StreamExt;
 
-use crate::traits::llm::{LlmOutput, LlmStream, LlmStreamChunk};
+use crate::traits::llm::{LlmOutput, LlmStream, LlmStreamChunk, ProviderStreamObservation};
 use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::step::{ActionCall, LlmResponse, TokenUsage};
+
+pub(super) struct LlmStreamCollection {
+    pub(super) result: Result<LlmOutput, EngineError>,
+    pub(super) observations: Vec<ProviderStreamObservation>,
+}
 
 #[derive(Default)]
 struct StreamAccumulator {
     text: String,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
+    observations: Vec<ProviderStreamObservation>,
     usage: TokenUsage,
     finish_reason: String,
     saw_done: bool,
@@ -25,10 +31,16 @@ struct ToolCallAccumulator {
 pub(super) async fn collect_llm_stream(
     mut stream: LlmStream<'_>,
     mut on_text_delta: impl FnMut(&str),
-) -> Result<LlmOutput, EngineError> {
+) -> LlmStreamCollection {
     let mut accumulator = StreamAccumulator::default();
     while let Some(item) = stream.next().await {
-        accumulator.push(item?, &mut on_text_delta)?;
+        let result = match item {
+            Ok(chunk) => accumulator.push(chunk, &mut on_text_delta),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            return accumulator.with_error(error);
+        }
     }
     accumulator.finish()
 }
@@ -61,6 +73,11 @@ impl StreamAccumulator {
                 merge_identity(&mut call.name, name, "name", index)?;
                 call.arguments.push_str(&args_delta);
             }
+            LlmStreamChunk::ProviderObservation(observation) => {
+                if !self.observations.contains(&observation) {
+                    self.observations.push(observation);
+                }
+            }
             LlmStreamChunk::Done {
                 usage,
                 finish_reason,
@@ -73,7 +90,23 @@ impl StreamAccumulator {
         Ok(())
     }
 
-    fn finish(self) -> Result<LlmOutput, EngineError> {
+    fn finish(mut self) -> LlmStreamCollection {
+        let observations = std::mem::take(&mut self.observations);
+        let result = self.finish_output();
+        LlmStreamCollection {
+            result,
+            observations,
+        }
+    }
+
+    fn with_error(mut self, error: EngineError) -> LlmStreamCollection {
+        LlmStreamCollection {
+            result: Err(error),
+            observations: std::mem::take(&mut self.observations),
+        }
+    }
+
+    fn finish_output(self) -> Result<LlmOutput, EngineError> {
         if !self.saw_done {
             return Err(llm_error("LLM stream ended before Done"));
         }
@@ -85,8 +118,6 @@ impl StreamAccumulator {
             for (index, call) in self.tool_calls {
                 calls.push(call.finish(index)?);
             }
-            // Consume FINAL pseudo-actions (provider-mangled CodeAct syntax)
-            // before they can enter tool history as unleasable actions.
             LlmResponse::from_action_calls(calls, (!self.text.is_empty()).then_some(self.text))
         };
 
@@ -180,8 +211,55 @@ mod tests {
     ) -> (Result<LlmOutput, EngineError>, Vec<String>) {
         let stream = stream::iter(items).boxed();
         let mut deltas = Vec::new();
-        let result = collect_llm_stream(stream, |delta| deltas.push(delta.to_string())).await;
-        (result, deltas)
+        let collection = collect_llm_stream(stream, |delta| deltas.push(delta.to_string())).await;
+        (collection.result, deltas)
+    }
+
+    #[tokio::test]
+    async fn collects_provider_observations_outside_text() {
+        let stream = stream::iter([
+            Ok(LlmStreamChunk::TextDelta("clean output".to_string())),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Retried,
+            )),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Retried,
+            )),
+            done(None),
+        ])
+        .boxed();
+        let collection = collect_llm_stream(stream, |_| {}).await;
+
+        assert!(matches!(
+            collection.result.expect("stream should collect").response,
+            LlmResponse::Text(text) if text == "clean output"
+        ));
+        assert_eq!(
+            collection.observations,
+            vec![ProviderStreamObservation::Retried]
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_abort_observation_when_stream_fails() {
+        let stream = stream::iter([
+            Ok(LlmStreamChunk::TextDelta("partial".to_string())),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Aborted,
+            )),
+            Err(EngineError::Llm {
+                kind: ModelFailureKind::Transient,
+                reason: "stream failed".to_string(),
+            }),
+        ])
+        .boxed();
+        let collection = collect_llm_stream(stream, |_| {}).await;
+
+        assert!(collection.result.is_err());
+        assert_eq!(
+            collection.observations,
+            vec![ProviderStreamObservation::Aborted]
+        );
     }
 
     #[tokio::test]
@@ -407,6 +485,7 @@ mod tests {
         let mut deltas = Vec::new();
         let output = collect_llm_stream(stream, |delta| deltas.push(delta.to_string()))
             .await
+            .result
             .expect("fallback stream should collect");
 
         assert_eq!(deltas, vec!["fallback text"]);
