@@ -115,7 +115,7 @@ impl TestGatewayBuilder {
         let addr: SocketAddr = "127.0.0.1:0"
             .parse()
             .expect("hard-coded address must parse"); // safety: constant literal
-        let bound = start_server(addr, state.clone(), auth).await?;
+        let bound = start_server(addr, state.clone(), auth, false).await?;
         Ok((bound, state))
     }
 
@@ -129,7 +129,13 @@ impl TestGatewayBuilder {
         let addr: SocketAddr = "127.0.0.1:0"
             .parse()
             .expect("hard-coded address must parse"); // safety: constant literal
-        let bound = start_server(addr, state.clone(), CombinedAuthState::from(auth)).await?;
+        let bound = start_server(
+            addr,
+            state.clone(),
+            CombinedAuthState::from(auth),
+            false,
+        )
+        .await?;
         Ok((bound, state))
     }
 }
