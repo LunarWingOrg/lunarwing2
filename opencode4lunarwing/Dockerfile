@@ -1,4 +1,5 @@
-# v1.18.25 resolves to this reviewed commit. Overrides must also be full SHAs.
+# v1.18.25 resolves to this reviewed commit. Both must move together.
+ARG OPENCODE_VERSION=v1.18.25
 ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
 ARG SOURCE_REVISION=unknown
@@ -8,6 +9,7 @@ ARG SOURCE_REVISION=unknown
 # ──────────────────────
 FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
 
+ARG OPENCODE_VERSION
 ARG OPENCODE_REF
 ARG DEBIAN_SNAPSHOT
 WORKDIR /build
@@ -27,9 +29,10 @@ RUN set -eu; \
 RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git init /build/opencode && \
     git -C /build/opencode remote add origin https://github.com/anomalyco/opencode.git && \
-    git -C /build/opencode fetch --depth 1 origin "${OPENCODE_REF}" && \
-    git -C /build/opencode checkout --detach FETCH_HEAD && \
-    test "$(git -C /build/opencode rev-parse HEAD)" = "${OPENCODE_REF}"
+    git -C /build/opencode fetch --depth 1 origin "refs/tags/${OPENCODE_VERSION}" && \
+    test "$(git -C /build/opencode rev-parse FETCH_HEAD)" = "${OPENCODE_REF}" && \
+    git -C /build/opencode checkout --detach "${OPENCODE_REF}" && \
+    git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
 RUN bun install --frozen-lockfile && bun pm cache rm
@@ -77,11 +80,10 @@ ARG SOURCE_REVISION
 # which are only needed to compile native dependencies at runtime.
 ARG WITH_TOOLCHAINS=false
 
-# Consume the global pin and record it in the runtime image so operators can
-# tell which upstream opencode ref a running worker was built from
-# (surfaced on the /health endpoint as `opencode_ref`).
+# Expose both the human release and immutable source revision at runtime.
+ARG OPENCODE_VERSION
 ARG OPENCODE_REF
-ENV OPENCODE_IMAGE_REF="${OPENCODE_REF}"
+ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
