@@ -1,22 +1,23 @@
 # GitLab CI/CD
 
-This directory implements phase 1 of
-`docs/proposals/GITLAB_CI_CD_PLAN.md`: unprivileged, secret-free merge request
-CI plus visible nonblocking debt checks. Package publication and deployment are
-intentionally absent. Current mt-admin upgrades rebuild per tenant and cannot
-yet activate one verified CI artifact safely.
+This directory implements unprivileged, secret-free merge request validation
+plus protected worker-image candidate publication. Production package and tenant
+deployment remain absent: current mt-admin upgrades rebuild per tenant and
+cannot yet activate one verified CI artifact safely.
 
 ## Pipeline behavior
 
 - Merge request pipelines replace branch pipelines once an MR is open.
 - Branch, tag, schedule, API, trigger, and manual pipelines remain supported.
-- Required jobs are interruptible and receive no production credentials.
+- Validation jobs are interruptible and receive no production credentials.
+  Registry-writing candidate/promotion jobs are non-interruptible and exist only
+  on a protected default branch or protected, version-shaped push tag.
 - Cargo always runs through `scripts/cargo-ci.sh`, with CPU affinity `0-5` and
   at most two build jobs to bound peak memory. Rust test cases run serially
   because many mutate the process environment.
-- PostgreSQL integration, WASM, browser, standalone-crate, package, release,
-  and deployment jobs remain deferred until their prerequisites in the plan
-  are fixed.
+- PostgreSQL integration now uses a disposable pgvector service. Browser,
+  standalone-crate, native package, and production deployment work remains
+  deferred until its separate prerequisites are met.
 
 ## Required runners
 
@@ -26,10 +27,12 @@ Create unprotected, unprivileged runners with these tags:
 |---|---|---|
 | `lint` | Isolated Docker/Kubernetes executor; 2-4 CPUs, 4-8 GB RAM | Public package mirrors only; no protected variables or Docker socket |
 | `rust-x86_64` | Isolated Docker/Kubernetes executor; 6 CPUs numbered `0-5`, 16 GB RAM, 40 GiB free disk | Public Cargo/Git/package mirrors only; no protected variables or Docker socket |
+| `container-build` | Isolated Docker/Kubernetes executor with rootless BuildKit user-namespace support | Protected registry credentials only; no Docker socket, privileged mode, or production network |
 
 Override `CI_LINT_RUNNER_TAG` or `CI_RUST_RUNNER_TAG` at project level if local
 runner tags differ. Do not map either variable to protected or privileged
-runners.
+runners. Keep `container-build` protected; unlike validation runners, it can
+write only to this project's container registry.
 
 Pinned images:
 
@@ -41,6 +44,12 @@ Pinned images:
   `sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f`
 - cargo-deny 0.20.2 x86-64 musl archive:
   `sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f`
+- BuildKit 0.25.1 rootless OCI index:
+  `sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51`
+- Trivy 0.74.0 OCI index:
+  `sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969`
+- pgvector PostgreSQL 16 OCI index:
+  `sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b`
 
 `ci-config` enforces Rust 1.96.1 across `ic/Cargo.toml` `rust-version`,
 `ic/rust-toolchain.toml`, and both primary/MSRV image tags. It also requires
@@ -119,8 +128,10 @@ registry paths to the allowlist when adopting option 2.
   policy, changed-line panic policy, rustfmt, and locked Cargo metadata.
 - Protected release-tag syntax, release-note codename, and four-part to
   three-part Cargo version mapping.
-- Default, PostgreSQL-only, libSQL-only, and all-feature `cargo check` jobs.
-- Workspace library tests and hermetic libSQL tests.
+- Default and all-feature `cargo check` jobs plus `--tests` compilation for
+  PostgreSQL-only and libSQL-only feature shapes.
+- Workspace library tests, hermetic libSQL tests, and a non-skipping PostgreSQL
+  workspace integration target against disposable pgvector/PostgreSQL 16.
 - Explicit onboarding, web, Kawarimi, and DarkIRC Python suites with zero skips.
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
 - `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
@@ -286,6 +297,12 @@ Add a real owner group to `CODEOWNERS`, then require its review for
 CODEOWNERS approvals must use protected `master` plus a documented Maintainer
 review policy.
 
+Create a protected `container-build` runner. Keep `privileged = false`, do not
+mount a Docker socket, and permit only the user-namespace/mount syscalls required
+by rootless BuildKit through a reviewed seccomp profile. Do not use
+`seccomp:unconfined`. The runner must be unable to route to production or tenant
+networks and must have at least a four-hour maximum timeout for large candidates.
+
 ### 4. Validate and activate
 
 Local includes cannot be fully linted until this branch exists on GitLab.
@@ -305,6 +322,16 @@ Local includes cannot be fully linted until this branch exists on GitLab.
    documented in `.gitlab/ci/*.yml`.
 8. Merge after CI Lint and one clean runner pipeline pass. Confirm the resulting
    default-branch pipeline starts.
+9. Create a protected RC tag on that exact SHA. Confirm the complete feature,
+   test, Cavepony, source-policy, secret, and cargo-deny gates appear. Trigger
+   one worker candidate, then verify its digest scan and SBOM before promotion.
+10. Confirm an ordinary branch, MR, web/API/trigger pipeline, and an unprotected
+    tag receive no registry-writing jobs. Confirm re-running a candidate creates
+    a new full-SHA/pipeline/job tag and cannot replace the first candidate.
+11. Promote once and retain `worker-image-evidence.json`. A second promotion to
+    an already-used release tag must be idempotent for the same digest and fail
+    if the tag points to different bytes. Tenant configuration must use the
+    recorded digest, never `latest`.
 
 ### 5. Add the nightly observation schedule
 
