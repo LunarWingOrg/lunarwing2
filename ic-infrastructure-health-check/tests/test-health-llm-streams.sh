@@ -78,6 +78,10 @@ run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha
 assert_eq "$RC" "1" "S4: malformed snapshot exits degraded"
 assert_contains "$(jq -r '.issues[0]' <<<"$OUT")" "invalid stream telemetry snapshot" "S4: malformed snapshot explained"
 
+printf '{"schema_version":99,"providers":{}}\n' > "$snapshot"
+run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha
+assert_eq "$RC" "1" "S4: unknown snapshot schema exits degraded"
+
 write_snapshot "$snapshot" "$old"
 report_dir="$ROOT/reports"
 mkdir -p "$report_dir"
