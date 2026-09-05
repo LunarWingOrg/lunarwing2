@@ -194,6 +194,14 @@ impl FailoverProvider {
         }
     }
 
+    fn bound_provider_for_current_task(&self) -> Option<usize> {
+        let task_id = Self::current_task_id()?;
+        self.provider_for_task
+            .lock()
+            .ok()
+            .and_then(|guard| guard.get(&task_id).copied())
+    }
+
     /// Take and remove the provider index bound to the current task.
     fn take_bound_provider_for_current_task(&self) -> Option<usize> {
         let task_id = Self::current_task_id()?;
@@ -461,7 +469,10 @@ impl LlmProvider for FailoverProvider {
     }
 
     fn active_model_name(&self) -> String {
-        self.providers[self.last_used.load(Ordering::Relaxed)].active_model_name()
+        let provider_index = self
+            .bound_provider_for_current_task()
+            .unwrap_or_else(|| self.last_used.load(Ordering::Relaxed));
+        self.providers[provider_index].active_model_name()
     }
 
     fn set_model(&self, model: &str) -> Result<(), LlmError> {
@@ -819,12 +830,13 @@ mod tests {
         let failover = Arc::new(FailoverProvider::new(vec![primary, fallback]).unwrap());
         let request_failover = Arc::clone(&failover);
 
-        let (effective_model, chunks) = tokio::spawn(async move {
+        let (active_model, effective_model, chunks) = tokio::spawn(async move {
             let stream = request_failover
                 .complete_stream(make_request())
                 .await
                 .expect("fallback stream should open");
             request_failover.last_used.store(0, Ordering::Relaxed);
+            let active_model = request_failover.active_model_name();
             let effective_model = request_failover.effective_model_name(None);
             let chunks = stream
                 .collect::<Vec<_>>()
@@ -832,11 +844,12 @@ mod tests {
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .expect("fallback stream should complete");
-            (effective_model, chunks)
+            (active_model, effective_model, chunks)
         })
         .await
         .expect("stream task should join");
 
+        assert_eq!(active_model, "fallback");
         assert_eq!(effective_model, "fallback");
         assert_eq!(
             chunks,
