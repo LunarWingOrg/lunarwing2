@@ -176,6 +176,14 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         errors.append("worker candidate and promotion templates must be non-interruptible")
     if candidate.get("retry") != 0 or promotion.get("retry") != 0:
         errors.append("worker publication must not retry after a timeout or partial push")
+    if not (ROOT / ".gitlab/scripts/build-worker-image.sh").is_file():
+        errors.append("worker candidate helper is missing")
+    for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "kimicode4lunarwing"):
+        dockerfile = (ROOT / worker_dir / "Dockerfile").read_text(encoding="utf-8")
+        if "ARG SOURCE_REVISION" not in dockerfile or (
+            'org.opencontainers.image.revision="${SOURCE_REVISION}"' not in dockerfile
+        ):
+            errors.append(f"{worker_dir}/Dockerfile must label the injected source revision")
 
     for template_name in (".worker-candidate", ".worker-scan", ".worker-promotion"):
         template = merged.get(template_name, {})
