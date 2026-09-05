@@ -377,7 +377,7 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(
+        server::start_server_with_mascot(
             addr,
             self.state.clone(),
             self.auth.clone(),
