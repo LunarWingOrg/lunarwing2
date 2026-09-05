@@ -87,7 +87,7 @@ Why it was added after v2.0.7.0:
 
 ## Current state (verified 2026-08-25)
 
-`infrastructure-health-check.sh` runs these eleven healthpoints in parallel,
+`infrastructure-health-check.sh` runs these twelve healthpoints in parallel,
 each emitting one JSON object (`component`, `status`, `metrics{...}`), exit
 0/1/2:
 
@@ -100,6 +100,7 @@ each emitting one JSON object (`component`, `status`, `metrics{...}`), exit
 | clickhouse | `health-clickhouse.sh` | `query_time_ms`, `disk_pct`, `memory_pct` |
 | tensorzero | `health-tensorzero.sh` | `p50_ms`, `p95_ms`, `error_rate`, `queue_depth`, `gpu_utilization` |
 | models | `health-models.sh` | `provider_count`, `providers_{healthy,degraded,critical}`, `latency_max_ms`, per-provider `provider_latency_ms` / `provider_status` numeric maps (status strings/`last_error` remain in `providers[]` and are dropped on export) |
+| llm_streams | `health-llm-streams.sh` | per-provider retry reasons, stream aborts, decode failures, corruption signatures, and time-to-first-chunk counters/timings with `provider` + `tenant` labels |
 | lunarvision | `health-lunarvision.sh` | `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms`, per-tenant `ocr_available`/`vl_available` |
 | lunarvoice | `health-lunarvoice.sh` | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | `health-netbird.sh` | `enabled`, `ready`, `probe_exit` |
