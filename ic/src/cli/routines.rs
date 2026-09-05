@@ -697,7 +697,6 @@ fn truncate(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::routine::RoutineAction;
 
     #[test]
     fn format_relative_future() {
