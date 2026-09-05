@@ -846,6 +846,21 @@ def activate_delivered_recovery(state):
     return changed
 
 
+def provider_stream_observation(response):
+    observation = response.get("provider_observation")
+    if (not isinstance(observation, str)
+            or not observation.startswith("Provider stream observation:")
+            or "\n" in observation
+            or len(observation) > 1000):
+        return None
+    return observation
+
+
+def append_provider_stream_observation(messages, observation):
+    if observation is not None:
+        append_message(messages, "System", observation)
+
+
 def shrink_context_for_model_recovery(state, goal, budget_factor=1.0):
     """Replace oversized protocol history with a bounded plain-text view."""
     if not isinstance(budget_factor, (int, float)) or budget_factor <= 0:
@@ -1132,6 +1147,7 @@ def run_loop(context, goal, actions, state, config):
 
         if resp_type == "model_error":
             recovery = ensure_failure_recovery(state)
+            observation = provider_stream_observation(response)
             kind = response.get("kind", "internal")
             if not isinstance(kind, str) or not kind:
                 kind = "internal"
@@ -1148,12 +1164,15 @@ def run_loop(context, goal, actions, state, config):
 
             recovery["model_recovery_attempts"] = attempts + 1
             recovery["model_recovery_total_attempts"] = total_attempts + 1
+            instruction = response.get(
+                "instruction",
+                "Model request failed. Continue concisely from current state.",
+            )
+            if observation is not None:
+                instruction = observation + "\n" + instruction
             recovery["pending_model_error"] = {
                 "kind": kind,
-                "instruction": response.get(
-                    "instruction",
-                    "Model request failed. Continue concisely from current state.",
-                ),
+                "instruction": instruction,
             }
             if kind == "context_overflow":
                 shrink_factors = policy.get("shrink") or [1.0]
@@ -1169,10 +1188,12 @@ def run_loop(context, goal, actions, state, config):
             continue
 
         delivered_recovery = activate_delivered_recovery(state)
+        observation = provider_stream_observation(response)
 
         if resp_type == "text":
             text = response.get("content", "")
             append_message(working_messages, "Assistant", text)
+            append_provider_stream_observation(working_messages, observation)
             if delivered_recovery:
                 __save_checkpoint__(state, {
                     "nudge_count": consecutive_nudges,
@@ -1284,6 +1305,7 @@ def run_loop(context, goal, actions, state, config):
             state["_obligation_resolved"] = True
             code = response.get("code", "")
             append_message(working_messages, "Assistant", "```repl\n" + code + "\n```")
+            append_provider_stream_observation(working_messages, observation)
             if delivered_recovery:
                 __save_checkpoint__(state, {
                     "nudge_count": consecutive_nudges,
@@ -1421,6 +1443,7 @@ def run_loop(context, goal, actions, state, config):
                 response.get("content", "") or "",
                 action_calls=calls,
             )
+            append_provider_stream_observation(working_messages, observation)
             if delivered_recovery:
                 __save_checkpoint__(state, {
                     "nudge_count": consecutive_nudges,
