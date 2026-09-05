@@ -27,7 +27,6 @@ variables:
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   PIP_ROOT_USER_ACTION: ignore
   PYTHONDONTWRITEBYTECODE: "1"
-  CI_CACHE_POLICY: pull
   CI_LINT_RUNNER_TAG: lint
   CI_RUST_RUNNER_TAG: rust-x86_64
   # Job base images, digest-pinned on Docker Hub. When Docker Hub's anonymous
@@ -68,7 +67,7 @@ variables:
         - .gitlab/requirements/python-tests.txt
     paths:
       - .ci-cache/pip/
-    policy: "$CI_CACHE_POLICY"
+    policy: pull
 
 .rust-job:
   image:
@@ -84,8 +83,8 @@ variables:
     - du -sh "$CI_PROJECT_DIR/ic/target" "$SCCACHE_DIR" 2>/dev/null || true
     - ${CI_PROJECT_DIR}/.ci-cache/bin/sccache --show-stats || true
   cache:
-    # Merge requests and release tags only pull caches. A trusted default-branch
-    # push may refresh them through CI_CACHE_POLICY from workflow.yml.
+    # Validation jobs are always pull-only; dedicated protected jobs refresh
+    # cache archives without exposing a policy variable to pipeline overrides.
     - key:
         prefix: "rust-1.96.1-dependencies"
         files:
@@ -94,12 +93,12 @@ variables:
         - .ci-cache/cargo/registry/index/
         - .ci-cache/cargo/registry/cache/
         - .ci-cache/cargo/git/db/
-      policy: "$CI_CACHE_POLICY"
+      policy: pull
     - key: "rust-1.96.1-sccache"
       paths:
         - .ci-cache/bin/
         - .ci-cache/sccache/
-      policy: "$CI_CACHE_POLICY"
+      policy: pull
 
 # MSRV check uses a separate cache namespace so future primary-toolchain bumps
 # do not contaminate artifacts built with the declared minimum toolchain.
@@ -128,12 +127,12 @@ variables:
         - .ci-cache/cargo/registry/index/
         - .ci-cache/cargo/registry/cache/
         - .ci-cache/cargo/git/db/
-      policy: "$CI_CACHE_POLICY"
+      policy: pull
     - key: "rust-1.96.1-msrv-sccache"
       paths:
         - .ci-cache/bin/
         - .ci-cache/sccache/
-      policy: "$CI_CACHE_POLICY"
+      policy: pull
 
 .gitleaks-job:
   image:
