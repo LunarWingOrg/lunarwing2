@@ -132,7 +132,7 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - Known-issues reconciled: docs/bugs/README.md still carries exactly the nine active canonical reports the notes enumerate; live GitLab API re-query (2026-09-02) confirmed the same six open items (#86, #87, #94, #95, #97, #98) and #96 closed, no newer items.
     - Edits applied: header/known-issues revision stamp `cc59a9a89` → `96c951785` with 2026-09-02 re-verification + tracker re-query date; added the post-stamp ShellCheck 0.9 compatibility change. Integration follow-up then reconciled the draft after MRs !767 and !768: interrupted history and the GitLab vendoring gap moved from Known Issues to Resolved, vendor/tool counts updated, and direct TensorZero URL derivation documented.
 23. [x] (S) chk again later ( last attempt was on: rarity/kimi-23-20260901-1801 and does address any of the actual issues found ) - one more fresh pass of item 9, complete with fresh created tenant, full repeat of tests, and tenant destruction.  document findings
-24. [x] (S) reserved for CI/CD fixes
+24. [ ] FIX CICD https://git.lunarwing.org/lunarwing/lunarwing2/-/jobs/53855/raw
 25. [x] (S) work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/100 - feel free to create new test tenant and use the web browser to address concerns. should be some stuff in facts store as well for it
 26. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/102
     - DONE 100% 2026-09-03 (aj/kimi-26-20260903-0000, commits a360ffeb1 + aba509cbe): added canonical links for the separately maintained LunarWing Desktop (`lunarwing2desktop`) and LunarWing Android (`lunarwing2droid`) repositories to the root README quick links and the documentation index.
