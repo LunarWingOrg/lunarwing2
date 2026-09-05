@@ -3486,7 +3486,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn test_extensions_deactivate_preserves_mcp_config() {
         use axum::body::Body;
