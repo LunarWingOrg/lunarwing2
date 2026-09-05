@@ -21,11 +21,11 @@ use crate::channels::web::GatewayChannel;
 use crate::channels::web::auth::{
     AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware,
 };
+#[cfg(feature = "libsql")]
+use crate::channels::web::server::WorkspacePool;
 use crate::channels::web::server::{
     ActiveConfigSnapshot, GatewayState, PerUserRateLimiter, PromptQueue, RateLimiter,
 };
-#[cfg(feature = "libsql")]
-use crate::channels::web::server::WorkspacePool;
 use crate::channels::web::sse::SseManager;
 use crate::config::GatewayConfig;
 
