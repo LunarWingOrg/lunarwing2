@@ -174,8 +174,11 @@ def promote() -> None:
     registry = required_env("CI_REGISTRY")
     candidate_ref = required_env("WORKER_IMAGE_REF")
     expected_digest = required_env("WORKER_IMAGE_DIGEST")
+    rebuild_digest = required_env("WORKER_REBUILD_DIGEST")
     if not DIGEST_RE.fullmatch(expected_digest):
         raise RuntimeError("WORKER_IMAGE_DIGEST is malformed")
+    if rebuild_digest != expected_digest:
+        raise RuntimeError("clean rebuild did not reproduce the candidate digest")
     repository, candidate_tag = split_image_ref(registry, candidate_ref)
     client = RegistryClient(
         registry,
@@ -231,6 +234,7 @@ def promote() -> None:
         "pipeline_url": os.environ.get("CI_PIPELINE_URL", ""),
         "promoted_at": datetime.now(timezone.utc).isoformat(),
         "release_tag": release_tag,
+        "rebuild_digest": rebuild_digest,
         "source_sha": source_sha,
         "config": config_summary,
         "scan": scan_summary,
