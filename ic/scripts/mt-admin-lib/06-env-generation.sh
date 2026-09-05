@@ -1791,7 +1791,6 @@ upload_tenant_darkirc_secret() {
   fi
 
   gateway_port="$(ports_get "$name" gateway)"
-
   # Wait for the gateway to be reachable (it may still be starting up).
   if ! _wait_tenant_gateway "$name"; then
     say "WARNING: gateway not reachable on port $gateway_port; DarkIRC adapter secret not uploaded (upload manually via the API)" >&2
@@ -1817,6 +1816,54 @@ upload_tenant_darkirc_secret() {
     # Do NOT echo $upload_result: the gateway or adapter may echo the secret
     # back in the error message. Emit a generic warning instead.
     say "WARNING: DarkIRC adapter secret upload failed (upload manually via the API)" >&2
+    return 1
+  fi
+}
+
+# Seed the Brave Search API key into the web-search tool's secrets store so
+# fresh tenants have working web search on first boot (2026-09-05, Christopher).
+# Mirrors upload_tenant_darkirc_secret: best-effort, secret via stdin only,
+# auth token via anonymous process-substitution FD (never argv/cmdline).
+# Source of truth: the host admin's BRAVE_API_KEY (read once at provision time;
+# tenants hold their own encrypted copy — rotating the source key later does not
+# affect already-provisioned tenants).
+upload_tenant_brave_search_secret() {
+  local name="$1"
+  local brave_key gateway_port gateway_token upload_result
+
+  # Optional: nothing to seed if the host admin has no Brave key configured.
+  # Source of truth: BRAVE_SEARCH_API_KEY (the herd-canonical name, matching
+  # ~/.hermes/.env); falls back to BRAVE_API_KEY for parity with the tool's
+  # declared env_var if an admin exports only that.
+  brave_key="${BRAVE_SEARCH_API_KEY:-${BRAVE_API_KEY:-}}"
+  [[ -n "$brave_key" ]] || return 0
+
+  gateway_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)"
+  if [[ -z "$gateway_token" ]]; then
+    say "WARNING: GATEWAY_AUTH_TOKEN not found for tenant $name; Brave key not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  gateway_port="$(ports_get "$name" gateway)"
+
+  if ! _wait_tenant_gateway "$name"; then
+    say "WARNING: gateway not reachable on port $gateway_port; Brave key not uploaded (upload manually via the API)" >&2
+    return 1
+  fi
+
+  local auth_header="Authorization: Bearer $gateway_token"
+  upload_result="$(jq -n --arg secret "$brave_key" \
+    '{secrets:{brave_api_key:$secret},fields:{}}' | \
+    curl -sf -X POST "http://127.0.0.1:${gateway_port}/api/extensions/web-search/setup" \
+      -H "Content-Type: application/json" \
+      -K <(printf 'header = \"%s\"\n' "$auth_header") \
+      -d @- 2>&1)" || true
+
+  if echo "$upload_result" | jq -e '.success == true' >/dev/null 2>&1; then
+    say "Brave Search key uploaded to secrets store"
+    return 0
+  else
+    say "WARNING: Brave Search key upload failed (upload manually via the API)" >&2
     return 1
   fi
 }
