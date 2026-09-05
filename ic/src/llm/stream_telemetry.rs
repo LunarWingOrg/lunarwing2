@@ -252,6 +252,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_marks_provider_as_recently_unhealthy() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("metrics.json");
+        let telemetry = StreamTelemetry::new(path.clone());
+
+        telemetry
+            .record_retry("provider-a", StreamFailureReason::Transport)
+            .await;
+
+        let snapshot: StreamTelemetrySnapshot =
+            serde_json::from_slice(&tokio::fs::read(path).await.expect("telemetry snapshot"))
+                .expect("valid telemetry JSON");
+        let metrics = snapshot
+            .providers
+            .get("provider-a")
+            .expect("provider metrics");
+        assert_eq!(metrics.retries_total, 1);
+        assert!(metrics.last_issue_unix_seconds > 0);
+    }
+
+    #[tokio::test]
     async fn persists_per_provider_stream_metrics_atomically() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("runtime/llm-stream-metrics.json");
