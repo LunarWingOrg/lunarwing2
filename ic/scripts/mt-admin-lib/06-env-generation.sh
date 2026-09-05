@@ -1832,7 +1832,10 @@ upload_tenant_brave_search_secret() {
   local brave_key gateway_port gateway_token upload_result
 
   # Optional: nothing to seed if the host admin has no Brave key configured.
-  brave_key="${BRAVE_API_KEY:-}"
+  # Source of truth: BRAVE_SEARCH_API_KEY (the herd-canonical name, matching
+  # ~/.hermes/.env); falls back to BRAVE_API_KEY for parity with the tool's
+  # declared env_var if an admin exports only that.
+  brave_key="${BRAVE_SEARCH_API_KEY:-${BRAVE_API_KEY:-}}"
   [[ -n "$brave_key" ]] || return 0
 
   gateway_token="$(_read_env_value "$(tenant_env_dir "$name")/lunarwing.env" GATEWAY_AUTH_TOKEN)"
