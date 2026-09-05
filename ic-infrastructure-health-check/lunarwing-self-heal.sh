@@ -442,6 +442,7 @@ declare -A NO_REMEDY=(
     [omemo]=1
     [ratelimit]=1
     [models]=1
+    [llm_streams]=1
 )
 
 # Components where detection is useful but automatic restart is unsafe. These

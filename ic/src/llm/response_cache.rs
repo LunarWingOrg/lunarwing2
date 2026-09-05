@@ -229,7 +229,8 @@ impl CachedProvider {
                         );
                     }
                     Err(_) => self.log_miss_without_insert(request_number),
-                    Ok(LlmStreamChunk::ToolCallDelta { .. }) => {}
+                    Ok(LlmStreamChunk::ToolCallDelta { .. })
+                    | Ok(LlmStreamChunk::Observation(_)) => {}
                 }
 
                 let finished = matches!(&item, Ok(LlmStreamChunk::Done { .. }) | Err(_));

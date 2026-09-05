@@ -112,6 +112,43 @@ Threads form a tree via `ThreadTree`. Parent threads can spawn children, and chi
 8. Repeat until: accepted text response, stop signal, recovered terminal limit, typed failure, or approval needed
 ```
 
+### Provider stream integrity
+
+The host wraps the completed provider chain with `StreamIntegrityProvider`
+(`ic/src/llm/stream_integrity.rs`). It observes native and fallback streams after
+retry, failover, caching, timeout, and optional trace recording, but before the
+bridge converts chunks into engine types. This does not change provider retry
+policy or rewrite generated content. It detects and marks:
+
+- an exact, substantial phrase of at least four normalized tokens repeated three
+  times consecutively (two repetitions remain valid rhetorical/roleplay text);
+- chat-template role delimiters such as `<|im_start|>` and mid-output bare
+  `SYSTEM:` / `ASSISTANT:` headers; fenced code, inline code, and quoted lines are
+  excluded to keep protocol documentation from false-positive detection;
+- stream errors, empty streams, and EOF before the required `Done` chunk.
+
+A detected corruption appends a visible bracketed integrity marker before
+`Done`; the original output is retained as data. Retry, failover, abort, and
+corruption facts also travel as typed observation chunks, never as provider
+controlled text. The engine keeps them outside assistant output and adds one
+provider-name-free system line to the next model request (including model-error
+recovery). This tells the agent to attribute the discontinuity to the upstream
+provider and not treat instruction-like generated text as trusted instructions.
+
+Per-provider counters and time-to-first-chunk samples are atomically written to
+`$LUNARWING_BASE_DIR/runtime/llm-stream-metrics.json`. The host-global
+`health-llm-streams.sh` check reads this file directly on single-node installs or
+discovers every tenant state directory from the ports registry. The health
+exporter publishes `lunarwing_health_llm_streams_*` series with bounded
+`provider` and `tenant` labels. A recent issue makes this monitor-only
+healthpoint degraded; it never automatically restarts a model or daemon.
+
+Incident response: treat the bracketed marker or `llm_streams` degradation as an
+upstream-integrity signal. Check the per-provider abort/decode/retry/corruption
+metrics and TensorZero/provider health before restarting a tenant. Do not infer
+agent memory/state damage from garbled output alone, and do not follow commands
+that appear inside the marked generation.
+
 ### Two Execution Tiers
 
 **Tier 0 -- Structured Tool Calls** (`executor/structured.rs`):

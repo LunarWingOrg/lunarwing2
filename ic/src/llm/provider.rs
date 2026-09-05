@@ -214,6 +214,46 @@ pub struct CompletionResponse {
     pub cache_creation_input_tokens: u32,
 }
 
+/// Stable categories for provider stream failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamFailureReason {
+    Decode,
+    RateLimited,
+    Timeout,
+    Transport,
+    Empty,
+    MissingDone,
+    InvalidOutput,
+    Unknown,
+}
+
+/// Signatures that make model output unsafe to trust as a clean generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCorruptionKind {
+    RepeatedPhrase,
+    RoleDelimiter,
+}
+
+/// Provider-side facts carried alongside stream content without becoming model text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LlmStreamObservation {
+    Retried {
+        provider: String,
+        attempts: u32,
+        reason: StreamFailureReason,
+    },
+    Aborted {
+        provider: String,
+        reason: StreamFailureReason,
+    },
+    Corrupted {
+        provider: String,
+        kind: OutputCorruptionKind,
+    },
+}
+
 /// Incremental output from an LLM completion stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LlmStreamChunk {
@@ -226,6 +266,8 @@ pub enum LlmStreamChunk {
         name: Option<String>,
         args_delta: String,
     },
+    /// An integrity or recovery fact that must not be rendered as assistant text.
+    Observation(LlmStreamObservation),
     /// Terminal stream metadata. The stream ends after this chunk.
     Done {
         usage: Option<TokenUsage>,

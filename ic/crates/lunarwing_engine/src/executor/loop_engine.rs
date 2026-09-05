@@ -527,7 +527,9 @@ mod tests {
     use super::*;
     use crate::runtime::messaging::ThreadSignal;
     use crate::traits::effect::ThreadExecutionContext;
-    use crate::traits::llm::{LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk};
+    use crate::traits::llm::{
+        LlmCallConfig, LlmOutput, LlmStream, LlmStreamChunk, ProviderStreamObservation,
+    };
     use crate::types::capability::{ActionDef, CapabilityLease, EffectType, GrantedActions};
     use crate::types::project::ProjectId;
     use crate::types::step::LlmResponse;
@@ -622,6 +624,7 @@ mod tests {
 
     struct StreamingMockLlm {
         streams: Mutex<VecDeque<Vec<Result<LlmStreamChunk, EngineError>>>>,
+        requests: Mutex<Vec<Vec<ThreadMessage>>>,
         blocking_calls: AtomicUsize,
         streaming_calls: AtomicUsize,
     }
@@ -630,9 +633,17 @@ mod tests {
         fn new(streams: Vec<Vec<Result<LlmStreamChunk, EngineError>>>) -> Self {
             Self {
                 streams: Mutex::new(streams.into()),
+                requests: Mutex::new(Vec::new()),
                 blocking_calls: AtomicUsize::new(0),
                 streaming_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn requests(&self) -> Vec<Vec<ThreadMessage>> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
         }
     }
 
@@ -653,13 +664,17 @@ mod tests {
 
         async fn complete_stream<'a>(
             &'a self,
-            _messages: &[ThreadMessage],
+            messages: &[ThreadMessage],
             _actions: &[ActionDef],
             _config: &LlmCallConfig,
         ) -> Result<LlmStream<'a>, EngineError> {
             use futures::StreamExt;
 
             self.streaming_calls.fetch_add(1, Ordering::Relaxed);
+            self.requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(messages.to_vec());
             let items = self
                 .streams
                 .lock()
@@ -1092,6 +1107,56 @@ mod tests {
         assert!(execution.thread.internal_messages.iter().any(|message| {
             message.role == crate::types::message::MessageRole::ActionResult
                 && message.action_call_id.as_deref() == Some("call-1")
+        }));
+    }
+
+    #[tokio::test]
+    async fn retried_stream_adds_honest_context_to_next_model_call() {
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".to_string()),
+                    name: Some("test_tool".to_string()),
+                    args_delta: "{}".to_string(),
+                }),
+                Ok(LlmStreamChunk::ProviderObservation(
+                    ProviderStreamObservation::Retried,
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "tool_calls".to_string(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta("FINAL(\"Done!\")".to_string())),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".to_string(),
+                }),
+            ],
+        ]));
+        let effect = ActionResult {
+            call_id: "call-1".to_string(),
+            action_name: "test_tool".to_string(),
+            output: serde_json::json!({"ok": true}),
+            is_error: false,
+            duration: Duration::from_millis(1),
+        };
+        let (mut execution, _signal_tx) =
+            make_loop_with_llm(llm.clone(), vec![Ok(effect)], ThreadConfig::default()).await;
+
+        let outcome = execution.run().await.expect("streamed turn should run");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(response) } if response == "Done!"
+        ));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message.role == crate::types::message::MessageRole::System
+                && message.content.contains("required an upstream retry")
         }));
     }
 

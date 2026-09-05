@@ -89,7 +89,7 @@ def norm: if (type == "string") and test("^-?[0-9]+(\\.[0-9]+)?$") then tonumber
 # elsewhere are skipped; non-numeric/non-boolean leaves are dropped.
 def toseries($prefix):
   to_entries[]
-  | select(.key as $k | (["instances","units","services","agents","enabled"] | index($k)) | not)
+  | select(.key as $k | (["instances","providers","units","services","agents","enabled"] | index($k)) | not)
   | (.key | esc) as $key
   | (.value | norm) as $v
   | if ($v | type) == "object" then ($v | toseries($prefix + $key + "_"))
@@ -116,6 +116,23 @@ def instances($comp):
           elif $v == "true" then $head + "1"
           elif $v == "false" then $head + "0"
           else empty end ) );
+
+# Per-provider stream telemetry. Provider and tenant stay bounded labels rather
+# than becoming metric-name fragments, while only numeric/boolean fields export.
+def providers($comp):
+  (.metrics.providers // [])[] | select(type == "object")
+  | ((.provider // "unknown") | tostring) as $p
+  | ((.tenant // "default") | tostring) as $t
+  | ( . as $provider
+    | ( $provider | to_entries[]
+      | select(.key as $k | (["provider","tenant"] | index($k)) | not)
+      | (.key | esc) as $key
+      | (.value | norm) as $v
+      | ("lunarwing_health_" + $comp + "_" + $key
+         + "{provider=\"" + ($p | lv) + "\",tenant=\"" + ($t | lv) + "\"} ") as $head
+      | if ($v | type) == "number" then $head + ($v | tostring)
+        elif ($v | type) == "boolean" then $head + (if $v then "1" else "0" end)
+        else empty end ) );
 
 # Init-agnostic unit series. systemd emits metrics.units[], openrc
 # metrics.services[], launchd metrics.agents[]; shapes differ slightly
@@ -158,6 +175,7 @@ def units($init):
             else [] end )
         + ($m | [toseries("lunarwing_health_" + $comp + "_")])
         + ($c | [instances($comp)])
+        + ($c | [providers($comp)])
         + ($c | [units((($c.component // "unknown") | tostring))])
       end ]
   | flatten
