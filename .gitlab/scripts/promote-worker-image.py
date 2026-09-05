@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+DOTENV_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 RELEASE_TAG_RE = re.compile(r"^v\d+\.\d+\.\d+\.\d+(?:-rc[1-9]\d*)?$")
 MANIFEST_ACCEPT = ", ".join(
     (
@@ -29,6 +30,29 @@ def required_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"required environment variable {name} is missing")
     return value
+
+
+def candidate_metadata() -> dict[str, str]:
+    allowed = {
+        "WORKER_CANDIDATE_TAG",
+        "WORKER_IMAGE_DIGEST",
+        "WORKER_IMAGE_NAME",
+        "WORKER_IMAGE_REF",
+        "WORKER_REBUILD_DIGEST",
+        "WORKER_REBUILD_REF",
+    }
+    values: dict[str, str] = {}
+    for line in pathlib.Path("worker-image.env").read_text(encoding="utf-8").splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or not DOTENV_KEY_RE.fullmatch(key) or key not in allowed:
+            raise RuntimeError("candidate metadata contains an invalid field")
+        if key in values or not value:
+            raise RuntimeError(f"candidate metadata has invalid {key}")
+        values[key] = value
+    missing = allowed - values.keys()
+    if missing:
+        raise RuntimeError(f"candidate metadata is missing {sorted(missing)}")
+    return values
 
 
 def split_image_ref(registry: str, image_ref: str) -> tuple[str, str]:
@@ -131,11 +155,13 @@ def verify_inputs(source_sha: str) -> list[str]:
     return lines
 
 
-def verify_scan() -> dict:
+def verify_scan(expected_target: str) -> dict:
     scan_path = pathlib.Path("worker-vulnerabilities.json")
     sbom_path = pathlib.Path("worker-sbom.cdx.json")
     scan = json.loads(scan_path.read_text(encoding="utf-8"))
     json.loads(sbom_path.read_text(encoding="utf-8"))
+    if scan.get("ArtifactName") != expected_target:
+        raise RuntimeError("vulnerability report targets a different image")
     critical = sum(
         1
         for result in scan.get("Results") or []
@@ -172,14 +198,24 @@ def verify_image_config(config: dict, source_sha: str) -> dict:
 def promote() -> None:
     source_sha, release_tag = validate_pipeline_context()
     registry = required_env("CI_REGISTRY")
-    candidate_ref = required_env("WORKER_IMAGE_REF")
-    expected_digest = required_env("WORKER_IMAGE_DIGEST")
-    rebuild_digest = required_env("WORKER_REBUILD_DIGEST")
+    metadata = candidate_metadata()
+    candidate_ref = metadata["WORKER_IMAGE_REF"]
+    expected_digest = metadata["WORKER_IMAGE_DIGEST"]
+    rebuild_digest = metadata["WORKER_REBUILD_DIGEST"]
     if not DIGEST_RE.fullmatch(expected_digest):
         raise RuntimeError("WORKER_IMAGE_DIGEST is malformed")
     if rebuild_digest != expected_digest:
         raise RuntimeError("clean rebuild did not reproduce the candidate digest")
     repository, candidate_tag = split_image_ref(registry, candidate_ref)
+    expected_tag = rf"{re.escape(source_sha)}-{re.escape(required_env('CI_PIPELINE_ID'))}-[1-9]\d*"
+    if not re.fullmatch(expected_tag, candidate_tag):
+        raise RuntimeError("candidate tag does not belong to this pipeline and source commit")
+    if metadata["WORKER_CANDIDATE_TAG"] != candidate_tag:
+        raise RuntimeError("candidate tag metadata is inconsistent")
+    if repository.rsplit("/", 1)[-1] != metadata["WORKER_IMAGE_NAME"]:
+        raise RuntimeError("candidate repository does not match its worker name")
+    if metadata["WORKER_REBUILD_REF"] != f"{candidate_ref}-rebuild":
+        raise RuntimeError("clean rebuild reference is inconsistent")
     client = RegistryClient(
         registry,
         repository,
@@ -204,7 +240,7 @@ def promote() -> None:
     config_body, _ = config_result
     config_summary = verify_image_config(json.loads(config_body), source_sha)
     input_lines = verify_inputs(source_sha)
-    scan_summary = verify_scan()
+    scan_summary = verify_scan(f"{candidate_ref}@{expected_digest}")
 
     existing = client.manifest(release_tag, missing_ok=True)
     if existing is not None:
