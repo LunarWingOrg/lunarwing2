@@ -138,6 +138,9 @@ COPY --from=builder /build/bridge/target/release/pebble4lunarwing /usr/local/bin
 COPY --from=builder /build/pebble/target/release/pebble /usr/local/bin/pebble
 COPY pebble4lunarwing/entrypoint.sh /usr/local/bin/entrypoint.sh
 
+RUN /usr/local/bin/pebble --version && \
+    test -x /usr/local/bin/pebble4lunarwing && \
+    test -x /usr/local/bin/entrypoint.sh
 RUN mkdir -p /workspace && chmod 777 /workspace
 
 ENV PEBBLE_BIN=/usr/local/bin/pebble \
