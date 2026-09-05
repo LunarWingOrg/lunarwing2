@@ -1045,6 +1045,13 @@ pub async fn is_authenticated(
     secrets: &Arc<dyn SecretsStore + Send + Sync>,
     user_id: &str,
 ) -> bool {
+    // Static header credentials are authenticated by construction: activation
+    // resolves them and the client attaches them to every request. No stored
+    // OAuth token is needed or wanted here.
+    if !server_config.header_secrets.is_empty() {
+        return true;
+    }
+
     // Check if we have a stored token (from either pre-configured OAuth or DCR)
     secrets
         .exists(user_id, &server_config.token_secret_name())
@@ -1137,6 +1144,30 @@ pub async fn refresh_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn header_secrets_config_is_authenticated_without_stored_tokens() {
+        let key = secrecy::SecretString::from(crate::secrets::keychain::generate_master_key_hex());
+        let crypto = Arc::new(crate::secrets::SecretsCrypto::new(key).expect("test crypto"));
+        let store = Arc::new(crate::secrets::InMemorySecretsStore::new(crypto))
+            as Arc<dyn SecretsStore + Send + Sync>;
+
+        let plain = McpServerConfig::new("server", "https://mcp.example.com");
+        assert!(
+            !is_authenticated(&plain, &store, "owner").await,
+            "no stored tokens and no static credentials: not authenticated"
+        );
+
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        assert!(
+            is_authenticated(&config, &store, "owner").await,
+            "static header credentials are authenticated by construction"
+        );
+    }
 
     #[test]
     fn test_pkce_challenge_generation() {
