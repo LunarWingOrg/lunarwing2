@@ -66,7 +66,10 @@ printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$CI_REGISTRY" "$auth" > "$HOME/.docke
 : > "$inputs_file"
 printf '%s\n' "$input_files" > "$CI_PROJECT_DIR/worker-input-files.txt"
 while IFS= read -r input_file; do
-    [ -n "$input_file" ] && sha256sum "$CI_PROJECT_DIR/$input_file" >> "$inputs_file"
+    if [ -n "$input_file" ]; then
+        checksum=$(sha256sum "$CI_PROJECT_DIR/$input_file" | cut -d ' ' -f 1)
+        printf '%s  %s\n' "$checksum" "$input_file" >> "$inputs_file"
+    fi
 done < "$CI_PROJECT_DIR/worker-input-files.txt"
 printf 'source_ref  %s\n' "$source_ref" >> "$inputs_file"
 printf 'source_sha  %s\n' "$CI_COMMIT_SHA" >> "$inputs_file"
