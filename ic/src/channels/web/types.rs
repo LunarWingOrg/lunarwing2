@@ -881,6 +881,10 @@ pub struct InstallExtensionRequest {
     #[serde(default)]
     pub env_secrets: std::collections::HashMap<String, String>,
     #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub header_secrets: std::collections::HashMap<String, String>,
+    #[serde(default)]
     pub component: Option<std::path::PathBuf>,
     #[serde(default)]
     pub memory_mb: Option<u64>,
@@ -945,7 +949,20 @@ impl InstallExtensionRequest {
                 if placement == McpPlacement::JobWorker {
                     return Err("Job-worker MCP servers only support stdio transport".to_string());
                 }
-                return Ok(None);
+                if self.headers.is_empty() && self.header_secrets.is_empty() {
+                    return Ok(None);
+                }
+                let mut config = crate::tools::mcp::McpServerConfig::new(
+                    &self.name,
+                    self.url.as_deref().expect("url checked above"),
+                );
+                if !self.headers.is_empty() {
+                    config = config.with_headers(self.headers.clone());
+                }
+                if !self.header_secrets.is_empty() {
+                    config = config.with_header_secrets(self.header_secrets.clone());
+                }
+                return Ok(Some(config));
             }
             Some("wasm") => {
                 let component = self.component.clone().ok_or_else(|| {
@@ -985,6 +1002,25 @@ impl InstallExtensionRequest {
                 )
             }
             Some(other) => return Err(format!("Unsupported MCP transport '{other}'")),
+            None if self.url.is_some()
+                && (!self.headers.is_empty() || !self.header_secrets.is_empty()) =>
+            {
+                // Headers default the transport to http when a url is present.
+                if placement == McpPlacement::JobWorker {
+                    return Err("Job-worker MCP servers only support stdio transport".to_string());
+                }
+                let mut config = crate::tools::mcp::McpServerConfig::new(
+                    &self.name,
+                    self.url.as_deref().expect("url checked above"),
+                );
+                if !self.headers.is_empty() {
+                    config = config.with_headers(self.headers.clone());
+                }
+                if !self.header_secrets.is_empty() {
+                    config = config.with_header_secrets(self.header_secrets.clone());
+                }
+                return Ok(Some(config));
+            }
             None if self.command.is_some()
                 || !self.args.is_empty()
                 || !self.env.is_empty()
