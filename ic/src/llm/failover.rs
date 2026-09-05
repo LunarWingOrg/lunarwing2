@@ -842,6 +842,11 @@ mod tests {
             chunks,
             vec![
                 LlmStreamChunk::TextDelta("fallback delta".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Transport,
+                }),
                 LlmStreamChunk::Done {
                     usage: None,
                     finish_reason: "stop".to_string(),
@@ -892,6 +897,11 @@ mod tests {
             chunks,
             vec![
                 LlmStreamChunk::TextDelta("calling tool".to_string()),
+                LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                    provider: "primary".to_string(),
+                    attempts: 1,
+                    reason: StreamFailureReason::Transport,
+                }),
                 LlmStreamChunk::ToolCallDelta {
                     index: 0,
                     id: Some("call_1".to_string()),
