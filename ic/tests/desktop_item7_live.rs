@@ -91,6 +91,7 @@ async fn forward_events(
 }
 
 #[tokio::test]
+#[ignore = "manual desktop integration harness; requires DESKTOP_ITEM7_CONTROL"]
 async fn serve_desktop_item7() {
     let control = PathBuf::from(
         std::env::var("DESKTOP_ITEM7_CONTROL")
