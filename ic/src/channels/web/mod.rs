@@ -377,7 +377,13 @@ impl Channel for GatewayChannel {
                 ),
             })?;
 
-        server::start_server(addr, self.state.clone(), self.auth.clone()).await?;
+        server::start_server_with_mascot(
+            addr,
+            self.state.clone(),
+            self.auth.clone(),
+            self.config.mascot_enabled,
+        )
+        .await?;
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
