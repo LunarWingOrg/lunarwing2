@@ -202,8 +202,10 @@ Create the Rust runner with:
 - Per-host job limit: one. Every Cargo job pins itself to CPUs `0-5`; parallel
   Rust jobs therefore require separate runner hosts or VMs, not overlapping
   jobs on one host.
-- Maximum job timeout: at least two hours. The project timeout and runner
-  maximum both cap the YAML timeout, and GitLab applies whichever is lower.
+- Maximum job timeout: at least eight hours for the protected
+  `container-build` runner and at least two hours for Rust runners. The project
+  timeout must be at least eight hours; GitLab applies whichever project/runner
+  limit is lower. Ordinary validation jobs still use their two-hour YAML cap.
 
 Essential Docker executor settings belong in runner-host `config.toml`, not in
 this repository:
@@ -248,8 +250,9 @@ Open **Settings > CI/CD** and apply:
 2. Under **General pipelines**, keep **Use separate caches for protected
    branches** enabled. Never allow protected and unprotected refs to share one
    cache namespace.
-3. Set the project build timeout to two hours. Set each Rust runner's maximum
-   timeout to at least two hours; the lower project/runner limit wins.
+3. Set the project build timeout to at least eight hours. Set Rust runner
+   maximum timeout to at least two hours and protected `container-build` runner
+   maximum timeout to at least eight hours; the lower project/runner limit wins.
 4. Keep **Allow merge request pipelines to access protected variables and
    runners** disabled under **Variables**.
 5. Add no secrets for phase 1. Jobs need no API keys, database URLs, signing
