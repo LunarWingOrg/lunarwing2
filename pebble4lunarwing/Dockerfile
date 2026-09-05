@@ -1,31 +1,39 @@
-FROM docker.io/library/rust:1.92-bookworm AS builder
+ARG PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
+ARG DEBIAN_SNAPSHOT=20260901T000000Z
 
-# Snapshot fallback helper — tries live mirror first, falls back to
-# snapshot.debian.org if live mirror has an invalid signature (e.g. pre-staged
-# security signatures not yet valid for the current UTC window).
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
-    }) && \
-    apt-get install -y --no-install-recommends git && \
+FROM docker.io/library/rust:1.96.1-bookworm@sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663 AS builder
+
+ARG PEBBLE_REF
+ARG DEBIAN_SNAPSHOT
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
+    apt-get install -y --no-install-recommends git; \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-# Build the bridge binary
 COPY pebble4lunarwing/Cargo.toml pebble4lunarwing/Cargo.lock ./bridge/
 COPY pebble4lunarwing/src ./bridge/src
-RUN cd bridge && cargo build --release
+RUN cd bridge && cargo build --release --locked
 
-# Build pebble
-RUN git clone --depth 1 https://github.com/nanogpt-community/pebble.git ./pebble
-RUN cd pebble && cargo build --release --bin pebble
+RUN printf '%s' "${PEBBLE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
+    git init /build/pebble && \
+    git -C /build/pebble remote add origin https://github.com/nanogpt-community/pebble.git && \
+    git -C /build/pebble fetch --depth 1 origin "${PEBBLE_REF}" && \
+    git -C /build/pebble checkout --detach FETCH_HEAD && \
+    test "$(git -C /build/pebble rev-parse HEAD)" = "${PEBBLE_REF}"
+RUN cd pebble && cargo build --release --locked --bin pebble
 
 # --- Runtime ---
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
+ARG DEBIAN_SNAPSHOT
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # Pass --build-arg WITH_TOOLCHAINS=true for the fat image (dev containers that
 # must compile native code), matching the opencode/kimi toolchain profile.
@@ -33,25 +41,22 @@ ARG WITH_TOOLCHAINS=false
 
 LABEL org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update 2>/dev/null || apt-get update -o Acquire::AllowInsecureRepositories=true; \
-    }) && \
-    apt-get install -y --no-install-recommends \
-      ca-certificates git curl && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm main" \
+      "deb https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bookworm-updates main" \
+      "deb https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bookworm-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
+    apt-get install -y --no-install-recommends ca-certificates git curl; \
     rm -rf /var/lib/apt/lists/*
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true. Mirrors the opencode
 # worker's list so all external workers expose the same dev-tool surface.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      set -e; \
-      (apt-get update 2>/dev/null || { \
-        echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-        sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update; \
-      }) && \
+      set -eu; \
+      apt-get -o Acquire::Check-Valid-Until=false update; \
       apt-get install -y --no-install-recommends \
         python3-dev \
         build-essential \
@@ -84,8 +89,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         libtool \
         meson \
         nodejs \
-        npm \
-      && rm -rf /var/lib/apt/lists/*; \
+        npm; \
+      rm -rf /var/lib/apt/lists/*; \
     fi
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────
@@ -93,16 +98,34 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) RUST_TARGET=x86_64-unknown-linux-gnu; RUSTUP_SHA=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;; \
+        arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
+        *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
+      echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
+      chmod +x /tmp/rustup-init; \
+      /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain 1.96.1; \
+      rm /tmp/rustup-init; \
+      chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      ARCH=$(dpkg --print-architecture) \
-      && curl -fsSL "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz" \
-        | tar -C /usr/local -xz; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) GO_SHA=3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8 ;; \
+        arm64) GO_SHA=a463cb59382bd7ae7d8f4c68846e73c4d589f223c589ac76871b66811ded7836 ;; \
+        *) echo "unsupported Go architecture" >&2; exit 1 ;; \
+      esac; \
+      ARCH=$(dpkg --print-architecture); \
+      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
+      tar -C /usr/local -xzf /tmp/go.tgz; \
+      rm /tmp/go.tgz; \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/root/go \
