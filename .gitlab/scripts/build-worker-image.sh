@@ -55,9 +55,17 @@ esac
 
 candidate_tag="${CI_COMMIT_SHA}-${CI_PIPELINE_ID}-${CI_JOB_ID}"
 candidate_ref="${CI_REGISTRY_IMAGE}/${image_name}:${candidate_tag}"
+rebuild_ref="${candidate_ref}-rebuild"
 metadata_file="$CI_PROJECT_DIR/worker-image-metadata.json"
+rebuild_metadata_file="$CI_PROJECT_DIR/worker-image-rebuild-metadata.json"
 inputs_file="$CI_PROJECT_DIR/worker-inputs.sha256"
 env_file="$CI_PROJECT_DIR/worker-image.env"
+source_date_epoch=$(git -C "$CI_PROJECT_DIR" show -s --format=%ct "$CI_COMMIT_SHA")
+case "$source_date_epoch" in
+    '' | *[!0-9]*) echo "invalid source commit timestamp" >&2; exit 1 ;;
+esac
+build_args="$build_args
+SOURCE_DATE_EPOCH=$source_date_epoch"
 
 mkdir -p "$HOME/.docker"
 auth=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
@@ -71,34 +79,57 @@ while IFS= read -r input_file; do
         printf '%s  %s\n' "$checksum" "$input_file" >> "$inputs_file"
     fi
 done < "$CI_PROJECT_DIR/worker-input-files.txt"
-printf 'source_ref  %s\n' "$source_ref" >> "$inputs_file"
-printf 'source_sha  %s\n' "$CI_COMMIT_SHA" >> "$inputs_file"
-
-set -- buildctl-daemonless.sh build \
-    --frontend dockerfile.v0 \
-    --local "context=$CI_PROJECT_DIR/$context" \
-    --local "dockerfile=$CI_PROJECT_DIR/$dockerfile_dir" \
-    --opt filename=Dockerfile \
-    --metadata-file "$metadata_file" \
-    --output "type=image,name=$candidate_ref,push=true,oci-mediatypes=false"
-
+{
+    printf 'source_ref  %s\n' "$source_ref"
+    printf 'source_sha  %s\n' "$CI_COMMIT_SHA"
+    printf 'source_date_epoch  %s\n' "$source_date_epoch"
+} >> "$inputs_file"
 printf '%s\n' "$build_args" > "$CI_PROJECT_DIR/worker-build-args.txt"
-while IFS= read -r build_arg; do
-    [ -n "$build_arg" ] && set -- "$@" --opt "build-arg:$build_arg"
-done < "$CI_PROJECT_DIR/worker-build-args.txt"
-"$@"
 
-digest=$(awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$metadata_file")
+build_image() {
+    output_ref=$1
+    output_metadata=$2
+    clean=$3
+    set -- buildctl-daemonless.sh build
+    [ "$clean" = true ] && set -- "$@" --no-cache
+    set -- "$@" \
+        --frontend dockerfile.v0 \
+        --local "context=$CI_PROJECT_DIR/$context" \
+        --local "dockerfile=$CI_PROJECT_DIR/$dockerfile_dir" \
+        --opt filename=Dockerfile \
+        --metadata-file "$output_metadata" \
+        --output "type=image,name=$output_ref,push=true,oci-mediatypes=false,rewrite-timestamp=true"
+    while IFS= read -r build_arg; do
+        [ -n "$build_arg" ] && set -- "$@" --opt "build-arg:$build_arg"
+    done < "$CI_PROJECT_DIR/worker-build-args.txt"
+    "$@"
+}
+
+metadata_digest() {
+    awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
+}
+
+build_image "$candidate_ref" "$metadata_file" false
+digest=$(metadata_digest "$metadata_file")
 case "$digest" in
     sha256:????????????????????????????????????????????????????????????????) ;;
     *) echo "BuildKit did not report a valid image digest" >&2; exit 1 ;;
 esac
+
+build_image "$rebuild_ref" "$rebuild_metadata_file" true
+rebuild_digest=$(metadata_digest "$rebuild_metadata_file")
+if [ "$rebuild_digest" != "$digest" ]; then
+    echo "clean rebuild digest mismatch: $rebuild_digest != $digest" >&2
+    exit 1
+fi
 
 {
     printf 'WORKER_IMAGE_NAME=%s\n' "$image_name"
     printf 'WORKER_CANDIDATE_TAG=%s\n' "$candidate_tag"
     printf 'WORKER_IMAGE_REF=%s\n' "$candidate_ref"
     printf 'WORKER_IMAGE_DIGEST=%s\n' "$digest"
+    printf 'WORKER_REBUILD_REF=%s\n' "$rebuild_ref"
+    printf 'WORKER_REBUILD_DIGEST=%s\n' "$rebuild_digest"
 } > "$env_file"
 
-printf 'Published immutable candidate %s@%s\n' "$candidate_ref" "$digest"
+printf 'Published reproducible candidate %s@%s\n' "$candidate_ref" "$digest"
