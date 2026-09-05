@@ -294,6 +294,10 @@ name = "engine_v2_tensorzero_streaming"
 required-features = ["libsql", "integration"]
 
 [[test]]
+name = "workspace_integration"
+required-features = ["postgres", "integration"]
+
+[[test]]
 name = "html_to_markdown"
 required-features = ["html-to-markdown"]
 

@@ -11,26 +11,21 @@ shell-harnesses:
   stage: test
   needs:
     - shell-syntax
-  timeout: 30m
+  timeout: 2h
   script:
     - bash .gitlab/scripts/shell-harnesses.sh
 
 cavepony-wasm:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: test
   variables:
     CAVEPONY_EXPECTED_VERSION: "0.4.2"
     CAVEPONY_WASM_REQUIRED: "1"
   needs:
     - rust-check-default
-  timeout: 30m
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*).
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
+  timeout: 2h
   script:
     - rustup target add --toolchain 1.96.1 wasm32-wasip2
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml

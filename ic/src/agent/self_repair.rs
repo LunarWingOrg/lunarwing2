@@ -792,10 +792,12 @@ mod tests {
     }
 
     /// Mock SoftwareBuilder that returns a successful build result.
+    #[cfg(feature = "libsql")]
     struct MockBuilder {
         build_count: std::sync::atomic::AtomicU32,
     }
 
+    #[cfg(feature = "libsql")]
     impl MockBuilder {
         fn new() -> Self {
             Self {
@@ -808,6 +810,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "libsql")]
     #[async_trait]
     impl crate::tools::SoftwareBuilder for MockBuilder {
         async fn analyze(
@@ -936,9 +939,11 @@ mod tests {
     }
 
     /// A minimal builtin (non-WASM) tool for self-verify tests.
+    #[cfg(feature = "libsql")]
     #[derive(Debug)]
     struct MockBuiltinTool;
 
+    #[cfg(feature = "libsql")]
     #[async_trait]
     impl crate::tools::Tool for MockBuiltinTool {
         fn name(&self) -> &str {

@@ -1,101 +1,153 @@
-# Container image builds for the external workers, published to this project's
-# GitLab container registry ($CI_REGISTRY_IMAGE). Requires the built-in registry
-# to be enabled on the GitLab server — see docs/ops/GITLAB_CONTAINER_REGISTRY.md
-# for the server-side setup and for how MT hosts/tenants pull these images.
-#
-# Images are built with Kaniko (unprivileged, works on any docker-executor
-# runner; produces docker-format images so the Dockerfiles' HEALTHCHECKs
-# survive). ALL image jobs are manual-only on every pipeline — multi-GB builds
-# never start automatically.
-#
-# If gcr.io is unreachable from the runners, mirror the executor image into
-# our own registry first (bootstrap notes in docs/ops/GITLAB_CONTAINER_REGISTRY.md).
-#
-# Tags: a moving version tag (WORKER_IMAGE_TAG, default v2.0.9.0), :latest,
-# plus an immutable $CI_COMMIT_SHORT_SHA tag. The moving tags silently retarget
-# between builds, so consumers that need a stable reference must pin the SHA
-# tag (or the digest it resolves to). SHA tags accumulate — pruning relies on
-# the server-side registry cleanup policy (docs/ops/GITLAB_CONTAINER_REGISTRY.md
-# section 4) because this registry's tag-delete UI has 502ed while trying to
-# clear them. Override WORKER_IMAGE_NAME / WORKER_IMAGE_TAG when playing a job
-# to push to a fresh repository or tag if the existing one is wedged.
+# Protected worker publication pipeline: immutable candidate -> digest scan/SBOM
+# -> manual immutable release-tag promotion. No job here is created for an
+# unprotected ref, and promotion never rebuilds or writes :latest.
 
-.container-job:
+.worker-candidate:
   image:
-    name: "gcr.io/kaniko-project/executor:v1.23.2-debug@sha256:c3109d5926a997b100c4343944e06c6b30a6804b2f9abe0994d3de6ef92b028e"
+    # Trust-sensitive publication images are literal pins, not pipeline-overridable variables.
+    name: "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51"
     entrypoint: [""]
   tags:
-    - "$CI_LINT_RUNNER_TAG"
+    - container-build
   stage: containers
-  # Start immediately, independent of earlier stages — image builds don't
-  # consume test artifacts, and stage gating would block the manual trigger
-  # behind the full Rust suite.
-  needs: []
+  interruptible: false
+  retry: 0
+  timeout: 8h
   variables:
-    # Kaniko + GitLab registry over HTTP/2 502s on blob PATCH (Traefik/nginx
-    # in front of registry). GitLab's documented workaround: force HTTP/1.1.
-    GODEBUG: "http2client=0"
-    WORKER_IMAGE_TAG: "v2.0.9.0"
-  before_script:
-    - mkdir -p /kaniko/.docker
-    - |
-      printf '{"auths":{"%s":{"username":"%s","password":"%s"}}}' \
-        "$CI_REGISTRY" "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" \
-        > /kaniko/.docker/config.json
-
-worker-pebble-image:
-  extends: .container-job
-  variables:
-    WORKER_IMAGE_NAME: worker-pebble
-  script:
-    - /kaniko/executor
-      --context "$CI_PROJECT_DIR"
-      --dockerfile "$CI_PROJECT_DIR/pebble4lunarwing/Dockerfile"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
-      --push-retry=5
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  artifacts:
+    when: always
+    expire_in: 30 days
+    reports:
+      dotenv: worker-image.env
+    paths:
+      - worker-image.env
+      - worker-image-metadata.json
+      - worker-image-rebuild-metadata.json
+      - worker-inputs.sha256
   rules:
-    - when: manual
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+      allow_failure: false
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
       allow_failure: true
+    - when: never
 
-worker-opencode-image:
-  extends: .container-job
+.worker-scan:
+  image:
+    name: "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969"
+    entrypoint: [""]
+  tags:
+    - container-build
+  stage: containers
+  timeout: 2h
   variables:
-    WORKER_IMAGE_NAME: worker-opencode
-    # Mirrors mt-admin's build_opencode_worker: slim by default; set
-    # WITH_TOOLCHAINS=true on a manual pipeline for the fat toolchain image.
-    WITH_TOOLCHAINS: "false"
+    TRIVY_CACHE_DIR: "$CI_PROJECT_DIR/.trivy-cache"
+    TRIVY_NO_PROGRESS: "true"
+    TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
+    TRIVY_USERNAME: "$CI_REGISTRY_USER"
   script:
-    - /kaniko/executor
-      --context "$CI_PROJECT_DIR/opencode4lunarwing"
-      --dockerfile "$CI_PROJECT_DIR/opencode4lunarwing/Dockerfile"
-      --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
-      --push-retry=5
+    - set -a; . ./worker-image.env; set +a
+    - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
+    - trivy image --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+    - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - worker-vulnerabilities.json
+      - worker-sbom.cdx.json
   rules:
-    - when: manual
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
       allow_failure: true
+    - when: never
 
-worker-kimi-image:
-  extends: .container-job
-  variables:
-    WORKER_IMAGE_NAME: worker-kimi
-    KIMI_CODE_VERSION: "0.39.1"
-    # Keep parity with OpenCode: slim default, opt-in toolchain image.
-    WITH_TOOLCHAINS: "false"
+.worker-promotion:
+  image:
+    name: "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+  tags:
+    - container-build
+  stage: containers
+  interruptible: false
+  retry: 0
+  timeout: 30m
   script:
-    - /kaniko/executor
-      --context "$CI_PROJECT_DIR/kimicode4lunarwing"
-      --dockerfile "$CI_PROJECT_DIR/kimicode4lunarwing/Dockerfile"
-      --build-arg "KIMI_CODE_VERSION=$KIMI_CODE_VERSION"
-      --build-arg "WITH_TOOLCHAINS=$WITH_TOOLCHAINS"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${WORKER_IMAGE_TAG}"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:latest"
-      --destination "$CI_REGISTRY_IMAGE/${WORKER_IMAGE_NAME}:${CI_COMMIT_SHORT_SHA}"
-      --push-retry=5
+    - python3 .gitlab/scripts/promote-worker-image.py promote
+  artifacts:
+    expire_in: 1 year
+    paths:
+      - worker-image-evidence.json
   rules:
-    - when: manual
-      allow_failure: true
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: manual
+      allow_failure: false
+    - when: never
+
+worker-pebble-candidate:
+  extends: .worker-candidate
+  script:
+    - sh .gitlab/scripts/build-worker-image.sh pebble
+
+worker-pebble-scan:
+  extends: .worker-scan
+  needs:
+    - job: worker-pebble-candidate
+      artifacts: true
+
+worker-pebble-promote:
+  extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-pebble"
+  resource_group: worker-pebble-promotion
+  needs:
+    - job: worker-pebble-candidate
+      artifacts: true
+    - job: worker-pebble-scan
+      artifacts: true
+
+worker-opencode-candidate:
+  extends: .worker-candidate
+  script:
+    - sh .gitlab/scripts/build-worker-image.sh opencode
+
+worker-opencode-scan:
+  extends: .worker-scan
+  needs:
+    - job: worker-opencode-candidate
+      artifacts: true
+
+worker-opencode-promote:
+  extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-opencode"
+  resource_group: worker-opencode-promotion
+  needs:
+    - job: worker-opencode-candidate
+      artifacts: true
+    - job: worker-opencode-scan
+      artifacts: true
+
+worker-kimi-candidate:
+  extends: .worker-candidate
+  script:
+    - sh .gitlab/scripts/build-worker-image.sh kimi
+
+worker-kimi-scan:
+  extends: .worker-scan
+  needs:
+    - job: worker-kimi-candidate
+      artifacts: true
+
+worker-kimi-promote:
+  extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-kimi"
+  resource_group: worker-kimi-promotion
+  needs:
+    - job: worker-kimi-candidate
+      artifacts: true
+    - job: worker-kimi-scan
+      artifacts: true
