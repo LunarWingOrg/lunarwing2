@@ -221,6 +221,10 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         errors.append("worker candidate and promotion templates must be non-interruptible")
     if candidate.get("retry") != 0 or promotion.get("retry") != 0:
         errors.append("worker publication must not retry after a timeout or partial push")
+    for template_name in (".worker-candidate", ".worker-scan", ".worker-promotion"):
+        image = image_name(merged.get(template_name, {}).get("image"))
+        if not image or VARIABLE_REF_PATTERN.search(image) or not IMAGE_PATTERN.search(image):
+            errors.append(f"{template_name} must use a literal digest-pinned image")
     scan_script = "\n".join(merged.get(".worker-scan", {}).get("script", []))
     if ". ./worker-image.env" not in scan_script:
         errors.append("worker scan must reload candidate values from its artifact")
