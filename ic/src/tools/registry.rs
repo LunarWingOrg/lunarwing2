@@ -497,6 +497,32 @@ impl ToolRegistry {
         tracing::debug!("Registered 5 development tools");
     }
 
+    /// Register the shell tool backed by the generic podman sandbox
+    /// (fail-closed: commands error instead of running on the host when the
+    /// sandbox is unavailable).
+    ///
+    /// If a plain `shell` tool was already registered (dev mode), this
+    /// replaces it — registration is keyed by tool name.
+    ///
+    /// BOUNDARY: this is the generic sandbox path (`crate::sandbox`), driven
+    /// by the podman/docker CLI. It is unrelated to the orchestrator's
+    /// `ContainerJobManager` worker-container path; do not mix the two.
+    pub fn register_sandboxed_shell(
+        &self,
+        sandbox: Arc<crate::sandbox::SandboxManager>,
+        policy: crate::sandbox::SandboxPolicy,
+    ) {
+        self.register_sync(Arc::new(
+            ShellTool::new()
+                .with_sandbox(sandbox)
+                .with_sandbox_policy(policy),
+        ));
+        tracing::info!(
+            policy = ?policy,
+            "Registered sandboxed shell tool (generic podman sandbox, fail-closed)"
+        );
+    }
+
     /// Register memory tools with a workspace resolver.
     ///
     /// Memory tools require a workspace resolver for persistence. Call this after

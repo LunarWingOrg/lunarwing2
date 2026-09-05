@@ -5,13 +5,20 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tracing;
 
-/// Docker sandbox configuration.
+/// Sandbox configuration (generic podman-first sandbox).
 #[derive(Debug, Clone)]
 pub struct SandboxModeConfig {
-    /// Whether the Docker sandbox is enabled.
+    /// Whether the sandbox is enabled.
     pub enabled: bool,
     /// Sandbox policy: "readonly", "workspace_write", or "full_access".
     pub policy: String,
+    /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
+    pub runtime: String,
+    /// Network egress mode for sandboxed policies: "proxy" or "none".
+    pub network: String,
+    /// Force sandboxed shell execution even in dev mode (ALLOW_LOCAL_TOOLS).
+    /// Default false: dev boxes keep direct host execution.
+    pub enforce: bool,
     /// Explicit opt-in for `FullAccess` policy.
     ///
     /// When `policy` is `full_access` but this is `false`, the policy is
@@ -25,7 +32,7 @@ pub struct SandboxModeConfig {
     pub memory_limit_mb: u64,
     /// CPU shares (relative weight).
     pub cpu_shares: u32,
-    /// Docker image for the sandbox.
+    /// Container image for the sandbox.
     pub image: String,
     /// Whether to auto-pull the image if not found.
     pub auto_pull_image: bool,
@@ -42,6 +49,9 @@ impl Default for SandboxModeConfig {
         Self {
             enabled: true,
             policy: "readonly".to_string(),
+            runtime: "auto".to_string(),
+            network: "proxy".to_string(),
+            enforce: false,
             allow_full_access: false,
             timeout_secs: 120,
             memory_limit_mb: 2048,
@@ -91,6 +101,10 @@ impl SandboxModeConfig {
         Ok(Self {
             enabled: parse_bool_env("SANDBOX_ENABLED", ss.enabled)?,
             policy: parse_string_env("SANDBOX_POLICY", ss.policy.clone())?,
+            runtime: parse_string_env("SANDBOX_RUNTIME", ss.runtime.clone())?,
+            network: parse_string_env("SANDBOX_NETWORK", ss.network.clone())?,
+            // enforce: env > settings, default false.
+            enforce: parse_bool_env("SANDBOX_ENFORCE", ss.enforce)?,
             // allow_full_access has no Settings counterpart — env > default only.
             allow_full_access: parse_bool_env("SANDBOX_ALLOW_FULL_ACCESS", false)?,
             timeout_secs: parse_optional_env("SANDBOX_TIMEOUT_SECS", ss.timeout_secs)?,
@@ -118,12 +132,30 @@ impl SandboxModeConfig {
         if policy == SandboxPolicy::FullAccess && !self.allow_full_access {
             tracing::error!(
                 "SANDBOX_POLICY=full_access is set but SANDBOX_ALLOW_FULL_ACCESS is not \
-                 set to 'true'. FullAccess bypasses Docker and runs commands directly on \
-                 the host. Downgrading to WorkspaceWrite for safety. Set \
+                 set to 'true'. FullAccess bypasses the container and runs commands \
+                 directly on the host. Downgrading to WorkspaceWrite for safety. Set \
                  SANDBOX_ALLOW_FULL_ACCESS=true to explicitly enable FullAccess."
             );
             policy = SandboxPolicy::WorkspaceWrite;
         }
+
+        let runtime = self.runtime.parse().unwrap_or_else(|e| {
+            tracing::error!(
+                value = %self.runtime,
+                error = %e,
+                "Invalid SANDBOX_RUNTIME; falling back to 'auto' (podman preferred)"
+            );
+            crate::sandbox::SandboxRuntime::Auto
+        });
+
+        let network = self.network.parse().unwrap_or_else(|e| {
+            tracing::error!(
+                value = %self.network,
+                error = %e,
+                "Invalid SANDBOX_NETWORK; falling back to 'proxy'"
+            );
+            crate::sandbox::SandboxNetworkMode::Proxy
+        });
 
         let mut allowlist = crate::sandbox::default_allowlist();
         allowlist.extend(self.extra_allowed_domains.clone());
@@ -139,6 +171,8 @@ impl SandboxModeConfig {
             image: self.image.clone(),
             auto_pull_image: self.auto_pull_image,
             proxy_port: 0, // Auto-assign
+            runtime,
+            network,
         }
     }
 }
@@ -302,6 +336,9 @@ mod tests {
         let cfg = SandboxModeConfig {
             enabled: false,
             policy: "full_access".to_string(),
+            runtime: "podman".to_string(),
+            network: "none".to_string(),
+            enforce: true,
             timeout_secs: 600,
             memory_limit_mb: 4096,
             cpu_shares: 512,
@@ -314,6 +351,9 @@ mod tests {
         };
         assert!(!cfg.enabled);
         assert_eq!(cfg.policy, "full_access");
+        assert_eq!(cfg.runtime, "podman");
+        assert_eq!(cfg.network, "none");
+        assert!(cfg.enforce);
         assert_eq!(cfg.timeout_secs, 600);
         assert_eq!(cfg.memory_limit_mb, 4096);
         assert_eq!(cfg.cpu_shares, 512);
@@ -327,6 +367,8 @@ mod tests {
         let mode = SandboxModeConfig {
             enabled: true,
             policy: "workspace_write".to_string(),
+            runtime: "docker".to_string(),
+            network: "none".to_string(),
             timeout_secs: 300,
             memory_limit_mb: 1024,
             cpu_shares: 2048,
@@ -336,6 +378,7 @@ mod tests {
             reaper_interval_secs: 300,
             orphan_threshold_secs: 600,
             allow_full_access: false,
+            enforce: false,
         };
         let sc = mode.to_sandbox_config();
         assert!(sc.enabled);
@@ -345,12 +388,59 @@ mod tests {
         assert_eq!(sc.cpu_shares, 2048);
         assert_eq!(sc.image, "test:latest");
         assert!(!sc.auto_pull_image);
+        assert_eq!(sc.runtime, crate::sandbox::SandboxRuntime::Docker);
+        assert_eq!(sc.network, crate::sandbox::SandboxNetworkMode::None);
         // extra domain should be in the allowlist
         assert!(
             sc.network_allowlist
                 .contains(&"custom.example.com".to_string()),
             "expected custom domain in allowlist"
         );
+    }
+
+    #[test]
+    fn sandbox_mode_invalid_runtime_network_fall_back() {
+        let mode = SandboxModeConfig {
+            runtime: "containerd".to_string(),
+            network: "wide-open".to_string(),
+            ..SandboxModeConfig::default()
+        };
+        let sc = mode.to_sandbox_config();
+        assert_eq!(sc.runtime, crate::sandbox::SandboxRuntime::Auto);
+        assert_eq!(sc.network, crate::sandbox::SandboxNetworkMode::Proxy);
+    }
+
+    #[test]
+    fn sandbox_runtime_network_env_overrides_settings() {
+        let _guard = crate::config::helpers::lock_env();
+        let mut settings = crate::settings::Settings::default();
+        settings.sandbox.runtime = "docker".to_string();
+        settings.sandbox.network = "none".to_string();
+        settings.sandbox.enforce = true;
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_RUNTIME", "podman") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve");
+        unsafe { std::env::remove_var("SANDBOX_RUNTIME") };
+
+        assert_eq!(cfg.runtime, "podman");
+        // No env override for network: settings win.
+        assert_eq!(cfg.network, "none");
+        assert!(cfg.enforce);
+    }
+
+    #[test]
+    fn sandbox_enforce_env_overrides_default() {
+        let _guard = crate::config::helpers::lock_env();
+        let settings = crate::settings::Settings::default();
+        assert!(!settings.sandbox.enforce);
+
+        // SAFETY: Under ENV_MUTEX, no concurrent env access.
+        unsafe { std::env::set_var("SANDBOX_ENFORCE", "true") };
+        let cfg = SandboxModeConfig::resolve(&settings).expect("resolve");
+        unsafe { std::env::remove_var("SANDBOX_ENFORCE") };
+
+        assert!(cfg.enforce);
     }
 
     #[test]

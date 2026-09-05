@@ -25,10 +25,36 @@ The shell tool scrubs sensitive env vars before executing commands. The sanitize
 
 | Policy | Filesystem | Network |
 |--------|-----------|---------|
-| ReadOnly | Read-only workspace | Allowlisted domains |
-| WorkspaceWrite | Read-write workspace | Allowlisted domains |
-| FullAccess | Full filesystem | Unrestricted |
+| ReadOnly | Read-only workspace | Proxy allowlist or `none` (see egress tiers) |
+| WorkspaceWrite | Read-write workspace | Proxy allowlist or `none` (see egress tiers) |
+| FullAccess | Full filesystem (host execution) | Unrestricted |
+
+The generic sandbox runs shell-tool commands in ephemeral hardened containers
+via the **podman/docker CLI** (`src/sandbox/cli_runner.rs` — no daemon socket).
+Shell-tool execution is **fail-closed**: when the sandbox is enabled but the
+runtime or image is unavailable, commands error with a structured
+`[sandbox:<kind>]` envelope instead of running on the host. Dev mode
+(`ALLOW_LOCAL_TOOLS=1`) keeps direct host execution unless `SANDBOX_ENFORCE=true`.
+
+## Network Egress Tiers
+
+- `proxy` (default): allowlist HTTP proxy + credential injection. **Advisory** —
+  enforced via `http_proxy`/`https_proxy` env vars, which a process may ignore.
+- `none`: `--network none` — kernel-enforced, no egress, no proxy started.
+
+## BOUNDARY: generic sandbox vs. orchestrator worker containers
+
+TWO container subsystems exist; never mix them:
+- `src/sandbox/` — generic sandbox (CLI runner, `lunarwing.sandbox` labels,
+  shell tool consumer).
+- `src/orchestrator/job_manager.rs` — live worker jobs (bollard Docker API,
+  `lunarwing.job_id` labels, job tokens).
+
+Do not pass `SandboxManager`/`CliRunner` into the orchestrator, and do not
+route shell execution through `ContainerJobManager`. The reaper
+(`src/orchestrator/reaper.rs`) is the only shared component and scans the two
+label namespaces separately.
 
 ## Zero-Exposure Credential Model
 
-Secrets are stored encrypted on the host and injected into HTTP requests by the proxy at transit time. Container processes never see raw credential values.
+Secrets are stored encrypted on the host and injected into HTTP requests by the proxy at transit time. Container processes never see raw credential values. Proxy denials are returned with the body prefix `sandbox-proxy denied: <reason>` so sandboxed agents can attribute them.

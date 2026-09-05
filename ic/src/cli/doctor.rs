@@ -737,15 +737,21 @@ fn check_service_installed() -> CheckResult {
     }
 }
 
-// ── Docker daemon ───────────────────────────────────────────
+// ── Container runtime ───────────────────────────────────────
 
 async fn check_docker_daemon() -> CheckResult {
+    // The generic sandbox drives the podman CLI directly (no daemon), so a
+    // usable podman satisfies sandboxing even without a docker daemon socket.
+    if crate::sandbox::check_podman().await.status.is_ok() {
+        return CheckResult::Pass("podman CLI available".into());
+    }
     let detection = crate::sandbox::check_docker().await;
     match detection.status {
         crate::sandbox::DockerStatus::Available => CheckResult::Pass("running".into()),
         crate::sandbox::DockerStatus::NotInstalled => CheckResult::Skip(format!(
-            "not installed. {}",
-            detection.platform.install_hint()
+            "not installed. {} (or {})",
+            detection.platform.install_hint(),
+            crate::sandbox::podman_install_hint()
         )),
         crate::sandbox::DockerStatus::NotRunning => CheckResult::Fail(format!(
             "installed but not running. {}",
