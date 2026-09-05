@@ -91,8 +91,11 @@ impl StreamAccumulator {
     }
 
     fn finish(mut self) -> LlmStreamCollection {
+        let corrupted = self
+            .observations
+            .contains(&ProviderStreamObservation::Corrupted);
         let observations = std::mem::take(&mut self.observations);
-        let result = self.finish_output();
+        let result = self.finish_output(corrupted);
         LlmStreamCollection {
             result,
             observations,
@@ -106,12 +109,14 @@ impl StreamAccumulator {
         }
     }
 
-    fn finish_output(self) -> Result<LlmOutput, EngineError> {
+    fn finish_output(self, corrupted: bool) -> Result<LlmOutput, EngineError> {
         if !self.saw_done {
             return Err(llm_error("LLM stream ended before Done"));
         }
 
-        let response = if self.tool_calls.is_empty() {
+        let response = if corrupted {
+            LlmResponse::Text(self.text)
+        } else if self.tool_calls.is_empty() {
             LlmResponse::from_text(self.text)
         } else {
             let mut calls = Vec::with_capacity(self.tool_calls.len());
@@ -238,6 +243,26 @@ mod tests {
             collection.observations,
             vec![ProviderStreamObservation::Retried]
         );
+    }
+
+    #[tokio::test]
+    async fn corrupted_output_is_retained_as_non_executable_text() {
+        let original = "```repl\ntest_tool()\n```";
+        let stream = stream::iter([
+            Ok(LlmStreamChunk::TextDelta(original.to_string())),
+            tool(0, Some("call-1"), Some("test_tool"), "{}"),
+            Ok(LlmStreamChunk::ProviderObservation(
+                ProviderStreamObservation::Corrupted,
+            )),
+            done(None),
+        ])
+        .boxed();
+        let collection = collect_llm_stream(stream, |_| {}).await;
+
+        assert!(matches!(
+            collection.result.expect("stream should collect").response,
+            LlmResponse::Text(text) if text == original
+        ));
     }
 
     #[tokio::test]
