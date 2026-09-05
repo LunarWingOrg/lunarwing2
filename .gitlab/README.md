@@ -25,7 +25,7 @@ Create unprotected, unprivileged runners with these tags:
 | Tag | Required capacity | Access |
 |---|---|---|
 | `lint` | Isolated Docker/Kubernetes executor; 2-4 CPUs, 4-8 GB RAM | Public package mirrors only; no protected variables or Docker socket |
-| `rust-x86_64` | Isolated Docker/Kubernetes executor; 6 CPUs numbered `0-5`, 16 GB RAM, 25 GB free disk | Public Cargo/Git/package mirrors only; no protected variables or Docker socket |
+| `rust-x86_64` | Isolated Docker/Kubernetes executor; 6 CPUs numbered `0-5`, 16 GB RAM, 40 GiB free disk | Public Cargo/Git/package mirrors only; no protected variables or Docker socket |
 
 Override `CI_LINT_RUNNER_TAG` or `CI_RUST_RUNNER_TAG` at project level if local
 runner tags differ. Do not map either variable to protected or privileged
@@ -183,12 +183,16 @@ Create the Rust runner with:
 - **Run untagged jobs**: disabled.
 - **Protected**: disabled.
 - Executor: isolated Docker or Kubernetes, never shell executor.
-- Capacity: six available CPUs numbered `0-5`, 16 GB RAM, and at least 25 GB
-  free disk.
+- Capacity: six available CPUs numbered `0-5`, 16 GB RAM, and at least 40 GiB
+  free disk. Budget approximately 1.5 GiB for checkout/vendor, 10 GiB for
+  sccache, 10 GiB for Cargo registries and test targets, and at least 18 GiB of
+  safety headroom. The former 80 GiB cache cap on a 25 GB runner let the
+  filesystem fail before sccache could evict entries.
 - Per-host job limit: one. Every Cargo job pins itself to CPUs `0-5`; parallel
   Rust jobs therefore require separate runner hosts or VMs, not overlapping
   jobs on one host.
-- Maximum job timeout: at least 60 minutes.
+- Maximum job timeout: at least two hours. The project timeout and runner
+  maximum both cap the YAML timeout, and GitLab applies whichever is lower.
 
 Essential Docker executor settings belong in runner-host `config.toml`, not in
 this repository:
@@ -233,8 +237,8 @@ Open **Settings > CI/CD** and apply:
 2. Under **General pipelines**, keep **Use separate caches for protected
    branches** enabled. Never allow protected and unprotected refs to share one
    cache namespace.
-3. Set project build timeout to at least 60 minutes. Set each Rust runner's
-   maximum timeout to at least the same value.
+3. Set the project build timeout to two hours. Set each Rust runner's maximum
+   timeout to at least two hours; the lower project/runner limit wins.
 4. Keep **Allow merge request pipelines to access protected variables and
    runners** disabled under **Variables**.
 5. Add no secrets for phase 1. Jobs need no API keys, database URLs, signing
@@ -249,9 +253,12 @@ Open **Settings > CI/CD** and apply:
    to this project unless one reviewed dependency needs broader access.
 
 Runner cache credentials, if a shared cache backend is used, stay in runner
-`config.toml`. Never expose them as merge-request CI variables. Cache only the
-dependency paths declared in `defaults.yml`; do not add `target/`, tenant data,
-environment files, or credentials.
+`config.toml`. Never expose them as merge-request CI variables. Merge requests,
+tags, schedules, and manually started pipelines use pull-only caches; only a
+trusted default-branch push publishes refreshed cache state. Rust jobs report
+before/after disk use, target/cache sizes, and sccache statistics. Cache only
+the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
+data, environment files, or credentials.
 
 ### 3. Protect refs and merges
 
