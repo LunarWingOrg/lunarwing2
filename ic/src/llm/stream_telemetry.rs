@@ -83,6 +83,7 @@ impl StreamTelemetry {
         metrics.retries_total = metrics.retries_total.saturating_add(1);
         increment(&mut metrics.retry_reasons, reason);
         record_failure(metrics, reason);
+        metrics.last_issue_unix_seconds = unix_timestamp();
         snapshot.updated_at_unix_seconds = unix_timestamp();
         self.persist(&snapshot).await;
     }
@@ -281,6 +282,7 @@ mod tests {
         assert_eq!(metrics.decode_failures_total, 1);
         assert_eq!(metrics.corruption_total, 1);
         assert_eq!(metrics.ttfc_last_ms, 125);
+        assert!(metrics.last_issue_unix_seconds > 0);
         assert_eq!(
             metrics.retry_reasons.get(&StreamFailureReason::Decode),
             Some(&1)
