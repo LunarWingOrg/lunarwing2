@@ -378,6 +378,10 @@ impl GatewayWorkflowHarness {
         format!("http://{}", self.addr)
     }
 
+    pub fn sse_manager(&self) -> Arc<SseManager> {
+        Arc::clone(&self.gateway_state.sse)
+    }
+
     pub fn webhook_base_url(&self) -> String {
         format!("http://{}", self.webhook_addr)
     }

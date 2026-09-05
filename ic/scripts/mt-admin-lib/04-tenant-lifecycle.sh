@@ -906,6 +906,11 @@ start_tenant() {
   # live from the store, so no daemon restart is required.
   upload_tenant_darkirc_secret "$name" || true
 
+  # Seed the Brave Search API key into the web-search tool's secrets store so
+  # fresh tenants have working web search from first boot. Best-effort: warns
+  # and continues on failure (upload manually via the API if needed).
+  upload_tenant_brave_search_secret "$name" || true
+
   # Patch WeeChat channel caps with the tenant's allocated ports. This ensures
   # the ports are correct even if install-wasm wasn't run or the caps were
   # manually edited. Runs before workers start so the channel connects immediately.

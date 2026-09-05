@@ -1471,6 +1471,7 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                pending_gate_expiry_secs: 1800,
                 lorebook: crate::config::LorebookConfig {
                     enabled: false,
                     ..crate::config::LorebookConfig::default()
@@ -2375,6 +2376,7 @@ mod tests {
                 handle_message_timeout: Duration::from_secs(400),
                 self_repair_op_timeout: Duration::from_secs(60),
                 session_prune_timeout: Duration::from_secs(30),
+                pending_gate_expiry_secs: 1800,
                 lorebook: crate::config::LorebookConfig {
                     enabled: false,
                     ..crate::config::LorebookConfig::default()
@@ -2511,6 +2513,7 @@ mod tests {
                     handle_message_timeout: Duration::from_secs(400),
                     self_repair_op_timeout: Duration::from_secs(60),
                     session_prune_timeout: Duration::from_secs(30),
+                    pending_gate_expiry_secs: 1800,
                     lorebook: crate::config::LorebookConfig {
                         enabled: false,
                         ..crate::config::LorebookConfig::default()

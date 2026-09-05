@@ -37,10 +37,32 @@ pub struct AgentConfig {
     pub self_repair_op_timeout: Duration,
     /// Max time for session pruning.
     pub session_prune_timeout: Duration,
+    /// Expiry window for pending execution gates (approval/auth). Gates older
+    /// than this are expired by the background sweep and the paused turn is
+    /// resumed with a wrap-up (WI#108). Default 1800s; values below 30s fall
+    /// back to the default (the gate sweep ticks every 60s).
+    /// Env: `AGENT_PENDING_GATE_EXPIRY_SECS`.
+    pub pending_gate_expiry_secs: u64,
     /// SillyTavern-import-subset lorebook behavior.
     pub lorebook: LorebookConfig,
     /// Reflex compiler configuration.
     pub reflex: ReflexConfig,
+}
+
+/// Fallback for `pending_gate_expiry_secs` (WI#111).
+pub(crate) const PENDING_GATE_EXPIRY_DEFAULT_SECS: u64 = 1800;
+/// Floor for `pending_gate_expiry_secs`: below this a gate could expire
+/// faster than the 60s background sweep can observe it, so smaller values
+/// fall back to [`PENDING_GATE_EXPIRY_DEFAULT_SECS`].
+pub(crate) const PENDING_GATE_EXPIRY_MIN_SECS: u64 = 30;
+
+/// Apply the floor/fallback rule for `pending_gate_expiry_secs`.
+pub(crate) fn clamp_pending_gate_expiry_secs(secs: u64) -> u64 {
+    if secs < PENDING_GATE_EXPIRY_MIN_SECS {
+        PENDING_GATE_EXPIRY_DEFAULT_SECS
+    } else {
+        secs
+    }
 }
 
 /// Lorebook activation configuration.
@@ -187,6 +209,7 @@ impl AgentConfig {
             handle_message_timeout: Duration::from_secs(630),
             self_repair_op_timeout: Duration::from_secs(60),
             session_prune_timeout: Duration::from_secs(30),
+            pending_gate_expiry_secs: 1800,
             lorebook: LorebookConfig {
                 enabled: false,
                 ..LorebookConfig::default()
@@ -263,6 +286,10 @@ impl AgentConfig {
                 "AGENT_SESSION_PRUNE_TIMEOUT_SECS",
                 settings.agent.session_prune_timeout_secs,
             )?),
+            pending_gate_expiry_secs: parse_optional_env(
+                "AGENT_PENDING_GATE_EXPIRY_SECS",
+                settings.agent.pending_gate_expiry_secs,
+            )?,
             lorebook: LorebookConfig::resolve()?,
             reflex: ReflexConfig {
                 enabled: parse_bool_env("REFLEX_COMPILER_ENABLED", false)?,
@@ -309,6 +336,43 @@ mod tests {
     #[test]
     fn reflex_semantic_matching_defaults_off() {
         assert!(!ReflexConfig::default().semantic_enabled);
+    }
+
+    #[test]
+    fn pending_gate_expiry_defaults_to_1800() {
+        let settings = Settings::default();
+        let config = AgentConfig::resolve(&settings).expect("resolve");
+        assert_eq!(config.pending_gate_expiry_secs, 1800);
+        assert_eq!(
+            clamp_pending_gate_expiry_secs(config.pending_gate_expiry_secs),
+            1800
+        );
+    }
+
+    #[test]
+    fn pending_gate_expiry_settings_value_flows_through_when_above_floor() {
+        let mut settings = Settings::default();
+        settings.agent.pending_gate_expiry_secs = 900;
+        let config = AgentConfig::resolve(&settings).expect("resolve");
+        assert_eq!(config.pending_gate_expiry_secs, 900);
+        assert_eq!(
+            clamp_pending_gate_expiry_secs(config.pending_gate_expiry_secs),
+            900
+        );
+    }
+
+    #[test]
+    fn pending_gate_expiry_below_floor_falls_back_to_default() {
+        // Under 30s a gate could expire faster than the 60s sweep observes it.
+        for secs in [0u64, 1, 29] {
+            assert_eq!(
+                clamp_pending_gate_expiry_secs(secs),
+                1800,
+                "{secs}s must fall back to the default"
+            );
+        }
+        assert_eq!(clamp_pending_gate_expiry_secs(30), 30);
+        assert_eq!(clamp_pending_gate_expiry_secs(120), 120);
     }
 
     #[test]

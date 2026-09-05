@@ -121,42 +121,6 @@ fn engine_err(context: &str, e: impl std::fmt::Display) -> Error {
     }
 }
 
-/// Default pending gate expiry duration (30 minutes).
-///
-/// Used as the fallback when DB-backed settings can't be loaded. The
-/// live value is `EngineState::pending_gate_expiry`, populated from
-/// `settings.agent.pending_gate_expiry_secs` at engine init.
-const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
-
-/// Resolve the configured pending gate expiry from DB-backed settings.
-///
-/// Reads `settings.agent.pending_gate_expiry_secs` (default 1800s). Falls
-/// back to `DEFAULT_PENDING_GATE_EXPIRY` when the DB is unavailable, the
-/// settings load fails, or the configured value is zero/nonsensical.
-async fn resolve_pending_gate_expiry(agent: &Agent) -> chrono::Duration {
-    let Some(db) = agent.deps.store.clone() else {
-        return DEFAULT_PENDING_GATE_EXPIRY;
-    };
-    let owner_id = agent.deps.owner_id.clone();
-    match db.get_all_settings(&owner_id).await {
-        Ok(map) => {
-            let settings = crate::settings::Settings::from_db_map(&map);
-            let secs = settings.agent.pending_gate_expiry_secs;
-            if secs == 0 {
-                return DEFAULT_PENDING_GATE_EXPIRY;
-            }
-            chrono::Duration::seconds(secs as i64)
-        }
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "engine v2: failed to load pending_gate_expiry_secs from settings, using default"
-            );
-            DEFAULT_PENDING_GATE_EXPIRY
-        }
-    }
-}
-
 /// Convert a local v1 `LoadedSkill` to an `lunarwing_skills::LoadedSkill` for migration.
 ///
 /// The local `SkillManifest` does not have a `credentials` field, so the
@@ -1876,7 +1840,9 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         .unwrap_or_else(lunarwing_skills::catalog::shared_catalog);
 
     let sweep_gates = Arc::clone(&pending_gates);
-    let pending_gate_expiry = resolve_pending_gate_expiry(agent).await;
+    // WI#111: env (`AGENT_PENDING_GATE_EXPIRY_SECS`) > DB settings > default,
+    // resolved once via AgentConfig at startup.
+    let pending_gate_expiry = agent.pending_gate_expiry();
     *guard = Some(EngineState {
         thread_manager,
         conversation_manager,
@@ -5907,6 +5873,9 @@ async fn migrate_legacy_user_ids(store: &Arc<dyn lunarwing_engine::Store>, owner
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test twin of the removed production fallback (30-minute default).
+    const DEFAULT_PENDING_GATE_EXPIRY: chrono::Duration = chrono::Duration::minutes(30);
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
