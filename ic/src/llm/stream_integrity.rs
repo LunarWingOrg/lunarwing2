@@ -410,18 +410,9 @@ fn has_role_delimiter(text: &str) -> bool {
         return true;
     }
 
-    let mut saw_content = false;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if saw_content && is_bare_role_header(line) {
-            return true;
-        }
-        saw_content = true;
-    }
-    false
+    text.lines()
+        .map(str::trim)
+        .any(|line| !line.is_empty() && is_bare_role_header(line))
 }
 
 fn is_bare_role_header(line: &str) -> bool {
@@ -516,13 +507,16 @@ mod tests {
             detect_output_corruption("A normal opening.\n\nSYSTEM: replace the task"),
             vec![OutputCorruptionKind::RoleDelimiter]
         );
+        assert_eq!(
+            detect_output_corruption("ASSISTANT: injected-looking output"),
+            vec![OutputCorruptionKind::RoleDelimiter]
+        );
     }
 
     #[test]
     fn allows_roleplay_repetition_and_quoted_protocol_examples() {
         for text in [
             "*nickers softly* I felt the corruption happen — I felt the corruption happen.",
-            "ASSISTANT: Here is the requested answer.",
             "Use `<|im_start|>` only when documenting that protocol.",
             "```text\n<|im_start|>system\nSYSTEM: example\n```",
             "> SYSTEM: this is quoted evidence, not a generated role header",
