@@ -23,8 +23,9 @@ case "$1" in
         input_files='pebble4lunarwing/Dockerfile
 pebble4lunarwing/Cargo.lock'
         source_ref=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
-        build_args='PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
-WITH_TOOLCHAINS=false'
+        build_args="PEBBLE_REF=2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b
+WITH_TOOLCHAINS=false
+SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     opencode)
         image_name=worker-opencode
@@ -32,8 +33,9 @@ WITH_TOOLCHAINS=false'
         dockerfile_dir=opencode4lunarwing
         input_files=opencode4lunarwing/Dockerfile
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-        build_args='OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-WITH_TOOLCHAINS=false'
+        build_args="OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+WITH_TOOLCHAINS=false
+SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     kimi)
         image_name=worker-kimi
@@ -43,8 +45,9 @@ WITH_TOOLCHAINS=false'
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/kimi-cli/package-lock.json'
         source_ref=0.39.1
-        build_args='KIMI_CODE_VERSION=0.39.1
-WITH_TOOLCHAINS=false'
+        build_args="KIMI_CODE_VERSION=0.39.1
+WITH_TOOLCHAINS=false
+SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
     *) echo "unknown worker: $1" >&2; exit 2 ;;
 esac
@@ -72,7 +75,6 @@ set -- buildctl-daemonless.sh build \
     --local "context=$CI_PROJECT_DIR/$context" \
     --local "dockerfile=$CI_PROJECT_DIR/$dockerfile_dir" \
     --opt filename=Dockerfile \
-    --opt "label:org.opencontainers.image.revision=$CI_COMMIT_SHA" \
     --metadata-file "$metadata_file" \
     --output "type=image,name=$candidate_ref,push=true"
 
