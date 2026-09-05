@@ -20,6 +20,14 @@ KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
+FULL_VALIDATION_RULES = (
+    '$CI_PIPELINE_SOURCE == "schedule"',
+    "$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
+    r"$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//",
+    "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH",
+    '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ '
+    rf'/{RELEASE_TAG_PREDICATE}/ && $CI_COMMIT_REF_PROTECTED == "true"',
+)
 FULL_VALIDATION_JOBS = (
     "rust-check-postgres",
     "rust-check-libsql",
@@ -145,9 +153,30 @@ def rule_conditions(job: object) -> list[str]:
     return [str(rule.get("if", "")) for rule in job["rules"] if isinstance(rule, dict)]
 
 
+def matches_full_validation_context(context: dict[str, str]) -> bool:
+    source = context.get("source", "")
+    branch = context.get("branch", "")
+    default_branch = context.get("default_branch", "master")
+    tag = context.get("tag", "")
+    return (
+        source == "schedule"
+        or branch == default_branch
+        or bool(re.fullmatch(r"aragents/kimil00p/.+", branch))
+        or context.get("target", "") == default_branch
+        or (
+            source == "push"
+            and context.get("protected") == "true"
+            and bool(re.fullmatch(RELEASE_TAG_PREDICATE, tag))
+        )
+    )
+
+
 def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> None:
     template = defaults.get(".full-validation-context")
     conditions = rule_conditions(template)
+    active_conditions = tuple(condition for condition in conditions if condition)
+    if active_conditions != FULL_VALIDATION_RULES:
+        errors.append("full-validation rules differ from the tested canonical predicate")
     release_conditions = [condition for condition in conditions if "CI_COMMIT_TAG" in condition]
     if len(release_conditions) != 1:
         errors.append("full-validation context must contain exactly one release-tag rule")
@@ -157,6 +186,22 @@ def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> N
         errors.append("full-validation release rule must require a protected ref")
     if not any("CI_PIPELINE_SOURCE" in condition for condition in release_conditions):
         errors.append("full-validation release rule must require a push pipeline")
+
+    context_matrix = (
+        ({"source": "merge_request_event", "target": "master"}, True),
+        ({"source": "push", "branch": "master"}, True),
+        ({"source": "push", "branch": "aragents/kimil00p/release"}, True),
+        ({"source": "schedule", "branch": "maintenance"}, True),
+        ({"source": "push", "tag": "v2.1.0.0-rc1", "protected": "true"}, True),
+        ({"source": "push", "tag": "v2.1.0.0", "protected": "true"}, True),
+        ({"source": "push", "tag": "v2.1.0.0", "protected": "false"}, False),
+        ({"source": "web", "tag": "v2.1.0.0", "protected": "true"}, False),
+        ({"source": "push", "tag": "release", "protected": "true"}, False),
+        ({"source": "push", "branch": "feature/item-28"}, False),
+    )
+    for context, expected in context_matrix:
+        if matches_full_validation_context(context) is not expected:
+            errors.append(f"full-validation context self-test failed for {context}")
 
     for job_name in FULL_VALIDATION_JOBS:
         if not extends_template(merged.get(job_name), ".full-validation-context"):
@@ -244,6 +289,46 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
             errors.append(f"{job_name} does not enforce its required backend test shape")
 
 
+def cache_policies(job: object) -> list[str]:
+    if not isinstance(job, dict):
+        return []
+    cache = job.get("cache", [])
+    entries = cache if isinstance(cache, list) else [cache]
+    return [str(entry.get("policy", "pull-push")) for entry in entries if isinstance(entry, dict)]
+
+
+def validate_cache_trust(merged: dict, defaults: dict, errors: list[str]) -> None:
+    for template_name in (".python-job", ".rust-job", ".rust-msrv-job"):
+        policies = cache_policies(defaults.get(template_name))
+        if not policies or any(policy != "pull" for policy in policies):
+            errors.append(f"{template_name} validation caches must be fixed pull-only")
+
+    writers = {
+        name
+        for name, job in merged.items()
+        if isinstance(job, dict) and "pull-push" in cache_policies(job)
+    }
+    if writers != {"rust-cache-refresh"}:
+        errors.append(f"unexpected writable cache jobs: {sorted(writers)}")
+    refresh = merged.get("rust-cache-refresh", {})
+    active_rules = [
+        rule
+        for rule in refresh.get("rules", [])
+        if isinstance(rule, dict) and rule.get("when") != "never"
+    ] if isinstance(refresh, dict) else []
+    if len(active_rules) != 1:
+        errors.append("rust-cache-refresh must have one active rule")
+    else:
+        condition = str(active_rules[0].get("if", ""))
+        required = (
+            'CI_PIPELINE_SOURCE == "push"',
+            "CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH",
+            'CI_COMMIT_REF_PROTECTED == "true"',
+        )
+        if any(fragment not in condition for fragment in required):
+            errors.append("rust-cache-refresh must require a protected default-branch push")
+
+
 def main() -> int:
     errors: list[str] = []
     root = load_yaml(ROOT_CONFIG)
@@ -315,6 +400,7 @@ def main() -> int:
     validate_release_gates(merged_config, defaults, errors)
     validate_worker_publication(merged_config, errors)
     validate_test_shapes(merged_config, errors)
+    validate_cache_trust(merged_config, defaults, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:
