@@ -719,8 +719,7 @@ pub async fn start_server(
 // --- Static file handlers ---
 
 const INDEX_HTML: &str = include_str!("static/index.html");
-const MASCOT_SCRIPT_AND_BODY_END: &str =
-    "  <script src=\"/mascot.js\" defer></script>\n</body>";
+const MASCOT_SCRIPT_AND_BODY_END: &str = "  <script src=\"/mascot.js\" defer></script>\n</body>";
 static MASCOT_INDEX_HTML: LazyLock<String> =
     LazyLock::new(|| INDEX_HTML.replacen("</body>", MASCOT_SCRIPT_AND_BODY_END, 1));
 
@@ -3678,7 +3677,10 @@ mod tests {
                 .await
                 .expect("mascot request")
                 .status();
-            assert_eq!(mascot_status.as_u16(), if mascot_enabled { 200 } else { 404 });
+            assert_eq!(
+                mascot_status.as_u16(),
+                if mascot_enabled { 200 } else { 404 }
+            );
 
             if let Some(tx) = state.shutdown_tx.write().await.take() {
                 let _ = tx.send(());
