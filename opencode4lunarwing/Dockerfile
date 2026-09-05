@@ -165,8 +165,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
       echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
       chmod +x /tmp/rustup-init; \
       CARGO_HOME=/usr/local/cargo /tmp/rustup-init -y --no-modify-path \
-        --profile minimal --default-toolchain 1.96.1; \
-      rm /tmp/rustup-init; \
+        --profile minimal --default-toolchain 1.96.1 \
+      ; rm /tmp/rustup-init; \
       chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
