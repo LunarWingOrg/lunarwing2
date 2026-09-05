@@ -14,7 +14,7 @@ rust-check-postgres:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features postgres
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --tests --no-default-features --features postgres
 
 rust-check-libsql:
   extends:
@@ -24,7 +24,7 @@ rust-check-libsql:
   needs:
     - cargo-metadata
   script:
-    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --no-default-features --features libsql
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --tests --no-default-features --features libsql
 
 rust-check-all-features:
   extends:
@@ -112,3 +112,28 @@ rust-test-libsql:
   script:
     # libSQL's full test link approaches the 16 GB runner limit; serialize rustc and omit debug info.
     - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features libsql --no-fail-fast -- --test-threads=1
+
+rust-test-postgres-integration:
+  extends:
+    - .rust-job
+    - .full-validation-context
+  stage: test
+  needs:
+    - job: rust-check-postgres
+      artifacts: false
+  timeout: 2h
+  services:
+    - name: "docker.io/pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b"
+      alias: postgres
+  variables:
+    POSTGRES_DB: lunarwing_test
+    POSTGRES_USER: lunarwing
+    POSTGRES_PASSWORD: lunarwing-ci-only
+    DATABASE_URL: "postgres://lunarwing:lunarwing-ci-only@postgres:5432/lunarwing_test"
+    DATABASE_SSLMODE: disable
+    PGSSLMODE: disable
+    LUNARWING_CLOUD_AUTH_URL: "http://127.0.0.1"
+    LUNARWING_CLOUD_BASE_URL: "http://127.0.0.1"
+    CARGO_PROFILE_TEST_DEBUG: "0"
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh test -j1 --locked --no-default-features --features postgres,integration --test workspace_integration -- --test-threads=1
