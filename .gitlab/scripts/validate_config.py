@@ -176,8 +176,19 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         errors.append("worker candidate and promotion templates must be non-interruptible")
     if candidate.get("retry") != 0 or promotion.get("retry") != 0:
         errors.append("worker publication must not retry after a timeout or partial push")
-    if not (ROOT / ".gitlab/scripts/build-worker-image.sh").is_file():
+    build_helper = ROOT / ".gitlab/scripts/build-worker-image.sh"
+    if not build_helper.is_file():
         errors.append("worker candidate helper is missing")
+    else:
+        helper_text = build_helper.read_text(encoding="utf-8")
+        for fragment in (
+            "--no-cache",
+            "rewrite-timestamp=true",
+            "WORKER_REBUILD_DIGEST",
+            "clean rebuild digest mismatch",
+        ):
+            if fragment not in helper_text:
+                errors.append(f"worker candidate helper lacks reproducibility control {fragment}")
     for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "kimicode4lunarwing"):
         dockerfile = (ROOT / worker_dir / "Dockerfile").read_text(encoding="utf-8")
         if "ARG SOURCE_REVISION" not in dockerfile or (
