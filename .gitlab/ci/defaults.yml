@@ -9,10 +9,6 @@ default:
       - runner_external_dependency_failure
       - runner_interrupted
       - scheduler_failure
-      - stuck_pending_with_matching_runners
-      - stuck_pending_no_matching_runners
-      - no_updates_running
-      - no_updates_canceling
 
 variables:
   GIT_STRATEGY: fetch
