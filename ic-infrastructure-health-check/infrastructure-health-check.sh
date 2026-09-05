@@ -117,6 +117,7 @@ run_check "health-ratelimit.sh" "ratelimit" > "$WORKDIR/check-ratelimit.tmp" 2> 
 run_check "health-clickhouse.sh" "clickhouse" > "$WORKDIR/check-clickhouse.tmp" 2> "$WORKDIR/log-clickhouse.tmp" &
 run_check "health-tensorzero.sh" "tensorzero" > "$WORKDIR/check-tensorzero.tmp" 2> "$WORKDIR/log-tensorzero.tmp" &
 run_check "health-models.sh" "models" > "$WORKDIR/check-models.tmp" 2> "$WORKDIR/log-models.tmp" &
+run_check "health-llm-streams.sh" "llm_streams" > "$WORKDIR/check-llm-streams.tmp" 2> "$WORKDIR/log-llm-streams.tmp" &
 run_check "health-lunarvision.sh" "lunarvision" > "$WORKDIR/check-lunarvision.tmp" 2> "$WORKDIR/log-lunarvision.tmp" &
 run_check "health-lunarvoice.sh" "lunarvoice" > "$WORKDIR/check-lunarvoice.tmp" 2> "$WORKDIR/log-lunarvoice.tmp" &
 run_check "health-netbird.sh" "netbird" > "$WORKDIR/check-netbird.tmp" 2> "$WORKDIR/log-netbird.tmp" &
@@ -131,7 +132,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models lunarvision lunarvoice netbird svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -143,6 +144,7 @@ check_ratelimit=$(cat "$WORKDIR/check-ratelimit.tmp" 2>/dev/null || echo)
 check_clickhouse=$(cat "$WORKDIR/check-clickhouse.tmp" 2>/dev/null || echo)
 check_tensorzero=$(cat "$WORKDIR/check-tensorzero.tmp" 2>/dev/null || echo)
 check_models=$(cat "$WORKDIR/check-models.tmp" 2>/dev/null || echo)
+check_llm_streams=$(cat "$WORKDIR/check-llm-streams.tmp" 2>/dev/null || echo)
 check_lunarvision=$(cat "$WORKDIR/check-lunarvision.tmp" 2>/dev/null || echo)
 check_lunarvoice=$(cat "$WORKDIR/check-lunarvoice.tmp" 2>/dev/null || echo)
 check_netbird=$(cat "$WORKDIR/check-netbird.tmp" 2>/dev/null || echo)
@@ -160,6 +162,7 @@ components=(
     "$check_clickhouse"
     "$check_tensorzero"
     "$check_models"
+    "$check_llm_streams"
     "$check_lunarvision"
     "$check_lunarvoice"
     "$check_netbird"
