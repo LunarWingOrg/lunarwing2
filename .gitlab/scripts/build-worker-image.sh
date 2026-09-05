@@ -33,7 +33,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         dockerfile_dir=opencode4lunarwing
         input_files=opencode4lunarwing/Dockerfile
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-        build_args="OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+        build_args="OPENCODE_VERSION=v1.18.25
+OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
