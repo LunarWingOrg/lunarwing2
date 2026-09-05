@@ -26,12 +26,13 @@ declare -A SUITES=(
     [lunarvoice]="test-health-lunarvoice.sh"
     [voice-init-templates]="test-lunarvoice-init-templates.sh"
     [netbird]="test-health-netbird.sh"
+    [llm-streams]="test-health-llm-streams.sh"
     [metrics-exporter]="test-health-metrics-exporter.sh"
     [metrics-unit]="test-health-metrics-unit.sh"
     [watchdog]="test-watchdog-systemd.sh"
     [watchdog-openrc]="test-watchdog-openrc.sh"
 )
-ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird metrics-exporter metrics-unit watchdog watchdog-openrc)
+ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird llm-streams metrics-exporter metrics-unit watchdog watchdog-openrc)
 
 # --list: print available suites and exit (for CI introspection). Derived from
 # ORDER so it can never drift out of sync with the registered suites.
