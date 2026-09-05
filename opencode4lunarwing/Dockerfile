@@ -1,6 +1,7 @@
 # v1.18.25 resolves to this reviewed commit. Overrides must also be full SHAs.
 ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
 # Stage 1: build opencode from source
@@ -67,6 +68,7 @@ RUN set -e; \
 FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS runtime
 
 ARG DEBIAN_SNAPSHOT
+ARG SOURCE_REVISION
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # The opencode binary is already built in the builder stage; these are only
 # needed if coding tasks inside the container must compile native code.
@@ -84,6 +86,7 @@ ENV OPENCODE_IMAGE_REF="${OPENCODE_REF}"
 LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
       org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
 RUN set -eu; \
