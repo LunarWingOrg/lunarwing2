@@ -16,9 +16,11 @@ use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
 use crate::llm::provider::{
-    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, ModelMetadata,
-    ToolCompletionRequest, ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, LlmProvider, LlmStream, LlmStreamChunk,
+    LlmStreamObservation, ModelMetadata, StreamFailureReason, ToolCompletionRequest,
+    ToolCompletionResponse,
 };
+use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
 use crate::llm::streaming::{FirstStreamItem, ProviderStreamRequest, replay_first, take_first};
 
 /// Upper bound for provider-suggested `Retry-After` delays.
@@ -171,11 +173,31 @@ impl Default for RetryConfig {
 pub struct RetryProvider {
     inner: Arc<dyn LlmProvider>,
     config: RetryConfig,
+    telemetry: Option<Arc<StreamTelemetry>>,
 }
 
 impl RetryProvider {
     pub fn new(inner: Arc<dyn LlmProvider>, config: RetryConfig) -> Self {
-        Self { inner, config }
+        Self {
+            inner,
+            config,
+            telemetry: None,
+        }
+    }
+
+    pub(crate) fn with_telemetry(mut self, telemetry: Arc<StreamTelemetry>) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    async fn record_retry(&self, error: &LlmError) -> StreamFailureReason {
+        let reason = classify_stream_failure(error);
+        if let Some(telemetry) = &self.telemetry {
+            telemetry
+                .record_retry(self.inner.model_name(), reason)
+                .await;
+        }
+        reason
     }
 
     async fn retry_loop<T, F, Fut>(&self, mut op: F, label: &str) -> Result<T, LlmError>
@@ -194,7 +216,7 @@ impl RetryProvider {
                     }
 
                     let delay = retry_delay(&err, attempt);
-
+                    self.record_retry(&err).await;
                     tracing::warn!(
                         provider = %self.inner.model_name(),
                         attempt = attempt + 1,
@@ -221,6 +243,8 @@ impl RetryProvider {
         request: ProviderStreamRequest,
         label: &str,
     ) -> Result<LlmStream<'a>, LlmError> {
+        let mut retries = 0;
+        let mut last_reason = StreamFailureReason::Unknown;
         for attempt in 0..=self.config.max_retries {
             let first = match request.open(self.inner.as_ref()).await {
                 Ok(stream) => take_first(stream).await,
@@ -229,14 +253,24 @@ impl RetryProvider {
 
             match first {
                 FirstStreamItem::Empty => return Ok(futures::stream::empty().boxed()),
-                FirstStreamItem::Chunk { first, rest } => {
+                FirstStreamItem::Chunk { first, rest } if retries == 0 => {
                     return Ok(replay_first(first, rest));
+                }
+                FirstStreamItem::Chunk { first, rest } => {
+                    let observation = LlmStreamObservation::Retried {
+                        provider: self.inner.model_name().to_string(),
+                        attempts: retries,
+                        reason: last_reason,
+                    };
+                    return Ok(replay_with_observation(first, rest, observation));
                 }
                 FirstStreamItem::Error(error) => {
                     if !is_retryable(&error) || attempt == self.config.max_retries {
                         return Err(error);
                     }
                     let delay = retry_delay(&error, attempt);
+                    last_reason = self.record_retry(&error).await;
+                    retries += 1;
                     tracing::warn!(
                         provider = %self.inner.model_name(),
                         attempt = attempt + 1,
@@ -255,6 +289,20 @@ impl RetryProvider {
             reason: "stream retry loop exhausted without a result".to_string(),
         })
     }
+}
+
+fn replay_with_observation<'a>(
+    first: LlmStreamChunk,
+    rest: LlmStream<'a>,
+    observation: LlmStreamObservation,
+) -> LlmStream<'a> {
+    let observation = LlmStreamChunk::Observation(observation);
+    let prefix = if matches!(first, LlmStreamChunk::Done { .. }) {
+        vec![Ok(observation), Ok(first)]
+    } else {
+        vec![Ok(first), Ok(observation)]
+    };
+    futures::stream::iter(prefix).chain(rest).boxed()
 }
 
 #[async_trait]
@@ -377,6 +425,17 @@ mod tests {
                 finish_reason: "stop".to_string(),
             }),
         ])
+    }
+
+    fn assert_retry_observation(chunks: &[Result<LlmStreamChunk, LlmError>]) {
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            Ok(LlmStreamChunk::Observation(LlmStreamObservation::Retried {
+                provider,
+                attempts: 1,
+                reason: StreamFailureReason::RateLimited,
+            })) if provider == "scripted"
+        )));
     }
 
     // -- Backoff delay tests --
@@ -581,6 +640,7 @@ mod tests {
             chunks.first(),
             Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
         ));
+        assert_retry_observation(&chunks);
     }
 
     #[tokio::test]
@@ -607,6 +667,7 @@ mod tests {
             chunks.first(),
             Some(Ok(LlmStreamChunk::TextDelta(text))) if text == "hello"
         ));
+        assert_retry_observation(&chunks);
     }
 
     #[tokio::test]
@@ -678,6 +739,7 @@ mod tests {
             chunks.first(),
             Some(Ok(LlmStreamChunk::ToolCallDelta { index: 0, .. }))
         ));
+        assert_retry_observation(&chunks);
     }
 
     #[tokio::test(start_paused = true)]
