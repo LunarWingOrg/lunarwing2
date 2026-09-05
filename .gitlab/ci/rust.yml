@@ -6,6 +6,33 @@ rust-check-default:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked
 
+rust-cache-refresh:
+  extends: .rust-job
+  stage: check
+  needs:
+    - job: rust-check-default
+      artifacts: false
+  cache:
+    - key:
+        prefix: "rust-1.96.1-dependencies"
+        files:
+          - ic/Cargo.lock
+      paths:
+        - .ci-cache/cargo/registry/index/
+        - .ci-cache/cargo/registry/cache/
+        - .ci-cache/cargo/git/db/
+      policy: pull-push
+    - key: "rust-1.96.1-sccache"
+      paths:
+        - .ci-cache/bin/
+        - .ci-cache/sccache/
+      policy: pull-push
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+  script:
+    - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked
+
 rust-check-postgres:
   extends:
     - .rust-job
