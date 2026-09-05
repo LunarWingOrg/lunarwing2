@@ -19,6 +19,17 @@ OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
+RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
+FULL_VALIDATION_JOBS = (
+    "rust-check-postgres",
+    "rust-check-libsql",
+    "rust-check-all-features",
+    "rust-test-libsql",
+    "rust-test-postgres-integration",
+    "cavepony-wasm",
+    "cargo-deny",
+)
+WORKER_NAMES = ("pebble", "opencode", "kimi")
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -119,6 +130,101 @@ def validate_cargo_profiles(defaults: dict, errors: list[str]) -> None:
         )
 
 
+def extends_template(job: object, template: str) -> bool:
+    if not isinstance(job, dict):
+        return False
+    extended = job.get("extends", [])
+    if isinstance(extended, str):
+        extended = [extended]
+    return isinstance(extended, list) and template in extended
+
+
+def rule_conditions(job: object) -> list[str]:
+    if not isinstance(job, dict) or not isinstance(job.get("rules"), list):
+        return []
+    return [str(rule.get("if", "")) for rule in job["rules"] if isinstance(rule, dict)]
+
+
+def validate_release_gates(merged: dict, defaults: dict, errors: list[str]) -> None:
+    template = defaults.get(".full-validation-context")
+    conditions = rule_conditions(template)
+    release_conditions = [condition for condition in conditions if "CI_COMMIT_TAG" in condition]
+    if len(release_conditions) != 1:
+        errors.append("full-validation context must contain exactly one release-tag rule")
+    elif RELEASE_TAG_PREDICATE not in release_conditions[0]:
+        errors.append("full-validation release rule differs from release-version policy")
+    if not any("CI_COMMIT_REF_PROTECTED" in condition for condition in release_conditions):
+        errors.append("full-validation release rule must require a protected ref")
+    if not any("CI_PIPELINE_SOURCE" in condition for condition in release_conditions):
+        errors.append("full-validation release rule must require a push pipeline")
+
+    for job_name in FULL_VALIDATION_JOBS:
+        if not extends_template(merged.get(job_name), ".full-validation-context"):
+            errors.append(f"{job_name} must extend .full-validation-context")
+
+    for job_name in ("version-policy", "panic-policy"):
+        conditions = rule_conditions(merged.get(job_name))
+        release = [condition for condition in conditions if "CI_COMMIT_TAG" in condition]
+        if not release or RELEASE_TAG_PREDICATE not in release[0]:
+            errors.append(f"{job_name} must run for protected release tags")
+
+
+def validate_worker_publication(merged: dict, errors: list[str]) -> None:
+    candidate = merged.get(".worker-candidate", {})
+    promotion = merged.get(".worker-promotion", {})
+    if candidate.get("interruptible") is not False or promotion.get("interruptible") is not False:
+        errors.append("worker candidate and promotion templates must be non-interruptible")
+    if candidate.get("retry") != 0 or promotion.get("retry") != 0:
+        errors.append("worker publication must not retry after a timeout or partial push")
+
+    for template_name in (".worker-candidate", ".worker-scan", ".worker-promotion"):
+        template = merged.get(template_name, {})
+        rules = template.get("rules", []) if isinstance(template, dict) else []
+        active_rules = [
+            rule
+            for rule in rules
+            if isinstance(rule, dict) and rule.get("when") != "never"
+        ]
+        if not active_rules or any(
+            "CI_COMMIT_REF_PROTECTED" not in str(rule.get("if", ""))
+            for rule in active_rules
+        ):
+            errors.append(f"{template_name} exposes a rule without protected-ref gating")
+
+    for worker in WORKER_NAMES:
+        candidate_name = f"worker-{worker}-candidate"
+        scan_name = f"worker-{worker}-scan"
+        promotion_name = f"worker-{worker}-promote"
+        promotion_job = merged.get(promotion_name, {})
+        if not isinstance(promotion_job, dict) or not promotion_job.get("resource_group"):
+            errors.append(f"{promotion_name} must serialize moving-tag publication")
+        needs = promotion_job.get("needs", []) if isinstance(promotion_job, dict) else []
+        needed_jobs = {need.get("job") for need in needs if isinstance(need, dict)}
+        if needed_jobs != {candidate_name, scan_name}:
+            errors.append(f"{promotion_name} must need its exact candidate and scan")
+        if not extends_template(merged.get(candidate_name), ".worker-candidate"):
+            errors.append(f"{candidate_name} must extend .worker-candidate")
+        if not extends_template(merged.get(scan_name), ".worker-scan"):
+            errors.append(f"{scan_name} must extend .worker-scan")
+
+
+def validate_test_shapes(merged: dict, errors: list[str]) -> None:
+    expected = {
+        "rust-check-postgres": ("--tests", "--features postgres"),
+        "rust-check-libsql": ("--tests", "--features libsql"),
+        "rust-test-postgres-integration": (
+            "--features postgres,integration",
+            "--test workspace_integration",
+        ),
+    }
+    for job_name, fragments in expected.items():
+        job = merged.get(job_name, {})
+        script = job.get("script", []) if isinstance(job, dict) else []
+        commands = "\n".join(script if isinstance(script, list) else [str(script)])
+        if any(fragment not in commands for fragment in fragments):
+            errors.append(f"{job_name} does not enforce its required backend test shape")
+
+
 def main() -> int:
     errors: list[str] = []
     root = load_yaml(ROOT_CONFIG)
@@ -183,7 +289,13 @@ def main() -> int:
 
     defaults_path = ROOT / ".gitlab" / "ci" / "defaults.yml"
     defaults = load_yaml(defaults_path)
+    merged_config: dict = {}
+    for _path, config in loaded_configs:
+        merged_config.update(config)
     validate_cargo_profiles(defaults, errors)
+    validate_release_gates(merged_config, defaults, errors)
+    validate_worker_publication(merged_config, errors)
+    validate_test_shapes(merged_config, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:
