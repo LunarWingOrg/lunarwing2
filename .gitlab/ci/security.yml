@@ -1,15 +1,10 @@
 cargo-deny:
-  extends: .rust-job
+  extends:
+    - .rust-job
+    - .full-validation-context
   stage: security
   needs:
     - cargo-metadata
-  rules:
-    # Full suite only on the default branch (and MRs into it) — see slim set.
-    # Also on release-integration branches (aragents/kimil00p/*).
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-    - if: '$CI_COMMIT_BRANCH =~ /^aragents\/kimil00p\//'
-    - if: '$CI_MERGE_REQUEST_TARGET_BRANCH_NAME == $CI_DEFAULT_BRANCH'
-    - when: never
   script:
     - bash .gitlab/scripts/install-cargo-deny.sh
     - PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/cargo-ci.sh deny check
