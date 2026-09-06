@@ -2,10 +2,6 @@
 # -> manual immutable release-tag promotion. No job here is created for an
 # unprotected ref, and promotion never rebuilds or writes :latest.
 
-# Protected worker publication pipeline: immutable candidate -> digest scan/SBOM
-# -> manual immutable release-tag promotion. No job here is created for an
-# unprotected ref, and promotion never rebuilds or writes :latest.
-
 .worker-candidate:
   image:
     # Trust-sensitive publication images are literal pins, not pipeline-overridable variables.
