@@ -32,9 +32,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         context=opencode4lunarwing
         dockerfile_dir=opencode4lunarwing
         input_files=opencode4lunarwing/Dockerfile
-        source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
-        build_args="OPENCODE_VERSION=v1.18.25
-OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+        source_ref=16747470f976aca3d362ad730bcd3fe82ecc2c9a
+        build_args="OPENCODE_VERSION=v1.18.29
+OPENCODE_REF=16747470f976aca3d362ad730bcd3fe82ecc2c9a
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
@@ -45,8 +45,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/kimi-cli/package-lock.json'
-        source_ref=0.39.1
-        build_args="KIMI_CODE_VERSION=0.39.1
+        source_ref=0.41.0
+        build_args="KIMI_CODE_VERSION=0.41.0
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
