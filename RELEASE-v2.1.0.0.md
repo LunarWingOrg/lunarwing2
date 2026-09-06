@@ -30,33 +30,43 @@ repository root until the release process moves it into `docs/releases/`.
 ## Overview
 
 LunarWing v2.1.0.0 is an agent-interaction control, voice/vision lifecycle,
-gateway presentation, supply-chain hardening, and release-engineering release.
-Its headline feature gives operators real-time control over a running agent
-turn: a mid-turn interrupt aborts an in-flight LLM stream or tool batch — not
-only at turn boundaries — and Hermes-style steer injects guidance at the next
-safe execution boundary without breaking message-role ordering.
+gateway presentation, memory-recall, supply-chain hardening, and
+release-engineering release. Its headline feature gives operators real-time
+control over a running agent turn: a mid-turn interrupt aborts an in-flight LLM
+stream or tool batch — not only at turn boundaries — and Hermes-style steer
+injects guidance at the next safe execution boundary without breaking
+message-role ordering.
 
 LunarVoice (the ONNX speech-to-text sidecar) gains a complete mt-admin lifecycle,
 registry-aware health integration, and a documented production configuration
 surface. LunarVision can now use an operator-managed external HTTPS instance,
 including automatic XMPP image enrichment and the `vision-analyze` WASM tool.
-For Rust builds rooted under `ic/`, the approved crates.io/git dependency closure
-is committed under `ic/vendor/` and source-replaces crates.io; root-level
-satellite projects outside `ic/` are intentionally outside that replacement.
+Mission knowledge recall now degrades safely when embeddings or strict full-text
+queries fail, and mission sub-agents can resolve the structured memory writer.
+For Rust builds rooted under `ic/`, the approved crates.io/git dependency
+closure is committed under `ic/vendor/` and source-replaces crates.io;
+root-level satellite projects outside `ic/` are intentionally outside that
+replacement.
 
-Correctness and operability work includes exportable Prometheus metrics from
+Correctness and operability work includes provider-stream integrity detection
+and per-provider telemetry; owner-scoped secret references for HTTP MCP
+headers; configurable pending-gate expiry; exportable Prometheus metrics from
 every healthpoint with env-configurable early-warning thresholds; end-to-end
 LLM `finish_reason` propagation; passive-voice fabricated-result detection;
 deterministic evaluation error ranking; room-bare-JID coordination-knowledge
 publisher authorization; durable SSH AcceptFirst pins; a mission-scheduler
-startup warmup; a blocking ShellCheck CI gate; and executable browser coverage
-for the onboarding web GUI. The web gateway also gains an emoting, draggable
-pony/unicorn mascot driven by action phrases in assistant responses.
+startup warmup; and executable browser coverage for the onboarding web GUI.
+The web gateway also gains an opt-in emoting, draggable pony/unicorn mascot;
+`MASCOT_ENABLED=false` keeps it disabled by default.
 
-The release identifier is `2.1.0.0`; LunarWing-owned Rust crates and channel
-packages use `2.1.0`. Rust 2024 and MSRV `1.96.1` are unchanged. There are no
-new SQL migrations (`V26__study_notes_knowledge.sql` remains latest) and no new
-multi-tenant port-registry migration (v16 remains current).
+Protected CI now validates release tags across the backend/test/security matrix
+and can publish worker images only through digest-bound, reproducible candidate
+and promotion jobs. Production daemon/package publication and tenant deployment
+remain outside this release. The release identifier is `2.1.0.0`;
+LunarWing-owned Rust crates and channel packages use `2.1.0`. Rust 2024 and
+MSRV `1.96.1` are unchanged. There are no new SQL migrations
+(`V26__study_notes_knowledge.sql` remains latest) and no new multi-tenant
+port-registry migration (v16 remains current).
 
 See the [v2.0.9.0 release notes](docs/releases/RELEASE-v2.0.9.0.md) for the
 previous compatibility baseline.
@@ -95,19 +105,23 @@ previous compatibility baseline.
   credentials, paths, queries, fragments, redirects, and cross-origin bearer
   forwarding are rejected; WASM egress is scoped to POST under the configured
   origin's `/v1/` path.
-- **Emoting web mascot.** The gateway classifies italic action phrases into
-  eight canonical emotes, attaches an optional `emotes` array to final response
-  events, and renders a draggable, hideable sprite widget with idle, working,
-  greeting, error, and FIFO emote states.
+- **Emoting web mascot (opt-in).** The gateway classifies italic action phrases
+  into eight canonical emotes, attaches an optional `emotes` array to final
+  response events, and renders a draggable, hideable sprite widget with idle,
+  working, greeting, error, and FIFO emote states. The parser covers the herd's
+  equine dialect and common roleplay verbs; `MASCOT_ENABLED=false` omits the
+  script and sprite routes by default, while `true` opts a tenant in.
 - **Durable SSH AcceptFirst pins.** Accepted host keys are stored as a versioned,
   tenant-scoped encrypted pin set before a first handshake succeeds. Restart,
   tenant-isolation, corruption, revocation, and concurrent-first-key paths are
   covered; SSH bridge creation fails closed when pin persistence cannot load.
 - **Every healthpoint exports metrics.** The models check now emits numeric
-  provider counts and latency/status maps, and all six legacy checks expose
-  degraded/critical thresholds through `HEALTH_<CHECK>_*` knobs. The exporter is
-  host-global and carries per-tenant labels where the source healthpoint is
-  tenant-scoped; `health_metrics` remains the v16 registry slot.
+  provider counts and latency/status maps, all six legacy checks expose
+  degraded/critical thresholds through `HEALTH_<CHECK>_*` knobs, and the new
+  `llm_streams` healthpoint exports per-provider stream/retry/abort/latency and
+  corruption counters. The exporter is host-global and carries per-tenant labels
+  where the source healthpoint is tenant-scoped; `health_metrics` remains the
+  v16 registry slot.
 - **The `ic/` dependency supply chain is vendored.** `ic/.cargo/config.toml`
   source-replaces crates.io with `ic/vendor/`; locked `ic/` builds pass with
   `CARGO_NET_OFFLINE=true`. `ic/scripts/refresh-vendor.sh` re-vendors the
@@ -117,6 +131,31 @@ previous compatibility baseline.
   bridge adapters, stream aggregation, and the worker proxy carry canonical
   `stop`/`length`/`tool_calls`/`content_filter`/`unknown` strings. The parser also
   accepts legacy `tool_use` for rolling-upgrade interop.
+- **Provider stream integrity is observable and fail-safe.** Repeated substantial
+  n-grams, ChatML/Llama role delimiters, and bare role headers are detected in
+  bounded prose (code fences are excluded). Corrupted output is marked
+  non-executable and tool calls are stripped; typed observations remain outside
+  model text and flow through retries, caches, failover, routing, and the
+  orchestrator. Per-provider telemetry persists and is exported without making
+  the healthpoint an automatic circuit breaker.
+- **Mission memory recall degrades instead of failing closed.** Embedding errors
+  fall back to keyword search, strict full-text misses get one sanitized OR pass,
+  retrieval filters on actual keyword overlap with a type/recency fallback, and
+  mission RLM children can resolve `__save_memory_doc__` with an explicit prompt
+  contract.
+- **HTTP MCP bearer headers can use owner-scoped secrets.** `header_secrets`
+  references are resolved only at activation, never persisted in plaintext, fail
+  closed on missing or wrong-owner secrets, and suppress the OAuth path for
+  static-header servers. The CLI and web install paths expose the same mapping.
+- **Pending-gate expiry is configurable.** `AGENT_PENDING_GATE_EXPIRY_SECS`
+  overrides the DB setting above the 30-second floor, with a 1,800-second
+  default and the same precedence as other env-over-DB agent settings.
+- **Protected CI/CD is release-aware.** Protected RC/final tags receive the
+  complete validation context, PostgreSQL-only and libSQL-only test-target
+  checks, a non-skipping PostgreSQL integration job, and digest-pinned security
+  checks. Worker candidates use rootless BuildKit, immutable full-SHA tags,
+  clean rebuild equality, Trivy/SBOM evidence, and worker-specific digest-bound
+  promotion; CI never publishes `latest` or short-SHA worker tags.
 - **Smarter fabricated-result detection.** The orchestrator recognizes five
   passive completion claims (for example, "was written" and "was retrieved")
   plus `memory write`/`memory/` tool mentions. When the current turn has no real
@@ -155,9 +194,12 @@ previous compatibility baseline.
 | Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
-| Worker image tool pins | opencode `v1.18.29`, kimi-code `0.41.0` |
-| Worker image moving tag | CI still defaults `WORKER_IMAGE_TAG` to `v2.0.9.0`; override it for a v2.1.0.0 image build |
-| CI scope | Source verification; no package publication or tenant deployment |
+| Worker image tool pins | opencode `v1.18.29` at reviewed upstream commit `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; kimi-code `0.41.0` |
+| Worker image publication | Protected rootless BuildKit candidates use unique full-SHA/pipeline/job tags; only the tested digest is promoted to `vX.Y.Z.W[-rcN]-<worker>`; CI publishes neither `latest` nor short-SHA tags |
+| Gateway mascot default | Disabled; set `MASCOT_ENABLED=true` per tenant to load the widget and sprite routes |
+| Pending-gate expiry | `AGENT_PENDING_GATE_EXPIRY_SECS` over DB `agent.pending_gate_expiry_secs`, default 1,800 seconds; values below 30 seconds fall back to the default |
+| HTTP MCP credentials | `header_secrets` are owner-scoped activation-time references; secret values are not persisted in `mcp-servers.json` |
+| CI scope | Protected worker-image candidate publication/promotion is supported; daemon/package publication and tenant deployment remain deferred |
 
 ## Changes
 
