@@ -2,16 +2,18 @@
 
 ## Codename: Ma-ai (間合い)
 
-**Status: PRE-RELEASE DRAFT ** Release date TBD
+**Status: PRE-RELEASE DRAFT** Release date TBD
 Claims below were rechecked against release-integration revision
-`d316097e5` (the tip of the `aragents/kimil00p/v2.1.0.0` lineage reviewed at
-that commit), the `v2.0.9.0..d316097e5` history, current source/manifests/locks,
-in-tree regression evidence, the canonical bug reports, and the public
-work-item tracker (2026-09-01 accuracy pass, a 2026-09-02 re-verification at
-`96c951785`, a 2026-09-03 re-verification at `a67fee21c`, and a second
-2026-09-03 pass at `d316097e5` covering the subsequently merged mascot-dialect
-and gate-expiry-resume work). This file remains at the repository root until
-the release process moves it into `docs/releases/`.
+`6786bd2fe3126608790c5aca082a4fb33329c049` (the source tip reviewed from
+`aj/kimi-44-20260906-0601`, also the current `aragents/kimil00p/v2.1.0.0`
+lineage), the `v2.0.9.0..6786bd2fe3126608790c5aca082a4fb33329c049` history,
+current source/manifests/locks, in-tree regression and live evidence, the
+canonical bug reports, and the public work-item tracker. Source, CI, and
+worker claims were refreshed on 2026-09-06; the latest tracker query at
+2026-09-06T06:12:00Z returned 18 open items. Earlier accuracy passes at
+`96c951785`, `a67fee21c`, and `d316097e5` remain useful provenance, including
+the mascot-dialect and gate-expiry-resume reviews. This file remains at the
+repository root until the release process moves it into `docs/releases/`.
 
 >Distance is a decision
 >
@@ -28,33 +30,43 @@ the release process moves it into `docs/releases/`.
 ## Overview
 
 LunarWing v2.1.0.0 is an agent-interaction control, voice/vision lifecycle,
-gateway presentation, supply-chain hardening, and release-engineering release.
-Its headline feature gives operators real-time control over a running agent
-turn: a mid-turn interrupt aborts an in-flight LLM stream or tool batch — not
-only at turn boundaries — and Hermes-style steer injects guidance at the next
-safe execution boundary without breaking message-role ordering.
+gateway presentation, memory-recall, supply-chain hardening, and
+release-engineering release. Its headline feature gives operators real-time
+control over a running agent turn: a mid-turn interrupt aborts an in-flight LLM
+stream or tool batch — not only at turn boundaries — and Hermes-style steer
+injects guidance at the next safe execution boundary without breaking
+message-role ordering.
 
 LunarVoice (the ONNX speech-to-text sidecar) gains a complete mt-admin lifecycle,
 registry-aware health integration, and a documented production configuration
 surface. LunarVision can now use an operator-managed external HTTPS instance,
 including automatic XMPP image enrichment and the `vision-analyze` WASM tool.
-For Rust builds rooted under `ic/`, the approved crates.io/git dependency closure
-is committed under `ic/vendor/` and source-replaces crates.io; root-level
-satellite projects outside `ic/` are intentionally outside that replacement.
+Mission knowledge recall now degrades safely when embeddings or strict full-text
+queries fail, and mission sub-agents can resolve the structured memory writer.
+For Rust builds rooted under `ic/`, the approved crates.io/git dependency
+closure is committed under `ic/vendor/` and source-replaces crates.io;
+root-level satellite projects outside `ic/` are intentionally outside that
+replacement.
 
-Correctness and operability work includes exportable Prometheus metrics from
+Correctness and operability work includes provider-stream integrity detection
+and per-provider telemetry; owner-scoped secret references for HTTP MCP
+headers; configurable pending-gate expiry; exportable Prometheus metrics from
 every healthpoint with env-configurable early-warning thresholds; end-to-end
 LLM `finish_reason` propagation; passive-voice fabricated-result detection;
 deterministic evaluation error ranking; room-bare-JID coordination-knowledge
 publisher authorization; durable SSH AcceptFirst pins; a mission-scheduler
-startup warmup; a blocking ShellCheck CI gate; and executable browser coverage
-for the onboarding web GUI. The web gateway also gains an emoting, draggable
-pony/unicorn mascot driven by action phrases in assistant responses.
+startup warmup; and executable browser coverage for the onboarding web GUI.
+The web gateway also gains an opt-in emoting, draggable pony/unicorn mascot;
+`MASCOT_ENABLED=false` keeps it disabled by default.
 
-The release identifier is `2.1.0.0`; LunarWing-owned Rust crates and channel
-packages use `2.1.0`. Rust 2024 and MSRV `1.96.1` are unchanged. There are no
-new SQL migrations (`V26__study_notes_knowledge.sql` remains latest) and no new
-multi-tenant port-registry migration (v16 remains current).
+Protected CI now validates release tags across the backend/test/security matrix
+and can publish worker images only through digest-bound, reproducible candidate
+and promotion jobs. Production daemon/package publication and tenant deployment
+remain outside this release. The release identifier is `2.1.0.0`;
+LunarWing-owned Rust crates and channel packages use `2.1.0`. Rust 2024 and
+MSRV `1.96.1` are unchanged. There are no new SQL migrations
+(`V26__study_notes_knowledge.sql` remains latest) and no new multi-tenant
+port-registry migration (v16 remains current).
 
 See the [v2.0.9.0 release notes](docs/releases/RELEASE-v2.0.9.0.md) for the
 previous compatibility baseline.
@@ -77,10 +89,12 @@ previous compatibility baseline.
   clears with the conversation, and pending notes are delivered on the next
   foreground turn and on running-thread, suspended, and approval/auth resumes.
   Engine V2 routes steer through the bridge into the scoped running thread when
-  one exists and acknowledges the queued note otherwise. Live verification on a
-  throwaway tenant passed 6/6 checks (web gateway, WeeChat, and XMPP ×
-  interrupt and steer). Evidence:
-  [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md).
+  one exists and acknowledges the queued note otherwise. The earlier OpenRC
+  `dragon` run passed 6/6 checks (web gateway, WeeChat, and XMPP × interrupt
+  and steer); item 43's later systemd `merlin` run passed the gateway cases and
+  recorded the fresh-channel caveats. Evidence:
+  [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md)
+  and [`docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`](docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md).
 - **LunarVoice production lifecycle.** mt-admin now provides
   install/configure/activate/deactivate/remove for the voice sidecar with
   transactional reconfiguration, model verification, per-tenant ports, systemd
@@ -93,19 +107,23 @@ previous compatibility baseline.
   credentials, paths, queries, fragments, redirects, and cross-origin bearer
   forwarding are rejected; WASM egress is scoped to POST under the configured
   origin's `/v1/` path.
-- **Emoting web mascot.** The gateway classifies italic action phrases into
-  eight canonical emotes, attaches an optional `emotes` array to final response
-  events, and renders a draggable, hideable sprite widget with idle, working,
-  greeting, error, and FIFO emote states.
+- **Emoting web mascot (opt-in).** The gateway classifies italic action phrases
+  into eight canonical emotes, attaches an optional `emotes` array to final
+  response events, and renders a draggable, hideable sprite widget with idle,
+  working, greeting, error, and FIFO emote states. The parser covers the herd's
+  equine dialect and common roleplay verbs; `MASCOT_ENABLED=false` omits the
+  script and sprite routes by default, while `true` opts a tenant in.
 - **Durable SSH AcceptFirst pins.** Accepted host keys are stored as a versioned,
   tenant-scoped encrypted pin set before a first handshake succeeds. Restart,
   tenant-isolation, corruption, revocation, and concurrent-first-key paths are
   covered; SSH bridge creation fails closed when pin persistence cannot load.
 - **Every healthpoint exports metrics.** The models check now emits numeric
-  provider counts and latency/status maps, and all six legacy checks expose
-  degraded/critical thresholds through `HEALTH_<CHECK>_*` knobs. The exporter is
-  host-global and carries per-tenant labels where the source healthpoint is
-  tenant-scoped; `health_metrics` remains the v16 registry slot.
+  provider counts and latency/status maps, all six legacy checks expose
+  degraded/critical thresholds through `HEALTH_<CHECK>_*` knobs, and the new
+  `llm_streams` healthpoint exports per-provider stream/retry/abort/latency and
+  corruption counters. The exporter is host-global and carries per-tenant labels
+  where the source healthpoint is tenant-scoped; `health_metrics` remains the
+  v16 registry slot.
 - **The `ic/` dependency supply chain is vendored.** `ic/.cargo/config.toml`
   source-replaces crates.io with `ic/vendor/`; locked `ic/` builds pass with
   `CARGO_NET_OFFLINE=true`. `ic/scripts/refresh-vendor.sh` re-vendors the
@@ -115,6 +133,31 @@ previous compatibility baseline.
   bridge adapters, stream aggregation, and the worker proxy carry canonical
   `stop`/`length`/`tool_calls`/`content_filter`/`unknown` strings. The parser also
   accepts legacy `tool_use` for rolling-upgrade interop.
+- **Provider stream integrity is observable and fail-safe.** Repeated substantial
+  n-grams, ChatML/Llama role delimiters, and bare role headers are detected in
+  bounded prose (code fences are excluded). Corrupted output is marked
+  non-executable and tool calls are stripped; typed observations remain outside
+  model text and flow through retries, caches, failover, routing, and the
+  orchestrator. Per-provider telemetry persists and is exported without making
+  the healthpoint an automatic circuit breaker.
+- **Mission memory recall degrades instead of failing closed.** Embedding errors
+  fall back to keyword search, strict full-text misses get one sanitized OR pass,
+  retrieval filters on actual keyword overlap with a type/recency fallback, and
+  mission RLM children can resolve `__save_memory_doc__` with an explicit prompt
+  contract.
+- **HTTP MCP bearer headers can use owner-scoped secrets.** `header_secrets`
+  references are resolved only at activation, never persisted in plaintext, fail
+  closed on missing or wrong-owner secrets, and suppress the OAuth path for
+  static-header servers. The CLI and web install paths expose the same mapping.
+- **Pending-gate expiry is configurable.** `AGENT_PENDING_GATE_EXPIRY_SECS`
+  overrides the DB setting above the 30-second floor, with a 1,800-second
+  default and the same precedence as other env-over-DB agent settings.
+- **Protected CI/CD is release-aware.** Protected RC/final tags receive the
+  complete validation context, PostgreSQL-only and libSQL-only test-target
+  checks, a non-skipping PostgreSQL integration job, and digest-pinned security
+  checks. Worker candidates use rootless BuildKit, immutable full-SHA tags,
+  clean rebuild equality, Trivy/SBOM evidence, and worker-specific digest-bound
+  promotion; CI never publishes `latest` or short-SHA worker tags.
 - **Smarter fabricated-result detection.** The orchestrator recognizes five
   passive completion claims (for example, "was written" and "was retrieved")
   plus `memory write`/`memory/` tool mentions. When the current turn has no real
@@ -153,9 +196,12 @@ previous compatibility baseline.
 | Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
-| Worker image tool pins | opencode `v1.18.29`, kimi-code `0.41.0` |
-| Worker image moving tag | CI still defaults `WORKER_IMAGE_TAG` to `v2.0.9.0`; override it for a v2.1.0.0 image build |
-| CI scope | Source verification; no package publication or tenant deployment |
+| Worker image tool pins | opencode `v1.18.29` at reviewed upstream commit `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; kimi-code `0.41.0` |
+| Worker image publication | Protected rootless BuildKit candidates use unique full-SHA/pipeline/job tags; only the tested digest is promoted to `vX.Y.Z.W[-rcN]-<worker>`; CI publishes neither `latest` nor short-SHA tags |
+| Gateway mascot default | Disabled; set `MASCOT_ENABLED=true` per tenant to load the widget and sprite routes |
+| Pending-gate expiry | `AGENT_PENDING_GATE_EXPIRY_SECS` over DB `agent.pending_gate_expiry_secs`, default 1,800 seconds; values below 30 seconds fall back to the default |
+| HTTP MCP credentials | `header_secrets` are owner-scoped activation-time references; secret values are not persisted in `mcp-servers.json` |
+| CI scope | Protected worker-image candidate publication/promotion is supported; daemon/package publication and tenant deployment remain deferred |
 
 ## Changes
 
@@ -213,8 +259,12 @@ races that the live pass could not cover:
   model-call boundary, after the current step or tool result, and deliberately
   never cancels the running tool. These fixes close the source side of work
   items #103 and #104 and the interrupt half of #105; regression coverage
-  passed, and the fresh cross-channel live pass remains on the release
-  checklist.
+  passed. Checklist item 43 then verified gateway in-flight cancellation,
+  mid-turn steer, idle queued steer, and the gate-expiry path on fresh tenant
+  `merlin`. WeeChat was skipped after a repeatable WASM poll trap, and XMPP
+  outbound peer delivery remained environment/bootstrap-shaped after inbound
+  processing succeeded. Evidence:
+  [`docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`](docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md).
 
 ### Expired-Gate Turn Resume (work item #108)
 
@@ -237,6 +287,19 @@ permanently unanswered. Expiry now resumes the paused turn:
   with an explanatory notice instead of looping. `/interrupt` and `/steer`
   still observe the wrap-up because the thread stays in the running map until
   terminal.
+- Checklist item 43 verified the full expiry path live with a 120-second
+  setting: the expired result reached the thread, the no-re-arm guard ended a
+  second approval request, and the completed reply arrived through SSE.
+
+### Configurable Pending-Gate Expiry (work item #111)
+
+`AGENT_PENDING_GATE_EXPIRY_SECS` is now the environment override for approval
+and authentication gate lifetime. Resolution remains env > DB setting
+`agent.pending_gate_expiry_secs` > the 1,800-second default. Values below 30
+seconds fall back to the default because the background sweep runs every 60
+seconds; the accessor is resolved once in `AgentConfig` instead of rereading
+settings ad hoc in the bridge router. The `.env.example` and Engine V2
+configuration guide document the knob and floor.
 
 ### External LunarVision Instances
 
@@ -256,6 +319,26 @@ instead of requiring a local GPU sidecar:
   origin and path; invalid configuration clears the tool's HTTP allowlist.
 - Ports-registry discovery and docs cover mixed local/external fleets on both
   systemd and OpenRC hosts. The `vision-analyze` tool registry version is 0.1.3.
+
+### HTTP MCP Header Secret References
+
+Hosted HTTP MCP servers that use a static bearer header no longer have to be
+misclassified as OAuth-only servers:
+
+- `McpServerConfig.header_secrets` maps an HTTP header name to an owner-scoped
+  secret name. The CLI's `--secret-header KEY=SECRET_NAME`, `mcp update`,
+  `tool_install`, and the web install path validate and preserve the mapping;
+  secret values never enter persisted MCP configuration.
+- Activation resolves each reference through the activating owner's secrets
+  store, fails closed on a missing store/secret or wrong owner, and injects the
+  resolved value only into the live HTTP client. Managed-header and duplicate
+  conflicts are rejected, and secret-bearing installs retain the Always
+  approval requirement.
+- Configured secret headers suppress OAuth discovery and stale OAuth bearer
+  injection. A live hosted study-notes server authenticated successfully after
+  activation with its resolved bearer header; focused owner-scope, failure, and
+  wire tests passed. Full details:
+  [`docs/ops/v2.1.0.0_MCP_HTTP_HEADER_SECRETS.md`](docs/ops/v2.1.0.0_MCP_HTTP_HEADER_SECRETS.md).
 
 ### Emoting Gateway Mascot
 
@@ -279,7 +362,12 @@ The gateway now includes a presentation-only mascot pipeline:
   never changes assistant text.
 - Eight allowlisted GIFs are embedded under `/mascot/`. The browser widget is
   draggable, position-persistent, hideable/restorable, and uses idle/working
-  fallbacks plus greeting, error, and bounded FIFO emote playback.
+  fallbacks plus greeting, error, and bounded FIFO emote playback. Its default
+  anchor clears the chat input bar.
+- The widget is now an explicit tenant opt-in: `MASCOT_ENABLED=false` is written
+  for new and legacy tenants, preserved on re-render and export/import, and
+  prevents mascot script, JavaScript, and sprite routes from being registered.
+  Setting it to `true` and restarting restores the existing widget.
 
 ### LunarVoice Production Completion
 
@@ -318,6 +406,28 @@ Completing the v2.0.8.0 exporter design
   tenant-scoped healthpoints; it is not one listener per tenant. Tests cover the
   new model series and per-metric threshold crossings, and the examples include
   one early-warning rule per healthpoint.
+
+### LLM Provider Stream Integrity (work item #110)
+
+The provider stream is now observed as a typed side channel rather than being
+left to the model to interpret as its own cognition:
+
+- The provider chain records stream starts, first-token latency, retries, aborts,
+  decode failures, and provider attribution through failover, response cache,
+  circuit breaker, and smart routing. Observations stay outside transcript text
+  and are validated before the orchestrator consumes them.
+- Bounded prose detection catches repeated substantial n-grams, ChatML/Llama
+  role-delimiter fragments, and bare `SYSTEM:`/`ASSISTANT:` headers while
+  ignoring fenced and inline code examples. A matched response is marked
+  non-executable, tool calls are removed, and a visible integrity marker tells
+  the agent to treat instruction-like content as generated data.
+- `health-llm-streams.sh` persists schema-versioned per-provider telemetry and
+  exports tenant/provider metrics through the host-global health pipeline. It is
+  monitor-only: a recent issue degrades the healthpoint but does not silently
+  remove a provider from service. Regression coverage includes fragmented
+  streams, retry attribution, malformed snapshots, and the corrupted-output
+  execution guard. A plain-prose role header remains an intentional fail-safe
+  false-positive trade-off.
 
 ### Fabricated Tool-Success Detection (F4 hardening)
 
@@ -364,6 +474,26 @@ proves a due mission cannot fire at 29 seconds and does fire at 30 seconds. This
 mitigates the startup race with a fixed delay; it does not observe watchdog
 health directly.
 
+### Mission Memory Persistence and Recall (work item #30)
+
+The investigation separated a misleading symptom from the actual defect:
+mission output was being persisted, but several recall paths failed closed and
+made an existing document look absent.
+
+- Embedding-provider failures now log and fall back to keyword-only search
+  instead of aborting the query. PostgreSQL full-text search gets one sanitized,
+  capped OR-term retry when its strict AND query returns no rows.
+- Engine retrieval filters on real keyword overlap; when there is no overlap it
+  returns a bounded type-priority/recency fallback rather than an empty context.
+  This avoids turning a weak match into a false claim that memory does not exist.
+- Mission RLM children carry mission semantics, so they can resolve the
+  `__save_memory_doc__` host function. Mission prompts now document the function,
+  supported document types, and raise-on-failure behavior.
+- A fresh webhook-fired probe wrote and indexed a structured mission note and
+  recovered it through exact, polluted, and natural-language searches. Existing
+  mission and workspace persistence formats remain compatible; unbounded mission
+  history and duplicate-seeding observations remain open follow-ups.
+
 ### Coordination-Knowledge Publisher Allowlist (work item #97)
 
 XMPP groupchat `sender_id` is the full occupant JID (`room@server/nick`). Exact
@@ -407,6 +537,38 @@ The multi-tenant onboarding web console gains executable browser coverage:
 - In `--no-token` mode the UI previously showed "Session token missing or
   invalid" merely because the URL lacked a token. It now shows that warning only
   after the backend returns `401`.
+
+### Protected CI/CD and Worker Image Reproducibility
+
+The release pipeline no longer treats worker-image publication as an ordinary
+manual job:
+
+- Candidate jobs exist only for protected default-branch pushes and protected
+  version-shaped RC/final tags. They are non-interruptible, do not retry, and
+  publish a unique full-commit/pipeline/job tag. A separate serialized
+  promotion job copies the already-tested digest to a worker-specific release
+  tag; it never rebuilds or writes `latest`.
+- Rootless BuildKit replaced archived Kaniko. Worker Dockerfiles and build
+  helpers pin base images, source revisions, package indexes, dependency locks,
+  and downloaded toolchains where applicable. A clean second build must match
+  the first digest; candidate metadata, input hashes, Trivy results, SBOM, and
+  source/health metadata are retained as promotion evidence.
+- Protected RC/final tags run the complete validation context, including
+  backend-specific test-target compilation, the non-skipping PostgreSQL
+  integration target, cargo-deny, secret/policy scans, WASM compatibility, and
+  the required Python and shell suites. Validation caches are pull-only;
+  `sccache` is capped at 10 GiB on the documented 40 GiB runner, with two-hour
+  validation and eight-hour worker-candidate timeout contracts.
+- The desktop live harness is explicitly ignored in ordinary libSQL test runs
+  because it requires an operator-controlled `DESKTOP_ITEM7_CONTROL` session;
+  it remains runnable with `--ignored` instead of failing a headless CI job.
+  The date-boundary assertion in the knowledge freshness regression was also
+  made deterministic for CI.
+- Production package publication and tenant deployment remain deliberately
+  deferred: mt-admin still builds/activates tenant software locally, while the
+  protected pipeline currently supplies verified worker-image artifacts and
+  evidence only. The activation checklist in [`.gitlab/README.md`](.gitlab/README.md)
+  remains required before enabling production distribution.
 
 ### Dependency Supply Chain Vendoring
 
@@ -452,11 +614,14 @@ committed:
   capability crates moved with that patch release. The release-cycle audit
   recorded no remaining semver-compatible updates across 19 tracked lockfile
   roots before the vendor snapshot.
-- Worker tool pins moved opencode `v1.18.23` → `v1.18.25` and kimi-code `0.39.0`
-  → `0.39.1`. Their respective Dockerfile defaults, examples/docs, the Kimi CI
-  variable, and the Kimi mt-admin harness assertion are synchronized. The
-  container job's moving image tag is a separate setting and remains
-  `v2.0.9.0` by default.
+- Worker tool pins are now opencode `v1.18.29` and kimi-code `0.41.0`,
+  superseding the earlier draft pins `v1.18.25` and `0.39.1`. OpenCode is
+  verified against upstream commit
+  `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; Kimi's package and integrity
+  lockfiles are installed with `npm ci`. Dockerfile defaults, protected CI
+  inputs, examples/docs, and the Kimi mt-admin assertion are synchronized.
+  Local version verification passed; full image build/smoke execution still
+  requires the protected worker-build runner.
 
 ### Runtime and Release-Engineering Hardening
 
@@ -485,6 +650,10 @@ committed:
 - `install-wasm` skips and removes the DarkIRC WASM channel when
   `enable_darkirc=false`, preventing polls against a nonexistent adapter and the
   resulting health-log noise. Its help text documents the behavior.
+- New tenant provisioning can seed `BRAVE_SEARCH_API_KEY` (with the legacy
+  `BRAVE_API_KEY` fallback) into the tenant's encrypted web-search secret store
+  after the gateway is ready. The upload is best-effort and never prints the
+  key; tenants without a host key are unchanged.
 
 ## Upgrade Notes
 
@@ -509,7 +678,11 @@ committed:
    thread when one exists; steer that arrives while a conversation is idle,
    interrupted, or approval-paused is acknowledged as queued and delivered on
    the next turn or resume instead of returning an idle response. Interrupting
-   a queued-but-not-running turn still returns "Nothing to interrupt."
+   a queued-but-not-running turn still returns "Nothing to interrupt." Checklist
+   item 43 passed the gateway interrupt/steer and idle-queue cases live; its
+   WeeChat case was skipped because of a fresh-channel WASM trap and its XMPP
+   outbound peer case remained bootstrap-shaped, so review the linked live record
+   before treating those channel paths as fully accepted.
 6. Manage LunarVoice through `install-voice`, `configure-voice`,
    `activate-voice`, `deactivate-voice`, and `remove-voice`. Reconcile any
    manually deployed sidecar to mt-admin's rendered units and registry ports.
@@ -518,16 +691,29 @@ committed:
    before the switch. `configure-vision-local <name>` restores the managed local
    sidecar. Existing local tenants remain local unless explicitly changed.
 8. Health thresholds are tunable through the documented `HEALTH_<CHECK>_*`
-   variables in `ic-infrastructure-health-check/config.sh.example`. Defaults
-   retain the previous thresholds.
+   variables in `ic-infrastructure-health-check/config.sh.example`. The new
+   `llm_streams` check reads persisted per-provider telemetry and uses its
+   documented issue window; defaults retain the previous thresholds.
 9. Coordination-knowledge tenants must both join the intended MUC via
    `XMPP_ALLOW_ROOMS_JSON` and authorize either exact occupant JIDs or the room
    bare JID in `COORD_KNOWLEDGE_PUBLISHERS`, then restart and verify the wire
    path. An empty room allowlist drops all groupchat.
-10. Worker tool pins are opencode `v1.18.29` and kimi-code `0.41.0`. The CI
-    container template still defaults the moving image tag to `v2.0.9.0`, so
-    set `WORKER_IMAGE_TAG=v2.1.0.0` when producing release-tagged images.
-11. Earlier releases have no durable AcceptFirst pin to migrate. The first
+10. Worker tool pins are opencode `v1.18.29` (reviewed upstream commit
+    `16747470f976aca3d362ad730bcd3fe82ecc2c9a`) and kimi-code `0.41.0`. Pull
+    worker images by the digest recorded in `worker-image-evidence.json`; do not
+    depend on a moving `WORKER_IMAGE_TAG`, `latest`, or a short-SHA tag.
+11. Set `MASCOT_ENABLED=true` in a tenant environment and restart to opt into
+    the gateway mascot. New and upgraded tenants default to `false`; export and
+    import preserve an explicit choice.
+12. Set `AGENT_PENDING_GATE_EXPIRY_SECS` in the tenant environment when a gate
+    lifetime other than the DB setting is required. Values below 30 seconds use
+    the safe 1,800-second default; restart the tenant after changing it.
+13. For an HTTP MCP server using a static bearer header, store the complete
+    header value in the owner's secrets store and configure
+    `header_secrets` (or `lunarwing mcp add --secret-header`). Do not put the
+    secret value in `mcp-servers.json`; activation resolves it per owner and
+    skips OAuth discovery.
+14. Earlier releases have no durable AcceptFirst pin to migrate. The first
     successful post-upgrade connection stores the encrypted pin used for later
     calls and restarts. If that initial path is not trustworthy, configure
     `known_host_key` from a trusted source and use `host_key_mode = "Strict"`
@@ -535,93 +721,122 @@ committed:
 
 ## Known Issues
 
-The accuracy pass reconciled two separate tracking surfaces against revision
-`d316097e5`: the nine active canonical reports in
-[`docs/bugs/README.md`](docs/bugs/README.md), and the public GitLab work-item
-state re-queried on 2026-09-03 (full reconciliation in
-[`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)).
-GitLab now has eleven open items: #86, #87, #95, #97, #100, #101, #103, #104,
-#105, #107, and #108 — the last two opened after the earlier 2026-09-03
-reconciliation, for the live-broken mascot and the paused-turn gate-expiry
-resume respectively. The closed set is #94, #96, #98, #99, and #102. An open
-tracker state is not treated as proof that its source fix is absent, so the
-source disposition is stated explicitly below.
+The source snapshot for this draft is
+`6786bd2fe3126608790c5aca082a4fb33329c049`. The public GitLab REST query at
+2026-09-06T06:12:00Z returned 18 open items:
+#86, #87, #97, #100, #101, #103, #107, #109, #110, #111, #112, #113, #114,
+#115, #116, #117, #119, and #120. Relevant v2.1 items closed since the earlier
+snapshot are #94, #95, #96, #98, #99, #102, #104, #105, #108, and #118. The
+older point-in-time reconciliation remains useful background
+([`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)),
+but it must not be read as the current tracker state. An open tracker state is
+not treated as proof that its source fix is absent, so the disposition below
+separates tracker status, source status, and remaining acceptance work.
 
 ### Public Work-Item Tracker Reconciliation
 
-- **#86 — legacy external-worker subprotocol is still present (open).** The
-  daemon and Pebble/OpenCode/Kimi workers still offer or accept
-  `ironclaw-agent-v1` alongside `lunarwing-agent-v1`. This is deliberate
-  compatibility in current source, but it does not satisfy the work item's
-  request to remove the old protocol name.
-- **#87 — LunarVision testing item is not actionable (open).** Its public title
-  and `lv` description provide no failure, scope, or acceptance criterion. No
-  specific release defect can be inferred; the item needs clarification before
-  it can be verified or closed.
-- **#94 — mission warmup race is mitigated, not health-synchronized (closed).**
-  Source now delays the first mission check by a fixed 30-second warmup; it does
-  not wait for an explicit watchdog-ready signal. Providers taking longer than
-  the fixed delay can still overlap the first mission check. The tracker closed
-  the item with the shipped fixed warmup on 2026-09-02.
-- **#95 — `finish_reason` source fix ships and re-verified (open).** Blocking,
-  streaming, bridge, and proxy paths carry the canonical value and have
-  regression coverage; the 2026-09-03 independent re-verification
-  ([`docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md))
-  re-passed every surface and found no repository defect. The remaining action
-  is reporter acceptance and tracker closure.
-- **#96 — deterministic top-error ranking is implemented and closed.** Its
-  source and tracker dispositions agree.
-- **#97 — room-bare publisher fallback live-verified on isolated tenants
-  (open).** The live 4/4 matrix over a real Prosody MUC with fresh OpenRC
-  tenants (positive full-occupant and room-bare cases; negative user-bare and
-  same-room-impostor cases) is recorded in
+- **#86 — legacy external-worker subprotocol remains (open).** The daemon and
+  Pebble/OpenCode/Kimi workers still offer or accept `ironclaw-agent-v1` beside
+  `lunarwing-agent-v1`. This is deliberate compatibility in current source but
+  does not satisfy the requested removal.
+- **#87 — LunarVision testing is not actionable (open).** Its `lv` description
+  supplies no failure, scope, or acceptance criterion.
+- **#97 — coordination-knowledge deployment follow-up remains (open).** The
+  room-bare publisher fallback is source-fixed and live-verified in the isolated
+  4/4 Prosody matrix; the sunburst/ruffles production configuration and KNOW
+  retest remain operator work. Evidence:
   [`docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md).
-  The sunburst/ruffles production rollout and live KNOW-path retest remain
-  operator actions; the tracker remains open.
-- **#98 — durable AcceptFirst pins ship (closed).** The encrypted persistent
-  pins and their restart/concurrency/failure coverage are present; the tracker
-  closed the item on 2026-09-02.
-- **#99 — closed.** The terse mascot item was closed on 2026-09-02.
-- **#100 — mascot refinement item is not actionable (open).** No specified
-  refinement, repro, or acceptance criteria are recorded.
-- **#101 — Pebble testing item is not actionable (open).** The referenced study
-  findings are not linked and no scope or acceptance matrix is recorded.
-- **#102 — closed.** The desktop and Android companion application repository
-  links landed in the README and documentation index.
-- **#103 — idle `/steer` drop fixed in source and regressions (open).** A
-  bounded four-note durable queue, queued acknowledgment, and next-turn and
-  resume delivery are in place; the fresh-tenant idle/approval/overflow live
-  pass (release-checklist item 43) remains the final acceptance step.
-- **#104 — XMPP steer routing fixed in source and regressions (open).** A fresh
-  live XMPP interrupt→steer pass remains the final acceptance step.
-- **#105 — interrupt fixed; steer-preemption premise needs clarification
-  (open).** `/interrupt` now cancels in-flight tool host calls promptly. The
-  "steer did not affect a running 120-second tool" observation matches the
-  documented contract — steer injects at the next model-call boundary after the
-  current step completes and never cancels the running tool; whether
-  steer-as-tool-preemption is wanted needs tracker clarification.
+- **#100 — mascot refinement is not actionable (open).** No refinement, repro,
+  or acceptance criteria are recorded.
+- **#101 — Pebble testing is not actionable (open).** The referenced findings
+  and acceptance matrix are not linked.
+- **#94 — mission warmup race is mitigated, not health-synchronized (closed).**
+  Source uses a fixed 30-second warmup rather than an explicit watchdog-ready
+  signal; the tracker closed the item with that shipped mitigation.
+- **#95 — `finish_reason` is implemented and verified (closed).** The focused
+  adapter, stream, bridge, and cross-surface checks passed; the public tracker
+  closed the item on 2026-09-04. Full evidence remains in
+  [`docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md).
+- **#96 — deterministic top-error ranking is implemented and closed.**
+- **#98 — durable AcceptFirst pins ship (closed).** Persistent encrypted pins and
+  restart/concurrency/failure coverage are present; the tracker closed it on
+  2026-09-02.
+- **#99 — terse mascot refinement item closed** on 2026-09-02.
+- **#102 — companion repository links landed and the item is closed.**
+- **#103 — idle `/steer` source fix and gateway acceptance are complete (open).**
+  The bounded durable queue, queued acknowledgment, and next-turn/resume paths
+  are covered by regression tests; item 43 passed the fresh gateway idle queue
+  case. Tracker closure remains outstanding.
+- **#104 — XMPP steer routing fixed and tracker-closed.** The scoped routing,
+  interrupt-race fallback, and resume delivery paths are covered in source and
+  tests; the tracker closed the item on 2026-09-05. The item-43 XMPP peer result
+  remains documented as environment/bootstrap-shaped rather than a new source
+  defect.
+- **#105 — in-flight interrupt fixed and tracker-closed.** Engine V2 cancels
+  active tool futures promptly. The observed lack of preemptive steer matches
+  the documented contract: steer waits for the current step/tool result and
+  does not cancel the running tool.
 - **#107 — live-broken mascot triaged; parser dialect gap fixed (open).** The
-  mascot was confirmed broken live by two independent parties on 2026-09-02.
-  The triage (item 33) disproved the event-shape and wiring hypotheses
-  (H1/H4), confirmed the keyword-table gap as the live defect (H2), and
-  extended the parser with the herd dialect and common roleplay verbs (27
-  parser tests). The item's own verification plan still requires a human live
-  animation check on a fresh tenant before closure. One residual is recorded
-  for a tracker decision: Engine V2 interrupted turns emit no terminal
-  `response` event by design, so the mascot lingers in its working state up to
-  the 30-second idle fallback instead of the legacy loop's immediate
-  `Interrupted.` emote path.
-- **#108 — paused-turn gate-expiry resume fixed in source (open).** The
-  reported symptom (a conversation whose pending gate auto-cleared never got a
-  reply) is root-caused and fixed: expiry now resumes the thread with an
-  injected expired-gate result, the model wraps the turn up, and the reply is
-  delivered to the source channel with the gateway approval prompt cleared.
-  Regression tests cover the resume, delivery order, and resume-failure
-  fallback; live verification on a rebuilt tenant is pending the item-43
-  fresh-tenant pass, and the tracker remains open until then.
+  keyword gap is fixed with 27 parser regressions and the event/wiring paths were
+  verified. A human fresh-tenant animation check remains; Engine V2 interrupted
+  turns intentionally lack a terminal response event, so the widget can linger
+  in `working` until the 30-second idle fallback.
+- **#108 — paused-turn gate-expiry resume is fixed and tracker-closed.** Source
+  regression tests and item 43's live 120-second gate run cover injected expiry,
+  source-channel/SSE delivery, and the no-re-arm guard; the tracker closed the
+  item on 2026-09-06.
+- **#109 — `sanitize-memory` mission trigger is unverified (open).** The mission
+  is registered Active, but no `thread_start` execution traffic has been shown;
+  no fix is claimed in this release.
+- **#110 — stream-integrity implementation is present; tracker remains open.**
+  Typed observations, bounded corruption detection, non-executable output
+  handling, and `llm_streams` telemetry are shipped with regression coverage;
+  public acceptance has not closed the item.
+- **#111 — gate-expiry environment override is present under the canonical name
+  (open).** The shipped `AGENT_PENDING_GATE_EXPIRY_SECS` name differs from the
+  issue's draft name; env-over-DB precedence, the 30-second floor, docs, and
+  tests are complete, but tracker closure remains outstanding.
+- **#112 — steer security review remains open.** The item requests a threat-model
+  and ingress/authorization review for steer over public channels; this draft
+  records the runtime contract but does not claim that review is complete.
+- **#113 — study-notes sweep request is unspecified (open).** No scope or
+  acceptance criterion is attached.
+- **#114 — generic Podman sandbox feature request is deferred (open).** It is
+  outside the v2.1.0.0 release scope.
+- **#115 — low-severity agent-loop report needs triage (open).** No verified
+  release regression or acceptance result is recorded.
+- **#116 — `skill_install` ZIP data-descriptor bug remains (open).** Valid
+  multi-file archives using local-header flag bit 3 can still be misread by the
+  hand-rolled parser, so a root `SKILL.md` may be reported missing.
+- **#117 — bearer-only MCP activation was fixed in source, tracker open.**
+  `header_secrets` now resolves the owner-scoped header and suppresses
+  inappropriate OAuth discovery; live acceptance and tracker closure remain.
+- **#119 — OpenCode version test is open.** The `v1.18.29` source pin and
+  metadata checks are synchronized; protected image build/smoke evidence is
+  still an operational prerequisite.
+- **#120 — Kimi version test is open.** The `0.41.0` package/image pins and
+  integrity locks are synchronized; protected image build/smoke evidence is
+  still an operational prerequisite.
+
+The formerly tracked implementation items #94 (warmup), #95 (`finish_reason`),
+#96 (deterministic ranking), #98 (AcceptFirst), #99/#102 (mascot/companion
+links), #104/#105 (XMPP steer and in-flight interrupt), and #108 (gate-expiry
+resume) are now closed in the public tracker. #118 (pipeline hardening) is also
+closed; source and verification details remain summarized above.
 
 ### Active Canonical Runtime and Integration Follow-ups
 
+- **Fresh WeeChat live verification is blocked by a channel trap.** Item 43 saw
+  the fresh tenant's WeeChat WASM channel trap on every poll, including with the
+  IRC network and buffers removed; the suspected `dm_policy=open`/empty
+  allowlist path needs its own reproduction and fix. The test-time capability
+  edit is not durable. See
+  [`docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`](docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md).
+- **Fresh XMPP outbound peer delivery remains environment-shaped.** Item 43
+  proved Prosody → bridge → daemon inbound delivery and the agent reply attempt,
+  but the plaintext fallback did not reach the connected peer while OMEMO was
+  settling. The run documented `SSL_CERT_FILE` trust behavior and the need for
+  plaintext bootstrap; this is not currently classified as a source defect.
 - **Synchronous worker calls still occupy their originating scheduling lane.**
   Built-in Docker `create_job` defaults to `wait=true` and holds that lane until
   result, timeout, or interrupt; external workers default to `wait=false`.
@@ -667,9 +882,11 @@ source disposition is stated explicitly below.
   `dm_policy` edit in `weechat.capabilities.json` is overwritten by rebuild or
   `install-wasm`. Persist policy through `extensions.weechat.setup_fields` (or
   the canonical local adapter config), not by editing the generated artifact.
-- **Worker release-image tags do not advance automatically.** The OpenCode and
-  Kimi binaries are pinned to the versions above, but `.gitlab/ci/containers.yml`
-  still defaults `WORKER_IMAGE_TAG` to `v2.0.9.0`; release jobs must override it.
+- **Worker release images still require an operator-triggered promotion.** The
+  OpenCode and Kimi binaries are pinned to the versions above, but a protected
+  RC/final-tag candidate, digest scan, clean rebuild, and worker-specific
+  promotion must be run before tenants can consume a registry artifact. The
+  pipeline does not publish `latest` or short-SHA tags.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -677,8 +894,9 @@ source disposition is stated explicitly below.
   delivery remain disabled behind separate acceptance gates.
 - MCP does not auto-install npm/pip packages, has no signed-package marketplace
   CLI, and does not pass configured MCP servers into `lunarwing-agent-v1`
-  external workers. Custom HTTP MCP headers remain direct string values in MCP
-  configuration rather than owner-scoped secret references.
+  external workers. HTTP `header_secrets` now provides owner-scoped references
+  for sensitive static headers, but non-secret literal headers remain literal
+  configuration values and the broader MCP limitations remain.
 - The browser gateway puts bearer tokens in native `EventSource` query strings.
   Protect browser history and access/proxy logs until the transport uses
   short-lived SSE tickets or cookie-scoped sessions.
@@ -691,12 +909,14 @@ source disposition is stated explicitly below.
 - `ALLOW_PRIVATE_IPS=1` opts out of public-address SSRF restrictions. Enable it
   only for intentionally trusted private-network deployments; the harness and
   rendered service environment intentionally seed it for private test services.
-- `taskset -c 0-11 cargo check -j12 --tests --no-default-features --features
-  postgres` still fails in cfg(test) paths that reference libsql-gated test
-  helpers. CI does not run that exact feature/test shape.
+- Protected CI now compiles PostgreSQL-only and libSQL-only test targets and
+  runs a non-skipping PostgreSQL integration job. That integration job requires
+  its disposable pgvector/PostgreSQL service; it is not a substitute for a
+  tenant deployment or a local live-provider test.
 - Kawarimi remains PostgreSQL-only.
-- GitLab CI verifies source but does not publish release packages or deploy
-  tenants automatically.
+- GitLab CI can publish protected, digest-bound worker images after candidate
+  verification, but it does not publish daemon packages or deploy tenants
+  automatically; mt-admin still performs tenant-local activation.
 - Large worker-image pushes can still fail with registry `499 Client Closed
   Request` until proxy-chain read timeouts are raised on the GitLab host. See
   [`docs/ops/REGISTRY_PUSH_499.md`](docs/ops/REGISTRY_PUSH_499.md).
@@ -704,8 +924,10 @@ source disposition is stated explicitly below.
 ### Resolved or Source-Fixed Since v2.0.9.0
 
 - Mid-turn interrupt aborts classic-loop LLM streams and tool batches, while
-  bridge-owned Engine V2 interrupt/steer targets scoped running threads. Live
-  gateway, WeeChat, and XMPP checks passed 6/6.
+  bridge-owned Engine V2 interrupt/steer targets scoped running threads. The
+  earlier OpenRC `dragon` matrix passed 6/6 across gateway, WeeChat, and XMPP;
+  the later systemd `merlin` rerun independently passed the gateway controls and
+  documented the fresh-channel WeeChat/XMPP caveats above.
 - Interrupted classic and Engine V2 turns persist a history marker and render
   as `Interrupted`, including paginated history boundaries, instead of being
   mislabeled `Failed` when no assistant row lands.
@@ -716,19 +938,21 @@ source disposition is stated explicitly below.
   sidecar with a constrained HTTPS origin.
 - The gateway mascot parses and renders eight emote states without changing chat
   content, and its keyword table now covers the herd's live roleplay dialect
-  after the work-item #107 triage (human live animation check still owed).
+  after the work-item #107 triage. It is now disabled by default and must be
+  opted into per tenant; the human live animation check remains owed.
 - SSH AcceptFirst pins persist across restart, fail closed on storage errors,
   and are shared with strict `ssh_git` host-key materialization (#98; closed
   2026-09-02).
-- Models now contribute numeric exporter series, and six legacy health checks
-  expose configurable degraded/critical thresholds.
+- Models now contribute numeric exporter series, six legacy health checks expose
+  configurable degraded/critical thresholds, and the `llm_streams` healthpoint
+  exports provider-labeled retry, abort, latency, decode, and corruption series.
 - The scoped `ic/` dependency closure is committed under `ic/vendor/`; locked
   offline workspace checks pass, every registered WASM tool has a committed
   lockfile, and the refresh script includes advisory verification. GitLab's
   formerly missing `serde_ignored` dependency is included.
 - LLM `finish_reason` survives blocking completions, stream aggregation, bridge,
-  and proxy paths (#95; repository-complete and re-verified 2026-09-03, tracker
-  closure pending). A partially emitted Engine V2 stream is no longer
+  and proxy paths (#95; repository-complete, re-verified 2026-09-03, and tracker
+  closed 2026-09-04). A partially emitted Engine V2 stream is no longer
   advertised as safely retryable.
 - Mission cron startup waits 30 seconds before its first due check (#94
   mitigation, closed), and evaluation top-error ranking is deterministic
@@ -738,14 +962,28 @@ source disposition is stated explicitly below.
   user-bare negative), and the sunburst/ruffles production retest remains an
   operator action (#97, open).
 - Idle, interrupted, and approval-paused steer now queues and acknowledges
-  instead of dropping (#103, #104, fixed in source and regressions), and
-  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#105's
-  interrupt half). The fresh-tenant live acceptance pass remains on the
-  release checklist.
+  instead of dropping (#103 source fix; item 43 gateway acceptance), and
+  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#104/#105
+  source fixes; both tracker-closed). The remaining WeeChat/XMPP caveats are
+  environmental/live-harness follow-ups, not silently marked as passes.
 - An expired approval gate now resumes the paused turn and delivers the
   wrap-up reply to the source channel instead of silently finalizing the
-  thread as `Failed` (#108; fixed in source and regressions, live check
-  pending the item-43 fresh-tenant pass).
+  thread as `Failed` (#108; regression-tested, live-verified by item 43, and
+  tracker-closed 2026-09-06).
+- Provider stream integrity is observed outside model text, corrupted output is
+  downgraded to non-executable content, and per-provider telemetry is exported
+  through `llm_streams` (#110 source fix; tracker acceptance pending).
+- Mission memory recall now degrades through keyword/OR/fallback paths and
+  mission children can resolve `__save_memory_doc__`; live persistence and
+  polluted/natural-language retrieval passed the item-30 probe.
+- HTTP MCP `header_secrets` resolves owner-scoped static bearer headers and
+  suppresses inappropriate OAuth discovery; focused and live hosted-server
+  checks passed, with public tracker acceptance still pending (#117).
+- Pending-gate expiry is configurable through `AGENT_PENDING_GATE_EXPIRY_SECS`
+  with env-over-DB precedence and a safe floor (#111 source fix).
+- Protected CI now gates release contexts and produces reproducible,
+  digest-bound worker candidates/promotions; daemon package publication and
+  tenant deployment remain deferred.
 - The desktop and Android companion application repositories are linked from
   the root README and the documentation index (#102, closed).
 - Passive fabricated-result phrases are detected and challenged with a bounded
