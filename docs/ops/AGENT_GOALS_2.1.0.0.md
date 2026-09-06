@@ -212,7 +212,9 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
     - W1/W2 weechat SKIPPED (sun): weechat WASM channel traps on every poll on the fresh tenant (unique vs derpy/spitfire/dwarfstar; persists with IRC buffers pristine; prime suspect dm_policy=open path — repro recipe in the doc). X1/X2 XMPP: inbound proven end-to-end (prosody → bridge → daemon ingest), but agent replies never delivered to the peer after the OMEMO→plaintext fallback (sun: OMEMO needs 1-2 plaintext exchanges to settle and is client-dependent — environment-shaped, not confirmed code defect); bridge TLS trust knowledge documented (honors `SSL_CERT_FILE`; leaf-as-anchor → `CaUsedAsEndEntity`).
     - Teardown verified complete: `remove-tenant merlin --purge` (services stopped, ports deallocated, user/home removed), throwaway prosody container + miniircd + harness removed, host trust store restored (`update-ca-trust`). FOLLOW-UP: re-provision merlin per the doc's Environment section when picking up the two documented fixes (weechat trap, XMPP outbound) — ~15 min including build
 44. [ ] look into a solution for automated resyncing of the knowledge_store as defined in: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/121 and write up a document in docs/ops for possible solutions that you can try and take for this
-45. [ ] ( things keep changing; more fixes keep getting applied; so we need to keep updating the release notes...) update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
+45. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/107 to see if fixed
+46. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 and see if issue has been addressed yet
+47. [ ] ( things keep changing; more fixes keep getting applied; so we need to keep updating the release notes...) update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
 
 ## Deferred (explicitly NOT this release)
 
