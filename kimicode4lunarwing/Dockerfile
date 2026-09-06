@@ -22,7 +22,8 @@ RUN set -eu; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
       python3 make g++ ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 COPY scripts/package.json scripts/package-lock.json scripts/tsconfig.json ./scripts/
 COPY scripts/*.ts ./scripts/
@@ -75,7 +76,8 @@ RUN set -eu; \
       openssh-client \
       jq \
       neovim; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
@@ -114,7 +116,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         meson \
         nodejs \
         npm; \
-      rm -rf /var/lib/apt/lists/*; \
+      rm -rf /var/lib/apt/lists/* \
+        /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache; \
     fi
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────────────
@@ -182,7 +185,8 @@ RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonsh
     npm ci --omit=dev --prefix /opt/kimi-cli && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \
-    npm cache clean --force
+    npm cache clean --force && \
+    rm -rf /root/.npm/_logs /tmp/node-compile-cache
 
 # ── XDG directories for kimi state ────────────────────────────────────────────
 RUN mkdir -p /home/kimi/.kimi-code \
