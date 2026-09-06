@@ -1,7 +1,7 @@
 # Keep release inputs immutable: the CLI version is cross-checked against the
 # committed npm lock, and package indexes come from one Debian snapshot.
 ARG KIMI_CODE_VERSION=0.41.0
-ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────────────
@@ -68,7 +68,6 @@ RUN set -eu; \
       python3-pip \
       python3-venv \
       git \
-      gh \
       ripgrep \
       curl \
       wget \
@@ -181,7 +180,10 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 ARG KIMI_CODE_VERSION
 ENV KIMI_CODE_IMAGE_VERSION="${KIMI_CODE_VERSION}"
 COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
+# The stock npm bundled in the node base ships node-tar < 7.5.19
+# (CVE-2026-59873); upgrade npm to a pinned release that bundles the fix.
 RUN test "$(node -p "require('/opt/kimi-cli/package.json').dependencies['@moonshot-ai/kimi-code']")" = "${KIMI_CODE_VERSION}" && \
+    npm install -g npm@12.0.2 && \
     npm ci --omit=dev --prefix /opt/kimi-cli && \
     ln -s /opt/kimi-cli/node_modules/.bin/kimi /usr/local/bin/kimi && \
     kimi --version && \

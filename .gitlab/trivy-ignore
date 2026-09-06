@@ -1,0 +1,26 @@
+# Trivy ignore list for the worker-image scan gate (`.worker-scan` in
+# `.gitlab/ci/containers.yml`). Every entry must carry a rationale and an
+# `expiring:` date — expired entries stop being ignored and the scan gate
+# fails again until the finding is re-reviewed. Verified against the
+# 20260906T000000Z Debian snapshot builds on 2026-09-06; all six CVEs report
+# no fix in Debian for the pinned toolchains (Trivy FixedVersion "-").
+# Reviewed: 2026-09-06, MR adding the worker scan-gate ignore policy.
+
+# perl is a hard dependency of git (`git Depends: perl`) and every worker
+# runtime ships git; removing perl removes git.
+CVE-2026-13221 expiring:2027-03-06
+CVE-2026-42496 expiring:2027-03-06
+CVE-2026-8376 expiring:2027-03-06
+
+# libpython3.11-stdlib -> libsqlite3-0: python3's sqlite3 stdlib module.
+# opencode scripts/study_notes_config.py imports sqlite3 and is exercised by
+# a build-time test gate. Revisit when the next-gen study-notes config lands.
+CVE-2025-7458 expiring:2027-03-06
+
+# openssh-client is required for git+ssh worker operation (CVE-2026-60002 is
+# a client-side UAF during host key re-exchange).
+CVE-2026-60002 expiring:2027-03-06
+
+# zlib1g CVE-2023-45853 affects the minizip code path Debian does not ship;
+# wontfix upstream. git itself Depends: zlib1g.
+CVE-2023-45853 expiring:2027-03-06
