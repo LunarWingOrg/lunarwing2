@@ -45,8 +45,8 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         input_files='kimicode4lunarwing/Dockerfile
 kimicode4lunarwing/scripts/package-lock.json
 kimicode4lunarwing/kimi-cli/package-lock.json'
-        source_ref=0.39.1
-        build_args="KIMI_CODE_VERSION=0.39.1
+        source_ref=0.41.0
+        build_args="KIMI_CODE_VERSION=0.41.0
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
