@@ -153,7 +153,7 @@ previous compatibility baseline.
 | Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
-| Worker image tool pins | opencode `v1.18.25`, kimi-code `0.39.1` |
+| Worker image tool pins | opencode `v1.18.29`, kimi-code `0.41.0` |
 | Worker image moving tag | CI still defaults `WORKER_IMAGE_TAG` to `v2.0.9.0`; override it for a v2.1.0.0 image build |
 | CI scope | Source verification; no package publication or tenant deployment |
 
@@ -524,7 +524,7 @@ committed:
    `XMPP_ALLOW_ROOMS_JSON` and authorize either exact occupant JIDs or the room
    bare JID in `COORD_KNOWLEDGE_PUBLISHERS`, then restart and verify the wire
    path. An empty room allowlist drops all groupchat.
-10. Worker tool pins are opencode `v1.18.25` and kimi-code `0.39.1`. The CI
+10. Worker tool pins are opencode `v1.18.29` and kimi-code `0.41.0`. The CI
     container template still defaults the moving image tag to `v2.0.9.0`, so
     set `WORKER_IMAGE_TAG=v2.1.0.0` when producing release-tagged images.
 11. Earlier releases have no durable AcceptFirst pin to migrate. The first
