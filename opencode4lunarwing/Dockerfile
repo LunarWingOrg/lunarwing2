@@ -1,7 +1,7 @@
 # v1.18.29 resolves to this reviewed commit. Both must move together.
 ARG OPENCODE_VERSION=v1.18.29
 ARG OPENCODE_REF=16747470f976aca3d362ad730bcd3fe82ecc2c9a
-ARG DEBIAN_SNAPSHOT=20260901T000000Z
+ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
@@ -106,7 +106,6 @@ RUN set -eu; \
       python3-pip \
       python3-venv \
       git \
-      gh \
       ripgrep \
       curl \
       wget \
