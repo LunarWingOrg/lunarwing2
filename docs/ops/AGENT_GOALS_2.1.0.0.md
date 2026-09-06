@@ -214,7 +214,8 @@ Desktop app — POINTER ITEM. LunarWing desktop application (own repo, own goals
 44. [ ] look into a solution for automated resyncing of the knowledge_store as defined in: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/121 and write up a document in docs/ops for possible solutions that you can try and take for this
 45. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/107 to see if fixed
 46. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/103 and see if issue has been addressed yet
-47. [ ] ( things keep changing; more fixes keep getting applied; so we need to keep updating the release notes...) update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
+47. [ ] look into https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/115 and address problem, unless already addressed
+48. [ ] ( things keep changing; more fixes keep getting applied; so we need to keep updating the release notes...) update release notes draft (at root of repo). commit hash of branch you reviewed must be present near top
 
 ## Deferred (explicitly NOT this release)
 
