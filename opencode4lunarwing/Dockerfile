@@ -24,7 +24,8 @@ RUN set -eu; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
       git python3 make g++ ca-certificates; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
     git init /build/opencode && \
@@ -113,7 +114,8 @@ RUN set -eu; \
       openssh-client \
       jq \
       neovim; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
@@ -152,7 +154,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         meson \
         nodejs \
         npm; \
-      rm -rf /var/lib/apt/lists/*; \
+      rm -rf /var/lib/apt/lists/* \
+        /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache; \
     fi
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────

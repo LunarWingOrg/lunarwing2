@@ -15,7 +15,8 @@ RUN set -eu; \
       > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends git; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 WORKDIR /build
 
@@ -53,7 +54,8 @@ RUN set -eu; \
       > /etc/apt/sources.list; \
     apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends ca-certificates git curl; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true. Mirrors the opencode
 # worker's list so all external workers expose the same dev-tool surface.
@@ -93,7 +95,8 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         meson \
         nodejs \
         npm; \
-      rm -rf /var/lib/apt/lists/*; \
+      rm -rf /var/lib/apt/lists/* \
+        /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache; \
     fi
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────
