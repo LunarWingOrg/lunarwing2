@@ -7,6 +7,7 @@ ci-config:
   script:
     - python3 .gitlab/scripts/validate_config.py
     - python3 .gitlab/scripts/verify_release_version.py --self-test
+    - python3 .gitlab/scripts/promote-worker-image.py self-test
 
 shell-syntax:
   extends: .shell-job
@@ -36,6 +37,7 @@ version-policy:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
   script:
     - bash .gitlab/scripts/version-policy.sh
@@ -47,6 +49,7 @@ panic-policy:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - when: never
   script:
     - bash .gitlab/scripts/panic-policy.sh

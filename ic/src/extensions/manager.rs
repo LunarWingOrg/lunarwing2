@@ -6401,7 +6401,7 @@ fn combine_install_errors(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "libsql"))]
 mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;

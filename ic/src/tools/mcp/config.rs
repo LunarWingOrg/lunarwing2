@@ -143,6 +143,14 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub headers: HashMap<String, String>,
 
+    /// HTTP header names mapped to owner-scoped secret names. Secret values
+    /// are resolved only when the server activates and replace the header
+    /// value entirely (e.g. store `Bearer lwst_…` as the secret for an
+    /// `Authorization` header). HTTP transport only; a configured reference
+    /// also suppresses OAuth for the server.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub header_secrets: HashMap<String, String>,
+
     /// OAuth configuration (if server requires authentication).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
@@ -215,6 +223,7 @@ impl McpServerConfig {
             placement: McpPlacement::Host,
             external_worker: None,
             headers: HashMap::new(),
+            header_secrets: HashMap::new(),
             oauth: None,
             enabled: true,
             recovery_circuit_open: false,
@@ -255,6 +264,7 @@ impl McpServerConfig {
             placement: McpPlacement::Host,
             external_worker: None,
             headers: HashMap::new(),
+            header_secrets: HashMap::new(),
             oauth: None,
             enabled: true,
             recovery_circuit_open: false,
@@ -276,6 +286,7 @@ impl McpServerConfig {
             placement: McpPlacement::Host,
             external_worker: None,
             headers: HashMap::new(),
+            header_secrets: HashMap::new(),
             oauth: None,
             enabled: true,
             recovery_circuit_open: false,
@@ -300,6 +311,7 @@ impl McpServerConfig {
             placement: McpPlacement::Host,
             external_worker: None,
             headers: HashMap::new(),
+            header_secrets: HashMap::new(),
             oauth: None,
             enabled: true,
             recovery_circuit_open: false,
@@ -381,6 +393,12 @@ impl McpServerConfig {
     /// Set custom headers.
     pub fn with_headers(mut self, headers: HashMap<String, String>) -> Self {
         self.headers = headers;
+        self
+    }
+
+    /// Set HTTP header names mapped to owner-scoped secret names.
+    pub fn with_header_secrets(mut self, header_secrets: HashMap<String, String>) -> Self {
+        self.header_secrets = header_secrets;
         self
     }
 
@@ -523,6 +541,26 @@ impl McpServerConfig {
                     return Err(ConfigError::InvalidConfig {
                         reason: "Server URL cannot be empty".to_string(),
                     });
+                }
+
+                for (name, secret_name) in &self.header_secrets {
+                    if name.is_empty() || name.contains('\0') {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Invalid HTTP header name '{name}'"),
+                        });
+                    }
+                    if secret_name.trim().is_empty() || secret_name.contains('\0') {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!("Invalid secret name for HTTP header '{name}'"),
+                        });
+                    }
+                    if self.headers.contains_key(name) {
+                        return Err(ConfigError::InvalidConfig {
+                            reason: format!(
+                                "HTTP header '{name}' cannot use both a plain value and a secret reference"
+                            ),
+                        });
+                    }
                 }
 
                 // Remote servers must use HTTPS (localhost is allowed for development)
@@ -696,6 +734,15 @@ impl McpServerConfig {
             }
         }
 
+        if !self.header_secrets.is_empty()
+            && !matches!(self.effective_transport(), EffectiveTransport::Http)
+        {
+            return Err(ConfigError::InvalidConfig {
+                reason: "Header secret references are only supported with the http transport"
+                    .to_string(),
+            });
+        }
+
         // Validate custom header names and values using the http crate's RFC 9110
         // token validation (catches CRLF, spaces, colons, null bytes, etc.)
         let mut normalized_headers = std::collections::HashSet::new();
@@ -720,6 +767,38 @@ impl McpServerConfig {
             }
             let normalized = name.to_ascii_lowercase();
             if !normalized_headers.insert(normalized.clone()) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Duplicate header name '{name}' (case-insensitive)"),
+                });
+            }
+            if matches!(
+                normalized.as_str(),
+                "mcp-session-id"
+                    | "content-type"
+                    | "accept"
+                    | "x-lunarwing-mcp-gateway-mode"
+                    | "x-lunarwing-mcp-route"
+            ) {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!("Header '{name}' is managed by the MCP client"),
+                });
+            }
+        }
+
+        let mut normalized_secret_headers = std::collections::HashSet::new();
+        for name in self.header_secrets.keys() {
+            if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(ConfigError::InvalidConfig {
+                    reason: format!(
+                        "Header name '{}' is not a valid HTTP header name (RFC 9110)",
+                        name
+                    ),
+                });
+            }
+            let normalized = name.to_ascii_lowercase();
+            if normalized_headers.contains(&normalized)
+                || !normalized_secret_headers.insert(normalized.clone())
+            {
                 return Err(ConfigError::InvalidConfig {
                     reason: format!("Duplicate header name '{name}' (case-insensitive)"),
                 });
@@ -801,6 +880,13 @@ impl McpServerConfig {
     ///
     /// Non-network transports (stdio, unix, WASM) never require auth.
     pub fn requires_auth(&self) -> bool {
+        // Static header credentials satisfy auth themselves: the factory
+        // resolves them at activation and gates must not demand OAuth or
+        // trigger discovery for such servers.
+        if !self.header_secrets.is_empty() {
+            return false;
+        }
+
         // Only direct HTTP and gateway transports use HTTP authentication.
         if !matches!(
             self.effective_transport(),
@@ -2881,6 +2967,66 @@ mod tests {
         let config =
             McpServerConfig::new("server", "https://mcp.example.com").with_headers(headers);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn header_secrets_satisfy_auth_requirement() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        assert!(
+            config.requires_auth(),
+            "remote https requires auth by default"
+        );
+
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        assert!(
+            !config.requires_auth(),
+            "static header credentials must suppress the OAuth requirement"
+        );
+    }
+
+    #[test]
+    fn header_secrets_rejected_off_http_transport() {
+        let mut config = McpServerConfig::new_stdio("server", "cat", Vec::new(), HashMap::new());
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("only supported with the http transport"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_secret_conflicting_with_plain_header_rejected() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        config
+            .headers
+            .insert("Authorization".to_string(), "Bearer plain".to_string());
+        config.header_secrets.insert(
+            "Authorization".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("both a plain value and a secret reference"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn header_secret_managed_header_rejected() {
+        let mut config = McpServerConfig::new("server", "https://mcp.example.com");
+        config.header_secrets.insert(
+            "Mcp-Session-Id".to_string(),
+            "lw2study_hosted_token".to_string(),
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("managed by the MCP client"), "got: {err}");
     }
 
     #[test]

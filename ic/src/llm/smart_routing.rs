@@ -711,6 +711,7 @@ async fn buffer_completion_stream(
                     reason: "plain smart-routing stream produced a tool call".to_string(),
                 });
             }
+            LlmStreamChunk::Observation(_) => {}
             LlmStreamChunk::Done {
                 usage,
                 finish_reason,

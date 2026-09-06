@@ -18,7 +18,7 @@ The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1`
 
 ## Build Notes
 
-The Dockerfile clones the anomalyco/opencode repo (formerly sst/opencode; the old URL still redirects) at build time. For reproducible builds, pin a specific commit by changing the `git clone` line in the Dockerfile.
+The Dockerfile fetches anomalyco/opencode at the full SHA in `OPENCODE_REF` and requires its committed Bun lock. Update the release-to-commit mapping deliberately. Base images, Debian package indexes, rustup, and Go archives are pinned; refresh their recorded digests/checksums rather than restoring tag-only or fallback installs.
 
 ## Do Not
 

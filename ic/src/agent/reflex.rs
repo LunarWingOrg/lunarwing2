@@ -1222,6 +1222,7 @@ pub fn spawn_reflex_evictor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "libsql")]
     use crate::db::{Database, ReflexStore};
 
     // ── Match-count write-behind ──

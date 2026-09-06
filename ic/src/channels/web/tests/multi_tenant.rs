@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(feature = "libsql")]
 use std::time::Duration;
 
 use axum::Router;
@@ -20,8 +21,10 @@ use crate::channels::web::GatewayChannel;
 use crate::channels::web::auth::{
     AuthenticatedUser, MultiAuthState, UserIdentity, auth_middleware,
 };
+#[cfg(feature = "libsql")]
+use crate::channels::web::server::WorkspacePool;
 use crate::channels::web::server::{
-    ActiveConfigSnapshot, GatewayState, PerUserRateLimiter, PromptQueue, RateLimiter, WorkspacePool,
+    ActiveConfigSnapshot, GatewayState, PerUserRateLimiter, PromptQueue, RateLimiter,
 };
 use crate::channels::web::sse::SseManager;
 use crate::config::GatewayConfig;
@@ -100,6 +103,7 @@ fn gateway_config() -> GatewayConfig {
         workspace_read_scopes: Vec::new(),
         memory_layers: Vec::new(),
         user_tokens: None,
+        mascot_enabled: false,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
     }
@@ -149,6 +153,7 @@ async fn test_db() -> (Arc<dyn crate::db::Database>, tempfile::TempDir) {
 }
 
 /// Build a minimal Routine for testing.
+#[cfg(feature = "libsql")]
 fn make_routine(user_id: &str, name: &str) -> crate::agent::routine::Routine {
     let now = chrono::Utc::now();
     crate::agent::routine::Routine {
@@ -192,6 +197,7 @@ fn make_routine(user_id: &str, name: &str) -> crate::agent::routine::Routine {
 }
 
 /// Build a minimal SandboxJobRecord for testing.
+#[cfg(feature = "libsql")]
 fn make_sandbox_job(user_id: &str, task: &str) -> crate::history::SandboxJobRecord {
     let now = chrono::Utc::now();
     crate::history::SandboxJobRecord {

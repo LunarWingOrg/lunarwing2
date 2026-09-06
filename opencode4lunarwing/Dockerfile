@@ -1,37 +1,42 @@
-# Pin opencode to a release tag for reproducible builds.
-# Override with: docker build --build-arg OPENCODE_REF=v1.18.25 ...
-# Bump this default when upgrading the worker to a newer opencode release.
-# Declared in global scope so both stages share one default; each stage
-# re-declares `ARG OPENCODE_REF` (no default) to consume it.
-ARG OPENCODE_REF=v1.18.25
+# v1.18.29 resolves to this reviewed commit. Both must move together.
+ARG OPENCODE_VERSION=v1.18.29
+ARG OPENCODE_REF=16747470f976aca3d362ad730bcd3fe82ecc2c9a
+ARG DEBIAN_SNAPSHOT=20260906T000000Z
+ARG SOURCE_REVISION=unknown
 
 # ──────────────────────
 # Stage 1: build opencode from source
 # ──────────────────────
-FROM docker.io/oven/bun:debian AS builder
+FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS builder
 
+ARG OPENCODE_VERSION
 ARG OPENCODE_REF
-
+ARG DEBIAN_SNAPSHOT
 WORKDIR /build
 
-# Snapshot fallback helper — tries live mirror first, falls back to
-# snapshot.debian.org if live mirror has an invalid signature (e.g. pre-staged
-# trixie-security signatures not yet valid for the current UTC window).
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update; \
-    }) && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
-      git python3 make g++ ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+      git python3 make g++ ca-certificates; \
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
-RUN git clone --depth 1 --branch "${OPENCODE_REF}" https://github.com/anomalyco/opencode.git /build/opencode
+RUN printf '%s' "${OPENCODE_REF}" | grep -Eq '^[0-9a-f]{40}$' && \
+    git init /build/opencode && \
+    git -C /build/opencode remote add origin https://github.com/anomalyco/opencode.git && \
+    git -C /build/opencode fetch --depth 1 origin "refs/tags/${OPENCODE_VERSION}" && \
+    test "$(git -C /build/opencode rev-parse FETCH_HEAD)" = "${OPENCODE_REF}" && \
+    git -C /build/opencode checkout --detach "${OPENCODE_REF}" && \
+    git -C /build/opencode tag --force "${OPENCODE_VERSION}" "${OPENCODE_REF}"
 
 WORKDIR /build/opencode
-RUN (bun install --frozen-lockfile || bun install) \
-    && bun pm cache rm
+RUN bun install --frozen-lockfile && bun pm cache rm
 
 WORKDIR /build/opencode/packages/sdk/js
 # The bridge imports @opencode-ai/sdk/v2/client from THIS build's output. Do not hide
@@ -50,10 +55,9 @@ WORKDIR /build/opencode/packages/opencode
 # See docs/proposals/OPENCODE-WORKER-SINGLE-TARGET-BUILD.md for full rationale.
 RUN bun run build -- --single
 
-# Keep cross-stage artifacts small. Copying the full monorepo makes Kaniko retain
-# thousands of source and node_modules files, exhausting CI runner memory while
-# snapshotting the runtime stage. The compiled binary is standalone; the bridge
-# only needs the generated SDK client source.
+# Keep cross-stage artifacts small. Copying the full monorepo retains thousands
+# of source and node_modules files in the runtime stage. The compiled binary is
+# standalone; the bridge only needs the generated SDK client source.
 RUN set -e; \
     set -- dist/opencode-*/bin/opencode; \
     [ "$#" -eq 1 ] && [ -x "$1" ]; \
@@ -65,8 +69,10 @@ RUN set -e; \
 # ──────────────────────
 # Stage 2: runtime image
 # ──────────────────────
-FROM docker.io/oven/bun:debian AS runtime
+FROM docker.io/oven/bun:debian@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 AS runtime
 
+ARG DEBIAN_SNAPSHOT
+ARG SOURCE_REVISION
 # WITH_TOOLCHAINS=false (default): slim runtime — no Rust/Go/C++ toolchains.
 # The opencode binary is already built in the builder stage; these are only
 # needed if coding tasks inside the container must compile native code.
@@ -75,24 +81,25 @@ FROM docker.io/oven/bun:debian AS runtime
 # which are only needed to compile native dependencies at runtime.
 ARG WITH_TOOLCHAINS=false
 
-# Consume the global pin and record it in the runtime image so operators can
-# tell which upstream opencode ref a running worker was built from
-# (surfaced on the /health endpoint as `opencode_ref`).
+# Expose both the human release and immutable source revision at runtime.
+ARG OPENCODE_VERSION
 ARG OPENCODE_REF
-ENV OPENCODE_IMAGE_REF="${OPENCODE_REF}"
+ENV OPENCODE_IMAGE_REF="${OPENCODE_VERSION}@${OPENCODE_REF}"
 
 LABEL org.opencontainers.image.title="LunarWing OpenCode Worker" \
       org.opencontainers.image.description="Persistent opencode worker with WebSocket agent communication" \
       org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
       org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"
 
-# Runtime packages: always installed (needed by the worker itself).
-RUN set -e; \
-    (apt-get update 2>/dev/null || { \
-      echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-      sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-      apt-get update; \
-    }) && \
+RUN set -eu; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie main" \
+      "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ trixie-updates main" \
+      "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ trixie-security main" \
+      > /etc/apt/sources.list; \
+    apt-get -o Acquire::Check-Valid-Until=false update; \
     apt-get install -y --no-install-recommends \
       tini \
       python3 \
@@ -105,17 +112,14 @@ RUN set -e; \
       ca-certificates \
       openssh-client \
       jq \
-      neovim \
-    && rm -rf /var/lib/apt/lists/*
+      neovim; \
+    rm -rf /var/lib/apt/lists/* \
+      /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache
 
 # Toolchain packages: only when WITH_TOOLCHAINS=true.
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      set -e; \
-      (apt-get update 2>/dev/null || { \
-        echo "apt-get update failed — switching to snapshot.debian.org fallback mirror" >&2; \
-        sed -i 's|debian\.org|snapshot.debian.org/archive|g' /etc/apt/sources.list; \
-        apt-get update; \
-      }) && \
+      set -eu; \
+      apt-get -o Acquire::Check-Valid-Until=false update; \
       apt-get install -y --no-install-recommends \
         python3-dev \
         build-essential \
@@ -148,33 +152,44 @@ RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
         libtool \
         meson \
         nodejs \
-        npm \
-      && rm -rf /var/lib/apt/lists/*; \
+        npm; \
+      rm -rf /var/lib/apt/lists/* \
+        /var/log/apt/* /var/log/dpkg.log* /var/log/alternatives.log* /var/cache/ldconfig/aux-cache; \
     fi
-
-# ── GitHub CLI ─────────────────
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list \
-    && apt-get update && apt-get install -y --no-install-recommends gh \
-    && rm -rf /var/lib/apt/lists/*
 
 # ── Rust toolchain (only with WITH_TOOLCHAINS=true) ───────────────────
 ENV RUSTUP_HOME=/usr/local/rustup
 
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | CARGO_HOME=/usr/local/cargo sh -s -- -y --default-toolchain 1.96.1 \
-      && chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) RUST_TARGET=x86_64-unknown-linux-gnu; RUSTUP_SHA=20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c ;; \
+        arm64) RUST_TARGET=aarch64-unknown-linux-gnu; RUSTUP_SHA=e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c ;; \
+        *) echo "unsupported Rust architecture" >&2; exit 1 ;; \
+      esac; \
+      curl -fsSLo /tmp/rustup-init \
+        "https://static.rust-lang.org/rustup/archive/1.28.2/${RUST_TARGET}/rustup-init"; \
+      echo "${RUSTUP_SHA}  /tmp/rustup-init" | sha256sum -c -; \
+      chmod +x /tmp/rustup-init; \
+      CARGO_HOME=/usr/local/cargo /tmp/rustup-init -y --no-modify-path \
+        --profile minimal --default-toolchain 1.96.1 \
+      ; rm /tmp/rustup-init; \
+      chmod -R a+rX /usr/local/rustup /usr/local/cargo; \
     fi
 
 # ── Go toolchain (only with WITH_TOOLCHAINS=true) ──────────────────────
 RUN if [ "${WITH_TOOLCHAINS}" = "true" ]; then \
-      ARCH=$(dpkg --print-architecture) \
-      && curl -fsSL "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz" \
-        | tar -C /usr/local -xz; \
+      set -eu; \
+      case "$(dpkg --print-architecture)" in \
+        amd64) GO_SHA=3333f6ea53afa971e9078895eaa4ac7204a8c6b5c68c10e6bc9a33e8e391bdd8 ;; \
+        arm64) GO_SHA=a463cb59382bd7ae7d8f4c68846e73c4d589f223c589ac76871b66811ded7836 ;; \
+        *) echo "unsupported Go architecture" >&2; exit 1 ;; \
+      esac; \
+      ARCH=$(dpkg --print-architecture); \
+      curl -fsSLo /tmp/go.tgz "https://go.dev/dl/go1.24.3.linux-${ARCH}.tar.gz"; \
+      echo "${GO_SHA}  /tmp/go.tgz" | sha256sum -c -; \
+      tar -C /usr/local -xzf /tmp/go.tgz; \
+      rm /tmp/go.tgz; \
     fi
 ENV GOROOT=/usr/local/go \
     GOPATH=/home/opencode/go \
@@ -206,7 +221,8 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # `docker build` and only surfaces as a module-resolution error when the bridge
 # starts inside the running container.
 RUN cd /app && bun -e 'import("@opencode-ai/sdk/v2/client").then(m => { if (typeof m.createOpencodeClient !== "function") { console.error("FATAL: @opencode-ai/sdk/v2/client resolved but is missing createOpencodeClient"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode-ai/sdk/v2/client —", e.message); process.exit(1) })'
-RUN cd /app \
+RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
+    && cd /app \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && python3 scripts/study_notes_config_test.py

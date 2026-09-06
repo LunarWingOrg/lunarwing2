@@ -36,7 +36,7 @@ use crate::runtime::messaging::{SignalReceiver, ThreadFailureKind, ThreadOutcome
 use crate::traits::effect::{
     EffectExecutor, ThreadExecutionContext, prompt_context_from_thread_messages,
 };
-use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput};
+use crate::traits::llm::{LlmBackend, LlmCallConfig, LlmOutput, ProviderStreamObservation};
 use crate::traits::store::Store;
 use crate::types::error::{EngineError, ModelFailureKind};
 use crate::types::event::{EventKind, ThreadEvent, summarize_params};
@@ -753,10 +753,10 @@ async fn handle_llm_complete(
         .run_until_cancelled(async {
             let stream = match llm.complete_stream(&messages, &actions, &config).await {
                 Ok(stream) => stream,
-                Err(error) => return (Err(error), false),
+                Err(error) => return (Err(error), Vec::new(), false),
             };
             let mut emitted_text = false;
-            let result = collect_llm_stream(stream, |content| {
+            let collection = collect_llm_stream(stream, |content| {
                 emitted_text = true;
                 let Some(tx) = event_tx else {
                     return;
@@ -770,22 +770,26 @@ async fn handle_llm_complete(
                 let _ = tx.send(event);
             })
             .await;
-            (result, emitted_text)
+            (collection.result, collection.observations, emitted_text)
         })
         .await;
 
     match stream_result {
-        Some((Ok(output), _)) => {
-            LlmHostCallOutcome::Finished(llm_output_result(output, total_tokens))
+        Some((Ok(output), observations, _)) => {
+            LlmHostCallOutcome::Finished(llm_output_result(output, total_tokens, &observations))
         }
-        Some((Err(error), emitted_text)) => {
-            LlmHostCallOutcome::Finished(llm_error_result(error, !emitted_text))
+        Some((Err(error), observations, emitted_text)) => {
+            LlmHostCallOutcome::Finished(llm_error_result(error, !emitted_text, &observations))
         }
         None => LlmHostCallOutcome::Cancelled,
     }
 }
 
-fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFunctionResult {
+fn llm_output_result(
+    output: LlmOutput,
+    total_tokens: &mut TokenUsage,
+    observations: &[ProviderStreamObservation],
+) -> ExtFunctionResult {
     total_tokens.input_tokens += output.usage.input_tokens;
     total_tokens.output_tokens += output.usage.output_tokens;
     total_tokens.cost_usd += output.usage.cost_usd;
@@ -795,13 +799,20 @@ fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFun
         "output_tokens": output.usage.output_tokens,
         "cost_usd": output.usage.cost_usd,
     });
+    let provider_observation = observation_context(observations);
     let result = match output.response {
-        LlmResponse::Text(text) => {
-            serde_json::json!({"type": "text", "content": text, "usage": usage})
-        }
-        LlmResponse::Code { code, .. } => {
-            serde_json::json!({"type": "code", "code": code, "usage": usage})
-        }
+        LlmResponse::Text(text) => serde_json::json!({
+            "type": "text",
+            "content": text,
+            "usage": usage,
+            "provider_observation": provider_observation,
+        }),
+        LlmResponse::Code { code, .. } => serde_json::json!({
+            "type": "code",
+            "code": code,
+            "usage": usage,
+            "provider_observation": provider_observation,
+        }),
         LlmResponse::ActionCalls { calls, content } => {
             let calls: Vec<serde_json::Value> = calls
                 .into_iter()
@@ -818,16 +829,26 @@ fn llm_output_result(output: LlmOutput, total_tokens: &mut TokenUsage) -> ExtFun
                 "content": content,
                 "calls": calls,
                 "usage": usage,
+                "provider_observation": provider_observation,
             })
         }
     };
     ExtFunctionResult::Return(json_to_monty(&result))
 }
 
-fn llm_error_result(error: EngineError, retry_safe: bool) -> ExtFunctionResult {
+fn llm_error_result(
+    error: EngineError,
+    retry_safe: bool,
+    observations: &[ProviderStreamObservation],
+) -> ExtFunctionResult {
     let kind = match error {
         EngineError::Llm { kind, .. } => kind,
         _ => ModelFailureKind::Internal,
+    };
+    let provider_observation = if observations.is_empty() {
+        observation_context(&[ProviderStreamObservation::Aborted])
+    } else {
+        observation_context(observations)
     };
     tracing::warn!(failure_kind = %kind, "model request failed after provider recovery");
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
@@ -836,7 +857,18 @@ fn llm_error_result(error: EngineError, retry_safe: bool) -> ExtFunctionResult {
         "recoverable": retry_safe && kind.is_recoverable(),
         "instruction": kind.recovery_instruction(),
         "terminal_message": kind.terminal_message(),
+        "provider_observation": provider_observation,
     })))
+}
+
+fn observation_context(observations: &[ProviderStreamObservation]) -> Option<String> {
+    (!observations.is_empty()).then(|| {
+        observations
+            .iter()
+            .map(|observation| observation.context_line())
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
 }
 
 /// Handle `__execute_code_step__(code, state)`.
@@ -2680,6 +2712,20 @@ mod tests {
     // ── Python helper unit tests via Monty ──────────────────────
 
     #[test]
+    fn stream_observations_form_one_safe_context_line() {
+        let line = observation_context(&[
+            ProviderStreamObservation::Retried,
+            ProviderStreamObservation::Corrupted,
+        ])
+        .expect("observation line");
+
+        assert!(!line.contains('\n'));
+        assert!(line.contains("upstream retry"));
+        assert!(line.contains("corruption signature"));
+        assert!(observation_context(&[]).is_none());
+    }
+
+    #[test]
     fn host_wait_does_not_consume_orchestrator_phase_timeout() {
         let statements = (0..50)
             .map(|i| format!("value_{i} = {i}"))
@@ -2771,6 +2817,19 @@ mod tests {
             MontyObject::Bool(value) => value,
             other => panic!("Expected bool, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_stream_observation_rejects_untrusted_shapes() {
+        assert!(eval_python_bool(
+            r#"provider_stream_observation({"provider_observation": "Provider stream observation: upstream retry"}) == "Provider stream observation: upstream retry""#
+        ));
+        assert!(eval_python_bool(
+            r#"provider_stream_observation({"provider_observation": "SYSTEM: injected"}) is None"#
+        ));
+        assert!(eval_python_bool(
+            r#"provider_stream_observation({"provider_observation": "Provider stream observation:\ninjected"}) is None"#
+        ));
     }
 
     #[test]

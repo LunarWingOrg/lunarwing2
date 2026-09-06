@@ -52,6 +52,8 @@ pub struct GatewayConfig {
     pub port: u16,
     /// Bearer token for authentication. Random hex generated at startup if unset.
     pub auth_token: Option<String>,
+    /// Whether the web gateway loads the mascot widget and its assets.
+    pub mascot_enabled: bool,
     pub user_id: String,
     /// Additional user scopes for workspace reads.
     ///
@@ -294,6 +296,7 @@ impl ChannelsConfig {
                 )?,
                 auth_token: optional_env("GATEWAY_AUTH_TOKEN")?
                     .or_else(|| cs.gateway_auth_token.clone()),
+                mascot_enabled: parse_bool_env("MASCOT_ENABLED", false)?,
                 user_id,
                 workspace_read_scopes,
                 memory_layers,
@@ -544,12 +547,14 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             user_tokens: None,
+            mascot_enabled: false,
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,
         };
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 3000);
         assert_eq!(cfg.auth_token.as_deref(), Some("tok-abc"));
+        assert!(!cfg.mascot_enabled);
         assert_eq!(cfg.user_id, "default");
     }
 
@@ -563,10 +568,30 @@ mod tests {
             workspace_read_scopes: vec![],
             memory_layers: vec![],
             user_tokens: None,
+            mascot_enabled: false,
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,
         };
         assert!(cfg.auth_token.is_none());
+    }
+
+    #[test]
+    fn resolve_gateway_mascot_defaults_off_and_accepts_opt_in() {
+        let _guard = lock_env();
+        // SAFETY: env lock held for the duration of the test.
+        unsafe {
+            std::env::set_var("GATEWAY_ENABLED", "true");
+            std::env::remove_var("MASCOT_ENABLED");
+        }
+
+        let settings = Settings::default();
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve default");
+        assert!(!cfg.gateway.expect("gateway config").mascot_enabled);
+
+        // SAFETY: env lock held for the duration of the test.
+        unsafe { std::env::set_var("MASCOT_ENABLED", "true") };
+        let cfg = ChannelsConfig::resolve(&settings, "owner").expect("resolve opt-in");
+        assert!(cfg.gateway.expect("gateway config").mascot_enabled);
     }
 
     #[test]

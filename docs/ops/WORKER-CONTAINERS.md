@@ -25,15 +25,15 @@ Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble`
 **Dockerfile:** `pebble4lunarwing/Dockerfile`
 
 ```bash
-cd pebble4lunarwing
-docker build -t lunarwing-worker-pebble:latest .
+# Run from the repository root; the Dockerfile copies the local bridge crate.
+docker build -f pebble4lunarwing/Dockerfile -t lunarwing-worker-pebble:latest .
 
 # Or select the worker per tenant and build the shared image via mt-admin
 sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-pebble
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 ```
 
-Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). See `pebble4lunarwing/` for details.
+Persistent worker mode (`PEBBLE_MODE=websocket`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth and optionally `NANOGPT_API_KEY` for the underlying NanoGPT backend (configure per-tenant via `configure-pebble <name> --nanogpt-api-key <key>`). Upstream Pebble v0.5.0 is fetched by its reviewed full commit, both Cargo builds use committed lockfiles, and base images/package indexes/toolchain downloads are pinned. See `pebble4lunarwing/` for details.
 
 ## Opencode Worker
 
@@ -56,7 +56,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker --with-toolchains
 ```
 
-The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> [--home <absolute-checkout>]` gives core and OpenCode the same lw2studymcp data. Without `--home` it uses the shared default checkout (`/var/cache/lunarwing/lw2studymcp`, override with `LUNARWING_MT_STUDY_NOTES_HOME`) and always syncs it to the latest upstream (`LUNARWING_MT_STUDY_NOTES_REPO`, default `https://git.lunarwing.org/cmc/lw2studymcp.git`) first — cloning when missing, fast-forwarding a clean checkout, and refusing to touch a dirty or non-git directory. `--sync` applies the same update to an explicit `--home`. `add-tenant <name> --with-study-mcp [--study-mcp-home <path>]` runs this auto-configuration (read-only) during provisioning so a new tenant starts with current knowledge of the LunarWing codebase. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. The opencode upstream is cloned at build time and pinned to a release tag via the `OPENCODE_REF` build arg (default `v1.18.25`); override with `podman build --build-arg OPENCODE_REF=<tag>`. The pinned ref is baked into the image as `OPENCODE_IMAGE_REF` and reported on the worker `/health` endpoint as `opencode_ref`. See `opencode4lunarwing/README.md` for the full env var reference.
+The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Build with `--with-toolchains` when worker jobs must compile or test code; the toolchain image uses Rust 1.96.1. Modes: `--mode websocket` (default, persistent) or `--mode cli` (one-shot; prompt via `TASK_PROMPT`). Requires `AGENT_AUTH_TOKEN` for WebSocket auth. Supports per-tenant model/base-URL overrides via `configure-opencode <name> [--model <m>] [--base-url <url>]`, optional Paseo MCP integration (`PASEO_URL`/`PASEO_TOKEN`), and SSH agent socket bind-mounting. `configure-study-mcp <name> [--home <absolute-checkout>]` gives core and OpenCode the same lw2studymcp data. Without `--home` it uses the shared default checkout (`/var/cache/lunarwing/lw2studymcp`, override with `LUNARWING_MT_STUDY_NOTES_HOME`) and always syncs it to the latest upstream (`LUNARWING_MT_STUDY_NOTES_REPO`, default `https://git.lunarwing.org/cmc/lw2studymcp.git`) first — cloning when missing, fast-forwarding a clean checkout, and refusing to touch a dirty or non-git directory. `--sync` applies the same update to an explicit `--home`. `add-tenant <name> --with-study-mcp [--study-mcp-home <path>]` runs this auto-configuration (read-only) during provisioning so a new tenant starts with current knowledge of the LunarWing codebase. `--allow-write` enables approved core-agent mutations in separate state; OpenCode always receives code and state read-only at `/opt/lw2studymcp` and `/var/lib/lw2studymcp`. OpenCode v1.18.29 is fetched by reviewed full commit `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; `OPENCODE_REF` accepts only a full SHA, the checkout is verified, and a frozen Bun lock is mandatory. The release and SHA are baked into `OPENCODE_IMAGE_REF` as `v1.18.29@<full-sha>` and reported together as `opencode_ref`. Base images, Debian indexes, and optional toolchain downloads are also pinned. See `opencode4lunarwing/README.md` for the full environment reference.
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
@@ -92,12 +92,12 @@ OpenCode profile. Server mode requires `AGENT_AUTH_TOKEN`, even on loopback;
 Compose rejects a missing value before container launch. `KIMI_API_KEY` remains
 optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
-path rather than plaintext argv. The Kimi Code CLI is installed from npm at
-build time and pinned via the `KIMI_CODE_VERSION` build arg (default `0.39.1`);
-override with `podman build --build-arg KIMI_CODE_VERSION=<version>` or
-mt-admin's `build-kimi-worker --kimi-code-version <version>`. The pinned
-version is baked into the image as `KIMI_CODE_IMAGE_VERSION` and reported on
-the worker `/health` endpoint as `kimi_code_version`.
+path rather than plaintext argv. The Kimi Code CLI and bridge are installed
+with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
+`0.41.0` and must match `kimi-cli/package-lock.json`; an override without a
+matching reviewed lock fails closed. The pinned version is baked into
+`KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`. Base images,
+Debian indexes, and optional toolchain downloads are also pinned.
 
 For every persistent worker, `add-tenant --with-<worker>` controls the tenant's
 selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the

@@ -21,6 +21,8 @@ pub mod retry;
 mod rig_adapter;
 pub mod session;
 pub mod smart_routing;
+mod stream_integrity;
+mod stream_telemetry;
 mod streaming;
 #[cfg(test)]
 pub(crate) mod streaming_test_support;
@@ -41,9 +43,9 @@ pub use lunarwing_cloud_chat::{
 };
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, ImageUrl,
-    LlmProvider, LlmStream, LlmStreamChunk, ModelMetadata, Role, TokenUsage, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, ToolResult,
-    generate_tool_call_id,
+    LlmProvider, LlmStream, LlmStreamChunk, LlmStreamObservation, ModelMetadata,
+    OutputCorruptionKind, Role, StreamFailureReason, TokenUsage, ToolCall, ToolCompletionRequest,
+    ToolCompletionResponse, ToolDefinition, ToolResult, generate_tool_call_id,
 };
 pub use reasoning::{
     ActionPlan, Reasoning, ReasoningContext, RespondOutput, RespondResult, SILENT_REPLY_TOKEN,
@@ -314,9 +316,11 @@ fn create_cheap_provider_for_backend(
 /// 4. FailoverProvider (fallback model when primary fails)
 /// 5. CircuitBreakerProvider (fast-fail when backend is degraded)
 /// 6. CachedProvider (in-memory response cache)
+/// 7. TimeoutProvider and optional RecordingLlm
+/// 8. StreamIntegrityProvider (post-stream detection and telemetry)
 ///
-/// Also returns a separate cheap LLM provider for heartbeat/evaluation (not
-/// part of the chain — it's a standalone provider for explicitly cheap tasks).
+/// Also returns a separate cheap LLM provider for heartbeat/evaluation, wrapped
+/// with the same output-integrity observer.
 ///
 /// This is the single source of truth for provider chain construction,
 /// called by both `main.rs` and `app.rs`.
@@ -332,6 +336,7 @@ pub async fn build_provider_chain(
     ),
     LlmError,
 > {
+    let telemetry = Arc::new(stream_telemetry::StreamTelemetry::from_env());
     let llm: Arc<dyn LlmProvider> = create_llm_provider(config, session.clone()).await?;
     tracing::debug!("LLM provider initialized: {}", llm.model_name());
 
@@ -344,7 +349,9 @@ pub async fn build_provider_chain(
             max_retries = retry_config.max_retries,
             "LLM retry wrapper enabled"
         );
-        Arc::new(RetryProvider::new(llm, retry_config.clone()))
+        Arc::new(
+            RetryProvider::new(llm, retry_config.clone()).with_telemetry(Arc::clone(&telemetry)),
+        )
     } else {
         llm
     };
@@ -360,7 +367,10 @@ pub async fn build_provider_chain(
                 ),
             })?;
         let cheap: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
-            Arc::new(RetryProvider::new(cheap, retry_config.clone()))
+            Arc::new(
+                RetryProvider::new(cheap, retry_config.clone())
+                    .with_telemetry(Arc::clone(&telemetry)),
+            )
         } else {
             cheap
         };
@@ -402,7 +412,10 @@ pub async fn build_provider_chain(
                 "LLM failover enabled"
             );
             let fallback: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
-                Arc::new(RetryProvider::new(fallback, retry_config.clone()))
+                Arc::new(
+                    RetryProvider::new(fallback, retry_config.clone())
+                        .with_telemetry(Arc::clone(&telemetry)),
+                )
             } else {
                 fallback
             };
@@ -412,10 +425,10 @@ pub async fn build_provider_chain(
                 ),
                 failure_threshold: config.lunarwing_cloud.failover_cooldown_threshold,
             };
-            Arc::new(FailoverProvider::with_cooldown(
-                vec![llm, fallback],
-                cooldown_config,
-            )?)
+            Arc::new(
+                FailoverProvider::with_cooldown(vec![llm, fallback], cooldown_config)?
+                    .with_telemetry(Arc::clone(&telemetry)),
+            )
         } else {
             llm
         };
@@ -478,8 +491,20 @@ pub async fn build_provider_chain(
         llm
     };
 
-    // Standalone cheap LLM for heartbeat/evaluation (not part of the chain)
-    let cheap_llm = create_cheap_llm_provider(config, session)?;
+    // Post-stream integrity observation remains outside recording so trace
+    // fixtures retain the provider's raw output and replay is checked again.
+    let llm: Arc<dyn LlmProvider> = Arc::new(stream_integrity::StreamIntegrityProvider::new(
+        llm,
+        Arc::clone(&telemetry),
+    ));
+
+    // Standalone cheap LLM for heartbeat/evaluation gets the same observation.
+    let cheap_llm = create_cheap_llm_provider(config, session)?.map(|cheap| {
+        Arc::new(stream_integrity::StreamIntegrityProvider::new(
+            cheap,
+            Arc::clone(&telemetry),
+        )) as Arc<dyn LlmProvider>
+    });
     if let Some(ref cheap) = cheap_llm {
         tracing::debug!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
