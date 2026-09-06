@@ -2,16 +2,18 @@
 
 ## Codename: Ma-ai (間合い)
 
-**Status: PRE-RELEASE DRAFT ** Release date TBD
+**Status: PRE-RELEASE DRAFT** Release date TBD
 Claims below were rechecked against release-integration revision
-`d316097e5` (the tip of the `aragents/kimil00p/v2.1.0.0` lineage reviewed at
-that commit), the `v2.0.9.0..d316097e5` history, current source/manifests/locks,
-in-tree regression evidence, the canonical bug reports, and the public
-work-item tracker (2026-09-01 accuracy pass, a 2026-09-02 re-verification at
-`96c951785`, a 2026-09-03 re-verification at `a67fee21c`, and a second
-2026-09-03 pass at `d316097e5` covering the subsequently merged mascot-dialect
-and gate-expiry-resume work). This file remains at the repository root until
-the release process moves it into `docs/releases/`.
+`6786bd2fe3126608790c5aca082a4fb33329c049` (the source tip reviewed from
+`aj/kimi-44-20260906-0601`, also the current `aragents/kimil00p/v2.1.0.0`
+lineage), the `v2.0.9.0..6786bd2fe3126608790c5aca082a4fb33329c049` history,
+current source/manifests/locks, in-tree regression and live evidence, the
+canonical bug reports, and the public work-item tracker. Source, CI, and
+worker claims were refreshed on 2026-09-06; the latest tracker query at
+2026-09-06T06:12:00Z returned 18 open items. Earlier accuracy passes at
+`96c951785`, `a67fee21c`, and `d316097e5` remain useful provenance, including
+the mascot-dialect and gate-expiry-resume reviews. This file remains at the
+repository root until the release process moves it into `docs/releases/`.
 
 >Distance is a decision
 >
