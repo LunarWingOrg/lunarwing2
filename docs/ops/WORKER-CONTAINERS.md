@@ -94,7 +94,7 @@ optional for OAuth-backed setups. mt-admin keeps both credentials out of process
 arguments by materializing private `kimi-runtime.env`; API key input uses file
 path rather than plaintext argv. The Kimi Code CLI and bridge are installed
 with `npm ci` from committed integrity locks. `KIMI_CODE_VERSION` defaults to
-`0.39.1` and must match `kimi-cli/package-lock.json`; an override without a
+`0.41.0` and must match `kimi-cli/package-lock.json`; an override without a
 matching reviewed lock fails closed. The pinned version is baked into
 `KIMI_CODE_IMAGE_VERSION` and reported as `kimi_code_version`. Base images,
 Debian indexes, and optional toolchain downloads are also pinned.
