@@ -146,7 +146,11 @@ registry paths to the allowlist when adopting option 2.
   info entirely to avoid OOM near 16 GB.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
-`/.gitleaksignore`. Broad path or rule exclusions are forbidden.
+`/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
+CRITICAL findings that Debian will not fix for the pinned toolchain
+dependencies are listed by exact CVE with rationale and expiry in
+`.gitlab/trivy-ignore`; expired entries stop being ignored and fail the
+scan gate again.
 
 `skip-version-check` is inert unless a maintainer also supplies
 `ALLOW_VERSION_CHECK_SKIP=1`; commit messages cannot bypass version policy.
