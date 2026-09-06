@@ -1,6 +1,6 @@
-# v1.18.25 resolves to this reviewed commit. Both must move together.
-ARG OPENCODE_VERSION=v1.18.25
-ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+# v1.18.29 resolves to this reviewed commit. Both must move together.
+ARG OPENCODE_VERSION=v1.18.29
+ARG OPENCODE_REF=16747470f976aca3d362ad730bcd3fe82ecc2c9a
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
 ARG SOURCE_REVISION=unknown
 
