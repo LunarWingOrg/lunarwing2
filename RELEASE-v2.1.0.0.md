@@ -149,9 +149,9 @@ previous compatibility baseline.
   references are resolved only at activation, never persisted in plaintext, fail
   closed on missing or wrong-owner secrets, and suppress the OAuth path for
   static-header servers. The CLI and web install paths expose the same mapping.
-- **Pending-gate expiry is configurable.** `AGENT_PENDING_GATE_EXPIRY_SECS`
-  overrides the DB setting above the 30-second floor, with a 1,800-second
-  default and the same precedence as other env-over-DB agent settings.
+- **Pending-gate expiry is configurable and bounded.**
+  `AGENT_PENDING_GATE_EXPIRY_SECS` overrides the DB setting within the inclusive
+  30-second-to-30-day range; out-of-range values use the 1,800-second default.
 - **Protected CI/CD is release-aware.** Protected RC/final tags receive the
   complete validation context, PostgreSQL-only and libSQL-only test-target
   checks, a non-skipping PostgreSQL integration job, and digest-pinned security
@@ -199,7 +199,7 @@ previous compatibility baseline.
 | Worker image tool pins | opencode `v1.18.29` at reviewed upstream commit `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; kimi-code `0.41.0` |
 | Worker image publication | Protected rootless BuildKit candidates use unique full-SHA/pipeline/job tags; only the tested digest is promoted to `vX.Y.Z.W[-rcN]-<worker>`; CI publishes neither `latest` nor short-SHA tags |
 | Gateway mascot default | Disabled; set `MASCOT_ENABLED=true` per tenant to load the widget and sprite routes |
-| Pending-gate expiry | `AGENT_PENDING_GATE_EXPIRY_SECS` over DB `agent.pending_gate_expiry_secs`, default 1,800 seconds; values below 30 seconds fall back to the default |
+| Pending-gate expiry | `AGENT_PENDING_GATE_EXPIRY_SECS` over DB `agent.pending_gate_expiry_secs`, default 1,800 seconds; values outside 30 seconds through 30 days fall back to the default |
 | HTTP MCP credentials | `header_secrets` are owner-scoped activation-time references; secret values are not persisted in `mcp-servers.json` |
 | CI scope | Protected worker-image candidate publication/promotion is supported; daemon/package publication and tenant deployment remain deferred |
 
@@ -291,15 +291,17 @@ permanently unanswered. Expiry now resumes the paused turn:
   setting: the expired result reached the thread, the no-re-arm guard ended a
   second approval request, and the completed reply arrived through SSE.
 
-### Configurable Pending-Gate Expiry (work item #111)
+### Configurable Pending-Gate Expiry (work items #111 and #115)
 
 `AGENT_PENDING_GATE_EXPIRY_SECS` is now the environment override for approval
 and authentication gate lifetime. Resolution remains env > DB setting
 `agent.pending_gate_expiry_secs` > the 1,800-second default. Values below 30
 seconds fall back to the default because the background sweep runs every 60
-seconds; the accessor is resolved once in `AgentConfig` instead of rereading
-settings ad hoc in the bridge router. The `.env.example` and Engine V2
-configuration guide document the knob and floor.
+seconds. Values above 2,592,000 seconds (30 days) also fall back, preventing
+unsigned-to-signed wraparound and Chrono duration overflow. The accessor is
+resolved once in `AgentConfig` instead of rereading settings ad hoc in the
+bridge router. The `.env.example` and Engine V2 configuration guide document
+the bounded range.
 
 ### External LunarVision Instances
 
@@ -706,8 +708,9 @@ committed:
     the gateway mascot. New and upgraded tenants default to `false`; export and
     import preserve an explicit choice.
 12. Set `AGENT_PENDING_GATE_EXPIRY_SECS` in the tenant environment when a gate
-    lifetime other than the DB setting is required. Values below 30 seconds use
-    the safe 1,800-second default; restart the tenant after changing it.
+    lifetime other than the DB setting is required. Values must be between 30
+    seconds and 30 days inclusive; otherwise the safe 1,800-second default is
+    used. Restart the tenant after changing it.
 13. For an HTTP MCP server using a static bearer header, store the complete
     header value in the owner's secrets store and configure
     `header_secrets` (or `lunarwing mcp add --secret-header`). Do not put the
@@ -803,8 +806,10 @@ separates tracker status, source status, and remaining acceptance work.
   acceptance criterion is attached.
 - **#114 — generic Podman sandbox feature request is deferred (open).** It is
   outside the v2.1.0.0 release scope.
-- **#115 — low-severity agent-loop report needs triage (open).** No verified
-  release regression or acceptance result is recorded.
+- **#115 — pending-gate expiry overflow is source-fixed; tracker remains open.**
+  Values above the 30-day ceiling now fall back to 1,800 seconds before the
+  `u64`-to-`i64` conversion; boundary regressions cover both Chrono's panic
+  range and the signed-wrap range.
 - **#116 — `skill_install` ZIP data-descriptor bug remains (open).** Valid
   multi-file archives using local-header flag bit 3 can still be misread by the
   hand-rolled parser, so a root `SKILL.md` may be reported missing.
@@ -980,7 +985,8 @@ closed; source and verification details remain summarized above.
   suppresses inappropriate OAuth discovery; focused and live hosted-server
   checks passed, with public tracker acceptance still pending (#117).
 - Pending-gate expiry is configurable through `AGENT_PENDING_GATE_EXPIRY_SECS`
-  with env-over-DB precedence and a safe floor (#111 source fix).
+  with env-over-DB precedence and safe lower/upper bounds (#111/#115 source
+  fixes).
 - Protected CI now gates release contexts and produces reproducible,
   digest-bound worker candidates/promotions; daemon package publication and
   tenant deployment remain deferred.
