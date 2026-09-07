@@ -3,17 +3,20 @@
 ## Codename: Ma-ai (間合い)
 
 **Status: PRE-RELEASE DRAFT** Release date TBD
-Claims below were rechecked against release-integration revision
-`6786bd2fe3126608790c5aca082a4fb33329c049` (the source tip reviewed from
-`aj/kimi-44-20260906-0601`, also the current `aragents/kimil00p/v2.1.0.0`
-lineage), the `v2.0.9.0..6786bd2fe3126608790c5aca082a4fb33329c049` history,
-current source/manifests/locks, in-tree regression and live evidence, the
-canonical bug reports, and the public work-item tracker. Source, CI, and
-worker claims were refreshed on 2026-09-06; the latest tracker query at
-2026-09-06T06:12:00Z returned 18 open items. Earlier accuracy passes at
-`96c951785`, `a67fee21c`, and `d316097e5` remain useful provenance, including
-the mascot-dialect and gate-expiry-resume reviews. This file remains at the
-repository root until the release process moves it into `docs/releases/`.
+Claims below were rechecked against revision
+`c10bd8acfdc1c5fbcdc0500eae8a39416992a41a` (the source tip reviewed from
+`aj/kimi-48-20260907-1801`), the
+`v2.0.9.0..c10bd8acfdc1c5fbcdc0500eae8a39416992a41a` history, current
+source/manifests/locks, in-tree regression and live evidence, the canonical
+bug reports, and the public work-item tracker. Source, CI, and worker claims
+were refreshed on 2026-09-07; the latest tracker query at
+2026-09-07T18:16:37Z returned 9 open items. Earlier accuracy passes at
+`6786bd2fe`, `96c951785`, `a67fee21c`, and `d316097e5` remain useful
+provenance. This refresh incorporates the later worker reproducibility and
+scan remediation, the OpenCode rollback, mascot/steer/gate rechecks, the
+knowledge-refresh design, and the work-item #127 gateway mitigation. This file
+remains at the repository root until the release process moves it into
+`docs/releases/`.
 
 >Distance is a decision
 >
@@ -55,9 +58,11 @@ every healthpoint with env-configurable early-warning thresholds; end-to-end
 LLM `finish_reason` propagation; passive-voice fabricated-result detection;
 deterministic evaluation error ranking; room-bare-JID coordination-knowledge
 publisher authorization; durable SSH AcceptFirst pins; a mission-scheduler
-startup warmup; and executable browser coverage for the onboarding web GUI.
-The web gateway also gains an opt-in emoting, draggable pony/unicorn mascot;
-`MASCOT_ENABLED=false` keeps it disabled by default.
+startup warmup; browser-side reconciliation for one lost-final-response path;
+and executable browser coverage for the onboarding web GUI. The web gateway
+also gains an opt-in emoting, draggable pony/unicorn mascot;
+`MASCOT_ENABLED=false` keeps it disabled by default. The broader server-side SSE
+gap-detection work remains open under work item #127.
 
 Protected CI now validates release tags across the backend/test/security matrix
 and can publish worker images only through digest-bound, reproducible candidate
@@ -111,8 +116,15 @@ previous compatibility baseline.
   into eight canonical emotes, attaches an optional `emotes` array to final
   response events, and renders a draggable, hideable sprite widget with idle,
   working, greeting, error, and FIFO emote states. The parser covers the herd's
-  equine dialect and common roleplay verbs; `MASCOT_ENABLED=false` omits the
-  script and sprite routes by default, while `true` opts a tenant in.
+  equine dialect and common roleplay verbs; non-empty emotes are pinned through
+  the WebSocket adapter; and enabled public gateways served all eight sprite
+  routes. `MASCOT_ENABLED=false` omits the script and sprite routes by default,
+  while `true` opts a tenant in. Work item #107 is tracker-closed.
+- **Lost final-response mitigation.** For work item #127, the browser records
+  terminal response events per thread and can reconcile persisted history after
+  `Done` when no final response reaches the page. The merged client guard covers
+  one loss shape; server-side lag signaling, sequence-aware recovery, and the
+  broader acceptance case remain open.
 - **Durable SSH AcceptFirst pins.** Accepted host keys are stored as a versioned,
   tenant-scoped encrypted pin set before a first handshake succeeds. Restart,
   tenant-isolation, corruption, revocation, and concurrent-first-key paths are
@@ -157,7 +169,11 @@ previous compatibility baseline.
   checks, a non-skipping PostgreSQL integration job, and digest-pinned security
   checks. Worker candidates use rootless BuildKit, immutable full-SHA tags,
   clean rebuild equality, Trivy/SBOM evidence, and worker-specific digest-bound
-  promotion; CI never publishes `latest` or short-SHA worker tags.
+  promotion; CI never publishes `latest` or short-SHA worker tags. Transient
+  apt/npm/V8 build state is scrubbed, and two cold builds per worker produced
+  identical OCI manifest digests. The critical-vulnerability gate removes
+  fixable findings and carries six reviewed, rationale-bearing, time-limited
+  no-fix exceptions that expire on 2027-03-06.
 - **Smarter fabricated-result detection.** The orchestrator recognizes five
   passive completion claims (for example, "was written" and "was retrieved")
   plus `memory write`/`memory/` tool mentions. When the current turn has no real
@@ -196,7 +212,7 @@ previous compatibility baseline.
 | Tool registry patches | cavepony 0.4.2 (was 0.4.0); GitLab 0.1.4 (was 0.1.3); llm-context 0.1.1 (was 0.1.0); multica-bridge 0.1.2 (was 0.1.1); ssh 0.1.1 (was 0.1.0); `vision-analyze` 0.1.3 (was 0.1.1); voice-transcribe 0.1.1 (was 0.1.0); web-search 0.2.2 (was 0.2.1) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (was 36.0.13) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; root-level satellites are out of scope |
-| Worker image tool pins | opencode `v1.18.29` at reviewed upstream commit `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; kimi-code `0.41.0` |
+| Worker image tool pins | opencode `v1.18.25` at reviewed upstream commit `cb7d8b2f5e44876ef98b661dc10590c915af3a9f` (rolled back from v1.18.29 after live upstream regressions); kimi-code `0.41.0` |
 | Worker image publication | Protected rootless BuildKit candidates use unique full-SHA/pipeline/job tags; only the tested digest is promoted to `vX.Y.Z.W[-rcN]-<worker>`; CI publishes neither `latest` nor short-SHA tags |
 | Gateway mascot default | Disabled; set `MASCOT_ENABLED=true` per tenant to load the widget and sprite routes |
 | Pending-gate expiry | `AGENT_PENDING_GATE_EXPIRY_SECS` over DB `agent.pending_gate_expiry_secs`, default 1,800 seconds; values outside 30 seconds through 30 days fall back to the default |
@@ -259,7 +275,8 @@ races that the live pass could not cover:
   model-call boundary, after the current step or tool result, and deliberately
   never cancels the running tool. These fixes close the source side of work
   items #103 and #104 and the interrupt half of #105; regression coverage
-  passed. Checklist item 43 then verified gateway in-flight cancellation,
+  passed, and all three tracker items were closed by 2026-09-07. Checklist item
+  43 then verified gateway in-flight cancellation,
   mid-turn steer, idle queued steer, and the gate-expiry path on fresh tenant
   `merlin`. WeeChat was skipped after a repeatable WASM poll trap, and XMPP
   outbound peer delivery remained environment/bootstrap-shaped after inbound
@@ -361,7 +378,9 @@ The gateway now includes a presentation-only mascot pipeline:
   [`docs/ops/v2.1.0.0_GOAL33_WI107_MASCOT_TRIAGE.md`](docs/ops/v2.1.0.0_GOAL33_WI107_MASCOT_TRIAGE.md).
 - Final assistant response events from direct gateway responses, broadcasts,
   and bridged `AppEvent` conversions carry `emotes` only when non-empty. Parsing
-  never changes assistant text.
+  never changes assistant text. The item-45 recheck added an explicit non-empty
+  WebSocket-adapter regression and verified that parser, widget, route, and disk
+  sprite sets agree 8/8.
 - Eight allowlisted GIFs are embedded under `/mascot/`. The browser widget is
   draggable, position-persistent, hideable/restorable, and uses idle/working
   fallbacks plus greeting, error, and bounded FIFO emote playback. Its default
@@ -369,7 +388,34 @@ The gateway now includes a presentation-only mascot pipeline:
 - The widget is now an explicit tenant opt-in: `MASCOT_ENABLED=false` is written
   for new and legacy tenants, preserved on re-render and export/import, and
   prevents mascot script, JavaScript, and sprite routes from being registered.
-  Setting it to `true` and restarting restores the existing widget.
+  Setting it to `true` and restarting restores the existing widget. Two enabled
+  public gateways served the current script and all eight sprites during the
+  item-45 recheck; no authenticated source-matched human animation turn was run.
+  Work item #107 is now tracker-closed. Full evidence:
+  [`docs/ops/v2.1.0.0_GOAL45_WI107_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL45_WI107_VERIFICATION.md).
+
+### Web Gateway Final-Response Reconciliation (work item #127)
+
+The gateway broadcasts terminal `Done` status before the final `response` event.
+If the broadcast receiver lags, the response can be dropped while SSE keepalive
+traffic leaves the connection looking healthy; the old `Done` handler then
+cleared live-work state without rendering or reloading the persisted answer.
+A client-side candidate mitigation is now present:
+
+- Final `response` events record a per-thread render timestamp, including for
+  background threads.
+- On `Done`, when the current page has neither live stream text nor a recent
+  rendered response, the browser waits 1.5 seconds for the normal response race
+  and then calls `loadHistory()` if the response still did not arrive. The
+  assistant row is persisted before `Done`, so this path can recover it.
+- Two Playwright scenarios were added to target the intended missing-response
+  reconcile and healthy no-reload paths through a controllable `EventSource`.
+
+This is not the complete transport fix. `BroadcastStream::Lagged` is still
+silently discarded, there is no gap event or per-thread sequence protocol, and
+the current `sawResponseThisTurn` condition does not schedule this reload when
+live stream text existed before `Done`. Work item #127 therefore remains open
+for server-side loss signaling, full-path correction, and acceptance.
 
 ### LunarVoice Production Completion
 
@@ -552,9 +598,19 @@ manual job:
   tag; it never rebuilds or writes `latest`.
 - Rootless BuildKit replaced archived Kaniko. Worker Dockerfiles and build
   helpers pin base images, source revisions, package indexes, dependency locks,
-  and downloaded toolchains where applicable. A clean second build must match
-  the first digest; candidate metadata, input hashes, Trivy results, SBOM, and
+  and downloaded toolchains where applicable. Transient apt/dpkg/ldconfig logs,
+  npm debug logs, and the Node V8 compile cache are removed in the creating
+  layer. After that remediation, two cold builds of each worker produced
+  identical OCI manifest digests. A clean second build must match the first
+  digest; candidate metadata, input hashes, Trivy results, SBOM, and
   source/health metadata are retained as promotion evidence.
+- The first full candidate-to-scan run passed reproducibility for all three
+  workers and exposed the remaining critical-image findings. Unused `gh` was
+  removed from OpenCode/Kimi, Kimi pins npm 12.0.2 for the fixed `tar` transitively
+  bundled by npm, and all workers use the 20260906 Debian snapshot. Six findings
+  with no fix in that snapshot remain in `.gitlab/trivy-ignore`, each with an
+  in-file dependency rationale and an `expiring:2027-03-06` deadline; expiration
+  restores a failing critical scan rather than silently extending the exception.
 - Protected RC/final tags run the complete validation context, including
   backend-specific test-target compilation, the non-skipping PostgreSQL
   integration target, cargo-deny, secret/policy scans, WASM compatibility, and
@@ -616,14 +672,17 @@ committed:
   capability crates moved with that patch release. The release-cycle audit
   recorded no remaining semver-compatible updates across 19 tracked lockfile
   roots before the vendor snapshot.
-- Worker tool pins are now opencode `v1.18.29` and kimi-code `0.41.0`,
-  superseding the earlier draft pins `v1.18.25` and `0.39.1`. OpenCode is
-  verified against upstream commit
-  `16747470f976aca3d362ad730bcd3fe82ecc2c9a`; Kimi's package and integrity
-  lockfiles are installed with `npm ci`. Dockerfile defaults, protected CI
-  inputs, examples/docs, and the Kimi mt-admin assertion are synchronized.
-  Local version verification passed; full image build/smoke execution still
-  requires the protected worker-build runner.
+- Worker tool pins are opencode `v1.18.25` and kimi-code `0.41.0`, advancing
+  the v2.0.9.0 defaults (`v1.18.23` and `0.39.0`). The attempted OpenCode
+  `v1.18.29` update was rolled back after live worker diagnosis found two
+  upstream regressions: incomplete model metadata can crash provider/model
+  resolution, and the ai-sdk stream path can terminate silently before its
+  first chunk. `v1.18.25` at reviewed commit
+  `cb7d8b2f5e44876ef98b661dc10590c915af3a9f` is the last release proven
+  end-to-end in this worker; the corrected model ID/API-key/context
+  configuration remains. Kimi's package and integrity lockfiles are installed
+  with `npm ci`. Dockerfile defaults, protected CI inputs, examples/docs, and
+  the Kimi mt-admin assertion are synchronized.
 
 ### Runtime and Release-Engineering Hardening
 
@@ -700,10 +759,13 @@ committed:
    `XMPP_ALLOW_ROOMS_JSON` and authorize either exact occupant JIDs or the room
    bare JID in `COORD_KNOWLEDGE_PUBLISHERS`, then restart and verify the wire
    path. An empty room allowlist drops all groupchat.
-10. Worker tool pins are opencode `v1.18.29` (reviewed upstream commit
-    `16747470f976aca3d362ad730bcd3fe82ecc2c9a`) and kimi-code `0.41.0`. Pull
-    worker images by the digest recorded in `worker-image-evidence.json`; do not
-    depend on a moving `WORKER_IMAGE_TAG`, `latest`, or a short-SHA tag.
+10. Worker tool pins are opencode `v1.18.25` (reviewed upstream commit
+    `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`) and kimi-code `0.41.0`.
+    Do not restore OpenCode v1.18.29 until both documented upstream regressions
+    are fixed. Pull worker images by the digest recorded in
+    `worker-image-evidence.json`; do not depend on a moving `WORKER_IMAGE_TAG`,
+    `latest`, or a short-SHA tag. Review the dated `.gitlab/trivy-ignore`
+    exceptions before promotion; all expire on 2027-03-06.
 11. Set `MASCOT_ENABLED=true` in a tenant environment and restart to opt into
     the gateway mascot. New and upgraded tenants default to `false`; export and
     import preserve an explicit choice.
@@ -725,16 +787,15 @@ committed:
 ## Known Issues
 
 The source snapshot for this draft is
-`6786bd2fe3126608790c5aca082a4fb33329c049`. The public GitLab REST query at
-2026-09-06T06:12:00Z returned 18 open items:
-#86, #87, #97, #100, #101, #103, #107, #109, #110, #111, #112, #113, #114,
-#115, #116, #117, #119, and #120. Relevant v2.1 items closed since the earlier
-snapshot are #94, #95, #96, #98, #99, #102, #104, #105, #108, and #118. The
-older point-in-time reconciliation remains useful background
+`c10bd8acfdc1c5fbcdc0500eae8a39416992a41a`. The public GitLab REST query at
+2026-09-07T18:16:37Z returned 9 open items: #86, #97, #109, #113, #114, #121,
+#122, #126, and #127. Since the 2026-09-06 draft snapshot, #87, #100, #101,
+#103, #107, #110, #111, #112, #115, #116, #117, #119, and #120 closed, while
+#121, #122, #126, and #127 opened. Tracker closure alone is not treated as
+proof of a source change, and an open item is not treated as proof that a source
+fix is absent. The older point-in-time reconciliation remains useful background
 ([`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)),
-but it must not be read as the current tracker state. An open tracker state is
-not treated as proof that its source fix is absent, so the disposition below
-separates tracker status, source status, and remaining acceptance work.
+but it must not be read as current tracker state.
 
 ### Public Work-Item Tracker Reconciliation
 
@@ -742,92 +803,46 @@ separates tracker status, source status, and remaining acceptance work.
   Pebble/OpenCode/Kimi workers still offer or accept `ironclaw-agent-v1` beside
   `lunarwing-agent-v1`. This is deliberate compatibility in current source but
   does not satisfy the requested removal.
-- **#87 — LunarVision testing is not actionable (open).** Its `lv` description
-  supplies no failure, scope, or acceptance criterion.
 - **#97 — coordination-knowledge deployment follow-up remains (open).** The
   room-bare publisher fallback is source-fixed and live-verified in the isolated
   4/4 Prosody matrix; the sunburst/ruffles production configuration and KNOW
   retest remain operator work. Evidence:
   [`docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md).
-- **#100 — mascot refinement is not actionable (open).** No refinement, repro,
-  or acceptance criteria are recorded.
-- **#101 — Pebble testing is not actionable (open).** The referenced findings
-  and acceptance matrix are not linked.
-- **#94 — mission warmup race is mitigated, not health-synchronized (closed).**
-  Source uses a fixed 30-second warmup rather than an explicit watchdog-ready
-  signal; the tracker closed the item with that shipped mitigation.
-- **#95 — `finish_reason` is implemented and verified (closed).** The focused
-  adapter, stream, bridge, and cross-surface checks passed; the public tracker
-  closed the item on 2026-09-04. Full evidence remains in
-  [`docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL31_WI95_VERIFICATION.md).
-- **#96 — deterministic top-error ranking is implemented and closed.**
-- **#98 — durable AcceptFirst pins ship (closed).** Persistent encrypted pins and
-  restart/concurrency/failure coverage are present; the tracker closed it on
-  2026-09-02.
-- **#99 — terse mascot refinement item closed** on 2026-09-02.
-- **#102 — companion repository links landed and the item is closed.**
-- **#103 — idle `/steer` source fix and gateway acceptance are complete (open).**
-  The bounded durable queue, queued acknowledgment, and next-turn/resume paths
-  are covered by regression tests; item 43 passed the fresh gateway idle queue
-  case. Tracker closure remains outstanding.
-- **#104 — XMPP steer routing fixed and tracker-closed.** The scoped routing,
-  interrupt-race fallback, and resume delivery paths are covered in source and
-  tests; the tracker closed the item on 2026-09-05. The item-43 XMPP peer result
-  remains documented as environment/bootstrap-shaped rather than a new source
-  defect.
-- **#105 — in-flight interrupt fixed and tracker-closed.** Engine V2 cancels
-  active tool futures promptly. The observed lack of preemptive steer matches
-  the documented contract: steer waits for the current step/tool result and
-  does not cancel the running tool.
-- **#107 — live-broken mascot triaged; parser dialect gap fixed (open).** The
-  keyword gap is fixed with 27 parser regressions and the event/wiring paths were
-  verified. A human fresh-tenant animation check remains; Engine V2 interrupted
-  turns intentionally lack a terminal response event, so the widget can linger
-  in `working` until the 30-second idle fallback.
-- **#108 — paused-turn gate-expiry resume is fixed and tracker-closed.** Source
-  regression tests and item 43's live 120-second gate run cover injected expiry,
-  source-channel/SSE delivery, and the no-re-arm guard; the tracker closed the
-  item on 2026-09-06.
 - **#109 — `sanitize-memory` mission trigger is unverified (open).** The mission
   is registered Active, but no `thread_start` execution traffic has been shown;
   no fix is claimed in this release.
-- **#110 — stream-integrity implementation is present; tracker remains open.**
-  Typed observations, bounded corruption detection, non-executable output
-  handling, and `llm_streams` telemetry are shipped with regression coverage;
-  public acceptance has not closed the item.
-- **#111 — gate-expiry environment override is present under the canonical name
-  (open).** The shipped `AGENT_PENDING_GATE_EXPIRY_SECS` name differs from the
-  issue's draft name; env-over-DB precedence, the 30-second floor, docs, and
-  tests are complete, but tracker closure remains outstanding.
-- **#112 — steer security review remains open.** The item requests a threat-model
-  and ingress/authorization review for steer over public channels; this draft
-  records the runtime contract but does not claim that review is complete.
 - **#113 — study-notes sweep request is unspecified (open).** No scope or
   acceptance criterion is attached.
 - **#114 — generic Podman sandbox feature request is deferred (open).** It is
   outside the v2.1.0.0 release scope.
-- **#115 — pending-gate expiry overflow is source-fixed; tracker remains open.**
-  Values above the 30-day ceiling now fall back to 1,800 seconds before the
-  `u64`-to-`i64` conversion; boundary regressions cover both Chrono's panic
-  range and the signed-wrap range.
-- **#116 — `skill_install` ZIP data-descriptor bug remains (open).** Valid
-  multi-file archives using local-header flag bit 3 can still be misread by the
-  hand-rolled parser, so a root `SKILL.md` may be reported missing.
-- **#117 — bearer-only MCP activation was fixed in source, tracker open.**
-  `header_secrets` now resolves the owner-scoped header and suppresses
-  inappropriate OAuth discovery; live acceptance and tracker closure remain.
-- **#119 — OpenCode version test is open.** The `v1.18.29` source pin and
-  metadata checks are synchronized; protected image build/smoke evidence is
-  still an operational prerequisite.
-- **#120 — Kimi version test is open.** The `0.41.0` package/image pins and
-  integrity locks are synchronized; protected image build/smoke evidence is
-  still an operational prerequisite.
+- **#121 — tenant knowledge seeds remain static snapshots (open; deferred to
+  2.1.1.0).** Checkout synchronization and native import are one-shot or
+  operator-triggered; seeded tenant knowledge does not automatically receive
+  later hosted Study Notes changes. The completed design review recommends an
+  opt-in daemon-owned cadence runner with durable cursor/backoff state and a
+  revisioned hosted change feed, with additive checkout generations as the
+  interim fallback. No synchronization behavior changes in 2.1.0.0. See
+  [`docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md).
+- **#122 — new human-supervised LunarVision test is underspecified (open).** The
+  public description contains only a heading and provides no scenario or
+  acceptance matrix; no new result is claimed.
+- **#126 — default `thread_start` mission behavior needs investigation (open).**
+  The item only links #109 and adds no independent reproduction or acceptance
+  criteria; no fix is claimed.
+- **#127 — intermittent blank gateway output is only partially mitigated
+  (open).** The client-side `Done` reconciliation candidate is described above,
+  but silent broadcast lag, missing sequence/gap signaling, and full-path
+  acceptance remain. Current source also gates the history reload on there being
+  no live stream text, so the broader lost-terminal-response shape is not marked
+  resolved.
 
-The formerly tracked implementation items #94 (warmup), #95 (`finish_reason`),
-#96 (deterministic ranking), #98 (AcceptFirst), #99/#102 (mascot/companion
-links), #104/#105 (XMPP steer and in-flight interrupt), and #108 (gate-expiry
-resume) are now closed in the public tracker. #118 (pipeline hardening) is also
-closed; source and verification details remain summarized above.
+Recently tracker-closed shipped work includes idle steer (#103), the mascot
+parser and adapter path (#107), provider stream integrity (#110), configurable
+and bounded gate expiry (#111/#115), and owner-scoped MCP header secrets (#117).
+The OpenCode version-test item (#119) also closed before live regressions forced
+the subsequent v1.18.29 → v1.18.25 rollback; the current pin documented in this
+release draft is authoritative. Earlier closed implementation items (#94, #95,
+#96, #98, #99, #102, #104, #105, #108, and #118) remain summarized above.
 
 ### Active Canonical Runtime and Integration Follow-ups
 
@@ -936,6 +951,10 @@ closed; source and verification details remain summarized above.
 - Interrupted classic and Engine V2 turns persist a history marker and render
   as `Interrupted`, including paginated history boundaries, instead of being
   mislabeled `Failed` when no assistant row lands.
+- The gateway client can reload persisted history for the `Done`/missing-final-
+  response case when no live stream text remains (#127 candidate mitigation).
+  Server-side gap signaling and the broader intermittent-output issue remain
+  open and are not marked resolved.
 - Proxy-disabled tenant generation derives TensorZero's `/openai/v1` surface
   from a bare upstream URL while preserving explicit `--llm-base-url` values.
 - LunarVoice has the complete mt-admin lifecycle and registry-aware readiness
@@ -943,8 +962,11 @@ closed; source and verification details remain summarized above.
   sidecar with a constrained HTTPS origin.
 - The gateway mascot parses and renders eight emote states without changing chat
   content, and its keyword table now covers the herd's live roleplay dialect
-  after the work-item #107 triage. It is now disabled by default and must be
-  opted into per tenant; the human live animation check remains owed.
+  after the work-item #107 triage. The item-45 pass explicitly pins non-empty
+  emotes through the WebSocket adapter and verified enabled public script/sprite
+  routes. It is disabled by default and must be opted into per tenant; work item
+  #107 is tracker-closed, although that pass did not run an authenticated,
+  source-matched human animation turn.
 - SSH AcceptFirst pins persist across restart, fail closed on storage errors,
   and are shared with strict `ssh_git` host-key materialization (#98; closed
   2026-09-02).
@@ -967,29 +989,31 @@ closed; source and verification details remain summarized above.
   user-bare negative), and the sunburst/ruffles production retest remains an
   operator action (#97, open).
 - Idle, interrupted, and approval-paused steer now queues and acknowledges
-  instead of dropping (#103 source fix; item 43 gateway acceptance), and
-  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#104/#105
-  source fixes; both tracker-closed). The remaining WeeChat/XMPP caveats are
-  environmental/live-harness follow-ups, not silently marked as passes.
+  instead of dropping (#103; tracker-closed after the item-46 recheck), and
+  Engine V2 `/interrupt` cancels in-flight tool host calls promptly (#104/#105;
+  both tracker-closed). The remaining WeeChat/XMPP caveats are environmental/
+  live-harness follow-ups, not silently marked as passes.
 - An expired approval gate now resumes the paused turn and delivers the
   wrap-up reply to the source channel instead of silently finalizing the
   thread as `Failed` (#108; regression-tested, live-verified by item 43, and
   tracker-closed 2026-09-06).
 - Provider stream integrity is observed outside model text, corrupted output is
   downgraded to non-executable content, and per-provider telemetry is exported
-  through `llm_streams` (#110 source fix; tracker acceptance pending).
+  through `llm_streams` (#110; tracker-closed 2026-09-06).
 - Mission memory recall now degrades through keyword/OR/fallback paths and
   mission children can resolve `__save_memory_doc__`; live persistence and
   polluted/natural-language retrieval passed the item-30 probe.
 - HTTP MCP `header_secrets` resolves owner-scoped static bearer headers and
   suppresses inappropriate OAuth discovery; focused and live hosted-server
-  checks passed, with public tracker acceptance still pending (#117).
+  checks passed, and #117 is tracker-closed.
 - Pending-gate expiry is configurable through `AGENT_PENDING_GATE_EXPIRY_SECS`
-  with env-over-DB precedence and safe lower/upper bounds (#111/#115 source
-  fixes).
+  with env-over-DB precedence and safe lower/upper bounds; #111 and #115 are
+  tracker-closed.
 - Protected CI now gates release contexts and produces reproducible,
-  digest-bound worker candidates/promotions; daemon package publication and
-  tenant deployment remain deferred.
+  digest-bound worker candidates/promotions. All three workers passed paired
+  cold-build digest checks; the critical scan's six reviewed no-fix exceptions
+  are explicit and expire on 2027-03-06. Daemon package publication and tenant
+  deployment remain deferred.
 - The desktop and Android companion application repositories are linked from
   the root README and the documentation index (#102, closed).
 - Passive fabricated-result phrases are detected and challenged with a bounded
