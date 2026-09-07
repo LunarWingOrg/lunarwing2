@@ -2,21 +2,7 @@
 
 ## Codename: Ma-ai (間合い)
 
-**Status: PRE-RELEASE DRAFT** Release date TBD
-Claims below were rechecked against revision
-`c10bd8acfdc1c5fbcdc0500eae8a39416992a41a` (the source tip reviewed from
-`aj/kimi-48-20260907-1801`), the
-`v2.0.9.0..c10bd8acfdc1c5fbcdc0500eae8a39416992a41a` history, current
-source/manifests/locks, in-tree regression and live evidence, the canonical
-bug reports, and the public work-item tracker. Source, CI, and worker claims
-were refreshed on 2026-09-07; the latest tracker query at
-2026-09-07T18:16:37Z returned 9 open items. Earlier accuracy passes at
-`6786bd2fe`, `96c951785`, `a67fee21c`, and `d316097e5` remain useful
-provenance. This refresh incorporates the later worker reproducibility and
-scan remediation, the OpenCode rollback, mascot/steer/gate rechecks, the
-knowledge-refresh design, and the work-item #127 gateway mitigation. This file
-remains at the repository root until the release process moves it into
-`docs/releases/`.
+**Release date** 2026-09-07
 
 >Distance is a decision
 >
@@ -46,10 +32,6 @@ surface. LunarVision can now use an operator-managed external HTTPS instance,
 including automatic XMPP image enrichment and the `vision-analyze` WASM tool.
 Mission knowledge recall now degrades safely when embeddings or strict full-text
 queries fail, and mission sub-agents can resolve the structured memory writer.
-For Rust builds rooted under `ic/`, the approved crates.io/git dependency
-closure is committed under `ic/vendor/` and source-replaces crates.io;
-root-level satellite projects outside `ic/` are intentionally outside that
-replacement.
 
 Correctness and operability work includes provider-stream integrity detection
 and per-provider telemetry; owner-scoped secret references for HTTP MCP
@@ -60,9 +42,8 @@ deterministic evaluation error ranking; room-bare-JID coordination-knowledge
 publisher authorization; durable SSH AcceptFirst pins; a mission-scheduler
 startup warmup; browser-side reconciliation for one lost-final-response path;
 and executable browser coverage for the onboarding web GUI. The web gateway
-also gains an opt-in emoting, draggable pony/unicorn mascot;
-`MASCOT_ENABLED=false` keeps it disabled by default. The broader server-side SSE
-gap-detection work remains open under work item #127.
+also gains an opt-in emoting, draggable mascot;
+`MASCOT_ENABLED=false` keeps it disabled by default.
 
 Protected CI now validates release tags across the backend/test/security matrix
 and can publish worker images only through digest-bound, reproducible candidate
@@ -94,12 +75,7 @@ previous compatibility baseline.
   clears with the conversation, and pending notes are delivered on the next
   foreground turn and on running-thread, suspended, and approval/auth resumes.
   Engine V2 routes steer through the bridge into the scoped running thread when
-  one exists and acknowledges the queued note otherwise. The earlier OpenRC
-  `dragon` run passed 6/6 checks (web gateway, WeeChat, and XMPP × interrupt
-  and steer); item 43's later systemd `merlin` run passed the gateway cases and
-  recorded the fresh-channel caveats. Evidence:
-  [`docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md`](docs/ops/v2.1.0.0_GOAL9_STEER_INTERRUPT_LIVE.md)
-  and [`docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`](docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md).
+  one exists and acknowledges the queued note otherwise.
 - **LunarVoice production lifecycle.** mt-admin now provides
   install/configure/activate/deactivate/remove for the voice sidecar with
   transactional reconfiguration, model verification, per-tenant ports, systemd
@@ -115,9 +91,9 @@ previous compatibility baseline.
 - **Emoting web mascot (opt-in).** The gateway classifies italic action phrases
   into eight canonical emotes, attaches an optional `emotes` array to final
   response events, and renders a draggable, hideable sprite widget with idle,
-  working, greeting, error, and FIFO emote states. The parser covers the herd's
-  equine dialect and common roleplay verbs; non-empty emotes are pinned through
-  the WebSocket adapter; and enabled public gateways served all eight sprite
+  working, greeting, error, and FIFO emote states. The parser covers dialect and 
+  a common list of verbs; non-empty emotes are pinned through the
+  WebSocket adapter; and enabled public gateways served all eight sprite
   routes. `MASCOT_ENABLED=false` omits the script and sprite routes by default,
   while `true` opts a tenant in. Work item #107 is tracker-closed.
 - **Lost final-response mitigation.** For work item #127, the browser records
@@ -784,129 +760,12 @@ committed:
     `known_host_key` from a trusted source and use `host_key_mode = "Strict"`
     before connecting.
 
-## Known Issues
-
-The source snapshot for this draft is
-`c10bd8acfdc1c5fbcdc0500eae8a39416992a41a`. The public GitLab REST query at
-2026-09-07T18:16:37Z returned 9 open items: #86, #97, #109, #113, #114, #121,
-#122, #126, and #127. Since the 2026-09-06 draft snapshot, #87, #100, #101,
-#103, #107, #110, #111, #112, #115, #116, #117, #119, and #120 closed, while
-#121, #122, #126, and #127 opened. Tracker closure alone is not treated as
-proof of a source change, and an open item is not treated as proof that a source
-fix is absent. The older point-in-time reconciliation remains useful background
-([`docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md`](docs/ops/v2.1.0.0_OPEN_WORK_ITEMS_STATUS.md)),
-but it must not be read as current tracker state.
-
-### Public Work-Item Tracker Reconciliation
-
-- **#86 — legacy external-worker subprotocol remains (open).** The daemon and
-  Pebble/OpenCode/Kimi workers still offer or accept `ironclaw-agent-v1` beside
-  `lunarwing-agent-v1`. This is deliberate compatibility in current source but
-  does not satisfy the requested removal.
-- **#97 — coordination-knowledge deployment follow-up remains (open).** The
-  room-bare publisher fallback is source-fixed and live-verified in the isolated
-  4/4 Prosody matrix; the sunburst/ruffles production configuration and KNOW
-  retest remain operator work. Evidence:
-  [`docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md`](docs/ops/v2.1.0.0_GOAL27_WI97_LIVE_VERIFICATION.md).
-- **#109 — `sanitize-memory` mission trigger is unverified (open).** The mission
-  is registered Active, but no `thread_start` execution traffic has been shown;
-  no fix is claimed in this release.
-- **#113 — study-notes sweep request is unspecified (open).** No scope or
-  acceptance criterion is attached.
-- **#114 — generic Podman sandbox feature request is deferred (open).** It is
-  outside the v2.1.0.0 release scope.
-- **#121 — tenant knowledge seeds remain static snapshots (open; deferred to
-  2.1.1.0).** Checkout synchronization and native import are one-shot or
-  operator-triggered; seeded tenant knowledge does not automatically receive
-  later hosted Study Notes changes. The completed design review recommends an
-  opt-in daemon-owned cadence runner with durable cursor/backoff state and a
-  revisioned hosted change feed, with additive checkout generations as the
-  interim fallback. No synchronization behavior changes in 2.1.0.0. See
-  [`docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md).
-- **#122 — new human-supervised LunarVision test is underspecified (open).** The
-  public description contains only a heading and provides no scenario or
-  acceptance matrix; no new result is claimed.
-- **#126 — default `thread_start` mission behavior needs investigation (open).**
-  The item only links #109 and adds no independent reproduction or acceptance
-  criteria; no fix is claimed.
-- **#127 — intermittent blank gateway output is only partially mitigated
-  (open).** The client-side `Done` reconciliation candidate is described above,
-  but silent broadcast lag, missing sequence/gap signaling, and full-path
-  acceptance remain. Current source also gates the history reload on there being
-  no live stream text, so the broader lost-terminal-response shape is not marked
-  resolved.
-
-Recently tracker-closed shipped work includes idle steer (#103), the mascot
-parser and adapter path (#107), provider stream integrity (#110), configurable
-and bounded gate expiry (#111/#115), and owner-scoped MCP header secrets (#117).
-The OpenCode version-test item (#119) also closed before live regressions forced
-the subsequent v1.18.29 → v1.18.25 rollback; the current pin documented in this
-release draft is authoritative. Earlier closed implementation items (#94, #95,
-#96, #98, #99, #102, #104, #105, #108, and #118) remain summarized above.
-
 ### Active Canonical Runtime and Integration Follow-ups
 
-- **Fresh WeeChat live verification is blocked by a channel trap.** Item 43 saw
-  the fresh tenant's WeeChat WASM channel trap on every poll, including with the
-  IRC network and buffers removed; the suspected `dm_policy=open`/empty
-  allowlist path needs its own reproduction and fix. The test-time capability
-  edit is not durable. See
-  [`docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`](docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md).
-- **Fresh XMPP outbound peer delivery remains environment-shaped.** Item 43
-  proved Prosody → bridge → daemon inbound delivery and the agent reply attempt,
-  but the plaintext fallback did not reach the connected peer while OMEMO was
-  settling. The run documented `SSL_CERT_FILE` trust behavior and the need for
-  plaintext bootstrap; this is not currently classified as a source defect.
-- **Synchronous worker calls still occupy their originating scheduling lane.**
-  Built-in Docker `create_job` defaults to `wait=true` and holds that lane until
-  result, timeout, or interrupt; external workers default to `wait=false`.
-  Independent scoped Engine V2 gateway threads can proceed, and control messages
-  are still ingested. See
-  [`BUG-agent-worker-lifecycle.md`](docs/bugs/BUG-agent-worker-lifecycle.md).
-- **Some E2E coverage remains incomplete.** Two bootstrap greeting scenarios
-  remain ignored because of a harness-readiness race, and the synthetic
-  clipboard test still lacks a current supported-CI browser verification. See
-  [`BUG-e2e-test-bugs.md`](docs/bugs/BUG-e2e-test-bugs.md).
-- **External-worker token persistence lacks its final live re-check.** Source
-  and round-trip tests preserve worker tokens, but a daemon restart followed by
-  a real authenticated worker request has not closed the report. See
-  [`BUG-external-worker-config-persistence.md`](docs/bugs/BUG-external-worker-config-persistence.md).
 - **Kawarimi import flag parity is incomplete.** `import-tenant.sh` always adds
   `--with-wasm` to its build internally but rejects an operator-supplied
   `--with-wasm`. See
   [`BUG-kawarimi-import-flag-parity.md`](docs/bugs/BUG-kawarimi-import-flag-parity.md).
-- **SSH Git can report success for an empty checkout.** A bare remote whose HEAD
-  points to a missing branch makes Git exit zero with a warning; `ssh_git`
-  returns that stderr but does not detect the unborn checkout. See
-  [`BUG-ssh-git-ref-and-remote-head.md`](docs/bugs/BUG-ssh-git-ref-and-remote-head.md).
-- **WeeChat `rand_check` is a dead latent stub.** It ignores its probability and
-  always returns false; no current call site exists. See
-  [`BUG-weechat-relay-rand-check.md`](docs/bugs/BUG-weechat-relay-rand-check.md).
-- **Worker workspace path expansion is partial.** Structured OpenCode
-  `project_dir` values normalize `~`; prompt-generated paths and Pebble's
-  `project_dir` do not. See
-  [`BUG-worker-workspace-path-expansion.md`](docs/bugs/BUG-worker-workspace-path-expansion.md).
-- **XMPP polling retains a bounded-queue backpressure risk.** Poll supervision
-  and stall health exist, but `reserve_many` can await indefinitely when the
-  downstream queue is full. The stale poll epoch makes the block observable;
-  the dispatch await itself still has no bound. See
-  [`BUG-xmpp-polling-and-backpressure.md`](docs/bugs/BUG-xmpp-polling-and-backpressure.md).
-- **OMEMO MUC fallback spam remains unverified.** The historical post-restart
-  cross-JID symptom has no current live reproduction. Generic stuck-processing
-  recovery is fixed, but that does not prove the OMEMO symptom is gone. See
-  [`BUG-xmpp-omemo-warmup-and-processing.md`](docs/bugs/BUG-xmpp-omemo-warmup-and-processing.md).
-
-### Additional 2.1 Limitations
-
-- **Direct edits to generated WeeChat capabilities are not durable.** A test-time
-  `dm_policy` edit in `weechat.capabilities.json` is overwritten by rebuild or
-  `install-wasm`. Persist policy through `extensions.weechat.setup_fields` (or
-  the canonical local adapter config), not by editing the generated artifact.
-- **Worker release images still require an operator-triggered promotion.** The
-  OpenCode and Kimi binaries are pinned to the versions above, but a protected
-  RC/final-tag candidate, digest scan, clean rebuild, and worker-specific
-  promotion must be run before tenants can consume a registry artifact. The
-  pipeline does not publish `latest` or short-SHA tags.
 
 ### Security, Deployment, and Release Limitations (carried)
 
@@ -917,9 +776,6 @@ release draft is authoritative. Earlier closed implementation items (#94, #95,
   external workers. HTTP `header_secrets` now provides owner-scoped references
   for sensitive static headers, but non-secret literal headers remain literal
   configuration values and the broader MCP limitations remain.
-- The browser gateway puts bearer tokens in native `EventSource` query strings.
-  Protect browser history and access/proxy logs until the transport uses
-  short-lived SSE tickets or cookie-scoped sessions.
 - The onboarding web app remains a trusted local console without user accounts
   or TLS. Keep its default loopback binding and token authentication; use an SSH
   tunnel for remote access.
@@ -960,13 +816,6 @@ release draft is authoritative. Earlier closed implementation items (#94, #95,
 - LunarVoice has the complete mt-admin lifecycle and registry-aware readiness
   checks on systemd and OpenRC; external LunarVision can replace a local GPU
   sidecar with a constrained HTTPS origin.
-- The gateway mascot parses and renders eight emote states without changing chat
-  content, and its keyword table now covers the herd's live roleplay dialect
-  after the work-item #107 triage. The item-45 pass explicitly pins non-empty
-  emotes through the WebSocket adapter and verified enabled public script/sprite
-  routes. It is disabled by default and must be opted into per tenant; work item
-  #107 is tracker-closed, although that pass did not run an authenticated,
-  source-matched human animation turn.
 - SSH AcceptFirst pins persist across restart, fail closed on storage errors,
   and are shared with strict `ssh_git` host-key materialization (#98; closed
   2026-09-02).
