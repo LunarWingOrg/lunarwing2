@@ -153,3 +153,150 @@ async def test_live_work_and_reasoning_stay_separate_from_final_answer(page):
     assert "external information" in result["rationale"]
     assert result["finalText"] == "Authoritative final answer"
     assert "working draft" not in result["finalText"]
+
+
+async def _install_fake_eventsource(page):
+    """Install a controllable EventSource fake before app.js binds.
+
+    app.js constructs `new EventSource('/api/chat/events?...')` and attaches
+    named listeners via addEventListener. The fake records listeners and
+    exposes window.__emitSSE(type, data) to dispatch to them, so tests can
+    drive the exact SSE contract without a live server stream."""
+    await page.add_init_script(
+        """
+        window.__sseListeners = {};
+        window.__sseHistory = { open: false, url: '' };
+        class FakeEventSource {
+          constructor(url) {
+            this.url = url;
+            this._listeners = {};
+            window.__sseHistory = { open: true, url };
+            window.__sseTarget = this;
+          }
+          addEventListener(type, fn) {
+            (this._listeners[type] = this._listeners[type] || []).push(fn);
+          }
+          removeEventListener(type, fn) {
+            const arr = this._listeners[type] || [];
+            const i = arr.indexOf(fn);
+            if (i >= 0) arr.splice(i, 1);
+          }
+          dispatch(type, dataObj) {
+            const evt = new MessageEvent(type, {
+              data: JSON.stringify(dataObj),
+            });
+            (this._listeners[type] || []).forEach((fn) => fn(evt));
+          }
+          close() { /* no-op for fake */ }
+        }
+        window.EventSource = FakeEventSource;
+        """
+    )
+
+
+async def test_done_without_response_reloads_history(page):
+    """WI#127 candidate 5 guard: Done arriving with no rendered response this
+    turn schedules a history reconcile instead of leaving a blank turn.
+
+    Simulates a lost final SSE response event: stream chunks arrive (direct
+    app.js state manipulation), then Done fires with no response event. The
+    guard must detect the missing render and call loadHistory() within its
+    1.5s grace window (stubbed to count invocations)."""
+    await _install_fake_eventsource(page)
+
+    await page.goto("/")
+
+    # App.js bound its SSE listeners to the fake. Prime the stream state:
+    # chunks for the current thread, NO response event ever dispatched.
+    await page.evaluate(
+        """
+        () => {
+          window.__loadHistoryCalls = 0;
+          window.__realLoadHistory = window.loadHistory;
+          window.loadHistory = (...args) => { window.__loadHistoryCalls += 1; };
+
+          const container = document.getElementById('chat-messages');
+          container.replaceChildren();
+
+          getOrCreateStreamingMessage('test-thread');
+          _streamParts = ['partial answer that WILL be lost'];
+          _streamBuffer = '';
+        }
+        """
+    )
+
+    # Dispatch Done through the fake EventSource — the real app.js handler
+    # (bound via addEventListener) receives it exactly as it would live.
+    await page.evaluate(
+        """
+        () => window.__sseTarget.dispatch('status', {
+          thread_id: 'test-thread',
+          message: 'Done',
+        })
+        """
+    )
+
+    # Guard schedules loadHistory after its 1.5s grace period.
+    await page.wait_for_function(
+        "() => window.__loadHistoryCalls >= 1",
+        timeout=5000,
+    )
+
+    calls = await page.evaluate("() => window.__loadHistoryCalls")
+    assert calls == 1, f"expected exactly 1 loadHistory call, got {calls}"
+
+    await page.evaluate(
+        "() => { window.loadHistory = window.__realLoadHistory; }"
+    )
+
+
+async def test_done_after_response_does_not_reload_history(page):
+    """Healthy path: response event arrives and renders (markResponseRendered
+    fires inside the real handler), so the Done guard must NOT schedule a
+    history reload — no duplicate render, no wasted fetch."""
+    await _install_fake_eventsource(page)
+
+    await page.goto("/")
+
+    await page.evaluate(
+        """
+        () => {
+          window.__loadHistoryCalls = 0;
+          window.__realLoadHistory = window.loadHistory;
+          window.loadHistory = (...args) => { window.__loadHistoryCalls += 1; };
+          const container = document.getElementById('chat-messages');
+          container.replaceChildren();
+        }
+        """
+    )
+
+    # Response first (healthy path) — dispatched through the fake so the REAL
+    # app.js handler runs, including markResponseRendered.
+    await page.evaluate(
+        """
+        () => window.__sseTarget.dispatch('response', {
+          thread_id: 'test-thread',
+          content: 'healthy final answer',
+          emotes: [],
+        })
+        """
+    )
+
+    # Then Done.
+    await page.evaluate(
+        """
+        () => window.__sseTarget.dispatch('status', {
+          thread_id: 'test-thread',
+          message: 'Done',
+        })
+        """
+    )
+
+    # Past the grace window: no reload may have been scheduled.
+    await page.wait_for_timeout(2000)
+    calls = await page.evaluate("() => window.__loadHistoryCalls")
+    assert calls == 0, f"healthy path must not reload history, got {calls} calls"
+
+    await page.evaluate(
+        "() => { window.loadHistory = window.__realLoadHistory; }"
+    )
