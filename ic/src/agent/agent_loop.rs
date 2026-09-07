@@ -1843,8 +1843,8 @@ impl Agent {
                     return crate::bridge::handle_interrupt(self, message).await;
                 }
                 // Steer is an Engine V2 control on routed channels: the bridge
-                // answers authoritatively (queued into the running engine
-                // thread, or "nothing is running") — no legacy fallthrough.
+                // answers authoritatively (injected into a running engine thread
+                // or persisted for the next foreground turn) — no legacy fallthrough.
                 Submission::Steer { content } => {
                     return crate::bridge::handle_steer(self, message, content).await;
                 }
