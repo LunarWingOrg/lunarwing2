@@ -825,9 +825,8 @@ struct EngineState {
     secrets_store: Option<Arc<dyn crate::secrets::SecretsStore + Send + Sync>>,
     /// Centralized auth manager for setup instruction lookup and credential checks.
     auth_manager: Option<Arc<AuthManager>>,
-    /// Configured pending gate expiry, sourced from
-    /// `settings.agent.pending_gate_expiry_secs` at init. Falls back to
-    /// `DEFAULT_PENDING_GATE_EXPIRY` when settings can't be loaded.
+    /// Configured pending gate expiry, resolved from the environment, DB-backed
+    /// settings, or default at init and bounded to the supported range.
     pending_gate_expiry: chrono::Duration,
 }
 
