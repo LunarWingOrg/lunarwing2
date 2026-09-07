@@ -335,8 +335,8 @@ impl Agent {
 
     /// Pending-gate expiry (WI#111): resolved from
     /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
-    /// settings via `AgentConfig::resolve`, with the config-layer floor
-    /// applied (see `clamp_pending_gate_expiry_secs`).
+    /// settings via `AgentConfig::resolve`, with config-layer lower and upper
+    /// bounds applied (see `clamp_pending_gate_expiry_secs`).
     pub(crate) fn pending_gate_expiry(&self) -> ChronoDuration {
         ChronoDuration::seconds(
             clamp_pending_gate_expiry_secs(self.config.pending_gate_expiry_secs) as i64,
