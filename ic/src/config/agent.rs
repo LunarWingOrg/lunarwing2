@@ -39,8 +39,8 @@ pub struct AgentConfig {
     pub session_prune_timeout: Duration,
     /// Expiry window for pending execution gates (approval/auth). Gates older
     /// than this are expired by the background sweep and the paused turn is
-    /// resumed with a wrap-up (WI#108). Default 1800s; values below 30s fall
-    /// back to the default (the gate sweep ticks every 60s).
+    /// resumed with a wrap-up (WI#108). Default 1800s; values outside 30s
+    /// through 30 days fall back to the default (the gate sweep ticks every 60s).
     /// Env: `AGENT_PENDING_GATE_EXPIRY_SECS`.
     pub pending_gate_expiry_secs: u64,
     /// SillyTavern-import-subset lorebook behavior.
@@ -52,13 +52,15 @@ pub struct AgentConfig {
 /// Fallback for `pending_gate_expiry_secs` (WI#111).
 pub(crate) const PENDING_GATE_EXPIRY_DEFAULT_SECS: u64 = 1800;
 /// Floor for `pending_gate_expiry_secs`: below this a gate could expire
-/// faster than the 60s background sweep can observe it, so smaller values
-/// fall back to [`PENDING_GATE_EXPIRY_DEFAULT_SECS`].
+/// faster than the 60s background sweep can observe it.
 pub(crate) const PENDING_GATE_EXPIRY_MIN_SECS: u64 = 30;
+/// Ceiling for `pending_gate_expiry_secs`: longer-lived approval/auth gates
+/// retain paused turns and risk overflowing downstream signed time arithmetic.
+pub(crate) const PENDING_GATE_EXPIRY_MAX_SECS: u64 = 30 * 24 * 60 * 60;
 
-/// Apply the floor/fallback rule for `pending_gate_expiry_secs`.
+/// Apply the bounded fallback rule for `pending_gate_expiry_secs`.
 pub(crate) fn clamp_pending_gate_expiry_secs(secs: u64) -> u64 {
-    if secs < PENDING_GATE_EXPIRY_MIN_SECS {
+    if !(PENDING_GATE_EXPIRY_MIN_SECS..=PENDING_GATE_EXPIRY_MAX_SECS).contains(&secs) {
         PENDING_GATE_EXPIRY_DEFAULT_SECS
     } else {
         secs
@@ -350,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_gate_expiry_settings_value_flows_through_when_above_floor() {
+    fn pending_gate_expiry_settings_value_flows_through_when_in_bounds() {
         let mut settings = Settings::default();
         settings.agent.pending_gate_expiry_secs = 900;
         let config = AgentConfig::resolve(&settings).expect("resolve");
@@ -367,12 +369,35 @@ mod tests {
         for secs in [0u64, 1, 29] {
             assert_eq!(
                 clamp_pending_gate_expiry_secs(secs),
-                1800,
+                PENDING_GATE_EXPIRY_DEFAULT_SECS,
                 "{secs}s must fall back to the default"
             );
         }
-        assert_eq!(clamp_pending_gate_expiry_secs(30), 30);
-        assert_eq!(clamp_pending_gate_expiry_secs(120), 120);
+        assert_eq!(
+            clamp_pending_gate_expiry_secs(PENDING_GATE_EXPIRY_MIN_SECS),
+            PENDING_GATE_EXPIRY_MIN_SECS
+        );
+    }
+
+    #[test]
+    fn pending_gate_expiry_above_ceiling_falls_back_to_default() {
+        assert_eq!(
+            clamp_pending_gate_expiry_secs(PENDING_GATE_EXPIRY_MAX_SECS),
+            PENDING_GATE_EXPIRY_MAX_SECS
+        );
+
+        for secs in [
+            PENDING_GATE_EXPIRY_MAX_SECS + 1,
+            i64::MAX as u64 / 1000 + 1,
+            i64::MAX as u64 + 1,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                clamp_pending_gate_expiry_secs(secs),
+                PENDING_GATE_EXPIRY_DEFAULT_SECS,
+                "{secs}s must fall back to the default"
+            );
+        }
     }
 
     #[test]

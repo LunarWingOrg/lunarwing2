@@ -632,8 +632,10 @@ approval/auth gate waits before the background sweep expires it and resumes
 the paused turn (WI#108) is configured on the daemon, not in `ThreadConfig`:
 `AGENT_PENDING_GATE_EXPIRY_SECS` env (read via `AgentConfig::resolve`) takes
 precedence over the DB-backed setting `agent.pending_gate_expiry_secs`;
-default **1800s (30 minutes)**. Values below 30s fall back to the default —
-the gate sweep ticks every 60s, so shorter windows cannot be observed.
+default **1800s (30 minutes)**. Values outside the inclusive range **30s to
+2592000s (30 days)** fall back to the default. The lower bound prevents windows
+shorter than the 60-second gate sweep can observe; the upper bound prevents
+unsigned-to-signed wraparound and Chrono duration overflow (WI#115).
 
 The engine inherits most configuration from the host daemon (LLM provider settings, database config, tool registry, safety settings). Engine-specific behavior is controlled through `ThreadConfig` at thread spawn time. `supervised_timeout_secs` (the fixed 300s fail-closed approval auto-deny) has no env override.
 

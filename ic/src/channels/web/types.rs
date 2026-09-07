@@ -1720,7 +1720,7 @@ mod tests {
         let sse = SseEvent::Response {
             content: "hello".to_string(),
             thread_id: "t1".to_string(),
-            emotes: Vec::new(),
+            emotes: vec!["greet".to_string(), "walk".to_string()],
         };
         let ws = WsServerMessage::from_sse_event(&sse);
         match ws {
@@ -1728,6 +1728,7 @@ mod tests {
                 assert_eq!(event_type, "response");
                 assert_eq!(data["content"], "hello");
                 assert_eq!(data["thread_id"], "t1");
+                assert_eq!(data["emotes"], serde_json::json!(["greet", "walk"]));
             }
             _ => panic!("Expected Event variant"),
         }
