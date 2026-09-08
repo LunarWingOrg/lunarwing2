@@ -1,5 +1,6 @@
-#![doc = include_str!("../../../README.md")]
+#![doc = include_str!("../README.md")]
 // these files first because they include macros for the rest of the crate to use
+mod boundary_uuid;
 mod heap;
 mod heap_traits;
 
@@ -7,46 +8,47 @@ mod args;
 mod asyncio;
 mod builtins;
 mod bytecode;
+mod codecs;
+mod dump_format;
 mod exception_private;
-mod exception_public;
 mod expressions;
 mod fstring;
 mod function;
+mod hash;
 mod heap_data;
+mod identity;
 mod intern;
-mod io;
 mod modules;
+mod name_map;
 mod namespace;
-mod object;
-mod os;
+mod object_bridge;
+mod os_dispatch;
 mod parse;
+mod predicate;
 mod prepare;
 mod repl;
-mod resource;
+mod resource_checks;
 mod run;
 mod run_progress;
-mod signature;
 mod sorting;
+mod source_map;
+mod str_format;
+mod string_builder;
+mod stringize;
 mod types;
 mod value;
 
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub use crate::function::FunctionMetadataFault;
 #[cfg(feature = "ref-count-return")]
 pub use crate::run::RefCountOutput;
 pub use crate::{
-    exception_private::ExcType,
-    exception_public::{CodeLoc, MontyException, StackFrame},
-    io::{PrintWriter, PrintWriterCallback},
-    object::{DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta, MontyTimeZone},
-    os::{OsFunction, dir_stat, file_stat, stat_result, symlink_stat},
+    dump_format::{DUMP_VERSION, Dump, DumpError, Session, SessionRef, dump},
     repl::{
         MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,
     },
-    resource::{
-        DEFAULT_MAX_RECURSION_DEPTH, LimitedTracker, NoLimitTracker, ResourceError, ResourceLimits, ResourceTracker,
-    },
     run::MontyRun,
-    run_progress::{
-        ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,
-    },
+    run_progress::{FunctionCall, NameLookup, OsCall, ResolveFutures, RunProgress},
 };

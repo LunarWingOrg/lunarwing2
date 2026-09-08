@@ -4,13 +4,59 @@ use super::VM;
 use crate::{
     bytecode::vm::CallResult,
     defer_drop,
-    exception_private::{ExcType, RunError},
+    exception_private::{ExcType, ExcTypeExt, RunError},
+    heap::{ContainsHeap, DropWithContext},
     intern::StringId,
-    resource::ResourceTracker,
-    value::EitherStr,
+    value::{EitherStr, Value},
 };
 
-impl<T: ResourceTracker> VM<'_, '_, T> {
+/// What a suspended lazy attribute lookup does with the host's answer when it
+/// resumes, instead of pushing the value (or raising `AttributeError` on
+/// `Undefined`) the way `obj.attr` does.
+///
+/// Produced by the `getattr()` / `hasattr()` builtins. It rides on
+/// [`CallResult::AttrLookup`] and `FrameExit::AttrLookup`, and is armed on
+/// [`VM::pending_lookup_effect`] once the lookup reaches the host, so it
+/// survives a dump/restore of the suspended session. A lookup that never
+/// reaches a host (no host, or a synchronous nested call) is `Undefined`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum PendingLookupEffect {
+    /// `hasattr()`: push `True` for a served value (which is dropped),
+    /// `False` for `Undefined`.
+    HasAttr,
+    /// `getattr(obj, name, default)`: push `default` for `Undefined`. Owns
+    /// the heap reference until the resume consumes it.
+    Default(Value),
+}
+
+impl PendingLookupEffect {
+    /// The value to push for the host's answer: `Some(value)` for a served
+    /// attribute, `None` for `Undefined`.
+    pub(crate) fn apply(self, answer: Option<Value>, vm: &mut VM<'_>) -> Value {
+        match (self, answer) {
+            (Self::HasAttr, Some(value)) => {
+                value.drop_with(vm);
+                Value::Bool(true)
+            }
+            (Self::HasAttr, None) => Value::Bool(false),
+            (Self::Default(default), Some(value)) => {
+                default.drop_with(vm);
+                value
+            }
+            (Self::Default(default), None) => default,
+        }
+    }
+}
+
+impl<C: ContainsHeap> DropWithContext<C> for PendingLookupEffect {
+    fn drop_with(self, heap: &mut C) {
+        if let Self::Default(value) = self {
+            value.drop_with(heap);
+        }
+    }
+}
+
+impl VM<'_> {
     /// Loads an attribute from an object and pushes it onto the stack.
     ///
     /// Returns an AttributeError if the attribute doesn't exist.
@@ -58,6 +104,6 @@ impl<T: ResourceTracker> VM<'_, '_, T> {
 
         let value = this.pop();
         // py_set_attr takes ownership of value and drops it on error
-        obj.py_set_attr(name_id, value, this)
+        obj.py_set_attr(&EitherStr::Interned(name_id), value, this)
     }
 }

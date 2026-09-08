@@ -1,0 +1,122 @@
+name: CI
+
+permissions: {}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_TERM_COLOR: always
+  PROPTEST_CASES: ${{ github.ref == 'refs/heads/main' && '10000' || '256' }}
+  RUSTFLAGS: "-D warnings"
+  RUSTUP_MAX_RETRIES: 10
+  MIRIFLAGS: "-Zmiri-strict-provenance"
+
+jobs:
+  check-zizmor:
+    uses: ./.github/workflows/check-zizmor.yml
+    permissions:
+      contents: read
+
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Format check
+        run: cargo fmt --all --check
+
+      - name: Lint check
+        run: |
+          cargo check --locked --all-features
+          cargo clippy --locked --all-targets --all-features
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        opt: ["", "--release"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Test (default)
+        run: cargo test --locked ${{ matrix.opt }}
+
+      - name: Test (no-default-features)
+        run: cargo test --locked ${{ matrix.opt }} --no-default-features
+
+      - name: Test (all-features)
+        run: cargo test --locked ${{ matrix.opt }} --all-features
+
+      - name: Test (Loom)
+        run: RUSTFLAGS="--cfg loom" cargo test --locked --test loom ${{ matrix.opt }} --features loom -- --test-threads=1
+
+  miri:
+    name: Miri (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        include:
+          - name: 64-bit LE
+            target: x86_64-unknown-linux-gnu
+          - name: 64-bit BE
+            target: powerpc64-unknown-linux-gnu
+          - name: 32-bit LE
+            target: i686-unknown-linux-gnu
+          - name: 32-bit BE
+            target: powerpc-unknown-linux-gnu
+            # get-size2 unconditionally imports 64-bit atomics, which this target lacks.
+            features: --features arbitrary,salsa,serde
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Miri
+        run: |
+          rustup toolchain install nightly --profile minimal
+          rustup +nightly component add miri
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          prefix-key: rust
+          shared-key: miri-${{ matrix.target }}
+
+      - name: Test (default)
+        run: cargo +nightly miri test --locked --target ${{ matrix.target }}
+
+      - name: Test (no-default-features)
+        run: cargo +nightly miri test --locked --target ${{ matrix.target }} --no-default-features
+
+      - name: Test (features)
+        run: cargo +nightly miri test --locked --target ${{ matrix.target }} ${{ matrix.features || '--all-features' }}
+
+      - name: Test (race condition)
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-preemption-rate=1"
+        run: cargo +nightly miri test --locked --target ${{ matrix.target }} --test race_condition

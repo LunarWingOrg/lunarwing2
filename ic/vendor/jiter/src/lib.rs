@@ -158,6 +158,8 @@ mod py_lossless_float;
 mod py_string_cache;
 #[cfg(feature = "python")]
 mod python;
+#[cfg(feature = "serde")]
+pub mod serde;
 #[cfg(target_arch = "aarch64")]
 mod simd_aarch64;
 mod string_decoder;
@@ -165,7 +167,7 @@ mod value;
 
 pub use errors::{JiterError, JiterErrorType, JsonError, JsonErrorType, JsonResult, JsonType, LinePosition};
 pub use jiter::{Jiter, JiterResult};
-pub use number_decoder::{NumberAny, NumberInt};
+pub use number_decoder::{NumberAny, NumberFloat, NumberInt};
 pub use parse::Peek;
 pub use value::{JsonArray, JsonObject, JsonValue};
 
@@ -173,10 +175,10 @@ pub use value::{JsonArray, JsonObject, JsonValue};
 pub use py_lossless_float::{FloatMode, LosslessFloat};
 #[cfg(feature = "python")]
 pub use py_string_cache::{
-    cache_clear, cache_usage, cached_py_string, cached_py_string_ascii, pystring_ascii_new, StringCacheMode,
+    StringCacheMode, cache_clear, cache_usage, cached_py_string, cached_py_string_ascii, pystring_ascii_new,
 };
 #[cfg(feature = "python")]
-pub use python::{map_json_error, PythonParse};
+pub use python::{PythonParse, map_json_error};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub enum PartialMode {
@@ -188,11 +190,7 @@ pub enum PartialMode {
 
 impl From<bool> for PartialMode {
     fn from(mode: bool) -> Self {
-        if mode {
-            Self::On
-        } else {
-            Self::Off
-        }
+        if mode { Self::On } else { Self::Off }
     }
 }
 

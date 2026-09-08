@@ -11,12 +11,96 @@
 use std::cmp::Ordering;
 
 use crate::{
+    args::{ArgValues, FromArgs, LaxBool},
     bytecode::VM,
-    exception_private::{ExcType, RunError},
-    resource::ResourceTracker,
-    types::PyTrait,
+    defer_drop, defer_drop_mut,
+    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
+    types::{CmpOrder, PyTrait},
     value::Value,
 };
+
+/// Argument shape for `list.sort(*, key=None, reverse=False)` and, by
+/// extension, the kwargs accepted by the `sorted()` builtin. Both fields
+/// are keyword-only (CPython rejects positional `key`/`reverse`). `key` is
+/// held as a raw `Option<Value>` so callers can normalise `key=None` to
+/// "no key"; `reverse` uses [`LaxBool`] to match CPython's `bool()`-style
+/// truth test (so `reverse=[]` is `False`, not a `TypeError`).
+#[derive(FromArgs)]
+#[from_args(name = "sort")]
+struct ListSortArgs {
+    #[from_args(kw_only, default)]
+    key: Option<Value>,
+    #[from_args(kw_only, default = LaxBool::new(false))]
+    reverse: LaxBool,
+}
+
+/// Parses `key`/`reverse` kwargs and sorts `items` in place. The single
+/// entry point for sorting used by both `list.sort` and the `sorted()`
+/// builtin — sharing here is what makes unknown-kwarg errors uniformly
+/// read `sort() got an unexpected keyword argument 'X'` (matching
+/// CPython, whose `sorted` delegates to `list.sort` internally).
+///
+/// `key_context` names the calling builtin in rejected-suspension errors.
+pub fn parse_and_sort(
+    key_context: &'static str,
+    items: &mut [Value],
+    args: ArgValues,
+    vm: &mut VM<'_>,
+) -> RunResult<()> {
+    let ListSortArgs { key, reverse } = ListSortArgs::from_args(args, vm)?;
+    let key_fn = match key {
+        Some(v) if matches!(v, Value::None) => {
+            v.drop_with(vm);
+            None
+        }
+        other => other,
+    };
+    defer_drop!(key_fn, vm);
+    sort_values(key_context, items, key_fn.as_ref(), reverse.bool(), vm)
+}
+
+/// Sorts a vector of values, with optional key function.
+/// `key_context` names the calling builtin — see [`parse_and_sort`].
+pub fn sort_values(
+    key_context: &'static str,
+    values: &mut [Value],
+    key_fn: Option<&Value>,
+    reverse: bool,
+    vm: &mut VM<'_>,
+) -> RunResult<()> {
+    if let Some(f) = key_fn {
+        // Sort by key function: compute all the keys, sort an index buffer, then
+        // rearrange the original values in-place according to the sorted indices.
+        let mut indices = (0..values.len()).collect::<Vec<_>>();
+        let keys: Vec<Value> = Vec::with_capacity(values.len());
+        defer_drop_mut!(keys, vm);
+
+        // Each key call re-enters `run()` with a fresh dispatch countdown, so a
+        // short key reaches no checkpoint: this is the pass's only clock poll.
+        for (i, item) in values.iter().enumerate() {
+            vm.heap.tracker.check_time_every(i)?;
+            let item = item.clone_with_heap(vm);
+            keys.push(vm.evaluate_function(key_context, f, ArgValues::One(item))?);
+        }
+
+        // 2. Sort indices by comparing key values (or values themselves if no key)
+        sort_indices(&mut indices, keys, reverse, vm)?;
+
+        // 3. Rearrange values in-place in the detached buffer.
+        apply_permutation(values, &mut indices);
+
+        Ok(())
+    } else {
+        // With no key function can sort directly on the original array
+        let mut sort_result: RunResult<()> = Ok(());
+        let mut n = 0usize;
+        values.sort_by(|a, b| {
+            n += 1;
+            compare_values(n, a, b, reverse, &mut sort_result, vm)
+        });
+        sort_result
+    }
+}
 
 /// Sorts a vector of indices by comparing items at those positions.
 ///
@@ -26,62 +110,28 @@ use crate::{
 ///
 /// The `values` slice is typically either the items themselves (no key function)
 /// or the pre-computed key values.
-pub fn sort_indices(
-    indices: &mut [usize],
-    values: &[Value],
-    reverse: bool,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> Result<(), RunError> {
-    let mut sort_error: Option<RunError> = None;
-
+pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> Result<(), RunError> {
+    let mut sort_result: RunResult<()> = Ok(());
+    let mut n = 0usize;
     indices.sort_by(|&a, &b| {
-        if sort_error.is_some() {
-            return Ordering::Equal;
-        }
-        if let Err(e) = vm.heap.check_time() {
-            sort_error = Some(e.into());
-            return Ordering::Equal;
-        }
-        match values[a].py_cmp(&values[b], vm) {
-            Ok(Some(ord)) => {
-                if reverse {
-                    ord.reverse()
-                } else {
-                    ord
-                }
-            }
-            Ok(None) => {
-                sort_error = Some(ExcType::type_error(format!(
-                    "'<' not supported between instances of '{}' and '{}'",
-                    values[a].py_type(vm),
-                    values[b].py_type(vm)
-                )));
-                Ordering::Equal
-            }
-            Err(e) => {
-                sort_error = Some(e.into());
-                Ordering::Equal
-            }
-        }
+        n += 1;
+        compare_values(n, &values[a], &values[b], reverse, &mut sort_result, vm)
     });
-
-    match sort_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    sort_result
 }
 
 /// Rearranges `items` in-place according to a permutation of indices.
 ///
-/// After calling this, `items[i]` will hold the value that was originally at
+/// After calling this, `items[i]` will hold the element that was originally at
 /// `items[indices[i]]`. The algorithm chases permutation cycles and swaps
 /// elements into their final positions, using O(1) extra memory beyond the
 /// `indices` slice (which is mutated to track visited positions).
 ///
-/// Each element is moved at most twice (one swap = two moves), so the total
-/// work is O(n) moves. This is at most 2x the moves of building a fresh
-/// `Vec`, but avoids allocating a second buffer.
-pub fn apply_permutation(items: &mut [Value], indices: &mut [usize]) {
+/// The helper is generic so callers can avoid allocating a second buffer when
+/// reordering either raw `Value`s or compound structures that already own their
+/// contents. Each element is moved at most twice (one swap = two moves), so
+/// the total work is O(n) moves while preserving the target permutation.
+pub fn apply_permutation<T>(items: &mut [T], indices: &mut [usize]) {
     for i in 0..items.len() {
         if indices[i] == i {
             continue;
@@ -97,4 +147,39 @@ pub fn apply_permutation(items: &mut [Value], indices: &mut [usize]) {
             current = target;
         }
     }
+}
+
+/// Helper for the sort functions which compares two values, handling any exceptions and timeouts.
+/// `n` is the caller's running comparison count, keying the amortized time check.
+fn compare_values(
+    n: usize,
+    a: &Value,
+    b: &Value,
+    reverse: bool,
+    sort_result: &mut RunResult<()>,
+    vm: &mut VM<'_>,
+) -> Ordering {
+    if sort_result.is_err() {
+        // short-circuit if we've already encountered an error in a previous comparison
+        return Ordering::Equal;
+    }
+    if let Err(e) = vm.heap.tracker.check_time_every(n) {
+        *sort_result = Err(e.into());
+        return Ordering::Equal;
+    }
+    let err = match a.py_cmp(b, vm) {
+        Ok(CmpOrder::Ordered(ord)) => return if reverse { ord.reverse() } else { ord },
+        // A `NaN` (or `NaN`-carrying container) has no ordering but must not
+        // raise: CPython's `sorted`/`list.sort` leave such elements wherever the
+        // comparisons happen to place them. Treat it as "equal" — no swap.
+        Ok(CmpOrder::Unordered) => return Ordering::Equal,
+        Ok(CmpOrder::Incomparable) => ExcType::type_error(format!(
+            "'<' not supported between instances of '{}' and '{}'",
+            a.py_type_name(vm),
+            b.py_type_name(vm)
+        )),
+        Err(e) => e,
+    };
+    *sort_result = Err(err);
+    Ordering::Equal
 }

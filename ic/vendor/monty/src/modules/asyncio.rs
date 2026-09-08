@@ -8,15 +8,14 @@
 //! The host acts as the event loop - Monty yields control when tasks are blocked.
 
 use crate::{
-    args::ArgValues,
-    asyncio::{GatherFuture, GatherItem},
+    args::{ArgValues, FromArgs},
+    asyncio::GatherFuture,
     bytecode::{CallResult, VM},
     defer_drop_mut,
-    exception_private::{ExcType, RunResult},
+    exception_private::{ExcType, ExcTypeExt, RunResult},
     heap::{Heap, HeapData, HeapId},
     intern::StaticStrings,
     modules::ModuleFunctions,
-    resource::{ResourceError, ResourceTracker},
     types::Module,
     value::Value,
 };
@@ -31,15 +30,12 @@ pub(crate) enum AsyncioFunctions {
 
 /// Creates the `asyncio` module and allocates it on the heap.
 ///
-/// The module contains only the `gather` function. Other asyncio functions
+/// The module contains only the `run` and `gather` functions. Other asyncio functions
 /// are not implemented as they would require additional VM/scheduler features.
-///
-/// # Returns
-/// A HeapId pointing to the newly allocated module.
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
+pub fn create_module(vm: &mut VM<'_>) -> HeapId {
     let mut module = Module::new(StaticStrings::Asyncio);
 
     module.set_attr(
@@ -53,16 +49,12 @@ pub fn create_module(vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<HeapId
         vm,
     );
 
-    vm.heap.allocate(HeapData::Module(module))
+    vm.heap.allocate(HeapData::Module(Box::new(module)))
 }
-pub(super) fn call(
-    heap: &mut Heap<impl ResourceTracker>,
-    functions: AsyncioFunctions,
-    args: ArgValues,
-) -> RunResult<CallResult> {
+pub(super) fn call(vm: &mut VM<'_>, functions: AsyncioFunctions, args: ArgValues) -> RunResult<CallResult> {
     match functions {
-        AsyncioFunctions::Gather => gather(heap, args).map(CallResult::Value),
-        AsyncioFunctions::Run => run(heap, args),
+        AsyncioFunctions::Gather => gather(vm, args).map(CallResult::Value),
+        AsyncioFunctions::Run => run(vm.heap, args),
     }
 }
 
@@ -73,7 +65,7 @@ pub(super) fn call(
 ///
 /// Returns `CallResult::AwaitValue` so the VM executes `exec_get_awaitable` on
 /// the value, which handles validation that it's actually a coroutine/awaitable.
-fn run(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<CallResult> {
+fn run(heap: &mut Heap, args: ArgValues) -> RunResult<CallResult> {
     let coroutine = args.get_one_arg("asyncio.run", heap)?;
     Ok(CallResult::AwaitValue(coroutine))
 }
@@ -98,47 +90,50 @@ fn run(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<Call
 ///
 /// # Errors
 /// Returns `TypeError` if any argument is not awaitable.
-pub(crate) fn gather(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let (pos_args, kwargs) = args.into_parts();
-    defer_drop_mut!(pos_args, heap);
+pub(crate) fn gather(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    // TODO: support keyword arguments (e.g. return_exceptions); for now any
+    // kwarg is rejected up front by the macro's `kwargs_not_supported_yet`
+    // flag with a `NotImplementedError: gather() does not yet support keyword
+    // arguments` (CPython would have given a TypeError naming the bad kwarg).
+    let GatherArgs { awaitables } = GatherArgs::from_args(args, vm)?;
+    defer_drop_mut!(awaitables, vm);
 
-    // TODO: support keyword arguments (e.g. return_exceptions)
-    kwargs.not_supported_yet("gather", heap)?;
-
-    // Validate all positional args are awaitable and collect them
-    let mut items = Vec::new();
-    let mut coroutine_ids_to_cleanup: Vec<HeapId> = Vec::new();
-
-    #[cfg_attr(not(feature = "ref-count-panic"), expect(unused_mut))]
-    for mut arg in pos_args {
-        match &arg {
-            Value::Ref(id) if heap.get(*id).is_coroutine() => {
-                coroutine_ids_to_cleanup.push(*id);
-                items.push(GatherItem::Coroutine(*id));
-                // Transfer ownership to GatherFuture - mark Value as consumed without dec_ref
-                #[cfg(feature = "ref-count-panic")]
-                arg.dec_ref_forget();
-            }
-            Value::ExternalFuture(call_id) => {
-                items.push(GatherItem::ExternalFuture(*call_id));
-                // ExternalFuture is Copy, no refcount to manage
-            }
-            _ => {
-                // Not awaitable - clean up and error
-                arg.drop_with_heap(heap);
-                // Drop already-collected coroutine refs
-                for cid in coroutine_ids_to_cleanup {
-                    heap.dec_ref(cid);
-                }
-                return Err(ExcType::type_error(
-                    "An asyncio.Future, a coroutine or an awaitable is required",
-                ));
-            }
+    // Validate every argument before transferring any references to the gather,
+    // so an invalid later argument needs no raw-HeapId rollback.
+    for arg in awaitables.iter() {
+        if !matches!(
+            arg,
+            Value::Ref(id)
+                if matches!(
+                    vm.heap.get(*id),
+                    HeapData::Coroutine(_) | HeapData::ExternalFuture(_) | HeapData::GatherFuture(_)
+                )
+        ) {
+            return Err(ExcType::type_error(
+                "An asyncio.Future, a coroutine or an awaitable is required",
+            ));
         }
     }
 
-    // Create GatherFuture on heap
+    let items = awaitables
+        .drain(..)
+        .map(|arg| arg.into_ref_id().expect("validated gather awaitable is heap-backed"))
+        .collect();
     let gather_future = GatherFuture::new(items);
-    let id = heap.allocate(HeapData::GatherFuture(gather_future))?;
+    let id = vm.heap.allocate(HeapData::GatherFuture(Box::new(gather_future)));
     Ok(Value::Ref(id))
+}
+
+/// `asyncio.gather(*awaitables)` — variadic positional, no kwargs accepted.
+///
+/// `kwargs_not_supported_yet` rejects any kwarg with the macro's
+/// "not yet implemented" `NotImplementedError`, replacing the previous
+/// `TypeError: gather() takes no keyword arguments` from `into_pos_only`.
+/// When CPython's `return_exceptions=False` is wired up this becomes a
+/// regular `kw_only` slot and the flag goes away.
+#[derive(FromArgs)]
+#[from_args(name = "gather", kwargs_not_supported_yet)]
+struct GatherArgs {
+    #[from_args(varargs)]
+    awaitables: Vec<Value>,
 }

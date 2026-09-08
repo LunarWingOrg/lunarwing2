@@ -62,7 +62,7 @@ pub struct NodeIndex(NonZeroU32);
 
 impl NodeIndex {
     /// A placeholder `NodeIndex`.
-    pub const NONE: NodeIndex = NodeIndex(NonZeroU32::new(NodeIndex::_NONE).unwrap());
+    const NONE: NodeIndex = NodeIndex(NonZeroU32::new(NodeIndex::_NONE).unwrap());
 
     // Note that the index `u32::MAX` is reserved for the `NonZeroU32` niche, and
     // this placeholder also reserves the second highest index.
@@ -160,7 +160,7 @@ impl std::fmt::Debug for NodeIndex {
 #[cfg_attr(feature = "get-size", derive(get_size2::GetSize))]
 pub struct AtomicNodeIndex(AtomicU32);
 
-#[allow(clippy::declare_interior_mutable_const)]
+#[expect(clippy::declare_interior_mutable_const)]
 impl AtomicNodeIndex {
     /// A placeholder `AtomicNodeIndex`.
     pub const NONE: AtomicNodeIndex = AtomicNodeIndex(AtomicU32::new(NodeIndex::_NONE));
@@ -214,6 +214,18 @@ impl Eq for AtomicNodeIndex {}
 impl PartialEq for AtomicNodeIndex {
     fn eq(&self, other: &Self) -> bool {
         self.load() == other.load()
+    }
+}
+
+impl PartialEq<NodeIndex> for AtomicNodeIndex {
+    fn eq(&self, other: &NodeIndex) -> bool {
+        self.load() == *other
+    }
+}
+
+impl PartialEq<AtomicNodeIndex> for NodeIndex {
+    fn eq(&self, other: &AtomicNodeIndex) -> bool {
+        *self == other.load()
     }
 }
 

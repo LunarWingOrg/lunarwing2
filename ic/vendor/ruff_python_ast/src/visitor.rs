@@ -265,10 +265,7 @@ pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {
             visitor.visit_expr(test);
             visitor.visit_body(body);
             for clause in elif_else_clauses {
-                if let Some(test) = &clause.test {
-                    visitor.visit_expr(test);
-                }
-                walk_elif_else_clause(visitor, clause);
+                visitor.visit_elif_else_clause(clause);
             }
         }
         Stmt::With(ast::StmtWith { items, body, .. }) => {
@@ -330,6 +327,7 @@ pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {
         }
         Stmt::Import(ast::StmtImport {
             names,
+            is_lazy: _,
             range: _,
             node_index: _,
         }) => {
@@ -478,7 +476,9 @@ pub fn walk_expr<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &'a Expr) {
             for comprehension in generators {
                 visitor.visit_comprehension(comprehension);
             }
-            visitor.visit_expr(key);
+            if let Some(key) = key {
+                visitor.visit_expr(key);
+            }
             visitor.visit_expr(value);
         }
         Expr::Generator(ast::ExprGenerator {
@@ -530,7 +530,7 @@ pub fn walk_expr<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &'a Expr) {
         Expr::Call(ast::ExprCall {
             func,
             arguments,
-            range: _,
+            range_start: _,
             node_index: _,
         }) => {
             visitor.visit_expr(func);

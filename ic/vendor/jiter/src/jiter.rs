@@ -1,8 +1,8 @@
-use crate::errors::{json_error, JiterError, JsonType, LinePosition, DEFAULT_RECURSION_LIMIT};
+use crate::errors::{DEFAULT_RECURSION_LIMIT, JiterError, JsonType, LinePosition, json_error};
 use crate::number_decoder::{NumberAny, NumberFloat, NumberInt, NumberRange};
 use crate::parse::{Parser, Peek};
 use crate::string_decoder::{StringDecoder, StringDecoderRange, Tape};
-use crate::value::{take_value_borrowed, take_value_owned, take_value_skip, JsonValue};
+use crate::value::{JsonValue, take_value_borrowed, take_value_owned, take_value_skip};
 use crate::{JsonError, JsonErrorType, PartialMode};
 
 pub type JiterResult<T> = Result<T, JiterError>;
@@ -168,6 +168,7 @@ impl<'j> Jiter<'j> {
     pub fn known_float(&mut self, peek: Peek) -> JiterResult<f64> {
         self.parser
             .consume_number::<NumberFloat>(peek.into_inner(), self.allow_inf_nan)
+            .map(|f| f.0)
             .map_err(|e| self.maybe_number_error(e, JsonType::Float, peek))
     }
 
@@ -178,7 +179,7 @@ impl<'j> Jiter<'j> {
     }
 
     /// Knowing the next value is a number, parse it and return bytes from the original JSON data.
-    fn known_number_bytes(&mut self, peek: Peek) -> JiterResult<&[u8]> {
+    pub fn known_number_bytes(&mut self, peek: Peek) -> JiterResult<&[u8]> {
         match self
             .parser
             .consume_number::<NumberRange>(peek.into_inner(), self.allow_inf_nan)

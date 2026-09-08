@@ -29,6 +29,17 @@ pub(crate) fn rand_bytes() -> impl Strategy<Value = Vec<u8>> {
     proptest::collection::vec(any::<u8>(), 0..80)
 }
 
+/// Generates byte sequences that interleave valid (often multibyte) UTF-8 runs with arbitrary byte
+/// fragments. Uniformly random bytes are almost never long valid non-ASCII runs, so this is what
+/// exercises `from_utf8_lossy` bulk-copying a valid multibyte run that sits between two errors.
+pub(crate) fn rand_utf8_with_errors() -> impl Strategy<Value = Vec<u8>> {
+    let segment = prop_oneof![
+        rand_unicode().prop_map(String::into_bytes),
+        proptest::collection::vec(any::<u8>(), 0..8),
+    ];
+    proptest::collection::vec(segment, 0..20).prop_map(|segments| segments.concat())
+}
+
 /// generates a random collection of `u16`s, upto 80 elements long
 pub(crate) fn rand_u16s() -> impl Strategy<Value = Vec<u16>> {
     proptest::collection::vec(any::<u16>(), 0..80)
@@ -67,6 +78,16 @@ fn proptest_strings_roundtrip(#[strategy(rand_unicode())] word: String) {
 fn proptest_strings_allocated_properly(#[strategy(rand_unicode())] word: String) {
     let compact = CompactString::new(word);
     assert_allocated_properly(&compact);
+}
+
+#[test]
+fn test_new_owned_string_reuses_heap_allocation() {
+    let value = "a".repeat(MAX_SIZE + 1);
+    let ptr = value.as_ptr();
+    let capacity = value.capacity();
+    let compact = CompactString::new(value);
+    assert_eq!(compact.as_ptr(), ptr);
+    assert_eq!(compact.capacity(), capacity);
 }
 
 #[proptest]
@@ -117,6 +138,50 @@ fn proptest_from_lossy_cow_roundtrips(#[strategy(rand_bytes())] bytes: Vec<u8>) 
     prop_assert_eq!(cow, compact);
 }
 
+#[test]
+fn test_as_mut_bytes_only_exposes_initialized_data() {
+    for mut compact in [
+        CompactString::new("inline"),
+        CompactString::with_capacity(100),
+    ] {
+        let len = compact.len();
+
+        // SAFETY: We do not modify the buffer, so the string remains valid UTF-8.
+        let bytes = unsafe { compact.as_mut_bytes() };
+
+        assert_eq!(bytes.len(), len);
+        for byte in bytes {
+            // Reading each byte under Miri verifies that `as_mut_bytes` only exposes initialized
+            // string data through a `[u8]` reference.
+            core::hint::black_box(*byte);
+        }
+    }
+}
+
+#[test]
+fn test_spare_capacity_mut() {
+    let mut inline = CompactString::new("");
+    let spare = unsafe { inline.spare_capacity_mut() };
+    assert_eq!(spare.len(), MAX_SIZE);
+    for slot in spare {
+        slot.write(b'a');
+    }
+    // SAFETY: Every byte is initialized to ASCII, including the inline tag byte, so the full
+    // buffer is valid UTF-8.
+    unsafe { inline.set_len(MAX_SIZE) };
+    assert_eq!(inline, "a".repeat(MAX_SIZE));
+
+    let mut heap = CompactString::with_capacity(100);
+    let suffix = b"hello";
+    let spare = unsafe { heap.spare_capacity_mut() };
+    for (slot, byte) in spare.iter_mut().zip(suffix) {
+        slot.write(*byte);
+    }
+    // SAFETY: The first `suffix.len()` bytes were initialized to valid UTF-8 above.
+    unsafe { heap.set_len(suffix.len()) };
+    assert_eq!(heap, "hello");
+}
+
 #[proptest]
 #[cfg_attr(miri, ignore)]
 fn proptest_reserve_and_write_bytes(#[strategy(rand_unicode())] word: String) {
@@ -126,9 +191,12 @@ fn proptest_reserve_and_write_bytes(#[strategy(rand_unicode())] word: String) {
     // reserve enough space to write our bytes
     compact.reserve(word.len());
 
-    // SAFETY: We're writing a String which we know is UTF-8
-    let slice = unsafe { compact.as_mut_bytes() };
-    slice[..word.len()].copy_from_slice(word.as_bytes());
+    // SAFETY: We only initialize a prefix of the spare capacity, and don't overwrite the inline
+    // tag unless `word` fills the entire inline buffer with valid UTF-8.
+    let spare = unsafe { compact.spare_capacity_mut() };
+    for (slot, byte) in spare.iter_mut().zip(word.bytes()) {
+        slot.write(byte);
+    }
 
     // SAFETY: We know this is the length of our string, since `compact` started with 0 bytes
     // and we just wrote `word.len()` bytes
@@ -146,9 +214,12 @@ fn proptest_reserve_and_write_bytes_allocated_properly(#[strategy(rand_unicode()
     // reserve enough space to write our bytes
     compact.reserve(word.len());
 
-    // SAFETY: We're writing a String which we know is UTF-8
-    let slice = unsafe { compact.as_mut_bytes() };
-    slice[..word.len()].copy_from_slice(word.as_bytes());
+    // SAFETY: We only initialize a prefix of the spare capacity, and don't overwrite the inline
+    // tag unless `word` fills the entire inline buffer with valid UTF-8.
+    let spare = unsafe { compact.spare_capacity_mut() };
+    for (slot, byte) in spare.iter_mut().zip(word.bytes()) {
+        slot.write(byte);
+    }
 
     // SAFETY: We know this is the length of our string, since `compact` started with 0 bytes
     // and we just wrote `word.len()` bytes
@@ -937,7 +1008,7 @@ fn test_to_compact_string() {
     assert_int_MAX_to_compact_string!(usize);
     assert_int_MAX_to_compact_string!(isize);
 
-    // Test specialisation for f32 and f64 using ryu
+    // Test specialisation for f32 and f64 using zmij
     // TODO: Fix bug in powerpc64, which is a little endian system
     #[cfg(not(all(target_arch = "powerpc64", target_pointer_width = "64")))]
     {
@@ -1387,6 +1458,25 @@ fn test_retain() {
     s.retain(|_| false);
     assert_eq!(s, "");
 
+    // Moving a multi-byte character by one byte temporarily leaves the full old-length
+    // buffer invalid UTF-8. `retain` must only interpret the untouched source suffix.
+    let mut s = CompactString::from("0è0");
+    s.retain(|c| c != '0');
+    assert_eq!(s, "è");
+
+    let input = "0èabcdefghijklmnopqrstuvwxyz";
+    let expected = "èabcdefghijklmnopqrstuvwxyz";
+
+    let mut heap = CompactString::from(input);
+    assert!(heap.is_heap_allocated());
+    heap.retain(|c| c != '0');
+    assert_eq!(heap, expected);
+
+    let mut static_str = CompactString::const_new(input);
+    assert_eq!(static_str.as_static_str(), Some(input));
+    static_str.retain(|c| c != '0');
+    assert_eq!(static_str, expected);
+
     let mut s = CompactString::from("0è0");
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut count = 0;
@@ -1668,6 +1758,18 @@ fn test_from_utf8_unchecked_empty() {
 #[proptest]
 #[cfg_attr(miri, ignore)]
 fn proptest_from_utf8_lossy(#[strategy(rand_bytes())] bytes: Vec<u8>) {
+    let compact = CompactString::from_utf8_lossy(&bytes);
+    let control = String::from_utf8_lossy(&bytes);
+
+    assert_eq!(compact, control);
+    assert_eq!(compact.len(), control.len());
+}
+
+// Like `proptest_from_utf8_lossy`, but the inputs interleave valid multibyte runs with invalid
+// fragments, which stresses the bulk-copy of valid runs between errors that random bytes miss.
+#[proptest]
+#[cfg_attr(miri, ignore)]
+fn proptest_from_utf8_lossy_interleaved(#[strategy(rand_utf8_with_errors())] bytes: Vec<u8>) {
     let compact = CompactString::from_utf8_lossy(&bytes);
     let control = String::from_utf8_lossy(&bytes);
 
@@ -1977,7 +2079,6 @@ fn test_alloc_excessively_long_string() {
 
 // This feature was enabled by <https://github.com/rust-lang/rust/pull/94075> which was first
 // released in Rust 1.65.
-#[rustversion::since(1.65)]
 #[test]
 fn multiple_niches_test() {
     #[allow(unused)]
@@ -2040,4 +2141,139 @@ fn test_shrink_to_within_min_heap_gap() {
 fn test_repeat_capacity_overflow() {
     let s = CompactString::new("abc");
     let _ = s.repeat(usize::MAX);
+}
+
+#[test]
+fn test_inline_max_len_maximal_last_byte() {
+    // Tightest case for `from_inline_ok`: a `MAX_SIZE`-length inline string. At `len == MAX_SIZE`
+    // the length byte is overwritten by real UTF-8 data, so the discriminant *is* the final data
+    // byte. `U+07FF` encodes as `DF BF`, giving a trailing byte of `0xBF` (191) — the largest a
+    // valid UTF-8 trailing byte can be, i.e. the closest the invariant ever gets to `HEAP_MASK`.
+    let s = "a".repeat(MAX_SIZE - 2) + "\u{07FF}";
+    assert_eq!(s.len(), MAX_SIZE);
+
+    // via `&str` -> `Repr::new` inline arm -> `from_inline_ok`
+    let a = CompactString::new(s.as_str());
+    assert!(!a.is_heap_allocated());
+    assert_eq!(a, s);
+
+    // via `String` -> `Repr::from_string(_, true)` inline arm -> `from_inline_ok`
+    let b = CompactString::from(s.clone());
+    assert!(!b.is_heap_allocated());
+    assert_eq!(b, s);
+}
+
+#[test]
+fn test_inline_all_lengths_reach_from_inline_ok() {
+    // Walk every inline length through both call sites of `from_inline_ok`.
+    for len in 0..=MAX_SIZE {
+        let s = "a".repeat(len);
+
+        let a = CompactString::new(s.as_str()); // Repr::new
+        assert!(!a.is_heap_allocated(), "len {} via &str went to heap", len);
+        assert_eq!(a, s);
+
+        let b = CompactString::from(s.clone()); // Repr::from_string(_, true)
+        assert!(
+            !b.is_heap_allocated(),
+            "len {} via String went to heap",
+            len
+        );
+        assert_eq!(b, s);
+    }
+}
+
+// Tests for `drain`, and specifically the drop-without-consuming path (see issue #435).
+// `Drain` is intentionally not `#[must_use]`: dropping it, even without iterating, still
+// removes the drained range, so `drain(range)` is a valid way to just delete a range.
+
+#[test]
+fn test_drain_without_consuming_removes_range_inline() {
+    // Keep this short enough to stay inline on 32-bit targets too (MAX_SIZE is 12 there, 24 here).
+    let mut s = CompactString::new("Hi world!");
+    assert!(!s.is_heap_allocated());
+    // Use `drain` purely to delete a range, without touching the returned iterator.
+    s.drain(2..8);
+    assert_eq!(s, "Hi!");
+}
+
+#[test]
+fn test_drain_without_consuming_removes_range_heap() {
+    let mut s = CompactString::new("this is a fairly long heap-allocated string value");
+    assert!(s.is_heap_allocated());
+    s.drain(10..22); // remove "fairly long "
+    assert_eq!(s, "this is a heap-allocated string value");
+    assert!(s.is_heap_allocated());
+}
+
+#[test]
+fn test_drain_partial_consume_removes_full_range() {
+    let mut s = CompactString::new("Hello, world!");
+    let mut d = s.drain(5..12); // ", world"
+    assert_eq!(d.next(), Some(','));
+    // Only one char was consumed, but dropping must still remove the WHOLE drained range.
+    drop(d);
+    assert_eq!(s, "Hello!");
+}
+
+#[test]
+fn test_drain_yields_removed_chars() {
+    let mut s = CompactString::new("Hello, world!");
+    let drained: String = s.drain(5..12).collect();
+    assert_eq!(drained, ", world");
+    assert_eq!(s, "Hello!");
+}
+
+#[test]
+fn test_drain_empty_range_is_noop() {
+    let mut s = CompactString::new("Hello");
+    s.drain(2..2);
+    assert_eq!(s, "Hello");
+}
+
+#[test]
+fn test_drain_full_range_clears() {
+    let mut s = CompactString::new("this is a fairly long heap-allocated string value");
+    assert!(s.is_heap_allocated());
+    s.drain(..);
+    assert_eq!(s, "");
+    assert!(s.is_empty());
+}
+
+#[test]
+fn test_drain_multibyte_boundary() {
+    let mut s = CompactString::new("αβγδε"); // each char is 2 bytes
+    s.drain(2..6); // remove "βγ"
+    assert_eq!(s, "αδε");
+}
+
+/// `CompactString::drain` must behave exactly like `String::drain`, both when the iterator
+/// is fully consumed and when it is dropped without consuming.
+#[proptest]
+#[cfg_attr(miri, ignore)]
+fn proptest_drain_matches_std(#[strategy(rand_unicode())] control: String, lo: usize, hi: usize) {
+    // Snap two arbitrary indices to char boundaries so the range is always valid.
+    let bounds: Vec<usize> = control
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(core::iter::once(control.len()))
+        .collect();
+    let i = lo % bounds.len();
+    let j = hi % bounds.len();
+    let (start, end) = (bounds[i.min(j)], bounds[i.max(j)]);
+
+    // (1) Fully consuming the iterator yields the same chars and leaves the same remainder.
+    let mut compact = CompactString::new(&control);
+    let mut std_string = control.clone();
+    let drained_compact: String = compact.drain(start..end).collect();
+    let drained_std: String = std_string.drain(start..end).collect();
+    prop_assert_eq!(&drained_compact, &drained_std);
+    prop_assert_eq!(compact.as_str(), std_string.as_str());
+
+    // (2) Dropping the iterator without consuming removes exactly the same range.
+    let mut compact = CompactString::new(&control);
+    let mut std_string = control.clone();
+    compact.drain(start..end);
+    std_string.drain(start..end);
+    prop_assert_eq!(compact.as_str(), std_string.as_str());
 }

@@ -1,12 +1,11 @@
 //! Implementation of the print() builtin function.
 
 use crate::{
-    args::{ArgValues, KwargsValues},
+    args::{ArgValues, FromArgs},
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, RunError, RunResult, SimpleException},
+    exception_private::{ExcType, RunResult, SimpleException},
     heap::HeapData,
-    resource::ResourceTracker,
     types::PyTrait,
     value::Value,
 };
@@ -16,32 +15,50 @@ use crate::{
 /// Supports the following keyword arguments:
 /// - `sep`: separator between values (default: " ")
 /// - `end`: string appended after the last value (default: "\n")
-/// - `flush`: whether to flush the stream (accepted but ignored)
+/// - `flush`: whether to flush the stream (accepted but ignored — Monty
+///   doesn't buffer stdout)
 ///
-/// The `file` kwarg is not supported.
-pub fn builtin_print(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    // Split into positional args and kwargs
-    let (positional, kwargs) = args.into_parts();
-    defer_drop!(positional, vm);
+/// The `file` keyword is recognised so it can produce a *specific* error
+/// (`"print() 'file' argument is not supported"`) rather than the generic
+/// "unexpected keyword" produced by leaving it off the struct.
+pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let PrintArgs {
+        objects,
+        sep,
+        end,
+        file,
+        flush: _,
+    } = PrintArgs::from_args(args, vm)?;
+    defer_drop!(objects, vm);
+    defer_drop!(sep, vm);
+    defer_drop!(end, vm);
+    defer_drop!(file, vm);
 
-    // Extract kwargs first
-    let (sep, end) = extract_print_kwargs(kwargs, vm)?;
+    if !matches!(file, Value::None) {
+        return Err(SimpleException::new_msg(ExcType::TypeError, "print() 'file' argument is not supported").into());
+    }
 
-    // Print positional args with separator, dropping each value after use
+    let sep_str = extract_string_kwarg(sep, "sep", vm)?;
+    let end_str = extract_string_kwarg(end, "end", vm)?;
+
     let mut first = true;
-    for value in positional.as_slice() {
+    for value in objects.as_slice() {
         if first {
             first = false;
-        } else if let Some(sep) = &sep {
+        } else if let Some(sep) = &sep_str {
             vm.print_writer.stdout_write(sep.as_str().into())?;
         } else {
             vm.print_writer.stdout_push(' ')?;
         }
-        vm.print_writer.stdout_write(value.py_str(vm)?)?;
+        let s = value.py_str(vm)?;
+        defer_drop!(s, vm);
+        // Resolve the `str` `Value` against the heap/interns tables directly so
+        // the `&str` borrow stays disjoint from the `&mut vm.print_writer` write.
+        vm.print_writer
+            .stdout_write(s.to_str_heap(vm.heap, vm.interns)?.into())?;
     }
 
-    // Append end string
-    if let Some(end) = end {
+    if let Some(end) = end_str {
         vm.print_writer.stdout_write(end.into())?;
     } else {
         vm.print_writer.stdout_push('\n')?;
@@ -50,68 +67,35 @@ pub fn builtin_print(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues)
     Ok(Value::None)
 }
 
-/// Extracts sep and end kwargs from print() arguments.
+/// Argument shape for `print(*objects, sep=' ', end='\n', file=sys.stdout, flush=False)`.
 ///
-/// Consumes the kwargs, dropping all values after extraction.
-/// Returns (sep, end) where each is Some if provided.
-fn extract_print_kwargs(
-    kwargs: KwargsValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<(Option<String>, Option<String>)> {
-    let mut sep: Option<String> = None;
-    let mut end: Option<String> = None;
-    let mut error: Option<RunError> = None;
-
-    for (key, value) in kwargs {
-        // defer_drop! ensures key and value are cleaned up on every path through
-        // the loop body — including continue, early return, and normal iteration
-        defer_drop!(key, vm);
-        defer_drop!(value, vm);
-
-        // If we already hit an error, just drop remaining values
-        if error.is_some() {
-            continue;
-        }
-
-        let Some(keyword_name) = key.as_either_str(vm.heap) else {
-            error = Some(SimpleException::new_msg(ExcType::TypeError, "keywords must be strings").into());
-            continue;
-        };
-
-        let key_str = keyword_name.as_str(vm.interns);
-        match key_str {
-            "sep" => match extract_string_kwarg(value, "sep", vm) {
-                Ok(custom_sep) => sep = custom_sep,
-                Err(e) => error = Some(e),
-            },
-            "end" => match extract_string_kwarg(value, "end", vm) {
-                Ok(custom_end) => end = custom_end,
-                Err(e) => error = Some(e),
-            },
-            "flush" => {} // Accepted but ignored (we don't buffer output)
-            "file" => {
-                error = Some(
-                    SimpleException::new_msg(ExcType::TypeError, "print() 'file' argument is not supported").into(),
-                );
-            }
-            _ => {
-                error = Some(ExcType::type_error_unexpected_keyword("print", key_str));
-            }
-        }
-    }
-
-    if let Some(error) = error {
-        Err(error)
-    } else {
-        Ok((sep, end))
-    }
+/// Every kwarg is held as a raw `Value` so the caller can do the
+/// "must be None or str" coercion inline, and so `flush` can be accepted
+/// without forcing a type check. Explicit `file` rejection lives in
+/// `builtin_print`.
+#[derive(FromArgs)]
+#[from_args(name = "print")]
+struct PrintArgs {
+    #[from_args(varargs)]
+    objects: Vec<Value>,
+    #[from_args(default = Value::None)]
+    sep: Value,
+    #[from_args(default = Value::None)]
+    end: Value,
+    #[from_args(default = Value::None)]
+    file: Value,
+    /// Accepted from Python for CPython compatibility but never consumed:
+    /// Monty doesn't buffer stdout, so there is nothing to flush.
+    #[expect(dead_code, reason = "accepted but ignored — Monty doesn't buffer stdout")]
+    #[from_args(default = Value::None)]
+    flush: Value,
 }
 
 /// Extracts a string value from a print() kwarg.
 ///
 /// The kwarg can be None (returns None) or a string (returns Some).
 /// Raises TypeError for other types.
-fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Option<String>> {
+fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_>) -> RunResult<Option<String>> {
     match value {
         Value::None => Ok(None),
         Value::InternString(string_id) => Ok(Some(vm.interns.get_str(*string_id).to_owned())),
@@ -121,13 +105,13 @@ fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_, '_, impl Resource
             }
             Err(SimpleException::new_msg(
                 ExcType::TypeError,
-                format!("{} must be None or a string, not {}", name, value.py_type(vm)),
+                format!("{} must be None or a string, not {}", name, value.py_type_name(vm)),
             )
             .into())
         }
         _ => Err(SimpleException::new_msg(
             ExcType::TypeError,
-            format!("{} must be None or a string, not {}", name, value.py_type(vm)),
+            format!("{} must be None or a string, not {}", name, value.py_type_name(vm)),
         )
         .into()),
     }

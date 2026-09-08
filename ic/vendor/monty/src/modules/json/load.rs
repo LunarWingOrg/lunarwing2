@@ -3,19 +3,19 @@
 //! This module owns conversion from JSON bytes into Monty runtime values,
 //! including CPython-compatible `JSONDecodeError` construction.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, mem};
 
 use jiter::{Jiter, JiterError, JiterErrorType, JsonErrorType, NumberAny, NumberInt, Peek};
 
+use super::JsonStringCache;
 use crate::{
-    args::ArgValues,
+    args::{ArgValues, FromArgs},
     bytecode::VM,
-    defer_drop,
-    exception_private::{ExcType, RunError, RunResult},
-    heap::{DropWithHeap, HeapData, HeapGuard},
-    resource::{ResourceError, ResourceTracker},
+    defer_drop_mut,
+    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
+    heap::{ContainsHeap, DropGuard, HeapData, HeapReader},
     types::{
-        Dict, List, LongInt, PyTrait,
+        Dict, List, LongInt,
         long_int::{check_decimal_digit_count, decimal_digit_count_ascii},
         str::allocate_string,
     },
@@ -44,12 +44,6 @@ impl From<RunError> for JsonLoadError {
     }
 }
 
-impl From<ResourceError> for JsonLoadError {
-    fn from(error: ResourceError) -> Self {
-        Self::Run(error.into())
-    }
-}
-
 /// Result type used internally while streaming JSON from `jiter`.
 type ParseResult<T> = Result<T, JsonLoadError>;
 
@@ -69,34 +63,23 @@ const JSON_RECURSION_LIMIT: usize = 200;
 /// CPython kwargs `cls`, `object_hook`, `parse_float`, `parse_int`,
 /// `parse_constant`, and `object_pairs_hook` are intentionally unsupported
 /// and will raise `TypeError` if passed.
-pub(super) fn call_loads(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let (mut pos, kwargs) = args.into_parts();
-    if let Some((key, value)) = kwargs.into_iter().next() {
-        defer_drop!(key, vm);
-        defer_drop!(value, vm);
-        let Some(keyword_name) = key.as_either_str(vm.heap) else {
-            return Err(ExcType::type_error_kwargs_nonstring_key());
-        };
-        pos.drop_with_heap(vm);
-        return Err(ExcType::type_error_unexpected_keyword(
-            "loads",
-            keyword_name.as_str(vm.interns),
-        ));
-    }
+pub(super) fn call_loads(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let JsonLoadsArgs { s } = JsonLoadsArgs::from_args(args, vm)?;
+    defer_drop_mut!(s, vm);
+    parse_json_input(s, vm)
+}
 
-    let Some(data) = pos.next() else {
-        return Err(ExcType::type_error_missing_positional_with_names("loads", &["s"]));
-    };
-    if pos.len() != 0 {
-        let actual = pos.len() + 1;
-        data.drop_with_heap(vm);
-        pos.drop_with_heap(vm);
-        return Err(ExcType::type_error_too_many_positional("loads", 1, actual, 0));
-    }
-
-    let mut data_guard = HeapGuard::new(data, vm);
-    let (data, vm) = data_guard.as_parts_mut();
-    parse_json_input(data, vm)
+/// Argument shape for `json.loads(s)`.
+///
+/// CPython's `loads` is a pure-Python `def loads(s, *, cls=None, …)`, so `s`
+/// is positional-or-keyword (`json.loads(s='1')` works) and signature errors
+/// use `style = def` wording. The additional CPython kwargs (`cls`, `object_hook`,
+/// …) are intentionally not implemented; leaving them off this struct means
+/// the macro emits the standard "unexpected keyword" error for them.
+#[derive(FromArgs)]
+#[from_args(name = "loads", style = def)]
+struct JsonLoadsArgs {
+    s: Value,
 }
 
 /// Parses a `json.loads()` input value and converts it into a Monty value.
@@ -104,36 +87,46 @@ pub(super) fn call_loads(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgVal
 /// The parser works directly on the underlying byte slice. Decoded strings from
 /// `jiter` are copied into Monty's heap immediately before any further parser
 /// movement so borrowed tape-backed data never escapes.
-fn parse_json_input(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn parse_json_input(value: &Value, vm: &mut VM<'_>) -> RunResult<Value> {
     let bytes: Cow<'_, [u8]> = match value {
         Value::InternString(string_id) => Cow::Borrowed(vm.interns.get_str(*string_id).as_bytes()),
         Value::InternBytes(bytes_id) => Cow::Borrowed(vm.interns.get_bytes(*bytes_id)),
         Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
             HeapData::Str(s) => Cow::Owned(s.as_str().as_bytes().to_vec()),
             HeapData::Bytes(b) => Cow::Owned(b.as_slice().to_vec()),
-            _ => return Err(ExcType::json_loads_type_error(value.py_type(vm))),
+            _ => return Err(ExcType::json_loads_type_error(&value.py_type_name(vm))),
         },
-        _ => return Err(ExcType::json_loads_type_error(value.py_type(vm))),
+        _ => return Err(ExcType::json_loads_type_error(&value.py_type_name(vm))),
     };
     parse_json_bytes(bytes.as_ref(), vm)
 }
 
 /// Parses raw JSON bytes using `jiter` and converts the result to a Monty value.
 ///
+/// The VM's per-run string cache is temporarily extracted so that it can be
+/// passed alongside the VM through the recursive parse functions without
+/// borrow conflicts. It is always restored before returning.
+///
 /// Syntax errors are wrapped in `json.JSONDecodeError` using the same
 /// line/column/character suffix as CPython.
-fn parse_json_bytes(bytes: &[u8], vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn parse_json_bytes(bytes: &[u8], vm: &mut VM<'_>) -> RunResult<Value> {
     let mut jiter = Jiter::new(bytes).with_allow_inf_nan();
-    let value = parse_json_value(&mut jiter, 0, vm).map_err(|error| match error {
+    // Take the cache out of the VM so we can pass it alongside &mut VM
+    // without conflicting borrows. `mem::take` leaves `Default` in its place.
+    let mut cache = mem::take(&mut vm.json_string_cache);
+    let result = parse_json_value(&mut jiter, 0, &mut cache, vm);
+    // Always restore the cache before returning, regardless of success/failure.
+    vm.json_string_cache = cache;
+    let value = result.map_err(|error| match error {
         JsonLoadError::Parse(error) => json_number_out_of_range_to_run_error(&error, bytes)
-            .unwrap_or_else(|| json_error_to_run_error(&error, &jiter, bytes)),
+            .unwrap_or_else(|| json_error_to_run_error(&error, bytes)),
         JsonLoadError::Run(error) => error,
     })?;
-    // The successfully parsed `value` must be dropped via `drop_with_heap` if
+    // The successfully parsed `value` must be dropped via `drop_with` if
     // `finish()` detects trailing data — a plain `?` would leak its refcount.
     if let Err(error) = jiter.finish() {
-        value.drop_with_heap(vm);
-        return Err(json_error_to_run_error(&error, &jiter, bytes));
+        value.drop_with(vm);
+        return Err(json_error_to_run_error(&error, bytes));
     }
     Ok(value)
 }
@@ -145,10 +138,11 @@ fn parse_json_bytes(bytes: &[u8], vm: &mut VM<'_, '_, impl ResourceTracker>) -> 
 fn parse_json_value(
     jiter: &mut Jiter<'_>,
     depth: usize,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
+    cache: &mut JsonStringCache,
+    vm: &mut VM<'_>,
 ) -> ParseResult<Value> {
     let peek = jiter.peek()?;
-    parse_json_value_from_peek(peek, jiter, depth, vm)
+    parse_json_value_from_peek(peek, jiter, depth, cache, vm)
 }
 
 /// Converts a peeked JSON token into a Monty value.
@@ -159,7 +153,8 @@ fn parse_json_value_from_peek(
     peek: Peek,
     jiter: &mut Jiter<'_>,
     depth: usize,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
+    cache: &mut JsonStringCache,
+    vm: &mut VM<'_>,
 ) -> ParseResult<Value> {
     match peek {
         Peek::Null => {
@@ -167,9 +162,9 @@ fn parse_json_value_from_peek(
             Ok(Value::None)
         }
         Peek::True | Peek::False => jiter.known_bool(peek).map(Value::Bool).map_err(Into::into),
-        Peek::String => Ok(allocate_string(parse_json_string(jiter)?, vm.heap)?),
-        Peek::Array => parse_json_array(jiter, depth, vm),
-        Peek::Object => parse_json_object(jiter, depth, vm),
+        Peek::String => Ok(allocate_cached_string(parse_json_string(jiter)?, cache, vm.heap)),
+        Peek::Array => parse_json_array(jiter, depth, cache, vm),
+        Peek::Object => parse_json_object(jiter, depth, cache, vm),
         _ if peek.is_num() => parse_json_number(peek, jiter, vm),
         _ => Err(JsonLoadError::Parse(JiterError {
             error_type: JiterErrorType::JsonError(JsonErrorType::ExpectedSomeValue),
@@ -178,26 +173,43 @@ fn parse_json_value_from_peek(
     }
 }
 
+/// Allocates a string using the cache when eligible, falling back to direct
+/// allocation for empty/single-char strings (already interned by
+/// `allocate_string`).
+fn allocate_cached_string(s: String, cache: &mut JsonStringCache, heap: &HeapReader<'_>) -> Value {
+    if s.len() < 2 {
+        // Empty and single-char strings are interned by allocate_string.
+        allocate_string(s, heap.heap())
+    } else {
+        cache.get_or_allocate(s, heap)
+    }
+}
+
 /// Parses a JSON number into the corresponding Monty numeric value.
 ///
-/// Integer tokens are counted directly from the source bytes so
-/// `INT_MAX_STR_DIGITS` errors report the same digit count as CPython without
-/// first allocating an oversized decimal string.
-fn parse_json_number(
-    peek: Peek,
-    jiter: &mut Jiter<'_>,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> ParseResult<Value> {
+/// Oversized integers that exceed Monty's digit limit are rejected with a `ValueError`
+fn parse_json_number(peek: Peek, jiter: &mut Jiter<'_>, vm: &mut VM<'_>) -> ParseResult<Value> {
     let start = jiter.current_index();
-    match jiter.known_number(peek) {
-        Ok(NumberAny::Int(NumberInt::Int(value))) => Ok(Value::Int(value)),
-        Ok(NumberAny::Int(NumberInt::BigInt(value))) => {
-            let digit_count = decimal_digit_count_ascii(jiter.slice_to_current(start));
-            check_decimal_digit_count(digit_count).map_err(JsonLoadError::Run)?;
-            Ok(LongInt::new(value).into_value(vm.heap)?)
-        }
-        Ok(NumberAny::Float(value)) => Ok(Value::Float(value)),
-        Err(error) => Err(error.into()),
+    // Parse to bytes so that we can check the digit count before any BigInt allocation occurs.
+    let token = jiter.known_number_bytes(peek)?;
+    if is_json_integer_token(token) {
+        let digit_count = decimal_digit_count_ascii(token);
+        check_decimal_digit_count(digit_count).map_err(JsonLoadError::Run)?;
+    }
+    // `known_number_bytes` already validated the token, so `NumberAny::from_bytes`
+    // only re-parses the same byte range. Errors here are mapped back into the
+    // outer document's coordinate space so `json_error_to_run_error` reports
+    // the correct line/column.
+    let number = NumberAny::from_bytes(token, true).map_err(|error| {
+        JsonLoadError::Parse(JiterError {
+            error_type: JiterErrorType::JsonError(error.error_type),
+            index: start + error.index,
+        })
+    })?;
+    match number {
+        NumberAny::Int(NumberInt::Int(value)) => Ok(Value::Int(value)),
+        NumberAny::Int(NumberInt::BigInt(value)) => Ok(LongInt::new(value).into_value(vm.heap)),
+        NumberAny::Float(value) => Ok(Value::Float(value)),
     }
 }
 
@@ -208,21 +220,22 @@ fn parse_json_number(
 fn parse_json_array(
     jiter: &mut Jiter<'_>,
     depth: usize,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
+    cache: &mut JsonStringCache,
+    vm: &mut VM<'_>,
 ) -> ParseResult<Value> {
     check_json_recursion_limit(jiter, depth)?;
 
     let Some(mut next) = jiter.known_array()? else {
-        let list_id = vm.heap.allocate(HeapData::List(List::new(Vec::new())))?;
+        let list_id = vm.heap.allocate(HeapData::List(List::new(Vec::new())));
         return Ok(Value::Ref(list_id));
     };
 
     let values = Vec::new();
-    let mut values_guard = HeapGuard::new(values, vm);
+    let mut values_guard = DropGuard::new(values, vm);
     {
         let (values, vm) = values_guard.as_parts_mut();
         loop {
-            values.push(parse_json_value_from_peek(next, jiter, depth + 1, vm)?);
+            values.push(parse_json_value_from_peek(next, jiter, depth + 1, cache, vm)?);
             let Some(array_peek) = jiter.array_step()? else {
                 break;
             };
@@ -231,7 +244,7 @@ fn parse_json_array(
     }
 
     let values = values_guard.into_inner();
-    let list_id = vm.heap.allocate(HeapData::List(List::new(values)))?;
+    let list_id = vm.heap.allocate(HeapData::List(List::new(values)));
     Ok(Value::Ref(list_id))
 }
 
@@ -250,23 +263,26 @@ fn parse_json_string(jiter: &mut Jiter<'_>) -> ParseResult<String> {
 fn parse_json_object(
     jiter: &mut Jiter<'_>,
     depth: usize,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
+    cache: &mut JsonStringCache,
+    vm: &mut VM<'_>,
 ) -> ParseResult<Value> {
     check_json_recursion_limit(jiter, depth)?;
 
     let Some(mut key) = parse_first_object_key(jiter)? else {
-        let dict_id = vm.heap.allocate(HeapData::Dict(Dict::new()))?;
+        let dict_id = vm.heap.allocate(HeapData::Dict(Dict::new()));
         return Ok(Value::Ref(dict_id));
     };
 
-    let pairs = Vec::new();
-    let mut pairs_guard = HeapGuard::new(pairs, vm);
+    let mut dict_guard = DropGuard::new(Dict::new(), vm);
     {
-        let (pairs, vm) = pairs_guard.as_parts_mut();
+        let (dict, vm) = dict_guard.as_parts_mut();
         loop {
-            let key_value = allocate_string(key, vm.heap)?;
-            let value = parse_json_value(jiter, depth + 1, vm)?;
-            pairs.push((key_value, value));
+            let mut key_guard = DropGuard::new(allocate_cached_string(key, cache, vm.heap), &mut *vm);
+            let value = parse_json_value(jiter, depth + 1, cache, key_guard.ctx())?;
+            let (key_value, vm) = key_guard.into_parts();
+            if let Some(old_value) = dict.set_json_string_key(key_value, value, vm)? {
+                old_value.drop_with(vm);
+            }
 
             let Some(next_key) = parse_next_object_key(jiter)? else {
                 break;
@@ -275,9 +291,8 @@ fn parse_json_object(
         }
     }
 
-    let pairs = pairs_guard.into_inner();
-    let dict = Dict::from_pairs(pairs, vm)?;
-    let dict_id = vm.heap.allocate(HeapData::Dict(dict))?;
+    let dict = dict_guard.into_inner();
+    let dict_id = vm.heap.allocate(HeapData::Dict(dict));
     Ok(Value::Ref(dict_id))
 }
 
@@ -357,14 +372,13 @@ fn is_json_number_byte(byte: u8) -> bool {
 
 /// Converts a `jiter` parse error into `json.JSONDecodeError`.
 ///
-/// `jiter` exposes the error byte index plus a helper for computing line and
-/// column, which is enough to reproduce CPython's message suffix exactly.
-fn json_error_to_run_error(error: &JiterError, jiter: &Jiter<'_>, bytes: &[u8]) -> RunError {
-    let (message, index, column_offset) = match &error.error_type {
+/// `jiter` exposes the error byte index; [`error_coordinates`] converts it to
+/// the character-based `pos`/`lineno`/`colno` CPython reports.
+fn json_error_to_run_error(error: &JiterError, bytes: &[u8]) -> RunError {
+    let (message, index) = match &error.error_type {
         JiterErrorType::JsonError(JsonErrorType::KeyMustBeAString) => (
             "Expecting property name enclosed in double quotes".to_owned(),
             error.index,
-            0,
         ),
         JiterErrorType::JsonError(JsonErrorType::TrailingComma) => {
             let comma_index = find_trailing_comma_index(bytes, error.index).unwrap_or(error.index);
@@ -376,25 +390,22 @@ fn json_error_to_run_error(error: &JiterError, jiter: &Jiter<'_>, bytes: &[u8]) 
                 Some(b']') => "Illegal trailing comma before end of array",
                 _ => "trailing comma",
             };
-            (message.to_owned(), comma_index, 0)
+            (message.to_owned(), comma_index)
         }
         JiterErrorType::JsonError(JsonErrorType::EofWhileParsingString) => (
             "Unterminated string starting at".to_owned(),
             find_unterminated_string_start(bytes, error.index).unwrap_or(error.index),
-            0,
         ),
         JiterErrorType::JsonError(JsonErrorType::EofWhileParsingValue | JsonErrorType::ExpectedSomeValue) => {
-            ("Expecting value".to_owned(), error.index, 0)
+            ("Expecting value".to_owned(), error.index)
         }
-        JiterErrorType::JsonError(JsonErrorType::ExpectedColon) => {
-            ("Expecting ':' delimiter".to_owned(), error.index, 0)
-        }
+        JiterErrorType::JsonError(JsonErrorType::ExpectedColon) => ("Expecting ':' delimiter".to_owned(), error.index),
         JiterErrorType::JsonError(
             JsonErrorType::ExpectedListCommaOrEnd
             | JsonErrorType::ExpectedObjectCommaOrEnd
             | JsonErrorType::EofWhileParsingList
             | JsonErrorType::EofWhileParsingObject,
-        ) => ("Expecting ',' delimiter".to_owned(), error.index, 1),
+        ) => ("Expecting ',' delimiter".to_owned(), error.index),
         JiterErrorType::JsonError(JsonErrorType::InvalidEscape) => {
             let escape_index = find_string_escape_start(bytes, error.index).unwrap_or(error.index);
             let is_unicode_escape = bytes.get(escape_index.saturating_add(1)) == Some(&b'u');
@@ -408,18 +419,41 @@ fn json_error_to_run_error(error: &JiterError, jiter: &Jiter<'_>, bytes: &[u8]) 
             } else {
                 escape_index
             };
-            (message.to_owned(), index, 0)
+            (message.to_owned(), index)
         }
-        JiterErrorType::JsonError(JsonErrorType::TrailingCharacters) => ("Extra data".to_owned(), error.index, 0),
-        JiterErrorType::JsonError(error_type) => (error_type.to_string(), error.index, 0),
-        JiterErrorType::WrongType { .. } => (error.error_type.to_string(), error.index, 0),
+        JiterErrorType::JsonError(JsonErrorType::TrailingCharacters) => ("Extra data".to_owned(), error.index),
+        JiterErrorType::JsonError(error_type) => (error_type.to_string(), error.index),
+        JiterErrorType::WrongType { .. } => (error.error_type.to_string(), error.index),
     };
-    let mut position = jiter.error_position(index);
-    if position.column == 0 {
-        position.column = 1;
+    let (pos, line, column) = error_coordinates(bytes, index);
+    ExcType::json_decode_error(&message, bytes, line, column, pos)
+}
+
+/// CPython-style error coordinates `(pos, lineno, colno)` for a byte offset
+/// into `bytes`: `pos` counts characters (UTF-8 sequence starts, not bytes),
+/// and `colno` is characters since the last newline + 1 — locked to `pos`
+/// exactly as `json.JSONDecodeError.__init__` derives them from `doc`.
+///
+/// This deliberately replaces `jiter`'s `error_position`, which counts bytes
+/// (wrong for multibyte documents) and clamps at end of input (wrong column
+/// for EOF errors).
+fn error_coordinates(bytes: &[u8], byte_index: usize) -> (usize, usize, usize) {
+    let prefix = &bytes[..byte_index.min(bytes.len())];
+    let mut pos = 0;
+    let mut lineno = 1;
+    let mut column_chars = 0;
+    for &byte in prefix {
+        // a character starts at every byte that is not a UTF-8 continuation byte
+        if !matches!(byte, 0x80..=0xBF) {
+            pos += 1;
+            column_chars += 1;
+        }
+        if byte == b'\n' {
+            lineno += 1;
+            column_chars = 0;
+        }
     }
-    position.column += column_offset;
-    ExcType::json_decode_error(&message, position.line, position.column, index)
+    (pos, lineno, column_chars + 1)
 }
 
 /// Finds the opening quote for an unterminated JSON string.

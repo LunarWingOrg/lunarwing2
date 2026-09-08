@@ -6,16 +6,24 @@
 /// The `AbstractValue` trait provides a common interface for all heap-allocated
 /// types, enabling efficient dispatch via `enum_dispatch`.
 pub mod bytes;
-pub mod dataclass;
+pub mod callable_iterator;
+pub mod class;
 pub mod date;
 pub mod datetime;
+pub mod deque;
 pub mod dict;
 pub mod dict_view;
+pub mod ext_function;
+pub mod file;
+pub mod host_class;
+pub mod instance;
 pub mod iter;
+pub mod itertools;
 pub mod list;
 pub mod long_int;
 pub mod module;
 pub mod namedtuple;
+pub mod partial;
 pub mod path;
 pub mod property;
 pub mod py_trait;
@@ -25,51 +33,38 @@ pub mod re_pattern;
 pub mod set;
 pub mod slice;
 pub mod str;
+pub mod time;
 pub mod timedelta;
 pub mod timezone;
 pub mod tuple;
 pub mod r#type;
 
-pub(crate) use bytes::Bytes;
-pub(crate) use dataclass::Dataclass;
-pub(crate) use dict::Dict;
+pub(crate) use bytes::{Bytes, BytesIterator};
+pub(crate) use class::{Class, DataclassOptions};
+pub(crate) use deque::Deque;
+pub(crate) use dict::{Dict, DictItemIterator, DictKeyIterator, DictValueIterator};
 pub(crate) use dict_view::{DictItemsView, DictKeysView, DictValuesView};
-pub(crate) use iter::MontyIter;
+pub(crate) use ext_function::ExtFunction;
+pub(crate) use file::OpenFile;
+pub(crate) use host_class::{HostClass, HostClassType, host_class_type};
+pub(crate) use instance::{BoundMethod, Instance};
+pub(crate) use iter::{collect_iterable, collect_iterable_bounded};
+pub(crate) use itertools::ItertoolsIter;
 pub(crate) use list::List;
 pub(crate) use long_int::LongInt;
 pub(crate) use module::Module;
-pub(crate) use namedtuple::NamedTuple;
+pub(crate) use namedtuple::{NamedTuple, NamedTupleClass, construct_namedtuple};
+pub(crate) use partial::Partial;
 pub(crate) use path::Path;
 pub(crate) use property::Property;
-pub(crate) use py_trait::{AttrCallResult, PyTrait};
-pub(crate) use range::Range;
+pub(crate) use py_trait::{AttrCallResult, CmpOrder, LazyHeapSet, PyTrait, attribute_name_value};
+pub(crate) use range::{Range, RangeIterator};
 pub(crate) use re_match::ReMatch;
-pub(crate) use re_pattern::RePattern;
-pub(crate) use set::{FrozenSet, Set};
+pub(crate) use re_pattern::{BoundedCompileError, RePattern};
+pub(crate) use set::{FrozenSet, Set, SetIterator};
 pub(crate) use slice::Slice;
-pub(crate) use str::Str;
+pub(crate) use str::{Str, StringIterator, allocate_string};
 pub(crate) use timedelta::TimeDelta;
 pub(crate) use timezone::TimeZone;
-pub(crate) use tuple::{Tuple, allocate_tuple};
+pub(crate) use tuple::{Tuple, TupleIterator, TupleVec, allocate_tuple};
 pub(crate) use r#type::Type;
-
-use crate::{
-    exception_private::{ExcType, RunResult, SimpleException},
-    value::Value,
-};
-
-/// Extracts an `i32` from a `Value`, accepting `Bool` and `Int`.
-///
-/// Used by `date`, `datetime`, and other constructors that expect
-/// integer arguments matching CPython's `int` coercion rules.
-pub(crate) fn value_to_i32(value: &Value) -> RunResult<i32> {
-    let int_value = match value {
-        Value::Bool(b) => i64::from(*b),
-        Value::Int(i) => *i,
-        _ => {
-            return Err(SimpleException::new_msg(ExcType::TypeError, "an integer is required (got type float)").into());
-        }
-    };
-    i32::try_from(int_value)
-        .map_err(|_| SimpleException::new_msg(ExcType::OverflowError, "signed integer is greater than maximum").into())
-}

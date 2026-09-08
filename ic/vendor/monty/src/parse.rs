@@ -1,26 +1,29 @@
 use std::{borrow::Cow, fmt};
 
+use monty_types::{MontyException, StackFrame};
 use num_bigint::BigInt;
 use num_traits::Num;
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ConversionFlag as RuffConversionFlag, ElifElseClause, Expr as AstExpr,
     InterpolatedStringElement, Keyword, Number, Operator as AstOperator, ParameterWithDefault, Stmt, UnaryOp,
     name::Name,
+    token::TokenKind,
+    visitor::{Visitor, walk_expr},
 };
 use ruff_python_parser::parse_module;
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::{
-    StackFrame,
     args::{ArgExprs, CallArg, CallKwarg, Kwarg},
     exception_private::ExcType,
-    exception_public::{CodeLoc, MontyException},
     expressions::{
-        Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, ImportName, Literal, Node, Operator,
-        SequenceItem, UnpackTarget,
+        AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, ImportName, Literal,
+        Node, Operator, SequenceItem, UnpackTarget,
     },
-    fstring::{ConversionFlag, FStringPart, FormatSpec},
+    fstring::{ConversionFlag, FStringPart, FormatSpec, ParsedFormatSpec, encode_format_spec},
     intern::{InternerBuilder, StringId},
+    source_map::{SourceMap, StackFrameExt},
+    stringize::stringize_annotation,
     types::long_int::INT_MAX_STR_DIGITS,
     value::EitherStr,
 };
@@ -34,7 +37,32 @@ pub const MAX_NESTING_DEPTH: u16 = 200;
 /// (no inlining, debug info, etc.). The limit is set conservatively to prevent
 /// stack overflow while still catching the error before the recursion limit.
 #[cfg(debug_assertions)]
-pub const MAX_NESTING_DEPTH: u16 = 35;
+pub const MAX_NESTING_DEPTH: u16 = 30;
+
+/// `from __future__ import ...` features whose semantics Monty already provides,
+/// so importing them is a no-op rather than an error.
+///
+/// All but the last are inert in CPython too, having become mandatory by 3.7.
+/// `annotations` is still meaningful there, and a no-op here only because Monty
+/// stringizes unconditionally (see `limitations/typing.md`) — what it asks for.
+const SUPPORTED_FUTURES: [&str; 9] = [
+    "nested_scopes",
+    "generators",
+    "division",
+    "absolute_import",
+    "with_statement",
+    "print_function",
+    "unicode_literals",
+    "generator_stop",
+    "annotations",
+];
+
+/// `from __future__ import ...` features Monty does not implement, rejected
+/// rather than silently ignored. `barry_as_FLUFL` (PEP 401) makes `<>` the
+/// inequality operator and `!=` a `SyntaxError`; Monty parses neither
+/// differently. With [`SUPPORTED_FUTURES`] this must cover CPython's
+/// `all_feature_names` — a name in neither is reported as undefined.
+const UNSUPPORTED_FUTURES: [&str; 1] = ["barry_as_FLUFL"];
 
 /// A parameter in a function signature with optional default value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -76,6 +104,22 @@ impl ParsedSignature {
             .chain(self.var_args.iter().copied())
             .chain(self.kwargs.iter().map(|p| p.name))
             .chain(self.var_kwargs.iter().copied())
+    }
+
+    /// Returns an iterator over every default-value expression in the signature.
+    ///
+    /// Defaults are evaluated at *definition* time in the **enclosing** scope,
+    /// not inside the function being defined. Closure analysis relies on this:
+    /// a name referenced by a default (e.g. `def inner(b=a)`) is a capture of
+    /// the enclosing scope, so the cell-var pre-pass must scan these as well as
+    /// the body (see `collect_cell_vars_from_node`). `*args`/`**kwargs` never
+    /// carry defaults, so they are not included.
+    pub fn default_exprs(&self) -> impl Iterator<Item = &ExprLoc> + '_ {
+        self.pos_args
+            .iter()
+            .chain(self.args.iter())
+            .chain(self.kwargs.iter())
+            .filter_map(|p| p.default.as_ref())
     }
 }
 
@@ -133,84 +177,144 @@ pub struct ParseResult {
 }
 
 pub(crate) fn parse(code: &str, filename: &str) -> Result<ParseResult, ParseError> {
-    parse_with_interner(code, filename, InternerBuilder::new(code))
+    let mut interner = InternerBuilder::new(code);
+    let nodes = parse_with_interner(code, filename, &mut interner)?;
+    Ok(ParseResult { nodes, interner })
 }
 
-/// Parses code using a caller-provided interner seed.
+/// Builds a [`CodeRange`] from an interned filename and a ruff range.
 ///
-/// This enables incremental compilation flows (e.g. REPL) where existing
-/// interned IDs must remain stable across parse invocations.
+/// Free rather than a `Parser` method so a syntax error raised before the parser
+/// exists can be located the same way [`Parser::convert_range`] does.
+fn code_range(filename: StringId, range: TextRange) -> CodeRange {
+    CodeRange {
+        filename,
+        start_byte: range.start().into(),
+        end_byte: range.end().into(),
+    }
+}
+
+/// Parses code, interning names into the caller's `interner`.
+///
+/// The interner is borrowed rather than consumed so incremental flows (the
+/// REPL) keep their table — ids appended by a snippet that then fails to parse
+/// are stable and harmless, so nothing needs rolling back.
 pub(crate) fn parse_with_interner(
     code: &str,
     filename: &str,
-    interner: InternerBuilder,
-) -> Result<ParseResult, ParseError> {
-    let mut parser = Parser::new(code, filename, interner);
-    let parsed = parse_module(code).map_err(|e| ParseError::syntax(e.to_string(), parser.convert_range(e.range())))?;
-    let module = parsed.into_syntax();
-    let nodes = parser.parse_statements(module.body)?;
-    Ok(ParseResult {
-        nodes,
-        interner: parser.interner,
-    })
+    interner: &mut InternerBuilder,
+) -> Result<Vec<ParseNode>, ParseError> {
+    // Interned up front so a syntax error can be located without a `Parser`,
+    // leaving the parser to be built once, fully populated, after parsing.
+    let filename_id = interner.intern(filename);
+    let parsed =
+        parse_module(code).map_err(|e| ParseError::syntax(e.error.to_string(), code_range(filename_id, e.range())))?;
+    // Harvested before `into_syntax` drops the token stream.
+    let class_keyword_offsets = parsed
+        .tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Class)
+        .map(Ranged::start)
+        .collect();
+    let mut parser = Parser::new(code, filename_id, interner, class_keyword_offsets);
+    parser.parse_statements(parsed.into_syntax().body)
 }
 
 /// Parser for converting ruff AST to Monty's intermediate ParseNode representation.
 ///
-/// Holds references to the source code and owns a string interner for names.
+/// Holds references to the source code and the caller's string interner for names.
 /// The filename is interned once at construction and reused for all CodeRanges.
 pub struct Parser<'a> {
-    line_ends: Vec<usize>,
     code: &'a str,
     /// Interned filename ID, used for all CodeRanges created by this parser.
     filename_id: StringId,
     /// String interner for names (variables, functions, etc).
-    pub interner: InternerBuilder,
+    interner: &'a mut InternerBuilder,
     /// Remaining nesting depth budget for recursive structures.
     /// Starts at MAX_NESTING_DEPTH and decrements on each nested level.
-    /// When it reaches zero, we return a "too many nested parentheses" error.
+    /// When it reaches zero, we return a "Source is too deeply nested" syntax error.
     depth_remaining: u16,
+    /// Ascending source offsets of every `class` keyword, taken from the lexer.
+    ///
+    /// Ruff's AST is abstract — a `StmtClassDef` *is* a class statement, so it
+    /// never records where `class` sat, and its range starts at the first
+    /// decorator. CPython locates a statement at its keyword, so a decorated
+    /// class's traceback frame needs the concrete position. Read only by
+    /// [`Parser::class_keyword_range`].
+    class_keyword_offsets: Vec<TextSize>,
 }
 
 impl<'a> Parser<'a> {
-    fn new(code: &'a str, filename: &'a str, mut interner: InternerBuilder) -> Self {
-        // Position of each line in the source code, to convert indexes to line number and column number
-        let mut line_ends = vec![];
-        for (i, c) in code.chars().enumerate() {
-            if c == '\n' {
-                line_ends.push(i);
-            }
-        }
-        let filename_id = interner.intern(filename);
+    fn new(
+        code: &'a str,
+        filename_id: StringId,
+        interner: &'a mut InternerBuilder,
+        class_keyword_offsets: Vec<TextSize>,
+    ) -> Self {
         Self {
-            line_ends,
             code,
             filename_id,
             interner,
             depth_remaining: MAX_NESTING_DEPTH,
+            class_keyword_offsets,
         }
     }
 
-    fn parse_statements(&mut self, statements: Vec<Stmt>) -> Result<Vec<ParseNode>, ParseError> {
-        statements.into_iter().map(|f| self.parse_statement(f)).collect()
+    fn parse_statements(
+        &mut self,
+        statements: impl IntoIterator<Item = Stmt, IntoIter: ExactSizeIterator>,
+    ) -> Result<Vec<ParseNode>, ParseError> {
+        // Explicit pre-allocation matters here — `.map(..).collect::<Result<Vec<_>, _>>()`
+        // does NOT pre-size the output. Collecting into `Result<Vec<_>, _>` runs the
+        // iterator through `iter::try_process`'s `Shunt` adapter (so an `Err` can
+        // short-circuit), and `Shunt`'s `size_hint` lower bound is 0 — which loses
+        // the `TrustedLen` specialization that would otherwise forward the source
+        // iterator's length. Each `Stmt` maps to exactly one `ParseNode`.
+        //
+        // Accepting `IntoIterator<Item = Stmt, IntoIter: ExactSizeIterator>` lets callers
+        // pass either `Vec<Stmt>` or ruff's `ThinVec<Stmt>` without an intermediate copy.
+        let iter = statements.into_iter();
+        let mut out = Vec::with_capacity(iter.len());
+        for stmt in iter {
+            out.push(self.parse_statement(stmt)?);
+        }
+        Ok(out)
     }
 
+    /// Folds a flat list of `elif`/`else` clauses into a right-nested `Node::If` tree.
+    ///
+    /// Ruff hands us the clauses as a flat `Vec`, but the prepared AST and the
+    /// bytecode compiler both walk the resulting tree recursively. Each `elif`
+    /// clause is therefore counted against the same depth budget that bounds
+    /// explicitly nested source constructs — without this, a long flat chain
+    /// would produce an AST far deeper than [`MAX_NESTING_DEPTH`] and overflow
+    /// the host's native stack during the prepare or compile phases.
+    ///
+    /// The depth budget consumed during the fold is restored on success so
+    /// sibling statements are not penalized. On parse errors the budget is
+    /// left decremented; this is harmless because the parser aborts entirely
+    /// and `depth_remaining` is never consulted again.
     fn parse_elif_else_clauses(&mut self, clauses: Vec<ElifElseClause>) -> Result<Vec<ParseNode>, ParseError> {
         let mut tail: Vec<ParseNode> = Vec::new();
+        let mut levels: u16 = 0;
         for clause in clauses.into_iter().rev() {
             match clause.test {
                 Some(test) => {
+                    // Account for the extra nesting level this clause adds to
+                    // the result tree.
+                    self.decr_depth_remaining(|| test.range())?;
+                    levels += 1;
                     let test = self.parse_expression(test)?;
                     let body = self.parse_statements(clause.body)?;
                     let or_else = tail;
-                    let nested = Node::If { test, body, or_else };
-                    tail = vec![nested];
+                    tail = vec![Node::If { test, body, or_else }];
                 }
                 None => {
                     tail = self.parse_statements(clause.body)?;
                 }
             }
         }
+        self.depth_remaining += levels;
         Ok(tail)
     }
 
@@ -241,59 +345,41 @@ impl<'a> Parser<'a> {
     fn parse_statement_impl(&mut self, statement: Stmt) -> Result<ParseNode, ParseError> {
         match statement {
             Stmt::FunctionDef(function) => {
-                let params = &function.parameters;
-
-                // Parse positional-only parameters (before /)
-                let pos_args = self.parse_params_with_defaults(&params.posonlyargs)?;
-
-                // Parse positional-or-keyword parameters
-                let args = self.parse_params_with_defaults(&params.args)?;
-
-                // Parse *args
-                let var_args = params.vararg.as_ref().map(|p| self.interner.intern(&p.name.id));
-
-                // Parse keyword-only parameters (after * or *args)
-                let kwargs = self.parse_params_with_defaults(&params.kwonlyargs)?;
-
-                // Parse **kwargs
-                let var_kwargs = params.kwarg.as_ref().map(|p| self.interner.intern(&p.name.id));
-
-                let signature = ParsedSignature {
-                    pos_args,
-                    args,
-                    var_args,
-                    kwargs,
-                    var_kwargs,
-                };
-
-                let name = self.identifier(&function.name.id, function.name.range);
-                // Parse function body recursively
-                let body = self.parse_statements(function.body)?;
-                let is_async = function.is_async;
-
-                Ok(Node::FunctionDef(RawFunctionDef {
-                    name,
-                    signature,
-                    body,
-                    is_async,
-                }))
+                let (def, decorators) = self.parse_function_def(function)?;
+                Ok(Node::FunctionDef { def, decorators })
             }
-            Stmt::ClassDef(c) => Err(ParseError::not_implemented(
-                "class definitions",
-                self.convert_range(c.range),
-            )),
-            Stmt::Return(ast::StmtReturn { value, .. }) => match value {
-                Some(value) => Ok(Node::Return(self.parse_expression(*value)?)),
-                None => Ok(Node::ReturnNone),
-            },
+            Stmt::ClassDef(c) => self.parse_class_def(c),
+            Stmt::Return(ast::StmtReturn { value, .. }) => Ok(Node::Return(match value {
+                Some(value) => Some(self.parse_expression(*value)?),
+                None => None,
+            })),
             Stmt::Delete(d) => Err(ParseError::not_implemented(
                 "the 'del' statement",
                 self.convert_range(d.range),
             )),
             Stmt::TypeAlias(t) => Err(ParseError::not_implemented("type aliases", self.convert_range(t.range))),
             Stmt::Assign(ast::StmtAssign {
-                targets, value, range, ..
-            }) => self.parse_assignment(first(targets, self.convert_range(range))?, *value),
+                mut targets,
+                value,
+                range,
+                ..
+            }) => {
+                // Ruff represents chained assignments (`a = b = 1`) as a single
+                // `StmtAssign` with multiple targets. For the common single-target
+                // case we produce the existing per-shape nodes so the hot path stays
+                // flat; only chained assignments are lowered into `Node::ChainAssign`.
+                match targets.len() {
+                    0 => Err(ParseError::syntax(
+                        "Assignment with no targets".to_string(),
+                        self.convert_range(range),
+                    )),
+                    1 => {
+                        let target = targets.pop().expect("len == 1");
+                        self.parse_assignment(target, *value)
+                    }
+                    _ => self.parse_chained_assignment(targets, *value),
+                }
+            }
             Stmt::AugAssign(ast::StmtAugAssign { target, op, value, .. }) => {
                 let op = convert_op(op);
                 let value = self.parse_expression(*value)?;
@@ -371,18 +457,74 @@ impl<'a> Parser<'a> {
                 let or_else = self.parse_elif_else_clauses(elif_else_clauses)?;
                 Ok(Node::If { test, body, or_else })
             }
-            Stmt::With(ast::StmtWith { is_async, range, .. }) => {
+            Stmt::With(ast::StmtWith {
+                is_async,
+                items,
+                body,
+                range,
+                ..
+            }) => {
                 if is_async {
-                    Err(ParseError::not_implemented(
+                    return Err(ParseError::not_implemented(
                         "async context managers (async with)",
                         self.convert_range(range),
-                    ))
-                } else {
-                    Err(ParseError::not_implemented(
-                        "context managers (with statements)",
-                        self.convert_range(range),
-                    ))
+                    ));
                 }
+                if items.is_empty() {
+                    return Err(ParseError::syntax(
+                        "with statement requires at least one context manager",
+                        self.convert_range(range),
+                    ));
+                }
+                // Multi-item `with a() as x, b() as y:` is desugared into nested
+                // `with` blocks at parse time: the outer `with` runs `a()` and
+                // wraps an inner `with` running `b()`, which wraps the user body.
+                // CPython evaluates context exprs left-to-right and exits them
+                // right-to-left, which is exactly the nested-block semantics —
+                // so the lowering is faithful and avoids needing multi-context
+                // support in the compiler / VM.
+                let position = self.convert_range(range);
+                let body = self.parse_statements(body)?;
+                let mut parsed_items: Vec<(ExprLoc, Option<UnpackTarget>)> = items
+                    .into_iter()
+                    .map(|item| -> Result<_, ParseError> {
+                        let context = self.parse_expression(item.context_expr)?;
+                        let target = match item.optional_vars {
+                            Some(expr) => Some(self.parse_unpack_target(*expr)?),
+                            None => None,
+                        };
+                        Ok((context, target))
+                    })
+                    .collect::<Result<_, _>>()?;
+                // Fold from the innermost outward: the last item wraps the user
+                // body; each outer item wraps the freshly-built inner `with`.
+                //
+                // Each synthetic nesting level must be charged against the parser
+                // depth budget so a flat `with a, b, c, ...:` statement cannot
+                // bypass `MAX_NESTING_DEPTH` and produce an AST that later
+                // overflows the host stack during prepare/compile. The budget is
+                // restored on success to avoid penalizing sibling statements, in
+                // the same pattern used by `parse_elif_else_clauses`.
+                let (last_context, last_target) = parsed_items.pop().expect("checked non-empty above");
+                let mut node = Node::With {
+                    context: last_context,
+                    target: last_target,
+                    body,
+                    position,
+                };
+                let mut levels: u16 = 0;
+                while let Some((context, target)) = parsed_items.pop() {
+                    self.decr_depth_remaining(|| range)?;
+                    levels += 1;
+                    node = Node::With {
+                        context,
+                        target,
+                        body: vec![node],
+                        position,
+                    };
+                }
+                self.depth_remaining += levels;
+                Ok(node)
             }
             Stmt::Match(m) => Err(ParseError::not_implemented(
                 "pattern matching (match statements)",
@@ -459,6 +601,40 @@ impl<'a> Parser<'a> {
                 ..
             }) => {
                 let position = self.convert_range(range);
+                // Compiler directives, not real imports: they bind nothing and lower
+                // to a no-op, so real-world modules import cleanly. Anything Monty
+                // does not implement is rejected rather than quietly failing to do
+                // what it says. `level == 0` keeps `from .__future__ import x` an
+                // ordinary relative import, falling through to the `ImportError`.
+                if level == 0 && module.as_ref().is_some_and(|m| m.as_str() == "__future__") {
+                    return match names
+                        .iter()
+                        .find(|a| a.asname.is_some() || !SUPPORTED_FUTURES.contains(&a.name.id.as_str()))
+                    {
+                        Some(alias) if UNSUPPORTED_FUTURES.contains(&alias.name.id.as_str()) => {
+                            Err(ParseError::not_implemented(
+                                format!("the '{}' future feature", alias.name.id),
+                                self.convert_range(alias.range),
+                            ))
+                        }
+                        // Name checks come first so an aliased unknown feature is
+                        // reported as undefined, as CPython does.
+                        Some(alias) if !SUPPORTED_FUTURES.contains(&alias.name.id.as_str()) => Err(ParseError::syntax(
+                            format!("future feature {} is not defined", alias.name.id),
+                            self.convert_range(alias.range),
+                        )),
+                        // A known feature, so the alias is what selected it. An
+                        // alias asks to bind a name and a no-op binds nothing, so
+                        // accepting it would fail exactly the way this branch
+                        // exists to prevent — the `NameError` would surface later,
+                        // far from the import.
+                        Some(alias) => Err(ParseError::not_implemented(
+                            "aliasing a `__future__` feature",
+                            self.convert_range(alias.range),
+                        )),
+                        None => Ok(Node::Pass),
+                    };
+                }
                 // We only support absolute imports (level 0)
                 if level != 0 {
                     return Err(ParseError::import_error(
@@ -536,58 +712,478 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `lhs = rhs` -> `lhs, rhs`
-    /// Handles simple assignments (x = value), subscript assignments (dict[key] = value),
-    /// attribute assignments (obj.attr = value), and tuple unpacking (a, b = value)
+    /// Parses a `def` into a [`RawFunctionDef`] plus its decorators.
+    ///
+    /// Shared by the top-level `Stmt::FunctionDef` arm and by class-body method
+    /// parsing in [`parse_class_def`](Self::parse_class_def). The decorators are
+    /// returned separately because they belong to the statement, not the function
+    /// (see [`Node::FunctionDef`]); the class-body path rejects decorated methods
+    /// before calling here, so it always receives an empty list.
+    fn parse_function_def(
+        &mut self,
+        function: ast::StmtFunctionDef,
+    ) -> Result<(RawFunctionDef, Vec<ExprLoc>), ParseError> {
+        let decorators = self.parse_decorators(function.decorator_list)?;
+
+        let params = &function.parameters;
+
+        // Parse positional-only parameters (before /)
+        let pos_args = self.parse_params_with_defaults(&params.posonlyargs)?;
+
+        // Parse positional-or-keyword parameters
+        let args = self.parse_params_with_defaults(&params.args)?;
+
+        // Parse *args
+        let var_args = params.vararg.as_ref().map(|p| self.interner.intern(&p.name.id));
+
+        // Parse keyword-only parameters (after * or *args)
+        let kwargs = self.parse_params_with_defaults(&params.kwonlyargs)?;
+
+        // Parse **kwargs
+        let var_kwargs = params.kwarg.as_ref().map(|p| self.interner.intern(&p.name.id));
+
+        let signature = ParsedSignature {
+            pos_args,
+            args,
+            var_args,
+            kwargs,
+            var_kwargs,
+        };
+
+        let name = self.identifier(&function.name.id, function.name.range);
+        // Parse function body recursively
+        let body = self.parse_statements(function.body)?;
+        let is_async = function.is_async;
+
+        Ok((
+            RawFunctionDef {
+                name,
+                signature,
+                body,
+                is_async,
+            },
+            decorators,
+        ))
+    }
+
+    /// Parses decorator expressions in source order.
+    ///
+    /// They are ordinary expressions evaluated in the enclosing scope; the
+    /// compiler emits the applying calls after building the decorated value.
+    /// Shared by [`parse_function_def`](Self::parse_function_def) and
+    /// [`parse_class_def`](Self::parse_class_def).
+    fn parse_decorators(
+        &mut self,
+        decorators: impl IntoIterator<Item = ast::Decorator>,
+    ) -> Result<Vec<ExprLoc>, ParseError> {
+        decorators
+            .into_iter()
+            .map(|d| self.parse_expression(d.expression))
+            .collect()
+    }
+
+    /// Parses a `class Foo: ...` definition into a [`Node::ClassDef`].
+    ///
+    /// The class body is modelled as a synthetic zero-argument function (like
+    /// CPython's class-body code object): the class statements are collected in
+    /// source order into a [`RawFunctionDef`] that, when prepared and compiled,
+    /// runs in its own scope and returns the assembled `Class`. Methods become
+    /// nested `FunctionDef`s; class variables become `Assign`s with arbitrary
+    /// expressions (`name = <expr>` / `name: T = <expr>`). Every member name is
+    /// recorded in `members`, in source order, for namespace assembly.
+    ///
+    /// `pass` and `...` are ignored; a leading docstring becomes a `__doc__`
+    /// member, and annotated names a stringized `__annotations__`. Class
+    /// decorators are supported (enclosing scope, applied bottom-up);
+    /// inheritance, function/method decorators, and anything else in the body
+    /// are rejected as not-implemented, reserving the syntax for later.
+    fn parse_class_def(&mut self, class: ast::StmtClassDef) -> Result<ParseNode, ParseError> {
+        let position = self.class_keyword_range(&class);
+        let decorators = self.parse_decorators(class.decorator_list)?;
+        // `class.arguments` carries base classes and metaclass keywords.
+        if class
+            .arguments
+            .is_some_and(|a| !a.args.is_empty() || !a.keywords.is_empty())
+        {
+            return Err(ParseError::not_implemented(
+                "class inheritance and metaclasses",
+                position,
+            ));
+        }
+
+        let name = self.identifier(&class.name.id, class.name.range);
+        // The class-body statements (in source order) and the member names they
+        // bind. Both methods and class vars are ordinary bindings of the body
+        // scope; `members` records the order so the compiler can assemble the
+        // namespace dict from the body's locals.
+        let mut body = Vec::new();
+        let mut members = Vec::new();
+        // `(name, "source text")` pairs assembled into `__annotations__` below;
+        // always stringized (PEP 563). See `limitations/typing.md`.
+        let mut annotations: Vec<DictItem> = Vec::new();
+
+        // CPython stores the class docstring as a real `__doc__` entry in the
+        // class dict (`None` when absent), so synthesize a `__doc__ = <docstring
+        // or None>` binding as the first class-body statement — `Foo.__doc__` and
+        // `obj.__doc__` then work through ordinary namespace lookup. An explicit
+        // `__doc__ = ...` later in the body overwrites it, as in CPython.
+        let doc_target = Identifier::new(self.interner.intern("__doc__"), self.convert_range(class.name.range));
+        let mut doc_value = ExprLoc::new(self.convert_range(class.name.range), Expr::Literal(Literal::None));
+
+        for (i, stmt) in class.body.into_iter().enumerate() {
+            match stmt {
+                Stmt::FunctionDef(function) => {
+                    if !function.decorator_list.is_empty() {
+                        return Err(ParseError::not_implemented(
+                            "method decorators (classmethod/staticmethod/property)",
+                            self.convert_range(function.range),
+                        ));
+                    }
+                    // Parameter defaults evaluate in the class-body scope, so a
+                    // walrus target there would become a class member (see
+                    // `reject_class_body_walrus`); walrus in the method *body*
+                    // binds in the method scope and is fine.
+                    for param in function.parameters.iter_non_variadic_params() {
+                        if let Some(default) = &param.default {
+                            self.reject_class_body_walrus(default)?;
+                        }
+                    }
+                    let (method, decorators) = self.parse_function_def(function)?;
+                    // Rejected above, so a decorated method never reaches the
+                    // class namespace — where a decorator's return value, not a
+                    // function, would end up bound as the member.
+                    debug_assert!(decorators.is_empty(), "method decorators are rejected above");
+                    members.push(method.name);
+                    body.push(Node::FunctionDef {
+                        def: method,
+                        decorators,
+                    });
+                }
+                // `name = <expr>` — a class-level variable.
+                Stmt::Assign(ast::StmtAssign {
+                    targets, value, range, ..
+                }) => {
+                    let [
+                        AstExpr::Name(ast::ExprName {
+                            id, range: name_range, ..
+                        }),
+                    ] = targets.as_slice()
+                    else {
+                        return Err(ParseError::not_implemented(
+                            "complex class variable targets (only `name = <expr>` is allowed)",
+                            self.convert_range(range),
+                        ));
+                    };
+                    let ident = self.identifier(id, *name_range);
+                    self.parse_class_var(ident, *value, &mut members, &mut body)?;
+                }
+                // `name: T [= <expr>]` — an annotated class-level name. The
+                // annotation is recorded (stringized) in `__annotations__`; a
+                // value additionally makes it a class variable. A bare `name: T`
+                // records the annotation but binds no value (matching CPython).
+                Stmt::AnnAssign(ast::StmtAnnAssign {
+                    target,
+                    mut annotation,
+                    value,
+                    range,
+                    ..
+                }) => {
+                    if let AstExpr::Name(ast::ExprName {
+                        id, range: name_range, ..
+                    }) = *target
+                    {
+                        let ident = self.identifier(&id, name_range);
+                        annotations.push(self.parse_class_annotation(ident, &mut annotation)?);
+                        if let Some(value) = value {
+                            self.parse_class_var(ident, *value, &mut members, &mut body)?;
+                        }
+                    } else if value.is_some() {
+                        // Complex target with a value (`x.y: T = v`) is unsupported;
+                        // a bare complex annotation (`x.y: T`) stores nothing in
+                        // CPython either, so it is ignored. CPython does still
+                        // evaluate the target expression (`undefined.attr: T` raises
+                        // `NameError`) where Monty drops it — see
+                        // `limitations/typing.md`.
+                        return Err(ParseError::not_implemented(
+                            "complex class variable targets (only `name = <expr>` is allowed)",
+                            self.convert_range(range),
+                        ));
+                    }
+                }
+                // `pass` and `...` (the common `class C: ...` stub idiom) are
+                // no-ops. A leading string literal is the class docstring and
+                // becomes the synthesized `__doc__` value; later bare string
+                // literals are no-ops.
+                Stmt::Pass(_) => {}
+                Stmt::Expr(ast::StmtExpr { value, .. })
+                    if matches!(*value, AstExpr::StringLiteral(_) | AstExpr::EllipsisLiteral(_)) =>
+                {
+                    if i == 0 && matches!(*value, AstExpr::StringLiteral(_)) {
+                        doc_value = self.parse_expression(*value)?;
+                    }
+                }
+                other => {
+                    return Err(ParseError::not_implemented(
+                        "class bodies containing anything other than methods and simple class variables",
+                        self.convert_range(other.range()),
+                    ));
+                }
+            }
+        }
+
+        // The synthesized `__doc__` binding runs first (like CPython's docstring
+        // store); the namespace assembly loads final local values, so an explicit
+        // `__doc__` member still wins.
+        members.insert(0, doc_target);
+        body.insert(
+            0,
+            Node::Assign {
+                target: doc_target,
+                object: doc_value,
+            },
+        );
+
+        // Last statement so the values are assembled after all members exist.
+        // Always present (empty dict) to match `Cls.__annotations__ == {}`.
+        let annotations_target = Identifier::new(self.interner.intern("__annotations__"), position);
+        let body_binds_annotations = members.iter().any(|m| m.name_id == annotations_target.name_id);
+        if body_binds_annotations && !annotations.is_empty() {
+            // Being last, the synthetic assignment would clobber the body's own
+            // binding and lose these entries. CPython stores into whatever the name
+            // holds instead — merging into a dict, `TypeError` otherwise.
+            return Err(ParseError::not_implemented(
+                "assigning `__annotations__` in a class body with annotated names",
+                position,
+            ));
+        }
+        // With nothing to store, the body's own binding stands — synthesizing an
+        // empty dict over it would break class bodies CPython accepts.
+        if !body_binds_annotations {
+            members.push(annotations_target);
+            body.push(Node::Assign {
+                target: annotations_target,
+                object: ExprLoc::new(position, Expr::Dict(annotations)),
+            });
+        }
+
+        // Wrap the body statements in a synthetic zero-arg function. The class
+        // name's `name_id` is reused for nicer tracebacks; this function is never
+        // registered in any scope (`prepare_class_def` prepares it directly,
+        // without binding a function name).
+        let body = RawFunctionDef {
+            name,
+            signature: ParsedSignature::default(),
+            body,
+            is_async: false,
+        };
+
+        Ok(Node::ClassDef {
+            name,
+            body,
+            members,
+            decorators,
+            position,
+        })
+    }
+
+    /// The range of a `class` statement from the `class` keyword, excluding
+    /// decorators: ruff's `StmtClassDef::range` starts at the first decorator
+    /// where CPython starts at the keyword, which would otherwise show decorator
+    /// lines in a class-body traceback frame.
+    ///
+    /// The keyword is located from the lexer's tokens rather than by searching the
+    /// source text, so a `class` inside a comment or a decorator's string argument
+    /// cannot be mistaken for it. Offsets are ascending, so this class's keyword is
+    /// simply the first one at or after its final decorator.
+    fn class_keyword_range(&self, class: &ast::StmtClassDef) -> CodeRange {
+        let start = match class.decorator_list.last() {
+            // Undecorated: ruff's range already starts at the keyword.
+            None => class.range.start().into(),
+            Some(last_decorator) => {
+                let after_decorators = last_decorator.range.end();
+                let index = self.class_keyword_offsets.partition_point(|&o| o < after_decorators);
+                // Bounded by the name so a malformed lookup cannot borrow a later
+                // class's keyword; the fallback is unreachable (a decorated class
+                // always has a keyword in this window) but avoids a panic path.
+                self.class_keyword_offsets
+                    .get(index)
+                    .filter(|&&offset| offset < class.name.range.start())
+                    .map_or_else(|| class.range.start().into(), |&offset| offset.into())
+            }
+        };
+        CodeRange {
+            filename: self.filename_id,
+            start_byte: start,
+            end_byte: class.range.end().into(),
+        }
+    }
+
+    /// Builds the `'name': 'annotation'` pair for one annotated class-body name.
+    ///
+    /// The annotation is stringized rather than evaluated (see
+    /// `limitations/typing.md`); [`stringize_annotation`] owns rendering it back
+    /// to the text CPython would store.
+    ///
+    /// The annotation never reaches [`Parser::parse_expression`], so the depth
+    /// check guarding stringization's two recursive passes is made here.
+    fn parse_class_annotation(&mut self, ident: Identifier, annotation: &mut AstExpr) -> Result<DictItem, ParseError> {
+        self.check_expression_depth(annotation)?;
+        let ann_range = annotation.range();
+        let ann_id = self.interner.intern(&stringize_annotation(annotation));
+        Ok(DictItem::Pair(
+            ExprLoc::new(ident.position, Expr::Literal(Literal::Str(ident.name_id))),
+            ExprLoc::new(self.convert_range(ann_range), Expr::Literal(Literal::Str(ann_id))),
+        ))
+    }
+
+    /// Parses a class-variable value and records the binding: rejects class-scope
+    /// walrus, parses the value expression, and appends the member / `Assign` pair
+    /// shared by the `Assign` and `AnnAssign` class-body arms.
+    fn parse_class_var(
+        &mut self,
+        ident: Identifier,
+        value: AstExpr,
+        members: &mut Vec<Identifier>,
+        body: &mut Vec<ParseNode>,
+    ) -> Result<(), ParseError> {
+        self.reject_class_body_walrus(&value)?;
+        let object = self.parse_expression(value)?;
+        members.push(ident);
+        body.push(Node::Assign { target: ident, object });
+        Ok(())
+    }
+
+    /// Rejects `:=` that binds in a class-body scope (in class-variable values
+    /// and method parameter defaults).
+    ///
+    /// A walrus target in such an expression binds in the class body, so in
+    /// CPython it becomes a class member (`class C: x = (y := 5)` gives `C.y`).
+    /// Monty's namespace assembly only records directly-assigned names, so the
+    /// binding would be silently dropped — reject the syntax until class-scope
+    /// walrus is implemented. A walrus inside a lambda *body* binds in the
+    /// lambda's own scope and is allowed (see [`contains_class_scope_walrus`]).
+    /// The depth check comes first: the search recurses over the raw ruff AST,
+    /// which `parse_expression` has not yet bounded.
+    fn reject_class_body_walrus(&self, expr: &AstExpr) -> Result<(), ParseError> {
+        self.check_expression_depth(expr)?;
+        if contains_class_scope_walrus(expr) {
+            Err(ParseError::not_implemented(
+                "assignment expressions (`:=`) in class bodies",
+                self.convert_range(expr.range()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// `lhs = rhs` — parses a single-target assignment into the appropriate `Node` variant.
+    ///
+    /// Dispatches on the shape of `lhs` by delegating to `parse_assign_target`, then wraps
+    /// the resulting `AssignTarget` together with the parsed RHS into one of the flat
+    /// per-shape node variants (`Assign`/`SubscriptAssign`/`AttrAssign`/`UnpackAssign`).
+    /// Handles simple assignments (`x = value`), subscript assignments (`dict[key] = value`),
+    /// attribute assignments (`obj.attr = value`), and tuple/list unpacking (`a, b = value`).
     fn parse_assignment(&mut self, lhs: AstExpr, rhs: AstExpr) -> Result<ParseNode, ParseError> {
+        // Parse the target first so sub-expression evaluation order (container, index, ...)
+        // stays consistent with per-shape parsing done before the refactor.
+        let target = self.parse_assign_target(lhs)?;
+        let rhs = self.parse_expression(rhs)?;
+        let node = match target {
+            AssignTarget::Name(target) => Node::Assign { target, object: rhs },
+            AssignTarget::Subscript {
+                target,
+                index,
+                target_position,
+            } => Node::SubscriptAssign {
+                target,
+                index,
+                value: rhs,
+                target_position,
+            },
+            AssignTarget::Attr {
+                object,
+                attr,
+                target_position,
+            } => Node::AttrAssign {
+                object,
+                attr,
+                target_position,
+                value: rhs,
+            },
+            AssignTarget::Unpack {
+                targets,
+                targets_position,
+            } => Node::UnpackAssign {
+                targets,
+                targets_position,
+                object: rhs,
+            },
+        };
+        Ok(node)
+    }
+
+    /// Parses a chained assignment like `a = b = c = value` into a `Node::ChainAssign`.
+    ///
+    /// The right-hand side `rhs` is evaluated once, and each entry in `targets` receives
+    /// the resulting value in left-to-right order. Each target may be any valid assignment
+    /// LHS — a name, subscript, attribute, or unpack pattern — mirroring the shapes handled
+    /// by `parse_assignment`.
+    fn parse_chained_assignment(&mut self, targets: Vec<AstExpr>, rhs: AstExpr) -> Result<ParseNode, ParseError> {
+        let parsed_targets = targets
+            .into_iter()
+            .map(|t| self.parse_assign_target(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let object = self.parse_expression(rhs)?;
+        Ok(Node::ChainAssign {
+            targets: parsed_targets,
+            object,
+        })
+    }
+
+    /// Parses a single assignment target expression into an `AssignTarget`.
+    ///
+    /// Central dispatch for assignment-target shapes, shared by `parse_assignment`
+    /// (for single-target and annotation-driven assignments) and
+    /// `parse_chained_assignment` (for `a = b = value`). Keeping shape dispatch in one
+    /// place means adding a new target form only requires updating this function and
+    /// its downstream consumers (prepare and compiler).
+    fn parse_assign_target(&mut self, lhs: AstExpr) -> Result<AssignTarget, ParseError> {
         match lhs {
-            // Subscript assignment like dict[key] = value
             AstExpr::Subscript(ast::ExprSubscript {
                 value, slice, range, ..
-            }) => Ok(Node::SubscriptAssign {
+            }) => Ok(AssignTarget::Subscript {
                 target: self.parse_expression(*value)?,
                 index: self.parse_expression(*slice)?,
-                value: self.parse_expression(rhs)?,
                 target_position: self.convert_range(range),
             }),
-            // Attribute assignment like obj.attr = value (supports chained like a.b.c = value)
-            AstExpr::Attribute(ast::ExprAttribute { value, attr, range, .. }) => Ok(Node::AttrAssign {
+            AstExpr::Attribute(ast::ExprAttribute { value, attr, range, .. }) => Ok(AssignTarget::Attr {
                 object: self.parse_expression(*value)?,
                 attr: EitherStr::Interned(self.interner.intern(attr.id())),
                 target_position: self.convert_range(range),
-                value: self.parse_expression(rhs)?,
             }),
-            // Tuple unpacking like a, b = value or (a, b), c = nested
             AstExpr::Tuple(ast::ExprTuple { elts, range, .. }) => {
                 let targets_position = self.convert_range(range);
                 let targets = elts
                     .into_iter()
-                    .map(|e| self.parse_unpack_target(e)) // Use parse_unpack_target for recursion
+                    .map(|e| self.parse_unpack_target(e))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Node::UnpackAssign {
+                Ok(AssignTarget::Unpack {
                     targets,
                     targets_position,
-                    object: self.parse_expression(rhs)?,
                 })
             }
-            // List unpacking like [a, b] = value or [a, *rest] = value
             AstExpr::List(ast::ExprList { elts, range, .. }) => {
                 let targets_position = self.convert_range(range);
                 let targets = elts
                     .into_iter()
                     .map(|e| self.parse_unpack_target(e))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Node::UnpackAssign {
+                Ok(AssignTarget::Unpack {
                     targets,
                     targets_position,
-                    object: self.parse_expression(rhs)?,
                 })
             }
-            // Simple identifier assignment like x = value
-            _ => Ok(Node::Assign {
-                target: self.parse_identifier(lhs)?,
-                object: self.parse_expression(rhs)?,
-            }),
+            other => Ok(AssignTarget::Name(self.parse_identifier(other)?)),
         }
     }
 
@@ -606,7 +1202,14 @@ impl<'a> Parser<'a> {
         match expression {
             AstExpr::BoolOp(ast::ExprBoolOp { op, values, range, .. }) => {
                 // Handle chained boolean operations like `a and b and c` by right-folding
-                // into nested binary operations: `a and (b and c)`
+                // into nested binary operations: `a and (b and c)`.
+                //
+                // Ruff hands the operands over as a flat `Vec`, but the fold
+                // produces a right-nested `Expr::Op` tree that the prepare and
+                // compile phases walk recursively. Count each fold step against
+                // the same depth budget that bounds explicitly nested source so
+                // a long flat chain cannot overflow the host's native stack
+                // downstream. The budget is restored once the fold completes.
                 let rust_op = convert_bool_op(op);
                 let position = self.convert_range(range);
                 let mut values_iter = values.into_iter().rev();
@@ -616,7 +1219,10 @@ impl<'a> Parser<'a> {
                 let mut result = self.parse_expression(last_value)?;
 
                 // Fold from right to left
+                let mut levels: u16 = 0;
                 for value in values_iter {
+                    self.decr_depth_remaining(|| value.range())?;
+                    levels += 1;
                     let left = Box::new(self.parse_expression(value)?);
                     result = ExprLoc::new(
                         position,
@@ -627,6 +1233,7 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
+                self.depth_remaining += levels;
                 Ok(result)
             }
             AstExpr::Named(ast::ExprNamed {
@@ -771,7 +1378,11 @@ impl<'a> Parser<'a> {
                 let generators = self.parse_comprehension_generators(generators)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::ListComp { elt, generators },
+                    Expr::ListComp {
+                        elt,
+                        generators,
+                        captured_slots: Vec::new(),
+                    },
                 ))
             }
             AstExpr::SetComp(ast::ExprSetComp {
@@ -781,7 +1392,11 @@ impl<'a> Parser<'a> {
                 let generators = self.parse_comprehension_generators(generators)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::SetComp { elt, generators },
+                    Expr::SetComp {
+                        elt,
+                        generators,
+                        captured_slots: Vec::new(),
+                    },
                 ))
             }
             AstExpr::DictComp(ast::ExprDictComp {
@@ -791,12 +1406,28 @@ impl<'a> Parser<'a> {
                 range,
                 ..
             }) => {
+                // Ruff models the key as `Option<Box<Expr>>` to represent the
+                // invalid `{**v for ...}` form during error recovery. Real Python
+                // forbids dict unpacking in a comprehension, so ruff also emits a
+                // syntax error for that case; treat `None` here as the same syntax
+                // error to keep behavior consistent if it ever leaks through.
+                let key = key.ok_or_else(|| {
+                    ParseError::syntax(
+                        "dict unpacking is not allowed in dict comprehension".to_string(),
+                        self.convert_range(range),
+                    )
+                })?;
                 let key = Box::new(self.parse_expression(*key)?);
                 let value = Box::new(self.parse_expression(*value)?);
                 let generators = self.parse_comprehension_generators(generators)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::DictComp { key, value, generators },
+                    Expr::DictComp {
+                        key,
+                        value,
+                        generators,
+                        captured_slots: Vec::new(),
+                    },
                 ))
             }
             AstExpr::Generator(ast::ExprGenerator {
@@ -809,7 +1440,11 @@ impl<'a> Parser<'a> {
                 let generators = self.parse_comprehension_generators(generators)?;
                 Ok(ExprLoc::new(
                     self.convert_range(range),
-                    Expr::ListComp { elt, generators },
+                    Expr::ListComp {
+                        elt,
+                        generators,
+                        captured_slots: Vec::new(),
+                    },
                 ))
             }
             AstExpr::Await(a) => {
@@ -850,13 +1485,12 @@ impl<'a> Parser<'a> {
                 // Chain comparison: transform to nested And expressions
                 self.parse_chain_comparison(*left, ops_vec, comparators_vec, position)
             }
-            AstExpr::Call(ast::ExprCall {
-                func, arguments, range, ..
-            }) => {
-                let position = self.convert_range(range);
+            AstExpr::Call(call) => {
+                let position = self.convert_range(call.range());
+                let ast::ExprCall { func, arguments, .. } = call;
                 let ast::Arguments { args, keywords, .. } = arguments;
                 let args_vec = args.into_vec();
-                let keywords_vec = keywords.into_vec();
+                let keywords_vec: Vec<_> = keywords.into_iter().collect();
 
                 // Detect whether we need the generalized path (PEP 448):
                 // - multiple *args unpacks, OR
@@ -1174,7 +1808,7 @@ impl<'a> Parser<'a> {
         match ast {
             AstExpr::Name(ast::ExprName { id, range, .. }) => Ok(self.identifier(&id, range)),
             other => Err(ParseError::syntax(
-                format!("Expected name, got {other:?}"),
+                format!("Expected name, got {}", describe_expr_kind(&other)),
                 self.convert_range(other.range()),
             )),
         }
@@ -1275,7 +1909,7 @@ impl<'a> Parser<'a> {
                 Ok(UnpackTarget::Tuple { targets, position })
             }
             other => Err(ParseError::syntax(
-                format!("invalid unpacking target: {other:?}"),
+                format!("invalid unpacking target: {}", describe_expr_kind(&other)),
                 self.convert_range(other.range()),
             )),
         }
@@ -1387,16 +2021,30 @@ impl<'a> Parser<'a> {
             }
             InterpolatedStringElement::Interpolation(interp) => {
                 let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
-                let conversion = convert_conversion_flag(interp.conversion);
                 let format_spec = match &interp.format_spec {
-                    Some(spec) => Some(self.parse_format_spec(spec)?),
+                    Some(spec) => self.parse_format_spec(spec)?,
                     None => None,
                 };
+                let mut conversion = convert_conversion_flag(interp.conversion);
+                // An explicit empty spec (`f"{x=:}"`) collapses to `None` in
+                // `parse_format_spec`, but — unlike the bare debug form
+                // (`f"{x=}"`), which defaults to `repr` — it must format with
+                // `str`. Mark the conversion `Str` so the compiler's repr
+                // default for debug forms is suppressed; this is exact because
+                // `format(x, "")` equals `str(x)` for builtins (the same
+                // equivalence the empty-spec collapse already relies on).
+                if interp.debug_text.is_some()
+                    && matches!(conversion, ConversionFlag::None)
+                    && interp.format_spec.is_some()
+                    && format_spec.is_none()
+                {
+                    conversion = ConversionFlag::Str;
+                }
                 // Extract debug prefix for `=` specifier (e.g., f'{a=}' -> "a=")
                 let debug_prefix = interp.debug_text.as_ref().map(|dt| {
                     let expr_text = &self.code[interp.expression.range()];
                     self.interner
-                        .intern(&format!("{}{}{}", dt.leading, expr_text, dt.trailing))
+                        .intern(&format!("{}{}{}", dt.leading(), expr_text, dt.trailing()))
                 });
                 Ok(FStringPart::Interpolation {
                     expr,
@@ -1410,90 +2058,102 @@ impl<'a> Parser<'a> {
 
     /// Parses a format specification, which may contain nested interpolations.
     ///
-    /// For static specs (no interpolations), parses the format string into a
-    /// `ParsedFormatSpec` at parse time to avoid runtime parsing overhead.
-    fn parse_format_spec(&mut self, spec: &ast::InterpolatedStringFormatSpec) -> Result<FormatSpec, ParseError> {
-        let mut parts = Vec::new();
-        let mut has_interpolation = false;
-
-        for element in &spec.elements {
-            match element {
-                InterpolatedStringElement::Literal(lit) => {
-                    // Intern the literal string
-                    let processed = lit.value.to_string();
-                    let string_id = self.interner.intern(&processed);
-                    parts.push(FStringPart::Literal(string_id));
-                }
-                InterpolatedStringElement::Interpolation(interp) => {
-                    has_interpolation = true;
-                    let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
-                    let conversion = convert_conversion_flag(interp.conversion);
-                    // Format specs within format specs are not allowed in Python,
-                    // and debug_prefix doesn't apply to nested interpolations
-                    parts.push(FStringPart::Interpolation {
-                        expr,
-                        conversion,
-                        format_spec: None,
-                        debug_prefix: None,
-                    });
-                }
-            }
-        }
+    /// Specs with no interpolations take the fast path: their literal text is
+    /// concatenated, parsed, and bit-packed into a single `u64` carried inside
+    /// `FormatSpec::Static`. The compiler then drops this straight into the
+    /// constant pool with no further work, and no per-segment interning is
+    /// performed (the parsed spec is the only thing the bytecode needs).
+    ///
+    /// Two cases force a `FormatSpec::Dynamic`:
+    /// 1. Any nested interpolation (e.g. `f"{x:{width}}"`) — the spec must be
+    ///    materialized at runtime.
+    /// 2. Valid but extreme specs whose width or precision exceed the compact
+    ///    encoding (e.g. `f"{x:>1048576}"`). The concatenated literal text is
+    ///    interned and emitted as a single-literal dynamic spec so the VM
+    ///    re-parses it at runtime.
+    fn parse_format_spec(
+        &mut self,
+        spec: &ast::InterpolatedStringFormatSpec,
+    ) -> Result<Option<FormatSpec>, ParseError> {
+        let has_interpolation = spec
+            .elements
+            .iter()
+            .any(|e| matches!(e, InterpolatedStringElement::Interpolation(_)));
 
         if has_interpolation {
-            Ok(FormatSpec::Dynamic(parts))
-        } else {
-            // Combine all literal parts into a single static string and parse at parse time
-            let static_spec: String = parts
-                .into_iter()
-                .filter_map(|p| {
-                    if let FStringPart::Literal(string_id) = p {
-                        Some(self.interner.get_str(string_id).to_owned())
-                    } else {
-                        None
+            let mut parts = Vec::with_capacity(spec.elements.len());
+            for element in &spec.elements {
+                match element {
+                    InterpolatedStringElement::Literal(lit) => {
+                        let string_id = self.interner.intern(&lit.value);
+                        parts.push(FStringPart::Literal(string_id));
                     }
+                    InterpolatedStringElement::Interpolation(interp) => {
+                        let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
+                        let conversion = convert_conversion_flag(interp.conversion);
+                        // Format specs within format specs are not allowed in Python,
+                        // and debug_prefix doesn't apply to nested interpolations
+                        parts.push(FStringPart::Interpolation {
+                            expr,
+                            conversion,
+                            format_spec: None,
+                            debug_prefix: None,
+                        });
+                    }
+                }
+            }
+            Ok(Some(FormatSpec::Dynamic(parts)))
+        } else {
+            let static_spec: String = spec
+                .elements
+                .iter()
+                .filter_map(|e| match e {
+                    InterpolatedStringElement::Literal(lit) => Some(&*lit.value),
+                    InterpolatedStringElement::Interpolation(_) => None,
                 })
                 .collect();
-            let parsed = static_spec.parse().map_err(|spec_str| {
-                ParseError::syntax(
-                    format!("Invalid format specifier '{spec_str}'"),
-                    self.convert_range(spec.range),
-                )
-            })?;
-            Ok(FormatSpec::Static(parsed))
+            // An empty spec (`f"{x:}"`) is identical to no spec (`f"{x}"`) for
+            // every builtin type — `format(x, "")` is `str(x)`. Emit no spec so
+            // the value takes the plain `str()` path rather than the default
+            // formatter, which diverges for some types (e.g. a bare float would
+            // otherwise go through `g`: `f"{1234567.0:}"` must be `"1234567.0"`,
+            // not `"1.23457e+06"`; a bool must be `"True"`, not `"1"`).
+            if static_spec.is_empty() {
+                return Ok(None);
+            }
+            match static_spec.parse::<ParsedFormatSpec>() {
+                Ok(parsed) => {
+                    if let Some(encoded) = encode_format_spec(&parsed) {
+                        Ok(Some(FormatSpec::Static(encoded)))
+                    } else {
+                        // Valid but too large for the compact encoding — re-parse
+                        // the literal at runtime.
+                        let string_id = self.interner.intern(&static_spec);
+                        Ok(Some(FormatSpec::Dynamic(vec![FStringPart::Literal(string_id)])))
+                    }
+                }
+                // Two kinds of failing spec are deferred to the dynamic
+                // (runtime) path rather than rejected here:
+                //  - one containing `%`, which may be a `strftime` string for a
+                //    date/datetime value (only resolvable once the type is known);
+                //  - one whose error CPython raises as a *runtime* `ValueError`
+                //    with type-dependent or format-time wording (`Unknown format
+                //    code`, grouping conflicts, missing precision) — see
+                //    [`ParseFormatSpecError::defer_to_runtime`]. The VM re-parses
+                //    the literal and raises the matching error.
+                // Genuinely-malformed specs and `usize` overflow still fail at
+                // compile time.
+                Err(err) if static_spec.contains('%') || err.defer_to_runtime() => {
+                    let string_id = self.interner.intern(&static_spec);
+                    Ok(Some(FormatSpec::Dynamic(vec![FStringPart::Literal(string_id)])))
+                }
+                Err(err) => Err(ParseError::syntax(err.to_string(), self.convert_range(spec.range))),
+            }
         }
     }
 
     fn convert_range(&self, range: TextRange) -> CodeRange {
-        let start = range.start().into();
-        let (start_line_no, start_line_start, _) = self.index_to_position(start);
-        let start = CodeLoc::new(start_line_no, start - start_line_start);
-
-        let end = range.end().into();
-        let (end_line_no, end_line_start, _) = self.index_to_position(end);
-        let end = CodeLoc::new(end_line_no, end - end_line_start);
-
-        // Store line number for single-line ranges, None for multi-line
-        let preview_line = if start_line_no == end_line_no {
-            Some(u32::try_from(start_line_no).expect("line number exceeds u32"))
-        } else {
-            None
-        };
-
-        CodeRange::new(self.filename_id, start, end, preview_line)
-    }
-
-    fn index_to_position(&self, index: usize) -> (usize, usize, Option<usize>) {
-        let mut line_start = 0;
-        for (line_no, line_end) in self.line_ends.iter().enumerate() {
-            if index <= *line_end {
-                return (line_no, line_start, Some(*line_end));
-            }
-            line_start = *line_end + 1;
-        }
-        // Content after the last newline (file without trailing newline)
-        // line_ends.len() gives the correct 0-indexed line number
-        (self.line_ends.len(), line_start, None)
+        code_range(self.filename_id, range)
     }
 
     /// Decrements the depth remaining for nested parentheses.
@@ -1504,21 +2164,53 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             let position = self.convert_range(get_range());
-            Err(ParseError::syntax("too many nested parentheses", position))
+            Err(ParseError::syntax("Source is too deeply nested", position))
         }
     }
-}
 
-fn first<T: fmt::Debug>(v: Vec<T>, position: CodeRange) -> Result<T, ParseError> {
-    if v.len() == 1 {
-        v.into_iter()
-            .next()
-            .ok_or_else(|| ParseError::syntax("Expected 1 element, got 0", position))
-    } else {
-        Err(ParseError::syntax(
-            format!("Expected 1 element, got {} (raw: {v:?})", v.len()),
-            position,
-        ))
+    /// Rejects an expression nested deeper than the remaining budget, without
+    /// consuming any of it — for callers that walk a raw ruff expression
+    /// recursively *before* [`Parser::parse_expression`] can bound it.
+    ///
+    /// Ruff builds deeply nested ASTs from flat source (long attribute chains)
+    /// without recursing itself, so such a walk can overflow the host stack at
+    /// compile time. The check stops descending once the budget is exhausted, so
+    /// its own depth is bounded by [`MAX_NESTING_DEPTH`].
+    fn check_expression_depth(&self, expr: &AstExpr) -> Result<(), ParseError> {
+        /// Expression visitor that reports whether the walk ever ran out of budget.
+        struct DepthCheck {
+            remaining: u16,
+            too_deep: bool,
+        }
+        impl<'a> Visitor<'a> for DepthCheck {
+            fn visit_expr(&mut self, expr: &'a AstExpr) {
+                // Nothing is pruned (not even lambda bodies): the guarded walks
+                // reach everywhere, so the bound must too.
+                match self.remaining.checked_sub(1) {
+                    _ if self.too_deep => {}
+                    None => self.too_deep = true,
+                    Some(remaining) => {
+                        self.remaining = remaining;
+                        walk_expr(self, expr);
+                        self.remaining += 1;
+                    }
+                }
+            }
+        }
+
+        let mut check = DepthCheck {
+            remaining: self.depth_remaining,
+            too_deep: false,
+        };
+        check.visit_expr(expr);
+        if check.too_deep {
+            Err(ParseError::syntax(
+                "Source is too deeply nested",
+                self.convert_range(expr.range()),
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1572,59 +2264,117 @@ fn convert_conversion_flag(flag: RuffConversionFlag) -> ConversionFlag {
     }
 }
 
-/// Source code location information for error reporting.
+/// Does `expr` contain a `:=` that binds in the enclosing (class-body) scope?
 ///
-/// Contains filename (as StringId), line/column positions, and optionally a line number for
-/// extracting the preview line from source during traceback formatting.
+/// Like ruff's `any_over_expr`, but scope-aware for lambdas: a walrus inside a
+/// lambda *body* binds in the lambda's own scope (legal CPython, e.g.
+/// `class C: f = lambda: (z := 1)`) and is skipped, while lambda parameter
+/// *defaults* evaluate in the enclosing scope and are still searched.
+/// Comprehensions ARE descended into: CPython also rejects an assignment
+/// expression within a comprehension in a class body (as a `SyntaxError`).
+fn contains_class_scope_walrus(expr: &AstExpr) -> bool {
+    /// Expression visitor that records whether a class-scope-binding walrus
+    /// was seen, pruning lambda bodies from the walk.
+    struct Finder {
+        found: bool,
+    }
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a AstExpr) {
+            match expr {
+                _ if self.found => {}
+                AstExpr::Named(_) => self.found = true,
+                AstExpr::Lambda(lambda) => {
+                    // Only the parameter defaults evaluate in the enclosing scope.
+                    for param in lambda.parameters.iter().flat_map(|p| p.iter_non_variadic_params()) {
+                        if let Some(default) = param.default.as_deref() {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+
+    let mut finder = Finder { found: false };
+    finder.visit_expr(expr);
+    finder.found
+}
+
+/// Short human-readable name for an `AstExpr` variant, for use in
+/// user-facing parse errors. Avoids the Rust `Debug` formatting of the
+/// node, which would leak internal field names, ranges, and struct
+/// layout of `ruff_python_ast` into the error message.
+fn describe_expr_kind(expr: &AstExpr) -> &'static str {
+    match expr {
+        AstExpr::Name(_) => "name",
+        AstExpr::Starred(_) => "starred expression",
+        AstExpr::Attribute(_) => "attribute",
+        AstExpr::Subscript(_) => "subscript",
+        AstExpr::Call(_) => "function call",
+        AstExpr::Tuple(_) => "tuple",
+        AstExpr::List(_) => "list",
+        AstExpr::Set(_) => "set",
+        AstExpr::Dict(_) => "dict",
+        AstExpr::NumberLiteral(_) => "number literal",
+        AstExpr::StringLiteral(_) => "string literal",
+        AstExpr::BytesLiteral(_) => "bytes literal",
+        AstExpr::BooleanLiteral(_) => "boolean literal",
+        AstExpr::NoneLiteral(_) => "None",
+        AstExpr::EllipsisLiteral(_) => "...",
+        AstExpr::FString(_) => "f-string",
+        AstExpr::TString(_) => "t-string",
+        AstExpr::Lambda(_) => "lambda",
+        AstExpr::If(_) => "conditional expression",
+        AstExpr::BoolOp(_) => "boolean expression",
+        AstExpr::BinOp(_) => "binary expression",
+        AstExpr::UnaryOp(_) => "unary expression",
+        AstExpr::Compare(_) => "comparison",
+        AstExpr::Named(_) => "named expression",
+        AstExpr::Yield(_) => "yield expression",
+        AstExpr::YieldFrom(_) => "yield from expression",
+        AstExpr::Await(_) => "await expression",
+        AstExpr::ListComp(_) => "list comprehension",
+        AstExpr::SetComp(_) => "set comprehension",
+        AstExpr::DictComp(_) => "dict comprehension",
+        AstExpr::Generator(_) => "generator expression",
+        AstExpr::Slice(_) => "slice",
+        AstExpr::IpyEscapeCommand(_) => "IPython escape command",
+    }
+}
+
+/// Source code location for a parsed node, stored as raw byte offsets.
 ///
-/// To display the filename, the caller must provide access to the string storage.
+/// `CodeRange` is written by the parser for every AST node and must therefore
+/// be cheap to construct. Storing just byte offsets (matching ruff's native
+/// `TextRange` representation) means producing a `CodeRange` is a single
+/// struct assignment — no line/column resolution, no UTF-8 char iteration,
+/// no line-index lookup.
+///
+/// When a diagnostic (traceback, syntax error) actually needs human-readable
+/// line/column positions or a source preview line, a [`SourceMap`] is built
+/// over the source text once at the diagnostic boundary and used to resolve
+/// byte offsets lazily. This keeps the parse hot path O(1) per node while
+/// preserving exact CPython-compatible column semantics (`chars().count()`
+/// on the relevant line only) at diagnostic time.
 #[derive(Clone, Copy, Default, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct CodeRange {
     /// Interned filename ID - look up in Interns to get the actual string.
     pub filename: StringId,
-    /// Line number (0-indexed) for extracting preview from source. None if range spans multiple lines.
-    preview_line: Option<u32>,
-    start: CodeLoc,
-    end: CodeLoc,
+    /// Byte offset of the range start within the source text.
+    pub start_byte: u32,
+    /// Byte offset of the range end (exclusive) within the source text.
+    pub end_byte: u32,
 }
 
-/// Custom Debug implementation to make displaying code much less verbose.
+/// Custom Debug implementation to keep AST-printing output compact.
 impl fmt::Debug for CodeRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "CodeRange{{filename: {:?}, start: {:?}, end: {:?}}}",
-            self.filename, self.start, self.end
+            "CodeRange{{filename: {:?}, start_byte: {}, end_byte: {}}}",
+            self.filename, self.start_byte, self.end_byte
         )
-    }
-}
-
-impl CodeRange {
-    fn new(filename: StringId, start: CodeLoc, end: CodeLoc, preview_line: Option<u32>) -> Self {
-        Self {
-            filename,
-            preview_line,
-            start,
-            end,
-        }
-    }
-
-    /// Returns the start position.
-    #[must_use]
-    pub fn start(&self) -> CodeLoc {
-        self.start
-    }
-
-    /// Returns the end position.
-    #[must_use]
-    pub fn end(&self) -> CodeLoc {
-        self.end
-    }
-
-    /// Returns the preview line number (0-indexed) if available.
-    #[must_use]
-    pub fn preview_line_number(&self) -> Option<u32> {
-        self.preview_line
     }
 }
 
@@ -1655,7 +2405,7 @@ pub enum ParseError {
 }
 
 impl ParseError {
-    fn not_implemented(msg: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
+    pub(crate) fn not_implemented(msg: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
         Self::NotImplemented {
             msg: msg.into(),
             position,
@@ -1686,26 +2436,31 @@ impl ParseError {
 
 impl ParseError {
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
+        let mut source_map = SourceMap::new(source);
         match self {
-            Self::Syntax { msg, position } => MontyException::new_full(
+            Self::Syntax { msg, position } => MontyException::with_traceback(
                 ExcType::SyntaxError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position_syntax_error(position, filename, source)],
+                vec![StackFrame::from_position_syntax_error(
+                    position,
+                    filename,
+                    &mut source_map,
+                )],
             ),
-            Self::NotImplemented { msg, position } => MontyException::new_full(
+            Self::NotImplemented { msg, position } => MontyException::with_traceback(
                 ExcType::NotImplementedError,
                 Some(format!("The monty syntax parser does not yet support {msg}")),
-                vec![StackFrame::from_position(position, filename, source)],
+                vec![StackFrame::from_position(position, filename, &mut source_map)],
             ),
-            Self::NotSupported { msg, position } => MontyException::new_full(
+            Self::NotSupported { msg, position } => MontyException::with_traceback(
                 ExcType::NotImplementedError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position(position, filename, source)],
+                vec![StackFrame::from_position(position, filename, &mut source_map)],
             ),
-            Self::Import { msg, position } => MontyException::new_full(
+            Self::Import { msg, position } => MontyException::with_traceback(
                 ExcType::ImportError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position_no_caret(position, filename, source)],
+                vec![StackFrame::from_position_no_caret(position, filename, &mut source_map)],
             ),
         }
     }

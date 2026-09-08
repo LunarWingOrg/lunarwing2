@@ -11,22 +11,23 @@
 
 [package]
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 name = "ruff_source_file"
-version = "0.0.0"
+version = "0.0.9"
 authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
 build = false
-publish = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
+description = "This is an internal component crate of Ruff"
 homepage = "https://docs.astral.sh/ruff"
 documentation = "https://docs.astral.sh/ruff"
-readme = false
+readme = "README.md"
 license = "MIT"
 repository = "https://github.com/astral-sh/ruff"
+resolver = "2"
 
 [features]
 get-size = [
@@ -43,13 +44,14 @@ name = "ruff_source_file"
 path = "src/lib.rs"
 
 [dependencies.get-size2]
-version = "0.7.3"
+version = "0.10.3"
 features = [
     "derive",
     "smallvec",
     "hashbrown",
     "compact-str",
     "ordermap",
+    "thin-vec",
 ]
 optional = true
 
@@ -57,7 +59,7 @@ optional = true
 version = "2.7.1"
 
 [dependencies.ruff_text_size]
-path = "../ruff_text_size"
+version = "0.0.9"
 
 [dependencies.serde]
 version = "1.0.197"
@@ -70,6 +72,7 @@ optional = true
 char_lit_as_u8 = "allow"
 collapsible_else_if = "allow"
 collapsible_if = "allow"
+collapsible_match = "allow"
 dbg_macro = "warn"
 debug_assert_with_mut_call = "warn"
 disallowed_methods = "allow"
@@ -80,7 +83,7 @@ get_unwrap = "warn"
 if_not_else = "allow"
 ignore_without_reason = "allow"
 implicit_hasher = "allow"
-large_stack_arrays = "allow"
+iter_over_hash_type = "warn"
 map_unwrap_or = "allow"
 match_same_arms = "allow"
 missing_errors_doc = "allow"

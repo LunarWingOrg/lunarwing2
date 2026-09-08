@@ -51,7 +51,7 @@ impl SourceType {
     pub fn from_extension(ext: &str) -> Self {
         match ext {
             "toml" => Self::Toml(TomlSourceType::Unrecognized),
-            "md" | "qmd" => Self::Markdown,
+            "md" => Self::Markdown,
             _ => Self::Python(PySourceType::from_extension(ext)),
         }
     }
@@ -69,6 +69,9 @@ impl<P: AsRef<Path>> From<P> for SourceType {
             Some(filename) if filename == "pyproject.toml" => Self::Toml(TomlSourceType::Pyproject),
             Some(filename) if filename == "Pipfile" => Self::Toml(TomlSourceType::Pipfile),
             Some(filename) if filename == "poetry.lock" => Self::Toml(TomlSourceType::Poetry),
+            Some(filename) if filename == "ruff.toml" || filename == ".ruff.toml" => {
+                Self::Toml(TomlSourceType::Ruff)
+            }
             _ => Self::from_extension(
                 path.as_ref()
                     .extension()
@@ -83,6 +86,8 @@ impl<P: AsRef<Path>> From<P> for SourceType {
 pub enum TomlSourceType {
     /// The source is a `pyproject.toml`.
     Pyproject,
+    /// The source is a `ruff.toml` or `.ruff.toml`.
+    Ruff,
     /// The source is a `Pipfile`.
     Pipfile,
     /// The source is a `poetry.lock`.

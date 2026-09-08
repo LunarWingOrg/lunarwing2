@@ -1,0 +1,957 @@
+use super::ReserveError;
+
+use core::{cmp, mem, ptr, slice, str};
+
+#[cfg(not(loom))]
+use core::sync::atomic::{Ordering::*, fence};
+#[cfg(loom)]
+use loom::sync::atomic::{Ordering::*, fence};
+
+mod heap_buffer;
+use heap_buffer::HeapBuffer;
+
+mod inline_buffer;
+use inline_buffer::InlineBuffer;
+
+mod static_buffer;
+use static_buffer::StaticBuffer;
+
+mod last_byte;
+use last_byte::LastByte;
+
+mod num_to_repr;
+use num_to_repr::NumToRepr;
+
+pub(crate) const MAX_INLINE_SIZE: usize = 2 * size_of::<usize>();
+
+#[repr(C)]
+#[cfg(target_pointer_width = "64")]
+pub(crate) struct Repr(*const (), [u8; 7], LastByte);
+
+#[repr(C)]
+#[cfg(target_pointer_width = "32")]
+pub(crate) struct Repr(*const (), [u8; 3], LastByte);
+
+const _: () = {
+    assert!(size_of::<Repr>() == MAX_INLINE_SIZE);
+    assert!(size_of::<Option<Repr>>() == MAX_INLINE_SIZE);
+    assert!(align_of::<Repr>() == align_of::<usize>());
+    assert!(align_of::<Option<Repr>>() == align_of::<usize>());
+};
+
+impl Repr {
+    #[inline]
+    pub(crate) const fn new() -> Self {
+        Repr::from_inline(InlineBuffer::empty())
+    }
+
+    #[inline]
+    pub(crate) fn from_str(text: &str) -> Result<Self, ReserveError> {
+        if text.len() <= MAX_INLINE_SIZE {
+            // SAFETY: `text.len()` is less than or equal to `MAX_INLINE_SIZE`
+            Ok(Repr::from_inline(unsafe { InlineBuffer::new(text) }))
+        } else {
+            HeapBuffer::new(text).map(Repr::from_heap)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_exact_str(text: &str) -> Result<Self, ReserveError> {
+        if text.len() <= MAX_INLINE_SIZE {
+            // SAFETY: `text.len()` is less than or equal to `MAX_INLINE_SIZE`.
+            Ok(Repr::from_inline(unsafe { InlineBuffer::new(text) }))
+        } else {
+            HeapBuffer::new_exact(text).map(Repr::from_heap)
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn from_inline_str(text: &str) -> Option<Self> {
+        if text.len() <= MAX_INLINE_SIZE {
+            // SAFETY: `text.len()` is less than or equal to `MAX_INLINE_SIZE`.
+            Some(Repr::from_inline(unsafe { InlineBuffer::new(text) }))
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_exact_heap_str(text: &str) -> Result<Self, ReserveError> {
+        HeapBuffer::new_exact(text).map(Repr::from_heap)
+    }
+
+    #[inline]
+    pub(crate) fn from_exact_joined_slices<T: AsRef<str>>(
+        slices: &[T],
+        separator: &str,
+    ) -> Result<Self, ReserveError> {
+        let separator_len =
+            separator.len().checked_mul(slices.len().saturating_sub(1)).ok_or(ReserveError)?;
+        let text_len = slices.iter().try_fold(separator_len, |len, text| {
+            len.checked_add(text.as_ref().len()).ok_or(ReserveError)
+        })?;
+
+        if text_len <= MAX_INLINE_SIZE {
+            InlineBuffer::from_joined_slices(slices, separator, text_len).map(Repr::from_inline)
+        } else {
+            HeapBuffer::new_exact_joined_slices(slices, separator, text_len).map(Repr::from_heap)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn from_char(ch: char) -> Self {
+        let inline = unsafe {
+            let mut buffer = [0; 4];
+            let str = ch.encode_utf8(&mut buffer);
+            InlineBuffer::new(str)
+        };
+        Repr::from_inline(inline)
+    }
+
+    #[inline]
+    pub(crate) fn from_bool(b: bool) -> Self {
+        // SAFETY: "true" and "false" are short enough (less than 8 bytes) to fit in InlineBuffer.
+        const TRUE: Repr = Repr::from_inline(unsafe { InlineBuffer::new("true") });
+        const FALSE: Repr = Repr::from_inline(unsafe { InlineBuffer::new("false") });
+        if b { TRUE } else { FALSE }
+    }
+
+    #[inline]
+    #[allow(private_bounds)]
+    pub(crate) fn from_num(value: impl NumToRepr) -> Result<Self, ReserveError> {
+        value.into_repr()
+    }
+
+    #[inline]
+    pub(crate) const fn from_static_str(text: &'static str) -> Result<Self, ReserveError> {
+        if text.len() <= MAX_INLINE_SIZE {
+            // SAFETY: `text.len()` is less than or equal to `MAX_INLINE_SIZE`
+            Ok(Repr::from_inline(unsafe { InlineBuffer::new(text) }))
+        } else {
+            // NOTE: .map(Repr::from_heap) is not possible in a `const fn`
+            match StaticBuffer::new(text) {
+                Ok(buffer) => Ok(Repr::from_static(buffer)),
+                Err(e) => Err(e),
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn with_capacity(capacity: usize) -> Result<Self, ReserveError> {
+        if capacity <= MAX_INLINE_SIZE {
+            Ok(Repr::new())
+        } else {
+            HeapBuffer::with_capacity(capacity).map(Repr::from_heap)
+        }
+    }
+
+    /// Converts growable heap storage to exact heap storage.
+    ///
+    /// Inline and static storage are left unchanged. A unique heap allocation is converted with
+    /// `realloc`; shared heap storage is copied into a new exact allocation.
+    pub(crate) fn make_exact(&mut self) -> Result<(), ReserveError> {
+        if !self.is_heap_buffer() {
+            return Ok(());
+        }
+
+        // SAFETY: We just checked that `self` is a heap buffer.
+        let heap = unsafe { self.as_heap_buffer_mut() };
+        debug_assert!(!heap.is_exact());
+
+        if heap.is_unique() {
+            // SAFETY: `heap` is growable and uniquely owned.
+            unsafe { heap.realloc_into_exact() }
+        } else {
+            let new_heap = HeapBuffer::new_exact(heap.as_str())?;
+            // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+            unsafe { heap.release() };
+            *self = Repr::from_heap(new_heap);
+            Ok(())
+        }
+    }
+
+    /// Converts exact heap storage to growable heap storage.
+    ///
+    /// Inline and static storage are left unchanged. A unique heap allocation is converted with
+    /// `realloc`; shared heap storage is copied into a new growable allocation.
+    pub(crate) fn make_growable(&mut self) -> Result<(), ReserveError> {
+        if !self.is_heap_buffer() {
+            return Ok(());
+        }
+
+        // SAFETY: We just checked that `self` is a heap buffer.
+        let heap = unsafe { self.as_heap_buffer_mut() };
+        debug_assert!(heap.is_exact());
+
+        if heap.is_unique() {
+            // SAFETY: `heap` is exact and uniquely owned.
+            unsafe { heap.realloc_into_growable() }
+        } else {
+            let new_heap = HeapBuffer::new(heap.as_str())?;
+            // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+            unsafe { heap.release() };
+            *self = Repr::from_heap(new_heap);
+            Ok(())
+        }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[inline]
+    pub(crate) const fn len(&self) -> usize {
+        let last_byte = self.last_byte();
+
+        let inline_len = {
+            let this = (last_byte as usize).wrapping_sub(LastByte::MASK_1100_0000 as usize);
+            // inline Ord::min because the trait impl is not const
+            if MAX_INLINE_SIZE < this { MAX_INLINE_SIZE } else { this }
+        };
+
+        let mut len = {
+            // SAFETY: `Repr` has the same size as `[usize; 2]` and is aligned as `usize`
+            let tail = unsafe {
+                let ptr = (self as *const _ as *const usize).add(1);
+                usize::from_le(*ptr)
+            };
+            tail & (usize::MAX >> 8)
+        };
+
+        // This code is compiled to a single branchless instruction, such as `cmov`
+        if last_byte < LastByte::ExactHeapMarker as u8 {
+            len = inline_len
+        }
+
+        len
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[inline]
+    pub(crate) const fn len(&self) -> usize {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            unsafe { self.as_heap_buffer() }.len()
+        } else if self.is_static_buffer() {
+            // SAFETY: we just checked that `self` is StaticBuffer
+            unsafe { self.as_static_buffer() }.len()
+        } else {
+            // Remaining is InlineBuffer
+            {
+                let this =
+                    (self.last_byte() as usize).wrapping_sub(LastByte::MASK_1100_0000 as usize);
+                // inline Ord::min because the trait impl is not const
+                if MAX_INLINE_SIZE < this { MAX_INLINE_SIZE } else { this }
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
+    pub(crate) fn capacity(&self) -> usize {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            unsafe { self.as_heap_buffer() }.capacity()
+        } else if self.is_static_buffer() {
+            // SAFETY: we just checked that `self` is StaticBuffer
+            unsafe { self.as_static_buffer() }.len()
+        } else {
+            MAX_INLINE_SIZE
+        }
+    }
+
+    #[inline]
+    pub(crate) const fn as_str(&self) -> &str {
+        // SAFETY: A `Repr` contains valid UTF-8
+        unsafe { str::from_utf8_unchecked(self.as_bytes()) }
+    }
+
+    #[inline]
+    pub(crate) const fn as_bytes(&self) -> &[u8] {
+        let len = self.len();
+
+        let ptr = if self.last_byte() >= LastByte::ExactHeapMarker as u8 {
+            self.0 as *const u8
+        } else {
+            self as *const _ as *const u8
+        };
+
+        // SAFETY: data (`ptr`) is valid, aligned, and part of the same contiguous allocated `len`
+        // chunk
+        unsafe { slice::from_raw_parts(ptr, len) }
+    }
+
+    #[inline]
+    pub(crate) fn content_eq(&self, other: &Self) -> bool {
+        let this = self.as_bytes();
+        let other = other.as_bytes();
+
+        // Shared growable and static buffers can have per-handle logical lengths.
+        this.len() == other.len() && (ptr::eq(this.as_ptr(), other.as_ptr()) || this == other)
+    }
+
+    #[inline]
+    pub(crate) fn content_cmp(&self, other: &Self) -> cmp::Ordering {
+        let this = self.as_bytes();
+        let other = other.as_bytes();
+
+        // Shared growable and static buffers can have per-handle logical lengths. When their data
+        // pointers match, their common prefix is identical and their lengths determine ordering.
+        if ptr::eq(this.as_ptr(), other.as_ptr()) {
+            this.len().cmp(&other.len())
+        } else {
+            this.cmp(other)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn reserve(&mut self, additional: usize) -> Result<(), ReserveError> {
+        if additional == 0 {
+            return Ok(());
+        }
+
+        let len = self.len();
+        let Some(needed_capacity) = len.checked_add(additional) else {
+            return reserve_overflow();
+        };
+
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked that `self` is HeapBuffer
+            let heap = unsafe { self.as_heap_buffer_mut() };
+            debug_assert!(!heap.is_exact());
+
+            if heap.is_unique() {
+                if heap.capacity() >= needed_capacity {
+                    // No need to reserve more capacity.
+                    return Ok(());
+                }
+
+                // SAFETY: We just verified that `heap` is unique, and `len` was read from `self`.
+                unsafe { reserve_unique_heap(heap, len, additional) }
+            } else {
+                // SAFETY: We identified `self` as a heap buffer above.
+                unsafe { reserve_shared_heap(self, additional) }
+            }
+        } else if self.is_static_buffer() {
+            reserve_static(self, additional, needed_capacity)
+        } else if needed_capacity <= MAX_INLINE_SIZE {
+            // An inline buffer already has enough capacity.
+            Ok(())
+        } else {
+            reserve_inline(self, additional)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shrink_to(&mut self, min_capacity: usize) -> Result<(), ReserveError> {
+        // If the buffer is not heap allocated, we can't shrink it.
+        if !self.is_heap_buffer() {
+            return Ok(());
+        }
+
+        // SAFETY: We did early return if the buffer is not HeapBuffer.
+        let heap = unsafe { self.as_heap_buffer_mut() };
+        debug_assert!(!heap.is_exact());
+
+        let new_capacity = heap.len().max(min_capacity);
+        let old_capacity = heap.capacity();
+
+        if new_capacity <= MAX_INLINE_SIZE {
+            // We can convert the HeapBuffer to InlineBuffer.
+            // SAFETY:
+            // `heap.len() <= new_capacity` and `new_capacity <= MAX_INLINE_SIZE`
+            // thus, `heap.len() <= MAX_INLINE_SIZE`
+            let inline = unsafe { InlineBuffer::new(heap.as_str()) };
+            self.replace_inner(Repr::from_inline(inline));
+        } else if new_capacity >= old_capacity {
+            // No need to shrink the buffer.
+        } else if heap.is_unique() {
+            // Try to extend the buffer in place.
+            // SAFETY: `heap` is unique, and `new_capacity < old_capacity`
+            unsafe { heap.realloc(new_capacity)? };
+        } else {
+            // We need to create a new buffer because the current buffer is shared with others.
+            let str = heap.as_str();
+            let new_heap = HeapBuffer::with_exact_capacity(str, new_capacity)?;
+            // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+            unsafe { heap.release() };
+            *self = Repr::from_heap(new_heap);
+        };
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn push_str(&mut self, string: &str) -> Result<(), ReserveError> {
+        if string.is_empty() {
+            return Ok(());
+        }
+        let len = self.len();
+        let str_len = string.len();
+
+        self.reserve(str_len)?;
+
+        // SAFETY:
+        // by calling `self.reserve()`:
+        // - We have reserved enough capacity.
+        // - The buffer is not StaticBuffer.
+        // - If the buffer is HeapBuffer, it must be unique.
+        // The source and destination don't overlap: any shared heap buffer was copied by
+        // `reserve`, and safe Rust can't borrow the same unique buffer as both `&mut self` and
+        // `string`.
+        // After `copy_nonoverlapping`:
+        // - `0..(len + str_len)` is initialized.
+        unsafe {
+            let data = self.as_mut_ptr();
+            ptr::copy_nonoverlapping(string.as_ptr(), data.add(len), str_len);
+            self.set_len(len + str_len);
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn pop(&mut self) -> Result<Option<char>, ReserveError> {
+        let ch = match self.as_str().chars().next_back() {
+            Some(ch) => ch,
+            None => return Ok(None),
+        };
+
+        // SAFETY: We know this is a valid length which falls on a char boundary
+        let new_len = self.len() - ch.len_utf8();
+
+        // SAFETY:
+        // - `new_len` is less than `len()` because we calculated it from `len() - ch.len_utf8()`.
+        // - `new_len` is a valid char boundary because `ch` is a valid char.
+        unsafe { self.truncate_unchecked(new_len) }?;
+
+        Ok(Some(ch))
+    }
+
+    #[inline]
+    pub(crate) fn remove(&mut self, idx: usize) -> Result<char, ReserveError> {
+        assert!(
+            self.as_str().is_char_boundary(idx),
+            "index is not a char boundary or out of bounds (index: {idx})",
+        );
+
+        let len = self.len();
+        assert!(idx < len, "index out of bounds (index: {idx}, len: {len})",);
+
+        // We will modify the buffer, we need to make sure it.
+        self.ensure_modifiable()?;
+
+        // SAFETY: `ensure_modifiable` guarantees that the buffer is not StaticBuffer and that
+        // a heap buffer is unique.
+        let ptr = unsafe { self.as_mut_ptr() };
+
+        // Get the char we want to remove
+        // SAFETY:
+        // - `idx < len`, and `ptr` is valid for `len` initialized bytes.
+        // - `idx` is a character boundary, so the nonempty suffix is valid UTF-8.
+        let ch = unsafe {
+            let suffix = slice::from_raw_parts(ptr.add(idx), len - idx);
+            str::from_utf8_unchecked(suffix).chars().next().unwrap_unchecked()
+        };
+        let ch_len = ch.len_utf8();
+
+        // Remove the char by shifting the rest of the string to the left.
+        // SAFETY:
+        // - Both ranges are within the initialized `0..len` bytes, and `ptr::copy` permits them to
+        //   overlap.
+        // - Removing a complete character leaves valid UTF-8 in `0..len - ch_len`.
+        unsafe {
+            ptr::copy(ptr.add(idx + ch_len), ptr.add(idx), len - idx - ch_len);
+            self.set_len(len - ch_len);
+        }
+
+        Ok(ch)
+    }
+
+    #[inline]
+    pub(crate) fn retain(
+        &mut self,
+        mut predicate: impl FnMut(char) -> bool,
+    ) -> Result<(), ReserveError> {
+        // We will modify the buffer, we need to make sure it.
+        self.ensure_modifiable()?;
+
+        struct SetLenOnDrop<'a> {
+            self_: &'a mut Repr,
+            src_idx: usize,
+            dst_idx: usize,
+        }
+
+        let len = self.len();
+        let mut g = SetLenOnDrop { self_: self, src_idx: 0, dst_idx: 0 };
+
+        // SAFETY: `ensure_modifiable` guarantees that the buffer is not StaticBuffer and that
+        // a heap buffer is unique.
+        let ptr = unsafe { g.self_.as_mut_ptr() };
+
+        while g.src_idx < len {
+            // SAFETY:
+            // - `g.src_idx < len`, and `ptr` is valid for `len` initialized bytes.
+            // - Previous writes end at or before `g.src_idx`, so the untouched suffix remains
+            //   valid UTF-8 and starts on a character boundary.
+            let ch = unsafe {
+                let suffix = slice::from_raw_parts(ptr.add(g.src_idx), len - g.src_idx);
+                str::from_utf8_unchecked(suffix).chars().next().unwrap_unchecked()
+            };
+            let ch_len = ch.len_utf8();
+
+            if predicate(ch) {
+                if g.dst_idx != g.src_idx {
+                    // SAFETY:
+                    // - Both ranges are within the initialized `0..len` bytes.
+                    // - The source is the UTF-8 encoding of `ch`, and `g.dst_idx` is a character
+                    //   boundary. `ptr::copy` permits the ranges to overlap.
+                    unsafe {
+                        ptr::copy(ptr.add(g.src_idx), ptr.add(g.dst_idx), ch_len);
+                    }
+                }
+                g.dst_idx += ch_len;
+            }
+            g.src_idx += ch_len;
+        }
+
+        impl Drop for SetLenOnDrop<'_> {
+            #[inline]
+            fn drop(&mut self) {
+                // SAFETY:
+                // - `dst_idx <= src_idx`, and `src_idx <= len`, so `dst_idx <= len`.
+                // - `dst_idx` doesn't split a char because it is a sum of `ch_len`.
+                unsafe { self.self_.set_len(self.dst_idx) }
+            }
+        }
+        drop(g);
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn insert_str(&mut self, idx: usize, string: &str) -> Result<(), ReserveError> {
+        assert!(
+            self.as_str().is_char_boundary(idx),
+            "index is not a char boundary or out of bounds (index: {idx})",
+        );
+
+        if string.is_empty() {
+            return Ok(());
+        }
+
+        let new_len = self.len().checked_add(string.len()).ok_or(ReserveError)?;
+
+        // reserve makes self unique and modifiable
+        self.reserve(string.len())?;
+        debug_assert!(self.is_unique());
+        debug_assert!(!self.is_static_buffer());
+
+        // SAFETY:
+        // - We contracted that we can split self at `idx`.
+        // - We just reserved enough capacity and set length after reserving.
+        // - The gap is filled by valid UTF-8 bytes.
+        unsafe {
+            // first move the tail to the new back
+            let data = self.as_mut_ptr();
+            ptr::copy(data.add(idx), data.add(idx + string.len()), new_len - idx - string.len());
+
+            // then insert the new bytes
+            ptr::copy_nonoverlapping(string.as_ptr(), data.add(idx), string.len());
+
+            // and lastly resize the string
+            self.set_len(new_len);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn truncate(&mut self, new_len: usize) -> Result<(), ReserveError> {
+        if new_len >= self.len() {
+            return Ok(());
+        }
+
+        let str = self.as_str();
+        assert!(
+            str.is_char_boundary(new_len),
+            "index is not a char boundary or out of bounds (index: {new_len})",
+        );
+
+        // SAFETY: We just checked that `new_len < len()` and `new_len` is a valid char
+        unsafe { self.truncate_unchecked(new_len) }
+    }
+
+    /// # Safety
+    ///
+    /// - `new_len` must be less than or equal to `len()`
+    /// - `new_len` must be a valid char boundary.
+    unsafe fn truncate_unchecked(&mut self, new_len: usize) -> Result<(), ReserveError> {
+        debug_assert!(new_len <= self.len());
+        debug_assert!(self.as_str().is_char_boundary(new_len));
+
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked that `self` is HeapBuffer
+            let heap = unsafe { self.as_heap_buffer_mut() };
+            debug_assert!(!heap.is_exact());
+
+            if !heap.is_len_on_heap() {
+                // Since len is inlined and we don't modify the buffer by popping a char, it is ok
+                // to just set the new length.
+                // SAFETY: `new_len <= len <= capacity`
+                unsafe { heap.set_len(new_len) };
+            } else if heap.is_unique() {
+                // SAFETY: `heap` is unique, we can set the new length in place.
+                unsafe { heap.set_len(new_len) };
+            } else {
+                // SAFETY: `heap.ptr` is valid for `new_len` bytes, and `HeapBuffer` contains
+                // valid UTF-8. Use the pointer directly to avoid a len read from the heap header.
+                let str = unsafe {
+                    let ptr = heap.ptr().as_ptr();
+                    let slice = slice::from_raw_parts(ptr, new_len);
+                    str::from_utf8_unchecked(slice)
+                };
+                let new_repr = Repr::from_str(str)?;
+                // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+                unsafe { heap.release() };
+                *self = new_repr;
+            }
+        } else if self.is_static_buffer() {
+            // SAFETY:
+            // - We just checked that `self` is StaticBuffer
+            // - `new_len <= len <= capacity`
+            unsafe { self.as_static_buffer_mut().set_len(new_len) };
+        } else {
+            // SAFETY:
+            // - The number of types of buffer is 3, and the remaining is InlineBuffer.
+            // - From `#Safety`, `new_len <= MAX_INLINE_SIZE` is true.
+            unsafe { self.as_inline_buffer_mut().set_len(new_len) };
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn is_unique(&self) -> bool {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            unsafe { self.as_heap_buffer() }.is_unique()
+        } else {
+            true
+        }
+    }
+
+    #[inline]
+    pub(crate) fn clear(&mut self) {
+        debug_assert!(!self.is_exact_heap_buffer());
+        if self.is_unique() {
+            // SAFETY:
+            // - `self` is unique.
+            // - A heap buffer is growable.
+            // - 0 bytes is always initialized and valid UTF-8.
+            unsafe { self.set_len(0) };
+        } else {
+            self.replace_inner(Repr::new());
+        }
+    }
+
+    #[inline]
+    pub(crate) fn make_shallow_clone(&self) -> Self {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked that `self` is HeapBuffer.
+            let heap = unsafe { self.as_heap_buffer() };
+
+            // Same as Arc::clone.
+            // No need to use `Acquire` ordering because a new reference is created from the
+            // existing reference, we don't need to wait for the previous operations to complete.
+            // No need to use `Release` ordering because we don't need after operations to wait for
+            // the new reference to be created, which should be handled (synchronized) at the
+            // drop/dealloc (decrement reference count) time.
+            let prev = heap.reference_count().fetch_add(1, Relaxed);
+
+            // Same as Arc::clone.
+            // We use `isize::MAX` instead of `usize::MAX` because a reference count slightly
+            // larger than the threshold may be observed if a large number of threads stay between
+            // fetch_add ~ if. Using isize::MAX requires an unusual amount of threads to be stuck
+            // in this position in order to overflow the reference counter. Therefore, in practice,
+            // the reference counter can be guaranteed not to overflow at this position.
+            if prev > isize::MAX as usize {
+                ref_count_overflow(self)
+            }
+
+            #[cold]
+            fn ref_count_overflow(repr: &Repr) -> ! {
+                // Decrement the reference count and deallocate the buffer (if needed).
+                unsafe { ptr::read(repr) }.replace_inner(Repr::new());
+                panic!("reference count overflow");
+            }
+        }
+
+        // SAFETY:
+        // - if `self` is HeapBuffer, we just incremented the reference count.
+        // - if `self` is InlineBuffer or StaticBuffer, we just copied the bytes.
+        unsafe { ptr::read(self) }
+    }
+
+    #[inline]
+    pub(crate) fn replace_inner(&mut self, other: Self) {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            let heap = unsafe { self.as_heap_buffer_mut() };
+            // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+            unsafe { heap.release() };
+        }
+
+        *self = other;
+    }
+
+    /// Releases any heap allocation without replacing this representation.
+    ///
+    /// # Safety
+    ///
+    /// After calling this method, `self` must never be accessed again.
+    #[inline]
+    pub(crate) unsafe fn release_for_drop(&mut self) {
+        if self.is_heap_buffer() {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated.
+            let heap = unsafe { self.as_heap_buffer_mut() };
+            // SAFETY: The caller guarantees that `self` is never accessed again, and `heap` is
+            // not accessed after this call.
+            unsafe { heap.release() };
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_heap_buffer(&self) -> bool {
+        let last_byte = self.last_byte();
+        last_byte == LastByte::ExactHeapMarker as u8 || last_byte == LastByte::HeapMarker as u8
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_exact_heap_buffer(&self) -> bool {
+        self.last_byte() == LastByte::ExactHeapMarker as u8
+    }
+
+    #[inline(always)]
+    pub(crate) const fn is_growable_heap_buffer(&self) -> bool {
+        self.last_byte() == LastByte::HeapMarker as u8
+    }
+
+    #[cfg(feature = "get-size")]
+    pub(crate) fn heap_allocation_size(&self) -> usize {
+        if self.is_heap_buffer() {
+            // SAFETY: The discriminant was checked above.
+            unsafe { self.as_heap_buffer() }.allocation_size()
+        } else {
+            0
+        }
+    }
+
+    #[inline(always)]
+    const fn is_static_buffer(&self) -> bool {
+        self.last_byte() == LastByte::StaticMarker as u8
+    }
+
+    /// Convert the buffer to a modifiable buffer.
+    ///
+    /// This method ensures:
+    ///
+    /// - The buffer is not StaticBuffer.
+    /// - If the buffer is HeapBuffer, it must be unique.
+    fn ensure_modifiable(&mut self) -> Result<(), ReserveError> {
+        if self.is_heap_buffer() {
+            // SAFETY: we just checked self is HeapBuffer
+            let heap = unsafe { self.as_heap_buffer_mut() };
+            debug_assert!(!heap.is_exact());
+
+            if !heap.is_unique() {
+                // Shared buffers need a new growable allocation.
+                let str = heap.as_str();
+                let new_heap = HeapBuffer::with_exact_capacity(str, str.len())?;
+                // SAFETY: `self` is overwritten immediately below and `heap` is not accessed again.
+                unsafe { heap.release() };
+                *self = Repr::from_heap(new_heap);
+            } else {
+                // `heap` is unique, we can modify it in place.
+            }
+        } else if self.is_static_buffer() {
+            // StaticBuffer is immutable, need to convert to other buffer.
+            let next = if self.len() <= MAX_INLINE_SIZE {
+                // SAFETY: The length was checked above.
+                Repr::from_inline(unsafe { InlineBuffer::new(self.as_str()) })
+            } else {
+                Repr::from_heap(HeapBuffer::with_exact_capacity(self.as_str(), self.len())?)
+            };
+            self.replace_inner(next);
+        }
+        Ok(())
+    }
+
+    /// Gets a mutable pointer to the data buffer.
+    ///
+    /// # Safety
+    /// - The buffer is not StaticBuffer
+    /// - If the buffer is HeapBuffer, it must be unique.
+    /// - If the buffer is HeapBuffer, it must be growable.
+    ///
+    /// Only the bytes in `0..self.len()` are initialized. The bytes from `self.len()` to
+    /// `self.capacity()` may be uninitialized and must not be used to create references to `u8`.
+    unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
+        debug_assert!(!self.is_static_buffer());
+        debug_assert!(!self.is_exact_heap_buffer());
+
+        if self.is_heap_buffer() {
+            let ptr = self.0 as *mut u8;
+            // SAFETY: We just checked that `self` is HeapBuffer
+            let heap = unsafe { self.as_heap_buffer() };
+            debug_assert!(heap.is_unique());
+            ptr
+        } else {
+            self as *mut _ as *mut u8
+        }
+    }
+
+    /// # Safety
+    /// - `new_len` must be less than or equal to `capacity()`
+    /// - The elements at `0..new_len` must be initialized and valid UTF-8.
+    /// - If the underlying buffer is a `HeapBuffer`, it must be unique.
+    /// - If the underlying buffer is a `HeapBuffer`, it must be growable.
+    /// - If the underlying buffer is a `InlineBuffer`, `new_len <= MAX_INLINE_SIZE` must be true.
+    #[inline]
+    pub(crate) unsafe fn set_len(&mut self, new_len: usize) {
+        debug_assert!(new_len <= self.capacity());
+
+        if self.is_static_buffer() {
+            // SAFETY:
+            // - We just checked that `self` is StaticBuffer
+            // - `new_len` is less than or equal to `capacity()`
+            unsafe { self.as_static_buffer_mut().set_len(new_len) };
+        } else if self.is_heap_buffer() {
+            // SAFETY:
+            // - We just checked that `self` is HeapBuffer.
+            // - From `#Safety`, the buffer is unique.
+            // - From `#Safety`, the buffer is growable.
+            unsafe { self.as_heap_buffer_mut().set_len(new_len) };
+        } else {
+            // SAFETY:
+            // - The number of types of buffer is 3, and the remaining is InlineBuffer.
+            // - From `#Safety`, `new_len <= MAX_INLINE_SIZE` is true.
+            unsafe { self.as_inline_buffer_mut().set_len(new_len) };
+        }
+    }
+
+    #[inline(always)]
+    const fn from_inline(buffer: InlineBuffer) -> Self {
+        unsafe { mem::transmute(buffer) }
+    }
+
+    #[inline(always)]
+    const fn from_heap(buffer: HeapBuffer) -> Self {
+        unsafe { mem::transmute(buffer) }
+    }
+
+    #[inline(always)]
+    const fn from_static(buffer: StaticBuffer) -> Self {
+        unsafe { mem::transmute(buffer) }
+    }
+
+    #[inline(always)]
+    const fn last_byte(&self) -> u8 {
+        self.2 as u8
+    }
+
+    #[inline(always)]
+    unsafe fn as_inline_buffer_mut(&mut self) -> &mut InlineBuffer {
+        // SAFETY: A `Repr` is transmuted from `InlineBuffer`
+        unsafe { &mut *(self as *mut _ as *mut InlineBuffer) }
+    }
+
+    #[inline(always)]
+    const unsafe fn as_heap_buffer(&self) -> &HeapBuffer {
+        // SAFETY: A `Repr` is transmuted from `HeapBuffer`
+        unsafe { &*(self as *const _ as *const HeapBuffer) }
+    }
+
+    #[inline(always)]
+    unsafe fn as_heap_buffer_mut(&mut self) -> &mut HeapBuffer {
+        // SAFETY: A `Repr` is transmuted from `HeapBuffer`
+        unsafe { &mut *(self as *mut _ as *mut HeapBuffer) }
+    }
+
+    #[inline(always)]
+    const unsafe fn as_static_buffer(&self) -> &StaticBuffer {
+        // SAFETY: A `Repr` is transmuted from `StaticBuffer`
+        unsafe { &*(self as *const _ as *const StaticBuffer) }
+    }
+
+    #[inline(always)]
+    unsafe fn as_static_buffer_mut(&mut self) -> &mut StaticBuffer {
+        // SAFETY: A `Repr` is transmuted from `StaticBuffer`
+        unsafe { &mut *(self as *mut _ as *mut StaticBuffer) }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn reserve_overflow() -> Result<(), ReserveError> {
+    Err(ReserveError)
+}
+
+#[cold]
+#[inline(never)]
+/// # Safety
+///
+/// `heap` must be unique, and `len` must equal its current length.
+unsafe fn reserve_unique_heap(
+    heap: &mut HeapBuffer,
+    len: usize,
+    additional: usize,
+) -> Result<(), ReserveError> {
+    let amortized_capacity = heap_buffer::amortized_growth(len, additional);
+    // SAFETY:
+    // - The caller verified that `heap` is unique.
+    // - `amortized_capacity` is greater than `len`.
+    unsafe { heap.realloc(amortized_capacity) }
+}
+
+#[cold]
+#[inline(never)]
+/// # Safety
+///
+/// `repr` must contain a live heap buffer.
+unsafe fn reserve_shared_heap(repr: &mut Repr, additional: usize) -> Result<(), ReserveError> {
+    // SAFETY: Guaranteed by the caller.
+    let heap = unsafe { repr.as_heap_buffer_mut() };
+    // Read the data while our counted reference is still live, then create an independent buffer.
+    let new_heap = HeapBuffer::with_additional(heap.as_str(), additional)?;
+    // Release our reference only after the copy is complete. If allocation fails, the reference
+    // count remains untouched. The caller immediately overwrites the old `Repr` and does not use
+    // `heap` again.
+    // SAFETY: `repr` is overwritten immediately below and `heap` is not accessed again.
+    unsafe { heap.release() };
+    *repr = Repr::from_heap(new_heap);
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn reserve_static(
+    repr: &mut Repr,
+    additional: usize,
+    needed_capacity: usize,
+) -> Result<(), ReserveError> {
+    *repr = if needed_capacity <= MAX_INLINE_SIZE {
+        // SAFETY: `repr.len() <= needed_capacity <= MAX_INLINE_SIZE`.
+        Repr::from_inline(unsafe { InlineBuffer::new(repr.as_str()) })
+    } else {
+        Repr::from_heap(HeapBuffer::with_additional(repr.as_str(), additional)?)
+    };
+    Ok(())
+}
+
+#[cold]
+#[inline(never)]
+fn reserve_inline(repr: &mut Repr, additional: usize) -> Result<(), ReserveError> {
+    *repr = Repr::from_heap(HeapBuffer::with_additional(repr.as_str(), additional)?);
+    Ok(())
+}

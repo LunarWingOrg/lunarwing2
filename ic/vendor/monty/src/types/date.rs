@@ -3,21 +3,28 @@
 //! Monty stores dates with `chrono::NaiveDate` and keeps CPython-compatible
 //! constructor validation and arithmetic behavior.
 
-use std::{borrow::Cow, cmp::Ordering, fmt::Write, mem};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::{self, Write},
+    hash::{Hash, Hasher},
+};
 
-use ahash::AHashSet;
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate, format::StrftimeItems};
+use monty_types::OsFunctionCall;
 
 use crate::{
-    args::ArgValues,
+    args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
-    defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunError, RunResult, SimpleException},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
+    defer_drop,
+    exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
+    hash::HashValue,
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
     intern::{Interns, StaticStrings},
-    os::OsFunction,
-    resource::{ResourceError, ResourceTracker},
-    types::{AttrCallResult, PyTrait, TimeDelta, Type, str::Str, timedelta, value_to_i32},
+    types::{
+        AttrCallResult, CmpOrder, LazyHeapSet, PyTrait, TimeDelta, Type,
+        str::{allocate_string, allocate_string_no_interning},
+        timedelta,
+    },
     value::{EitherStr, Value},
 };
 
@@ -106,103 +113,49 @@ pub(crate) fn to_ymd(date: Date) -> (i32, u32, u32) {
 }
 
 /// Constructor for `date(year, month, day)`.
-pub(crate) fn init(heap: &mut Heap<impl ResourceTracker>, args: ArgValues, interns: &Interns) -> RunResult<Value> {
-    let (pos, kwargs) = args.into_parts();
-    // CPython's date() is C-implemented and counts total args (pos + kwargs).
-    // Any total > 3 is rejected before checking individual args.
-    let total_args = pos.len() + kwargs.len();
-    defer_drop_mut!(pos, heap);
-    let kwargs = kwargs.into_iter();
-    defer_drop_mut!(kwargs, heap);
-
-    if total_args > 3 {
-        return Err(ExcType::type_error_c_at_most(3, total_args));
-    }
-
-    let mut year: Option<i32> = None;
-    let mut month: Option<i32> = None;
-    let mut day: Option<i32> = None;
-
-    for (index, arg) in pos.by_ref().enumerate() {
-        defer_drop!(arg, heap);
-        match index {
-            0 => year = Some(value_to_i32(arg)?),
-            1 => month = Some(value_to_i32(arg)?),
-            2 => day = Some(value_to_i32(arg)?),
-            _ => unreachable!("total_args check above prevents this"),
-        }
-    }
-
-    for (key, value) in kwargs {
-        defer_drop!(key, heap);
-        defer_drop!(value, heap);
-
-        let Some(key_name) = key.as_either_str(heap) else {
-            return Err(ExcType::type_error_kwargs_nonstring_key());
-        };
-        match key_name.string_id() {
-            Some(id) if id == StaticStrings::Year => {
-                if year.is_some() {
-                    return Err(ExcType::type_error_multiple_values("date", "year"));
-                }
-                year = Some(value_to_i32(value)?);
-            }
-            Some(id) if id == StaticStrings::Month => {
-                if month.is_some() {
-                    return Err(ExcType::type_error_multiple_values("date", "month"));
-                }
-                month = Some(value_to_i32(value)?);
-            }
-            Some(id) if id == StaticStrings::Day => {
-                if day.is_some() {
-                    return Err(ExcType::type_error_multiple_values("date", "day"));
-                }
-                day = Some(value_to_i32(value)?);
-            }
-            _ => return Err(ExcType::type_error_unexpected_keyword("date", key_name.as_str(interns))),
-        }
-    }
-
-    let Some(year) = year else {
-        return Err(ExcType::type_error_c_missing_required("year", 1));
-    };
-    let Some(month) = month else {
-        return Err(ExcType::type_error_c_missing_required("month", 2));
-    };
-    let Some(day) = day else {
-        return Err(ExcType::type_error_c_missing_required("day", 3));
-    };
-
+pub(crate) fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    let DateInitArgs { year, month, day } = DateInitArgs::from_args(args, vm)?;
     let date = from_ymd(year, month, day)?;
-    Ok(Value::Ref(heap.allocate(HeapData::Date(date))?))
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Date(date))))
+}
+
+/// Argument shape for `date(year, month, day)`.
+///
+/// CPython's `date()` is C-implemented (`PyArg_ParseTupleAndKeywords`), hence
+/// `style = c` — "function takes at most N arguments", "function missing
+/// required argument 'X' (pos N)", etc. Unlike `datetime()` it has no
+/// keyword-only fields, so the derive keeps the plain (non-"positional")
+/// at-most wording automatically.
+#[derive(FromArgs)]
+#[from_args(name = "function", style = c, at_most_total)]
+struct DateInitArgs {
+    year: i32,
+    month: i32,
+    day: i32,
 }
 
 /// Classmethod implementation for `date.today()`.
 ///
 /// Issues a `DateToday` OS call with no arguments. The host should return
 /// `MontyObject::Date` directly.
-pub(crate) fn class_today(heap: &mut Heap<impl ResourceTracker>, args: ArgValues) -> RunResult<AttrCallResult> {
+pub(crate) fn class_today(heap: &mut Heap, args: ArgValues) -> RunResult<AttrCallResult> {
     args.check_zero_args("date.today", heap)?;
-    Ok(AttrCallResult::OsCall(OsFunction::DateToday, ArgValues::Empty))
+    Ok(AttrCallResult::OsCall(OsFunctionCall::DateToday))
 }
 
 /// Classmethod `date.fromisoformat(date_string)`.
 ///
 /// Parses ISO 8601 date strings in the formats `YYYY-MM-DD` and `YYYYMMDD`,
 /// matching CPython 3.11+ behavior.
-pub(crate) fn class_fromisoformat(
-    heap: &mut Heap<impl ResourceTracker>,
-    args: ArgValues,
-    interns: &Interns,
-) -> RunResult<Value> {
+pub(crate) fn class_fromisoformat(heap: &mut Heap, args: ArgValues, interns: &Interns) -> RunResult<Value> {
     let value = args.get_one_arg("date.fromisoformat", heap)?;
     let s = extract_str_arg(&value, "fromisoformat", heap, interns);
-    value.drop_with_heap(heap);
+    value.drop_with(heap);
     let s = s?;
 
     let date = parse_iso_date(&s)
         .ok_or_else(|| SimpleException::new_msg(ExcType::ValueError, format!("Invalid isoformat string: '{s}'")))?;
-    Ok(Value::Ref(heap.allocate(HeapData::Date(date))?))
+    Ok(Value::Ref(heap.allocate(HeapData::Date(date))))
 }
 
 /// Parses an ISO 8601 date string into a `Date`.
@@ -214,12 +167,7 @@ fn parse_iso_date(s: &str) -> Option<Date> {
 }
 
 /// Extracts a string from a `Value` for use by classmethods.
-pub(crate) fn extract_str_arg(
-    value: &Value,
-    method_name: &str,
-    heap: &Heap<impl ResourceTracker>,
-    interns: &Interns,
-) -> RunResult<String> {
+pub(crate) fn extract_str_arg(value: &Value, method_name: &str, heap: &Heap, interns: &Interns) -> RunResult<String> {
     match value {
         Value::InternString(string_id) => Ok(interns.get_str(*string_id).to_owned()),
         Value::Ref(heap_id) => match heap.get(*heap_id) {
@@ -231,86 +179,100 @@ pub(crate) fn extract_str_arg(
 }
 
 impl HeapItem for Date {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {}
 }
 
 /// `HeapRead`-based dispatch for `Date`, enabling the `HeapReadOutput` enum to
 /// delegate `PyTrait` calls to heap-resident dates.
-impl<'h> PyTrait<'h> for HeapRead<'h, Date> {
-    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Date> {
+    fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Date
     }
 
-    fn py_len(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
+    fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {
         None
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
-        Ok(*self.get(vm.heap) == *other.get(vm.heap))
+    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let Some(HeapReadOutput::Date(other)) = other.read_heap(vm) else {
+            return Ok(None);
+        };
+        Ok(Some(*self.get(vm.heap) == *other.get(vm.heap)))
     }
 
-    fn py_cmp(
-        &self,
-        other: &Self,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-    ) -> Result<Option<Ordering>, ResourceError> {
-        Ok(self.get(vm.heap).partial_cmp(other.get(vm.heap)))
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        let mut hasher = DefaultHasher::new();
+        self.get(vm.heap).hash(&mut hasher);
+        Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
-        true
+    fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
+        Ok(CmpOrder::from_total(self.get(vm.heap).partial_cmp(other.get(vm.heap))))
     }
 
-    fn py_repr_fmt(
-        &self,
-        f: &mut impl Write,
-        vm: &VM<'h, '_, impl ResourceTracker>,
-        _heap_ids: &mut AHashSet<HeapId>,
-    ) -> RunResult<()> {
+    fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(true)
+    }
+
+    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
         let (year, month, day) = to_ymd(*self.get(vm.heap));
         write!(f, "datetime.date({year}, {month}, {day})")?;
         Ok(())
     }
 
-    fn py_str(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
+    fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
         let (year, month, day) = to_ymd(*self.get(vm.heap));
-        Ok(Cow::Owned(format!("{year:04}-{month:02}-{day:02}")))
+        Ok(allocate_string(format!("{year:04}-{month:02}-{day:02}"), vm.heap))
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let Some(HeapReadOutput::TimeDelta(other)) = other.read_heap(vm) else {
+            return Ok(None);
+        };
+        Ok(py_add(*self.get(vm.heap), *other.get(vm.heap), vm.heap))
+    }
+
+    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        match other.read_heap(vm) {
+            Some(HeapReadOutput::Date(other)) => Ok(py_sub_date(*self.get(vm.heap), *other.get(vm.heap), vm.heap)),
+            Some(HeapReadOutput::TimeDelta(other)) => {
+                Ok(py_sub_timedelta(*self.get(vm.heap), *other.get(vm.heap), vm.heap))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let date = *self.get(vm.heap);
         match attr.string_id() {
             Some(id) if id == StaticStrings::Isoformat => {
                 args.check_zero_args("date.isoformat", vm.heap)?;
                 let (year, month, day) = to_ymd(date);
-                Ok(CallResult::Value(Value::Ref(vm.heap.allocate(HeapData::Str(
-                    Str::new(format!("{year:04}-{month:02}-{day:02}")),
-                ))?)))
+                Ok(CallResult::Value(allocate_string_no_interning(
+                    format!("{year:04}-{month:02}-{day:02}"),
+                    vm.heap,
+                )))
             }
             Some(id) if id == StaticStrings::Strftime => {
-                let fmt = extract_strftime_arg(args, "date.strftime", vm.heap, vm.interns)?;
-                let formatted = date.0.format(&fmt).to_string();
-                Ok(CallResult::Value(Value::Ref(
-                    vm.heap.allocate(HeapData::Str(Str::new(formatted)))?,
-                )))
+                let StrftimeArgs { format } = StrftimeArgs::from_args(args, vm)?;
+                defer_drop!(format, vm);
+                let formatted = format_date_strftime(date, format.as_str(vm))?;
+                Ok(CallResult::Value(allocate_string(formatted, vm.heap)))
             }
             Some(id) if id == StaticStrings::Replace => {
                 let (year, month, day) = to_ymd(date);
-                let (new_year, new_month, new_day) =
-                    extract_date_replace_kwargs(args, year, month, day, vm.heap, vm.interns)?;
-                let new_date = from_ymd(new_year, new_month, new_day)?;
+                let DateReplaceArgs {
+                    year: new_year,
+                    month: new_month,
+                    day: new_day,
+                } = DateReplaceArgs::from_args(args, vm)?;
+                let new_date = from_ymd(
+                    new_year.unwrap_or(year),
+                    new_month.unwrap_or(i32::try_from(month).expect("month in 1..=12")),
+                    new_day.unwrap_or(i32::try_from(day).expect("day in 1..=31")),
+                )?;
                 Ok(CallResult::Value(Value::Ref(
-                    vm.heap.allocate(HeapData::Date(new_date))?,
+                    vm.heap.allocate(HeapData::Date(new_date)),
                 )))
             }
             Some(id) if id == StaticStrings::Weekday => {
@@ -325,11 +287,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Date> {
                     date.0.weekday().number_from_monday(),
                 ))))
             }
-            _ => Err(ExcType::attribute_error(Type::Date, attr.as_str(vm.interns))),
+            _ => Err(ExcType::attribute_error_method(Type::Date, attr, args, vm)),
         }
     }
 
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
         let (year, month, day) = to_ymd(*self.get(vm.heap));
         match attr.string_id() {
             Some(id) if id == StaticStrings::Year => Ok(Some(CallResult::Value(Value::Int(i64::from(year))))),
@@ -341,128 +303,92 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Date> {
 }
 
 /// `date - date` returns a timedelta with the difference in days.
-pub(crate) fn py_sub_date(
-    a: Date,
-    b: Date,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> Result<Option<Value>, ResourceError> {
+pub(crate) fn py_sub_date(a: Date, b: Date, heap: &mut Heap) -> Option<Value> {
     let diff_days = i64::from(to_ordinal(a)) - i64::from(to_ordinal(b));
-    let Ok(delta) = timedelta::from_total_microseconds(i128::from(diff_days) * MICROSECONDS_PER_DAY) else {
-        return Ok(None);
-    };
-    Ok(Some(Value::Ref(heap.allocate(HeapData::TimeDelta(delta))?)))
+    let delta = timedelta::from_total_microseconds(i128::from(diff_days) * MICROSECONDS_PER_DAY).ok()?;
+    Some(Value::Ref(heap.allocate(HeapData::TimeDelta(delta))))
 }
 
 /// `date + timedelta` helper.
-pub(crate) fn py_add(
-    date: Date,
-    delta: TimeDelta,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> Result<Option<Value>, ResourceError> {
+pub(crate) fn py_add(date: Date, delta: TimeDelta, heap: &mut Heap) -> Option<Value> {
     let (days, _, _) = timedelta::components(&delta);
-    let new_ordinal = i64::from(to_ordinal(date)).checked_add(i64::from(days));
-    let Some(new_ordinal) = new_ordinal else {
-        return Ok(None);
-    };
-    let Ok(new_ordinal) = i32::try_from(new_ordinal) else {
-        return Ok(None);
-    };
-    match from_ordinal(new_ordinal) {
-        Ok(value) => Ok(Some(Value::Ref(heap.allocate(HeapData::Date(value))?))),
-        Err(_) => Ok(None),
-    }
+    let new_ordinal = i64::from(to_ordinal(date)).checked_add(i64::from(days))?;
+    let new_ordinal = i32::try_from(new_ordinal).ok()?;
+    let value = from_ordinal(new_ordinal).ok()?;
+    Some(Value::Ref(heap.allocate(HeapData::Date(value))))
 }
 
 /// `date - timedelta` helper.
-pub(crate) fn py_sub_timedelta(
-    date: Date,
-    delta: TimeDelta,
-    heap: &mut Heap<impl ResourceTracker>,
-) -> Result<Option<Value>, ResourceError> {
+pub(crate) fn py_sub_timedelta(date: Date, delta: TimeDelta, heap: &mut Heap) -> Option<Value> {
     let (days, _, _) = timedelta::components(&delta);
-    let new_ordinal = i64::from(to_ordinal(date)).checked_sub(i64::from(days));
-    let Some(new_ordinal) = new_ordinal else {
-        return Ok(None);
-    };
-    let Ok(new_ordinal) = i32::try_from(new_ordinal) else {
-        return Ok(None);
-    };
-    match from_ordinal(new_ordinal) {
-        Ok(value) => Ok(Some(Value::Ref(heap.allocate(HeapData::Date(value))?))),
-        Err(_) => Ok(None),
-    }
+    let new_ordinal = i64::from(to_ordinal(date)).checked_sub(i64::from(days))?;
+    let new_ordinal = i32::try_from(new_ordinal).ok()?;
+    let value = from_ordinal(new_ordinal).ok()?;
+    Some(Value::Ref(heap.allocate(HeapData::Date(value))))
 }
 
-/// Extracts the format string argument for `strftime()`.
+/// Formats a [`Date`] with a `strftime` directive string, shared by the
+/// `date.strftime()` method and f-string formatting (`f"{d:%Y-%m-%d}"`).
 ///
-/// Accepts exactly one positional string argument.
-pub(crate) fn extract_strftime_arg(
-    args: ArgValues,
-    method_name: &str,
-    heap: &mut Heap<impl ResourceTracker>,
-    interns: &Interns,
-) -> RunResult<String> {
-    let value = args.get_one_arg(method_name, heap)?;
-    let result = match &value {
-        Value::InternString(string_id) => Ok(interns.get_str(*string_id).to_owned()),
-        Value::Ref(heap_id) => match heap.get(*heap_id) {
-            HeapData::Str(s) => Ok(s.as_str().to_owned()),
-            _ => Err(ExcType::type_error(
-                "descriptor 'strftime' requires a 'str' object but received a non-str type".to_owned(),
-            )),
-        },
-        _ => Err(ExcType::type_error(
-            "descriptor 'strftime' requires a 'str' object but received a non-str type".to_owned(),
-        )),
-    };
-    value.drop_with_heap(heap);
-    result
+/// Uses `chrono`'s **lenient** parser so an unrecognised directive is emitted
+/// verbatim (`%Q` → `"%Q"`), matching glibc/Linux CPython — see
+/// [`invalid_strftime_error`] for why that platform is the target. The
+/// `ValueError` path remains for the rare directive that parses but can't be
+/// rendered (so [`render_strftime`] never has to panic).
+pub(crate) fn format_date_strftime(date: Date, format: &str) -> RunResult<String> {
+    render_strftime(date.0.format_with_items(StrftimeItems::new_lenient(format))).ok_or_else(invalid_strftime_error)
 }
 
-/// Parses keyword arguments for `date.replace()`.
+/// Renders a `chrono` strftime result without the panic that `.to_string()`
+/// triggers on an invalid directive.
 ///
-/// Returns `(year, month, day)` with original values as defaults.
-fn extract_date_replace_kwargs(
-    args: ArgValues,
-    year: i32,
-    month: u32,
-    day: u32,
-    heap: &mut Heap<impl ResourceTracker>,
-    interns: &Interns,
-) -> RunResult<(i32, i32, i32)> {
-    let (pos, kwargs) = args.into_parts();
-    defer_drop_mut!(pos, heap);
-    let kwargs = kwargs.into_iter();
-    defer_drop_mut!(kwargs, heap);
+/// `chrono`'s `DelayedFormat` `Display` impl returns `fmt::Error` for an
+/// unsupported/invalid directive, and `ToString::to_string` turns that into a
+/// panic — unacceptable for untrusted sandbox input. Writing into our own
+/// buffer surfaces the failure as `None` so the caller can raise instead.
+pub(crate) fn render_strftime(formatted: impl fmt::Display) -> Option<String> {
+    let mut out = String::new();
+    write!(out, "{formatted}").ok().map(|()| out)
+}
 
-    let mut new_year = year;
-    let mut new_month = i32::try_from(month).expect("month is always in 1..=12");
-    let mut new_day = i32::try_from(day).expect("day is always in 1..=31");
+/// The `ValueError` raised when a `strftime` directive parses but can't be
+/// rendered for this value (e.g. a time directive on a bare `date`).
+///
+/// Unrecognised directives no longer reach this path — the lenient parser
+/// emits them verbatim to match glibc/Linux CPython (`strftime('%Q') == '%Q'`),
+/// rather than CPython's macOS behaviour (`'Q'`) which we deliberately don't
+/// follow; see `limitations/datetime.md`.
+pub(crate) fn invalid_strftime_error() -> RunError {
+    SimpleException::new_msg(ExcType::ValueError, "Invalid format string".to_owned()).into()
+}
 
-    // replace() takes no positional args
-    if let Some(arg) = pos.next() {
-        arg.drop_with_heap(heap);
-        return Err(ExcType::type_error("replace() takes 0 positional arguments".to_owned()));
-    }
+/// Argument shape for `date.strftime(format)` and `datetime.strftime(format)`.
+///
+/// CPython implements `strftime` as a C method and reports errors with the
+/// bare method name (no class prefix), so we use `style = c_named` + the
+/// `"strftime"` descriptor — matching wordings like
+/// `strftime() missing required argument 'format' (pos 1)` and
+/// `strftime() takes at most 1 argument (2 given)`.
+///
+/// `bad_arg` opts the wrong-type wording into CPython's `_PyArg_BadArgument`
+/// form (`strftime() argument 1 must be str, not <type>`), including the
+/// `None`-vs-`NoneType` special case — so the type-check logic lives in
+/// the derive rather than a hand-written extract helper.
+#[derive(FromArgs)]
+#[from_args(name = "strftime", style = c_named, at_most_total, bad_arg)]
+pub(crate) struct StrftimeArgs {
+    pub(crate) format: StrArg,
+}
 
-    for (key, value) in kwargs {
-        defer_drop!(key, heap);
-        defer_drop!(value, heap);
-        let Some(key_name) = key.as_either_str(heap) else {
-            return Err(ExcType::type_error_kwargs_nonstring_key());
-        };
-        match key_name.string_id() {
-            Some(id) if id == StaticStrings::Year => new_year = value_to_i32(value)?,
-            Some(id) if id == StaticStrings::Month => new_month = value_to_i32(value)?,
-            Some(id) if id == StaticStrings::Day => new_day = value_to_i32(value)?,
-            _ => {
-                return Err(ExcType::type_error_unexpected_keyword(
-                    "replace",
-                    key_name.as_str(interns),
-                ));
-            }
-        }
-    }
-
-    Ok((new_year, new_month, new_day))
+/// Keyword arguments for `date.replace()`. All keyword-only; absent fields
+/// inherit the original date's component via `unwrap_or` at the call site.
+#[derive(FromArgs)]
+#[from_args(name = "replace")]
+struct DateReplaceArgs {
+    #[from_args(kw_only, default)]
+    year: Option<i32>,
+    #[from_args(kw_only, default)]
+    month: Option<i32>,
+    #[from_args(kw_only, default)]
+    day: Option<i32>,
 }

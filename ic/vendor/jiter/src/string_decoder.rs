@@ -1,7 +1,7 @@
 use std::ops::Range;
 use std::str::{from_utf8, from_utf8_unchecked};
 
-use crate::errors::{json_err, json_error, JsonErrorType, JsonResult};
+use crate::errors::{JsonErrorType, JsonResult, json_err, json_error};
 
 pub type Tape = Vec<u8>;
 
@@ -45,7 +45,7 @@ mod string_output {
     where
         'j: 't,
     {
-        data: StringOutputType<'t, 'j>,
+        pub(crate) data: StringOutputType<'t, 'j>,
         // SAFETY: this is used as an invariant to determine if the string is ascii only
         // so this should not be set except when known
         ascii_only: bool,

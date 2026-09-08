@@ -1,37 +1,63 @@
+use std::{cell::Cell, fmt::Write, ops};
+
 /// Python string type, wrapping a Rust `String`.
 ///
 /// This type provides Python string semantics. Currently supports basic
 /// operations like length and equality comparison.
-use std::{borrow::Cow, cmp::Ordering, fmt, fmt::Write, mem, ops};
-
-use ahash::AHashSet;
+use monty_types::{ResourceError, ResourceTracker};
+pub use monty_types::{StringRepr, string_repr_fmt};
+use ruff_python_stdlib::{identifiers::is_identifier, keyword::is_keyword};
 use smallvec::smallvec;
 
-use super::{Bytes, MontyIter, PyTrait};
+use super::{Bytes, CmpOrder, PyTrait};
 use crate::{
-    args::ArgValues,
+    args::{ArgValues, FromArgs, StrArg},
     bytecode::{CallResult, VM},
-    defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunResult},
-    heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
-    intern::{StaticStrings, StringId},
-    resource::{ResourceError, ResourceTracker, check_repeat_size, check_replace_size},
-    types::Type,
-    value::{EitherStr, Value},
+    codecs::Codec,
+    defer_drop,
+    exception_private::{ExcType, ExcTypeExt, RunResult},
+    hash::{HashValue, hash_python_str},
+    heap::{
+        DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, heap_read_ref_as_field,
+    },
+    intern::{Interns, StaticStrings, StringId},
+    resource_checks::{check_repeat_size, check_replace_size},
+    str_format::str_format,
+    string_builder::StringBuilder,
+    types::{
+        LazyHeapSet, Type,
+        long_int::repeat_count,
+        slice::{optional_sequence_bound, slice_collect_iterator},
+    },
+    value::{EitherStr, Value, eq_str},
 };
 
 /// Python string value stored on the heap.
 ///
 /// Wraps a Rust `String` and provides Python-compatible operations.
 /// `len()` returns the number of Unicode codepoints (characters), matching Python semantics.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Str(Box<str>);
+///
+/// Carries an inline `cached_hash` field so a `Str` only computes its Python
+/// hash once.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct Str(Box<str>, #[serde(skip)] Cell<Option<HashValue>>);
+
+impl PartialEq for Str {
+    /// Compares only the string content — the `cached_hash` field is a pure
+    /// optimisation and must not affect equality.
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
 
 impl Str {
-    /// Creates a new Str from a Rust String.
+    /// Creates a new Str from anything convertible into a `Box<str>`.
+    ///
+    /// Private — use [`allocate_string`] or [`allocate_string_no_interning`] instead.
     #[must_use]
-    pub fn new(s: String) -> Self {
-        Self(s.into())
+    fn new(s: impl Into<Box<str>>) -> Self {
+        Self(s.into(), Cell::new(None))
     }
 
     /// Returns a reference to the inner string.
@@ -42,50 +68,96 @@ impl Str {
 
     /// Creates a string from the `str()` constructor call.
     ///
-    /// - `str()` with no args returns an empty string
+    /// - `str()` with no args returns an empty string (even with `encoding=`)
     /// - `str(x)` converts x to its string representation using `py_str`
-    pub fn init(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-        let value = args.get_zero_one_named_arg("str", StaticStrings::Object, vm.heap, vm.interns)?;
-        match value {
-            None => Ok(Value::InternString(StaticStrings::EmptyString.into())),
-            Some(v) => {
-                defer_drop!(v, vm);
-                let s = v.py_str(vm)?.into_owned();
-                allocate_string(s, vm.heap)
-            }
+    /// - `str(b, encoding, errors)` decodes a bytes object via the codec registry
+    pub fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+        let StrInitArgs {
+            object,
+            encoding,
+            errors,
+        } = StrInitArgs::from_args(args, vm)?;
+        defer_drop!(object, vm);
+        defer_drop!(encoding, vm);
+        defer_drop!(errors, vm);
+        if encoding.is_none() && errors.is_none() {
+            return match object {
+                None => Ok(Value::InternString(StaticStrings::EmptyString.into())),
+                Some(v) => v.py_str(vm),
+            };
         }
+        // Decoding mode. Type-check `encoding` then `errors` first — CPython's
+        // clinic converters run before the constructor body sees the object.
+        str_ctor_arg_check(encoding.as_ref(), "encoding", vm)?;
+        str_ctor_arg_check(errors.as_ref(), "errors", vm)?;
+        let Some(object) = object else {
+            // A missing object wins over the decoding args: `str(encoding='utf-8')` is ''.
+            return Ok(Value::InternString(StaticStrings::EmptyString.into()));
+        };
+        let bytes: &[u8] = match object {
+            Value::InternBytes(bytes_id) => vm.interns.get_bytes(*bytes_id),
+            Value::InternString(_) => return Err(ExcType::type_error_decoding_str_not_supported()),
+            Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
+                HeapData::Bytes(b) => b.as_slice(),
+                HeapData::Str(_) => return Err(ExcType::type_error_decoding_str_not_supported()),
+                _ => return Err(ExcType::type_error_decoding_need_bytes(object.py_type_name(vm))),
+            },
+            _ => return Err(ExcType::type_error_decoding_need_bytes(object.py_type_name(vm))),
+        };
+        let encoding = ctor_str_arg(encoding.as_ref(), "utf-8", vm)?;
+        let errors = ctor_str_arg(errors.as_ref(), "strict", vm)?;
+        let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
+        let s = codec.decode(bytes, errors)?;
+        Ok(allocate_string(s, vm.heap))
     }
 
     /// Handles slice-based indexing for strings.
     ///
     /// Returns a new string containing the selected characters (Unicode-aware).
-    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
-        let char_count = self.0.chars().count();
-        let (start, stop, step) = slice
-            .indices(char_count)
-            .map_err(|()| ExcType::value_error_slice_step_zero())?;
-
-        let result_str = get_str_slice(&self.0, start, stop, step);
-        let heap_id = heap.allocate(HeapData::Str(Self::from(result_str)))?;
-        Ok(Value::Ref(heap_id))
+    fn getitem_slice(&self, vm: &VM<'_>, slice: &super::Slice) -> RunResult<Value> {
+        let result_str: Box<str> = slice_collect_iterator(vm, slice, self.0.chars(), |c| c)?;
+        Ok(allocate_string(result_str, vm.heap))
     }
 }
 
-impl From<String> for Str {
-    fn from(s: String) -> Self {
-        Self(s.into())
+/// Argument shape for `str(object='', encoding='utf-8', errors='strict')`.
+///
+/// `encoding`/`errors` are raw `Value`s validated in the body: CPython's
+/// `unicode_new` names a wrong type by its `tp_name` (`must be str, not
+/// NoneType`), not `_PyArg_BadArgument`'s `None` special case, so the macro's
+/// `bad_arg_named` wording can't be used. `vectorcall` + `at_most_total`
+/// model `unicode_vectorcall`'s dual arity wording.
+#[derive(FromArgs)]
+#[from_args(name = "str", at_most_total, vectorcall)]
+struct StrInitArgs {
+    #[from_args(default)]
+    object: Option<Value>,
+    #[from_args(default)]
+    encoding: Option<Value>,
+    #[from_args(default)]
+    errors: Option<Value>,
+}
+
+/// Rejects a non-str `encoding`/`errors` argument to `str()` with CPython's
+/// `str() argument '{name}' must be str, not {tp_name}` wording.
+fn str_ctor_arg_check(arg: Option<&Value>, name: &str, vm: &VM<'_>) -> RunResult<()> {
+    match arg {
+        Some(v) if !v.is_str(vm.heap) => Err(ExcType::type_error_bad_arg_named(
+            "str",
+            name,
+            "str",
+            v.py_type_name(vm),
+        )),
+        _ => Ok(()),
     }
 }
 
-impl From<&str> for Str {
-    fn from(s: &str) -> Self {
-        Self(s.into())
-    }
-}
-
-impl From<Str> for String {
-    fn from(value: Str) -> Self {
-        value.0.into_string()
+/// Borrows a validated (str-typed) optional constructor argument's text,
+/// falling back to `default` when the argument was absent.
+fn ctor_str_arg<'a>(arg: Option<&'a Value>, default: &'a str, vm: &'a VM<'_>) -> RunResult<&'a str> {
+    match arg {
+        None => Ok(default),
+        Some(v) => v.to_str(vm),
     }
 }
 
@@ -97,20 +169,42 @@ impl From<Str> for String {
 /// - Other strings are allocated on the heap
 ///
 /// This avoids heap allocation for common cases like results from `strip()`,
-/// `split()`, string iteration, etc.
-pub fn allocate_string(s: String, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
-    match s.len() {
-        0 => Ok(Value::InternString(StaticStrings::EmptyString.into())),
-        1 => {
-            // Single byte means single ASCII character
-            let byte = s.as_bytes()[0];
-            Ok(Value::InternString(StringId::from_ascii(byte)))
-        }
-        _ => {
-            let heap_id = heap.allocate(HeapData::Str(Str::new(s)))?;
-            Ok(Value::Ref(heap_id))
-        }
+/// `split()`, string iteration, etc. Prefer this over manual `Str` construction
+/// so callsites consistently benefit from interning. When the caller can prove
+/// the string is longer than one byte, [`allocate_string_no_interning`] avoids
+/// the length branch.
+///
+/// The dual bound `AsRef<str> + Into<Box<str>>` lets the function peek the
+/// length via the borrow before committing to a conversion. Callers with an
+/// owned `String`/`Box<str>` move the value in (consumed only on the heap
+/// path), and borrowed `&str` callers avoid an upfront `to_owned()` —
+/// allocation happens only when the string actually needs heap storage.
+///
+pub fn allocate_string(s: impl AsRef<str> + Into<Box<str>>, heap: &Heap) -> Value {
+    let bytes = s.as_ref().as_bytes();
+    match bytes.len() {
+        0 => Value::InternString(StaticStrings::EmptyString.into()),
+        1 => Value::InternString(StringId::from_ascii(bytes[0])),
+        _ => allocate_string_no_interning(s, heap),
     }
+}
+
+/// Allocates a string directly on the heap, skipping the intern check.
+///
+/// Use this only when the caller can guarantee the string is longer than one
+/// byte (e.g. always contains a fixed prefix like `"0x"`, `"0o"`, or a
+/// formatted date). For inputs of unknown length, use [`allocate_string`].
+///
+/// Accepts `impl Into<Box<str>>` for the same reasons as [`allocate_string`].
+pub fn allocate_string_no_interning(s: impl Into<Box<str>>, heap: &Heap) -> Value {
+    let heap_id = heap.allocate(HeapData::Str(Str::new(s)));
+    Value::Ref(heap_id)
+}
+
+/// Repeats a string after validating the allocation against resource limits.
+pub(crate) fn repeat_str(value: &str, count: usize, heap: &Heap) -> Result<Value, ResourceError> {
+    check_repeat_size(value.len(), count, &heap.tracker)?;
+    Ok(allocate_string(value.repeat(count), heap))
 }
 
 /// Allocates a single character as a string value.
@@ -119,13 +213,28 @@ pub fn allocate_string(s: String, heap: &Heap<impl ResourceTracker>) -> RunResul
 /// Non-ASCII characters are allocated on the heap.
 ///
 /// This is used by string iteration and `chr()` builtin.
-pub fn allocate_char(c: char, heap: &Heap<impl ResourceTracker>) -> Result<Value, ResourceError> {
+pub fn allocate_char(c: char, heap: &Heap) -> Value {
     if c.is_ascii() {
-        Ok(Value::InternString(StringId::from_ascii(c as u8)))
+        Value::InternString(StringId::from_ascii(c as u8))
     } else {
-        let heap_id = heap.allocate(HeapData::Str(Str::new(c.to_string())))?;
-        Ok(Value::Ref(heap_id))
+        let heap_id = heap.allocate(HeapData::Str(Str::new(c.to_string())));
+        Value::Ref(heap_id)
     }
+}
+
+/// Concatenates two string slices and allocates the result as a Python string.
+///
+/// Backs the `str + str` arms of `py_add`: one exactly-sized allocation filled
+/// via `push_str`, instead of `format!`'s runtime formatting machinery. The
+/// result size is bounded by two already-tracked inputs, so a plain `String`
+/// is fine per the `StringBuilder` rule.
+pub(crate) fn concat_allocate_str(a: &str, b: &str, heap: &Heap) -> Result<Value, ResourceError> {
+    let result_len = a.len().saturating_add(b.len());
+    check_repeat_size(result_len, 1, &heap.tracker)?;
+    let mut concat = String::with_capacity(result_len);
+    concat.push_str(a);
+    concat.push_str(b);
+    Ok(allocate_string(concat, heap))
 }
 
 /// Gets the character at a given index in a string, handling negative indices.
@@ -147,52 +256,6 @@ pub fn get_char_at_index(s: &str, index: i64) -> Option<char> {
     s.chars().nth(idx)
 }
 
-/// Extracts a slice of a string (Unicode-aware).
-///
-/// Handles both positive and negative step values. For negative step,
-/// iterates backward from start down to (but not including) stop.
-/// The `stop` parameter uses a sentinel value of `len + 1` for negative
-/// step to indicate "go to the beginning".
-///
-/// Note: step must be non-zero (callers should validate this via `slice.indices()`).
-pub(crate) fn get_str_slice(s: &str, start: usize, stop: usize, step: i64) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-
-    // try_from succeeds for non-negative step; step==0 rejected upstream by slice.indices()
-    if let Ok(step_usize) = usize::try_from(step) {
-        // Positive step: iterate forward
-        let mut i = start;
-        while i < stop && i < chars.len() {
-            result.push(chars[i]);
-            i += step_usize;
-        }
-    } else {
-        // Negative step: iterate backward
-        // start is the highest index, stop is the sentinel
-        // stop > chars.len() means "go to the beginning"
-        let step_abs = usize::try_from(-step).expect("step is negative so -step is positive");
-        let step_abs_i64 = i64::try_from(step_abs).expect("step magnitude fits in i64");
-        let mut i = i64::try_from(start).expect("start index fits in i64");
-        // stop > chars.len() is sentinel meaning "go to beginning", use -1
-        let stop_i64 = if stop > chars.len() {
-            -1
-        } else {
-            i64::try_from(stop).expect("stop bounded by chars.len() fits in i64")
-        };
-
-        while let Ok(i_usize) = usize::try_from(i) {
-            if i_usize >= chars.len() || i <= stop_i64 {
-                break;
-            }
-            result.push(chars[i_usize]);
-            i -= step_abs_i64;
-        }
-    }
-
-    result
-}
-
 impl ops::Deref for Str {
     type Target = str;
 
@@ -201,22 +264,40 @@ impl ops::Deref for Str {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, Str> {
-    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Str> {
+    fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
+        true
+    }
+
+    /// Substring search; `in` on a str requires a str on the left.
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let container = self.get(vm.heap).as_str();
+        str_contains(container, item, vm.heap, vm.interns).map(Some)
+    }
+
+    fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Str
     }
 
-    fn py_len(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(StringIterator::from_heap(
+            self.id(),
+            self.get(vm.heap).as_str().is_ascii(),
+            vm,
+        ))
+    }
+
+    fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         // Count Unicode characters, not bytes, to match Python semantics
         Some(self.get(vm.heap).0.chars().count())
     }
 
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
             && let HeapData::Slice(slice) = vm.heap.get(*id)
         {
-            return self.get(vm.heap).getitem_slice(slice, vm.heap);
+            return self.get(vm.heap).getitem_slice(vm, slice);
         }
 
         // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt
@@ -225,55 +306,66 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Str> {
         // Use single-pass indexing to avoid Vec<char> allocation
         let s = self.get(vm.heap);
         let c = get_char_at_index(&s.0, index).ok_or_else(ExcType::str_index_error)?;
-        Ok(allocate_char(c, vm.heap)?)
+        Ok(allocate_char(c, vm.heap))
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
-        Ok(self.get(vm.heap).0 == other.get(vm.heap).0)
+    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        // A heap string equals an interned or heap string with the same content.
+        Ok(eq_str(self.get(vm.heap).as_str(), other, vm))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
-        !self.get(vm.heap).0.is_empty()
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        let s = self.get(vm.heap);
+        if let Some(cached) = s.1.get() {
+            return Ok(Some(cached));
+        }
+        // Delegates to the canonical helper used by both heap and intern paths;
+        // an interned `"foo"` and a heap `"foo"` must hash identically for dict
+        // lookup to work.
+        let hash = hash_python_str(s.as_str());
+        s.1.set(Some(hash));
+        Ok(Some(hash))
     }
 
-    fn py_cmp(
-        &self,
-        other: &Self,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-    ) -> Result<Option<Ordering>, ResourceError> {
-        Ok(Some(self.get(vm.heap).0.cmp(&other.get(vm.heap).0)))
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(!self.get(vm.heap).0.is_empty())
     }
 
-    fn py_repr_fmt(
-        &self,
-        f: &mut impl Write,
-        vm: &VM<'h, '_, impl ResourceTracker>,
-        _heap_ids: &mut AHashSet<HeapId>,
-    ) -> RunResult<()> {
+    fn py_cmp(&self, other: &Self, vm: &mut VM<'h>) -> RunResult<CmpOrder> {
+        Ok(CmpOrder::Ordered(self.get(vm.heap).0.cmp(&other.get(vm.heap).0)))
+    }
+
+    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
         Ok(string_repr_fmt(&self.get(vm.heap).0, f)?)
     }
 
-    fn py_str(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
-        Ok(self.get(vm.heap).0.clone().into_string().into())
+    fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(allocate_string(self.get(vm.heap).as_str(), vm.heap))
     }
 
-    fn py_add(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<Option<Value>, ResourceError> {
-        let self_str = self.get(vm.heap).0.clone();
-        let other_str = other.get(vm.heap).0.clone();
-        let result = format!("{self_str}{other_str}");
-        let id = vm.heap.allocate(HeapData::Str(result.into()))?;
-        Ok(Some(Value::Ref(id)))
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let other = match other {
+            Value::InternString(id) => vm.interns.get_str(*id),
+            Value::Ref(id) if let HeapData::Str(value) = vm.heap.get(*id) => value.as_str(),
+            _ => return Ok(None),
+        };
+        Ok(Some(concat_allocate_str(self.get(vm.heap).as_str(), other, vm.heap)?))
     }
 
-    fn py_call_attr(
-        &mut self,
-        _self_id: HeapId,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> RunResult<CallResult> {
+    fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let Some(count) = repeat_count(other, vm)? else {
+            return Ok(None);
+        };
+        Ok(Some(repeat_str(self.get(vm.heap).as_str(), count, vm.heap)?))
+    }
+
+    fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        self.py_mul_impl(other, vm)
+    }
+
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         let Some(method) = attr.static_string() else {
-            args.drop_with_heap(vm);
+            args.drop_with(vm);
             return Err(ExcType::attribute_error(Type::Str, attr.as_str(vm.interns)));
         };
 
@@ -284,10 +376,6 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Str> {
 }
 
 impl HeapItem for Str {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.0.len()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // No-op: strings don't hold Value references
     }
@@ -297,13 +385,8 @@ impl HeapItem for Str {
 ///
 /// This is the entry point for string method calls from the VM on interned strings.
 /// Converts the `StringId` to `StaticStrings` and delegates to `call_str_method_impl`.
-pub fn call_str_method(
-    s: &str,
-    method_id: StringId,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let args_guard = HeapGuard::new(args, vm.heap);
+pub fn call_str_method(s: &str, method_id: StringId, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Value> {
+    let args_guard = DropGuard::new(args, vm.heap);
     let Some(method) = StaticStrings::from_string_id(method_id) else {
         return Err(ExcType::attribute_error(Type::Str, vm.interns.get_str(method_id)));
     };
@@ -311,20 +394,36 @@ pub fn call_str_method(
     call_str_method_impl(&vm.heap.protect(s), method, args, vm)
 }
 
+const FORMAT_TEMPLATE_COPY_CHUNK: usize = 64 * 1024;
+
+fn copy_format_template(template: &str, tracker: &ResourceTracker) -> RunResult<String> {
+    tracker.check_time()?;
+    let mut copy = StringBuilder::with_capacity(template.len(), tracker)?;
+    let mut start = 0;
+    while start < template.len() {
+        tracker.check_time()?;
+        let mut end = start.saturating_add(FORMAT_TEMPLATE_COPY_CHUNK).min(template.len());
+        while !template.is_char_boundary(end) {
+            end -= 1;
+        }
+        copy.push_str(&template[start..end])?;
+        start = end;
+    }
+    tracker.check_time()?;
+    copy.finish_raw()
+}
+
 /// Dispatches a method call on a string value.
 ///
 /// This is the unified implementation for string method calls, used by both:
-/// - `HeapRead<Str>::py_call_attr()` for heap-allocated strings
+/// - `HeapObjectRead<Str>::py_call_attr()` for heap-allocated strings
 /// - `call_str_method()` for interned string literals from the VM
 ///
 /// # Not Yet Implemented
 ///
 /// The following Python string methods are not yet implemented:
 ///
-/// - `format()` - Requires implementing the format spec mini-language (PEP 3101),
-///   which is complex and involves parsing format specifications like `{:>10.2f}`.
-/// - `format_map(mapping)` - Similar to `format()` but takes a mapping; depends on
-///   `format()` implementation.
+/// - `format_map(mapping)` - Mapping-only variant of `format()`.
 /// - `maketrans()` / `translate()` - Character translation tables; moderate complexity,
 ///   requires building and applying Unicode translation maps.
 /// - `expandtabs(tabsize=8)` - Tab expansion; simple but rarely used in practice.
@@ -334,33 +433,33 @@ fn call_str_method_impl<'h>(
     s: &HeapRead<'h, str>,
     method: StaticStrings,
     args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
+    vm: &mut VM<'h>,
 ) -> RunResult<Value> {
     match method {
         // Simple transformations (no arguments)
         StaticStrings::Lower => {
             args.check_zero_args("str.lower", vm.heap)?;
-            str_lower(s.get(vm.heap), vm)
+            Ok(str_lower(s.get(vm.heap), vm))
         }
         StaticStrings::Upper => {
             args.check_zero_args("str.upper", vm.heap)?;
-            str_upper(s.get(vm.heap), vm)
+            Ok(str_upper(s.get(vm.heap), vm))
         }
         StaticStrings::Capitalize => {
             args.check_zero_args("str.capitalize", vm.heap)?;
-            str_capitalize(s.get(vm.heap), vm)
+            Ok(str_capitalize(s.get(vm.heap), vm))
         }
         StaticStrings::Title => {
             args.check_zero_args("str.title", vm.heap)?;
-            str_title(s.get(vm.heap), vm)
+            Ok(str_title(s.get(vm.heap), vm))
         }
         StaticStrings::Swapcase => {
             args.check_zero_args("str.swapcase", vm.heap)?;
-            str_swapcase(s.get(vm.heap), vm)
+            Ok(str_swapcase(s.get(vm.heap), vm))
         }
         StaticStrings::Casefold => {
             args.check_zero_args("str.casefold", vm.heap)?;
-            str_casefold(s.get(vm.heap), vm)
+            Ok(str_casefold(s.get(vm.heap), vm))
         }
         // Predicate methods (no arguments, return bool)
         StaticStrings::Isalpha => {
@@ -426,6 +525,16 @@ fn call_str_method_impl<'h>(
         StaticStrings::Rjust => str_rjust(s, args, vm),
         StaticStrings::Zfill => str_zfill(s, args, vm),
         StaticStrings::Expandtabs => str_expandtabs(s, args, vm),
+        StaticStrings::Format => {
+            let template = match copy_format_template(s.get(vm.heap), &vm.heap.tracker) {
+                Ok(template) => template,
+                Err(error) => {
+                    args.drop_with(vm);
+                    return Err(error);
+                }
+            };
+            str_format(&template, args, vm)
+        }
         // Additional methods
         StaticStrings::Encode => str_encode(s, args, vm),
         StaticStrings::Isidentifier => {
@@ -442,7 +551,7 @@ fn call_str_method_impl<'h>(
             str_join(s, iterable, vm)
         }
         _ => {
-            args.drop_with_heap(vm);
+            args.drop_with(vm);
             Err(ExcType::attribute_error(Type::Str, method.into()))
         }
     }
@@ -461,22 +570,22 @@ fn call_str_method_impl<'h>(
 ///
 /// # Errors
 /// Returns `TypeError` if the argument is not iterable or if any element is not a string.
-fn str_join<'h>(
-    separator: &HeapRead<'h, str>,
-    iterable: Value,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    // Create MontyIter from the iterable, with join-specific error message
-    let Ok(iter) = MontyIter::new(iterable, vm) else {
+fn str_join<'h>(separator: &HeapRead<'h, str>, iterable: Value, vm: &mut VM<'h>) -> RunResult<Value> {
+    // Checked up front: a user `__iter__` can raise anything, and rewriting that
+    // as "can only join an iterable" would hide it, resource errors included.
+    if !iterable.py_is_iterable(vm) {
+        iterable.drop_with(vm);
         return Err(ExcType::type_error_join_not_iterable());
-    };
-    defer_drop_mut!(iter, vm);
+    }
+    let iter = iterable.into_py_iter(vm)?;
+    defer_drop!(iter, vm);
+    let mut iter = iter.read(vm);
 
     // Build result string, tracking index for error messages
     let mut result = String::new();
     let mut index = 0usize;
 
-    while let Some(item) = iter.for_next(vm)? {
+    while let Some(item) = iter.py_next(vm)? {
         defer_drop!(item, vm);
         if index > 0 {
             result.push_str(separator.get(vm.heap));
@@ -491,69 +600,20 @@ fn str_join<'h>(
                 if let HeapData::Str(s) = vm.heap.get(*heap_id) {
                     result.push_str(s.as_str());
                 } else {
-                    let t = item.py_type(vm);
-                    return Err(ExcType::type_error_join_item(index, t));
+                    let t = item.py_type_name(vm);
+                    return Err(ExcType::type_error_join_item(index, &t));
                 }
             }
             _ => {
-                let t = item.py_type(vm);
-                return Err(ExcType::type_error_join_item(index, t));
+                let t = item.py_type_name(vm);
+                return Err(ExcType::type_error_join_item(index, &t));
             }
         }
         index += 1;
     }
 
     // Allocate result (uses interned empty string if result is empty)
-    allocate_string(result, vm.heap)
-}
-
-/// Writes a Python repr() string for a given string slice to a formatter.
-///
-/// Chooses between single and double quotes based on the string content:
-/// - Uses double quotes if the string contains single quotes but not double quotes
-/// - Uses single quotes by default, escaping any contained single quotes
-///
-/// Common escape sequences (backslash, newline, tab, carriage return) are always escaped.
-pub fn string_repr_fmt(s: &str, f: &mut impl Write) -> fmt::Result {
-    // Check if the string contains single quotes but not double quotes
-    if s.contains('\'') && !s.contains('"') {
-        // Use double quotes if string contains only single quotes
-        f.write_char('"')?;
-        for c in s.chars() {
-            match c {
-                '\\' => f.write_str("\\\\")?,
-                '\n' => f.write_str("\\n")?,
-                '\t' => f.write_str("\\t")?,
-                '\r' => f.write_str("\\r")?,
-                _ => f.write_char(c)?,
-            }
-        }
-        f.write_char('"')
-    } else {
-        // Use single quotes by default, escape any single quotes in the string
-        f.write_char('\'')?;
-        for c in s.chars() {
-            match c {
-                '\\' => f.write_str("\\\\")?,
-                '\n' => f.write_str("\\n")?,
-                '\t' => f.write_str("\\t")?,
-                '\r' => f.write_str("\\r")?,
-                '\'' => f.write_str("\\'")?,
-                _ => f.write_char(c)?,
-            }
-        }
-        f.write_char('\'')
-    }
-}
-
-/// Formatter for a Python repr() string.
-#[derive(Debug)]
-pub struct StringRepr<'a>(pub &'a str);
-
-impl fmt::Display for StringRepr<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        string_repr_fmt(self.0, f)
-    }
+    Ok(allocate_string(result, vm.heap))
 }
 
 // =============================================================================
@@ -561,19 +621,19 @@ impl fmt::Display for StringRepr<'_> {
 // =============================================================================
 
 /// Implements Python's `str.lower()` method.
-fn str_lower(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_lower(s: &str, vm: &VM<'_>) -> Value {
     allocate_string(s.to_lowercase(), vm.heap)
 }
 
 /// Implements Python's `str.upper()` method.
-fn str_upper(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_upper(s: &str, vm: &VM<'_>) -> Value {
     allocate_string(s.to_uppercase(), vm.heap)
 }
 
 /// Implements Python's `str.capitalize()` method.
 ///
 /// Returns a copy of the string with its first character capitalized and the rest lowercased.
-fn str_capitalize(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_capitalize(s: &str, vm: &VM<'_>) -> Value {
     let mut chars = s.chars();
     let result = match chars.next() {
         None => String::new(),
@@ -592,7 +652,7 @@ fn str_capitalize(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<V
 ///
 /// Returns a titlecased version of the string where words start with an uppercase
 /// character and the remaining characters are lowercase.
-fn str_title(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_title(s: &str, vm: &VM<'_>) -> Value {
     let mut result = String::with_capacity(s.len());
     let mut prev_is_cased = false;
 
@@ -611,7 +671,7 @@ fn str_title(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value>
 /// Implements Python's `str.swapcase()` method.
 ///
 /// Returns a copy of the string with uppercase characters converted to lowercase and vice versa.
-fn str_swapcase(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_swapcase(s: &str, vm: &VM<'_>) -> Value {
     let mut result = String::with_capacity(s.len());
 
     for c in s.chars() {
@@ -631,7 +691,7 @@ fn str_swapcase(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Val
 ///
 /// Returns a casefolded copy of the string. Casefolding is similar to lowercasing
 /// but more aggressive because it is intended for caseless string matching.
-fn str_casefold(s: &str, vm: &VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_casefold(s: &str, vm: &VM<'_>) -> Value {
     // Rust's to_lowercase() is equivalent to Unicode casefolding for most purposes
     allocate_string(s.to_lowercase(), vm.heap)
 }
@@ -896,7 +956,7 @@ fn is_unicode_digit(c: char) -> bool {
 ///
 /// Returns the lowest index in the string where substring sub is found within
 /// the slice s[start:end]. Returns -1 if sub is not found.
-fn str_find<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
+fn str_find<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
     let (sub, start, end) = parse_search_args("str.find", str_len, args, vm)?;
     let s = s.get(vm.heap);
@@ -916,11 +976,7 @@ fn str_find<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h, '_, impl
 ///
 /// Returns the highest index in the string where substring sub is found within
 /// the slice s[start:end]. Returns -1 if sub is not found.
-fn str_rfind<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_rfind<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
     let (sub, start, end) = parse_search_args("str.rfind", str_len, args, vm)?;
     let s = s.get(vm.heap);
@@ -939,11 +995,7 @@ fn str_rfind<'h>(
 /// Implements Python's `str.index(sub, start?, end?)` method.
 ///
 /// Like find(), but raises ValueError when the substring is not found.
-fn str_index<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_index<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
     let (sub, start, end) = parse_search_args("str.index", str_len, args, vm)?;
     let s = s.get(vm.heap);
@@ -961,11 +1013,7 @@ fn str_index<'h>(
 /// Implements Python's `str.rindex(sub, start?, end?)` method.
 ///
 /// Like rfind(), but raises ValueError when the substring is not found.
-fn str_rindex<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_rindex<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
     let (sub, start, end) = parse_search_args("str.rindex", str_len, args, vm)?;
     let s = s.get(vm.heap);
@@ -984,11 +1032,7 @@ fn str_rindex<'h>(
 ///
 /// Returns the number of non-overlapping occurrences of substring sub in
 /// the string s[start:end].
-fn str_count<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_count<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
     let (sub, start, end) = parse_search_args("str.count", str_len, args, vm)?;
     let s = s.get(vm.heap);
@@ -1007,34 +1051,104 @@ fn str_count<'h>(
 ///
 /// Returns True if the string starts with the prefix, otherwise returns False.
 /// The prefix argument can be a string or a tuple of strings.
-fn str_startswith<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let str_len = s.get(vm.heap).chars().count();
-    let (prefixes, start, end) = parse_prefix_suffix_args("str.startswith", str_len, args, vm)?;
-    let s = s.get(vm.heap);
-    let slice = slice_string(s, start, end);
-    let result = prefixes.iter().any(|prefix| slice.starts_with(prefix));
-    Ok(Value::Bool(result))
+fn str_startswith<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    str_starts_ends_with(s, "str.startswith", |hay, prefix| hay.starts_with(prefix), args, vm)
 }
 
 /// Implements Python's `str.endswith(suffix, start?, end?)` method.
 ///
 /// Returns True if the string ends with the suffix, otherwise returns False.
 /// The suffix argument can be a string or a tuple of strings.
-fn str_endswith<'h>(
+fn str_endswith<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    str_starts_ends_with(s, "str.endswith", |hay, suffix| hay.ends_with(suffix), args, vm)
+}
+
+/// Shared implementation of `str.startswith`/`str.endswith`.
+///
+/// Argument handling mirrors CPython's order: arg count, then start/end index
+/// conversion (bad indices raise before the affix is even looked at), then the
+/// affix itself — where tuple elements are validated lazily and in order, so a
+/// match short-circuits before later elements are type-checked. Affix strings
+/// are borrowed straight from interns/heap, never copied.
+fn str_starts_ends_with<'h>(
     s: &HeapRead<'h, str>,
+    method: &'static str,
+    matcher: impl Fn(&str, &str) -> bool,
     args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
+    vm: &mut VM<'h>,
 ) -> RunResult<Value> {
     let str_len = s.get(vm.heap).chars().count();
-    let (suffixes, start, end) = parse_prefix_suffix_args("str.endswith", str_len, args, vm)?;
-    let s = s.get(vm.heap);
-    let slice = slice_string(s, start, end);
-    let result = suffixes.iter().any(|suffix| slice.ends_with(suffix));
-    Ok(Value::Bool(result))
+    let pos = args.into_pos_only(method, vm.heap)?;
+    defer_drop!(pos, vm);
+    let [affix, rest @ ..] = pos.as_slice() else {
+        return Err(ExcType::type_error_at_least(method, 1, 0));
+    };
+    if rest.len() > 2 {
+        return Err(ExcType::type_error_at_most(method, 3, pos.len()));
+    }
+    let start = match rest.first() {
+        Some(value) => optional_sequence_bound(value, 0, str_len, vm)?,
+        None => 0,
+    };
+    let end = match rest.get(1) {
+        Some(value) => optional_sequence_bound(value, str_len, str_len, vm)?,
+        None => str_len,
+    };
+    let slice = slice_string(s.get(vm.heap), start, end);
+    Ok(Value::Bool(affix_matches(affix, slice, method, matcher, vm)?))
+}
+
+/// Tests `matcher(slice, affix)` (`str::starts_with` or `str::ends_with`) against
+/// the affix argument, validating it in the process — see [`str_starts_ends_with`].
+///
+/// Tuple elements are checked in CPython order: a matching element returns
+/// `Ok(true)` before later elements are type-checked; the first non-str element
+/// reached raises `tuple for {method} must only contain str, not {type}`.
+fn affix_matches(
+    affix: &Value,
+    slice: &str,
+    method: &'static str,
+    matcher: impl Fn(&str, &str) -> bool,
+    vm: &VM<'_>,
+) -> RunResult<bool> {
+    // CPython error messages use the bare method name, not "str.startswith".
+    let short_method = method.strip_prefix("str.").unwrap_or(method);
+    let check = |a: &str| matcher(slice, a);
+    match affix {
+        Value::InternString(id) => Ok(check(vm.interns.get_str(*id))),
+        Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
+            HeapData::Str(a) => Ok(check(a.as_str())),
+            HeapData::Tuple(tuple) => {
+                for item in tuple.as_slice() {
+                    let matched = match item {
+                        Value::InternString(id) => check(vm.interns.get_str(*id)),
+                        Value::Ref(hid) if let HeapData::Str(a) = vm.heap.get(*hid) => check(a.as_str()),
+                        _ => {
+                            return Err(ExcType::type_error_affix_tuple_item(
+                                short_method,
+                                "str",
+                                &item.py_type_name(vm),
+                            ));
+                        }
+                    };
+                    if matched {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            _ => Err(ExcType::type_error_affix_arg(
+                short_method,
+                "str",
+                &affix.py_type_name(vm),
+            )),
+        },
+        _ => Err(ExcType::type_error_affix_arg(
+            short_method,
+            "str",
+            &affix.py_type_name(vm),
+        )),
+    }
 }
 
 /// Parses arguments for search methods (find, rfind, index, rindex, count, startswith, endswith).
@@ -1044,7 +1158,7 @@ fn parse_search_args(
     method: &str,
     str_len: usize,
     args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
+    vm: &mut VM<'_>,
 ) -> RunResult<(String, usize, usize)> {
     let pos = args.into_pos_only(method, vm.heap)?;
     defer_drop!(pos, vm);
@@ -1055,13 +1169,13 @@ fn parse_search_args(
         }
         [sub_value, start_value] => {
             let sub = extract_string_arg(sub_value, vm)?;
-            let start = optional_index(start_value, 0, str_len, vm)?;
+            let start = optional_sequence_bound(start_value, 0, str_len, vm)?;
             Ok((sub, start, str_len))
         }
         [sub_value, start_value, end_value] => {
             let sub = extract_string_arg(sub_value, vm)?;
-            let start = optional_index(start_value, 0, str_len, vm)?;
-            let end = optional_index(end_value, str_len, str_len, vm)?;
+            let start = optional_sequence_bound(start_value, 0, str_len, vm)?;
+            let end = optional_sequence_bound(end_value, str_len, str_len, vm)?;
             Ok((sub, start, end))
         }
         [] => Err(ExcType::type_error_at_least(method, 1, 0)),
@@ -1069,78 +1183,8 @@ fn parse_search_args(
     }
 }
 
-/// Parses arguments for startswith/endswith methods.
-///
-/// Returns (prefixes/suffixes as Vec, start, end) where start and end are character indices.
-/// The first argument can be either a string or a tuple of strings.
-fn parse_prefix_suffix_args(
-    method: &str,
-    str_len: usize,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<(Vec<String>, usize, usize)> {
-    let pos = args.into_pos_only(method, vm.heap)?;
-    defer_drop!(pos, vm);
-    match pos.as_slice() {
-        [prefix_value] => {
-            let prefixes = extract_str_or_tuple_of_str(prefix_value, vm)?;
-            Ok((prefixes, 0, str_len))
-        }
-        [prefix_value, start_value] => {
-            let prefixes = extract_str_or_tuple_of_str(prefix_value, vm)?;
-            let start = optional_index(start_value, 0, str_len, vm)?;
-            Ok((prefixes, start, str_len))
-        }
-        [prefix_value, start_value, end_value] => {
-            let prefixes = extract_str_or_tuple_of_str(prefix_value, vm)?;
-            let start = optional_index(start_value, 0, str_len, vm)?;
-            let end = optional_index(end_value, str_len, str_len, vm)?;
-            Ok((prefixes, start, end))
-        }
-        [] => Err(ExcType::type_error_at_least(method, 1, 0)),
-        _ => Err(ExcType::type_error_at_most(method, 3, pos.len())),
-    }
-}
-
-/// Extracts a string or tuple of strings from a Value.
-///
-/// Returns a Vec of strings - a single-element Vec if given a string,
-/// or multiple elements if given a tuple of strings.
-fn extract_str_or_tuple_of_str(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Vec<String>> {
-    match value {
-        Value::InternString(id) => Ok(vec![vm.interns.get_str(*id).to_owned()]),
-        Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
-            HeapData::Str(s) => Ok(vec![s.as_str().to_owned()]),
-            HeapData::Tuple(tuple) => {
-                // Inline string extraction to avoid borrow conflict — vm.heap is
-                // already borrowed immutably to access the tuple's items.
-                let items = tuple.as_slice();
-                let mut strings = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::InternString(id) => {
-                            strings.push(vm.interns.get_str(*id).to_owned());
-                        }
-                        Value::Ref(hid) => {
-                            if let HeapData::Str(s) = vm.heap.get(*hid) {
-                                strings.push(s.as_str().to_owned());
-                            } else {
-                                return Err(ExcType::type_error("expected str or tuple of str"));
-                            }
-                        }
-                        _ => return Err(ExcType::type_error("expected str or tuple of str")),
-                    }
-                }
-                Ok(strings)
-            }
-            _ => Err(ExcType::type_error("expected str or tuple of str")),
-        },
-        _ => Err(ExcType::type_error("expected str or tuple of str")),
-    }
-}
-
 /// Extracts a string from a Value, returning an error if not a string.
-fn extract_string_arg(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<String> {
+fn extract_string_arg(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
     match value {
         Value::InternString(id) => Ok(vm.interns.get_str(*id).to_owned()),
         Value::Ref(heap_id) => {
@@ -1155,50 +1199,25 @@ fn extract_string_arg(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) 
 }
 
 /// Extracts an integer from a Value, returning an error if not an integer.
-fn extract_int_arg(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<i64> {
-    match value {
-        Value::Int(i) => Ok(*i),
-        Value::Ref(heap_id) => {
-            if let HeapData::LongInt(li) = vm.heap.get(*heap_id) {
-                // Try to convert to i64
-                li.to_i64().ok_or_else(|| ExcType::type_error("integer too large"))
-            } else {
-                Err(ExcType::type_error("expected int"))
-            }
-        }
-        _ => Err(ExcType::type_error("expected int")),
-    }
-}
-
-/// Normalizes a Python-style index to a valid index in range [0, len].
-fn normalize_index(index: i64, len: usize) -> usize {
-    if index < 0 {
-        // Safe cast: we've checked index is negative, so -index is positive
-        // For very large negative numbers that don't fit in usize, saturate to usize::MAX
-        let abs_index = usize::try_from(-index).unwrap_or(usize::MAX);
-        len.saturating_sub(abs_index)
-    } else {
-        // Safe cast: we've checked index is non-negative
-        // For values > usize::MAX, saturate to len
-        usize::try_from(index).unwrap_or(len).min(len)
-    }
-}
-
-/// Extracts an optional index from a `Value`, treating `None` as `default`.
 ///
-/// Used by argument parsers where `None` means "use the default index" and
-/// any other value is interpreted as an integer and normalized against `str_len`.
-fn optional_index(
-    value: &Value,
-    default: usize,
-    str_len: usize,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<usize> {
-    if matches!(value, Value::None) {
-        Ok(default)
-    } else {
-        Ok(normalize_index(extract_int_arg(value, vm)?, str_len))
-    }
+/// Delegates rather than re-matching: [`Value::as_int`] is the one place that
+/// knows about `LongInt` and a user `__index__`, and its wording is CPython's
+/// (`'str' object cannot be interpreted as an integer`, `Python int too large
+/// to convert to C ssize_t`) where the hand-rolled version here was not.
+fn extract_int_arg(value: &Value, vm: &mut VM<'_>) -> RunResult<i64> {
+    value.as_int(vm)
+}
+
+/// Extracts a C `int`-bounded integer, as CPython's clinic `int` converter does.
+///
+/// Distinct from [`extract_int_arg`], which is `ssize_t`-bounded: `str.expandtabs`
+/// declares `tabsize` as a C `int`, so `2**31` is an `OverflowError` there while
+/// an `ssize_t` argument still accepts it. Rejecting up front also keeps a large
+/// `tabsize` from reaching the space-building loop, where each tab amplifies into
+/// `tabsize` bytes.
+fn extract_c_int_arg(value: &Value, vm: &mut VM<'_>) -> RunResult<i32> {
+    let as_i64 = value.as_int_with_overflow(vm, ExcType::overflow_c_int)?;
+    i32::try_from(as_i64).map_err(|_| ExcType::overflow_c_int())
 }
 
 /// Returns a substring of s from character index start to end.
@@ -1231,62 +1250,46 @@ fn slice_string(s: &str, start: usize, end: usize) -> &str {
 ///
 /// Returns a copy of the string with leading and trailing characters removed.
 /// If chars is not specified, whitespace characters are removed.
-fn str_strip<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_strip<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let chars = parse_strip_arg("str.strip", args, vm)?;
     let s = s.get(vm.heap);
     let result = match &chars {
         Some(c) => s.trim_matches(|ch| c.contains(ch)).to_owned(),
         None => s.trim().to_owned(),
     };
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Implements Python's `str.lstrip(chars?)` method.
 ///
 /// Returns a copy of the string with leading characters removed.
-fn str_lstrip<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_lstrip<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let chars = parse_strip_arg("str.lstrip", args, vm)?;
     let s = s.get(vm.heap);
     let result = match &chars {
         Some(c) => s.trim_start_matches(|ch| c.contains(ch)).to_owned(),
         None => s.trim_start().to_owned(),
     };
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Implements Python's `str.rstrip(chars?)` method.
 ///
 /// Returns a copy of the string with trailing characters removed.
-fn str_rstrip<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_rstrip<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let chars = parse_strip_arg("str.rstrip", args, vm)?;
     let s = s.get(vm.heap);
     let result = match &chars {
         Some(c) => s.trim_end_matches(|ch| c.contains(ch)).to_owned(),
         None => s.trim_end().to_owned(),
     };
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Parses the optional chars argument for strip methods.
 ///
 /// Accepts None as a value meaning "use default whitespace stripping".
-fn parse_strip_arg(
-    method: &str,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<Option<String>> {
+fn parse_strip_arg(method: &str, args: ArgValues, vm: &mut VM<'_>) -> RunResult<Option<String>> {
     let value = args.get_zero_one_arg(method, vm.heap)?;
     match value {
         None => Ok(None),
@@ -1303,36 +1306,28 @@ fn parse_strip_arg(
 ///
 /// If the string starts with the prefix string, return string[len(prefix):].
 /// Otherwise, return a copy of the original string.
-fn str_removeprefix<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_removeprefix<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let prefix_value = args.get_one_arg("str.removeprefix", vm.heap)?;
     defer_drop!(prefix_value, vm);
     let prefix = extract_string_arg(prefix_value, vm)?;
 
     let s = s.get(vm.heap);
     let result = s.strip_prefix(&prefix).unwrap_or(s).to_owned();
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Implements Python's `str.removesuffix(suffix)` method.
 ///
 /// If the string ends with the suffix string, return string[:-len(suffix)].
 /// Otherwise, return a copy of the original string.
-fn str_removesuffix<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_removesuffix<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let suffix_value = args.get_one_arg("str.removesuffix", vm.heap)?;
     defer_drop!(suffix_value, vm);
     let suffix = extract_string_arg(suffix_value, vm)?;
 
     let s = s.get(vm.heap);
     let result = s.strip_suffix(&suffix).unwrap_or(s).to_owned();
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 // =============================================================================
@@ -1342,12 +1337,9 @@ fn str_removesuffix<'h>(
 /// Implements Python's `str.split(sep?, maxsplit?)` method.
 ///
 /// Returns a list of the words in the string, using sep as the delimiter string.
-fn str_split<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let (sep, maxsplit) = parse_split_args("str.split", args, vm)?;
+fn str_split<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    let SplitArgs { sep, maxsplit } = SplitArgs::from_args(args, vm)?;
+    let (sep, maxsplit) = coerce_split_args(sep, maxsplit, vm)?;
     let s = s.get(vm.heap);
 
     let parts: Vec<&str> = match &sep {
@@ -1378,13 +1370,13 @@ fn str_split<'h>(
 
     // Convert to list of strings (using interned empty string when applicable)
     let mut list_items = Vec::with_capacity(parts.len());
-    for part in parts {
-        vm.heap.check_time()?;
-        list_items.push(allocate_string(part.to_owned(), vm.heap)?);
+    for (i, part) in parts.into_iter().enumerate() {
+        vm.heap.tracker.check_memory_time_every(i)?;
+        list_items.push(allocate_string(part, vm.heap));
     }
 
     let list = super::List::new(list_items);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
@@ -1392,12 +1384,9 @@ fn str_split<'h>(
 ///
 /// Returns a list of the words in the string, using sep as the delimiter string,
 /// splitting from the right.
-fn str_rsplit<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let (sep, maxsplit) = parse_split_args("str.rsplit", args, vm)?;
+fn str_rsplit<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    let RsplitArgs { sep, maxsplit } = RsplitArgs::from_args(args, vm)?;
+    let (sep, maxsplit) = coerce_split_args(sep, maxsplit, vm)?;
     let s = s.get(vm.heap);
 
     let parts: Vec<&str> = match &sep {
@@ -1430,101 +1419,52 @@ fn str_rsplit<'h>(
 
     // Convert to list of strings (using interned empty string when applicable)
     let mut list_items = Vec::with_capacity(parts.len());
-    for part in parts {
-        vm.heap.check_time()?;
-        list_items.push(allocate_string(part.to_owned(), vm.heap)?);
+    for (i, part) in parts.into_iter().enumerate() {
+        vm.heap.tracker.check_memory_time_every(i)?;
+        list_items.push(allocate_string(part, vm.heap));
     }
 
     let list = super::List::new(list_items);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
-/// Parses arguments for split methods.
+/// Coerces extracted `sep` / `maxsplit` `Value`s into the runtime shape used
+/// by the actual `split`/`rsplit` implementations.
 ///
-/// Supports both positional and keyword arguments for sep and maxsplit.
-fn parse_split_args(
-    method: &str,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<(Option<String>, i64)> {
-    let (pos, kwargs) = args.into_parts();
-    let kwargs_iter = kwargs.into_iter();
-    defer_drop_mut!(kwargs_iter, vm);
-
-    let mut pos_iter = pos;
-    let sep_value = pos_iter.next();
-    defer_drop_mut!(sep_value, vm);
-    let maxsplit_value = pos_iter.next();
-    defer_drop_mut!(maxsplit_value, vm);
-
-    // Check no extra positional arguments
-    if pos_iter.len() != 0 {
-        return Err(ExcType::type_error_at_most(method, 2, 3));
-    }
-
-    // Extract positional sep (default None)
-    let mut has_pos_sep = sep_value.is_some();
-    let mut sep = if let Some(v) = sep_value.as_ref() {
-        if matches!(v, Value::None) {
-            None
-        } else {
-            Some(extract_string_arg(v, vm)?)
-        }
-    } else {
-        None
+/// `sep = None` is documented as "split on whitespace", so it is mapped to
+/// `Option::None`; any other value is run through `extract_string_arg`.
+/// `maxsplit` is always coerced to `i64` via `extract_int_arg`. Each argument
+/// is dropped on every path so refcounts stay balanced.
+fn coerce_split_args(sep: Value, maxsplit: Value, vm: &mut VM<'_>) -> RunResult<(Option<String>, i64)> {
+    defer_drop!(sep, vm);
+    defer_drop!(maxsplit, vm);
+    let sep = match sep {
+        Value::None => None,
+        _ => Some(extract_string_arg(sep, vm)?),
     };
-
-    // Extract positional maxsplit (default -1)
-    let mut has_pos_maxsplit = maxsplit_value.is_some();
-    let mut maxsplit = if let Some(v) = maxsplit_value.as_ref() {
-        extract_int_arg(v, vm)?
-    } else {
-        -1
-    };
-
-    // Process kwargs
-    for (key, value) in kwargs_iter {
-        defer_drop!(key, vm);
-        defer_drop!(value, vm);
-
-        let Some(keyword_name) = key.as_either_str(vm.heap) else {
-            return Err(ExcType::type_error("keywords must be strings"));
-        };
-
-        let key_str = keyword_name.as_str(vm.interns);
-        match key_str {
-            "sep" => {
-                if has_pos_sep {
-                    return Err(ExcType::type_error(format!(
-                        "{method}() got multiple values for argument 'sep'"
-                    )));
-                }
-                if matches!(value, Value::None) {
-                    sep = None;
-                } else {
-                    sep = Some(extract_string_arg(value, vm)?);
-                }
-                has_pos_sep = true;
-            }
-            "maxsplit" => {
-                if has_pos_maxsplit {
-                    return Err(ExcType::type_error(format!(
-                        "{method}() got multiple values for argument 'maxsplit'"
-                    )));
-                }
-                maxsplit = extract_int_arg(value, vm)?;
-                has_pos_maxsplit = true;
-            }
-            _ => {
-                return Err(ExcType::type_error(format!(
-                    "'{key_str}' is an invalid keyword argument for {method}()"
-                )));
-            }
-        }
-    }
-
+    let maxsplit = extract_int_arg(maxsplit, vm)?;
     Ok((sep, maxsplit))
+}
+
+/// Argument shape for `str.split(sep=None, maxsplit=-1)`.
+#[derive(FromArgs)]
+#[from_args(name = "split")]
+struct SplitArgs {
+    #[from_args(default = Value::None)]
+    sep: Value,
+    #[from_args(default = Value::Int(-1))]
+    maxsplit: Value,
+}
+
+/// Argument shape for `str.rsplit(sep=None, maxsplit=-1)`.
+#[derive(FromArgs)]
+#[from_args(name = "rsplit")]
+struct RsplitArgs {
+    #[from_args(default = Value::None)]
+    sep: Value,
+    #[from_args(default = Value::Int(-1))]
+    maxsplit: Value,
 }
 
 /// Split string on whitespace, returning at most `maxsplit + 1` parts.
@@ -1558,7 +1498,8 @@ fn rsplit_whitespace_n(s: &str, maxsplit: usize) -> Vec<&str> {
 
     while !remaining.is_empty() && count < maxsplit {
         if let Some(start) = remaining.rfind(|c: char| c.is_whitespace()) {
-            parts.push(&remaining[start + 1..]);
+            let ws_len = remaining[start..].chars().next().unwrap().len_utf8();
+            parts.push(&remaining[start + ws_len..]);
             remaining = remaining[..start].trim_end();
             count += 1;
         } else {
@@ -1578,11 +1519,7 @@ fn rsplit_whitespace_n(s: &str, maxsplit: usize) -> Vec<&str> {
 ///
 /// Returns a list of the lines in the string, breaking at line boundaries.
 /// Accepts keepends as either positional or keyword argument.
-fn str_splitlines<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_splitlines<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let keepends = parse_splitlines_args(args, vm)?;
     let s = s.get(vm.heap);
 
@@ -1592,7 +1529,7 @@ fn str_splitlines<'h>(
     let len = bytes.len();
 
     while start < len {
-        vm.heap.check_time()?;
+        vm.heap.tracker.check_memory_time_every(lines.len())?;
 
         // Find the next line ending
         let mut end = start;
@@ -1623,29 +1560,34 @@ fn str_splitlines<'h>(
 
         let line = if keepends { &s[start..end] } else { &s[start..line_end] };
 
-        lines.push(allocate_string(line.to_owned(), vm.heap)?);
+        lines.push(allocate_string(line, vm.heap));
 
         start = end;
     }
 
     let list = super::List::new(lines);
-    let heap_id = vm.heap.allocate(HeapData::List(list))?;
+    let heap_id = vm.heap.allocate(HeapData::List(list));
     Ok(Value::Ref(heap_id))
 }
 
 /// Parses arguments for splitlines method.
 ///
 /// Supports both positional and keyword arguments for keepends.
-fn parse_splitlines_args(args: ArgValues, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<bool> {
-    let val = args.get_zero_one_named_arg("str.splitlines", StaticStrings::Keepends, vm.heap, vm.interns)?;
-    let keepends = if let Some(v) = val {
-        let result = value_is_truthy(&v);
-        v.drop_with_heap(vm.heap);
-        result
-    } else {
-        false
-    };
-    Ok(keepends)
+fn parse_splitlines_args(args: ArgValues, vm: &mut VM<'_>) -> RunResult<bool> {
+    let SplitlinesArgs { keepends } = SplitlinesArgs::from_args(args, vm)?;
+    let result = keepends.as_ref().is_some_and(value_is_truthy);
+    keepends.drop_with(vm.heap);
+    Ok(result)
+}
+
+/// Argument shape for `str.splitlines(keepends=False)`. CPython evaluates
+/// `keepends` for truthiness rather than strict-typing, so the field stays as
+/// a raw `Value` for `value_is_truthy` to inspect.
+#[derive(FromArgs)]
+#[from_args(name = "splitlines", at_most_total)]
+struct SplitlinesArgs {
+    #[from_args(default)]
+    keepends: Option<Value>,
 }
 
 /// Checks if a value is truthy for bool conversion.
@@ -1662,11 +1604,7 @@ fn value_is_truthy(v: &Value) -> bool {
 ///
 /// Splits the string at the first occurrence of sep, and returns a 3-tuple
 /// containing the part before the separator, the separator itself, and the part after.
-fn str_partition<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_partition<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let sep_value = args.get_one_arg("str.partition", vm.heap)?;
     defer_drop!(sep_value, vm);
     let sep = extract_string_arg(sep_value, vm)?;
@@ -1681,25 +1619,21 @@ fn str_partition<'h>(
         None => (s, "", ""),
     };
 
-    let before_val = allocate_string(before.to_owned(), vm.heap)?;
-    let sep_val = allocate_string(sep_found.to_owned(), vm.heap)?;
-    let after_val = allocate_string(after.to_owned(), vm.heap)?;
+    let before_val = allocate_string(before, vm.heap);
+    let sep_val = allocate_string(sep_found, vm.heap);
+    let after_val = allocate_string(after, vm.heap);
 
     Ok(super::allocate_tuple(
         smallvec![before_val, sep_val, after_val],
         vm.heap,
-    )?)
+    ))
 }
 
 /// Implements Python's `str.rpartition(sep)` method.
 ///
 /// Splits the string at the last occurrence of sep, and returns a 3-tuple
 /// containing the part before the separator, the separator itself, and the part after.
-fn str_rpartition<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_rpartition<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let sep_value = args.get_one_arg("str.rpartition", vm.heap)?;
     defer_drop!(sep_value, vm);
     let sep = extract_string_arg(sep_value, vm)?;
@@ -1714,14 +1648,14 @@ fn str_rpartition<'h>(
         None => ("", "", s),
     };
 
-    let before_val = allocate_string(before.to_owned(), vm.heap)?;
-    let sep_val = allocate_string(sep_found.to_owned(), vm.heap)?;
-    let after_val = allocate_string(after.to_owned(), vm.heap)?;
+    let before_val = allocate_string(before, vm.heap);
+    let sep_val = allocate_string(sep_found, vm.heap);
+    let after_val = allocate_string(after, vm.heap);
 
     Ok(super::allocate_tuple(
         smallvec![before_val, sep_val, after_val],
         vm.heap,
-    )?)
+    ))
 }
 
 // =============================================================================
@@ -1732,15 +1666,11 @@ fn str_rpartition<'h>(
 ///
 /// Returns a copy with all occurrences of substring old replaced by new.
 /// If count is given, only the first count occurrences are replaced.
-fn str_replace<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_replace<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let (old, new, count) = parse_replace_args("str.replace", args, vm)?;
     let s = s.get(vm.heap);
 
-    check_replace_size(s.len(), old.len(), new.len(), count, vm.heap.tracker())?;
+    check_replace_size(s.len(), old.len(), new.len(), count, &vm.heap.tracker)?;
 
     let result = if count < 0 {
         s.replace(&old, &new)
@@ -1750,174 +1680,119 @@ fn str_replace<'h>(
         s.replacen(&old, &new, n)
     };
 
-    allocate_string(result, vm.heap)
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Parses arguments for the replace method.
 ///
 /// Supports both positional and keyword arguments for count (Python 3.13+).
-fn parse_replace_args(
-    method: &str,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<(String, String, i64)> {
-    let (pos, kwargs) = args.into_parts();
-    let kwargs_iter = kwargs.into_iter();
-    defer_drop_mut!(kwargs_iter, vm);
+fn parse_replace_args(_method: &str, args: ArgValues, vm: &mut VM<'_>) -> RunResult<(String, String, i64)> {
+    let ReplaceArgs { old, new, count } = ReplaceArgs::from_args(args, vm)?;
+    defer_drop!(old, vm);
+    defer_drop!(new, vm);
+    defer_drop!(count, vm);
 
-    let mut pos_iter = pos;
-    let Some(old_value) = pos_iter.next() else {
-        return Err(ExcType::type_error_at_least(method, 2, 0));
-    };
-    defer_drop!(old_value, vm);
+    let old_s = extract_string_arg(old, vm)?;
+    let new_s = extract_string_arg(new, vm)?;
+    let count_i = extract_int_arg(count, vm)?;
+    Ok((old_s, new_s, count_i))
+}
 
-    let Some(new_value) = pos_iter.next() else {
-        return Err(ExcType::type_error_at_least(method, 2, 1));
-    };
-    defer_drop!(new_value, vm);
-
-    let count_value = pos_iter.next();
-    defer_drop_mut!(count_value, vm);
-
-    // Check no extra positional arguments
-    if pos_iter.len() != 0 {
-        return Err(ExcType::type_error_at_most(method, 3, 4));
-    }
-
-    let old = extract_string_arg(old_value, vm)?;
-    let new = extract_string_arg(new_value, vm)?;
-
-    let mut has_pos_count = count_value.is_some();
-    let mut count = if let Some(v) = count_value.as_ref() {
-        extract_int_arg(v, vm)?
-    } else {
-        -1
-    };
-
-    // Process kwargs (Python 3.13+ allows count as keyword)
-    for (key, value) in kwargs_iter {
-        defer_drop!(key, vm);
-        defer_drop!(value, vm);
-
-        let Some(keyword_name) = key.as_either_str(vm.heap) else {
-            return Err(ExcType::type_error("keywords must be strings"));
-        };
-
-        let key_str = keyword_name.as_str(vm.interns);
-        if key_str == "count" {
-            if has_pos_count {
-                return Err(ExcType::type_error(format!(
-                    "{method}() got multiple values for argument 'count'"
-                )));
-            }
-            count = extract_int_arg(value, vm)?;
-            has_pos_count = true;
-        } else {
-            return Err(ExcType::type_error(format!(
-                "'{key_str}' is an invalid keyword argument for {method}()"
-            )));
-        }
-    }
-
-    Ok((old, new, count))
+/// Argument shape for `str.replace(old, new, count=-1)`.
+///
+/// `old` and `new` are positional-only at the C level — passing them as
+/// kwargs produces CPython's "takes at least 2 positional arguments"
+/// error, which the macro derives from the required pos-only count.
+/// Python 3.13 promoted `count` from positional-only to
+/// positional-or-keyword, hence the un-annotated default.
+#[derive(FromArgs)]
+#[from_args(name = "replace")]
+struct ReplaceArgs {
+    #[from_args(pos_only)]
+    old: Value,
+    #[from_args(pos_only)]
+    new: Value,
+    #[from_args(default = Value::Int(-1))]
+    count: Value,
 }
 
 /// Implements Python's `str.center(width, fillchar?)` method.
 ///
 /// Returns centered in a string of length width. Padding is done using the
 /// specified fill character (default is a space).
-fn str_center<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_center<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let (width, fillchar) = parse_justify_args("str.center", args, vm)?;
     let s = s.get(vm.heap);
     let len = s.chars().count();
 
-    let result = if width <= len {
-        s.to_owned()
+    if width <= len {
+        Ok(allocate_string(s, vm.heap))
     } else {
-        check_repeat_size(width, fillchar.len_utf8(), vm.heap.tracker())?;
+        // Exact byte capacity: the original string (`s.len()` bytes, possibly
+        // multibyte) plus `pad` fillchars of `fillchar.len_utf8()` bytes each.
+        // `width * fillchar.len_utf8()` would mis-charge the `s`-slot bytes.
         let total_pad = width - len;
+        let capacity = s.len().saturating_add(total_pad.saturating_mul(fillchar.len_utf8()));
+        let mut builder = StringBuilder::with_capacity(capacity, &vm.heap.tracker)?;
         let left_pad = total_pad / 2;
         let right_pad = total_pad - left_pad;
-        let mut result = String::with_capacity(width);
         for _ in 0..left_pad {
-            result.push(fillchar);
+            builder.push(fillchar)?;
         }
-        result.push_str(s);
+        builder.push_str(s)?;
         for _ in 0..right_pad {
-            result.push(fillchar);
+            builder.push(fillchar)?;
         }
-        result
-    };
-
-    allocate_string(result, vm.heap)
+        builder.finish(vm.heap)
+    }
 }
 
 /// Implements Python's `str.ljust(width, fillchar?)` method.
 ///
 /// Returns left-justified in a string of length width.
-fn str_ljust<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_ljust<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let (width, fillchar) = parse_justify_args("str.ljust", args, vm)?;
     let s = s.get(vm.heap);
     let len = s.chars().count();
 
-    let result = if width <= len {
-        s.to_owned()
+    if width <= len {
+        Ok(allocate_string(s, vm.heap))
     } else {
-        check_repeat_size(width, fillchar.len_utf8(), vm.heap.tracker())?;
         let pad = width - len;
-        let mut result = String::with_capacity(width);
-        result.push_str(s);
+        let capacity = s.len().saturating_add(pad.saturating_mul(fillchar.len_utf8()));
+        let mut builder = StringBuilder::with_capacity(capacity, &vm.heap.tracker)?;
+        builder.push_str(s)?;
         for _ in 0..pad {
-            result.push(fillchar);
+            builder.push(fillchar)?;
         }
-        result
-    };
-
-    allocate_string(result, vm.heap)
+        builder.finish(vm.heap)
+    }
 }
 
 /// Implements Python's `str.rjust(width, fillchar?)` method.
 ///
 /// Returns right-justified in a string of length width.
-fn str_rjust<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_rjust<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let (width, fillchar) = parse_justify_args("str.rjust", args, vm)?;
     let s = s.get(vm.heap);
     let len = s.chars().count();
 
-    let result = if width <= len {
-        s.to_owned()
+    if width <= len {
+        Ok(allocate_string(s, vm.heap))
     } else {
-        check_repeat_size(width, fillchar.len_utf8(), vm.heap.tracker())?;
         let pad = width - len;
-        let mut result = String::with_capacity(width);
+        let capacity = s.len().saturating_add(pad.saturating_mul(fillchar.len_utf8()));
+        let mut builder = StringBuilder::with_capacity(capacity, &vm.heap.tracker)?;
         for _ in 0..pad {
-            result.push(fillchar);
+            builder.push(fillchar)?;
         }
-        result.push_str(s);
-        result
-    };
-
-    allocate_string(result, vm.heap)
+        builder.push_str(s)?;
+        builder.finish(vm.heap)
+    }
 }
 
 /// Parses arguments for justify methods (center, ljust, rjust).
-fn parse_justify_args(
-    method: &str,
-    args: ArgValues,
-    vm: &mut VM<'_, '_, impl ResourceTracker>,
-) -> RunResult<(usize, char)> {
+fn parse_justify_args(method: &str, args: ArgValues, vm: &mut VM<'_>) -> RunResult<(usize, char)> {
     let pos = args.into_pos_only(method, vm.heap)?;
     defer_drop!(pos, vm);
 
@@ -1953,11 +1828,7 @@ fn parse_justify_args(
 ///
 /// Returns a copy of the string left filled with ASCII '0' digits to make a
 /// string of length width. A sign prefix is handled correctly.
-fn str_zfill<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
+fn str_zfill<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
     let width_value = args.get_one_arg("str.zfill", vm.heap)?;
     defer_drop!(width_value, vm);
     let width_i64 = extract_int_arg(width_value, vm)?;
@@ -1971,74 +1842,75 @@ fn str_zfill<'h>(
     let s = s.get(vm.heap);
     let len = s.chars().count();
 
-    let result = if width <= len {
-        s.to_owned()
+    if width <= len {
+        Ok(allocate_string(s, vm.heap))
     } else {
-        // zfill always pads with ASCII '0' (1 byte)
-        check_repeat_size(width, 1, vm.heap.tracker())?;
+        // Exact byte capacity: zfill pads with ASCII '0' (1 byte each), so the
+        // result is `s.len() + pad` bytes — `s.len()` (possibly multibyte)
+        // rather than `width` (character count).
         let pad = width - len;
+        let capacity = s.len().saturating_add(pad);
+        let mut builder = StringBuilder::with_capacity(capacity, &vm.heap.tracker)?;
         let mut chars = s.chars();
         let first = chars.next();
 
-        let mut result = String::with_capacity(width);
-
-        // Handle sign prefix
         if matches!(first, Some('+' | '-')) {
-            result.push(first.unwrap());
+            builder.push(first.unwrap())?;
             for _ in 0..pad {
-                result.push('0');
+                builder.push('0')?;
             }
-            result.extend(chars);
+            for c in chars {
+                builder.push(c)?;
+            }
         } else {
             for _ in 0..pad {
-                result.push('0');
+                builder.push('0')?;
             }
-            result.push_str(s);
+            builder.push_str(s)?;
         }
-        result
-    };
-
-    allocate_string(result, vm.heap)
+        builder.finish(vm.heap)
+    }
 }
 
 /// Implements Python's `str.expandtabs(tabsize=8)` method.
 ///
 /// Returns a copy of the string where all tab characters are replaced by one or
 /// more spaces, depending on the current column and the given tab size.
-fn str_expandtabs<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let tabsize_val = args.get_zero_one_named_arg("str.expandtabs", StaticStrings::Tabsize, vm.heap, vm.interns)?;
+fn str_expandtabs<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    let ExpandtabsArgs { tabsize } = ExpandtabsArgs::from_args(args, vm)?;
 
-    let tabsize = match tabsize_val {
+    let tabsize = match tabsize {
         None => 8,
         Some(val) => {
-            let result_int = extract_int_arg(&val, vm)?;
-            val.drop_with_heap(vm.heap);
-            if result_int < 0 {
-                0
-            } else {
-                usize::try_from(result_int).unwrap_or(usize::MAX)
-            }
+            // `defer_drop!` rather than a trailing `drop_with`: the conversion
+            // raises for anything outside C `int`, and that `?` would otherwise
+            // leave `val`'s reference behind.
+            defer_drop!(val, vm);
+            // A negative tabsize expands to nothing, as CPython's `<= 0` test does.
+            usize::try_from(extract_c_int_arg(val, vm)?).unwrap_or(0)
         }
     };
 
-    let mut result = String::with_capacity(s.get(vm.heap).len());
+    let s = s.get(vm.heap);
+    // `tabsize` is bounded by C `int` above, but a tab still amplifies into
+    // `tabsize` bytes and the result size is not known up front, so use the
+    // unbounded builder — its 2× growth policy rejects the build at the first
+    // push that would exceed the memory limit, capping wasted intermediate
+    // allocation to `O(limit)`.
+    let mut builder = StringBuilder::new(&vm.heap.tracker);
     let mut column = 0;
 
-    for c in s.get(vm.heap).chars() {
+    for c in s.chars() {
         if c == '\t' {
             if tabsize > 0 {
                 let spaces = tabsize - (column % tabsize);
                 for _ in 0..spaces {
-                    result.push(' ');
+                    builder.push(' ')?;
                 }
                 column += spaces;
             }
         } else {
-            result.push(c);
+            builder.push(c)?;
             if c == '\n' || c == '\r' {
                 column = 0;
             } else {
@@ -2047,58 +1919,56 @@ fn str_expandtabs<'h>(
         }
     }
 
-    allocate_string(result, vm.heap)
+    builder.finish(vm.heap)
+}
+
+/// Argument shape for `str.expandtabs(tabsize=8)`. `tabsize` is `Option<Value>`
+/// so callers can distinguish "absent" (default 8) from any explicit value
+/// without forcing the macro into a type-checked default.
+#[derive(FromArgs)]
+#[from_args(name = "expandtabs", at_most_total)]
+struct ExpandtabsArgs {
+    #[from_args(default)]
+    tabsize: Option<Value>,
 }
 
 /// Implements Python's `str.encode(encoding='utf-8', errors='strict')` method.
 ///
-/// Returns an encoded version of the string as a bytes object. Only supports
-/// UTF-8 encoding (the native encoding for Rust strings).
-fn str_encode<'h>(
-    s: &HeapRead<'h, str>,
-    args: ArgValues,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> RunResult<Value> {
-    let (encoding, errors) = parse_encode_args(args, vm)?;
+/// Returns an encoded version of the string as a bytes object. Encoding-name
+/// resolution and the codec implementations (UTF-8, ASCII, UTF-16/32
+/// families) live in [`crate::codecs`]. Like CPython, the error handler name
+/// is only looked up (and validated) when an actual encoding error occurs —
+/// `'hello'.encode('ascii', 'bogus')` succeeds because there's nothing for
+/// the handler to do.
+fn str_encode<'h>(s: &HeapRead<'h, str>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+    let EncodeArgs { encoding, errors } = EncodeArgs::from_args(args, vm)?;
+    defer_drop!(encoding, vm);
+    defer_drop!(errors, vm);
+    let encoding = encoding.as_ref().map_or("utf-8", |e| e.as_str(vm));
+    let errors = errors.as_ref().map_or("strict", |e| e.as_str(vm));
 
-    // Only UTF-8 is supported - Rust strings are always valid UTF-8
-    let encoding_lower = encoding.to_ascii_lowercase();
-    if encoding_lower != "utf-8" && encoding_lower != "utf8" {
-        return Err(ExcType::lookup_error_unknown_encoding(&encoding));
-    }
-
-    // For UTF-8 encoding of a valid UTF-8 string, errors mode doesn't matter
-    // since there's nothing to handle - the string is already valid UTF-8
-    if errors != "strict" && errors != "ignore" && errors != "replace" && errors != "backslashreplace" {
-        return Err(ExcType::lookup_error_unknown_error_handler(&errors));
-    }
-
-    let bytes = s.get(vm.heap).as_bytes().to_vec();
-    let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(bytes)))?;
+    let codec = Codec::find(encoding).ok_or_else(|| ExcType::lookup_error_unknown_encoding(encoding))?;
+    let bytes = codec.encode(s.get(vm.heap), errors, &vm.heap.tracker)?;
+    let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(bytes)));
     Ok(Value::Ref(heap_id))
 }
 
-/// Parses arguments for `str.encode()`.
+/// Argument shape for `str.encode(encoding='utf-8', errors='strict')`.
 ///
-/// Returns (encoding, errors) with defaults "utf-8" and "strict".
-fn parse_encode_args(args: ArgValues, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<(String, String)> {
-    let (first, second) = args.get_zero_one_two_args("str.encode", vm.heap)?;
-
-    let encoding = if let Some(v) = first {
-        defer_drop!(v, vm);
-        extract_string_arg(v, vm)?
-    } else {
-        "utf-8".to_owned()
-    };
-
-    let errors = if let Some(v) = second {
-        defer_drop!(v, vm);
-        extract_string_arg(v, vm)?
-    } else {
-        "strict".to_owned()
-    };
-
-    Ok((encoding, errors))
+/// `bad_arg_named` opts in to CPython's `_PyArg_BadArgument` named wording
+/// (`encode() argument 'encoding' must be str, not <type>`) so wrong-type
+/// errors match the C implementation. Both fields default to `None` (absent)
+/// and the implementation supplies `"utf-8"` / `"strict"` after extraction;
+/// CPython rejects explicit `None` here with the bad-arg error, which falls
+/// out naturally because `Option<StrArg>::from_value` delegates to
+/// `StrArg::from_value` and rejects `Value::None`.
+#[derive(FromArgs)]
+#[from_args(name = "encode", at_most_total, bad_arg_named)]
+struct EncodeArgs {
+    #[from_args(default)]
+    encoding: Option<StrArg>,
+    #[from_args(default)]
+    errors: Option<StrArg>,
 }
 
 /// Implements Python's `str.isidentifier()` predicate.
@@ -2106,37 +1976,19 @@ fn parse_encode_args(args: ArgValues, vm: &mut VM<'_, '_, impl ResourceTracker>)
 /// Returns True if the string is a valid Python identifier according to
 /// the language definition (starts with letter or underscore, followed by
 /// letters, digits, or underscores). Empty strings return False.
-fn str_isidentifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-
-    let mut chars = s.chars();
-
-    // First character must be a letter (Unicode) or underscore
-    let first = chars.next().unwrap();
-    if !is_xid_start(first) && first != '_' {
-        return false;
-    }
-
-    // Remaining characters must be letters, digits (Unicode), or underscores
-    chars.all(is_xid_continue)
-}
-
-/// Checks if a character is valid at the start of an identifier (XID_Start).
 ///
-/// This is a simplified implementation that covers ASCII and common Unicode letters.
-/// Python uses the full Unicode XID_Start property.
-fn is_xid_start(c: char) -> bool {
-    c.is_alphabetic()
-}
-
-/// Checks if a character is valid in the continuation of an identifier (XID_Continue).
+/// Note this matches `str.isidentifier()`, which accepts keywords (`'def'`
+/// is an identifier); callers needing the keyword distinction (e.g.
+/// `collections.namedtuple`) must combine this with a separate keyword check.
 ///
-/// This is a simplified implementation that covers ASCII and common Unicode.
-/// Python uses the full Unicode XID_Continue property.
-fn is_xid_continue(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// Uses ruff's `is_identifier` — the full Unicode `XID_Start`/`XID_Continue`
+/// tables, so combining marks and other non-ASCII identifier characters are
+/// accepted like CPython (a bare `is_alphanumeric` check would reject them).
+/// `is_identifier` rejects keywords, but every keyword is XID-valid, so OR-ing
+/// the keyword check back in reconstructs `str.isidentifier()`'s "keywords are
+/// identifiers" behaviour exactly.
+pub(crate) fn str_isidentifier(s: &str) -> bool {
+    is_identifier(s) || is_keyword(s)
 }
 
 /// Implements Python's `str.istitle()` predicate.
@@ -2174,4 +2026,151 @@ fn str_istitle(s: &str) -> bool {
     }
 
     has_cased
+}
+
+/// Source representation retained by a string iterator.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+enum StringIteratorSource {
+    Intern(StringId),
+    Heap(HeapId),
+}
+
+/// Iterator over Unicode code points with CPython's ASCII/non-ASCII type split.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct StringIterator {
+    source: StringIteratorSource,
+    byte_offset: usize,
+    ascii: bool,
+}
+
+impl StringIterator {
+    /// Allocates an iterator over an interned string.
+    pub(crate) fn from_intern(id: StringId, vm: &mut VM<'_>) -> Value {
+        let ascii = vm.interns.get_str(id).is_ascii();
+        Self::allocate(StringIteratorSource::Intern(id), ascii, vm)
+    }
+
+    /// Allocates an iterator retaining a heap string.
+    fn from_heap(id: HeapId, ascii: bool, vm: &mut VM<'_>) -> Value {
+        Self::allocate(StringIteratorSource::Heap(id), ascii, vm)
+    }
+
+    /// Returns the Python-visible iterator type for this string representation.
+    pub(crate) fn py_type(&self) -> Type {
+        if self.ascii {
+            Type::StrAsciiIterator
+        } else {
+            Type::StrIterator
+        }
+    }
+
+    /// Returns a retained heap source, if the string is not interned.
+    pub(crate) fn source_id(&self) -> Option<HeapId> {
+        match self.source {
+            StringIteratorSource::Intern(_) => None,
+            StringIteratorSource::Heap(id) => Some(id),
+        }
+    }
+
+    /// Returns the number of Unicode code points not yet yielded.
+    pub(crate) fn size_hint(&self, vm: &VM<'_>) -> usize {
+        self.as_str(vm).chars().count()
+    }
+
+    /// Borrows the unconsumed string suffix.
+    fn as_str<'a>(&self, vm: &'a VM<'_>) -> &'a str {
+        let string = match self.source {
+            StringIteratorSource::Intern(id) => vm.interns.get_str(id),
+            StringIteratorSource::Heap(id) => match vm.heap.get(id) {
+                HeapData::Str(string) => string.as_str(),
+                _ => unreachable!("string iterator must retain a string"),
+            },
+        };
+        &string[self.byte_offset..]
+    }
+
+    /// Allocates an iterator and retains a heap source when present.
+    fn allocate(source: StringIteratorSource, ascii: bool, vm: &mut VM<'_>) -> Value {
+        let source_id = match source {
+            StringIteratorSource::Heap(id) => Some(id),
+            StringIteratorSource::Intern(_) => None,
+        };
+        let id = vm.heap.allocate(HeapData::StringIterator(Self {
+            source,
+            byte_offset: 0,
+            ascii,
+        }));
+        if let Some(source_id) = source_id {
+            vm.heap.inc_ref(source_id);
+        }
+        Value::Ref(id)
+    }
+}
+
+impl HeapItem for StringIterator {
+    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        if let Some(id) = self.source_id() {
+            stack.push(id);
+        }
+    }
+}
+
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, StringIterator> {
+    fn py_is_iterable(&self, _: &VM<'h>) -> bool {
+        true
+    }
+
+    fn py_type(&self, vm: &VM<'h>) -> Type {
+        self.get(vm.heap).py_type()
+    }
+
+    fn py_len(&self, _: &VM<'h>) -> Option<usize> {
+        None
+    }
+
+    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
+        Ok(None)
+    }
+
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
+    }
+
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let next = self.get(vm.heap).as_str(vm).chars().next();
+        if let Some(character) = next {
+            let value = allocate_char(character, vm.heap);
+            self.get_mut(vm.heap).byte_offset += character.len_utf8();
+            Ok(Some(value))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Helper for substring containment check in strings.
+///
+/// Called by `HeapObjectRead<Str>::py_contains_impl` and, for interned strings, by
+/// `Value::py_contains`. A non-str probe reports its own type, as CPython does.
+pub(crate) fn str_contains(container_str: &str, item: &Value, heap: &Heap, interns: &Interns) -> RunResult<bool> {
+    match item {
+        Value::InternString(item_id) => {
+            let item_str = interns.get_str(*item_id);
+            Ok(container_str.contains(item_str))
+        }
+        Value::Ref(item_heap_id) => {
+            if let HeapData::Str(item_str) = heap.get(*item_heap_id) {
+                Ok(container_str.contains(item_str.as_str()))
+            } else {
+                Err(ExcType::type_error(format!(
+                    "'in <string>' requires string as left operand, not {}",
+                    item.py_type_name_heap(heap, interns)
+                )))
+            }
+        }
+        _ => Err(ExcType::type_error(format!(
+            "'in <string>' requires string as left operand, not {}",
+            item.py_type_name_heap(heap, interns)
+        ))),
+    }
 }

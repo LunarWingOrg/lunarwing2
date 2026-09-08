@@ -1,6 +1,6 @@
 {
   "git": {
-    "sha1": "bdf1ad3617ba00b9f878b7d02906b29798361abb"
+    "sha1": "c965ebeac29459b4ac9efe33c763bb40bc031299"
   },
   "path_in_vcs": "crates/get-size2"
 }

@@ -3,18 +3,22 @@
 //! Provides a range object that supports iteration over a sequence of integers
 //! with configurable start, stop, and step values.
 
-use std::{fmt::Write, mem};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+};
 
-use ahash::AHashSet;
+use num_integer::div_ceil;
 
 use crate::{
     args::ArgValues,
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, RunResult},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
-    resource::{ResourceError, ResourceTracker},
-    types::{PyTrait, Type},
+    exception_private::{ExcType, ExcTypeExt, RunResult},
+    hash::HashValue,
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
+    types::{LazyHeapSet, PyTrait, Type},
     value::Value,
 };
 
@@ -66,22 +70,17 @@ impl Range {
     /// Returns the length of the range (number of elements it will yield).
     #[must_use]
     pub fn len(&self) -> usize {
-        if self.step > 0 {
-            if self.stop > self.start {
-                let len_i64 = (self.stop - self.start - 1) / self.step + 1;
-                usize::try_from(len_i64).expect("range length guaranteed non-negative")
-            } else {
-                0
-            }
-        } else {
-            // step < 0
-            if self.start > self.stop {
-                let len_i64 = (self.start - self.stop - 1) / (-self.step) + 1;
-                usize::try_from(len_i64).expect("range length guaranteed non-negative")
-            } else {
-                0
-            }
-        }
+        self.len_i128().try_into().unwrap_or(usize::MAX)
+    }
+
+    fn len_i128(&self) -> i128 {
+        // self.stop - self.start could be up to i64::MAX - i64::MIN, which overflows i64,
+        // so we use i128 for the calculation to avoid overflow.
+        let start = i128::from(self.start);
+        let stop = i128::from(self.stop);
+        let step = i128::from(self.step);
+
+        div_ceil(stop - start, step).max(0)
     }
 
     #[must_use]
@@ -93,21 +92,21 @@ impl Range {
     ///
     /// A value is contained if it falls within the range bounds and is aligned
     /// with the step (i.e., `(n - start) % step == 0`).
+    ///
+    /// The subtraction is widened to `i128` because `n - self.start` would
+    /// overflow `i64` for ranges spanning the full integer span (e.g.
+    /// `range(i64::MIN, i64::MAX, k)` checked against any positive `n`).
     #[must_use]
     pub fn contains(&self, n: i64) -> bool {
-        if self.step > 0 {
-            // Forward range: start <= n < stop
-            if n < self.start || n >= self.stop {
-                return false;
-            }
+        let in_bounds = if self.step > 0 {
+            n >= self.start && n < self.stop
         } else {
-            // Backward range: stop < n <= start
-            if n > self.start || n <= self.stop {
-                return false;
-            }
+            n <= self.start && n > self.stop
+        };
+        if !in_bounds {
+            return false;
         }
-        // Check if n is on the step grid
-        (n - self.start) % self.step == 0
+        (i128::from(n) - i128::from(self.start)) % i128::from(self.step) == 0
     }
 
     /// Creates a range from the `range()` constructor call.
@@ -116,7 +115,7 @@ impl Range {
     /// - `range(stop)` - range from 0 to stop
     /// - `range(start, stop)` - range from start to stop
     /// - `range(start, stop, step)` - range with custom step
-    pub fn init(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         let pos_args = args.into_pos_only("range", vm.heap)?;
         defer_drop!(pos_args, vm);
 
@@ -143,56 +142,40 @@ impl Range {
             _ => return Err(ExcType::type_error_at_most("range", 3, pos_args.len())),
         };
 
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))?))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))))
     }
 
     /// Handles slice-based indexing for ranges.
     ///
     /// Returns a new range object representing the sliced view.
     /// The new range has computed start, stop, and step values.
-    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap) -> RunResult<Value> {
         let range_len = self.len();
-        let (start, stop, step) = slice
-            .indices(range_len)
-            .map_err(|()| ExcType::value_error_slice_step_zero())?;
+        let (start, stop, step) = slice.indices(range_len)?;
 
-        // Calculate the new range parameters
-        // new_start = self.start + start * self.step
-        // new_step = self.step * slice_step
-        // new_stop needs to be computed based on the number of elements
+        // All intermediate arithmetic is done in `i128` to avoid saturating during
+        // calculation. If any of the resulting `start`, `stop`, or `step`
+        // values do not fit in `i64`, we raise `OverflowError` — Monty's `Range`
+        // stores `i64`, so unlike CPython we cannot represent a range whose
+        // parameters exceed that span.
+        let self_step = i128::from(self.step);
+        let self_start = i128::from(self.start);
+        let slice_step = i128::from(step);
 
-        let new_step = self.step.saturating_mul(step);
-        let start_i64 = i64::try_from(start).expect("start index fits in i64");
-        let new_start = self.start.saturating_add(start_i64.saturating_mul(self.step));
+        let new_step_i128 = self_step * slice_step;
+        let new_start_i128 = self_start + i128::from(start) * self_step;
 
-        // Calculate the number of elements in the sliced range
-        // try_from succeeds for non-negative step; step==0 rejected by slice.indices()
-        let num_elements = if let Ok(step_usize) = usize::try_from(step) {
-            // Forward iteration
-            if start >= stop {
-                0
-            } else {
-                ((stop - start - 1) / step_usize) + 1
-            }
-        } else {
-            // Backward iteration
-            let step_abs = usize::try_from(-step).expect("step is negative so -step is positive");
-            if stop > range_len {
-                // stop sentinel means "go to the beginning"
-                (start / step_abs) + 1
-            } else if start <= stop {
-                0
-            } else {
-                ((start - stop - 1) / step_abs) + 1
-            }
-        };
+        // The guarantee on `slice.indices` is that `stop` and `start` are at most
+        // `range_len` apart, so the subtraction won't overflow.
+        let num_elements = div_ceil(i128::from(stop) - i128::from(start), slice_step);
+        let new_stop_i128 = new_start_i128 + num_elements * new_step_i128;
 
-        // new_stop = new_start + num_elements * new_step
-        let num_elements_i64 = i64::try_from(num_elements).expect("num_elements fits in i64");
-        let new_stop = new_start.saturating_add(num_elements_i64.saturating_mul(new_step));
+        let new_step = i64::try_from(new_step_i128).map_err(|_| ExcType::overflow_c_ssize_t())?;
+        let new_start = i64::try_from(new_start_i128).map_err(|_| ExcType::overflow_c_ssize_t())?;
+        let new_stop = i64::try_from(new_stop_i128).map_err(|_| ExcType::overflow_c_ssize_t())?;
 
         let new_range = Self::new(new_start, new_stop, new_step);
-        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))?))
+        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))))
     }
 }
 
@@ -202,16 +185,50 @@ impl Default for Range {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
-    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
+    fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
+        true
+    }
+
+    /// O(1) containment: bounds plus step alignment, no iteration. Non-integral
+    /// items can never be members, matching CPython's fast path.
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let range = self.get(vm.heap);
+        let n = match item {
+            Value::Int(i) => *i,
+            Value::Bool(b) => i64::from(*b),
+            Value::Float(f) => {
+                if f.fract() != 0.0 {
+                    return Ok(Some(false));
+                }
+                let int_val = f.trunc();
+                // Exclusive upper bound: `i64::MAX as f64` rounds up to 2^63, which
+                // `int_val as i64` would saturate back down to `i64::MAX`.
+                if int_val < i64::MIN as f64 || int_val >= i64::MAX as f64 {
+                    return Ok(Some(false));
+                }
+                #[expect(clippy::cast_possible_truncation)]
+                let n = int_val as i64;
+                n
+            }
+            _ => return Ok(Some(false)),
+        };
+        Ok(Some(range.contains(n)))
+    }
+
+    fn py_type(&self, _vm: &VM<'h>) -> Type {
         Type::Range
     }
 
-    fn py_len(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(RangeIterator::allocate(*self.get(vm.heap), vm))
+    }
+
+    fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
         Some(self.get(vm.heap).len())
     }
 
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
             && let HeapData::Slice(slice) = vm.heap.get(*id)
@@ -222,11 +239,14 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
 
         let range = *self.get(vm.heap);
 
+        // Calculate in i128 space to avoid overflow issues with large ranges and indices.
+
         // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt
-        let index = key.as_index(vm, Type::Range)?;
+        let index = i128::from(key.as_index(vm, Type::Range)?);
 
         // Get range length for normalization
-        let len = i64::try_from(range.len()).expect("range length exceeds i64::MAX");
+        let len = range.len_i128();
+
         let normalized = if index < 0 { index + len } else { index };
 
         // Bounds check
@@ -234,42 +254,65 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
             return Err(ExcType::range_index_error());
         }
 
-        // Calculate: start + normalized * step
-        // Use checked arithmetic to avoid overflow in intermediate calculations
-        let offset = normalized
-            .checked_mul(range.step)
-            .and_then(|v| range.start.checked_add(v))
-            .expect("range element calculation overflowed");
-        Ok(Value::Int(offset))
+        // Calculate: start + normalized * step.
+        //
+        // Mathematically `offset` falls within `[min(start, stop), max(start, stop))`
+        // — within i64 — when the `Range` invariant holds (every element is a valid
+        // i64). The fallible conversion below is defence-in-depth so that an invariant
+        // violation surfaces as a Python `OverflowError` rather than a host panic.
+        let offset = i128::from(range.start) + (normalized * i128::from(range.step));
+        let offset_i64 = i64::try_from(offset).map_err(|_| ExcType::overflow_c_ssize_t())?;
+        Ok(Value::Int(offset_i64))
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        let Some(HeapReadOutput::Range(other)) = other.read_heap(vm) else {
+            return Ok(None);
+        };
         let a = self.get(vm.heap);
         let b = other.get(vm.heap);
         // Compare ranges by their actual sequences, not parameters.
         // Two ranges are equal if they produce the same elements.
         let len1 = a.len();
         let len2 = b.len();
-        if len1 != len2 {
-            return Ok(false);
-        }
-        // Same length - compare first element and step (if non-empty)
-        if len1 == 0 {
-            return Ok(true); // Both empty
-        }
-        Ok(a.start == b.start && a.step == b.step)
+        Ok(Some(if len1 != len2 {
+            false
+        } else if len1 == 0 {
+            true // Both empty
+        } else if len1 == 1 {
+            // Single-element ranges are equal when their one element matches,
+            // regardless of step (e.g. range(0, 1, 1) == range(0, 2, 2)).
+            a.start == b.start
+        } else {
+            // Same length (>1) - compare first element and step.
+            a.start == b.start && a.step == b.step
+        }))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
-        !self.get(vm.heap).is_empty()
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        // Ranges are equal by the sequence they produce, so the hash must depend
+        // only on what equality compares: length, then start (if non-empty), then
+        // step (only if length > 1). Hashing the raw `start`/`stop`/`step` fields
+        // would break `hash(a) == hash(b)` for equal ranges like `range(0, 1, 1)`
+        // and `range(0, 2, 2)`.
+        let r = self.get(vm.heap);
+        let len = r.len();
+        let mut hasher = DefaultHasher::new();
+        len.hash(&mut hasher);
+        if len > 0 {
+            r.start.hash(&mut hasher);
+            if len > 1 {
+                r.step.hash(&mut hasher);
+            }
+        }
+        Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_repr_fmt(
-        &self,
-        f: &mut impl Write,
-        vm: &VM<'h, '_, impl ResourceTracker>,
-        _heap_ids: &mut AHashSet<HeapId>,
-    ) -> RunResult<()> {
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        Ok(!self.get(vm.heap).is_empty())
+    }
+
+    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
         let this = self.get(vm.heap);
         if this.step == 1 {
             Ok(write!(f, "range({}, {})", this.start, this.stop)?)
@@ -280,11 +323,71 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
 }
 
 impl HeapItem for Range {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Range doesn't contain heap references, nothing to do
+    }
+}
+
+/// Iterator over the arithmetic progression represented by a range.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct RangeIterator {
+    next: i64,
+    step: i64,
+    remaining: usize,
+}
+
+impl RangeIterator {
+    /// Allocates independent iteration state copied from `range`.
+    fn allocate(range: Range, vm: &mut VM<'_>) -> Value {
+        Value::Ref(vm.heap.allocate(HeapData::RangeIterator(Self {
+            next: range.start,
+            step: range.step,
+            remaining: range.len(),
+        })))
+    }
+
+    /// Returns the exact number of values not yet yielded.
+    pub(crate) fn size_hint(&self) -> usize {
+        self.remaining
+    }
+}
+
+impl HeapItem for RangeIterator {
+    fn py_dec_ref_ids(&mut self, _: &mut Vec<HeapId>) {}
+}
+
+impl<'h> PyTrait<'h> for HeapObjectRead<'h, RangeIterator> {
+    fn py_is_iterable(&self, _: &VM<'h>) -> bool {
+        true
+    }
+
+    fn py_type(&self, _: &VM<'h>) -> Type {
+        Type::RangeIterator
+    }
+
+    fn py_len(&self, _: &VM<'h>) -> Option<usize> {
+        None
+    }
+
+    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
+        Ok(None)
+    }
+
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        Ok(self.clone_value(vm.heap))
+    }
+
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        let iter = self.get_mut(vm.heap);
+        if iter.remaining == 0 {
+            Ok(None)
+        } else {
+            let value = iter.next;
+            iter.remaining -= 1;
+            if iter.remaining > 0 {
+                iter.next += iter.step;
+            }
+            Ok(Some(Value::Int(value)))
+        }
     }
 }

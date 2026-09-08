@@ -11,25 +11,26 @@
 
 [package]
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 name = "ruff_python_parser"
-version = "0.0.0"
+version = "0.0.9"
 authors = [
     "Charlie Marsh <charlie.r.marsh@gmail.com>",
     "RustPython Team",
 ]
 build = false
-publish = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
+description = "This is an internal component crate of Ruff"
 homepage = "https://docs.astral.sh/ruff"
 documentation = "https://docs.astral.sh/ruff"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/astral-sh/ruff"
+resolver = "2"
 
 [lib]
 name = "ruff_python_parser"
@@ -50,31 +51,32 @@ version = "2.5.0"
 [dependencies.bstr]
 version = "1.9.1"
 
-[dependencies.compact_str]
-version = "0.9.0"
+[dependencies.drop_bomb]
+version = "0.1.5"
 
 [dependencies.get-size2]
-version = "0.7.3"
+version = "0.10.3"
 features = [
     "derive",
     "smallvec",
     "hashbrown",
     "compact-str",
     "ordermap",
+    "thin-vec",
 ]
 
 [dependencies.memchr]
 version = "2.7.1"
 
 [dependencies.ruff_python_ast]
-path = "../ruff_python_ast"
+version = "0.0.9"
 features = ["get-size"]
 
 [dependencies.ruff_python_trivia]
-path = "../ruff_python_trivia"
+version = "0.0.9"
 
 [dependencies.ruff_text_size]
-path = "../ruff_text_size"
+version = "0.0.9"
 features = ["get-size"]
 
 [dependencies.rustc-hash]
@@ -82,6 +84,9 @@ version = "2.0.0"
 
 [dependencies.static_assertions]
 version = "1.1.0"
+
+[dependencies.thin-vec]
+version = "0.2.14"
 
 [dependencies.unicode-ident]
 version = "1.0.12"
@@ -102,17 +107,17 @@ version = "0.3.3"
 version = "1.35.1"
 
 [dev-dependencies.itertools]
-version = "0.14.0"
+version = "0.15.0"
 
 [dev-dependencies.ruff_annotate_snippets]
-path = "../ruff_annotate_snippets"
+version = "0.0.9"
 
 [dev-dependencies.ruff_python_ast]
-path = "../ruff_python_ast"
+version = "0.0.9"
 features = ["serde"]
 
 [dev-dependencies.ruff_source_file]
-path = "../ruff_source_file"
+version = "0.0.9"
 
 [dev-dependencies.serde]
 version = "1.0.197"
@@ -128,6 +133,7 @@ version = "2.3.2"
 char_lit_as_u8 = "allow"
 collapsible_else_if = "allow"
 collapsible_if = "allow"
+collapsible_match = "allow"
 dbg_macro = "warn"
 debug_assert_with_mut_call = "warn"
 disallowed_methods = "allow"
@@ -138,7 +144,7 @@ get_unwrap = "warn"
 if_not_else = "allow"
 ignore_without_reason = "allow"
 implicit_hasher = "allow"
-large_stack_arrays = "allow"
+iter_over_hash_type = "warn"
 map_unwrap_or = "allow"
 match_same_arms = "allow"
 missing_errors_doc = "allow"

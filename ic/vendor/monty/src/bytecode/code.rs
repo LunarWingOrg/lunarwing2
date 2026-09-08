@@ -4,15 +4,13 @@
 //! bytecode instructions, a constant pool, source location information for tracebacks,
 //! and an exception handler table.
 
-use std::collections::HashSet;
-
 use crate::{intern::StringId, parse::CodeRange, value::Value};
 
 /// Compiled bytecode for a function or module.
 ///
 /// This is the output of the bytecode compiler and the input to the VM.
 /// Each function has its own Code object; module-level code also gets one.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Code {
     /// Raw bytecode instructions as a byte vector.
     ///
@@ -56,20 +54,27 @@ pub struct Code {
     /// Maps slot indices to variable names. Used to generate proper NameError
     /// messages when accessing undefined local variables (e.g., "name 'x' is not defined").
     local_names: Vec<StringId>,
-
-    /// Local variable slots that are assigned somewhere in this function.
-    ///
-    /// Used to determine whether to raise `UnboundLocalError` (slot is assigned somewhere
-    /// but accessed before assignment) or `NameError` (name doesn't exist in any scope).
-    assigned_locals: HashSet<u16>,
 }
 
 impl Code {
+    /// Creates an empty code object for tests that only need VM context.
+    #[cfg(test)]
+    pub(crate) fn empty() -> Self {
+        Self::new(
+            Vec::new(),
+            ConstPool::default(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            0,
+            Vec::new(),
+        )
+    }
+
     /// Creates a new Code object with all components.
     ///
     /// This is typically called by `CodeBuilder::build()` after compilation.
     #[must_use]
-    #[expect(clippy::too_many_arguments)]
     pub fn new(
         bytecode: Vec<u8>,
         constants: ConstPool,
@@ -78,7 +83,6 @@ impl Code {
         num_locals: u16,
         stack_size: u16,
         local_names: Vec<StringId>,
-        assigned_locals: HashSet<u16>,
     ) -> Self {
         Self {
             bytecode,
@@ -88,7 +92,6 @@ impl Code {
             num_locals,
             stack_size,
             local_names,
-            assigned_locals,
         }
     }
 
@@ -112,27 +115,20 @@ impl Code {
         self.local_names.get(slot as usize).copied()
     }
 
-    /// Returns whether the slot is an assigned local (vs an undefined reference).
-    ///
-    /// Used to determine whether to raise `UnboundLocalError` (true) or `NameError` (false)
-    /// when loading an undefined local variable.
-    #[must_use]
-    pub fn is_assigned_local(&self, slot: u16) -> bool {
-        self.assigned_locals.contains(&slot)
-    }
-
     /// Finds the location entry for a given bytecode offset.
     ///
     /// Location entries are recorded at instruction boundaries. This method finds
     /// the most recent entry at or before the given offset.
     ///
-    /// Returns `None` if the location table is empty or the offset is before
-    /// the first recorded location.
+    /// Returns `None` if the location table is empty, the offset is before
+    /// the first recorded location, or the offset exceeds `u32::MAX` (an
+    /// invariant violation; we degrade gracefully rather than panic since
+    /// this is on the traceback hot path).
     #[must_use]
     pub fn location_for_offset(&self, offset: usize) -> Option<&LocationEntry> {
+        let offset_u32 = u32::try_from(offset).ok()?;
         // Location entries are in order by bytecode offset.
         // Find the last entry where bytecode_offset <= offset.
-        let offset_u32 = u32::try_from(offset).expect("bytecode offset exceeds u32");
         self.location_table
             .iter()
             .rev()
@@ -163,13 +159,6 @@ impl Code {
 pub(crate) struct ConstPool {
     /// The constant values, indexed by the operand of `LoadConst`.
     values: Vec<Value>,
-}
-
-impl Clone for ConstPool {
-    fn clone(&self) -> Self {
-        let values = self.values.iter().map(Value::clone_immediate).collect();
-        Self { values }
-    }
 }
 
 impl ConstPool {
@@ -238,6 +227,17 @@ impl LocationEntry {
     }
 }
 
+/// Whether a handler reads the exception value from the operand stack.
+/// Pushing it for a cleanup handler that only re-raises is wasted work on
+/// every level an exception propagates through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HandlerKind {
+    /// `except` dispatch and `with`, which read the value off the stack.
+    Consuming,
+    /// Only re-raises: the VM skips the push, the compiler the matching `Pop`.
+    Cleanup,
+}
+
 /// Entry in the exception table - maps a protected bytecode range to its handler.
 ///
 /// Instead of maintaining a runtime stack of handlers (push/pop during execution),
@@ -276,18 +276,41 @@ pub struct ExceptionEntry {
     /// The VM pops values until the stack reaches this depth, then
     /// pushes the exception value.
     stack_depth: u16,
+
+    /// This frame's `exception_stack` depth at region entry.
+    /// Unwinding trims later entries so bare `raise` cannot revive exceptions
+    /// from abandoned handlers.
+    exception_stack_count: u16,
+
+    /// Whether the handler wants the exception on the operand stack.
+    kind: HandlerKind,
 }
 
 impl ExceptionEntry {
     /// Creates a new exception table entry.
     #[must_use]
-    pub fn new(start: u32, end: u32, handler: u32, stack_depth: u16) -> Self {
+    pub fn new(
+        start: u32,
+        end: u32,
+        handler: u32,
+        stack_depth: u16,
+        exception_stack_count: u16,
+        kind: HandlerKind,
+    ) -> Self {
         Self {
             start,
             end,
             handler,
             stack_depth,
+            exception_stack_count,
+            kind,
         }
+    }
+
+    /// Whether the VM must push the exception value before entering the handler.
+    #[must_use]
+    pub fn pushes_exception(&self) -> bool {
+        matches!(self.kind, HandlerKind::Consuming)
     }
 
     /// Returns the handler bytecode offset.
@@ -300,6 +323,12 @@ impl ExceptionEntry {
     #[must_use]
     pub fn stack_depth(&self) -> u16 {
         self.stack_depth
+    }
+
+    /// Returns this frame's exception-stack depth at region entry.
+    #[must_use]
+    pub fn exception_stack_count(&self) -> u16 {
+        self.exception_stack_count
     }
 
     /// Returns true if the given bytecode offset is within this entry's protected range.

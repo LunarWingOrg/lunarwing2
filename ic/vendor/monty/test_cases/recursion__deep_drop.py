@@ -1,3 +1,5 @@
+# gc-interval=200
+
 # Test that dropping deeply nested containers doesn't crash (stack overflow).
 # Heap::dec_ref recurses in Rust when freeing child references, so deeply
 # nested containers can overflow the Rust call stack during cleanup.
@@ -9,18 +11,18 @@ x = [1]
 for _ in range(10000):
     x = [x]
 x = None  # triggers recursive dec_ref chain
-assert True, 'survived deep list drop'
+assert True
 
 # === Deep tuple drop ===
 y = (1,)
 for _ in range(10000):
     y = (y,)
 y = None  # triggers recursive dec_ref chain
-assert True, 'survived deep tuple drop'
+assert True
 
 # === Deep dict drop ===
 z = {'a': 1}
 for _ in range(10000):
     z = {'a': z}
 z = None  # triggers recursive dec_ref chain
-assert True, 'survived deep dict drop'
+assert True

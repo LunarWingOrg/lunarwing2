@@ -1,129 +1,173 @@
-use std::{borrow::Cow, fmt::Write, mem, ops::Deref};
+use std::{
+    borrow::Cow,
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem,
+    ops::Deref,
+};
 
-use ahash::AHashSet;
-use num_integer::Integer;
+use monty_types::ExcType;
 
 use crate::{
-    ExcType, ResourceTracker,
     args::ArgValues,
-    asyncio::{CallId, Coroutine, GatherFuture, GatherItem},
+    asyncio::{Awaiter, Coroutine, ExternalFuture, ExternalFutureState, GatherFuture, GatherState},
     bytecode::{CallResult, VM},
-    exception_private::{RunError, RunResult, SimpleException},
-    heap::{DropWithHeap, HeapId, HeapItem, HeapReadOutput},
+    exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
+    expressions::CmpOperator,
+    hash::{HashValue, identity_hash},
+    heap::{DropWithContext, HeapId, HeapItem, HeapReadOutput},
     intern::FunctionId,
-    types::{
-        Bytes, Dataclass, Dict, DictItemsView, DictKeysView, DictValuesView, FrozenSet, List, LongInt, Module,
-        MontyIter, NamedTuple, Path, PyTrait, Range, ReMatch, RePattern, Set, Slice, Str, Tuple, Type, date, datetime,
-        dict_view::DictView, timedelta, timezone,
-    },
+    modules::collections::defaultdict::defaultdict_missing,
+    types::{LazyHeapSet, LongInt, PyTrait, Type, str::allocate_string},
     value::{EitherStr, Value},
 };
 
-/// HeapData captures every runtime value that must live in the arena.
-///
-/// Each variant wraps a type that implements `PyTrait`, providing
-/// Python-compatible operations. The trait is manually implemented to dispatch
-/// to the appropriate variant's implementation.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) enum HeapData {
-    Str(Str),
-    Bytes(Bytes),
-    List(List),
-    Tuple(Tuple),
-    NamedTuple(NamedTuple),
-    Dict(Dict),
-    DictKeysView(DictKeysView),
-    DictItemsView(DictItemsView),
-    DictValuesView(DictValuesView),
-    Set(Set),
-    FrozenSet(FrozenSet),
-    Closure(Closure),
-    FunctionDefaults(FunctionDefaults),
-    /// A cell wrapping a single mutable value for closure support.
-    ///
-    /// Cells enable nonlocal variable access by providing a heap-allocated
-    /// container that can be shared between a function and its nested functions.
-    /// Both the outer function and inner function hold references to the same
-    /// cell, allowing modifications to propagate across scope boundaries.
-    Cell(CellValue),
-    /// A range object (e.g., `range(10)` or `range(1, 10, 2)`).
-    ///
-    /// Stored on the heap to keep `Value` enum small (16 bytes). Range objects
-    /// are immutable and hashable.
-    Range(Range),
-    /// A slice object (e.g., `slice(1, 10, 2)` or from `x[1:10:2]`).
-    ///
-    /// Stored on the heap to keep `Value` enum small. Slice objects represent
-    /// start:stop:step indices for sequence slicing operations.
-    Slice(Slice),
-    /// An exception instance (e.g., `ValueError('message')`).
-    ///
-    /// Stored on the heap to keep `Value` enum small (16 bytes). Exceptions
-    /// are created when exception types are called or when `raise` is executed.
-    Exception(SimpleException),
-    /// A dataclass instance with fields and method references.
-    ///
-    /// Contains a class name, a Dict of field name -> value mappings, and a set
-    /// of method names that trigger external function calls when invoked.
-    Dataclass(Dataclass),
-    /// An iterator for for-loop iteration and the `iter()` type constructor.
-    ///
-    /// Created by the `GetIter` opcode or `iter()` builtin, advanced by `ForIter`.
-    /// Stores iteration state for lists, tuples, strings, ranges, dicts, and sets.
-    Iter(MontyIter),
-    /// An arbitrary precision integer (LongInt).
-    ///
-    /// Stored on the heap to keep `Value` enum at 16 bytes. Python has one `int` type,
-    /// so LongInt is an implementation detail - we use `Value::Int(i64)` for performance
-    /// when values fit, and promote to LongInt on overflow. When LongInt results fit back
-    /// in i64, they are demoted back to `Value::Int` for performance.
-    LongInt(LongInt),
-    /// A Python module (e.g., `sys`, `typing`).
-    ///
-    /// Modules have a name and a dictionary of attributes. They are created by
-    /// import statements and can have refs to other heap values in their attributes.
-    Module(Module),
-    /// A coroutine object from an async function call.
-    ///
-    /// Contains pre-bound arguments and captured cells, ready to be awaited.
-    /// When awaited, a new frame is pushed using the stored namespace.
-    Coroutine(Coroutine),
-    /// A gather() result tracking multiple coroutines/tasks.
-    ///
-    /// Created by asyncio.gather() and spawns tasks when awaited.
-    GatherFuture(GatherFuture),
-    /// A filesystem path from `pathlib.Path`.
-    ///
-    /// Stored on the heap to provide Python-compatible path operations.
-    /// Pure methods (name, parent, etc.) are handled directly by the VM.
-    /// I/O methods (exists, read_text, etc.) yield external function calls.
-    Path(Path),
-    /// A compiled regex pattern from `re.compile()`.
-    ///
-    /// Contains the original pattern string, flags, and compiled regex engine.
-    /// Leaf type: no heap references, not GC-tracked.
-    RePattern(Box<RePattern>),
-    /// A regex match result from a successful regex operation.
-    ///
-    /// Contains the matched text, capture groups, positions, and input string.
-    /// Leaf type: no heap references, not GC-tracked.
-    ReMatch(ReMatch),
-    /// Reference to an external function whose name was not found in the intern table.
-    ///
-    /// Created when the host resolves a `NameLookup` to a callable whose name does not
-    /// match any interned string (e.g., the host returns a function with a different
-    /// `__name__` than the variable it was assigned to). When called, the VM yields
-    /// `FrameExit::ExternalCall` with an `EitherStr::Heap` containing this name.
-    ExtFunction(String),
-    /// A `datetime.date` value stored with `chrono::NaiveDate`.
-    Date(date::Date),
-    /// A `datetime.datetime` value stored with chrono primitives.
-    DateTime(datetime::DateTime),
-    /// A `datetime.timedelta` duration value stored with `chrono::TimeDelta`.
-    TimeDelta(timedelta::TimeDelta),
-    /// A fixed-offset `datetime.timezone` value.
-    TimeZone(timezone::TimeZone),
+macro_rules! heap_storage_type {
+    (inline $payload:ty) => {
+        $payload
+    };
+    (boxed $payload:ty) => {
+        Box<$payload>
+    };
 }
+
+/// Invokes a consumer macro with every concrete payload stored by the heap.
+///
+/// This is the single payload registry. Its order is append-only because
+/// `HeapData`'s serde discriminants are snapshot data.
+macro_rules! heap_payloads {
+    ($consumer:ident) => {
+        $consumer! {
+            Str(inline $crate::types::Str),
+            Bytes(inline $crate::types::Bytes),
+            List(inline $crate::types::List),
+            /// `collections.deque` — a double-ended queue with an optional `maxlen`.
+            Deque(inline $crate::types::Deque),
+            Tuple(inline $crate::types::Tuple),
+            NamedTuple(boxed $crate::types::NamedTuple),
+            /// A `collections.namedtuple` class object (the callable that builds instances).
+            NamedTupleClass(boxed $crate::types::NamedTupleClass),
+            Dict(inline $crate::types::Dict),
+            DictKeysView(inline $crate::types::DictKeysView),
+            DictItemsView(inline $crate::types::DictItemsView),
+            DictValuesView(inline $crate::types::DictValuesView),
+            Set(inline $crate::types::Set),
+            FrozenSet(inline $crate::types::FrozenSet),
+            Closure(inline $crate::heap_data::Closure),
+            FunctionDefaults(inline $crate::heap_data::FunctionDefaults),
+            /// A cell wrapping a single mutable value for closure support.
+            Cell(inline $crate::heap_data::CellValue),
+            /// A range object such as `range(1, 10, 2)`.
+            Range(inline $crate::types::Range),
+            /// A slice object such as `slice(1, 10, 2)`.
+            Slice(inline $crate::types::Slice),
+            /// An exception instance such as `ValueError('message')`.
+            Exception(inline $crate::exception_private::SimpleException),
+            /// A host-backed class instance (the heap form of the wire `ClassInstance`).
+            HostClass(boxed $crate::types::HostClass),
+            /// The lightweight type object `type(x)` materializes for a `HostClass`
+            /// instance — the real class lives on the host, so this is a named
+            /// stand-in (see `HostClassType`).
+            HostClassType(boxed $crate::types::HostClassType),
+            /// A user-defined class object created by a `class` statement.
+            Class(boxed $crate::types::Class),
+            /// An instance of a user-defined class.
+            Instance(boxed $crate::types::Instance),
+            /// A method bound to an instance.
+            BoundMethod(inline $crate::types::BoundMethod),
+            /// One `dataclasses.Field` held by a class's `__dataclass_fields__` dictionary.
+            DataclassField(inline $crate::modules::dataclasses::DataclassField),
+            /// A `list_iterator` object.
+            ListIterator(inline $crate::types::list::ListIterator),
+            /// A `_collections._deque_iterator` object.
+            DequeIterator(inline $crate::types::deque::DequeIterator),
+            /// A `tuple_iterator` object.
+            TupleIterator(inline $crate::types::TupleIterator),
+            /// A `str_ascii_iterator` or `str_iterator` object.
+            StringIterator(inline $crate::types::StringIterator),
+            /// A `bytes_iterator` object.
+            BytesIterator(inline $crate::types::BytesIterator),
+            /// A `range_iterator` object.
+            RangeIterator(inline $crate::types::RangeIterator),
+            /// A `dict_keyiterator` object.
+            DictKeyIterator(inline $crate::types::DictKeyIterator),
+            /// A `dict_itemiterator` object.
+            DictItemIterator(inline $crate::types::DictItemIterator),
+            /// A `dict_valueiterator` object.
+            DictValueIterator(inline $crate::types::DictValueIterator),
+            /// A `set_iterator` object.
+            SetIterator(inline $crate::types::SetIterator),
+            /// A `callable_iterator` object from `iter(callable, sentinel)`.
+            CallableIterator(inline $crate::types::callable_iterator::CallableIterator),
+            /// An arbitrary-precision integer used when a Python `int` does not fit in `i64`.
+            LongInt(inline $crate::types::LongInt),
+            /// A Python module and its attributes.
+            Module(boxed $crate::types::Module),
+            /// A coroutine object from an async function call.
+            Coroutine(inline $crate::asyncio::Coroutine),
+            /// An `asyncio.gather()` result tracking multiple coroutines or tasks.
+            GatherFuture(boxed $crate::asyncio::GatherFuture),
+            /// An external future driven by the host.
+            ExternalFuture(boxed $crate::asyncio::ExternalFuture),
+            /// A filesystem path from `pathlib.Path`.
+            Path(inline $crate::types::Path),
+            /// A path-backed file object returned by `open()`.
+            OpenFile(boxed $crate::types::OpenFile),
+            /// A compiled regular-expression pattern.
+            RePattern(boxed $crate::types::RePattern),
+            /// A regular-expression match result.
+            ReMatch(boxed $crate::types::ReMatch),
+            /// A reference to an external function supplied by the host.
+            ExtFunction(inline $crate::types::ExtFunction),
+            /// A `datetime.date` value.
+            Date(inline $crate::types::date::Date),
+            /// A `datetime.datetime` value.
+            DateTime(inline $crate::types::datetime::DateTime),
+            /// A `datetime.timedelta` value.
+            TimeDelta(inline $crate::types::timedelta::TimeDelta),
+            /// A fixed-offset `datetime.timezone` value.
+            TimeZone(inline $crate::types::timezone::TimeZone),
+            // Append-only: a mid-list insertion changes serde's discriminants for all
+            // following variants and makes snapshots decode as the wrong payload type.
+            /// Any `itertools` iterator (`count`, `repeat`, and others).
+            Itertools(inline $crate::types::ItertoolsIter),
+            /// The options of a `@dataclass`, held in `__dataclass_params__`.
+            DataclassParams(inline $crate::modules::dataclasses::DataclassParams),
+            /// A `datetime.time` value stored with narrow integer fields.
+            ///
+            /// Appended here rather than beside `DateTime` because this list is
+            /// append-only (see the note above).
+            Time(inline $crate::types::time::Time),
+            /// A `functools.partial` object.
+            Partial(boxed $crate::types::Partial),
+        }
+    };
+}
+
+pub(crate) use heap_payloads;
+
+macro_rules! define_heap_data {
+    ($(
+        $(#[$meta:meta])*
+        $variant:ident($storage:ident $payload:ty)
+    ),* $(,)?) => {
+        /// Every runtime value that can be stored in the heap arena.
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        pub(crate) enum HeapData {
+            $(
+                $(#[$meta])*
+                $variant(heap_storage_type!($storage $payload)),
+            )*
+        }
+    };
+}
+
+heap_payloads!(define_heap_data);
+
+// `HeapData` is copied on every allocate and free. `Dict`, the largest hot
+// variant, sets the payload ceiling; larger variants should remain boxed.
+const _: () = assert!(mem::size_of::<HeapData>() <= 80);
 
 impl HeapData {
     /// Returns whether this heap data type can participate in reference cycles.
@@ -134,75 +178,85 @@ impl HeapData {
     ///
     /// This optimization allows programs that allocate many leaf objects (like strings)
     /// to avoid triggering unnecessary GC cycles.
+    ///
+    /// Matched exhaustively so new variants must choose.
     #[inline]
     pub(crate) fn is_gc_tracked(&self) -> bool {
-        matches!(
-            self,
-            Self::List(_)
-                | Self::Tuple(_)
-                | Self::NamedTuple(_)
-                | Self::Dict(_)
-                | Self::DictKeysView(_)
-                | Self::DictItemsView(_)
-                | Self::DictValuesView(_)
-                | Self::Set(_)
-                | Self::FrozenSet(_)
-                | Self::Closure(_)
-                | Self::FunctionDefaults(_)
-                | Self::Cell(_)
-                | Self::Dataclass(_)
-                | Self::Iter(_)
-                | Self::Module(_)
-                | Self::Coroutine(_)
-                | Self::GatherFuture(_)
-        )
-    }
-
-    /// Returns whether this heap data currently contains any heap references (`Value::Ref`).
-    ///
-    /// Used during allocation to determine if this data could create reference cycles.
-    /// When true, `mark_potential_cycle()` should be called to enable GC.
-    ///
-    /// Note: This is separate from `is_gc_tracked()` - a container may be GC-tracked
-    /// (capable of holding refs) but not currently contain any refs.
-    #[inline]
-    pub(crate) fn has_refs(&self) -> bool {
         match self {
-            Self::List(list) => list.contains_refs(),
-            Self::Tuple(tuple) => tuple.contains_refs(),
-            Self::NamedTuple(nt) => nt.contains_refs(),
-            Self::Dict(dict) => dict.has_refs(),
-            Self::DictKeysView(_) | Self::DictItemsView(_) | Self::DictValuesView(_) => true,
-            Self::Set(set) => set.has_refs(),
-            Self::FrozenSet(fset) => fset.has_refs(),
-            // Closures always have refs when they have captured cells (HeapIds)
-            Self::Closure(closure) => {
-                !closure.cells.is_empty() || closure.defaults.iter().any(|v| matches!(v, Value::Ref(_)))
-            }
-            Self::FunctionDefaults(fd) => fd.defaults.iter().any(|v| matches!(v, Value::Ref(_))),
-            Self::Cell(cell) => matches!(&cell.0, Value::Ref(_)),
-            Self::Dataclass(dc) => dc.has_refs(),
-            Self::Iter(iter) => iter.has_refs(),
-            Self::Module(m) => m.has_refs(),
-            // Coroutines have refs from namespace values (params, cell/free vars)
-            Self::Coroutine(coro) => coro.namespace.iter().any(|v| matches!(v, Value::Ref(_))),
-            // GatherFutures have refs from coroutine items and results
-            Self::GatherFuture(gather) => {
-                gather.items.iter().any(|item| matches!(item, GatherItem::Coroutine(_)))
-                    || gather
-                        .results
-                        .iter()
-                        .any(|r| r.as_ref().is_some_and(|v| matches!(v, Value::Ref(_))))
-            }
-            // Leaf types cannot have refs
-            _ => false,
+            Self::Itertools(iter) => iter.is_gc_tracked(),
+            Self::List(_)
+            | Self::Deque(_)
+            | Self::Tuple(_)
+            | Self::NamedTuple(_)
+            | Self::NamedTupleClass(_)
+            | Self::Dict(_)
+            | Self::DictKeysView(_)
+            | Self::DictItemsView(_)
+            | Self::DictValuesView(_)
+            | Self::Set(_)
+            | Self::FrozenSet(_)
+            | Self::Closure(_)
+            | Self::FunctionDefaults(_)
+            | Self::Cell(_)
+            | Self::HostClass(_)
+            | Self::HostClassType(_)
+            | Self::Class(_)
+            | Self::Instance(_)
+            | Self::BoundMethod(_)
+            | Self::DataclassField(_)
+            | Self::ListIterator(_)
+            | Self::DequeIterator(_)
+            | Self::TupleIterator(_)
+            | Self::DictKeyIterator(_)
+            | Self::DictItemIterator(_)
+            | Self::DictValueIterator(_)
+            | Self::SetIterator(_)
+            | Self::CallableIterator(_)
+            | Self::Module(_)
+            | Self::Coroutine(_)
+            | Self::GatherFuture(_)
+            | Self::ExternalFuture(_)
+            | Self::Partial(_) => true,
+            // Leaf types, plus iterators whose heap refs only point at leaves and so
+            // cannot close a cycle. Move one up if it gains a container-valued field.
+            Self::Str(_)
+            | Self::Bytes(_)
+            | Self::Range(_)
+            | Self::Slice(_)
+            | Self::Exception(_)
+            | Self::DataclassParams(_)
+            | Self::StringIterator(_)
+            | Self::BytesIterator(_)
+            | Self::RangeIterator(_)
+            | Self::LongInt(_)
+            | Self::Path(_)
+            | Self::OpenFile(_)
+            | Self::RePattern(_)
+            | Self::ReMatch(_)
+            | Self::ExtFunction(_)
+            | Self::Date(_)
+            | Self::DateTime(_)
+            | Self::Time(_)
+            | Self::TimeDelta(_)
+            | Self::TimeZone(_) => false,
         }
     }
 
-    /// Returns true if this heap data is a coroutine.
-    #[inline]
-    pub fn is_coroutine(&self) -> bool {
-        matches!(self, Self::Coroutine(_))
+    /// Whether calling a `Ref` to this heap data would succeed at dispatch.
+    ///
+    /// The one place the callable heap-variant set is listed; keep in sync with
+    /// `VM::call_heap_callable`.
+    #[must_use]
+    pub(crate) fn is_callable(&self) -> bool {
+        matches!(
+            self,
+            Self::Class(_)
+                | Self::BoundMethod(_)
+                | Self::Closure(_)
+                | Self::FunctionDefaults(_)
+                | Self::ExtFunction(_)
+                | Self::Partial(_)
+        )
     }
 
     /// Returns the Python `Type` for this heap data without requiring VM access.
@@ -216,8 +270,11 @@ impl HeapData {
             Self::Str(_) => Type::Str,
             Self::Bytes(_) => Type::Bytes,
             Self::List(_) => Type::List,
+            Self::Deque(_) => Type::Deque,
             Self::Tuple(_) | Self::NamedTuple(_) => Type::Tuple,
+            Self::NamedTupleClass(_) => Type::Type,
             Self::Dict(_) => Type::Dict,
+            Self::Partial(_) => Type::Partial,
             Self::DictKeysView(_) => Type::DictKeys,
             Self::DictItemsView(_) => Type::DictItems,
             Self::DictValuesView(_) => Type::DictValues,
@@ -228,54 +285,38 @@ impl HeapData {
             Self::Range(_) => Type::Range,
             Self::Slice(_) => Type::Slice,
             Self::Exception(e) => Type::Exception(e.exc_type()),
-            Self::Dataclass(_) => Type::Dataclass,
-            Self::Iter(_) => Type::Iterator,
+            Self::HostClass(_) => Type::HostClass,
+            Self::HostClassType(_) => Type::Type,
+            // A class object's type is `type`; an instance's carries its class id.
+            Self::Class(_) => Type::Type,
+            Self::Instance(instance) => Type::Instance(instance.class()),
+            Self::BoundMethod(_) => Type::Function,
+            Self::DataclassField(_) => Type::DataclassField,
+            Self::DataclassParams(_) => Type::DataclassParams,
             Self::LongInt(_) => Type::Int,
             Self::Module(_) => Type::Module,
-            Self::Coroutine(_) | Self::GatherFuture(_) => Type::Coroutine,
+            Self::Coroutine(_) | Self::GatherFuture(_) | Self::ExternalFuture(_) => Type::Coroutine,
             Self::Path(_) => Type::Path,
+            Self::OpenFile(file) => file.file_type(),
             Self::RePattern(_) => Type::RePattern,
             Self::ReMatch(_) => Type::ReMatch,
             Self::Date(_) => Type::Date,
             Self::DateTime(_) => Type::DateTime,
+            Self::Time(_) => Type::Time,
             Self::TimeDelta(_) => Type::TimeDelta,
             Self::TimeZone(_) => Type::TimeZone,
-        }
-    }
-
-    pub fn py_estimate_size(&self) -> usize {
-        match self {
-            Self::Str(s) => s.py_estimate_size(),
-            Self::Bytes(b) => b.py_estimate_size(),
-            Self::List(l) => l.py_estimate_size(),
-            Self::Tuple(t) => t.py_estimate_size(),
-            Self::NamedTuple(nt) => nt.py_estimate_size(),
-            Self::Dict(d) => d.py_estimate_size(),
-            Self::DictKeysView(view) => view.py_estimate_size(),
-            Self::DictItemsView(view) => view.py_estimate_size(),
-            Self::DictValuesView(view) => view.py_estimate_size(),
-            Self::Set(s) => s.py_estimate_size(),
-            Self::FrozenSet(fs) => fs.py_estimate_size(),
-            Self::Closure(closure) => closure.py_estimate_size(),
-            Self::FunctionDefaults(fd) => fd.py_estimate_size(),
-            Self::Cell(cell) => cell.py_estimate_size(),
-            Self::Range(r) => r.py_estimate_size(),
-            Self::Slice(s) => s.py_estimate_size(),
-            Self::Exception(e) => e.py_estimate_size(),
-            Self::Dataclass(dc) => dc.py_estimate_size(),
-            Self::Iter(iter) => iter.py_estimate_size(),
-            Self::LongInt(li) => li.py_estimate_size(),
-            Self::Module(m) => m.py_estimate_size(),
-            Self::Coroutine(coro) => coro.py_estimate_size(),
-            Self::GatherFuture(gather) => gather.py_estimate_size(),
-            Self::Path(p) => p.py_estimate_size(),
-            Self::ReMatch(m) => m.py_estimate_size(),
-            Self::RePattern(p) => p.py_estimate_size(),
-            Self::ExtFunction(s) => mem::size_of::<String>() + s.len(),
-            Self::Date(d) => d.py_estimate_size(),
-            Self::DateTime(d) => d.py_estimate_size(),
-            Self::TimeDelta(d) => d.py_estimate_size(),
-            Self::TimeZone(d) => d.py_estimate_size(),
+            Self::ListIterator(_) => Type::ListIterator,
+            Self::DequeIterator(_) => Type::DequeIterator,
+            Self::TupleIterator(_) => Type::TupleIterator,
+            Self::StringIterator(iter) => iter.py_type(),
+            Self::BytesIterator(_) => Type::BytesIterator,
+            Self::RangeIterator(_) => Type::RangeIterator,
+            Self::DictKeyIterator(_) => Type::DictKeyIterator,
+            Self::DictItemIterator(_) => Type::DictItemIterator,
+            Self::DictValueIterator(_) => Type::DictValueIterator,
+            Self::SetIterator(_) => Type::SetIterator,
+            Self::CallableIterator(_) => Type::CallableIterator,
+            Self::Itertools(i) => i.py_type(),
         }
     }
 }
@@ -326,22 +367,12 @@ pub(crate) struct FunctionDefaults {
 }
 
 impl HeapItem for CellValue {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Value>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         self.0.py_dec_ref_ids(stack);
     }
 }
 
 impl HeapItem for Closure {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.cells.len() * mem::size_of::<HeapId>()
-            + self.defaults.len() * mem::size_of::<Value>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Decrement ref count for captured cells
         stack.extend(self.cells.iter().copied());
@@ -353,10 +384,6 @@ impl HeapItem for Closure {
 }
 
 impl HeapItem for FunctionDefaults {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.defaults.len() * mem::size_of::<Value>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Decrement ref count for default values that are heap references
         for default in &mut self.defaults {
@@ -366,30 +393,18 @@ impl HeapItem for FunctionDefaults {
 }
 
 impl HeapItem for SimpleException {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.arg().map_or(0, String::len)
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Exceptions don't contain heap references
     }
 }
 
 impl HeapItem for LongInt {
-    fn py_estimate_size(&self) -> usize {
-        self.estimate_size()
-    }
-
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // LongInt doesn't contain heap references
     }
 }
 
 impl HeapItem for Coroutine {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>() + self.namespace.len() * mem::size_of::<Value>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Decrement ref count for namespace values that are heap references
         for value in &mut self.namespace {
@@ -399,521 +414,642 @@ impl HeapItem for Coroutine {
 }
 
 impl HeapItem for GatherFuture {
-    fn py_estimate_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.items.len() * mem::size_of::<GatherItem>()
-            + self.results.len() * mem::size_of::<Option<Value>>()
-            + self.pending_calls.len() * mem::size_of::<CallId>()
-    }
-
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
-        // Decrement ref count for coroutine HeapIds
-        for item in &self.items {
-            if let GatherItem::Coroutine(id) = item {
-                stack.push(*id);
+        // Decrement ref count for items the gather owns (every entry in
+        // `items` is inc_ref'd at construction time).
+        stack.extend(self.items.iter().copied());
+        // Release per-state heap refs: in-flight slot results plus this
+        // gather's own awaiter (if `GatherSlot`, it owns an inc_ref on the
+        // outer gather), or the cached result list once the gather has
+        // completed successfully. `Pending` and `Failed` carry no heap refs.
+        match &mut self.state {
+            GatherState::Awaited(awaited) => {
+                if let Awaiter::GatherSlot { gather, .. } = &awaited.awaiter {
+                    stack.push(*gather);
+                }
+                for result in awaited.results.iter_mut().flatten() {
+                    result.py_dec_ref_ids(stack);
+                }
             }
-        }
-        // Decrement ref count for result values that are heap references
-        for result in self.results.iter_mut().flatten() {
-            result.py_dec_ref_ids(stack);
+            GatherState::Completed(Value::Ref(id)) => stack.push(*id),
+            GatherState::Pending | GatherState::Failed(_) | GatherState::Completed(_) => {}
         }
     }
 }
 
+impl HeapItem for ExternalFuture {
+    fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
+        // `Pending { awaiter: Some(Awaiter::GatherSlot { gather, .. }) }`
+        // owns an inc_ref on `gather` — release it when this entry is
+        // freed. `Awaiter::Task` and `None` own nothing. `Resolved` owns
+        // the cached value; `Failed` carries no heap refs.
+        match &mut self.state {
+            ExternalFutureState::Resolved(value) => value.py_dec_ref_ids(stack),
+            ExternalFutureState::Pending {
+                awaiter: Some(Awaiter::GatherSlot { gather, .. }),
+            } => stack.push(*gather),
+            ExternalFutureState::Pending {
+                awaiter: None | Some(Awaiter::Task(_)),
+            }
+            | ExternalFutureState::Failed(_) => {}
+        }
+    }
+}
+
+macro_rules! heap_read_output_py_trait_forward {
+    ($self:expr, |$value:ident| $body:expr, else $fallback:expr) => {
+        match $self {
+            Self::Str($value) => $body,
+            Self::Bytes($value) => $body,
+            Self::List($value) => $body,
+            Self::Deque($value) => $body,
+            Self::ListIterator($value) => $body,
+            Self::DequeIterator($value) => $body,
+            Self::TupleIterator($value) => $body,
+            Self::StringIterator($value) => $body,
+            Self::BytesIterator($value) => $body,
+            Self::RangeIterator($value) => $body,
+            Self::DictKeyIterator($value) => $body,
+            Self::DictItemIterator($value) => $body,
+            Self::DictValueIterator($value) => $body,
+            Self::SetIterator($value) => $body,
+            Self::CallableIterator($value) => $body,
+            Self::Itertools($value) => $body,
+            Self::Partial($value) => $body,
+            Self::Tuple($value) => $body,
+            Self::NamedTuple($value) => $body,
+            Self::NamedTupleClass($value) => $body,
+            Self::Dict($value) => $body,
+            Self::DictKeysView($value) => $body,
+            Self::DictItemsView($value) => $body,
+            Self::DictValuesView($value) => $body,
+            Self::Set($value) => $body,
+            Self::FrozenSet($value) => $body,
+            Self::Range($value) => $body,
+            Self::Slice($value) => $body,
+            Self::HostClass($value) => $body,
+            Self::HostClassType($value) => $body,
+            Self::Class($value) => $body,
+            Self::Instance($value) => $body,
+            Self::BoundMethod($value) => $body,
+            Self::DataclassField($value) => $body,
+            Self::DataclassParams($value) => $body,
+            Self::LongInt($value) => $body,
+            Self::Path($value) => $body,
+            Self::OpenFile($value) => $body,
+            Self::RePattern($value) => $body,
+            Self::ReMatch($value) => $body,
+            Self::Date($value) => $body,
+            Self::DateTime($value) => $body,
+            Self::Time($value) => $body,
+            Self::TimeDelta($value) => $body,
+            Self::TimeZone($value) => $body,
+            Self::Closure(_)
+            | Self::FunctionDefaults(_)
+            | Self::ExtFunction(_)
+            | Self::Cell(_)
+            | Self::Exception(_)
+            | Self::Module(_)
+            | Self::Coroutine(_)
+            | Self::GatherFuture(_)
+            | Self::ExternalFuture(_) => $fallback,
+        }
+    };
+}
+
+/// Subscripts a heap value, routing a `defaultdict` miss through `__missing__`
+/// and everything else — Counter included — to `py_getitem`.
+///
+/// A defaultdict's miss stores `factory()`, so that mutating case stays outside
+/// [`PyTrait::py_getitem`]'s read-only interface while retaining the identity-aware
+/// object handle supplied by `Value::py_getitem`.
+pub(crate) fn heap_subscript<'h>(value: HeapReadOutput<'h>, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
+    match value {
+        HeapReadOutput::Dict(mut dict) if dict.get(vm.heap).is_defaultdict() => match dict.dict_get(key, vm)? {
+            Some(value) => Ok(value),
+            None => defaultdict_missing(&mut dict, key, vm),
+        },
+        value => value.py_getitem(key, vm),
+    }
+}
+
 impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
-    fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
-        match self {
-            Self::Str(s) => s.py_bool(vm),
-            Self::Bytes(b) => b.py_bool(vm),
-            Self::List(l) => l.py_bool(vm),
-            Self::Tuple(t) => t.py_bool(vm),
-            Self::NamedTuple(nt) => nt.py_bool(vm),
-            Self::Dict(d) => d.py_bool(vm),
-            Self::DictKeysView(view) => view.py_bool(vm),
-            Self::DictItemsView(view) => view.py_bool(vm),
-            Self::DictValuesView(view) => view.py_bool(vm),
-            Self::Set(s) => s.py_bool(vm),
-            Self::FrozenSet(fs) => fs.py_bool(vm),
-            Self::Closure(_) | Self::FunctionDefaults(_) | Self::ExtFunction(_) => true,
-            Self::Cell(_) => true,
-            Self::Range(r) => r.py_bool(vm),
-            Self::Slice(s) => s.py_bool(vm),
-            Self::Exception(_) => true,
-            Self::Dataclass(dc) => dc.py_bool(vm),
-            Self::Iter(_) => true,
-            Self::LongInt(li) => !li.get(vm.heap).is_zero(),
-            Self::Module(_) => true,
-            Self::Coroutine(_) => true,
-            Self::GatherFuture(_) => true,
-            Self::Path(p) => p.py_bool(vm),
-            Self::ReMatch(m) => m.py_bool(vm),
-            Self::RePattern(p) => p.py_bool(vm),
-            Self::TimeDelta(td) => td.py_bool(vm),
-            Self::Date(_) | Self::DateTime(_) | Self::TimeZone(_) => true,
-        }
+    /// Forwards so host class instances and named tuples name their real class.
+    fn py_type_name(&self, vm: &VM<'h>) -> Cow<'h, str> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_type_name(vm),
+            else self.py_type(vm).name(vm.heap, vm.interns)
+        )
     }
 
-    fn py_call_attr(
-        &mut self,
-        self_id: HeapId,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-        attr: &EitherStr,
-        args: ArgValues,
-    ) -> Result<CallResult, RunError> {
-        match self {
-            HeapReadOutput::Str(s) => Ok(s.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Bytes(b) => Ok(b.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::List(list) => Ok(list.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Tuple(t) => Ok(t.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Dict(dict) => Ok(dict.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::DictKeysView(view) => Ok(view.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::DictItemsView(view) => Ok(view.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::DictValuesView(view) => Ok(view.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Set(s) => Ok(s.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::FrozenSet(fs) => Ok(fs.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Dataclass(dc) => Ok(dc.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Path(p) => Ok(p.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Module(m) => Ok(m.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::ReMatch(m) => Ok(m.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::RePattern(p) => Ok(p.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::TimeDelta(td) => Ok(td.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::Date(d) => Ok(d.py_call_attr(self_id, vm, attr, args)?),
-            HeapReadOutput::DateTime(dt) => Ok(dt.py_call_attr(self_id, vm, attr, args)?),
-            // Types without methods — return AttributeError
-            _ => {
-                args.drop_with_heap(vm);
-                let type_name = vm.heap.read(self_id).py_type(vm);
-                Err(ExcType::attribute_error(type_name, attr.as_str(vm.interns)))
-            }
-        }
+    /// Delegates to the types defining their own `in`; the rest keep the trait
+    /// default (`None`), leaving `Value::py_contains` to iterate or raise.
+    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_contains_impl(item, vm), else Ok(None))
     }
 
-    fn py_type(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
-        match self {
-            Self::Str(s) => s.py_type(vm),
-            Self::Bytes(b) => b.py_type(vm),
-            Self::List(l) => l.py_type(vm),
-            Self::Tuple(t) => t.py_type(vm),
-            Self::NamedTuple(nt) => nt.py_type(vm),
-            Self::Dict(d) => d.py_type(vm),
-            Self::DictKeysView(v) => v.py_type(vm),
-            Self::DictItemsView(v) => v.py_type(vm),
-            Self::DictValuesView(v) => v.py_type(vm),
-            Self::Set(s) => s.py_type(vm),
-            Self::FrozenSet(fs) => fs.py_type(vm),
-            Self::Closure(_) | Self::FunctionDefaults(_) | Self::ExtFunction(_) => Type::Function,
-            Self::Cell(_) => Type::Cell,
-            Self::Range(r) => r.py_type(vm),
-            Self::Slice(s) => s.py_type(vm),
-            Self::Exception(e) => e.py_type(vm),
-            Self::Dataclass(dc) => dc.py_type(vm),
-            Self::Iter(_) => Type::Iterator,
-            Self::LongInt(_) => Type::Int,
-            Self::Module(_) => Type::Module,
-            Self::Coroutine(_) | Self::GatherFuture(_) => Type::Coroutine,
-            Self::Path(p) => p.py_type(vm),
-            Self::ReMatch(re) => re.py_type(vm),
-            Self::RePattern(p) => p.py_type(vm),
-            Self::Date(d) => d.py_type(vm),
-            Self::DateTime(d) => d.py_type(vm),
-            Self::TimeDelta(d) => d.py_type(vm),
-            Self::TimeZone(d) => d.py_type(vm),
-        }
-    }
-
-    fn py_len(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
-        match self {
-            Self::Str(s) => s.py_len(vm),
-            Self::Bytes(b) => b.py_len(vm),
-            Self::List(l) => l.py_len(vm),
-            Self::Tuple(t) => t.py_len(vm),
-            Self::NamedTuple(nt) => nt.py_len(vm),
-            Self::Dict(d) => d.py_len(vm),
-            Self::DictKeysView(view) => view.py_len(vm),
-            Self::DictItemsView(view) => view.py_len(vm),
-            Self::DictValuesView(view) => view.py_len(vm),
-            Self::Set(s) => s.py_len(vm),
-            Self::FrozenSet(fs) => fs.py_len(vm),
-            Self::Range(r) => r.py_len(vm),
-            Self::Slice(s) => s.py_len(vm),
-            Self::Dataclass(dc) => dc.py_len(vm),
-            Self::ReMatch(m) => m.py_len(vm),
-            Self::RePattern(p) => p.py_len(vm),
-            // Types without length — return None
-            _ => None,
-        }
-    }
-
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, crate::ResourceError> {
-        match (self, other) {
-            // Simple types: compare with shared borrows (no &mut VM needed)
-            (HeapReadOutput::Str(a), HeapReadOutput::Str(b)) => Ok(a.get(vm.heap).as_str() == b.get(vm.heap).as_str()),
-            (HeapReadOutput::Bytes(a), HeapReadOutput::Bytes(b)) => {
-                Ok(a.get(vm.heap).as_slice() == b.get(vm.heap).as_slice())
-            }
-            (HeapReadOutput::LongInt(a), HeapReadOutput::LongInt(b)) => Ok(a.get(vm.heap) == b.get(vm.heap)),
-            (HeapReadOutput::Closure(a), HeapReadOutput::Closure(b)) => {
-                let a = a.get(vm.heap);
-                let b = b.get(vm.heap);
-                Ok(a.func_id == b.func_id && a.cells == b.cells)
-            }
-            (HeapReadOutput::FunctionDefaults(a), HeapReadOutput::FunctionDefaults(b)) => {
-                Ok(a.get(vm.heap).func_id == b.get(vm.heap).func_id)
-            }
-            (HeapReadOutput::Range(a), HeapReadOutput::Range(b)) => {
-                // Range::py_eq is pure data comparison — inline to avoid
-                // borrow conflict with the &mut VM signature
-                let a = a.get(vm.heap);
-                let b = b.get(vm.heap);
-                let len_a = a.len();
-                if len_a != b.len() {
-                    Ok(false)
-                } else if len_a == 0 {
-                    Ok(true)
-                } else {
-                    Ok(a.start == b.start && a.step == b.step)
+    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_bool(vm),
+            else {
+                match self {
+                    Self::Closure(_)
+                    | Self::FunctionDefaults(_)
+                    | Self::ExtFunction(_)
+                    | Self::Cell(_)
+                    | Self::Exception(_)
+                    | Self::Module(_)
+                    | Self::Coroutine(_)
+                    | Self::GatherFuture(_)
+                    | Self::ExternalFuture(_) => Ok(true),
+                    _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
                 }
             }
-            // Container types: use HeapRead-specific comparison methods
-            (HeapReadOutput::List(a), HeapReadOutput::List(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::Tuple(a), HeapReadOutput::Tuple(b)) => a.py_eq(b, vm),
-            // Container types with HeapRead eq methods
-            (HeapReadOutput::Dict(a), HeapReadOutput::Dict(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::Set(a), HeapReadOutput::Set(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::FrozenSet(a), HeapReadOutput::FrozenSet(b)) => a.py_eq(b, vm),
-            // NamedTuple: element-wise comparison via HeapRead clone_item
-            (HeapReadOutput::NamedTuple(a), HeapReadOutput::NamedTuple(b)) => a.py_eq(b, vm),
-            // NamedTuple/Tuple cross-type comparison
-            (HeapReadOutput::NamedTuple(nt), HeapReadOutput::Tuple(t))
-            | (HeapReadOutput::Tuple(t), HeapReadOutput::NamedTuple(nt)) => nt.eq_tuple(t, vm),
-            // DictKeysView comparisons — copy view to local, pass HeapRead directly
-            (HeapReadOutput::DictKeysView(a), HeapReadOutput::DictKeysView(b)) => {
-                let a_view = DictKeysView::new(a.get(vm.heap).dict_id());
-                let b_view = DictKeysView::new(b.get(vm.heap).dict_id());
-                a_view.eq_view(b_view, vm)
-            }
-            (HeapReadOutput::DictKeysView(a), HeapReadOutput::Set(b)) => {
-                let view = DictKeysView::new(a.get(vm.heap).dict_id());
-                view.eq_set(b, vm)
-            }
-            (HeapReadOutput::Set(b), HeapReadOutput::DictKeysView(a)) => {
-                let view = DictKeysView::new(a.get(vm.heap).dict_id());
-                view.eq_set(b, vm)
-            }
-            (HeapReadOutput::DictKeysView(a), HeapReadOutput::FrozenSet(b)) => {
-                let view = DictKeysView::new(a.get(vm.heap).dict_id());
-                view.eq_frozenset(b, vm)
-            }
-            (HeapReadOutput::FrozenSet(b), HeapReadOutput::DictKeysView(a)) => {
-                let view = DictKeysView::new(a.get(vm.heap).dict_id());
-                view.eq_frozenset(b, vm)
-            }
-            // DictItemsView comparisons
-            (HeapReadOutput::DictItemsView(a), HeapReadOutput::DictItemsView(b)) => {
-                let a_view = DictItemsView::new(a.get(vm.heap).dict_id());
-                let b_view = DictItemsView::new(b.get(vm.heap).dict_id());
-                a_view.eq_view(b_view, vm)
-            }
-            (HeapReadOutput::DictItemsView(a), HeapReadOutput::Set(b)) => {
-                let view = DictItemsView::new(a.get(vm.heap).dict_id());
-                view.eq_set(b, vm)
-            }
-            (HeapReadOutput::Set(b), HeapReadOutput::DictItemsView(a)) => {
-                let view = DictItemsView::new(a.get(vm.heap).dict_id());
-                view.eq_set(b, vm)
-            }
-            (HeapReadOutput::DictItemsView(a), HeapReadOutput::FrozenSet(b)) => {
-                let view = DictItemsView::new(a.get(vm.heap).dict_id());
-                view.eq_frozenset(b, vm)
-            }
-            (HeapReadOutput::FrozenSet(b), HeapReadOutput::DictItemsView(a)) => {
-                let view = DictItemsView::new(a.get(vm.heap).dict_id());
-                view.eq_frozenset(b, vm)
-            }
-            (HeapReadOutput::Dataclass(a), HeapReadOutput::Dataclass(b)) => {
-                if a.get(vm.heap).name(vm.interns) != b.get(vm.heap).name(vm.interns) {
-                    return Ok(false);
+        )
+    }
+
+    fn py_radd_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_radd_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rsub_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rsub_impl(other, vm), else Ok(None))
+    }
+
+    fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_mul_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rmul_impl(other, vm), else Ok(None))
+    }
+
+    fn py_matmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_matmul_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rmatmul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rmatmul_impl(other, vm), else Ok(None))
+    }
+
+    fn py_truediv_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_truediv_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rtruediv_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rtruediv_impl(other, vm), else Ok(None))
+    }
+
+    fn py_floordiv_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_floordiv_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rfloordiv_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rfloordiv_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rmod_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rmod_impl(other, vm), else Ok(None))
+    }
+
+    fn py_pow_impl(&self, other: &Value, modulus: Option<&Value>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_pow_impl(other, modulus, vm), else Ok(None))
+    }
+
+    fn py_rpow_impl(&self, other: &Value, modulus: Option<&Value>, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rpow_impl(other, modulus, vm), else Ok(None))
+    }
+
+    fn py_and_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_and_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rand_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rand_impl(other, vm), else Ok(None))
+    }
+
+    fn py_or_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_or_impl(other, vm), else Ok(None))
+    }
+
+    fn py_ror_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_ror_impl(other, vm), else Ok(None))
+    }
+
+    fn py_xor_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_xor_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rxor_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rxor_impl(other, vm), else Ok(None))
+    }
+
+    fn py_lshift_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_lshift_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rlshift_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rlshift_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rshift_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rshift_impl(other, vm), else Ok(None))
+    }
+
+    fn py_rrshift_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_rrshift_impl(other, vm), else Ok(None))
+    }
+
+    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> Result<CallResult, RunError> {
+        if let Self::Module(module) = self {
+            Ok(module.py_call_attr(vm, attr, args)?)
+        } else {
+            heap_read_output_py_trait_forward!(
+                self,
+                |value| Ok(value.py_call_attr(vm, attr, args)?),
+                else {
+                    args.drop_with(vm);
+                    let type_name = self.py_type_name(vm);
+                    Err(ExcType::attribute_error(type_name, attr.as_str(vm.interns)))
                 }
-                a.attrs().py_eq(&b.attrs(), vm)
-            }
-            // Pure data comparisons (no VM needed)
-            (HeapReadOutput::Slice(a), HeapReadOutput::Slice(b)) => {
-                let a = a.get(vm.heap);
-                let b = b.get(vm.heap);
-                Ok(a.start == b.start && a.stop == b.stop && a.step == b.step)
-            }
-            (HeapReadOutput::Path(a), HeapReadOutput::Path(b)) => Ok(a.get(vm.heap) == b.get(vm.heap)),
-            (HeapReadOutput::RePattern(a), HeapReadOutput::RePattern(b)) => Ok(a.get(vm.heap) == b.get(vm.heap)),
-            // Datetime types
-            (HeapReadOutput::Date(a), HeapReadOutput::Date(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::DateTime(a), HeapReadOutput::DateTime(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::TimeDelta(a), HeapReadOutput::TimeDelta(b)) => a.py_eq(b, vm),
-            (HeapReadOutput::TimeZone(a), HeapReadOutput::TimeZone(b)) => a.py_eq(b, vm),
-            // Identity-only types (handled by HeapId comparison above)
-            (HeapReadOutput::ReMatch(_), HeapReadOutput::ReMatch(_))
-            | (HeapReadOutput::Cell(_), HeapReadOutput::Cell(_))
-            | (HeapReadOutput::Exception(_), HeapReadOutput::Exception(_))
-            | (HeapReadOutput::Iter(_), HeapReadOutput::Iter(_))
-            | (HeapReadOutput::Module(_), HeapReadOutput::Module(_))
-            | (HeapReadOutput::Coroutine(_), HeapReadOutput::Coroutine(_))
-            | (HeapReadOutput::GatherFuture(_), HeapReadOutput::GatherFuture(_))
-            | (HeapReadOutput::DictValuesView(_), HeapReadOutput::DictValuesView(_)) => Ok(false),
-            // Different types are never equal
-            _ => Ok(false),
+            )
         }
     }
 
-    fn py_repr_fmt(
-        &self,
-        f: &mut impl Write,
-        vm: &VM<'h, '_, impl ResourceTracker>,
-        heap_ids: &mut AHashSet<HeapId>,
-    ) -> RunResult<()> {
+    fn py_is_iterator(&self, vm: &VM<'h>) -> bool {
         match self {
-            Self::Str(s) => s.py_repr_fmt(f, vm, heap_ids),
-            Self::Bytes(b) => b.py_repr_fmt(f, vm, heap_ids),
-            Self::List(l) => l.py_repr_fmt(f, vm, heap_ids),
-            Self::Tuple(t) => t.py_repr_fmt(f, vm, heap_ids),
-            Self::NamedTuple(nt) => nt.py_repr_fmt(f, vm, heap_ids),
-            Self::Dict(d) => d.py_repr_fmt(f, vm, heap_ids),
-            Self::DictKeysView(view) => view.py_repr_fmt(f, vm, heap_ids),
-            Self::DictItemsView(view) => view.py_repr_fmt(f, vm, heap_ids),
-            Self::DictValuesView(view) => view.py_repr_fmt(f, vm, heap_ids),
-            Self::Set(s) => s.py_repr_fmt(f, vm, heap_ids),
-            Self::FrozenSet(fs) => fs.py_repr_fmt(f, vm, heap_ids),
-            Self::Closure(closure) => Ok(vm
-                .interns
-                .get_function(closure.get(vm.heap).func_id)
-                .py_repr_fmt(f, vm.interns, 0)?),
-            Self::FunctionDefaults(fd) => Ok(vm
-                .interns
-                .get_function(fd.get(vm.heap).func_id)
-                .py_repr_fmt(f, vm.interns, 0)?),
-            Self::Cell(cell) => Ok(write!(f, "<cell: {} object>", cell.get(vm.heap).0.py_type(vm))?),
-            Self::Range(r) => r.py_repr_fmt(f, vm, heap_ids),
-            Self::Slice(s) => s.py_repr_fmt(f, vm, heap_ids),
-            Self::Exception(e) => Ok(e.get(vm.heap).py_repr_fmt(f)?),
-            Self::Dataclass(dc) => dc.py_repr_fmt(f, vm, heap_ids),
-            Self::Iter(_) => Ok(write!(f, "<iterator>")?),
-            Self::LongInt(li) => {
-                let li = li.get(vm.heap);
-                li.check_str_digits_limit()?;
-                Ok(write!(f, "{li}")?)
-            }
-            Self::Module(m) => Ok(write!(f, "<module '{}'>", vm.interns.get_str(m.get(vm.heap).name()))?),
-            Self::Coroutine(coro) => {
-                let func = vm.interns.get_function(coro.get(vm.heap).func_id);
-                let name = vm.interns.get_str(func.name.name_id);
-                Ok(write!(f, "<coroutine object {name}>")?)
-            }
-            Self::GatherFuture(gather) => Ok(write!(f, "<gather({})>", gather.get(vm.heap).item_count())?),
-            Self::Path(p) => p.py_repr_fmt(f, vm, heap_ids),
-            Self::ReMatch(m) => m.py_repr_fmt(f, vm, heap_ids),
-            Self::RePattern(p) => p.py_repr_fmt(f, vm, heap_ids),
-            Self::ExtFunction(name) => Ok(write!(f, "<function '{}' external>", name.get(vm.heap))?),
-            Self::Date(d) => d.py_repr_fmt(f, vm, heap_ids),
-            Self::DateTime(d) => d.py_repr_fmt(f, vm, heap_ids),
-            Self::TimeDelta(d) => d.py_repr_fmt(f, vm, heap_ids),
-            Self::TimeZone(d) => d.py_repr_fmt(f, vm, heap_ids),
+            // A user-defined class is an iterator only if it defines `__next__`.
+            Self::Instance(inst) => inst.py_is_iterator(vm),
+            // Every built-in iterator is identified by its type, so there is no
+            // list to keep in step with new iterator types here.
+            other => other.py_type(vm).is_iterator(),
         }
     }
 
-    fn py_str(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
-        match self {
-            // Strings return their value directly without quotes
-            Self::Str(s) => Ok(Cow::Owned(s.get(vm.heap).as_str().to_owned())),
-            // LongInt returns its string representation
-            Self::LongInt(li) => {
-                let li = li.get(vm.heap);
-                li.check_str_digits_limit()?;
-                Ok(Cow::Owned(li.to_string()))
-            }
-            // Exceptions return just the message (or empty string if no message)
-            Self::Exception(e) => Ok(Cow::Owned(e.get(vm.heap).py_str())),
-            // Paths return the path string without the PosixPath() wrapper
-            Self::Path(p) => Ok(Cow::Owned(p.get(vm.heap).as_str().to_owned())),
-            // Datetime types have their own str output
-            Self::Date(d) => d.py_str(vm),
-            Self::DateTime(d) => d.py_str(vm),
-            Self::TimeDelta(d) => d.py_str(vm),
-            Self::TimeZone(d) => d.py_str(vm),
-            // All other types use repr
-            _ => self.py_repr(vm),
-        }
+    fn py_is_iterable(&self, vm: &VM<'h>) -> bool {
+        heap_read_output_py_trait_forward!(self, |value| value.py_is_iterable(vm), else false)
     }
 
-    fn py_add(
-        &self,
-        other: &Self,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-    ) -> Result<Option<Value>, crate::ResourceError> {
-        match (self, other) {
-            (HeapReadOutput::Str(a), HeapReadOutput::Str(b)) => {
-                let concat = format!("{}{}", a.get(vm.heap).as_str(), b.get(vm.heap).as_str());
-                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::Str(concat.into()))?)))
-            }
-            (HeapReadOutput::Bytes(a), HeapReadOutput::Bytes(b)) => {
-                let a_bytes = a.get(vm.heap).as_slice();
-                let b_bytes = b.get(vm.heap).as_slice();
-                let mut result = Vec::with_capacity(a_bytes.len() + b_bytes.len());
-                result.extend_from_slice(a_bytes);
-                result.extend_from_slice(b_bytes);
-                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::Bytes(result.into()))?)))
-            }
-            (HeapReadOutput::List(a), HeapReadOutput::List(b)) => a.py_add(b, vm),
-            (HeapReadOutput::Tuple(a), HeapReadOutput::Tuple(b)) => a.py_add(b, vm),
-            (HeapReadOutput::LongInt(a), HeapReadOutput::LongInt(b)) => {
-                let bi = a.get(vm.heap).inner() + b.get(vm.heap).inner();
-                Ok(LongInt::new(bi).into_value(vm.heap).map(Some)?)
-            }
-            // Datetime arithmetic: copy small values to release the borrow before allocating
-            (HeapReadOutput::Date(d), HeapReadOutput::TimeDelta(td))
-            | (HeapReadOutput::TimeDelta(td), HeapReadOutput::Date(d)) => {
-                let d = *d.get(vm.heap);
-                let td = *td.get(vm.heap);
-                date::py_add(d, td, vm.heap)
-            }
-            (HeapReadOutput::DateTime(dt), HeapReadOutput::TimeDelta(td))
-            | (HeapReadOutput::TimeDelta(td), HeapReadOutput::DateTime(dt)) => {
-                let dt = dt.get(vm.heap).clone();
-                let td = *td.get(vm.heap);
-                datetime::py_add(&dt, &td, vm.heap)
-            }
-            (HeapReadOutput::TimeDelta(a), HeapReadOutput::TimeDelta(b)) => {
-                let total = timedelta::total_microseconds(a.get(vm.heap))
-                    .checked_add(timedelta::total_microseconds(b.get(vm.heap)));
-                let Some(total) = total else { return Ok(None) };
-                let Ok(result) = timedelta::from_total_microseconds(total) else {
-                    return Ok(None);
-                };
-                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
-            }
-            _ => Ok(None),
-        }
+    fn py_is_context_manager(&self, vm: &VM<'h>) -> bool {
+        // Only types that implement the protocol return true; everything else
+        // inherits the default `false`. The `with` statement gates `py_enter`
+        // / `py_exit` on this check, so a real context manager whose
+        // `__enter__` happens to raise `AttributeError` is no longer
+        // misdiagnosed as "not a context manager".
+        heap_read_output_py_trait_forward!(self, |value| value.py_is_context_manager(vm), else false)
     }
 
-    fn py_sub(
-        &self,
-        other: &Self,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-    ) -> Result<Option<Value>, crate::ResourceError> {
-        match (self, other) {
-            (HeapReadOutput::LongInt(a), HeapReadOutput::LongInt(b)) => {
-                let bi = a.get(vm.heap).inner() - b.get(vm.heap).inner();
-                Ok(LongInt::new(bi).into_value(vm.heap).map(Some)?)
-            }
-            // Datetime same-type subtraction: copy small values to release borrow before allocating
-            (HeapReadOutput::Date(a), HeapReadOutput::Date(b)) => {
-                let a = *a.get(vm.heap);
-                let b = *b.get(vm.heap);
-                date::py_sub_date(a, b, vm.heap)
-            }
-            (HeapReadOutput::DateTime(a), HeapReadOutput::DateTime(b)) => {
-                let a = a.get(vm.heap).clone();
-                let b = b.get(vm.heap).clone();
-                datetime::py_sub_datetime(&a, &b, vm.heap)
-            }
-            (HeapReadOutput::TimeDelta(a), HeapReadOutput::TimeDelta(b)) => {
-                let total = timedelta::total_microseconds(a.get(vm.heap))
-                    .checked_sub(timedelta::total_microseconds(b.get(vm.heap)));
-                let Some(total) = total else { return Ok(None) };
-                let Ok(result) = timedelta::from_total_microseconds(total) else {
-                    return Ok(None);
-                };
-                Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result))?)))
-            }
-            // Cross-type datetime subtraction
-            (HeapReadOutput::Date(d), HeapReadOutput::TimeDelta(td)) => {
-                let d = *d.get(vm.heap);
-                let td = *td.get(vm.heap);
-                date::py_sub_timedelta(d, td, vm.heap)
-            }
-            (HeapReadOutput::DateTime(dt), HeapReadOutput::TimeDelta(td)) => {
-                let dt = dt.get(vm.heap).clone();
-                let td = *td.get(vm.heap);
-                datetime::py_sub_timedelta(&dt, &td, vm.heap)
-            }
-            _ => Ok(None),
-        }
+    fn py_enter(&mut self, vm: &mut VM<'h>) -> RunResult<CallResult> {
+        // Only types that override the trait default need explicit arms; all
+        // others fall through to the catch-all `AttributeError`, matching how
+        // `py_call_attr` is structured.
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_enter(vm),
+            else { Err(ExcType::attribute_error(self.py_type_name(vm), "__enter__")) }
+        )
     }
 
-    fn py_mod(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<Value>> {
-        match (self, other) {
-            (HeapReadOutput::LongInt(a), HeapReadOutput::LongInt(b)) => {
-                if b.get(vm.heap).is_zero() {
-                    Err(ExcType::zero_division().into())
-                } else {
-                    let bi = a.get(vm.heap).inner().mod_floor(b.get(vm.heap).inner());
-                    Ok(LongInt::new(bi).into_value(vm.heap).map(Some)?)
+    fn py_exit(&mut self, vm: &mut VM<'h>, exc: Option<HeapId>) -> RunResult<CallResult> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_exit(vm, exc),
+            else { Err(ExcType::attribute_error(self.py_type_name(vm), "__exit__")) }
+        )
+    }
+
+    fn py_type(&self, vm: &VM<'h>) -> Type {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_type(vm),
+            else {
+                match self {
+                    Self::Closure(_) | Self::FunctionDefaults(_) | Self::ExtFunction(_) => Type::Function,
+                    Self::Cell(_) => Type::Cell,
+                    Self::Exception(e) => e.py_type(vm),
+                    Self::Module(_) => Type::Module,
+                    Self::Coroutine(_) | Self::GatherFuture(_) | Self::ExternalFuture(_) => Type::Coroutine,
+                    _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
                 }
             }
-            _ => Ok(None),
-        }
+        )
     }
 
-    fn py_iadd(
-        &mut self,
-        other: &Value,
-        vm: &mut VM<'h, '_, impl ResourceTracker>,
-        self_id: Option<HeapId>,
-    ) -> Result<bool, crate::ResourceError> {
-        match self {
-            HeapReadOutput::List(list) => list.py_iadd(other, vm, self_id),
-            _ => Ok(false),
-        }
+    fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_len(vm), else None)
     }
 
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
-        match self {
-            Self::Str(s) => s.py_getitem(key, vm),
-            Self::Bytes(b) => b.py_getitem(key, vm),
-            Self::List(l) => l.py_getitem(key, vm),
-            Self::Tuple(t) => t.py_getitem(key, vm),
-            Self::NamedTuple(nt) => nt.py_getitem(key, vm),
-            Self::Dict(d) => d.py_getitem(key, vm),
-            Self::Range(r) => r.py_getitem(key, vm),
-            Self::ReMatch(m) => m.py_getitem(key, vm),
-            _ => Err(ExcType::type_error_not_sub(self.py_type(vm))),
-        }
-    }
-
-    fn py_setitem(&mut self, key: Value, value: Value, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<()> {
-        match self {
-            Self::List(l) => l.py_setitem(key, value, vm),
-            Self::Dict(d) => d.py_setitem(key, value, vm),
-            _ => {
-                key.drop_with_heap(vm);
-                value.drop_with_heap(vm);
-                Err(ExcType::type_error_not_sub_assignment(self.py_type(vm)))
+    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_eq_impl(other, vm),
+            else {
+                match self {
+                    Self::Closure(a) => Ok(match other.read_heap(vm) {
+                        Some(Self::Closure(b)) => {
+                            let a = a.get(vm.heap);
+                            let b = b.get(vm.heap);
+                            Some(a.func_id == b.func_id && a.cells == b.cells)
+                        }
+                        _ => None,
+                    }),
+                    Self::FunctionDefaults(a) => Ok(match other.read_heap(vm) {
+                        Some(Self::FunctionDefaults(b)) => Some(a.get(vm.heap).func_id == b.get(vm.heap).func_id),
+                        _ => None,
+                    }),
+                    Self::ExtFunction(_)
+                    | Self::Cell(_)
+                    | Self::Exception(_)
+                    | Self::Module(_)
+                    | Self::Coroutine(_)
+                    | Self::GatherFuture(_)
+                    | Self::ExternalFuture(_) => Ok(None),
+                    _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
+                }
             }
+        )
+    }
+
+    /// Dispatches hashing to per-type `PyTrait` implementations where possible.
+    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_hash(vm),
+            else {
+                match self {
+                    Self::Closure(c) => {
+                        let mut hasher = DefaultHasher::new();
+                        c.get(vm.heap).func_id.hash(&mut hasher);
+                        Ok(Some(HashValue::new(hasher.finish())))
+                    }
+                    Self::FunctionDefaults(fd) => {
+                        let mut hasher = DefaultHasher::new();
+                        fd.get(vm.heap).func_id.hash(&mut hasher);
+                        Ok(Some(HashValue::new(hasher.finish())))
+                    }
+                    Self::Cell(value) => Ok(Some(identity_hash(value.id()))),
+                    Self::ExtFunction(value) => Ok(Some(identity_hash(value.id()))),
+                    Self::Exception(_)
+                    | Self::Module(_)
+                    | Self::Coroutine(_)
+                    | Self::GatherFuture(_)
+                    | Self::ExternalFuture(_) => Ok(None),
+                    _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
+                }
+            }
+        )
+    }
+
+    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, heap_ids: &mut LazyHeapSet) -> RunResult<()> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_repr_fmt(f, vm, heap_ids),
+            else {
+                match self {
+                    Self::Closure(closure) => Ok(vm
+                        .interns
+                        .get_function(closure.get(vm.heap).func_id)
+                        .py_repr_fmt(f, vm.interns, 0)?),
+                    Self::FunctionDefaults(fd) => Ok(vm
+                        .interns
+                        .get_function(fd.get(vm.heap).func_id)
+                        .py_repr_fmt(f, vm.interns, 0)?),
+                    Self::Cell(cell) => Ok(write!(f, "<cell: {} object>", cell.get(vm.heap).0.py_type_name(vm))?),
+                    Self::Exception(e) => Ok(e.get(vm.heap).py_repr_fmt(f)?),
+                    Self::Module(m) => Ok(write!(f, "<module '{}'>", vm.interns.get_str(m.get(vm.heap).name()))?),
+                    Self::Coroutine(coro) => {
+                        let func = vm.interns.get_function(coro.get(vm.heap).func_id);
+                        let name = vm.interns.get_str(func.name.name_id);
+                        Ok(write!(f, "<coroutine object {name}>")?)
+                    }
+                    Self::GatherFuture(gather) => Ok(write!(f, "<gather({})>", gather.get(vm.heap).item_count())?),
+                    Self::ExternalFuture(fut) => Ok(write!(
+                        f,
+                        "<coroutine external_future({})>",
+                        fut.get(vm.heap).call_id.raw()
+                    )?),
+                    Self::ExtFunction(function) => {
+                        Ok(write!(f, "<function '{}' external>", function.get(vm.heap).as_str())?)
+                    }
+                    _ => unreachable!("py-trait variants handled by heap_read_output_py_trait_forward"),
+                }
+            }
+        )
+    }
+
+    fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_str(vm),
+            else {
+                match self {
+                    Self::Exception(e) => Ok(allocate_string(e.get(vm.heap).py_str(), vm.heap)),
+                    _ => self.py_repr(vm),
+                }
+            }
+        )
+    }
+
+    fn py_add_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_add_impl(other, vm), else Ok(None))
+    }
+
+    fn py_sub_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_sub_impl(other, vm), else Ok(None))
+    }
+
+    fn py_mod_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_mod_impl(other, vm), else Ok(None))
+    }
+
+    fn py_index_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_index_impl(vm), else Ok(None))
+    }
+
+    fn py_neg_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_neg_impl(vm), else Ok(None))
+    }
+
+    fn py_pos_impl(&self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_pos_impl(vm), else Ok(None))
+    }
+
+    fn py_iadd_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_iadd_impl(other, vm), else Ok(false))
+    }
+
+    fn py_isub_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_isub_impl(other, vm), else Ok(false))
+    }
+
+    fn py_iand_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_iand_impl(other, vm), else Ok(false))
+    }
+
+    fn py_ior_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_ior_impl(other, vm), else Ok(false))
+    }
+
+    fn py_cmp_op(&self, other: &Value, op: CmpOperator, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
+        heap_read_output_py_trait_forward!(self, |value| value.py_cmp_op(other, op, vm), else Ok(None))
+    }
+
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_getitem(key, vm),
+            else { Err(ExcType::type_error_not_sub(&self.py_type_name(vm))) }
+        )
+    }
+
+    fn py_setitem(&mut self, key: Value, value: Value, vm: &mut VM<'h>) -> RunResult<()> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |item| item.py_setitem(key, value, vm),
+            else {
+                key.drop_with(vm);
+                value.drop_with(vm);
+                Err(ExcType::type_error_not_sub_assignment(
+                    &self.py_type_name(vm),
+                ))
+            }
+        )
+    }
+
+    fn py_set_attr(&mut self, name: &EitherStr, value: Value, vm: &mut VM<'h>) -> RunResult<()> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |item| item.py_set_attr(name, value, vm),
+            else {
+                value.drop_with(vm);
+                let type_name = self.py_type_name(vm);
+                Err(ExcType::attribute_error_no_setattr(
+                    &type_name,
+                    name.as_str(vm.interns),
+                ))
+            }
+        )
+    }
+
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
+        heap_read_output_py_trait_forward!(
+            self,
+            |value| value.py_getattr(attr, vm),
+            else {
+                match self {
+                    Self::Module(m) => Ok(m.py_getattr(attr, vm)),
+                    Self::Exception(e) => Ok(e.py_getattr(attr, vm)),
+                    _ => Ok(None),
+                }
+            }
+        )
+    }
+
+    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+        match self {
+            Self::Str(value) => value.py_iter(vm),
+            Self::Bytes(value) => value.py_iter(vm),
+            Self::List(value) => value.py_iter(vm),
+            Self::Deque(value) => value.py_iter(vm),
+            Self::ListIterator(value) => value.py_iter(vm),
+            Self::DequeIterator(value) => value.py_iter(vm),
+            Self::TupleIterator(value) => value.py_iter(vm),
+            Self::StringIterator(value) => value.py_iter(vm),
+            Self::BytesIterator(value) => value.py_iter(vm),
+            Self::RangeIterator(value) => value.py_iter(vm),
+            Self::DictKeyIterator(value) => value.py_iter(vm),
+            Self::DictItemIterator(value) => value.py_iter(vm),
+            Self::DictValueIterator(value) => value.py_iter(vm),
+            Self::SetIterator(value) => value.py_iter(vm),
+            Self::CallableIterator(value) => value.py_iter(vm),
+            Self::Itertools(value) => value.py_iter(vm),
+            Self::Tuple(value) => value.py_iter(vm),
+            Self::NamedTuple(value) => value.py_iter(vm),
+            Self::Dict(value) => value.py_iter(vm),
+            Self::DictKeysView(value) => value.py_iter(vm),
+            Self::DictItemsView(value) => value.py_iter(vm),
+            Self::DictValuesView(value) => value.py_iter(vm),
+            Self::Set(value) => value.py_iter(vm),
+            Self::FrozenSet(value) => value.py_iter(vm),
+            Self::Range(value) => value.py_iter(vm),
+            Self::Slice(value) => value.py_iter(vm),
+            Self::HostClass(value) => value.py_iter(vm),
+            Self::HostClassType(value) => value.py_iter(vm),
+            Self::Class(value) => value.py_iter(vm),
+            Self::Instance(value) => value.py_iter(vm),
+            Self::BoundMethod(value) => value.py_iter(vm),
+            Self::DataclassField(value) => value.py_iter(vm),
+            Self::DataclassParams(value) => value.py_iter(vm),
+            Self::Path(value) => value.py_iter(vm),
+            Self::OpenFile(value) => value.py_iter(vm),
+            Self::ReMatch(value) => value.py_iter(vm),
+            Self::RePattern(value) => value.py_iter(vm),
+            Self::Date(value) => value.py_iter(vm),
+            Self::DateTime(value) => value.py_iter(vm),
+            Self::Time(value) => value.py_iter(vm),
+            Self::TimeDelta(value) => value.py_iter(vm),
+            Self::TimeZone(value) => value.py_iter(vm),
+            Self::NamedTupleClass(_)
+            | Self::Closure(_)
+            | Self::FunctionDefaults(_)
+            | Self::ExtFunction(_)
+            | Self::Partial(_)
+            | Self::Cell(_)
+            | Self::Exception(_)
+            | Self::LongInt(_)
+            | Self::Module(_)
+            | Self::Coroutine(_)
+            | Self::GatherFuture(_)
+            | Self::ExternalFuture(_) => Err(ExcType::type_error_not_iterable(&self.py_type_name(vm))),
         }
     }
 
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
+    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
         match self {
-            Self::Str(s) => s.py_getattr(attr, vm),
-            Self::Bytes(b) => b.py_getattr(attr, vm),
-            Self::List(l) => l.py_getattr(attr, vm),
-            Self::Tuple(t) => t.py_getattr(attr, vm),
-            Self::NamedTuple(nt) => nt.py_getattr(attr, vm),
-            Self::Dict(d) => d.py_getattr(attr, vm),
-            Self::DictKeysView(view) => view.py_getattr(attr, vm),
-            Self::DictItemsView(view) => view.py_getattr(attr, vm),
-            Self::DictValuesView(view) => view.py_getattr(attr, vm),
-            Self::Set(s) => s.py_getattr(attr, vm),
-            Self::FrozenSet(fs) => fs.py_getattr(attr, vm),
-            Self::Range(r) => r.py_getattr(attr, vm),
-            Self::Slice(s) => s.py_getattr(attr, vm),
-            Self::Dataclass(dc) => dc.py_getattr(attr, vm),
-            Self::ReMatch(m) => m.py_getattr(attr, vm),
-            Self::RePattern(p) => p.py_getattr(attr, vm),
-            Self::Module(m) => Ok(m.py_getattr(attr, vm)),
-            Self::Exception(e) => e.py_getattr(attr, vm),
-            Self::Path(p) => p.py_getattr(attr, vm),
-            Self::Date(d) => d.py_getattr(attr, vm),
-            Self::DateTime(dt) => dt.py_getattr(attr, vm),
-            Self::TimeDelta(td) => td.py_getattr(attr, vm),
-            _ => Ok(None),
+            Self::Str(value) => value.py_next(vm),
+            Self::Bytes(value) => value.py_next(vm),
+            Self::List(value) => value.py_next(vm),
+            Self::ListIterator(value) => value.py_next(vm),
+            Self::DequeIterator(value) => value.py_next(vm),
+            Self::TupleIterator(value) => value.py_next(vm),
+            Self::StringIterator(value) => value.py_next(vm),
+            Self::BytesIterator(value) => value.py_next(vm),
+            Self::RangeIterator(value) => value.py_next(vm),
+            Self::DictKeyIterator(value) => value.py_next(vm),
+            Self::DictItemIterator(value) => value.py_next(vm),
+            Self::DictValueIterator(value) => value.py_next(vm),
+            Self::SetIterator(value) => value.py_next(vm),
+            Self::CallableIterator(value) => value.py_next(vm),
+            Self::Itertools(value) => value.py_next(vm),
+            Self::Tuple(value) => value.py_next(vm),
+            Self::NamedTuple(value) => value.py_next(vm),
+            Self::Dict(value) => value.py_next(vm),
+            Self::DictKeysView(value) => value.py_next(vm),
+            Self::DictItemsView(value) => value.py_next(vm),
+            Self::DictValuesView(value) => value.py_next(vm),
+            Self::Set(value) => value.py_next(vm),
+            Self::FrozenSet(value) => value.py_next(vm),
+            Self::Range(value) => value.py_next(vm),
+            Self::Slice(value) => value.py_next(vm),
+            Self::HostClass(value) => value.py_next(vm),
+            Self::HostClassType(value) => value.py_next(vm),
+            Self::Class(value) => value.py_next(vm),
+            Self::Instance(value) => value.py_next(vm),
+            Self::BoundMethod(value) => value.py_next(vm),
+            Self::DataclassField(value) => value.py_next(vm),
+            Self::DataclassParams(value) => value.py_next(vm),
+            Self::Path(value) => value.py_next(vm),
+            Self::OpenFile(value) => value.py_next(vm),
+            Self::ReMatch(value) => value.py_next(vm),
+            Self::RePattern(value) => value.py_next(vm),
+            Self::Date(value) => value.py_next(vm),
+            Self::DateTime(value) => value.py_next(vm),
+            Self::Time(value) => value.py_next(vm),
+            Self::TimeDelta(value) => value.py_next(vm),
+            Self::TimeZone(value) => value.py_next(vm),
+            other => Err(ExcType::type_error_not_iterator(&other.py_type_name(vm))),
         }
     }
 }

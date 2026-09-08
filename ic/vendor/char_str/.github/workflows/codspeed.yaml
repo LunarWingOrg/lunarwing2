@@ -1,0 +1,38 @@
+name: CodSpeed
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codspeed-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmarks:
+    name: Benchmarks
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed --locked --version 5.0.1
+
+      - name: Build benchmarks
+        run: cargo codspeed build --measurement-mode simulation
+
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@a4a36bb07c0638b0b4ca52bf1f3dad1b4289e52f # v4.18.1
+        with:
+          mode: simulation
+          run: cargo codspeed run

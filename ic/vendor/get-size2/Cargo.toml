@@ -12,13 +12,16 @@
 [package]
 edition = "2024"
 name = "get-size2"
-version = "0.7.4"
+version = "0.10.3"
 authors = [
     "Denis Kerp",
     "Nicolas",
 ]
 build = false
-exclude = ["examples/*"]
+exclude = [
+    "examples/*",
+    "tests/*",
+]
 autolib = false
 autobins = false
 autoexamples = false
@@ -53,11 +56,17 @@ bytes = ["dep:bytes"]
 chrono = ["dep:chrono"]
 chrono-tz = ["dep:chrono-tz"]
 compact-str = ["dep:compact_str"]
+dashmap = ["dep:dashmap"]
 default = []
 derive = ["get-size-derive2"]
+half = ["dep:half"]
 hashbrown = ["dep:hashbrown"]
 indexmap = ["dep:indexmap"]
 ordermap = ["dep:ordermap"]
+orx-concurrent-vec = ["dep:orx-concurrent-vec"]
+parking_lot = ["dep:parking_lot"]
+portable-atomic = ["dep:portable-atomic"]
+roaring = ["dep:roaring"]
 smallvec = ["dep:smallvec"]
 thin-vec = ["dep:thin-vec"]
 url = ["dep:url"]
@@ -82,26 +91,57 @@ optional = true
 default-features = false
 
 [dependencies.compact_str]
-version = "0.9"
+version = "0.10"
+optional = true
+default-features = false
+
+[dependencies.dashmap]
+version = "6"
 optional = true
 default-features = false
 
 [dependencies.get-size-derive2]
-version = "0.7.4"
+version = "0.10.3"
 optional = true
 
+[dependencies.half]
+version = "2"
+optional = true
+default-features = false
+
 [dependencies.hashbrown]
-version = "0.16"
+version = "0.17"
 optional = true
 default-features = false
 
 [dependencies.indexmap]
-version = "2.10"
+version = "2.14"
 optional = true
 default-features = false
 
 [dependencies.ordermap]
-version = "1.0"
+version = "1.2"
+optional = true
+default-features = false
+
+[dependencies.orx-concurrent-vec]
+version = "3.10"
+optional = true
+default-features = false
+
+[dependencies.parking_lot]
+version = "0.12"
+optional = true
+default-features = false
+
+[dependencies.portable-atomic]
+version = "1"
+features = ["fallback"]
+optional = true
+default-features = false
+
+[dependencies.roaring]
+version = "0.11"
 optional = true
 default-features = false
 

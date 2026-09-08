@@ -12,7 +12,7 @@ async def task2():
 
 
 result = await asyncio.gather(task1(), task2())  # pyright: ignore
-assert result == [1, 2], 'gather should return results as a list'
+assert result == [1, 2]
 
 
 # === Result ordering ===
@@ -26,11 +26,11 @@ async def fast():
 
 
 result = await asyncio.gather(slow(), fast())  # pyright: ignore
-assert result == ['slow', 'fast'], 'gather should preserve argument order'
+assert result == ['slow', 'fast']
 
 # === Empty gather ===
 result = await asyncio.gather()  # pyright: ignore
-assert result == [], 'empty gather should return empty list'
+assert result == []
 
 
 # === Single coroutine ===
@@ -39,7 +39,7 @@ async def single():
 
 
 result = await asyncio.gather(single())  # pyright: ignore
-assert result == [42], 'gather with single coroutine should return list with one element'
+assert result == [42]
 
 # === repr of gather function ===
 r = repr(asyncio.gather)
@@ -83,3 +83,306 @@ assert result == [], f'gather with empty *args: {result}'
 coro_tuple = (a(), b())
 result = await asyncio.gather(*coro_tuple)  # pyright: ignore
 assert result == ['a', 'b'], f'gather with *tuple unpacking: {result}'
+
+
+# === gather with the same coroutine passed twice ===
+dup_runs = [0]
+
+
+async def dup():
+    dup_runs[0] += 1
+    return 1
+
+
+dup_coro = dup()
+result = await asyncio.gather(dup_coro, dup_coro)  # pyright: ignore
+assert result == [1, 1], f'expected [1, 1], got {result}'
+assert dup_runs[0] == 1, f'coroutine body should run once, ran {dup_runs[0]} times'
+
+
+# Three duplicates and a mix of duplicates with a unique coroutine.
+async def dup3():
+    return 'x'
+
+
+dup3_coro = dup3()
+result = await asyncio.gather(dup3_coro, dup3_coro, dup3_coro)  # pyright: ignore
+assert result == ['x', 'x', 'x'], f'expected three xs, got {result}'
+
+
+async def alpha():
+    return 'a'
+
+
+async def beta():
+    return 'b'
+
+
+a_coro = alpha()
+b_coro = beta()
+result = await asyncio.gather(a_coro, b_coro, a_coro)  # pyright: ignore
+assert result == ['a', 'b', 'a'], f'mixed dedup: expected [a, b, a], got {result}'
+
+
+# === gather with an already-awaited coroutine raises RuntimeError ===
+async def already():
+    return 1
+
+
+already_coro = already()
+await already_coro  # pyright: ignore
+try:
+    await asyncio.gather(already_coro)  # pyright: ignore
+    assert False, 'should have raised RuntimeError'
+except RuntimeError as e:
+    assert str(e) == 'cannot reuse already awaited coroutine', f'unexpected error: {e}'
+
+
+# === Re-awaiting a completed gather returns the cached result list ===
+# CPython's _GatheringFuture is a Future that stores its result; every await
+# returns the same list. Monty caches the result on the GatherFuture so this
+# matches.
+
+
+async def reawait_member():
+    return 7
+
+
+g = asyncio.gather(reawait_member(), reawait_member())
+first = await g  # pyright: ignore
+second = await g  # pyright: ignore
+third = await g  # pyright: ignore
+assert first == [7, 7], f'first await: {first}'
+assert second == [7, 7], f'second await: {second}'
+assert third == [7, 7], f'third await: {third}'
+# Identity: every re-await yields the same list object (CPython behavior).
+assert first is second
+assert second is third
+
+
+# === Re-awaiting an empty gather returns the same empty list ===
+g_empty = asyncio.gather()
+e1 = await g_empty  # pyright: ignore
+e2 = await g_empty  # pyright: ignore
+assert e1 == [] and e2 == [], 'empty gather re-await: both empty'
+assert e1 is e2
+
+
+# === Re-awaiting a failed gather re-raises the same exception ===
+
+
+async def boom():
+    raise ValueError('detonate')
+
+
+g_fail = asyncio.gather(boom())
+try:
+    await g_fail  # pyright: ignore
+    assert False, 'first await should have raised'
+except ValueError as e:
+    assert str(e) == 'detonate', f'first await message: {e}'
+
+try:
+    await g_fail  # pyright: ignore
+    assert False, 'second await should have raised'
+except ValueError as e:
+    assert str(e) == 'detonate', f'second await message: {e}'
+
+try:
+    await g_fail  # pyright: ignore
+    assert False, 'third await should have raised'
+except ValueError as e:
+    assert str(e) == 'detonate', f'third await message: {e}'
+
+
+# === Nested gather ===
+
+nested_1 = asyncio.gather(task1(), task1())
+nested_2 = asyncio.gather(nested_1, nested_1)
+
+assert await nested_2 == [[1, 1], [1, 1]]  # pyright: ignore
+
+
+# === Nested gather that settles before its parent finishes its items ===
+# An empty gather has nothing to wait for, so it settles while the outer gather
+# is still working through its items; the result must land in the outer's slot
+# rather than leaving the outer waiting on it.
+assert await asyncio.gather(asyncio.gather()) == [[]]  # pyright: ignore
+assert await asyncio.gather(asyncio.gather(asyncio.gather())) == [[[]]]  # pyright: ignore
+
+settled = asyncio.gather()
+assert await asyncio.gather(settled, task1(), settled) == [[], 1, []]  # pyright: ignore
+
+
+# === Sibling failure while blocked on a gather of gathers ===
+# The failing sibling settles the gather that a task blocked on
+# `gather(gather(...))` was a child of, whose inner gather owns a task of its
+# own; the scheduler must keep running after.
+async def leaf():
+    return 1
+
+
+async def blocked_on_nested():
+    return await asyncio.gather(asyncio.gather(leaf()))
+
+
+async def detonate_sibling():
+    raise ValueError('boom')
+
+
+try:
+    await asyncio.gather(blocked_on_nested(), detonate_sibling())  # pyright: ignore
+    assert False, 'expected the failing sibling to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+assert await asyncio.gather(leaf(), leaf()) == [1, 1]  # pyright: ignore
+
+
+# === A failing gather leaves its siblings running ===
+# CPython does not cancel the other children when one raises; they stay on the
+# loop and finish as it turns. `ticks` gives the loop those turns, and the
+# order the orphans interleave in is not part of the contract, hence `sorted`.
+sibling_log = []
+
+
+async def tick():
+    pass
+
+
+async def ticks(n):
+    for _ in range(n):
+        await asyncio.gather(tick())
+
+
+async def step(tag):
+    sibling_log.append(tag)
+
+
+async def stepping_worker():
+    for i in range(3):
+        await asyncio.gather(step('step' + str(i)))
+    sibling_log.append('finished')
+
+
+async def raise_boom():
+    raise ValueError('boom')
+
+
+try:
+    await asyncio.gather(stepping_worker(), raise_boom())  # pyright: ignore
+    assert False, 'expected the failing child to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+await ticks(8)  # pyright: ignore
+assert sorted(sibling_log) == ['finished', 'step0', 'step1', 'step2']
+
+
+# === ... including the children of a gather a sibling was awaiting ===
+nested_log = []
+
+
+async def nested_leaf():
+    nested_log.append('leaf')
+
+
+async def awaits_nested_gather():
+    await asyncio.gather(asyncio.gather(nested_leaf()))
+    nested_log.append('holder finished')
+
+
+try:
+    await asyncio.gather(awaits_nested_gather(), raise_boom())  # pyright: ignore
+    assert False, 'expected the failing child to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+await ticks(4)  # pyright: ignore
+assert sorted(nested_log) == ['holder finished', 'leaf']
+
+
+# === A gather that fails while starting up leaves them running too ===
+# The second item is already awaited, so `gather` itself raises — after the
+# first item has been spawned. That one keeps running.
+startup_log = []
+
+
+async def startup_step():
+    startup_log.append('ran')
+
+
+reused_coroutine = startup_step()
+await reused_coroutine  # pyright: ignore
+startup_log.clear()
+
+try:
+    await asyncio.gather(startup_step(), reused_coroutine)  # pyright: ignore
+    assert False, 'expected the reused coroutine to be rejected'
+except RuntimeError as e:
+    assert str(e) == 'cannot reuse already awaited coroutine'
+
+await ticks(4)  # pyright: ignore
+assert startup_log == ['ran']
+
+
+# === An exception in a task nobody awaits any more is discarded ===
+# CPython stores it on the task and reports it unretrieved at collection;
+# either way it does not reach the code that stopped waiting.
+orphan_log = []
+
+
+async def raises_after_yielding():
+    await asyncio.gather(tick())
+    orphan_log.append('reached the raise')
+    raise KeyError('nobody is listening')
+
+
+try:
+    await asyncio.gather(raises_after_yielding(), raise_boom())  # pyright: ignore
+    assert False, 'expected the failing child to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+await ticks(4)  # pyright: ignore
+orphan_log.append('run continues')
+assert orphan_log == ['reached the raise', 'run continues']
+
+
+# === A nested gather outlives the parent that settled ===
+# The inner gather is an item of the failing one, so it keeps driving its own
+# children. When one of them raises it settles on that error with nobody left
+# to raise into, and when it is the last one in flight the settling releases
+# the inner gather's final reference.
+nested_late_log = []
+
+
+async def nested_raiser():
+    await asyncio.gather(tick())
+    raise KeyError('inner raised late')
+
+
+async def nested_survivor():
+    await asyncio.gather(tick())
+    nested_late_log.append('survivor finished')
+
+
+try:
+    await asyncio.gather(asyncio.gather(nested_raiser(), nested_survivor()), raise_boom())  # pyright: ignore
+    assert False, 'expected the failing child to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+await ticks(6)  # pyright: ignore
+assert nested_late_log == ['survivor finished']
+
+# The same with the raiser as the inner gather's only child.
+try:
+    await asyncio.gather(asyncio.gather(nested_raiser()), raise_boom())  # pyright: ignore
+    assert False, 'expected the failing child to propagate'
+except ValueError as e:
+    assert str(e) == 'boom'
+
+await ticks(6)  # pyright: ignore
+nested_late_log.append('run continues')
+assert nested_late_log == ['survivor finished', 'run continues']

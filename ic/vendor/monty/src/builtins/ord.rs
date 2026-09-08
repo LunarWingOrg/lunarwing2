@@ -6,15 +6,13 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
     heap::HeapData,
-    resource::ResourceTracker,
-    types::PyTrait,
     value::Value,
 };
 
 /// Implementation of the ord() builtin function.
 ///
 /// Returns the Unicode code point of a one-character string.
-pub fn builtin_ord(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_ord(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("ord", vm.heap)?;
     defer_drop!(value, vm);
 
@@ -33,30 +31,21 @@ pub fn builtin_ord(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -
                 .into())
             }
         }
-        Value::Ref(id) => {
-            if let HeapData::Str(s) = vm.heap.get(*id) {
-                let mut chars = s.as_str().chars();
-                if let (Some(c), None) = (chars.next(), chars.next()) {
-                    Ok(Value::Int(c as i64))
-                } else {
-                    let len = s.as_str().chars().count();
-                    Err(SimpleException::new_msg(
-                        ExcType::TypeError,
-                        format!("ord() expected a character, but string of length {len} found"),
-                    )
-                    .into())
-                }
+        Value::Ref(id) if let HeapData::Str(s) = vm.heap.get(*id) => {
+            let mut chars = s.as_str().chars();
+            if let (Some(c), None) = (chars.next(), chars.next()) {
+                Ok(Value::Int(c as i64))
             } else {
-                let type_name = value.py_type(vm);
+                let len = s.as_str().chars().count();
                 Err(SimpleException::new_msg(
                     ExcType::TypeError,
-                    format!("ord() expected string of length 1, but {type_name} found"),
+                    format!("ord() expected a character, but string of length {len} found"),
                 )
                 .into())
             }
         }
         _ => {
-            let type_name = value.py_type(vm);
+            let type_name = value.py_type_name(vm);
             Err(SimpleException::new_msg(
                 ExcType::TypeError,
                 format!("ord() expected string of length 1, but {type_name} found"),
