@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "get-size-derive2"
-version = "0.10.3"
+version = "0.9.0"
 authors = [
     "Denis Kerp",
     "Nicolas",

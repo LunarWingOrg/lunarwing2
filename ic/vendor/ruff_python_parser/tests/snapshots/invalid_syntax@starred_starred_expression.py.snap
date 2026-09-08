@@ -127,3 +127,4 @@ Module(
 2 | *[])
 3 | print(* *[])
   |         ^^^ Syntax Error: Starred expression cannot be used here
+  |

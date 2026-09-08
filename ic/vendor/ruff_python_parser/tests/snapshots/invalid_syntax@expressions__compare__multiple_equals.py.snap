@@ -123,6 +123,7 @@ Module(
 2 | x === y
 3 | x !== y
   |     ^ Syntax Error: Expected an expression
+  |
 
 
   |
@@ -130,3 +131,4 @@ Module(
 2 | x === y
 3 | x !== y
   | ^^^^ Syntax Error: Invalid assignment target
+  |

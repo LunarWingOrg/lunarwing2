@@ -11,9 +11,8 @@
 
 [package]
 edition = "2021"
-rust-version = "1.71"
 name = "compact_str"
-version = "0.10.0"
+version = "0.9.1"
 authors = ["Parker Timmerman <parker@parkertimmerman.com>"]
 build = false
 autolib = false
@@ -49,22 +48,14 @@ rustdoc-args = [
 
 [features]
 arbitrary = ["dep:arbitrary"]
-bevy-reflect = [
-    "dep:bevy_reflect",
-    "serde",
-]
 borsh = ["dep:borsh"]
 bytes = ["dep:bytes"]
 default = ["std"]
-defmt = ["dep:defmt"]
 diesel = ["dep:diesel"]
-garde = ["dep:garde"]
 markup = ["dep:markup"]
 proptest = ["dep:proptest"]
-pyo3 = ["dep:pyo3"]
 quickcheck = ["dep:quickcheck"]
 rkyv = ["dep:rkyv"]
-schemars = ["dep:schemars"]
 serde = ["dep:serde"]
 smallvec = ["dep:smallvec"]
 sqlx = [
@@ -84,11 +75,6 @@ sqlx-sqlite = [
     "sqlx/sqlite",
 ]
 std = []
-utoipa = [
-    "dep:utoipa",
-    "std",
-]
-valuable = ["dep:valuable"]
 zeroize = ["dep:zeroize"]
 
 [lib]
@@ -99,10 +85,6 @@ path = "src/lib.rs"
 version = "1"
 optional = true
 default-features = false
-
-[dependencies.bevy_reflect]
-version = "0.19"
-optional = true
 
 [dependencies.borsh]
 version = "1"
@@ -125,28 +107,17 @@ version = "2"
 optional = true
 default-features = false
 
-[dependencies.garde]
-version = "0.23"
-features = ["derive"]
-optional = true
-default-features = false
-
 [dependencies.itoa]
 version = "1"
 
 [dependencies.markup]
-version = "0.16"
+version = "0.15"
 optional = true
 default-features = false
 
 [dependencies.proptest]
 version = "1"
 features = ["std"]
-optional = true
-default-features = false
-
-[dependencies.pyo3]
-version = "0.29"
 optional = true
 default-features = false
 
@@ -160,10 +131,11 @@ version = "0.8"
 optional = true
 default-features = false
 
-[dependencies.schemars]
+[dependencies.rustversion]
 version = "1"
-optional = true
-default-features = false
+
+[dependencies.ryu]
+version = "1"
 
 [dependencies.serde]
 version = "1"
@@ -180,29 +152,17 @@ features = ["union"]
 optional = true
 
 [dependencies.sqlx]
-version = "0.9"
+version = "0.8"
 optional = true
 default-features = false
 
 [dependencies.static_assertions]
 version = "1"
 
-[dependencies.utoipa]
-version = "5"
-optional = true
-
-[dependencies.valuable]
-version = "0.1.1"
-optional = true
-default-features = false
-
 [dependencies.zeroize]
 version = "1"
 optional = true
 default-features = false
-
-[dependencies.zmij]
-version = "1"
 
 [dev-dependencies.cfg-if]
 version = "1"
@@ -242,20 +202,3 @@ version = "3"
 
 [dev-dependencies.test-strategy]
 version = "0.3"
-
-[dev-dependencies.zeroize]
-version = "1"
-features = ["alloc"]
-default-features = false
-
-[dev-dependencies.zmij]
-version = "=1.0.21"
-
-[target.'cfg(not(target_os = "windows"))'.dependencies.defmt]
-version = "1"
-optional = true
-
-[lints.rust.unexpected_cfgs]
-level = "warn"
-priority = 0
-check-cfg = ["cfg(kani)"]

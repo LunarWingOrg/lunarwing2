@@ -1,4 +1,6 @@
 #[cfg(feature = "experimental-inspect")]
+use crate::inspect::types::TypeInfo;
+#[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
 #[cfg(feature = "experimental-inspect")]
 use crate::type_object::PyTypeInfo;
@@ -6,8 +8,7 @@ use crate::{
     conversion::IntoPyObject, instance::Bound, types::PyString, Borrowed, FromPyObject, PyAny,
     PyErr, Python,
 };
-use alloc::borrow::Cow;
-use core::convert::Infallible;
+use std::{borrow::Cow, convert::Infallible};
 
 impl<'py> IntoPyObject<'py> for &str {
     type Target = PyString;
@@ -20,6 +21,11 @@ impl<'py> IntoPyObject<'py> for &str {
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Ok(PyString::new(py, self))
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
     }
 }
 
@@ -35,6 +41,11 @@ impl<'py> IntoPyObject<'py> for &&str {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (*self).into_pyobject(py)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
+    }
 }
 
 impl<'py> IntoPyObject<'py> for Cow<'_, str> {
@@ -48,6 +59,11 @@ impl<'py> IntoPyObject<'py> for Cow<'_, str> {
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (*self).into_pyobject(py)
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
     }
 }
 
@@ -63,6 +79,11 @@ impl<'py> IntoPyObject<'py> for &Cow<'_, str> {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (&**self).into_pyobject(py)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
+    }
 }
 
 impl<'py> IntoPyObject<'py> for char {
@@ -76,6 +97,11 @@ impl<'py> IntoPyObject<'py> for char {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let mut bytes = [0u8; 4];
         Ok(PyString::new(py, self.encode_utf8(&mut bytes)))
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
     }
 }
 
@@ -91,6 +117,11 @@ impl<'py> IntoPyObject<'py> for &char {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (*self).into_pyobject(py)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
+    }
 }
 
 impl<'py> IntoPyObject<'py> for String {
@@ -103,6 +134,11 @@ impl<'py> IntoPyObject<'py> for String {
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Ok(PyString::new(py, &self))
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        TypeInfo::builtin("str")
     }
 }
 
@@ -118,28 +154,43 @@ impl<'py> IntoPyObject<'py> for &String {
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Ok(PyString::new(py, self))
     }
-}
-
-#[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
-impl<'a> FromPyObject<'a, '_> for &'a str {
-    type Error = PyErr;
 
     #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyString::TYPE_HINT;
-
-    fn extract(ob: Borrowed<'a, '_, PyAny>) -> Result<Self, Self::Error> {
-        ob.cast::<PyString>()?.to_str()
+    fn type_output() -> TypeInfo {
+        <String>::type_output()
     }
 }
 
-impl<'a> FromPyObject<'a, '_> for Cow<'a, str> {
+#[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
+impl<'a> crate::conversion::FromPyObject<'a, '_> for &'a str {
     type Error = PyErr;
 
     #[cfg(feature = "experimental-inspect")]
     const INPUT_TYPE: PyStaticExpr = PyString::TYPE_HINT;
 
-    fn extract(ob: Borrowed<'a, '_, PyAny>) -> Result<Self, Self::Error> {
+    fn extract(ob: crate::Borrowed<'a, '_, PyAny>) -> Result<Self, Self::Error> {
+        ob.cast::<PyString>()?.to_str()
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        <String as crate::FromPyObject>::type_input()
+    }
+}
+
+impl<'a> crate::conversion::FromPyObject<'a, '_> for Cow<'a, str> {
+    type Error = PyErr;
+
+    #[cfg(feature = "experimental-inspect")]
+    const INPUT_TYPE: PyStaticExpr = PyString::TYPE_HINT;
+
+    fn extract(ob: crate::Borrowed<'a, '_, PyAny>) -> Result<Self, Self::Error> {
         ob.cast::<PyString>()?.to_cow()
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        <String as crate::FromPyObject>::type_input()
     }
 }
 
@@ -153,6 +204,11 @@ impl FromPyObject<'_, '_> for String {
 
     fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         obj.cast::<PyString>()?.to_cow().map(Cow::into_owned)
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        Self::type_output()
     }
 }
 
@@ -173,13 +229,18 @@ impl FromPyObject<'_, '_> for char {
             ))
         }
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        <String>::type_input()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::types::any::PyAnyMethods;
     use crate::{IntoPyObject, Python};
-    use alloc::borrow::Cow;
+    use std::borrow::Cow;
 
     #[test]
     fn test_cow_into_pyobject() {

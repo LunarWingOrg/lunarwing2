@@ -122,9 +122,7 @@ fn test_polymorphic_container_does_not_accept_other_types() {
 #[test]
 fn test_pyref_as_base() {
     Python::attach(|py| {
-        let initializer =
-            PyClassInitializer::from(BaseClass { value: 120 }).add_subclass(SubClass {});
-        let cell = Bound::new(py, initializer).unwrap();
+        let cell = Bound::new(py, (SubClass {}, BaseClass { value: 120 })).unwrap();
 
         // First try PyRefMut
         let sub: PyRefMut<'_, SubClass> = cell.borrow_mut();
@@ -144,9 +142,7 @@ fn test_pyref_as_base() {
 #[test]
 fn test_pycell_deref() {
     Python::attach(|py| {
-        let initializer =
-            PyClassInitializer::from(BaseClass { value: 120 }).add_subclass(SubClass {});
-        let obj = Bound::new(py, initializer).unwrap();
+        let obj = Bound::new(py, (SubClass {}, BaseClass { value: 120 })).unwrap();
 
         // Should be able to deref as PyAny
         assert_eq!(

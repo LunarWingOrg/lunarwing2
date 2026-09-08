@@ -1,7 +1,8 @@
 use crate::object::*;
 #[cfg(not(GraalPy))]
 use crate::{PyCFunctionObject, PyMethodDefPointer, METH_METHOD, METH_STATIC};
-use core::ffi::c_int;
+use std::ffi::c_int;
+use std::ptr::addr_of_mut;
 
 #[cfg(not(GraalPy))]
 pub struct PyCMethodObject {
@@ -9,18 +10,19 @@ pub struct PyCMethodObject {
     pub mm_class: *mut PyTypeObject,
 }
 
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     pub static mut PyCMethod_Type: PyTypeObject;
 }
 
 #[inline]
 pub unsafe fn PyCMethod_CheckExact(op: *mut PyObject) -> c_int {
-    Py_IS_TYPE(op, &raw mut PyCMethod_Type)
+    (Py_TYPE(op) == addr_of_mut!(PyCMethod_Type)) as c_int
 }
 
 #[inline]
 pub unsafe fn PyCMethod_Check(op: *mut PyObject) -> c_int {
-    PyObject_TypeCheck(op, &raw mut PyCMethod_Type)
+    PyObject_TypeCheck(op, addr_of_mut!(PyCMethod_Type))
 }
 
 #[cfg(not(GraalPy))]
@@ -39,7 +41,7 @@ pub unsafe fn PyCFunction_GET_SELF(func: *mut PyObject) -> *mut PyObject {
 
     let func = func.cast::<PyCFunctionObject>();
     if (*(*func).m_ml).ml_flags & METH_STATIC != 0 {
-        core::ptr::null_mut()
+        std::ptr::null_mut()
     } else {
         (*func).m_self
     }
@@ -64,6 +66,6 @@ pub unsafe fn PyCFunction_GET_CLASS(func: *mut PyObject) -> *mut PyTypeObject {
         let func = func.cast::<PyCMethodObject>();
         (*func).mm_class
     } else {
-        core::ptr::null_mut()
+        std::ptr::null_mut()
     }
 }

@@ -10,12 +10,11 @@
 //! structural values, not strings.
 
 use insta::assert_snapshot;
-use monty::MontyRun;
-use monty_types::{CompileOptions, ExcType, MontyObject};
+use monty::{ExcType, MontyObject, MontyRun};
 
 /// Evaluate a Python snippet under Monty and return its final value.
 fn eval(code: &str) -> MontyObject {
-    let ex = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
+    let ex = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
     ex.run_no_limits(vec![]).unwrap()
 }
 
@@ -82,19 +81,6 @@ fn json_output_exception() {
 fn json_output_repr() {
     let obj = MontyObject::Repr("<function foo>".to_string());
     assert_snapshot!(to_json(&obj), @r#"{"Repr":"<function foo>"}"#);
-}
-
-#[test]
-fn json_output_builtin_function() {
-    // Builtin functions serialize by their lowercase Python name, matching
-    // the strum `Display`/wire representation.
-    assert_snapshot!(to_json(&eval("print")), @r#"{"BuiltinFunction":"print"}"#);
-}
-
-#[test]
-fn json_deserialize_builtin_function() {
-    let obj: MontyObject = serde_json::from_str(r#"{"BuiltinFunction":"print"}"#).unwrap();
-    assert_eq!(obj, eval("print"));
 }
 
 #[test]
@@ -174,7 +160,6 @@ fn json_roundtrip() {
         "{'items': [1, 'two', None], 'flag': True}".to_owned(),
         "test.py",
         vec![],
-        CompileOptions::default(),
     )
     .unwrap();
     let result = ex.run_no_limits(vec![]).unwrap();
@@ -197,13 +182,7 @@ fn json_roundtrip_empty() {
 #[test]
 fn cycle_equality_same_id() {
     // Multiple references to the same cyclic object should produce equal Cycle values
-    let ex = MontyRun::new(
-        "a = []; a.append(a); [a, a]".to_owned(),
-        "test.py",
-        vec![],
-        CompileOptions::default(),
-    )
-    .unwrap();
+    let ex = MontyRun::new("a = []; a.append(a); [a, a]".to_owned(), "test.py", vec![]).unwrap();
     let result = ex.run_no_limits(vec![]).unwrap();
 
     if let MontyObject::List(outer) = &result {
@@ -229,7 +208,6 @@ fn cycle_equality_different_ids() {
         "a = []; a.append(a); b = []; b.append(b); [a, b]".to_owned(),
         "test.py",
         vec![],
-        CompileOptions::default(),
     )
     .unwrap();
     let result = ex.run_no_limits(vec![]).unwrap();

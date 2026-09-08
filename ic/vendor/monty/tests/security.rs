@@ -1,6 +1,5 @@
 use insta::assert_snapshot;
 use monty::MontyRun;
-use monty_types::CompileOptions;
 
 #[test]
 fn deeply_nested_parentheses_do_not_stack_overflow() {
@@ -13,7 +12,7 @@ fn deeply_nested_parentheses_do_not_stack_overflow() {
     for _ in 0..depth {
         code.push(')');
     }
-    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+    let result = MontyRun::new(code, "test.py", vec![]);
     let err = result.expect_err("expected parse error for deeply nested parentheses");
     assert_snapshot!(err.message().unwrap_or(""), @"Source is too deeply nested");
 }
@@ -30,7 +29,7 @@ fn deeply_nested_attribute_access_does_not_stack_overflow() {
     for _ in 0..depth {
         code.push_str(".x");
     }
-    let result = MontyRun::new(code, "test.py", vec![], CompileOptions::default());
+    let result = MontyRun::new(code, "test.py", vec![]);
     let err = result.expect_err("expected parse error for deeply nested attribute access");
     assert_snapshot!(err.message().unwrap_or(""), @"Source is too deeply nested");
 }

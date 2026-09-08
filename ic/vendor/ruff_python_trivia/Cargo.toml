@@ -11,39 +11,35 @@
 
 [package]
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.93"
 name = "ruff_python_trivia"
-version = "0.0.9"
+version = "0.0.0"
 authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
 build = false
+publish = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "This is an internal component crate of Ruff"
 homepage = "https://docs.astral.sh/ruff"
 documentation = "https://docs.astral.sh/ruff"
-readme = "README.md"
+readme = false
 license = "MIT"
 repository = "https://github.com/astral-sh/ruff"
-resolver = "2"
 
 [lib]
 name = "ruff_python_trivia"
 path = "src/lib.rs"
 
 [dependencies.itertools]
-version = "0.15.0"
+version = "0.14.0"
 
 [dependencies.ruff_source_file]
-version = "0.0.9"
+path = "../ruff_source_file"
 
 [dependencies.ruff_text_size]
-version = "0.0.9"
-
-[dependencies.rustc-hash]
-version = "2.0.0"
+path = "../ruff_text_size"
 
 [dependencies.unicode-ident]
 version = "1.0.12"
@@ -63,7 +59,7 @@ get_unwrap = "warn"
 if_not_else = "allow"
 ignore_without_reason = "allow"
 implicit_hasher = "allow"
-iter_over_hash_type = "warn"
+large_stack_arrays = "allow"
 map_unwrap_or = "allow"
 match_same_arms = "allow"
 missing_errors_doc = "allow"

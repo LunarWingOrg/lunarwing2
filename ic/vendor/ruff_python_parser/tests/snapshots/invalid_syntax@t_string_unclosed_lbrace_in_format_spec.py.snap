@@ -153,3 +153,4 @@ Module(
 2 | t"hello {x:"
 3 | t"hello {x:.3f"
   |               ^ Syntax Error: t-string: expecting `}`
+  |

@@ -14,9 +14,6 @@ mod inline;
 mod iter;
 mod last_utf8_char;
 mod num;
-#[allow(unexpected_cfgs)]
-#[cfg(kani)]
-mod proofs;
 mod static_str;
 mod traits;
 
@@ -73,41 +70,9 @@ impl Repr {
         } else if len <= MAX_SIZE {
             // SAFETY: We checked that the length of text is less than or equal to MAX_SIZE
             let inline = unsafe { InlineBuffer::new(text) };
-            Repr::from_inline_ok(inline)
+            Ok(Repr::from_inline(inline))
         } else {
             HeapBuffer::new(text).map(Repr::from_heap)
-        }
-    }
-
-    /// Infallible variant of [`Repr::new`] that panics on allocation failure.
-    ///
-    /// Keeping the inline arm out of the `Result` machinery lets the compiler drop the dead unwrap
-    /// check from the hot inline path.
-    #[inline]
-    #[track_caller]
-    pub(crate) fn new_panic(text: &str) -> Self {
-        let len = text.len();
-
-        // Note(parker): `len == 0` is intentionally not special-cased.
-        //
-        // I've gone back and forth on this a few times, but the slight performance win
-        // for empty strings is not worth the instruction bloat. `copy_small(_, _, 0)` in
-        // `InlineBuffer::new` ends up being a no-op as well.
-
-        if len <= MAX_SIZE {
-            // SAFETY: We checked that the length of text is less than or equal to MAX_SIZE
-            let inline = unsafe { InlineBuffer::new(text) };
-            Repr::from_inline(inline)
-        } else {
-            // N.B. `alloc_copy_panic` is `#[inline(always)]`, so the `HeapBuffer` it
-            // returns is assembled right here at the callsite. The only value crossing
-            // the call boundary is the two-word `(ptr, capacity)`.
-            //
-            // Previously returning a full 24-byte `HeapBuffer` across that boundary
-            // instead routed it through a stack temporary that LLVM scatter-copied into
-            // the return slot on x86 which caused a store-forwarding stall.
-            let heap = HeapBuffer::alloc_copy_panic(text);
-            Repr::from_heap(heap)
         }
     }
 
@@ -155,17 +120,11 @@ impl Repr {
         // Create a Repr with enough capacity for the entire buffer
         let mut repr = Repr::with_capacity(bytes_len)?;
 
-        // Write the bytes into the uninitialized buffer without first creating a reference to
-        // that memory.
-        //
-        // SAFETY:
-        // * `repr` was created with capacity for at least `bytes_len` bytes.
-        // * `bytes` is valid for reads of `bytes_len` bytes.
-        // * The newly allocated buffer does not overlap `bytes`.
-        unsafe {
-            repr.as_mut_ptr()
-                .copy_from_nonoverlapping(bytes.as_ptr(), bytes_len)
-        };
+        // SAFETY: The caller is responsible for making sure the provided buffer is UTF-8. This
+        // invariant is documented in the public API
+        let slice = repr.as_mut_buf();
+        // write the chunk into the Repr
+        slice[..bytes_len].copy_from_slice(bytes);
 
         // Set the length of the Repr
         // SAFETY: We just wrote the entire `buf` into the Repr
@@ -184,20 +143,27 @@ impl Repr {
         let og_cap = s.capacity();
         let cap = Capacity::new(og_cap);
 
-        if cap.is_heap() {
-            // We only hit this case if the provided String is > 16MB and we're on a 32-bit arch.
-            //
-            // `alloc_copy` is the cold out-of-line core, keeping this arm off the hot path without
-            // a helper that would return the 24-byte `Repr` through a stack temporary.
-            let len = s.len();
-            let (ptr, cap) = HeapBuffer::alloc_copy(s.as_str())?;
-            Ok(Repr::from_heap(HeapBuffer { ptr, len, cap }))
-        } else if og_cap == 0 {
+        #[cold]
+        fn capacity_on_heap(s: String) -> Result<Repr, ReserveError> {
+            HeapBuffer::new(s.as_str()).map(Repr::from_heap)
+        }
+
+        #[cold]
+        fn empty() -> Result<Repr, ReserveError> {
             Ok(EMPTY)
+        }
+
+        if cap.is_heap() {
+            // We only hit this case if the provided String is > 16MB and we're on a 32-bit arch. We
+            // expect it to be unlikely, thus we hint that to the compiler
+            capacity_on_heap(s)
+        } else if og_cap == 0 {
+            // We don't expect converting from an empty String often, so we make this code path cold
+            empty()
         } else if should_inline && s.len() <= MAX_SIZE {
             // SAFETY: Checked to make sure the string would fit inline
             let inline = unsafe { InlineBuffer::new(s.as_str()) };
-            Repr::from_inline_ok(inline)
+            Ok(Repr::from_inline(inline))
         } else {
             let mut s = mem::ManuallyDrop::new(s.into_bytes());
             let len = s.len();
@@ -355,24 +321,17 @@ impl Repr {
         let len = self.len();
         let str_len = s.len();
 
-        // Only call the (out-of-line) grow path when we actually need to; the common append
-        // already has room. A `&'static str` always has to be converted first.
-        if self.is_static_str() || len + str_len > self.capacity() {
-            self.reserve(str_len).unwrap_with_msg();
-        }
+        // Reserve at least enough space to fit `s`
+        self.reserve(str_len).unwrap_with_msg();
 
-        // Copy the string into the spare capacity without first creating a reference to the
-        // uninitialized memory.
-        //
-        // SAFETY:
-        // * `reserve` guarantees at least `len + str_len` bytes of capacity.
-        // * `s` is valid for reads of `str_len` bytes.
-        // * The mutable borrow of `self` guarantees the source and destination do not overlap.
-        unsafe {
-            self.as_mut_ptr()
-                .add(len)
-                .copy_from_nonoverlapping(s.as_ptr(), str_len)
-        };
+        // SAFETY: `s` which we're appending to the buffer, is valid UTF-8
+        let slice = unsafe { self.as_mut_buf() };
+        let push_buffer = &mut slice[len..len + str_len];
+
+        debug_assert_eq!(push_buffer.len(), s.len());
+
+        // Copy the string into our buffer
+        push_buffer.copy_from_slice(s.as_bytes());
 
         // Increment the length of our string
         //
@@ -496,7 +455,8 @@ impl Repr {
     }
 
     #[inline]
-    pub(crate) const fn as_static_str(&self) -> Option<&'static str> {
+    #[rustversion::attr(since(1.64), const)]
+    pub(crate) fn as_static_str(&self) -> Option<&'static str> {
         if self.is_static_str() {
             // SAFETY: A `Repr` is transmuted from `StaticStr`
             let s: &StaticStr = unsafe { &*(self as *const Self as *const StaticStr) };
@@ -517,12 +477,11 @@ impl Repr {
         }
     }
 
-    /// Returns a mutable raw pointer to the start of the underlying buffer.
+    /// Return a mutable reference to the entirely underlying buffer
     ///
-    /// The pointer is valid for writes up to [`Repr::capacity`], but only the first [`Repr::len`]
-    /// bytes are guaranteed to be initialized.
-    #[inline]
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+    /// # Safety
+    /// * Callers must guarantee that any modifications made to the buffer are valid UTF-8
+    pub(crate) unsafe fn as_mut_buf(&mut self) -> &mut [u8] {
         #[cold]
         fn inline_static_str(this: &mut Repr) {
             if let Some(s) = this.as_static_str() {
@@ -534,12 +493,23 @@ impl Repr {
             inline_static_str(self);
         }
 
-        if self.is_heap_allocated() {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated.
-            unsafe { self.as_mut_heap().ptr.as_ptr() }
+        // the last byte stores our discriminant and stack length
+        let last_byte = self.last_byte();
+
+        let (ptr, cap) = if last_byte == HEAP_MASK {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            let heap_buffer = self.as_heap();
+            let ptr = heap_buffer.ptr.as_ptr();
+            let cap = heap_buffer.capacity();
+
+            (ptr, cap)
         } else {
-            self as *mut Self as *mut u8
-        }
+            let ptr = self as *mut Self as *mut u8;
+            (ptr, MAX_SIZE)
+        };
+
+        // SAFETY: Our data is valid for `cap` bytes, and is initialized
+        core::slice::from_raw_parts_mut(ptr, cap)
     }
 
     /// Sets the length of the string that our underlying buffer contains
@@ -547,7 +517,6 @@ impl Repr {
     /// # Safety
     /// * `len` bytes in the buffer must be valid UTF-8
     /// * If the underlying buffer is stored inline, `len` must be <= MAX_SIZE
-    #[inline]
     pub(crate) unsafe fn set_len(&mut self, len: usize) {
         if let Some(s) = self.as_static_variant_mut() {
             s.set_len(len);
@@ -662,18 +631,6 @@ impl Repr {
         unsafe { core::mem::transmute(inline) }
     }
 
-    /// `Ok(from_inline(inline))`, plus a hint to the compiler that the result is in fact `Ok`.
-    #[inline(always)]
-    fn from_inline_ok(inline: InlineBuffer) -> Result<Self, ReserveError> {
-        let repr = Self::from_inline(inline);
-        // SAFETY: `InlineBuffer` always produces a valid inline last byte (`< HEAP_MASK`). The
-        // compiler cannot see this through the transmute; without the hint it cannot fold the
-        // niche-encoded `Err` arm at the call site. Kept here (not in `from_inline`) so callers
-        // that don't wrap in `Result` avoid materializing the load of the last byte.
-        unsafe { assume(repr.last_byte() < HEAP_MASK) };
-        Ok(repr)
-    }
-
     /// Reinterprets a [`HeapBuffer`] into a [`Repr`]
     ///
     /// Note: This is safe because [`HeapBuffer`] and [`Repr`] are the same size. We used to define
@@ -776,15 +733,16 @@ impl Repr {
 impl Clone for Repr {
     #[inline]
     fn clone(&self) -> Self {
+        #[inline(never)]
+        fn clone_heap(this: &Repr) -> Repr {
+            Repr::new(this.as_str()).unwrap_with_msg()
+        }
+
         // There are only two cases we need to care about: If the string is allocated on the heap
         // or not. If it is, then the data must be cloned properly, otherwise we can simply copy
         // the `Repr`.
-        //
-        // `new_panic`'s heap arm is the cold out-of-line `alloc_copy` returning `(ptr, cap)` in
-        // registers; an out-of-line helper returning the 24-byte `Repr` here would route the hot
-        // copy arm below through a scatter-copied stack temporary on x86 (store-forwarding stall).
         if self.is_heap_allocated() {
-            Repr::new_panic(self.as_str())
+            clone_heap(self)
         } else {
             // SAFETY: We just checked that `self` can be copied because it is an inline string or
             // a reference to a `&'static str`.
@@ -819,17 +777,14 @@ impl Drop for Repr {
         // By "outlining" the actual Drop code and only calling it if we're a heap variant, it
         // allows dropping an inline variant to be as cheap as possible.
         if self.is_heap_allocated() {
-            // SAFETY: We just checked the discriminant to make sure we're heap allocated
-            let heap = unsafe { self.as_heap() };
-            // Pass the heap fields by value so the address of `*self` never escapes, otherwise
-            // dropping a by-value `CompactString` must materialize the full 24 bytes on the
-            // caller's stack just to hand `&mut Repr` to the outlined function.
-            outlined_drop(heap.ptr, heap.cap)
+            outlined_drop(self)
         }
 
         #[cold]
-        fn outlined_drop(ptr: ptr::NonNull<u8>, cap: Capacity) {
-            heap::deallocate_ptr(ptr, cap);
+        fn outlined_drop(this: &mut Repr) {
+            // SAFETY: We just checked the discriminant to make sure we're heap allocated
+            let heap_buffer = unsafe { this.as_mut_heap() };
+            heap_buffer.dealloc();
         }
     }
 }
@@ -837,7 +792,7 @@ impl Drop for Repr {
 impl Extend<char> for Repr {
     #[inline]
     fn extend<T: IntoIterator<Item = char>>(&mut self, iter: T) {
-        let mut iter = iter.into_iter();
+        let iter = iter.into_iter();
 
         let (lower_bound, _) = iter.size_hint();
         if lower_bound > 0 {
@@ -845,46 +800,8 @@ impl Extend<char> for Repr {
             let _: Result<(), ReserveError> = self.reserve(lower_bound);
         }
 
-        // Append into the spare capacity directly, tracking the length locally so we avoid the
-        // per-char `len`/`set_len` discriminant work of pushing one char at a time. If a char
-        // doesn't fit, grow via `push_str` and re-resolve the buffer.
-        'refetch: loop {
-            // Pull a char before resolving the buffer so an empty iterator does no work.
-            let mut next = iter.next();
-            if next.is_none() {
-                return;
-            }
-
-            let cap = self.capacity();
-            let mut cur = self.len();
-            // Also converts a `&'static str` into an owned inline buffer.
-            let ptr = self.as_mut_ptr();
-            let mut buf = [0u8; 4];
-
-            while let Some(c) = next {
-                let encoded = c.encode_utf8(&mut buf);
-                let n = encoded.len();
-
-                if cur + n > cap {
-                    // SAFETY: `cur` bytes of valid UTF-8 have been written into the buffer.
-                    unsafe { self.set_len(cur) };
-                    self.push_str(encoded);
-                    continue 'refetch;
-                }
-
-                // SAFETY: `cur + n <= cap` leaves room for `n` bytes; `ptr` stays valid until the
-                // next `continue 'refetch`, which re-derives it; `encoded` cannot overlap `ptr`.
-                unsafe {
-                    ptr.add(cur).copy_from_nonoverlapping(encoded.as_ptr(), n);
-                }
-                cur += n;
-
-                next = iter.next();
-            }
-
-            // SAFETY: `cur` bytes of valid UTF-8 have been written into the buffer.
-            unsafe { self.set_len(cur) };
-            return;
+        for c in iter {
+            self.push_str(c.encode_utf8(&mut [0; 4]));
         }
     }
 }
@@ -925,9 +842,8 @@ fn ensure_read(value: usize) -> usize {
     // SAFETY: This assembly instruction is a noop that only affects the instruction ordering.
     //
     // TODO(parkmycar): Re-add loongarch and riscv once we have CI coverage for them.
-    #[allow(unexpected_cfgs)]
     #[cfg(all(
-        not(any(kani, miri)),
+        not(miri),
         any(
             target_arch = "x86",
             target_arch = "x86_64",
@@ -944,94 +860,6 @@ fn ensure_read(value: usize) -> usize {
     };
 
     value
-}
-
-/// Polyfill for [`core::hint::assert_unchecked`] (stabilized in Rust 1.81; our MSRV is 1.71). The
-/// two are equivalent — `assert_unchecked` is defined as this — so the release codegen is identical.
-///
-/// In debug builds we also `debug_assert!` the condition, so a violated invariant panics loudly
-/// instead of being silent UB. This compiles out of release builds, leaving only the hint.
-///
-/// TODO(MSRV 1.81): drop this and call `core::hint::assert_unchecked` directly.
-///
-/// # Safety
-/// `cond` must always hold; the compiler is free to assume it.
-#[inline(always)]
-const unsafe fn assume(cond: bool) {
-    debug_assert!(cond);
-    if !cond {
-        // SAFETY: guaranteed by the caller.
-        core::hint::unreachable_unchecked();
-    }
-}
-
-/// Copies `len` bytes (`len <= MAX_SIZE`) from `src` to `dst`, for the inline-string path.
-///
-/// A `ptr::copy_nonoverlapping` with a *runtime* length lowers to an out-of-line `memcpy` call
-/// (the backend only inlines the copy when the length is a compile-time constant), which is
-/// wasteful for the tiny copies used when inlining a string. Since an inline string is at most
-/// `MAX_SIZE` bytes we instead use a ladder of *constant*-length overlapping copies, each of which
-/// the compiler lowers to a couple of load/store instructions — and which const-fold away entirely
-/// when `len` is known (e.g. `CompactString::const_new` / string literals).
-///
-/// # Safety
-/// * `len <= MAX_SIZE`.
-/// * `src` is valid for reads of `len` bytes; `dst` is valid for writes of `len` bytes.
-/// * `src` and `dst` do not overlap.
-#[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
-#[inline(always)]
-pub(crate) unsafe fn copy_small(src: *const u8, dst: *mut u8, len: usize) {
-    debug_assert!(len <= MAX_SIZE);
-
-    // Each branch only touches bytes within `[0, len)` — the tail copy starts at `len - N` only
-    // once we know `len >= N` — so the overlapping copies never read or write out of range.
-    if len >= 16 {
-        ptr::copy_nonoverlapping(src, dst, 16);
-        ptr::copy_nonoverlapping(src.add(len - 16), dst.add(len - 16), 16);
-    } else if len >= 8 {
-        ptr::copy_nonoverlapping(src, dst, 8);
-        ptr::copy_nonoverlapping(src.add(len - 8), dst.add(len - 8), 8);
-    } else if len >= 4 {
-        ptr::copy_nonoverlapping(src, dst, 4);
-        ptr::copy_nonoverlapping(src.add(len - 4), dst.add(len - 4), 4);
-    } else if len >= 2 {
-        ptr::copy_nonoverlapping(src, dst, 2);
-        ptr::copy_nonoverlapping(src.add(len - 2), dst.add(len - 2), 2);
-    } else if len == 1 {
-        *dst = *src;
-    }
-}
-
-/// Copies `len` bytes from `src` to `dst`, for the heap-string path.
-///
-/// The common case for a freshly heap-allocated `CompactString` is a length just over
-/// the inline threshold. For those the medium bands `[16,64]` are copied inline with two
-/// overlapping fixed-size load/stores, skipping the `memcpy` call boundary like
-/// [`copy_small`].
-///
-/// Copies `> 64` bytes delegate to `memcpy`, which has per-CPU-tuned large-copy paths
-/// that any optimization we do won't beat.
-/// Copies `< 16` bytes are rare on this path so they simply delegate to `memcpy` as well
-/// which keeps this correct for *any* length.
-///
-/// # Safety
-///
-/// * `src` is valid for reads of `len` bytes; `dst` is valid for writes of `len` bytes.
-/// * `src` and `dst` do not overlap.
-///
-#[inline]
-pub(crate) unsafe fn copy_medium(src: *const u8, dst: *mut u8, len: usize) {
-    if len > 64 {
-        ptr::copy_nonoverlapping(src, dst, len);
-    } else if len >= 32 {
-        ptr::copy_nonoverlapping(src, dst, 32);
-        ptr::copy_nonoverlapping(src.add(len - 32), dst.add(len - 32), 32);
-    } else if len >= 16 {
-        ptr::copy_nonoverlapping(src, dst, 16);
-        ptr::copy_nonoverlapping(src.add(len - 16), dst.add(len - 16), 16);
-    } else {
-        ptr::copy_nonoverlapping(src, dst, len);
-    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ def outer_dict():
     return inner()
 
 
-assert outer_dict() == {'a': 1, 'b': 2, 'c': 3}
+assert outer_dict() == {'a': 1, 'b': 2, 'c': 3}, 'closure: dict unpack'
 
 
 # === Closure capturing variable used in list unpack ===
@@ -30,7 +30,7 @@ def outer_list():
     return inner()
 
 
-assert outer_list() == [1, 2, 3, 4, 5]
+assert outer_list() == [1, 2, 3, 4, 5], 'closure: list unpack'
 
 
 # === Closure capturing variable used in tuple unpack ===
@@ -44,7 +44,7 @@ def outer_tuple():
     return inner()
 
 
-assert outer_tuple() == (1, 2, 3, 4)
+assert outer_tuple() == (1, 2, 3, 4), 'closure: tuple unpack'
 
 
 # === Closure capturing variable used in set unpack ===
@@ -57,7 +57,7 @@ def outer_set():
     return inner()
 
 
-assert outer_set() == {1, 2, 3}
+assert outer_set() == {1, 2, 3}, 'closure: set unpack'
 
 
 # === Closure using PEP 448 in a function call (single * and **) ===
@@ -74,7 +74,7 @@ def outer_call_star():
     return inner()
 
 
-assert outer_call_star() == ((1, 2, 3), {'x': 10})
+assert outer_call_star() == ((1, 2, 3), {'x': 10}), 'closure: call *args **kw'
 
 
 # === Closure using multiple * and ** in a call ===
@@ -93,7 +93,7 @@ def outer_multi():
     return inner()
 
 
-assert outer_multi() == ((1, 2, 3, 4), {'x': 10, 'y': 20})
+assert outer_multi() == ((1, 2, 3, 4), {'x': 10, 'y': 20}), 'closure: multi-star call'
 
 
 # === Closure calling with keyword-only args (ArgExprs::Kwargs) ===
@@ -116,7 +116,7 @@ def outer_kwargs_call():
     return inner()
 
 
-assert outer_kwargs_call() == {'a': 10, 'b': 20}
+assert outer_kwargs_call() == {'a': 10, 'b': 20}, 'closure: keyword-only call'
 
 
 # === Closure calling with positional + *star (ArgsKargs with args=Some) ===
@@ -136,7 +136,7 @@ def outer_argsstar():
     return inner()
 
 
-assert outer_argsstar() == [1, 2, 3]
+assert outer_argsstar() == [1, 2, 3], 'closure: positional + *args'
 
 
 # === Closure calling with named kwarg + **kw (ArgsKargs with kwargs=Some) ===
@@ -156,7 +156,7 @@ def outer_kwargsstar():
     return inner()
 
 
-assert outer_kwargsstar() == {'a': 1, 'b': 2}
+assert outer_kwargsstar() == {'a': 1, 'b': 2}, 'closure: named kwarg + **kw'
 
 
 # === Closure with GeneralizedCall and Named kwarg ===
@@ -178,7 +178,7 @@ def outer_generalized_named():
     return inner()
 
 
-assert outer_generalized_named() == ((1, 2, 3), {'key': 99})
+assert outer_generalized_named() == ((1, 2, 3), {'key': 99}), 'closure: generalized call with named kwarg'
 
 
 # === Closure with GeneralizedCall and plain Value arg ===
@@ -200,4 +200,4 @@ def outer_generalized_mixed():
     return inner()
 
 
-assert outer_generalized_mixed() == [0, 1, 2, 3, 4]
+assert outer_generalized_mixed() == [0, 1, 2, 3, 4], 'closure: generalized call with value + unpack args'

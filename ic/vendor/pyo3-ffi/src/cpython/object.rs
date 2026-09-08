@@ -1,11 +1,12 @@
+#[cfg(Py_3_8)]
 use crate::vectorcallfunc;
 use crate::{object, PyGetSetDef, PyMemberDef, PyMethodDef, PyObject, Py_ssize_t};
-use core::ffi::{c_char, c_int, c_uint, c_void};
+use std::ffi::{c_char, c_int, c_uint, c_void};
+use std::mem;
 
 // skipped private _Py_NewReference
 // skipped private _Py_NewReferenceNoTotal
 // skipped private _Py_ResurrectReference
-// skipped private _Py_ForgetReference
 
 // skipped private _Py_GetGlobalRefTotal
 // skipped private _Py_GetRefTotal
@@ -21,8 +22,8 @@ use core::ffi::{c_char, c_int, c_uint, c_void};
 #[cfg(not(Py_3_11))] // moved to src/buffer.rs from Python
 mod bufferinfo {
     use crate::Py_ssize_t;
-    use core::ffi::{c_char, c_int, c_void};
-    use core::ptr;
+    use std::ffi::{c_char, c_int, c_void};
+    use std::ptr;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -214,6 +215,9 @@ pub struct PyTypeObject {
     pub tp_basicsize: Py_ssize_t,
     pub tp_itemsize: Py_ssize_t,
     pub tp_dealloc: Option<object::destructor>,
+    #[cfg(not(Py_3_8))]
+    pub tp_print: Option<printfunc>,
+    #[cfg(Py_3_8)]
     pub tp_vectorcall_offset: Py_ssize_t,
     pub tp_getattr: Option<object::getattrfunc>,
     pub tp_setattr: Option<object::setattrfunc>,
@@ -229,7 +233,7 @@ pub struct PyTypeObject {
     pub tp_setattro: Option<object::setattrofunc>,
     pub tp_as_buffer: *mut PyBufferProcs,
     #[cfg(not(Py_GIL_DISABLED))]
-    pub tp_flags: core::ffi::c_ulong,
+    pub tp_flags: std::ffi::c_ulong,
     #[cfg(Py_GIL_DISABLED)]
     pub tp_flags: crate::impl_::AtomicCULong,
     pub tp_doc: *const c_char,
@@ -260,10 +264,11 @@ pub struct PyTypeObject {
     pub tp_del: Option<object::destructor>,
     pub tp_version_tag: c_uint,
     pub tp_finalize: Option<object::destructor>,
+    #[cfg(Py_3_8)]
     pub tp_vectorcall: Option<vectorcallfunc>,
     #[cfg(Py_3_12)]
     pub tp_watched: c_char,
-    #[cfg(not(any(PyPy, Py_3_9)))]
+    #[cfg(all(not(PyPy), Py_3_8, not(Py_3_9)))]
     pub tp_print: Option<printfunc>,
     #[cfg(py_sys_config = "COUNT_ALLOCS")]
     pub tp_allocs: Py_ssize_t,
@@ -275,10 +280,6 @@ pub struct PyTypeObject {
     pub tp_prev: *mut PyTypeObject,
     #[cfg(py_sys_config = "COUNT_ALLOCS")]
     pub tp_next: *mut PyTypeObject,
-    #[cfg(Py_3_13)]
-    pub tp_versions_used: u16,
-    #[cfg(Py_3_15)]
-    pub _tp_iteritem: Option<object::_Py_iteritemfunc>,
 }
 
 #[cfg(Py_3_11)]
@@ -317,11 +318,18 @@ pub struct PyHeapTypeObject {
     pub unique_id: Py_ssize_t,
 }
 
+impl Default for PyHeapTypeObject {
+    #[inline]
+    fn default() -> Self {
+        unsafe { mem::zeroed() }
+    }
+}
+
 #[inline]
 #[cfg(not(Py_3_11))]
 pub unsafe fn PyHeapType_GET_MEMBERS(etype: *mut PyHeapTypeObject) -> *mut PyMemberDef {
     let py_type = object::Py_TYPE(etype as *mut object::PyObject);
-    let ptr = etype.byte_offset((*py_type).tp_basicsize);
+    let ptr = etype.offset((*py_type).tp_basicsize);
     ptr as *mut PyMemberDef
 }
 
@@ -329,7 +337,7 @@ pub unsafe fn PyHeapType_GET_MEMBERS(etype: *mut PyHeapTypeObject) -> *mut PyMem
 // skipped private _PyType_Lookup
 // skipped private _PyType_LookupRef
 
-extern_libpython! {
+extern "C" {
     #[cfg(Py_3_12)]
     pub fn PyType_GetDict(o: *mut PyTypeObject) -> *mut PyObject;
 
@@ -390,23 +398,3 @@ extern_libpython! {
 // skipped PyRefTracer
 // skipped PyRefTracer_SetTracer
 // skipped PyRefTracer_GetTracer
-
-#[cfg(Py_3_14)]
-extern_libpython! {
-    // skipped PyUnstable_Object_EnableDeferredRefcount
-
-    pub fn PyUnstable_Object_IsUniqueReferencedTemporary(obj: *mut PyObject) -> c_int;
-
-    // skipped PyUnstable_IsImmortal
-
-    pub fn PyUnstable_TryIncRef(obj: *mut PyObject) -> c_int;
-
-    pub fn PyUnstable_EnableTryIncRef(obj: *mut PyObject);
-
-    pub fn PyUnstable_Object_IsUniquelyReferenced(op: *mut PyObject) -> c_int;
-}
-
-#[cfg(Py_3_15)]
-extern_libpython! {
-    pub fn PyUnstable_SetImmortal(op: *mut PyObject) -> c_int;
-}

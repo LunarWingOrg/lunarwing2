@@ -1,190 +1,174 @@
 # === Construction ===
 s = set()
-assert len(s) == 0
-assert s == set()
+assert len(s) == 0, 'empty set len'
+assert s == set(), 'empty set equality'
 
 s = set([1, 2, 3])
-assert len(s) == 3
+assert len(s) == 3, 'set from list len'
 
 # === Basic Methods ===
 s = set()
 s.add(1)
 s.add(2)
 s.add(1)  # duplicate
-assert len(s) == 2
+assert len(s) == 2, 'add with duplicate'
 
 # === Discard and Remove ===
 s = set([1, 2, 3])
 s.discard(2)
-assert len(s) == 2
+assert len(s) == 2, 'discard existing'
 s.discard(99)  # should not raise
-assert len(s) == 2
+assert len(s) == 2, 'discard non-existing'
 
 # === Pop ===
 s = set([1])
 v = s.pop()
-assert v == 1
-assert len(s) == 0
+assert v == 1, 'pop returns element'
+assert len(s) == 0, 'pop removes element'
 
 # === Clear ===
 s = set([1, 2, 3])
 s.clear()
-assert len(s) == 0
+assert len(s) == 0, 'clear'
 
 # === Copy ===
 s = set([1, 2, 3])
 s2 = s.copy()
-assert s == s2
+assert s == s2, 'copy equality'
 s.add(4)
-assert s != s2
+assert s != s2, 'copy is independent'
 
 # === Update ===
 s = set([1, 2])
 s.update([2, 3, 4])
-assert len(s) == 4
+assert len(s) == 4, 'update with list'
 
 # === Union ===
 s1 = set([1, 2])
 s2 = set([2, 3])
 u = s1.union(s2)
-assert len(u) == 3
+assert len(u) == 3, 'union len'
 
 # === Intersection ===
 s1 = set([1, 2, 3])
 s2 = set([2, 3, 4])
 i = s1.intersection(s2)
-assert len(i) == 2
+assert len(i) == 2, 'intersection len'
 
 # === Difference ===
 s1 = set([1, 2, 3])
 s2 = set([2, 3, 4])
 d = s1.difference(s2)
-assert len(d) == 1
+assert len(d) == 1, 'difference len'
 
 # === Symmetric Difference ===
 s1 = set([1, 2, 3])
 s2 = set([2, 3, 4])
 sd = s1.symmetric_difference(s2)
-assert len(sd) == 2
+assert len(sd) == 2, 'symmetric_difference len'
 
 # === Binary operators ===
 s = {1, 2}
 t = {2, 3}
 fs = frozenset([2, 3])
 
-assert s & t == {2}
-assert s | t == {1, 2, 3}
-assert s ^ t == {1, 3}
-assert s - t == {1}
+assert s & t == {2}, 'set & set works'
+assert s | t == {1, 2, 3}, 'set | set works'
+assert s ^ t == {1, 3}, 'set ^ set works'
+assert s - t == {1}, 'set - set works'
 
-assert s & fs == {2}
-assert s | fs == {1, 2, 3}
-assert s ^ fs == {1, 3}
-assert s - fs == {1}
+assert s & fs == {2}, 'set & frozenset works'
+assert s | fs == {1, 2, 3}, 'set | frozenset works'
+assert s ^ fs == {1, 3}, 'set ^ frozenset works'
+assert s - fs == {1}, 'set - frozenset works'
 
 keys = {'a': 1, 'b': 2}.keys()
 items = {'a': 1, 'b': 2}.items()
-assert {'a'} & keys == {'a'}
-assert {'a'} | keys == {'a', 'b'}
-assert {('a', 1)} ^ items == {('b', 2)}
-assert {('a', 1), ('b', 2)} - items == set()
+assert {'a'} & keys == {'a'}, 'set & dict_keys works'
+assert {'a'} | keys == {'a', 'b'}, 'set | dict_keys works'
+assert {('a', 1)} ^ items == {('b', 2)}, 'set ^ dict_items works'
+assert {('a', 1), ('b', 2)} - items == set(), 'set - dict_items works'
 
-assert type(s & fs).__name__ == 'set'
+assert type(s & fs).__name__ == 'set', 'set operators keep the left operand type'
 
 try:
     s & [1, 2]
     assert False, 'set operators reject non-set rhs'
 except TypeError as e:
-    assert str(e) == "unsupported operand type(s) for &: 'set' and 'list'"
+    assert str(e) == "unsupported operand type(s) for &: 'set' and 'list'", 'set & rhs error matches CPython'
 
 try:
     s | [1, 2]
     assert False, 'set union operator rejects non-set rhs'
 except TypeError as e:
-    assert str(e) == "unsupported operand type(s) for |: 'set' and 'list'"
+    assert str(e) == "unsupported operand type(s) for |: 'set' and 'list'", 'set | rhs error matches CPython'
 
 try:
     s ^ [1, 2]
     assert False, 'set xor operator rejects non-set rhs'
 except TypeError as e:
-    assert str(e) == "unsupported operand type(s) for ^: 'set' and 'list'"
+    assert str(e) == "unsupported operand type(s) for ^: 'set' and 'list'", 'set ^ rhs error matches CPython'
 
 try:
     s - [1, 2]
     assert False, 'set subtraction operator rejects non-set rhs'
 except TypeError as e:
-    assert str(e) == "unsupported operand type(s) for -: 'set' and 'list'"
+    assert str(e) == "unsupported operand type(s) for -: 'set' and 'list'", 'set - rhs error matches CPython'
 
 # === Issubset ===
 s1 = set([1, 2])
 s2 = set([1, 2, 3])
-assert s1.issubset(s2) == True
-assert s2.issubset(s1) == False
-# non-Ref iterable argument (range) must not raise
-assert set([1, 2, 3]).issubset(range(10)) == True
+assert s1.issubset(s2) == True, 'issubset true'
+assert s2.issubset(s1) == False, 'issubset false'
 
 # === Issuperset ===
 s1 = set([1, 2, 3])
 s2 = set([1, 2])
-assert s1.issuperset(s2) == True
-assert s2.issuperset(s1) == False
-assert set([1, 2, 3]).issuperset(range(1, 3)) == True
+assert s1.issuperset(s2) == True, 'issuperset true'
+assert s2.issuperset(s1) == False, 'issuperset false'
 
 # === Isdisjoint ===
 s1 = set([1, 2])
 s2 = set([3, 4])
 s3 = set([2, 3])
-assert s1.isdisjoint(s2) == True
-assert s1.isdisjoint(s3) == False
-assert set([1, 2, 3]).isdisjoint(range(10, 20)) == True
+assert s1.isdisjoint(s2) == True, 'isdisjoint true'
+assert s1.isdisjoint(s3) == False, 'isdisjoint false'
 
 # === Bool ===
-assert bool(set()) == False
-assert bool(set([1])) == True
+assert bool(set()) == False, 'empty set is falsy'
+assert bool(set([1])) == True, 'non-empty set is truthy'
 
 # === repr ===
-assert repr(set()) == 'set()'
-# non-empty set repr has no type prefix; frozenset repr does
-assert repr({1, 2}) == '{1, 2}' or repr({1, 2}) == '{2, 1}', 'set repr should not have a type prefix'
-assert repr(frozenset()) == 'frozenset()'
-fs_repr = repr(frozenset({1, 2}))
-assert fs_repr == 'frozenset({1, 2})' or fs_repr == 'frozenset({2, 1})', 'frozenset repr should include the type name'
-
-# === Construction with nested heap objects ===
-# The temporary list argument is dropped after construction; a missed refcount
-# increment on the nested tuple would corrupt these.
-assert repr(set([(1, 2)])) == '{(1, 2)}'
-assert repr(set([(3, 4)])) == '{(3, 4)}'
-assert repr(frozenset([(5, 6)])) == 'frozenset({(5, 6)})'
+assert repr(set()) == 'set()', 'empty set repr'
 
 # === Set literals ===
 s = {1, 2, 3}
-assert len(s) == 3
+assert len(s) == 3, 'set literal len'
 
 s = {1, 1, 2, 2, 3}
-assert len(s) == 3
+assert len(s) == 3, 'set literal deduplication'
 
 # Set literal with expressions
 x = 5
 s = {x, x + 1, x + 2}
-assert len(s) == 3
+assert len(s) == 3, 'set literal with expressions'
 
 # === Set unpacking (PEP 448) ===
 a = [1, 2]
 b = [3, 4]
-assert {*a} == {1, 2}
-assert {*a, *b} == {1, 2, 3, 4}
-assert {0, *a, 5} == {0, 1, 2, 5}
-assert {*[]} == set()
-assert {*(1, 2)} == {1, 2}
-assert {*{'a': 1, 'b': 2}} == {'a', 'b'}
-assert {*'aab'} == {'a', 'b'}
+assert {*a} == {1, 2}, 'single set unpack from list'
+assert {*a, *b} == {1, 2, 3, 4}, 'double set unpack'
+assert {0, *a, 5} == {0, 1, 2, 5}, 'mixed set unpack'
+assert {*[]} == set(), 'unpack empty into set'
+assert {*(1, 2)} == {1, 2}, 'unpack tuple into set'
+assert {*{'a': 1, 'b': 2}} == {'a', 'b'}, 'unpack dict keys into set'
+assert {*'aab'} == {'a', 'b'}, 'unpack string into set'
 # Heap-allocated set: covers the HeapData::Set arm in set_extend
 inner_set = {1, 2, 3}
-assert {*inner_set} == {1, 2, 3}
+assert {*inner_set} == {1, 2, 3}, 'unpack set into set'
 # Heap-allocated Str (result of concat, not interned): covers HeapData::Str in set_extend
 hs = 'hel' + 'lo'
-assert {*hs} == {'h', 'e', 'l', 'o'}
+assert {*hs} == {'h', 'e', 'l', 'o'}, 'unpack heap string into set'
 
 
 # Non-iterable heap-allocated Ref (closure) hits the inner `_` arm in set_extend.
@@ -205,65 +189,3 @@ try:
     assert False, 'expected TypeError for non-iterable heap closure in set unpack'
 except TypeError:
     pass
-
-# === `in` / `not in` ===
-members = {1, 2, 3}
-assert 2 in members
-assert 9 not in members
-
-
-# === an asymmetric __eq__ is always asked stored-value-first ===
-# CPython's set lookup compares the stored element on the left, so a stored
-# element claiming equality wins regardless of what the incoming one says.
-class Asym:
-    def __init__(self, result):
-        self.result = result
-
-    def __hash__(self):
-        return 1
-
-    def __eq__(self, other):
-        return self.result
-
-
-def _pair():
-    return Asym(True), Asym(False)
-
-
-yes, no = _pair()
-assert (yes == no) is True
-assert (no == yes) is False
-
-# every construction route collapses the pair, not just `set.add`
-yes, no = _pair()
-seeded = {yes}
-seeded.add(no)
-assert len(seeded) == 1
-
-yes, no = _pair()
-assert len({yes, no}) == 1
-
-yes, no = _pair()
-assert len(set([yes, no])) == 1
-
-yes, no = _pair()
-assert len(frozenset([yes, no])) == 1
-
-yes, no = _pair()
-updated = {yes}
-updated.update([no])
-assert len(updated) == 1
-
-# and the binary operators agree
-yes, no = _pair()
-assert len({yes} | {no}) == 1
-
-yes, no = _pair()
-assert len({yes} & {no}) == 1
-
-# `&` walks the smaller side, and on a tie the right one, so that side's
-# elements are the ones kept — visible through equal-but-distinct numbers
-assert repr({1} & {1.0}) == '{1.0}'
-assert repr({1.0} & {1}) == '{1}'
-assert repr({1, 2} & {1.0}) == '{1.0}'
-assert repr({1.0} & {1, 2}) == '{1.0}'

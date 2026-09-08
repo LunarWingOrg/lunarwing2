@@ -4,27 +4,29 @@
 mut_point = make_mutable_point()
 
 setattr(mut_point, 'x', 100)
-assert mut_point.x == 100
+assert mut_point.x == 100, 'setattr updated x to 100'
 
 setattr(mut_point, 'y', 200)
-assert mut_point.y == 200
+assert mut_point.y == 200, 'setattr updated y to 200'
 
 setattr(mut_point, 'z', 300)
-assert mut_point.z == 300
+assert mut_point.z == 300, 'setattr created new attribute z'
 
 setattr(mut_point, 'name', 'test')
-assert mut_point.name == 'test'
+assert mut_point.name == 'test', 'setattr with string value'
 
 setattr(mut_point, 'active', True)
-assert mut_point.active == True
+assert mut_point.active == True, 'setattr with bool value'
 
 result = setattr(mut_point, 'x', 999)
-assert result == None
+assert result == None, 'setattr returns None'
 
-# setattr on any host instance mutates the local copy only
-other_point = make_point()
-setattr(other_point, 'x', 10)
-assert other_point.x == 10
+frozen_point = make_point()
+try:
+    setattr(frozen_point, 'x', 10)
+    assert False, 'setattr on frozen dataclass should raise AttributeError'
+except AttributeError as e:
+    assert str(e) == "cannot assign to field 'x'", str(e)
 
 try:
     setattr()

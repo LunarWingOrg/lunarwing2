@@ -269,7 +269,7 @@ impl<'a> Line<'a> {
     }
 
     #[inline]
-    fn full_text_len(&self) -> TextSize {
+    pub fn full_text_len(&self) -> TextSize {
         self.text.text_len()
     }
 }

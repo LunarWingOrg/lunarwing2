@@ -1,6 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 //! Various types defined by the Python interpreter such as `int`, `str` and `tuple`.
 
 pub use self::any::{PyAny, PyAnyMethods};
@@ -14,14 +11,15 @@ pub use self::datetime::{PyDate, PyDateTime, PyDelta, PyTime, PyTzInfo, PyTzInfo
 #[cfg(not(Py_LIMITED_API))]
 pub use self::datetime::{PyDateAccess, PyDeltaAccess, PyTimeAccess};
 pub use self::dict::{IntoPyDict, PyDict, PyDictMethods};
-#[cfg(not(any(PyPy, GraalPy, RustPython)))]
+#[cfg(not(any(PyPy, GraalPy)))]
 pub use self::dict::{PyDictItems, PyDictKeys, PyDictValues};
 pub use self::ellipsis::PyEllipsis;
 pub use self::float::{PyFloat, PyFloatMethods};
 #[cfg(all(not(Py_LIMITED_API), not(PyPy), not(GraalPy)))]
-pub use self::frame::{PyFrame, PyFrameMethods};
+pub use self::frame::PyFrame;
 pub use self::frozenset::{PyFrozenSet, PyFrozenSetBuilder, PyFrozenSetMethods};
 pub use self::function::PyCFunction;
+#[cfg(not(Py_LIMITED_API))]
 pub use self::function::PyFunction;
 #[cfg(Py_3_9)]
 pub use self::genericalias::PyGenericAlias;
@@ -62,6 +60,7 @@ pub use self::weakref::{PyWeakref, PyWeakrefMethods, PyWeakrefProxy, PyWeakrefRe
 /// ```rust
 /// use pyo3::prelude::*;
 /// use pyo3::types::PyDict;
+/// use pyo3::ffi::c_str;
 ///
 /// # pub fn main() -> PyResult<()> {
 /// Python::attach(|py| {
@@ -94,7 +93,7 @@ pub mod iter {
 /// This marks types that can be upcast into a [`PyAny`] and used in its place.
 /// This essentially includes every Python object except [`PyAny`] itself.
 ///
-/// This is used to provide the [`Deref<Target = Bound<'_, PyAny>>`](core::ops::Deref)
+/// This is used to provide the [`Deref<Target = Bound<'_, PyAny>>`](std::ops::Deref)
 /// implementations for [`Bound<'_, T>`](crate::Bound).
 ///
 /// Users should not need to implement this trait directly. It's implementation
@@ -133,7 +132,7 @@ macro_rules! pyobject_native_type_named (
 #[macro_export]
 macro_rules! pyobject_native_static_type_object(
     ($typeobject:expr) => {
-        |_py| &raw mut $typeobject
+        |_py| ::std::ptr::addr_of_mut!($typeobject)
     };
 );
 
@@ -168,7 +167,7 @@ macro_rules! pyobject_native_type_info(
         // SAFETY: macro caller has upheld the safety contracts
         unsafe impl<$($generics,)*> $crate::type_object::PyTypeInfo for $name {
             const NAME: &'static str = stringify!($name);
-            const MODULE: ::core::option::Option<&'static str> = $module;
+            const MODULE: ::std::option::Option<&'static str> = $module;
             $crate::pyobject_type_info_type_hint!($type_hint_module, $type_hint_name);
 
             #[inline]
@@ -210,7 +209,7 @@ macro_rules! pyobject_native_type_core {
         $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name, #module=$module $(, #checkfunction=$checkfunction)? $(;$generics)*);
     };
     ($name:ty, $typeobject:expr, $type_hint_module:expr, $type_hint_name:expr $(, #checkfunction=$checkfunction:path)? $(;$generics:ident)*) => {
-        $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name, #module=::core::option::Option::Some("builtins") $(, #checkfunction=$checkfunction)? $(;$generics)*);
+        $crate::pyobject_native_type_core!($name, $typeobject, $type_hint_module, $type_hint_name, #module=::std::option::Option::Some("builtins") $(, #checkfunction=$checkfunction)? $(;$generics)*);
     };
 }
 
@@ -242,7 +241,6 @@ macro_rules! pyobject_subclassable_native_type {
 #[macro_export]
 macro_rules! pyobject_native_type_sized {
     ($name:ty, $layout:path $(;$generics:ident)*) => {
-        // SAFETY: native objects are valid
         unsafe impl $crate::type_object::PyLayout<$name> for $layout {}
         impl $crate::type_object::PySizedLayout<$name> for $layout {}
     };

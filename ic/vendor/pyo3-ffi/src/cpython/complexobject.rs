@@ -1,5 +1,5 @@
 use crate::PyObject;
-use core::ffi::c_double;
+use std::ffi::c_double;
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -22,7 +22,7 @@ pub struct PyComplexObject {
     pub cval: Py_complex,
 }
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyComplex_FromCComplex")]
     pub fn PyComplex_FromCComplex(v: Py_complex) -> *mut PyObject;
     #[cfg_attr(PyPy, link_name = "PyPyComplex_AsCComplex")]

@@ -68,3 +68,4 @@ Module(
   |
 1 | def f(): return *x
   |                 ^^ Syntax Error: Starred expression cannot be used here
+  |

@@ -1,15 +1,15 @@
 # Test getattr() builtin function
 
 s = slice(1, 10, 2)
-assert getattr(s, 'start') == 1
-assert getattr(s, 'stop') == 10
-assert getattr(s, 'step') == 2
+assert getattr(s, 'start') == 1, 'getattr(slice, "start") should return 1'
+assert getattr(s, 'stop') == 10, 'getattr(slice, "stop") should return 10'
+assert getattr(s, 'step') == 2, 'getattr(slice, "step") should return 2'
 
-assert getattr(s, 'nonexistent', 'default') == 'default'
-assert getattr(s, 'nonexistent', None) == None
-assert getattr(s, 'nonexistent', 42) == 42
+assert getattr(s, 'nonexistent', 'default') == 'default', 'getattr with default should return default'
+assert getattr(s, 'nonexistent', None) == None, 'getattr with None default should return None'
+assert getattr(s, 'nonexistent', 42) == 42, 'getattr with numeric default should return number'
 
-assert getattr(s, 'start', 999) == 1
+assert getattr(s, 'start', 999) == 1, 'getattr should return actual value, not default'
 
 try:
     getattr(s, 'nonexistent')
@@ -57,23 +57,23 @@ try:
     raise ValueError('test error')
 except ValueError as e:
     args = getattr(e, 'args')
-    assert args == ('test error',)
+    assert args == ('test error',), 'exception args should be accessible via getattr'
 
 # === Dynamic (heap-allocated) attribute name strings ===
 # These test that getattr works with non-interned strings (e.g. from concatenation)
 s2 = slice(5, 15, 3)
 attr_name = 'sta' + 'rt'
-assert getattr(s2, attr_name) == 5
+assert getattr(s2, attr_name) == 5, 'getattr with concatenated string should work'
 
 attr_name = 'st' + 'op'
-assert getattr(s2, attr_name) == 15
+assert getattr(s2, attr_name) == 15, 'getattr with concatenated "stop" should work'
 
 attr_name = 'st' + 'ep'
-assert getattr(s2, attr_name) == 3
+assert getattr(s2, attr_name) == 3, 'getattr with concatenated "step" should work'
 
 # Dynamic attribute name with default for missing attribute
 attr_name = 'non' + 'existent'
-assert getattr(s2, attr_name, 42) == 42
+assert getattr(s2, attr_name, 42) == 42, 'getattr with dynamic missing attr should return default'
 
 # Dynamic attribute name on exception
 try:
@@ -81,16 +81,4 @@ try:
 except TypeError as e:
     attr_name = 'ar' + 'gs'
     args = getattr(e, attr_name)
-    assert args == ('dynamic test',)
-
-# === Dynamic names on builtin types ===
-# Builtin attributes dispatch on interned string ids, so a name built at
-# runtime has to be resolved back through the interner before dispatch.
-import datetime
-
-assert getattr(datetime.timezone, 'ut' + 'c') is datetime.timezone.utc
-assert getattr(datetime.time(12, 30), 'ho' + 'ur') == 12
-assert getattr(datetime.date(2024, 6, 15), 'mon' + 'th') == 6
-assert getattr(datetime.timedelta(hours=1), 'sec' + 'onds') == 3600
-# a name the interner has never seen still misses, rather than erroring oddly
-assert getattr(datetime.date(2024, 6, 15), 'no' + 'pe', 'MISSING') == 'MISSING'
+    assert args == ('dynamic test',), 'exception args via dynamic string should work'

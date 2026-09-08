@@ -20,11 +20,6 @@ pub struct ScriptTag {
 }
 
 impl ScriptTag {
-    /// Returns the TOML contents of the metadata block.
-    pub fn metadata(&self) -> &str {
-        &self.metadata
-    }
-
     /// Given the contents of a Python file, extract the `script` metadata block with leading
     /// comment hashes removed, any preceding shebang or content (prelude), and the remaining Python
     /// script.
@@ -54,12 +49,9 @@ impl ScriptTag {
     ///
     /// See: <https://peps.python.org/pep-0723/>
     pub fn parse(contents: &[u8]) -> Option<Self> {
-        FINDER
-            .find_iter(contents)
-            .find_map(|index| Self::parse_at(contents, index))
-    }
+        // Identify the opening pragma.
+        let index = FINDER.find(contents)?;
 
-    fn parse_at(contents: &[u8], index: usize) -> Option<Self> {
         // The opening pragma must be the first line, or immediately preceded by a newline.
         if !(index == 0 || matches!(contents[index - 1], b'\r' | b'\n')) {
             return None;

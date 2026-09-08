@@ -22,6 +22,7 @@ use ahash::RandomState;
 
 use crate::{
     heap::{ContainsHeap, HeapReader},
+    resource::{ResourceError, ResourceTracker},
     types::str::{allocate_string, allocate_string_no_interning},
     value::Value,
 };
@@ -80,7 +81,11 @@ impl JsonStringCache {
     /// cache entirely and are allocated directly.
     ///
     /// The backing array is allocated lazily on the first eligible string.
-    pub fn get_or_allocate(&mut self, s: String, heap: &HeapReader<'_>) -> Value {
+    pub fn get_or_allocate(
+        &mut self,
+        s: String,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> Result<Value, ResourceError> {
         let len = s.len();
         if !(MIN_LEN..=MAX_LEN).contains(&len) {
             return allocate_string(s, heap.heap());
@@ -97,7 +102,7 @@ impl JsonStringCache {
         if let Some(inner) = &mut self.inner {
             for entry in inner.entries.iter_mut() {
                 if let Some((_, _, value)) = entry.take() {
-                    value.drop_with(heap);
+                    value.drop_with_heap(heap);
                 }
             }
         }
@@ -123,7 +128,11 @@ impl CacheInner {
 
     /// Looks up `s` in the cache. On hit, returns a cloned `Value`. On miss,
     /// allocates on the heap and inserts into the cache.
-    fn get_or_allocate(&mut self, s: String, heap: &HeapReader<'_>) -> Value {
+    fn get_or_allocate(
+        &mut self,
+        s: String,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> Result<Value, ResourceError> {
         let hash = self.hash_builder.hash_one(s.as_str());
         // Truncation is intentional — we only need the low bits for indexing.
         #[expect(clippy::cast_possible_truncation)]
@@ -136,7 +145,7 @@ impl CacheInner {
             match entry {
                 Some((entry_hash, cached_str, cached_value)) => {
                     if *entry_hash == hash && **cached_str == *s {
-                        return cached_value.clone_with_heap(heap);
+                        return Ok(cached_value.clone_with_heap(heap));
                     }
                 }
                 None => {
@@ -152,12 +161,18 @@ impl CacheInner {
 
     /// Allocates `s` on the heap, stores a clone in `entries[index]`, and
     /// returns the original `Value`.
-    fn insert_at(&mut self, index: usize, hash: u64, s: String, heap: &HeapReader<'_>) -> Value {
+    fn insert_at(
+        &mut self,
+        index: usize,
+        hash: u64,
+        s: String,
+        heap: &HeapReader<'_, impl ResourceTracker>,
+    ) -> Result<Value, ResourceError> {
         let key = s.clone().into_boxed_str();
         // Length is in [MIN_LEN..=MAX_LEN] here so interning would never apply.
-        let value = allocate_string_no_interning(s, heap.heap());
+        let value = allocate_string_no_interning(s, heap.heap())?;
         let cached = value.clone_with_heap(heap);
         self.entries[index] = Some((hash, key, cached));
-        value
+        Ok(value)
     }
 }

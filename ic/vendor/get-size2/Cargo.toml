@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "get-size2"
-version = "0.10.3"
+version = "0.9.0"
 authors = [
     "Denis Kerp",
     "Nicolas",
@@ -63,10 +63,7 @@ half = ["dep:half"]
 hashbrown = ["dep:hashbrown"]
 indexmap = ["dep:indexmap"]
 ordermap = ["dep:ordermap"]
-orx-concurrent-vec = ["dep:orx-concurrent-vec"]
 parking_lot = ["dep:parking_lot"]
-portable-atomic = ["dep:portable-atomic"]
-roaring = ["dep:roaring"]
 smallvec = ["dep:smallvec"]
 thin-vec = ["dep:thin-vec"]
 url = ["dep:url"]
@@ -91,7 +88,7 @@ optional = true
 default-features = false
 
 [dependencies.compact_str]
-version = "0.10"
+version = "0.9"
 optional = true
 default-features = false
 
@@ -101,7 +98,7 @@ optional = true
 default-features = false
 
 [dependencies.get-size-derive2]
-version = "0.10.3"
+version = "0.9.0"
 optional = true
 
 [dependencies.half]
@@ -124,24 +121,8 @@ version = "1.2"
 optional = true
 default-features = false
 
-[dependencies.orx-concurrent-vec]
-version = "3.10"
-optional = true
-default-features = false
-
 [dependencies.parking_lot]
 version = "0.12"
-optional = true
-default-features = false
-
-[dependencies.portable-atomic]
-version = "1"
-features = ["fallback"]
-optional = true
-default-features = false
-
-[dependencies.roaring]
-version = "0.11"
 optional = true
 default-features = false
 

@@ -1,6 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 #[cfg(any(doc, all(Py_3_14, not(Py_LIMITED_API))))]
 use crate::{types::PyString, Python};
 #[cfg(all(Py_3_14, not(Py_LIMITED_API)))]
@@ -10,12 +7,13 @@ use {
         PyUnicodeWriter_WriteChar, PyUnicodeWriter_WriteUTF8,
     },
     crate::ffi_ptr_ext::FfiPtrExt,
+    crate::impl_::callback::WrappingCastTo,
     crate::py_result_ext::PyResultExt,
     crate::IntoPyObject,
     crate::{ffi, Bound, PyErr, PyResult},
-    core::fmt,
-    core::mem::ManuallyDrop,
-    core::ptr::NonNull,
+    std::fmt,
+    std::mem::ManuallyDrop,
+    std::ptr::NonNull,
 };
 
 /// This macro is analogous to Rust's [`format!`] macro, but returns a [`PyString`] instead of a [`String`].
@@ -72,7 +70,7 @@ impl<'py> PyUnicodeWriter<'py> {
     /// Creates a new `PyUnicodeWriter` with the specified initial capacity.
     #[inline]
     pub fn with_capacity(py: Python<'py>, capacity: usize) -> PyResult<Self> {
-        match NonNull::new(unsafe { PyUnicodeWriter_Create(capacity.try_into()?) }) {
+        match NonNull::new(unsafe { PyUnicodeWriter_Create(capacity.wrapping_cast()) }) {
             Some(ptr) => Ok(PyUnicodeWriter {
                 python: py,
                 writer: ptr,
@@ -184,7 +182,7 @@ mod tests {
     #[allow(clippy::write_literal)]
     #[cfg(all(Py_3_14, not(Py_LIMITED_API)))]
     fn unicode_writer_test() {
-        use core::fmt::Write;
+        use std::fmt::Write;
         Python::attach(|py| {
             let mut writer = PyUnicodeWriter::new(py).unwrap();
             write!(writer, "Hello {}!", "world").unwrap();
@@ -198,7 +196,7 @@ mod tests {
     #[allow(clippy::write_literal)]
     #[cfg(all(Py_3_14, not(Py_LIMITED_API)))]
     fn unicode_writer_with_capacity() {
-        use core::fmt::Write;
+        use std::fmt::Write;
         Python::attach(|py| {
             let mut writer = PyUnicodeWriter::with_capacity(py, 10).unwrap();
             write!(writer, "Hello {}!", "world").unwrap();

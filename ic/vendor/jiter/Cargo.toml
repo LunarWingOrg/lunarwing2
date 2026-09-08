@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.88"
 name = "jiter"
-version = "0.16.0"
+version = "0.15.0"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
 build = "build.rs"
 autolib = false
@@ -51,7 +51,6 @@ python = [
     "dep:pyo3",
     "dep:pyo3-build-config",
 ]
-serde = ["dep:serde"]
 
 [lib]
 name = "jiter"
@@ -65,11 +64,6 @@ path = "tests/main.rs"
 name = "python"
 path = "tests/python.rs"
 required-features = ["python"]
-
-[[test]]
-name = "serde"
-path = "tests/serde.rs"
-required-features = ["serde"]
 
 [[bench]]
 name = "main"
@@ -100,11 +94,7 @@ optional = true
 version = "0.2.16"
 
 [dependencies.pyo3]
-version = "0.29.0"
-optional = true
-
-[dependencies.serde]
-version = "1.0.147"
+version = "0.28.2"
 optional = true
 
 [dependencies.smallvec]
@@ -116,16 +106,12 @@ version = "2.7.2"
 [dev-dependencies.paste]
 version = "1.0.7"
 
-[dev-dependencies.proptest]
-version = "1.4.0"
-
 [dev-dependencies.pyo3]
-version = "0.29.0"
+version = "0.28.2"
 features = ["auto-initialize"]
 
 [dev-dependencies.serde]
 version = "1.0.147"
-features = ["derive"]
 
 [dev-dependencies.serde_json]
 version = "1.0.87"
@@ -136,7 +122,7 @@ features = [
 ]
 
 [build-dependencies.pyo3-build-config]
-version = "0.29.0"
+version = "0.28.2"
 optional = true
 
 [lints.clippy]

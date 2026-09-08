@@ -63,13 +63,6 @@ fn unary_arithmetic() {
             c.bitnot().unwrap().repr().unwrap().as_any(),
             "UA(0.37037037037037035)"
         );
-
-        // Ensure that passing a wrong self type from Python does not cause UB
-        py_expect_exception!(py, c, "type(c).__neg__(object())", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__pos__(object())", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__abs__(object())", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__invert__(object())", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__round__(object())", PyTypeError);
     });
 }
 
@@ -103,12 +96,6 @@ fn indexable() {
         py_run!(py, i, "assert [0, 1, 2, 3, 4, 5][i] == 5");
         py_run!(py, i, "assert float(i) == 5.0");
         py_run!(py, i, "assert int(~i) == -6");
-
-        // Ensure that passing a wrong self type from Python does not cause UB
-        py_expect_exception!(py, i, "type(i).__index__(object())", PyTypeError);
-        py_expect_exception!(py, i, "type(i).__int__(object())", PyTypeError);
-        py_expect_exception!(py, i, "type(i).__float__(object())", PyTypeError);
-        py_expect_exception!(py, i, "type(i).__invert__(object())", PyTypeError);
     })
 }
 
@@ -181,18 +168,6 @@ fn inplace_operations() {
             3,
             "d = c; c.__ipow__(4); assert repr(c) == repr(d) == 'IPO(81)'",
         );
-
-        let c = Py::new(py, InPlaceOperations { value: 0 }).unwrap();
-        // Ensure that passing a wrong self type from Python does not cause UB
-        py_expect_exception!(py, c, "type(c).__iadd__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__isub__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__imul__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ilshift__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__irshift__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__iand__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ixor__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ior__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ipow__(object(), 1)", PyTypeError);
     });
 }
 
@@ -322,51 +297,51 @@ fn binary_arithmetic() {
 }
 
 #[pyclass]
-struct RhsArithmetic(String);
+struct RhsArithmetic {}
 
 #[pymethods]
 impl RhsArithmetic {
     fn __radd__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} + {}", self.0)
+        format!("{other:?} + RA")
     }
 
     fn __rsub__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} - {}", self.0)
+        format!("{other:?} - RA")
     }
 
     fn __rmul__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} * {}", self.0)
+        format!("{other:?} * RA")
     }
 
     fn __rlshift__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} << {}", self.0)
+        format!("{other:?} << RA")
     }
 
     fn __rrshift__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} >> {}", self.0)
+        format!("{other:?} >> RA")
     }
 
     fn __rand__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} & {}", self.0)
+        format!("{other:?} & RA")
     }
 
     fn __rxor__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} ^ {}", self.0)
+        format!("{other:?} ^ RA")
     }
 
     fn __ror__(&self, other: &Bound<'_, PyAny>) -> String {
-        format!("{other:?} | {}", self.0)
+        format!("{other:?} | RA")
     }
 
     fn __rpow__(&self, other: &Bound<'_, PyAny>, _mod: Option<&Bound<'_, PyAny>>) -> String {
-        format!("{other:?} ** {}", self.0)
+        format!("{other:?} ** RA")
     }
 }
 
 #[test]
 fn rhs_arithmetic() {
     Python::attach(|py| {
-        let c = Py::new(py, RhsArithmetic("RA".to_string())).unwrap();
+        let c = Py::new(py, RhsArithmetic {}).unwrap();
         py_run!(py, c, "assert c.__radd__(1) == '1 + RA'");
         py_run!(py, c, "assert 1 + c == '1 + RA'");
         py_run!(py, c, "assert c.__rsub__(1) == '1 - RA'");
@@ -496,7 +471,7 @@ impl LhsAndRhs {
 fn lhs_fellback_to_rhs() {
     Python::attach(|py| {
         let c = Py::new(py, LhsAndRhs {}).unwrap();
-        // If the left hand value is `LhsAndRhs`, LHS is used.
+        // If the light hand value is `LhsAndRhs`, LHS is used.
         py_run!(py, c, "assert c + 1 == 'LR + 1'");
         py_run!(py, c, "assert c - 1 == 'LR - 1'");
         py_run!(py, c, "assert c * 1 == 'LR * 1'");
@@ -590,14 +565,6 @@ fn rich_comparisons() {
         py_run!(py, c, "assert (c >= c) == 'RC >= RC'");
         py_run!(py, c, "assert (c >= 1) == 'RC >= 1'");
         py_run!(py, c, "assert (1 >= c) == 'RC <= 1'");
-
-        // Ensure that passing a wrong self type from Python does not cause UB
-        py_expect_exception!(py, c, "type(c).__lt__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__le__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__eq__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ne__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__gt__(object(), 1)", PyTypeError);
-        py_expect_exception!(py, c, "type(c).__ge__(object(), 1)", PyTypeError);
     });
 }
 

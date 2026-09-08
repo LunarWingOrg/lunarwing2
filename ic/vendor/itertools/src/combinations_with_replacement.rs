@@ -1,62 +1,52 @@
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use std::fmt;
 use std::iter::FusedIterator;
 
 use super::lazy_buffer::LazyBuffer;
 use crate::adaptors::checked_binomial;
-use crate::combinations::PoolIndex;
+
 /// An iterator to iterate through all the `n`-length combinations in an iterator, with replacement.
 ///
 /// See [`.combinations_with_replacement()`](crate::Itertools::combinations_with_replacement)
 /// for more information.
 #[derive(Clone)]
 #[must_use = "iterator adaptors are lazy and do nothing unless consumed"]
-pub struct CombinationsWithReplacementGeneric<I, Idx>
+pub struct CombinationsWithReplacement<I>
 where
     I: Iterator,
     I::Item: Clone,
 {
-    indices: Idx,
+    indices: Box<[usize]>,
     pool: LazyBuffer<I>,
     first: bool,
 }
 
-/// Iterator for `Box<[I]>` valued combinations_with_replacement returned by [`.combinations_with_replacement()`](crate::Itertools::combinations_with_replacement)
-pub type CombinationsWithReplacement<I> = CombinationsWithReplacementGeneric<I, Box<[usize]>>;
-/// Iterator for const generic combinations_with_replacement returned by [`.array_combinations_with_replacement()`](crate::Itertools::array_combinations_with_replacement)
-pub type ArrayCombinationsWithReplacement<I, const K: usize> =
-    CombinationsWithReplacementGeneric<I, [usize; K]>;
-
-impl<I, Idx> fmt::Debug for CombinationsWithReplacementGeneric<I, Idx>
+impl<I> fmt::Debug for CombinationsWithReplacement<I>
 where
     I: Iterator + fmt::Debug,
     I::Item: fmt::Debug + Clone,
-    Idx: fmt::Debug,
 {
-    debug_fmt_fields!(CombinationsWithReplacementGeneric, indices, pool, first);
+    debug_fmt_fields!(CombinationsWithReplacement, indices, pool, first);
 }
 
-/// Create a new `ArrayCombinationsWithReplacement`` from a cloneable iterator.
-pub fn array_combinations_with_replacement<I: Iterator, const K: usize>(
-    iter: I,
-) -> ArrayCombinationsWithReplacement<I, K>
-where
-    I::Item: Clone,
-{
-    ArrayCombinationsWithReplacement::new(iter, [0; K])
-}
-/// Create a new `CombinationsWithReplacement` from a cloneable iterator.
+/// Create a new `CombinationsWithReplacement` from a clonable iterator.
 pub fn combinations_with_replacement<I>(iter: I, k: usize) -> CombinationsWithReplacement<I>
 where
     I: Iterator,
     I::Item: Clone,
 {
     let indices = alloc::vec![0; k].into_boxed_slice();
+    let pool: LazyBuffer<I> = LazyBuffer::new(iter);
 
-    CombinationsWithReplacementGeneric::new(iter, indices)
+    CombinationsWithReplacement {
+        indices,
+        pool,
+        first: true,
+    }
 }
 
-impl<I: Iterator, Idx: PoolIndex<I::Item>> CombinationsWithReplacementGeneric<I, Idx>
+impl<I> CombinationsWithReplacement<I>
 where
     I: Iterator,
     I::Item: Clone,
@@ -72,8 +62,7 @@ where
 
         // Work out where we need to update our indices
         let mut increment = None;
-        let indices: &mut [usize] = self.indices.borrow_mut();
-        for (i, indices_int) in indices.iter().enumerate().rev() {
+        for (i, indices_int) in self.indices.iter().enumerate().rev() {
             if *indices_int < self.pool.len() - 1 {
                 increment = Some((i, indices_int + 1));
                 break;
@@ -84,48 +73,39 @@ where
             Some((increment_from, increment_value)) => {
                 // We need to update the rightmost non-max value
                 // and all those to the right
-                indices[increment_from..].fill(increment_value);
+                self.indices[increment_from..].fill(increment_value);
                 false
             }
             // Otherwise, we're done
             None => true,
         }
     }
-    /// Constructor with arguments the inner iterator and the initial state for the indices.
-    fn new(iter: I, indices: Idx) -> Self {
-        Self {
-            indices,
-            pool: LazyBuffer::new(iter),
-            first: true,
-        }
-    }
 }
 
-impl<I, Idx> Iterator for CombinationsWithReplacementGeneric<I, Idx>
+impl<I> Iterator for CombinationsWithReplacement<I>
 where
     I: Iterator,
     I::Item: Clone,
-    Idx: PoolIndex<I::Item>,
 {
-    type Item = Idx::Item;
+    type Item = Vec<I::Item>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.first {
             // In empty edge cases, stop iterating immediately
-            if !(self.indices.borrow().is_empty() || self.pool.get_next()) {
+            if !(self.indices.is_empty() || self.pool.get_next()) {
                 return None;
             }
             self.first = false;
         } else if self.increment_indices() {
             return None;
         }
-        Some(self.indices.extract_item(&self.pool))
+        Some(self.pool.get_at(&self.indices))
     }
 
     fn nth(&mut self, n: usize) -> Option<Self::Item> {
         if self.first {
             // In empty edge cases, stop iterating immediately
-            if !(self.indices.borrow().is_empty() || self.pool.get_next()) {
+            if !(self.indices.is_empty() || self.pool.get_next()) {
                 return None;
             }
             self.first = false;
@@ -137,13 +117,13 @@ where
                 return None;
             }
         }
-        Some(self.indices.extract_item(&self.pool))
+        Some(self.pool.get_at(&self.indices))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (mut low, mut upp) = self.pool.size_hint();
-        low = remaining_for(low, self.first, self.indices.borrow()).unwrap_or(usize::MAX);
-        upp = upp.and_then(|upp| remaining_for(upp, self.first, self.indices.borrow()));
+        low = remaining_for(low, self.first, &self.indices).unwrap_or(usize::MAX);
+        upp = upp.and_then(|upp| remaining_for(upp, self.first, &self.indices));
         (low, upp)
     }
 
@@ -154,15 +134,14 @@ where
             first,
         } = self;
         let n = pool.count();
-        remaining_for(n, first, indices.borrow()).unwrap()
+        remaining_for(n, first, &indices).unwrap()
     }
 }
 
-impl<I, Idx> FusedIterator for CombinationsWithReplacementGeneric<I, Idx>
+impl<I> FusedIterator for CombinationsWithReplacement<I>
 where
     I: Iterator,
     I::Item: Clone,
-    Idx: PoolIndex<I::Item>,
 {
 }
 

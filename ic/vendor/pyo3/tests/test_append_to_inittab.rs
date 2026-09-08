@@ -1,5 +1,4 @@
-#![cfg(feature = "macros")]
-#![cfg(not(PyPy))]
+#![cfg(all(feature = "macros", not(PyPy)))]
 
 use pyo3::prelude::*;
 
@@ -20,7 +19,7 @@ mod module_mod_with_functions {
     use super::foo;
 }
 
-#[cfg(not(any(PyPy, GraalPy, all(Py_LIMITED_API, Py_GIL_DISABLED))))]
+#[cfg(not(any(PyPy, GraalPy)))]
 #[test]
 fn test_module_append_to_inittab() {
     use pyo3::append_to_inittab;

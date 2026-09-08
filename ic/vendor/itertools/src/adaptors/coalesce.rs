@@ -74,9 +74,9 @@ where
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (low, hi) = size_hint::add_scalar(
             self.iter.size_hint(),
-            usize::from(matches!(self.last, Some(Some(_)))),
+            matches!(self.last, Some(Some(_))) as usize,
         );
-        (usize::from(low > 0), hi)
+        ((low > 0) as usize, hi)
     }
 
     fn fold<Acc, FnAcc>(self, acc: Acc, mut fn_acc: FnAcc) -> Acc
@@ -110,10 +110,8 @@ where
 {
 }
 
-#[derive(Debug)]
 pub struct NoCount;
 
-#[derive(Debug)]
 pub struct WithCount;
 
 pub trait CountItem<T> {

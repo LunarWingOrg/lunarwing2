@@ -10,12 +10,12 @@ use std::{
 
 use crate::{
     args::{ArgValues, FromArgs},
-    bytecode::{ContainsVM, VM},
-    defer_drop, defer_drop_mut,
-    exception_private::{ExcType, ExcTypeExt, RunResult},
-    heap::{ContainsHeap, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapRead, HeapReadOutput},
+    bytecode::VM,
+    exception_private::{ExcType, RunResult},
+    heap::{HeapData, HeapGuard, HeapId, HeapReadOutput},
+    resource::ResourceTracker,
     sorting::{apply_permutation, sort_indices},
-    types::{Dict, PyTrait, long_int::check_bigint_str_digits_limit, str::allocate_string},
+    types::{PyTrait, long_int::check_bigint_str_digits_limit, str::allocate_string},
     value::Value,
 };
 
@@ -84,7 +84,7 @@ impl JsonDumpsConfig {
     /// the "JSONEncoder.__init__" prefix that matches CPython's error
     /// wording). This method only translates the raw `Value` slots into the
     /// concrete encoder options used by the serializer.
-    fn from_macro_args(args: JsonDumpsArgs, vm: &mut VM<'_>) -> RunResult<(Value, Self)> {
+    fn from_macro_args(args: JsonDumpsArgs, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<(Value, Self)> {
         let JsonDumpsArgs {
             obj,
             indent,
@@ -97,18 +97,18 @@ impl JsonDumpsConfig {
 
         // Keep `obj` alive across kwarg processing — early errors below must
         // not leak the heap reference.
-        let mut obj_guard = DropGuard::new(obj, vm);
-        let vm = obj_guard.ctx();
+        let mut obj_guard = HeapGuard::new(obj, vm);
+        let vm = obj_guard.heap();
 
         let mut config = Self::default();
 
         let indent = parse_indent_value(indent, vm)?;
         config.indent = indent;
 
-        config.flags = apply_bool_flag(config.flags, Self::SORT_KEYS, sort_keys, vm)?;
-        config.flags = apply_bool_flag(config.flags, Self::ENSURE_ASCII, ensure_ascii, vm)?;
-        config.flags = apply_bool_flag(config.flags, Self::ALLOW_NAN, allow_nan, vm)?;
-        config.flags = apply_bool_flag(config.flags, Self::SKIPKEYS, skipkeys, vm)?;
+        config.flags = apply_bool_flag(config.flags, Self::SORT_KEYS, sort_keys, vm);
+        config.flags = apply_bool_flag(config.flags, Self::ENSURE_ASCII, ensure_ascii, vm);
+        config.flags = apply_bool_flag(config.flags, Self::ALLOW_NAN, allow_nan, vm);
+        config.flags = apply_bool_flag(config.flags, Self::SKIPKEYS, skipkeys, vm);
 
         // `separators=None` is documented as equivalent to "use the indent-
         // aware defaults", so we only override the per-instance separators
@@ -138,28 +138,27 @@ impl JsonDumpsConfig {
 ///
 /// CPython kwargs `cls`, `default`, and `check_circular` are intentionally
 /// unsupported and will raise `TypeError` if passed.
-pub(super) fn call_dumps(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+pub(super) fn call_dumps(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let macro_args = JsonDumpsArgs::from_args(args, vm)?;
     let (obj, config) = JsonDumpsConfig::from_macro_args(macro_args, vm)?;
 
-    defer_drop!(obj, vm);
+    let mut obj_guard = HeapGuard::new(obj, vm);
     let mut output = String::new();
     let mut active_containers = Vec::new();
-    let mut encoder = Encoder {
-        out: &mut output,
-        config: &config,
-        active_containers: &mut active_containers,
-        vm,
-    };
-    encoder.serialize_value(obj, 0)?;
-    Ok(allocate_string(output, vm.heap))
+    {
+        let (obj, vm) = obj_guard.as_parts_mut();
+        serialize_value(obj, &mut output, &config, 0, &mut active_containers, vm)?;
+    }
+
+    let (obj, vm) = obj_guard.into_parts();
+    obj.drop_with_heap(vm);
+    Ok(allocate_string(output, vm.heap)?)
 }
 
 /// Argument shape for `json.dumps(obj, *, indent=None, sort_keys=False,
 /// ensure_ascii=True, allow_nan=True, separators=None, skipkeys=False)`.
 ///
-/// Arity and missing-arg errors use the `dumps()` descriptor with `style =
-/// def` wording (CPython's `json.dumps` is a pure-Python `def`), but the
+/// Arity and missing-arg errors use the `dumps()` descriptor, but the
 /// unknown-kwarg error uses `JSONEncoder.__init__()` — CPython's `json.dumps`
 /// forwards unknown kwargs straight to the encoder constructor, which is what
 /// surfaces in the error. `kwarg_error_name` overrides the function name used
@@ -168,7 +167,7 @@ pub(super) fn call_dumps(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
 /// (`py_bool`) or shape coercion (`parse_indent_value` /
 /// `parse_separators_value`) on the way through.
 #[derive(FromArgs)]
-#[from_args(name = "dumps", style = def, kwarg_error_name = "JSONEncoder.__init__")]
+#[from_args(name = "dumps", kwarg_error_name = "JSONEncoder.__init__")]
 struct JsonDumpsArgs {
     obj: Value,
     #[from_args(kw_only, default = Value::None)]
@@ -188,13 +187,10 @@ struct JsonDumpsArgs {
 /// Sets `bit` in `flags` when `value` is truthy, clearing it otherwise. The
 /// value is dropped afterwards. Used by the json.dumps kwarg pipeline so each
 /// boolean-style flag is handled with a single line.
-fn apply_bool_flag(flags: u8, bit: u8, value: Value, vm: &mut VM<'_>) -> RunResult<u8> {
-    defer_drop!(value, vm);
-    if value.py_bool(vm)? {
-        Ok(flags | bit)
-    } else {
-        Ok(flags & !bit)
-    }
+fn apply_bool_flag(flags: u8, bit: u8, value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> u8 {
+    let new_flags = if value.py_bool(vm) { flags | bit } else { flags & !bit };
+    value.drop_with_heap(vm);
+    new_flags
 }
 
 /// Parses the `indent=` value for `json.dumps()`.
@@ -203,8 +199,9 @@ fn apply_bool_flag(flags: u8, bit: u8, value: Value, vm: &mut VM<'_>) -> RunResu
 /// spaces per nesting level (with zero and negative values enabling newline-
 /// only pretty printing), and
 /// strings are repeated once per depth level exactly like CPython.
-fn parse_indent_value(value: Value, vm: &mut VM<'_>) -> RunResult<Option<String>> {
-    defer_drop!(value, vm);
+fn parse_indent_value(value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<String>> {
+    let mut value_guard = HeapGuard::new(value, vm);
+    let (value, vm) = value_guard.as_parts_mut();
 
     match value {
         Value::None => Ok(None),
@@ -241,8 +238,9 @@ fn spaces_from_indent_count(count: i64) -> RunResult<Option<String>> {
 ///
 /// `None` leaves the default separators intact. Otherwise the value must be a
 /// two-item list or tuple of strings representing the item and key separators.
-fn parse_separators_value(value: Value, vm: &mut VM<'_>) -> RunResult<Option<(String, String)>> {
-    defer_drop!(value, vm);
+fn parse_separators_value(value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Option<(String, String)>> {
+    let mut value_guard = HeapGuard::new(value, vm);
+    let (value, vm) = value_guard.as_parts_mut();
 
     if matches!(value, Value::None) {
         return Ok(None);
@@ -269,14 +267,14 @@ fn parse_separators_value(value: Value, vm: &mut VM<'_>) -> RunResult<Option<(St
             _ => {
                 return Err(ExcType::type_error(format!(
                     "cannot unpack non-iterable {} object",
-                    value.py_type_name(vm)
+                    value.py_type(vm)
                 )));
             }
         },
         _ => {
             return Err(ExcType::type_error(format!(
                 "cannot unpack non-iterable {} object",
-                value.py_type_name(vm)
+                value.py_type(vm)
             )));
         }
     };
@@ -306,7 +304,7 @@ fn check_separators_length(len: usize) -> RunResult<()> {
 /// their positional argument index in `make_encoder()`. The `role` parameter
 /// selects the matching CPython argument number (6 for `item_separator`,
 /// 5 for `key_separator`) so the error message matches CPython exactly.
-fn json_separator_to_string(value: &Value, role: &str, vm: &VM<'_>) -> RunResult<String> {
+fn json_separator_to_string(value: &Value, role: &str, vm: &VM<'_, impl ResourceTracker>) -> RunResult<String> {
     let arg_num = if role == "item_separator" { 6 } else { 5 };
     match value {
         Value::InternString(string_id) => Ok(vm.interns.get_str(*string_id).to_owned()),
@@ -314,274 +312,193 @@ fn json_separator_to_string(value: &Value, role: &str, vm: &VM<'_>) -> RunResult
             HeapData::Str(string) => Ok(string.as_str().to_owned()),
             _ => Err(ExcType::type_error(format!(
                 "make_encoder() argument {arg_num} must be str, not {}",
-                value.py_type_name(vm)
+                value.py_type(vm)
             ))),
         },
         _ => Err(ExcType::type_error(format!(
             "make_encoder() argument {arg_num} must be str, not {}",
-            value.py_type_name(vm)
+            value.py_type(vm)
         ))),
     }
 }
 
-/// Mutable serialization context shared across the recursive `serialize_*`
-/// methods.
+/// Serializes a Monty value into JSON text.
 ///
-/// Groups the four pieces of per-call state that every recursive level needs
-/// — the JSON output buffer, the encoder configuration, the cycle-detection
-/// stack, and the VM (heap + interns) — so the recursive methods can be
-/// invoked as `encoder.serialize_value(value, depth)` rather than threading
-/// five separate parameters through every signature.
+/// The function handles immediate primitives directly and delegates to
+/// heap-specific helpers for strings, long integers, lists, tuples, and dicts.
+fn serialize_value(
+    value: &Value,
+    out: &mut String,
+    config: &JsonDumpsConfig,
+    depth: usize,
+    active_containers: &mut Vec<HeapId>,
+    vm: &mut VM<'_, impl ResourceTracker>,
+) -> RunResult<()> {
+    match value {
+        Value::None => {
+            out.push_str("null");
+            Ok(())
+        }
+        Value::Bool(true) => {
+            out.push_str("true");
+            Ok(())
+        }
+        Value::Bool(false) => {
+            out.push_str("false");
+            Ok(())
+        }
+        Value::Int(value) => {
+            write!(out, "{value}").expect("writing to String cannot fail");
+            Ok(())
+        }
+        Value::Float(value) => serialize_float(*value, out, config),
+        Value::InternString(string_id) => {
+            write_json_string(vm.interns.get_str(*string_id), out, config.ensure_ascii());
+            Ok(())
+        }
+        Value::InternLongInt(long_int_id) => {
+            let value = vm.interns.get_long_int(*long_int_id);
+            check_bigint_str_digits_limit(value)?;
+            write!(out, "{value}").expect("writing to String cannot fail");
+            Ok(())
+        }
+        Value::Ref(heap_id) => match vm.heap.read(*heap_id) {
+            HeapReadOutput::Str(string) => {
+                write_json_string(string.get(vm.heap).as_str(), out, config.ensure_ascii());
+                Ok(())
+            }
+            HeapReadOutput::LongInt(long_int) => {
+                long_int.get(vm.heap).check_str_digits_limit()?;
+                write!(out, "{}", long_int.get(vm.heap).inner()).expect("writing to String cannot fail");
+                Ok(())
+            }
+            HeapReadOutput::List(list) => {
+                let items: Vec<Value> = list
+                    .get(vm.heap)
+                    .as_slice()
+                    .iter()
+                    .map(|value| value.clone_with_heap(vm))
+                    .collect();
+                let mut items_guard = HeapGuard::new(items, vm);
+                let (items, vm) = items_guard.as_parts_mut();
+                with_entered_container(active_containers, *heap_id, |active_containers| {
+                    serialize_sequence(items.as_slice(), out, config, depth, active_containers, vm)
+                })
+            }
+            HeapReadOutput::Tuple(tuple) => {
+                let items: Vec<Value> = tuple
+                    .get(vm.heap)
+                    .as_slice()
+                    .iter()
+                    .map(|value| value.clone_with_heap(vm))
+                    .collect();
+                let mut items_guard = HeapGuard::new(items, vm);
+                let (items, vm) = items_guard.as_parts_mut();
+                with_entered_container(active_containers, *heap_id, |active_containers| {
+                    serialize_sequence(items.as_slice(), out, config, depth, active_containers, vm)
+                })
+            }
+            HeapReadOutput::Dict(dict) => {
+                let entries: Vec<(Value, Value)> = dict
+                    .get(vm.heap)
+                    .iter()
+                    .map(|(key, value)| (key.clone_with_heap(vm), value.clone_with_heap(vm)))
+                    .collect();
+                let mut entries_guard = HeapGuard::new(entries, vm);
+                let (entries, vm) = entries_guard.as_parts_mut();
+                with_entered_container(active_containers, *heap_id, |active_containers| {
+                    serialize_dict(entries, out, config, depth, active_containers, vm)
+                })
+            }
+            _ => Err(ExcType::json_not_serializable_error(value.py_type(vm))),
+        },
+        _ => Err(ExcType::json_not_serializable_error(value.py_type(vm))),
+    }
+}
+
+/// Serializes a list or tuple as a JSON array.
 ///
-/// `depth` is intentionally **not** a field of this struct: every recursive
-/// call needs to bump it by one for the descent and restore it on return,
-/// which is exactly what a stack-passed parameter does for free.
-struct Encoder<'a, 'h> {
-    out: &'a mut String,
-    config: &'a JsonDumpsConfig,
-    active_containers: &'a mut Vec<HeapId>,
-    vm: &'a mut VM<'h>,
+/// Sequence formatting is shared because JSON does not distinguish tuples from
+/// lists, but circular-reference tracking still happens at the container level
+/// before this helper is called.
+fn serialize_sequence(
+    items: &[Value],
+    out: &mut String,
+    config: &JsonDumpsConfig,
+    depth: usize,
+    active_containers: &mut Vec<HeapId>,
+    vm: &mut VM<'_, impl ResourceTracker>,
+) -> RunResult<()> {
+    out.push('[');
+    if items.is_empty() {
+        out.push(']');
+        return Ok(());
+    }
+
+    let pretty = config.indent.is_some();
+    for (index, item) in items.iter().enumerate() {
+        if index != 0 {
+            out.push_str(&config.item_separator);
+        }
+        if pretty {
+            out.push('\n');
+            write_indent(out, config, depth + 1);
+        }
+        serialize_value(item, out, config, depth + 1, active_containers, vm)?;
+    }
+    if pretty {
+        out.push('\n');
+        write_indent(out, config, depth);
+    }
+    out.push(']');
+    Ok(())
 }
 
-/// Lets the encoder participate in the [`DropGuard`] / [`defer_drop_mut!`]
-/// pattern: passing the encoder as the "heap" argument re-borrows the whole
-/// encoder (including its `vm`) into the guard, which is exactly what we need
-/// so the rebound iter and the rebound encoder share a lifetime.
-impl ContainsHeap for Encoder<'_, '_> {
-    fn heap(&self) -> &Heap {
-        self.vm.heap()
+/// Serializes a dict as a JSON object.
+///
+/// Dict keys are validated and optionally skipped before serialization. When
+/// `sort_keys=True`, entries are sorted using Python comparison semantics on the
+/// original keys so mixed incomparable key types raise the same style of
+/// `TypeError` as CPython.
+fn serialize_dict(
+    entries: &mut Vec<(Value, Value)>,
+    out: &mut String,
+    config: &JsonDumpsConfig,
+    depth: usize,
+    active_containers: &mut Vec<HeapId>,
+    vm: &mut VM<'_, impl ResourceTracker>,
+) -> RunResult<()> {
+    if config.skipkeys() {
+        skip_disallowed_dict_keys(entries, vm);
+    } else if let Some((key, _)) = entries.iter().find(|(key, _)| !is_json_key_allowed(key, vm)) {
+        return Err(ExcType::json_invalid_key_error(key.py_type(vm)));
     }
 
-    fn heap_mut(&mut self) -> &mut Heap {
-        self.vm.heap_mut()
-    }
-}
-
-/// Lets a [`RecursionToken`](crate::bytecode::RecursionToken) (and the container
-/// iterators that hold one) be released through the encoder via `defer_drop!`,
-/// reaching the VM-side recursion counter while the encoder itself stays borrowable.
-impl<'h> ContainsVM<'h> for Encoder<'_, 'h> {
-    fn vm(&mut self) -> &mut VM<'h> {
-        self.vm
-    }
-}
-
-impl<'h> Encoder<'_, 'h> {
-    /// Serializes a Monty value into JSON text.
-    ///
-    /// Handles immediate primitives directly and delegates to type-specific
-    /// helpers for strings, long integers, lists, tuples, and dicts.
-    fn serialize_value(&mut self, value: &Value, depth: usize) -> RunResult<()> {
-        match value {
-            Value::None => {
-                self.out.push_str("null");
-                Ok(())
-            }
-            Value::Bool(true) => {
-                self.out.push_str("true");
-                Ok(())
-            }
-            Value::Bool(false) => {
-                self.out.push_str("false");
-                Ok(())
-            }
-            Value::Int(value) => {
-                write!(self.out, "{value}").expect("writing to String cannot fail");
-                Ok(())
-            }
-            Value::Float(value) => serialize_float(*value, self.out, self.config),
-            Value::InternString(string_id) => {
-                write_json_string(
-                    self.vm.interns.get_str(*string_id),
-                    self.out,
-                    self.config.ensure_ascii(),
-                );
-                Ok(())
-            }
-            Value::InternLongInt(long_int_id) => {
-                let value = self.vm.interns.get_long_int(*long_int_id);
-                check_bigint_str_digits_limit(value)?;
-                write!(self.out, "{value}").expect("writing to String cannot fail");
-                Ok(())
-            }
-            Value::Ref(heap_id) => match self.vm.heap.read(*heap_id) {
-                HeapReadOutput::Str(string) => {
-                    write_json_string(string.get(self.vm.heap).as_str(), self.out, self.config.ensure_ascii());
-                    Ok(())
-                }
-                HeapReadOutput::LongInt(long_int) => {
-                    long_int.get(self.vm.heap).check_str_digits_limit()?;
-                    write!(self.out, "{}", long_int.get(self.vm.heap).inner()).expect("writing to String cannot fail");
-                    Ok(())
-                }
-                HeapReadOutput::List(list) => self.with_entered_container(*heap_id, |enc| {
-                    let iter = list.iter(enc.vm)?;
-                    defer_drop_mut!(iter, enc);
-                    enc.serialize_array(depth, |enc, depth| {
-                        if let Some(item) = iter.next(enc.vm)? {
-                            enc.serialize_value(item, depth)?;
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                }),
-                HeapReadOutput::Tuple(tuple) => self.with_entered_container(*heap_id, |enc| {
-                    let iter = tuple.iter(enc.vm)?;
-                    defer_drop_mut!(iter, enc);
-                    enc.serialize_array(depth, |enc, depth| {
-                        if let Some(item) = iter.next(enc.vm)? {
-                            enc.serialize_value(item, depth)?;
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    })
-                }),
-                HeapReadOutput::Dict(dict) => {
-                    // Dict pre-materializes entries because `sort_keys` and
-                    // `skipkeys` need to mutate the entries vector before
-                    // output.
-                    let entries = self.collect_dict_entries(&dict);
-                    let this = self;
-                    defer_drop_mut!(entries, this);
-                    // Need to explicitly acquire a recursion token for the dict as we don't go
-                    // via the default dict iterator.
-                    let token = this.vm.recursion_token()?;
-                    defer_drop!(token, this);
-                    this.with_entered_container(*heap_id, |enc| enc.serialize_dict(entries, depth))
-                }
-                _ => Err(ExcType::json_not_serializable_error(&value.py_type_name(self.vm))),
-            },
-            _ => Err(ExcType::json_not_serializable_error(&value.py_type_name(self.vm))),
-        }
+    if config.sort_keys() {
+        sort_dict_entries(entries, vm)?;
     }
 
-    /// Streams items from a list or tuple into a JSON array, formatting
-    /// separators and indentation between calls to `write_next`.
-    ///
-    /// `write_next` is invoked once per item slot and should write the JSON
-    /// for the next item, returning `Ok(true)` if it wrote one or `Ok(false)`
-    /// when the underlying iterator is exhausted. This shape lets the caller
-    /// plug in either a [`ListIter`](crate::types::list::ListIter) or a
-    /// [`TupleIter`](crate::types::tuple::TupleIter) without having to unify
-    /// their lending-iterator types.
-    ///
-    /// Circular-reference tracking still happens at the container level (via
-    /// [`with_entered_container`](Self::with_entered_container)) before this
-    /// helper is called; the recursion-depth bound is enforced by the
-    /// iterator's `RecursionToken`.
-    fn serialize_array(
-        &mut self,
-        depth: usize,
-        mut write_next: impl FnMut(&mut Self, usize) -> RunResult<bool>,
-    ) -> RunResult<()> {
-        self.out.push('[');
-        let pretty = self.config.indent.is_some();
-        let mut wrote_any = false;
-        loop {
-            // Reserve the separator + indent BEFORE we know whether the next
-            // item exists; if `write_next` reports exhaustion we roll the
-            // cursor back.
-            let prefix_start = self.out.len();
-            if wrote_any {
-                self.out.push_str(&self.config.item_separator);
-            }
-            if pretty {
-                self.out.push('\n');
-                write_indent(self.out, self.config, depth + 1);
-            }
-            let body_start = self.out.len();
-            if !write_next(self, depth + 1)? {
-                self.out.truncate(prefix_start);
-                break;
-            }
-            debug_assert!(
-                self.out.len() > body_start,
-                "write_next reported true but wrote nothing"
-            );
-            wrote_any = true;
+    out.push('{');
+
+    let pretty = config.indent.is_some();
+    for (index, (key, value)) in entries.iter().enumerate() {
+        if index != 0 {
+            out.push_str(&config.item_separator);
         }
-        if pretty && wrote_any {
-            self.out.push('\n');
-            write_indent(self.out, self.config, depth);
+        if pretty {
+            out.push('\n');
+            write_indent(out, config, depth + 1);
         }
-        self.out.push(']');
-        Ok(())
+        write_json_key(key, out, config, vm)?;
+        out.push_str(&config.key_separator);
+        serialize_value(value, out, config, depth + 1, active_containers, vm)?;
     }
-
-    /// Copies a dict's `(key, value)` pairs into an owned `Vec` via
-    /// [`DictIter`](crate::types::dict::DictIter), so subsequent passes
-    /// (`skipkeys`, `sort_keys`) can mutate the buffer in place. The
-    /// `DictIter`'s recursion token is acquired and released during the
-    /// copy, bounding the depth of the *enclosing* `serialize_value` call.
-    fn collect_dict_entries(&mut self, dict: &HeapRead<'h, Dict>) -> Vec<(Value, Value)> {
-        dict.get(self.vm.heap)
-            .iter()
-            .map(|(k, v)| (k.clone_with_heap(self.vm.heap), v.clone_with_heap(self.vm.heap)))
-            .collect::<Vec<_>>()
+    if pretty && !entries.is_empty() {
+        out.push('\n');
+        write_indent(out, config, depth);
     }
-
-    /// Serializes a dict as a JSON object.
-    ///
-    /// Dict keys are validated and optionally skipped before serialization.
-    /// When `sort_keys=True`, entries are sorted using Python comparison
-    /// semantics on the original keys so mixed incomparable key types raise
-    /// the same style of `TypeError` as CPython.
-    fn serialize_dict(&mut self, entries: &mut Vec<(Value, Value)>, depth: usize) -> RunResult<()> {
-        if self.config.skipkeys() {
-            skip_disallowed_dict_keys(entries, self.vm);
-        } else if let Some((key, _)) = entries.iter().find(|(key, _)| !is_json_key_allowed(key, self.vm)) {
-            return Err(ExcType::json_invalid_key_error(&key.py_type_name(self.vm)));
-        }
-
-        if self.config.sort_keys() {
-            sort_dict_entries(entries, self.vm)?;
-        }
-
-        self.out.push('{');
-
-        let pretty = self.config.indent.is_some();
-        for (index, (key, value)) in entries.iter().enumerate() {
-            if index != 0 {
-                self.out.push_str(&self.config.item_separator);
-            }
-            if pretty {
-                self.out.push('\n');
-                write_indent(self.out, self.config, depth + 1);
-            }
-            write_json_key(key, self.out, self.config, self.vm)?;
-            self.out.push_str(&self.config.key_separator);
-            self.serialize_value(value, depth + 1)?;
-        }
-        if pretty && !entries.is_empty() {
-            self.out.push('\n');
-            write_indent(self.out, self.config, depth);
-        }
-        self.out.push('}');
-        Ok(())
-    }
-
-    /// Runs `f` while `heap_id` is marked active for cycle detection.
-    ///
-    /// Centralizes the push/pop bookkeeping so every serialization path pops
-    /// the container again regardless of whether recursive serialization
-    /// succeeds or returns early with an error.
-    fn with_entered_container<T>(
-        &mut self,
-        heap_id: HeapId,
-        f: impl FnOnce(&mut Self) -> RunResult<T>,
-    ) -> RunResult<T> {
-        if self.active_containers.contains(&heap_id) {
-            return Err(ExcType::json_circular_reference_error());
-        }
-        self.active_containers.push(heap_id);
-        let result = f(self);
-        self.active_containers
-            .pop()
-            .expect("entered container missing from JSON serialization stack");
-        result
-    }
+    out.push('}');
+    Ok(())
 }
 
 /// Sorts dict entries in-place using Python comparison semantics on the keys.
@@ -589,18 +506,23 @@ impl<'h> Encoder<'_, 'h> {
 /// The implementation mirrors the error style used by `sorted()` and
 /// `list.sort()`: when two keys are not orderable, it raises
 /// `TypeError: '<' not supported between instances of ...`.
-fn sort_dict_entries(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_>) -> RunResult<()> {
+fn sort_dict_entries(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<()> {
     let mut indices: Vec<usize> = (0..entries.len()).collect();
     let compare_values: Vec<Value> = entries.iter().map(|(key, _)| key.clone_with_heap(vm)).collect();
-    defer_drop!(compare_values, vm);
+    let mut compare_values_guard = HeapGuard::new(compare_values, vm);
+    let (compare_values, vm) = compare_values_guard.as_parts_mut();
     sort_indices(&mut indices, compare_values.as_slice(), false, vm)?;
     apply_permutation(entries.as_mut_slice(), &mut indices);
     Ok(())
 }
 
 /// Removes dict entries whose keys are not JSON-serializable, preserving order.
-fn skip_disallowed_dict_keys(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_>) {
-    // Use two pointers to preserve relative order
+///
+/// `skipkeys=True` must drop invalid entries without disturbing the relative
+/// order of the retained pairs. A two-pointer compaction avoids the repeated
+/// shifting cost of `Vec::remove(i)` while still cleaning up skipped `Value`
+/// references with `drop_with_heap`.
+fn skip_disallowed_dict_keys(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_, impl ResourceTracker>) {
     let mut write = 0;
     for read in 0..entries.len() {
         if is_json_key_allowed(&entries[read].0, vm) {
@@ -611,15 +533,17 @@ fn skip_disallowed_dict_keys(entries: &mut Vec<(Value, Value)>, vm: &mut VM<'_>)
         }
     }
 
-    // Drain the disallowed entries
-    entries.drain(write..).drop_with(vm);
+    for (key, value) in entries.drain(write..) {
+        key.drop_with_heap(vm);
+        value.drop_with_heap(vm);
+    }
 }
 
 /// Returns whether a value is an allowed JSON object key type.
 ///
 /// CPython accepts strings, integers, floats, booleans, and `None`, then
 /// coerces the non-string cases to JSON strings during output.
-fn is_json_key_allowed(value: &Value, vm: &VM<'_>) -> bool {
+fn is_json_key_allowed(value: &Value, vm: &VM<'_, impl ResourceTracker>) -> bool {
     matches!(
         value,
         Value::None | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::InternString(_)
@@ -630,7 +554,12 @@ fn is_json_key_allowed(value: &Value, vm: &VM<'_>) -> bool {
 ///
 /// Non-string supported key types are rendered to their JSON string form first,
 /// then escaped as a JSON string token.
-fn write_json_key(key: &Value, out: &mut String, config: &JsonDumpsConfig, vm: &VM<'_>) -> RunResult<()> {
+fn write_json_key(
+    key: &Value,
+    out: &mut String,
+    config: &JsonDumpsConfig,
+    vm: &VM<'_, impl ResourceTracker>,
+) -> RunResult<()> {
     let ensure_ascii = config.ensure_ascii();
     match key {
         Value::None => write_json_ascii_key("null", out),
@@ -647,9 +576,9 @@ fn write_json_key(key: &Value, out: &mut String, config: &JsonDumpsConfig, vm: &
                 long_int.check_str_digits_limit()?;
                 write_json_display_key(long_int.inner(), out);
             }
-            _ => return Err(ExcType::json_invalid_key_error(&key.py_type_name(vm))),
+            _ => return Err(ExcType::json_invalid_key_error(key.py_type(vm))),
         },
-        _ => return Err(ExcType::json_invalid_key_error(&key.py_type_name(vm))),
+        _ => return Err(ExcType::json_invalid_key_error(key.py_type(vm))),
     }
     Ok(())
 }
@@ -784,6 +713,27 @@ fn write_indent(out: &mut String, config: &JsonDumpsConfig, depth: usize) {
             out.push_str(indent);
         }
     }
+}
+
+/// Runs a closure while a container is marked active for cycle detection.
+///
+/// The helper centralizes the push/pop bookkeeping so every serialization path
+/// pops the container again regardless of whether recursive serialization
+/// succeeds or returns early with an error.
+fn with_entered_container<R>(
+    stack: &mut Vec<HeapId>,
+    heap_id: HeapId,
+    f: impl FnOnce(&mut Vec<HeapId>) -> RunResult<R>,
+) -> RunResult<R> {
+    if stack.contains(&heap_id) {
+        return Err(ExcType::json_circular_reference_error());
+    }
+    stack.push(heap_id);
+    let result = f(stack);
+    stack
+        .pop()
+        .expect("entered container missing from JSON serialization stack");
+    result
 }
 
 /// Writes a Rust string as a JSON string token.

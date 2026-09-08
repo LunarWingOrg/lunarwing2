@@ -1,18 +1,17 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(feature = "macros")]
+#![warn(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
 
-#[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+#[cfg(not(Py_LIMITED_API))]
 use pyo3::buffer::PyBuffer;
 #[cfg(any(not(Py_LIMITED_API), Py_3_12))]
 use pyo3::exceptions::PyWarning;
 use pyo3::exceptions::{PyFutureWarning, PyUserWarning};
 use pyo3::prelude::*;
+#[cfg(not(Py_LIMITED_API))]
 use pyo3::types::PyDateTime;
-#[cfg(not(PyPy))]
+#[cfg(not(any(Py_LIMITED_API, PyPy)))]
 use pyo3::types::PyFunction;
 use pyo3::types::{self, PyCFunction};
 use pyo3_macros::pyclass;
@@ -114,7 +113,7 @@ fn test_required_optional_class() {
     });
 }
 
-#[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+#[cfg(not(Py_LIMITED_API))]
 #[pyfunction]
 fn buffer_inplace_add(py: Python<'_>, x: PyBuffer<i32>, y: PyBuffer<i32>) {
     let x = x.as_mut_slice(py).unwrap();
@@ -125,7 +124,7 @@ fn buffer_inplace_add(py: Python<'_>, x: PyBuffer<i32>, y: PyBuffer<i32>) {
     }
 }
 
-#[cfg(any(not(Py_LIMITED_API), Py_3_11))]
+#[cfg(not(Py_LIMITED_API))]
 #[test]
 fn test_buffer_add() {
     Python::attach(|py| {
@@ -157,7 +156,7 @@ assert a, array.array("i", [2, 4, 6, 8])
     });
 }
 
-#[cfg(not(PyPy))]
+#[cfg(not(any(Py_LIMITED_API, PyPy)))]
 #[pyfunction]
 fn function_with_pyfunction_arg<'py>(fun: &Bound<'py, PyFunction>) -> PyResult<Bound<'py, PyAny>> {
     fun.call((), None)
@@ -185,7 +184,7 @@ fn test_functions_with_function_args() {
         "#
         );
 
-        #[cfg(not(PyPy))]
+        #[cfg(not(any(Py_LIMITED_API, PyPy)))]
         {
             let py_func_arg = wrap_pyfunction!(function_with_pyfunction_arg)(py).unwrap();
 
@@ -201,6 +200,7 @@ fn test_functions_with_function_args() {
     });
 }
 
+#[cfg(not(Py_LIMITED_API))]
 fn datetime_to_timestamp(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
     let dt = dt.cast::<PyDateTime>()?;
     let ts: f64 = dt.call_method0("timestamp")?.extract()?;
@@ -208,6 +208,7 @@ fn datetime_to_timestamp(dt: &Bound<'_, PyAny>) -> PyResult<i64> {
     Ok(ts as i64)
 }
 
+#[cfg(not(Py_LIMITED_API))]
 #[pyfunction]
 fn function_with_custom_conversion(
     #[pyo3(from_py_with = datetime_to_timestamp)] timestamp: i64,
@@ -215,6 +216,7 @@ fn function_with_custom_conversion(
     timestamp
 }
 
+#[cfg(not(Py_LIMITED_API))]
 #[test]
 fn test_function_with_custom_conversion() {
     Python::attach(|py| {
@@ -233,6 +235,7 @@ fn test_function_with_custom_conversion() {
     });
 }
 
+#[cfg(not(Py_LIMITED_API))]
 #[test]
 fn test_function_with_custom_conversion_error() {
     Python::attach(|py| {
@@ -243,8 +246,7 @@ fn test_function_with_custom_conversion_error() {
             custom_conv_func,
             "custom_conv_func(['a'])",
             PyTypeError,
-            "'list' object is not an instance of 'datetime'",
-            "while processing 'timestamp'"
+            "argument 'timestamp': 'list' object is not an instance of 'datetime'"
         );
     });
 }
@@ -316,40 +318,35 @@ fn test_conversion_error() {
             conversion_error,
             "conversion_error(None, None, None, None, None)",
             PyTypeError,
-            "'None' is not an instance of 'str'",
-            "while processing 'str_arg'"
+            "argument 'str_arg': 'None' is not an instance of 'str'"
         );
         py_expect_exception!(
             py,
             conversion_error,
             "conversion_error(100, None, None, None, None)",
             PyTypeError,
-            "'int' object is not an instance of 'str'",
-            "while processing 'str_arg'"
+            "argument 'str_arg': 'int' object is not an instance of 'str'"
         );
         py_expect_exception!(
             py,
             conversion_error,
             "conversion_error('string1', 'string2', None, None, None)",
             PyTypeError,
-            "'str' object cannot be interpreted as an integer",
-            "while processing 'int_arg'"
+            "argument 'int_arg': 'str' object cannot be interpreted as an integer"
         );
         py_expect_exception!(
             py,
             conversion_error,
             "conversion_error('string1', -100, 'string2', None, None)",
             PyTypeError,
-            "'str' object is not an instance of 'tuple'",
-            "while processing 'tuple_arg'"
+            "argument 'tuple_arg': 'str' object is not an instance of 'tuple'"
         );
         py_expect_exception!(
             py,
             conversion_error,
             "conversion_error('string1', -100, ('string2', 10.), 'string3', None)",
             PyTypeError,
-            "'str' object cannot be interpreted as an integer",
-            "while processing 'option_arg'"
+            "argument 'option_arg': 'str' object cannot be interpreted as an integer"
         );
         let exception = py_expect_exception!(
             py,
@@ -361,22 +358,9 @@ class ValueClass:
 conversion_error('string1', -100, ('string2', 10.), None, ValueClass(\"no_expected_type\"))",
             PyTypeError
         );
-        if exception.value(py).hasattr("add_note").unwrap() {
-            assert_eq!(
-                exception
-                    .value(py)
-                    .getattr("__notes__")
-                    .unwrap()
-                    .get_item(0)
-                    .unwrap()
-                    .extract::<std::borrow::Cow<'_, str>>()
-                    .unwrap(),
-                "while processing 'struct_arg'"
-            );
-        }
         assert_eq!(
             extract_traceback(py, exception),
-            "TypeError: failed to \
+            "TypeError: argument 'struct_arg': failed to \
     extract field ValueClass.value: TypeError: 'str' object cannot be interpreted as an integer"
         );
 
@@ -390,22 +374,9 @@ class ValueClass:
 conversion_error('string1', -100, ('string2', 10.), None, ValueClass(-5))",
             PyTypeError
         );
-        if exception.value(py).hasattr("add_note").unwrap() {
-            assert_eq!(
-                exception
-                    .value(py)
-                    .getattr("__notes__")
-                    .unwrap()
-                    .get_item(0)
-                    .unwrap()
-                    .extract::<std::borrow::Cow<'_, str>>()
-                    .unwrap(),
-                "while processing 'struct_arg'"
-            );
-        }
         assert_eq!(
             extract_traceback(py, exception),
-            "TypeError: failed to \
+            "TypeError: argument 'struct_arg': failed to \
     extract field ValueClass.value: OverflowError: can't convert negative int to unsigned"
         );
     });
@@ -562,12 +533,13 @@ fn test_closure() {
 #[test]
 fn test_closure_counter() {
     Python::attach(|py| {
-        let counter = AtomicI32::new(0);
+        let counter = std::cell::RefCell::new(0);
         let counter_fn = move |_args: &Bound<'_, types::PyTuple>,
                                _kwargs: Option<&Bound<'_, types::PyDict>>|
               -> PyResult<i32> {
-            let prev_count = counter.fetch_add(1, Ordering::SeqCst);
-            Ok(prev_count + 1)
+            let mut counter = counter.borrow_mut();
+            *counter += 1;
+            Ok(*counter)
         };
         let counter_py = PyCFunction::new_closure(py, None, None, counter_fn).unwrap();
 

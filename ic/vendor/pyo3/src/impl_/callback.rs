@@ -4,34 +4,19 @@ use crate::err::{PyErr, PyResult};
 use crate::exceptions::PyOverflowError;
 use crate::ffi::{self, Py_hash_t};
 use crate::{BoundObject, IntoPyObject, Py, PyAny, Python};
-use core::ffi::c_int;
+use std::ffi::c_int;
 
 /// A type which can be the return type of a python C-API callback
-pub trait PyCallbackOutput: Copy + py_callback_output::Sealed {
+pub trait PyCallbackOutput: Copy {
     /// The error value to return to python if the callback raised an exception
     const ERR_VALUE: Self;
 }
 
-/// Seals `PyCallbackOutput` so that types outside PyO3 cannot implement it.
-mod py_callback_output {
-    use core::ffi::c_int;
-
-    use pyo3_ffi::Py_ssize_t;
-
-    use crate::ffi::PyObject;
-
-    pub trait Sealed {}
-
-    impl Sealed for *mut PyObject {}
-    impl Sealed for c_int {}
-    impl Sealed for Py_ssize_t {}
-}
-
 impl PyCallbackOutput for *mut ffi::PyObject {
-    const ERR_VALUE: Self = core::ptr::null_mut();
+    const ERR_VALUE: Self = std::ptr::null_mut();
 }
 
-impl PyCallbackOutput for core::ffi::c_int {
+impl PyCallbackOutput for std::ffi::c_int {
     const ERR_VALUE: Self = -1;
 }
 
@@ -40,34 +25,8 @@ impl PyCallbackOutput for ffi::Py_ssize_t {
 }
 
 /// Convert the result of callback function into the appropriate return value.
-pub trait IntoPyCallbackOutput<'py, Target>: into_py_callback_output::Sealed<'py, Target> {
+pub trait IntoPyCallbackOutput<'py, Target> {
     fn convert(self, py: Python<'py>) -> PyResult<Target>;
-}
-
-/// Seals `IntoPyCallbackOutput` so that types outside PyO3 cannot implement it.
-mod into_py_callback_output {
-    use pyo3_ffi::Py_hash_t;
-
-    use crate::{
-        ffi,
-        impl_::callback::{HashCallbackOutput, IntoPyCallbackOutput, WrappingCastTo},
-        IntoPyObject, Py, PyAny, PyErr,
-    };
-
-    pub trait Sealed<'py, Target> {}
-
-    impl<'py, T: IntoPyObject<'py>> Sealed<'py, *mut ffi::PyObject> for T {}
-    impl<'py, T: IntoPyCallbackOutput<'py, U>, E: Into<PyErr>, U> Sealed<'py, U> for Result<T, E> {}
-    impl Sealed<'_, Self> for *mut ffi::PyObject {}
-    impl Sealed<'_, core::ffi::c_int> for () {}
-    impl Sealed<'_, core::ffi::c_int> for bool {}
-    impl Sealed<'_, ()> for () {}
-    impl Sealed<'_, ffi::Py_ssize_t> for usize {}
-    impl Sealed<'_, bool> for bool {}
-    impl Sealed<'_, usize> for usize {}
-    impl<'py, T: IntoPyObject<'py>> Sealed<'py, Py<PyAny>> for T {}
-    impl Sealed<'_, Py_hash_t> for HashCallbackOutput {}
-    impl<T: WrappingCastTo<Py_hash_t>> Sealed<'_, HashCallbackOutput> for T {}
 }
 
 impl<'py, T, E, U> IntoPyCallbackOutput<'py, U> for Result<T, E>
@@ -103,16 +62,16 @@ impl IntoPyCallbackOutput<'_, Self> for *mut ffi::PyObject {
     }
 }
 
-impl IntoPyCallbackOutput<'_, core::ffi::c_int> for () {
+impl IntoPyCallbackOutput<'_, std::ffi::c_int> for () {
     #[inline]
-    fn convert(self, _: Python<'_>) -> PyResult<core::ffi::c_int> {
+    fn convert(self, _: Python<'_>) -> PyResult<std::ffi::c_int> {
         Ok(0)
     }
 }
 
-impl IntoPyCallbackOutput<'_, core::ffi::c_int> for bool {
+impl IntoPyCallbackOutput<'_, std::ffi::c_int> for bool {
     #[inline]
-    fn convert(self, _: Python<'_>) -> PyResult<core::ffi::c_int> {
+    fn convert(self, _: Python<'_>) -> PyResult<std::ffi::c_int> {
         Ok(self as c_int)
     }
 }
@@ -131,7 +90,7 @@ impl IntoPyCallbackOutput<'_, ffi::Py_ssize_t> for usize {
     }
 }
 
-// Conversion traits needed by pyo3's macros
+// Converters needed for `#[pyproto]` implementations
 
 impl IntoPyCallbackOutput<'_, bool> for bool {
     #[inline]
@@ -160,13 +119,8 @@ where
     }
 }
 
-pub trait WrappingCastTo<T>: wrapping_cast_to::Sealed<T> {
+pub trait WrappingCastTo<T> {
     fn wrapping_cast(self) -> T;
-}
-
-/// Seals `WrappingCastTo` so that types outside PyO3 cannot implement it.
-mod wrapping_cast_to {
-    pub trait Sealed<T> {}
 }
 
 macro_rules! wrapping_cast {
@@ -177,7 +131,6 @@ macro_rules! wrapping_cast {
                 self as $to
             }
         }
-        impl wrapping_cast_to::Sealed<$to> for $from {}
     };
 }
 wrapping_cast!(u8, Py_hash_t);

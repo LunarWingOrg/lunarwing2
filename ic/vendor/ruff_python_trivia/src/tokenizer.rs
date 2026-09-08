@@ -848,7 +848,7 @@ impl<'a> BackwardsTokenizer<'a> {
         self.filter(|t| !t.kind().is_trivia())
     }
 
-    fn next_token(&mut self) -> SimpleToken {
+    pub fn next_token(&mut self) -> SimpleToken {
         self.cursor.start_token();
         self.back_offset = self.cursor.text_len() + self.offset;
 

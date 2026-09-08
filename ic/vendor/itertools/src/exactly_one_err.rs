@@ -8,9 +8,7 @@ use either::Either;
 
 use crate::size_hint;
 
-/// Iterator returned for the error case of `Itertools`
-/// [`exactly_one()`](crate::Itertools::exactly_one) and
-/// [`at_most_one()`](crate::Itertools::at_most_one).
+/// Iterator returned for the error case of `Itertools::exactly_one()`
 /// This iterator yields exactly the same elements as the input iterator.
 ///
 /// During the execution of `exactly_one` the iterator must be mutated.  This wrapper
@@ -64,13 +62,6 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         size_hint::add_scalar(self.inner.size_hint(), self.additional_len())
-    }
-
-    fn count(self) -> usize
-    where
-        Self: Sized,
-    {
-        self.additional_len() + self.inner.count()
     }
 
     fn fold<B, F>(self, mut init: B, mut f: F) -> B

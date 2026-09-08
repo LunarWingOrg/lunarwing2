@@ -277,3 +277,4 @@ Module(
 7 | @
 8 | class Test
   |           ^ Syntax Error: Expected `:`, found newline
+  |

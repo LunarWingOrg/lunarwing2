@@ -233,6 +233,7 @@ Module(
 7 | def f3():
 8 |     from module import *, *
   |                        ^^^^ Syntax Error: Star import must be the only import
+  |
 
 
 ## Semantic Syntax Errors
@@ -271,3 +272,4 @@ Module(
 7 | def f3():
 8 |     from module import *, *
   |     ^^^^^^^^^^^^^^^^^^^^^^^ Syntax Error: `from module import *` only allowed at module level
+  |

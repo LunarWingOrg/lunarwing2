@@ -1,7 +1,7 @@
 #[crate::pyfunction]
 #[pyo3(crate = "crate")]
 fn do_something(x: i32) -> crate::PyResult<i32> {
-    ::core::result::Result::Ok(x)
+    ::std::result::Result::Ok(x)
 }
 
 #[crate::pymodule]
@@ -10,7 +10,7 @@ fn foo(
     _py: crate::Python<'_>,
     _m: &crate::Bound<'_, crate::types::PyModule>,
 ) -> crate::PyResult<()> {
-    ::core::result::Result::Ok(())
+    ::std::result::Result::Ok(())
 }
 
 #[crate::pymodule]
@@ -25,7 +25,7 @@ fn my_module(m: &crate::Bound<'_, crate::types::PyModule>) -> crate::PyResult<()
         crate::wrap_pymodule!(foo),
     )?;
 
-    ::core::result::Result::Ok(())
+    ::std::result::Result::Ok(())
 }
 
 #[crate::pymodule(submodule)]

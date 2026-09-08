@@ -11,16 +11,19 @@ use crate::{
     bytecode::VM,
     heap::{HeapData, HeapId},
     intern::StaticStrings,
+    resource::{ResourceError, ResourceTracker},
     types::Module,
     value::{Marker, Value},
 };
 
 /// Creates the `typing` module and allocates it on the heap.
 ///
+/// Returns a HeapId pointing to the newly allocated module.
+///
 /// # Panics
 ///
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_>) -> HeapId {
+pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
     let mut module = Module::new(StaticStrings::Typing);
 
     // typing.TYPE_CHECKING - always False
@@ -31,7 +34,7 @@ pub fn create_module(vm: &mut VM<'_>) -> HeapId {
         module.set_attr(*ss, Value::Marker(Marker(*ss)), vm);
     }
 
-    vm.heap.allocate(HeapData::Module(Box::new(module)))
+    vm.heap.allocate(HeapData::Module(module))
 }
 
 /// Typing marker attributes exported by this module.

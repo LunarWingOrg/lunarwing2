@@ -12,7 +12,6 @@ extern crate alloc;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::string::String;
-use castaway::match_type;
 #[doc(hidden)] // Referenced in macros.
 pub use core;
 use core::borrow::{Borrow, BorrowMut};
@@ -130,8 +129,7 @@ pub struct CompactString(Repr);
 
 impl CompactString {
     /// Creates a new [`CompactString`] from any type that implements `AsRef<str>`.
-    /// If the string is short enough, then it will be inlined on the stack! When `text` is an owned
-    /// [`String`] that does not fit inline, its existing allocation is reused.
+    /// If the string is short enough, then it will be inlined on the stack!
     ///
     /// In a `static` or `const` context you can use the method [`CompactString::const_new()`].
     ///
@@ -185,14 +183,7 @@ impl CompactString {
     #[inline]
     #[track_caller]
     pub fn new<T: AsRef<str>>(text: T) -> Self {
-        // Route `&str` through the infallible `new_panic` so the hot inline path avoids the
-        // `Result` machinery, while still reusing an owned `String`'s allocation via `from_string`.
-        let repr = match_type!(text, {
-            String as text => Repr::from_string(text, true).unwrap_with_msg(),
-            text => Repr::new_panic(text.as_ref()),
-        });
-
-        CompactString(repr)
+        Self::try_new(text).unwrap_with_msg()
     }
 
     /// Fallible version of [`CompactString::new()`]
@@ -201,12 +192,7 @@ impl CompactString {
     /// Otherwise it behaves the same as [`CompactString::new()`].
     #[inline]
     pub fn try_new<T: AsRef<str>>(text: T) -> Result<Self, ReserveError> {
-        let repr = match_type!(text, {
-            String as text => Repr::from_string(text, true)?,
-            text => Repr::new(text.as_ref())?,
-        });
-
-        Ok(CompactString(repr))
+        Repr::new(text.as_ref()).map(CompactString)
     }
 
     /// Creates a new inline [`CompactString`] from `&'static str` at compile time.
@@ -242,7 +228,8 @@ impl CompactString {
     /// );
     /// ```
     #[inline]
-    pub const fn as_static_str(&self) -> Option<&'static str> {
+    #[rustversion::attr(since(1.64), const)]
+    pub fn as_static_str(&self) -> Option<&'static str> {
         self.0.as_static_str()
     }
 
@@ -584,52 +571,16 @@ impl CompactString {
     #[inline]
     pub fn as_mut_str(&mut self) -> &mut str {
         let len = self.len();
-        let ptr = self.0.as_mut_ptr();
-        // SAFETY: The first `len` bytes of a `CompactString` are initialized and valid UTF-8.
-        let bytes = unsafe { slice::from_raw_parts_mut(ptr, len) };
-        // SAFETY: The bytes came from a valid `CompactString`.
-        unsafe { core::str::from_utf8_unchecked_mut(bytes) }
+        unsafe { core::str::from_utf8_unchecked_mut(&mut self.0.as_mut_buf()[..len]) }
     }
 
-    /// Returns the remaining spare capacity of this [`CompactString`] as a slice of
-    /// [`MaybeUninit`](mem::MaybeUninit) bytes.
-    ///
-    /// The returned slice covers the range `len()..capacity()`. After initializing a prefix of the
-    /// slice, use [`CompactString::set_len`] to include those bytes in the string.
-    ///
-    /// # Safety
-    ///
-    /// * Before increasing the length, the caller must initialize every newly included byte and
-    ///   ensure the resulting string is valid UTF-8.
-    /// * For an inline string, the final byte of the spare capacity also stores the representation
-    ///   tag. It may only be overwritten as the final byte of a completely initialized, valid
-    ///   UTF-8 string that fills the inline capacity.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use compact_str::CompactString;
-    /// let mut s = CompactString::new("hello");
-    /// let suffix = b" world";
-    ///
-    /// let spare = unsafe { s.spare_capacity_mut() };
-    /// for (slot, byte) in spare.iter_mut().zip(suffix) {
-    ///     slot.write(*byte);
-    /// }
-    /// // SAFETY: We initialized the appended bytes, and the result is valid UTF-8.
-    /// unsafe { s.set_len(s.len() + suffix.len()) };
-    ///
-    /// assert_eq!(s, "hello world");
-    /// ```
-    #[inline]
-    pub unsafe fn spare_capacity_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
+    unsafe fn spare_capacity_mut(&mut self) -> &mut [mem::MaybeUninit<u8>] {
+        let buf = self.0.as_mut_buf();
+        let ptr = buf.as_mut_ptr();
+        let cap = buf.len();
         let len = self.len();
-        let ptr = self.0.as_mut_ptr();
-        let cap = self.capacity();
 
-        // SAFETY: The buffer is valid for `cap` bytes, and `len <= cap`. `MaybeUninit<u8>` does
-        // not require the spare bytes to be initialized.
-        unsafe { slice::from_raw_parts_mut(ptr.add(len) as *mut mem::MaybeUninit<u8>, cap - len) }
+        slice::from_raw_parts_mut(ptr.add(len) as *mut mem::MaybeUninit<u8>, cap - len)
     }
 
     /// Returns a byte slice of the [`CompactString`]'s contents.
@@ -648,10 +599,7 @@ impl CompactString {
 
     // TODO: Implement a `try_as_mut_slice(...)` that will fail if it results in cloning?
     //
-    /// Provides a mutable reference to the initialized bytes in this [`CompactString`].
-    ///
-    /// The returned slice has length [`CompactString::len()`]. To write into the remaining
-    /// capacity, use [`CompactString::spare_capacity_mut`].
+    /// Provides a mutable reference to the underlying buffer of bytes.
     ///
     /// # Safety
     /// * All Rust strings, including `CompactString`, must be valid UTF-8. The caller must
@@ -662,18 +610,17 @@ impl CompactString {
     /// # use compact_str::CompactString;
     /// let mut s = CompactString::new("hello");
     ///
-    /// let bytes = unsafe { s.as_mut_bytes() };
-    /// bytes[0] = b'H';
+    /// let slice = unsafe { s.as_mut_bytes() };
+    /// // copy bytes into our string
+    /// slice[5..11].copy_from_slice(" world".as_bytes());
+    /// // set the len of the string
+    /// unsafe { s.set_len(11) };
     ///
-    /// assert_eq!(s, "Hello");
+    /// assert_eq!(s, "hello world");
     /// ```
     #[inline]
     pub unsafe fn as_mut_bytes(&mut self) -> &mut [u8] {
-        let len = self.len();
-        let ptr = self.0.as_mut_ptr();
-
-        // SAFETY: The first `len` bytes of a `CompactString` are initialized.
-        unsafe { slice::from_raw_parts_mut(ptr, len) }
+        self.0.as_mut_buf()
     }
 
     /// Appends the given [`char`] to the end of this [`CompactString`].
@@ -1035,7 +982,7 @@ impl CompactString {
     /// Converts a mutable [`CompactString`] to a raw pointer.
     #[inline]
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
+        unsafe { self.0.as_mut_buf().as_mut_ptr() }
     }
 
     /// Insert string character at an index.
@@ -1214,7 +1161,7 @@ impl CompactString {
     /// The resulting capactity is never less than the size of 3×[`usize`],
     /// i.e. the capacity than can be inlined.
     ///
-    /// This method is effectively the same as calling `string.shrink_to(0)`.
+    /// This method is effectively the same as calling [`string.shrink_to(0)`].
     ///
     /// # Examples
     ///
@@ -1279,26 +1226,14 @@ impl CompactString {
             src_idx: 0,
             dst_idx: 0,
         };
-        let original_len = g.self_.len();
-        let ptr = g.self_.0.as_mut_ptr();
-        while g.src_idx < original_len {
-            // SAFETY: Everything at and after `src_idx` is an untouched suffix of the
-            // original string. In particular, it is initialized, valid UTF-8, and non-empty.
-            let ch = unsafe {
-                let suffix =
-                    core::slice::from_raw_parts(ptr.add(g.src_idx), original_len - g.src_idx);
-                core::str::from_utf8_unchecked(suffix)
-                    .chars()
-                    .next()
-                    .expect("source suffix is non-empty")
-            };
+        let s = g.self_.as_mut_str();
+        while let Some(ch) = s[g.src_idx..].chars().next() {
             let ch_len = ch.len_utf8();
             if predicate(ch) {
-                // SAFETY: Both ranges are in the allocation and `copy` permits overlap. The
-                // destination ends no later than the end of the current source character, so
-                // the unprocessed suffix remains unchanged.
+                // SAFETY: We know that both indices are valid, and that we don't split a char.
                 unsafe {
-                    core::ptr::copy(ptr.add(g.src_idx), ptr.add(g.dst_idx), ch_len);
+                    let p = s.as_mut_ptr();
+                    core::ptr::copy(p.add(g.src_idx), p.add(g.dst_idx), ch_len);
                 }
                 g.dst_idx += ch_len;
             }
@@ -1352,47 +1287,89 @@ impl CompactString {
     /// );
     /// ```
     pub fn from_utf8_lossy(v: &[u8]) -> Self {
-        // Fast path: the entire input is valid UTF-8, so copy it in a single shot. This is the
-        // common case, and mirrors `String::from_utf8_lossy`, which borrows the input here.
-        let mut error = match core::str::from_utf8(v) {
-            Ok(valid) => return Self::new(valid),
-            Err(error) => error,
-        };
+        fn next_char<'a>(
+            iter: &mut <&[u8] as IntoIterator>::IntoIter,
+            buf: &'a mut [u8; 4],
+        ) -> Option<&'a [u8]> {
+            const REPLACEMENT: &[u8] = "\u{FFFD}".as_bytes();
 
-        // Slow path: bulk-copy each run of valid UTF-8, emitting a single replacement character for
-        // every maximal invalid subsequence. This produces the same result as
-        // `String::from_utf8_lossy`, but writes straight into the `CompactString` rather than
-        // building an intermediate `String`.
-        const REPLACEMENT: &str = "\u{FFFD}";
-        // `v.len()` is a heuristic, not an upper bound: a 1-byte invalid subsequence expands to the
-        // 3-byte replacement character, so pathological all-invalid input may reallocate. This
-        // matches what `String::from_utf8_lossy` does (`String::with_capacity(v.len())`).
-        let mut result = Self::with_capacity(v.len());
-        let mut remaining = v;
-        loop {
-            let valid_up_to = error.valid_up_to();
-            // SAFETY: `remaining[..valid_up_to]` is valid UTF-8, by definition of `valid_up_to`.
-            let valid = unsafe { core::str::from_utf8_unchecked(&remaining[..valid_up_to]) };
-            result.push_str(valid);
-            result.push_str(REPLACEMENT);
+            macro_rules! ensure_range {
+                ($idx:literal, $range:pat) => {{
+                    let mut i = iter.clone();
+                    match i.next() {
+                        Some(&c) if matches!(c, $range) => {
+                            buf[$idx] = c;
+                            *iter = i;
+                        }
+                        _ => return Some(REPLACEMENT),
+                    }
+                }};
+            }
 
-            let invalid_len = match error.error_len() {
-                Some(len) => len,
-                // `None` means the input ended with an incomplete (but not yet invalid) sequence,
-                // which we've now replaced, so we're done.
-                None => return result,
-            };
-            remaining = &remaining[valid_up_to + invalid_len..];
+            macro_rules! ensure_cont {
+                ($idx:literal) => {{
+                    ensure_range!($idx, 0x80..=0xBF);
+                }};
+            }
 
-            // Re-validate the rest. If it's all valid we're done; otherwise loop on the next error.
-            match core::str::from_utf8(remaining) {
-                Ok(valid) => {
-                    result.push_str(valid);
-                    return result;
+            let c = *iter.next()?;
+            buf[0] = c;
+
+            match c {
+                0x00..=0x7F => {
+                    // simple ASCII: push as is
+                    Some(&buf[..1])
                 }
-                Err(next) => error = next,
+                0xC2..=0xDF => {
+                    // two bytes
+                    ensure_cont!(1);
+                    Some(&buf[..2])
+                }
+                0xE0..=0xEF => {
+                    // three bytes
+                    match c {
+                        // 0x80..=0x9F encodes surrogate half
+                        0xE0 => ensure_range!(1, 0xA0..=0xBF),
+                        // 0xA0..=0xBF encodes surrogate half
+                        0xED => ensure_range!(1, 0x80..=0x9F),
+                        // all UTF-8 continuation bytes are valid
+                        _ => ensure_cont!(1),
+                    }
+                    ensure_cont!(2);
+                    Some(&buf[..3])
+                }
+                0xF0..=0xF4 => {
+                    // four bytes
+                    match c {
+                        // 0x80..=0x8F encodes overlong three byte codepoint
+                        0xF0 => ensure_range!(1, 0x90..=0xBF),
+                        // 0x90..=0xBF encodes codepoint > U+10FFFF
+                        0xF4 => ensure_range!(1, 0x80..=0x8F),
+                        // all UTF-8 continuation bytes are valid
+                        _ => ensure_cont!(1),
+                    }
+                    ensure_cont!(2);
+                    ensure_cont!(3);
+                    Some(&buf[..4])
+                }
+                | 0x80..=0xBF // unicode continuation, invalid
+                | 0xC0..=0xC1 // overlong one byte character
+                | 0xF5..=0xF7 // four bytes that encode > U+10FFFF
+                | 0xF8..=0xFB // five bytes, invalid
+                | 0xFC..=0xFD // six bytes, invalid
+                | 0xFE..=0xFF => Some(REPLACEMENT), // always invalid
             }
         }
+
+        let mut buf = [0; 4];
+        let mut result = Self::with_capacity(v.len());
+        let mut iter = v.iter();
+        while let Some(s) = next_char(&mut iter, &mut buf) {
+            // SAFETY: next_char() only returns valid strings
+            let s = unsafe { core::str::from_utf8_unchecked(s) };
+            result.push_str(s);
+        }
+        result
     }
 
     fn from_utf16x(
@@ -1400,7 +1377,6 @@ impl CompactString {
         from_int: impl Fn(u16) -> u16,
         from_bytes: impl Fn([u8; 2]) -> u16,
     ) -> Result<Self, Utf16Error> {
-        #[allow(clippy::manual_is_multiple_of)]
         if v.len() % 2 != 0 {
             // Input had an odd number of bytes.
             return Err(Utf16Error(()));
@@ -1442,7 +1418,6 @@ impl CompactString {
         // Notice: We write the string "�" instead of the character '�', so the character does not
         //         have to be formatted before it can be appended.
 
-        #[allow(clippy::manual_is_multiple_of)]
         let (trailing_extra_byte, v) = match v.len() % 2 != 0 {
             true => (true, &v[..v.len() - 1]),
             false => (false, v),
@@ -1989,7 +1964,7 @@ impl Clone for CompactString {
 impl Default for CompactString {
     #[inline]
     fn default() -> Self {
-        CompactString::const_new("")
+        CompactString::new("")
     }
 }
 
@@ -2517,11 +2492,7 @@ impl fmt::Display for Utf16Error {
 }
 
 /// An iterator over the exacted data by [`CompactString::drain()`].
-///
-/// Note: this is deliberately not `#[must_use]`. Dropping a `Drain` still removes the
-/// selected range from the source `CompactString` (see the `Drop` impl), so calling
-/// `drain(range)` purely to delete a range, without consuming the iterator, is a valid
-/// and common use, mirroring `alloc::string::Drain`.
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct Drain<'a> {
     compact_string: *mut CompactString,
     start: usize,

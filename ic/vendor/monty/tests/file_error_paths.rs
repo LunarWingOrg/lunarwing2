@@ -6,10 +6,9 @@
 //! interned-string return value that hits the `InternBytes`/empty-string
 //! materialisation branch of [`apply_buffer_store`]).
 
-use monty::MontyRun;
-use monty_types::{
-    CompileOptions, ExcType, ExtFunctionResult, FileMode, MontyException, MontyFileHandle, MontyObject, PrintWriter,
-    ResourceTracker,
+use monty::{
+    ExcType, ExtFunctionResult, FileMode, MontyException, MontyFileHandle, MontyObject, MontyRun, NoLimitTracker,
+    PrintWriter,
 };
 
 /// Drives an `open()` followed by a single read/write OS call, then resumes
@@ -23,12 +22,10 @@ fn run_with_open_then_io(
     file_handle: MontyFileHandle,
     io_result: ExtFunctionResult,
 ) -> Result<MontyObject, MontyException> {
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let progress = runner
-        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
-        .unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
     let open_call = progress.into_os_call().expect("expected Open OsCall");
-    assert_eq!(open_call.function_call.name(), "open");
+    assert_eq!(open_call.function_call.name(), "Open");
     let progress = open_call
         .resume(MontyObject::FileHandle(file_handle), PrintWriter::Stdout)
         .unwrap();
@@ -82,10 +79,8 @@ except OSError:
     pass
 f.readline()
 ";
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let progress = runner
-        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
-        .unwrap();
+    let runner = MontyRun::new(code.to_owned(), "test.py", vec![]).unwrap();
+    let progress = runner.start(vec![], NoLimitTracker, PrintWriter::Stdout).unwrap();
     let open_call = progress.into_os_call().expect("expected Open OsCall");
     let progress = open_call
         .resume(MontyObject::FileHandle(file_handle("/x.txt", "r")), PrintWriter::Stdout)
@@ -188,39 +183,6 @@ f.read(5)
     )
     .expect("script should complete");
     assert_eq!(result, MontyObject::Bytes(Vec::new()));
-}
-
-#[test]
-fn rejected_read_suspension_catchable_inside_key_fn() {
-    let code = r"
-f = open('/x.txt')
-caught = []
-
-def key_fn(x):
-    try:
-        f.read(5)
-    except NotImplementedError as e:
-        caught.append(str(e))
-    return x
-
-sorted([1], key=key_fn)
-caught[0]
-";
-    let runner = MontyRun::new(code.to_owned(), "test.py", vec![], CompileOptions::default()).unwrap();
-    let progress = runner
-        .start(vec![], ResourceTracker::default(), PrintWriter::Stdout)
-        .unwrap();
-    let open_call = progress.into_os_call().expect("expected Open OsCall");
-    let progress = open_call
-        .resume(MontyObject::FileHandle(file_handle("/x.txt", "r")), PrintWriter::Stdout)
-        .unwrap();
-    let result = progress.into_complete().expect("expected Complete");
-    assert_eq!(
-        result,
-        MontyObject::String(
-            "sorted() key argument: OS function 'Path.read_text' is not yet supported in this context".to_owned()
-        )
-    );
 }
 
 // ---------------------------------------------------------------------------

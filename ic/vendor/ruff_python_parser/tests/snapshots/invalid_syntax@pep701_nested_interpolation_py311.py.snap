@@ -228,3 +228,4 @@ Module(
 3 | f'{1: abcd "{'aa'}" }'
 4 | f'{1: abcd "{"\n"}" }'
   |               ^ Syntax Error: Cannot use an escape sequence (backslash) in f-strings on Python 3.11 (syntax was added in Python 3.12)
+  |

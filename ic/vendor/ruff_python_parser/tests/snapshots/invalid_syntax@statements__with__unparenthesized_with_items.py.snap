@@ -402,3 +402,4 @@ Module(
 8 | with item1 as f, *item2: pass
 9 | with item := 0 as f: pass
   |           ^^ Syntax Error: Expected `,`, found `:=`
+  |

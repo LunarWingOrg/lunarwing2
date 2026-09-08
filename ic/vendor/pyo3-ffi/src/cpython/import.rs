@@ -1,9 +1,9 @@
 #[cfg(any(not(PyPy), Py_3_14))]
 use crate::PyObject;
 #[cfg(any(not(PyPy), Py_3_14))]
-use core::ffi::c_char;
+use std::ffi::c_char;
 #[cfg(not(PyPy))]
-use core::ffi::{c_int, c_uchar};
+use std::ffi::{c_int, c_uchar};
 
 #[cfg(not(PyPy))]
 #[repr(C)]
@@ -13,7 +13,8 @@ pub struct _inittab {
     pub initfunc: Option<unsafe extern "C" fn() -> *mut PyObject>,
 }
 
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg(not(PyPy))]
     pub static mut PyImport_Inittab: *mut _inittab;
 
@@ -34,7 +35,8 @@ pub struct _frozen {
     pub get_code: Option<unsafe extern "C" fn() -> *mut PyObject>,
 }
 
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg(not(PyPy))]
     pub static mut PyImport_FrozenModules: *const _frozen;
 

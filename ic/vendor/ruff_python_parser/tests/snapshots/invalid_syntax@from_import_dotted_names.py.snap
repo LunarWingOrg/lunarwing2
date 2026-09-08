@@ -188,6 +188,7 @@ Module(
 2 | from x import a.b
 3 | from x import a, b.c, d, e.f, g
   |                   ^ Syntax Error: Expected `,`, found `.`
+  |
 
 
   |
@@ -195,3 +196,4 @@ Module(
 2 | from x import a.b
 3 | from x import a, b.c, d, e.f, g
   |                           ^ Syntax Error: Expected `,`, found `.`
+  |

@@ -1,13 +1,14 @@
 //! Implementation of the hasattr() builtin function.
 
-use monty_types::ExcType;
-
 use crate::{
+    ExcType,
     args::ArgValues,
-    bytecode::{CallResult, PendingLookupEffect, VM},
+    bytecode::{CallResult, VM},
     defer_drop,
-    exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
-    heap::DropWithContext,
+    exception_private::{RunError, RunResult, SimpleException},
+    heap::DropWithHeap,
+    resource::ResourceTracker,
+    types::PyTrait,
     value::Value,
 };
 
@@ -19,9 +20,7 @@ use crate::{
 /// Signature: `hasattr(object, name)`
 ///
 /// Note: This is implemented by calling getattr(object, name) and returning
-/// True if it succeeds, False if it raises an exception. A lazy attribute on a
-/// host-backed object suspends to the host like `obj.attr` does, with a
-/// [`PendingLookupEffect::HasAttr`] turning the answer into the bool.
+/// True if it succeeds, False if it raises an exception.
 ///
 /// Examples:
 /// ```python
@@ -29,7 +28,7 @@ use crate::{
 /// hasattr(slice(1, 10), 'start') # True - slice has start attribute
 /// hasattr(42, 'nonexistent')    # False - int has no such attribute
 /// ```
-pub fn builtin_hasattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
+pub fn builtin_hasattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("hasattr", vm.heap)?;
     defer_drop!(positional, vm);
 
@@ -38,10 +37,10 @@ pub fn builtin_hasattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult
         other => return Err(ExcType::type_error_arg_count("hasattr", 2, other.len())),
     };
 
-    let Some(name) = name.as_either_str(vm.heap).map(|s| s.resolve_interned(vm.interns)) else {
+    let Some(name) = name.as_either_str(vm.heap) else {
         return Err(SimpleException::new_msg(
             ExcType::TypeError,
-            format!("attribute name must be string, not '{}'", name.py_type_name(vm)),
+            format!("attribute name must be string, not '{}'", name.py_type(vm)),
         )
         .into());
     };
@@ -49,26 +48,11 @@ pub fn builtin_hasattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult
     // important: we must own the returned value if py_get_attr succeeds to drop it
     let has_attr = match object.py_getattr(&name, vm) {
         Ok(CallResult::Value(value)) => {
-            value.drop_with(vm);
+            value.drop_with_heap(vm);
             true
         }
-        Ok(CallResult::AttrLookup {
-            name,
-            class_name,
-            object_id,
-            type_object,
-            effect: _,
-        }) => {
-            return Ok(CallResult::AttrLookup {
-                name,
-                class_name,
-                object_id,
-                type_object,
-                effect: Some(PendingLookupEffect::HasAttr),
-            });
-        }
         Ok(other) => {
-            other.drop_with(vm);
+            other.drop_with_heap(vm);
             // hasattr() only tests attribute values — OS calls, external calls,
             // method calls, and awaits are not supported here
             //
@@ -81,5 +65,5 @@ pub fn builtin_hasattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult
         Err(e) => return Err(e),
     };
 
-    Ok(CallResult::Value(Value::Bool(has_attr)))
+    Ok(Value::Bool(has_attr))
 }

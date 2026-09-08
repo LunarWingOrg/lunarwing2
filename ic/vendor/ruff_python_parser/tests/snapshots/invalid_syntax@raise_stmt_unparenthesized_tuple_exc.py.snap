@@ -143,3 +143,4 @@ Module(
 2 | raise x, y
 3 | raise x, y from z
   |       ^^^^ Syntax Error: Unparenthesized tuple expression cannot be used here
+  |

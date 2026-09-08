@@ -1,6 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 use crate::conversion::{FromPyObjectOwned, FromPyObjectSequence, IntoPyObject};
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_subscript, PyStaticExpr};
@@ -20,7 +17,7 @@ where
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = T::SEQUENCE_OUTPUT_TYPE;
 
-    /// Turns [`[u8; N]`](core::array) into [`PyBytes`], all other `T`s will be turned into a [`PyList`]
+    /// Turns [`[u8; N]`](std::array) into [`PyBytes`], all other `T`s will be turned into a [`PyList`]
     ///
     /// [`PyBytes`]: crate::types::PyBytes
     /// [`PyList`]: crate::types::PyList
@@ -71,21 +68,24 @@ where
 {
     // Types that pass `PySequence_Check` usually implement enough of the sequence protocol
     // to support this function and if not, we will only fail extraction safely.
-    if unsafe { ffi::PySequence_Check(obj.as_ptr()) } == 0 {
-        return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
-    }
-
-    let seq_len = obj.len()?;
+    let seq = unsafe {
+        if ffi::PySequence_Check(obj.as_ptr()) != 0 {
+            obj.cast_unchecked::<PySequence>()
+        } else {
+            return Err(CastError::new(obj, PySequence::type_object(obj.py()).into_any()).into());
+        }
+    };
+    let seq_len = seq.len()?;
     if seq_len != N {
         return Err(invalid_sequence_length(N, seq_len));
     }
     array_try_from_fn(|idx| {
-        obj.get_item(idx)
+        seq.get_item(idx)
             .and_then(|any| any.extract().map_err(Into::into))
     })
 }
 
-// TODO use core::array::try_from_fn, if that stabilises:
+// TODO use std::array::try_from_fn, if that stabilises:
 // (https://github.com/rust-lang/rust/issues/89379)
 fn array_try_from_fn<E, F, T, const N: usize>(mut cb: F) -> Result<[T; N], E>
 where
@@ -136,9 +136,10 @@ pub(crate) fn invalid_sequence_length(expected: usize, actual: usize) -> PyErr {
 #[cfg(test)]
 mod tests {
     #[cfg(panic = "unwind")]
-    use core::sync::atomic::{AtomicUsize, Ordering};
-    #[cfg(panic = "unwind")]
-    use std::panic;
+    use std::{
+        panic,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::{
         conversion::IntoPyObject,

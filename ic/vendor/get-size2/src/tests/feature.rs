@@ -174,12 +174,7 @@ fn test_indexmap() {
     let hasher = RandomState::new();
 
     let mut map = indexmap::IndexMap::with_capacity_and_hasher(1, hasher);
-    // The allocation is `capacity * size_of::<(K, V)>()`, which is pointer-width
-    // dependent (40 bytes on 64-bit, 20 on 32-bit) — don't hard-code it.
-    assert_eq!(
-        map.get_heap_size(),
-        map.capacity() * size_of::<(&'static str, String)>()
-    );
+    assert_eq!(map.get_heap_size(), 40);
     map.insert(VALUE_STR, String::from(VALUE_STR));
     assert!(map.get_heap_size() >= size_of::<(&'static str, String)>() + VALUE_STR.len());
 
@@ -223,12 +218,7 @@ fn test_ordermap() {
     let hasher = RandomState::new();
 
     let mut map = ordermap::OrderMap::with_capacity_and_hasher(1, hasher);
-    // The allocation is `capacity * size_of::<(K, V)>()`, which is pointer-width
-    // dependent (40 bytes on 64-bit, 20 on 32-bit) — don't hard-code it.
-    assert_eq!(
-        map.get_heap_size(),
-        map.capacity() * size_of::<(&'static str, String)>()
-    );
+    assert_eq!(map.get_heap_size(), 40);
     map.insert(VALUE_STR, String::from(VALUE_STR));
     assert!(map.get_heap_size() >= size_of::<(&'static str, String)>() + VALUE_STR.len());
 
@@ -241,135 +231,4 @@ fn test_ordermap() {
     assert_eq!(set.get_heap_size(), 0);
     set.insert(String::from(VALUE_STR));
     assert!(set.get_heap_size() >= size_of::<String>() + VALUE_STR.len());
-}
-
-#[test]
-fn test_roaring_bitmap() {
-    // Empty bitmap: no containers, no allocations.
-    let empty = roaring::RoaringBitmap::new();
-    assert_eq!(empty.get_heap_size(), 0);
-
-    // Dense run that fits in one array container: should equal what
-    // `statistics()` reports for an array container — `capacity * 4`.
-    let dense: roaring::RoaringBitmap = (1..100).collect();
-    let stats = dense.statistics();
-    assert_eq!(stats.n_containers, 1);
-    assert_eq!(stats.n_array_containers, 1);
-    assert_eq!(dense.get_heap_size() as u64, stats.n_bytes_array_containers);
-    assert!(dense.get_heap_size() > 0);
-
-    // Bitmap container kicks in past ~4096 entries; verify we count
-    // the fixed 8 KiB allocation. Equality against the sum of all three
-    // flavor totals catches regressions that drop a flavor.
-    let wide: roaring::RoaringBitmap = (0..5000).collect();
-    let stats = wide.statistics();
-    assert!(stats.n_bitset_containers >= 1);
-    assert_eq!(
-        wide.get_heap_size() as u64,
-        stats.n_bytes_array_containers
-            + stats.n_bytes_bitset_containers
-            + stats.n_bytes_run_containers
-    );
-
-    // Run containers are produced by `optimize()` when a container has
-    // long dense runs. Verify we count run-container bytes too.
-    let mut run = (0..10_000).collect::<roaring::RoaringBitmap>();
-    run.optimize();
-    let stats = run.statistics();
-    assert!(stats.n_run_containers >= 1);
-    assert_eq!(
-        run.get_heap_size() as u64,
-        stats.n_bytes_array_containers
-            + stats.n_bytes_bitset_containers
-            + stats.n_bytes_run_containers
-    );
-
-    // Tracker-variant: threading a real tracker through must return the
-    // same size as the no-tracker path.
-    let tracker = StandardTracker::new();
-    let (size, _) = wide.get_heap_size_with_tracker(tracker);
-    assert_eq!(size, wide.get_heap_size());
-}
-
-#[test]
-fn test_roaring_treemap() {
-    let empty = roaring::RoaringTreemap::new();
-    assert_eq!(empty.get_heap_size(), 0);
-
-    // Two high-32-bit partitions → two inner RoaringBitmaps. The second
-    // partition holds many values so the per-bitmap heap size is
-    // non-trivial (exercises propagation through the BTreeMap walk).
-    let mut tm = roaring::RoaringTreemap::new();
-    tm.insert(1);
-    for v in 0..5000u64 {
-        tm.insert((1u64 << 32) + v);
-    }
-    let mut bitmap_count = 0;
-    let mut expected_inner: usize = 0;
-    for (_, bitmap) in tm.bitmaps() {
-        bitmap_count += 1;
-        expected_inner +=
-            bitmap.get_heap_size() + size_of::<u32>() + size_of::<roaring::RoaringBitmap>();
-    }
-    assert_eq!(bitmap_count, 2);
-    assert_eq!(tm.get_heap_size(), expected_inner);
-
-    // Tracker-variant: threading a tracker through the BTreeMap walk
-    // must match the no-tracker path.
-    let tracker = StandardTracker::new();
-    let (size, _) = tm.get_heap_size_with_tracker(tracker);
-    assert_eq!(size, tm.get_heap_size());
-}
-
-#[test]
-fn test_orx_concurrent_vec() {
-    use orx_concurrent_vec::{ConcurrentElement, ConcurrentVec};
-
-    const S: &str = "Hello world";
-
-    let empty: ConcurrentVec<u32> = ConcurrentVec::new();
-    assert_eq!(
-        empty.get_heap_size(),
-        empty.capacity() * size_of::<ConcurrentElement<u32>>()
-    );
-
-    let vec: ConcurrentVec<u32> = ConcurrentVec::new();
-    vec.extend(0u32..16);
-    assert_eq!(
-        vec.get_heap_size(),
-        vec.capacity() * size_of::<ConcurrentElement<u32>>()
-    );
-
-    let vec: ConcurrentVec<String> = ConcurrentVec::new();
-    vec.push(String::from(S));
-    vec.push(String::from(S));
-    let expected = vec.capacity() * size_of::<ConcurrentElement<String>>() + S.len() * 2;
-    assert_eq!(vec.get_heap_size(), expected);
-
-    let tracker = StandardTracker::new();
-    let (size, _) = vec.get_heap_size_with_tracker(tracker);
-    assert_eq!(size, vec.get_heap_size());
-}
-
-#[test]
-fn test_portable_atomic() {
-    // Atomics are stack-only, so heap size is 0 and total size equals the
-    // type's own size. `AtomicU64`/`AtomicI64`/`AtomicU128`/`AtomicI128` are
-    // the whole point of the feature: they exist here even on targets without
-    // native 64/128-bit atomics.
-    let u64 = portable_atomic::AtomicU64::new(1);
-    assert_eq!(u64.get_heap_size(), 0);
-    assert_eq!(u64.get_size(), size_of::<portable_atomic::AtomicU64>());
-
-    let i64 = portable_atomic::AtomicI64::new(-1);
-    assert_eq!(i64.get_heap_size(), 0);
-    assert_eq!(i64.get_size(), size_of::<portable_atomic::AtomicI64>());
-
-    let u128 = portable_atomic::AtomicU128::new(1);
-    assert_eq!(u128.get_heap_size(), 0);
-    assert_eq!(u128.get_size(), size_of::<portable_atomic::AtomicU128>());
-
-    let b = portable_atomic::AtomicBool::new(true);
-    assert_eq!(b.get_heap_size(), 0);
-    assert_eq!(b.get_size(), size_of::<portable_atomic::AtomicBool>());
 }

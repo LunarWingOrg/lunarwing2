@@ -138,6 +138,7 @@ Module(
 2 | from __future__ import annotations, invalid_feature
 3 | from __future__ import invalid_feature_1, invalid_feature_2
   |                        ^^^^^^^^^^^^^^^^^ Syntax Error: Future feature `invalid_feature_1` is not defined
+  |
 
 
   |
@@ -145,3 +146,4 @@ Module(
 2 | from __future__ import annotations, invalid_feature
 3 | from __future__ import invalid_feature_1, invalid_feature_2
   |                                           ^^^^^^^^^^^^^^^^^ Syntax Error: Future feature `invalid_feature_2` is not defined
+  |

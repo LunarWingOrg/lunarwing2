@@ -239,6 +239,7 @@ Module(
 4 |
 5 | call(**x := 1)
   |          ^^ Syntax Error: Expected `,`, found `:=`
+  |
 
 
   |
@@ -246,3 +247,4 @@ Module(
 4 |
 5 | call(**x := 1)
   |             ^ Syntax Error: Positional argument cannot follow keyword argument unpacking
+  |

@@ -385,7 +385,6 @@ macro_rules! impl_tuple_collect {
                 count_ident!($($Y)*)
             }
 
-            /// Shift all elements one position to the left and push the new item to the end.
             fn left_shift_push(&mut self, mut item: A) {
                 use std::mem::replace;
 

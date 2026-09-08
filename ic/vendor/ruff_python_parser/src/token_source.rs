@@ -5,6 +5,7 @@ use crate::Mode;
 use crate::error::LexicalError;
 use crate::lexer::{Lexer, LexerCheckpoint};
 use crate::string::InterpolatedStringKind;
+use crate::token::TokenValue;
 
 /// Token source for the parser that skips over any trivia tokens.
 #[derive(Debug)]
@@ -20,7 +21,7 @@ pub(crate) struct TokenSource<'src> {
 
 impl<'src> TokenSource<'src> {
     /// Create a new token source for the given lexer.
-    fn new(lexer: Lexer<'src>, source: &str, start_offset: TextSize) -> Self {
+    pub(crate) fn new(lexer: Lexer<'src>, source: &str, start_offset: TextSize) -> Self {
         TokenSource {
             lexer,
             tokens: allocate_tokens_vec(&source[start_offset.to_usize()..]),
@@ -38,24 +39,32 @@ impl<'src> TokenSource<'src> {
     }
 
     /// Returns the kind of the current token.
-    pub(crate) const fn current_kind(&self) -> TokenKind {
+    pub(crate) fn current_kind(&self) -> TokenKind {
         self.lexer.current_kind()
     }
 
     /// Returns the range of the current token.
-    pub(crate) const fn current_range(&self) -> TextRange {
+    pub(crate) fn current_range(&self) -> TextRange {
         self.lexer.current_range()
     }
 
     /// Returns the current parenthesis, bracket, and brace nesting level.
     #[inline]
-    pub(crate) const fn nesting(&self) -> u32 {
+    pub(crate) fn nesting(&self) -> u32 {
         self.lexer.nesting()
     }
 
     /// Returns the flags for the current token.
-    pub(crate) const fn current_flags(&self) -> TokenFlags {
+    pub(crate) fn current_flags(&self) -> TokenFlags {
         self.lexer.current_flags()
+    }
+
+    /// Calls the underlying [`take_value`] method on the lexer. Refer to its documentation
+    /// for more info.
+    ///
+    /// [`take_value`]: Lexer::take_value
+    pub(crate) fn take_value(&mut self) -> TokenValue {
+        self.lexer.take_value()
     }
 
     /// Calls the underlying [`re_lex_logical_token`] method on the lexer with the new lexer

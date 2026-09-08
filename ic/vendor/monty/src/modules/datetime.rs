@@ -3,7 +3,6 @@
 //! This module exposes a minimal phase-1 surface:
 //! - `date`
 //! - `datetime`
-//! - `time`
 //! - `timedelta`
 //! - `timezone`
 //!
@@ -15,16 +14,19 @@ use crate::{
     bytecode::VM,
     heap::{HeapData, HeapId},
     intern::StaticStrings,
+    resource::{ResourceError, ResourceTracker},
     types::{Module, Type},
     value::Value,
 };
 
 /// Creates the `datetime` module and allocates it on the heap.
 ///
+/// Returns a `HeapId` pointing to the newly allocated module.
+///
 /// # Panics
 ///
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_>) -> HeapId {
+pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
     let mut module = Module::new(StaticStrings::Datetime);
 
     module.set_attr(StaticStrings::Date, Value::Builtin(Builtins::Type(Type::Date)), vm);
@@ -33,7 +35,6 @@ pub fn create_module(vm: &mut VM<'_>) -> HeapId {
         Value::Builtin(Builtins::Type(Type::DateTime)),
         vm,
     );
-    module.set_attr(StaticStrings::Time, Value::Builtin(Builtins::Type(Type::Time)), vm);
     module.set_attr(
         StaticStrings::Timedelta,
         Value::Builtin(Builtins::Type(Type::TimeDelta)),
@@ -45,5 +46,5 @@ pub fn create_module(vm: &mut VM<'_>) -> HeapId {
         vm,
     );
 
-    vm.heap.allocate(HeapData::Module(Box::new(module)))
+    vm.heap.allocate(HeapData::Module(module))
 }

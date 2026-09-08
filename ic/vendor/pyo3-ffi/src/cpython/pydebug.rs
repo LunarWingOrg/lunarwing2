@@ -1,7 +1,8 @@
-use core::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int};
 
 #[cfg(not(Py_LIMITED_API))]
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[deprecated(note = "Python 3.12")]
     #[cfg_attr(PyPy, link_name = "PyPy_DebugFlag")]
     pub static mut Py_DebugFlag: c_int;
@@ -54,7 +55,7 @@ extern_libpython! {
     pub static mut Py_LegacyWindowsStdioFlag: c_int;
 }
 
-extern_libpython! {
+extern "C" {
     #[cfg(Py_3_11)]
     pub fn Py_GETENV(name: *const c_char) -> *mut c_char;
 }
@@ -64,7 +65,7 @@ extern_libpython! {
 pub unsafe fn Py_GETENV(name: *const c_char) -> *mut c_char {
     #[allow(deprecated)]
     if Py_IgnoreEnvironmentFlag != 0 {
-        core::ptr::null_mut()
+        std::ptr::null_mut()
     } else {
         libc::getenv(name)
     }

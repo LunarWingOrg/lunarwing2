@@ -6,8 +6,8 @@
 use core::{mem, num, ptr};
 
 use super::traits::IntoRepr;
-use super::{InlineBuffer, Repr, LENGTH_MASK, MAX_SIZE};
-use crate::ToCompactStringError;
+use super::Repr;
+use crate::{ToCompactStringError, UnwrapWithMsg};
 
 const DEC_DIGITS_LUT: &[u8] = b"\
       0001020304050607080910111213141516171819\
@@ -21,24 +21,11 @@ macro_rules! impl_IntoRepr {
     ($t:ident, $conv_ty:ident) => {
         impl IntoRepr for $t {
             fn into_repr(self) -> Result<Repr, ToCompactStringError> {
-                // The formatted value is at most 20 characters (`i64::MIN`). On 64-bit that always
-                // fits inline, so we can write straight into an `InlineBuffer` and skip the
-                // discriminant dispatch of `with_capacity`/`as_mut_ptr`/`set_len`. The only case
-                // that doesn't fit is `u64`/`i64` on a 32-bit target (`MAX_SIZE` is 12 there); we
-                // hand those off to `itoa` like the 128-bit types.
+                // Determine the number of digits in this value
                 //
-                // `MAX_LEN` is an upper bound on the formatted length including the sign; it's `<
-                // MAX_SIZE` (not `<=`) so the length still fits in the last byte.
-                const MAX_LEN: usize = <$t>::MAX.ilog10() as usize + 2;
-
-                if MAX_LEN >= MAX_SIZE {
-                    let mut itoa_buf = itoa::Buffer::new();
-                    return Ok(Repr::new(itoa_buf.format(self))?);
-                }
-
-                // Number of characters to write, including a leading `-` for negatives.
+                // Note: this considers the `-` symbol
                 let num_digits = NumChars::num_chars(self);
-                let mut buffer = [0u8; MAX_SIZE];
+                let mut repr = Repr::with_capacity(num_digits).unwrap_with_msg();
 
                 #[allow(unused_comparisons)]
                 let is_nonnegative = self >= 0;
@@ -50,7 +37,11 @@ macro_rules! impl_IntoRepr {
                 };
                 let mut curr = num_digits as isize;
 
-                let buf_ptr = buffer.as_mut_ptr();
+                // our string will end up being num_digits long
+                unsafe { repr.set_len(num_digits) };
+                // get mutable pointer to our buffer
+                let buf_ptr = unsafe { repr.as_mut_buf().as_mut_ptr() };
+
                 let lut_ptr = DEC_DIGITS_LUT.as_ptr();
 
                 unsafe {
@@ -103,13 +94,7 @@ macro_rules! impl_IntoRepr {
                 // we should have moved all the way down our buffer
                 debug_assert_eq!(curr, 0);
 
-                // `num_digits < MAX_SIZE`, so the length lives in the last byte, distinct from the
-                // digits.
-                buffer[MAX_SIZE - 1] = num_digits as u8 | LENGTH_MASK;
-
-                // SAFETY: the leading `num_digits` bytes are ASCII digits (with an optional `-`),
-                // and the last byte is a valid inline length marker.
-                Ok(Repr::from_inline(InlineBuffer(buffer)))
+                Ok(repr)
             }
         }
     };
@@ -181,7 +166,7 @@ impl_NonZero_IntoRepr!(num::NonZeroI128);
 /// All of these `num_chars(...)` methods are kind of crazy, but they are necessary.
 ///
 /// An alternate way to calculate the number of digits in a value is to do:
-/// ```no_run
+/// ```
 /// let val = 42;
 /// let num_digits = ((val as f32).log10().floor()) as usize + 1;
 /// assert_eq!(num_digits, 2);
@@ -192,7 +177,7 @@ impl_NonZero_IntoRepr!(num::NonZeroI128);
 ///
 /// For example, consider this relatively large value...
 ///
-/// ```no_run
+/// ```
 /// let val = 9999995;
 /// let num_digits = ((val as f32).log10().floor()) as usize + 1;
 ///
@@ -202,7 +187,7 @@ impl_NonZero_IntoRepr!(num::NonZeroI128);
 ///
 /// you can use `f64` to get better precision, e.g.
 ///
-/// ```no_run
+/// ```
 /// let val = 9999995;
 /// let num_digits = ((val as f64).log10().floor()) as usize + 1;
 ///
@@ -212,7 +197,7 @@ impl_NonZero_IntoRepr!(num::NonZeroI128);
 ///
 /// ...but still not precise enough!
 ///
-/// ```no_run
+/// ```
 /// let val: u64 = 9999999999999999999;
 /// let num_digits = ((val as f64).log10().floor()) as usize + 1;
 ///
@@ -328,20 +313,74 @@ impl NumChars for i32 {
 impl NumChars for u64 {
     #[inline(always)]
     fn num_chars(val: u64) -> usize {
-        // `checked_ilog10` is `None` only for `0`, which has one digit. Cheaper than a 20-arm
-        // match for 64-bit values, and exact (unlike `f64::log10`).
-        val.checked_ilog10().map_or(1, |log| log as usize + 1)
+        match val {
+            u64::MIN..=9 => 1,
+            10..=99 => 2,
+            100..=999 => 3,
+            1000..=9999 => 4,
+            10000..=99999 => 5,
+            100000..=999999 => 6,
+            1000000..=9999999 => 7,
+            10000000..=99999999 => 8,
+            100000000..=999999999 => 9,
+            1000000000..=9999999999 => 10,
+            10000000000..=99999999999 => 11,
+            100000000000..=999999999999 => 12,
+            1000000000000..=9999999999999 => 13,
+            10000000000000..=99999999999999 => 14,
+            100000000000000..=999999999999999 => 15,
+            1000000000000000..=9999999999999999 => 16,
+            10000000000000000..=99999999999999999 => 17,
+            100000000000000000..=999999999999999999 => 18,
+            1000000000000000000..=9999999999999999999 => 19,
+            10000000000000000000..=u64::MAX => 20,
+        }
     }
 }
 
 impl NumChars for i64 {
     #[inline(always)]
     fn num_chars(val: i64) -> usize {
-        // Digits of the magnitude plus one for the sign. `unsigned_abs` avoids `-i64::MIN`.
-        val.unsigned_abs()
-            .checked_ilog10()
-            .map_or(1, |log| log as usize + 1)
-            + (val < 0) as usize
+        match val {
+            i64::MIN..=-1000000000000000000 => 20,
+            -999999999999999999..=-100000000000000000 => 19,
+            -99999999999999999..=-10000000000000000 => 18,
+            -9999999999999999..=-1000000000000000 => 17,
+            -999999999999999..=-100000000000000 => 16,
+            -99999999999999..=-10000000000000 => 15,
+            -9999999999999..=-1000000000000 => 14,
+            -999999999999..=-100000000000 => 13,
+            -99999999999..=-10000000000 => 12,
+            -9999999999..=-1000000000 => 11,
+            -999999999..=-100000000 => 10,
+            -99999999..=-10000000 => 9,
+            -9999999..=-1000000 => 8,
+            -999999..=-100000 => 7,
+            -99999..=-10000 => 6,
+            -9999..=-1000 => 5,
+            -999..=-100 => 4,
+            -99..=-10 => 3,
+            -9..=-1 => 2,
+            0..=9 => 1,
+            10..=99 => 2,
+            100..=999 => 3,
+            1000..=9999 => 4,
+            10000..=99999 => 5,
+            100000..=999999 => 6,
+            1000000..=9999999 => 7,
+            10000000..=99999999 => 8,
+            100000000..=999999999 => 9,
+            1000000000..=9999999999 => 10,
+            10000000000..=99999999999 => 11,
+            100000000000..=999999999999 => 12,
+            1000000000000..=9999999999999 => 13,
+            10000000000000..=99999999999999 => 14,
+            100000000000000..=999999999999999 => 15,
+            1000000000000000..=9999999999999999 => 16,
+            10000000000000000..=99999999999999999 => 17,
+            100000000000000000..=999999999999999999 => 18,
+            1000000000000000000..=i64::MAX => 19,
+        }
     }
 }
 
@@ -381,7 +420,7 @@ mod tests {
 
     #[test]
     fn test_from_u8_sanity() {
-        let vals = [u8::MIN, 1, 0, 42, u8::MAX - 1, u8::MAX];
+        let vals = [u8::MIN, u8::MIN + 1, 0, 42, u8::MAX - 1, u8::MAX];
 
         for x in &vals {
             let repr = u8::into_repr(*x).unwrap();
@@ -401,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_from_u16_sanity() {
-        let vals = [u16::MIN, 1, 0, 42, u16::MAX - 1, u16::MAX];
+        let vals = [u16::MIN, u16::MIN + 1, 0, 42, u16::MAX - 1, u16::MAX];
 
         for x in &vals {
             let repr = u16::into_repr(*x).unwrap();
@@ -421,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_from_u32_sanity() {
-        let vals = [u32::MIN, 1, 0, 42, u32::MAX - 1, u32::MAX];
+        let vals = [u32::MIN, u32::MIN + 1, 0, 42, u32::MAX - 1, u32::MAX];
 
         for x in &vals {
             let repr = u32::into_repr(*x).unwrap();
@@ -441,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_from_u64_sanity() {
-        let vals = [u64::MIN, 1, 0, 42, u64::MAX - 1, u64::MAX];
+        let vals = [u64::MIN, u64::MIN + 1, 0, 42, u64::MAX - 1, u64::MAX];
 
         for x in &vals {
             let repr = u64::into_repr(*x).unwrap();
@@ -461,7 +500,14 @@ mod tests {
 
     #[test]
     fn test_from_usize_sanity() {
-        let vals = [usize::MIN, 1, 0, 42, usize::MAX - 1, usize::MAX];
+        let vals = [
+            usize::MIN,
+            usize::MIN + 1,
+            0,
+            42,
+            usize::MAX - 1,
+            usize::MAX,
+        ];
 
         for x in &vals {
             let repr = usize::into_repr(*x).unwrap();
@@ -488,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_from_u128_sanity() {
-        let vals = [u128::MIN, 1, 0, 42, u128::MAX - 1, u128::MAX];
+        let vals = [u128::MIN, u128::MIN + 1, 0, 42, u128::MAX - 1, u128::MAX];
 
         for x in &vals {
             let repr = u128::into_repr(*x).unwrap();

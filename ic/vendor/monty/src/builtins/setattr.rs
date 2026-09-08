@@ -1,12 +1,13 @@
 //! Implementation of the setattr() builtin function.
 
-use monty_types::ExcType;
-
 use crate::{
+    ExcType,
     args::ArgValues,
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcTypeExt, RunResult, SimpleException},
+    exception_private::{RunResult, SimpleException},
+    resource::ResourceTracker,
+    types::PyTrait,
     value::Value,
 };
 
@@ -20,7 +21,7 @@ use crate::{
 /// setattr(obj, 'x', 42)      # Set obj.x = 42
 /// setattr(obj, 'name', 'foo') # Set obj.name = 'foo'
 /// ```
-pub fn builtin_setattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_setattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("setattr", vm.heap)?;
     defer_drop!(positional, vm);
 
@@ -29,10 +30,10 @@ pub fn builtin_setattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
         other => return Err(ExcType::type_error_arg_count("setattr", 3, other.len())),
     };
 
-    let Some(name) = name.as_either_str(vm.heap).map(|s| s.resolve_interned(vm.interns)) else {
+    let Some(name) = name.as_either_str(vm.heap) else {
         return Err(SimpleException::new_msg(
             ExcType::TypeError,
-            format!("attribute name must be string, not '{}'", name.py_type_name(vm)),
+            format!("attribute name must be string, not '{}'", name.py_type(vm)),
         )
         .into());
     };

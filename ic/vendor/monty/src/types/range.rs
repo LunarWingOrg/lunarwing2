@@ -7,18 +7,21 @@ use std::{
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
+    mem,
 };
 
+use ahash::AHashSet;
 use num_integer::div_ceil;
 
 use crate::{
     args::ArgValues,
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, ExcTypeExt, RunResult},
+    exception_private::{ExcType, RunResult},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
-    types::{LazyHeapSet, PyTrait, Type},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
+    resource::{ResourceError, ResourceTracker},
+    types::{PyTrait, Type},
     value::Value,
 };
 
@@ -115,7 +118,7 @@ impl Range {
     /// - `range(stop)` - range from 0 to stop
     /// - `range(start, stop)` - range from start to stop
     /// - `range(start, stop, step)` - range with custom step
-    pub fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    pub fn init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         let pos_args = args.into_pos_only("range", vm.heap)?;
         defer_drop!(pos_args, vm);
 
@@ -142,14 +145,14 @@ impl Range {
             _ => return Err(ExcType::type_error_at_most("range", 3, pos_args.len())),
         };
 
-        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::Range(range))?))
     }
 
     /// Handles slice-based indexing for ranges.
     ///
     /// Returns a new range object representing the sliced view.
     /// The new range has computed start, stop, and step values.
-    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap) -> RunResult<Value> {
+    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         let range_len = self.len();
         let (start, stop, step) = slice.indices(range_len)?;
 
@@ -175,7 +178,7 @@ impl Range {
         let new_stop = i64::try_from(new_stop_i128).map_err(|_| ExcType::overflow_c_ssize_t())?;
 
         let new_range = Self::new(new_start, new_stop, new_step);
-        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))))
+        Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))?))
     }
 }
 
@@ -185,50 +188,16 @@ impl Default for Range {
     }
 }
 
-impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
-    fn py_is_iterable(&self, _vm: &VM<'h>) -> bool {
-        true
-    }
-
-    /// O(1) containment: bounds plus step alignment, no iteration. Non-integral
-    /// items can never be members, matching CPython's fast path.
-    fn py_contains_impl(&self, item: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let range = self.get(vm.heap);
-        let n = match item {
-            Value::Int(i) => *i,
-            Value::Bool(b) => i64::from(*b),
-            Value::Float(f) => {
-                if f.fract() != 0.0 {
-                    return Ok(Some(false));
-                }
-                let int_val = f.trunc();
-                // Exclusive upper bound: `i64::MAX as f64` rounds up to 2^63, which
-                // `int_val as i64` would saturate back down to `i64::MAX`.
-                if int_val < i64::MIN as f64 || int_val >= i64::MAX as f64 {
-                    return Ok(Some(false));
-                }
-                #[expect(clippy::cast_possible_truncation)]
-                let n = int_val as i64;
-                n
-            }
-            _ => return Ok(Some(false)),
-        };
-        Ok(Some(range.contains(n)))
-    }
-
-    fn py_type(&self, _vm: &VM<'h>) -> Type {
+impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
+    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::Range
     }
 
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(RangeIterator::allocate(*self.get(vm.heap), vm))
-    }
-
-    fn py_len(&self, vm: &VM<'h>) -> Option<usize> {
+    fn py_len(&self, vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
         Some(self.get(vm.heap).len())
     }
 
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'h>) -> RunResult<Value> {
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(id) = key
             && let HeapData::Slice(slice) = vm.heap.get(*id)
@@ -265,54 +234,39 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
         Ok(Value::Int(offset_i64))
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::Range(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
         let a = self.get(vm.heap);
         let b = other.get(vm.heap);
         // Compare ranges by their actual sequences, not parameters.
         // Two ranges are equal if they produce the same elements.
         let len1 = a.len();
         let len2 = b.len();
-        Ok(Some(if len1 != len2 {
-            false
-        } else if len1 == 0 {
-            true // Both empty
-        } else if len1 == 1 {
-            // Single-element ranges are equal when their one element matches,
-            // regardless of step (e.g. range(0, 1, 1) == range(0, 2, 2)).
-            a.start == b.start
-        } else {
-            // Same length (>1) - compare first element and step.
-            a.start == b.start && a.step == b.step
-        }))
+        if len1 != len2 {
+            return Ok(false);
+        }
+        // Same length - compare first element and step (if non-empty)
+        if len1 == 0 {
+            return Ok(true); // Both empty
+        }
+        Ok(a.start == b.start && a.step == b.step)
     }
 
-    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
-        // Ranges are equal by the sequence they produce, so the hash must depend
-        // only on what equality compares: length, then start (if non-empty), then
-        // step (only if length > 1). Hashing the raw `start`/`stop`/`step` fields
-        // would break `hash(a) == hash(b)` for equal ranges like `range(0, 1, 1)`
-        // and `range(0, 2, 2)`.
-        let r = self.get(vm.heap);
-        let len = r.len();
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
-        len.hash(&mut hasher);
-        if len > 0 {
-            r.start.hash(&mut hasher);
-            if len > 1 {
-                r.step.hash(&mut hasher);
-            }
-        }
+        self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_bool(&self, vm: &mut VM<'h>) -> RunResult<bool> {
-        Ok(!self.get(vm.heap).is_empty())
+    fn py_bool(&self, vm: &mut VM<'h, impl ResourceTracker>) -> bool {
+        !self.get(vm.heap).is_empty()
     }
 
-    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
+    fn py_repr_fmt(
+        &self,
+        f: &mut impl Write,
+        vm: &mut VM<'h, impl ResourceTracker>,
+        _heap_ids: &mut AHashSet<HeapId>,
+    ) -> RunResult<()> {
         let this = self.get(vm.heap);
         if this.step == 1 {
             Ok(write!(f, "range({}, {})", this.start, this.stop)?)
@@ -323,71 +277,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Range> {
 }
 
 impl HeapItem for Range {
+    fn py_estimate_size(&self) -> usize {
+        mem::size_of::<Self>()
+    }
+
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // Range doesn't contain heap references, nothing to do
-    }
-}
-
-/// Iterator over the arithmetic progression represented by a range.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RangeIterator {
-    next: i64,
-    step: i64,
-    remaining: usize,
-}
-
-impl RangeIterator {
-    /// Allocates independent iteration state copied from `range`.
-    fn allocate(range: Range, vm: &mut VM<'_>) -> Value {
-        Value::Ref(vm.heap.allocate(HeapData::RangeIterator(Self {
-            next: range.start,
-            step: range.step,
-            remaining: range.len(),
-        })))
-    }
-
-    /// Returns the exact number of values not yet yielded.
-    pub(crate) fn size_hint(&self) -> usize {
-        self.remaining
-    }
-}
-
-impl HeapItem for RangeIterator {
-    fn py_dec_ref_ids(&mut self, _: &mut Vec<HeapId>) {}
-}
-
-impl<'h> PyTrait<'h> for HeapObjectRead<'h, RangeIterator> {
-    fn py_is_iterable(&self, _: &VM<'h>) -> bool {
-        true
-    }
-
-    fn py_type(&self, _: &VM<'h>) -> Type {
-        Type::RangeIterator
-    }
-
-    fn py_len(&self, _: &VM<'h>) -> Option<usize> {
-        None
-    }
-
-    fn py_eq_impl(&self, _: &Value, _: &mut VM<'h>) -> RunResult<Option<bool>> {
-        Ok(None)
-    }
-
-    fn py_iter(&self, vm: &mut VM<'h>) -> RunResult<Value> {
-        Ok(self.clone_value(vm.heap))
-    }
-
-    fn py_next(&mut self, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        let iter = self.get_mut(vm.heap);
-        if iter.remaining == 0 {
-            Ok(None)
-        } else {
-            let value = iter.next;
-            iter.remaining -= 1;
-            if iter.remaining > 0 {
-                iter.next += iter.step;
-            }
-            Ok(Some(Value::Int(value)))
-        }
     }
 }

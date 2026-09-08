@@ -7,7 +7,7 @@ def direct_return():
 
 
 result = direct_return()
-assert result == 30
+assert result == 30, 'ext call as direct return value'
 
 
 def return_with_expression():
@@ -15,7 +15,7 @@ def return_with_expression():
 
 
 result = return_with_expression()
-assert result == 10
+assert result == 10, 'ext call expression as return value'
 
 
 def conditional_return():
@@ -25,4 +25,4 @@ def conditional_return():
 
 
 result = conditional_return()
-assert result == 300
+assert result == 300, 'ext call in conditional return'

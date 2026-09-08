@@ -1,45 +1,47 @@
 # call-external
 # === Basic dataclass tests ===
 
-# Get dataclass instance from external function
+# Get immutable dataclass from external function
 point = make_point()
 
 # === repr and str ===
 assert repr(point) == 'Point(x=1, y=2)', f'point repr {point=!r}'
-assert str(point) == 'Point(x=1, y=2)'
+assert str(point) == 'Point(x=1, y=2)', 'point str'
 
 # === Boolean truthiness ===
 # Dataclasses are always truthy (like Python class instances)
-assert bool(point)
+assert bool(point), 'dataclass bool is True'
 
-# === Host instances are unhashable ===
-# A dataclass with eq (the default) and no frozen=True defines __eq__ without
-# __hash__, so instances are unhashable — in CPython and in the sandbox.
+# === Hash for immutable dataclass ===
+# Immutable (frozen) dataclasses are hashable
+h1 = hash(point)
+assert h1 != 0, 'hash is not zero'
+
+# Hash is consistent - same object hashes to same value
+h2 = hash(point)
+assert h1 == h2, 'hash is consistent'
+
+# Equal frozen dataclasses hash to same value
 point2 = make_point()
-try:
-    hash(point)
-    assert False, 'expected TypeError from hash()'
-except TypeError as e:
-    assert str(e) == "unhashable type: 'Point'"
+assert hash(point) == hash(point2), 'equal dataclasses have equal hash'
 
+# Frozen dataclass can be used as dict key
+d = {point: 'first'}
+assert d[point] == 'first', 'frozen dataclass as dict key'
+assert d[point2] == 'first', 'equal frozen dataclass looks up same value'
+
+# Frozen dataclass can be added to set
+s = {point, point2}
+assert len(s) == 1, 'equal frozen dataclasses deduplicated in set'
+
+# Different field values produce different hash
 alice = make_user('Alice')
 bob = make_user('Bob')
-
-# === Equality ===
-assert point == point2
-assert alice != bob
-assert point != alice
-# A dataclass is never equal to a non-dataclass, even with matching fields
-assert point != (1, 2)
-assert point != {'x': 1, 'y': 2}
+assert hash(alice) != hash(bob), 'different field values have different hash'
 
 # === Mutable dataclass ===
 mut_point = make_mutable_point()
 assert repr(mut_point) == 'MutablePoint(x=1, y=2)', f'mutable point repr {mut_point=!r}'
-# Distinct classes are not equal even with identical field names and values
-# (Point and MutablePoint are both (x=1, y=2)).
-assert point != mut_point
-assert mut_point != point
 
 # === Dataclass with string argument ===
 alice = make_user('Alice')
@@ -47,107 +49,105 @@ assert repr(alice) == "User(name='Alice', active=True)", f'user repr with string
 
 # === Dataclass in list (using existing variables) ===
 points = [point, mut_point, alice]
-assert len(points) == 3
+assert len(points) == 3, 'dataclass list length'
 
 # === Attribute access (get) ===
 # Access fields on immutable dataclass
-assert point.x == 1
-assert point.y == 2
+assert point.x == 1, 'point.x is 1'
+assert point.y == 2, 'point.y is 2'
 
 # Access fields on mutable dataclass
-assert mut_point.x == 1
-assert mut_point.y == 2
+assert mut_point.x == 1, 'mut_point.x is 1'
+assert mut_point.y == 2, 'mut_point.y is 2'
 
 # Access fields on dataclass with string field
-assert alice.name == 'Alice'
-assert alice.active == True
+assert alice.name == 'Alice', 'alice.name is Alice'
+assert alice.active == True, 'alice.active is True'
 
 # === Attribute assignment (set) ===
 # Modify mutable dataclass
 mut_point.x = 10
-assert mut_point.x == 10
+assert mut_point.x == 10, 'mut_point.x updated to 10'
 mut_point.y = 20
-assert mut_point.y == 20
+assert mut_point.y == 20, 'mut_point.y updated to 20'
 assert repr(mut_point) == 'MutablePoint(x=10, y=20)', f'repr after attribute update {mut_point=!r}'
 
 # === set other attributes
-# NOTE: repr is deliberately not asserted here — Monty shows all eager attrs
-# (including z), CPython's dataclass repr shows declared fields only
-# (see limitations/classes.md).
 mut_point.z = 30
-assert mut_point.z == 30
+assert mut_point.z == 30, 'mut_point.z updated to 30'
+assert repr(mut_point) == 'MutablePoint(x=10, y=20)', 'repr after attribute update'
 
 # === Augmented attribute assignment (+=, -=, etc.) ===
 aug_point = make_mutable_point()
 aug_point.x += 5
-assert aug_point.x == 6
+assert aug_point.x == 6, 'augmented attr assign +='
 aug_point.y -= 1
-assert aug_point.y == 1
+assert aug_point.y == 1, 'augmented attr assign -='
 aug_point.x *= 3
-assert aug_point.x == 18
+assert aug_point.x == 18, 'augmented attr assign *='
 
 # === Chained augmented attribute assignment ===
 outer_aug = make_mutable_point()
 inner_aug = make_mutable_point()
 outer_aug.x = inner_aug
 outer_aug.x.y += 100
-assert inner_aug.y == 102
+assert inner_aug.y == 102, 'chained augmented attr assign'
 
 # === Chained attribute assignment (a.x = b.x = value) ===
 ca = make_mutable_point()
 cb = make_mutable_point()
 ca.x = cb.x = 77
-assert ca.x == 77
-assert cb.x == 77
+assert ca.x == 77, 'chained attr assign ca.x'
+assert cb.x == 77, 'chained attr assign cb.x'
 
 # === Chained mixed attribute/name/subscript assignment ===
 # Attribute in the *middle* of a chain, between a name and a subscript target.
 holder = [0]
 cm = make_mutable_point()
 val = cm.y = holder[0] = 321
-assert val == 321
-assert cm.y == 321
-assert holder[0] == 321
+assert val == 321, 'chain name gets value'
+assert cm.y == 321, 'chain attribute gets value'
+assert holder[0] == 321, 'chain subscript gets value'
 
 # === Attribute as the *last* target of a chain ===
 attr_last_name_box = [0]
 attr_last_obj = make_mutable_point()
 attr_last_name = attr_last_name_box[0] = attr_last_obj.y = 555
-assert attr_last_name == 555
-assert attr_last_name_box[0] == 555
-assert attr_last_obj.y == 555
+assert attr_last_name == 555, 'attr last: name'
+assert attr_last_name_box[0] == 555, 'attr last: subscript'
+assert attr_last_obj.y == 555, 'attr last: attribute'
 
 # === Attribute as the *first* (non-last) target of a chain ===
 attr_first_obj = make_mutable_point()
 attr_first_obj.x = attr_first_name = 556
-assert attr_first_obj.x == 556
-assert attr_first_name == 556
+assert attr_first_obj.x == 556, 'attr first: attribute'
+assert attr_first_name == 556, 'attr first: name'
 
 # === Three attribute targets in one chain ===
 pa = make_mutable_point()
 pb = make_mutable_point()
 pc = make_mutable_point()
 pa.x = pb.x = pc.x = 999
-assert pa.x == 999
-assert pb.x == 999
-assert pc.x == 999
+assert pa.x == 999, 'three-attr chain: pa'
+assert pb.x == 999, 'three-attr chain: pb'
+assert pc.x == 999, 'three-attr chain: pc'
 
 # === Nested attribute target as part of a chain ===
 nest_outer = make_mutable_point()
 nest_inner = make_mutable_point()
 nest_outer.x = nest_inner
 nested_chain_name = nest_outer.x.y = 444
-assert nested_chain_name == 444
-assert nest_inner.y == 444
-assert nest_outer.x.y == 444
+assert nested_chain_name == 444, 'nested attr chain: name'
+assert nest_inner.y == 444, 'nested attr chain: inner.y'
+assert nest_outer.x.y == 444, 'nested attr chain: outer.x.y'
 
 # === Chain with attribute + tuple unpack into attribute values ===
 # Each chain step must see the same RHS value.
 unpack_dst = make_mutable_point()
 (ua1, ua2) = unpack_dst.x = unpack_chain_name = (13, 14)
 assert ua1 == 13 and ua2 == 14, 'attr-unpack chain: unpack'
-assert unpack_dst.x == (13, 14)
-assert unpack_chain_name == (13, 14)
+assert unpack_dst.x == (13, 14), 'attr-unpack chain: attribute'
+assert unpack_chain_name == (13, 14), 'attr-unpack chain: name'
 
 # === Nested attribute access (chained get) ===
 # Create outer dataclass with inner dataclass as field
@@ -158,19 +158,19 @@ inner.y = 200
 outer.x = inner
 
 # Chained attribute get: outer.x.y
-assert outer.x.x == 100
-assert outer.x.y == 200
+assert outer.x.x == 100, 'outer.x.x is 100'
+assert outer.x.y == 200, 'outer.x.y is 200'
 
 # === Nested attribute assignment (chained set) ===
 # Modify nested field via chained access
 outer.x.x = 999
-assert outer.x.x == 999
+assert outer.x.x == 999, 'outer.x.x updated to 999'
 outer.x.y = 888
-assert outer.x.y == 888
+assert outer.x.y == 888, 'outer.x.y updated to 888'
 
 # Verify inner was modified (same object)
-assert inner.x == 999
-assert inner.y == 888
+assert inner.x == 999, 'inner.x also updated to 999'
+assert inner.y == 888, 'inner.y also updated to 888'
 
 # === Deeper nesting (3 levels) ===
 level1 = make_mutable_point()
@@ -181,24 +181,27 @@ level2.x = level3
 level1.x = level2
 
 # 3-level chained get
-assert level1.x.x.x == 42
+assert level1.x.x.x == 42, 'level1.x.x.x is 42'
 
 # 3-level chained set
 level1.x.x.x = 7
-assert level1.x.x.x == 7
-assert level3.x == 7
+assert level1.x.x.x == 7, 'level1.x.x.x updated to 7'
+assert level3.x == 7, 'level3.x also updated to 7'
 
 # === Empty dataclass ===
 empty = make_empty()
-assert repr(empty) == 'Empty()'
-assert str(empty) == 'Empty()'
+assert repr(empty) == 'Empty()', 'empty dataclass repr'
+assert str(empty) == 'Empty()', 'empty dataclass str'
 
-# === setattr mutates the sandbox copy only ===
-copy_point = make_point()
-copy_point.x = 10
-assert copy_point.x == 10
-# a fresh instance from the host is unaffected
-assert make_point().x == 1
+# === FrozenInstanceError is subclass of AttributeError ===
+# Catching AttributeError should also catch FrozenInstanceError
+frozen_point = make_point()
+caught = False
+try:
+    frozen_point.x = 10
+except AttributeError:
+    caught = True
+assert caught, 'FrozenInstanceError caught by AttributeError'
 
 # === Error: accessing non-existent attribute ===
 try:
@@ -305,117 +308,3 @@ try:
     assert False, 'should have raised AttributeError for missing method on User'
 except AttributeError as e:
     assert str(e) == "'User' object has no attribute 'missing'", f'wrong message: {e}'
-
-# === type() of host class instances names the real class ===
-# NOTE: repr(type(x)) is deliberately not asserted — CPython qualifies it with
-# the defining module ("<class 'test_fixtures.Point'>"), Monty shows the bare
-# class name (see limitations/classes.md).
-type_pt = make_point()
-type_pt2 = make_point()
-type_mut = make_mutable_point()
-assert type(type_pt).__name__ == 'Point'
-assert type(type_pt) == type(type_pt2)
-assert type(type_pt) != type(type_mut)
-# equal type objects collide in sets (hash consistent with eq)
-assert len({type(type_pt), type(type_pt2)}) == 1
-assert len({type(type_pt), type(type_mut)}) == 2
-
-# === Error messages name the real class, not a placeholder ===
-try:
-    hash(type_mut)
-    assert False, 'should have raised TypeError for unhashable mutable instance'
-except TypeError as e:
-    assert str(e) == "unhashable type: 'MutablePoint'", f'wrong message: {e}'
-
-# === Lazy attribute lookups (class attributes served by the host) ===
-# `dimensions` is a class attribute, not a field: CPython resolves it via
-# class lookup, Monty suspends a NameLookup routed by instance_id.
-assert point.dimensions == 2
-assert mut_point.dimensions == 2
-# repeated access re-consults the host (no caching) and stays consistent
-assert point.dimensions == 2
-# lazy attrs are not part of repr or equality
-assert repr(point) == 'Point(x=1, y=2)'
-# a locally mutated instance still allows lazy attribute reads
-assert copy_point.dimensions == 2
-
-# === Lazy lookup answered Undefined raises AttributeError ===
-try:
-    alice2.dimensions
-    assert False, 'should have raised AttributeError for lazy attr on User'
-except AttributeError as e:
-    assert str(e) == "'User' object has no attribute 'dimensions'", f'wrong message: {e}'
-
-# === getattr()/hasattr() consult the host like obj.attr ===
-assert hasattr(point, 'dimensions') is True
-assert getattr(point, 'dimensions') == 2
-assert getattr(point, 'dimensions', 99) == 2
-assert hasattr(alice2, 'dimensions') is False
-assert getattr(alice2, 'dimensions', 99) == 99
-try:
-    getattr(alice2, 'dimensions')
-    assert False, 'should have raised AttributeError for getattr of a lazy attr on User'
-except AttributeError as e:
-    assert str(e) == "'User' object has no attribute 'dimensions'", f'wrong message: {e}'
-
-# === Default protocol errors name the real class, not 'HostClass' ===
-proto_point = make_mutable_point()
-try:
-    proto_point[0]
-    assert False, 'expected subscript to fail'
-except TypeError as e:
-    assert str(e) == "'MutablePoint' object is not subscriptable"
-try:
-    proto_point[0] = 1
-    assert False, 'expected item assignment to fail'
-except TypeError as e:
-    assert str(e) == "'MutablePoint' object does not support item assignment"
-try:
-    for _ in proto_point:
-        pass
-    assert False, 'expected iteration to fail'
-except TypeError as e:
-    assert str(e) == "'MutablePoint' object is not iterable"
-try:
-    next(proto_point)
-    assert False, 'expected next() to fail'
-except TypeError as e:
-    assert str(e) == "'MutablePoint' object is not an iterator"
-try:
-    proto_point()
-    assert False, 'expected call to fail'
-except TypeError as e:
-    assert str(e) == "'MutablePoint' object is not callable"
-
-# === A callable set on the sandbox copy is called as-is ===
-proto_point.f = lambda: 42
-assert proto_point.f() == 42
-proto_point.g = lambda a, b=1: a + b
-assert proto_point.g(2) == 3
-assert proto_point.g(2, b=5) == 7
-try:
-    proto_point.x()
-    assert False, 'expected calling a data attribute to fail'
-except TypeError as e:
-    assert str(e) == "'int' object is not callable"
-
-# === Lazy attribute errors propagate ===
-# `MutablePoint.boom` is a property that raises KeyError on the host. Only
-# AttributeError means "absent": anything else is raised in the sandbox as-is,
-# so hasattr() does not swallow it and getattr() does not fall back to its
-# default — exactly as CPython treats a raising property.
-try:
-    mut_point.boom
-    assert False, 'expected KeyError from the boom property'
-except KeyError as e:
-    assert str(e) == "'boom'"
-try:
-    hasattr(mut_point, 'boom')
-    assert False, 'expected hasattr() to propagate KeyError'
-except KeyError as e:
-    assert str(e) == "'boom'"
-try:
-    getattr(mut_point, 'boom', 1)
-    assert False, 'expected getattr() with a default to propagate KeyError'
-except KeyError as e:
-    assert str(e) == "'boom'"

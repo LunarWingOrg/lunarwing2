@@ -1,9 +1,9 @@
 use crate::object::PyObject;
-use core::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int};
 
 pub const PY_STDIOTEXTMODE: &str = "b";
 
-extern_libpython! {
+extern "C" {
     pub fn PyFile_FromFd(
         arg1: c_int,
         arg2: *const c_char,
@@ -24,7 +24,8 @@ extern_libpython! {
     pub fn PyObject_AsFileDescriptor(arg1: *mut PyObject) -> c_int;
 }
 
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[deprecated(note = "Python 3.12")]
     pub static mut Py_FileSystemDefaultEncoding: *const c_char;
     #[deprecated(note = "Python 3.12")]

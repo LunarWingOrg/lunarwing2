@@ -65,3 +65,4 @@ Module(
   |
 1 | async def f(): yield from x
   |                ^^^^^^^^^^^^ Syntax Error: `yield from` statement in async function; use `async for` instead
+  |

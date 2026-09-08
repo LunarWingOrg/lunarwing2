@@ -6,14 +6,9 @@ use crate::py_result_ext::PyResultExt;
 use crate::types::bytes::PyBytesMethods;
 use crate::types::PyBytes;
 use crate::{ffi, Bound, Py, PyAny, PyResult, Python};
-#[cfg(RustPython)]
-use crate::{
-    sync::PyOnceLock,
-    types::{PyType, PyTypeMethods},
-};
-use alloc::borrow::Cow;
-use core::ffi::CStr;
-use core::{fmt, str};
+use std::borrow::Cow;
+use std::ffi::CStr;
+use std::{fmt, str};
 
 /// Represents raw data backing a Python `str`.
 ///
@@ -39,10 +34,10 @@ impl<'a> PyStringData<'a> {
         match self {
             Self::Ucs1(s) => s,
             Self::Ucs2(s) => unsafe {
-                core::slice::from_raw_parts(s.as_ptr().cast(), s.len() * self.value_width_bytes())
+                std::slice::from_raw_parts(s.as_ptr().cast(), s.len() * self.value_width_bytes())
             },
             Self::Ucs4(s) => unsafe {
-                core::slice::from_raw_parts(s.as_ptr().cast(), s.len() * self.value_width_bytes())
+                std::slice::from_raw_parts(s.as_ptr().cast(), s.len() * self.value_width_bytes())
             },
         }
     }
@@ -88,7 +83,7 @@ impl<'a> PyStringData<'a> {
                     .into())
                 }
             },
-            Self::Ucs4(data) => match data.iter().copied().map(char::from_u32).collect() {
+            Self::Ucs4(data) => match data.iter().map(|&c| std::char::from_u32(c)).collect() {
                 Some(s) => Ok(Cow::Owned(s)),
                 None => Err(PyUnicodeDecodeError::new(
                     py,
@@ -116,7 +111,7 @@ impl<'a> PyStringData<'a> {
             Self::Ucs2(data) => Cow::Owned(String::from_utf16_lossy(data)),
             Self::Ucs4(data) => Cow::Owned(
                 data.iter()
-                    .map(|&c| char::from_u32(c).unwrap_or('\u{FFFD}'))
+                    .map(|&c| std::char::from_u32(c).unwrap_or('\u{FFFD}'))
                     .collect(),
             ),
         }
@@ -157,20 +152,7 @@ impl<'a> PyStringData<'a> {
 #[repr(transparent)]
 pub struct PyString(PyAny);
 
-#[cfg(not(RustPython))]
 pyobject_native_type_core!(PyString, pyobject_native_static_type_object!(ffi::PyUnicode_Type), "builtins", "str", #checkfunction=ffi::PyUnicode_Check);
-
-#[cfg(RustPython)]
-pyobject_native_type_core!(
-    PyString,
-    |py| {
-        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-        TYPE.import(py, "builtins", "str").unwrap().as_type_ptr()
-    },
-    "builtins",
-    "str",
-    #checkfunction=ffi::PyUnicode_Check
-);
 
 impl PyString {
     /// Creates a new Python string object.
@@ -235,8 +217,8 @@ impl PyString {
         encoding: Option<&CStr>,
         errors: Option<&CStr>,
     ) -> PyResult<Bound<'py, PyString>> {
-        let encoding = encoding.map_or(core::ptr::null(), CStr::as_ptr);
-        let errors = errors.map_or(core::ptr::null(), CStr::as_ptr);
+        let encoding = encoding.map_or(std::ptr::null(), CStr::as_ptr);
+        let errors = errors.map_or(std::ptr::null(), CStr::as_ptr);
         // Safety:
         // - `src` is a valid Python object
         // - `encoding` and `errors` are either null or valid C strings. `encoding` and `errors` are
@@ -264,7 +246,7 @@ impl PyString {
         #[cfg(all(Py_3_14, not(Py_LIMITED_API)))]
         {
             use crate::fmt::PyUnicodeWriter;
-            use core::fmt::Write as _;
+            use std::fmt::Write as _;
 
             let mut writer = PyUnicodeWriter::new(py)?;
             writer
@@ -366,7 +348,7 @@ impl<'a> Borrowed<'a, '_, PyString> {
             Err(crate::PyErr::fetch(self.py()))
         } else {
             Ok(unsafe {
-                core::str::from_utf8_unchecked(core::slice::from_raw_parts(data, size as usize))
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(data, size as usize))
             })
         }
     }
@@ -428,15 +410,15 @@ impl<'a> Borrowed<'a, '_, PyString> {
             let kind = ffi::PyUnicode_KIND(ptr);
 
             match kind {
-                ffi::PyUnicode_1BYTE_KIND => Ok(PyStringData::Ucs1(core::slice::from_raw_parts(
+                ffi::PyUnicode_1BYTE_KIND => Ok(PyStringData::Ucs1(std::slice::from_raw_parts(
                     raw_data as *const u8,
                     length,
                 ))),
-                ffi::PyUnicode_2BYTE_KIND => Ok(PyStringData::Ucs2(core::slice::from_raw_parts(
+                ffi::PyUnicode_2BYTE_KIND => Ok(PyStringData::Ucs2(std::slice::from_raw_parts(
                     raw_data as *const u16,
                     length,
                 ))),
-                ffi::PyUnicode_4BYTE_KIND => Ok(PyStringData::Ucs4(core::slice::from_raw_parts(
+                ffi::PyUnicode_4BYTE_KIND => Ok(PyStringData::Ucs4(std::slice::from_raw_parts(
                     raw_data as *const u32,
                     length,
                 ))),

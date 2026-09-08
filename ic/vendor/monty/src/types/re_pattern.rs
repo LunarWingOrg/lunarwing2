@@ -9,9 +9,10 @@
 //! Custom serde serializes only the pattern string and flags, recompiling the regex
 //! on deserialization. This supports Monty's snapshot/restore feature.
 
-use std::{borrow::Cow, cell::OnceCell, cmp::Ordering, fmt::Write, iter, str};
+use std::{borrow::Cow, fmt::Write, iter, mem, str};
 
-use fancy_regex::{CompileError, Error as RegexError, Regex, RegexBuilder};
+use ahash::AHashSet;
+use fancy_regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use smallvec::SmallVec;
 
@@ -19,15 +20,14 @@ use crate::{
     args::{ArgValues, FromArgs},
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapRead, HeapReadOutput},
+    exception_private::{ExcType, RunResult},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::StaticStrings,
     modules::re::{ASCII, DOTALL, IGNORECASE, MULTILINE},
-    resource_checks::check_estimated_size,
+    resource::{ResourceError, ResourceTracker, check_estimated_size},
     types::{
-        LazyHeapSet, List, PyTrait, ReMatch, Type, allocate_tuple,
+        List, PyTrait, ReMatch, Type, allocate_tuple,
         str::{allocate_string, string_repr_fmt},
-        tuple::TupleVec,
     },
     value::{EitherStr, Value},
 };
@@ -49,28 +49,20 @@ pub(crate) struct RePattern {
     flags: u16,
     /// The compiled Rust regex, unanchored.
     compiled: Regex,
-    /// The regex anchored with `\A(?:...)` for `match()`, compiled lazily on first
-    /// use (most patterns are only ever `search`/`split`/`sub`ed).
+    /// The compiled regex anchored with `\A(?:...)` for `match()`.
     ///
     /// Uses `\A` (absolute start anchor) instead of `^` so the MULTILINE flag
     /// doesn't cause it to match at line boundaries. This correctly handles
     /// alternations — e.g. `match('b|ab', 'ab')` must match `ab`, not fail
     /// because the engine found only `b` starting at position 1.
-    compiled_match: OnceCell<Regex>,
-    /// The regex anchored with `\A(?:...)\z` for `fullmatch()`, compiled lazily on
-    /// first use (see `compiled_match`).
+    compiled_match: Regex,
+    /// The compiled regex anchored with `\A(?:...)\z` for `fullmatch()`.
     ///
     /// Uses `\A`/`\z` (absolute anchors) instead of `^`/`$` so the MULTILINE flag
     /// doesn't cause them to match at line boundaries. This correctly handles
     /// alternations — e.g. `fullmatch('a|ab', 'ab')` must match `ab`, not fail
     /// because the engine found `a` first.
-    compiled_fullmatch: OnceCell<Regex>,
-    /// The `delegate_size_limit` the plain regex was compiled with, forwarded to
-    /// the anchored variants above so a *cached* entry's total retained compiled
-    /// size stays bounded (the anchors add only O(1) bytes, so a pattern that fit
-    /// unanchored still fits anchored). `None` = the engine's default limit. Not
-    /// serialized — restored patterns recompile at the default limit.
-    delegate_size_limit: Option<usize>,
+    compiled_fullmatch: Regex,
 }
 
 impl PartialEq for RePattern {
@@ -79,120 +71,38 @@ impl PartialEq for RePattern {
     }
 }
 
-/// Failure of [`RePattern::compile_bounded`], separating "valid pattern whose
-/// compiled form exceeds the size cap" (the caller retries uncached at default
-/// limits) from a genuine pattern error (reported to the user).
-pub(crate) enum BoundedCompileError {
-    /// The compiled regex exceeded the requested `delegate_size_limit`.
-    TooBig,
-    /// The pattern itself is invalid, already converted to `re.PatternError`.
-    Invalid(RunError),
-}
-
 impl RePattern {
     /// Creates a compiled pattern from a Python regex string and flags.
     ///
     /// Translates Python flag constants into inline regex flag prefixes and compiles
-    /// the unanchored pattern. The anchored variants used by `match`/`fullmatch` are
-    /// compiled lazily on first use (see [`RePattern::match_regex`]).
+    /// the pattern. Also pre-compiles anchored variants for `match` (`\A(?:pattern)`)
+    /// and `fullmatch` (`\A(?:pattern)\z`) to correctly handle alternations.
     ///
     /// # Errors
     ///
     /// Returns `re.PatternError` if the pattern is invalid.
     pub fn compile(pattern: String, flags: u16) -> RunResult<Self> {
-        Self::compile_inner(pattern, flags, None).map_err(ExcType::re_pattern_error)
-    }
-
-    /// As [`RePattern::compile`], but caps the compiled size of the delegated regex
-    /// (`RegexBuilder::delegate_size_limit`) so the `re` module's pattern cache can
-    /// retain entries with a hard per-entry memory ceiling. The limit is retained
-    /// and applied to the lazily-compiled anchored `match`/`fullmatch` variants
-    /// too, so a cached entry cannot pin large regexes via `.match()`/`.fullmatch()`.
-    pub(crate) fn compile_bounded(
-        pattern: String,
-        flags: u16,
-        delegate_size_limit: usize,
-    ) -> Result<Self, BoundedCompileError> {
-        Self::compile_inner(pattern, flags, Some(delegate_size_limit)).map_err(|err| {
-            if is_size_limit_error(&err) {
-                BoundedCompileError::TooBig
-            } else {
-                BoundedCompileError::Invalid(ExcType::re_pattern_error(err))
-            }
-        })
-    }
-
-    /// True when this was compiled from exactly `(pattern, flags)`.
-    ///
-    /// Lets the `re` module's pattern cache confirm a slot on a hash hit without
-    /// storing its own copy of the key — the compiled pattern already owns both,
-    /// and duplicating the source text is what makes a cached entry expensive.
-    pub(crate) fn is_compiled_from(&self, pattern: &str, flags: u16) -> bool {
-        self.flags == flags && self.pattern == pattern
-    }
-
-    /// Shared constructor for [`RePattern::compile`] / [`RePattern::compile_bounded`].
-    fn compile_inner(pattern: String, flags: u16, delegate_size_limit: Option<usize>) -> Result<Self, RegexError> {
-        let compiled = compile_regex_limited(&pattern, flags, delegate_size_limit)?;
+        let compiled = compile_regex(&pattern, flags)?;
+        let compiled_match = compile_regex(&format!("\\A(?:{pattern})"), flags)?;
+        let compiled_fullmatch = compile_regex(&format!("\\A(?:{pattern})\\z"), flags)?;
         Ok(Self {
             pattern,
             flags,
             compiled,
-            compiled_match: OnceCell::new(),
-            compiled_fullmatch: OnceCell::new(),
-            delegate_size_limit,
+            compiled_match,
+            compiled_fullmatch,
         })
-    }
-
-    /// Returns the `\A(?:pattern)` regex for `match()`, compiling it on first use.
-    ///
-    /// Wrapping a pattern that already compiled essentially never fails, so any
-    /// error surfaces (as `re.PatternError`) at `match()` rather than `re.compile()`.
-    fn match_regex(&self) -> RunResult<&Regex> {
-        if let Some(regex) = self.compiled_match.get() {
-            return Ok(regex);
-        }
-        let compiled = compile_regex_limited(
-            &format!("\\A(?:{})", self.pattern),
-            self.flags,
-            self.delegate_size_limit,
-        )
-        .map_err(ExcType::re_pattern_error)?;
-        // `set` only fails on a concurrent init, impossible on the single-threaded VM.
-        let _ = self.compiled_match.set(compiled);
-        Ok(self.compiled_match.get().expect("cell was just initialised"))
-    }
-
-    /// Returns the `\A(?:pattern)\z` regex for `fullmatch()`, compiling on first use.
-    fn fullmatch_regex(&self) -> RunResult<&Regex> {
-        if let Some(regex) = self.compiled_fullmatch.get() {
-            return Ok(regex);
-        }
-        let compiled = compile_regex_limited(
-            &format!("\\A(?:{})\\z", self.pattern),
-            self.flags,
-            self.delegate_size_limit,
-        )
-        .map_err(ExcType::re_pattern_error)?;
-        let _ = self.compiled_fullmatch.set(compiled);
-        Ok(self.compiled_fullmatch.get().expect("cell was just initialised"))
-    }
-
-    /// Builds a single `ReMatch` heap value from a capture result, keeping the
-    /// subject alive by refcount (`subject.clone_with_heap`) rather than copying
-    /// its text. `all_ascii` is precomputed by the caller (once per `finditer`).
-    fn build_match(&self, caps: &fancy_regex::Captures<'_>, subject: &Value, all_ascii: bool, heap: &Heap) -> Value {
-        let m = ReMatch::from_captures(caps, subject.clone_with_heap(heap), all_ascii, &self.compiled);
-        Value::Ref(heap.allocate(HeapData::ReMatch(Box::new(m))))
     }
 
     /// `pattern.search(string)` — find first match anywhere in the string.
     ///
-    /// `subject` is the subject `Value` (stored by the match); `text` is its
-    /// borrowed contents. Returns a `ReMatch` heap object, or `Value::None`.
-    pub fn search(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
+    /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
+    pub fn search(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         match self.compiled.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+            Ok(Some(caps)) => {
+                let m = ReMatch::from_captures(&caps, text, &self.pattern, &self.compiled);
+                Ok(Value::Ref(heap.allocate(HeapData::ReMatch(m))?))
+            }
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -205,9 +115,12 @@ impl RePattern {
     /// anchor forces the engine to try all alternatives at position 0.
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
-    pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.match_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+    pub fn match_start(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+        match self.compiled_match.captures(text) {
+            Ok(Some(caps)) => {
+                let match_obj = ReMatch::from_captures(&caps, text, &self.pattern, &self.compiled);
+                Ok(Value::Ref(heap.allocate(HeapData::ReMatch(match_obj))?))
+            }
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -220,9 +133,12 @@ impl RePattern {
     /// anchors force the engine to try all alternatives for a full-string match.
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
-    pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.fullmatch_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+    pub fn fullmatch(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+        match self.compiled_fullmatch.captures(text) {
+            Ok(Some(caps)) => {
+                let match_obj = ReMatch::from_captures(&caps, text, &self.pattern, &self.compiled);
+                Ok(Value::Ref(heap.allocate(HeapData::ReMatch(match_obj))?))
+            }
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -234,7 +150,7 @@ impl RePattern {
     /// - No capture groups: returns a list of matched strings
     /// - One capture group: returns a list of the group's matched strings
     /// - Multiple capture groups: returns a list of tuples of matched strings
-    pub fn findall(&self, text: &str, heap: &Heap) -> RunResult<Value> {
+    pub fn findall(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         let cap_count = self.compiled.captures_len();
         let mut results = Vec::new();
 
@@ -243,7 +159,7 @@ impl RePattern {
             0 | 1 => {
                 for m in self.compiled.find_iter(text) {
                     let val = m.map_err(ExcType::re_pattern_error)?.as_str();
-                    results.push(allocate_string(val, heap));
+                    results.push(allocate_string(val, heap)?);
                 }
             }
             // One capture group — return list of the group's strings
@@ -251,25 +167,25 @@ impl RePattern {
                 for caps in self.compiled.captures_iter(text) {
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     let val = caps.get(1).map_or("", |m| m.as_str());
-                    results.push(allocate_string(val, heap));
+                    results.push(allocate_string(val, heap)?);
                 }
             }
             // Multiple capture groups — return list of tuples
             _ => {
                 for caps in self.compiled.captures_iter(text) {
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
-                    let mut elements: TupleVec = SmallVec::with_capacity(cap_count - 1);
+                    let mut elements: SmallVec<[Value; 3]> = SmallVec::with_capacity(cap_count - 1);
                     for cap in caps.iter().skip(1) {
                         let val = cap.map_or("", |m| m.as_str());
-                        elements.push(allocate_string(val, heap));
+                        elements.push(allocate_string(val, heap)?);
                     }
-                    results.push(allocate_tuple(elements, heap));
+                    results.push(allocate_tuple(elements, heap)?);
                 }
             }
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
     }
 
     /// `pattern.sub(repl, string, count=0)` — substitute matches with a replacement.
@@ -283,7 +199,7 @@ impl RePattern {
     /// after each match, bailing out immediately if the budget is exceeded. This
     /// avoids both false rejections from conservative pre-estimates and untracked
     /// Rust heap allocations from delegating to `fancy_regex::replace_all()`.
-    pub fn sub(&self, repl: &str, text: &str, count: usize, heap: &Heap) -> RunResult<Value> {
+    pub fn sub(&self, repl: &str, text: &str, count: usize, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         // Translate Python-style backreferences (\1, \2) to regex crate style ($1, $2)
         let rust_repl = translate_replacement(repl);
         let effective_count = if count == 0 { usize::MAX } else { count };
@@ -298,45 +214,37 @@ impl RePattern {
             caps.expand(rust_repl.as_ref(), &mut result);
             last_end = m.end();
             // Check running size: current result + remaining unprocessed text.
-            check_estimated_size(result.len() + (text.len() - last_end), &heap.tracker)?;
+            check_estimated_size(result.len() + (text.len() - last_end), heap.tracker())?;
         }
 
         result.push_str(&text[last_end..]);
-        Ok(allocate_string(result, heap))
+        Ok(allocate_string(result, heap)?)
     }
 
     /// `pattern.split(string, maxsplit=0)` — split string by pattern occurrences.
     ///
-    /// Returns a list of strings. If `maxsplit` is positive, at most `maxsplit`
-    /// splits occur and the remainder of the string is returned as the final
-    /// element; if it is negative, no splits occur at all (CPython's split loop
-    /// runs zero times), returning the whole subject as a single element.
-    pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
-        let pieces: Vec<&str> = match maxsplit.cmp(&0) {
-            Ordering::Less => vec![text],
-            Ordering::Equal => self
-                .compiled
+    /// Returns a list of strings. If `maxsplit` is non-zero, at most `maxsplit`
+    /// splits occur and the remainder of the string is returned as the final element.
+    pub fn split(&self, text: &str, maxsplit: usize, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
+        let pieces: Vec<&str> = if maxsplit == 0 {
+            self.compiled
                 .split(text)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(ExcType::re_pattern_error)?,
-            Ordering::Greater => {
-                // `maxsplit + 1` pieces = at most `maxsplit` splits; saturate
-                // for absurdly large limits (splitn caps at the piece count).
-                let limit = usize::try_from(maxsplit).unwrap_or(usize::MAX).saturating_add(1);
-                self.compiled
-                    .splitn(text, limit)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(ExcType::re_pattern_error)?
-            }
+                .map_err(ExcType::re_pattern_error)?
+        } else {
+            self.compiled
+                .splitn(text, maxsplit + 1)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ExcType::re_pattern_error)?
         };
 
         let mut results = Vec::with_capacity(pieces.len());
         for piece in pieces {
-            results.push(allocate_string(piece, heap));
+            results.push(allocate_string(piece, heap)?);
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
     }
 
     /// `pattern.finditer(string)` — return all matches as a list.
@@ -344,43 +252,43 @@ impl RePattern {
     /// Eagerly collects all match objects into a list. This differs from CPython's
     /// lazy iterator but produces the same results when iterated. The VM's `GetIter`
     /// opcode handles iteration over the returned list.
-    pub fn finditer(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        // Every match shares one refcounted subject reference, not a copy each.
-        let all_ascii = text.is_ascii();
-
+    pub fn finditer(&self, text: &str, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         let mut results = Vec::new();
         for caps in self.compiled.captures_iter(text) {
             let caps = caps.map_err(ExcType::re_pattern_error)?;
-            results.push(self.build_match(&caps, subject, all_ascii, heap));
+            let m = ReMatch::from_captures(&caps, text, &self.pattern, &self.compiled);
+            results.push(Value::Ref(heap.allocate(HeapData::ReMatch(m))?));
         }
 
         let list = List::new(results);
-        Ok(Value::Ref(heap.allocate(HeapData::List(list))))
+        Ok(Value::Ref(heap.allocate(HeapData::List(list))?))
     }
 }
 
-impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
-    fn py_type(&self, _vm: &VM<'h>) -> Type {
+impl<'h> PyTrait<'h> for HeapRead<'h, RePattern> {
+    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::RePattern
     }
 
-    fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {
+    fn py_len(&self, _vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::RePattern(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        Ok(Some(self.get(vm.heap) == other.get(vm.heap)))
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+        Ok(self.get(vm.heap) == other.get(vm.heap))
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {
+    fn py_bool(&self, _vm: &mut VM<'h, impl ResourceTracker>) -> bool {
         // Pattern objects are always truthy (matching CPython).
-        Ok(true)
+        true
     }
 
-    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
+    fn py_repr_fmt(
+        &self,
+        f: &mut impl Write,
+        vm: &mut VM<'h, impl ResourceTracker>,
+        _heap_ids: &mut AHashSet<HeapId>,
+    ) -> RunResult<()> {
         let this = self.get(vm.heap);
         write!(f, "re.compile(")?;
         string_repr_fmt(&this.pattern, f)?;
@@ -403,10 +311,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
         Ok(write!(f, ")")?)
     }
 
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h>) -> RunResult<Option<CallResult>> {
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
         match attr.static_string() {
             Some(StaticStrings::PatternAttr) => {
-                let v = allocate_string(self.get(vm.heap).pattern.as_str(), vm.heap);
+                let v = allocate_string(self.get(vm.heap).pattern.as_str(), vm.heap)?;
                 Ok(Some(CallResult::Value(v)))
             }
             Some(StaticStrings::Flags) => Ok(Some(CallResult::Value(Value::Int(i64::from(self.get(vm.heap).flags))))),
@@ -414,47 +322,57 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
         }
     }
 
-    fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
+    fn py_call_attr(
+        &mut self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, impl ResourceTracker>,
+        attr: &EitherStr,
+        args: ArgValues,
+    ) -> RunResult<CallResult> {
         let result = match attr.static_string() {
             Some(StaticStrings::Search) => {
                 let arg = args.get_one_arg("Pattern.search", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
-                self.get(vm.heap).search(arg, text, vm.heap)
+                let text = value_to_str(arg, vm)?.into_owned();
+                self.get(vm.heap).search(&text, vm.heap)
             }
             Some(StaticStrings::Match) => {
                 let arg = args.get_one_arg("Pattern.match", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
-                self.get(vm.heap).match_start(arg, text, vm.heap)
+                let text = value_to_str(arg, vm)?.into_owned();
+                self.get(vm.heap).match_start(&text, vm.heap)
             }
             Some(StaticStrings::Fullmatch) => {
                 let arg = args.get_one_arg("Pattern.fullmatch", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
-                self.get(vm.heap).fullmatch(arg, text, vm.heap)
+                let text = value_to_str(arg, vm)?.into_owned();
+                self.get(vm.heap).fullmatch(&text, vm.heap)
             }
             Some(StaticStrings::Findall) => {
                 let arg = args.get_one_arg("Pattern.findall", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
-                self.get(vm.heap).findall(text, vm.heap)
+                let text = value_to_str(arg, vm)?.into_owned();
+                self.get(vm.heap).findall(&text, vm.heap)
             }
             Some(StaticStrings::Sub) => call_pattern_sub(self, args, vm),
             Some(StaticStrings::Split) => call_pattern_split(self, args, vm),
             Some(StaticStrings::Finditer) => {
                 let arg = args.get_one_arg("Pattern.finditer", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
-                self.get(vm.heap).finditer(arg, text, vm.heap)
+                let text = value_to_str(arg, vm)?.into_owned();
+                self.get(vm.heap).finditer(&text, vm.heap)
             }
-            _ => return Err(ExcType::attribute_error_method(Type::RePattern, attr, args, vm)),
+            _ => return Err(ExcType::attribute_error(Type::RePattern, attr.as_str(vm.interns))),
         }?;
         Ok(CallResult::Value(result))
     }
 }
 
 impl HeapItem for RePattern {
+    fn py_estimate_size(&self) -> usize {
+        mem::size_of::<Self>() + self.pattern.len()
+    }
+
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {
         // No heap references — all data is owned.
     }
@@ -465,7 +383,11 @@ impl HeapItem for RePattern {
 /// Separated from the main `py_call_attr` match to keep the borrow checker happy —
 /// extracting multiple string arguments requires careful ordering of borrows.
 /// Supports `count` as either positional or keyword argument.
-fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+fn call_pattern_sub<'h>(
+    pattern: &HeapRead<'h, RePattern>,
+    args: ArgValues,
+    vm: &mut VM<'h, impl ResourceTracker>,
+) -> RunResult<Value> {
     let PatternSubArgs {
         repl: repl_val,
         string: string_val,
@@ -474,36 +396,50 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
     defer_drop!(repl_val, vm);
     defer_drop!(string_val, vm);
 
-    let count = extract_count(count_val, vm)?;
+    #[expect(
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation,
+        reason = "n is checked non-negative above"
+    )]
+    let count = match count_val {
+        Some(Value::Int(n)) if n >= 0 => n as usize,
+        Some(Value::Bool(b)) => usize::from(b),
+        Some(Value::Int(_)) => {
+            // Negative count — Pattern.sub returns the input string unchanged,
+            // so just typecheck and bump the refcount; no need to re-allocate.
+            if !string_val.is_str(vm.heap) {
+                let t = string_val.py_type(vm);
+                return Err(ExcType::type_error(format!("expected string, not {t}")));
+            }
+            return Ok(string_val.clone_with_heap(vm.heap));
+        }
+        Some(other) => {
+            let t = other.py_type(vm);
+            other.drop_with_heap(vm);
+            return Err(ExcType::type_error(format!("expected int for count, not {t}")));
+        }
+        None => 0,
+    };
 
-    // Check that repl is a string — callable replacement is not supported.
-    // CPython processes the replacement template *before* its match loop, so
-    // this check must precede the negative-count early return below: a bad
-    // repl raises even when zero substitutions will run.
+    // Check that repl is a string — callable replacement is not supported
     if !repl_val.is_str(vm.heap) {
         return Err(ExcType::type_error(
             "callable replacement is not yet supported in re.sub()",
         ));
     }
-
-    let Some(count) = count else {
-        // Negative count — Pattern.sub returns the input string unchanged.
-        // The subject is still type-checked (`to_str` raises this method's
-        // `expected string, not {t}` wording) before the refcount bump; no
-        // need to re-allocate.
-        let _ = string_val.to_str(vm)?;
-        return Ok(string_val.clone_with_heap(vm.heap));
-    };
-
-    let repl = repl_val.to_str(vm)?.to_owned();
-    let text = string_val.to_str(vm)?.to_owned();
+    let repl = value_to_str(repl_val, vm)?.into_owned();
+    let text = value_to_str(string_val, vm)?.into_owned();
     pattern.get(vm.heap).sub(&repl, &text, count, vm.heap)
 }
 
 /// Handles `pattern.split(string, maxsplit=0)` argument extraction and dispatch.
 ///
 /// Supports `maxsplit` as either positional or keyword argument.
-fn call_pattern_split<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: &mut VM<'h>) -> RunResult<Value> {
+fn call_pattern_split<'h>(
+    pattern: &HeapRead<'h, RePattern>,
+    args: ArgValues,
+    vm: &mut VM<'h, impl ResourceTracker>,
+) -> RunResult<Value> {
     let PatternSplitArgs {
         string: string_val,
         maxsplit: maxsplit_val,
@@ -511,7 +447,7 @@ fn call_pattern_split<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm
     defer_drop!(string_val, vm);
 
     let maxsplit = extract_maxsplit(maxsplit_val, vm)?;
-    let text = string_val.to_str(vm)?.to_owned();
+    let text = value_to_str(string_val, vm)?.into_owned();
     pattern.get(vm.heap).split(&text, maxsplit, vm.heap)
 }
 
@@ -522,7 +458,7 @@ fn call_pattern_split<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm
 /// is taken by the `re.Pattern.string` attribute name in CPython's class
 /// hierarchy).
 #[derive(FromArgs)]
-#[from_args(name = "sub", style = c_named, at_most_total)]
+#[from_args(name = "sub", c_error_named, at_most_total)]
 struct PatternSubArgs {
     repl: Value,
     #[from_args(static_string = "StringAttr")]
@@ -535,7 +471,7 @@ struct PatternSubArgs {
 ///
 /// See `PatternSubArgs` for why `string` uses `static_string`.
 #[derive(FromArgs)]
-#[from_args(name = "split", style = c_named, at_most_total)]
+#[from_args(name = "split", c_error_named, at_most_total)]
 struct PatternSplitArgs {
     #[from_args(static_string = "StringAttr")]
     string: Value,
@@ -543,50 +479,24 @@ struct PatternSplitArgs {
     maxsplit: Option<Value>,
 }
 
-/// Extracts a `maxsplit` value from an optional `Value` for [`RePattern::split`].
+/// Extracts a `maxsplit` value from an optional `Value`.
 ///
-/// Returns 0 (split all) if not provided; negatives pass through — the split
-/// loop then runs zero times, matching CPython. Non-ints get CPython's
-/// argument-clinic message. Shared by `Pattern.split` and module-level
-/// `re.split`.
-pub(crate) fn extract_maxsplit(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<i64> {
+/// Returns 0 if not provided. Negative values are treated as 0 (split all).
+fn extract_maxsplit(val: Option<Value>, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<usize> {
     match val {
         None => Ok(0),
-        Some(Value::Int(n)) => Ok(n),
-        Some(Value::Bool(b)) => Ok(i64::from(b)),
+        Some(Value::Int(n)) if n <= 0 => Ok(0),
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "n is checked positive above"
+        )]
+        Some(Value::Int(n)) => Ok(n as usize),
+        Some(Value::Bool(b)) => Ok(usize::from(b)),
         Some(other) => {
-            let t = other.py_type_name(vm);
-            other.drop_with(vm);
-
-            Err(ExcType::type_error(format!(
-                "'{t}' object cannot be interpreted as an integer"
-            )))
-        }
-    }
-}
-
-/// Extracts a `count` value from an optional `Value` for [`RePattern::sub`].
-///
-/// Returns `Ok(None)` for a negative count, which callers turn into "return
-/// the subject unchanged" (CPython's match loop runs zero times there).
-/// Non-ints get CPython's argument-clinic message. Shared by `Pattern.sub`
-/// and module-level `re.sub`.
-pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Option<usize>> {
-    match val {
-        None => Ok(Some(0)),
-        // Saturate rather than `as`-cast: on 32-bit targets (wasm) a count
-        // above usize::MAX would otherwise truncate — e.g. 2**32 to 0, which
-        // means "replace all" instead of an unreachably large cap.
-        Some(Value::Int(n)) if n >= 0 => Ok(Some(usize::try_from(n).unwrap_or(usize::MAX))),
-        Some(Value::Bool(b)) => Ok(Some(usize::from(b))),
-        Some(Value::Int(_)) => Ok(None),
-        Some(other) => {
-            let t = other.py_type_name(vm);
-            other.drop_with(vm);
-
-            Err(ExcType::type_error(format!(
-                "'{t}' object cannot be interpreted as an integer"
-            )))
+            let t = other.py_type(vm);
+            other.drop_with_heap(vm);
+            Err(ExcType::type_error(format!("expected int for maxsplit, not {t}")))
         }
     }
 }
@@ -598,16 +508,10 @@ pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Op
 /// - `re.MULTILINE` (8) → `(?m)` prefix
 /// - `re.DOTALL` (16) → `(?s)` prefix
 ///
-/// `delegate_size_limit` optionally caps the compiled size of the delegated
-/// regex (`RegexBuilder::delegate_size_limit`) — used to bound cached patterns;
-/// `None` uses the engine's default limit.
-///
 /// # Errors
 ///
-/// Returns the raw `fancy_regex` error so callers can distinguish a size-limit
-/// overflow from an invalid pattern (see [`is_size_limit_error`]) before
-/// converting to `re.PatternError`.
-fn compile_regex_limited(pattern: &str, flags: u16, delegate_size_limit: Option<usize>) -> Result<Regex, RegexError> {
+/// Returns `re.PatternError(...)` if the pattern is invalid.
+pub(crate) fn compile_regex(pattern: &str, flags: u16) -> RunResult<Regex> {
     let mut prefix = String::new();
     if flags & IGNORECASE != 0 {
         prefix.push('i');
@@ -629,23 +533,7 @@ fn compile_regex_limited(pattern: &str, flags: u16, delegate_size_limit: Option<
         format!("(?{prefix}){pattern}")
     };
 
-    let mut builder = RegexBuilder::new(&full_pattern);
-    if let Some(limit) = delegate_size_limit {
-        builder.delegate_size_limit(limit);
-    }
-    builder.build()
-}
-
-/// True when `err` is the delegated engine's exceeded-size-limit error: the
-/// pattern is valid, its compiled form just doesn't fit the requested cap.
-fn is_size_limit_error(err: &RegexError) -> bool {
-    match err {
-        RegexError::CompileError(compile_error) => match &**compile_error {
-            CompileError::InnerError(inner) => inner.size_limit().is_some(),
-            _ => false,
-        },
-        _ => false,
-    }
+    Regex::new(&full_pattern).map_err(ExcType::re_pattern_error)
 }
 
 /// Translates Python-style replacement backreferences to `fancy_regex` syntax.
@@ -752,6 +640,20 @@ fn translate_g_backref(chars: &mut iter::Peekable<str::Chars<'_>>, result: &mut 
     result.push('{');
     result.push_str(&name);
     result.push('}');
+}
+
+/// Extracts a string from a `Value`, supporting both interned and heap strings.
+///
+/// Returns a `Cow<str>` to avoid unnecessary copies for interned strings.
+pub(crate) fn value_to_str<'a>(val: &'a Value, vm: &'a VM<'_, impl ResourceTracker>) -> RunResult<Cow<'a, str>> {
+    match val {
+        Value::InternString(string_id) => Ok(Cow::Borrowed(vm.interns.get_str(*string_id))),
+        Value::Ref(heap_id) => match vm.heap.get(*heap_id) {
+            HeapData::Str(s) => Ok(Cow::Borrowed(s.as_str())),
+            _ => Err(ExcType::type_error(format!("expected string, not {}", val.py_type(vm)))),
+        },
+        _ => Err(ExcType::type_error(format!("expected string, not {}", val.py_type(vm)))),
+    }
 }
 
 impl Serialize for RePattern {

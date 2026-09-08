@@ -1,4 +1,4 @@
-use core::cell::Cell;
+use std::cell::Cell;
 
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;

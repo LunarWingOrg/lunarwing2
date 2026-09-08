@@ -67,12 +67,8 @@ use uuid::{NonNilUuid, Uuid};
 
 use crate::conversion::IntoPyObject;
 use crate::exceptions::{PyTypeError, PyValueError};
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::PyStaticExpr;
 use crate::instance::Bound;
 use crate::sync::PyOnceLock;
-#[cfg(feature = "experimental-inspect")]
-use crate::type_hint_identifier;
 use crate::types::any::PyAnyMethods;
 use crate::types::PyType;
 use crate::{intern, Borrowed, FromPyObject, Py, PyAny, PyErr, PyResult, Python};
@@ -84,9 +80,6 @@ fn get_uuid_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType>> {
 
 impl FromPyObject<'_, '_> for Uuid {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = type_hint_identifier!("uuid", "UUID");
 
     fn extract(obj: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let py = obj.py();
@@ -106,9 +99,6 @@ impl<'py> IntoPyObject<'py> for Uuid {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("uuid", "UUID");
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let uuid_cls = get_uuid_cls(py)?;
 
@@ -121,9 +111,6 @@ impl<'py> IntoPyObject<'py> for &Uuid {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = Uuid::OUTPUT_TYPE;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (*self).into_pyobject(py)
     }
@@ -131,9 +118,6 @@ impl<'py> IntoPyObject<'py> for &Uuid {
 
 impl FromPyObject<'_, '_> for NonNilUuid {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = Uuid::INPUT_TYPE;
 
     fn extract(obj: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let uuid: Uuid = obj.extract()?;
@@ -146,9 +130,6 @@ impl<'py> IntoPyObject<'py> for NonNilUuid {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = Uuid::OUTPUT_TYPE;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         Uuid::from(self).into_pyobject(py)
     }
@@ -158,9 +139,6 @@ impl<'py> IntoPyObject<'py> for &NonNilUuid {
     type Target = PyAny;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = NonNilUuid::OUTPUT_TYPE;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         (*self).into_pyobject(py)
@@ -172,7 +150,7 @@ mod tests {
     use super::*;
     use crate::types::dict::PyDictMethods;
     use crate::types::PyDict;
-    use alloc::ffi::CString;
+    use std::ffi::CString;
     use uuid::Uuid;
 
     macro_rules! convert_constants {

@@ -1,17 +1,14 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
 //! Interaction with attachment of the current thread to the Python interpreter.
 
 #[cfg(pyo3_disable_reference_pool)]
 use crate::impl_::panic::PanicTrap;
 use crate::{ffi, Python};
 
-use core::cell::Cell;
-#[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
-use core::{mem, ptr::NonNull};
+use std::cell::Cell;
 #[cfg(not(pyo3_disable_reference_pool))]
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+#[cfg_attr(pyo3_disable_reference_pool, allow(unused_imports))]
+use std::{mem, ptr::NonNull, sync};
 
 std::thread_local! {
     /// This is an internal counter in pyo3 monitoring whether this thread is attached to the interpreter.
@@ -189,14 +186,14 @@ type PyObjVec = Vec<NonNull<ffi::PyObject>>;
 #[cfg(not(pyo3_disable_reference_pool))]
 /// Thread-safe storage for objects which were dec_ref while not attached.
 struct ReferencePool {
-    pending_decrefs: Mutex<PyObjVec>,
+    pending_decrefs: sync::Mutex<PyObjVec>,
 }
 
 #[cfg(not(pyo3_disable_reference_pool))]
 impl ReferencePool {
     const fn new() -> Self {
         Self {
-            pending_decrefs: Mutex::new(Vec::new()),
+            pending_decrefs: sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -370,7 +367,7 @@ fn decrement_attach_count() {
 mod tests {
     use super::*;
 
-    use crate::{Py, PyAny, Python};
+    use crate::{types::PyAnyMethods, Py, PyAny, Python};
 
     fn get_object(py: Python<'_>) -> Py<PyAny> {
         py.eval(c"object()", None, None).unwrap().unbind()
@@ -404,14 +401,14 @@ mod tests {
             // Create a reference to drop while attached.
             let reference = obj.clone_ref(py);
 
-            assert_eq!(obj._get_refcnt(py), 2);
+            assert_eq!(obj.get_refcnt(py), 2);
             #[cfg(not(pyo3_disable_reference_pool))]
             assert!(pool_dec_refs_does_not_contain(&obj));
 
             // While attached, reference count will be decreased immediately.
             drop(reference);
 
-            assert_eq!(obj._get_refcnt(py), 1);
+            assert_eq!(obj.get_refcnt(py), 1);
             #[cfg(not(any(pyo3_disable_reference_pool)))]
             assert!(pool_dec_refs_does_not_contain(&obj));
         });
@@ -425,7 +422,7 @@ mod tests {
             // Create a reference to drop while detached.
             let reference = obj.clone_ref(py);
 
-            assert_eq!(obj._get_refcnt(py), 2);
+            assert_eq!(obj.get_refcnt(py), 2);
             assert!(pool_dec_refs_does_not_contain(&obj));
 
             // Drop reference in a separate (detached) thread.
@@ -433,7 +430,7 @@ mod tests {
 
             // The reference count should not have changed, it is remembered
             // to release later.
-            assert_eq!(obj._get_refcnt(py), 2);
+            assert_eq!(obj.get_refcnt(py), 2);
             #[cfg(not(Py_GIL_DISABLED))]
             assert!(pool_dec_refs_contains(&obj));
             obj
@@ -446,7 +443,7 @@ mod tests {
             // DECREFs after releasing the lock on the POOL, so the
             // refcnt could still be 2 when this assert happens
             #[cfg(not(Py_GIL_DISABLED))]
-            assert_eq!(obj._get_refcnt(py), 1);
+            assert_eq!(obj.get_refcnt(py), 1);
             assert!(pool_dec_refs_does_not_contain(&obj));
         });
     }
@@ -509,7 +506,7 @@ mod tests {
         Python::attach(|py| {
             // Make a simple object with 1 reference
             let obj = get_object(py);
-            assert_eq!(obj._get_refcnt(py), 1);
+            assert_eq!(obj.get_refcnt(py), 1);
             // Cloning the object when detached should panic
             py.detach(|| obj.clone());
         });
@@ -519,7 +516,7 @@ mod tests {
     fn recursive_attach_ok() {
         Python::attach(|py| {
             let obj = Python::attach(|_| py.eval(c"object()", None, None).unwrap());
-            assert_eq!(obj._get_refcnt(), 1);
+            assert_eq!(obj.get_refcnt(), 1);
         })
     }
 
@@ -528,12 +525,12 @@ mod tests {
     fn test_clone_attached() {
         Python::attach(|py| {
             let obj = get_object(py);
-            let count = obj._get_refcnt(py);
+            let count = obj.get_refcnt(py);
 
             // Cloning when attached should increase reference count immediately
             #[expect(clippy::redundant_clone)]
             let c = obj.clone();
-            assert_eq!(count + 1, c._get_refcnt(py));
+            assert_eq!(count + 1, c.get_refcnt(py));
         })
     }
 
@@ -559,7 +556,7 @@ mod tests {
 
                     Bound::from_owned_ptr(
                         pool.python(),
-                        ffi::PyCapsule_GetPointer(capsule, core::ptr::null()) as _,
+                        ffi::PyCapsule_GetPointer(capsule, std::ptr::null()) as _,
                     )
                 };
             }
@@ -567,7 +564,7 @@ mod tests {
             let ptr = obj.into_ptr();
 
             let capsule =
-                unsafe { ffi::PyCapsule_New(ptr as _, core::ptr::null(), Some(capsule_drop)) };
+                unsafe { ffi::PyCapsule_New(ptr as _, std::ptr::null(), Some(capsule_drop)) };
 
             get_pool().register_decref(NonNull::new(capsule).unwrap());
 

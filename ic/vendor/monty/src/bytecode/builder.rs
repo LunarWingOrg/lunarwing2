@@ -3,8 +3,10 @@
 //! `CodeBuilder` provides methods for emitting opcodes and operands, handling
 //! forward jumps with patching, and tracking source locations for tracebacks.
 
+use std::collections::HashSet;
+
 use super::{
-    code::{Code, ConstPool, ExceptionEntry, HandlerKind, LocationEntry},
+    code::{Code, ConstPool, ExceptionEntry, LocationEntry},
     compiler::CompileError,
     op::{Opcode, Operand},
 };
@@ -51,8 +53,12 @@ pub struct CodeBuilder {
     /// Current focus location within the source range.
     current_focus: Option<CodeRange>,
 
-    /// Operand-stack depth before the next opcode, or `None` in dead code.
-    /// Unconditional terminators include `AssertFailed`, but not `Assert`.
+    /// Operand-stack depth at the point the next opcode will be emitted, or
+    /// `None` if not emitting a code region.
+    ///
+    /// Unconditional terminators (`Jump`, `ReturnValue`, `Raise`, `Reraise`,
+    /// `RaiseImportError`, `RaiseUnboundLocal`)
+    /// finish code regions, transitioning the builder to the dead-code state.
     current_stack_depth: Option<u16>,
 
     /// Maximum stack depth seen during compilation.
@@ -63,6 +69,12 @@ pub struct CodeBuilder {
     /// Populated during compilation to enable proper NameError messages
     /// when accessing undefined local variables.
     local_names: Vec<Option<StringId>>,
+
+    /// Local variable slots that are assigned somewhere in this function.
+    ///
+    /// Used to determine whether to raise `UnboundLocalError` or `NameError`
+    /// when loading an undefined local variable.
+    assigned_locals: HashSet<u16>,
 }
 
 impl CodeBuilder {
@@ -306,12 +318,6 @@ impl CodeBuilder {
         Offset(self.bytecode.len())
     }
 
-    /// Returns the current source position for compile-time diagnostics.
-    #[must_use]
-    pub fn current_position(&self) -> CodeRange {
-        self.current_location.unwrap_or_default()
-    }
-
     /// Returns a `JumpTarget` capturing both the current bytecode position and
     /// the stack depth at that position.
     #[must_use]
@@ -343,6 +349,15 @@ impl CodeBuilder {
         }
     }
 
+    /// Registers a local variable slot as "assigned" (vs undefined reference).
+    ///
+    /// Called during compilation for variables that are assigned somewhere in the function.
+    /// Used at runtime to determine whether to raise `UnboundLocalError` (assigned local
+    /// accessed before assignment) or `NameError` (name doesn't exist anywhere).
+    pub fn register_assigned_local(&mut self, slot: u16) {
+        self.assigned_locals.insert(slot);
+    }
+
     /// Emits a `RaiseUnboundLocal` opcode carrying the comprehension target
     /// name to be reported in `UnboundLocalError`.
     ///
@@ -367,6 +382,21 @@ impl CodeBuilder {
                     self.emit_u16(Opcode::LoadLocalW, slot)
                 }
             }
+        }
+    }
+
+    /// Emits a `LoadLocalCallable` instruction for call-context loads.
+    ///
+    /// Unlike `emit_load_local`, this does NOT use specialized 0-3 variants since
+    /// external function calls are rare enough that the optimization isn't worth
+    /// the extra opcode slots. The `name_id` is encoded directly in the operand
+    /// to avoid needing to look up the name from the code's local_names array.
+    pub fn emit_load_local_callable(&mut self, slot: u16, name_id: StringId) -> Result<(), CompileError> {
+        let name_id_u16 = u16::try_from(name_id.index()).map_err(|_| self.name_id_too_large())?;
+        if let Ok(s) = u8::try_from(slot) {
+            self.emit_with_operand(Opcode::LoadLocalCallable, Operand::U8U16(s, name_id_u16))
+        } else {
+            self.emit_with_operand(Opcode::LoadLocalCallableW, Operand::U16U16(slot, name_id_u16))
         }
     }
 
@@ -414,12 +444,11 @@ impl CodeBuilder {
         handler: Offset,
         stack_depth: u16,
         exception_stack_count: u16,
-        kind: HandlerKind,
     ) -> Result<(), CompileError> {
         let start = start.as_u32().ok_or_else(|| self.bytecode_too_large())?;
         let end = end.as_u32().ok_or_else(|| self.bytecode_too_large())?;
         let handler = handler.as_u32().ok_or_else(|| self.bytecode_too_large())?;
-        let entry = ExceptionEntry::new(start, end, handler, stack_depth, exception_stack_count, kind);
+        let entry = ExceptionEntry::new(start, end, handler, stack_depth, exception_stack_count);
         self.exception_table.push(entry);
         Ok(())
     }
@@ -457,6 +486,7 @@ impl CodeBuilder {
             num_locals,
             self.max_stack_depth,
             local_names,
+            self.assigned_locals,
         )
     }
 
@@ -502,11 +532,11 @@ impl CodeBuilder {
     /// Positive values indicate pushes, negative values indicate pops.
     /// In the dead-code state this is a no-op: dead code can be emitted
     /// freely.
-    fn adjust_stack(&mut self, delta: i32) -> Result<(), CompileError> {
+    fn adjust_stack(&mut self, delta: i16) -> Result<(), CompileError> {
         let Some(depth) = self.current_stack_depth else {
             return Ok(());
         };
-        let new_depth = i32::from(depth) + delta;
+        let new_depth = i32::from(depth) + i32::from(delta);
         // Stack depth shouldn't go negative (indicates compiler bug)
         debug_assert!(new_depth >= 0, "Stack depth went negative: {new_depth}");
         let new_depth = u16::try_from(new_depth.max(0)).map_err(|_| self.stack_too_large())?;
@@ -515,9 +545,20 @@ impl CodeBuilder {
         Ok(())
     }
 
-    /// Emits an instruction, recording its location and stack effect.
-    /// Unconditional terminators enter dead code, where emission is a no-op.
-    /// Jump helpers use this path to keep stack-depth tracking centralized.
+    /// Single-source-of-truth emit path for all bytecode emission: records
+    /// location, writes opcode + operand bytes, applies the stack-effect
+    /// computed by `Opcode::stack_effect`, and transitions the tracker to
+    /// dead for unconditional terminators (`Jump`, `ReturnValue`, `Raise`,
+    /// `Reraise`).
+    ///
+    /// In the dead-code state the method silently no-ops. This lets the
+    /// compiler drive emission uniformly without gating individual emits
+    /// on reachability — dead trailers, epilogues, and orphaned cleanup
+    /// pairs all vanish naturally.
+    ///
+    /// `emit_jump` and `emit_jump_to` route their byte emission through here;
+    /// `emit_jump` additionally captures the pre-emit offset and computes the
+    /// jump-taken target depth for the returned `JumpLabel`.
     fn emit_with_operand(&mut self, op: Opcode, operand: Operand<'_>) -> Result<(), CompileError> {
         if self.is_dead() {
             return Ok(());
@@ -533,6 +574,10 @@ impl CodeBuilder {
             Operand::U8U8(a, b) => {
                 self.bytecode.push(a);
                 self.bytecode.push(b);
+            }
+            Operand::U8U16(a, w) => {
+                self.bytecode.push(a);
+                self.bytecode.extend(w.to_le_bytes());
             }
             Operand::U16U8(w, b) => {
                 self.bytecode.extend(w.to_le_bytes());
@@ -577,7 +622,6 @@ impl CodeBuilder {
                 | Opcode::Reraise
                 | Opcode::RaiseImportError
                 | Opcode::RaiseUnboundLocal
-                | Opcode::AssertFailed
                 | Opcode::Jump
         ) {
             self.current_stack_depth = None;
@@ -594,7 +638,7 @@ impl CodeBuilder {
 
     /// Builds the `CompileError` for a `StringId` that doesn't fit in the
     /// `u16` operand of a name-bearing opcode. Used by emit helpers that
-    /// inline the name id directly (e.g. `LoadGlobalCallable`).
+    /// inline the name id directly (e.g. `LoadLocalCallable`).
     ///
     /// The count is `u16::MAX + 1` (`65 536`) because a `u16` operand can
     /// address indices `0..=u16::MAX`, so the format can name that many

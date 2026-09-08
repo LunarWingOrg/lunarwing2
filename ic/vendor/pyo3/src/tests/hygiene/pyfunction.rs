@@ -1,13 +1,13 @@
 #[crate::pyfunction]
 #[pyo3(crate = "crate")]
 fn do_something(x: i32) -> crate::PyResult<i32> {
-    ::core::result::Result::Ok(x)
+    ::std::result::Result::Ok(x)
 }
 
 #[crate::pyfunction]
 #[pyo3(crate = "crate", name = "check5012")]
 fn check_5012(x: i32) -> crate::PyResult<i32> {
-    ::core::result::Result::Ok(x)
+    ::std::result::Result::Ok(x)
 }
 
 #[crate::pyfunction]

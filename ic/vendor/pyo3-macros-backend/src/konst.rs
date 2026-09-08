@@ -2,8 +2,6 @@ use std::borrow::Cow;
 use std::ffi::CString;
 
 use crate::attributes::{self, get_pyo3_options, take_attributes, NameAttribute};
-#[cfg(feature = "experimental-inspect")]
-use crate::utils::PythonDoc;
 use proc_macro2::{Ident, Span};
 use syn::LitCStr;
 use syn::{
@@ -14,14 +12,12 @@ use syn::{
 };
 
 pub struct ConstSpec {
-    pub rust_ident: Ident,
+    pub rust_ident: syn::Ident,
     pub attributes: ConstAttributes,
     #[cfg(feature = "experimental-inspect")]
     pub expr: Option<syn::Expr>,
     #[cfg(feature = "experimental-inspect")]
     pub ty: syn::Type,
-    #[cfg(feature = "experimental-inspect")]
-    pub doc: Option<PythonDoc>,
 }
 
 impl ConstSpec {

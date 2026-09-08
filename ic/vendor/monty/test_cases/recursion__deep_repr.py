@@ -1,18 +1,17 @@
+# max-recursion-depth=10
+
 # Test that deeply nested lists don't crash during repr().
-# `sys.setrecursionlimit(10)` caps both Monty and CPython at depth 10, so any
-# input deeper than that exercises the truncation / RecursionError paths.
-
-import sys
-
-sys.setrecursionlimit(10)
-
+# The `max-recursion-depth` directive caps Monty's limit at 10, so any input
+# deeper than that exercises the truncation path. CPython has its own (much
+# higher) default limit and produces a full repr — the assertion accepts
+# both shapes.
 x = []
 for _ in range(20):
     x = [x]
 
 result = repr(x)
-assert isinstance(result, str)
-assert result.startswith('[')
+assert isinstance(result, str), 'repr should return a string'
+assert result.startswith('['), 'repr should start with ['
 assert result.endswith(']') or '...' in result, 'repr should end with ] or contain ...'
 
 # Deeply nested one-element tuples must hit the same depth guard, otherwise
@@ -22,6 +21,6 @@ for _ in range(20):
     t = (t,)
 
 result2 = repr(t)
-assert isinstance(result2, str)
-assert result2.startswith('(')
+assert isinstance(result2, str), 'tuple repr should return a string'
+assert result2.startswith('('), 'tuple repr should start with ('
 assert result2.endswith(')') or '...' in result2, 'tuple repr should end with ) or contain ...'

@@ -4,9 +4,7 @@
 //! When a Property is retrieved via `py_getattr`, its getter is invoked
 //! rather than returning the Property itself.
 
-use monty_types::OsFunctionCall;
-
-use crate::bytecode::CallResult;
+use crate::{bytecode::CallResult, os::OsFunctionCall};
 
 /// Property descriptor for computed attributes (mirrors Python's descriptor
 /// protocol — accessing the property invokes its getter).

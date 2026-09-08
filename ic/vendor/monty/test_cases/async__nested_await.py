@@ -12,4 +12,4 @@ async def outer():
 
 
 result = await outer()  # pyright: ignore
-assert result == 50
+assert result == 50, 'nested async calls should work'

@@ -24,7 +24,7 @@ impl<T: Clone> MinMaxResult<T> {
     /// # Examples
     ///
     /// ```
-    /// use itertools::MinMaxResult::{self, MinMax, NoElements, OneElement};
+    /// use itertools::MinMaxResult::{self, NoElements, OneElement, MinMax};
     ///
     /// let r: MinMaxResult<i32> = NoElements;
     /// assert_eq!(r.into_option(), None);

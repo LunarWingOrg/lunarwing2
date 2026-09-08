@@ -1,8 +1,8 @@
 use crate::object::*;
 use crate::pyport::Py_ssize_t;
-use core::ffi::{c_char, c_int};
+use std::ffi::{c_char, c_int};
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyErr_SetNone")]
     pub fn PyErr_SetNone(arg1: *mut PyObject);
     #[cfg_attr(PyPy, link_name = "PyPyErr_SetObject")]
@@ -53,12 +53,6 @@ extern_libpython! {
     pub fn PyErr_GetRaisedException() -> *mut PyObject;
     #[cfg(Py_3_12)]
     pub fn PyErr_SetRaisedException(exc: *mut PyObject);
-    #[cfg(Py_3_11)]
-    #[cfg_attr(PyPy, link_name = "PyPyErr_GetHandledException")]
-    pub fn PyErr_GetHandledException() -> *mut PyObject;
-    #[cfg(Py_3_11)]
-    #[cfg_attr(PyPy, link_name = "PyPyErr_SetHandledException")]
-    pub fn PyErr_SetHandledException(exc: *mut PyObject);
     #[cfg_attr(PyPy, link_name = "PyPyException_SetTraceback")]
     pub fn PyException_SetTraceback(arg1: *mut PyObject, arg2: *mut PyObject) -> c_int;
     #[cfg_attr(PyPy, link_name = "PyPyException_GetTraceback")]
@@ -72,18 +66,12 @@ extern_libpython! {
     #[cfg_attr(PyPy, link_name = "PyPyException_SetContext")]
     pub fn PyException_SetContext(arg1: *mut PyObject, arg2: *mut PyObject);
 
-    #[cfg(RustPython)]
-    pub fn PyExceptionClass_Check(x: *mut PyObject) -> c_int;
-    #[cfg(RustPython)]
-    pub fn PyExceptionInstance_Check(x: *mut PyObject) -> c_int;
-
     #[cfg(PyPy)]
     #[link_name = "PyPyExceptionInstance_Class"]
     pub fn PyExceptionInstance_Class(x: *mut PyObject) -> *mut PyObject;
 }
 
 #[inline]
-#[cfg(not(RustPython))]
 pub unsafe fn PyExceptionClass_Check(x: *mut PyObject) -> c_int {
     (PyType_Check(x) != 0
         && PyType_FastSubclass(x as *mut PyTypeObject, Py_TPFLAGS_BASE_EXC_SUBCLASS) != 0)
@@ -91,7 +79,6 @@ pub unsafe fn PyExceptionClass_Check(x: *mut PyObject) -> c_int {
 }
 
 #[inline]
-#[cfg(not(RustPython))]
 pub unsafe fn PyExceptionInstance_Check(x: *mut PyObject) -> c_int {
     PyType_FastSubclass(Py_TYPE(x), Py_TPFLAGS_BASE_EXC_SUBCLASS)
 }
@@ -124,7 +111,8 @@ pub unsafe fn PyUnicodeDecodeError_Create(
     )
 }
 
-extern_libpython! {
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyExc_BaseException")]
     pub static mut PyExc_BaseException: *mut PyObject;
     #[cfg(Py_3_11)]
@@ -276,7 +264,7 @@ extern_libpython! {
     pub static mut PyExc_EncodingWarning: *mut PyObject;
 }
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyErr_BadArgument")]
     pub fn PyErr_BadArgument() -> c_int;
     #[cfg_attr(PyPy, link_name = "PyPyErr_NoMemory")]
@@ -310,30 +298,9 @@ extern_libpython! {
         arg2: *mut PyObject,
         arg3: *mut PyObject,
     ) -> *mut PyObject;
-    #[cfg(PyPy)]
     #[cfg_attr(PyPy, link_name = "PyPyErr_BadInternalCall")]
     pub fn PyErr_BadInternalCall();
-
-    #[cfg(not(PyPy))]
-    fn _PyErr_BadInternalCall(filename: *const c_char, lineno: c_int);
-}
-
-#[cfg(not(PyPy))]
-#[track_caller]
-#[inline]
-pub unsafe fn PyErr_BadInternalCall() {
-    let location = core::panic::Location::caller();
-    let filename = alloc::ffi::CString::new(location.file()).unwrap();
-    // SAFETY: `filename` is null terminated, `location.line()` saturates if exceeds c_int
-    unsafe {
-        _PyErr_BadInternalCall(
-            filename.as_ptr(),
-            location.line().try_into().unwrap_or(c_int::MAX),
-        )
-    }
-}
-
-extern_libpython! {
+    pub fn _PyErr_BadInternalCall(filename: *const c_char, lineno: c_int);
     #[cfg_attr(PyPy, link_name = "PyPyErr_NewException")]
     pub fn PyErr_NewException(
         name: *const c_char,
@@ -355,7 +322,7 @@ extern_libpython! {
     pub fn PyErr_SetInterrupt();
     #[cfg(Py_3_10)]
     #[cfg_attr(PyPy, link_name = "PyPyErr_SetInterruptEx")]
-    pub fn PyErr_SetInterruptEx(signum: c_int) -> c_int;
+    pub fn PyErr_SetInterruptEx(signum: c_int);
     #[cfg_attr(PyPy, link_name = "PyPyErr_SyntaxLocation")]
     pub fn PyErr_SyntaxLocation(filename: *const c_char, lineno: c_int);
     #[cfg_attr(PyPy, link_name = "PyPyErr_SyntaxLocationEx")]

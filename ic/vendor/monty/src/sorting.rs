@@ -14,8 +14,9 @@ use crate::{
     args::{ArgValues, FromArgs, LaxBool},
     bytecode::VM,
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, ExcTypeExt, RunError, RunResult},
-    types::{CmpOrder, PyTrait},
+    exception_private::{ExcType, RunError, RunResult},
+    resource::ResourceTracker,
+    types::PyTrait,
     value::Value,
 };
 
@@ -39,34 +40,25 @@ struct ListSortArgs {
 /// builtin — sharing here is what makes unknown-kwarg errors uniformly
 /// read `sort() got an unexpected keyword argument 'X'` (matching
 /// CPython, whose `sorted` delegates to `list.sort` internally).
-///
-/// `key_context` names the calling builtin in rejected-suspension errors.
-pub fn parse_and_sort(
-    key_context: &'static str,
-    items: &mut [Value],
-    args: ArgValues,
-    vm: &mut VM<'_>,
-) -> RunResult<()> {
+pub fn parse_and_sort(items: &mut [Value], args: ArgValues, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<()> {
     let ListSortArgs { key, reverse } = ListSortArgs::from_args(args, vm)?;
     let key_fn = match key {
         Some(v) if matches!(v, Value::None) => {
-            v.drop_with(vm);
+            v.drop_with_heap(vm);
             None
         }
         other => other,
     };
     defer_drop!(key_fn, vm);
-    sort_values(key_context, items, key_fn.as_ref(), reverse.bool(), vm)
+    sort_values(items, key_fn.as_ref(), reverse.bool(), vm)
 }
 
 /// Sorts a vector of values, with optional key function.
-/// `key_context` names the calling builtin — see [`parse_and_sort`].
 pub fn sort_values(
-    key_context: &'static str,
     values: &mut [Value],
     key_fn: Option<&Value>,
     reverse: bool,
-    vm: &mut VM<'_>,
+    vm: &mut VM<'_, impl ResourceTracker>,
 ) -> RunResult<()> {
     if let Some(f) = key_fn {
         // Sort by key function: compute all the keys, sort an index buffer, then
@@ -75,12 +67,9 @@ pub fn sort_values(
         let keys: Vec<Value> = Vec::with_capacity(values.len());
         defer_drop_mut!(keys, vm);
 
-        // Each key call re-enters `run()` with a fresh dispatch countdown, so a
-        // short key reaches no checkpoint: this is the pass's only clock poll.
-        for (i, item) in values.iter().enumerate() {
-            vm.heap.tracker.check_time_every(i)?;
+        for item in values.iter() {
             let item = item.clone_with_heap(vm);
-            keys.push(vm.evaluate_function(key_context, f, ArgValues::One(item))?);
+            keys.push(vm.evaluate_function("sorted() key argument", f, ArgValues::One(item))?);
         }
 
         // 2. Sort indices by comparing key values (or values themselves if no key)
@@ -93,11 +82,7 @@ pub fn sort_values(
     } else {
         // With no key function can sort directly on the original array
         let mut sort_result: RunResult<()> = Ok(());
-        let mut n = 0usize;
-        values.sort_by(|a, b| {
-            n += 1;
-            compare_values(n, a, b, reverse, &mut sort_result, vm)
-        });
+        values.sort_by(|a, b| compare_values(a, b, reverse, &mut sort_result, vm));
         sort_result
     }
 }
@@ -110,13 +95,14 @@ pub fn sort_values(
 ///
 /// The `values` slice is typically either the items themselves (no key function)
 /// or the pre-computed key values.
-pub fn sort_indices(indices: &mut [usize], values: &[Value], reverse: bool, vm: &mut VM<'_>) -> Result<(), RunError> {
+pub fn sort_indices(
+    indices: &mut [usize],
+    values: &[Value],
+    reverse: bool,
+    vm: &mut VM<'_, impl ResourceTracker>,
+) -> Result<(), RunError> {
     let mut sort_result: RunResult<()> = Ok(());
-    let mut n = 0usize;
-    indices.sort_by(|&a, &b| {
-        n += 1;
-        compare_values(n, &values[a], &values[b], reverse, &mut sort_result, vm)
-    });
+    indices.sort_by(|&a, &b| compare_values(&values[a], &values[b], reverse, &mut sort_result, vm));
     sort_result
 }
 
@@ -150,35 +136,29 @@ pub fn apply_permutation<T>(items: &mut [T], indices: &mut [usize]) {
 }
 
 /// Helper for the sort functions which compares two values, handling any exceptions and timeouts.
-/// `n` is the caller's running comparison count, keying the amortized time check.
 fn compare_values(
-    n: usize,
     a: &Value,
     b: &Value,
     reverse: bool,
     sort_result: &mut RunResult<()>,
-    vm: &mut VM<'_>,
+    vm: &mut VM<'_, impl ResourceTracker>,
 ) -> Ordering {
     if sort_result.is_err() {
         // short-circuit if we've already encountered an error in a previous comparison
         return Ordering::Equal;
     }
-    if let Err(e) = vm.heap.tracker.check_time_every(n) {
+    if let Err(e) = vm.heap.check_time() {
         *sort_result = Err(e.into());
         return Ordering::Equal;
     }
     let err = match a.py_cmp(b, vm) {
-        Ok(CmpOrder::Ordered(ord)) => return if reverse { ord.reverse() } else { ord },
-        // A `NaN` (or `NaN`-carrying container) has no ordering but must not
-        // raise: CPython's `sorted`/`list.sort` leave such elements wherever the
-        // comparisons happen to place them. Treat it as "equal" — no swap.
-        Ok(CmpOrder::Unordered) => return Ordering::Equal,
-        Ok(CmpOrder::Incomparable) => ExcType::type_error(format!(
+        Ok(Some(ord)) => return if reverse { ord.reverse() } else { ord },
+        Ok(None) => ExcType::type_error(format!(
             "'<' not supported between instances of '{}' and '{}'",
-            a.py_type_name(vm),
-            b.py_type_name(vm)
+            a.py_type(vm),
+            b.py_type(vm)
         )),
-        Err(e) => e,
+        Err(e) => e.into(),
     };
     *sort_result = Err(err);
     Ordering::Equal

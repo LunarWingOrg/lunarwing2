@@ -11,23 +11,22 @@
 
 [package]
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.93"
 name = "ruff_python_ast"
-version = "0.0.9"
+version = "0.0.0"
 authors = ["Charlie Marsh <charlie.r.marsh@gmail.com>"]
 build = false
+publish = false
 autolib = false
 autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "This is an internal component crate of Ruff"
 homepage = "https://docs.astral.sh/ruff"
 documentation = "https://docs.astral.sh/ruff"
-readme = "README.md"
+readme = false
 license = "MIT"
 repository = "https://github.com/astral-sh/ruff"
-resolver = "2"
 
 [package.metadata.cargo-shear]
 ignored = ["ruff_cache"]
@@ -39,10 +38,8 @@ cache = [
 ]
 get-size = [
     "dep:get-size2",
-    "char_str/get-size",
     "ruff_text_size/get-size",
 ]
-salsa = ["dep:salsa"]
 schemars = [
     "dep:schemars",
     "dep:serde_json",
@@ -51,7 +48,6 @@ serde = [
     "dep:serde",
     "ruff_text_size/serde",
     "dep:ruff_cache",
-    "char_str/serde",
     "compact_str/serde",
     "thin-vec/serde",
 ]
@@ -63,20 +59,14 @@ path = "src/lib.rs"
 [dependencies.aho-corasick]
 version = "1.1.3"
 
-[dependencies.arrayvec]
-version = "0.7.6"
-
 [dependencies.bitflags]
 version = "2.5.0"
 
-[dependencies.char_str]
-version = "0.0.2"
-
 [dependencies.compact_str]
-version = "0.10.0"
+version = "0.9.0"
 
 [dependencies.get-size2]
-version = "0.10.3"
+version = "0.9.0"
 features = [
     "derive",
     "smallvec",
@@ -94,27 +84,27 @@ version = "0.3.5"
 version = "2.7.1"
 
 [dependencies.ruff_cache]
-version = "0.0.9"
+path = "../ruff_cache"
 optional = true
 
 [dependencies.ruff_macros]
-version = "0.0.9"
+path = "../ruff_macros"
 optional = true
 
 [dependencies.ruff_python_trivia]
-version = "0.0.9"
+path = "../ruff_python_trivia"
 
 [dependencies.ruff_source_file]
-version = "0.0.9"
+path = "../ruff_source_file"
 
 [dependencies.ruff_text_size]
-version = "0.0.9"
+path = "../ruff_text_size"
 
 [dependencies.rustc-hash]
 version = "2.0.0"
 
 [dependencies.salsa]
-version = "0.28.2"
+version = "0.26.1"
 features = [
     "compact_str",
     "macros",
@@ -158,7 +148,7 @@ get_unwrap = "warn"
 if_not_else = "allow"
 ignore_without_reason = "allow"
 implicit_hasher = "allow"
-iter_over_hash_type = "warn"
+large_stack_arrays = "allow"
 map_unwrap_or = "allow"
 match_same_arms = "allow"
 missing_errors_doc = "allow"

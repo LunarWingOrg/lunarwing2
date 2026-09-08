@@ -265,7 +265,10 @@ pub fn walk_stmt<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, stmt: &'a Stmt) {
             visitor.visit_expr(test);
             visitor.visit_body(body);
             for clause in elif_else_clauses {
-                visitor.visit_elif_else_clause(clause);
+                if let Some(test) = &clause.test {
+                    visitor.visit_expr(test);
+                }
+                walk_elif_else_clause(visitor, clause);
             }
         }
         Stmt::With(ast::StmtWith { items, body, .. }) => {
@@ -530,7 +533,7 @@ pub fn walk_expr<'a, V: Visitor<'a> + ?Sized>(visitor: &mut V, expr: &'a Expr) {
         Expr::Call(ast::ExprCall {
             func,
             arguments,
-            range_start: _,
+            range: _,
             node_index: _,
         }) => {
             visitor.visit_expr(func);

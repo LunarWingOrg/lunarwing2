@@ -1,13 +1,15 @@
 //! Implementation of the getattr() builtin function.
 
-use monty_types::ExcType;
-
 use crate::{
+    ExcType,
     args::ArgValues,
-    bytecode::{CallResult, PendingLookupEffect, VM},
+    bytecode::{CallResult, VM},
     defer_drop,
-    exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
-    heap::DropWithContext,
+    exception_private::{RunError, RunResult, SimpleException},
+    heap::DropWithHeap,
+    resource::ResourceTracker,
+    types::PyTrait,
+    value::Value,
 };
 
 /// Implementation of the getattr() builtin function.
@@ -20,17 +22,13 @@ use crate::{
 /// at compilation time, one must manually mangle a private attribute's (attributes with
 /// two leading underscores) name in order to retrieve it with getattr()."
 ///
-/// A lazy attribute on a host-backed object suspends to the host like
-/// `obj.attr` does; the `default` rides along as a [`PendingLookupEffect`]
-/// so an `Undefined` answer yields it instead of raising.
-///
 /// Examples:
 /// ```python
 /// getattr(obj, 'x')             # Get obj.x
 /// getattr(obj, 'y', None)       # Get obj.y or None if not found
 /// getattr(module, 'function')   # Get module.function
 /// ```
-pub fn builtin_getattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult> {
+pub fn builtin_getattr(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let positional = args.into_pos_only("getattr", vm.heap)?;
     defer_drop!(positional, vm);
 
@@ -41,30 +39,17 @@ pub fn builtin_getattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult
         too_many => return Err(ExcType::type_error_at_most("getattr", 3, too_many.len())),
     };
 
-    let Some(attr) = name.as_either_str(vm.heap).map(|s| s.resolve_interned(vm.interns)) else {
-        let ty = name.py_type_name(vm);
+    let Some(attr) = name.as_either_str(vm.heap) else {
+        let ty = name.py_type(vm);
         return Err(
             SimpleException::new_msg(ExcType::TypeError, format!("attribute name must be string, not '{ty}'")).into(),
         );
     };
 
     match object.py_getattr(&attr, vm) {
-        Ok(CallResult::Value(value)) => Ok(CallResult::Value(value)),
-        Ok(CallResult::AttrLookup {
-            name,
-            class_name,
-            object_id,
-            type_object,
-            effect: _,
-        }) => Ok(CallResult::AttrLookup {
-            name,
-            class_name,
-            object_id,
-            type_object,
-            effect: default.map(|d| PendingLookupEffect::Default(d.clone_with_heap(vm))),
-        }),
+        Ok(CallResult::Value(value)) => Ok(value),
         Ok(other) => {
-            other.drop_with(vm);
+            other.drop_with_heap(vm);
             // getattr() only retrieves attribute values — OS calls, external calls,
             // method calls, and awaits are not supported here
             //
@@ -75,7 +60,7 @@ pub fn builtin_getattr(vm: &mut VM<'_>, args: ArgValues) -> RunResult<CallResult
             if let Some(d) = default
                 && e.exc.exc_type() == ExcType::AttributeError =>
         {
-            Ok(CallResult::Value(d.clone_with_heap(vm)))
+            Ok(d.clone_with_heap(vm))
         }
         Err(e) => Err(e),
     }

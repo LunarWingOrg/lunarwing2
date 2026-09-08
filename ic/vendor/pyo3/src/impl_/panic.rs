@@ -15,7 +15,7 @@ impl PanicTrap {
 
     #[inline]
     pub const fn disarm(self) {
-        core::mem::forget(self)
+        std::mem::forget(self)
     }
 }
 

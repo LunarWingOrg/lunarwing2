@@ -1,11 +1,8 @@
-use crate::object::{PyObject, PyTypeObject};
+use crate::object::{PyObject, PyTypeObject, Py_TYPE};
 #[cfg(Py_3_9)]
-#[cfg(not(RustPython))]
 use crate::PyObject_TypeCheck;
-#[cfg(not(RustPython))]
-use crate::Py_IS_TYPE;
-use core::ffi::{c_char, c_int, c_void};
-use core::{mem, ptr};
+use std::ffi::{c_char, c_int, c_void};
+use std::{mem, ptr};
 
 #[cfg(all(Py_3_9, not(Py_LIMITED_API), not(GraalPy)))]
 pub struct PyCFunctionObject {
@@ -18,33 +15,28 @@ pub struct PyCFunctionObject {
     pub vectorcall: Option<crate::vectorcallfunc>,
 }
 
-extern_libpython! {
-    #[cfg(not(RustPython))]
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyCFunction_Type")]
     pub static mut PyCFunction_Type: PyTypeObject;
-
-    #[cfg(RustPython)]
-    pub fn PyCFunction_CheckExact(op: *mut PyObject) -> c_int;
-    #[cfg(RustPython)]
-    pub fn PyCFunction_Check(op: *mut PyObject) -> c_int;
 }
 
-#[cfg(all(Py_3_9, not(RustPython)))]
+#[cfg(Py_3_9)]
 #[inline]
 pub unsafe fn PyCFunction_CheckExact(op: *mut PyObject) -> c_int {
-    Py_IS_TYPE(op, &raw mut PyCFunction_Type)
+    (Py_TYPE(op) == ptr::addr_of_mut!(PyCFunction_Type)) as c_int
 }
 
-#[cfg(all(Py_3_9, not(RustPython)))]
+#[cfg(Py_3_9)]
 #[inline]
 pub unsafe fn PyCFunction_Check(op: *mut PyObject) -> c_int {
-    PyObject_TypeCheck(op, &raw mut PyCFunction_Type)
+    PyObject_TypeCheck(op, ptr::addr_of_mut!(PyCFunction_Type))
 }
 
-#[cfg(not(any(Py_3_9, RustPython)))]
+#[cfg(not(Py_3_9))]
 #[inline]
 pub unsafe fn PyCFunction_Check(op: *mut PyObject) -> c_int {
-    Py_IS_TYPE(op, &raw mut PyCFunction_Type)
+    (Py_TYPE(op) == ptr::addr_of_mut!(PyCFunction_Type)) as c_int
 }
 
 pub type PyCFunction =
@@ -88,7 +80,7 @@ pub type PyCMethod = unsafe extern "C" fn(
     kwnames: *mut PyObject,
 ) -> *mut PyObject;
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyCFunction_GetFunction")]
     pub fn PyCFunction_GetFunction(f: *mut PyObject) -> Option<PyCFunction>;
     pub fn PyCFunction_GetSelf(f: *mut PyObject) -> *mut PyObject;
@@ -186,7 +178,6 @@ pub union PyMethodDefPointer {
 
 impl PyMethodDefPointer {
     pub fn as_ptr(&self) -> *mut c_void {
-        // SAFETY: self is pointer sized
         unsafe { self.Void }
     }
 
@@ -203,14 +194,14 @@ impl PyMethodDefPointer {
 
 impl PartialEq for PyMethodDefPointer {
     fn eq(&self, other: &Self) -> bool {
-        self.as_ptr() == other.as_ptr()
+        unsafe { self.Void == other.Void }
     }
 }
 
-impl core::fmt::Pointer for PyMethodDefPointer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let ptr = self.as_ptr();
-        core::fmt::Pointer::fmt(&ptr, f)
+impl std::fmt::Pointer for PyMethodDefPointer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ptr = unsafe { self.Void };
+        std::fmt::Pointer::fmt(&ptr, f)
     }
 }
 
@@ -218,7 +209,7 @@ const _: () =
     assert!(mem::size_of::<PyMethodDefPointer>() == mem::size_of::<Option<extern "C" fn()>>());
 
 #[cfg(not(Py_3_9))]
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyCFunction_New")]
     pub fn PyCFunction_New(ml: *mut PyMethodDef, slf: *mut PyObject) -> *mut PyObject;
 
@@ -233,7 +224,7 @@ extern_libpython! {
 #[cfg(Py_3_9)]
 #[inline]
 pub unsafe fn PyCFunction_New(ml: *mut PyMethodDef, slf: *mut PyObject) -> *mut PyObject {
-    PyCFunction_NewEx(ml, slf, core::ptr::null_mut())
+    PyCFunction_NewEx(ml, slf, std::ptr::null_mut())
 }
 
 #[cfg(Py_3_9)]
@@ -243,11 +234,11 @@ pub unsafe fn PyCFunction_NewEx(
     slf: *mut PyObject,
     module: *mut PyObject,
 ) -> *mut PyObject {
-    PyCMethod_New(ml, slf, module, core::ptr::null_mut())
+    PyCMethod_New(ml, slf, module, std::ptr::null_mut())
 }
 
 #[cfg(Py_3_9)]
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyCMethod_New")]
     pub fn PyCMethod_New(
         ml: *mut PyMethodDef,
@@ -287,7 +278,7 @@ pub const METH_FASTCALL: c_int = 0x0080;
 #[cfg(all(Py_3_9, not(Py_LIMITED_API)))]
 pub const METH_METHOD: c_int = 0x0200;
 
-extern_libpython! {
+extern "C" {
     #[cfg(not(Py_3_9))]
     pub fn PyCFunction_ClearFreeList() -> c_int;
 }

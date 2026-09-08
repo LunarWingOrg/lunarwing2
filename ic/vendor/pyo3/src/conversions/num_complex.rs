@@ -1,5 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
 #![cfg(feature = "num-complex")]
 
 //!  Conversions to and from [num-complex](https://docs.rs/num-complex)’
@@ -95,16 +93,12 @@
 //! result = get_eigenvalues(m11,m12,m21,m22)
 //! assert result == [complex(1,-1), complex(-2,0)]
 //! ```
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::PyStaticExpr;
-#[cfg(feature = "experimental-inspect")]
-use crate::type_hint_identifier;
 use crate::{
     ffi, ffi_ptr_ext::FfiPtrExt, types::PyComplex, Borrowed, Bound, FromPyObject, PyAny, PyErr,
     Python,
 };
-use core::ffi::c_double;
 use num_complex::Complex;
+use std::ffi::c_double;
 
 impl PyComplex {
     /// Creates a new Python `PyComplex` object from `num_complex`'s [`Complex`].
@@ -126,10 +120,7 @@ macro_rules! complex_conversion {
         impl<'py> crate::conversion::IntoPyObject<'py> for Complex<$float> {
             type Target = PyComplex;
             type Output = Bound<'py, Self::Target>;
-            type Error = core::convert::Infallible;
-
-            #[cfg(feature = "experimental-inspect")]
-            const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("builtins", "complex");
+            type Error = std::convert::Infallible;
 
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
                 unsafe {
@@ -146,10 +137,7 @@ macro_rules! complex_conversion {
         impl<'py> crate::conversion::IntoPyObject<'py> for &Complex<$float> {
             type Target = PyComplex;
             type Output = Bound<'py, Self::Target>;
-            type Error = core::convert::Infallible;
-
-            #[cfg(feature = "experimental-inspect")]
-            const OUTPUT_TYPE: PyStaticExpr = <Complex<$float>>::OUTPUT_TYPE;
+            type Error = std::convert::Infallible;
 
             #[inline]
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
@@ -160,9 +148,6 @@ macro_rules! complex_conversion {
         #[cfg_attr(docsrs, doc(cfg(feature = "num-complex")))]
         impl FromPyObject<'_, '_> for Complex<$float> {
             type Error = PyErr;
-
-            #[cfg(feature = "experimental-inspect")]
-            const INPUT_TYPE: PyStaticExpr = type_hint_identifier!("builtins", "complex");
 
             fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Complex<$float>, Self::Error> {
                 #[cfg(not(any(Py_LIMITED_API, PyPy)))]
@@ -269,11 +254,15 @@ class C:
                 from_float.extract::<Complex<f64>>().unwrap(),
                 Complex::new(3.0, 0.0)
             );
-            let from_index = module.getattr("C").unwrap().call0().unwrap();
-            assert_eq!(
-                from_index.extract::<Complex<f64>>().unwrap(),
-                Complex::new(3.0, 0.0)
-            );
+            // Before Python 3.8, `__index__` wasn't tried by `float`/`complex`.
+            #[cfg(Py_3_8)]
+            {
+                let from_index = module.getattr("C").unwrap().call0().unwrap();
+                assert_eq!(
+                    from_index.extract::<Complex<f64>>().unwrap(),
+                    Complex::new(3.0, 0.0)
+                );
+            }
         })
     }
     #[test]
@@ -307,11 +296,14 @@ class C(First, IndexMixin): pass
                 from_float.extract::<Complex<f64>>().unwrap(),
                 Complex::new(3.0, 0.0)
             );
-            let from_index = module.getattr("C").unwrap().call0().unwrap();
-            assert_eq!(
-                from_index.extract::<Complex<f64>>().unwrap(),
-                Complex::new(3.0, 0.0)
-            );
+            #[cfg(Py_3_8)]
+            {
+                let from_index = module.getattr("C").unwrap().call0().unwrap();
+                assert_eq!(
+                    from_index.extract::<Complex<f64>>().unwrap(),
+                    Complex::new(3.0, 0.0)
+                );
+            }
         })
     }
     #[test]

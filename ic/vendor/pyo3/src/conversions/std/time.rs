@@ -12,8 +12,7 @@ use crate::types::any::PyAnyMethods;
 use crate::types::PyDeltaAccess;
 use crate::types::{PyDateTime, PyDelta, PyTzInfo};
 use crate::{Borrowed, Bound, FromPyObject, Py, PyAny, PyErr, PyResult, Python};
-use core::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
@@ -99,7 +98,7 @@ impl<'py> IntoPyObject<'py> for &Duration {
 
 // Conversions between SystemTime and datetime do not rely on the floating point timestamp of the
 // timestamp/fromtimestamp APIs to avoid possible precision loss but goes through the
-// timedelta/core::time::Duration types by taking for reference point the UNIX epoch.
+// timedelta/std::time::Duration types by taking for reference point the UNIX epoch.
 //
 // TODO: it might be nice to investigate using timestamps anyway, at least when the datetime is a safe range.
 

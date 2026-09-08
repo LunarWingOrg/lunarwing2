@@ -6,13 +6,15 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
     heap::HeapData,
+    resource::ResourceTracker,
+    types::PyTrait,
     value::Value,
 };
 
 /// Implementation of the ord() builtin function.
 ///
 /// Returns the Unicode code point of a one-character string.
-pub fn builtin_ord(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_ord(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("ord", vm.heap)?;
     defer_drop!(value, vm);
 
@@ -45,7 +47,7 @@ pub fn builtin_ord(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
             }
         }
         _ => {
-            let type_name = value.py_type_name(vm);
+            let type_name = value.py_type(vm);
             Err(SimpleException::new_msg(
                 ExcType::TypeError,
                 format!("ord() expected string of length 1, but {type_name} found"),

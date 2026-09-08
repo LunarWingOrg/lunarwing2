@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt::{Formatter, Write};
 
-use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
 use datatest_stable::Utf8Path;
 use itertools::Itertools;
+use ruff_annotate_snippets::{Level, Renderer, Snippet};
 use ruff_python_ast::token::{Token, Tokens};
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::visitor::source_order::{SourceOrderVisitor, TraversalSignal, walk_module};
@@ -69,10 +69,7 @@ fn test_valid_syntax(input_path: &Utf8Path, source: &str, root: &str) {
         let line_index = LineIndex::from_source_text(source);
         let source_code = SourceCode::new(source, &line_index);
 
-        let mut message = "\
-            Expected no syntax errors for a valid program \
-                but the parser generated the following errors:\n"
-            .to_string();
+        let mut message = "Expected no syntax errors for a valid program but the parser generated the following errors:\n".to_string();
 
         for error in parsed.errors() {
             writeln!(
@@ -221,8 +218,7 @@ fn test_invalid_syntax(input_path: &Utf8Path, source: &str, root: &str) {
 
     assert!(
         parsed.has_syntax_errors() || !semantic_syntax_errors.is_empty(),
-        "Expected parser to generate at least one syntax error \
-            for a program containing syntax errors."
+        "Expected parser to generate at least one syntax error for a program containing syntax errors."
     );
 
     if !semantic_syntax_errors.is_empty() {
@@ -384,14 +380,14 @@ impl std::fmt::Display for CodeFrame<'_> {
         let label = format!("Syntax Error: {error}", error = self.error);
 
         let span = usize::from(annotation_range.start())..usize::from(annotation_range.end());
-        let annotation = AnnotationKind::Primary.span(span).label(&label);
+        let annotation = Level::Error.span(span).label(&label);
         let snippet = Snippet::source(source)
             .line_start(start_index.get())
             .annotation(annotation)
             .fold(false);
-        let message = Group::with_level(Level::ERROR).element(snippet);
+        let message = Level::None.title("").snippet(snippet);
         let renderer = Renderer::plain().cut_indicator("…");
-        let rendered = renderer.render(&[message]);
+        let rendered = renderer.render(message);
         writeln!(f, "{rendered}")
     }
 }
@@ -467,13 +463,7 @@ impl ValidateAstVisitor<'_> {
             // At this point, next_token.end() > node.start()
             assert!(
                 next.start() >= node.start(),
-                "\
-The start of the node falls within a token.
-Node: {node:#?}
-
-Token: {next:#?}
-
-Root: {root:#?}",
+                "The start of the node falls within a token.\nNode: {node:#?}\n\nToken: {next:#?}\n\nRoot: {root:#?}",
                 root = self.parents.first()
             );
         }
@@ -492,13 +482,7 @@ Root: {root:#?}",
             // At this point, `next_token.end() > node.end()`
             assert!(
                 next.start() >= node.end(),
-                "\
-The end of the node falls within a token.
-Node: {node:#?}
-
-Token: {next:#?}
-
-Root: {root:#?}",
+                "The end of the node falls within a token.\nNode: {node:#?}\n\nToken: {next:#?}\n\nRoot: {root:#?}",
                 root = self.parents.first()
             );
         }
@@ -516,13 +500,7 @@ impl<'ast> SourceOrderVisitor<'ast> for ValidateAstVisitor<'ast> {
             assert_ne!(
                 previous.range().ordering(node.range()),
                 Ordering::Greater,
-                "\
-The ranges of the nodes are not strictly increasing when traversing the AST in pre-order.
-Previous node: {previous:#?}
-
-Current node: {node:#?}
-
-Root: {root:#?}",
+                "The ranges of the nodes are not strictly increasing when traversing the AST in pre-order.\nPrevious node: {previous:#?}\n\nCurrent node: {node:#?}\n\nRoot: {root:#?}",
                 root = self.parents.first()
             );
         }
@@ -530,13 +508,7 @@ Root: {root:#?}",
         if let Some(parent) = self.parents.last() {
             assert!(
                 parent.range().contains_range(node.range()),
-                "\
-The range of the parent node does not fully enclose the range of the child node.
-Parent node: {parent:#?}
-
-Child node: {node:#?}
-
-Root: {root:#?}",
+                "The range of the parent node does not fully enclose the range of the child node.\nParent node: {parent:#?}\n\nChild node: {node:#?}\n\nRoot: {root:#?}",
                 root = self.parents.first()
             );
         }
@@ -657,17 +629,6 @@ impl SemanticSyntaxContext for SemanticSyntaxCheckerVisitor<'_> {
         for scope in &self.scopes {
             if let Scope::Comprehension { is_async: false } = scope {
                 return true;
-            }
-        }
-        false
-    }
-
-    fn in_class_body_comprehension(&self) -> bool {
-        for scope in self.scopes.iter().rev() {
-            match scope {
-                Scope::Comprehension { .. } => {}
-                Scope::Class => return true,
-                Scope::Module | Scope::Function { .. } => return false,
             }
         }
         false

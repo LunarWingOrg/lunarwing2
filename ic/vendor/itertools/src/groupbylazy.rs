@@ -1,6 +1,5 @@
 use alloc::vec::{self, Vec};
 use std::cell::{Cell, RefCell};
-use std::fmt::Debug;
 
 /// A trait to unify `FnMut` for `ChunkBy` with the chunk key in `IntoChunks`
 trait KeyFunction<A> {
@@ -75,27 +74,6 @@ where
     /// index of last group iter that was dropped,
     /// `usize::MAX` initially when no group was dropped
     dropped_group: usize,
-}
-
-impl<K, I, F> Debug for GroupInner<K, I, F>
-where
-    K: Debug,
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(
-        GroupInner,
-        // key, omitted because functions are almost never Debug
-        iter,
-        current_key,
-        current_elt,
-        done,
-        top_group,
-        oldest_buffered_group,
-        bottom_group,
-        buffer,
-        dropped_group
-    );
 }
 
 impl<K, I, F> GroupInner<K, I, F>
@@ -197,11 +175,14 @@ where
 
         while let Some(elt) = self.next_element() {
             let key = self.key.call_mut(&elt);
-            if let Some(old_key) = self.current_key.take() {
-                if old_key != key {
-                    self.current_key = Some(key);
-                    first_elt = Some(elt);
-                    break;
+            match self.current_key.take() {
+                None => {}
+                Some(old_key) => {
+                    if old_key != key {
+                        self.current_key = Some(key);
+                        first_elt = Some(elt);
+                        break;
+                    }
                 }
             }
             self.current_key = Some(key);
@@ -245,12 +226,15 @@ where
             None => None,
             Some(elt) => {
                 let key = self.key.call_mut(&elt);
-                if let Some(old_key) = self.current_key.take() {
-                    if old_key != key {
-                        self.current_key = Some(key);
-                        self.current_elt = Some(elt);
-                        self.top_group += 1;
-                        return None;
+                match self.current_key.take() {
+                    None => {}
+                    Some(old_key) => {
+                        if old_key != key {
+                            self.current_key = Some(key);
+                            self.current_elt = Some(elt);
+                            self.top_group += 1;
+                            return None;
+                        }
                     }
                 }
                 self.current_key = Some(key);
@@ -327,15 +311,6 @@ where
     index: Cell<usize>,
 }
 
-impl<K, I, F> Debug for ChunkBy<K, I, F>
-where
-    K: Debug,
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(ChunkBy, inner, index);
-}
-
 /// Create a new
 pub fn new<K, J, F>(iter: J, f: F) -> ChunkBy<K, J::IntoIter, F>
 where
@@ -410,15 +385,6 @@ where
     parent: &'a ChunkBy<K, I, F>,
 }
 
-impl<'a, K, I, F> Debug for Groups<'a, K, I, F>
-where
-    K: Debug,
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(Groups, parent);
-}
-
 impl<'a, K, I, F> Iterator for Groups<'a, K, I, F>
 where
     I: Iterator,
@@ -472,15 +438,6 @@ where
     }
 }
 
-impl<'a, K, I, F> Debug for Group<'a, K, I, F>
-where
-    K: Debug,
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(Group, parent, index, first);
-}
-
 impl<'a, K, I, F> Iterator for Group<'a, K, I, F>
 where
     I: Iterator,
@@ -522,7 +479,7 @@ where
     }
 }
 
-/// `IntoChunks` is the storage for a lazy chunking operation.
+/// `ChunkLazy` is the storage for a lazy chunking operation.
 ///
 /// `IntoChunks` behaves just like `ChunkBy`: it is iterable, and
 /// it only buffers if several chunk iterators are alive at the same time.
@@ -544,14 +501,6 @@ where
     // the chunk iterator's current index. Keep this in the main value
     // so that simultaneous iterators all use the same state.
     index: Cell<usize>,
-}
-
-impl<I> Debug for IntoChunks<I>
-where
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(IntoChunks, inner, index);
 }
 
 impl<I> Clone for IntoChunks<I>
@@ -605,14 +554,6 @@ where
     parent: &'a IntoChunks<I>,
 }
 
-impl<'a, I> Debug for Chunks<'a, I>
-where
-    I: Iterator + Debug,
-    I::Item: Debug,
-{
-    debug_fmt_fields!(Chunks, parent);
-}
-
 impl<'a, I> Iterator for Chunks<'a, I>
 where
     I: Iterator,
@@ -636,7 +577,6 @@ where
 /// An iterator for the elements in a single chunk.
 ///
 /// Iterator element type is `I::Item`.
-#[derive(Debug)]
 pub struct Chunk<'a, I>
 where
     I: Iterator + 'a,

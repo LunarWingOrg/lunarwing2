@@ -7,36 +7,24 @@ use crate::instance::Bound;
 use crate::types::any::PyAnyMethods;
 use crate::types::{PyAny, PyIterator, PyList};
 use crate::{ffi, Python};
-#[cfg(RustPython)]
-use crate::{
-    sync::PyOnceLock,
-    types::{PyType, PyTypeMethods},
-    Py,
-};
+
+use std::ffi::c_int;
 
 /// Represents a Python `mappingproxy`.
 #[repr(transparent)]
 pub struct PyMappingProxy(PyAny);
 
-#[cfg(not(RustPython))]
+#[inline]
+unsafe fn dict_proxy_check(op: *mut ffi::PyObject) -> c_int {
+    unsafe { ffi::Py_IS_TYPE(op, std::ptr::addr_of_mut!(ffi::PyDictProxy_Type)) }
+}
+
 pyobject_native_type_core!(
     PyMappingProxy,
     pyobject_native_static_type_object!(ffi::PyDictProxy_Type),
     "types",
-    "MappingProxyType"
-);
-
-#[cfg(RustPython)]
-pyobject_native_type_core!(
-    PyMappingProxy,
-    |py| {
-        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-        TYPE.import(py, "types", "MappingProxyType")
-            .unwrap()
-            .as_type_ptr()
-    },
-    "types",
-    "MappingProxyType"
+    "MappingProxyType",
+    #checkfunction=dict_proxy_check
 );
 
 impl PyMappingProxy {
@@ -148,14 +136,13 @@ impl<'py> Iterator for BoundMappingProxyIterator<'py, '_> {
 mod tests {
 
     use super::*;
-    use crate::platform::HashMap;
     use crate::types::dict::*;
     use crate::Python;
     use crate::{
         exceptions::PyKeyError,
         types::{PyInt, PyTuple},
     };
-    use alloc::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_new() {
@@ -232,12 +219,12 @@ mod tests {
             let cnt;
             {
                 let none = py.None();
-                cnt = none._get_refcnt(py);
+                cnt = none.get_refcnt(py);
                 let dict = [(10, none)].into_py_dict(py).unwrap();
                 let _mappingproxy = PyMappingProxy::new(py, dict.as_mapping());
             }
             {
-                assert_eq!(cnt, py.None()._get_refcnt(py));
+                assert_eq!(cnt, py.None().get_refcnt(py));
             }
         });
     }
@@ -435,7 +422,7 @@ mod tests {
         });
     }
 
-    #[cfg(not(any(PyPy, GraalPy, RustPython)))]
+    #[cfg(not(any(PyPy, GraalPy)))]
     fn abc_mappingproxy(py: Python<'_>) -> Bound<'_, PyMappingProxy> {
         let mut map = HashMap::<&'static str, i32>::new();
         map.insert("a", 1);
@@ -446,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(PyPy, GraalPy, RustPython)))]
+    #[cfg(not(any(PyPy, GraalPy)))]
     fn mappingproxy_keys_view() {
         Python::attach(|py| {
             let mappingproxy = abc_mappingproxy(py);
@@ -456,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(PyPy, GraalPy, RustPython)))]
+    #[cfg(not(any(PyPy, GraalPy)))]
     fn mappingproxy_values_view() {
         Python::attach(|py| {
             let mappingproxy = abc_mappingproxy(py);
@@ -466,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(PyPy, GraalPy, RustPython)))]
+    #[cfg(not(any(PyPy, GraalPy)))]
     fn mappingproxy_items_view() {
         Python::attach(|py| {
             let mappingproxy = abc_mappingproxy(py);

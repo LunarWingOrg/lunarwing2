@@ -49,12 +49,8 @@
 //! assert d + 1 == value
 //! ```
 
-use core::str::FromStr;
+use std::str::FromStr;
 
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::PyStaticExpr;
-#[cfg(feature = "experimental-inspect")]
-use crate::type_hint_identifier;
 use crate::types::PyTuple;
 use crate::{
     exceptions::PyValueError,
@@ -78,9 +74,6 @@ fn get_invalid_operation_error_cls(py: Python<'_>) -> PyResult<&Bound<'_, PyType
 impl FromPyObject<'_, '_> for BigDecimal {
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = type_hint_identifier!("decimal", "Decimal");
-
     fn extract(obj: Borrowed<'_, '_, PyAny>) -> PyResult<Self> {
         let py_str = &obj.str()?;
         let rs_str = &py_str.to_cow()?;
@@ -94,9 +87,6 @@ impl<'py> IntoPyObject<'py> for BigDecimal {
     type Output = Bound<'py, Self::Target>;
 
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("decimal", "Decimal");
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let cls = get_decimal_cls(py)?;
@@ -121,7 +111,7 @@ mod test_bigdecimal {
     use super::*;
     use crate::types::dict::PyDictMethods;
     use crate::types::PyDict;
-    use alloc::ffi::CString;
+    use std::ffi::CString;
 
     use bigdecimal::{One, Zero};
     #[cfg(not(target_arch = "wasm32"))]

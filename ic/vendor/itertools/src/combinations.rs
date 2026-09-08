@@ -1,4 +1,3 @@
-use alloc::boxed::Box;
 use core::array;
 use core::borrow::BorrowMut;
 use std::fmt;
@@ -14,7 +13,7 @@ pub type Combinations<I> = CombinationsGeneric<I, Vec<usize>>;
 /// Iterator for const generic combinations returned by [`.array_combinations()`](crate::Itertools::array_combinations)
 pub type ArrayCombinations<I, const K: usize> = CombinationsGeneric<I, [usize; K]>;
 
-/// Create a new `Combinations` from a cloneable iterator.
+/// Create a new `Combinations` from a clonable iterator.
 pub fn combinations<I: Iterator>(iter: I, k: usize) -> Combinations<I>
 where
     I::Item: Clone,
@@ -22,7 +21,7 @@ where
     Combinations::new(iter, (0..k).collect())
 }
 
-/// Create a new `ArrayCombinations` from a cloneable iterator.
+/// Create a new `ArrayCombinations` from a clonable iterator.
 pub fn array_combinations<I: Iterator, const K: usize>(iter: I) -> ArrayCombinations<I, K>
 where
     I::Item: Clone,
@@ -53,16 +52,7 @@ pub trait PoolIndex<T>: BorrowMut<[usize]> {
         self.borrow().len()
     }
 }
-impl<T> PoolIndex<T> for Box<[usize]> {
-    type Item = Vec<T>;
 
-    fn extract_item<I: Iterator<Item = T>>(&self, pool: &LazyBuffer<I>) -> Vec<T>
-    where
-        T: Clone,
-    {
-        pool.get_at(self)
-    }
-}
 impl<T> PoolIndex<T> for Vec<usize> {
     type Item = Vec<T>;
 

@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95"
 name = "monty-macros"
-version = "0.0.23"
+version = "0.0.18"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
 build = false
 autolib = false
@@ -26,18 +26,15 @@ homepage = "https://github.com/pydantic/monty/"
 readme = "README.md"
 license = "MIT"
 repository = "https://github.com/pydantic/monty/"
-resolver = "2"
 
 [lib]
 name = "monty_macros"
 path = "src/lib.rs"
 proc-macro = true
 
-[dependencies.proc-macro2]
-version = "1"
-
-[dependencies.quote]
-version = "1"
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
 
 [dependencies.syn]
 version = "2"
@@ -45,9 +42,6 @@ features = [
     "full",
     "extra-traits",
 ]
-
-[dev-dependencies.insta]
-version = "1.47"
 
 [lints.clippy]
 absolute_paths = "warn"
@@ -66,9 +60,6 @@ use_self = "warn"
 [lints.clippy.pedantic]
 level = "warn"
 priority = -1
-
-[lints.rust]
-unsafe_code = "deny"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

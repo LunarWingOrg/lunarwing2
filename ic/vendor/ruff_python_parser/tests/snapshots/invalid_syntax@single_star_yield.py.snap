@@ -74,3 +74,4 @@ Module(
   |
 1 | def f(): yield *x
   |                ^^ Syntax Error: Starred expression cannot be used here
+  |

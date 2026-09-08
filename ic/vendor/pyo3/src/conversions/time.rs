@@ -50,9 +50,7 @@
 //! }
 //! ```
 
-use crate::exceptions::{PyOverflowError, PyTypeError, PyValueError};
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::PyStaticExpr;
+use crate::exceptions::{PyTypeError, PyValueError};
 #[cfg(Py_LIMITED_API)]
 use crate::intern;
 #[cfg(not(Py_LIMITED_API))]
@@ -60,8 +58,6 @@ use crate::types::datetime::{PyDateAccess, PyDeltaAccess};
 use crate::types::{PyAnyMethods, PyDate, PyDateTime, PyDelta, PyNone, PyTime, PyTzInfo};
 #[cfg(not(Py_LIMITED_API))]
 use crate::types::{PyTimeAccess, PyTzInfoAccess};
-#[cfg(feature = "experimental-inspect")]
-use crate::{type_hint_identifier, PyTypeInfo};
 use crate::{Borrowed, Bound, FromPyObject, IntoPyObject, PyAny, PyErr, PyResult, Python};
 use time::{
     Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time, UtcDateTime, UtcOffset,
@@ -76,9 +72,6 @@ macro_rules! impl_into_py_for_ref {
             type Target = $target;
             type Output = Bound<'py, Self::Target>;
             type Error = PyErr;
-
-            #[cfg(feature = "experimental-inspect")]
-            const OUTPUT_TYPE: PyStaticExpr = <$type>::OUTPUT_TYPE;
 
             #[inline]
             fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
@@ -156,9 +149,6 @@ impl<'py> IntoPyObject<'py> for Duration {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyDelta::TYPE_HINT;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let total_seconds = self.whole_seconds();
         let micro_seconds = self.subsec_microseconds();
@@ -178,13 +168,11 @@ impl<'py> IntoPyObject<'py> for Duration {
                 total_seconds % SECONDS_PER_DAY,
             )
         };
-        let days = days
-            .try_into()
-            .map_err(|_| PyOverflowError::new_err("duration out of range for Python timedelta"))?;
-
+        // Create the timedelta with days, seconds, microseconds
+        // Safe to unwrap as we've verified the values are within bounds
         PyDelta::new(
             py,
-            days,
+            days.try_into().expect("days overflow"),
             seconds.try_into().expect("seconds overflow"),
             micro_seconds,
             true,
@@ -194,9 +182,6 @@ impl<'py> IntoPyObject<'py> for Duration {
 
 impl FromPyObject<'_, '_> for Duration {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyDelta::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         #[cfg(not(Py_LIMITED_API))]
@@ -231,9 +216,6 @@ impl<'py> IntoPyObject<'py> for Date {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyDate::TYPE_HINT;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let year = self.year();
         let month = self.month() as u8;
@@ -245,9 +227,6 @@ impl<'py> IntoPyObject<'py> for Date {
 
 impl FromPyObject<'_, '_> for Date {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyDate::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let (year, month, day) = {
@@ -279,9 +258,6 @@ impl<'py> IntoPyObject<'py> for Time {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyTime::TYPE_HINT;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let hour = self.hour();
         let minute = self.minute();
@@ -294,9 +270,6 @@ impl<'py> IntoPyObject<'py> for Time {
 
 impl FromPyObject<'_, '_> for Time {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyTime::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let (hour, minute, second, microsecond) = {
@@ -330,9 +303,6 @@ impl<'py> IntoPyObject<'py> for PrimitiveDateTime {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let date = self.date();
         let time = self.time();
@@ -362,9 +332,6 @@ impl<'py> IntoPyObject<'py> for PrimitiveDateTime {
 impl FromPyObject<'_, '_> for PrimitiveDateTime {
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
-
     fn extract(dt: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let has_tzinfo = {
             #[cfg(not(Py_LIMITED_API))]
@@ -393,9 +360,6 @@ impl<'py> IntoPyObject<'py> for UtcOffset {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = type_hint_identifier!("datetime", "timezone");
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         // Get offset in seconds
         let seconds_offset = self.whole_seconds();
@@ -406,9 +370,6 @@ impl<'py> IntoPyObject<'py> for UtcOffset {
 
 impl FromPyObject<'_, '_> for UtcOffset {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyTzInfo::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         #[cfg(not(Py_LIMITED_API))]
@@ -435,9 +396,6 @@ impl<'py> IntoPyObject<'py> for OffsetDateTime {
     type Target = PyDateTime;
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
 
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let date = self.date();
@@ -471,9 +429,6 @@ impl<'py> IntoPyObject<'py> for OffsetDateTime {
 
 impl FromPyObject<'_, '_> for OffsetDateTime {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let offset: UtcOffset = {
@@ -509,9 +464,6 @@ impl<'py> IntoPyObject<'py> for UtcDateTime {
     type Output = Bound<'py, Self::Target>;
     type Error = PyErr;
 
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
-
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
         let date = self.date();
         let time = self.time();
@@ -542,9 +494,6 @@ impl<'py> IntoPyObject<'py> for UtcDateTime {
 
 impl FromPyObject<'_, '_> for UtcDateTime {
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const INPUT_TYPE: PyStaticExpr = PyDateTime::TYPE_HINT;
 
     fn extract(ob: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
         let tzinfo = {
@@ -863,11 +812,6 @@ mod tests {
             assert!(result.is_err());
             let err_type = result.unwrap_err().get_type(py).name().unwrap();
             assert_eq!(err_type, "OverflowError");
-
-            for duration in [Duration::MIN, Duration::MAX] {
-                let err = duration.into_pyobject(py).unwrap_err();
-                assert_eq!(err.get_type(py).name().unwrap(), "OverflowError");
-            }
         });
     }
 

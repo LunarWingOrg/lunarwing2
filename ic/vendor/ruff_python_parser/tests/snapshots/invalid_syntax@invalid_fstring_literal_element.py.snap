@@ -101,3 +101,4 @@ Module(
 1 | f'hello \N{INVALID} world'
 2 | f"""hello \N{INVALID} world"""
   |              ^^^^^^^ Syntax Error: Got unexpected unicode
+  |

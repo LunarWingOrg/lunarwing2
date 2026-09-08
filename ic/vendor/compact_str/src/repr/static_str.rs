@@ -33,7 +33,8 @@ impl StaticStr {
         }
     }
 
-    pub(super) const fn get_text(&self) -> &'static str {
+    #[rustversion::attr(since(1.64), const)]
+    pub(super) fn get_text(&self) -> &'static str {
         // SAFETY: `StaticStr` invariants requires it to be a valid str
         unsafe { str::from_utf8_unchecked(slice::from_raw_parts(self.ptr.as_ptr(), self.len)) }
     }

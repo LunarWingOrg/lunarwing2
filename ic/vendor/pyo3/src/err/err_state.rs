@@ -1,14 +1,9 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
-use core::cell::UnsafeCell;
 use std::{
+    cell::UnsafeCell,
     sync::{Mutex, Once},
     thread::ThreadId,
 };
 
-#[cfg(not(Py_3_12))]
-use crate::sync::MutexExt;
 use crate::{
     exceptions::{PyBaseException, PyTypeError},
     ffi,
@@ -142,7 +137,7 @@ pub(crate) struct PyErrStateNormalized {
     ptype: Py<PyType>,
     pub pvalue: Py<PyBaseException>,
     #[cfg(not(Py_3_12))]
-    ptraceback: std::sync::Mutex<Option<Py<PyTraceback>>>,
+    ptraceback: Option<Py<PyTraceback>>,
 }
 
 impl PyErrStateNormalized {
@@ -152,11 +147,9 @@ impl PyErrStateNormalized {
             ptype: pvalue.get_type().into(),
             #[cfg(not(Py_3_12))]
             ptraceback: unsafe {
-                Mutex::new(
-                    ffi::PyException_GetTraceback(pvalue.as_ptr())
-                        .assume_owned_or_opt(pvalue.py())
-                        .map(|b| b.cast_into_unchecked().unbind()),
-                )
+                ffi::PyException_GetTraceback(pvalue.as_ptr())
+                    .assume_owned_or_opt(pvalue.py())
+                    .map(|b| b.cast_into_unchecked().unbind())
             },
             pvalue: pvalue.into(),
         }
@@ -175,8 +168,6 @@ impl PyErrStateNormalized {
     #[cfg(not(Py_3_12))]
     pub(crate) fn ptraceback<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyTraceback>> {
         self.ptraceback
-            .lock_py_attached(py)
-            .unwrap()
             .as_ref()
             .map(|traceback| traceback.bind(py).clone())
     }
@@ -188,21 +179,6 @@ impl PyErrStateNormalized {
                 .assume_owned_or_opt(py)
                 .map(|b| b.cast_into_unchecked())
         }
-    }
-
-    #[cfg(not(Py_3_12))]
-    pub(crate) fn set_ptraceback<'py>(&self, py: Python<'py>, tb: Option<Bound<'py, PyTraceback>>) {
-        *self.ptraceback.lock_py_attached(py).unwrap() = tb.map(Bound::unbind);
-    }
-
-    #[cfg(Py_3_12)]
-    pub(crate) fn set_ptraceback<'py>(&self, py: Python<'py>, tb: Option<Bound<'py, PyTraceback>>) {
-        let tb = tb
-            .as_ref()
-            .map(Bound::as_ptr)
-            .unwrap_or_else(|| crate::types::PyNone::get(py).as_ptr());
-
-        unsafe { ffi::PyException_SetTraceback(self.pvalue.as_ptr(), tb) };
     }
 
     pub(crate) fn take(py: Python<'_>) -> Option<PyErrStateNormalized> {
@@ -221,9 +197,9 @@ impl PyErrStateNormalized {
         #[cfg(not(Py_3_12))]
         {
             let (ptype, pvalue, ptraceback) = unsafe {
-                let mut ptype: *mut ffi::PyObject = core::ptr::null_mut();
-                let mut pvalue: *mut ffi::PyObject = core::ptr::null_mut();
-                let mut ptraceback: *mut ffi::PyObject = core::ptr::null_mut();
+                let mut ptype: *mut ffi::PyObject = std::ptr::null_mut();
+                let mut pvalue: *mut ffi::PyObject = std::ptr::null_mut();
+                let mut ptraceback: *mut ffi::PyObject = std::ptr::null_mut();
 
                 ffi::PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptraceback);
 
@@ -250,7 +226,7 @@ impl PyErrStateNormalized {
             ptype.map(|ptype| PyErrStateNormalized {
                 ptype: ptype.unbind(),
                 pvalue: pvalue.expect("normalized exception value missing").unbind(),
-                ptraceback: std::sync::Mutex::new(ptraceback.map(Bound::unbind)),
+                ptraceback: ptraceback.map(Bound::unbind),
             })
         }
     }
@@ -277,10 +253,8 @@ impl PyErrStateNormalized {
                     .cast_into_unchecked()
             }
             .unbind(),
-            ptraceback: Mutex::new(
-                unsafe { ptraceback.assume_owned_or_opt(py) }
-                    .map(|b| unsafe { b.cast_into_unchecked() }.unbind()),
-            ),
+            ptraceback: unsafe { ptraceback.assume_owned_or_opt(py) }
+                .map(|b| unsafe { b.cast_into_unchecked() }.unbind()),
         }
     }
 
@@ -290,13 +264,10 @@ impl PyErrStateNormalized {
             ptype: self.ptype.clone_ref(py),
             pvalue: self.pvalue.clone_ref(py),
             #[cfg(not(Py_3_12))]
-            ptraceback: std::sync::Mutex::new(
-                self.ptraceback
-                    .lock_py_attached(py)
-                    .unwrap()
-                    .as_ref()
-                    .map(|ptraceback| ptraceback.clone_ref(py)),
-            ),
+            ptraceback: self
+                .ptraceback
+                .as_ref()
+                .map(|ptraceback| ptraceback.clone_ref(py)),
         }
     }
 }
@@ -347,10 +318,7 @@ impl PyErrStateInner {
             }) => (
                 ptype.into_ptr(),
                 pvalue.into_ptr(),
-                ptraceback
-                    .into_inner()
-                    .unwrap()
-                    .map_or(core::ptr::null_mut(), Py::into_ptr),
+                ptraceback.map_or(std::ptr::null_mut(), Py::into_ptr),
             ),
         };
         unsafe { ffi::PyErr_Restore(ptype, pvalue, ptraceback) }
@@ -375,9 +343,9 @@ fn lazy_into_normalized_ffi_tuple(
     // To be consistent with 3.12 logic, go via raise_lazy, but also then normalize
     // the resulting exception
     raise_lazy(py, lazy);
-    let mut ptype = core::ptr::null_mut();
-    let mut pvalue = core::ptr::null_mut();
-    let mut ptraceback = core::ptr::null_mut();
+    let mut ptype = std::ptr::null_mut();
+    let mut pvalue = std::ptr::null_mut();
+    let mut ptraceback = std::ptr::null_mut();
     unsafe {
         ffi::PyErr_Fetch(&mut ptype, &mut pvalue, &mut ptraceback);
         ffi::PyErr_NormalizeException(&mut ptype, &mut pvalue, &mut ptraceback);
@@ -449,7 +417,7 @@ mod tests {
                 // releasing the GIL potentially allows for other threads to deadlock
                 // with the normalization going on here
                 py.detach(|| {
-                    std::thread::sleep(core::time::Duration::from_millis(10));
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 });
                 py.None()
             }

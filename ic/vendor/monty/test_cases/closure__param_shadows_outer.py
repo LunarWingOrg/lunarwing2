@@ -8,7 +8,7 @@ def outer_basic():
     return inner(10)
 
 
-assert outer_basic() == 11
+assert outer_basic() == 11, 'inner param should shadow outer local'
 
 
 # === Parameter shadows outer local (multiple params) ===
@@ -22,7 +22,7 @@ def outer_multi():
     return inner(1, 2)
 
 
-assert outer_multi() == 3
+assert outer_multi() == 3, 'both params should shadow outer locals'
 
 
 # === Mixed: one param shadows, one captures ===
@@ -36,7 +36,7 @@ def outer_mixed():
     return inner(5)
 
 
-assert outer_mixed() == 25
+assert outer_mixed() == 25, 'x should be param (5), y should be captured (20)'
 
 
 # === Parameter shadows with default value ===
@@ -49,7 +49,7 @@ def outer_default():
     return inner()
 
 
-assert outer_default() == 7
+assert outer_default() == 7, 'default param should shadow outer local'
 
 
 # === Deeply nested: param shadows grandparent local ===
@@ -65,7 +65,7 @@ def outer_deep():
     return middle()
 
 
-assert outer_deep() == 6
+assert outer_deep() == 6, 'inner param should shadow grandparent local'
 
 
 # === Parameter used in complex expression ===
@@ -78,4 +78,4 @@ def outer_expr():
     return inner(5, 10)
 
 
-assert outer_expr() == 51
+assert outer_expr() == 51, 'scale param should shadow outer scale'

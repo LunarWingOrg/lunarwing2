@@ -100,11 +100,7 @@ impl<T> GetSize for Rc<[T]>
 where
     T: GetSize,
 {
-    fn get_heap_size_with_tracker<Tr: GetSizeTracker>(&self, mut tracker: Tr) -> (usize, Tr) {
-        if !tracker.track(Self::as_ptr(self).cast::<()>()) {
-            return (0, tracker);
-        }
-
+    fn get_heap_size_with_tracker<Tr: GetSizeTracker>(&self, tracker: Tr) -> (usize, Tr) {
         let (size, tracker) = self.iter().fold((0, tracker), |(size, tracker), element| {
             let (elem_size, tracker) = T::get_heap_size_with_tracker(element, tracker);
             (size + elem_size, tracker)
@@ -116,11 +112,7 @@ where
 }
 
 impl GetSize for Rc<str> {
-    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, mut tracker: T) -> (usize, T) {
-        if !tracker.track(Self::as_ptr(self).cast::<()>()) {
-            return (0, tracker);
-        }
-
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         (self.len(), tracker)
     }
 }
@@ -129,11 +121,7 @@ impl<T> GetSize for Arc<[T]>
 where
     T: GetSize,
 {
-    fn get_heap_size_with_tracker<Tr: GetSizeTracker>(&self, mut tracker: Tr) -> (usize, Tr) {
-        if !tracker.track(Self::as_ptr(self).cast::<()>()) {
-            return (0, tracker);
-        }
-
+    fn get_heap_size_with_tracker<Tr: GetSizeTracker>(&self, tracker: Tr) -> (usize, Tr) {
         let (size, tracker) = self.iter().fold((0, tracker), |(size, tracker), element| {
             let (elem_size, tracker) = T::get_heap_size_with_tracker(element, tracker);
             (size + elem_size, tracker)
@@ -145,11 +133,7 @@ where
 }
 
 impl GetSize for Arc<str> {
-    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, mut tracker: T) -> (usize, T) {
-        if !tracker.track(Self::as_ptr(self).cast::<()>()) {
-            return (0, tracker);
-        }
-
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         (self.len(), tracker)
     }
 }

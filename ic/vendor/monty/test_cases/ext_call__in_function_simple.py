@@ -4,4 +4,4 @@ def foo():
 
 
 result = foo()
-assert result == 3
+assert result == 3, 'basic ext call in function'

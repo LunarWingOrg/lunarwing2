@@ -300,11 +300,11 @@ where
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         // Not ExactSizeIterator because size may be larger than usize
-        size_hint::add_scalar(self.iter.size_hint(), usize::from(self.top.is_some()))
+        size_hint::add_scalar(self.iter.size_hint(), self.top.is_some() as usize)
     }
 
     fn count(self) -> usize {
-        self.iter.count() + usize::from(self.top.is_some())
+        self.iter.count() + (self.top.is_some() as usize)
     }
 
     fn last(self) -> Option<Self::Item> {
@@ -522,8 +522,8 @@ where
     debug_fmt_fields!(TakeWhileRef, iter);
 }
 
-/// Create a new `TakeWhileRef` from a reference to cloneable iterator.
-pub fn take_while_ref<I, F>(iter: &mut I, f: F) -> TakeWhileRef<'_, I, F>
+/// Create a new `TakeWhileRef` from a reference to clonable iterator.
+pub fn take_while_ref<I, F>(iter: &mut I, f: F) -> TakeWhileRef<I, F>
 where
     I: Iterator + Clone,
 {
@@ -626,10 +626,10 @@ pub trait HasCombination<I>: Sized {
     type Combination: From<I> + Iterator<Item = Self>;
 }
 
-/// Create a new `TupleCombinations` from a cloneable iterator.
+/// Create a new `TupleCombinations` from a clonable iterator.
 pub fn tuple_combinations<T, I>(iter: I) -> TupleCombinations<I, T>
 where
-    I: Iterator,
+    I: Iterator + Clone,
     I::Item: Clone,
     T: HasCombination<I>,
 {
@@ -992,7 +992,7 @@ fn transpose_result<T, E>(result: Result<Option<T>, E>) -> Option<Result<T, E>> 
     }
 }
 
-/// Create a new `FilterMapOk` iterator.
+/// Create a new `FilterOk` iterator.
 pub fn filter_map_ok<I, F, T, U, E>(iter: I, f: F) -> FilterMapOk<I, F>
 where
     I: Iterator<Item = Result<T, E>>,

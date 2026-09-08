@@ -1,10 +1,3 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
-#[cfg(feature = "experimental-inspect")]
-use crate::inspect::PyStaticExpr;
-#[cfg(feature = "experimental-inspect")]
-use crate::PyTypeInfo;
 #[cfg(not(Py_LIMITED_API))]
 use crate::{
     err::error_on_minusone,
@@ -19,12 +12,12 @@ use crate::{
     py_result_ext::PyResultExt,
 };
 use crate::{types::PyBytes, Bound, IntoPyObject, PyErr, PyResult, Python};
+use std::io::IoSlice;
 #[cfg(not(Py_LIMITED_API))]
-use core::{
+use std::{
     mem::ManuallyDrop,
     ptr::{self, NonNull},
 };
-use std::io::IoSlice;
 
 pub struct PyBytesWriter<'py> {
     python: Python<'py>,
@@ -45,8 +38,9 @@ impl<'py> PyBytesWriter<'py> {
     #[inline]
     #[cfg_attr(Py_LIMITED_API, allow(clippy::unnecessary_wraps))]
     pub fn with_capacity(py: Python<'py>, capacity: usize) -> PyResult<Self> {
-        cfg_select! {
-            not(Py_LIMITED_API) => NonNull::new(unsafe { PyBytesWriter_Create(capacity as _) }).map_or_else(
+        #[cfg(not(Py_LIMITED_API))]
+        {
+            NonNull::new(unsafe { PyBytesWriter_Create(capacity as _) }).map_or_else(
                 || Err(PyErr::fetch(py)),
                 |writer| {
                     let mut writer = PyBytesWriter { python: py, writer };
@@ -56,8 +50,12 @@ impl<'py> PyBytesWriter<'py> {
                     }
                     Ok(writer)
                 },
-            ),
-            Py_LIMITED_API => Ok(PyBytesWriter {
+            )
+        }
+
+        #[cfg(Py_LIMITED_API)]
+        {
+            Ok(PyBytesWriter {
                 python: py,
                 buffer: Vec::with_capacity(capacity),
             })
@@ -67,11 +65,14 @@ impl<'py> PyBytesWriter<'py> {
     /// Get the current length of the internal buffer.
     #[inline]
     pub fn len(&self) -> usize {
-        cfg_select! {
-            not(Py_LIMITED_API) => unsafe {
-                PyBytesWriter_GetSize(self.writer.as_ptr()) as _
-            },
-            Py_LIMITED_API => self.buffer.len()
+        #[cfg(not(Py_LIMITED_API))]
+        unsafe {
+            PyBytesWriter_GetSize(self.writer.as_ptr()) as _
+        }
+
+        #[cfg(Py_LIMITED_API)]
+        {
+            self.buffer.len()
         }
     }
 
@@ -105,16 +106,17 @@ impl<'py> TryFrom<PyBytesWriter<'py>> for Bound<'py, PyBytes> {
     #[inline]
     fn try_from(value: PyBytesWriter<'py>) -> Result<Self, Self::Error> {
         let py = value.python;
-        cfg_select! {
-            // SAFETY:
-            //  - we no longer use `value` after this call
-            //  - `PyBytesWriter_Finish` will return a new reference to a bytes object on success
-            not(Py_LIMITED_API) => unsafe {
-                PyBytesWriter_Finish(ManuallyDrop::new(value).writer.as_ptr())
-                    .assume_owned_or_err(py)
-                    .cast_into_unchecked()
-            },
-            Py_LIMITED_API => Ok(PyBytes::new(py, &value.buffer))
+
+        #[cfg(not(Py_LIMITED_API))]
+        unsafe {
+            PyBytesWriter_Finish(ManuallyDrop::new(value).writer.as_ptr())
+                .assume_owned_or_err(py)
+                .cast_into_unchecked()
+        }
+
+        #[cfg(Py_LIMITED_API)]
+        {
+            Ok(PyBytes::new(py, &value.buffer))
         }
     }
 }
@@ -123,9 +125,6 @@ impl<'py> IntoPyObject<'py> for PyBytesWriter<'py> {
     type Target = PyBytes;
     type Output = Bound<'py, PyBytes>;
     type Error = PyErr;
-
-    #[cfg(feature = "experimental-inspect")]
-    const OUTPUT_TYPE: PyStaticExpr = PyBytes::TYPE_HINT;
 
     #[inline]
     fn into_pyobject(self, _py: Python<'py>) -> Result<Self::Output, Self::Error> {
@@ -205,7 +204,7 @@ impl std::io::Write for PyBytesWriter<'_> {
         self.buffer.write_all(buf)
     }
 
-    fn write_fmt(&mut self, args: core::fmt::Arguments<'_>) -> std::io::Result<()> {
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
         self.buffer.write_fmt(args)
     }
 }

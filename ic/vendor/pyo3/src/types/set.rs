@@ -6,13 +6,7 @@ use crate::{
     py_result_ext::PyResultExt,
 };
 use crate::{ffi, Borrowed, BoundObject, IntoPyObject, IntoPyObjectExt, PyAny, Python};
-#[cfg(RustPython)]
-use crate::{
-    sync::PyOnceLock,
-    types::{PyType, PyTypeMethods},
-    Py,
-};
-use core::ptr;
+use std::ptr;
 
 /// Represents a Python `set`.
 ///
@@ -27,24 +21,11 @@ pub struct PySet(PyAny);
 #[cfg(not(any(PyPy, GraalPy)))]
 pyobject_subclassable_native_type!(PySet, crate::ffi::PySetObject);
 
-#[cfg(all(not(any(PyPy, GraalPy)), not(RustPython)))]
+#[cfg(not(any(PyPy, GraalPy)))]
 pyobject_native_type!(
     PySet,
     ffi::PySetObject,
     pyobject_native_static_type_object!(ffi::PySet_Type),
-    "builtins",
-    "set",
-    #checkfunction=ffi::PySet_Check
-);
-
-#[cfg(all(not(any(PyPy, GraalPy)), RustPython))]
-pyobject_native_type!(
-    PySet,
-    ffi::PySetObject,
-    |py| {
-        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-        TYPE.import(py, "builtins", "set").unwrap().as_type_ptr()
-    },
     "builtins",
     "set",
     #checkfunction=ffi::PySet_Check
@@ -71,11 +52,7 @@ impl PySet {
     where
         T: IntoPyObject<'py>,
     {
-        let set = Self::empty(py)?;
-        for e in elements {
-            set.add(e)?;
-        }
-        Ok(set)
+        try_new_from_iter(py, elements)
     }
 
     /// Creates a new empty set.
@@ -283,15 +260,40 @@ impl ExactSizeIterator for BoundSetIterator<'_> {
     }
 }
 
+#[inline]
+pub(crate) fn try_new_from_iter<'py, T>(
+    py: Python<'py>,
+    elements: impl IntoIterator<Item = T>,
+) -> PyResult<Bound<'py, PySet>>
+where
+    T: IntoPyObject<'py>,
+{
+    let set = unsafe {
+        // We create the `Bound` pointer because its Drop cleans up the set if
+        // user code errors or panics.
+        ffi::PySet_New(std::ptr::null_mut())
+            .assume_owned_or_err(py)?
+            .cast_into_unchecked()
+    };
+    let ptr = set.as_ptr();
+
+    elements.into_iter().try_for_each(|element| {
+        let obj = element.into_pyobject_or_pyerr(py)?;
+        err::error_on_minusone(py, unsafe { ffi::PySet_Add(ptr, obj.as_ptr()) })
+    })?;
+
+    Ok(set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::PySet;
-    use crate::platform::HashSet;
     use crate::{
         conversion::IntoPyObject,
         types::{PyAnyMethods, PySetMethods},
         Python,
     };
+    use std::collections::HashSet;
 
     #[test]
     fn test_set_new() {

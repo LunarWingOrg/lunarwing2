@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.95"
 name = "monty"
-version = "0.0.23"
+version = "0.0.18"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
 build = false
 autolib = false
@@ -23,7 +23,7 @@ autotests = false
 autobenches = false
 description = "A sandboxed, snapshotable Python interpreter written in Rust."
 homepage = "https://github.com/pydantic/monty/"
-readme = "README.md"
+readme = "../../README.md"
 keywords = [
     "python",
     "interpreter",
@@ -37,24 +37,15 @@ categories = [
 ]
 license = "MIT"
 repository = "https://github.com/pydantic/monty/"
-resolver = "2"
 
 [features]
 memory-model-checks = []
 ref-count-return = ["test-hooks"]
-test-hooks = ["monty-types/test-hooks"]
+test-hooks = []
 
 [lib]
 name = "monty"
 path = "src/lib.rs"
-
-[[test]]
-name = "abort"
-path = "tests/abort.rs"
-
-[[test]]
-name = "assert_messages"
-path = "tests/assert_messages.rs"
 
 [[test]]
 name = "asyncio"
@@ -69,26 +60,6 @@ name = "bytecode_limits"
 path = "tests/bytecode_limits.rs"
 
 [[test]]
-name = "collections"
-path = "tests/collections.rs"
-
-[[test]]
-name = "dataclass_fields"
-path = "tests/dataclass_fields.rs"
-
-[[test]]
-name = "dataclass_rejections"
-path = "tests/dataclass_rejections.rs"
-
-[[test]]
-name = "datetime_format"
-path = "tests/datetime_format.rs"
-
-[[test]]
-name = "encoding"
-path = "tests/encoding.rs"
-
-[[test]]
 name = "error_locations"
 path = "tests/error_locations.rs"
 
@@ -101,6 +72,18 @@ name = "file_error_paths"
 path = "tests/file_error_paths.rs"
 
 [[test]]
+name = "file_resource_tracking"
+path = "tests/file_resource_tracking.rs"
+
+[[test]]
+name = "fs"
+path = "tests/fs.rs"
+
+[[test]]
+name = "fs_security"
+path = "tests/fs_security.rs"
+
+[[test]]
 name = "heap_reader_compile_fail"
 path = "tests/heap_reader_compile_fail.rs"
 
@@ -109,8 +92,8 @@ name = "inputs"
 path = "tests/inputs.rs"
 
 [[test]]
-name = "json_error_data"
-path = "tests/json_error_data.rs"
+name = "json_output"
+path = "tests/json_output.rs"
 
 [[test]]
 name = "json_serde"
@@ -123,10 +106,6 @@ path = "tests/main.rs"
 [[test]]
 name = "math_module"
 path = "tests/math_module.rs"
-
-[[test]]
-name = "module_dunders"
-path = "tests/module_dunders.rs"
 
 [[test]]
 name = "name_lookup"
@@ -143,10 +122,6 @@ path = "tests/parse_errors.rs"
 [[test]]
 name = "parse_large_literals"
 path = "tests/parse_large_literals.rs"
-
-[[test]]
-name = "print_collect_limits"
-path = "tests/print_collect_limits.rs"
 
 [[test]]
 name = "print_writer"
@@ -177,8 +152,15 @@ name = "try_from"
 path = "tests/try_from.rs"
 
 [[test]]
-name = "type_names"
-path = "tests/type_names.rs"
+name = "with_test_cm"
+path = "tests/with_test_cm.rs"
+
+[dependencies]
+fancy-regex = "0.17.0"
+hashbrown = "0.16"
+itertools = "0.14.0"
+libm = "0.2"
+speedate = "0.17.0"
 
 [dependencies.ahash]
 version = "0.8.0"
@@ -188,39 +170,16 @@ features = ["serde"]
 version = "0.4"
 features = ["serde"]
 
-[dependencies.fancy-regex]
-version = "0.17.0"
-
-[dependencies.getrandom]
-version = "0.3"
-
-[dependencies.hashbrown]
-version = "0.16"
-
 [dependencies.indexmap]
-version = "2"
-
-[dependencies.itertools]
-version = "0.14.0"
-
-[dependencies.itoa]
-version = "1"
+version = "2.9"
+features = ["serde"]
 
 [dependencies.jiter]
-version = "0.16.0"
+version = "0.15.0"
 features = ["num-bigint"]
 
-[dependencies.libm]
-version = "0.2"
-
-[dependencies.memchr]
-version = "2.7"
-
 [dependencies.monty-macros]
-version = "0.0.23"
-
-[dependencies.monty-types]
-version = "0.0.23"
+path = "../monty-macros"
 
 [dependencies.num-bigint]
 version = "0.4"
@@ -237,22 +196,24 @@ version = "1.1"
 features = ["alloc"]
 
 [dependencies.ruff_python_ast]
-version = "0.0.9"
-
-[dependencies.ruff_python_codegen]
-version = "0.0.9"
+git = "https://github.com/samuelcolvin/ruff.git"
+rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+package = "ruff_python_ast"
 
 [dependencies.ruff_python_parser]
-version = "0.0.9"
+git = "https://github.com/samuelcolvin/ruff.git"
+rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+package = "ruff_python_parser"
 
 [dependencies.ruff_python_stdlib]
-version = "0.0.9"
-
-[dependencies.ruff_source_file]
-version = "0.0.9"
+git = "https://github.com/samuelcolvin/ruff.git"
+rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+package = "ruff_python_stdlib"
 
 [dependencies.ruff_text_size]
-version = "0.0.9"
+git = "https://github.com/samuelcolvin/ruff.git"
+rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+package = "ruff_text_size"
 
 [dependencies.serde]
 version = "1.0"
@@ -261,34 +222,23 @@ features = [
     "rc",
 ]
 
+[dependencies.serde_json]
+version = "1.0"
+features = ["arbitrary_precision"]
+
 [dependencies.smallvec]
 version = "1.13"
 features = ["serde"]
-
-[dependencies.speedate]
-version = "0.17.0"
 
 [dependencies.strum]
 version = "0.27"
 features = ["derive"]
 
-[dependencies.unicode-general-category]
-version = "1"
-
-[dependencies.unicode-normalization]
-version = "0.1"
-
-[dependencies.unicode_names2]
-version = "1"
+[dev-dependencies]
+tempfile = "3"
 
 [dev-dependencies.insta]
 version = "1.47"
-
-[dev-dependencies.serde_json]
-version = "1.0"
-
-[dev-dependencies.tempfile]
-version = "3"
 
 [lints.clippy]
 absolute_paths = "warn"
@@ -307,9 +257,6 @@ use_self = "warn"
 [lints.clippy.pedantic]
 level = "warn"
 priority = -1
-
-[lints.rust]
-unsafe_code = "deny"
 
 [lints.rust.unexpected_cfgs]
 level = "warn"

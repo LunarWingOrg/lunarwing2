@@ -1,10 +1,7 @@
-// TODO https://github.com/PyO3/pyo3/issues/5487
-#![allow(clippy::undocumented_unsafe_blocks)]
-
-use core::{
-    ffi::{c_int, c_void},
+use std::{
     marker::PhantomData,
     num::NonZero,
+    os::raw::{c_int, c_void},
 };
 
 use crate::{ffi, Py};
@@ -40,7 +37,7 @@ impl PyVisit<'_> {
     where
         T: Into<Option<&'a Py<U>>>,
     {
-        let ptr = obj.into().map_or_else(core::ptr::null_mut, Py::as_ptr);
+        let ptr = obj.into().map_or_else(std::ptr::null_mut, Py::as_ptr);
         if !ptr.is_null() {
             match NonZero::new(unsafe { (self.visit)(ptr, self.arg) }) {
                 None => Ok(()),

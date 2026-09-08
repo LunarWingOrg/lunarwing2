@@ -4,13 +4,7 @@ use crate::instance::{Borrowed, Bound};
 use crate::py_result_ext::PyResultExt;
 use crate::sync::critical_section::with_critical_section;
 use crate::{ffi, PyAny, Python};
-#[cfg(RustPython)]
-use crate::{
-    sync::PyOnceLock,
-    types::{PyType, PyTypeMethods},
-    Py,
-};
-use core::slice;
+use std::slice;
 
 /// Represents a Python `bytearray`.
 ///
@@ -22,20 +16,7 @@ use core::slice;
 #[repr(transparent)]
 pub struct PyByteArray(PyAny);
 
-#[cfg(not(RustPython))]
 pyobject_native_type_core!(PyByteArray, pyobject_native_static_type_object!(ffi::PyByteArray_Type), "builtins", "bytearray", #checkfunction=ffi::PyByteArray_Check);
-
-#[cfg(RustPython)]
-pyobject_native_type_core!(
-    PyByteArray,
-    |py| {
-        static TYPE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
-        TYPE.import(py, "builtins", "bytearray").unwrap().as_type_ptr()
-    },
-    "builtins",
-    "bytearray",
-    #checkfunction=ffi::PyByteArray_Check
-);
 
 impl PyByteArray {
     /// Creates a new Python bytearray object.
@@ -82,17 +63,17 @@ impl PyByteArray {
         unsafe {
             // Allocate buffer and check for an error
             let pybytearray: Bound<'_, Self> =
-                ffi::PyByteArray_FromStringAndSize(core::ptr::null(), len as ffi::Py_ssize_t)
+                ffi::PyByteArray_FromStringAndSize(std::ptr::null(), len as ffi::Py_ssize_t)
                     .assume_owned_or_err(py)?
                     .cast_into_unchecked();
 
             let buffer: *mut u8 = ffi::PyByteArray_AsString(pybytearray.as_ptr()).cast();
             debug_assert!(!buffer.is_null());
             // Zero-initialise the uninitialised bytearray
-            core::ptr::write_bytes(buffer, 0u8, len);
+            std::ptr::write_bytes(buffer, 0u8, len);
             // (Further) Initialise the bytearray in init
             // If init returns an Err, pypybytearray will automatically deallocate the buffer
-            init(core::slice::from_raw_parts_mut(buffer, len)).map(|_| pybytearray)
+            init(std::slice::from_raw_parts_mut(buffer, len)).map(|_| pybytearray)
         }
     }
 
@@ -208,7 +189,7 @@ pub trait PyByteArrayMethods<'py>: crate::sealed::Sealed {
     /// #[pyfunction]
     /// fn bug(py: Python<'_>, bytes: &Bound<'_, PyByteArray>) {
     ///     // No critical section is being used.
-    ///     // This means that for free-threaded Python another thread could be modifying the
+    ///     // This means that for no-gil Python another thread could be modifying the
     ///     // bytearray concurrently and thus invalidate `slice` any time.
     ///     let slice = unsafe { bytes.as_bytes() };
     ///
@@ -291,7 +272,7 @@ impl<'py> PyByteArrayMethods<'py> for Bound<'py, PyByteArray> {
         with_critical_section(self, || {
             // SAFETY:
             //  * `self` is a `Bound` object, which guarantees that the Python GIL is held.
-            //  * For free-threaded Python, a critical section is used in lieu of the GIL.
+            //  * For no-gil Python, a critical section is used in lieu of the GIL.
             //  * We don't interact with the interpreter
             //  * We don't mutate the underlying slice
             unsafe { self.as_bytes() }.to_vec()
@@ -482,11 +463,11 @@ mod tests {
         use crate::instance::Py;
         use crate::sync::{critical_section::with_critical_section, MutexExt};
 
-        use core::sync::atomic::{AtomicBool, Ordering};
-        use core::time::Duration;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Mutex;
         use std::thread;
         use std::thread::ScopedJoinHandle;
+        use std::time::Duration;
 
         const SIZE: usize = 1_000_000;
         const DATA_VALUE: u8 = 42;

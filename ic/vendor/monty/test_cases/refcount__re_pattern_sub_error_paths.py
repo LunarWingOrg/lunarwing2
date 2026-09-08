@@ -28,14 +28,14 @@ except TypeError:
 # returns the value untouched (refcount-bumped), so an interned input stays
 # interned — no heap allocation, no entry in the refcount map.
 interned_result = p.sub('repl', 'hello', -1)
-assert interned_result == 'hello'
+assert interned_result == 'hello', 'negative count returns interned input unchanged'
 
 # Negative count path with a HEAP-allocated input: the short-circuit shares the
 # same heap object back to the caller, so input_str and result alias each other.
 # (Concatenation at runtime defeats compile-time literal interning.)
 input_str = 'hel' + 'lo'
 result = p.sub('repl', input_str, -1)
-assert result == 'hello'
+assert result == 'hello', 'negative count returns heap input unchanged'
 
 # repl_list: 1 (variable)
 # input_list: 1 (variable)

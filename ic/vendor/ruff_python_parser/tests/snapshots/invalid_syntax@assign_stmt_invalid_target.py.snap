@@ -276,6 +276,7 @@ Module(
 3 | x = 1 = y = 2 = z
 4 | ["a", "b"] = ["a", "b"]
   |  ^^^ Syntax Error: Invalid assignment target
+  |
 
 
   |
@@ -283,3 +284,4 @@ Module(
 3 | x = 1 = y = 2 = z
 4 | ["a", "b"] = ["a", "b"]
   |       ^^^ Syntax Error: Invalid assignment target
+  |

@@ -119,3 +119,4 @@ Module(
 2 | t"{x!123}"
 3 | t"{x!'a'}"
   |      ^^^ Syntax Error: t-string: invalid conversion character
+  |

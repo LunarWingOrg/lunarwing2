@@ -6,6 +6,7 @@ use crate::{
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
     heap::HeapData,
+    resource::ResourceTracker,
     types::PyTrait,
     value::Value,
 };
@@ -21,7 +22,7 @@ use crate::{
 /// The `file` keyword is recognised so it can produce a *specific* error
 /// (`"print() 'file' argument is not supported"`) rather than the generic
 /// "unexpected keyword" produced by leaving it off the struct.
-pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_print(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let PrintArgs {
         objects,
         sep,
@@ -51,11 +52,7 @@ pub fn builtin_print(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
             vm.print_writer.stdout_push(' ')?;
         }
         let s = value.py_str(vm)?;
-        defer_drop!(s, vm);
-        // Resolve the `str` `Value` against the heap/interns tables directly so
-        // the `&str` borrow stays disjoint from the `&mut vm.print_writer` write.
-        vm.print_writer
-            .stdout_write(s.to_str_heap(vm.heap, vm.interns)?.into())?;
+        vm.print_writer.stdout_write(s)?;
     }
 
     if let Some(end) = end_str {
@@ -95,7 +92,7 @@ struct PrintArgs {
 ///
 /// The kwarg can be None (returns None) or a string (returns Some).
 /// Raises TypeError for other types.
-fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_>) -> RunResult<Option<String>> {
+fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_, impl ResourceTracker>) -> RunResult<Option<String>> {
     match value {
         Value::None => Ok(None),
         Value::InternString(string_id) => Ok(Some(vm.interns.get_str(*string_id).to_owned())),
@@ -105,13 +102,13 @@ fn extract_string_kwarg(value: &Value, name: &str, vm: &VM<'_>) -> RunResult<Opt
             }
             Err(SimpleException::new_msg(
                 ExcType::TypeError,
-                format!("{} must be None or a string, not {}", name, value.py_type_name(vm)),
+                format!("{} must be None or a string, not {}", name, value.py_type(vm)),
             )
             .into())
         }
         _ => Err(SimpleException::new_msg(
             ExcType::TypeError,
-            format!("{} must be None or a string, not {}", name, value.py_type_name(vm)),
+            format!("{} must be None or a string, not {}", name, value.py_type(vm)),
         )
         .into()),
     }

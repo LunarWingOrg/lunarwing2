@@ -1,23 +1,27 @@
 use crate::object::*;
-use core::ffi::c_int;
+use std::ffi::c_int;
+#[cfg(not(PyPy))]
+use std::ptr::addr_of_mut;
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyTraceBack_Here")]
     pub fn PyTraceBack_Here(arg1: *mut crate::PyFrameObject) -> c_int;
     #[cfg_attr(PyPy, link_name = "PyPyTraceBack_Print")]
     pub fn PyTraceBack_Print(arg1: *mut PyObject, arg2: *mut PyObject) -> c_int;
+}
 
-    #[cfg(not(RustPython))]
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyTraceBack_Type")]
     pub static mut PyTraceBack_Type: PyTypeObject;
 
-    #[cfg(any(PyPy, RustPython))]
-    #[cfg_attr(PyPy, link_name = "PyPyTraceBack_Check")]
+    #[cfg(PyPy)]
+    #[link_name = "PyPyTraceBack_Check"]
     pub fn PyTraceBack_Check(op: *mut PyObject) -> c_int;
 }
 
 #[inline]
-#[cfg(not(any(PyPy, RustPython)))]
+#[cfg(not(PyPy))]
 pub unsafe fn PyTraceBack_Check(op: *mut PyObject) -> c_int {
-    Py_IS_TYPE(op, &raw mut PyTraceBack_Type)
+    (Py_TYPE(op) == addr_of_mut!(PyTraceBack_Type)) as c_int
 }

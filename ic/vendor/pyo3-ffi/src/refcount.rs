@@ -1,18 +1,18 @@
 use crate::pyport::Py_ssize_t;
 use crate::PyObject;
 #[cfg(all(not(Py_LIMITED_API), py_sys_config = "Py_REF_DEBUG"))]
-use core::ffi::c_char;
+use std::ffi::c_char;
 #[cfg(any(Py_3_12, all(py_sys_config = "Py_REF_DEBUG", not(Py_LIMITED_API))))]
-use core::ffi::c_int;
+use std::ffi::c_int;
 #[cfg(all(Py_3_14, any(not(Py_GIL_DISABLED), target_pointer_width = "32")))]
-use core::ffi::c_long;
+use std::ffi::c_long;
 #[cfg(any(Py_GIL_DISABLED, all(Py_3_12, not(Py_3_14))))]
-use core::ffi::c_uint;
+use std::ffi::c_uint;
 #[cfg(all(Py_3_14, not(Py_GIL_DISABLED)))]
-use core::ffi::c_ulong;
-use core::ptr;
-#[cfg(all(Py_GIL_DISABLED, not(Py_LIMITED_API)))]
-use core::sync::atomic::Ordering::Relaxed;
+use std::ffi::c_ulong;
+use std::ptr;
+#[cfg(Py_GIL_DISABLED)]
+use std::sync::atomic::Ordering::Relaxed;
 
 #[cfg(all(Py_3_14, not(Py_3_15)))]
 const _Py_STATICALLY_ALLOCATED_FLAG: c_int = 1 << 7;
@@ -74,7 +74,7 @@ const _Py_REF_SHARED_SHIFT: isize = 2;
 
 // skipped private _Py_REF_SHARED
 
-extern_libpython! {
+extern "C" {
     #[cfg(all(Py_3_14, Py_LIMITED_API))]
     pub fn Py_REFCNT(ob: *mut PyObject) -> Py_ssize_t;
 }
@@ -116,7 +116,6 @@ pub unsafe fn Py_REFCNT(ob: *mut PyObject) -> Py_ssize_t {
     }
 }
 
-#[cfg(not(all(Py_LIMITED_API, Py_GIL_DISABLED)))]
 #[cfg(Py_3_12)]
 #[inline(always)]
 unsafe fn _Py_IsImmortal(op: *mut PyObject) -> c_int {
@@ -148,7 +147,7 @@ unsafe fn _Py_IsImmortal(op: *mut PyObject) -> c_int {
 
 // TODO: Py_SET_REFCNT
 
-extern_libpython! {
+extern "C" {
     #[cfg(all(py_sys_config = "Py_REF_DEBUG", not(Py_LIMITED_API)))]
     fn _Py_NegativeRefcount(filename: *const c_char, lineno: c_int, op: *mut PyObject);
     #[cfg(all(Py_3_12, py_sys_config = "Py_REF_DEBUG", not(Py_LIMITED_API)))]
@@ -299,8 +298,8 @@ pub unsafe fn Py_DECREF(op: *mut PyObject) {
 
             #[cfg(py_sys_config = "Py_REF_DEBUG")]
             if (*op).ob_refcnt.ob_refcnt < 0 {
-                let location = core::panic::Location::caller();
-                let filename = alloc::ffi::CString::new(location.file()).unwrap();
+                let location = std::panic::Location::caller();
+                let filename = std::ffi::CString::new(location.file()).unwrap();
                 _Py_NegativeRefcount(filename.as_ptr(), location.line() as i32, op);
             }
 
@@ -343,7 +342,7 @@ pub unsafe fn Py_XDECREF(op: *mut PyObject) {
     }
 }
 
-extern_libpython! {
+extern "C" {
     #[cfg(all(Py_3_10, Py_LIMITED_API, not(PyPy)))]
     #[cfg_attr(docsrs, doc(cfg(Py_3_10)))]
     pub fn Py_NewRef(obj: *mut PyObject) -> *mut PyObject;

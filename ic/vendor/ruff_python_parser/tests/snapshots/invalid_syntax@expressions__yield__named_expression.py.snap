@@ -126,3 +126,4 @@ Module(
 3 |
 4 | yield 1, x := 2, 3
   |            ^^ Syntax Error: Expected `,`, found `:=`
+  |

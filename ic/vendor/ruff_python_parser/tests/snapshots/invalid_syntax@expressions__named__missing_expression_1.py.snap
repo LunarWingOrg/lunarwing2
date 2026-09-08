@@ -49,3 +49,4 @@ Module(
 2 |
 3 | (x :=
   |      ^ Syntax Error: unexpected EOF while parsing
+  |

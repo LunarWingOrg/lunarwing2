@@ -79,3 +79,11 @@ Module(
 5 | else:
 6 |     pass
   | ^^^^ Syntax Error: Unexpected indentation
+  |
+
+
+  |
+5 | else:
+6 |     pass
+  |         ^ Syntax Error: Expected a statement
+  |

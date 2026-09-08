@@ -1,43 +1,51 @@
 use crate::object::*;
 use crate::pyport::Py_ssize_t;
-use core::ffi::{c_char, c_int, c_void};
 use libc::wchar_t;
+use std::ffi::{c_char, c_int, c_void};
+#[cfg(not(PyPy))]
+use std::ptr::addr_of_mut;
+
+#[cfg(not(Py_LIMITED_API))]
+#[cfg_attr(
+    Py_3_13,
+    deprecated(note = "Deprecated since Python 3.13. Use `libc::wchar_t` instead.")
+)]
+pub type Py_UNICODE = wchar_t;
 
 pub type Py_UCS4 = u32;
 pub type Py_UCS2 = u16;
 pub type Py_UCS1 = u8;
 
-extern_libpython! {
-    #[cfg(not(RustPython))]
+#[cfg_attr(windows, link(name = "pythonXY"))]
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_Type")]
     pub static mut PyUnicode_Type: PyTypeObject;
-    #[cfg(not(RustPython))]
     pub static mut PyUnicodeIter_Type: PyTypeObject;
 
-    #[cfg(any(PyPy, RustPython))]
-    #[cfg_attr(PyPy, link_name = "PyPyUnicode_Check")]
+    #[cfg(PyPy)]
+    #[link_name = "PyPyUnicode_Check"]
     pub fn PyUnicode_Check(op: *mut PyObject) -> c_int;
 
-    #[cfg(any(PyPy, RustPython))]
-    #[cfg_attr(PyPy, link_name = "PyPyUnicode_CheckExact")]
+    #[cfg(PyPy)]
+    #[link_name = "PyPyUnicode_CheckExact"]
     pub fn PyUnicode_CheckExact(op: *mut PyObject) -> c_int;
 }
 
 #[inline]
-#[cfg(not(any(PyPy, RustPython)))]
+#[cfg(not(PyPy))]
 pub unsafe fn PyUnicode_Check(op: *mut PyObject) -> c_int {
     PyType_FastSubclass(Py_TYPE(op), Py_TPFLAGS_UNICODE_SUBCLASS)
 }
 
 #[inline]
-#[cfg(not(any(PyPy, RustPython)))]
+#[cfg(not(PyPy))]
 pub unsafe fn PyUnicode_CheckExact(op: *mut PyObject) -> c_int {
-    Py_IS_TYPE(op, &raw mut PyUnicode_Type)
+    (Py_TYPE(op) == addr_of_mut!(PyUnicode_Type)) as c_int
 }
 
 pub const Py_UNICODE_REPLACEMENT_CHARACTER: Py_UCS4 = 0xFFFD;
 
-extern_libpython! {
+extern "C" {
 
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_FromStringAndSize")]
     pub fn PyUnicode_FromStringAndSize(u: *const c_char, size: Py_ssize_t) -> *mut PyObject;
@@ -103,7 +111,6 @@ extern_libpython! {
     ) -> *mut wchar_t;
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_FromOrdinal")]
     pub fn PyUnicode_FromOrdinal(ordinal: c_int) -> *mut PyObject;
-    #[cfg(not(Py_3_9))]
     pub fn PyUnicode_ClearFreeList() -> c_int;
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_GetDefaultEncoding")]
     pub fn PyUnicode_GetDefaultEncoding() -> *const c_char;
@@ -114,22 +121,16 @@ extern_libpython! {
         encoding: *const c_char,
         errors: *const c_char,
     ) -> *mut PyObject;
-    #[cfg(not(Py_3_15))]
-    #[deprecated(note = "use PyCodec_Decode() instead")]
     pub fn PyUnicode_AsDecodedObject(
         unicode: *mut PyObject,
         encoding: *const c_char,
         errors: *const c_char,
     ) -> *mut PyObject;
-    #[cfg(not(Py_3_15))]
-    #[deprecated(note = "use PyCodec_Decode() instead")]
     pub fn PyUnicode_AsDecodedUnicode(
         unicode: *mut PyObject,
         encoding: *const c_char,
         errors: *const c_char,
     ) -> *mut PyObject;
-    #[cfg(not(Py_3_15))]
-    #[deprecated(note = "use PyCodec_Encode() instead")]
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_AsEncodedObject")]
     pub fn PyUnicode_AsEncodedObject(
         unicode: *mut PyObject,
@@ -142,8 +143,6 @@ extern_libpython! {
         encoding: *const c_char,
         errors: *const c_char,
     ) -> *mut PyObject;
-    #[cfg(not(Py_3_15))]
-    #[deprecated(note = "use PyCodec_Encode() instead")]
     pub fn PyUnicode_AsEncodedUnicode(
         unicode: *mut PyObject,
         encoding: *const c_char,
@@ -249,11 +248,6 @@ extern_libpython! {
         unicode: *mut PyObject,
         mapping: *mut PyObject,
     ) -> *mut PyObject;
-    // skipped PyUnicode_DecodeMBCS
-    // skipped PyUnicode_DecodeMBCSStateful
-    // skipped PyUnicode_DecodeCodePageStateful
-    // skipped PyUnicode_AsMBCSString
-    // skipped PyUnicode_EncodeCodePage
     pub fn PyUnicode_DecodeLocaleAndSize(
         str: *const c_char,
         len: Py_ssize_t,
@@ -297,15 +291,6 @@ extern_libpython! {
     ) -> *mut PyObject;
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_Join")]
     pub fn PyUnicode_Join(separator: *mut PyObject, seq: *mut PyObject) -> *mut PyObject;
-}
-
-#[cfg(PyPy)]
-type TailmatchResult = c_int;
-
-#[cfg(not(PyPy))]
-type TailmatchResult = Py_ssize_t;
-
-extern_libpython! {
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_Tailmatch")]
     pub fn PyUnicode_Tailmatch(
         str: *mut PyObject,
@@ -313,7 +298,7 @@ extern_libpython! {
         start: Py_ssize_t,
         end: Py_ssize_t,
         direction: c_int,
-    ) -> TailmatchResult;
+    ) -> Py_ssize_t;
     #[cfg_attr(PyPy, link_name = "PyPyUnicode_Find")]
     pub fn PyUnicode_Find(
         str: *mut PyObject,
@@ -355,7 +340,7 @@ extern_libpython! {
         string: *const c_char,
         size: Py_ssize_t,
     ) -> c_int;
-    // skipped PyUnicode_Equal
+
     pub fn PyUnicode_RichCompare(
         left: *mut PyObject,
         right: *mut PyObject,

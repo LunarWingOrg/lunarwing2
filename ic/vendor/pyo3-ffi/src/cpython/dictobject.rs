@@ -2,13 +2,6 @@
 use crate::object::*;
 #[cfg(not(any(PyPy, GraalPy)))]
 use crate::pyport::Py_ssize_t;
-#[cfg(all(GraalPy, Py_3_13))]
-use crate::PyObject;
-
-#[cfg(all(not(PyPy), Py_3_13))]
-use core::ffi::c_char;
-#[cfg(all(not(PyPy), Py_3_12))]
-use core::ffi::c_int;
 
 #[cfg(not(PyPy))]
 opaque_struct!(pub PyDictKeysObject);
@@ -46,52 +39,19 @@ pub struct PyDictObject {
     _tmpkeys: *mut PyObject,
 }
 
-extern_libpython! {
-    #[cfg(Py_3_15)]
-    pub fn PyFrozenDict_New(iterable: *mut PyObject) -> *mut PyObject;
-}
-
 // skipped private _PyDict_GetItem_KnownHash
 // skipped private _PyDict_GetItemStringWithError
 
-extern_libpython! {
-    #[cfg(not(GraalPy))]
-    pub fn PyDict_SetDefault(
-        mp: *mut PyObject,
-        key: *mut PyObject,
-        default_obj: *mut PyObject,
-    ) -> *mut PyObject;
-    /*
-    #[cfg(all(Py_3_13, not(Py_3_15)))]
-    pub fn PyDict_SetDefaultRef(
-        mp: *mut PyObject,
-        key: *mut PyObject,
-        default_obj: *mut PyObject,
-        result: *mut *mut PyObject,
-    ) -> c_int;
-    */
-}
+// skipped PyDict_SetDefault
+// skipped PyDict_SetDefaultRef
 
 // skipped PyDict_GET_SIZE
-
-extern_libpython! {
-    #[cfg(Py_3_13)]
-    pub fn PyDict_ContainsString(mp: *mut PyObject, key: *const c_char) -> c_int;
-}
+// skipped PyDict_ContainsString
 
 // skipped private _PyDict_NewPresized
 
-extern_libpython! {
-    #[cfg(Py_3_13)]
-    pub fn PyDict_Pop(dict: *mut PyObject, key: *mut PyObject, result: *mut *mut PyObject)
-        -> c_int;
-    #[cfg(Py_3_13)]
-    pub fn PyDict_PopString(
-        dict: *mut PyObject,
-        key: *const c_char,
-        result: *mut *mut PyObject,
-    ) -> c_int;
-}
+// skipped PyDict_Pop
+// skipped PyDict_PopString
 
 // skipped private _PyDict_Pop
 
@@ -101,14 +61,7 @@ extern_libpython! {
 // skipped PyDict_WatchCallback
 
 // skipped PyDict_AddWatcher
+// skipped PyDict_ClearWatcher
 
-extern_libpython! {
-    #[cfg(Py_3_12)]
-    pub fn PyDict_ClearWatcher(watcher_id: c_int) -> c_int;
-    #[cfg(Py_3_12)]
-    #[cfg(not(GraalPy))]
-    pub fn PyDict_Watch(watcher_id: c_int, dict: *mut PyObject) -> c_int;
-    #[cfg(Py_3_12)]
-    #[cfg(not(GraalPy))]
-    pub fn PyDict_Unwatch(watcher_id: c_int, dict: *mut PyObject) -> c_int;
-}
+// skipped PyDict_Watch
+// skipped PyDict_Unwatch

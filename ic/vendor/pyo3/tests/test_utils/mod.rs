@@ -24,11 +24,11 @@ mod inner {
 
     use pyo3::prelude::*;
 
-    #[cfg(any(not(all(Py_GIL_DISABLED, Py_3_14)), feature = "macros"))]
+    #[cfg(any(not(all(Py_GIL_DISABLED, Py_3_14)), all(feature = "macros", Py_3_8)))]
     use pyo3::sync::MutexExt;
     use pyo3::types::{IntoPyDict, PyList};
 
-    #[cfg(any(not(all(Py_GIL_DISABLED, Py_3_14)), feature = "macros"))]
+    #[cfg(any(not(all(Py_GIL_DISABLED, Py_3_14)), all(feature = "macros", Py_3_8)))]
     use std::sync::{Mutex, PoisonError};
 
     use uuid::Uuid;
@@ -69,17 +69,10 @@ mod inner {
             err
         }};
         // Case3: idents & err_msg
-        ($py:expr, $($val:ident)+, $code:expr, $err:ident, $err_msg:literal $(,$notes:literal)*) => {{
+        ($py:expr, $($val:ident)+, $code:expr, $err:ident, $err_msg:literal) => {{
             let err = py_expect_exception!($py, $($val)+, $code, $err);
             // Suppose that the error message looks like 'TypeError: ~'
             assert_eq!(format!("Py{}", err), concat!(stringify!($err), ": ", $err_msg));
-            if err.value($py).hasattr("add_note").unwrap() {
-                let notes = err.value($py).getattr("__notes__").map(|n| n.cast_into::<pyo3::types::PyList>().unwrap()).unwrap_or_else(|_| pyo3::types::PyList::empty($py));
-                let mut _notes_iter = notes.iter();
-                $(
-                    assert_eq!(_notes_iter.next().as_ref().map(|v| v.extract::<std::borrow::Cow<'_, str>>().unwrap()).as_deref(), Some($notes));
-                )*
-            }
             err
         }};
         // Case4: dict & err_msg
@@ -132,12 +125,13 @@ mod inner {
         };
     }
 
-    #[cfg(feature = "macros")]
+    // sys.unraisablehook not available until Python 3.8
+    #[cfg(all(feature = "macros", Py_3_8))]
     pub struct UnraisableCapture<'py> {
         hook: Bound<'py, UnraisableCaptureHook>,
     }
 
-    #[cfg(feature = "macros")]
+    #[cfg(all(feature = "macros", Py_3_8))]
     impl<'py> UnraisableCapture<'py> {
         /// Runs the closure `f` with a custom sys.unraisablehook installed.
         ///
@@ -170,7 +164,7 @@ mod inner {
         }
     }
 
-    #[cfg(feature = "macros")]
+    #[cfg(all(feature = "macros", Py_3_8))]
     impl Drop for UnraisableCapture<'_> {
         fn drop(&mut self) {
             let py = self.hook.py();
@@ -178,14 +172,14 @@ mod inner {
         }
     }
 
-    #[cfg(feature = "macros")]
+    #[cfg(all(feature = "macros", Py_3_8))]
     #[pyclass(crate = "pyo3", frozen)]
     struct UnraisableCaptureHook {
         pub capture: Mutex<Option<(PyErr, Py<PyAny>)>>,
         old_hook: Py<PyAny>,
     }
 
-    #[cfg(feature = "macros")]
+    #[cfg(all(feature = "macros", Py_3_8))]
     #[pymethods(crate = "pyo3")]
     impl UnraisableCaptureHook {
         pub fn hook(&self, unraisable: Bound<'_, PyAny>) {
@@ -195,7 +189,7 @@ mod inner {
         }
     }
 
-    #[cfg(feature = "macros")]
+    #[cfg(all(feature = "macros", Py_3_8))]
     impl UnraisableCaptureHook {
         fn install(py: Python<'_>) -> Bound<'_, Self> {
             let sys = py.import("sys").unwrap();

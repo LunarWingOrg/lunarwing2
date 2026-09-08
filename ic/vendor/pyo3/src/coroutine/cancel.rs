@@ -1,8 +1,8 @@
 use crate::{Py, PyAny};
-use alloc::sync::Arc;
-use core::future::poll_fn;
-use core::task::{Context, Poll, Waker};
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, Waker};
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -44,12 +44,22 @@ impl CancelHandle {
 
     /// Retrieve the exception thrown in the associated coroutine.
     pub async fn cancelled(&mut self) -> Py<PyAny> {
-        poll_fn(|cx| self.poll_cancelled(cx)).await
+        Cancelled(self).await
     }
 
     #[doc(hidden)]
     pub fn throw_callback(&self) -> ThrowCallback {
         ThrowCallback(self.0.clone())
+    }
+}
+
+// Because `poll_fn` is not available in MSRV
+struct Cancelled<'a>(&'a mut CancelHandle);
+
+impl Future for Cancelled<'_> {
+    type Output = Py<PyAny>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.0.poll_cancelled(cx)
     }
 }
 

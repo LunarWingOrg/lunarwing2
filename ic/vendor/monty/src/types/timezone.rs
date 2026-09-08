@@ -3,31 +3,37 @@
 //! Phase 1 intentionally supports only fixed offsets (no DST or IANA database).
 
 use std::{
+    borrow::Cow,
     collections::hash_map::DefaultHasher,
     fmt::Write,
     hash::{Hash, Hasher},
+    mem,
 };
 
-// The bounds live in `monty-types` so the wire decoder shares them; re-exported
-// here because this is where the sandbox-side constructor enforces them.
-pub(crate) use monty_types::{MAX_TIMEZONE_OFFSET_SECONDS, MIN_TIMEZONE_OFFSET_SECONDS};
+use ahash::AHashSet;
 
 use crate::{
     args::{ArgValues, FromArgs},
     bytecode::VM,
     defer_drop,
-    exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
+    exception_private::{ExcType, RunError, RunResult, SimpleException},
     hash::HashValue,
-    heap::{Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadOutput},
+    heap::{Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::Interns,
+    resource::{ResourceError, ResourceTracker},
     types::{
-        LazyHeapSet, PyTrait, Type,
-        str::{StringRepr, allocate_string},
+        PyTrait, Type,
+        str::StringRepr,
         timedelta,
         timedelta::{MICROSECONDS_PER_SECOND, SECONDS_PER_HOUR, SECONDS_PER_MINUTE},
     },
     value::Value,
 };
+
+/// Minimum allowed timezone offset in seconds: -23:59.
+pub(crate) const MIN_TIMEZONE_OFFSET_SECONDS: i32 = -86_399;
+/// Maximum allowed timezone offset in seconds: +23:59.
+pub(crate) const MAX_TIMEZONE_OFFSET_SECONDS: i32 = 86_399;
 
 /// Python `datetime.timezone` value.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -63,7 +69,7 @@ impl TimeZone {
     }
 
     /// Parses timezone constructor arguments.
-    pub fn init(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
+    pub fn init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         let TimezoneInitArgs { offset, name } = TimezoneInitArgs::from_args(args, vm)?;
         // Keep `offset` and `name` alive across the validation helpers — they
         // own the heap refs (TimeDelta / Str) we're reading from. `name` is
@@ -71,7 +77,7 @@ impl TimeZone {
         // `None`: CPython accepts `timezone(td)` but rejects `timezone(td,
         // None)` with `TypeError: timezone() argument 2 must be str, not None`.
         defer_drop!(offset, vm);
-        let offset_seconds = extract_offset_seconds(offset, vm.heap, vm.interns)?;
+        let offset_seconds = extract_offset_seconds(offset, vm.heap)?;
         let name_str: Option<String> = match name {
             None => None,
             Some(name) => {
@@ -81,11 +87,17 @@ impl TimeZone {
         };
 
         if offset_seconds == 0 && name_str.is_none() {
-            return Ok(vm.heap.get_timezone_utc());
+            return vm.heap.get_timezone_utc().map_err(Into::into);
         }
 
         let tz = Self::new(offset_seconds, name_str)?;
-        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))))
+        Ok(Value::Ref(vm.heap.allocate(HeapData::TimeZone(tz))?))
+    }
+
+    /// Formats offset as `+HH:MM` / `-HH:MM` with optional `:SS`.
+    #[must_use]
+    pub fn format_utc_offset(&self) -> String {
+        format_offset_hms(self.offset_seconds)
     }
 }
 
@@ -93,13 +105,13 @@ impl TimeZone {
 ///
 /// `timezone` is a C-implemented constructor that emits its function name in
 /// error messages (unlike `datetime`, which uses the bare `"function"`
-/// label). Hence `style = c_named`.
+/// label). Hence the `c_error_named` style.
 ///
 /// Both `offset` and `name` are held as `Value` so the inner code can do its
 /// own custom validation (`offset` must be a `timedelta`; `name` must be a
 /// `str`). The macro only handles arg-count/keyword dispatch.
 #[derive(FromArgs)]
-#[from_args(name = "timezone", style = c_named, at_most_total)]
+#[from_args(name = "timezone", c_error_named, at_most_total)]
 struct TimezoneInitArgs {
     offset: Value,
     // `Option<Value>` (with `default`) preserves the distinction between
@@ -124,11 +136,11 @@ impl Hash for TimeZone {
     }
 }
 
-fn extract_offset_seconds(offset_arg: &Value, heap: &Heap, interns: &Interns) -> RunResult<i32> {
+fn extract_offset_seconds(offset_arg: &Value, heap: &Heap<impl ResourceTracker>) -> RunResult<i32> {
     let bad_type = || {
         ExcType::type_error(format!(
             "timezone() argument 1 must be datetime.timedelta, not {}",
-            offset_arg.py_type_heap(heap).cpython_arg_name(heap, interns),
+            offset_arg.py_type_heap(heap).cpython_arg_name(),
         ))
     };
     let Value::Ref(offset_id) = offset_arg else {
@@ -175,28 +187,6 @@ pub(crate) fn format_offset_hms(offset_seconds: i32) -> String {
     format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
 }
 
-/// The name a fixed-offset zone reports from `tzname()` and `str()`.
-///
-/// An explicit constructor name wins; otherwise CPython renders the zero offset
-/// as the bare `UTC` and every other offset as `UTC±HH:MM[:SS]`.
-#[must_use]
-pub(crate) fn tzname_string(offset_seconds: i32, name: Option<&str>) -> String {
-    match name {
-        Some(name) => name.to_owned(),
-        None if offset_seconds == 0 => "UTC".to_owned(),
-        None => format!("UTC{}", format_offset_hms(offset_seconds)),
-    }
-}
-
-/// Builds the value `utcoffset()` returns: a `timedelta` for a fixed offset,
-/// `None` for a naive one.
-pub(crate) fn utcoffset_value(offset_seconds: Option<i32>, heap: &Heap) -> Value {
-    match offset_seconds {
-        None => Value::None,
-        Some(offset_seconds) => timedelta::allocate_micros(i128::from(offset_seconds) * MICROSECONDS_PER_SECOND, heap),
-    }
-}
-
 /// Formats a canonical `datetime.timedelta(...)` repr for a fixed offset in seconds.
 #[must_use]
 pub(crate) fn format_offset_timedelta_repr(offset_seconds: i32) -> String {
@@ -205,61 +195,65 @@ pub(crate) fn format_offset_timedelta_repr(offset_seconds: i32) -> String {
     timedelta::format_repr(&delta)
 }
 
-fn extract_name(name_arg: &Value, heap: &Heap, interns: &Interns) -> RunResult<Option<String>> {
+fn extract_name(name_arg: &Value, heap: &Heap<impl ResourceTracker>, interns: &Interns) -> RunResult<Option<String>> {
     match name_arg {
         Value::InternString(id) => Ok(Some(interns.get_str(*id).to_owned())),
         Value::Ref(id) => match heap.get(*id) {
             HeapData::Str(s) => Ok(Some(s.as_str().to_owned())),
-            _ => Err(bad_name_arg(name_arg, heap, interns)),
+            _ => Err(bad_name_arg(name_arg, heap)),
         },
-        _ => Err(bad_name_arg(name_arg, heap, interns)),
+        _ => Err(bad_name_arg(name_arg, heap)),
     }
 }
 
 /// Builds the `timezone() argument 2 must be str, not <type>` error CPython
 /// raises for any non-`str` `name` argument (including explicit `None`).
-fn bad_name_arg(name_arg: &Value, heap: &Heap, interns: &Interns) -> RunError {
+fn bad_name_arg(name_arg: &Value, heap: &Heap<impl ResourceTracker>) -> RunError {
     ExcType::type_error(format!(
         "timezone() argument 2 must be str, not {}",
-        name_arg.py_type_heap(heap).cpython_arg_name(heap, interns)
+        name_arg.py_type_heap(heap).cpython_arg_name()
     ))
 }
 
 impl HeapItem for TimeZone {
+    fn py_estimate_size(&self) -> usize {
+        mem::size_of::<Self>() + self.name.as_ref().map_or(0, String::len)
+    }
+
     fn py_dec_ref_ids(&mut self, _stack: &mut Vec<HeapId>) {}
 }
 
 /// `HeapRead`-based dispatch for `TimeZone`, enabling the `HeapReadOutput` enum to
 /// delegate `PyTrait` calls to heap-resident timezone objects.
-impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeZone> {
-    fn py_type(&self, _vm: &VM<'h>) -> Type {
+impl<'h> PyTrait<'h> for HeapRead<'h, TimeZone> {
+    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
         Type::TimeZone
     }
 
-    fn py_len(&self, _vm: &VM<'h>) -> Option<usize> {
+    fn py_len(&self, _vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
         None
     }
 
-    fn py_eq_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<bool>> {
-        let Some(HeapReadOutput::TimeZone(other)) = other.read_heap(vm) else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.get(vm.heap).offset_seconds == other.get(vm.heap).offset_seconds,
-        ))
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+        Ok(self.get(vm.heap).offset_seconds == other.get(vm.heap).offset_seconds)
     }
 
-    fn py_hash(&self, vm: &mut VM<'h>) -> RunResult<Option<HashValue>> {
+    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
         let mut hasher = DefaultHasher::new();
         self.get(vm.heap).hash(&mut hasher);
         Ok(Some(HashValue::new(hasher.finish())))
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h>) -> RunResult<bool> {
-        Ok(true)
+    fn py_bool(&self, _vm: &mut VM<'h, impl ResourceTracker>) -> bool {
+        true
     }
 
-    fn py_repr_fmt(&self, f: &mut impl Write, vm: &mut VM<'h>, _heap_ids: &mut LazyHeapSet) -> RunResult<()> {
+    fn py_repr_fmt(
+        &self,
+        f: &mut impl Write,
+        vm: &mut VM<'h, impl ResourceTracker>,
+        _heap_ids: &mut AHashSet<HeapId>,
+    ) -> RunResult<()> {
         let tz = self.get(vm.heap);
         if tz.offset_seconds == 0 && tz.name.is_none() {
             f.write_str("datetime.timezone.utc")?;
@@ -275,9 +269,14 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeZone> {
         Ok(())
     }
 
-    fn py_str(&self, vm: &mut VM<'h>) -> RunResult<Value> {
+    fn py_str(&self, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Cow<'static, str>> {
         let tz = self.get(vm.heap);
-        let s = tzname_string(tz.offset_seconds, tz.name.as_deref());
-        Ok(allocate_string(s, vm.heap))
+        if let Some(name) = &tz.name {
+            return Ok(Cow::Owned(name.clone()));
+        }
+        if tz.offset_seconds == 0 {
+            return Ok(Cow::Borrowed("UTC"));
+        }
+        Ok(Cow::Owned(format!("UTC{}", tz.format_utc_offset())))
     }
 }

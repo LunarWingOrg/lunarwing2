@@ -297,3 +297,4 @@ Module(
 4 | f"{"
 5 | f"""{"""
   |      ^^^ Syntax Error: Expected an expression
+  |

@@ -1,7 +1,6 @@
-# Test that a nested GatherFuture is released when the outer gather fails and the
-# detached sibling never runs again. Nothing balances these refs mid-run — the
-# end-of-run scheduler teardown does — so this covers the sibling that never
-# finishes; refcount__gather_detached_sibling.py covers the one that does.
+# Test that nested GatherFuture is properly cleaned up when outer task is cancelled.
+# When one task in an outer gather fails, sibling tasks (including those with inner gathers)
+# should be cancelled and all GatherFutures properly cleaned up.
 import asyncio
 
 

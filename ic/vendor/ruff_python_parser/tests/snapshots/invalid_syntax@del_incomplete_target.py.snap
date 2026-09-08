@@ -137,3 +137,4 @@ Module(
 3 | del x, y[
 4 | z
   |  ^ Syntax Error: unexpected EOF while parsing
+  |

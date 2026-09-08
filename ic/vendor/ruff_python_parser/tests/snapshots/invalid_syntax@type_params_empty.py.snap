@@ -111,3 +111,4 @@ Module(
 2 |     pass
 3 | type ListOrSet[] = list | set
   |                ^ Syntax Error: Type parameter list cannot be empty
+  |

@@ -1,40 +1,36 @@
-use crate::exceptions::PyUnicodeDecodeError;
 #[cfg(feature = "experimental-inspect")]
 use crate::inspect::PyStaticExpr;
 #[cfg(feature = "experimental-inspect")]
 use crate::type_object::PyTypeInfo;
 use crate::types::PyString;
 use crate::{Borrowed, Bound, FromPyObject, IntoPyObject, PyAny, PyErr, Python};
-use alloc::borrow::Cow;
-use core::ffi::CStr;
-use std::ffi::CString;
+use std::borrow::Cow;
+use std::ffi::{CStr, CString};
+use std::str::Utf8Error;
 #[cfg(any(Py_3_10, not(Py_LIMITED_API)))]
 use {
     crate::{exceptions::PyValueError, ffi},
-    core::slice,
+    std::slice,
 };
 
 impl<'py> IntoPyObject<'py> for &CStr {
     type Target = PyString;
     type Output = Bound<'py, Self::Target>;
-    type Error = PyErr;
+    type Error = Utf8Error;
 
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = <&str>::OUTPUT_TYPE;
 
     #[inline]
     fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
-        self.to_str()
-            .map_err(|e| PyUnicodeDecodeError::new_err_from_utf8(py, self.to_bytes(), e))?
-            .into_pyobject(py)
-            .map_err(|err| match err {})
+        self.to_str()?.into_pyobject(py).map_err(|err| match err {})
     }
 }
 
 impl<'py> IntoPyObject<'py> for CString {
     type Target = PyString;
     type Output = Bound<'py, Self::Target>;
-    type Error = PyErr;
+    type Error = Utf8Error;
 
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = <&CStr>::OUTPUT_TYPE;
@@ -48,7 +44,7 @@ impl<'py> IntoPyObject<'py> for CString {
 impl<'py> IntoPyObject<'py> for &CString {
     type Target = PyString;
     type Output = Bound<'py, Self::Target>;
-    type Error = PyErr;
+    type Error = Utf8Error;
 
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = <&CStr>::OUTPUT_TYPE;
@@ -62,7 +58,7 @@ impl<'py> IntoPyObject<'py> for &CString {
 impl<'py> IntoPyObject<'py> for Cow<'_, CStr> {
     type Target = PyString;
     type Output = Bound<'py, Self::Target>;
-    type Error = PyErr;
+    type Error = Utf8Error;
 
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = <&CStr>::OUTPUT_TYPE;
@@ -75,7 +71,7 @@ impl<'py> IntoPyObject<'py> for Cow<'_, CStr> {
 impl<'py> IntoPyObject<'py> for &Cow<'_, CStr> {
     type Target = PyString;
     type Output = Bound<'py, Self::Target>;
-    type Error = PyErr;
+    type Error = Utf8Error;
 
     #[cfg(feature = "experimental-inspect")]
     const OUTPUT_TYPE: PyStaticExpr = <&CStr>::OUTPUT_TYPE;

@@ -1,6 +1,6 @@
-use core::ffi::c_int;
+use std::ffi::c_int;
 
-extern_libpython! {
+extern "C" {
     #[cfg_attr(PyPy, link_name = "PyPyOS_InterruptOccurred")]
     pub fn PyOS_InterruptOccurred() -> c_int;
     #[cfg(not(Py_3_10))]

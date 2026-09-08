@@ -25,6 +25,7 @@ mod pyclass;
 mod pyfunction;
 mod pyimpl;
 mod pymethod;
+mod pyversions;
 mod quotes;
 
 pub use frompyobject::build_derive_from_pyobject;

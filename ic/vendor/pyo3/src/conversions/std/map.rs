@@ -1,4 +1,6 @@
 #[cfg(feature = "experimental-inspect")]
+use crate::inspect::types::TypeInfo;
+#[cfg(feature = "experimental-inspect")]
 use crate::inspect::{type_hint_subscript, PyStaticExpr};
 #[cfg(feature = "experimental-inspect")]
 use crate::type_object::PyTypeInfo;
@@ -8,8 +10,7 @@ use crate::{
     types::{any::PyAnyMethods, dict::PyDictMethods, PyDict},
     Borrowed, FromPyObject, PyAny, PyErr, Python,
 };
-use core::{cmp, hash};
-use std::collections;
+use std::{cmp, collections, hash};
 
 impl<'py, K, V, H> IntoPyObject<'py> for collections::HashMap<K, V, H>
 where
@@ -31,6 +32,11 @@ where
             dict.set_item(k, v)?;
         }
         Ok(dict)
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        TypeInfo::dict_of(K::type_output(), V::type_output())
     }
 }
 
@@ -55,6 +61,11 @@ where
         }
         Ok(dict)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        TypeInfo::dict_of(<&K>::type_output(), <&V>::type_output())
+    }
 }
 
 impl<'py, K, V> IntoPyObject<'py> for collections::BTreeMap<K, V>
@@ -76,6 +87,11 @@ where
             dict.set_item(k, v)?;
         }
         Ok(dict)
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        TypeInfo::dict_of(K::type_output(), V::type_output())
     }
 }
 
@@ -100,6 +116,11 @@ where
             dict.set_item(k, v)?;
         }
         Ok(dict)
+    }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_output() -> TypeInfo {
+        TypeInfo::dict_of(<&K>::type_output(), <&V>::type_output())
     }
 }
 
@@ -126,6 +147,11 @@ where
         }
         Ok(ret)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        TypeInfo::mapping_of(K::type_input(), V::type_input())
+    }
 }
 
 impl<'py, K, V> FromPyObject<'_, 'py> for collections::BTreeMap<K, V>
@@ -150,13 +176,17 @@ where
         }
         Ok(ret)
     }
+
+    #[cfg(feature = "experimental-inspect")]
+    fn type_input() -> TypeInfo {
+        TypeInfo::mapping_of(K::type_input(), V::type_input())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::collections::BTreeMap;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     #[test]
     fn test_hashmap_to_python() {
