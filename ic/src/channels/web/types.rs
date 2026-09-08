@@ -181,6 +181,8 @@ pub enum SseEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_id: Option<String>,
     },
+    #[serde(rename = "stream_gap")]
+    StreamGap { missed_events: u64 },
     #[serde(rename = "status")]
     Status {
         message: String,
@@ -1402,6 +1404,7 @@ impl WsServerMessage {
             SseEvent::ToolCompleted { .. } => "tool_completed",
             SseEvent::ToolResult { .. } => "tool_result",
             SseEvent::StreamChunk { .. } => "stream_chunk",
+            SseEvent::StreamGap { .. } => "stream_gap",
             SseEvent::Status { .. } => "status",
             SseEvent::JobStarted { .. } => "job_started",
             SseEvent::ApprovalNeeded { .. } => "approval_needed",
@@ -1744,6 +1747,22 @@ mod tests {
         let json = serde_json::to_string(&sse).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(parsed.get("emotes").is_none());
+    }
+
+    #[test]
+    fn test_stream_gap_serializes_for_sse_and_websocket() {
+        let gap = SseEvent::StreamGap { missed_events: 7 };
+        let json = serde_json::to_value(&gap).unwrap();
+        assert_eq!(json["type"], "stream_gap");
+        assert_eq!(json["missed_events"], 7);
+
+        match WsServerMessage::from_sse_event(&gap) {
+            WsServerMessage::Event { event_type, data } => {
+                assert_eq!(event_type, "stream_gap");
+                assert_eq!(data["missed_events"], 7);
+            }
+            _ => panic!("Expected Event variant"),
+        }
     }
 
     #[test]
