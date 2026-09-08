@@ -22,7 +22,10 @@
 
 3. [ ] **#127 — Web gateway "sometimes output doesn't load" (SSE delivery-loss + Done-wipes-stream)** `[bug,2.1.0.0]` - Client-side mitigation merged (history reload on Done/missing-final). REMAINING per #48 relnotes pass: **server-side gap signaling** and **stream-text reload** limitation. Audit reference: `references/sse-stream-loss-audit.md` (WI#127 composite bug: Lagged swallow server-side + client Done-guard). See previous goal file from aragents/kimil00p/v2.1.0.0 for more reference
 
-4. [ ] **#126 — Investigate default mission behavior for thread start** - No goal item from aragents/kimil00p/v2.1.0.0 ever addressed it. Needs scoping before it's executable (investigation-shaped, not directive).
+4. [x] **#126 — Investigate default mission behavior for thread start** - No goal item from aragents/kimil00p/v2.1.0.0 ever addressed it. Needs scoping before it's executable (investigation-shaped, not directive).
+    - DONE (item 4): source investigation and executable follow-up scopes recorded in `docs/ops/v2.1.1.0_GOAL4_WI126_THREAD_START_MISSION_SCOPE.md`.
+    - DECISION: keep the existing default fleet; do not add an asynchronous default thread-start mission. Optional best-effort `thread_start` plumbing and WI#109's mandatory synchronous sanitizer are separate scopes.
+    - VERIFY: focused lifecycle, structured-event, and public-cadence tests passed (6 tests total).
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision.
 
