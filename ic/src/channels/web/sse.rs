@@ -44,7 +44,7 @@ pub struct SseManager {
 impl SseManager {
     /// Create a new SSE manager.
     pub fn new() -> Self {
-        // Buffer 256 events; slow clients will miss events (acceptable for SSE with reconnect)
+        // Buffer 256 events; lagging subscribers receive StreamGap before retained events.
         let (tx, _) = broadcast::channel(256);
         Self {
             tx,
