@@ -377,7 +377,11 @@ pub async fn execute_orchestrator(
     let tracker = LimitedTracker::new(orchestrator_limits());
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runner.start(input_values, tracker, PrintWriter::Collect(&mut stdout))
+        runner.start(
+            input_values,
+            tracker,
+            PrintWriter::CollectString(&mut stdout),
+        )
     }));
 
     let mut progress = match run_result {
@@ -617,7 +621,7 @@ pub async fn execute_orchestrator(
                 // Host I/O may take minutes. Bound active VM execution, not suspended time.
                 reset_orchestrator_phase_timeout(&mut call, active_vm_duration);
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                    call.resume(ext_result, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -645,7 +649,7 @@ pub async fn execute_orchestrator(
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     lookup.resume(
                         NameLookupResult::Undefined,
-                        PrintWriter::Collect(&mut stdout),
+                        PrintWriter::CollectString(&mut stdout),
                     )
                 })) {
                     Ok(Ok(p)) => progress = p,
@@ -2736,7 +2740,7 @@ mod tests {
             LimitedTracker::new(ResourceLimits::new().max_duration(Duration::from_millis(1)));
         let mut stdout = String::new();
         let progress = runner
-            .start(vec![], tracker, PrintWriter::Collect(&mut stdout))
+            .start(vec![], tracker, PrintWriter::CollectString(&mut stdout))
             .expect("test code should reach host call");
         let RunProgress::FunctionCall(mut call) = progress else {
             panic!("test code should suspend at host call");
@@ -2747,7 +2751,7 @@ mod tests {
         reset_orchestrator_phase_timeout(&mut call, active_duration);
         let result = call.resume(
             ExtFunctionResult::Return(MontyObject::None),
-            PrintWriter::Collect(&mut stdout),
+            PrintWriter::CollectString(&mut stdout),
         );
 
         assert!(matches!(result, Ok(RunProgress::Complete(_))));
@@ -2775,7 +2779,7 @@ mod tests {
         let tracker = LimitedTracker::new(ResourceLimits::new().max_allocations(500_000));
 
         let mut progress = runner
-            .start(vec![], tracker, PrintWriter::Collect(&mut stdout))
+            .start(vec![], tracker, PrintWriter::CollectString(&mut stdout))
             .expect("Failed to start orchestrator test");
 
         // Drive the VM — handle the FINAL() host call
@@ -2787,7 +2791,7 @@ mod tests {
                         let value = call.args.first().cloned().unwrap_or(MontyObject::None);
                         let _ = call.resume(
                             ExtFunctionResult::Return(MontyObject::None),
-                            PrintWriter::Collect(&mut stdout),
+                            PrintWriter::CollectString(&mut stdout),
                         );
                         return value;
                     }
@@ -2795,7 +2799,7 @@ mod tests {
                     progress = call
                         .resume(
                             ExtFunctionResult::Return(MontyObject::None),
-                            PrintWriter::Collect(&mut stdout),
+                            PrintWriter::CollectString(&mut stdout),
                         )
                         .expect("resume failed");
                 }
@@ -2803,7 +2807,7 @@ mod tests {
                     progress = lookup
                         .resume(
                             NameLookupResult::Undefined,
-                            PrintWriter::Collect(&mut stdout),
+                            PrintWriter::CollectString(&mut stdout),
                         )
                         .expect("name lookup resume failed");
                 }

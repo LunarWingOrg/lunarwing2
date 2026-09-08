@@ -4,6 +4,8 @@ use std::{
     vec::{Drain, IntoIter},
 };
 
+use smallvec::SmallVec;
+
 use crate::{
     ResourceTracker,
     heap::{Heap, HeapId, RecursionToken},
@@ -44,7 +46,7 @@ pub(crate) trait HeapItem {
     /// This is called during `dec_ref` to find nested heap references that
     /// need their refcounts decremented when this value is freed.
     ///
-    /// When the `ref-count-panic` feature is enabled, this method also marks all
+    /// When the `memory-model-checks` feature is enabled, this method also marks all
     /// contained `Value`s as `Dereferenced` to prevent Drop panics. This
     /// co-locates the cleanup logic with the reference collection logic.
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>);
@@ -105,6 +107,17 @@ impl<U: DropWithHeap> DropWithHeap for Option<U> {
 }
 
 impl<U: DropWithHeap> DropWithHeap for Vec<U> {
+    fn drop_with_heap<H: ContainsHeap>(self, heap: &mut H) {
+        for value in self {
+            value.drop_with_heap(heap);
+        }
+    }
+}
+
+impl<A: smallvec::Array> DropWithHeap for SmallVec<A>
+where
+    A::Item: DropWithHeap,
+{
     fn drop_with_heap<H: ContainsHeap>(self, heap: &mut H) {
         for value in self {
             value.drop_with_heap(heap);

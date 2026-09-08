@@ -13,7 +13,10 @@ use crate::{
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
     sorting::{apply_permutation, sort_indices},
-    types::Type,
+    types::{
+        Type,
+        slice::{normalize_sequence_index, slice_collect_iterator},
+    },
     value::{EitherStr, VALUE_SIZE, Value},
 };
 
@@ -192,11 +195,9 @@ impl<'h> HeapRead<'h, List> {
     ///
     /// Returns a new list containing the selected elements.
     fn getitem_slice(&self, slice: &super::Slice, vm: &VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
-        let (start, stop, step) = slice
-            .indices(self.get(vm.heap).items.len())
-            .map_err(|()| ExcType::value_error_slice_step_zero())?;
-
-        let items = get_slice_items(&self.get(vm.heap).items, start, stop, step, vm.heap)?;
+        let items = slice_collect_iterator(vm, slice, self.get(vm.heap).items.iter(), |item| {
+            item.clone_with_heap(vm.heap)
+        })?;
         let heap_id = vm.heap.allocate(HeapData::List(List::new(items)))?;
         Ok(Value::Ref(heap_id))
     }
@@ -425,7 +426,7 @@ impl HeapItem for List {
         for obj in &mut self.items {
             if let Value::Ref(id) = obj {
                 stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
+                #[cfg(feature = "memory-model-checks")]
                 obj.dec_ref_forget();
             }
         }
@@ -644,12 +645,12 @@ fn list_index<'h>(
         [] => return Err(ExcType::type_error_at_least("list.index", 1, 0)),
         [value] => (value, 0, len),
         [value, start_arg] => {
-            let start = normalize_list_index(start_arg.as_int(vm)?, len);
+            let start = normalize_sequence_index(start_arg.as_int(vm)?, len);
             (value, start, len)
         }
         [value, start_arg, end_arg] => {
-            let start = normalize_list_index(start_arg.as_int(vm)?, len);
-            let end = normalize_list_index(end_arg.as_int(vm)?, len).max(start);
+            let start = normalize_sequence_index(start_arg.as_int(vm)?, len);
+            let end = normalize_sequence_index(end_arg.as_int(vm)?, len).max(start);
             (value, start, end)
         }
         other => return Err(ExcType::type_error_at_most("list.index", 3, other.len())),
@@ -693,16 +694,6 @@ fn list_count<'h>(
 
     let count_i64 = i64::try_from(count).expect("count exceeds i64::MAX");
     Ok(Value::Int(count_i64))
-}
-
-/// Normalizes a Python-style list index to a valid index in range [0, len].
-fn normalize_list_index(index: i64, len: usize) -> usize {
-    if index < 0 {
-        let abs_index = usize::try_from(-index).unwrap_or(usize::MAX);
-        len.saturating_sub(abs_index)
-    } else {
-        usize::try_from(index).unwrap_or(len).min(len)
-    }
 }
 
 /// Performs an in-place sort on a list with optional key function and reverse flag.
@@ -809,59 +800,6 @@ pub(crate) fn repr_sequence_fmt(
     f.write_char(end)?;
 
     Ok(())
-}
-
-/// Helper to extract items from a slice for list/tuple slicing.
-///
-/// Handles both positive and negative step values. For negative step,
-/// iterates backward from start down to (but not including) stop.
-///
-/// Returns a new Vec of cloned values with proper refcount increments.
-/// Checks the time limit on each iteration to enforce timeouts during slicing.
-///
-/// Note: step must be non-zero (callers should validate this via `slice.indices()`).
-pub(crate) fn get_slice_items(
-    items: &[Value],
-    start: usize,
-    stop: usize,
-    step: i64,
-    heap: &Heap<impl ResourceTracker>,
-) -> RunResult<Vec<Value>> {
-    let mut result = Vec::new();
-
-    // try_from succeeds for non-negative step; step==0 rejected upstream by slice.indices()
-    if let Ok(step_usize) = usize::try_from(step) {
-        // Positive step: iterate forward
-        let mut i = start;
-        while i < stop && i < items.len() {
-            heap.check_time()?;
-            result.push(items[i].clone_with_heap(heap));
-            i += step_usize;
-        }
-    } else {
-        // Negative step: iterate backward
-        // start is the highest index, stop is the sentinel
-        // stop > items.len() means "go to the beginning"
-        let step_abs = usize::try_from(-step).expect("step is negative so -step is positive");
-        let step_abs_i64 = i64::try_from(step_abs).expect("step magnitude fits in i64");
-        let mut i = i64::try_from(start).expect("start index fits in i64");
-        let stop_i64 = if stop > items.len() {
-            -1
-        } else {
-            i64::try_from(stop).expect("stop bounded by items.len() fits in i64")
-        };
-
-        while let Ok(i_usize) = usize::try_from(i) {
-            if i_usize >= items.len() || i <= stop_i64 {
-                break;
-            }
-            heap.check_time()?;
-            result.push(items[i_usize].clone_with_heap(heap));
-            i -= step_abs_i64;
-        }
-    }
-
-    Ok(result)
 }
 
 #[cfg(test)]

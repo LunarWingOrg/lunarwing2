@@ -2,7 +2,15 @@
 ///
 /// This type provides Python string semantics. Currently supports basic
 /// operations like length and equality comparison.
-use std::{borrow::Cow, cmp::Ordering, fmt, fmt::Write, mem, ops};
+use std::{
+    borrow::Cow,
+    cmp::Ordering,
+    collections::hash_map::DefaultHasher,
+    fmt,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem, ops,
+};
 
 use ahash::AHashSet;
 use smallvec::smallvec;
@@ -16,7 +24,10 @@ use crate::{
     heap::{DropWithHeap, Heap, HeapData, HeapGuard, HeapId, HeapItem, HeapRead, heap_read_ref_as_field},
     intern::{StaticStrings, StringId},
     resource::{ResourceError, ResourceTracker, check_repeat_size, check_replace_size},
-    types::Type,
+    types::{
+        Type,
+        slice::{normalize_sequence_index, slice_collect_iterator},
+    },
     value::{EitherStr, Value},
 };
 
@@ -32,6 +43,12 @@ impl Str {
     #[must_use]
     pub fn new(s: String) -> Self {
         Self(s.into())
+    }
+
+    /// Creates a new Str from a Rust Box<str>.
+    #[must_use]
+    pub fn from_boxed(s: Box<str>) -> Self {
+        Self(s)
     }
 
     /// Returns a reference to the inner string.
@@ -59,14 +76,9 @@ impl Str {
     /// Handles slice-based indexing for strings.
     ///
     /// Returns a new string containing the selected characters (Unicode-aware).
-    fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
-        let char_count = self.0.chars().count();
-        let (start, stop, step) = slice
-            .indices(char_count)
-            .map_err(|()| ExcType::value_error_slice_step_zero())?;
-
-        let result_str = get_str_slice(&self.0, start, stop, step);
-        let heap_id = heap.allocate(HeapData::Str(Self::from(result_str)))?;
+    fn getitem_slice(&self, vm: &VM<'_, '_, impl ResourceTracker>, slice: &super::Slice) -> RunResult<Value> {
+        let result_str = slice_collect_iterator(vm, slice, self.0.chars(), |c| c)?;
+        let heap_id = vm.heap.allocate(HeapData::Str(Self(result_str)))?;
         Ok(Value::Ref(heap_id))
     }
 }
@@ -147,52 +159,6 @@ pub fn get_char_at_index(s: &str, index: i64) -> Option<char> {
     s.chars().nth(idx)
 }
 
-/// Extracts a slice of a string (Unicode-aware).
-///
-/// Handles both positive and negative step values. For negative step,
-/// iterates backward from start down to (but not including) stop.
-/// The `stop` parameter uses a sentinel value of `len + 1` for negative
-/// step to indicate "go to the beginning".
-///
-/// Note: step must be non-zero (callers should validate this via `slice.indices()`).
-pub(crate) fn get_str_slice(s: &str, start: usize, stop: usize, step: i64) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-
-    // try_from succeeds for non-negative step; step==0 rejected upstream by slice.indices()
-    if let Ok(step_usize) = usize::try_from(step) {
-        // Positive step: iterate forward
-        let mut i = start;
-        while i < stop && i < chars.len() {
-            result.push(chars[i]);
-            i += step_usize;
-        }
-    } else {
-        // Negative step: iterate backward
-        // start is the highest index, stop is the sentinel
-        // stop > chars.len() means "go to the beginning"
-        let step_abs = usize::try_from(-step).expect("step is negative so -step is positive");
-        let step_abs_i64 = i64::try_from(step_abs).expect("step magnitude fits in i64");
-        let mut i = i64::try_from(start).expect("start index fits in i64");
-        // stop > chars.len() is sentinel meaning "go to beginning", use -1
-        let stop_i64 = if stop > chars.len() {
-            -1
-        } else {
-            i64::try_from(stop).expect("stop bounded by chars.len() fits in i64")
-        };
-
-        while let Ok(i_usize) = usize::try_from(i) {
-            if i_usize >= chars.len() || i <= stop_i64 {
-                break;
-            }
-            result.push(chars[i_usize]);
-            i -= step_abs_i64;
-        }
-    }
-
-    result
-}
-
 impl ops::Deref for Str {
     type Target = str;
 
@@ -216,7 +182,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Str> {
         if let Value::Ref(id) = key
             && let HeapData::Slice(slice) = vm.heap.get(*id)
         {
-            return self.get(vm.heap).getitem_slice(slice, vm.heap);
+            return self.get(vm.heap).getitem_slice(vm, slice);
         }
 
         // Extract integer index, accepting Int, Bool (True=1, False=0), and LongInt
@@ -230,6 +196,18 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Str> {
 
     fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
         Ok(self.get(vm.heap).0 == other.get(vm.heap).0)
+    }
+
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
+        // Must match `Value::InternString` so the same characters hash equally
+        // regardless of whether the string lives on the heap or in the intern table.
+        let mut hasher = DefaultHasher::new();
+        self.get(vm.heap).as_str().hash(&mut hasher);
+        Ok(Some(hasher.finish()))
     }
 
     fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
@@ -1170,20 +1148,6 @@ fn extract_int_arg(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> 
     }
 }
 
-/// Normalizes a Python-style index to a valid index in range [0, len].
-fn normalize_index(index: i64, len: usize) -> usize {
-    if index < 0 {
-        // Safe cast: we've checked index is negative, so -index is positive
-        // For very large negative numbers that don't fit in usize, saturate to usize::MAX
-        let abs_index = usize::try_from(-index).unwrap_or(usize::MAX);
-        len.saturating_sub(abs_index)
-    } else {
-        // Safe cast: we've checked index is non-negative
-        // For values > usize::MAX, saturate to len
-        usize::try_from(index).unwrap_or(len).min(len)
-    }
-}
-
 /// Extracts an optional index from a `Value`, treating `None` as `default`.
 ///
 /// Used by argument parsers where `None` means "use the default index" and
@@ -1197,7 +1161,7 @@ fn optional_index(
     if matches!(value, Value::None) {
         Ok(default)
     } else {
-        Ok(normalize_index(extract_int_arg(value, vm)?, str_len))
+        Ok(normalize_sequence_index(extract_int_arg(value, vm)?, str_len))
     }
 }
 

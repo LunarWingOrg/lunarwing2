@@ -1,10 +1,8 @@
 use std::{
     cell::{Cell, UnsafeCell},
-    collections::hash_map::DefaultHasher,
     fmt,
-    hash::{Hash, Hasher},
     marker::PhantomData,
-    mem::{self, ManuallyDrop, discriminant, size_of},
+    mem::{ManuallyDrop, size_of},
     ops::{Deref, DerefMut},
     ptr::{self, NonNull},
     vec,
@@ -25,8 +23,8 @@ use crate::{
     resource::{ResourceError, ResourceTracker, check_mult_size, check_repeat_size},
     types::{
         Bytes, Dataclass, Dict, DictItemsView, DictKeysView, DictValuesView, FrozenSet, List, LongInt, Module,
-        MontyIter, NamedTuple, Path, Range, ReMatch, RePattern, Set, Slice, Str, TimeZone, Tuple, allocate_tuple, date,
-        datetime, timedelta, timezone,
+        MontyIter, NamedTuple, Path, PyTrait, Range, ReMatch, RePattern, Set, Slice, Str, TimeZone, Tuple,
+        allocate_tuple, date, datetime, timedelta, timezone,
     },
     value::Value,
 };
@@ -355,7 +353,7 @@ impl<'a, T: ?Sized> HeapRead<'a, T> {
         //    paged storage (`HeapEntries`) where each page is never reallocated or moved.
         //  - The HeapRead holds a strong reader reference (via the `readers` counter in
         //    `HeapValue`) which guarantees the entry will never be freed by `dec_ref`
-        //    while this `HeapRead` exists.
+        //    or `collect_garbage` while this `HeapRead` exists.
         //  - The type of the `HeapValue` can never change once allocated. This is
         //    guaranteed by never exposing `&mut HeapData` outside of this module.
         //  - The borrow on `HeapReader` guarantees that there are no mutable borrows on any heap
@@ -561,7 +559,7 @@ pub(crate) use heap_read_ref_as_field_mut;
 /// then restore the data. This avoids unsafe code while keeping `refcount` accessible
 /// for `inc_ref`/`dec_ref` during the borrow.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct HeapValue {
+pub struct HeapEntry {
     refcount: Cell<usize>,
     /// Number of active `HeapRead` pointers into this entry's data.
     ///
@@ -710,11 +708,18 @@ impl<'de, T: ResourceTracker + serde::Deserialize<'de>> serde::Deserialize<'de> 
     }
 }
 
-/// GC interval - run GC every 100,000 applicable allocations.
+/// Default GC interval - run GC every 100,000 applicable allocations unless
+/// the configured resource tracker overrides it.
 ///
 /// This is intentionally infrequent to minimize overhead while still
 /// eventually collecting reference cycles.
-const GC_INTERVAL: u32 = 100_000;
+///
+/// When the `memory-model-checks` feature is enabled, this is reduced to 1 to stress-test GC behavior.
+const DEFAULT_GC_INTERVAL: usize = if cfg!(feature = "memory-model-checks") {
+    1
+} else {
+    100_000
+};
 
 impl<T: ResourceTracker> Heap<T> {
     /// Creates a new heap with the given resource tracker.
@@ -729,11 +734,17 @@ impl<T: ResourceTracker> Heap<T> {
             recursion_depth: Cell::new(0),
             timezone_utc: None,
         };
-        // TBC: should the empty tuple contribute to the resource limits?
-        // If not, can just place it in `entries` directly without going through `allocate()`.
-        let empty_tuple = this
-            .allocate(HeapData::Tuple(Tuple::default()))
-            .expect("Failed to allocate empty tuple singleton");
+
+        let empty_tuple = HeapData::Tuple(Tuple::default());
+        let hash_state = HashState::for_data(&empty_tuple);
+        let new_entry = HeapEntry {
+            refcount: Cell::new(1),
+            readers: Cell::new(0),
+            data: UnsafeHeapData(UnsafeCell::new(empty_tuple)),
+            hash_state,
+        };
+
+        let empty_tuple = this.entries.allocate(new_entry);
         debug_assert_eq!(empty_tuple, EMPTY_TUPLE_ID);
         this
     }
@@ -876,7 +887,7 @@ impl<T: ResourceTracker> Heap<T> {
         }
 
         let hash_state = HashState::for_data(&data);
-        let new_entry = HeapValue {
+        let new_entry = HeapEntry {
             refcount: Cell::new(1),
             readers: Cell::new(0),
             data: UnsafeHeapData(UnsafeCell::new(data)),
@@ -992,6 +1003,12 @@ impl<T: ResourceTracker> Heap<T> {
     /// # Panics
     /// Panics if the value ID is invalid or the value has already been freed.
     pub fn get_or_compute_hash(vm: &mut VM<'_, '_, T>, id: HeapId) -> Result<Option<u64>, ResourceError> {
+        // TODO: it should be possible to refactor the triple lookup to just one, probably by having an
+        // internal `vm.heap.read_entry` method which can then derive the `HeapReadOutput` for `py_hash`
+        // later, and can live without a VM borrow to allow reading / writing the hash.
+        //
+        // That only matters before the hash is cached, so not the worst thing for performance.
+
         let entry = vm
             .heap
             .entries
@@ -1005,16 +1022,7 @@ impl<T: ResourceTracker> Heap<T> {
             HashState::Unknown => {}
         }
 
-        // Handle Cell specially - uses identity-based hashing (like Python cell objects)
-        if let HeapData::Cell(_) = entry.data.0.get_mut() {
-            let mut hasher = DefaultHasher::new();
-            id.hash(&mut hasher);
-            let hash = hasher.finish();
-            entry.hash_state = HashState::Cached(hash);
-            return Ok(Some(hash));
-        }
-
-        let hash = compute_hash_from_read(vm.heap.read(id), id, vm)?;
+        let hash = vm.heap.read(id).py_hash(id, vm)?;
 
         // Cache the result
         let entry = vm
@@ -1173,7 +1181,8 @@ impl<T: ResourceTracker> Heap<T> {
     /// and the number of allocations since the last GC exceeds the interval.
     #[inline]
     pub fn should_gc(&self) -> bool {
-        self.may_have_cycles.get() && self.allocations_since_gc.get() >= GC_INTERVAL
+        let interval = self.tracker.gc_interval().unwrap_or(DEFAULT_GC_INTERVAL);
+        self.may_have_cycles.get() && (self.allocations_since_gc.get() as usize) >= interval
     }
 
     /// Runs mark-sweep garbage collection to free unreachable cycles.
@@ -1196,9 +1205,26 @@ impl<T: ResourceTracker> Heap<T> {
         // Use Vec<bool> instead of HashSet for O(1) operations without hashing overhead
         let mut reachable: Vec<bool> = vec![false; self.entries.len()];
         let mut work_list: Vec<HeapId> = root;
+
+        // Need to always visit the empty tuple to avoid it being freed.
+        work_list.push(EMPTY_TUPLE_ID);
+
         // Add the timezone UTC singleton as a GC root if it exists
         if let Some(utc_id) = self.timezone_utc {
             work_list.push(utc_id);
+        }
+
+        // TODO: any value which lives on the C stack should also be a root, this is
+        // a structural deficiency which needs fixing. Will cause bugs and panics
+        // all over the place plus strange execution.
+        for (id, entry) in self.entries.iter() {
+            if entry.readers.get() > 0 {
+                // This entry is currently borrowed as a HeapRead, use it as a root
+                //
+                // This is a poor substitute for proper stack roots but at least
+                // ensures that the invariant in `HeapRead` is not violated.
+                work_list.push(id);
+            }
         }
 
         while let Some(id) = work_list.pop() {
@@ -1225,8 +1251,8 @@ impl<T: ResourceTracker> Heap<T> {
             // Notify tracker of freed memory
             self.tracker.on_free(|| value.data.0.get_mut().py_estimate_size());
 
-            // Mark Values as Dereferenced when ref-count-panic is enabled
-            #[cfg(feature = "ref-count-panic")]
+            // Mark Values as Dereferenced when memory-model-checks is enabled
+            #[cfg(feature = "memory-model-checks")]
             py_dec_ref_ids_for_data(value.data.0.get_mut(), &mut Vec::new());
 
             false
@@ -1273,177 +1299,6 @@ fn longint_to_repeat_count(li: &LongInt) -> RunResult<usize> {
         Ok(count)
     } else {
         Err(ExcType::overflow_repeat_count().into())
-    }
-}
-
-/// Computes the hash for a heap value via the `HeapRead` pattern.
-///
-/// Data stays in the heap throughout — no take-and-restore needed. For recursive types
-/// (Tuple, NamedTuple, FrozenSet, Dataclass), uses the short-lived borrow pattern:
-/// read element via shared borrow, release borrow, then recurse into `get_or_compute_hash`
-/// for Ref children.
-///
-/// Returns `Ok(Some(hash))` for hashable types, `Ok(None)` for unhashable types,
-/// or `Err(ResourceError::Recursion)` if the recursion limit is exceeded.
-fn compute_hash_from_read<'h>(
-    output: HeapReadOutput<'h>,
-    id: HeapId,
-    vm: &mut VM<'h, '_, impl ResourceTracker>,
-) -> Result<Option<u64>, ResourceError> {
-    /// Helper to get the `HeapData` discriminant for mixing into hashes.
-    /// Uses a short-lived borrow on the reader.
-    fn heap_disc<T: ResourceTracker>(reader: &HeapReader<'_, T>, id: HeapId) -> mem::Discriminant<HeapData> {
-        discriminant(reader.get(id))
-    }
-
-    match output {
-        // Str/Bytes: hash just the content (consistent with InternString/InternBytes)
-        HeapReadOutput::Str(s) => {
-            let mut hasher = DefaultHasher::new();
-            s.get(vm.heap).as_str().hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        HeapReadOutput::Bytes(b) => {
-            let mut hasher = DefaultHasher::new();
-            b.get(vm.heap).as_slice().hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // Tuple: hashable only if all elements are hashable
-        HeapReadOutput::Tuple(tuple) => {
-            let token = vm.heap.incr_recursion_depth()?;
-            crate::defer_drop!(token, vm);
-            let len = tuple.get(vm.heap).as_slice().len();
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            for i in 0..len {
-                let h = hash_element_at(|r| &tuple.get(r).as_slice()[i], vm)?;
-                match h {
-                    Some(h) => h.hash(&mut hasher),
-                    None => return Ok(None),
-                }
-            }
-            Ok(Some(hasher.finish()))
-        }
-        // NamedTuple: hash by elements only (not type_name) to match equality semantics
-        HeapReadOutput::NamedTuple(nt) => {
-            let token = vm.heap.incr_recursion_depth()?;
-            crate::defer_drop!(token, vm);
-            let len = nt.get(vm.heap).as_vec().len();
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            for i in 0..len {
-                let h = hash_element_at(|r| &nt.get(r).as_vec()[i], vm)?;
-                match h {
-                    Some(h) => h.hash(&mut hasher),
-                    None => return Ok(None),
-                }
-            }
-            Ok(Some(hasher.finish()))
-        }
-        // FrozenSet: XOR of all element hashes (order-independent).
-        HeapReadOutput::FrozenSet(fs) => fs.compute_hash(vm),
-        // Dataclass: hash frozen instances by class name + declared field values
-        HeapReadOutput::Dataclass(dc) => dc.compute_hash(vm),
-        // Closure/FunctionDefaults: hash by function ID
-        HeapReadOutput::Closure(closure) => {
-            let func_id = closure.get(vm.heap).func_id;
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            func_id.hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        HeapReadOutput::FunctionDefaults(fd) => {
-            let func_id = fd.get(vm.heap).func_id;
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            func_id.hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // Range: hash start, stop, step
-        HeapReadOutput::Range(range) => {
-            let r = range.get(vm.heap);
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            r.start.hash(&mut hasher);
-            r.stop.hash(&mut hasher);
-            r.step.hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // Slice: hash start, stop, step
-        HeapReadOutput::Slice(slice) => {
-            let s = slice.get(vm.heap);
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            s.start.hash(&mut hasher);
-            s.stop.hash(&mut hasher);
-            s.step.hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // Path: hash the path string
-        HeapReadOutput::Path(path) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            path.get(vm.heap).as_str().hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // LongInt: uses its own hash method
-        HeapReadOutput::LongInt(li) => Ok(Some(li.get(vm.heap).hash())),
-        // ExtFunction: hash by name
-        HeapReadOutput::ExtFunction(name) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            name.get(vm.heap).hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // Datetime types: hash by discriminant + value
-        HeapReadOutput::Date(d) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            d.get(vm.heap).hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        HeapReadOutput::DateTime(d) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            d.get(vm.heap).hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        HeapReadOutput::TimeDelta(d) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            d.get(vm.heap).hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        HeapReadOutput::TimeZone(d) => {
-            let mut hasher = DefaultHasher::new();
-            heap_disc(vm.heap, id).hash(&mut hasher);
-            d.get(vm.heap).hash(&mut hasher);
-            Ok(Some(hasher.finish()))
-        }
-        // All other types are unhashable
-        _ => Ok(None),
-    }
-}
-
-/// Hashes a single element from a container using the short-lived borrow pattern.
-///
-/// The `read_element` closure reads `&Value` from the container via a shared borrow on the
-/// reader. If the element is `Ref(id)`, the borrow is released and `get_or_compute_hash`
-/// is called recursively. For non-Ref values, the element is cloned via `clone_immediate()`
-/// and hashed directly (non-Ref values never need heap access for hashing).
-fn hash_element_at<'h, T: ResourceTracker>(
-    read_element: impl for<'r> Fn(&'r HeapReader<'h, T>) -> &'r Value,
-    vm: &mut VM<'h, '_, T>,
-) -> Result<Option<u64>, ResourceError> {
-    let ref_id = match read_element(vm.heap) {
-        Value::Ref(id) => Some(*id),
-        _ => None,
-    };
-    if let Some(id) = ref_id {
-        Heap::get_or_compute_hash(vm, id)
-    } else {
-        let value = read_element(vm.heap).clone_immediate();
-        value.py_hash(vm)
     }
 }
 

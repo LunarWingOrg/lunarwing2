@@ -4498,7 +4498,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "lunarwing"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "aes-gcm 0.10.3",
  "agent-client-protocol",
@@ -4608,7 +4608,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_common"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4616,7 +4616,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_engine"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4640,7 +4640,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_health_metrics"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "anyhow",
  "http-body-util",
@@ -4652,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_safety"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "aho-corasick",
  "regex",
@@ -4664,7 +4664,7 @@ dependencies = [
 
 [[package]]
 name = "lunarwing_skills"
-version = "2.1.0"
+version = "2.1.1"
 dependencies = [
  "chrono",
  "futures",
@@ -4927,8 +4927,8 @@ dependencies = [
 
 [[package]]
 name = "monty"
-version = "0.0.9"
-source = "git+https://github.com/pydantic/monty.git?rev=7a0d4b75b72e6ddacafaf36e26486186cdb6eb68#7a0d4b75b72e6ddacafaf36e26486186cdb6eb68"
+version = "0.0.17"
+source = "git+https://github.com/pydantic/monty.git?rev=5c7cf2b62be8e4421a4828072d41ebe69328bbf2#5c7cf2b62be8e4421a4828072d41ebe69328bbf2"
 dependencies = [
  "ahash 0.8.12",
  "bytemuck",
@@ -4943,11 +4943,12 @@ dependencies = [
  "num-integer",
  "num-traits",
  "postcard",
- "pyo3-build-config",
  "ruff_python_ast",
  "ruff_python_parser",
+ "ruff_python_stdlib",
  "ruff_text_size",
  "serde",
+ "serde_json",
  "smallvec",
  "speedate",
  "strum 0.27.2",
@@ -6714,6 +6715,15 @@ dependencies = [
  "unicode-ident",
  "unicode-normalization",
  "unicode_names2",
+]
+
+[[package]]
+name = "ruff_python_stdlib"
+version = "0.0.0"
+source = "git+https://github.com/astral-sh/ruff.git?rev=6ded4bed1651e30b34dd04cdaa50c763036abb0d#6ded4bed1651e30b34dd04cdaa50c763036abb0d"
+dependencies = [
+ "bitflags 2.13.1",
+ "unicode-ident",
 ]
 
 [[package]]
@@ -10213,13 +10223,14 @@ dependencies = [
 
 [[package]]
 name = "wnaf"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab12e7090f27e2ffd9322651492942d50c2926094af30601e1964337db39daf1"
+checksum = "795ca18b3fdb5e62bf982199278341ddcf7ebf7d32e25e212ad05d496e95f6fa"
 dependencies = [
  "ff",
  "group",
  "hybrid-array",
+ "primefield",
 ]
 
 [[package]]

@@ -31,7 +31,7 @@ use crate::{
     heap_data::{Closure, FunctionDefaults},
     intern::{FunctionId, Interns, StringId},
     io::PrintWriter,
-    modules::StandardLib,
+    modules::{StandardLib, json::JsonStringCache},
     os::OsFunction,
     parse::CodeRange,
     resource::ResourceTracker,
@@ -583,6 +583,13 @@ pub struct VM<'h, 'a, T: ResourceTracker> {
     /// back to a `NameError`, so the traceback points to the name reference rather than
     /// the call expression.
     ext_function_load_ip: Option<usize>,
+
+    /// Per-run string cache for `json.loads()`.
+    ///
+    /// Deduplicates heap allocations for repeated strings (especially dict keys)
+    /// across multiple `json.loads()` calls within a single execution. Lazily
+    /// initialized on first use, cleaned up when the VM is dropped.
+    pub(crate) json_string_cache: JsonStringCache,
 }
 
 impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
@@ -605,6 +612,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             scheduler: Scheduler::new(),
             ext_function_load_ip: None, // Set by LoadGlobalCallable/LoadLocalCallable
             module_code: None,
+            json_string_cache: JsonStringCache::default(),
         }
     }
 
@@ -666,8 +674,10 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
             scheduler: snapshot.scheduler,
             module_code: Some(module_code),
             ext_function_load_ip: None,
+            json_string_cache: JsonStringCache::default(),
         }
     }
+
     /// Consumes the VM and creates a snapshot for pause/resume.
     ///
     /// **Ownership transfer:** This method takes `self` by value, consuming the VM.
@@ -676,16 +686,20 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
     ///
     /// This is NOT a clone - it's a transfer. After calling this, the original VM
     /// is gone and only the snapshot (+ serialized heap/namespaces) represents the state.
-    pub fn snapshot(self) -> VMSnapshot {
+    pub fn snapshot(mut self) -> VMSnapshot {
+        // Drop cached JSON strings before consuming the VM — they are not
+        // included in the snapshot and their refcounts must be decremented.
+        self.json_string_cache.drop_all(self.heap);
+
         VMSnapshot {
             // Move values directly — no clone, no refcount increment needed
             // (the VM owned them, now the snapshot owns them)
-            stack: self.stack,
-            globals: self.globals,
-            frames: self.frames.into_iter().map(|f| f.serialize()).collect(),
-            exception_stack: self.exception_stack,
+            stack: mem::take(&mut self.stack),
+            globals: mem::take(&mut self.globals),
+            frames: self.frames.iter().map(CallFrame::serialize).collect(),
+            exception_stack: mem::take(&mut self.exception_stack),
             instruction_ip: self.instruction_ip,
-            scheduler: self.scheduler,
+            scheduler: mem::take(&mut self.scheduler),
         }
     }
 
@@ -695,20 +709,6 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         self.module_code = Some(code);
         self.push_frame(CallFrame::new_module(code))?;
         self.run()
-    }
-
-    /// Cleans up VM state before the VM is dropped.
-    ///
-    /// This method must be called before the VM goes out of scope to ensure
-    /// proper reference counting cleanup for any exception values and scheduler state.
-    pub fn cleanup(&mut self) {
-        // Drop all exceptions in the exception stack
-        self.exception_stack.drain(..).drop_with_heap(self.heap);
-        // Clean up current task's stack values and frame cell references
-        self.cleanup_current_task();
-        // Clean up scheduler state (task stacks, pending calls, resolved values, frame cells)
-        self.scheduler.cleanup(self.heap);
-        self.globals.drain(..).drop_with_heap(self.heap);
     }
 
     /// Returns the `stack_base` of the current (topmost) call frame.
@@ -724,8 +724,9 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
 
     /// Takes ownership of the globals vector, replacing it with an empty vec.
     ///
-    /// Used by the REPL to reclaim globals after VM execution completes,
-    /// before calling `cleanup()` (which would destroy them in ref-count-panic mode).
+    /// Used by the REPL to reclaim globals after VM execution completes.
+    /// Must be called before the VM is dropped, since `Drop` will clean up
+    /// any remaining globals with `drop_with_heap`.
     pub fn take_globals(&mut self) -> Vec<Value> {
         mem::take(&mut self.globals)
     }
@@ -1381,8 +1382,8 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                     // We use individual pops which reverses order, so we need to reverse back
                     let mut cells = Vec::with_capacity(cell_count);
                     for _ in 0..cell_count {
-                        // mut needed for dec_ref_forget when ref-count-panic feature is enabled
-                        #[cfg_attr(not(feature = "ref-count-panic"), expect(unused_mut))]
+                        // mut needed for dec_ref_forget when memory-model-checks feature is enabled
+                        #[cfg_attr(not(feature = "memory-model-checks"), expect(unused_mut))]
                         let mut cell_val = self.pop();
                         match &cell_val {
                             Value::Ref(heap_id) => {
@@ -1391,7 +1392,7 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
                                 // Mark the Value as dereferenced since Closure takes ownership
                                 // of the reference count (we don't call drop_with_heap because
                                 // we're not decrementing the refcount, just transferring it)
-                                #[cfg(feature = "ref-count-panic")]
+                                #[cfg(feature = "memory-model-checks")]
                                 cell_val.dec_ref_forget();
                             }
                             _ => {
@@ -1702,34 +1703,53 @@ impl<'h, 'a, T: ResourceTracker> VM<'h, 'a, T> {
         self.frames.clear();
     }
 
-    /// Runs garbage collection with proper GC roots.
+    /// Collects every heap root currently reachable from the VM and scheduler.
     ///
-    /// GC roots include values in the stack (locals + operands), globals, and exception stack.
+    /// The active VM only owns the current task's stack. Async scheduler state
+    /// stores additional reachable values for suspended tasks, completed task
+    /// results, gather bookkeeping, and resolved futures, so those roots must be
+    /// included here as well.
+    fn gc_roots(&self) -> Vec<HeapId> {
+        let mut roots: Vec<HeapId> = self.stack.iter().filter_map(Value::ref_id).collect();
+        roots.extend(self.globals.iter().filter_map(Value::ref_id));
+        roots.extend(self.exception_stack.iter().filter_map(Value::ref_id));
+        roots.extend(self.json_string_cache.gc_roots());
+        self.scheduler.extend_gc_roots(&mut roots);
+        roots
+    }
+
+    /// Runs garbage collection with the VM's complete root set.
     fn run_gc(&mut self) {
-        // Collect roots from all reachable values
-        let stack_roots = self.stack.iter().filter_map(Value::ref_id);
-        let globals_roots = self.globals.iter().filter_map(Value::ref_id);
-        let exc_roots = self.exception_stack.iter().filter_map(Value::ref_id);
-
-        // Collect all roots into a vec to avoid lifetime issues
-        let roots: Vec<HeapId> = stack_roots.chain(globals_roots).chain(exc_roots).collect();
-
+        let roots = self.gc_roots();
         self.heap.collect_garbage(roots);
     }
 
-    /// Returns the current source position for traceback generation.
+    /// Forces a GC cycle using the production root walk.
+    ///
+    /// This is only compiled for tests so integration tests can reproduce GC
+    /// bugs deterministically without reimplementing the root-set logic.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn __force_gc_for_tests(&mut self) {
+        self.run_gc();
+    }
+
+    /// Returns the current source position for traceback generation, or `None`
+    /// when no frames are on the stack (e.g. host-initiated calls via
+    /// [`MontyRepl`](crate::MontyRepl)).
     ///
     /// Uses `instruction_ip` which is set at the start of each instruction in the run loop,
     /// ensuring accurate position tracking even when using cached IP for bytecode fetching.
-    pub(super) fn current_position(&self) -> CodeRange {
-        let frame = self.current_frame();
+    pub(super) fn current_position(&self) -> Option<CodeRange> {
+        let frame = self.frames.last()?;
         // Use instruction_ip which points to the start of the current instruction
         // (set at the beginning of each loop iteration in run())
-        frame
-            .code
-            .location_for_offset(self.instruction_ip)
-            .map(LocationEntry::range)
-            .unwrap_or_default()
+        Some(
+            frame
+                .code
+                .location_for_offset(self.instruction_ip)
+                .map(LocationEntry::range)
+                .unwrap_or_default(),
+        )
     }
 
     // ========================================================================
@@ -1949,5 +1969,21 @@ impl<T: ResourceTracker> ContainsHeap for VM<'_, '_, T> {
     }
     fn heap_mut(&mut self) -> &mut Heap<T> {
         self.heap
+    }
+}
+
+/// Ensures proper reference-counting cleanup when the VM goes out of scope.
+///
+/// Drains exception stack, operand stack, globals, scheduler state, and JSON
+/// string cache — all of which may hold heap references that need their
+/// ref-counts decremented. Fields that were already emptied (e.g. by
+/// `take_globals`) are harmlessly drained as empty.
+impl<T: ResourceTracker> Drop for VM<'_, '_, T> {
+    fn drop(&mut self) {
+        self.exception_stack.drain(..).drop_with_heap(self.heap);
+        self.cleanup_current_task();
+        self.scheduler.cleanup(self.heap);
+        self.globals.drain(..).drop_with_heap(self.heap);
+        self.json_string_cache.drop_all(self.heap);
     }
 }

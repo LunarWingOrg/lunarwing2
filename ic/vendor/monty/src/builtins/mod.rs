@@ -12,6 +12,7 @@ mod divmod;
 mod enumerate;
 mod filter;
 mod getattr;
+mod hasattr;
 mod hash;
 mod hex;
 mod id;
@@ -27,6 +28,7 @@ mod print;
 mod repr;
 mod reversed;
 mod round;
+mod setattr;
 mod sorted;
 mod sum;
 mod type_;
@@ -161,7 +163,7 @@ pub enum BuiltinsFunctions {
     // frozenset - handled by Type enum
     Getattr,
     // Globals,
-    // Hasattr,
+    Hasattr,
     Hash,
     // Help,
     Hex,
@@ -191,7 +193,7 @@ pub enum BuiltinsFunctions {
     Reversed,
     Round,
     // set - handled by Type enum
-    // Setattr,
+    Setattr,
     // Slice,
     Sorted,
     // Staticmethod,
@@ -221,6 +223,7 @@ impl BuiltinsFunctions {
             Self::Enumerate => enumerate::builtin_enumerate(vm, args),
             Self::Filter => filter::builtin_filter(vm, args),
             Self::Getattr => getattr::builtin_getattr(vm, args),
+            Self::Hasattr => hasattr::builtin_hasattr(vm, args),
             Self::Hash => hash::builtin_hash(vm, args),
             Self::Hex => hex::builtin_hex(vm, args),
             Self::Id => id::builtin_id(vm, args),
@@ -237,6 +240,7 @@ impl BuiltinsFunctions {
             Self::Repr => repr::builtin_repr(vm, args),
             Self::Reversed => reversed::builtin_reversed(vm, args),
             Self::Round => round::builtin_round(vm, args),
+            Self::Setattr => setattr::builtin_setattr(vm, args),
             Self::Sorted => sorted::builtin_sorted(vm, args),
             Self::Sum => sum::builtin_sum(vm, args),
             Self::Type => type_::builtin_type(vm, args),

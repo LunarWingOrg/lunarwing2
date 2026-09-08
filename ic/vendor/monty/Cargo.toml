@@ -13,9 +13,9 @@
 edition = "2024"
 rust-version = "1.90"
 name = "monty"
-version = "0.0.9"
+version = "0.0.17"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
-build = "build.rs"
+build = false
 autolib = false
 autobins = false
 autoexamples = false
@@ -39,8 +39,9 @@ license = "MIT"
 repository = "https://github.com/pydantic/monty/"
 
 [features]
-ref-count-panic = []
+memory-model-checks = []
 ref-count-return = []
+test-hooks = []
 
 [lib]
 name = "monty"
@@ -59,9 +60,16 @@ name = "bytecode_limits"
 path = "tests/bytecode_limits.rs"
 
 [[test]]
-name = "datatest_runner"
-path = "tests/datatest_runner.rs"
-harness = false
+name = "error_locations"
+path = "tests/error_locations.rs"
+
+[[test]]
+name = "fs"
+path = "tests/fs.rs"
+
+[[test]]
+name = "fs_security"
+path = "tests/fs_security.rs"
 
 [[test]]
 name = "heap_reader_compile_fail"
@@ -70,6 +78,10 @@ path = "tests/heap_reader_compile_fail.rs"
 [[test]]
 name = "inputs"
 path = "tests/inputs.rs"
+
+[[test]]
+name = "json_output"
+path = "tests/json_output.rs"
 
 [[test]]
 name = "json_serde"
@@ -123,11 +135,6 @@ path = "tests/resource_limits.rs"
 name = "try_from"
 path = "tests/try_from.rs"
 
-[[bench]]
-name = "main"
-path = "benches/main.rs"
-harness = false
-
 [dependencies]
 fancy-regex = "0.17.0"
 hashbrown = "0.16"
@@ -179,6 +186,11 @@ git = "https://github.com/astral-sh/ruff.git"
 rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 package = "ruff_python_parser"
 
+[dependencies.ruff_python_stdlib]
+git = "https://github.com/astral-sh/ruff.git"
+rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
+package = "ruff_python_stdlib"
+
 [dependencies.ruff_text_size]
 git = "https://github.com/astral-sh/ruff.git"
 rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
@@ -187,6 +199,10 @@ package = "ruff_text_size"
 [dependencies.serde]
 version = "1.0"
 features = ["derive"]
+
+[dependencies.serde_json]
+version = "1.0"
+features = ["arbitrary_precision"]
 
 [dependencies.smallvec]
 version = "1.13"
@@ -197,26 +213,10 @@ version = "0.27"
 features = ["derive"]
 
 [dev-dependencies]
-codspeed-criterion-compat = "4.2.1"
-criterion = "0.5"
-datatest-stable = "0.2"
-serde_json = "1.0"
-similar = "2.7.0"
+tempfile = "3"
 
-[dev-dependencies.pprof]
-version = "0.15"
-features = [
-    "flamegraph",
-    "criterion",
-]
-
-[dev-dependencies.pyo3]
-version = "0.28"
-features = ["auto-initialize"]
-
-[build-dependencies.pyo3-build-config]
-version = "0.28"
-features = ["resolve-config"]
+[dev-dependencies.insta]
+version = "1.47"
 
 [lints.clippy]
 absolute_paths = "warn"

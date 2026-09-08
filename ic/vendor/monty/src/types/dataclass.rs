@@ -11,7 +11,7 @@ use crate::{
     args::ArgValues,
     bytecode::{CallResult, VM},
     defer_drop,
-    exception_private::{ExcType, RunResult},
+    exception_private::{ExcType, RunResult, SimpleException},
     heap::{
         BorrowedHeapRead, BorrowedHeapReadMut, HeapId, HeapItem, HeapRead, heap_read_ref_as_field,
         heap_read_ref_as_field_mut,
@@ -141,48 +141,16 @@ impl<'h> HeapRead<'h, Dataclass> {
     ) -> RunResult<Option<Value>> {
         if self.get(vm.heap).frozen {
             // Get attribute name for error message
-            let attr_name = match &name {
-                Value::InternString(id) => vm.interns.get_str(*id).to_string(),
-                _ => "<unknown>".to_string(),
-            };
+            let exc = SimpleException::new_msg(
+                ExcType::FrozenInstanceError,
+                format!("cannot assign to field {}", &name.py_repr(vm)?),
+            );
             // Drop the values we were given ownership of
             name.drop_with_heap(vm);
             value.drop_with_heap(vm);
-            return Err(ExcType::frozen_instance_error(&attr_name));
+            return Err(exc.into());
         }
         self.attrs_mut().set(name, value, vm)
-    }
-
-    /// Computes the hash for this dataclass if it's frozen.
-    ///
-    /// Returns `Ok(Some(hash))` for frozen (immutable) dataclasses, `Ok(None)` for mutable ones.
-    /// Returns `Err(ResourceError::Recursion)` if the recursion limit is exceeded.
-    /// The hash is computed from the class name and declared field values only.
-    pub fn compute_hash(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<Option<u64>, ResourceError> {
-        // Only frozen (immutable) dataclasses are hashable
-        if !self.get(vm.heap).frozen {
-            return Ok(None);
-        }
-        let token = vm.heap.incr_recursion_depth()?;
-        crate::defer_drop!(token, vm);
-        let mut hasher = DefaultHasher::new();
-        // Hash the class name
-        self.get(vm.heap).name.hash(&mut hasher);
-        // Hash each declared field (name, value) pair in order
-        let field_count = self.get(vm.heap).field_names.len();
-        for i in 0..field_count {
-            let field_name = &self.get(vm.heap).field_names[i];
-            field_name.hash(&mut hasher);
-            if let Some(value) = self.get(vm.heap).attrs.get_by_str(field_name, vm.heap, vm.interns) {
-                let value = value.clone_with_heap(vm.heap);
-                defer_drop!(value, vm);
-                match value.py_hash(vm)? {
-                    Some(h) => h.hash(&mut hasher),
-                    None => return Ok(None),
-                }
-            }
-        }
-        Ok(Some(hasher.finish()))
     }
 
     pub fn attrs(&self) -> BorrowedHeapRead<'_, 'h, Dict> {
@@ -207,6 +175,40 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
         // Dataclasses are equal if they have the same name and equal attrs
         Ok(self.get(vm.heap).name == other.get(vm.heap).name && self.attrs().py_eq(&other.attrs(), vm)?)
+    }
+
+    /// Hashes a frozen dataclass by its class name and the values of declared fields.
+    ///
+    /// Mutable (non-frozen) dataclasses return `None` (unhashable).
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
+        // Only frozen (immutable) dataclasses are hashable
+        if !self.get(vm.heap).frozen {
+            return Ok(None);
+        }
+        let token = vm.heap.incr_recursion_depth()?;
+        crate::defer_drop!(token, vm);
+        let mut hasher = DefaultHasher::new();
+        // Hash the class name
+        self.get(vm.heap).name.hash(&mut hasher);
+        // Hash each declared field (name, value) pair in order
+        let field_count = self.get(vm.heap).field_names.len();
+        for i in 0..field_count {
+            let field_name = &self.get(vm.heap).field_names[i];
+            field_name.hash(&mut hasher);
+            if let Some(value) = self.get(vm.heap).attrs.get_by_str(field_name, vm.heap, vm.interns) {
+                let value = value.clone_with_heap(vm.heap);
+                defer_drop!(value, vm);
+                match value.py_hash(vm)? {
+                    Some(h) => h.hash(&mut hasher),
+                    None => return Ok(None),
+                }
+            }
+        }
+        Ok(Some(hasher.finish()))
     }
 
     fn py_bool(&self, _vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
