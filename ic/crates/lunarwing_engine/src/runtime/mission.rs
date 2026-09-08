@@ -39,6 +39,7 @@ const MANAGED_RECURRING_METADATA_KEY: &str = "managed_recurring";
 const MANAGED_DEFINITION_VERSION_KEY: &str = "managed_definition_version";
 const MANAGED_DEFINITION_VERSION: u64 = 1;
 const SKILL_MAINTENANCE_EVENT: &str = "skill_maintenance_due";
+const THREAD_START_EVENT: &str = "thread_start";
 /// Metadata marker recording that a mission was paused by the
 /// `SKILL_SELF_IMPROVEMENT` gate rather than by an operator. Only
 /// marker-carrying paused missions auto-resume when the toggle is
@@ -1148,16 +1149,17 @@ impl MissionManager {
         Ok(spawned)
     }
 
-    /// Start a background event listener that fires learning missions when
-    /// threads complete.
+    /// Start a background event listener that fires missions from thread
+    /// lifecycle events.
     ///
     /// Subscribes to the ThreadManager's event broadcast channel and watches
-    /// for terminal `StateChanged` events. For each non-Mission thread:
+    /// for initial and terminal `StateChanged` events. For each non-Mission thread:
     ///
-    /// 1. **Error diagnosis** — if trace has issues, fires `thread_completed_with_issues`
-    /// 2. **Skill extraction** — if thread succeeded with many steps/actions,
+    /// 1. **Thread start** — fires `thread_start` on the initial transition to Running
+    /// 2. **Error diagnosis** — if trace has issues, fires `thread_completed_with_issues`
+    /// 3. **Skill extraction** — if thread succeeded with many steps/actions,
     ///    fires `thread_completed_with_learnings`
-    /// 3. **Conversation insights** — after every N threads in a conversation,
+    /// 4. **Conversation insights** — after every N threads in a conversation,
     ///    fires `conversation_insights_due`
     pub async fn start_event_listener(self: &Arc<Self>, _owner_id: String) {
         let mgr = Arc::clone(self);
@@ -1185,24 +1187,46 @@ impl MissionManager {
                     Ok(event) => {
                         let terminal_state = match event.kind {
                             crate::types::event::EventKind::StateChanged {
+                                from: crate::types::thread::ThreadState::Created,
+                                to: crate::types::thread::ThreadState::Running,
+                                ..
+                            } => None,
+                            crate::types::event::EventKind::StateChanged {
                                 to:
                                     state @ (crate::types::thread::ThreadState::Done
                                     | crate::types::thread::ThreadState::Failed),
                                 ..
-                            } => state,
+                            } => Some(state),
                             _ => continue,
                         };
 
-                        // Load the completed thread
                         let thread = match mgr.store.load_thread(event.thread_id).await {
                             Ok(Some(t)) => t,
                             _ => continue,
                         };
 
-                        // Skip Mission threads (no recursive self-improvement)
                         if thread.thread_type == ThreadType::Mission {
                             continue;
                         }
+
+                        let Some(terminal_state) = terminal_state else {
+                            let payload = serde_json::json!({
+                                "source_thread_id": event.thread_id.0.to_string(),
+                                "goal": thread.goal,
+                            });
+                            if let Err(error) = mgr
+                                .fire_on_system_event(
+                                    "engine",
+                                    THREAD_START_EVENT,
+                                    &thread.user_id,
+                                    Some(payload),
+                                )
+                                .await
+                            {
+                                debug!("event listener: failed to fire thread-start mission: {error}");
+                            }
+                            continue;
+                        };
 
                         // ── Trigger 1: Error diagnosis ──────────────────
                         let trace = crate::executor::trace::build_trace(&thread);
@@ -4999,6 +5023,82 @@ mod tests {
             !alice_m.thread_history.is_empty(),
             "alice's mission should have recorded the spawned thread"
         );
+    }
+
+    #[tokio::test]
+    async fn thread_start_events_fire_matching_mission_without_recursion() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "done",
+        ));
+        let project_id = ProjectId::new();
+        let mission_id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "sanitize-memory",
+                "sanitize stale memory",
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: THREAD_START_EVENT.into(),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.start_event_listener("test-user".into()).await;
+
+        let source_thread_id = mgr
+            .thread_manager
+            .spawn_thread(
+                "source thread",
+                ThreadType::Foreground,
+                project_id,
+                ThreadConfig::default(),
+                None,
+                "test-user",
+            )
+            .await
+            .unwrap();
+        mgr.thread_manager
+            .join_thread(source_thread_id)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
+                if !mission.thread_history.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("thread start should fire the matching mission");
+
+        let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
+        let mission_thread_id = mission.thread_history[0];
+        mgr.thread_manager
+            .join_thread(mission_thread_id)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
+        let source_thread_id = source_thread_id.0.to_string();
+        assert_eq!(mission.thread_history.len(), 1);
+        assert_eq!(
+            mission
+                .last_trigger_payload
+                .as_ref()
+                .and_then(|payload| payload.get("source_thread_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(source_thread_id.as_str())
+        );
+
+        mgr.shutdown().await;
     }
 
     #[tokio::test]
