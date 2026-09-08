@@ -901,7 +901,7 @@ async fn execute_code_with_skills_and_action_limit(
             }
 
             RunProgress::OsCall(os_call) => {
-                debug!(function = ?os_call.function, "Monty: OS call denied");
+                debug!(function = ?os_call.function_call, "Monty: OS call denied");
                 let err = ExtFunctionResult::Error(MontyException::new(
                     ExcType::OSError,
                     Some("OS operations are not permitted in CodeAct scripts".into()),
