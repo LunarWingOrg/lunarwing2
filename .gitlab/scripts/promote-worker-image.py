@@ -65,6 +65,31 @@ def split_image_ref(registry: str, image_ref: str) -> tuple[str, str]:
     return repository, tag
 
 
+def trusted_realm_hosts(registry_host: str) -> set[str]:
+    hosts = {(registry_host or "").lower()}
+    server_host = os.environ.get("CI_SERVER_HOST", "").lower()
+    if server_host:
+        hosts.add(server_host)
+    return hosts
+
+
+def validate_realm(challenge: str, registry_host: str) -> dict[str, str]:
+    fields = dict(re.findall(r'(\w+)="([^"]+)"', challenge))
+    realm = fields.get("realm")
+    if not realm:
+        raise RuntimeError("registry authentication challenge has no realm")
+    realm_url = urllib.parse.urlparse(realm)
+    # The GitLab container registry issues its token challenge on the GitLab
+    # application host, which differs from the registry host in standard
+    # deployments; require HTTPS and restrict the realm to those hosts.
+    if (
+        realm_url.scheme != "https"
+        or (realm_url.hostname or "").lower() not in trusted_realm_hosts(registry_host)
+    ):
+        raise RuntimeError("registry authentication realm is not a trusted HTTPS origin")
+    return fields
+
+
 def sha256_file(path: pathlib.Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -81,14 +106,7 @@ class RegistryClient:
         self.token: str | None = None
 
     def _login(self, challenge: str) -> None:
-        fields = dict(re.findall(r'(\w+)="([^"]+)"', challenge))
-        realm = fields.get("realm")
-        if not realm:
-            raise RuntimeError("registry authentication challenge has no realm")
-        realm_url = urllib.parse.urlparse(realm)
-        registry_host = urllib.parse.urlparse(self.base).hostname
-        if realm_url.scheme != "https" or realm_url.hostname != registry_host:
-            raise RuntimeError("registry authentication realm is not same-origin HTTPS")
+        fields = validate_realm(challenge, urllib.parse.urlparse(self.base).hostname)
         query = urllib.parse.urlencode(
             {
                 "service": fields.get("service", "container_registry"),
@@ -96,7 +114,8 @@ class RegistryClient:
             }
         )
         request = urllib.request.Request(
-            f"{realm}?{query}", headers={"Authorization": f"Basic {self.basic_auth}"}
+            f'{fields["realm"]}?{query}',
+            headers={"Authorization": f"Basic {self.basic_auth}"},
         )
         with urllib.request.urlopen(request, timeout=60) as response:
             payload = json.load(response)
@@ -301,6 +320,35 @@ def self_test() -> None:
         assert RELEASE_TAG_RE.fullmatch(valid)
     for invalid in ("v2.1.0", "v2.1.0.0-rc0", "latest", "v2.1.0.0-beta1"):
         assert not RELEASE_TAG_RE.fullmatch(invalid)
+
+    challenge = 'Bearer realm="{0}",service="container_registry"'.format(
+        "https://git.example/jwt/auth"
+    )
+    realm_fields = validate_realm(challenge, "git.example")
+    assert realm_fields["realm"] == "https://git.example/jwt/auth"
+    assert realm_fields["service"] == "container_registry"
+    previous_server_host = os.environ.get("CI_SERVER_HOST")
+    try:
+        os.environ["CI_SERVER_HOST"] = "git.example"
+        assert (
+            validate_realm(challenge, "registry.example")["realm"]
+            == "https://git.example/jwt/auth"
+        )
+        for bad in (
+            'Bearer realm="http://git.example/jwt/auth"',
+            'Bearer realm="https://evil.example/jwt/auth"',
+            'Bearer realm="https://gite.example/jwt/auth"',
+        ):
+            try:
+                validate_realm(bad, "registry.example")
+                raise AssertionError(f"realm {bad} unexpectedly accepted")
+            except RuntimeError:
+                pass
+    finally:
+        if previous_server_host is None:
+            os.environ.pop("CI_SERVER_HOST", None)
+        else:
+            os.environ["CI_SERVER_HOST"] = previous_server_host
 
     metadata = {
         "WORKER_CANDIDATE_TAG": "a" * 40 + "-1-1",
