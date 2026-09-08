@@ -1364,19 +1364,21 @@ start_tenant_pebble() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file
+    local quadlet_file pebble_service
+    pebble_service="lunarwing-pebble-${name}.service"
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-pebble-${name}.service" "lunarwing-pebble-${name}"
+      _recreate_quadlet_container "$name" "$pebble_service" "lunarwing-pebble-${name}"
     fi
-    if _systemctl_user "$name" start "lunarwing-pebble-${name}.service" >/dev/null 2>&1; then
+    _systemctl_user "$name" reset-failed "$pebble_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$pebble_service" >/dev/null 2>&1; then
       _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file"
-      say "pebble worker ready via quadlet (lunarwing-pebble-${name}.service, WSS port $wss_port)"
+      say "pebble worker ready via quadlet ($pebble_service, WSS port $wss_port)"
     else
-      say "WARNING: lunarwing-pebble-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-pebble-${name}.service" --no-pager >&2 || true
+      say "WARNING: $pebble_service failed to start" >&2
+      _systemctl_user "$name" status "$pebble_service" --no-pager >&2 || true
     fi
     return 0
   fi
@@ -1483,6 +1485,12 @@ stop_tenant_pebble() {
     _deregister_babysitter "$container_name"
     rc-service "$container_name" stop >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    if _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+        || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
+      say "pebble worker stopped ($container_name)"
+    fi
   elif _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
