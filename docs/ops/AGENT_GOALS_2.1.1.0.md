@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.1.0
 
-## Codename: UNKNOWN
+## Codename: Zanshin (残心)
 
 **Open TODOs (v2.1.1.0) — To be done before release**
 
