@@ -254,7 +254,7 @@ impl ExecutionLoop {
 
         // Transition to Running if this is a fresh start or restart from a resumable state.
         if self.thread.state != ThreadState::Running {
-            self.thread.transition_to(ThreadState::Running, None)?;
+            self.transition_to_broadcast(ThreadState::Running, None)?;
         }
 
         // Pre-fetch shared memory docs once — used by both prompt overlay and
@@ -1822,13 +1822,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_are_recorded() {
-        let (mut exec, _tx) = make_loop(
+    async fn events_are_recorded_and_thread_start_is_broadcast() {
+        let (exec, _tx) = make_loop(
             vec![text_response("Hello!")],
             vec![],
             ThreadConfig::default(),
         )
         .await;
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let mut exec = exec.with_event_tx(event_tx);
         exec.thread.goal = "hello".to_string();
 
         exec.run().await.unwrap();
@@ -1840,13 +1842,19 @@ mod tests {
             .map(|e| format!("{:?}", std::mem::discriminant(&e.kind)))
             .collect();
 
-        // Should have: StateChanged(Created->Running), StepStarted, MessageAdded,
-        // StepCompleted, StateChanged(Running->Completed)
         assert!(exec.thread.events.len() >= 4);
-
-        // Verify first event is state change to Running
         assert!(matches!(
             &exec.thread.events[0].kind,
+            EventKind::StateChanged {
+                from: ThreadState::Created,
+                to: ThreadState::Running,
+                ..
+            }
+        ));
+
+        let start_event = event_rx.try_recv().unwrap();
+        assert!(matches!(
+            start_event.kind,
             EventKind::StateChanged {
                 from: ThreadState::Created,
                 to: ThreadState::Running,
