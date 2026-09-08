@@ -32,7 +32,10 @@
 
 8. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-9. [ ] **#109 — sanitize-memory mission registered Active but not firing on thread_start** `[bug,mission,sanitize-memory]` - Related scheduler work shipped (#94 warmup) but this firing bug itself is unaddressed. Real defect, needs repro.
+9. [x] **#109 — sanitize-memory mission registered Active but not firing on thread_start** `[bug,mission,sanitize-memory]` - Related scheduler work shipped (#94 warmup) but this firing bug itself is unaddressed. Real defect, needs repro.
+    - Reproduced with an active `engine/thread_start` sanitize-memory mission; the regression test now proves one foreground start fires it exactly once without Mission-thread recursion.
+    - Fixed by broadcasting the initial `Created` → `Running` transition and routing it through the mission event listener with a stable `source_thread_id` payload.
+    - Verified with targeted thread-start and terminal-event tests, `cargo fmt --all -- --check`, and warning-clean `cargo clippy -p lunarwing_engine --all-targets -- -D warnings`.
 
 10. [ ] **#97 — Coordination knowledge sharing (production residual)** `[coordination,knowledge-sharing]` - Repo fix + 4/4 live matrix done (goals #13/#27/#37). REMAINING: (a) production sunburst/ruffles operator actions — set `XMPP_ALLOW_ROOMS_JSON`, `COORD_KNOWLEDGE_PUBLISHERS` full-occupant JIDs, restart both engines, re-test `KNOW:` wire path; (b) tracker body still carries the live-disproved user-bare recommendation — correct/close; (c) suggested hardening from #37: init-agnostic read-only mt-admin coordination doctor, bounded reason counters + empty-publisher startup warning, automated 4-case live matrix for release-sensitive changes, optional server-attested real-JID policy for non-anonymous MUCs
 
