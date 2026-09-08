@@ -12,17 +12,13 @@
 //! * 1000 to count(StaticStrings) - strings StaticStrings
 //! * 10_000+ - strings interned per executor
 
-use std::{slice::from_ref, str::FromStr};
+use std::{array, str::FromStr, sync::LazyLock};
 
 use ahash::AHashMap;
 use num_bigint::BigInt;
-use strum::{EnumCount, EnumString, FromRepr, IntoStaticStr};
+use strum::{EnumString, FromRepr, IntoStaticStr};
 
-use crate::{
-    function::Function,
-    hash::{ASCII_HASHES, HashValue, STATIC_HASHES, WithHash, hash_python_str},
-    value::Value,
-};
+use crate::{function::Function, value::Value};
 
 /// Index into the string interner's storage.
 ///
@@ -55,60 +51,32 @@ impl StringId {
 }
 
 /// StringId offsets
-const STATIC_STRING_ID_OFFSET: u16 = 1000;
+const STATIC_STRING_ID_OFFSET: u32 = 1000;
 const INTERN_STRING_ID_OFFSET: usize = 10_000;
 
-/// Static strings for all 128 ASCII characters.
+/// Static strings for all 128 ASCII characters, built once on first access.
 ///
-/// Exposed `pub(crate)` so the [`crate::hash::ASCII_HASHES`] table can hash
-/// them in lockstep — both tables must agree on the same `&str` per byte.
-pub(crate) static ASCII_STRS: [&str; 128] = const {
-    // Initialize array of 128 bytes which will be used as the raw storage
-    const ASCII_BYTES: [u8; 128] = const {
-        let mut bytes: [u8; 128] = [0; 128];
-        let mut i: u8 = 0;
-        while i < 128 {
-            bytes[i as usize] = i;
-            i += 1;
-        }
-        bytes
-    };
-    // Index into the above array to build the `&'static str` forms
-    let mut strs: [&str; 128] = [""; 128];
-    let mut i = 0;
-    while i < 128 {
-        strs[i] = match str::from_utf8(from_ref(&ASCII_BYTES[i])) {
-            Ok(s) => s,
-            Err(_) => panic!("invalid ascii byte"),
-        };
-        i += 1;
-    }
-    strs
-};
+/// Uses `LazyLock` to build the array at runtime (once), leaking the strings to get
+/// `'static` lifetime. The leak is intentional and bounded (128 single-byte strings).
+static ASCII_STRS: LazyLock<[&'static str; 128]> = LazyLock::new(|| {
+    array::from_fn(|i| {
+        // Safe: i is always 0-127 for a 128-element array
+        let s = char::from(u8::try_from(i).expect("index out of u8 range")).to_string();
+        // Leak to get 'static lifetime - this is intentional and bounded (128 bytes total)
+        // Reborrow as immutable since we won't mutate
+        &*Box::leak(s.into_boxed_str())
+    })
+});
 
 /// Static string values which are known at compile time and don't need to be interned.
-///
-/// Discriminant starts from STATIC_STRING_ID_OFFSET to make conversion to/from stringid
-/// cheap when within bounds.
 #[repr(u16)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    FromRepr,
-    EnumCount,
-    EnumString,
-    IntoStaticStr,
-    PartialEq,
-    Eq,
-    Hash,
-    serde::Serialize,
-    serde::Deserialize,
+    Debug, Clone, Copy, FromRepr, EnumString, IntoStaticStr, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
 pub enum StaticStrings {
     #[strum(serialize = "")]
-    EmptyString = STATIC_STRING_ID_OFFSET,
+    EmptyString,
     #[strum(serialize = "<module>")]
     Module,
     // ==========================
@@ -206,7 +174,6 @@ pub enum StaticStrings {
     // Keyword argument names for string/bytes methods and constructors
     Tabsize,
     Keepends,
-    Obj,
     Object,
     Source,
     // Additional string methods
@@ -338,10 +305,6 @@ pub enum StaticStrings {
     // Type attributes
     #[strum(serialize = "__name__")]
     DunderName,
-    #[strum(serialize = "__enter__")]
-    Enter,
-    #[strum(serialize = "__exit__")]
-    Exit,
 
     // ==========================
     // pathlib module strings
@@ -383,44 +346,10 @@ pub enum StaticStrings {
     // Path write methods (require OsAccess - yield external calls)
     WriteText,
     WriteBytes,
-    AppendText,
-    AppendBytes,
     Mkdir,
     Unlink,
     Rmdir,
     Rename,
-
-    // Path.open(): wraps the same `OsFunction::Open` round-trip as the
-    // `open()` builtin. Handled in `Path::py_call_attr` with custom
-    // mode/kwarg validation (so it cannot go through the generic
-    // `OsFunction::try_from(StaticStrings)` short-circuit).
-    Open,
-
-    // ==========================
-    // File object methods and attributes
-    Read,
-    Write,
-    Close,
-    Flush,
-    Readable,
-    Writable,
-    Seekable,
-    Readline,
-    Readlines,
-    Tell,
-    Seek,
-    Closed,
-    Mode,
-    Encoding,
-    File,
-    Buffering,
-    Errors,
-    Newline,
-    Closefd,
-    Opener,
-    Repl,
-    Old,
-    New,
 
     // Slice attributes
     Start,
@@ -555,7 +484,6 @@ pub enum StaticStrings {
     Minute,
     Second,
     Microsecond,
-    Fold,
     // timedelta constructor/attribute names
     Days,
     Seconds,
@@ -653,45 +581,6 @@ pub enum StaticStrings {
     Finditer,
     /// `match.groupdict()` method
     Groupdict,
-
-    // ==========================
-    // gc module strings (only reachable when the `test-hooks` feature is enabled,
-    // but interned unconditionally so the variant ordering — and therefore every
-    // `StringId` used elsewhere — stays stable across feature combinations).
-    /// Module name for `import gc`.
-    Gc,
-    /// `gc.collect()` function.
-    Collect,
-    /// `gc.disable()` function.
-    Disable,
-    /// `gc.enable()` function.
-    Enable,
-
-    // ==========================
-    // Kwarg names referenced by `#[derive(FromArgs)]` macros and the
-    // hand-written argument extractors they're gradually replacing.
-    // These exist purely as `StaticStrings` so the generated dispatch
-    // code can use `StringId` equality (O(1)) instead of string compare.
-    /// Kwarg name `key` — `sorted(key=...)`, `min(key=...)`, etc.
-    Key,
-    /// Kwarg name `sep` — `str.split(sep=...)`, `print(sep=...)`, etc.
-    Sep,
-    /// Kwarg name `maxsplit` — `str.split(maxsplit=...)`, `re.split(maxsplit=...)`.
-    Maxsplit,
-    /// Kwarg name `strict` — `zip(strict=...)`.
-    Strict,
-    /// Kwarg name `return_exceptions` — `asyncio.gather(return_exceptions=...)`.
-    ReturnExceptions,
-    /// Kwarg name `rel_tol` — `math.isclose(rel_tol=...)`.
-    RelTol,
-    /// Kwarg name `abs_tol` — `math.isclose(abs_tol=...)`.
-    AbsTol,
-    /// Kwarg name `format` — `date.strftime(format=...)`, `datetime.strftime(format=...)`.
-    Format,
-    /// Kwarg name `parents` — `Path.mkdir(parents=...)`.
-    Parents,
-    /// Kwarg name `exist_ok` — `Path.mkdir(exist_ok=...)`.
-    ExistOk,
 }
 
 impl StaticStrings {
@@ -700,14 +589,16 @@ impl StaticStrings {
     /// Returns `None` if the `StringId` doesn't correspond to a static string
     /// (e.g., it's an ASCII char or a dynamically interned string).
     pub fn from_string_id(id: StringId) -> Option<Self> {
-        u16::try_from(id.0).ok().and_then(Self::from_repr)
+        let enum_id = id.0.checked_sub(STATIC_STRING_ID_OFFSET)?;
+        u16::try_from(enum_id).ok().and_then(Self::from_repr)
     }
 }
 
 /// Converts this static string variant to its corresponding `StringId`.
 impl From<StaticStrings> for StringId {
     fn from(value: StaticStrings) -> Self {
-        Self(value as u32)
+        let string_id = value as u32;
+        Self(string_id + STATIC_STRING_ID_OFFSET)
     }
 }
 
@@ -793,18 +684,14 @@ impl FunctionId {
 pub struct InternerBuilder {
     /// Maps strings to their indices for deduplication during interning.
     string_map: AHashMap<String, StringId>,
-    /// Storage for interned strings, indexed by `StringId`. Each entry pairs
-    /// the string with its precomputed [`HashValue`] (see [`WithHash`]) so
-    /// `str_hash(id)` is a plain index lookup at runtime.
-    strings: Vec<WithHash<String>>,
-    /// Storage for interned bytes literals, indexed by `BytesId`. Each
-    /// entry carries its precomputed [`HashValue`].
+    /// Storage for interned interns, indexed by `StringId`.
+    strings: Vec<String>,
+    /// Storage for interned bytes literals, indexed by `BytesId`.
     /// Not deduplicated since bytes literals are rare.
-    bytes: Vec<WithHash<Vec<u8>>>,
+    bytes: Vec<Vec<u8>>,
     /// Storage for interned long integer literals, indexed by `LongIntId`.
-    /// Each entry carries its precomputed [`HashValue`].
     /// Not deduplicated since long integer literals are rare.
-    long_ints: Vec<WithHash<BigInt>>,
+    long_ints: Vec<BigInt>,
 }
 
 impl InternerBuilder {
@@ -848,11 +735,11 @@ impl InternerBuilder {
             .strings
             .iter()
             .enumerate()
-            .map(|(index, entry)| {
+            .map(|(index, value)| {
                 let id = StringId(
                     u32::try_from(INTERN_STRING_ID_OFFSET + index).expect("StringId overflow while seeding interner"),
                 );
-                (entry.value().clone(), id)
+                (value.clone(), id)
             })
             .collect();
         builder
@@ -873,7 +760,7 @@ impl InternerBuilder {
             *self.string_map.entry(s.to_owned()).or_insert_with(|| {
                 let string_id = self.strings.len() + INTERN_STRING_ID_OFFSET;
                 let id = StringId(string_id.try_into().expect("StringId overflow"));
-                self.strings.push(WithHash::for_str(s.to_owned()));
+                self.strings.push(s.to_owned());
                 id
             })
         }
@@ -884,7 +771,7 @@ impl InternerBuilder {
     /// Unlike interns, bytes are not deduplicated (bytes literals are rare).
     pub fn intern_bytes(&mut self, b: &[u8]) -> BytesId {
         let id = BytesId(self.bytes.len().try_into().expect("BytesId overflow"));
-        self.bytes.push(WithHash::for_bytes(b.to_vec()));
+        self.bytes.push(b.to_vec());
         id
     }
 
@@ -893,7 +780,7 @@ impl InternerBuilder {
     /// Big integers are not deduplicated since literals exceeding i64 are rare.
     pub fn intern_long_int(&mut self, bi: BigInt) -> LongIntId {
         let id = LongIntId(self.long_ints.len().try_into().expect("LongIntId overflow"));
-        self.long_ints.push(WithHash::for_long_int(bi));
+        self.long_ints.push(bi);
         id
     }
 
@@ -909,11 +796,11 @@ impl InternerBuilder {
 /// # Panics
 ///
 /// Panics if the `StringId` is invalid - not from this interner or ascii chars or StaticStrings.
-fn get_str(strings: &[WithHash<String>], id: StringId) -> &str {
-    if let Some(ascii_str) = ASCII_STRS.get(id.index()) {
-        ascii_str
+fn get_str(strings: &[String], id: StringId) -> &str {
+    if let Ok(c) = u8::try_from(id.0) {
+        ASCII_STRS[c as usize]
     } else if let Some(intern_index) = id.index().checked_sub(INTERN_STRING_ID_OFFSET) {
-        strings[intern_index].value()
+        &strings[intern_index]
     } else {
         let static_str = StaticStrings::from_string_id(id).expect("Invalid static string ID");
         static_str.into()
@@ -923,18 +810,11 @@ fn get_str(strings: &[WithHash<String>], id: StringId) -> &str {
 /// Read-only storage for interned strings, bytes, and long integers.
 ///
 /// This provides lookup by `StringId`, `BytesId`, `LongIntId` and `FunctionId` for interned literals and functions.
-///
-/// # Hash tables
-///
-/// Each entry in `strings`/`bytes`/`long_ints` is a [`WithHash`] pairing
-/// the value with its precomputed [`HashValue`] — populated eagerly at
-/// intern time by [`InternerBuilder`]. `str_hash` / `bytes_hash` /
-/// `long_int_hash` are plain index lookups.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Interns {
-    strings: Vec<WithHash<String>>,
-    bytes: Vec<WithHash<Vec<u8>>>,
-    long_ints: Vec<WithHash<BigInt>>,
+    strings: Vec<String>,
+    bytes: Vec<Vec<u8>>,
+    long_ints: Vec<BigInt>,
     functions: Vec<Function>,
 }
 
@@ -965,7 +845,7 @@ impl Interns {
     /// Panics if the `BytesId` is invalid.
     #[inline]
     pub fn get_bytes(&self, id: BytesId) -> &[u8] {
-        self.bytes[id.index()].value()
+        &self.bytes[id.index()]
     }
 
     /// Looks up a long integer by its `LongIntId`.
@@ -975,7 +855,7 @@ impl Interns {
     /// Panics if the `LongIntId` is invalid.
     #[inline]
     pub fn get_long_int(&self, id: LongIntId) -> &BigInt {
-        self.long_ints[id.index()].value()
+        &self.long_ints[id.index()]
     }
 
     /// Lookup a function by its `FunctionId`
@@ -986,70 +866,6 @@ impl Interns {
     #[inline]
     pub fn get_function(&self, id: FunctionId) -> &Function {
         self.functions.get(id.index()).expect("Function not found")
-    }
-
-    /// Returns the Python hash for an interned string.
-    ///
-    /// Dispatches by id range:
-    /// * ASCII (`id < 128`): looks up [`ASCII_HASHES`] (per-slot lazy);
-    ///   computes via [`hash_python_str`] on first use of that byte.
-    /// * Static (`id < INTERN_STRING_ID_OFFSET`): looks up [`STATIC_HASHES`]
-    ///   (per-slot lazy); computes from the variant's `&'static str` on
-    ///   first use of that variant.
-    /// * Interned (`id >= INTERN_STRING_ID_OFFSET`): reads the [`HashValue`]
-    ///   from the corresponding [`WithHash`] entry — populated eagerly at
-    ///   intern time.
-    ///
-    /// All three paths must agree with [`hash_python_str`] applied to the
-    /// underlying `&str` — interned and heap strings with equal contents
-    /// must hash identically.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `StringId` is invalid (same as [`Self::get_str`]).
-    #[inline]
-    pub fn str_hash(&self, id: StringId) -> HashValue {
-        if id.index() < ASCII_STRS.len() {
-            ASCII_HASHES.get_or_compute(id.index(), || hash_python_str(ASCII_STRS[id.index()]))
-        } else if let Some(intern_index) = id.index().checked_sub(INTERN_STRING_ID_OFFSET) {
-            self.strings[intern_index].hash()
-        } else {
-            let static_str = StaticStrings::from_string_id(id).expect("Invalid static string ID");
-            STATIC_HASHES.get_or_compute((static_str as usize) - STATIC_STRING_ID_OFFSET as usize, || {
-                hash_python_str(static_str.into())
-            })
-        }
-    }
-
-    /// Returns the Python hash for interned bytes.
-    ///
-    /// Reads the [`HashValue`] from the corresponding [`WithHash`] entry
-    /// (populated at intern time). Must agree with [`hash_python_bytes`]
-    /// applied to the underlying `&[u8]`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `BytesId` is invalid.
-    #[inline]
-    pub fn bytes_hash(&self, id: BytesId) -> HashValue {
-        self.bytes[id.index()].hash()
-    }
-
-    /// Returns the Python hash for an interned long integer.
-    ///
-    /// Reads the [`HashValue`] from the corresponding [`WithHash`] entry
-    /// (populated at intern time). Must agree with [`hash_python_long_int`].
-    /// Note that interned long ints are only created for values that don't
-    /// fit in `i64` (see `parse.rs`), so the `to_i64()` fast path inside
-    /// `hash_python_long_int` is a defensive consistency guarantee rather
-    /// than a hot path.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `LongIntId` is invalid.
-    #[inline]
-    pub fn long_int_hash(&self, id: LongIntId) -> HashValue {
-        self.long_ints[id.index()].hash()
     }
 
     /// Looks up the `StringId` for a string, checking ASCII, static strings, and interned strings.
@@ -1070,7 +886,7 @@ impl Interns {
         }
         // Check interned strings
         for (i, interned) in self.strings.iter().enumerate() {
-            if interned.value() == s {
+            if interned == s {
                 return u32::try_from(INTERN_STRING_ID_OFFSET + i).ok().map(StringId);
             }
         }

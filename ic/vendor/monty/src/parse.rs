@@ -19,7 +19,7 @@ use crate::{
         AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, ImportName, Literal,
         Node, Operator, SequenceItem, UnpackTarget,
     },
-    fstring::{ConversionFlag, FStringPart, FormatSpec, ParseFormatSpecError, ParsedFormatSpec, encode_format_spec},
+    fstring::{ConversionFlag, FStringPart, FormatSpec},
     intern::{InternerBuilder, StringId},
     types::long_int::INT_MAX_STR_DIGITS,
     value::EitherStr,
@@ -146,8 +146,7 @@ pub(crate) fn parse_with_interner(
     interner: InternerBuilder,
 ) -> Result<ParseResult, ParseError> {
     let mut parser = Parser::new(code, filename, interner);
-    let parsed =
-        parse_module(code).map_err(|e| ParseError::syntax(e.error.to_string(), parser.convert_range(e.range())))?;
+    let parsed = parse_module(code).map_err(|e| ParseError::syntax(e.to_string(), parser.convert_range(e.range())))?;
     let module = parsed.into_syntax();
     let nodes = parser.parse_statements(module.body)?;
     Ok(ParseResult {
@@ -168,7 +167,7 @@ pub struct Parser<'a> {
     pub interner: InternerBuilder,
     /// Remaining nesting depth budget for recursive structures.
     /// Starts at MAX_NESTING_DEPTH and decrements on each nested level.
-    /// When it reaches zero, we return a "Source is too deeply nested" syntax error.
+    /// When it reaches zero, we return a "too many nested parentheses" error.
     depth_remaining: u16,
 }
 
@@ -183,61 +182,36 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_statements(
-        &mut self,
-        statements: impl IntoIterator<Item = Stmt, IntoIter: ExactSizeIterator>,
-    ) -> Result<Vec<ParseNode>, ParseError> {
+    fn parse_statements(&mut self, statements: Vec<Stmt>) -> Result<Vec<ParseNode>, ParseError> {
         // Explicit pre-allocation matters here — `.map(..).collect::<Result<Vec<_>, _>>()`
         // does NOT pre-size the output. Collecting into `Result<Vec<_>, _>` runs the
         // iterator through `iter::try_process`'s `Shunt` adapter (so an `Err` can
         // short-circuit), and `Shunt`'s `size_hint` lower bound is 0 — which loses
         // the `TrustedLen` specialization that would otherwise forward the source
-        // iterator's length. Each `Stmt` maps to exactly one `ParseNode`.
-        //
-        // Accepting `IntoIterator<Item = Stmt, IntoIter: ExactSizeIterator>` lets callers
-        // pass either `Vec<Stmt>` or ruff's `ThinVec<Stmt>` without an intermediate copy.
-        let iter = statements.into_iter();
-        let mut out = Vec::with_capacity(iter.len());
-        for stmt in iter {
+        // `Vec`'s length. Each `Stmt` maps to exactly one `ParseNode`.
+        let mut out = Vec::with_capacity(statements.len());
+        for stmt in statements {
             out.push(self.parse_statement(stmt)?);
         }
         Ok(out)
     }
 
-    /// Folds a flat list of `elif`/`else` clauses into a right-nested `Node::If` tree.
-    ///
-    /// Ruff hands us the clauses as a flat `Vec`, but the prepared AST and the
-    /// bytecode compiler both walk the resulting tree recursively. Each `elif`
-    /// clause is therefore counted against the same depth budget that bounds
-    /// explicitly nested source constructs — without this, a long flat chain
-    /// would produce an AST far deeper than [`MAX_NESTING_DEPTH`] and overflow
-    /// the host's native stack during the prepare or compile phases.
-    ///
-    /// The depth budget consumed during the fold is restored on success so
-    /// sibling statements are not penalized. On parse errors the budget is
-    /// left decremented; this is harmless because the parser aborts entirely
-    /// and `depth_remaining` is never consulted again.
     fn parse_elif_else_clauses(&mut self, clauses: Vec<ElifElseClause>) -> Result<Vec<ParseNode>, ParseError> {
         let mut tail: Vec<ParseNode> = Vec::new();
-        let mut levels: u16 = 0;
         for clause in clauses.into_iter().rev() {
             match clause.test {
                 Some(test) => {
-                    // Account for the extra nesting level this clause adds to
-                    // the result tree.
-                    self.decr_depth_remaining(|| test.range())?;
-                    levels += 1;
                     let test = self.parse_expression(test)?;
                     let body = self.parse_statements(clause.body)?;
                     let or_else = tail;
-                    tail = vec![Node::If { test, body, or_else }];
+                    let nested = Node::If { test, body, or_else };
+                    tail = vec![nested];
                 }
                 None => {
                     tail = self.parse_statements(clause.body)?;
                 }
             }
         }
-        self.depth_remaining += levels;
         Ok(tail)
     }
 
@@ -309,10 +283,10 @@ impl<'a> Parser<'a> {
                 "class definitions",
                 self.convert_range(c.range),
             )),
-            Stmt::Return(ast::StmtReturn { value, .. }) => Ok(Node::Return(match value {
-                Some(value) => Some(self.parse_expression(*value)?),
-                None => None,
-            })),
+            Stmt::Return(ast::StmtReturn { value, .. }) => match value {
+                Some(value) => Ok(Node::Return(self.parse_expression(*value)?)),
+                None => Ok(Node::ReturnNone),
+            },
             Stmt::Delete(d) => Err(ParseError::not_implemented(
                 "the 'del' statement",
                 self.convert_range(d.range),
@@ -417,74 +391,18 @@ impl<'a> Parser<'a> {
                 let or_else = self.parse_elif_else_clauses(elif_else_clauses)?;
                 Ok(Node::If { test, body, or_else })
             }
-            Stmt::With(ast::StmtWith {
-                is_async,
-                items,
-                body,
-                range,
-                ..
-            }) => {
+            Stmt::With(ast::StmtWith { is_async, range, .. }) => {
                 if is_async {
-                    return Err(ParseError::not_implemented(
+                    Err(ParseError::not_implemented(
                         "async context managers (async with)",
                         self.convert_range(range),
-                    ));
-                }
-                if items.is_empty() {
-                    return Err(ParseError::syntax(
-                        "with statement requires at least one context manager",
+                    ))
+                } else {
+                    Err(ParseError::not_implemented(
+                        "context managers (with statements)",
                         self.convert_range(range),
-                    ));
+                    ))
                 }
-                // Multi-item `with a() as x, b() as y:` is desugared into nested
-                // `with` blocks at parse time: the outer `with` runs `a()` and
-                // wraps an inner `with` running `b()`, which wraps the user body.
-                // CPython evaluates context exprs left-to-right and exits them
-                // right-to-left, which is exactly the nested-block semantics —
-                // so the lowering is faithful and avoids needing multi-context
-                // support in the compiler / VM.
-                let position = self.convert_range(range);
-                let body = self.parse_statements(body)?;
-                let mut parsed_items: Vec<(ExprLoc, Option<UnpackTarget>)> = items
-                    .into_iter()
-                    .map(|item| -> Result<_, ParseError> {
-                        let context = self.parse_expression(item.context_expr)?;
-                        let target = match item.optional_vars {
-                            Some(expr) => Some(self.parse_unpack_target(*expr)?),
-                            None => None,
-                        };
-                        Ok((context, target))
-                    })
-                    .collect::<Result<_, _>>()?;
-                // Fold from the innermost outward: the last item wraps the user
-                // body; each outer item wraps the freshly-built inner `with`.
-                //
-                // Each synthetic nesting level must be charged against the parser
-                // depth budget so a flat `with a, b, c, ...:` statement cannot
-                // bypass `MAX_NESTING_DEPTH` and produce an AST that later
-                // overflows the host stack during prepare/compile. The budget is
-                // restored on success to avoid penalizing sibling statements, in
-                // the same pattern used by `parse_elif_else_clauses`.
-                let (last_context, last_target) = parsed_items.pop().expect("checked non-empty above");
-                let mut node = Node::With {
-                    context: last_context,
-                    target: last_target,
-                    body,
-                    position,
-                };
-                let mut levels: u16 = 0;
-                while let Some((context, target)) = parsed_items.pop() {
-                    self.decr_depth_remaining(|| range)?;
-                    levels += 1;
-                    node = Node::With {
-                        context,
-                        target,
-                        body: vec![node],
-                        position,
-                    };
-                }
-                self.depth_remaining += levels;
-                Ok(node)
             }
             Stmt::Match(m) => Err(ParseError::not_implemented(
                 "pattern matching (match statements)",
@@ -764,14 +682,7 @@ impl<'a> Parser<'a> {
         match expression {
             AstExpr::BoolOp(ast::ExprBoolOp { op, values, range, .. }) => {
                 // Handle chained boolean operations like `a and b and c` by right-folding
-                // into nested binary operations: `a and (b and c)`.
-                //
-                // Ruff hands the operands over as a flat `Vec`, but the fold
-                // produces a right-nested `Expr::Op` tree that the prepare and
-                // compile phases walk recursively. Count each fold step against
-                // the same depth budget that bounds explicitly nested source so
-                // a long flat chain cannot overflow the host's native stack
-                // downstream. The budget is restored once the fold completes.
+                // into nested binary operations: `a and (b and c)`
                 let rust_op = convert_bool_op(op);
                 let position = self.convert_range(range);
                 let mut values_iter = values.into_iter().rev();
@@ -781,10 +692,7 @@ impl<'a> Parser<'a> {
                 let mut result = self.parse_expression(last_value)?;
 
                 // Fold from right to left
-                let mut levels: u16 = 0;
                 for value in values_iter {
-                    self.decr_depth_remaining(|| value.range())?;
-                    levels += 1;
                     let left = Box::new(self.parse_expression(value)?);
                     result = ExprLoc::new(
                         position,
@@ -795,7 +703,6 @@ impl<'a> Parser<'a> {
                         },
                     );
                 }
-                self.depth_remaining += levels;
                 Ok(result)
             }
             AstExpr::Named(ast::ExprNamed {
@@ -960,17 +867,6 @@ impl<'a> Parser<'a> {
                 range,
                 ..
             }) => {
-                // Ruff models the key as `Option<Box<Expr>>` to represent the
-                // invalid `{**v for ...}` form during error recovery. Real Python
-                // forbids dict unpacking in a comprehension, so ruff also emits a
-                // syntax error for that case; treat `None` here as the same syntax
-                // error to keep behavior consistent if it ever leaks through.
-                let key = key.ok_or_else(|| {
-                    ParseError::syntax(
-                        "dict unpacking is not allowed in dict comprehension".to_string(),
-                        self.convert_range(range),
-                    )
-                })?;
                 let key = Box::new(self.parse_expression(*key)?);
                 let value = Box::new(self.parse_expression(*value)?);
                 let generators = self.parse_comprehension_generators(generators)?;
@@ -1354,7 +1250,7 @@ impl<'a> Parser<'a> {
         match ast {
             AstExpr::Name(ast::ExprName { id, range, .. }) => Ok(self.identifier(&id, range)),
             other => Err(ParseError::syntax(
-                format!("Expected name, got {}", describe_expr_kind(&other)),
+                format!("Expected name, got {other:?}"),
                 self.convert_range(other.range()),
             )),
         }
@@ -1455,7 +1351,7 @@ impl<'a> Parser<'a> {
                 Ok(UnpackTarget::Tuple { targets, position })
             }
             other => Err(ParseError::syntax(
-                format!("invalid unpacking target: {}", describe_expr_kind(&other)),
+                format!("invalid unpacking target: {other:?}"),
                 self.convert_range(other.range()),
             )),
         }
@@ -1576,7 +1472,7 @@ impl<'a> Parser<'a> {
                 let debug_prefix = interp.debug_text.as_ref().map(|dt| {
                     let expr_text = &self.code[interp.expression.range()];
                     self.interner
-                        .intern(&format!("{}{}{}", dt.leading(), expr_text, dt.trailing()))
+                        .intern(&format!("{}{}{}", dt.leading, expr_text, dt.trailing))
                 });
                 Ok(FStringPart::Interpolation {
                     expr,
@@ -1590,66 +1486,57 @@ impl<'a> Parser<'a> {
 
     /// Parses a format specification, which may contain nested interpolations.
     ///
-    /// Specs with no interpolations take the fast path: their literal text is
-    /// concatenated, parsed, and bit-packed into a single `u64` carried inside
-    /// `FormatSpec::Static`. The compiler then drops this straight into the
-    /// constant pool with no further work, and no per-segment interning is
-    /// performed (the parsed spec is the only thing the bytecode needs).
-    ///
-    /// Two cases force a `FormatSpec::Dynamic`:
-    /// 1. Any nested interpolation (e.g. `f"{x:{width}}"`) — the spec must be
-    ///    materialized at runtime.
-    /// 2. Valid but extreme specs whose width or precision exceed the compact
-    ///    encoding (e.g. `f"{x:>1048576}"`). The concatenated literal text is
-    ///    interned and emitted as a single-literal dynamic spec so the VM
-    ///    re-parses it at runtime.
+    /// For static specs (no interpolations), parses the format string into a
+    /// `ParsedFormatSpec` at parse time to avoid runtime parsing overhead.
     fn parse_format_spec(&mut self, spec: &ast::InterpolatedStringFormatSpec) -> Result<FormatSpec, ParseError> {
-        let has_interpolation = spec
-            .elements
-            .iter()
-            .any(|e| matches!(e, InterpolatedStringElement::Interpolation(_)));
+        let mut parts = Vec::new();
+        let mut has_interpolation = false;
 
-        if has_interpolation {
-            let mut parts = Vec::with_capacity(spec.elements.len());
-            for element in &spec.elements {
-                match element {
-                    InterpolatedStringElement::Literal(lit) => {
-                        let string_id = self.interner.intern(&lit.value);
-                        parts.push(FStringPart::Literal(string_id));
-                    }
-                    InterpolatedStringElement::Interpolation(interp) => {
-                        let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
-                        let conversion = convert_conversion_flag(interp.conversion);
-                        // Format specs within format specs are not allowed in Python,
-                        // and debug_prefix doesn't apply to nested interpolations
-                        parts.push(FStringPart::Interpolation {
-                            expr,
-                            conversion,
-                            format_spec: None,
-                            debug_prefix: None,
-                        });
-                    }
+        for element in &spec.elements {
+            match element {
+                InterpolatedStringElement::Literal(lit) => {
+                    // Intern the literal string
+                    let processed = lit.value.to_string();
+                    let string_id = self.interner.intern(&processed);
+                    parts.push(FStringPart::Literal(string_id));
+                }
+                InterpolatedStringElement::Interpolation(interp) => {
+                    has_interpolation = true;
+                    let expr = Box::new(self.parse_expression((*interp.expression).clone())?);
+                    let conversion = convert_conversion_flag(interp.conversion);
+                    // Format specs within format specs are not allowed in Python,
+                    // and debug_prefix doesn't apply to nested interpolations
+                    parts.push(FStringPart::Interpolation {
+                        expr,
+                        conversion,
+                        format_spec: None,
+                        debug_prefix: None,
+                    });
                 }
             }
+        }
+
+        if has_interpolation {
             Ok(FormatSpec::Dynamic(parts))
         } else {
-            let static_spec: String = spec
-                .elements
-                .iter()
-                .filter_map(|e| match e {
-                    InterpolatedStringElement::Literal(lit) => Some(&*lit.value),
-                    InterpolatedStringElement::Interpolation(_) => None,
+            // Combine all literal parts into a single static string and parse at parse time
+            let static_spec: String = parts
+                .into_iter()
+                .filter_map(|p| {
+                    if let FStringPart::Literal(string_id) = p {
+                        Some(self.interner.get_str(string_id).to_owned())
+                    } else {
+                        None
+                    }
                 })
                 .collect();
-            let parsed: ParsedFormatSpec = static_spec.parse().map_err(|err: ParseFormatSpecError| {
-                ParseError::syntax(err.to_string(), self.convert_range(spec.range))
+            let parsed = static_spec.parse().map_err(|spec_str| {
+                ParseError::syntax(
+                    format!("Invalid format specifier '{spec_str}'"),
+                    self.convert_range(spec.range),
+                )
             })?;
-            if let Some(encoded) = encode_format_spec(&parsed) {
-                Ok(FormatSpec::Static(encoded))
-            } else {
-                let string_id = self.interner.intern(&static_spec);
-                Ok(FormatSpec::Dynamic(vec![FStringPart::Literal(string_id)]))
-            }
+            Ok(FormatSpec::Static(parsed))
         }
     }
 
@@ -1669,7 +1556,7 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             let position = self.convert_range(get_range());
-            Err(ParseError::syntax("Source is too deeply nested", position))
+            Err(ParseError::syntax("too many nested parentheses", position))
         }
     }
 }
@@ -1721,48 +1608,6 @@ fn convert_conversion_flag(flag: RuffConversionFlag) -> ConversionFlag {
         RuffConversionFlag::Str => ConversionFlag::Str,
         RuffConversionFlag::Repr => ConversionFlag::Repr,
         RuffConversionFlag::Ascii => ConversionFlag::Ascii,
-    }
-}
-
-/// Short human-readable name for an `AstExpr` variant, for use in
-/// user-facing parse errors. Avoids the Rust `Debug` formatting of the
-/// node, which would leak internal field names, ranges, and struct
-/// layout of `ruff_python_ast` into the error message.
-fn describe_expr_kind(expr: &AstExpr) -> &'static str {
-    match expr {
-        AstExpr::Name(_) => "name",
-        AstExpr::Starred(_) => "starred expression",
-        AstExpr::Attribute(_) => "attribute",
-        AstExpr::Subscript(_) => "subscript",
-        AstExpr::Call(_) => "function call",
-        AstExpr::Tuple(_) => "tuple",
-        AstExpr::List(_) => "list",
-        AstExpr::Set(_) => "set",
-        AstExpr::Dict(_) => "dict",
-        AstExpr::NumberLiteral(_) => "number literal",
-        AstExpr::StringLiteral(_) => "string literal",
-        AstExpr::BytesLiteral(_) => "bytes literal",
-        AstExpr::BooleanLiteral(_) => "boolean literal",
-        AstExpr::NoneLiteral(_) => "None",
-        AstExpr::EllipsisLiteral(_) => "...",
-        AstExpr::FString(_) => "f-string",
-        AstExpr::TString(_) => "t-string",
-        AstExpr::Lambda(_) => "lambda",
-        AstExpr::If(_) => "conditional expression",
-        AstExpr::BoolOp(_) => "boolean expression",
-        AstExpr::BinOp(_) => "binary expression",
-        AstExpr::UnaryOp(_) => "unary expression",
-        AstExpr::Compare(_) => "comparison",
-        AstExpr::Named(_) => "named expression",
-        AstExpr::Yield(_) => "yield expression",
-        AstExpr::YieldFrom(_) => "yield from expression",
-        AstExpr::Await(_) => "await expression",
-        AstExpr::ListComp(_) => "list comprehension",
-        AstExpr::SetComp(_) => "set comprehension",
-        AstExpr::DictComp(_) => "dict comprehension",
-        AstExpr::Generator(_) => "generator expression",
-        AstExpr::Slice(_) => "slice",
-        AstExpr::IpyEscapeCommand(_) => "IPython escape command",
     }
 }
 
@@ -1859,31 +1704,27 @@ impl ParseError {
 
 impl ParseError {
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
-        let mut source_map = SourceMap::new(source);
+        let source_map = SourceMap::new(source);
         match self {
             Self::Syntax { msg, position } => MontyException::new_full(
                 ExcType::SyntaxError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position_syntax_error(
-                    position,
-                    filename,
-                    &mut source_map,
-                )],
+                vec![StackFrame::from_position_syntax_error(position, filename, &source_map)],
             ),
             Self::NotImplemented { msg, position } => MontyException::new_full(
                 ExcType::NotImplementedError,
                 Some(format!("The monty syntax parser does not yet support {msg}")),
-                vec![StackFrame::from_position(position, filename, &mut source_map)],
+                vec![StackFrame::from_position(position, filename, &source_map)],
             ),
             Self::NotSupported { msg, position } => MontyException::new_full(
                 ExcType::NotImplementedError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position(position, filename, &mut source_map)],
+                vec![StackFrame::from_position(position, filename, &source_map)],
             ),
             Self::Import { msg, position } => MontyException::new_full(
                 ExcType::ImportError,
                 Some(msg.into_owned()),
-                vec![StackFrame::from_position_no_caret(position, filename, &mut source_map)],
+                vec![StackFrame::from_position_no_caret(position, filename, &source_map)],
             ),
         }
     }

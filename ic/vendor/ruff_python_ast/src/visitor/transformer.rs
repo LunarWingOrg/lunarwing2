@@ -314,7 +314,6 @@ pub fn walk_stmt<V: Transformer + ?Sized>(visitor: &V, stmt: &mut Stmt) {
         }
         Stmt::Import(ast::StmtImport {
             names,
-            is_lazy: _,
             range: _,
             node_index: _,
         }) => {
@@ -463,9 +462,7 @@ pub fn walk_expr<V: Transformer + ?Sized>(visitor: &V, expr: &mut Expr) {
             for comprehension in generators {
                 visitor.visit_comprehension(comprehension);
             }
-            if let Some(key) = key {
-                visitor.visit_expr(key);
-            }
+            visitor.visit_expr(key);
             visitor.visit_expr(value);
         }
         Expr::Generator(ast::ExprGenerator {

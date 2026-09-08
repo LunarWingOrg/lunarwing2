@@ -5,7 +5,6 @@ use std::{
 };
 
 use ahash::AHashSet;
-use serde::ser::SerializeStruct;
 
 use super::{Dict, PyTrait};
 use crate::{
@@ -13,7 +12,6 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, RunResult, SimpleException},
-    hash::HashValue,
     heap::{
         BorrowedHeapRead, BorrowedHeapReadMut, HeapId, HeapItem, HeapRead, heap_read_ref_as_field,
         heap_read_ref_as_field_mut,
@@ -105,6 +103,15 @@ impl Dataclass {
         &self.field_names
     }
 
+    /// Returns whether this dataclass contains any heap references (`Value::Ref`).
+    ///
+    /// Delegates to the underlying attrs Dict.
+    #[inline]
+    #[must_use]
+    pub fn has_refs(&self) -> bool {
+        self.attrs.has_refs()
+    }
+
     /// Returns a reference to the attrs Dict.
     #[must_use]
     pub fn attrs(&self) -> &Dict {
@@ -130,13 +137,13 @@ impl<'h> HeapRead<'h, Dataclass> {
         &mut self,
         name: Value,
         value: Value,
-        vm: &mut VM<'h, impl ResourceTracker>,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
     ) -> RunResult<Option<Value>> {
         if self.get(vm.heap).frozen {
             // Get attribute name for error message
             let exc = SimpleException::new_msg(
                 ExcType::FrozenInstanceError,
-                format!("cannot assign to field {}", name.py_repr(vm)?),
+                format!("cannot assign to field {}", &name.py_repr(vm)?),
             );
             // Drop the values we were given ownership of
             name.drop_with_heap(vm);
@@ -156,16 +163,16 @@ impl<'h> HeapRead<'h, Dataclass> {
 }
 
 impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
-    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
+    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
         Type::Dataclass
     }
 
-    fn py_len(&self, _vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
+    fn py_len(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
         // Dataclasses don't have a length
         None
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
         // Dataclasses are equal if they have the same name and equal attrs
         Ok(self.get(vm.heap).name == other.get(vm.heap).name && self.attrs().py_eq(&other.attrs(), vm)?)
     }
@@ -173,7 +180,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     /// Hashes a frozen dataclass by its class name and the values of declared fields.
     ///
     /// Mutable (non-frozen) dataclasses return `None` (unhashable).
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
         // Only frozen (immutable) dataclasses are hashable
         if !self.get(vm.heap).frozen {
             return Ok(None);
@@ -197,10 +208,10 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
                 }
             }
         }
-        Ok(Some(HashValue::new(hasher.finish())))
+        Ok(Some(hasher.finish()))
     }
 
-    fn py_bool(&self, _vm: &mut VM<'h, impl ResourceTracker>) -> bool {
+    fn py_bool(&self, _vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
         // Dataclass instances are always truthy (like Python objects)
         true
     }
@@ -208,14 +219,15 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        vm: &mut VM<'h, impl ResourceTracker>,
+        vm: &VM<'h, '_, impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
     ) -> RunResult<()> {
         // Check depth limit before recursing
-        let Ok(token) = vm.heap.incr_recursion_depth() else {
+        let heap = &*vm.heap;
+        let Some(token) = heap.incr_recursion_depth_for_repr() else {
             return Ok(f.write_str("...")?);
         };
-        defer_drop!(token, vm);
+        crate::defer_drop_immutable_heap!(token, heap);
 
         // Format: ClassName(field1=value1, field2=value2, ...)
         // Only declared fields are shown, not dynamically added attributes
@@ -223,21 +235,19 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
         f.write_str(dc.name(vm.interns))?;
         f.write_char('(')?;
 
-        let field_count = self.get(vm.heap).field_names.len();
-        let interns = vm.interns;
-        for i in 0..field_count {
-            if i > 0 {
+        let mut first = true;
+        for field_name in &dc.field_names {
+            if !first {
                 f.write_str(", ")?;
             }
+            first = false;
+
             // Write field name
-            let field_name = &self.get(vm.heap).field_names[i];
             f.write_str(field_name)?;
             f.write_char('=')?;
 
             // Look up value in attrs
-            if let Some(value) = self.get(vm.heap).attrs.get_by_str(field_name, vm.heap, interns) {
-                let value = value.clone_with_heap(vm.heap);
-                defer_drop!(value, vm);
+            if let Some(value) = self.get(vm.heap).attrs.get_by_str(field_name, heap, vm.interns) {
                 value.py_repr_fmt(f, vm, heap_ids)?;
             } else {
                 // Field not found - shouldn't happen for well-formed dataclasses
@@ -259,7 +269,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
     fn py_call_attr(
         &mut self,
         self_id: HeapId,
-        vm: &mut VM<'h, impl ResourceTracker>,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
         attr: &EitherStr,
         args: ArgValues,
     ) -> RunResult<CallResult> {
@@ -297,7 +307,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Dataclass> {
         }
     }
 
-    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
+    fn py_getattr(&self, attr: &EitherStr, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Option<CallResult>> {
         let attr_name = attr.as_str(vm.interns);
         match self.get(vm.heap).attrs.get_by_str(attr_name, vm.heap, vm.interns) {
             Some(value) => Ok(Some(CallResult::Value(value.clone_with_heap(vm.heap)))),
@@ -325,6 +335,7 @@ impl HeapItem for Dataclass {
 // Serializes all five fields.
 impl serde::Serialize for Dataclass {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
         let mut state = serializer.serialize_struct("Dataclass", 5)?;
         state.serialize_field("name", &self.name)?;
         state.serialize_field("type_id", &self.type_id)?;

@@ -4,15 +4,10 @@
 //! via path traversal, null bytes, symlinks, or any other technique.
 //! Tests cover all mount modes to ensure the security invariant holds everywhere.
 
-#[cfg(unix)]
-use std::os::unix::fs::symlink;
-#[cfg(windows)]
-use std::os::windows::fs::{symlink_dir as win_symlink_dir, symlink_file as win_symlink_file};
-use std::{fmt, fs, path::Path};
+use std::{fs, path::Path};
 
 use monty::{
-    FileMode, MkdirCallArgs, MontyObject, MontyPath, OpenCallArgs, OsFunctionCall, PathBytesDataArgs,
-    PathStringDataArgs,
+    MontyObject, OsFunction,
     fs::{MountError, MountMode, MountTable, OverlayState},
 };
 use tempfile::TempDir;
@@ -20,67 +15,6 @@ use tempfile::TempDir;
 // =============================================================================
 // Helpers
 // =============================================================================
-
-/// Local discriminator used by the call helpers to pick the right
-/// [`OsFunctionCall`] variant. Mirrors the old `OsFunction` enum shape so the
-/// rest of the test body reads the same — the wrapper just builds the typed
-/// args struct around each call.
-#[derive(Clone, Copy)]
-enum PathOp {
-    Exists,
-    IsFile,
-    IsDir,
-    IsSymlink,
-    ReadText,
-    ReadBytes,
-    Stat,
-    Iterdir,
-    Unlink,
-    Mkdir,
-    WriteText,
-    WriteBytes,
-}
-
-impl PathOp {
-    /// Builds an [`OsFunctionCall`] for a path-only operation. Panics if used
-    /// with an op that needs extra args (use the helpers below for those).
-    fn build_path_only(self, path: &str) -> OsFunctionCall {
-        let p = MontyPath::new(path.to_owned());
-        match self {
-            Self::Exists => OsFunctionCall::Exists(p),
-            Self::IsFile => OsFunctionCall::IsFile(p),
-            Self::IsDir => OsFunctionCall::IsDir(p),
-            Self::IsSymlink => OsFunctionCall::IsSymlink(p),
-            Self::ReadText => OsFunctionCall::ReadText(p),
-            Self::ReadBytes => OsFunctionCall::ReadBytes(p),
-            Self::Stat => OsFunctionCall::Stat(p),
-            Self::Iterdir => OsFunctionCall::Iterdir(p),
-            Self::Unlink => OsFunctionCall::Unlink(p),
-            Self::Mkdir | Self::WriteText | Self::WriteBytes => {
-                panic!("op {self:?} requires extra args — use the dedicated helper")
-            }
-        }
-    }
-}
-
-impl fmt::Debug for PathOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Exists => "Exists",
-            Self::IsFile => "IsFile",
-            Self::IsDir => "IsDir",
-            Self::IsSymlink => "IsSymlink",
-            Self::ReadText => "ReadText",
-            Self::ReadBytes => "ReadBytes",
-            Self::Stat => "Stat",
-            Self::Iterdir => "Iterdir",
-            Self::Unlink => "Unlink",
-            Self::Mkdir => "Mkdir",
-            Self::WriteText => "WriteText",
-            Self::WriteBytes => "WriteBytes",
-        })
-    }
-}
 
 /// Creates the standard test directory.
 fn create_test_dir() -> TempDir {
@@ -103,34 +37,32 @@ fn mount_at_mnt(tmpdir: &TempDir, mode: MountMode) -> MountTable {
 }
 
 /// Shorthand: call handle_os_call with a single path argument.
-fn call(mt: &mut MountTable, op: PathOp, path: &str) -> Option<Result<MontyObject, MountError>> {
-    mt.handle_os_call(&op.build_path_only(path))
+fn call(mt: &mut MountTable, func: OsFunction, path: &str) -> Option<Result<MontyObject, MountError>> {
+    mt.handle_os_call(func, &[MontyObject::Path(path.to_owned())], &[])
 }
 
-/// Shorthand: call `mkdir` handle_os_call with the supplied kwargs.
-fn call_mkdir(
+/// Shorthand: call handle_os_call with kwargs.
+fn call_with_kwargs(
     mt: &mut MountTable,
+    func: OsFunction,
     path: &str,
-    parents: bool,
-    exist_ok: bool,
+    kwargs: &[(MontyObject, MontyObject)],
 ) -> Option<Result<MontyObject, MountError>> {
-    mt.handle_os_call(&OsFunctionCall::Mkdir(MkdirCallArgs {
-        path: MontyPath::new(path.to_owned()),
-        parents,
-        exist_ok,
-    }))
+    mt.handle_os_call(func, &[MontyObject::Path(path.to_owned())], kwargs)
+}
+
+/// Returns kwargs for `mkdir(parents=True, exist_ok=True)`.
+fn mkdir_parents_kwargs() -> Vec<(MontyObject, MontyObject)> {
+    vec![
+        (MontyObject::String("parents".to_owned()), MontyObject::Bool(true)),
+        (MontyObject::String("exist_ok".to_owned()), MontyObject::Bool(true)),
+    ]
 }
 
 /// Asserts that the operation is blocked: either an error (PathEscape, NoMountPoint, Io)
 /// or `None` (no matching mount for the normalized path).
-fn assert_blocked(mt: &mut MountTable, op: PathOp, path: &str) {
-    // `Mkdir` needs extra args, so route it through the dedicated helper
-    // with the boring `parents=false, exist_ok=false` defaults — the
-    // boundary check happens before any kwargs are inspected.
-    let result = match op {
-        PathOp::Mkdir => call_mkdir(mt, path, false, false),
-        _ => call(mt, op, path),
-    };
+fn assert_blocked(mt: &mut MountTable, func: OsFunction, path: &str) {
+    let result = call(mt, func, path);
     match result {
         Some(Err(MountError::PathEscape { .. } | MountError::NoMountPoint(_) | MountError::Io(_, _))) | None => {}
         Some(Ok(val)) => panic!("expected blocked, got Ok({val:?}) for path: {path}"),
@@ -139,38 +71,17 @@ fn assert_blocked(mt: &mut MountTable, op: PathOp, path: &str) {
 }
 
 /// Asserts blocked for a write operation with content.
-fn assert_write_blocked(mt: &mut MountTable, op: PathOp, path: &str) {
-    let p = MontyPath::new(path.to_owned());
-    let call_variant = match op {
-        PathOp::WriteText => OsFunctionCall::WriteText(PathStringDataArgs {
-            path: p,
-            data: "attack".to_owned(),
-        }),
-        PathOp::WriteBytes => OsFunctionCall::WriteBytes(PathBytesDataArgs {
-            path: p,
-            data: b"attack".to_vec(),
-        }),
-        other => panic!("assert_write_blocked: unexpected op {other:?}"),
+fn assert_write_blocked(mt: &mut MountTable, func: OsFunction, path: &str) {
+    let content = match func {
+        OsFunction::WriteText => MontyObject::String("attack".to_owned()),
+        OsFunction::WriteBytes => MontyObject::Bytes(b"attack".to_vec()),
+        _ => MontyObject::None,
     };
-    let result = mt.handle_os_call(&call_variant);
+    let result = mt.handle_os_call(func, &[MontyObject::Path(path.to_owned()), content], &[]);
     match result {
         Some(Err(MountError::PathEscape { .. } | MountError::NoMountPoint(_) | MountError::Io(_, _))) | None => {}
         Some(Ok(val)) => panic!("expected write blocked, got Ok({val:?}) for path: {path}"),
         Some(Err(other)) => panic!("unexpected error variant for write to {path}: {other}"),
-    }
-}
-
-/// Asserts that `open(path, mode)` is blocked at open time.
-fn assert_open_blocked(mt: &mut MountTable, path: &str, mode: &str) {
-    let mode = mode.parse::<FileMode>().expect("test mode parses");
-    let result = mt.handle_os_call(&OsFunctionCall::Open(OpenCallArgs {
-        path: MontyPath::new(path.to_owned()),
-        mode,
-    }));
-    match result {
-        Some(Err(MountError::PathEscape { .. } | MountError::NoMountPoint(_) | MountError::Io(_, _))) | None => {}
-        Some(Ok(val)) => panic!("expected open blocked, got Ok({val:?}) for path: {path} mode: {mode:?}"),
-        Some(Err(other)) => panic!("unexpected error variant for open of {path}: {other}"),
     }
 }
 
@@ -189,9 +100,15 @@ fn all_modes() -> Vec<(&'static str, MountMode)> {
 /// `std::os::windows::fs::symlink_file`.
 fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) {
     #[cfg(unix)]
-    symlink(original.as_ref(), link.as_ref()).unwrap();
+    {
+        use std::os::unix::fs::symlink;
+        symlink(original.as_ref(), link.as_ref()).unwrap();
+    }
     #[cfg(windows)]
-    win_symlink_file(original.as_ref(), link.as_ref()).unwrap();
+    {
+        use std::os::windows::fs::symlink_file as win_symlink_file;
+        win_symlink_file(original.as_ref(), link.as_ref()).unwrap();
+    }
 }
 
 /// Cross-platform symlink to a directory.
@@ -200,9 +117,15 @@ fn symlink_file(original: impl AsRef<Path>, link: impl AsRef<Path>) {
 /// `std::os::windows::fs::symlink_dir`.
 fn symlink_dir(original: impl AsRef<Path>, link: impl AsRef<Path>) {
     #[cfg(unix)]
-    symlink(original.as_ref(), link.as_ref()).unwrap();
+    {
+        use std::os::unix::fs::symlink;
+        symlink(original.as_ref(), link.as_ref()).unwrap();
+    }
     #[cfg(windows)]
-    win_symlink_dir(original.as_ref(), link.as_ref()).unwrap();
+    {
+        use std::os::windows::fs::symlink_dir as win_symlink_dir;
+        win_symlink_dir(original.as_ref(), link.as_ref()).unwrap();
+    }
 }
 
 // =============================================================================
@@ -214,8 +137,8 @@ fn traversal_dotdot_from_root() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/../etc/passwd");
-        assert_blocked(&mut mt, PathOp::Exists, "/mnt/../etc/passwd");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/../etc/passwd");
+        assert_blocked(&mut mt, OsFunction::Exists, "/mnt/../etc/passwd");
         eprintln!("  {label}: passed");
     }
 }
@@ -225,7 +148,7 @@ fn traversal_dotdot_from_subdir() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/subdir/../../etc/passwd");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/subdir/../../etc/passwd");
         eprintln!("  {label}: passed");
     }
 }
@@ -235,7 +158,7 @@ fn traversal_many_dotdots() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/a/../../../../../../../etc/passwd");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/a/../../../../../../../etc/passwd");
         eprintln!("  {label}: passed");
     }
 }
@@ -245,7 +168,7 @@ fn traversal_dotdot_write_text() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_write_blocked(&mut mt, PathOp::WriteText, "/mnt/../escape.txt");
+        assert_write_blocked(&mut mt, OsFunction::WriteText, "/mnt/../escape.txt");
         eprintln!("  {label}: passed");
     }
 }
@@ -255,21 +178,7 @@ fn traversal_dotdot_write_bytes() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_write_blocked(&mut mt, PathOp::WriteBytes, "/mnt/../escape.bin");
-        eprintln!("  {label}: passed");
-    }
-}
-
-#[test]
-fn traversal_dotdot_open() {
-    for (label, mode) in all_modes() {
-        let dir = create_test_dir();
-        let mut mt = mount_at_mnt(&dir, mode);
-        // `w`/`a` open performs an out-of-mount write at open time; `r` would
-        // read an out-of-mount file. All must be blocked.
-        assert_open_blocked(&mut mt, "/mnt/../open_escape.txt", "w");
-        assert_open_blocked(&mut mt, "/mnt/../open_escape.txt", "a");
-        assert_open_blocked(&mut mt, "/mnt/../../etc/passwd", "r");
+        assert_write_blocked(&mut mt, OsFunction::WriteBytes, "/mnt/../escape.bin");
         eprintln!("  {label}: passed");
     }
 }
@@ -279,7 +188,7 @@ fn traversal_dotdot_mkdir() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::Mkdir, "/mnt/../escape_dir");
+        assert_blocked(&mut mt, OsFunction::Mkdir, "/mnt/../escape_dir");
         eprintln!("  {label}: passed");
     }
 }
@@ -289,7 +198,7 @@ fn traversal_dotdot_unlink() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::Unlink, "/mnt/../some_file");
+        assert_blocked(&mut mt, OsFunction::Unlink, "/mnt/../some_file");
         eprintln!("  {label}: passed");
     }
 }
@@ -299,7 +208,7 @@ fn traversal_dotdot_stat() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::Stat, "/mnt/../etc/passwd");
+        assert_blocked(&mut mt, OsFunction::Stat, "/mnt/../etc/passwd");
         eprintln!("  {label}: passed");
     }
 }
@@ -309,7 +218,7 @@ fn traversal_dotdot_iterdir() {
     for (label, mode) in all_modes() {
         let dir = create_test_dir();
         let mut mt = mount_at_mnt(&dir, mode);
-        assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/..");
+        assert_blocked(&mut mt, OsFunction::Iterdir, "/mnt/..");
         eprintln!("  {label}: passed");
     }
 }
@@ -320,7 +229,7 @@ fn valid_dotdot_within_mount() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-    let result = call(&mut mt, PathOp::ReadText, "/mnt/subdir/../hello.txt")
+    let result = call(&mut mt, OsFunction::ReadText, "/mnt/subdir/../hello.txt")
         .unwrap()
         .unwrap();
     assert_eq!(result, MontyObject::String("hello world\n".to_owned()));
@@ -334,44 +243,44 @@ fn valid_dotdot_within_mount() {
 fn null_byte_middle() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-    assert_blocked(&mut mt, PathOp::ReadText, "/mnt/hello\x00.txt");
+    assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/hello\x00.txt");
 }
 
 #[test]
 fn null_byte_start() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-    assert_blocked(&mut mt, PathOp::Exists, "/mnt/\x00hello.txt");
+    assert_blocked(&mut mt, OsFunction::Exists, "/mnt/\x00hello.txt");
 }
 
 #[test]
 fn null_byte_end() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-    assert_blocked(&mut mt, PathOp::Exists, "/mnt/hello.txt\x00");
+    assert_blocked(&mut mt, OsFunction::Exists, "/mnt/hello.txt\x00");
 }
 
 #[test]
 fn null_byte_in_directory() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-    assert_blocked(&mut mt, PathOp::ReadText, "/mnt/sub\x00dir/nested.txt");
+    assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/sub\x00dir/nested.txt");
 }
 
 #[test]
 fn null_byte_write_ops() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-    assert_write_blocked(&mut mt, PathOp::WriteText, "/mnt/evil\x00.txt");
-    assert_write_blocked(&mut mt, PathOp::WriteBytes, "/mnt/evil\x00.bin");
+    assert_write_blocked(&mut mt, OsFunction::WriteText, "/mnt/evil\x00.txt");
+    assert_write_blocked(&mut mt, OsFunction::WriteBytes, "/mnt/evil\x00.bin");
 }
 
 #[test]
 fn null_byte_overlay_memory() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
-    assert_blocked(&mut mt, PathOp::ReadText, "/mnt/hello\x00.txt");
-    assert_blocked(&mut mt, PathOp::Exists, "/mnt/\x00evil");
+    assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/hello\x00.txt");
+    assert_blocked(&mut mt, OsFunction::Exists, "/mnt/\x00evil");
 }
 
 // =============================================================================
@@ -391,9 +300,9 @@ mod symlink_tests {
         symlink_dir(outside.path(), dir.path().join("escape_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/escape_link/secret.txt");
-        assert_blocked(&mut mt, PathOp::Exists, "/mnt/escape_link/secret.txt");
-        assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/escape_link");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/escape_link/secret.txt");
+        assert_blocked(&mut mt, OsFunction::Exists, "/mnt/escape_link/secret.txt");
+        assert_blocked(&mut mt, OsFunction::Iterdir, "/mnt/escape_link");
     }
 
     #[test]
@@ -405,23 +314,7 @@ mod symlink_tests {
         symlink_file(outside.path().join("secret.txt"), dir.path().join("link_to_file"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/link_to_file");
-    }
-
-    #[test]
-    fn symlink_open_escape() {
-        // `open()` on a path that escapes the mount via a symlink must be
-        // rejected — for read (would read an outside file) and for write
-        // (the open-time truncate would write outside the mount).
-        let dir = create_test_dir();
-        let outside = TempDir::new().unwrap();
-        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
-        symlink_dir(outside.path(), dir.path().join("escape_link"));
-
-        let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_open_blocked(&mut mt, "/mnt/escape_link/secret.txt", "r");
-        assert_open_blocked(&mut mt, "/mnt/escape_link/new.txt", "w");
-        assert_open_blocked(&mut mt, "/mnt/escape_link/new.txt", "a");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/link_to_file");
     }
 
     #[test]
@@ -432,7 +325,7 @@ mod symlink_tests {
         symlink_dir(parent, dir.path().join("parent_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/parent_link");
+        assert_blocked(&mut mt, OsFunction::Iterdir, "/mnt/parent_link");
     }
 
     #[test]
@@ -444,7 +337,7 @@ mod symlink_tests {
         symlink_dir("../../", dir.path().join("rel_escape"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_blocked(&mut mt, PathOp::Iterdir, "/mnt/rel_escape");
+        assert_blocked(&mut mt, OsFunction::Iterdir, "/mnt/rel_escape");
     }
 
     #[test]
@@ -455,7 +348,7 @@ mod symlink_tests {
         symlink_dir(outside.path(), dir.path().join("escape"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/escape/secret");
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/escape/secret");
         match result {
             Some(Err(ref err)) => {
                 let msg = format!("{err}");
@@ -477,8 +370,8 @@ mod symlink_tests {
         symlink_dir(outside.path(), dir.path().join("escape"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/escape/secret.txt");
-        assert_blocked(&mut mt, PathOp::Exists, "/mnt/escape/secret.txt");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/escape/secret.txt");
+        assert_blocked(&mut mt, OsFunction::Exists, "/mnt/escape/secret.txt");
     }
 
     #[test]
@@ -488,7 +381,9 @@ mod symlink_tests {
         symlink_file(dir.path().join("hello.txt"), dir.path().join("internal_link"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/internal_link").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/internal_link")
+            .unwrap()
+            .unwrap();
         assert_eq!(result, MontyObject::String("hello world\n".to_owned()));
     }
 
@@ -501,17 +396,17 @@ mod symlink_tests {
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
         // Reading a file through the symlinked directory should work.
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/dir_link/nested.txt")
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/dir_link/nested.txt")
             .unwrap()
             .unwrap();
         assert_eq!(result, MontyObject::String("nested content".to_owned()));
 
         // Listing the symlinked directory should work.
-        let result = call(&mut mt, PathOp::Iterdir, "/mnt/dir_link");
+        let result = call(&mut mt, OsFunction::Iterdir, "/mnt/dir_link");
         assert!(result.unwrap().is_ok());
 
         // Checking existence through the symlink should work.
-        let result = call(&mut mt, PathOp::Exists, "/mnt/dir_link/deep/file.txt")
+        let result = call(&mut mt, OsFunction::Exists, "/mnt/dir_link/deep/file.txt")
             .unwrap()
             .unwrap();
         assert_eq!(result, MontyObject::Bool(true));
@@ -525,7 +420,7 @@ mod symlink_tests {
         symlink_file(dir.path().join("link1"), dir.path().join("link2"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/link2").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/link2").unwrap().unwrap();
         assert_eq!(result, MontyObject::String("hello world\n".to_owned()));
     }
 
@@ -541,7 +436,7 @@ mod symlink_tests {
         symlink_dir(dir.path().join("link1"), dir.path().join("link2"));
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_blocked(&mut mt, PathOp::ReadText, "/mnt/link2/secret.txt");
+        assert_blocked(&mut mt, OsFunction::ReadText, "/mnt/link2/secret.txt");
     }
 
     #[test]
@@ -554,9 +449,10 @@ mod symlink_tests {
         // Create a symlink inside the mount that points outside.
         symlink_dir(outside.path(), dir.path().join("escape"));
 
+        let kwargs = mkdir_parents_kwargs();
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-        let result = call_mkdir(&mut mt, "/mnt/escape/pwned", true, true);
+        let result = call_with_kwargs(&mut mt, OsFunction::Mkdir, "/mnt/escape/pwned", &kwargs);
         match result {
             Some(Err(MountError::PathEscape { .. } | MountError::Io(_, _))) => {}
             Some(Ok(_)) => panic!("mkdir through symlink escape should be blocked"),
@@ -577,9 +473,10 @@ mod symlink_tests {
         let outside = TempDir::new().unwrap();
         symlink_dir(outside.path(), dir.path().join("escape"));
 
+        let kwargs = mkdir_parents_kwargs();
         let mut mt = mount_at_mnt(&dir, MountMode::ReadOnly);
 
-        let result = call_mkdir(&mut mt, "/mnt/escape/pwned", true, true);
+        let result = call_with_kwargs(&mut mt, OsFunction::Mkdir, "/mnt/escape/pwned", &kwargs);
         match result {
             Some(Err(MountError::PathEscape { .. } | MountError::Io(_, _) | MountError::ReadOnly(_))) => {}
             Some(Ok(_)) => panic!("mkdir through symlink escape should be blocked"),
@@ -601,9 +498,10 @@ mod symlink_tests {
         // subdir/link -> outside
         symlink_dir(outside.path(), dir.path().join("subdir").join("link"));
 
+        let kwargs = mkdir_parents_kwargs();
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-        let result = call_mkdir(&mut mt, "/mnt/subdir/link/deep/dir", true, true);
+        let result = call_with_kwargs(&mut mt, OsFunction::Mkdir, "/mnt/subdir/link/deep/dir", &kwargs);
         match result {
             Some(Err(MountError::PathEscape { .. } | MountError::Io(_, _))) => {}
             Some(Ok(_)) => panic!("mkdir through nested symlink escape should be blocked"),
@@ -620,9 +518,10 @@ mod symlink_tests {
     fn mkdir_parents_within_mount_allowed() {
         // mkdir(parents=True) for paths entirely within the mount should succeed.
         let dir = create_test_dir();
+        let kwargs = mkdir_parents_kwargs();
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-        let result = call_mkdir(&mut mt, "/mnt/new/nested/dir", true, true);
+        let result = call_with_kwargs(&mut mt, OsFunction::Mkdir, "/mnt/new/nested/dir", &kwargs);
         assert!(result.unwrap().is_ok(), "mkdir within mount should succeed");
         assert!(dir.path().join("new/nested/dir").exists());
     }
@@ -635,9 +534,10 @@ mod symlink_tests {
         // Create a symlink within mount pointing to another dir within mount.
         symlink_dir(dir.path().join("subdir"), dir.path().join("internal_link"));
 
+        let kwargs = mkdir_parents_kwargs();
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-        let result = call_mkdir(&mut mt, "/mnt/internal_link/new_child", true, true);
+        let result = call_with_kwargs(&mut mt, OsFunction::Mkdir, "/mnt/internal_link/new_child", &kwargs);
         assert!(result.unwrap().is_ok(), "mkdir through internal symlink should succeed");
         assert!(dir.path().join("subdir/new_child").exists());
     }
@@ -667,7 +567,9 @@ mod hard_link_tests {
         fs::hard_link(dir.path().join("hello.txt"), dir.path().join("hardlink.txt")).unwrap();
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/hardlink.txt").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/hardlink.txt")
+            .unwrap()
+            .unwrap();
         assert_eq!(result, MontyObject::String("hello world\n".to_owned()));
     }
 
@@ -686,7 +588,7 @@ mod hard_link_tests {
         fs::hard_link(&outside_file, dir.path().join("hardlink_ext.txt")).unwrap();
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::ReadText, "/mnt/hardlink_ext.txt")
+        let result = call(&mut mt, OsFunction::ReadText, "/mnt/hardlink_ext.txt")
             .unwrap()
             .unwrap();
         assert_eq!(result, MontyObject::String("external content".to_owned()));
@@ -699,10 +601,12 @@ mod hard_link_tests {
         fs::hard_link(dir.path().join("hello.txt"), dir.path().join("hardlink.txt")).unwrap();
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::IsFile, "/mnt/hardlink.txt").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::IsFile, "/mnt/hardlink.txt").unwrap().unwrap();
         assert_eq!(result, MontyObject::Bool(true));
 
-        let result = call(&mut mt, PathOp::IsSymlink, "/mnt/hardlink.txt").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::IsSymlink, "/mnt/hardlink.txt")
+            .unwrap()
+            .unwrap();
         assert_eq!(result, MontyObject::Bool(false));
     }
 
@@ -711,6 +615,8 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn broken_symlink_write_escape_blocked() {
+        use std::os::unix::fs::symlink;
+
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         let escape_target = outside.path().join("pwned.txt");
@@ -723,8 +629,8 @@ mod hard_link_tests {
         assert!(dir.path().join("broken_link.txt").symlink_metadata().is_ok());
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        assert_write_blocked(&mut mt, PathOp::WriteText, "/mnt/broken_link.txt");
-        assert_write_blocked(&mut mt, PathOp::WriteBytes, "/mnt/broken_link.txt");
+        assert_write_blocked(&mut mt, OsFunction::WriteText, "/mnt/broken_link.txt");
+        assert_write_blocked(&mut mt, OsFunction::WriteBytes, "/mnt/broken_link.txt");
 
         // The target file must NOT have been created.
         assert!(
@@ -739,6 +645,8 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn broken_symlink_overlay_writes_to_memory_not_real_fs() {
+        use std::os::unix::fs::symlink;
+
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         let escape_target = outside.path().join("pwned.txt");
@@ -749,10 +657,14 @@ mod hard_link_tests {
 
         // Write succeeds (goes to overlay memory).
         let result = mt
-            .handle_os_call(&OsFunctionCall::WriteText(PathStringDataArgs {
-                path: MontyPath::new("/mnt/broken_link.txt".to_owned()),
-                data: "safe".to_owned(),
-            }))
+            .handle_os_call(
+                OsFunction::WriteText,
+                &[
+                    MontyObject::Path("/mnt/broken_link.txt".to_owned()),
+                    MontyObject::String("safe".to_owned()),
+                ],
+                &[],
+            )
             .unwrap()
             .unwrap();
         assert_eq!(result, MontyObject::Int(4));
@@ -766,6 +678,8 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn iterdir_filters_outbound_symlinks_but_keeps_regular_and_inbound() {
+        use std::os::unix::fs::symlink;
+
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("external.txt"), "external").unwrap();
@@ -776,7 +690,7 @@ mod hard_link_tests {
         symlink(dir.path().join("hello.txt"), dir.path().join("internal_link")).unwrap();
 
         let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let result = call(&mut mt, PathOp::Iterdir, "/mnt").unwrap().unwrap();
+        let result = call(&mut mt, OsFunction::Iterdir, "/mnt").unwrap().unwrap();
 
         if let MontyObject::List(entries) = &result {
             let names: Vec<String> = entries
@@ -811,6 +725,8 @@ mod hard_link_tests {
     #[test]
     #[cfg(unix)]
     fn overlay_iterdir_filters_symlinks_like_direct_mode() {
+        use std::os::unix::fs::symlink;
+
         let dir = create_test_dir();
         let outside = TempDir::new().unwrap();
         fs::write(outside.path().join("external.txt"), "external").unwrap();
@@ -820,10 +736,10 @@ mod hard_link_tests {
         symlink(dir.path().join("hello.txt"), dir.path().join("internal_link")).unwrap();
 
         let mut direct = mount_at_mnt(&dir, MountMode::ReadWrite);
-        let direct_result = call(&mut direct, PathOp::Iterdir, "/mnt").unwrap().unwrap();
+        let direct_result = call(&mut direct, OsFunction::Iterdir, "/mnt").unwrap().unwrap();
 
         let mut overlay = mount_at_mnt(&dir, MountMode::OverlayMemory(OverlayState::new()));
-        let overlay_result = call(&mut overlay, PathOp::Iterdir, "/mnt").unwrap().unwrap();
+        let overlay_result = call(&mut overlay, OsFunction::Iterdir, "/mnt").unwrap().unwrap();
 
         let direct_names = sorted_names_from_list(&direct_result);
         let overlay_names = sorted_names_from_list(&overlay_result);
@@ -864,7 +780,7 @@ fn double_slashes() {
 
     // Double slashes should be normalized.
     assert_eq!(
-        call(&mut mt, PathOp::ReadText, "/mnt//hello.txt").unwrap().unwrap(),
+        call(&mut mt, OsFunction::ReadText, "/mnt//hello.txt").unwrap().unwrap(),
         MontyObject::String("hello world\n".to_owned())
     );
 }
@@ -875,11 +791,13 @@ fn dot_components() {
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
     assert_eq!(
-        call(&mut mt, PathOp::ReadText, "/mnt/./hello.txt").unwrap().unwrap(),
+        call(&mut mt, OsFunction::ReadText, "/mnt/./hello.txt")
+            .unwrap()
+            .unwrap(),
         MontyObject::String("hello world\n".to_owned())
     );
     assert_eq!(
-        call(&mut mt, PathOp::ReadText, "/mnt/./subdir/./nested.txt")
+        call(&mut mt, OsFunction::ReadText, "/mnt/./subdir/./nested.txt")
             .unwrap()
             .unwrap(),
         MontyObject::String("nested content".to_owned())
@@ -893,7 +811,7 @@ fn triple_dots_literal_name() {
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
     // Trying to read a file named "..." that doesn't exist should give NotFound, not PathEscape.
-    let result = call(&mut mt, PathOp::Exists, "/mnt/...");
+    let result = call(&mut mt, OsFunction::Exists, "/mnt/...");
     match result {
         Some(Ok(MontyObject::Bool(false))) => {} // Good — just doesn't exist.
         Some(Err(MountError::Io(_, _))) => {}    // Also acceptable.
@@ -950,7 +868,7 @@ fn path_escape_error_only_contains_virtual_path() {
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
     // Null byte should trigger PathEscape.
-    let result = call(&mut mt, PathOp::Exists, "/mnt/file\x00evil");
+    let result = call(&mut mt, OsFunction::Exists, "/mnt/file\x00evil");
     match result {
         Some(Err(MountError::PathEscape { virtual_path })) => {
             assert_eq!(virtual_path, "/mnt/file\x00evil");
@@ -970,7 +888,7 @@ fn no_mount_point_returns_none() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-    let result = call(&mut mt, PathOp::ReadText, "/outside/secret.txt");
+    let result = call(&mut mt, OsFunction::ReadText, "/outside/secret.txt");
     assert!(
         result.is_none(),
         "expected None for path outside all mounts, got {result:?}"
@@ -999,12 +917,12 @@ fn empty_table_all_ops_unhandled() {
     let mut mt = MountTable::new();
 
     for func in [
-        PathOp::Exists,
-        PathOp::IsFile,
-        PathOp::IsDir,
-        PathOp::ReadText,
-        PathOp::Stat,
-        PathOp::Iterdir,
+        OsFunction::Exists,
+        OsFunction::IsFile,
+        OsFunction::IsDir,
+        OsFunction::ReadText,
+        OsFunction::Stat,
+        OsFunction::Iterdir,
     ] {
         let result = call(&mut mt, func, "/any/path");
         assert!(
@@ -1023,10 +941,14 @@ fn rename_traversal_src() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-    let result = mt.handle_os_call(&OsFunctionCall::Rename(monty::RenameCallArgs {
-        src: MontyPath::new("/mnt/../etc/passwd".to_owned()),
-        dst: MontyPath::new("/mnt/stolen.txt".to_owned()),
-    }));
+    let result = mt.handle_os_call(
+        OsFunction::Rename,
+        &[
+            MontyObject::Path("/mnt/../etc/passwd".to_owned()),
+            MontyObject::Path("/mnt/stolen.txt".to_owned()),
+        ],
+        &[],
+    );
     match result {
         Some(Err(MountError::PathEscape { .. } | MountError::NoMountPoint(_) | MountError::Io(_, _))) => {}
         // If src doesn't match any mount, handle_rename returns None and normal dispatch
@@ -1041,10 +963,14 @@ fn rename_traversal_dst() {
     let dir = create_test_dir();
     let mut mt = mount_at_mnt(&dir, MountMode::ReadWrite);
 
-    let result = mt.handle_os_call(&OsFunctionCall::Rename(monty::RenameCallArgs {
-        src: MontyPath::new("/mnt/hello.txt".to_owned()),
-        dst: MontyPath::new("/mnt/../escape.txt".to_owned()),
-    }));
+    let result = mt.handle_os_call(
+        OsFunction::Rename,
+        &[
+            MontyObject::Path("/mnt/hello.txt".to_owned()),
+            MontyObject::Path("/mnt/../escape.txt".to_owned()),
+        ],
+        &[],
+    );
     match result {
         Some(Err(
             MountError::PathEscape { .. }
@@ -1088,17 +1014,21 @@ fn rename_symlink_escape_overlay_read_text() {
     let mut mt = mount_at_mnt(&mount_dir, MountMode::OverlayMemory(OverlayState::new()));
 
     // Step 1: Rename the symlink within the mount.
-    let rename_result = mt.handle_os_call(&OsFunctionCall::Rename(monty::RenameCallArgs {
-        src: MontyPath::new("/mnt/escape_link".to_owned()),
-        dst: MontyPath::new("/mnt/renamed".to_owned()),
-    }));
+    let rename_result = mt.handle_os_call(
+        OsFunction::Rename,
+        &[
+            MontyObject::Path("/mnt/escape_link".to_owned()),
+            MontyObject::Path("/mnt/renamed".to_owned()),
+        ],
+        &[],
+    );
     // The rename itself may succeed or may be blocked — either is acceptable.
     // The critical invariant is that reading the renamed path must NEVER
     // return the outside file's contents.
 
     if matches!(rename_result, Some(Ok(_))) {
         // Rename succeeded — now try to read the renamed path.
-        let read_result = call(&mut mt, PathOp::ReadText, "/mnt/renamed");
+        let read_result = call(&mut mt, OsFunction::ReadText, "/mnt/renamed");
         match read_result {
             Some(Ok(MontyObject::String(content))) => {
                 assert_ne!(
@@ -1133,13 +1063,17 @@ fn rename_symlink_escape_overlay_read_bytes() {
 
     let mut mt = mount_at_mnt(&mount_dir, MountMode::OverlayMemory(OverlayState::new()));
 
-    let rename_result = mt.handle_os_call(&OsFunctionCall::Rename(monty::RenameCallArgs {
-        src: MontyPath::new("/mnt/escape_link".to_owned()),
-        dst: MontyPath::new("/mnt/renamed".to_owned()),
-    }));
+    let rename_result = mt.handle_os_call(
+        OsFunction::Rename,
+        &[
+            MontyObject::Path("/mnt/escape_link".to_owned()),
+            MontyObject::Path("/mnt/renamed".to_owned()),
+        ],
+        &[],
+    );
 
     if matches!(rename_result, Some(Ok(_))) {
-        let read_result = call(&mut mt, PathOp::ReadBytes, "/mnt/renamed");
+        let read_result = call(&mut mt, OsFunction::ReadBytes, "/mnt/renamed");
         match read_result {
             Some(Ok(MontyObject::Bytes(content))) => {
                 assert_ne!(

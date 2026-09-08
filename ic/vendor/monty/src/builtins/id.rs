@@ -7,11 +7,11 @@ use crate::{
 /// Implementation of the id() builtin function.
 ///
 /// Returns the identity of an object (unique integer for the object's lifetime).
-pub fn builtin_id(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_id(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let value = args.get_one_arg("id", vm.heap)?;
     defer_drop!(value, vm);
 
-    let id = value.id(vm);
+    let id = value.id();
 
     // Python's id() returns a signed integer; reinterpret bits for large values
     // On 64-bit: large addresses wrap to negative; on 32-bit: always fits positive

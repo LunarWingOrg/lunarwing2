@@ -61,12 +61,6 @@ pub enum Type {
     Module,
     /// Marker types like stdout/stderr - displays as "TextIOWrapper"
     TextIOWrapper,
-    /// Binary file object returned by `open(..., "rb")`.
-    BufferedReader,
-    /// Binary file object returned by write-only binary modes.
-    BufferedWriter,
-    /// Binary file object returned by read/write binary modes.
-    BufferedRandom,
     /// typing module special forms (Any, Optional, Union, etc.) - displays as "typing._SpecialForm"
     SpecialForm,
     /// A filesystem path from `pathlib.Path` - displays as "PosixPath"
@@ -77,12 +71,6 @@ pub enum Type {
     RePattern,
     /// A regex match result from `re.match()` / `re.search()` etc. - displays as "re.Match"
     ReMatch,
-    /// Synthetic context manager exposed via the `_test_cm` builtin. Only
-    /// reachable under the `test-hooks` cargo feature; intentionally a
-    /// distinct `Type` variant rather than one of the existing ones so a
-    /// production sandbox can't get confused with it via stale snapshots.
-    #[cfg(feature = "test-hooks")]
-    TestContextManager,
 }
 
 impl fmt::Display for Type {
@@ -120,58 +108,16 @@ impl fmt::Display for Type {
             Self::Coroutine => f.write_str("coroutine"),
             Self::Module => f.write_str("module"),
             Self::TextIOWrapper => f.write_str("_io.TextIOWrapper"),
-            Self::BufferedReader => f.write_str("_io.BufferedReader"),
-            Self::BufferedWriter => f.write_str("_io.BufferedWriter"),
-            Self::BufferedRandom => f.write_str("_io.BufferedRandom"),
             Self::SpecialForm => f.write_str("typing._SpecialForm"),
             Self::Path => f.write_str("PosixPath"),
             Self::Property => f.write_str("property"),
             Self::RePattern => f.write_str("re.Pattern"),
             Self::ReMatch => f.write_str("re.Match"),
-            #[cfg(feature = "test-hooks")]
-            Self::TestContextManager => f.write_str("_test_cm"),
-        }
-    }
-}
-
-/// `Display` adapter for [`Type::cpython_arg_name`] — see that method.
-///
-/// Held separately so the rendering stays allocation-free (no `Cow<'static, str>`
-/// or owned `String` needed) and embeds directly into `format!` / `write!`.
-pub struct CpythonArgName<'a>(&'a Type);
-
-impl fmt::Display for CpythonArgName<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // CPython's `_PyArg_BadArgument` formatter has a single special case:
-        // when the offending value is `Py_None`, it reports `"None"` rather
-        // than the type name `"NoneType"`. Since `NoneType` is a singleton
-        // (only `None` ever has this type), branching on the type is
-        // equivalent to branching on the value and lets the helper live on
-        // `Type` for callers that already have one.
-        match self.0 {
-            Type::NoneType => f.write_str("None"),
-            other => fmt::Display::fmt(other, f),
         }
     }
 }
 
 impl Type {
-    /// Renders the type name used by CPython's `_PyArg_BadArgument`
-    /// ("argument N must be X, not Y") error formatter.
-    ///
-    /// Identical to [`Display`] except that [`Type::NoneType`] renders as
-    /// `"None"` rather than `"NoneType"`. CPython has this special case in
-    /// `_PyArg_BadArgument`: `arg == Py_None ? "None" : Py_TYPE(arg)->tp_name`.
-    ///
-    /// Use this for the "not Y" half of arg-type error messages. For repr /
-    /// `type(x).__name__` output, keep using plain [`Display`].
-    ///
-    /// [`Display`]: fmt::Display
-    #[must_use]
-    pub fn cpython_arg_name(&self) -> CpythonArgName<'_> {
-        CpythonArgName(self)
-    }
-
     /// Returns the Python source-level name for builtin types that can be called directly.
     ///
     /// This differs from `Display` for internal representation-only names such as
@@ -305,7 +251,7 @@ impl Type {
         self,
         method_id: StringId,
         args: ArgValues,
-        vm: &mut VM<'_, impl ResourceTracker>,
+        vm: &mut VM<'_, '_, impl ResourceTracker>,
     ) -> RunResult<AttrCallResult> {
         match (self, method_id) {
             (Self::Dict, m) if m == StaticStrings::Fromkeys => dict_fromkeys(args, vm).map(AttrCallResult::Value),
@@ -314,7 +260,7 @@ impl Type {
             (Self::Date, m) if m == StaticStrings::Fromisoformat => {
                 date::class_fromisoformat(vm.heap, args, vm.interns).map(AttrCallResult::Value)
             }
-            (Self::DateTime, m) if m == StaticStrings::Now => datetime::class_now(vm, args),
+            (Self::DateTime, m) if m == StaticStrings::Now => datetime::class_now(vm.heap, args, vm.interns),
             (Self::DateTime, m) if m == StaticStrings::Strptime => {
                 datetime::class_strptime(vm.heap, args, vm.interns).map(AttrCallResult::Value)
             }
@@ -333,7 +279,7 @@ impl Type {
     ///
     /// Dispatches to the appropriate type's init method for container types,
     /// or handles primitive type conversions inline.
-    pub(crate) fn call(self, vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub(crate) fn call(self, vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         match self {
             // Container types - delegate to init methods
             Self::List => List::init(vm, args),
@@ -345,10 +291,10 @@ impl Type {
             Self::Bytes => Bytes::init(vm, args),
             Self::Range => Range::init(vm, args),
             Self::Slice => Slice::init(vm, args),
-            Self::Date => date::init(vm, args),
-            Self::DateTime => datetime::init(vm, args),
-            Self::TimeDelta => timedelta::init(vm, args),
-            Self::TimeZone => TimeZone::init(vm, args),
+            Self::Date => date::init(vm.heap, args, vm.interns),
+            Self::DateTime => datetime::init(vm.heap, args, vm.interns),
+            Self::TimeDelta => timedelta::init(vm.heap, args, vm.interns),
+            Self::TimeZone => TimeZone::init(vm.heap, args, vm.interns),
             Self::Iterator => MontyIter::init(vm, args),
             Self::Path => Path::init(vm, args),
 

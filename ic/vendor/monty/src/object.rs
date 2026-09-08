@@ -16,19 +16,17 @@ use num_traits::Zero;
 use crate::{
     builtins::{Builtins, BuiltinsFunctions},
     bytecode::VM,
-    defer_drop,
     exception_private::{ExcType, RunError, SimpleException},
-    heap::{HeapData, HeapId, HeapReadOutput},
+    heap::{HeapData, HeapId},
     resource::{ResourceError, ResourceTracker},
     types::{
-        Dataclass, LongInt, NamedTuple, OpenFile, Path, PyTrait, TimeZone, Type, allocate_tuple,
+        LongInt, NamedTuple, Path, PyTrait, TimeZone, Type, allocate_tuple,
         bytes::{Bytes, bytes_repr},
         date as date_type, datetime as datetime_type,
         dict::Dict,
-        file::FileMode,
         list::List,
         set::{FrozenSet, Set},
-        str::{StringRepr, allocate_string, string_repr_fmt},
+        str::{Str, StringRepr, string_repr_fmt},
         timedelta as timedelta_type, timezone as timezone_type,
     },
     value::{EitherStr, Value},
@@ -291,8 +289,6 @@ pub enum MontyObject {
     ///
     /// Represents a filesystem path. Can be used both as input (from host) and output.
     Path(String),
-    /// An open file object (the result of `open()`).
-    FileHandle(MontyFileHandle),
     /// A dataclass instance with class name, field names, attributes, and mutability.
     ///
     /// Method calls are detected lazily at runtime: when `call_attr` is invoked
@@ -355,7 +351,7 @@ impl MontyObject {
     /// then properly drops the Value via `drop_with_heap` to maintain reference counting.
     ///
     /// The `interns` parameter is used to look up interned string/bytes content.
-    pub(crate) fn new(value: Value, vm: &mut VM<'_, impl ResourceTracker>) -> Self {
+    pub(crate) fn new(value: Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> Self {
         let py_obj = Self::from_value(&value, vm);
         value.drop_with_heap(vm);
         py_obj
@@ -375,7 +371,7 @@ impl MontyObject {
     /// # Errors
     /// Returns `InvalidInputError` if called on the `Repr` variant,
     /// as it is only valid as an output from code execution, not as an input.
-    pub(crate) fn to_value(self, vm: &mut VM<'_, impl ResourceTracker>) -> Result<Value, InvalidInputError> {
+    pub(crate) fn to_value(self, vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<Value, InvalidInputError> {
         match self {
             Self::Ellipsis => Ok(Value::Ellipsis),
             Self::None => Ok(Value::None),
@@ -383,7 +379,7 @@ impl MontyObject {
             Self::Int(i) => Ok(Value::Int(i)),
             Self::BigInt(bi) => Ok(LongInt::new(bi).into_value(vm.heap)?),
             Self::Float(f) => Ok(Value::Float(f)),
-            Self::String(s) => Ok(allocate_string(s, vm.heap)?),
+            Self::String(s) => Ok(Value::Ref(vm.heap.allocate(HeapData::Str(Str::new(s)))?)),
             Self::Bytes(b) => Ok(Value::Ref(vm.heap.allocate(HeapData::Bytes(Bytes::new(b)))?)),
             Self::List(items) => {
                 let values: Vec<Value> = items
@@ -507,6 +503,7 @@ impl MontyObject {
                 attrs,
                 frozen,
             } => {
+                use crate::types::Dataclass;
                 // Convert attrs to Dict
                 let pairs: Result<Vec<(Value, Value)>, InvalidInputError> = attrs
                     .into_iter()
@@ -518,10 +515,6 @@ impl MontyObject {
                 Ok(Value::Ref(vm.heap.allocate(HeapData::Dataclass(dc))?))
             }
             Self::Path(s) => Ok(Value::Ref(vm.heap.allocate(HeapData::Path(Path::new(s)))?)),
-            Self::FileHandle(handle) => {
-                let file = OpenFile::with_state(handle.path, handle.mode, handle.position);
-                Ok(Value::Ref(vm.heap.allocate(HeapData::OpenFile(file))?))
-            }
             Self::Type(t) => Ok(Value::Builtin(Builtins::Type(t))),
             Self::BuiltinFunction(f) => Ok(Value::Builtin(Builtins::Function(f))),
             Self::Function { name, .. } => {
@@ -540,31 +533,24 @@ impl MontyObject {
         }
     }
 
-    /// Top-level entry into [`from_value_inner`], allocating the visited-set used
-    /// for cycle detection.
-    fn from_value(object: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> Self {
+    fn from_value(object: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> Self {
         let mut visited = AHashSet::new();
         Self::from_value_inner(object, vm, &mut visited)
     }
 
     /// Internal helper for converting Value to MontyObject with cycle detection.
     ///
-    /// Non-`Ref` variants are produced inline using only the interner — they
-    /// never recurse through the heap. `Ref` variants dispatch via
-    /// `vm.heap.read(id)` so the resulting [`HeapRead`] keeps the heap entry
-    /// alive (through its reader count) without retaining a borrow on
-    /// `vm.heap`. Container children are walked via short-lived borrows that
-    /// `clone_with_heap` the next child before recursing — the `inc_ref` makes
-    /// it safe for a future user-defined `__repr__` to mutate the surrounding
-    /// container during the recursive call without freeing the value mid-format.
-    fn from_value_inner(object: &Value, vm: &mut VM<'_, impl ResourceTracker>, visited: &mut AHashSet<HeapId>) -> Self {
+    /// The `visited` set tracks HeapIds we're currently processing. When we encounter
+    /// a HeapId already in the set, we've found a cycle and return `MontyObject::Cycle`
+    /// with an appropriate placeholder string.
+    ///
+    /// Recursion depth is tracked via `heap.incr_recursion_depth_for_repr()`.
+    fn from_value_inner(object: &Value, vm: &VM<'_, '_, impl ResourceTracker>, visited: &mut AHashSet<HeapId>) -> Self {
         // Check depth limit before processing
-        let Ok(token) = vm.heap.incr_recursion_depth() else {
+        let Some(token) = vm.heap.incr_recursion_depth_for_repr() else {
             return Self::Repr("<deeply nested>".to_owned());
         };
-        defer_drop!(token, vm);
-
-        let interns = vm.interns;
+        crate::defer_drop_immutable_heap!(token, vm);
         match object {
             Value::Undefined => panic!("Undefined found while converting to MontyObject"),
             Value::Ellipsis => Self::Ellipsis,
@@ -572,9 +558,8 @@ impl MontyObject {
             Value::Bool(b) => Self::Bool(*b),
             Value::Int(i) => Self::Int(*i),
             Value::Float(f) => Self::Float(*f),
-            Value::InternString(string_id) => Self::String(interns.get_str(*string_id).to_owned()),
-            Value::InternBytes(bytes_id) => Self::Bytes(interns.get_bytes(*bytes_id).to_owned()),
-            Value::InternLongInt(li_id) => Self::BigInt(interns.get_long_int(*li_id).clone()),
+            Value::InternString(string_id) => Self::String(vm.interns.get_str(*string_id).to_owned()),
+            Value::InternBytes(bytes_id) => Self::Bytes(vm.interns.get_bytes(*bytes_id).to_owned()),
             Value::Ref(id) => {
                 // Check for cycle
                 if visited.contains(id) {
@@ -590,120 +575,69 @@ impl MontyObject {
                 // Mark this id as being visited
                 visited.insert(*id);
 
-                let result = match vm.heap.read(*id) {
-                    HeapReadOutput::Str(s) => Self::String(s.get(vm.heap).as_str().to_owned()),
-                    HeapReadOutput::Bytes(b) => Self::Bytes(b.get(vm.heap).as_slice().to_owned()),
-                    HeapReadOutput::List(list) => {
-                        let len = list.get(vm.heap).len();
-                        let mut items = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let item = list.get(vm.heap).as_slice()[i].clone_with_heap(vm.heap);
-                            defer_drop!(item, vm);
-                            items.push(Self::from_value_inner(item, vm, visited));
-                        }
-                        Self::List(items)
-                    }
-                    HeapReadOutput::Tuple(tuple) => {
-                        let len = tuple.get(vm.heap).as_slice().len();
-                        let mut items = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let item = tuple.get(vm.heap).as_slice()[i].clone_with_heap(vm.heap);
-                            defer_drop!(item, vm);
-                            items.push(Self::from_value_inner(item, vm, visited));
-                        }
-                        Self::Tuple(items)
-                    }
-                    HeapReadOutput::NamedTuple(nt) => {
-                        let type_name = nt.get(vm.heap).name(vm.interns).to_owned();
-                        let field_names = nt
-                            .get(vm.heap)
+                let result = match vm.heap.get(*id) {
+                    HeapData::Str(s) => Self::String(s.as_str().to_owned()),
+                    HeapData::Bytes(b) => Self::Bytes(b.as_slice().to_owned()),
+                    HeapData::List(list) => Self::List(
+                        list.as_slice()
+                            .iter()
+                            .map(|obj| Self::from_value_inner(obj, vm, visited))
+                            .collect(),
+                    ),
+                    HeapData::Tuple(tuple) => Self::Tuple(
+                        tuple
+                            .as_slice()
+                            .iter()
+                            .map(|obj| Self::from_value_inner(obj, vm, visited))
+                            .collect(),
+                    ),
+                    HeapData::NamedTuple(nt) => Self::NamedTuple {
+                        type_name: nt.name(vm.interns).to_owned(),
+                        field_names: nt
                             .field_names()
                             .iter()
-                            .map(|fname| fname.as_str(vm.interns).to_owned())
-                            .collect::<Vec<_>>();
-                        let len = nt.get(vm.heap).len();
-                        let mut values = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let item = nt.get(vm.heap).as_vec()[i].clone_with_heap(vm.heap);
-                            defer_drop!(item, vm);
-                            values.push(Self::from_value_inner(item, vm, visited));
-                        }
-                        Self::NamedTuple {
-                            type_name,
-                            field_names,
-                            values,
-                        }
-                    }
-                    HeapReadOutput::Dict(dict) => {
-                        let len = dict.get(vm.heap).len();
-                        let mut pairs = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let key = dict
-                                .get(vm.heap)
-                                .key_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(key, vm);
-                            let k = Self::from_value_inner(key, vm, visited);
-                            let value = dict
-                                .get(vm.heap)
-                                .value_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(value, vm);
-                            let v = Self::from_value_inner(value, vm, visited);
-                            pairs.push((k, v));
-                        }
-                        Self::Dict(DictPairs(pairs))
-                    }
-                    HeapReadOutput::Set(set) => {
-                        let len = set.get(vm.heap).len();
-                        let mut items = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let item = set
-                                .get(vm.heap)
-                                .storage()
-                                .value_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(item, vm);
-                            items.push(Self::from_value_inner(item, vm, visited));
-                        }
-                        Self::Set(items)
-                    }
-                    HeapReadOutput::FrozenSet(fs) => {
-                        let len = fs.get(vm.heap).len();
-                        let mut items = Vec::with_capacity(len);
-                        for i in 0..len {
-                            let item = fs
-                                .get(vm.heap)
-                                .storage()
-                                .value_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(item, vm);
-                            items.push(Self::from_value_inner(item, vm, visited));
-                        }
-                        Self::FrozenSet(items)
-                    }
-                    // Cells are internal closure implementation details — show
-                    // the contents directly without exposing the wrapper.
-                    HeapReadOutput::Cell(cell) => {
-                        let inner = cell.get(vm.heap).0.clone_with_heap(vm.heap);
-                        defer_drop!(inner, vm);
-                        Self::from_value_inner(inner, vm, visited)
-                    }
-                    HeapReadOutput::Date(d) => {
-                        let (year, month, day) = date_type::to_ymd(*d.get(vm.heap));
+                            .map(|field_name| field_name.as_str(vm.interns).to_owned())
+                            .collect(),
+                        values: nt
+                            .as_vec()
+                            .iter()
+                            .map(|obj| Self::from_value_inner(obj, vm, visited))
+                            .collect(),
+                    },
+                    HeapData::Dict(dict) => Self::Dict(DictPairs(
+                        dict.into_iter()
+                            .map(|(k, v)| {
+                                (
+                                    Self::from_value_inner(k, vm, visited),
+                                    Self::from_value_inner(v, vm, visited),
+                                )
+                            })
+                            .collect(),
+                    )),
+                    HeapData::Set(set) => Self::Set(
+                        set.storage()
+                            .iter()
+                            .map(|obj| Self::from_value_inner(obj, vm, visited))
+                            .collect(),
+                    ),
+                    HeapData::FrozenSet(frozenset) => Self::FrozenSet(
+                        frozenset
+                            .storage()
+                            .iter()
+                            .map(|obj| Self::from_value_inner(obj, vm, visited))
+                            .collect(),
+                    ),
+                    HeapData::Date(date) => {
+                        let (year, month, day) = date_type::to_ymd(*date);
                         Self::Date(MontyDate {
                             year,
                             month: u8::try_from(month).expect("month is always 1..=12"),
                             day: u8::try_from(day).expect("day is always 1..=31"),
                         })
                     }
-                    HeapReadOutput::DateTime(dt) => {
+                    HeapData::DateTime(datetime) => {
                         if let Some((year, month, day, hour, minute, second, microsecond)) =
-                            datetime_type::to_components(dt.get(vm.heap))
+                            datetime_type::to_components(datetime)
                         {
                             Self::DateTime(MontyDateTime {
                                 year,
@@ -713,107 +647,86 @@ impl MontyObject {
                                 minute,
                                 second,
                                 microsecond,
-                                offset_seconds: datetime_type::offset_seconds(dt.get(vm.heap)),
-                                timezone_name: datetime_type::timezone_info(dt.get(vm.heap)).and_then(|tz| tz.name),
+                                offset_seconds: datetime_type::offset_seconds(datetime),
+                                timezone_name: datetime_type::timezone_info(datetime).and_then(|tz| tz.name),
                             })
                         } else {
                             repr_or_error(object, vm)
                         }
                     }
-                    HeapReadOutput::TimeDelta(td) => {
-                        let (days, seconds, microseconds) = timedelta_type::components(td.get(vm.heap));
+                    HeapData::TimeDelta(delta) => {
+                        let (days, seconds, microseconds) = timedelta_type::components(delta);
                         Self::TimeDelta(MontyTimeDelta {
                             days,
                             seconds,
                             microseconds,
                         })
                     }
-                    HeapReadOutput::TimeZone(tz) => {
-                        let tz_ref = tz.get(vm.heap);
-                        Self::TimeZone(MontyTimeZone {
-                            offset_seconds: tz_ref.offset_seconds,
-                            name: tz_ref.name.clone(),
-                        })
+                    HeapData::TimeZone(tz) => Self::TimeZone(MontyTimeZone {
+                        offset_seconds: tz.offset_seconds,
+                        name: tz.name.clone(),
+                    }),
+                    // Cells are internal closure implementation details
+                    HeapData::Cell(cell) => {
+                        // Show the cell's contents
+                        Self::from_value_inner(&cell.0, vm, visited)
                     }
-                    HeapReadOutput::Exception(exc) => {
-                        let exc_ref = exc.get(vm.heap);
-                        Self::Exception {
-                            exc_type: exc_ref.exc_type(),
-                            arg: exc_ref.arg().map(ToString::to_string),
-                        }
-                    }
-                    HeapReadOutput::Dataclass(dc) => {
-                        let (name, type_id, field_names, frozen, attrs_len) = {
-                            let dc_ref = dc.get(vm.heap);
-                            (
-                                dc_ref.name(vm.interns).to_owned(),
-                                dc_ref.type_id(),
-                                dc_ref.field_names().to_vec(),
-                                dc_ref.is_frozen(),
-                                dc_ref.attrs().len(),
-                            )
-                        };
-                        let mut pairs = Vec::with_capacity(attrs_len);
-                        for i in 0..attrs_len {
-                            let key = dc
-                                .get(vm.heap)
-                                .attrs()
-                                .key_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(key, vm);
-                            let k = Self::from_value_inner(key, vm, visited);
-                            let value = dc
-                                .get(vm.heap)
-                                .attrs()
-                                .value_at(i)
-                                .expect("index in range")
-                                .clone_with_heap(vm.heap);
-                            defer_drop!(value, vm);
-                            let v = Self::from_value_inner(value, vm, visited);
-                            pairs.push((k, v));
-                        }
+                    HeapData::Closure(..) | HeapData::FunctionDefaults(..) => repr_or_error(object, vm),
+                    HeapData::Range(_) => repr_or_error(object, vm),
+                    HeapData::Exception(exc) => Self::Exception {
+                        exc_type: exc.exc_type(),
+                        arg: exc.arg().map(ToString::to_string),
+                    },
+                    HeapData::Dataclass(dc) => {
+                        // Convert attrs to DictPairs
+                        let attrs = DictPairs(
+                            dc.attrs()
+                                .into_iter()
+                                .map(|(k, v)| {
+                                    (
+                                        Self::from_value_inner(k, vm, visited),
+                                        Self::from_value_inner(v, vm, visited),
+                                    )
+                                })
+                                .collect(),
+                        );
                         Self::Dataclass {
-                            name,
-                            type_id,
-                            field_names,
-                            attrs: DictPairs(pairs),
-                            frozen,
+                            name: dc.name(vm.interns).to_owned(),
+                            type_id: dc.type_id(),
+                            field_names: dc.field_names().to_vec(),
+                            attrs,
+                            frozen: dc.is_frozen(),
                         }
                     }
-                    // Iterators are internal objects — represent as a fixed type
-                    // string rather than recursing.
-                    HeapReadOutput::Iter(_) => Self::Repr("<iterator>".to_owned()),
-                    HeapReadOutput::LongInt(li) => Self::BigInt(li.get(vm.heap).inner().clone()),
-                    HeapReadOutput::Module(m) => {
-                        Self::Repr(format!("<module '{}'>", vm.interns.get_str(m.get(vm.heap).name())))
+                    HeapData::Iter(_) => {
+                        // Iterators are internal objects - represent as a type string
+                        Self::Repr("<iterator>".to_owned())
                     }
-                    HeapReadOutput::Coroutine(coro) => {
-                        let func_id = coro.get(vm.heap).func_id;
-                        let func = vm.interns.get_function(func_id);
+                    HeapData::DictKeysView(_) | HeapData::DictItemsView(_) | HeapData::DictValuesView(_) => {
+                        repr_or_error(object, vm)
+                    }
+                    HeapData::LongInt(li) => Self::BigInt(li.inner().clone()),
+                    HeapData::Module(m) => {
+                        // Modules are represented as a repr string
+                        Self::Repr(format!("<module '{}'>", vm.interns.get_str(m.name())))
+                    }
+                    HeapData::Slice(_) => repr_or_error(object, vm),
+                    HeapData::Coroutine(coro) => {
+                        // Coroutines are represented as a repr string
+                        let func = vm.interns.get_function(coro.func_id);
                         let name = vm.interns.get_str(func.name.name_id);
                         Self::Repr(format!("<coroutine object {name}>"))
                     }
-                    HeapReadOutput::GatherFuture(gather) => {
-                        Self::Repr(format!("<gather({})>", gather.get(vm.heap).item_count()))
+                    HeapData::GatherFuture(gather) => {
+                        // GatherFutures are represented as a repr string
+                        Self::Repr(format!("<gather({})>", gather.item_count()))
                     }
-                    HeapReadOutput::Path(path) => Self::Path(path.get(vm.heap).as_str().to_owned()),
-                    // File objects carry no heap refs (leaf type) — no recursion.
-                    // This is how `file.read()`/`write()` deliver the open file
-                    // to the host as the first OS-call argument.
-                    HeapReadOutput::OpenFile(file) => {
-                        let file = file.get(vm.heap);
-                        Self::FileHandle(MontyFileHandle {
-                            path: file.path().to_owned(),
-                            mode: *file.file_mode(),
-                            position: file.position(),
-                        })
-                    }
-                    HeapReadOutput::ExtFunction(name) => Self::Function {
-                        name: name.get(vm.heap).clone(),
+                    HeapData::Path(path) => Self::Path(path.as_str().to_owned()),
+                    HeapData::RePattern(_) | HeapData::ReMatch(_) => repr_or_error(object, vm),
+                    HeapData::ExtFunction(name) => Self::Function {
+                        name: name.clone(),
                         docstring: None,
                     },
-                    _ => repr_or_error(object, vm),
                 };
 
                 // Remove from visited set after processing
@@ -823,14 +736,6 @@ impl MontyObject {
             Value::Builtin(Builtins::Type(t)) => Self::Type(*t),
             Value::Builtin(Builtins::ExcType(e)) => Self::Type(Type::Exception(*e)),
             Value::Builtin(Builtins::Function(f)) => Self::BuiltinFunction(*f),
-            // Inline external function: export under the same shape as the heap
-            // path's `HeapReadOutput::ExtFunction` arm above, so an interned
-            // function name round-trips through Monty as `MontyObject::Function`
-            // regardless of which representation it took (issue #345).
-            Value::ExtFunction(name_id) => Self::Function {
-                name: vm.interns.get_str(*name_id).to_owned(),
-                docstring: None,
-            },
             #[cfg(feature = "memory-model-checks")]
             Value::Dereferenced => panic!("Dereferenced found while converting to MontyObject"),
             _ => repr_or_error(object, vm),
@@ -840,7 +745,7 @@ impl MontyObject {
 
 /// Converts a value to its repr string for `MontyObject`, falling back to a
 /// descriptive error message if `py_repr` fails (e.g. INT_MAX_STR_DIGITS).
-fn repr_or_error(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> MontyObject {
+fn repr_or_error(value: &Value, vm: &VM<'_, '_, impl ResourceTracker>) -> MontyObject {
     match value.py_repr(vm) {
         Ok(s) => MontyObject::Repr(s.into_owned()),
         Err(e) => {
@@ -1077,7 +982,6 @@ impl MontyObject {
                 f.write_char(')')
             }
             Self::Path(p) => write!(f, "PosixPath('{p}')"),
-            Self::FileHandle(handle) => write!(f, "{handle}"),
             Self::Type(t) => write!(f, "<class '{t}'>"),
             Self::BuiltinFunction(func) => write!(f, "<built-in function {func}>"),
             Self::Function { name, .. } => write!(f, "<function '{name}' external>"),
@@ -1117,9 +1021,8 @@ impl MontyObject {
             Self::TimeDelta(delta) => delta.days != 0 || delta.seconds != 0 || delta.microseconds != 0,
             Self::TimeZone(_) => true,
             Self::Exception { .. } => true,
-            Self::Path(_) => true,           // Path instances are always truthy
-            Self::FileHandle { .. } => true, // File objects are always truthy
-            Self::Dataclass { .. } => true,  // Dataclass instances are always truthy
+            Self::Path(_) => true,          // Path instances are always truthy
+            Self::Dataclass { .. } => true, // Dataclass instances are always truthy
             Self::Type(_) | Self::BuiltinFunction(_) | Self::Function { .. } | Self::Repr(_) | Self::Cycle(_, _) => {
                 true
             }
@@ -1151,7 +1054,6 @@ impl MontyObject {
             Self::TimeZone(_) => "timezone",
             Self::Exception { .. } => "Exception",
             Self::Path(_) => "PosixPath",
-            Self::FileHandle(handle) => handle.mode.type_name(),
             Self::Dataclass { .. } => "dataclass",
             Self::Type(_) => "type",
             Self::BuiltinFunction(_) => "builtin_function_or_method",
@@ -1194,11 +1096,6 @@ impl Hash for MontyObject {
             Self::TimeDelta(delta) => delta.hash(state),
             Self::TimeZone(timezone) => timezone.hash(state),
             Self::Path(path) => path.hash(state),
-            Self::FileHandle(MontyFileHandle { path, mode, position }) => {
-                path.hash(state);
-                mode.as_str().hash(state);
-                position.hash(state);
-            }
             Self::Type(t) => t.to_string().hash(state),
             Self::Cycle(_, _) => panic!("cycle values are not hashable"),
             _ => panic!("{} python values are not hashable", self.type_name()),
@@ -1278,18 +1175,6 @@ impl PartialEq for MontyObject {
                     && a_frozen == b_frozen
             }
             (Self::Path(a), Self::Path(b)) => a == b,
-            (
-                Self::FileHandle(MontyFileHandle {
-                    path: a_path,
-                    mode: a_mode,
-                    position: a_pos,
-                }),
-                Self::FileHandle(MontyFileHandle {
-                    path: b_path,
-                    mode: b_mode,
-                    position: b_pos,
-                }),
-            ) => a_path == b_path && a_mode == b_mode && a_pos == b_pos,
             (
                 Self::Function {
                     name: a_name,
@@ -1502,40 +1387,5 @@ impl DictPairs {
 
     fn iter(&self) -> impl Iterator<Item = &(MontyObject, MontyObject)> {
         self.0.iter()
-    }
-}
-
-/// An open file object (the result of `open()`).
-///
-/// This is the boundary representation of Monty's heap [`OpenFile`](crate::types::OpenFile)
-/// wrapper. It carries everything needed to service a file operation from a
-/// host that holds no live OS handle: the virtual `path`, the `mode`, and
-/// the byte `position` for seek-aware reads.
-///
-/// The host produces a `FileHandle` as the result of an
-/// [`OsFunction::Open`](crate::os::OsFunction::Open) call; `to_value` then
-/// builds the `OpenFile` heap wrapper from it. Conversely, a heap file
-/// object passed as an argument to a `read`/`write` OS call is converted
-/// back to a `FileHandle` so the host receives this state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MontyFileHandle {
-    /// The virtual (sandbox) path of the file. Never a host path.
-    pub path: String,
-    /// The parsed `open()` mode.
-    pub mode: FileMode,
-    /// Position for sized/line/seek operations: char index in text mode,
-    /// byte index in binary mode. `0` for a freshly opened file.
-    pub position: u64,
-}
-
-impl fmt::Display for MontyFileHandle {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "<{} name={} mode={}>",
-            self.mode.file_type(),
-            StringRepr(&self.path),
-            StringRepr(self.mode.as_str())
-        )
     }
 }

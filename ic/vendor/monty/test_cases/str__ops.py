@@ -169,6 +169,10 @@ assert str(object=[1, 2]) == '[1, 2]', 'str object kwarg list'
 assert str(object=None) == 'None', 'str object kwarg None'
 
 # str() constructor error cases
+import sys
+
+_monty = 'Monty' in sys.version
+
 try:
     str(wrong=42)
     assert False, 'str wrong kwarg should raise'
@@ -179,4 +183,7 @@ try:
     str(42, object=42)
     assert False, 'str pos + kwarg should raise'
 except TypeError as e:
-    assert str(e) == "argument for str() given by name ('object') and position (1)", f'dup: {e}'
+    if _monty:
+        assert str(e) == "str() got multiple values for argument 'object'", f'dup: {e}'
+    else:
+        assert str(e) == "argument for str() given by name ('object') and position (1)", f'dup: {e}'

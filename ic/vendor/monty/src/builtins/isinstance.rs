@@ -6,72 +6,62 @@ use crate::{
     bytecode::VM,
     defer_drop,
     exception_private::{ExcType, RunResult},
-    heap::{HeapRead, HeapReadOutput},
+    heap::{Heap, HeapData},
     resource::ResourceTracker,
-    types::{PyTrait, Tuple, Type},
+    types::{PyTrait, Type},
     value::Value,
 };
 
 /// Implementation of the isinstance() builtin function.
 ///
 /// Checks if an object is an instance of a class or a tuple of classes.
-pub fn builtin_isinstance(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+pub fn builtin_isinstance(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (obj, classinfo) = args.get_two_args("isinstance", vm.heap)?;
     defer_drop!(obj, vm);
     defer_drop!(classinfo, vm);
     let obj_type = obj.py_type(vm);
+    let heap = &mut *vm.heap;
 
-    isinstance_check(obj_type, classinfo, vm).map(Value::Bool)
+    match isinstance_check(obj_type, classinfo, heap) {
+        Ok(result) => Ok(Value::Bool(result)),
+        Err(()) => Err(ExcType::isinstance_arg2_error()),
+    }
 }
 
-/// Checks if `obj_type` matches a single classinfo entry.
+/// Recursively checks if obj_type matches classinfo for isinstance().
+///
+/// Returns `Ok(true)` if the type matches, `Ok(false)` if it doesn't,
+/// or `Err(())` if classinfo is invalid (not a type or tuple of types).
 ///
 /// Supports:
 /// - Single types: `isinstance(x, int)`
 /// - Exception types: `isinstance(err, ValueError)`
 /// - Exception hierarchy: `isinstance(err, LookupError)` for KeyError/IndexError
-/// - Tuples (possibly nested) of the above
-fn isinstance_check(obj_type: Type, classinfo: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<bool> {
+/// - Nested tuples: `isinstance(x, (int, (str, bytes)))`
+fn isinstance_check(obj_type: Type, classinfo: &Value, heap: &Heap<impl ResourceTracker>) -> Result<bool, ()> {
     match classinfo {
+        // Single type: isinstance(x, int)
         Value::Builtin(Builtins::Type(t)) => Ok(obj_type.is_instance_of(*t)),
+
+        // Exception type: isinstance(err, ValueError) or isinstance(err, LookupError)
         Value::Builtin(Builtins::ExcType(handler_type)) => {
+            // Check exception hierarchy using is_subclass_of
             Ok(matches!(obj_type, Type::Exception(exc_type) if exc_type.is_subclass_of(*handler_type)))
         }
-        Value::Ref(id) if let HeapReadOutput::Tuple(tuple) = vm.heap.read(*id) => {
-            isinstance_check_tuple(obj_type, &tuple, vm)
-        }
-        _ => Err(ExcType::isinstance_arg2_error()),
-    }
-}
 
-/// Recursively walks a tuple of classinfo entries.
-fn isinstance_check_tuple<'h>(
-    obj_type: Type,
-    tuple: &HeapRead<'h, Tuple>,
-    vm: &mut VM<'h, impl ResourceTracker>,
-) -> RunResult<bool> {
-    let len = tuple.get(vm.heap).as_slice().len();
-    let token = vm.heap.incr_recursion_depth()?;
-    defer_drop!(token, vm);
-    for i in 0..len {
-        match &tuple.get(vm.heap).as_slice()[i] {
-            Value::Builtin(Builtins::Type(t)) => {
-                if obj_type.is_instance_of(*t) {
-                    return Ok(true);
+        // Tuple of types (possibly nested): isinstance(x, (int, (str, bytes)))
+        Value::Ref(id) => {
+            if let HeapData::Tuple(tuple) = heap.get(*id) {
+                for v in tuple.as_slice() {
+                    if isinstance_check(obj_type, v, heap)? {
+                        return Ok(true);
+                    }
                 }
+                Ok(false)
+            } else {
+                Err(()) // Not a tuple - invalid
             }
-            Value::Builtin(Builtins::ExcType(exc)) => {
-                if matches!(obj_type, Type::Exception(et) if et.is_subclass_of(*exc)) {
-                    return Ok(true);
-                }
-            }
-            Value::Ref(nested_id) if let HeapReadOutput::Tuple(tuple) = vm.heap.read(*nested_id) => {
-                if isinstance_check_tuple(obj_type, &tuple, vm)? {
-                    return Ok(true);
-                }
-            }
-            _ => return Err(ExcType::isinstance_arg2_error()),
         }
+        _ => Err(()), // Invalid classinfo
     }
-    Ok(false)
 }

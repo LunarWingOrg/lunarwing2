@@ -27,16 +27,16 @@
 use std::borrow::Cow;
 
 use crate::{
-    args::{ArgValues, FromArgs},
+    args::ArgValues,
     builtins::Builtins,
     bytecode::{CallResult, VM},
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunResult},
-    heap::{HeapData, HeapId},
+    heap::{DropWithHeap, HeapData, HeapId},
     intern::StaticStrings,
     modules::ModuleFunctions,
     resource::{ResourceError, ResourceTracker},
-    types::{Module, PyTrait, RePattern, Type, re_pattern::value_to_str, str::allocate_string},
+    types::{Module, PyTrait, RePattern, Str, Type, re_pattern::value_to_str},
     value::Value,
 };
 
@@ -89,7 +89,7 @@ pub(crate) enum ReFunctions {
 ///
 /// # Panics
 /// Panics if the required strings have not been pre-interned during prepare phase.
-pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
+pub fn create_module(vm: &mut VM<'_, '_, impl ResourceTracker>) -> Result<HeapId, ResourceError> {
     let mut module = Module::new(StaticStrings::Re);
 
     // Functions
@@ -184,7 +184,7 @@ pub fn create_module(vm: &mut VM<'_, impl ResourceTracker>) -> Result<HeapId, Re
 /// `RePattern` method. All functions return `CallResult::Value` since regex
 /// operations don't need host involvement.
 pub(super) fn call(
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
     function: ReFunctions,
     args: ArgValues,
 ) -> RunResult<CallResult> {
@@ -205,7 +205,7 @@ pub(super) fn call(
 ///
 /// Returns a `re.Pattern` object that can be reused for multiple match operations.
 /// The pattern is compiled once and stored, avoiding recompilation overhead.
-fn call_compile(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_compile(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern_val, flags) = extract_pattern_and_flags(args, "re.compile", vm)?;
     let compiled = RePattern::compile(pattern_val, flags)?;
     Ok(Value::Ref(vm.heap.allocate(HeapData::RePattern(Box::new(compiled)))?))
@@ -215,7 +215,7 @@ fn call_compile(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunRe
 ///
 /// Compiles the pattern, then delegates to `RePattern::search`. Returns a `re.Match`
 /// object on success, or `None` if no position in the string matches.
-fn call_search(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_search(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern, text, flags) = extract_pattern_string_flags(args, "re.search", vm)?;
     let compiled = RePattern::compile(pattern, flags)?;
     compiled.search(&text, vm.heap)
@@ -225,7 +225,7 @@ fn call_search(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunRes
 ///
 /// Compiles the pattern, then delegates to `RePattern::match_start`. Returns a `re.Match`
 /// object if the pattern matches at position 0, or `None` otherwise.
-fn call_match(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_match(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern, text, flags) = extract_pattern_string_flags(args, "re.match", vm)?;
     let compiled = RePattern::compile(pattern, flags)?;
     compiled.match_start(&text, vm.heap)
@@ -235,7 +235,7 @@ fn call_match(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResu
 ///
 /// Compiles the pattern, then delegates to `RePattern::fullmatch`. Returns a `re.Match`
 /// object if the pattern matches the whole string, or `None` otherwise.
-fn call_fullmatch(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_fullmatch(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern, text, flags) = extract_pattern_string_flags(args, "re.fullmatch", vm)?;
     let compiled = RePattern::compile(pattern, flags)?;
     compiled.fullmatch(&text, vm.heap)
@@ -245,7 +245,7 @@ fn call_fullmatch(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> Run
 ///
 /// Compiles the pattern, then delegates to `RePattern::findall`. Returns a list of
 /// strings or tuples depending on the number of capture groups (matching CPython semantics).
-fn call_findall(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_findall(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern, text, flags) = extract_pattern_string_flags(args, "re.findall", vm)?;
     let compiled = RePattern::compile(pattern, flags)?;
     compiled.findall(&text, vm.heap)
@@ -256,17 +256,71 @@ fn call_findall(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunRe
 /// Compiles the pattern, then delegates to `RePattern::sub`. Replaces occurrences of the
 /// pattern with the replacement string. When `count` is 0, all matches are replaced.
 /// Supports both positional and keyword arguments for `count` and `flags`.
-fn call_sub(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let ReSubArgs {
-        pattern: pattern_val,
-        repl: repl_val,
-        string: string_val,
-        count: count_val,
-        flags: flags_val,
-    } = ReSubArgs::from_args(args, vm)?;
+fn call_sub(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    let (pos, kwargs) = args.into_parts();
+    defer_drop_mut!(pos, vm);
+    let kwargs = kwargs.into_iter();
+    defer_drop_mut!(kwargs, vm);
+
+    let Some(pattern_val) = pos.next() else {
+        return Err(ExcType::type_error("re.sub() missing required argument: 'pattern'"));
+    };
     defer_drop!(pattern_val, vm);
+
+    let Some(repl_val) = pos.next() else {
+        return Err(ExcType::type_error("re.sub() missing required argument: 'repl'"));
+    };
     defer_drop!(repl_val, vm);
+
+    let Some(string_val) = pos.next() else {
+        return Err(ExcType::type_error("re.sub() missing required argument: 'string'"));
+    };
     defer_drop!(string_val, vm);
+
+    // Extract count and flags from remaining positional args
+    let pos_count = pos.next();
+    let pos_flags = pos.next();
+
+    if let Some(extra) = pos.next() {
+        extra.drop_with_heap(vm);
+        return Err(ExcType::type_error("re.sub() takes at most 5 positional arguments"));
+    }
+
+    // Extract count and flags from kwargs (if not given positionally)
+    let (mut kw_count, mut kw_flags): (Option<Value>, Option<Value>) = (None, None);
+    for (key, value) in kwargs {
+        defer_drop!(key, vm);
+        let Some(keyword_name) = key.as_either_str(vm.heap) else {
+            value.drop_with_heap(vm);
+            return Err(ExcType::type_error("keywords must be strings"));
+        };
+        let key_str = keyword_name.as_str(vm.interns);
+        match key_str {
+            "count" => {
+                if pos_count.is_some() {
+                    value.drop_with_heap(vm);
+                    return Err(ExcType::type_error("re.sub() got multiple values for argument 'count'"));
+                }
+                kw_count.replace(value).drop_with_heap(vm);
+            }
+            "flags" => {
+                if pos_flags.is_some() {
+                    value.drop_with_heap(vm);
+                    return Err(ExcType::type_error("re.sub() got multiple values for argument 'flags'"));
+                }
+                kw_flags.replace(value).drop_with_heap(vm);
+            }
+            _ => {
+                value.drop_with_heap(vm);
+                return Err(ExcType::type_error(format!(
+                    "'{key_str}' is an invalid keyword argument for re.sub()"
+                )));
+            }
+        }
+    }
+
+    let count_val = pos_count.or(kw_count);
+    let flags_val = pos_flags.or(kw_flags);
 
     #[expect(
         clippy::cast_sign_loss,
@@ -277,14 +331,11 @@ fn call_sub(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult
         Some(Value::Int(n)) if n >= 0 => n as usize,
         Some(Value::Bool(b)) => usize::from(b),
         Some(Value::Int(_)) => {
-            // Negative count — re.sub returns the input string unchanged, so
-            // just typecheck and bump the refcount; no need to re-allocate.
+            // Negative count — return original string unchanged
             let _flags = extract_flags(flags_val, vm)?;
-            if !string_val.is_str(vm.heap) {
-                let t = string_val.py_type(vm);
-                return Err(ExcType::type_error(format!("expected string, not {t}")));
-            }
-            return Ok(string_val.clone_with_heap(vm.heap));
+            let text = value_to_str(string_val, vm)?.into_owned();
+            let s = Str::new(text);
+            return Ok(Value::Ref(vm.heap.allocate(HeapData::Str(s))?));
         }
         Some(other) => {
             let t = other.py_type(vm);
@@ -318,18 +369,68 @@ fn call_sub(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult
 /// Returns a list of strings. If `maxsplit` is non-zero, at most `maxsplit` splits occur
 /// and the remainder of the string is returned as the final list element.
 /// Supports both positional and keyword arguments for `maxsplit` and `flags`.
-fn call_split(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let ReSplitArgs {
-        pattern: pattern_val,
-        string: string_val,
-        maxsplit: maxsplit_val,
-        flags: flags_val,
-    } = ReSplitArgs::from_args(args, vm)?;
+fn call_split(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    let (pos, kwargs) = args.into_parts();
+    defer_drop_mut!(pos, vm);
+    let kwargs = kwargs.into_iter();
+    defer_drop_mut!(kwargs, vm);
+
+    let Some(pattern_val) = pos.next() else {
+        return Err(ExcType::type_error("re.split() missing required argument: 'pattern'"));
+    };
     defer_drop!(pattern_val, vm);
+
+    let Some(string_val) = pos.next() else {
+        return Err(ExcType::type_error("re.split() missing required argument: 'string'"));
+    };
     defer_drop!(string_val, vm);
 
-    let maxsplit = extract_maxsplit(maxsplit_val, vm)?;
-    let flags = extract_flags(flags_val, vm)?;
+    let pos_maxsplit = pos.next();
+    let pos_flags = pos.next();
+
+    if let Some(extra) = pos.next() {
+        extra.drop_with_heap(vm);
+        return Err(ExcType::type_error("re.split() takes at most 4 positional arguments"));
+    }
+
+    let (mut kw_maxsplit, mut kw_flags): (Option<Value>, Option<Value>) = (None, None);
+    for (key, value) in kwargs {
+        defer_drop!(key, vm);
+        let Some(keyword_name) = key.as_either_str(vm.heap) else {
+            value.drop_with_heap(vm);
+            return Err(ExcType::type_error("keywords must be strings"));
+        };
+        let key_str = keyword_name.as_str(vm.interns);
+        match key_str {
+            "maxsplit" => {
+                if pos_maxsplit.is_some() {
+                    value.drop_with_heap(vm);
+                    return Err(ExcType::type_error(
+                        "re.split() got multiple values for argument 'maxsplit'",
+                    ));
+                }
+                kw_maxsplit.replace(value).drop_with_heap(vm);
+            }
+            "flags" => {
+                if pos_flags.is_some() {
+                    value.drop_with_heap(vm);
+                    return Err(ExcType::type_error(
+                        "re.split() got multiple values for argument 'flags'",
+                    ));
+                }
+                kw_flags.replace(value).drop_with_heap(vm);
+            }
+            _ => {
+                value.drop_with_heap(vm);
+                return Err(ExcType::type_error(format!(
+                    "'{key_str}' is an invalid keyword argument for re.split()"
+                )));
+            }
+        }
+    }
+
+    let maxsplit = extract_maxsplit(pos_maxsplit.or(kw_maxsplit), vm)?;
+    let flags = extract_flags(pos_flags.or(kw_flags), vm)?;
 
     let pattern = value_to_str(pattern_val, vm)?.into_owned();
     let text = value_to_str(string_val, vm)?.into_owned();
@@ -338,49 +439,12 @@ fn call_split(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResu
     compiled.split(&text, maxsplit, vm.heap)
 }
 
-/// Argument shape for `re.sub(pattern, repl, string, count=0, flags=0)`.
-///
-/// The `pattern` and `string` field names override their `StaticStrings`
-/// variant via `static_string =` because `Pattern` / `String` are
-/// already used by other interner entries (`re.Pattern` class name and
-/// `match.string` attribute respectively). The actual interned string for
-/// dispatch is still `"pattern"` / `"string"` via those repurposed variants.
-#[derive(FromArgs)]
-#[from_args(name = "sub")]
-struct ReSubArgs {
-    #[from_args(static_string = "PatternAttr")]
-    pattern: Value,
-    repl: Value,
-    #[from_args(static_string = "StringAttr")]
-    string: Value,
-    #[from_args(default)]
-    count: Option<Value>,
-    #[from_args(default)]
-    flags: Option<Value>,
-}
-
-/// Argument shape for `re.split(pattern, string, maxsplit=0, flags=0)`.
-///
-/// See `ReSubArgs` for why `pattern` / `string` use `static_string`.
-#[derive(FromArgs)]
-#[from_args(name = "split")]
-struct ReSplitArgs {
-    #[from_args(static_string = "PatternAttr")]
-    pattern: Value,
-    #[from_args(static_string = "StringAttr")]
-    string: Value,
-    #[from_args(default)]
-    maxsplit: Option<Value>,
-    #[from_args(default)]
-    flags: Option<Value>,
-}
-
 /// `re.finditer(pattern, string, flags=0)` — return all matches as a list.
 ///
 /// Eagerly collects all match objects into a list. When the user iterates with
 /// `for m in re.finditer(...)`, the VM's `GetIter` opcode handles iteration
 /// over the returned list automatically.
-fn call_finditer(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_finditer(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let (pattern, text, flags) = extract_pattern_string_flags(args, "re.finditer", vm)?;
     let compiled = RePattern::compile(pattern, flags)?;
     compiled.finditer(&text, vm.heap)
@@ -393,7 +457,7 @@ fn call_finditer(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunR
 /// escaped, matching CPython 3.7+ behavior.
 ///
 /// Escaped characters: `\t \n \v \f \r   # $ & ( ) * + - . ? [ \ ] ^ { | } ~`
-fn call_escape(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+fn call_escape(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
     let arg = args.get_one_arg("re.escape", vm.heap)?;
     defer_drop!(arg, vm);
     let text = value_to_str(arg, vm)?.into_owned();
@@ -406,7 +470,8 @@ fn call_escape(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunRes
         result.push(c);
     }
 
-    Ok(allocate_string(result, vm.heap)?)
+    let s = Str::new(result);
+    Ok(Value::Ref(vm.heap.allocate(HeapData::Str(s))?))
 }
 
 /// Returns whether a character should be escaped by `re.escape()`.
@@ -444,7 +509,7 @@ fn should_escape(c: char) -> bool {
 /// Extracts a `maxsplit` value from an optional `Value`.
 ///
 /// Returns 0 if not provided. Negative values are treated as 0 (split all).
-fn extract_maxsplit(val: Option<Value>, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<usize> {
+fn extract_maxsplit(val: Option<Value>, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<usize> {
     match val {
         None => Ok(0),
         Some(Value::Int(n)) if n <= 0 => Ok(0),
@@ -470,7 +535,7 @@ fn extract_maxsplit(val: Option<Value>, vm: &mut VM<'_, impl ResourceTracker>) -
 fn extract_pattern_and_flags(
     args: ArgValues,
     func_name: &str,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> RunResult<(String, u16)> {
     let (pattern_val, flags_val) = args.get_one_two_args(func_name, vm.heap)?;
     defer_drop!(pattern_val, vm);
@@ -483,7 +548,7 @@ fn extract_pattern_and_flags(
 
 /// Extracts a flags value from an optional `Value`, validating it is a non-negative integer
 /// that fits in a `u16`.
-fn extract_flags(flags_val: Option<Value>, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<u16> {
+fn extract_flags(flags_val: Option<Value>, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<u16> {
     match flags_val {
         Some(Value::Int(n)) => {
             u16::try_from(n).map_err(|_| ExcType::type_error("flags must be a non-negative integer"))
@@ -506,7 +571,7 @@ fn extract_flags(flags_val: Option<Value>, vm: &mut VM<'_, impl ResourceTracker>
 fn extract_pattern_string_flags(
     args: ArgValues,
     func_name: &str,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> RunResult<(String, Cow<'static, str>, u16)> {
     let pos = args.into_pos_only(func_name, vm.heap)?;
     defer_drop_mut!(pos, vm);

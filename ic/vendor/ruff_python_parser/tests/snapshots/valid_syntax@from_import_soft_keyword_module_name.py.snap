@@ -8,7 +8,7 @@ input_file: crates/ruff_python_parser/resources/inline/ok/from_import_soft_keywo
 Module(
     ModModule {
         node_index: NodeIndex(None),
-        range: 0..125,
+        range: 0..104,
         body: [
             ImportFrom(
                 StmtImportFrom {
@@ -34,7 +34,6 @@ Module(
                         },
                     ],
                     level: 0,
-                    is_lazy: false,
                 },
             ),
             ImportFrom(
@@ -61,7 +60,6 @@ Module(
                         },
                     ],
                     level: 0,
-                    is_lazy: false,
                 },
             ),
             ImportFrom(
@@ -88,61 +86,32 @@ Module(
                         },
                     ],
                     level: 0,
-                    is_lazy: false,
                 },
             ),
             ImportFrom(
                 StmtImportFrom {
                     node_index: NodeIndex(None),
-                    range: 72..92,
-                    module: Some(
-                        Identifier {
-                            id: Name("lazy"),
-                            range: 77..81,
-                            node_index: NodeIndex(None),
-                        },
-                    ),
-                    names: [
-                        Alias {
-                            range: 89..92,
-                            node_index: NodeIndex(None),
-                            name: Identifier {
-                                id: Name("qux"),
-                                range: 89..92,
-                                node_index: NodeIndex(None),
-                            },
-                            asname: None,
-                        },
-                    ],
-                    level: 0,
-                    is_lazy: false,
-                },
-            ),
-            ImportFrom(
-                StmtImportFrom {
-                    node_index: NodeIndex(None),
-                    range: 93..124,
+                    range: 72..103,
                     module: Some(
                         Identifier {
                             id: Name("match.type.case"),
-                            range: 98..113,
+                            range: 77..92,
                             node_index: NodeIndex(None),
                         },
                     ),
                     names: [
                         Alias {
-                            range: 121..124,
+                            range: 100..103,
                             node_index: NodeIndex(None),
                             name: Identifier {
                                 id: Name("foo"),
-                                range: 121..124,
+                                range: 100..103,
                                 node_index: NodeIndex(None),
                             },
                             asname: None,
                         },
                     ],
                     level: 0,
-                    is_lazy: false,
                 },
             ),
         ],

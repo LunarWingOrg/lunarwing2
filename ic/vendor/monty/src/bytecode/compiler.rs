@@ -10,12 +10,10 @@
 
 use std::{borrow::Cow, mem};
 
-use ahash::AHashSet;
-
 use super::{
-    builder::{CodeBuilder, JumpLabel, JumpTarget},
-    code::Code,
-    op::{FORMAT_VALUE_HAS_SPEC, FORMAT_VALUE_STATIC_SPEC, Opcode},
+    builder::{CodeBuilder, JumpLabel},
+    code::{Code, ExceptionEntry},
+    op::Opcode,
 };
 use crate::{
     args::{ArgExprs, CallArg, CallKwarg, Kwarg},
@@ -26,7 +24,7 @@ use crate::{
         AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, Literal, NameScope,
         Node, Operator, PreparedFunctionDef, PreparedNode, SequenceItem, UnpackTarget,
     },
-    fstring::{ConversionFlag, FStringPart, FormatSpec},
+    fstring::{ConversionFlag, FStringPart, FormatSpec, ParsedFormatSpec, encode_format_spec},
     function::Function,
     intern::{Interns, StringId},
     modules::StandardLib,
@@ -40,177 +38,6 @@ use crate::{
 /// use a u8 operand for the argument count, so max 255. Python itself has no
 /// such limit but we need one for our bytecode encoding.
 const MAX_CALL_ARGS: usize = 255;
-
-/// Maximum number of distinct names in a single namespace (module or function).
-///
-/// `LoadLocal`/`LoadGlobal`/`StoreLocal`/etc. encode the namespace slot in 16
-/// bits, so the slot index must fit in `u16`. CPython has no equivalent limit
-/// but this is intrinsic to our compact bytecode encoding — exceeding it
-/// surfaces to the user as a `SyntaxError`.
-const MAX_NAMESPACE_SIZE: usize = u16::MAX as usize;
-
-/// Maximum number of targets in a single tuple-unpacking pattern (e.g.
-/// `a, b, c = it` or the nested form `(a, b), c = it`).
-///
-/// `UnpackSequence` / `UnpackEx` encode the per-level target count in `u8`,
-/// so any individual unpacking level is capped at 255 targets (with
-/// `UnpackEx` splitting that count into before-star and after-star halves).
-const MAX_UNPACK_TARGETS: usize = 255;
-
-/// Maximum number of `for ... in ...` clauses in a single comprehension.
-///
-/// `compile_comprehension_generators` recurses once per generator clause, so
-/// without an up-front guard a syntactically valid source file with tens of
-/// thousands of clauses can exhaust the Rust call stack during compilation —
-/// well before runtime resource limits become active. The cap also matches
-/// the `u8` operand consumed by `ListAppend` / `SetAdd` / `DictSetItem`:
-/// each additional generator adds one iterator layer (plus its target
-/// leaves) to the operand stack, and the bytecode format can only encode a
-/// `u8` depth. CPython has no equivalent limit but real Python comprehension
-/// usage is far below this cap.
-const MAX_COMP_GENERATORS: usize = 255;
-
-/// Converts a `usize` namespace size into the `u16` slot count expected by
-/// the bytecode, surfacing a `CompileError` if the limit is exceeded.
-///
-/// `kind` ("module", "function", or "lambda") is interpolated into the error
-/// message so the user can distinguish which scope hit the cap. The position
-/// is left as the default `CodeRange` because the relevant location is the
-/// whole compile unit — there is no single offending statement to highlight.
-fn check_namespace_size_u16(size: usize, kind: &'static str) -> Result<u16, CompileError> {
-    u16::try_from(size).map_err(|_| namespace_too_large(size, kind))
-}
-
-#[cold]
-#[inline(never)]
-fn namespace_too_large(size: usize, kind: &'static str) -> CompileError {
-    CompileError::new(
-        format!(
-            "{kind} uses too many distinct names ({size}); the bytecode format supports up to {MAX_NAMESPACE_SIZE}"
-        ),
-        CodeRange::default(),
-    )
-}
-
-/// Converts a tuple-unpacking target count into the `u8` operand for
-/// `UnpackSequence` (or the before/after halves of `UnpackEx`).
-fn check_unpack_targets(count: usize, position: CodeRange) -> Result<u8, CompileError> {
-    u8::try_from(count).map_err(|_| too_many_unpack_targets(count, position))
-}
-
-/// Rejects comprehensions with more than [`MAX_COMP_GENERATORS`] for-clauses
-/// before recursive compilation, so attacker-controlled source cannot
-/// trigger a Rust stack overflow during `Compiler::compile_module`.
-///
-/// Anchored to the body expression's position because that's the
-/// comprehension's most stable location to point at in a traceback caret.
-fn check_comp_generators(count: usize, position: CodeRange) -> Result<(), CompileError> {
-    if count > MAX_COMP_GENERATORS {
-        Err(CompileError::new(
-            format!("comprehension has too many nested clauses ({count}); maximum is {MAX_COMP_GENERATORS}"),
-            position,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// Returns a position that locates `target` in source for error reporting.
-///
-/// `Name` / `Starred` carry the identifier's position; `Tuple` carries its
-/// own. Used by comp-target unpacking when the per-leaf position isn't
-/// available at the error point.
-fn target_position(target: &UnpackTarget) -> CodeRange {
-    match target {
-        UnpackTarget::Name(ident) | UnpackTarget::Starred(ident) => ident.position,
-        UnpackTarget::Tuple { position, .. } => *position,
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn too_many_unpack_targets(count: usize, position: CodeRange) -> CompileError {
-    CompileError::new(
-        format!("too many targets in tuple unpacking ({count}); maximum is {MAX_UNPACK_TARGETS}"),
-        position,
-    )
-}
-
-/// Converts an in-memory collection length (list/tuple/dict/set literal element
-/// count, dict pair count) into the `u16` operand of `BuildList`/`BuildTuple`/
-/// `BuildDict`/`BuildSet`.
-fn check_collection_size_u16(count: usize, position: CodeRange) -> Result<u16, CompileError> {
-    u16::try_from(count).map_err(|_| collection_too_large(count, position))
-}
-
-#[cold]
-#[inline(never)]
-fn collection_too_large(count: usize, position: CodeRange) -> CompileError {
-    CompileError::new(
-        format!(
-            "collection literal has too many elements ({count}); maximum is {}",
-            u16::MAX
-        ),
-        position,
-    )
-}
-
-/// Converts the index of a newly-defined function into the `u16` operand used
-/// by `MakeFunction`/`MakeClosure`. The cap is the total number of
-/// `def`/`lambda`/comprehension function objects in the *whole module*, since
-/// `FunctionId`s are allocated linearly across nested scopes.
-fn check_function_count_u16(func_id: usize, position: CodeRange) -> Result<u16, CompileError> {
-    u16::try_from(func_id).map_err(|_| too_many_functions(func_id, position))
-}
-
-#[cold]
-#[inline(never)]
-fn too_many_functions(func_id: usize, position: CodeRange) -> CompileError {
-    CompileError::new(
-        format!(
-            "module defines too many functions/lambdas ({}); maximum is {}",
-            func_id + 1,
-            u16::MAX
-        ),
-        position,
-    )
-}
-
-/// Converts a `StringId` (intern pool index) into the `u16` operand used by
-/// every name-bearing opcode (`LoadAttr`, `StoreAttr`, `LoadGlobal`,
-/// `CallFunctionKw` keyword names, etc.). Called inline at every emission
-/// site — overflow only happens when the intern pool exceeded `u16::MAX`
-/// during parse/prepare, so the error construction is `#[cold]` and the
-/// success path inlines to a single `as u16`.
-fn check_name_index_u16(name_id: StringId, position: CodeRange) -> Result<u16, CompileError> {
-    u16::try_from(name_id.index()).map_err(|_| name_index_too_large(position))
-}
-
-#[cold]
-#[inline(never)]
-fn name_index_too_large(position: CodeRange) -> CompileError {
-    CompileError::new(
-        format!(
-            "module has too many distinct names; the bytecode format supports up to {} interned strings",
-            usize::from(u16::MAX) + 1,
-        ),
-        position,
-    )
-}
-
-/// Converts a call-related count (positional args, keyword args, defaults,
-/// closure cells) into the `u8` operand used by the corresponding opcodes.
-/// `kind` (e.g. "default parameter values") is interpolated into the error
-/// message so the diagnostic identifies which kind of count overflowed.
-fn check_call_args_u8(count: usize, kind: &'static str, position: CodeRange) -> Result<u8, CompileError> {
-    u8::try_from(count).map_err(|_| too_many_call_args(count, kind, position))
-}
-
-#[cold]
-#[inline(never)]
-fn too_many_call_args(count: usize, kind: &'static str, position: CodeRange) -> CompileError {
-    CompileError::new(format!("more than {MAX_CALL_ARGS} {kind} ({count})"), position)
-}
 
 /// Compiles prepared AST nodes to bytecode.
 ///
@@ -250,12 +77,9 @@ pub struct Compiler<'a> {
     /// Tracks nesting depth inside exception handlers.
     ///
     /// When break/continue/return is inside an except handler, we need to
-    /// emit one `ClearException` per enclosing handler to drain the per-handler
-    /// `exception_stack` entries before jumping to the finally path or loop
-    /// target. The exception *value* is already off the operand stack — it's
-    /// consumed eagerly at handler entry (stored to the `as` binding or
-    /// popped) — so no operand-stack Pop is needed here.
-    except_handler_depth: u16,
+    /// clear the current exception (`ClearException`) and pop the exception
+    /// value from the stack before jumping to the finally path or loop target.
+    except_handler_depth: usize,
 
     /// Whether the compiler is currently compiling module-level code.
     ///
@@ -264,43 +88,6 @@ pub struct Compiler<'a> {
     /// globals array. In function bodies this is `false` and these scopes use local
     /// opcodes that index into the stack.
     is_module_scope: bool,
-
-    /// Number of stack-resident locals in the running frame for this code object.
-    ///
-    /// - Function scope: equals the function's `namespace_size` (params + cells +
-    ///   free vars + assigned locals).
-    /// - Module scope: `0` — module-level "locals" live in `self.globals`, so
-    ///   nothing is stored in the frame's locals region.
-    ///
-    /// Comp-var loads/stores are emitted as `LoadLocal/W` / `StoreLocal/W` with
-    /// the slot operand set to `frame_locals + offset`, where `offset` is the
-    /// comp-var's absolute operand-stack offset. At runtime, the local opcodes
-    /// access `stack[stack_base + slot]`; with `frame_locals` chosen to match
-    /// the runtime `locals_count`, this resolves correctly in both scopes.
-    frame_locals: u16,
-
-    /// Operand-stack offsets for comp-var slot IDs currently in scope.
-    ///
-    /// Indexed by the slot ID stored in the prepared `Identifier`. The value is
-    /// the absolute operand-stack offset of that comp-var (set after the
-    /// `FOR_ITER` / `UNPACK_SEQUENCE` / `LIFT_TO_TOP` chain that landed it on
-    /// the stack, by `compile_comp_target_unpack`). Used by `compile_name` for
-    /// `NameScope::CompVar` to emit `LoadLocal/W(frame_locals + offset)`.
-    ///
-    /// Pushed/truncated with each comprehension via `enter_comprehension` /
-    /// `exit_comprehension`, so sibling comps reuse slot IDs cleanly.
-    slot_offsets: Vec<u16>,
-
-    /// Slot IDs that are statically known to have been assigned at the current
-    /// emission point.
-    ///
-    /// Updated by `compile_comp_target_unpack` when it records a leaf's offset
-    /// (= the moment the comp's `for` clause has stored a value into that
-    /// slot). Read by `compile_name` for `NameScope::CompVar`: bound reads
-    /// emit `LoadLocal/W`; unbound reads (slot not yet in this set) emit
-    /// `RaiseUnboundLocal(name_id)`. The same comprehension's slots are
-    /// removed at `exit_comprehension`, so sibling comps start fresh.
-    bound_comp_slots: AHashSet<u16>,
 }
 
 /// Information about a loop for break/continue handling.
@@ -313,12 +100,9 @@ pub struct Compiler<'a> {
 /// - `has_iterator_on_stack`: whether this loop has an iterator on the stack that
 ///   needs to be popped on break (true for `for` loops, false for `while` loops)
 struct LoopInfo {
-    /// Bytecode position + stack depth at loop start (for continue).
-    /// `emit_jump_to` uses the depth to enforce the backward-jump merge invariant.
-    start: JumpTarget,
+    /// Bytecode offset of loop start (for continue).
+    start: usize,
     /// Jump labels that need patching to loop end (for break).
-    /// Entries from breaks emitted in dead state are no-op labels — `patch_jump`
-    /// ignores them silently.
     break_jumps: Vec<JumpLabel>,
     /// Whether this loop has an iterator on the stack.
     /// True for `for` loops, false for `while` loops.
@@ -331,8 +115,7 @@ struct LoopInfo {
 /// before executing the break/continue. This struct tracks the jump and which
 /// loop it targets.
 struct BreakContinueThruFinally {
-    /// The jump instruction that needs to be patched. A no-op label if the
-    /// break/continue was emitted from dead state; `patch_jump` ignores it.
+    /// The jump instruction that needs to be patched.
     jump: JumpLabel,
     /// The loop depth (index in loop_stack) being targeted.
     target_loop_depth: usize,
@@ -352,32 +135,6 @@ struct FinallyTarget {
     /// The loop depth when this finally was entered.
     /// Used to determine if break/continue targets a loop outside this finally.
     loop_depth_at_entry: usize,
-    /// `except_handler_depth` at the try-statement entry — i.e. the number
-    /// of enclosing `except` clauses that are still alive while control is
-    /// inside this finally's protected region. A `return` that crosses
-    /// this finally must NOT pop those handlers' exception state (the
-    /// finally body might reference them); cleanup of handlers between
-    /// here and the next-outer finally is the responsibility of this
-    /// finally's emit_return_routing trailer.
-    except_handler_depth_at_entry: u16,
-}
-
-/// A simulated entry on the operand stack during comprehension target unpacking.
-///
-/// The compiler walks each comp target by recursively unpacking tuples,
-/// emitting `UnpackSequence`/`UnpackEx`/`LiftToTop` as needed, and tracks the
-/// per-step stack state in a `Vec<SimItem>`. Tracking is necessary because
-/// `LiftToTop` reorders items; without simulating, the compiler couldn't tell
-/// which final operand-stack offset each comp-var leaf ends up at.
-enum SimItem<'a> {
-    /// A finalized comp-var leaf. The slot ID gets mapped to an absolute
-    /// operand-stack offset (via its position in the sim Vec) once all
-    /// unpacking has finished.
-    Leaf(u16),
-    /// A value that still needs to be matched against an `UnpackTarget`
-    /// (which may be a nested `Tuple`). The borrowed target tells the
-    /// compiler how to drive the next UNPACK / Lift step.
-    Pending(&'a UnpackTarget),
 }
 
 /// Result of module compilation: the module code and all compiled functions.
@@ -390,27 +147,15 @@ pub struct CompileResult {
 
 impl<'a> Compiler<'a> {
     /// Creates a new compiler with access to the string interner.
-    ///
-    /// `frame_locals` is the runtime `locals_count` for this code object:
-    /// 0 for module-level code (globals live in `self.globals`, not on the
-    /// stack), or the function's namespace size at function scope. Comp-var
-    /// load/store opcodes encode `frame_locals + offset` as their slot
-    /// operand so plain `LoadLocal/W` and `StoreLocal/W` reach the correct
-    /// operand-stack position at runtime.
-    fn new(interns: &'a Interns, functions: Vec<Function>, is_module_scope: bool, frame_locals: u16) -> Self {
-        let mut code = CodeBuilder::new();
-        code.new_code_region(0);
+    fn new(interns: &'a Interns, functions: Vec<Function>) -> Self {
         Self {
-            code,
+            code: CodeBuilder::new(),
             interns,
             functions,
             loop_stack: Vec::new(),
             finally_targets: Vec::new(),
             except_handler_depth: 0,
-            is_module_scope,
-            frame_locals,
-            slot_offsets: Vec::new(),
-            bound_comp_slots: AHashSet::new(),
+            is_module_scope: false,
         }
     }
 
@@ -422,9 +167,9 @@ impl<'a> Compiler<'a> {
     pub fn compile_module(
         nodes: &[PreparedNode],
         interns: &Interns,
-        namespace_size: usize,
+        num_locals: u16,
     ) -> Result<CompileResult, CompileError> {
-        Self::compile_module_with_functions(nodes, interns, namespace_size, Vec::new())
+        Self::compile_module_with_functions(nodes, interns, num_locals, Vec::new())
     }
 
     /// Compiles module-level code while preserving an existing function table prefix.
@@ -435,19 +180,17 @@ impl<'a> Compiler<'a> {
     pub fn compile_module_with_functions(
         nodes: &[PreparedNode],
         interns: &Interns,
-        namespace_size: usize,
+        num_locals: u16,
         existing_functions: Vec<Function>,
     ) -> Result<CompileResult, CompileError> {
-        let num_locals = check_namespace_size_u16(namespace_size, "module")?;
-        // Module frames have `locals_count = 0` at runtime (globals live in
-        // `self.globals`), so comp-var offsets are emitted as plain operand-
-        // stack indices.
-        let mut compiler = Compiler::new(interns, existing_functions, true, 0);
+        let mut compiler = Compiler::new(interns, Vec::new());
+        compiler.functions = existing_functions;
+        compiler.is_module_scope = true;
         compiler.compile_block(nodes)?;
 
         // Module returns None if no explicit return
-        compiler.code.emit(Opcode::LoadNone)?;
-        compiler.code.emit(Opcode::ReturnValue)?;
+        compiler.code.emit(Opcode::LoadNone);
+        compiler.code.emit(Opcode::ReturnValue);
 
         Ok(CompileResult {
             code: compiler.code.build(num_locals),
@@ -469,15 +212,12 @@ impl<'a> Compiler<'a> {
         functions: Vec<Function>,
         num_locals: u16,
     ) -> Result<(Code, Vec<Function>), CompileError> {
-        // Function frames have `locals_count = num_locals` at runtime, so
-        // comp-var load/store opcodes use `num_locals + offset` to skip past
-        // the locals region into the operand-stack region.
-        let mut compiler = Compiler::new(interns, functions, false, num_locals);
+        let mut compiler = Compiler::new(interns, functions);
         compiler.compile_block(body)?;
 
         // Implicit return None if no explicit return
-        compiler.code.emit(Opcode::LoadNone)?;
-        compiler.code.emit(Opcode::ReturnValue)?;
+        compiler.code.emit(Opcode::LoadNone);
+        compiler.code.emit(Opcode::ReturnValue);
 
         Ok((compiler.code.build(num_locals), compiler.functions))
     }
@@ -485,10 +225,6 @@ impl<'a> Compiler<'a> {
     /// Compiles a block of statements.
     fn compile_block(&mut self, nodes: &[PreparedNode]) -> Result<(), CompileError> {
         for node in nodes {
-            if self.code.is_dead() {
-                // Don't bother compiling dead code
-                break;
-            }
             self.compile_stmt(node)?;
         }
         Ok(())
@@ -504,14 +240,19 @@ impl<'a> Compiler<'a> {
         match node {
             Node::Expr(expr) => {
                 self.compile_expr(expr)?;
-                self.code.emit(Opcode::Pop)?; // Discard result
+                self.code.emit(Opcode::Pop); // Discard result
             }
             Node::Return(expr) => {
-                self.compile_return(expr.as_ref())?;
+                self.compile_expr(expr)?;
+                self.compile_return();
+            }
+            Node::ReturnNone => {
+                self.code.emit(Opcode::LoadNone);
+                self.compile_return();
             }
             Node::Assign { target, object } => {
                 self.compile_expr(object)?;
-                self.compile_store(target)?;
+                self.compile_store(target);
             }
             Node::UnpackAssign {
                 targets,
@@ -519,7 +260,7 @@ impl<'a> Compiler<'a> {
                 object,
             } => {
                 self.compile_expr(object)?;
-                self.emit_unpack_store(targets, *targets_position)?;
+                self.emit_unpack_store(targets, *targets_position);
             }
             Node::OpAssign { target, op, value } => {
                 let Some(opcode) = operator_to_inplace_opcode(op) else {
@@ -528,10 +269,10 @@ impl<'a> Compiler<'a> {
                         target.position,
                     ));
                 };
-                self.compile_name(target)?;
+                self.compile_name(target);
                 self.compile_expr(value)?;
-                self.code.emit(opcode)?;
-                self.compile_store(target)?;
+                self.code.emit(opcode);
+                self.compile_store(target);
             }
             Node::SubscriptOpAssign {
                 target,
@@ -548,14 +289,14 @@ impl<'a> Compiler<'a> {
                 };
                 self.compile_expr(target)?;
                 self.compile_expr(index)?;
-                self.code.emit(Opcode::Dup2)?;
+                self.code.emit(Opcode::Dup2);
                 self.code.set_location(*target_position, None);
-                self.code.emit(Opcode::BinarySubscr)?;
+                self.code.emit(Opcode::BinarySubscr);
                 self.compile_expr(value)?;
-                self.code.emit(opcode)?;
-                self.code.emit(Opcode::Rot3)?;
+                self.code.emit(opcode);
+                self.code.emit(Opcode::Rot3);
                 self.code.set_location(*target_position, None);
-                self.code.emit(Opcode::StoreSubscr)?;
+                self.code.emit(Opcode::StoreSubscr);
             }
             Node::SubscriptAssign {
                 target,
@@ -580,17 +321,17 @@ impl<'a> Compiler<'a> {
                     ));
                 };
                 let name_id = attr.string_id().expect("LoadAttr requires interned attr name");
-                let name_idx = check_name_index_u16(name_id, *target_position)?;
+                let name_idx = u16::try_from(name_id.index()).expect("name index exceeds u16");
                 // Stack: compile object, dup for later store, load attr, apply op, rotate, store
                 self.compile_expr(object)?; // [obj]
-                self.code.emit(Opcode::Dup)?; // [obj, obj]
+                self.code.emit(Opcode::Dup); // [obj, obj]
                 self.code.set_location(*target_position, None);
-                self.code.emit_u16(Opcode::LoadAttr, name_idx)?; // [obj, attr_val]
+                self.code.emit_u16(Opcode::LoadAttr, name_idx); // [obj, attr_val]
                 self.compile_expr(value)?; // [obj, attr_val, rhs]
-                self.code.emit(opcode)?; // [obj, result]
-                self.code.emit(Opcode::Rot2)?; // [result, obj]
+                self.code.emit(opcode); // [obj, result]
+                self.code.emit(Opcode::Rot2); // [result, obj]
                 self.code.set_location(*target_position, None);
-                self.code.emit_u16(Opcode::StoreAttr, name_idx)?; // []
+                self.code.emit_u16(Opcode::StoreAttr, name_idx); // []
             }
             Node::AttrAssign {
                 object,
@@ -617,12 +358,12 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(object)?;
                 if let Some((last, rest)) = targets.split_last() {
                     for target in rest {
-                        self.code.emit(Opcode::Dup)?;
+                        self.code.emit(Opcode::Dup);
                         self.compile_assign_target(target)?;
                     }
                     self.compile_assign_target(last)?;
                 } else {
-                    self.code.emit(Opcode::Pop)?;
+                    self.code.emit(Opcode::Pop);
                 }
             }
             Node::If { test, body, or_else } => self.compile_if(test, body, or_else)?,
@@ -637,26 +378,23 @@ impl<'a> Compiler<'a> {
             Node::Raise(expr) => {
                 if let Some(exc) = expr {
                     self.compile_expr(exc)?;
-                    self.code.emit(Opcode::Raise)?;
+                    self.code.emit(Opcode::Raise);
                 } else {
-                    self.code.emit(Opcode::Reraise)?;
+                    self.code.emit(Opcode::Reraise);
                 }
             }
             Node::FunctionDef(func_def) => self.compile_function_def(func_def)?,
             Node::Try(try_block) => self.compile_try(try_block)?,
-            Node::With {
-                context, target, body, ..
-            } => self.compile_with(context, target.as_ref(), body)?,
             Node::Import { names } => {
                 for import_name in names {
-                    self.compile_import(import_name.module_name, &import_name.binding)?;
+                    self.compile_import(import_name.module_name, &import_name.binding);
                 }
             }
             Node::ImportFrom {
                 module_name,
                 names,
                 position,
-            } => self.compile_import_from(*module_name, names, *position)?,
+            } => self.compile_import_from(*module_name, names, *position),
             Node::Break { position } => self.compile_break(*position)?,
             Node::Continue { position } => self.compile_continue(*position)?,
             // These are handled during the prepare phase and produce no bytecode
@@ -675,15 +413,24 @@ impl<'a> Compiler<'a> {
     fn compile_function_def(&mut self, func_def: &PreparedFunctionDef) -> Result<(), CompileError> {
         let func_pos = func_def.name.position;
 
-        // Bound the bytecode-operand counts before compiling — the `u8` casts
-        // below depend on these fitting in 255.
-        let defaults_count = check_call_args_u8(func_def.default_exprs.len(), "default parameter values", func_pos)?;
-        let cell_count = check_call_args_u8(func_def.free_var_enclosing_slots.len(), "closure variables", func_pos)?;
+        // Check bytecode operand limits
+        if func_def.default_exprs.len() > MAX_CALL_ARGS {
+            return Err(CompileError::new(
+                format!("more than {MAX_CALL_ARGS} default parameter values"),
+                func_pos,
+            ));
+        }
+        if func_def.free_var_enclosing_slots.len() > MAX_CALL_ARGS {
+            return Err(CompileError::new(
+                format!("more than {MAX_CALL_ARGS} closure variables"),
+                func_pos,
+            ));
+        }
 
         // 1. Compile the function body recursively
         // Take ownership of functions for the recursive compile, then restore
         let functions = mem::take(&mut self.functions);
-        let namespace_size = check_namespace_size_u16(func_def.namespace_size, "function")?;
+        let namespace_size = u16::try_from(func_def.namespace_size).expect("function namespace size exceeds u16");
         let (body_code, mut functions) =
             Self::compile_function_body(&func_def.body, self.interns, functions, namespace_size)?;
 
@@ -709,29 +456,30 @@ impl<'a> Compiler<'a> {
         for default_expr in &func_def.default_exprs {
             self.compile_expr(default_expr)?;
         }
-        let func_id_u16 = check_function_count_u16(func_id, func_pos)?;
+        let defaults_count =
+            u8::try_from(func_def.default_exprs.len()).expect("function default argument count exceeds u8");
+        let func_id_u16 = u16::try_from(func_id).expect("function count exceeds u16");
 
         // 4. Emit MakeFunction or MakeClosure (if has free vars)
         if func_def.free_var_enclosing_slots.is_empty() {
             // MakeFunction: func_id (u16) + defaults_count (u8)
-            self.code
-                .emit_u16_u8(Opcode::MakeFunction, func_id_u16, defaults_count)?;
+            self.code.emit_u16_u8(Opcode::MakeFunction, func_id_u16, defaults_count);
         } else {
             // Push captured cells from enclosing scope
             for &slot in &func_def.free_var_enclosing_slots {
-                // Load the cell reference from the enclosing namespace.
-                // `slot` is a `NamespaceId` bound by `check_namespace_size_u16`
-                // on the enclosing scope, so the conversion is an invariant
-                // rather than a user-input check (panic-on-failure is fine).
-                self.code.emit_load_local(slot.as_u16())?;
+                // Load the cell reference from the enclosing namespace
+                let slot_u16 = u16::try_from(slot.index()).expect("closure slot index exceeds u16");
+                self.code.emit_load_local(slot_u16);
             }
+            let cell_count =
+                u8::try_from(func_def.free_var_enclosing_slots.len()).expect("closure cell count exceeds u8");
             // MakeClosure: func_id (u16) + defaults_count (u8) + cell_count (u8)
             self.code
-                .emit_u16_u8_u8(Opcode::MakeClosure, func_id_u16, defaults_count, cell_count)?;
+                .emit_u16_u8_u8(Opcode::MakeClosure, func_id_u16, defaults_count, cell_count);
         }
 
         // 5. Store the function object to its name slot
-        self.compile_store(&func_def.name)?;
+        self.compile_store(&func_def.name);
 
         Ok(())
     }
@@ -745,14 +493,23 @@ impl<'a> Compiler<'a> {
     fn compile_lambda(&mut self, func_def: &PreparedFunctionDef) -> Result<(), CompileError> {
         let func_pos = func_def.name.position;
 
-        // Bound the bytecode-operand counts before compiling — the `u8` casts
-        // below depend on these fitting in 255.
-        let defaults_count = check_call_args_u8(func_def.default_exprs.len(), "default parameter values", func_pos)?;
-        let cell_count = check_call_args_u8(func_def.free_var_enclosing_slots.len(), "closure variables", func_pos)?;
+        // Check bytecode operand limits
+        if func_def.default_exprs.len() > MAX_CALL_ARGS {
+            return Err(CompileError::new(
+                format!("more than {MAX_CALL_ARGS} default parameter values"),
+                func_pos,
+            ));
+        }
+        if func_def.free_var_enclosing_slots.len() > MAX_CALL_ARGS {
+            return Err(CompileError::new(
+                format!("more than {MAX_CALL_ARGS} closure variables"),
+                func_pos,
+            ));
+        }
 
         // 1. Compile the function body recursively
         let functions = mem::take(&mut self.functions);
-        let namespace_size = check_namespace_size_u16(func_def.namespace_size, "lambda")?;
+        let namespace_size = u16::try_from(func_def.namespace_size).expect("function namespace size exceeds u16");
         let (body_code, mut functions) =
             Self::compile_function_body(&func_def.body, self.interns, functions, namespace_size)?;
 
@@ -778,23 +535,25 @@ impl<'a> Compiler<'a> {
         for default_expr in &func_def.default_exprs {
             self.compile_expr(default_expr)?;
         }
-        let func_id_u16 = check_function_count_u16(func_id, func_pos)?;
+        let defaults_count =
+            u8::try_from(func_def.default_exprs.len()).expect("function default argument count exceeds u8");
+        let func_id_u16 = u16::try_from(func_id).expect("function count exceeds u16");
 
         // 4. Emit MakeFunction or MakeClosure (if has free vars)
         if func_def.free_var_enclosing_slots.is_empty() {
             // MakeFunction: func_id (u16) + defaults_count (u8)
-            self.code
-                .emit_u16_u8(Opcode::MakeFunction, func_id_u16, defaults_count)?;
+            self.code.emit_u16_u8(Opcode::MakeFunction, func_id_u16, defaults_count);
         } else {
-            // Push captured cells from enclosing scope. `slot` is a
-            // `NamespaceId` from the enclosing scope, bounded by
-            // `check_namespace_size_u16`; the conversion is an invariant.
+            // Push captured cells from enclosing scope
             for &slot in &func_def.free_var_enclosing_slots {
-                self.code.emit_load_local(slot.as_u16())?;
+                let slot_u16 = u16::try_from(slot.index()).expect("closure slot index exceeds u16");
+                self.code.emit_load_local(slot_u16);
             }
+            let cell_count =
+                u8::try_from(func_def.free_var_enclosing_slots.len()).expect("closure cell count exceeds u8");
             // MakeClosure: func_id (u16) + defaults_count (u8) + cell_count (u8)
             self.code
-                .emit_u16_u8_u8(Opcode::MakeClosure, func_id_u16, defaults_count, cell_count)?;
+                .emit_u16_u8_u8(Opcode::MakeClosure, func_id_u16, defaults_count, cell_count);
         }
 
         // NOTE: Unlike compile_function_def, we do NOT call compile_store here.
@@ -808,23 +567,22 @@ impl<'a> Compiler<'a> {
     /// Emits `LoadModule` to create the module, then stores it to the binding name.
     /// If the module is unknown, emits `RaiseImportError` to defer the error to runtime.
     /// This allows imports inside `if TYPE_CHECKING:` blocks to compile successfully.
-    fn compile_import(&mut self, module_name: StringId, binding: &Identifier) -> Result<(), CompileError> {
+    fn compile_import(&mut self, module_name: StringId, binding: &Identifier) {
         let position = binding.position;
         self.code.set_location(position, None);
 
         // Look up the module by name
         if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
-            self.code.emit_u8(Opcode::LoadModule, builtin_module as u8)?;
+            self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
             // Store to the binding (respects Local/Global/Cell scope)
-            self.compile_store(binding)?;
+            self.compile_store(binding);
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
             // This allows TYPE_CHECKING imports to compile without error
-            let name_const = self.code.add_const(Value::InternString(module_name))?;
-            self.code.emit_u16(Opcode::RaiseImportError, name_const)?;
+            let name_const = self.code.add_const(Value::InternString(module_name));
+            self.code.emit_u16(Opcode::RaiseImportError, name_const);
         }
-        Ok(())
     }
 
     /// Compiles a `from module import name, ...` statement.
@@ -833,40 +591,34 @@ impl<'a> Compiler<'a> {
     /// Invalid attribute names will raise `AttributeError` at runtime.
     /// If the module is unknown, emits `RaiseImportError` to defer the error to runtime.
     /// This allows imports inside `if TYPE_CHECKING:` blocks to compile successfully.
-    fn compile_import_from(
-        &mut self,
-        module_name: StringId,
-        names: &[(StringId, Identifier)],
-        position: CodeRange,
-    ) -> Result<(), CompileError> {
+    fn compile_import_from(&mut self, module_name: StringId, names: &[(StringId, Identifier)], position: CodeRange) {
         self.code.set_location(position, None);
 
         // Look up the module
         if let Some(builtin_module) = StandardLib::from_string_id(module_name) {
             // Known module - emit LoadModule
-            self.code.emit_u8(Opcode::LoadModule, builtin_module as u8)?;
+            self.code.emit_u8(Opcode::LoadModule, builtin_module as u8);
 
             // For each name to import
             for (i, (import_name, binding)) in names.iter().enumerate() {
                 // Dup the module if this isn't the last import (last one consumes the module)
                 if i < names.len() - 1 {
-                    self.code.emit(Opcode::Dup)?;
+                    self.code.emit(Opcode::Dup);
                 }
 
                 // Load the attribute from the module (raises ImportError if not found)
-                let name_idx = check_name_index_u16(*import_name, position)?;
-                self.code.emit_u16(Opcode::LoadAttrImport, name_idx)?;
+                let name_idx = u16::try_from(import_name.index()).expect("name index exceeds u16");
+                self.code.emit_u16(Opcode::LoadAttrImport, name_idx);
 
                 // Store to the binding
-                self.compile_store(binding)?;
+                self.compile_store(binding);
             }
         } else {
             // Unknown module - defer error to runtime with RaiseImportError
             // This allows TYPE_CHECKING imports to compile without error
-            let name_const = self.code.add_const(Value::InternString(module_name))?;
-            self.code.emit_u16(Opcode::RaiseImportError, name_const)?;
+            let name_const = self.code.add_const(Value::InternString(module_name));
+            self.code.emit_u16(Opcode::RaiseImportError, name_const);
         }
-        Ok(())
     }
 
     // ========================================================================
@@ -879,13 +631,13 @@ impl<'a> Compiler<'a> {
         self.code.set_location(expr_loc.position, None);
 
         match &expr_loc.expr {
-            Expr::Literal(lit) => self.compile_literal(lit)?,
+            Expr::Literal(lit) => self.compile_literal(lit),
 
-            Expr::Name(ident) => self.compile_name(ident)?,
+            Expr::Name(ident) => self.compile_name(ident),
 
             Expr::Builtin(builtin) => {
-                let idx = self.code.add_const(Value::Builtin(*builtin))?;
-                self.code.emit_u16(Opcode::LoadConst, idx)?;
+                let idx = self.code.add_const(Value::Builtin(*builtin));
+                self.code.emit_u16(Opcode::LoadConst, idx);
             }
 
             Expr::Op { left, op, right } => {
@@ -899,10 +651,10 @@ impl<'a> Compiler<'a> {
                 self.code.set_location(expr_loc.position, None);
                 // ModEq needs special handling - it has a constant operand
                 if let CmpOperator::ModEq(value) = op {
-                    let const_idx = self.code.add_const(Value::Int(*value))?;
-                    self.code.emit_u16(Opcode::CompareModEq, const_idx)?;
+                    let const_idx = self.code.add_const(Value::Int(*value));
+                    self.code.emit_u16(Opcode::CompareModEq, const_idx);
                 } else {
-                    self.code.emit(cmp_operator_to_opcode(op))?;
+                    self.code.emit(cmp_operator_to_opcode(op));
                 }
             }
 
@@ -914,43 +666,43 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(operand)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::UnaryNot)?;
+                self.code.emit(Opcode::UnaryNot);
             }
 
             Expr::UnaryMinus(operand) => {
                 self.compile_expr(operand)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::UnaryNeg)?;
+                self.code.emit(Opcode::UnaryNeg);
             }
 
             Expr::UnaryPlus(operand) => {
                 self.compile_expr(operand)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::UnaryPos)?;
+                self.code.emit(Opcode::UnaryPos);
             }
 
             Expr::UnaryInvert(operand) => {
                 self.compile_expr(operand)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::UnaryInvert)?;
+                self.code.emit(Opcode::UnaryInvert);
             }
 
             Expr::List(elements) => {
                 if has_unpack_seq(elements) {
                     // Generalized path: build incrementally for PEP 448 *unpacks
-                    self.code.emit_u16(Opcode::BuildList, 0)?;
+                    self.code.emit_u16(Opcode::BuildList, 0);
                     for item in elements {
                         match item {
                             SequenceItem::Value(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit_u8(Opcode::ListAppend, 0)?;
+                                self.code.emit_u8(Opcode::ListAppend, 0);
                             }
                             SequenceItem::Unpack(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit(Opcode::ListExtend)?;
+                                self.code.emit(Opcode::ListExtend);
                             }
                         }
                     }
@@ -963,28 +715,30 @@ impl<'a> Compiler<'a> {
                         };
                         self.compile_expr(e)?;
                     }
-                    let count = check_collection_size_u16(elements.len(), expr_loc.position)?;
-                    self.code.emit_u16(Opcode::BuildList, count)?;
+                    self.code.emit_u16(
+                        Opcode::BuildList,
+                        u16::try_from(elements.len()).expect("elements count exceeds u16"),
+                    );
                 }
             }
 
             Expr::Tuple(elements) => {
                 if has_unpack_seq(elements) {
                     // Generalized path: build via list then convert for PEP 448 *unpacks
-                    self.code.emit_u16(Opcode::BuildList, 0)?;
+                    self.code.emit_u16(Opcode::BuildList, 0);
                     for item in elements {
                         match item {
                             SequenceItem::Value(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit_u8(Opcode::ListAppend, 0)?;
+                                self.code.emit_u8(Opcode::ListAppend, 0);
                             }
                             SequenceItem::Unpack(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit(Opcode::ListExtend)?;
+                                self.code.emit(Opcode::ListExtend);
                             }
                         }
                     }
-                    self.code.emit(Opcode::ListToTuple)?;
+                    self.code.emit(Opcode::ListToTuple);
                 } else {
                     // Fast path: all values, single BuildTuple.
                     // SAFETY: has_unpack_seq(elements) is false, so every item is Value.
@@ -994,27 +748,29 @@ impl<'a> Compiler<'a> {
                         };
                         self.compile_expr(e)?;
                     }
-                    let count = check_collection_size_u16(elements.len(), expr_loc.position)?;
-                    self.code.emit_u16(Opcode::BuildTuple, count)?;
+                    self.code.emit_u16(
+                        Opcode::BuildTuple,
+                        u16::try_from(elements.len()).expect("elements count exceeds u16"),
+                    );
                 }
             }
 
             Expr::Dict(dict_items) => {
                 if has_unpack_dict(dict_items) {
                     // Generalized path: build incrementally for PEP 448 **unpacks
-                    self.code.emit_u16(Opcode::BuildDict, 0)?;
+                    self.code.emit_u16(Opcode::BuildDict, 0);
                     for item in dict_items {
                         match item {
                             DictItem::Pair(key, value) => {
                                 self.compile_expr(key)?;
                                 self.compile_expr(value)?;
                                 // depth=0: dict is at TOS after key/value are popped
-                                self.code.emit_u8(Opcode::DictSetItem, 0)?;
+                                self.code.emit_u8(Opcode::DictSetItem, 0);
                             }
                             DictItem::Unpack(e) => {
                                 self.compile_expr(e)?;
                                 // depth=0: dict is directly below mapping on stack
-                                self.code.emit_u8(Opcode::DictUpdate, 0)?;
+                                self.code.emit_u8(Opcode::DictUpdate, 0);
                             }
                         }
                     }
@@ -1028,24 +784,26 @@ impl<'a> Compiler<'a> {
                         self.compile_expr(key)?;
                         self.compile_expr(value)?;
                     }
-                    let count = check_collection_size_u16(dict_items.len(), expr_loc.position)?;
-                    self.code.emit_u16(Opcode::BuildDict, count)?;
+                    self.code.emit_u16(
+                        Opcode::BuildDict,
+                        u16::try_from(dict_items.len()).expect("pairs count exceeds u16"),
+                    );
                 }
             }
 
             Expr::Set(elements) => {
                 if has_unpack_seq(elements) {
                     // Generalized path: build incrementally for PEP 448 *unpacks
-                    self.code.emit_u16(Opcode::BuildSet, 0)?;
+                    self.code.emit_u16(Opcode::BuildSet, 0);
                     for item in elements {
                         match item {
                             SequenceItem::Value(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit_u8(Opcode::SetAdd, 0)?;
+                                self.code.emit_u8(Opcode::SetAdd, 0);
                             }
                             SequenceItem::Unpack(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit_u8(Opcode::SetExtend, 0)?;
+                                self.code.emit_u8(Opcode::SetExtend, 0);
                             }
                         }
                     }
@@ -1058,8 +816,10 @@ impl<'a> Compiler<'a> {
                         };
                         self.compile_expr(e)?;
                     }
-                    let count = check_collection_size_u16(elements.len(), expr_loc.position)?;
-                    self.code.emit_u16(Opcode::BuildSet, count)?;
+                    self.code.emit_u16(
+                        Opcode::BuildSet,
+                        u16::try_from(elements.len()).expect("elements count exceeds u16"),
+                    );
                 }
             }
 
@@ -1068,7 +828,7 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(index)?;
                 // Restore the full subscript expression's position for traceback
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::BinarySubscr)?;
+                self.code.emit(Opcode::BinarySubscr);
             }
 
             Expr::IfElse { test, body, orelse } => {
@@ -1080,8 +840,10 @@ impl<'a> Compiler<'a> {
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
                 let name_id = attr.string_id().expect("LoadAttr requires interned attr name");
-                let name_idx = check_name_index_u16(name_id, expr_loc.position)?;
-                self.code.emit_u16(Opcode::LoadAttr, name_idx)?;
+                self.code.emit_u16(
+                    Opcode::LoadAttr,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                );
             }
 
             Expr::Call { callable, args } => {
@@ -1107,7 +869,7 @@ impl<'a> Compiler<'a> {
             Expr::FString(parts) => {
                 // Compile each part and build the f-string
                 let part_count = self.compile_fstring_parts(parts)?;
-                self.code.emit_u16(Opcode::BuildFString, part_count)?;
+                self.code.emit_u16(Opcode::BuildFString, part_count);
             }
 
             Expr::ListComp { elt, generators } => {
@@ -1137,7 +899,7 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(value)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(expr_loc.position, None);
-                self.code.emit(Opcode::Await)?;
+                self.code.emit(Opcode::Await);
             }
 
             Expr::Slice { lower, upper, step } => {
@@ -1145,28 +907,28 @@ impl<'a> Compiler<'a> {
                 if let Some(lower) = lower {
                     self.compile_expr(lower)?;
                 } else {
-                    self.code.emit(Opcode::LoadNone)?;
+                    self.code.emit(Opcode::LoadNone);
                 }
                 if let Some(upper) = upper {
                     self.compile_expr(upper)?;
                 } else {
-                    self.code.emit(Opcode::LoadNone)?;
+                    self.code.emit(Opcode::LoadNone);
                 }
                 if let Some(step) = step {
                     self.compile_expr(step)?;
                 } else {
-                    self.code.emit(Opcode::LoadNone)?;
+                    self.code.emit(Opcode::LoadNone);
                 }
-                self.code.emit(Opcode::BuildSlice)?;
+                self.code.emit(Opcode::BuildSlice);
             }
 
             Expr::Named { target, value } => {
                 // Compile the value expression (leaves result on stack)
                 self.compile_expr(value)?;
                 // Duplicate so value remains after store
-                self.code.emit(Opcode::Dup)?;
+                self.code.emit(Opcode::Dup);
                 // Store to target (pops one copy)
-                self.compile_store(target)?;
+                self.compile_store(target);
             }
         }
         Ok(())
@@ -1177,24 +939,34 @@ impl<'a> Compiler<'a> {
     // ========================================================================
 
     /// Compiles a literal value.
-    fn compile_literal(&mut self, literal: &Literal) -> Result<(), CompileError> {
+    fn compile_literal(&mut self, literal: &Literal) {
         match literal {
-            Literal::None => self.code.emit(Opcode::LoadNone),
-            Literal::Bool(true) => self.code.emit(Opcode::LoadTrue),
-            Literal::Bool(false) => self.code.emit(Opcode::LoadFalse),
+            Literal::None => {
+                self.code.emit(Opcode::LoadNone);
+            }
+
+            Literal::Bool(true) => {
+                self.code.emit(Opcode::LoadTrue);
+            }
+
+            Literal::Bool(false) => {
+                self.code.emit(Opcode::LoadFalse);
+            }
+
             Literal::Int(n) => {
                 // Use LoadSmallInt for values that fit in i8
                 if let Ok(small) = i8::try_from(*n) {
-                    self.code.emit_i8(Opcode::LoadSmallInt, small)
+                    self.code.emit_i8(Opcode::LoadSmallInt, small);
                 } else {
-                    let idx = self.code.add_const(Value::from(*literal))?;
-                    self.code.emit_u16(Opcode::LoadConst, idx)
+                    let idx = self.code.add_const(Value::from(*literal));
+                    self.code.emit_u16(Opcode::LoadConst, idx);
                 }
             }
+
             // For Float, Str, Bytes, Ellipsis - use LoadConst with Value::from
             _ => {
-                let idx = self.code.add_const(Value::from(*literal))?;
-                self.code.emit_u16(Opcode::LoadConst, idx)
+                let idx = self.code.add_const(Value::from(*literal));
+                self.code.emit_u16(Opcode::LoadConst, idx);
             }
         }
     }
@@ -1207,61 +979,38 @@ impl<'a> Compiler<'a> {
     ///
     /// At module level, `Local` and `LocalUnassigned` scopes emit global opcodes
     /// because module-level locals live in the globals array.
-    fn compile_name(&mut self, ident: &Identifier) -> Result<(), CompileError> {
-        let slot = ident.namespace_id().as_u16();
+    fn compile_name(&mut self, ident: &Identifier) {
+        let slot = u16::try_from(ident.namespace_id().index()).expect("local slot exceeds u16");
         match ident.scope {
             NameScope::Local => {
                 // True local - register name and mark as assigned for UnboundLocalError
                 self.code.register_local_name(slot, ident.name_id);
                 self.code.register_assigned_local(slot);
                 if self.is_module_scope {
-                    self.code.emit_u16(Opcode::LoadGlobal, slot)
+                    self.code.emit_u16(Opcode::LoadGlobal, slot);
                 } else {
-                    self.code.emit_load_local(slot)
+                    self.code.emit_load_local(slot);
                 }
             }
             NameScope::LocalUnassigned => {
                 // Undefined reference - register name but NOT as assigned for NameError
                 self.code.register_local_name(slot, ident.name_id);
                 if self.is_module_scope {
-                    self.code.emit_u16(Opcode::LoadGlobal, slot)
+                    self.code.emit_u16(Opcode::LoadGlobal, slot);
                 } else {
-                    self.code.emit_load_local(slot)
+                    self.code.emit_load_local(slot);
                 }
             }
             NameScope::Global => {
                 // Register the name for NameError/NameLookup messages
                 self.code.register_local_name(slot, ident.name_id);
-                self.code.emit_u16(Opcode::LoadGlobal, slot)
+                self.code.emit_u16(Opcode::LoadGlobal, slot);
             }
             NameScope::Cell => {
                 // Register the name for NameError messages (unbound free variable)
                 self.code.register_local_name(slot, ident.name_id);
                 // Emit local slot index — the VM reads the cell HeapId from the stack
-                self.code.emit_u16(Opcode::LoadCell, slot)
-            }
-            NameScope::CompVar => {
-                // Comprehension target read. Static analysis tells us
-                // whether the corresponding `for` has stored to this slot
-                // yet in the linear emission order:
-                //
-                // - Bound (`slot ∈ bound_comp_slots`): emit a regular
-                //   `LoadLocal/W` — the comp var lives on the operand stack
-                //   at `frame_locals + offset` (set up by
-                //   `compile_comp_target_unpack` at the corresponding
-                //   FOR_ITER / UNPACK step).
-                // - Unbound: the corresponding `for` clause hasn't stored
-                //   to the slot at this point in the comp (e.g. an earlier
-                //   generator's iter references a later target). Emit
-                //   `RaiseUnboundLocal(name_id)`; the name lives in the
-                //   opcode so sibling comps with different unbound targets
-                //   each report the correct variable.
-                if self.bound_comp_slots.contains(&slot) {
-                    let absolute = self.slot_offsets[slot as usize];
-                    self.code.emit_load_local(absolute)
-                } else {
-                    self.code.emit_raise_unbound_local(ident.name_id)
-                }
+                self.code.emit_u16(Opcode::LoadCell, slot);
             }
         }
     }
@@ -1275,27 +1024,27 @@ impl<'a> Compiler<'a> {
     ///
     /// For `Local` and `Cell` scopes, delegates to `compile_name` since those can't
     /// be external functions (they're always defined locally or captured).
-    fn compile_name_callable(&mut self, ident: &Identifier) -> Result<(), CompileError> {
-        let slot = ident.namespace_id().as_u16();
+    fn compile_name_callable(&mut self, ident: &Identifier) {
+        let slot = u16::try_from(ident.namespace_id().index()).expect("local slot exceeds u16");
         match ident.scope {
             NameScope::LocalUnassigned => {
                 // Undefined reference in call context - use callable-aware load.
                 // At module level, use global callable since locals are in the globals array.
                 self.code.register_local_name(slot, ident.name_id);
                 if self.is_module_scope {
-                    self.code.emit_load_global_callable(slot, ident.name_id)
+                    self.code.emit_load_global_callable(slot, ident.name_id);
                 } else {
-                    self.code.emit_load_local_callable(slot, ident.name_id)
+                    self.code.emit_load_local_callable(slot, ident.name_id);
                 }
             }
             NameScope::Global => {
                 // Global scope - name_id is encoded in the operand because global slot
                 // indices are in a different namespace from local slots, so looking up
                 // the name from the current frame's local_names would be incorrect
-                self.code.emit_load_global_callable(slot, ident.name_id)
+                self.code.emit_load_global_callable(slot, ident.name_id);
             }
-            // Local, Cell, and CompVar can't be external functions - use regular load
-            NameScope::Local | NameScope::Cell | NameScope::CompVar => self.compile_name(ident),
+            // Local and Cell can't be external functions - use regular load
+            NameScope::Local | NameScope::Cell => self.compile_name(ident),
         }
     }
 
@@ -1303,35 +1052,23 @@ impl<'a> Compiler<'a> {
     ///
     /// At module level, `Local` and `LocalUnassigned` scopes emit `StoreGlobal`
     /// because module-level locals live in the globals array.
-    fn compile_store(&mut self, target: &Identifier) -> Result<(), CompileError> {
-        let slot = target.namespace_id().as_u16();
+    fn compile_store(&mut self, target: &Identifier) {
+        let slot = u16::try_from(target.namespace_id().index()).expect("local slot exceeds u16");
         match target.scope {
             NameScope::Local | NameScope::LocalUnassigned => {
                 self.code.register_local_name(slot, target.name_id);
                 if self.is_module_scope {
-                    self.code.emit_u16(Opcode::StoreGlobal, slot)
+                    self.code.emit_u16(Opcode::StoreGlobal, slot);
                 } else {
-                    self.code.emit_store_local(slot)
+                    self.code.emit_store_local(slot);
                 }
             }
-            NameScope::Global => self.code.emit_u16(Opcode::StoreGlobal, slot),
+            NameScope::Global => {
+                self.code.emit_u16(Opcode::StoreGlobal, slot);
+            }
             NameScope::Cell => {
                 // Emit local slot index — the VM reads the cell HeapId from the stack
-                self.code.emit_u16(Opcode::StoreCell, slot)
-            }
-            NameScope::CompVar => {
-                // Comp-var stores never go through `compile_store`. They are
-                // handled by `compile_comp_target_unpack`, which leaves the
-                // value on the operand stack as the natural result of
-                // `FOR_ITER` (and any subsequent `UNPACK_SEQUENCE` /
-                // `LIFT_TO_TOP` for nested tuples). The non-comp store paths
-                // (`compile_assign_target`, walrus via
-                // `get_id_for_store_target`, etc.) resolve their targets to
-                // `Local`/`Global`/`Cell` — never `CompVar` — so reaching
-                // here means a compile-flow bug.
-                unreachable!(
-                    "compile_store called with NameScope::CompVar — comp targets are stored via compile_comp_target_unpack"
-                )
+                self.code.emit_u16(Opcode::StoreCell, slot);
             }
         }
     }
@@ -1355,17 +1092,17 @@ impl<'a> Compiler<'a> {
             // Short-circuit AND: evaluate left, jump if falsy
             Operator::And => {
                 self.compile_expr(left)?;
-                let end_jump = self.code.emit_jump(Opcode::JumpIfFalseOrPop)?;
+                let end_jump = self.code.emit_jump(Opcode::JumpIfFalseOrPop);
                 self.compile_expr(right)?;
-                self.code.patch_jump(end_jump)?;
+                self.code.patch_jump(end_jump);
             }
 
             // Short-circuit OR: evaluate left, jump if truthy
             Operator::Or => {
                 self.compile_expr(left)?;
-                let end_jump = self.code.emit_jump(Opcode::JumpIfTrueOrPop)?;
+                let end_jump = self.code.emit_jump(Opcode::JumpIfTrueOrPop);
                 self.compile_expr(right)?;
-                self.code.patch_jump(end_jump)?;
+                self.code.patch_jump(end_jump);
             }
 
             // Regular binary operators
@@ -1374,7 +1111,7 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(right)?;
                 // Restore the full expression's position for traceback caret range
                 self.code.set_location(parent_pos, None);
-                self.code.emit(operator_to_opcode(op))?;
+                self.code.emit(operator_to_opcode(op));
             }
         }
         Ok(())
@@ -1409,6 +1146,9 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), CompileError> {
         let n = comparisons.len();
 
+        // Remember stack depth before the chain for cleanup calculation
+        let base_depth = self.code.stack_depth();
+
         // Compile leftmost operand
         self.compile_expr(left)?;
 
@@ -1423,38 +1163,44 @@ impl<'a> Compiler<'a> {
 
             if !is_last {
                 // Keep a copy of the intermediate for the next comparison
-                self.code.emit(Opcode::Dup)?;
+                self.code.emit(Opcode::Dup);
                 // Reorder: [prev, curr, curr] -> [curr, prev, curr]
-                self.code.emit(Opcode::Rot3)?;
+                self.code.emit(Opcode::Rot3);
             }
 
             // Emit comparison
             self.code.set_location(position, None);
             if let CmpOperator::ModEq(value) = op {
-                let const_idx = self.code.add_const(Value::Int(*value))?;
-                self.code.emit_u16(Opcode::CompareModEq, const_idx)?;
+                let const_idx = self.code.add_const(Value::Int(*value));
+                self.code.emit_u16(Opcode::CompareModEq, const_idx);
             } else {
-                self.code.emit(cmp_operator_to_opcode(op))?;
+                self.code.emit(cmp_operator_to_opcode(op));
             }
 
             if !is_last {
                 // Short-circuit: if false, jump to cleanup
-                let jump = self.code.emit_jump(Opcode::JumpIfFalseOrPop)?;
+                let jump = self.code.emit_jump(Opcode::JumpIfFalseOrPop);
                 cleanup_jumps.push(jump);
             }
         }
 
-        // Jump past cleanup (result already on stack).
-        let end_jump = self.code.emit_jump(Opcode::Jump)?;
+        // Jump past cleanup (result already on stack)
+        let end_jump = self.code.emit_jump(Opcode::Jump);
 
-        // Cleanup: remove the saved intermediate value, keep False result.
+        // Cleanup: remove the saved intermediate value, keep False result
+        // The cleanup is only reached via JumpIfFalseOrPop which doesn't pop,
+        // so the stack has: [intermediate, False] (2 extra items from base)
         for jump in cleanup_jumps {
-            self.code.patch_jump(jump)?;
+            self.code.patch_jump(jump);
         }
-        self.code.emit(Opcode::Rot2)?; // [False, intermediate]
-        self.code.emit(Opcode::Pop)?; // [False]
+        self.code.set_stack_depth(base_depth + 2); // [intermediate, False]
+        self.code.emit(Opcode::Rot2); // [False, intermediate]
+        self.code.emit(Opcode::Pop); // [False]
 
-        self.code.patch_jump(end_jump)?;
+        self.code.patch_jump(end_jump);
+        // Final result is on stack: base_depth + 1
+        self.code.set_stack_depth(base_depth + 1);
+
         Ok(())
     }
 
@@ -1473,17 +1219,17 @@ impl<'a> Compiler<'a> {
 
         if or_else.is_empty() {
             // Simple if without else
-            let end_jump = self.code.emit_jump(Opcode::JumpIfFalse)?;
+            let end_jump = self.code.emit_jump(Opcode::JumpIfFalse);
             self.compile_block(body)?;
-            self.code.patch_jump(end_jump)?;
+            self.code.patch_jump(end_jump);
         } else {
             // If with else
-            let else_jump = self.code.emit_jump(Opcode::JumpIfFalse)?;
+            let else_jump = self.code.emit_jump(Opcode::JumpIfFalse);
             self.compile_block(body)?;
-            let end_jump = self.code.emit_jump(Opcode::Jump)?;
-            self.code.patch_jump(else_jump)?;
+            let end_jump = self.code.emit_jump(Opcode::Jump);
+            self.code.patch_jump(else_jump);
             self.compile_block(or_else)?;
-            self.code.patch_jump(end_jump)?;
+            self.code.patch_jump(end_jump);
         }
         Ok(())
     }
@@ -1491,12 +1237,12 @@ impl<'a> Compiler<'a> {
     /// Compiles a ternary conditional expression.
     fn compile_if_else_expr(&mut self, test: &ExprLoc, body: &ExprLoc, orelse: &ExprLoc) -> Result<(), CompileError> {
         self.compile_expr(test)?;
-        let else_jump = self.code.emit_jump(Opcode::JumpIfFalse)?;
+        let else_jump = self.code.emit_jump(Opcode::JumpIfFalse);
         self.compile_expr(body)?;
-        let end_jump = self.code.emit_jump(Opcode::Jump)?;
-        self.code.patch_jump(else_jump)?;
+        let end_jump = self.code.emit_jump(Opcode::Jump);
+        self.code.patch_jump(else_jump);
         self.compile_expr(orelse)?;
-        self.code.patch_jump(end_jump)?;
+        self.code.patch_jump(end_jump);
         Ok(())
     }
 
@@ -1518,7 +1264,7 @@ impl<'a> Compiler<'a> {
         {
             // Optimization applied - CallBuiltinFunction emitted
             self.code.set_location(call_pos, None);
-            self.code.emit_call_builtin_function(*builtin_func as u8, arg_count)?;
+            self.code.emit_call_builtin_function(*builtin_func as u8, arg_count);
             return Ok(());
         }
         // Fall through to standard path for kwargs/unpacking
@@ -1532,7 +1278,7 @@ impl<'a> Compiler<'a> {
         {
             // Optimization applied - CallBuiltinType emitted
             self.code.set_location(call_pos, None);
-            self.code.emit_call_builtin_type(type_id, arg_count)?;
+            self.code.emit_call_builtin_type(type_id, arg_count);
             return Ok(());
         }
         // Fall through to standard path for kwargs/unpacking or non-callable types
@@ -1541,14 +1287,14 @@ impl<'a> Compiler<'a> {
         // Push the callable (use name position for NameError caret range)
         match callable {
             Callable::Builtin(builtin) => {
-                let idx = self.code.add_const(Value::Builtin(*builtin))?;
-                self.code.emit_u16(Opcode::LoadConst, idx)?;
+                let idx = self.code.add_const(Value::Builtin(*builtin));
+                self.code.emit_u16(Opcode::LoadConst, idx);
             }
             Callable::Name(ident) => {
                 // Use callable-aware load opcodes so undefined names produce ExtFunction
                 // instead of yielding NameLookup, allowing CallFunction to yield FunctionCall
                 self.code.set_location(ident.position, None);
-                self.compile_name_callable(ident)?;
+                self.compile_name_callable(ident);
             }
         }
 
@@ -1557,18 +1303,18 @@ impl<'a> Compiler<'a> {
         match args {
             ArgExprs::Empty => {
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 0)?;
+                self.code.emit_u8(Opcode::CallFunction, 0);
             }
             ArgExprs::One(arg) => {
                 self.compile_expr(arg)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 1)?;
+                self.code.emit_u8(Opcode::CallFunction, 1);
             }
             ArgExprs::Two(arg1, arg2) => {
                 self.compile_expr(arg1)?;
                 self.compile_expr(arg2)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 2)?;
+                self.code.emit_u8(Opcode::CallFunction, 2);
             }
             ArgExprs::Args(args) => {
                 // Check argument count limit before compiling
@@ -1583,7 +1329,7 @@ impl<'a> Compiler<'a> {
                 }
                 let arg_count = u8::try_from(args.len()).expect("argument count exceeds u8");
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, arg_count)?;
+                self.code.emit_u8(Opcode::CallFunction, arg_count);
             }
             ArgExprs::Kwargs(kwargs) => {
                 // Check keyword argument count limit
@@ -1597,10 +1343,10 @@ impl<'a> Compiler<'a> {
                 let mut kwname_ids = Vec::with_capacity(kwargs.len());
                 for kwarg in kwargs {
                     self.compile_expr(&kwarg.value)?;
-                    kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                    kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                 }
                 self.code.set_location(call_pos, None);
-                self.code.emit_call_function_kw(0, &kwname_ids)?;
+                self.code.emit_call_function_kw(0, &kwname_ids);
             }
             ArgExprs::ArgsKargs {
                 args,
@@ -1651,7 +1397,7 @@ impl<'a> Compiler<'a> {
                     if let Some(kwargs) = kwargs {
                         for kwarg in kwargs {
                             self.compile_expr(&kwarg.value)?;
-                            kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                            kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                         }
                     }
 
@@ -1659,13 +1405,13 @@ impl<'a> Compiler<'a> {
                     self.code.emit_call_function_kw(
                         u8::try_from(pos_count).expect("positional arg count exceeds u8"),
                         &kwname_ids,
-                    )?;
+                    );
                 }
             }
             ArgExprs::GeneralizedCall { args, kwargs } => {
                 // PEP 448: generalized unpacking — multiple *args or **kwargs.
                 // Callable was already pushed above this match; delegate to the helper.
-                let func_name_id = self.get_callable_name_id(callable)?;
+                let func_name_id = self.get_callable_name_id(callable);
                 self.compile_generalized_call_body(args, kwargs, func_name_id, call_pos)?;
             }
         }
@@ -1680,18 +1426,18 @@ impl<'a> Compiler<'a> {
         match args {
             ArgExprs::Empty => {
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 0)?;
+                self.code.emit_u8(Opcode::CallFunction, 0);
             }
             ArgExprs::One(arg) => {
                 self.compile_expr(arg)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 1)?;
+                self.code.emit_u8(Opcode::CallFunction, 1);
             }
             ArgExprs::Two(arg1, arg2) => {
                 self.compile_expr(arg1)?;
                 self.compile_expr(arg2)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, 2)?;
+                self.code.emit_u8(Opcode::CallFunction, 2);
             }
             ArgExprs::Args(args) => {
                 if args.len() > MAX_CALL_ARGS {
@@ -1705,7 +1451,7 @@ impl<'a> Compiler<'a> {
                 }
                 let arg_count = u8::try_from(args.len()).expect("argument count exceeds u8");
                 self.code.set_location(call_pos, None);
-                self.code.emit_u8(Opcode::CallFunction, arg_count)?;
+                self.code.emit_u8(Opcode::CallFunction, arg_count);
             }
             ArgExprs::Kwargs(kwargs) => {
                 if kwargs.len() > MAX_CALL_ARGS {
@@ -1717,10 +1463,10 @@ impl<'a> Compiler<'a> {
                 let mut kwname_ids = Vec::with_capacity(kwargs.len());
                 for kwarg in kwargs {
                     self.compile_expr(&kwarg.value)?;
-                    kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                    kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                 }
                 self.code.set_location(call_pos, None);
-                self.code.emit_call_function_kw(0, &kwname_ids)?;
+                self.code.emit_call_function_kw(0, &kwname_ids);
             }
             ArgExprs::ArgsKargs {
                 args,
@@ -1770,14 +1516,14 @@ impl<'a> Compiler<'a> {
                     let mut kwname_ids = Vec::with_capacity(kw_count);
                     for kwarg in kw_args {
                         self.compile_expr(&kwarg.value)?;
-                        kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                        kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                     }
 
                     self.code.set_location(call_pos, None);
                     self.code.emit_call_function_kw(
                         u8::try_from(pos_count).expect("positional arg count exceeds u8"),
                         &kwname_ids,
-                    )?;
+                    );
                 }
             }
             ArgExprs::GeneralizedCall { args, kwargs } => {
@@ -1811,17 +1557,19 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(arg)?;
             }
         }
-        let pos_count_u16 = check_collection_size_u16(pos_count, call_pos)?;
-        self.code.emit_u16(Opcode::BuildList, pos_count_u16)?;
+        self.code.emit_u16(
+            Opcode::BuildList,
+            u16::try_from(pos_count).expect("positional arg count exceeds u16"),
+        );
 
         // Extend with *args if present
         if let Some(var_args_expr) = var_args {
             self.compile_expr(var_args_expr)?;
-            self.code.emit(Opcode::ListExtend)?;
+            self.code.emit(Opcode::ListExtend);
         }
 
         // Convert list to tuple
-        self.code.emit(Opcode::ListToTuple)?;
+        self.code.emit(Opcode::ListToTuple);
 
         // 2. Build kwargs dict (if we have kwargs or var_kwargs)
         let has_kwargs = kwargs.is_some() || var_kwargs.is_some();
@@ -1831,27 +1579,29 @@ impl<'a> Compiler<'a> {
             if let Some(kwargs) = kwargs {
                 for kwarg in kwargs {
                     // Push key as interned string constant
-                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id))?;
-                    self.code.emit_u16(Opcode::LoadConst, key_const)?;
+                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id));
+                    self.code.emit_u16(Opcode::LoadConst, key_const);
                     // Push value
                     self.compile_expr(&kwarg.value)?;
                 }
             }
-            let kw_count_u16 = check_collection_size_u16(kw_count, call_pos)?;
-            self.code.emit_u16(Opcode::BuildDict, kw_count_u16)?;
+            self.code.emit_u16(
+                Opcode::BuildDict,
+                u16::try_from(kw_count).expect("keyword count exceeds u16"),
+            );
 
             // Merge **kwargs if present
             // Use 0xFFFF for func_name_id (like builtins) since we don't have a name
             if let Some(var_kwargs_expr) = var_kwargs {
                 self.compile_expr(var_kwargs_expr)?;
-                self.code.emit_u16(Opcode::DictMerge, 0xFFFF)?;
+                self.code.emit_u16(Opcode::DictMerge, 0xFFFF);
             }
         }
 
         // 3. Call the function
         self.code.set_location(call_pos, None);
         let flags = u8::from(has_kwargs);
-        self.code.emit_u8(Opcode::CallFunctionExtended, flags)?;
+        self.code.emit_u8(Opcode::CallFunctionExtended, flags);
         Ok(())
     }
 
@@ -1910,7 +1660,7 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), CompileError> {
         // Get function name for error messages. Builtins use their real interned name
         // so duplicate-kwargs errors from **unpacking match CPython.
-        let func_name_id = self.get_callable_name_id(callable)?;
+        let func_name_id = self.get_callable_name_id(callable);
 
         // 1. Build args tuple
         // Push regular positional args and build list
@@ -1920,17 +1670,19 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(arg)?;
             }
         }
-        let pos_count_u16 = check_collection_size_u16(pos_count, call_pos)?;
-        self.code.emit_u16(Opcode::BuildList, pos_count_u16)?;
+        self.code.emit_u16(
+            Opcode::BuildList,
+            u16::try_from(pos_count).expect("positional arg count exceeds u16"),
+        );
 
         // Extend with *args if present
         if let Some(var_args_expr) = var_args {
             self.compile_expr(var_args_expr)?;
-            self.code.emit(Opcode::ListExtend)?;
+            self.code.emit(Opcode::ListExtend);
         }
 
         // Convert list to tuple
-        self.code.emit(Opcode::ListToTuple)?;
+        self.code.emit(Opcode::ListToTuple);
 
         // 2. Build kwargs dict (if we have kwargs or var_kwargs)
         let has_kwargs = kwargs.is_some() || var_kwargs.is_some();
@@ -1940,26 +1692,28 @@ impl<'a> Compiler<'a> {
             if let Some(kwargs) = kwargs {
                 for kwarg in kwargs {
                     // Push key as interned string constant
-                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id))?;
-                    self.code.emit_u16(Opcode::LoadConst, key_const)?;
+                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id));
+                    self.code.emit_u16(Opcode::LoadConst, key_const);
                     // Push value
                     self.compile_expr(&kwarg.value)?;
                 }
             }
-            let kw_count_u16 = check_collection_size_u16(kw_count, call_pos)?;
-            self.code.emit_u16(Opcode::BuildDict, kw_count_u16)?;
+            self.code.emit_u16(
+                Opcode::BuildDict,
+                u16::try_from(kw_count).expect("keyword count exceeds u16"),
+            );
 
             // Merge **kwargs if present
             if let Some(var_kwargs_expr) = var_kwargs {
                 self.compile_expr(var_kwargs_expr)?;
-                self.code.emit_u16(Opcode::DictMerge, func_name_id)?;
+                self.code.emit_u16(Opcode::DictMerge, func_name_id);
             }
         }
 
         // 3. Call the function
         self.code.set_location(call_pos, None);
         let flags = u8::from(has_kwargs);
-        self.code.emit_u8(Opcode::CallFunctionExtended, flags)?;
+        self.code.emit_u8(Opcode::CallFunctionExtended, flags);
         Ok(())
     }
 
@@ -1970,10 +1724,10 @@ impl<'a> Compiler<'a> {
     /// When the callable is not a named local/global, we still try to resolve
     /// builtin functions, builtin exception constructors, and builtin types to
     /// their interned public names.
-    fn get_callable_name_id(&self, callable: &Callable) -> Result<u16, CompileError> {
+    fn get_callable_name_id(&self, callable: &Callable) -> u16 {
         match callable {
-            Callable::Name(ident) => check_name_index_u16(ident.name_id, ident.position),
-            Callable::Builtin(builtin) => Ok(self.get_builtin_name_id(*builtin).unwrap_or(0xFFFF)),
+            Callable::Name(ident) => u16::try_from(ident.name_id.index()).expect("name index exceeds u16"),
+            Callable::Builtin(builtin) => self.get_builtin_name_id(*builtin).unwrap_or(0xFFFF),
         }
     }
 
@@ -2008,27 +1762,37 @@ impl<'a> Compiler<'a> {
         args: &ArgExprs,
         call_pos: CodeRange,
     ) -> Result<(), CompileError> {
-        // Get the interned attribute name, converted up-front so the limit check
-        // happens once per method call rather than at every emit-site below.
+        // Get the interned attribute name
         let name_id = attr.string_id().expect("CallAttr requires interned attr name");
-        let name_idx = check_name_index_u16(name_id, call_pos)?;
 
         // Compile arguments based on the argument type
         match args {
             ArgExprs::Empty => {
                 self.code.set_location(call_pos, None);
-                self.code.emit_u16_u8(Opcode::CallAttr, name_idx, 0)?;
+                self.code.emit_u16_u8(
+                    Opcode::CallAttr,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                    0,
+                );
             }
             ArgExprs::One(arg) => {
                 self.compile_expr(arg)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u16_u8(Opcode::CallAttr, name_idx, 1)?;
+                self.code.emit_u16_u8(
+                    Opcode::CallAttr,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                    1,
+                );
             }
             ArgExprs::Two(arg1, arg2) => {
                 self.compile_expr(arg1)?;
                 self.compile_expr(arg2)?;
                 self.code.set_location(call_pos, None);
-                self.code.emit_u16_u8(Opcode::CallAttr, name_idx, 2)?;
+                self.code.emit_u16_u8(
+                    Opcode::CallAttr,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                    2,
+                );
             }
             ArgExprs::Args(args) => {
                 // Check argument count limit
@@ -2043,7 +1807,11 @@ impl<'a> Compiler<'a> {
                 }
                 let arg_count = u8::try_from(args.len()).expect("argument count exceeds u8");
                 self.code.set_location(call_pos, None);
-                self.code.emit_u16_u8(Opcode::CallAttr, name_idx, arg_count)?;
+                self.code.emit_u16_u8(
+                    Opcode::CallAttr,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                    arg_count,
+                );
             }
             ArgExprs::Kwargs(kwargs) => {
                 // Keyword-only method call
@@ -2057,10 +1825,14 @@ impl<'a> Compiler<'a> {
                 let mut kwname_ids = Vec::with_capacity(kwargs.len());
                 for kwarg in kwargs {
                     self.compile_expr(&kwarg.value)?;
-                    kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                    kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                 }
                 self.code.set_location(call_pos, None);
-                self.code.emit_call_attr_kw(name_idx, 0, &kwname_ids)?;
+                self.code.emit_call_attr_kw(
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                    0, // no positional args
+                    &kwname_ids,
+                );
             }
             ArgExprs::ArgsKargs {
                 args,
@@ -2109,55 +1881,55 @@ impl<'a> Compiler<'a> {
                 if let Some(kwargs) = kwargs {
                     for kwarg in kwargs {
                         self.compile_expr(&kwarg.value)?;
-                        kwname_ids.push(check_name_index_u16(kwarg.key.name_id, call_pos)?);
+                        kwname_ids.push(u16::try_from(kwarg.key.name_id.index()).expect("name index exceeds u16"));
                     }
                 }
 
                 self.code.set_location(call_pos, None);
                 self.code.emit_call_attr_kw(
-                    name_idx,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
                     u8::try_from(pos_count).expect("positional arg count exceeds u8"),
                     &kwname_ids,
-                )?;
+                );
             }
             ArgExprs::GeneralizedCall { args, kwargs } => {
                 // PEP 448: generalized unpacking on a method call.
                 // Receiver is already on the stack; build args tuple and kwargs dict,
                 // then emit CallAttrExtended.
-                let func_name_id = name_idx;
+                let func_name_id = u16::try_from(name_id.index()).expect("name index exceeds u16");
                 let has_kwargs = !kwargs.is_empty();
 
                 // 1. Build args tuple
-                self.code.emit_u16(Opcode::BuildList, 0)?;
+                self.code.emit_u16(Opcode::BuildList, 0);
                 for arg in args {
                     match arg {
                         CallArg::Value(e) => {
                             self.compile_expr(e)?;
-                            self.code.emit_u8(Opcode::ListAppend, 0)?;
+                            self.code.emit_u8(Opcode::ListAppend, 0);
                         }
                         CallArg::Unpack(e) => {
                             self.compile_expr(e)?;
-                            self.code.emit(Opcode::ListExtend)?;
+                            self.code.emit(Opcode::ListExtend);
                         }
                     }
                 }
-                self.code.emit(Opcode::ListToTuple)?;
+                self.code.emit(Opcode::ListToTuple);
 
                 // 2. Build kwargs dict (if any)
                 if has_kwargs {
-                    self.code.emit_u16(Opcode::BuildDict, 0)?;
+                    self.code.emit_u16(Opcode::BuildDict, 0);
                     for kwarg in kwargs {
                         match kwarg {
                             CallKwarg::Named(kw) => {
-                                let key_const = self.code.add_const(Value::InternString(kw.key.name_id))?;
-                                self.code.emit_u16(Opcode::LoadConst, key_const)?;
+                                let key_const = self.code.add_const(Value::InternString(kw.key.name_id));
+                                self.code.emit_u16(Opcode::LoadConst, key_const);
                                 self.compile_expr(&kw.value)?;
-                                self.code.emit_u16(Opcode::BuildDict, 1)?;
-                                self.code.emit_u16(Opcode::MethodDictMerge, func_name_id)?;
+                                self.code.emit_u16(Opcode::BuildDict, 1);
+                                self.code.emit_u16(Opcode::DictMerge, func_name_id);
                             }
                             CallKwarg::Unpack(e) => {
                                 self.compile_expr(e)?;
-                                self.code.emit_u16(Opcode::MethodDictMerge, func_name_id)?;
+                                self.code.emit_u16(Opcode::DictMerge, func_name_id);
                             }
                         }
                     }
@@ -2166,7 +1938,7 @@ impl<'a> Compiler<'a> {
                 // 3. Emit CallAttrExtended
                 self.code.set_location(call_pos, None);
                 let flags = u8::from(has_kwargs);
-                self.code.emit_u16_u8(Opcode::CallAttrExtended, func_name_id, flags)?;
+                self.code.emit_u16_u8(Opcode::CallAttrExtended, func_name_id, flags);
             }
         }
         Ok(())
@@ -2185,10 +1957,6 @@ impl<'a> Compiler<'a> {
         var_kwargs: Option<&ExprLoc>,
         call_pos: CodeRange,
     ) -> Result<(), CompileError> {
-        // Convert the attribute name id up front so the overflow check happens
-        // once and both `DictMerge` (for error messages) and `CallAttrExtended`
-        // can reuse the converted value.
-        let name_idx = check_name_index_u16(name_id, call_pos)?;
         // 1. Build args tuple
         // Push regular positional args and build list
         let pos_count = args.map_or(0, Vec::len);
@@ -2197,17 +1965,19 @@ impl<'a> Compiler<'a> {
                 self.compile_expr(arg)?;
             }
         }
-        let pos_count_u16 = check_collection_size_u16(pos_count, call_pos)?;
-        self.code.emit_u16(Opcode::BuildList, pos_count_u16)?;
+        self.code.emit_u16(
+            Opcode::BuildList,
+            u16::try_from(pos_count).expect("positional arg count exceeds u16"),
+        );
 
         // Extend with *args if present
         if let Some(var_args_expr) = var_args {
             self.compile_expr(var_args_expr)?;
-            self.code.emit(Opcode::ListExtend)?;
+            self.code.emit(Opcode::ListExtend);
         }
 
         // Convert list to tuple
-        self.code.emit(Opcode::ListToTuple)?;
+        self.code.emit(Opcode::ListToTuple);
 
         // 2. Build kwargs dict (if we have kwargs or var_kwargs)
         let has_kwargs = kwargs.is_some() || var_kwargs.is_some();
@@ -2217,28 +1987,33 @@ impl<'a> Compiler<'a> {
             if let Some(kwargs) = kwargs {
                 for kwarg in kwargs {
                     // Push key as interned string constant
-                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id))?;
-                    self.code.emit_u16(Opcode::LoadConst, key_const)?;
+                    let key_const = self.code.add_const(Value::InternString(kwarg.key.name_id));
+                    self.code.emit_u16(Opcode::LoadConst, key_const);
                     // Push value
                     self.compile_expr(&kwarg.value)?;
                 }
             }
-            let kw_count_u16 = check_collection_size_u16(kw_count, call_pos)?;
-            self.code.emit_u16(Opcode::BuildDict, kw_count_u16)?;
+            self.code.emit_u16(
+                Opcode::BuildDict,
+                u16::try_from(kw_count).expect("keyword count exceeds u16"),
+            );
 
             // Merge **kwargs if present
             if let Some(var_kwargs_expr) = var_kwargs {
                 self.compile_expr(var_kwargs_expr)?;
-                // Method-call form — `MethodDictMerge` qualifies the duplicate-
-                // kwarg error with the receiver's type (e.g. `list.sort()`).
-                self.code.emit_u16(Opcode::MethodDictMerge, name_idx)?;
+                // Use the method name for error messages
+                self.code.emit_u16(
+                    Opcode::DictMerge,
+                    u16::try_from(name_id.index()).expect("name index exceeds u16"),
+                );
             }
         }
 
         // 3. Call the method with CallAttrExtended
         self.code.set_location(call_pos, None);
+        let name_idx = u16::try_from(name_id.index()).expect("name index exceeds u16");
         let flags = u8::from(has_kwargs);
-        self.code.emit_u16_u8(Opcode::CallAttrExtended, name_idx, flags)?;
+        self.code.emit_u16_u8(Opcode::CallAttrExtended, name_idx, flags);
         Ok(())
     }
 
@@ -2263,40 +2038,40 @@ impl<'a> Compiler<'a> {
         call_pos: CodeRange,
     ) -> Result<(), CompileError> {
         // 1. Build args tuple
-        self.code.emit_u16(Opcode::BuildList, 0)?;
+        self.code.emit_u16(Opcode::BuildList, 0);
         for arg in args {
             match arg {
                 CallArg::Value(e) => {
                     self.compile_expr(e)?;
-                    self.code.emit_u8(Opcode::ListAppend, 0)?;
+                    self.code.emit_u8(Opcode::ListAppend, 0);
                 }
                 CallArg::Unpack(e) => {
                     self.compile_expr(e)?;
-                    self.code.emit(Opcode::ListExtend)?;
+                    self.code.emit(Opcode::ListExtend);
                 }
             }
         }
-        self.code.emit(Opcode::ListToTuple)?;
+        self.code.emit(Opcode::ListToTuple);
 
         // 2. Build kwargs dict (if any)
         let has_kwargs = !kwargs.is_empty();
         if has_kwargs {
             // Start with an empty dict, then merge each kwarg one at a time via DictMerge
             // so that duplicates (including Named+Unpack ordering) raise TypeError correctly.
-            self.code.emit_u16(Opcode::BuildDict, 0)?;
+            self.code.emit_u16(Opcode::BuildDict, 0);
             for kwarg in kwargs {
                 match kwarg {
                     CallKwarg::Named(kw) => {
                         // Wrap key+value in a single-item dict, then merge into kwargs dict.
-                        let key_const = self.code.add_const(Value::InternString(kw.key.name_id))?;
-                        self.code.emit_u16(Opcode::LoadConst, key_const)?;
+                        let key_const = self.code.add_const(Value::InternString(kw.key.name_id));
+                        self.code.emit_u16(Opcode::LoadConst, key_const);
                         self.compile_expr(&kw.value)?;
-                        self.code.emit_u16(Opcode::BuildDict, 1)?;
-                        self.code.emit_u16(Opcode::DictMerge, func_name_id)?;
+                        self.code.emit_u16(Opcode::BuildDict, 1);
+                        self.code.emit_u16(Opcode::DictMerge, func_name_id);
                     }
                     CallKwarg::Unpack(e) => {
                         self.compile_expr(e)?;
-                        self.code.emit_u16(Opcode::DictMerge, func_name_id)?;
+                        self.code.emit_u16(Opcode::DictMerge, func_name_id);
                     }
                 }
             }
@@ -2305,7 +2080,7 @@ impl<'a> Compiler<'a> {
         // 3. Emit the extended call
         self.code.set_location(call_pos, None);
         let flags = u8::from(has_kwargs);
-        self.code.emit_u8(Opcode::CallFunctionExtended, flags)?;
+        self.code.emit_u8(Opcode::CallFunctionExtended, flags);
         Ok(())
     }
 
@@ -2317,13 +2092,17 @@ impl<'a> Compiler<'a> {
         body: &[PreparedNode],
         or_else: &[PreparedNode],
     ) -> Result<(), CompileError> {
+        // Record stack depth at loop start (before iterator is pushed)
+        // This is the depth we return to when the loop finishes (iterator popped)
+        let loop_exit_depth = self.code.stack_depth();
+
         // Compile iterator expression
         self.compile_expr(iter)?;
         // Convert to iterator
-        self.code.emit(Opcode::GetIter)?;
+        self.code.emit(Opcode::GetIter);
 
         // Loop start
-        let loop_start = self.code.current_jump_target();
+        let loop_start = self.code.current_offset();
 
         // Push loop info for break/continue
         self.loop_stack.push(LoopInfo {
@@ -2333,18 +2112,21 @@ impl<'a> Compiler<'a> {
         });
 
         // ForIter: advance iterator or jump to end
-        let end_jump = self.code.emit_jump(Opcode::ForIter)?;
+        let end_jump = self.code.emit_jump(Opcode::ForIter);
 
         // Store current value to target (handles both single identifiers and tuple unpacking)
-        self.compile_unpack_target(target)?;
+        self.compile_unpack_target(target);
 
         // Compile body
         self.compile_block(body)?;
 
         // Jump back to loop start
-        self.code.emit_jump_to(Opcode::Jump, loop_start)?;
+        self.code.emit_jump_to(Opcode::Jump, loop_start);
+
         // End of loop - ForIter jumps here when iterator is exhausted
-        self.code.patch_jump(end_jump)?;
+        self.code.patch_jump(end_jump);
+        // Iterator is popped when loop ends normally, so restore depth to before loop
+        self.code.set_stack_depth(loop_exit_depth);
 
         // Pop loop info before compiling else block
         let loop_info = self.loop_stack.pop().expect("loop stack underflow");
@@ -2356,7 +2138,7 @@ impl<'a> Compiler<'a> {
 
         // Patch break jumps to here - AFTER the else block so break skips else
         for break_jump in loop_info.break_jumps {
-            self.code.patch_jump(break_jump)?;
+            self.code.patch_jump(break_jump);
         }
 
         Ok(())
@@ -2387,7 +2169,7 @@ impl<'a> Compiler<'a> {
         body: &[PreparedNode],
         or_else: &[PreparedNode],
     ) -> Result<(), CompileError> {
-        let loop_start = self.code.current_jump_target();
+        let loop_start = self.code.current_offset();
 
         self.loop_stack.push(LoopInfo {
             start: loop_start,
@@ -2396,12 +2178,12 @@ impl<'a> Compiler<'a> {
         });
 
         self.compile_expr(test)?;
-        let end_jump = self.code.emit_jump(Opcode::JumpIfFalse)?;
+        let end_jump = self.code.emit_jump(Opcode::JumpIfFalse);
 
         self.compile_block(body)?;
-        self.code.emit_jump_to(Opcode::Jump, loop_start)?;
+        self.code.emit_jump_to(Opcode::Jump, loop_start);
 
-        self.code.patch_jump(end_jump)?;
+        self.code.patch_jump(end_jump);
         let loop_info = self.loop_stack.pop().expect("loop stack underflow");
 
         if !or_else.is_empty() {
@@ -2409,7 +2191,7 @@ impl<'a> Compiler<'a> {
         }
 
         for break_jump in loop_info.break_jumps {
-            self.code.patch_jump(break_jump)?;
+            self.code.patch_jump(break_jump);
         }
 
         Ok(())
@@ -2435,46 +2217,48 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::new("'break' outside loop", position));
         }
 
+        // `break` never falls through, but we still compile following statements in the same
+        // block. Preserve the statement-entry depth for that unreachable compilation so
+        // stack-effect tracking remains stable across dead code.
+        let dead_code_depth = self.code.stack_depth();
         let target_loop_depth = self.loop_stack.len() - 1;
 
-        // If inside except handlers, clear each enclosing exception_stack
-        // entry.
+        // If inside except handlers, clean up ALL exception states
+        // Each nested except handler has pushed an exception onto the stack,
+        // so we need to clear/pop each one when breaking out
         for _ in 0..self.except_handler_depth {
-            self.code.emit(Opcode::ClearException)?;
+            self.code.emit(Opcode::ClearException);
+            self.code.emit(Opcode::Pop); // Pop the exception value
+        }
+
+        // Pop the iterator only for `for` loops (has iterator on stack)
+        // `while` loops don't have an iterator to pop
+        if self.loop_stack[target_loop_depth].has_iterator_on_stack {
+            self.code.emit(Opcode::Pop);
         }
 
         // Check if we need to go through any finally blocks
         // We need to run finally if break crosses the try boundary, i.e., if
         // we're breaking from a loop that existed before the try started.
-        let routes_through_finally = self
-            .finally_targets
-            .last()
-            .is_some_and(|ft| target_loop_depth < ft.loop_depth_at_entry);
-
-        if routes_through_finally {
-            // Routed path: leave the iterator on the stack — the chain of
-            // finally trailers may have its own per-block stack contributions
-            // (e.g. a `with` block sits on top of the iterator), and popping
-            // the iterator here would pop the wrong slot. The outermost
-            // trailer (`compile_control_flow_after_finally`) pops the
-            // iterator just before jumping to the loop's break target.
-            let jump = self.code.emit_jump(Opcode::Jump)?;
-            self.finally_targets
-                .last_mut()
-                .expect("checked above")
-                .break_jumps
-                .push(BreakContinueThruFinally {
-                    jump,
-                    target_loop_depth,
-                });
-        } else {
-            // Direct path: pop the iterator (if any) and jump to loop end.
-            if self.loop_stack[target_loop_depth].has_iterator_on_stack {
-                self.code.emit(Opcode::Pop)?;
-            }
-            let jump = self.code.emit_jump(Opcode::Jump)?;
-            self.loop_stack[target_loop_depth].break_jumps.push(jump);
+        if let Some(finally_target) = self.finally_targets.last_mut()
+            && target_loop_depth < finally_target.loop_depth_at_entry
+        {
+            // Breaking from a loop that's outside (or at the start of) this try-finally,
+            // so finally must run before the break
+            let jump = self.code.emit_jump(Opcode::Jump);
+            finally_target.break_jumps.push(BreakContinueThruFinally {
+                jump,
+                target_loop_depth,
+            });
+            self.code.set_stack_depth(dead_code_depth);
+            return Ok(());
         }
+
+        // No finally to go through, jump directly to loop end
+        let jump = self.code.emit_jump(Opcode::Jump);
+        self.loop_stack[target_loop_depth].break_jumps.push(jump);
+
+        self.code.set_stack_depth(dead_code_depth);
 
         Ok(())
     }
@@ -2489,12 +2273,17 @@ impl<'a> Compiler<'a> {
             return Err(CompileError::new("'continue' not properly in loop", position));
         }
 
+        // `continue` never falls through. Preserve the statement-entry stack depth so
+        // subsequent dead statements in this block are compiled with the right abstract stack.
+        let dead_code_depth = self.code.stack_depth();
         let target_loop_depth = self.loop_stack.len() - 1;
 
-        // If inside except handlers, clear each enclosing exception_stack
-        // entry.
+        // If inside except handlers, clean up ALL exception states
+        // Each nested except handler has pushed an exception onto the stack,
+        // so we need to clear/pop each one when continuing
         for _ in 0..self.except_handler_depth {
-            self.code.emit(Opcode::ClearException)?;
+            self.code.emit(Opcode::ClearException);
+            self.code.emit(Opcode::Pop); // Pop the exception value
         }
 
         // Check if we need to go through any finally blocks
@@ -2504,16 +2293,20 @@ impl<'a> Compiler<'a> {
         {
             // Continuing a loop that's outside (or at the start of) this try-finally,
             // so finally must run before the continue
-            let jump = self.code.emit_jump(Opcode::Jump)?;
+            let jump = self.code.emit_jump(Opcode::Jump);
             finally_target.continue_jumps.push(BreakContinueThruFinally {
                 jump,
                 target_loop_depth,
             });
+            self.code.set_stack_depth(dead_code_depth);
+            return Ok(());
         }
 
         // No finally to go through, jump directly to loop start
         let loop_start = self.loop_stack[target_loop_depth].start;
-        self.code.emit_jump_to(Opcode::Jump, loop_start)?;
+        self.code.emit_jump_to(Opcode::Jump, loop_start);
+
+        self.code.set_stack_depth(dead_code_depth);
 
         Ok(())
     }
@@ -2527,17 +2320,13 @@ impl<'a> Compiler<'a> {
     /// Note: All items in the list jumped to the same finally block, so they all
     /// have the same starting point. After finally runs, we need to route each
     /// to its target loop, potentially through more finally blocks.
-    fn compile_control_flow_after_finally(
-        &mut self,
-        items: &[BreakContinueThruFinally],
-        is_break: bool,
-    ) -> Result<(), CompileError> {
+    fn compile_control_flow_after_finally(&mut self, items: &[BreakContinueThruFinally], is_break: bool) {
         // All items went through the same finally, now we need to dispatch to
         // potentially different loops. For simplicity, we assume all items in
         // a single finally target the same loop (the innermost one at the time).
         // This is always true since break/continue only targets the innermost loop.
         let Some(first) = items.first() else {
-            return Ok(());
+            return;
         };
         let target_loop_depth = first.target_loop_depth;
 
@@ -2546,7 +2335,7 @@ impl<'a> Compiler<'a> {
             && target_loop_depth < finally_target.loop_depth_at_entry
         {
             // Need to go through another finally
-            let jump = self.code.emit_jump(Opcode::Jump)?;
+            let jump = self.code.emit_jump(Opcode::Jump);
             let jump_info = BreakContinueThruFinally {
                 jump,
                 target_loop_depth,
@@ -2557,27 +2346,18 @@ impl<'a> Compiler<'a> {
                 // else continue
                 finally_target.continue_jumps.push(jump_info);
             }
-            return Ok(());
+            return;
         }
 
-        // No more finally blocks, jump directly to the loop target. For
-        // break paths we pop the for-loop iterator here (rather than at the
-        // break statement) so that intervening per-block stack contributions
-        // — e.g. a `with` block sitting on top of the iterator — get to clean
-        // themselves up in their own trailers first. Continue paths leave the
-        // iterator on top because the loop start (`ForIter`) expects it.
+        // No more finally blocks, jump directly to the loop target
         if is_break {
-            if self.loop_stack[target_loop_depth].has_iterator_on_stack {
-                self.code.emit(Opcode::Pop)?;
-            }
-            let jump = self.code.emit_jump(Opcode::Jump)?;
+            let jump = self.code.emit_jump(Opcode::Jump);
             self.loop_stack[target_loop_depth].break_jumps.push(jump);
         } else {
             // else continue
             let loop_start = self.loop_stack[target_loop_depth].start;
-            self.code.emit_jump_to(Opcode::Jump, loop_start)?;
+            self.code.emit_jump_to(Opcode::Jump, loop_start);
         }
-        Ok(())
     }
 
     // ========================================================================
@@ -2588,46 +2368,30 @@ impl<'a> Compiler<'a> {
     ///
     /// Bytecode structure:
     /// ```text
-    /// BUILD_LIST 0
+    /// BUILD_LIST 0          ; empty result
     /// <compile first iter>
     /// GET_ITER
     /// loop_start:
-    ///   FOR_ITER end_loop        ; pushes the iter's value
-    ///   [UNPACK / LIFT_TO_TOP]   ; comp-var leaves end up on operand stack
+    ///   FOR_ITER end_loop
+    ///   STORE_LOCAL target
     ///   <compile filters - jump back to loop_start if any fails>
     ///   [nested generators...]
     ///   <compile elt>
-    ///   LIST_APPEND depth        ; reaches list by counting items between
-    ///   POP × K_this_generator   ; remove this generator's comp vars
+    ///   LIST_APPEND depth
     ///   JUMP loop_start
-    /// end_loop:                  ; FOR_ITER popped the iter on exhaustion
+    /// end_loop:
     /// ; result list on stack
     /// ```
-    ///
-    /// Comprehension targets live on the operand stack as the values pushed
-    /// by `FOR_ITER` (plus unpacked sub-values). The compiler tracks each
-    /// leaf's absolute operand-stack offset in `Compiler::slot_offsets` so
-    /// that `compile_name` for `NameScope::CompVar` can emit
-    /// `LoadLocal/W(frame_locals + offset)`. Per-iteration `POP`s clean the
-    /// comp vars before the JUMP so the loop's stack discipline is preserved.
     fn compile_list_comp(&mut self, elt: &ExprLoc, generators: &[Comprehension]) -> Result<(), CompileError> {
-        if self.code.is_dead() {
-            return Ok(());
-        }
-        check_comp_generators(generators.len(), elt.position)?;
-        self.code.emit_u16(Opcode::BuildList, 0)?;
-        let depth_after_collection = self
-            .code
-            .stack_depth()
-            .expect("list comp: BuildList kept us live, stack_depth must be Some");
+        // Build empty list
+        self.code.emit_u16(Opcode::BuildList, 0);
 
+        // Compile the nested generators, which will eventually append to the list
+        let depth = u8::try_from(generators.len()).expect("too many generators in list comprehension");
         self.compile_comprehension_generators(generators, 0, |compiler| {
             compiler.compile_expr(elt)?;
-            if compiler.code.is_dead() {
-                return Ok(());
-            }
-            let depth = compiler.compute_append_depth(depth_after_collection, 1, elt.position)?;
-            compiler.code.emit_u8(Opcode::ListAppend, depth)
+            compiler.code.emit_u8(Opcode::ListAppend, depth);
+            Ok(())
         })?;
 
         Ok(())
@@ -2635,23 +2399,15 @@ impl<'a> Compiler<'a> {
 
     /// Compiles a set comprehension: `{elt for target in iter if cond...}`
     fn compile_set_comp(&mut self, elt: &ExprLoc, generators: &[Comprehension]) -> Result<(), CompileError> {
-        if self.code.is_dead() {
-            return Ok(());
-        }
-        check_comp_generators(generators.len(), elt.position)?;
-        self.code.emit_u16(Opcode::BuildSet, 0)?;
-        let depth_after_collection = self
-            .code
-            .stack_depth()
-            .expect("set comp: BuildSet kept us live, stack_depth must be Some");
+        // Build empty set
+        self.code.emit_u16(Opcode::BuildSet, 0);
 
+        // Compile the nested generators, which will eventually add to the set
+        let depth = u8::try_from(generators.len()).expect("too many generators in set comprehension");
         self.compile_comprehension_generators(generators, 0, |compiler| {
             compiler.compile_expr(elt)?;
-            if compiler.code.is_dead() {
-                return Ok(());
-            }
-            let depth = compiler.compute_append_depth(depth_after_collection, 1, elt.position)?;
-            compiler.code.emit_u8(Opcode::SetAdd, depth)
+            compiler.code.emit_u8(Opcode::SetAdd, depth);
+            Ok(())
         })?;
 
         Ok(())
@@ -2664,77 +2420,32 @@ impl<'a> Compiler<'a> {
         value: &ExprLoc,
         generators: &[Comprehension],
     ) -> Result<(), CompileError> {
-        if self.code.is_dead() {
-            return Ok(());
-        }
-        check_comp_generators(generators.len(), key.position)?;
-        self.code.emit_u16(Opcode::BuildDict, 0)?;
-        let depth_after_collection = self
-            .code
-            .stack_depth()
-            .expect("dict comp: BuildDict kept us live, stack_depth must be Some");
+        // Build empty dict
+        self.code.emit_u16(Opcode::BuildDict, 0);
 
+        // Compile the nested generators, which will eventually set items in the dict
+        let depth = u8::try_from(generators.len()).expect("too many generators in dict comprehension");
         self.compile_comprehension_generators(generators, 0, |compiler| {
             compiler.compile_expr(key)?;
             compiler.compile_expr(value)?;
-            if compiler.code.is_dead() {
-                return Ok(());
-            }
-            // DictSetItem pops 2 (key+value), so the post-pop offset for the
-            // collection is one deeper than the list/set case.
-            let depth = compiler.compute_append_depth(depth_after_collection, 2, key.position)?;
-            compiler.code.emit_u8(Opcode::DictSetItem, depth)
+            compiler.code.emit_u8(Opcode::DictSetItem, depth);
+            Ok(())
         })?;
 
         Ok(())
     }
 
-    /// Computes the `depth` operand for `ListAppend` / `SetAdd` / `DictSetItem`.
-    ///
-    /// All three opcodes pop their value(s) first and then index the
-    /// collection at `len_post_pop - 1 - depth`. We want the collection at
-    /// its known position (`depth_after_collection - 1`), so the operand is
-    /// `current_stack_depth - depth_after_collection - 1` for list/set (pops 1)
-    /// or `current_stack_depth - depth_after_collection - 2` for dict (pops 2).
-    /// The caller passes the pop count.
-    fn compute_append_depth(
-        &self,
-        depth_after_collection: u16,
-        pops: u16,
-        position: CodeRange,
-    ) -> Result<u8, CompileError> {
-        let current = self.code.stack_depth().expect("compute_append_depth in dead code");
-        let depth = current
-            .checked_sub(depth_after_collection)
-            .and_then(|d| d.checked_sub(pops))
-            .ok_or_else(|| CompileError::new("comprehension stack-depth bookkeeping went negative", position))?;
-        u8::try_from(depth).map_err(|_| {
-            CompileError::new(
-                "comprehension target + iterator count exceeds u8 depth operand",
-                position,
-            )
-        })
-    }
-
     /// Recursively compiles comprehension generators (the for/if clauses).
     ///
     /// For each generator:
-    /// 1. Compile the iterator expression and `GET_ITER`.
-    /// 2. Start loop: `FOR_ITER` pushes the iter's value (or pops iter and
-    ///    jumps to end on exhaustion).
-    /// 3. Unpack the comp target — `compile_comp_target_unpack` emits any
-    ///    `UNPACK_SEQUENCE` / `UNPACK_EX` / `LIFT_TO_TOP` needed and records
-    ///    each leaf's operand-stack offset.
-    /// 4. Compile filter conditions; on false, jump back to loop start
-    ///    (skipping per-iter POPs and the body — the per-iter operand-stack
-    ///    items live below the filter result, so this works the same way it
-    ///    did with the dedicated-region scheme).
-    /// 5. Either recurse for the next generator, or call `body_fn` at the
-    ///    innermost level (which emits the element expression and
-    ///    `LIST_APPEND` / `SET_ADD` / `DICT_SET_ITEM`).
-    /// 6. Per-iteration `POP` for each comp-var leaf produced by this
-    ///    generator's target, restoring the loop-start stack shape.
-    /// 7. Jump back to loop start.
+    /// 1. Compile the iterator expression and get iterator
+    /// 2. Start loop: FOR_ITER to get next value or exit
+    /// 3. Store to target variable
+    /// 4. Compile filter conditions (jump back to loop start if any fails)
+    /// 5. Either recurse for inner generator, or call the body callback
+    /// 6. Jump back to loop start
+    ///
+    /// The `body_fn` callback is called at the innermost level to emit the element/key-value code.
     fn compile_comprehension_generators(
         &mut self,
         generators: &[Comprehension],
@@ -2743,189 +2454,47 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), CompileError> {
         let generator = &generators[index];
 
+        // Record stack depth before iterator expression
+        // This is the depth we return to when the loop finishes (iterator popped)
+        let loop_exit_depth = self.code.stack_depth();
+
         // Compile iterator expression
         self.compile_expr(&generator.iter)?;
-        self.code.emit(Opcode::GetIter)?;
+        self.code.emit(Opcode::GetIter);
 
         // Loop start
-        let loop_start = self.code.current_jump_target();
+        let loop_start = self.code.current_offset();
 
-        // FOR_ITER: pushes value, or pops iter and jumps to end on exhaustion.
-        let end_jump = self.code.emit_jump(Opcode::ForIter)?;
+        // FOR_ITER: advance iterator or jump to end
+        let end_jump = self.code.emit_jump(Opcode::ForIter);
 
-        // Unpack target — leaves the comp vars on the operand stack at offsets
-        // recorded in `self.slot_offsets`, and marks them in `bound_comp_slots`.
-        let comp_var_slots = self.compile_comp_target_unpack(&generator.target)?;
+        // Store current value to target (single variable or tuple unpacking)
+        self.compile_unpack_target(&generator.target);
 
-        // Filters: any false → forward-jump to the per-iter cleanup block
-        // below. We can't jump directly to `loop_start`: the comp vars are
-        // on the operand stack, so we must pop them first to keep the
-        // loop-start stack shape consistent. `JumpIfFalse` pops `cond`, so
-        // arrival depth at the cleanup label matches the post-body depth
-        // (both are `loop_start + K`).
-        let mut filter_skip_jumps = Vec::with_capacity(generator.ifs.len());
+        // Compile filter conditions - jump back to loop start if any fails
         for cond in &generator.ifs {
             self.compile_expr(cond)?;
-            filter_skip_jumps.push(self.code.emit_jump(Opcode::JumpIfFalse)?);
+            // If condition is false, skip to next iteration
+            self.code.emit_jump_to(Opcode::JumpIfFalse, loop_start);
         }
 
-        // Recurse or emit body.
+        // Either recurse for inner generator, or emit body
         if index + 1 < generators.len() {
+            // Recurse for inner generator
             self.compile_comprehension_generators(generators, index + 1, body_fn)?;
         } else {
+            // Innermost level - emit body (the element/key-value expression and append/add/set)
             body_fn(self)?;
         }
 
-        // Per-iteration cleanup block: pop this generator's comp vars so the
-        // JUMP back to `loop_start` lands at the same stack shape as the
-        // previous iteration's entry. Filter-failure jumps also land here.
-        for jmp in filter_skip_jumps {
-            self.code.patch_jump(jmp)?;
-        }
-        for _ in 0..comp_var_slots.len() {
-            self.code.emit(Opcode::Pop)?;
-        }
-
         // Jump back to loop start
-        self.code.emit_jump_to(Opcode::Jump, loop_start)?;
-        self.code.patch_jump(end_jump)?;
+        self.code.emit_jump_to(Opcode::Jump, loop_start);
 
-        // Comp vars are out of scope after the loop body; clear their
-        // bound-state so a sibling comprehension that reuses the same slot
-        // IDs sees its own targets as unbound at iter-prep time.
-        // `slot_offsets` entries are simply overwritten by whoever uses the
-        // slot next, so we leave them as-is.
-        for slot in &comp_var_slots {
-            self.bound_comp_slots.remove(slot);
-        }
+        // End of loop
+        self.code.patch_jump(end_jump);
+        // Iterator is popped when loop ends normally, so restore depth to before loop
+        self.code.set_stack_depth(loop_exit_depth);
 
-        Ok(())
-    }
-
-    /// Compiles the unpacking of a comprehension target.
-    ///
-    /// At entry, `FOR_ITER` has pushed the iter's value at TOS. This emits
-    /// `UNPACK_SEQUENCE` / `UNPACK_EX` / `LIFT_TO_TOP` as needed (nested
-    /// tuples force `LIFT_TO_TOP` to bring sub-iterables to TOS for
-    /// further unpacking) and records each leaf's absolute operand-stack
-    /// offset in `self.slot_offsets`. Also marks each leaf's slot ID in
-    /// `self.bound_comp_slots`.
-    ///
-    /// Returns the slot IDs for this target's leaves so the caller can
-    /// emit a matching `POP` per leaf for per-iteration cleanup.
-    fn compile_comp_target_unpack(&mut self, target: &UnpackTarget) -> Result<Vec<u16>, CompileError> {
-        // `FOR_ITER` just pushed; current depth's TOS index is the value's
-        // operand-stack offset, which is also the offset of the first leaf
-        // produced by this unpack.
-        //
-        // If we're already in dead-code state (e.g. an earlier generator's
-        // iter expression contained a `RaiseUnboundLocal` that terminated the
-        // current code region), no bytecode emission would have any effect.
-        // Return an empty slot list — `compile_comprehension_generators` then
-        // emits its `POP`s and `JUMP` in dead state (also no-ops). The
-        // comp-var slots stay out of `bound_comp_slots`, so any subsequent
-        // `CompVar` read would dispatch to `RaiseUnboundLocal` — also a
-        // no-op in dead code.
-        let Some(stack_depth) = self.code.stack_depth() else {
-            return Ok(Vec::new());
-        };
-        let base_offset = stack_depth - 1;
-
-        let mut sim: Vec<SimItem<'_>> = vec![SimItem::Pending(target)];
-        self.process_unpack_sim(&mut sim)?;
-
-        // All items should be Leafs now. Record offsets in order.
-        let mut slot_ids = Vec::with_capacity(sim.len());
-        for (i, item) in sim.into_iter().enumerate() {
-            let SimItem::Leaf(slot) = item else {
-                unreachable!("process_unpack_sim left a Pending on the sim");
-            };
-            let i_u16 = u16::try_from(i).expect("comp-var index bounded by u8 unpack count");
-            let offset = base_offset.checked_add(i_u16).ok_or_else(|| {
-                CompileError::new(
-                    "comprehension operand-stack offset exceeds u16",
-                    target_position(target),
-                )
-            })?;
-            let slot_idx = slot as usize;
-            if slot_idx >= self.slot_offsets.len() {
-                self.slot_offsets.resize(slot_idx + 1, 0);
-            }
-            self.slot_offsets[slot_idx] = self.frame_locals.checked_add(offset).ok_or_else(|| {
-                CompileError::new(
-                    "comprehension comp-var slot exceeds u16 (frame_locals + offset)",
-                    target_position(target),
-                )
-            })?;
-            self.bound_comp_slots.insert(slot);
-            slot_ids.push(slot);
-        }
-
-        Ok(slot_ids)
-    }
-
-    /// Drives one step of the unpack simulation: takes the topmost `Pending`
-    /// off `sim` and either marks it `Leaf` (for `Name`/`Starred`) or emits
-    /// `UNPACK_SEQUENCE`/`UNPACK_EX` and recursively processes sub-targets,
-    /// using `LIFT_TO_TOP` to bring each sub-target to TOS before recursion.
-    ///
-    /// Precondition: `sim`'s topmost item is `Pending`.
-    fn process_unpack_sim(&mut self, sim: &mut Vec<SimItem<'_>>) -> Result<(), CompileError> {
-        let target = match sim.pop() {
-            Some(SimItem::Pending(t)) => t,
-            Some(SimItem::Leaf(_)) => unreachable!("process_unpack_sim called with Leaf at TOS"),
-            None => unreachable!("process_unpack_sim called on empty sim"),
-        };
-
-        match target {
-            UnpackTarget::Name(ident) | UnpackTarget::Starred(ident) => {
-                sim.push(SimItem::Leaf(ident.namespace_id().as_u16()));
-            }
-            UnpackTarget::Tuple { targets, position } => {
-                // Pick UNPACK_EX vs UNPACK_SEQUENCE based on whether a starred
-                // sub-target is present (same logic as the regular assignment
-                // path in `compile_unpack_target`).
-                let star_idx = targets.iter().position(|t| matches!(t, UnpackTarget::Starred(_)));
-                self.code.set_location(*position, None);
-                if let Some(star_idx) = star_idx {
-                    let before = check_unpack_targets(star_idx, *position)?;
-                    let after = check_unpack_targets(targets.len() - star_idx - 1, *position)?;
-                    self.code.emit_u8_u8(Opcode::UnpackEx, before, after)?;
-                } else {
-                    let count = check_unpack_targets(targets.len(), *position)?;
-                    self.code.emit_u8(Opcode::UnpackSequence, count)?;
-                }
-
-                // UNPACK pushes sub-targets in reverse source order: sub n-1
-                // ends up at the bottom of the new region, sub 0 at TOS.
-                let base = sim.len();
-                for sub in targets.iter().rev() {
-                    sim.push(SimItem::Pending(sub));
-                }
-
-                // Process sub-targets in source order. Each lift only moves
-                // items at or above the source-index, so subs we haven't
-                // processed yet (lower indices, deeper in the sim) keep
-                // their position.
-                let n = targets.len();
-                for i in 0..n {
-                    let target_idx = base + (n - 1 - i);
-                    let tos_idx = sim.len() - 1;
-                    if tos_idx > target_idx {
-                        let lift_n = tos_idx - target_idx;
-                        let lift_n_u8 = u8::try_from(lift_n).map_err(|_| {
-                            CompileError::new("comprehension nesting requires lift offset > u8", *position)
-                        })?;
-                        self.code.emit_u8(Opcode::LiftToTop, lift_n_u8)?;
-                        let item = sim.remove(target_idx);
-                        sim.push(item);
-                    }
-                    // Now sub i is at TOS. Recurse to either mark Leaf or
-                    // unpack further.
-                    self.process_unpack_sim(sim)?;
-                }
-            }
-        }
         Ok(())
     }
 
@@ -2934,16 +2503,16 @@ impl<'a> Compiler<'a> {
     /// For single identifiers: emits a simple store.
     /// For nested tuples: emits `UnpackSequence` (or `UnpackEx` with starred) and recursively
     /// handles each sub-target.
-    fn compile_unpack_target(&mut self, target: &UnpackTarget) -> Result<(), CompileError> {
+    fn compile_unpack_target(&mut self, target: &UnpackTarget) {
         match target {
             UnpackTarget::Name(ident) => {
                 // Single identifier - just store directly
-                self.compile_store(ident)?;
+                self.compile_store(ident);
             }
             UnpackTarget::Starred(ident) => {
                 // Starred target by itself (shouldn't happen at top level normally)
                 // Just store as if it were a name
-                self.compile_store(ident)?;
+                self.compile_store(ident);
             }
             UnpackTarget::Tuple { targets, position } => {
                 // Check if there's a starred target
@@ -2953,23 +2522,22 @@ impl<'a> Compiler<'a> {
 
                 if let Some(star_idx) = star_idx {
                     // Has starred target - use UnpackEx
-                    let before = check_unpack_targets(star_idx, *position)?;
-                    let after = check_unpack_targets(targets.len() - star_idx - 1, *position)?;
-                    self.code.emit_u8_u8(Opcode::UnpackEx, before, after)?;
+                    let before = u8::try_from(star_idx).expect("too many targets before star");
+                    let after = u8::try_from(targets.len() - star_idx - 1).expect("too many targets after star");
+                    self.code.emit_u8_u8(Opcode::UnpackEx, before, after);
                 } else {
                     // No starred target - use UnpackSequence
-                    let count = check_unpack_targets(targets.len(), *position)?;
-                    self.code.emit_u8(Opcode::UnpackSequence, count)?;
+                    let count = u8::try_from(targets.len()).expect("too many targets in nested unpack");
+                    self.code.emit_u8(Opcode::UnpackSequence, count);
                 }
 
                 // After UnpackSequence/UnpackEx, values are on stack with first item on top
                 // Store them in order, recursively handling further nesting
                 for target in targets {
-                    self.compile_unpack_target(target)?;
+                    self.compile_unpack_target(target);
                 }
             }
         }
-        Ok(())
     }
 
     /// Compiles a single assignment step, assuming the value to assign is on top of stack.
@@ -2981,7 +2549,7 @@ impl<'a> Compiler<'a> {
     /// chained forms.
     fn compile_assign_target(&mut self, target: &AssignTarget) -> Result<(), CompileError> {
         match target {
-            AssignTarget::Name(ident) => self.compile_store(ident)?,
+            AssignTarget::Name(ident) => self.compile_store(ident),
             AssignTarget::Subscript {
                 target,
                 index,
@@ -2995,7 +2563,7 @@ impl<'a> Compiler<'a> {
             AssignTarget::Unpack {
                 targets,
                 targets_position,
-            } => self.emit_unpack_store(targets, *targets_position)?,
+            } => self.emit_unpack_store(targets, *targets_position),
         }
         Ok(())
     }
@@ -3014,7 +2582,7 @@ impl<'a> Compiler<'a> {
         self.compile_expr(target)?;
         self.compile_expr(index)?;
         self.code.set_location(target_position, None);
-        self.code.emit(Opcode::StoreSubscr)?;
+        self.code.emit(Opcode::StoreSubscr);
         Ok(())
     }
 
@@ -3041,10 +2609,12 @@ impl<'a> Compiler<'a> {
                 target_position,
             ));
         };
-        let name_idx = check_name_index_u16(name_id, target_position)?;
         self.compile_expr(object)?;
         self.code.set_location(target_position, None);
-        self.code.emit_u16(Opcode::StoreAttr, name_idx)?;
+        self.code.emit_u16(
+            Opcode::StoreAttr,
+            u16::try_from(name_id.index()).expect("name index exceeds u16"),
+        );
         Ok(())
     }
 
@@ -3054,21 +2624,20 @@ impl<'a> Compiler<'a> {
     /// (no starred target) and `UnpackEx` (exactly one starred target), then stores the
     /// unpacked values into each sub-target — recursing through nested tuple patterns.
     /// Shared between `Node::UnpackAssign` and chained-assignment unpack steps.
-    fn emit_unpack_store(&mut self, targets: &[UnpackTarget], targets_position: CodeRange) -> Result<(), CompileError> {
+    fn emit_unpack_store(&mut self, targets: &[UnpackTarget], targets_position: CodeRange) {
         let star_idx = targets.iter().position(|t| matches!(t, UnpackTarget::Starred(_)));
         self.code.set_location(targets_position, None);
         if let Some(star_idx) = star_idx {
-            let before = check_unpack_targets(star_idx, targets_position)?;
-            let after = check_unpack_targets(targets.len() - star_idx - 1, targets_position)?;
-            self.code.emit_u8_u8(Opcode::UnpackEx, before, after)?;
+            let before = u8::try_from(star_idx).expect("too many targets before star");
+            let after = u8::try_from(targets.len() - star_idx - 1).expect("too many targets after star");
+            self.code.emit_u8_u8(Opcode::UnpackEx, before, after);
         } else {
-            let count = check_unpack_targets(targets.len(), targets_position)?;
-            self.code.emit_u8(Opcode::UnpackSequence, count)?;
+            let count = u8::try_from(targets.len()).expect("too many targets in unpack");
+            self.code.emit_u8(Opcode::UnpackSequence, count);
         }
         for t in targets {
-            self.compile_unpack_target(t)?;
+            self.compile_unpack_target(t);
         }
-        Ok(())
     }
 
     // ========================================================================
@@ -3080,25 +2649,25 @@ impl<'a> Compiler<'a> {
         // Compile test
         self.compile_expr(test)?;
         // Jump over raise if truthy
-        let skip_jump = self.code.emit_jump(Opcode::JumpIfTrue)?;
+        let skip_jump = self.code.emit_jump(Opcode::JumpIfTrue);
 
         // Raise AssertionError
         let exc_idx = self
             .code
-            .add_const(Value::Builtin(Builtins::ExcType(ExcType::AssertionError)))?;
-        self.code.emit_u16(Opcode::LoadConst, exc_idx)?;
+            .add_const(Value::Builtin(Builtins::ExcType(ExcType::AssertionError)));
+        self.code.emit_u16(Opcode::LoadConst, exc_idx);
 
         if let Some(msg_expr) = msg {
             // Call AssertionError(msg)
             self.compile_expr(msg_expr)?;
-            self.code.emit_u8(Opcode::CallFunction, 1)?;
+            self.code.emit_u8(Opcode::CallFunction, 1);
         } else {
             // Call AssertionError()
-            self.code.emit_u8(Opcode::CallFunction, 0)?;
+            self.code.emit_u8(Opcode::CallFunction, 0);
         }
 
-        self.code.emit(Opcode::Raise)?;
-        self.code.patch_jump(skip_jump)?;
+        self.code.emit(Opcode::Raise);
+        self.code.patch_jump(skip_jump);
         Ok(())
     }
 
@@ -3114,8 +2683,8 @@ impl<'a> Compiler<'a> {
             match part {
                 FStringPart::Literal(string_id) => {
                     // Push the interned string as a constant
-                    let const_idx = self.code.add_const(Value::InternString(*string_id))?;
-                    self.code.emit_u16(Opcode::LoadConst, const_idx)?;
+                    let const_idx = self.code.add_const(Value::InternString(*string_id));
+                    self.code.emit_u16(Opcode::LoadConst, const_idx);
                     count += 1;
                 }
                 FStringPart::Interpolation {
@@ -3126,8 +2695,8 @@ impl<'a> Compiler<'a> {
                 } => {
                     // If debug prefix present, push it first
                     if let Some(prefix_id) = debug_prefix {
-                        let const_idx = self.code.add_const(Value::InternString(*prefix_id))?;
-                        self.code.emit_u16(Opcode::LoadConst, const_idx)?;
+                        let const_idx = self.code.add_const(Value::InternString(*prefix_id));
+                        self.code.emit_u16(Opcode::LoadConst, const_idx);
                         count += 1;
                     }
 
@@ -3143,7 +2712,7 @@ impl<'a> Compiler<'a> {
 
                     // Emit FormatValue with appropriate flags
                     let flags = self.compile_format_value(effective_conversion, format_spec.as_ref())?;
-                    self.code.emit_u8(Opcode::FormatValue, flags)?;
+                    self.code.emit_u8(Opcode::FormatValue, flags);
                     count += 1;
                 }
             }
@@ -3154,11 +2723,8 @@ impl<'a> Compiler<'a> {
 
     /// Compiles format value flags and optionally pushes format spec to stack.
     ///
-    /// Returns the flags byte encoding conversion, spec presence, and (for
-    /// static specs) that the on-stack spec is the encoded `Int` form rather
-    /// than a string. See [`FORMAT_VALUE_HAS_SPEC`]/[`FORMAT_VALUE_STATIC_SPEC`]
-    /// for the bit layout. If a format spec is present it's pushed to the
-    /// stack before the value.
+    /// Returns the flags byte encoding conversion and format spec presence.
+    /// If a format spec is present, it's pushed to the stack before the value.
     fn compile_format_value(
         &mut self,
         conversion: ConversionFlag,
@@ -3174,87 +2740,59 @@ impl<'a> Compiler<'a> {
 
         match format_spec {
             None => Ok(conv_bits),
-            Some(FormatSpec::Static(encoded)) => {
-                // Push the raw encoded form; the static-spec flag tells the
-                // VM to read it back via decode_format_spec without inspecting
-                // the Value variant.
-                let const_idx = self.code.add_const(Value::Int(*encoded))?;
-                self.code.emit_u16(Opcode::LoadConst, const_idx)?;
-                Ok(conv_bits | FORMAT_VALUE_HAS_SPEC | FORMAT_VALUE_STATIC_SPEC)
+            Some(FormatSpec::Static(parsed)) => {
+                // Static format spec - push a marker constant with the parsed spec info
+                // We store this as a special format spec value in the constant pool
+                // The VM will recognize this and use the pre-parsed spec
+                let const_idx = self.add_format_spec_const(parsed);
+                self.code.emit_u16(Opcode::LoadConst, const_idx);
+                Ok(conv_bits | 0x04) // has format spec on stack
             }
             Some(FormatSpec::Dynamic(dynamic_parts)) => {
                 // Compile dynamic format spec parts to build a format spec string
                 // Then parse it at runtime
                 let part_count = self.compile_fstring_parts(dynamic_parts)?;
                 if part_count > 1 {
-                    self.code.emit_u16(Opcode::BuildFString, part_count)?;
+                    self.code.emit_u16(Opcode::BuildFString, part_count);
                 }
                 // Format spec string is now on stack
-                Ok(conv_bits | FORMAT_VALUE_HAS_SPEC)
+                Ok(conv_bits | 0x04) // has format spec on stack
             }
         }
+    }
+
+    /// Adds a format spec to the constant pool as an encoded integer.
+    ///
+    /// Uses the encoding from `fstring::encode_format_spec` and stores it as
+    /// a negative integer to distinguish from regular ints.
+    fn add_format_spec_const(&mut self, spec: &ParsedFormatSpec) -> u16 {
+        let encoded = encode_format_spec(spec);
+        // Use negative to distinguish from regular ints (format spec marker)
+        // We negate and subtract 1 to ensure it's negative and recoverable
+        let encoded_i64 = i64::try_from(encoded).expect("format spec encoding exceeds i64::MAX");
+        let marker = -(encoded_i64 + 1);
+        self.code.add_const(Value::Int(marker))
     }
 
     // ========================================================================
     // Exception Handling Compilation
     // ========================================================================
 
-    /// Compiles a return statement.
+    /// Compiles a return statement, handling finally blocks properly.
     ///
-    /// `expr` is the expression after `return` (`None` for a bare `return`).
-    fn compile_return(&mut self, expr: Option<&ExprLoc>) -> Result<(), CompileError> {
-        if let Some(expr) = expr {
-            self.compile_expr(expr)?;
-        } else {
-            self.code.emit(Opcode::LoadNone)?;
-        }
-
-        self.compile_return_routing()?;
-
-        Ok(())
-    }
-
-    /// Used for returning from current function. The return value must already
-    /// be on the top of the stack.
-    ///
-    /// Will either emit a direct `ReturnValue`, or jump to the next enclosing
-    /// finally block (if we're inside one).
-    ///
-    /// Clears active-exception state for every `except` handler we're
-    /// exiting up to (but not past) the next enclosing finally — finally
-    /// bodies between us and the next-outer finally need to run with their
-    /// textually-enclosing exception state intact, e.g.:
-    ///
-    /// ```python
-    /// try:
-    ///     raise ValueError
-    /// except ValueError:
-    ///     try:
-    ///         return  # inner finally below must STILL see ValueError as
-    ///     finally:    # the active exception so bare `raise` re-raises it.
-    ///         ...
-    /// ```
-    ///
-    /// The remaining handlers are cleared further out by the finally
-    /// trailers in [`compile_try`] as control flows through them.
-    fn compile_return_routing(&mut self) -> Result<(), CompileError> {
-        let target_depth = self
-            .finally_targets
-            .last()
-            .map_or(0, |t| t.except_handler_depth_at_entry);
-
-        for _ in 0..(self.except_handler_depth - target_depth) {
-            self.code.emit(Opcode::ClearException)?;
-        }
-
+    /// If we're inside a try-finally block, the return value is kept on the stack
+    /// and we jump to a "finally with return" section that runs finally then returns.
+    /// Otherwise, we emit a direct `ReturnValue`.
+    fn compile_return(&mut self) {
         if let Some(finally_target) = self.finally_targets.last_mut() {
-            let jump = self.code.emit_jump(Opcode::Jump)?;
+            // Inside a try-finally: jump to finally, then return
+            // Return value is already on stack
+            let jump = self.code.emit_jump(Opcode::Jump);
             finally_target.return_jumps.push(jump);
         } else {
-            self.code.emit(Opcode::ReturnValue)?;
+            // Normal return
+            self.code.emit(Opcode::ReturnValue);
         }
-
-        Ok(())
     }
 
     /// Compiles a try/except/else/finally block.
@@ -3296,16 +2834,7 @@ impl<'a> Compiler<'a> {
         let has_else = !try_block.or_else.is_empty();
 
         // Record stack depth at try entry (for unwinding on exception)
-        let Some(stack_depth) = self.code.stack_depth() else {
-            // Compiling dead code, don't need to emit anything
-            return Ok(());
-        };
-
-        // Record `except_handler_depth` at try entry — the count of this
-        // frame's exception_stack entries that should be active inside the
-        // try body. The VM uses this on unwind to drain entries left
-        // behind by abandoned-but-trailer-skipped handlers.
-        let try_exc_stack_count = self.except_handler_depth;
+        let stack_depth = self.code.stack_depth();
 
         // If there's a finally block, track returns/break/continue inside try/handlers/else
         if has_finally {
@@ -3314,28 +2843,36 @@ impl<'a> Compiler<'a> {
                 break_jumps: Vec::new(),
                 continue_jumps: Vec::new(),
                 loop_depth_at_entry: self.loop_stack.len(),
-                except_handler_depth_at_entry: self.except_handler_depth,
             });
         }
 
         // === Compile try body ===
         let try_start = self.code.current_offset();
         self.compile_block(&try_block.body)?;
+        let try_end = self.code.current_offset();
 
         // Jump to else/finally if no exception (skip handlers)
-        let after_try_jump = self.code.emit_jump(Opcode::Jump)?;
-        // End of the try-body region for the exception table. This is past
-        // the `after_try_jump` if it was emitted, so an exception that fires
-        // up to and including that Jump still routes to the handler.
-        let try_end = self.code.current_offset();
+        let after_try_jump = self.code.emit_jump(Opcode::Jump);
 
         // === Handler dispatch starts here ===
         let handler_start = self.code.current_offset();
 
+        // VM pushes exception onto stack when entering handler.
+        // Adjust compiler's stack depth tracking to reflect this.
+        self.code.adjust_stack_depth(1);
+
         // Track jumps that go to finally (for patching later)
         let mut finally_jumps: Vec<JumpLabel> = Vec::new();
 
-        self.compile_exception_handlers(stack_depth, &try_block.handlers, &mut finally_jumps)?;
+        if has_handlers {
+            // Compile exception handlers
+            // handler_entry_depth = stack_depth + 1 (exception on stack)
+            let handler_entry_depth = stack_depth + 1;
+            self.compile_exception_handlers(&try_block.handlers, &mut finally_jumps, handler_entry_depth)?;
+        } else {
+            // No handlers - just reraise (this only happens with try-finally)
+            self.code.emit(Opcode::Reraise);
+        }
 
         // After handler dispatch, each handler path either:
         // 1. Matched and popped the exception (via Pop), then jumped to finally
@@ -3352,14 +2889,14 @@ impl<'a> Compiler<'a> {
         let finally_cleanup_start = if has_finally {
             let cleanup_start = self.code.current_offset();
             // Exception value is on stack (pushed by VM), so stack = stack_depth + 1
-            self.code.new_code_region(stack_depth + 1);
+            self.code.set_stack_depth(stack_depth + 1);
             // We need to pop it, run finally, then reraise
             // But we can't easily save the exception, so we use a different approach:
             // The exception is already on the exception_stack from handle_exception,
             // so we can just pop from operand stack, run finally, then reraise.
-            self.code.emit(Opcode::Pop)?; // Pop exception from operand stack
+            self.code.emit(Opcode::Pop); // Pop exception from operand stack
             self.compile_block(&try_block.finally)?;
-            self.code.emit(Opcode::Reraise)?; // Re-raise from exception_stack
+            self.code.emit(Opcode::Reraise); // Re-raise from exception_stack
             Some(cleanup_start)
         } else {
             None
@@ -3376,10 +2913,12 @@ impl<'a> Compiler<'a> {
             } else {
                 let start = self.code.current_offset();
                 for jump in finally_target.return_jumps {
-                    self.code.patch_jump(jump)?;
+                    self.code.patch_jump(jump);
                 }
+                // Return value is on stack, stack = stack_depth + 1
+                self.code.set_stack_depth(stack_depth + 1);
                 self.compile_block(&try_block.finally)?;
-                self.compile_return_routing()?;
+                self.compile_return();
                 Some(start)
             };
 
@@ -3389,21 +2928,26 @@ impl<'a> Compiler<'a> {
             // - Jump directly to the loop's break target
             if !finally_target.break_jumps.is_empty() {
                 for break_info in &finally_target.break_jumps {
-                    self.code.patch_jump(break_info.jump)?;
+                    self.code.patch_jump(break_info.jump);
                 }
+                // Break already popped the iterator, so stack = stack_depth - 1
+                // (the iterator was on stack at try entry, break removed it)
+                self.code.set_stack_depth(stack_depth.saturating_sub(1));
                 self.compile_block(&try_block.finally)?;
                 // After finally, compile the break again (handles nested finally or direct jump)
-                self.compile_control_flow_after_finally(&finally_target.break_jumps, true)?;
+                self.compile_control_flow_after_finally(&finally_target.break_jumps, true);
             }
 
             // === Finally with continue path ===
             if !finally_target.continue_jumps.is_empty() {
                 for continue_info in &finally_target.continue_jumps {
-                    self.code.patch_jump(continue_info.jump)?;
+                    self.code.patch_jump(continue_info.jump);
                 }
+                // Continue doesn't pop the iterator, stack = stack_depth
+                self.code.set_stack_depth(stack_depth);
                 self.compile_block(&try_block.finally)?;
                 // After finally, compile the continue again (handles nested finally or direct jump)
-                self.compile_control_flow_after_finally(&finally_target.continue_jumps, false)?;
+                self.compile_control_flow_after_finally(&finally_target.continue_jumps, false);
             }
 
             return_start
@@ -3412,7 +2956,9 @@ impl<'a> Compiler<'a> {
         };
 
         // === Else block (runs if no exception) ===
-        self.code.patch_jump(after_try_jump)?;
+        self.code.patch_jump(after_try_jump);
+        // Normal path from try body, stack = stack_depth
+        self.code.set_stack_depth(stack_depth);
         let else_start = self.code.current_offset();
         if has_else {
             self.compile_block(&try_block.or_else)?;
@@ -3422,236 +2968,60 @@ impl<'a> Compiler<'a> {
         // === Normal finally path (no exception pending, no return) ===
         // Patch all jumps from handlers to go here
         for jump in finally_jumps {
-            self.code.patch_jump(jump)?;
+            self.code.patch_jump(jump);
         }
 
         if has_finally {
+            // Stack = stack_depth (no exception, no return value)
+            self.code.set_stack_depth(stack_depth);
             self.compile_block(&try_block.finally)?;
         }
 
         // === Add exception table entries ===
         // Order matters: entries are searched in order, so inner entries must come first.
 
-        // Entry 1: Try body -> handler dispatch.
-        // exception_stack_count = try_exc_stack_count: entering the try body
-        // adds no handler entries.
+        // Entry 1: Try body -> handler dispatch
         if has_handlers || has_finally {
-            self.code
-                .add_exception_entry(try_start, try_end, handler_start, stack_depth, try_exc_stack_count)?;
+            self.code.add_exception_entry(ExceptionEntry::new(
+                u32::try_from(try_start).expect("bytecode offset exceeds u32"),
+                u32::try_from(try_end).expect("bytecode offset exceeds u32") + 3, // +3 to include the JUMP instruction
+                u32::try_from(handler_start).expect("bytecode offset exceeds u32"),
+                stack_depth,
+            ));
         }
 
-        // Entry 2: Handler dispatch -> finally cleanup (only if has_finally).
-        // exception_stack_count = try_exc_stack_count + 1: the original
-        // exception was pushed onto exception_stack by entry 1's catch and
-        // is still active throughout handler dispatch.
+        // Entry 2: Handler dispatch -> finally cleanup (only if has_finally)
+        // This ensures finally runs when RERAISE is executed or any exception occurs in handlers
         if let Some(cleanup_start) = finally_cleanup_start {
-            self.code.add_exception_entry(
-                handler_start,
-                handler_dispatch_end,
-                cleanup_start,
+            self.code.add_exception_entry(ExceptionEntry::new(
+                u32::try_from(handler_start).expect("bytecode offset exceeds u32"),
+                u32::try_from(handler_dispatch_end).expect("bytecode offset exceeds u32"),
+                u32::try_from(cleanup_start).expect("bytecode offset exceeds u32"),
                 stack_depth,
-                try_exc_stack_count + 1,
-            )?;
+            ));
         }
 
         // Entry 3: Finally with return -> finally cleanup
         // If an exception occurs while running finally (in the return path), catch it
         if let (Some(return_start), Some(cleanup_start)) = (finally_with_return_start, finally_cleanup_start) {
-            // End at else_start (before else block).
-            self.code.add_exception_entry(
-                return_start,
-                else_start,
-                cleanup_start,
+            self.code.add_exception_entry(ExceptionEntry::new(
+                u32::try_from(return_start).expect("bytecode offset exceeds u32"),
+                u32::try_from(else_start).expect("bytecode offset exceeds u32"), // End at else_start (before else block)
+                u32::try_from(cleanup_start).expect("bytecode offset exceeds u32"),
                 stack_depth,
-                try_exc_stack_count,
-            )?;
+            ));
         }
 
-        // Entry 4: Else block -> finally cleanup (only if has_finally and
-        // has_else). Else runs when no exception was raised, so no handler
-        // pushed an entry: exception_stack_count = try_exc_stack_count.
+        // Entry 4: Else block -> finally cleanup (only if has_finally and has_else)
+        // Exceptions in else block should go through finally
         if has_else && let Some(cleanup_start) = finally_cleanup_start {
-            self.code
-                .add_exception_entry(else_start, else_end, cleanup_start, stack_depth, try_exc_stack_count)?;
+            self.code.add_exception_entry(ExceptionEntry::new(
+                u32::try_from(else_start).expect("bytecode offset exceeds u32"),
+                u32::try_from(else_end).expect("bytecode offset exceeds u32"),
+                u32::try_from(cleanup_start).expect("bytecode offset exceeds u32"),
+                stack_depth,
+            ));
         }
-
-        Ok(())
-    }
-
-    /// Compiles a `with` statement: `with EXPR [as TARGET]: BODY`.
-    ///
-    /// The bytecode shape is:
-    /// ```text
-    /// <compile context expr>            ; [ctx]
-    /// BEFORE_WITH                       ; [ctx, value]
-    /// try_start:
-    ///   <store target or POP>           ; [ctx]
-    ///   <compile body>                  ; [ctx]
-    ///   WITH_EXIT                       ; []
-    ///   JUMP end                        ; skip the exception handler
-    /// try_end:
-    /// handler_start:
-    ///   ; VM pushes the exception: stack is [ctx, exc]
-    ///   WITH_EXCEPT_START               ; [ctx, exc, suppress]
-    ///   JUMP_IF_TRUE swallow            ; pops suppress; falsy = continue
-    ///   POP                             ; [ctx]
-    ///   POP                             ; []
-    ///   RERAISE                         ; propagate
-    /// swallow:                          ; [ctx, exc]
-    ///   POP                             ; [ctx]
-    ///   POP                             ; []
-    ///   CLEAR_EXCEPTION
-    ///   JUMP end
-    /// <return / break / continue trailers, each running WITH_EXIT before
-    ///  routing to the outer target>
-    /// end:
-    /// ```
-    ///
-    /// The `<store target or POP>` step lives *inside* the protected region so
-    /// `with f() as (a, b):` invokes `__exit__` when the unpack fails —
-    /// matching CPython, which similarly places `UNPACK_SEQUENCE` inside the
-    /// `BEFORE_WITH` exception-table entry. If the store raises, the unwinder
-    /// drops any partial unpack state down to the handler's expected depth
-    /// (`stack_depth + 1`) before pushing `exc` and entering `handler_start`.
-    ///
-    /// A single exception-table entry covers the body, routing exceptions to
-    /// `handler_start` with stack depth `outer + 1` (the context manager). If
-    /// the cleanup itself (`__exit__` invocation) raises, the new exception
-    /// replaces the original one and propagates via the surrounding frame's
-    /// exception table — this matches CPython's behavior.
-    ///
-    /// `return`/`break`/`continue` inside the body are routed through this
-    /// method's trailers (analogous to `try`/`finally`) so `__exit__` is called
-    /// before propagating the early exit. The `return` trailer uses `Rot2` to
-    /// preserve the return value while invoking `WithExit` on the context
-    /// manager underneath.
-    fn compile_with(
-        &mut self,
-        context: &ExprLoc,
-        target: Option<&UnpackTarget>,
-        body: &[PreparedNode],
-    ) -> Result<(), CompileError> {
-        // Record outer stack depth for the exception-table entry. If we are in
-        // dead-code state there's nothing to emit.
-        let Some(stack_depth) = self.code.stack_depth() else {
-            return Ok(());
-        };
-
-        let try_exc_stack_count = self.except_handler_depth;
-
-        // Evaluate context expr and invoke __enter__.
-        self.compile_expr(context)?;
-        self.code.emit(Opcode::BeforeWith)?;
-
-        // Track early exits inside the body so we can call __exit__ before
-        // they propagate. Mirrors the FinallyTarget push in `compile_try`.
-        self.finally_targets.push(FinallyTarget {
-            return_jumps: Vec::new(),
-            break_jumps: Vec::new(),
-            continue_jumps: Vec::new(),
-            loop_depth_at_entry: self.loop_stack.len(),
-            except_handler_depth_at_entry: self.except_handler_depth,
-        });
-
-        // === Body (protected region) ===
-        let try_start = self.code.current_offset();
-        // Bind the __enter__ result to the `as` target (or discard it). This
-        // lives inside the protected region so `with f() as (a, b):` calls
-        // `__exit__` when the unpack fails — matching CPython, which similarly
-        // covers UNPACK_SEQUENCE with the with-block's exception table entry.
-        if let Some(target) = target {
-            self.compile_unpack_target(target)?;
-        } else {
-            self.code.emit(Opcode::Pop)?;
-        }
-        self.compile_block(body)?;
-        // Close the protected range BEFORE `WithExit` so the normal-exit
-        // cleanup is outside the body's exception-table entry. If
-        // `__exit__` raises here, the new exception should propagate to
-        // the outer frame's exception table (matching CPython, where an
-        // `__exit__` exception replaces any prior state). Routing it
-        // back to our own handler would invoke `__exit__` a second time
-        // with the ctx already popped, blowing up the stack-depth
-        // bookkeeping in the unwinder.
-        let try_end = self.code.current_offset();
-
-        // Normal exit: __exit__(None, None, None); pop the (discarded) result;
-        // skip the handler.
-        self.code.emit(Opcode::WithExit)?;
-        self.code.emit(Opcode::Pop)?;
-        let after_body_jump = self.code.emit_jump(Opcode::Jump)?;
-
-        // === Exception handler ===
-        let handler_start = self.code.current_offset();
-        // VM unwinds to `stack_depth + 1` (the ctx) and then pushes the exception
-        // value itself, so we enter at depth `stack_depth + 2` with [ctx, exc].
-        self.code.new_code_region(stack_depth + 2);
-
-        self.code.emit(Opcode::WithExceptStart)?;
-        // Stack: [ctx, exc, suppress]
-        let swallow_jump = self.code.emit_jump(Opcode::JumpIfTrue)?;
-        // Falsy path: stack = [ctx, exc]. Drop both and re-raise.
-        self.code.emit(Opcode::Pop)?;
-        self.code.emit(Opcode::Pop)?;
-        self.code.emit(Opcode::Reraise)?;
-
-        // Swallow path: stack = [ctx, exc]. Drop both, clear current exception,
-        // jump to end.
-        self.code.patch_jump(swallow_jump)?;
-        self.code.emit(Opcode::Pop)?;
-        self.code.emit(Opcode::Pop)?;
-        self.code.emit(Opcode::ClearException)?;
-        let after_swallow_jump = self.code.emit_jump(Opcode::Jump)?;
-
-        // === Early-exit trailers (return/break/continue inside body) ===
-        let finally_target = self.finally_targets.pop().expect("finally_targets should not be empty");
-
-        // === Return path ===
-        // Stack at patch site: [ctx, return_value]. Swap so ctx is on top for
-        // WithExit, discard its result, then route the (preserved) return value.
-        if !finally_target.return_jumps.is_empty() {
-            for jump in finally_target.return_jumps {
-                self.code.patch_jump(jump)?;
-            }
-            self.code.emit(Opcode::Rot2)?;
-            self.code.emit(Opcode::WithExit)?;
-            self.code.emit(Opcode::Pop)?;
-            self.compile_return_routing()?;
-        }
-
-        // === Break path ===
-        // Stack at patch site: [ctx] (compile_break already popped any for-loop
-        // iterator). Call __exit__, discard its result, then route to the break target.
-        if !finally_target.break_jumps.is_empty() {
-            for break_info in &finally_target.break_jumps {
-                self.code.patch_jump(break_info.jump)?;
-            }
-            self.code.emit(Opcode::WithExit)?;
-            self.code.emit(Opcode::Pop)?;
-            self.compile_control_flow_after_finally(&finally_target.break_jumps, true)?;
-        }
-
-        // === Continue path ===
-        // Stack at patch site: [ctx]. Same shape as the break path.
-        if !finally_target.continue_jumps.is_empty() {
-            for continue_info in &finally_target.continue_jumps {
-                self.code.patch_jump(continue_info.jump)?;
-            }
-            self.code.emit(Opcode::WithExit)?;
-            self.code.emit(Opcode::Pop)?;
-            self.compile_control_flow_after_finally(&finally_target.continue_jumps, false)?;
-        }
-
-        // === Merge point for the normal-exit and swallowed-exception paths ===
-        self.code.patch_jump(after_body_jump)?;
-        self.code.patch_jump(after_swallow_jump)?;
-
-        // === Exception-table entry: body -> handler ===
-        // `stack_depth + 1` accounts for the ctx left on the stack; the VM
-        // pushes the exception value itself on top of that. `exception_stack_count`
-        // is unchanged because the with-block does not push to exception_stack.
-        self.code
-            .add_exception_entry(try_start, try_end, handler_start, stack_depth + 1, try_exc_stack_count)?;
 
         Ok(())
     }
@@ -3661,63 +3031,142 @@ impl<'a> Compiler<'a> {
     /// Each handler checks if the exception matches its type, and if so,
     /// executes the handler body. If no handler matches, the exception is re-raised.
     ///
-    /// The caller is responsible for calling this from a dead-code region; otherwise
-    /// the attempt to create a new code region will panic.
-    ///
-    /// The region is closed at the end of this function, so the caller will need
-    /// to start a new code region for any code that follows the handlers.
+    /// `handler_entry_depth` is the stack depth when entering handler dispatch
+    /// (i.e., base stack_depth + 1 for the exception value).
     fn compile_exception_handlers(
         &mut self,
-        stack_depth: u16,
         handlers: &[ExceptHandler<PreparedNode>],
         finally_jumps: &mut Vec<JumpLabel>,
+        handler_entry_depth: u16,
     ) -> Result<(), CompileError> {
-        // Start a new code region for the exception handlers, +1 for
-        // the exception value pushed by the VM on entry to the handler dispatch
-        self.code.new_code_region(stack_depth + 1);
+        // Track jumps from non-matching handlers to next handler
+        let mut next_handler_jumps: Vec<JumpLabel> = Vec::new();
 
-        for handler in handlers {
-            let no_match_jump = if let Some(exc_type) = &handler.exc_type {
-                // Typed handler: `except ExcType:` or `except ExcType as e:`.
-                // Stack on entry: [exception]. `CheckExcMatch` peeks the
-                // exception (doesn't pop it), so [exception] stays on the
-                // stack across the check on both match and no-match paths.
+        for (i, handler) in handlers.iter().enumerate() {
+            let is_last = i == handlers.len() - 1;
+
+            // Patch jumps from previous handler's non-match to here
+            // If jumping from a previous handler's no-match, stack has [exc, exc] (duplicate)
+            // We need to pop the duplicate before starting this handler's check
+            if !next_handler_jumps.is_empty() {
+                for jump in next_handler_jumps.drain(..) {
+                    self.code.patch_jump(jump);
+                }
+                // Reset stack depth for jump target: [exc, exc] = handler_entry_depth + 1
+                self.code.set_stack_depth(handler_entry_depth + 1);
+                // Pop the duplicate from previous handler's check
+                self.code.emit(Opcode::Pop);
+            }
+
+            if let Some(exc_type) = &handler.exc_type {
+                // Typed handler: except ExcType: or except ExcType as e:
+                // Stack: [exception]
+
+                // Duplicate exception for type check
+                self.code.emit(Opcode::Dup);
+                // Stack: [exception, exception]
+
+                // Load the exception type to match against
                 self.compile_expr(exc_type)?;
-                self.code.emit(Opcode::CheckExcMatch)?;
-                Some(self.code.emit_jump(Opcode::JumpIfFalse)?)
+                // Stack: [exception, exception, exc_type]
+
+                // Check if exception matches the type
+                // This validates exc_type is a valid exception type and performs the match
+                // CheckExcMatch pops exc_type, peeks exception, pushes bool
+                self.code.emit(Opcode::CheckExcMatch);
+                // Stack: [exception, exception, bool]
+
+                // Jump to next handler if match returned False
+                // JumpIfFalse pops the bool, leaving [exception, exception]
+                let no_match_jump = self.code.emit_jump(Opcode::JumpIfFalse);
+
+                if is_last {
+                    // Last handler - if no match, reraise
+                    // But first we need to handle the exception var cleanup
+                } else {
+                    next_handler_jumps.push(no_match_jump);
+                }
+
+                // After JumpIfFalse (match succeeded), stack is [exception, exception]
+                // Pop the duplicate that was used for the type check
+                self.code.emit(Opcode::Pop);
+                // Stack: [exception]
+
+                // Exception matched! Bind to variable if needed
+                if let Some(name) = &handler.name {
+                    // Stack: [exception]
+                    // Store to variable (don't pop - we still need it for current_exception)
+                    self.code.emit(Opcode::Dup);
+                    self.compile_store(name);
+                }
+
+                // Track that we're inside an except handler (for break/continue cleanup)
+                self.except_handler_depth += 1;
+
+                // Compile handler body
+                self.compile_block(&handler.body)?;
+
+                // Exit except handler context
+                self.except_handler_depth -= 1;
+
+                // Delete exception variable (Python 3 behavior)
+                if let Some(name) = &handler.name {
+                    self.compile_delete(name);
+                }
+
+                // Clear current_exception
+                self.code.emit(Opcode::ClearException);
+
+                // Pop the exception from stack
+                self.code.emit(Opcode::Pop);
+
+                // Jump to finally
+                finally_jumps.push(self.code.emit_jump(Opcode::Jump));
+
+                // If this was last handler and no match, we need to reraise
+                if is_last {
+                    self.code.patch_jump(no_match_jump);
+                    // Coming from JumpIfFalse no-match path, stack has [exception, exception]
+                    // Reset stack depth for jump target
+                    self.code.set_stack_depth(handler_entry_depth + 1);
+                    // We need to pop the duplicate before reraising
+                    self.code.emit(Opcode::Pop);
+                    self.code.emit(Opcode::Reraise);
+                }
             } else {
-                // Bare `except:` (must be the last handler per Python rules).
-                None
-            };
+                // Bare except: catches everything
+                // Stack: [exception]
 
-            // Match path: consume exception from the stack and store
-            // to target if present.
-            if let Some(name) = &handler.name {
-                self.compile_store(name)?;
-            } else {
-                self.code.emit(Opcode::Pop)?;
-            }
+                // Bind to variable if needed
+                if let Some(name) = &handler.name {
+                    self.code.emit(Opcode::Dup);
+                    self.compile_store(name);
+                }
 
-            self.except_handler_depth += 1;
-            self.compile_block(&handler.body)?;
-            self.except_handler_depth -= 1;
+                // Track that we're inside an except handler (for break/continue cleanup)
+                self.except_handler_depth += 1;
 
-            if let Some(name) = &handler.name {
-                self.compile_delete(name)?;
-            }
+                // Compile handler body
+                self.compile_block(&handler.body)?;
 
-            self.code.emit(Opcode::ClearException)?;
-            finally_jumps.push(self.code.emit_jump(Opcode::Jump)?);
+                // Exit except handler context
+                self.except_handler_depth -= 1;
 
-            if let Some(no_match_jump) = no_match_jump {
-                // No-match landing: stack is [exception]. Falls through into
-                // the next handler's check (or the post-loop `Reraise`).
-                self.code.patch_jump(no_match_jump)?;
+                // Delete exception variable
+                if let Some(name) = &handler.name {
+                    self.compile_delete(name);
+                }
+
+                // Clear current_exception
+                self.code.emit(Opcode::ClearException);
+
+                // Pop the exception from stack
+                self.code.emit(Opcode::Pop);
+
+                // Jump to finally
+                finally_jumps.push(self.code.emit_jump(Opcode::Jump));
             }
         }
-
-        // No handler matched - reraise the exception
-        self.code.emit(Opcode::Reraise)?;
 
         Ok(())
     }
@@ -3726,51 +3175,29 @@ impl<'a> Compiler<'a> {
     ///
     /// At module level, `Local` and `LocalUnassigned` scopes emit `DeleteGlobal`
     /// because module-level locals live in the globals array.
-    ///
-    /// Function-scope `Local` deletes are limited to the first 256 slots
-    /// because the only available opcode (`DeleteLocal`) takes a `u8`
-    /// operand; a wide variant has not been added because slot-255 deletes
-    /// are essentially unreachable in real code (each `except ... as e`
-    /// implicitly emits a delete on the bound name, but functions with 256+
-    /// locals plus an `except as` are exotic enough that we surface a
-    /// `SyntaxError` rather than introduce a new opcode just for this).
-    fn compile_delete(&mut self, target: &Identifier) -> Result<(), CompileError> {
-        let slot = target.namespace_id().as_u16();
+    fn compile_delete(&mut self, target: &Identifier) {
+        let slot = u16::try_from(target.namespace_id().index()).expect("local slot exceeds u16");
         match target.scope {
             NameScope::Local | NameScope::LocalUnassigned => {
                 if self.is_module_scope {
-                    self.code.emit_u16(Opcode::DeleteGlobal, slot)?;
+                    self.code.emit_u16(Opcode::DeleteGlobal, slot);
                 } else if let Ok(s) = u8::try_from(slot) {
-                    self.code.emit_u8(Opcode::DeleteLocal, s)?;
+                    self.code.emit_u8(Opcode::DeleteLocal, s);
                 } else {
-                    return Err(CompileError::new(
-                        format!(
-                            "cannot delete local variable in function with more than {} locals (slot {slot})",
-                            u16::from(u8::MAX) + 1,
-                        ),
-                        target.position,
-                    ));
+                    // Wide variant not implemented yet
+                    todo!("DeleteLocalW for slot > 255");
                 }
             }
             NameScope::Global => {
-                self.code.emit_u16(Opcode::DeleteGlobal, slot)?;
+                self.code.emit_u16(Opcode::DeleteGlobal, slot);
             }
             NameScope::Cell => {
                 // Delete cell not commonly needed
                 // For now, just store None
-                self.code.emit(Opcode::LoadNone)?;
-                self.compile_store(target)?;
-            }
-            NameScope::CompVar => {
-                // Comprehension targets only appear as generator targets
-                // inside inlined comprehensions; the parser does not surface
-                // a `del` target with `CompVar` scope (there is no syntax
-                // for `del x` on a comp target). Reaching here means a
-                // compile-flow bug.
-                unreachable!("compile_delete called with NameScope::CompVar — no Python syntax produces this")
+                self.code.emit(Opcode::LoadNone);
+                self.compile_store(target);
             }
         }
-        Ok(())
     }
 }
 
@@ -3793,7 +3220,7 @@ impl CompileError {
     /// Creates a new compile error with the given message and position.
     ///
     /// Defaults to `SyntaxError` exception type.
-    pub(super) fn new(message: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
+    fn new(message: impl Into<Cow<'static, str>>, position: CodeRange) -> Self {
         Self {
             message: message.into(),
             position,
@@ -3807,12 +3234,12 @@ impl CompileError {
     /// - SyntaxError: hides the `, in <module>` part (CPython's format)
     /// - ModuleNotFoundError: hides caret markers (CPython doesn't show them)
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
-        let mut source_map = SourceMap::new(source);
+        let source_map = SourceMap::new(source);
         let mut frame = if self.exc_type == ExcType::SyntaxError {
             // SyntaxError uses different format: no `, in <module>`
-            StackFrame::from_position_syntax_error(self.position, filename, &mut source_map)
+            StackFrame::from_position_syntax_error(self.position, filename, &source_map)
         } else {
-            StackFrame::from_position(self.position, filename, &mut source_map)
+            StackFrame::from_position(self.position, filename, &source_map)
         };
         // CPython doesn't show carets for module not found errors
         if self.exc_type == ExcType::ModuleNotFoundError {

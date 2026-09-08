@@ -8,18 +8,12 @@ mod chrono;
 mod chrono_tz;
 #[cfg(feature = "compact-str")]
 mod compact_str;
-#[cfg(feature = "dashmap")]
-mod dashmap;
-#[cfg(feature = "half")]
-mod half;
 #[cfg(feature = "hashbrown")]
 mod hashbrown;
 #[cfg(feature = "indexmap")]
 mod indexmap;
 #[cfg(feature = "ordermap")]
 mod ordermap;
-#[cfg(feature = "parking_lot")]
-mod parking_lot;
 #[cfg(feature = "smallvec")]
 mod smallvec;
 #[cfg(feature = "thin-vec")]

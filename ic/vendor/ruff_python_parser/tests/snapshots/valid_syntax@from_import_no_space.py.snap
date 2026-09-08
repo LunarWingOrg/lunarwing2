@@ -28,7 +28,6 @@ Module(
                         },
                     ],
                     level: 1,
-                    is_lazy: false,
                 },
             ),
             ImportFrom(
@@ -49,7 +48,6 @@ Module(
                         },
                     ],
                     level: 3,
-                    is_lazy: false,
                 },
             ),
         ],

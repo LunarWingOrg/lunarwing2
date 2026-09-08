@@ -14,10 +14,10 @@ use crate::{
     bytecode::FrameExit,
     defer_drop,
     exception_private::{ExcType, RunError},
-    heap::{ContainsHeap, DropWithHeap, HeapData, HeapGuard, HeapId},
+    heap::{DropWithHeap, HeapData, HeapGuard, HeapId},
     heap_data::CellValue,
-    intern::{FunctionId, StaticStrings, StringId},
-    os::OsFunctionCall,
+    intern::{FunctionId, StringId},
+    os::OsFunction,
     resource::ResourceTracker,
     types::{Dict, PyTrait, Type, bytes::call_bytes_method, str::call_str_method},
     value::{EitherStr, Value},
@@ -43,9 +43,7 @@ pub(crate) enum CallResult {
     /// OS operation call requested - VM should yield `FrameExit::OsCall` to host.
     ///
     /// The host executes the OS operation and resumes the VM with the result.
-    /// The [`OsFunctionCall`] is a tagged enum whose variants carry their own
-    /// typed args, so no separate `ArgValues` is needed at this layer.
-    OsCall(OsFunctionCall),
+    OsCall(OsFunction, ArgValues),
     /// Dataclass method call requested - VM should yield `FrameExit::MethodCall` to host.
     ///
     /// The method name (e.g. `"distance"`) and the args include the dataclass instance
@@ -58,45 +56,9 @@ pub(crate) enum CallResult {
     /// Used by `asyncio.run()` to execute a coroutine without an explicit `await`.
     /// The VM will push the value onto the stack and execute `exec_get_awaitable`.
     AwaitValue(Value),
-    /// OS call whose result must be stored into a heap [`OpenFile`](crate::types::OpenFile)'s
-    /// buffer rather than pushed onto the operand stack.
-    ///
-    /// Used by `read(N)` / `readline()` / `readlines()` / `seek()` on the first
-    /// operation that needs the full file content. The host services the OS
-    /// call (always `ReadText` or `ReadBytes` against the file referenced by
-    /// `file_id`); on resume the VM stores the returned content into
-    /// `OpenFile::buffer` and then consumes the file's `pending_read`
-    /// [`ReadSpec`](crate::types::ReadSpec) to compute the slice that becomes
-    /// the call's return value.
-    ///
-    /// The OS-call payload is a [`OsFunctionCall::ReadText`] /
-    /// [`OsFunctionCall::ReadBytes`] (the only legal variants here) carrying
-    /// the file's virtual path; the per-call slice spec lives on the
-    /// `OpenFile` itself (in `pending_read`), so this variant only needs to
-    /// carry the typed call plus the file id used to look up the buffer slot.
-    OsCallStoreBuffer { call: OsFunctionCall, file_id: HeapId },
 }
 
-impl DropWithHeap for CallResult {
-    fn drop_with_heap<H: ContainsHeap>(self, heap: &mut H) {
-        match self {
-            Self::Value(value) | Self::AwaitValue(value) => value.drop_with_heap(heap),
-            Self::External(_, args) | Self::MethodCall(_, args) => {
-                args.drop_with_heap(heap);
-            }
-            Self::OsCall(call) => call.drop_with_heap(heap),
-            Self::FramePushed => {}
-            Self::OsCallStoreBuffer { call, file_id } => {
-                call.drop_with_heap(heap);
-                let heap = heap.heap_mut();
-                heap.dec_ref(file_id);
-                heap.dec_ref(file_id);
-            }
-        }
-    }
-}
-
-impl<T: ResourceTracker> VM<'_, T> {
+impl<T: ResourceTracker> VM<'_, '_, T> {
     // ========================================================================
     // Call Opcode Executors
     // ========================================================================
@@ -120,11 +82,7 @@ impl<T: ResourceTracker> VM<'_, T> {
     ///
     /// Calls a builtin function directly without stack manipulation for the callable.
     /// This is an optimization that avoids constant pool lookup and stack manipulation.
-    pub(super) fn exec_call_builtin_function(
-        &mut self,
-        builtin_id: u8,
-        arg_count: usize,
-    ) -> Result<CallResult, RunError> {
+    pub(super) fn exec_call_builtin_function(&mut self, builtin_id: u8, arg_count: usize) -> Result<Value, RunError> {
         // Convert u8 to BuiltinsFunctions via FromRepr
         if let Some(builtin) = BuiltinsFunctions::from_repr(builtin_id) {
             let args = self.pop_n_args(arg_count);
@@ -306,32 +264,9 @@ impl<T: ResourceTracker> VM<'_, T> {
     ///
     /// For interned strings (`Value::InternString`), uses the unified `call_str_method`.
     /// For interned bytes (`Value::InternBytes`), uses the unified `call_bytes_method`.
-    ///
-    /// **Dunder dispatch**: before reaching the type-specific dispatcher, this
-    /// method intercepts known dunder names (`__enter__`, `__exit__`, …) and
-    /// routes them to the corresponding [`PyTrait`] method
-    /// (`py_enter` / `py_exit` / …). The default trait impls return
-    /// `AttributeError`, so types that don't override the dunder behave
-    /// identically to a generic "no such method" lookup; types that *do*
-    /// override only need a single trait impl, not parallel `StaticStrings::Foo`
-    /// arms in their `py_call_attr` body. New dunder methods plug into the
-    /// dispatch table here without touching individual types.
     fn call_attr(&mut self, obj: Value, name_id: StringId, args: ArgValues) -> Result<CallResult, RunError> {
         let this = self;
         let attr = EitherStr::Interned(name_id);
-
-        // Centralised dunder dispatch — see `dispatch_dunder`. Wrap `args`
-        // in an `Option` so the helper can `take()` it only when it
-        // actually matches a dunder; on the fall-through path the
-        // original `args` is still owned here and goes into `py_call_attr`.
-        let mut args_slot = Some(args);
-        if let Value::Ref(heap_id) = obj
-            && let Some(result) = dispatch_dunder(name_id, heap_id, this, &mut args_slot)
-        {
-            defer_drop!(obj, this);
-            return result;
-        }
-        let args = args_slot.expect("dispatch_dunder returned None without taking args");
 
         match obj {
             Value::Ref(heap_id) => {
@@ -384,8 +319,11 @@ impl<T: ResourceTracker> VM<'_, T> {
                 self.current_frame_mut().should_return = true;
                 match self.run()? {
                     FrameExit::Return(v) => return Ok(v),
-                    exit => {
-                        exit.drop_with_heap(self);
+                    FrameExit::ResolveFutures(_)
+                    | FrameExit::ExternalCall { .. }
+                    | FrameExit::OsCall { .. }
+                    | FrameExit::MethodCall { .. }
+                    | FrameExit::NameLookup { .. } => {
                         // Pop frames off the stack from this failed evaluation
                         // (including the one just pushed)
                         while self.frames.len() >= stack_depth {
@@ -394,7 +332,10 @@ impl<T: ResourceTracker> VM<'_, T> {
                     }
                 }
             }
-            other => other.drop_with_heap(self),
+            CallResult::External(_, _)
+            | CallResult::OsCall(_, _)
+            | CallResult::MethodCall(_, _)
+            | CallResult::AwaitValue(_) => {}
         }
 
         Err(ExcType::not_implemented(format!(
@@ -413,7 +354,10 @@ impl<T: ResourceTracker> VM<'_, T> {
     /// - `Value::Ref`: checks for closure/function on heap
     pub(crate) fn call_function(&mut self, callable: &Value, args: ArgValues) -> Result<CallResult, RunError> {
         match callable {
-            Value::Builtin(builtin) => builtin.call(self, args),
+            Value::Builtin(builtin) => {
+                let result = builtin.call(self, args)?;
+                Ok(CallResult::Value(result))
+            }
             Value::ModuleFunction(mf) => mf.call(self, args),
             Value::ExtFunction(name_id) => {
                 // External function - return to caller to execute
@@ -761,10 +705,7 @@ impl<T: ResourceTracker> VM<'_, T> {
         let namespace_size = func.namespace_size;
         let locals_count = u16::try_from(namespace_size).expect("function namespace size exceeds u16");
 
-        // Track memory for this frame's locals. Symmetric with
-        // `cleanup_frame_state`. Comprehension variables live on the operand
-        // stack (pushed per-comp), not in any frame-level region, so they
-        // don't enter this accounting.
+        // Track memory for this frame's locals
         let size = namespace_size * mem::size_of::<Value>();
         self.heap.tracker_mut().on_allocate(|| size)?;
 
@@ -813,97 +754,18 @@ impl<T: ResourceTracker> VM<'_, T> {
 
         let code = &func.code;
 
-        // 6. Commit the guard (no rollback) and push the frame. The operand
-        // stack starts immediately above the locals region — any
-        // comprehensions emit their own push/pop bytecode at entry/exit, so
-        // no frame-level region is reserved here.
+        // 6. Commit the guard (no rollback) and push the frame
         let (namespace, this) = namespace_guard.into_parts();
         this.stack.extend(namespace);
 
-        let exc_stack_base = this.exception_stack.len();
         this.push_frame(CallFrame::new_function(
             code,
             stack_base,
             locals_count,
-            exc_stack_base,
             func_id,
             call_position,
         ))?;
 
         Ok(CallResult::FramePushed)
     }
-}
-
-/// Centralised dunder dispatch for `__enter__` / `__exit__` (and, when added,
-/// any other dunder that maps to a [`PyTrait`] method).
-///
-/// Returns `Some(result)` when `name_id` names a recognised dunder — `args`
-/// is taken out of the slot and consumed. Returns `None` when it isn't —
-/// `args` is left untouched in the slot so the caller can hand it off to
-/// the regular `py_call_attr` dispatch.
-///
-/// The `&mut Option<ArgValues>` shape is what keeps "all the recognition
-/// and dispatch logic in one function" honest: `args` is non-`Copy` and
-/// has a `Drop` impl that panics on stray `Ref` values, so it can only be
-/// passed by value once we know we'll consume it.
-///
-/// Adding a new dunder is just a new arm in the inner `match`; type
-/// implementations only need to override the corresponding `PyTrait`
-/// method, never a `StaticStrings::Foo` arm in their `py_call_attr`.
-fn dispatch_dunder<T: ResourceTracker>(
-    name_id: StringId,
-    heap_id: HeapId,
-    vm: &mut VM<'_, T>,
-    args: &mut Option<ArgValues>,
-) -> Option<Result<CallResult, RunError>> {
-    let static_str = StaticStrings::from_string_id(name_id)?;
-    Some(match static_str {
-        StaticStrings::Enter => {
-            let args = args.take().expect("dispatch_dunder called with empty args slot");
-            args.check_zero_args("__enter__", vm.heap)
-                .and_then(|()| vm.heap.read(heap_id).py_enter(heap_id, vm))
-        }
-        StaticStrings::Exit => {
-            let args = args.take().expect("dispatch_dunder called with empty args slot");
-            dispatch_exit(heap_id, vm, args)
-        }
-        _ => return None,
-    })
-}
-
-/// Direct `obj.__exit__(typ, val, tb)` invocation.
-///
-/// Validates that exactly three positional arguments are passed (CPython
-/// raises `TypeError` for any other arity) and forwards `val` to
-/// [`PyTrait::py_exit`] as `Option<HeapId>`:
-///
-/// - `val is None` → `None`, treated as the "normal exit" path.
-/// - `val is a heap-allocated value` → `Some(heap_id)`. For built-in context
-///   managers this is the exception instance, matching the `with`-statement
-///   call shape.
-/// - `val is a scalar (Int, Bool, …)` → `None`. The trait abstraction can
-///   only carry `HeapId`s, so non-Ref values cannot be forwarded; in
-///   practice no supported context manager inspects a non-exception `val`,
-///   and CPython's behavior for such calls is implementation-defined per
-///   the user-provided `__exit__`.
-///
-/// `typ` and `tb` are discarded: every implementation we have re-derives the
-/// type from `val` and Monty has no traceback objects (see
-/// `limitations/with.md`).
-fn dispatch_exit<T: ResourceTracker>(
-    heap_id: HeapId,
-    vm: &mut VM<'_, T>,
-    args: ArgValues,
-) -> Result<CallResult, RunError> {
-    let positional = args.into_pos_only("__exit__", vm.heap)?;
-    defer_drop!(positional, vm);
-    let [typ, val, tb] = positional.as_slice() else {
-        return Err(ExcType::type_error_arg_count("__exit__", 3, positional.len()));
-    };
-    let _ = (typ, tb);
-    let exc = match val {
-        Value::Ref(id) => Some(*id),
-        _ => None,
-    };
-    vm.heap.read(heap_id).py_exit(heap_id, vm, exc)
 }

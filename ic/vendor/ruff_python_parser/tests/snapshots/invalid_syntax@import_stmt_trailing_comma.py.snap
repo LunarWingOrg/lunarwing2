@@ -15,7 +15,6 @@ Module(
                     node_index: NodeIndex(None),
                     range: 0..8,
                     names: [],
-                    is_lazy: false,
                 },
             ),
             Import(
@@ -44,7 +43,6 @@ Module(
                             asname: None,
                         },
                     ],
-                    is_lazy: false,
                 },
             ),
         ],

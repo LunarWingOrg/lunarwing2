@@ -15,7 +15,6 @@ Module(
                     node_index: NodeIndex(None),
                     range: 0..6,
                     names: [],
-                    is_lazy: false,
                 },
             ),
             Expr(
@@ -37,7 +36,6 @@ Module(
                     node_index: NodeIndex(None),
                     range: 11..17,
                     names: [],
-                    is_lazy: false,
                 },
             ),
             Expr(

@@ -3,11 +3,12 @@
 use std::{cmp::Ordering, mem};
 
 use crate::{
-    args::{ArgValues, FromArgs},
+    args::{ArgValues, KwargsValues},
     bytecode::VM,
     defer_drop, defer_drop_mut,
     exception_private::{ExcType, RunError, RunResult, SimpleException},
     heap::HeapGuard,
+    heap_traits::DropWithHeap,
     resource::ResourceTracker,
     types::{MontyIter, PyTrait},
     value::Value,
@@ -19,9 +20,8 @@ use crate::{
 /// Supports two forms:
 /// - `min(iterable)` - returns smallest item from iterable
 /// - `min(arg1, arg2, ...)` - returns smallest of the arguments
-pub fn builtin_min(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let MinArgs { args, key, default } = MinArgs::from_args(args, vm)?;
-    run_min_max(vm, args, key, default, true)
+pub fn builtin_min(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    builtin_min_max(vm, args, true)
 }
 
 /// Implementation of the max() builtin function.
@@ -30,62 +30,41 @@ pub fn builtin_min(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> Ru
 /// Supports two forms:
 /// - `max(iterable)` - returns largest item from iterable
 /// - `max(arg1, arg2, ...)` - returns largest of the arguments
-pub fn builtin_max(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let MaxArgs { args, key, default } = MaxArgs::from_args(args, vm)?;
-    run_min_max(vm, args, key, default, false)
+pub fn builtin_max(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    builtin_min_max(vm, args, false)
 }
 
-/// Shared implementation for min() and max() after argument extraction.
+/// Shared implementation for min() and max().
 ///
 /// When `is_min` is true, returns the minimum; otherwise returns the maximum.
-fn run_min_max(
-    vm: &mut VM<'_, impl ResourceTracker>,
-    args: Vec<Value>,
-    key: Value,
-    default: Option<Value>,
-    is_min: bool,
-) -> RunResult<Value> {
+fn builtin_min_max(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues, is_min: bool) -> RunResult<Value> {
     let func_name = if is_min { "min" } else { "max" };
     let key_context = if is_min {
         "min() key argument"
     } else {
         "max() key argument"
     };
+    let (positional, kwargs) = args.into_parts();
+    defer_drop_mut!(positional, vm);
 
-    // Normalise `key=None` to "no key function" so the comparison path can
-    // skip the call entirely.
-    let key_fn = match key {
-        Value::None => {
-            key.drop_with_heap(vm);
-            None
-        }
-        _ => Some(key),
-    };
-    defer_drop!(key_fn, vm);
-
-    // `default_value` is `Option<Value>` — we may consume it on the "empty
-    // iterable" path, or drop it on error paths. `HeapGuard` ensures cleanup
-    // on every `?`-style early return.
-    let mut default_guard = HeapGuard::new(default, vm);
-    let (default_value, vm) = default_guard.as_parts_mut();
-
-    // Wrap the remaining positional args in a guard so any unconsumed items
-    // are released on early error returns (e.g. the user-supplied `key`
-    // function raising mid-iteration).
-    let mut args_guard = HeapGuard::new(args, vm);
-    let (args, vm) = args_guard.as_parts_mut();
-
-    if args.is_empty() {
+    let Some(first_arg) = positional.next() else {
+        kwargs.drop_with_heap(vm);
         return Err(SimpleException::new_msg(
             ExcType::TypeError,
             format!("{func_name} expected at least 1 argument, got 0"),
         )
         .into());
-    }
+    };
 
-    let first_arg = args.remove(0);
+    let mut first_arg_guard = HeapGuard::new(first_arg, vm);
+    let (key_fn, default_value) = parse_min_max_kwargs(kwargs, func_name, first_arg_guard.heap())?;
+    let (first_arg, vm) = first_arg_guard.into_parts();
+    defer_drop!(key_fn, vm);
+    let mut default_guard = HeapGuard::new(default_value, vm);
+    let (default_value, vm) = default_guard.as_parts_mut();
 
-    if args.is_empty() {
+    // decide what to do based on remaining arguments
+    if positional.len() == 0 {
         // Single argument: iterate over it
         let iter = MontyIter::new(first_arg, vm)?;
         defer_drop_mut!(iter, vm);
@@ -144,9 +123,6 @@ fn run_min_max(
         // Multiple arguments: compare them directly
         if default_value.is_some() {
             first_arg.drop_with_heap(vm);
-            // `default_value` and `args` are owned by their respective guards
-            // — their Drop impls release the held values when the function
-            // returns.
             return Err(default_with_multiple_args(func_name));
         }
 
@@ -159,7 +135,7 @@ fn run_min_max(
                 {
                     let (result_key, vm) = result_key_guard.as_parts_mut();
 
-                    for item in args.drain(..) {
+                    for item in positional {
                         defer_drop_mut!(item, vm);
                         let item_key = evaluate_key(item.clone_with_heap(vm), key_fn, key_context, vm)?;
                         defer_drop_mut!(item_key, vm);
@@ -179,7 +155,7 @@ fn run_min_max(
             let mut result_guard = HeapGuard::new(first_arg, vm);
             let (result, vm) = result_guard.as_parts_mut();
 
-            for item in args.drain(..) {
+            for item in positional {
                 defer_drop_mut!(item, vm);
 
                 if candidate_wins(result, item, is_min, vm)? {
@@ -192,37 +168,33 @@ fn run_min_max(
     }
 }
 
-/// Argument shape for `min(*args, key=None, default=...)`.
+/// Parses `key=` and `default=` for min()/max().
 ///
-/// `key` is held as `Value` so `key=None` can be normalised to "no key
-/// function". `default` is `Option<Value>` (with `default` attr) so the
-/// implementation can distinguish "not provided" from "provided with any
-/// value" — that distinction matters because `default=` is only valid with a
-/// single iterable argument.
-#[derive(FromArgs)]
-#[from_args(name = "min")]
-struct MinArgs {
-    #[from_args(varargs)]
-    args: Vec<Value>,
-    #[from_args(default = Value::None)]
-    key: Value,
-    #[from_args(default)]
-    default: Option<Value>,
-}
+/// Returns `(key_fn, default_value)`. Passing `key=None` is normalized to `None`
+/// so the comparison logic can treat it the same as omitting the keyword.
+fn parse_min_max_kwargs(
+    kwargs: KwargsValues,
+    func_name: &str,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> RunResult<(Option<Value>, Option<Value>)> {
+    let (key_fn, default_value) = kwargs.parse_named_kwargs_pair(
+        func_name,
+        "key",
+        "default",
+        vm.heap,
+        vm.interns,
+        ExcType::type_error_unexpected_keyword,
+    )?;
 
-/// Argument shape for `max(*args, key=None, default=...)`.
-///
-/// See [`MinArgs`] for field semantics; the only difference is the function
-/// name used in error messages.
-#[derive(FromArgs)]
-#[from_args(name = "max")]
-struct MaxArgs {
-    #[from_args(varargs)]
-    args: Vec<Value>,
-    #[from_args(default = Value::None)]
-    key: Value,
-    #[from_args(default)]
-    default: Option<Value>,
+    let key_fn = match key_fn {
+        Some(value) if matches!(value, Value::None) => {
+            value.drop_with_heap(vm);
+            None
+        }
+        other => other,
+    };
+
+    Ok((key_fn, default_value))
 }
 
 /// Calls the user-provided key function for a single candidate value.
@@ -234,7 +206,7 @@ fn evaluate_key(
     item: Value,
     key_fn: &Value,
     key_context: &'static str,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> RunResult<Value> {
     vm.evaluate_function(key_context, key_fn, ArgValues::One(item))
 }
@@ -248,7 +220,7 @@ fn candidate_wins(
     current: &Value,
     candidate: &Value,
     is_min: bool,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> RunResult<bool> {
     let Some(ordering) = candidate.py_cmp(current, vm)? else {
         return Err(ord_not_supported(candidate, current, is_min, vm));
@@ -268,7 +240,7 @@ fn default_with_multiple_args(func_name: &str) -> RunError {
 }
 
 #[cold]
-fn ord_not_supported(left: &Value, right: &Value, is_min: bool, vm: &VM<'_, impl ResourceTracker>) -> RunError {
+fn ord_not_supported(left: &Value, right: &Value, is_min: bool, vm: &VM<'_, '_, impl ResourceTracker>) -> RunError {
     let left_type = left.py_type(vm);
     let right_type = right.py_type(vm);
     let operator = if is_min { '<' } else { '>' };

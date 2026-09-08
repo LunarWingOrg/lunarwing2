@@ -26,7 +26,6 @@ Module(
                             asname: None,
                         },
                     ],
-                    is_lazy: false,
                 },
             ),
             Import(
@@ -45,7 +44,6 @@ Module(
                             asname: None,
                         },
                     ],
-                    is_lazy: false,
                 },
             ),
         ],

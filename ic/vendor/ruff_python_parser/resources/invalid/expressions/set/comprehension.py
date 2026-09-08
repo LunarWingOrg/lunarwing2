@@ -1,3 +1,6 @@
+# Iterable unpacking not allowed
+{*x for x in y}
+
 # Invalid target
 {x for 1 in y}
 {x for 'a' in y}

@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/bircni/get-size2"
 keywords = ["size", "heap", "ram", "memory", "get-size"]
 categories = ["memory-management", "caching"]
-exclude = ["examples/*", "tests/*"]
+exclude = ["examples/*"]
 
 [lints]
 workspace = true
@@ -21,12 +21,9 @@ bytes = { version = "1", default-features = false, optional = true }
 chrono = { version = "0.4", default-features = false, optional = true }
 chrono-tz = { version = "0.10", default-features = false, optional = true }
 compact_str = { version = "0.9", default-features = false, optional = true }
-dashmap = { version = "6", default-features = false, optional = true }
-half = { version = "2", default-features = false, optional = true }
-hashbrown = { version = "0.17", default-features = false, optional = true }
-indexmap = { version = "2.14", default-features = false, optional = true }
-ordermap = { version = "1.2", default-features = false, optional = true }
-parking_lot = { version = "0.12", default-features = false, optional = true }
+hashbrown = { version = "0.16", default-features = false, optional = true }
+indexmap = { version = "2.10", default-features = false, optional = true }
+ordermap = { version = "1.0", default-features = false, optional = true }
 smallvec = { version = "1", default-features = false, optional = true }
 thin-vec = { version = "0.2", default-features = false, optional = true }
 url = { version = "2", default-features = false, optional = true }
@@ -38,12 +35,9 @@ get-size2 = { path = ".", features = [
     "chrono",
     "chrono-tz",
     "compact-str",
-    "dashmap",
-    "half",
     "hashbrown",
     "indexmap",
     "ordermap",
-    "parking_lot",
     "smallvec",
     "thin-vec",
     "url",
@@ -57,12 +51,9 @@ bytes = ["dep:bytes"]
 chrono = ["dep:chrono"]
 chrono-tz = ["dep:chrono-tz"]
 compact-str = ["dep:compact_str"]
-dashmap = ["dep:dashmap"]
-half = ["dep:half"]
 hashbrown = ["dep:hashbrown"]
 indexmap = ["dep:indexmap"]
 ordermap = ["dep:ordermap"]
-parking_lot = ["dep:parking_lot"]
 smallvec = ["dep:smallvec"]
 thin-vec = ["dep:thin-vec"]
 url = ["dep:url"]

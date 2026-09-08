@@ -1,15 +1,11 @@
 //! Typed dispatch for filesystem OS calls.
 //!
-//! The mount table projects an [`OsFunctionCall`](crate::os::OsFunctionCall) into
-//! [`FsRequest`] (a borrowed view over the call's typed args). From that point
-//! onward the backends operate on semantic requests with `&str` / `FileMode`
-//! fields rather than re-parsing `MontyObject` arrays or walking kwargs.
+//! The mount table parses a raw [`OsFunction`](crate::os::OsFunction) call once
+//! into [`FsRequest`]. From that point onward the backends operate on semantic
+//! requests instead of indexing into `MontyObject` arrays or re-parsing kwargs.
 
-use super::{
-    common::MountContext, direct, error::MountError, mount_mode::MountMode, overlay,
-    path_security::normalize_virtual_path,
-};
-use crate::{MontyFileHandle, MontyObject, os::OsFunctionCall, types::file::FileMode};
+use super::{common::MountContext, direct, error::MountError, mount_mode::MountMode, overlay};
+use crate::{MontyObject, os::OsFunction};
 
 /// Parsed filesystem request passed to the direct or overlay backend.
 #[derive(Clone, Copy, Debug)]
@@ -30,10 +26,6 @@ pub(super) enum FsRequest<'a> {
     WriteText { path: &'a str, data: &'a str },
     /// `Path.write_bytes(data)`
     WriteBytes { path: &'a str, data: &'a [u8] },
-    /// `Path.append_text(data)`
-    AppendText { path: &'a str, data: &'a str },
-    /// `Path.append_bytes(data)`
-    AppendBytes { path: &'a str, data: &'a [u8] },
     /// `Path.mkdir(parents=..., exist_ok=...)`
     Mkdir {
         /// Target path.
@@ -57,15 +49,6 @@ pub(super) enum FsRequest<'a> {
     Resolve { path: &'a str },
     /// `Path.absolute()`
     Absolute { path: &'a str },
-    /// `open(path, mode)` — performs the open-time effect and returns a
-    /// [`MontyObject::FileHandle`]. The mode is parsed once during dispatch
-    /// so backends never re-parse the raw string.
-    Open {
-        /// Target path.
-        path: &'a str,
-        /// Parsed `open()` mode.
-        mode: FileMode,
-    },
 }
 
 impl<'a> FsRequest<'a> {
@@ -81,8 +64,6 @@ impl<'a> FsRequest<'a> {
             | Self::ReadBytes { path }
             | Self::WriteText { path, .. }
             | Self::WriteBytes { path, .. }
-            | Self::AppendText { path, .. }
-            | Self::AppendBytes { path, .. }
             | Self::Mkdir { path, .. }
             | Self::Unlink { path }
             | Self::Rmdir { path }
@@ -90,7 +71,6 @@ impl<'a> FsRequest<'a> {
             | Self::Stat { path }
             | Self::Resolve { path }
             | Self::Absolute { path }
-            | Self::Open { path, .. }
             | Self::Rename { src: path, .. } => path,
         }
     }
@@ -105,82 +85,66 @@ impl<'a> FsRequest<'a> {
     }
 
     /// Returns whether the request mutates filesystem state.
-    ///
-    /// This is the read-only-mount gate (see [`execute`]). For `Open` it is
-    /// mode-aware: `w`/`w+`/`a`/`a+` write (truncate or create), while pure
-    /// `r`/`r+` only need read access.
     #[must_use]
     pub fn is_write(self) -> bool {
-        match self {
+        matches!(
+            self,
             Self::WriteText { .. }
-            | Self::WriteBytes { .. }
-            | Self::AppendText { .. }
-            | Self::AppendBytes { .. }
-            | Self::Mkdir { .. }
-            | Self::Unlink { .. }
-            | Self::Rmdir { .. }
-            | Self::Rename { .. } => true,
-            Self::Open { mode, .. } => mode.create(),
-            _ => false,
-        }
+                | Self::WriteBytes { .. }
+                | Self::Mkdir { .. }
+                | Self::Unlink { .. }
+                | Self::Rmdir { .. }
+                | Self::Rename { .. }
+        )
     }
 }
 
-/// Projects an [`OsFunctionCall`] into a typed [`FsRequest`].
+/// Parses a filesystem OS call into a typed request.
 ///
-/// This is a trivial 1:1 mapping — every field is already typed on the
-/// caller side (no `MontyObject` introspection, no kwarg walks, no mode
-/// reparse), so the function is infallible. Non-FS variants are filtered
-/// out by [`OsFunctionCall::is_filesystem`] before reaching here and panic
-/// the catch-all arm if they slip through.
-pub(super) fn fs_request_from_call(call: &OsFunctionCall) -> FsRequest<'_> {
-    match call {
-        OsFunctionCall::Exists(p) => FsRequest::Exists { path: p.as_str() },
-        OsFunctionCall::IsFile(p) => FsRequest::IsFile { path: p.as_str() },
-        OsFunctionCall::IsDir(p) => FsRequest::IsDir { path: p.as_str() },
-        OsFunctionCall::IsSymlink(p) => FsRequest::IsSymlink { path: p.as_str() },
-        OsFunctionCall::ReadText(p) => FsRequest::ReadText { path: p.as_str() },
-        OsFunctionCall::ReadBytes(p) => FsRequest::ReadBytes { path: p.as_str() },
-        OsFunctionCall::WriteText(a) => FsRequest::WriteText {
-            path: a.path.as_str(),
-            data: a.data.as_str(),
-        },
-        OsFunctionCall::WriteBytes(a) => FsRequest::WriteBytes {
-            path: a.path.as_str(),
-            data: a.data.as_slice(),
-        },
-        OsFunctionCall::AppendText(a) => FsRequest::AppendText {
-            path: a.path.as_str(),
-            data: a.data.as_str(),
-        },
-        OsFunctionCall::AppendBytes(a) => FsRequest::AppendBytes {
-            path: a.path.as_str(),
-            data: a.data.as_slice(),
-        },
-        OsFunctionCall::Mkdir(a) => FsRequest::Mkdir {
-            path: a.path.as_str(),
-            parents: a.parents,
-            exist_ok: a.exist_ok,
-        },
-        OsFunctionCall::Unlink(p) => FsRequest::Unlink { path: p.as_str() },
-        OsFunctionCall::Rmdir(p) => FsRequest::Rmdir { path: p.as_str() },
-        OsFunctionCall::Iterdir(p) => FsRequest::Iterdir { path: p.as_str() },
-        OsFunctionCall::Stat(p) => FsRequest::Stat { path: p.as_str() },
-        OsFunctionCall::Rename(a) => FsRequest::Rename {
-            src: a.src.as_str(),
-            dst: a.dst.as_str(),
-        },
-        OsFunctionCall::Resolve(p) => FsRequest::Resolve { path: p.as_str() },
-        OsFunctionCall::Absolute(p) => FsRequest::Absolute { path: p.as_str() },
-        OsFunctionCall::Open(a) => FsRequest::Open {
-            path: a.path.as_str(),
-            mode: a.mode,
-        },
-        OsFunctionCall::Getenv(_)
-        | OsFunctionCall::GetEnviron
-        | OsFunctionCall::DateToday
-        | OsFunctionCall::DateTimeNow(_) => unreachable!("non-filesystem OS function reached filesystem parser"),
-        OsFunctionCall::Used => unreachable!("OsFunctionCall::Used reached filesystem parser"),
+/// TODO: this should all be replaced with a proper solution
+/// once we have https://github.com/pydantic/monty/issues/294
+pub(super) fn parse_fs_request<'a>(
+    function: OsFunction,
+    args: &'a [MontyObject],
+    kwargs: &'a [(MontyObject, MontyObject)],
+) -> Result<FsRequest<'a>, MountError> {
+    let path = parse_primary_path(args)?;
+    let extra_args = &args[1..];
+
+    match function {
+        OsFunction::Exists => Ok(FsRequest::Exists { path }),
+        OsFunction::IsFile => Ok(FsRequest::IsFile { path }),
+        OsFunction::IsDir => Ok(FsRequest::IsDir { path }),
+        OsFunction::IsSymlink => Ok(FsRequest::IsSymlink { path }),
+        OsFunction::ReadText => Ok(FsRequest::ReadText { path }),
+        OsFunction::ReadBytes => Ok(FsRequest::ReadBytes { path }),
+        OsFunction::WriteText => Ok(FsRequest::WriteText {
+            path,
+            data: parse_string_data(extra_args, "write_text")?,
+        }),
+        OsFunction::WriteBytes => Ok(FsRequest::WriteBytes {
+            path,
+            data: parse_bytes_data(extra_args, "write_bytes")?,
+        }),
+        OsFunction::Mkdir => {
+            let (parents, exist_ok) = parse_mkdir_kwargs(kwargs);
+            Ok(FsRequest::Mkdir {
+                path,
+                parents,
+                exist_ok,
+            })
+        }
+        OsFunction::Unlink => Ok(FsRequest::Unlink { path }),
+        OsFunction::Rmdir => Ok(FsRequest::Rmdir { path }),
+        OsFunction::Iterdir => Ok(FsRequest::Iterdir { path }),
+        OsFunction::Stat => Ok(FsRequest::Stat { path }),
+        OsFunction::Rename => Ok(FsRequest::Rename {
+            src: path,
+            dst: parse_path_arg(extra_args, "rename")?,
+        }),
+        OsFunction::Resolve => Ok(FsRequest::Resolve { path }),
+        OsFunction::Absolute => Ok(FsRequest::Absolute { path }),
+        _ => unreachable!("non-filesystem OS function reached filesystem parser"),
     }
 }
 
@@ -200,14 +164,68 @@ pub(super) fn execute(
     }
 }
 
-/// Builds the [`MontyObject::FileHandle`] an `Open` request resolves to.
-///
-/// The handle carries the **virtual** (sandbox) path — never a host path — so
-/// subsequent `read`/`write` calls re-resolve it through `resolve_path`.
-pub(super) fn file_handle_result(path: &str, mode: FileMode) -> MontyObject {
-    MontyObject::FileHandle(MontyFileHandle {
-        path: normalize_virtual_path(path),
-        mode,
-        position: 0,
-    })
+/// Extracts the first path argument from a raw OS call.
+fn parse_primary_path(args: &[MontyObject]) -> Result<&str, MountError> {
+    match args.first() {
+        Some(MontyObject::Path(path)) => Ok(path.as_str()),
+        Some(MontyObject::String(path)) => Ok(path.as_str()),
+        _ => Err(MountError::InvalidMount(
+            "filesystem operation missing path argument".to_owned(),
+        )),
+    }
+}
+
+/// Extracts the string payload for `Path.write_text`.
+fn parse_string_data<'a>(extra_args: &'a [MontyObject], op_name: &str) -> Result<&'a str, MountError> {
+    match extra_args.first() {
+        Some(MontyObject::String(data)) => Ok(data.as_str()),
+        Some(arg) => Err(MountError::InvalidMount(format!(
+            "data must be str, not {}",
+            arg.type_name()
+        ))),
+        None => Err(MountError::InvalidMount(format!(
+            "Path.{op_name}() missing 1 required positional argument: 'data'"
+        ))),
+    }
+}
+
+/// Extracts the bytes payload for `Path.write_bytes`.
+fn parse_bytes_data<'a>(extra_args: &'a [MontyObject], op_name: &str) -> Result<&'a [u8], MountError> {
+    match extra_args.first() {
+        Some(MontyObject::Bytes(data)) => Ok(data.as_slice()),
+        Some(arg) => Err(MountError::InvalidMount(format!(
+            "memoryview: a bytes-like object is required, not '{}'",
+            arg.type_name()
+        ))),
+        None => Err(MountError::InvalidMount(format!(
+            "Path.{op_name}() missing 1 required positional argument: 'data'"
+        ))),
+    }
+}
+
+/// Extracts a path-like argument such as `Path.rename(dst)`.
+fn parse_path_arg<'a>(extra_args: &'a [MontyObject], op_name: &str) -> Result<&'a str, MountError> {
+    match extra_args.first() {
+        Some(MontyObject::Path(path)) => Ok(path.as_str()),
+        Some(MontyObject::String(path)) => Ok(path.as_str()),
+        _ => Err(MountError::InvalidMount(format!("{op_name}: expected path argument"))),
+    }
+}
+
+/// Extracts the supported keyword arguments for `Path.mkdir`.
+fn parse_mkdir_kwargs(kwargs: &[(MontyObject, MontyObject)]) -> (bool, bool) {
+    let mut parents = false;
+    let mut exist_ok = false;
+
+    for (key, value) in kwargs {
+        if let (MontyObject::String(name), MontyObject::Bool(flag)) = (key, value) {
+            match name.as_str() {
+                "parents" => parents = *flag,
+                "exist_ok" => exist_ok = *flag,
+                _ => {}
+            }
+        }
+    }
+
+    (parents, exist_ok)
 }

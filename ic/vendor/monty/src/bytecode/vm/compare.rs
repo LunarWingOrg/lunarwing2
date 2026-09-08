@@ -11,7 +11,7 @@ use crate::{
     value::Value,
 };
 
-impl<T: ResourceTracker> VM<'_, T> {
+impl<T: ResourceTracker> VM<'_, '_, T> {
     /// Equality comparison.
     pub(super) fn compare_eq(&mut self) -> Result<(), RunError> {
         let this = self;
@@ -58,6 +58,14 @@ impl<T: ResourceTracker> VM<'_, T> {
     }
 
     /// Identity comparison (is/is not).
+    ///
+    /// Compares identity using `Value::is()` which compares IDs.
+    ///
+    /// Identity is determined by `Value::id()` which uses:
+    /// - Fixed IDs for singletons (None, True, False, Ellipsis)
+    /// - Interned string/bytes index for InternString/InternBytes
+    /// - HeapId for heap-allocated values (Ref)
+    /// - Value-based hashing for immediate types (Int, Float, Function, etc.)
     pub(super) fn compare_is(&mut self, negate: bool) {
         let this = self;
 
@@ -66,7 +74,7 @@ impl<T: ResourceTracker> VM<'_, T> {
         let lhs = this.pop();
         defer_drop!(lhs, this);
 
-        let result = lhs.is(rhs, this);
+        let result = lhs.is(rhs);
         this.push(Value::Bool(if negate { !result } else { result }));
     }
 

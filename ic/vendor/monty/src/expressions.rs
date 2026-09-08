@@ -40,16 +40,6 @@ pub enum NameScope {
     /// The namespace slot contains `Value::Ref(cell_id)` pointing to a `HeapData::Cell`.
     /// Access requires dereferencing through the cell.
     Cell,
-    /// Comprehension target stored in the frame's anonymous comp-var region.
-    ///
-    /// Inlined list/set/dict comprehensions allocate their loop variables in a
-    /// fixed-size frame-local region that sits between the regular locals and
-    /// operand-stack growth. The slot index in `opt_namespace_id` is
-    /// interpreted as a comp-var slot index (separate namespace from locals
-    /// or globals). The region is initialized to `Value::Undefined` on frame
-    /// entry and drained on frame exit, so comprehension targets never leak
-    /// into the enclosing scope. See `limitations/comprehensions.md` for details.
-    CompVar,
 }
 
 /// An identifier (variable or function name) with source location and scope information.
@@ -511,7 +501,8 @@ pub enum Node<F> {
     /// No-op statement. Only present in parsed form, filtered out during prepare.
     Pass,
     Expr(ExprLoc),
-    Return(Option<ExprLoc>),
+    Return(ExprLoc),
+    ReturnNone,
     Raise(Option<ExprLoc>),
     Assert {
         test: ExprLoc,
@@ -664,29 +655,6 @@ pub enum Node<F> {
     /// Executes body, catches matching exceptions with handlers, runs else if no exception,
     /// and always runs finally.
     Try(Try<Self>),
-    /// `with EXPR [as TARGET]: BODY` — runs BODY with a context manager.
-    ///
-    /// Semantics match CPython: `EXPR` is evaluated, `__enter__` is called on
-    /// the result and bound to `TARGET` (if present), then `BODY` runs. On a
-    /// normal exit `__exit__(None, None, None)` is called; on exception,
-    /// `__exit__(type, value, None)` is called (Monty has no traceback objects),
-    /// and a truthy return value suppresses the exception.
-    ///
-    /// `target` is `Option<UnpackTarget>` to permit `with foo() as (a, b):`
-    /// shapes uniformly with [`Node::For`]; today the parser only emits the
-    /// `Name` variant since other unpack patterns are not yet exercised by
-    /// any user.
-    ///
-    /// Multi-item `with a() as x, b() as y:` is desugared into nested `With`
-    /// nodes by the parser, so this variant only ever carries a single
-    /// context. See `parse.rs` for the lowering and `limitations/with.md`
-    /// for the user-facing semantics.
-    With {
-        context: ExprLoc,
-        target: Option<UnpackTarget>,
-        body: Vec<Self>,
-        position: CodeRange,
-    },
     /// Import statement (e.g., `import sys`, `import sys, os`, `import sys as s`).
     ///
     /// Loads one or more modules and binds them to names in the current namespace.

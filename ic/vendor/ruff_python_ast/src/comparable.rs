@@ -517,39 +517,10 @@ pub enum ComparableInterpolatedStringElement<'a> {
     InterpolatedElement(InterpolatedElement<'a>),
 }
 
-/// Comparable wrapper for [`ast::DebugText`].
-///
-/// Compares the full debug text (leading + expression source + trailing) rather than only the
-/// expression source, because whitespace is part of the f-string's runtime output: `f"{x =}"`
-/// produces `"x =<value>"` while `f"{x=}"` produces `"x=<value>"`, making them distinct
-/// `Literal` types.
-#[derive(Debug, PartialEq, Eq, Hash)]
-pub struct ComparableDebugText<'a> {
-    text: Cow<'a, str>,
-}
-
-impl<'a> From<&'a ast::DebugText> for ComparableDebugText<'a> {
-    fn from(debug_text: &'a ast::DebugText) -> Self {
-        // Normalizing newlines is safe because Python normalizes `\r\n` and `\r` to `\n`
-        // at compile time, so they produce identical runtime values.
-        Self {
-            text: normalize_newlines(debug_text.as_str()),
-        }
-    }
-}
-
-fn normalize_newlines(contents: &str) -> Cow<'_, str> {
-    if contents.contains('\r') {
-        Cow::Owned(contents.replace("\r\n", "\n").replace('\r', "\n"))
-    } else {
-        Cow::Borrowed(contents)
-    }
-}
-
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct InterpolatedElement<'a> {
     expression: ComparableExpr<'a>,
-    debug_text: Option<ComparableDebugText<'a>>,
+    debug_text: Option<&'a ast::DebugText>,
     conversion: ast::ConversionFlag,
     format_spec: Option<Vec<ComparableInterpolatedStringElement<'a>>>,
 }
@@ -581,7 +552,7 @@ impl<'a> From<&'a ast::InterpolatedElement> for InterpolatedElement<'a> {
 
         Self {
             expression: (expression).into(),
-            debug_text: debug_text.as_ref().map(Into::into),
+            debug_text: debug_text.as_ref(),
             conversion: *conversion,
             format_spec: format_spec
                 .as_ref()
@@ -913,7 +884,7 @@ pub struct ExprSetComp<'a> {
 
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ExprDictComp<'a> {
-    key: Option<Box<ComparableExpr<'a>>>,
+    key: Box<ComparableExpr<'a>>,
     value: Box<ComparableExpr<'a>>,
     generators: Vec<ComparableComprehension<'a>>,
 }
@@ -955,7 +926,7 @@ pub struct ExprCall<'a> {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct ExprInterpolatedElement<'a> {
     value: Box<ComparableExpr<'a>>,
-    debug_text: Option<ComparableDebugText<'a>>,
+    debug_text: Option<&'a ast::DebugText>,
     conversion: ast::ConversionFlag,
     format_spec: Vec<ComparableInterpolatedStringElement<'a>>,
 }
@@ -1186,7 +1157,7 @@ impl<'a> From<&'a ast::Expr> for ComparableExpr<'a> {
                 range: _,
                 node_index: _,
             }) => Self::DictComp(ExprDictComp {
-                key: key.as_ref().map(Into::into),
+                key: key.into(),
                 value: value.into(),
                 generators: generators.iter().map(Into::into).collect(),
             }),
@@ -1561,7 +1532,6 @@ pub struct StmtAssert<'a> {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct StmtImport<'a> {
     names: Vec<ComparableAlias<'a>>,
-    is_lazy: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1569,7 +1539,6 @@ pub struct StmtImportFrom<'a> {
     module: Option<&'a str>,
     names: Vec<ComparableAlias<'a>>,
     level: u32,
-    is_lazy: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1809,25 +1778,21 @@ impl<'a> From<&'a ast::Stmt> for ComparableStmt<'a> {
             }),
             ast::Stmt::Import(ast::StmtImport {
                 names,
-                is_lazy,
                 range: _,
                 node_index: _,
             }) => Self::Import(StmtImport {
                 names: names.iter().map(Into::into).collect(),
-                is_lazy: *is_lazy,
             }),
             ast::Stmt::ImportFrom(ast::StmtImportFrom {
                 module,
                 names,
                 level,
-                is_lazy,
                 range: _,
                 node_index: _,
             }) => Self::ImportFrom(StmtImportFrom {
                 module: module.as_deref(),
                 names: names.iter().map(Into::into).collect(),
                 level: *level,
-                is_lazy: *is_lazy,
             }),
             ast::Stmt::Global(ast::StmtGlobal {
                 names,

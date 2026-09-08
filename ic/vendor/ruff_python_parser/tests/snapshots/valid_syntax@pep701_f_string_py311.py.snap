@@ -8,7 +8,7 @@ input_file: crates/ruff_python_parser/resources/inline/ok/pep701_f_string_py311.
 Module(
     ModModule {
         node_index: NodeIndex(None),
-        range: 0..415,
+        range: 0..398,
         body: [
             Expr(
                 StmtExpr {
@@ -509,81 +509,33 @@ Module(
             Expr(
                 StmtExpr {
                     node_index: NodeIndex(None),
-                    range: 231..247,
+                    range: 231..263,
                     value: FString(
                         ExprFString {
                             node_index: NodeIndex(None),
-                            range: 231..247,
+                            range: 231..263,
                             value: FStringValue {
                                 inner: Single(
                                     FString(
                                         FString {
-                                            range: 231..247,
-                                            node_index: NodeIndex(None),
-                                            elements: [
-                                                Interpolation(
-                                                    InterpolatedElement {
-                                                        range: 235..244,
-                                                        node_index: NodeIndex(None),
-                                                        expression: NumberLiteral(
-                                                            ExprNumberLiteral {
-                                                                node_index: NodeIndex(None),
-                                                                range: 241..242,
-                                                                value: Int(
-                                                                    1,
-                                                                ),
-                                                            },
-                                                        ),
-                                                        debug_text: None,
-                                                        conversion: None,
-                                                        format_spec: None,
-                                                    },
-                                                ),
-                                            ],
-                                            flags: FStringFlags {
-                                                quote_style: Double,
-                                                prefix: Regular,
-                                                triple_quoted: true,
-                                                unclosed: false,
-                                            },
-                                        },
-                                    ),
-                                ),
-                            },
-                        },
-                    ),
-                },
-            ),
-            Expr(
-                StmtExpr {
-                    node_index: NodeIndex(None),
-                    range: 248..280,
-                    value: FString(
-                        ExprFString {
-                            node_index: NodeIndex(None),
-                            range: 248..280,
-                            value: FStringValue {
-                                inner: Single(
-                                    FString(
-                                        FString {
-                                            range: 248..280,
+                                            range: 231..263,
                                             node_index: NodeIndex(None),
                                             elements: [
                                                 Literal(
                                                     InterpolatedStringLiteralElement {
-                                                        range: 250..271,
+                                                        range: 233..254,
                                                         node_index: NodeIndex(None),
                                                         value: "escape outside of \t ",
                                                     },
                                                 ),
                                                 Interpolation(
                                                     InterpolatedElement {
-                                                        range: 271..277,
+                                                        range: 254..260,
                                                         node_index: NodeIndex(None),
                                                         expression: Name(
                                                             ExprName {
                                                                 node_index: NodeIndex(None),
-                                                                range: 272..276,
+                                                                range: 255..259,
                                                                 id: Name("expr"),
                                                                 ctx: Load,
                                                             },
@@ -595,7 +547,7 @@ Module(
                                                 ),
                                                 Literal(
                                                     InterpolatedStringLiteralElement {
-                                                        range: 277..279,
+                                                        range: 260..262,
                                                         node_index: NodeIndex(None),
                                                         value: "\n",
                                                     },
@@ -618,21 +570,21 @@ Module(
             Expr(
                 StmtExpr {
                     node_index: NodeIndex(None),
-                    range: 281..294,
+                    range: 264..277,
                     value: FString(
                         ExprFString {
                             node_index: NodeIndex(None),
-                            range: 281..294,
+                            range: 264..277,
                             value: FStringValue {
                                 inner: Single(
                                     FString(
                                         FString {
-                                            range: 281..294,
+                                            range: 264..277,
                                             node_index: NodeIndex(None),
                                             elements: [
                                                 Literal(
                                                     InterpolatedStringLiteralElement {
-                                                        range: 283..293,
+                                                        range: 266..276,
                                                         node_index: NodeIndex(None),
                                                         value: "test\"abcd",
                                                     },
@@ -655,26 +607,26 @@ Module(
             Expr(
                 StmtExpr {
                     node_index: NodeIndex(None),
-                    range: 295..306,
+                    range: 278..289,
                     value: FString(
                         ExprFString {
                             node_index: NodeIndex(None),
-                            range: 295..306,
+                            range: 278..289,
                             value: FStringValue {
                                 inner: Single(
                                     FString(
                                         FString {
-                                            range: 295..306,
+                                            range: 278..289,
                                             node_index: NodeIndex(None),
                                             elements: [
                                                 Interpolation(
                                                     InterpolatedElement {
-                                                        range: 297..305,
+                                                        range: 280..288,
                                                         node_index: NodeIndex(None),
                                                         expression: NumberLiteral(
                                                             ExprNumberLiteral {
                                                                 node_index: NodeIndex(None),
-                                                                range: 298..299,
+                                                                range: 281..282,
                                                                 value: Int(
                                                                     1,
                                                                 ),
@@ -684,12 +636,12 @@ Module(
                                                         conversion: None,
                                                         format_spec: Some(
                                                             InterpolatedStringFormatSpec {
-                                                                range: 300..304,
+                                                                range: 283..287,
                                                                 node_index: NodeIndex(None),
                                                                 elements: [
                                                                     Literal(
                                                                         InterpolatedStringLiteralElement {
-                                                                            range: 300..304,
+                                                                            range: 283..287,
                                                                             node_index: NodeIndex(None),
                                                                             value: "d",
                                                                         },
@@ -717,26 +669,26 @@ Module(
             Expr(
                 StmtExpr {
                     node_index: NodeIndex(None),
-                    range: 347..359,
+                    range: 330..342,
                     value: FString(
                         ExprFString {
                             node_index: NodeIndex(None),
-                            range: 347..359,
+                            range: 330..342,
                             value: FStringValue {
                                 inner: Single(
                                     FString(
                                         FString {
-                                            range: 347..359,
+                                            range: 330..342,
                                             node_index: NodeIndex(None),
                                             elements: [
                                                 Interpolation(
                                                     InterpolatedElement {
-                                                        range: 349..358,
+                                                        range: 332..341,
                                                         node_index: NodeIndex(None),
                                                         expression: NumberLiteral(
                                                             ExprNumberLiteral {
                                                                 node_index: NodeIndex(None),
-                                                                range: 350..351,
+                                                                range: 333..334,
                                                                 value: Int(
                                                                     1,
                                                                 ),
@@ -746,12 +698,12 @@ Module(
                                                         conversion: None,
                                                         format_spec: Some(
                                                             InterpolatedStringFormatSpec {
-                                                                range: 352..357,
+                                                                range: 335..340,
                                                                 node_index: NodeIndex(None),
                                                                 elements: [
                                                                     Literal(
                                                                         InterpolatedStringLiteralElement {
-                                                                            range: 352..357,
+                                                                            range: 335..340,
                                                                             node_index: NodeIndex(None),
                                                                             value: "\"d\"",
                                                                         },

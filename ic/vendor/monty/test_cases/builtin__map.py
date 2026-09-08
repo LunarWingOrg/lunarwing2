@@ -65,12 +65,10 @@ except ValueError as e:
 
 try:
     map()
-    assert False, 'map() should require arguments'
 except TypeError as e:
-    assert str(e) == 'map() must have at least two arguments.', f'map() arity: {e}'
+    assert str(e) == 'map() must have at least two arguments.', 'map with no arguments'
 
 try:
     map(None)
-    assert False, 'map() with single arg should fail'
 except TypeError as e:
-    assert str(e) == 'map() must have at least two arguments.', f'map(fn) arity: {e}'
+    assert str(e) == 'map() must have at least two arguments.', 'map with only function argument'

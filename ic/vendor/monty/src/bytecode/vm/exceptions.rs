@@ -12,14 +12,11 @@ use crate::{
     value::Value,
 };
 
-impl<T: ResourceTracker> VM<'_, T> {
+impl<T: ResourceTracker> VM<'_, '_, T> {
     /// Returns the current frame's name for traceback generation.
     ///
     /// Returns the function name for user-defined functions, or `<module>` for
-    /// module-level code. The frame stack must be non-empty: callers in the
-    /// async path that may run with no active frame (e.g. just before a spawned
-    /// task's first frame is pushed) are expected to route errors through
-    /// `handle_task_failure` rather than the regular exception machinery.
+    /// module-level code.
     fn current_frame_name(&self) -> StringId {
         let frame = self.current_frame();
         match frame.function_id {
@@ -157,29 +154,12 @@ impl<T: ResourceTracker> VM<'_, T> {
             // Search exception table for a handler covering this IP
             if let Some(entry) = frame.code.find_exception_handler(ip) {
                 // Found a handler! Unwind stack and jump to it.
-                // The operand stack lives directly above the locals region.
-                // `entry.stack_depth()` is the compiler's operand-stack depth
-                // at the try region, so the absolute stack index to unwind to
-                // is `stack_base + locals_count + stack_depth`. Any in-flight
-                // comprehension variables sit on the operand stack inside this
-                // depth window and get cleaned up by the same drain.
                 let handler_offset = usize::try_from(entry.handler()).expect("handler offset exceeds usize");
                 let target_stack_depth = frame.stack_base + frame.locals_count as usize + entry.stack_depth() as usize;
-                let target_exc_stack_depth = frame.exception_stack_base + entry.exception_stack_count() as usize;
 
                 // Unwind stack to target depth (drop excess values)
-                for value in this.stack.drain(target_stack_depth..).rev() {
-                    value.drop_with_heap(this.heap);
-                }
-
-                // Drop any `exception_stack` entries left behind by handlers
-                // the propagating exception is bypassing — without this, a
-                // handler whose body terminated via `raise`/`return`/`break`/
-                // `continue` (so its trailer's `ClearException` is dead code)
-                // would leak its exception onto `exception_stack`, where a
-                // later bare `raise` could resurrect it.
-                while this.exception_stack.len() > target_exc_stack_depth {
-                    let value = this.exception_stack.pop().unwrap();
+                while this.stack.len() > target_stack_depth {
+                    let value = this.stack.pop().unwrap();
                     value.drop_with_heap(this);
                 }
 
@@ -190,9 +170,8 @@ impl<T: ResourceTracker> VM<'_, T> {
                 // Reclaim exc_value from guard - it's being pushed onto exception_stack
                 let (exc_value, this) = exc_guard.into_parts();
 
-                // Push exception onto the exception_stack for bare raise.
-                // This allows nested except handlers to restore outer
-                // exception context.
+                // Push exception onto the exception_stack for bare raise
+                // This allows nested except handlers to restore outer exception context
                 this.exception_stack.push(exc_value);
 
                 // Jump to handler
@@ -284,71 +263,39 @@ impl<T: ResourceTracker> VM<'_, T> {
         Ok(Value::Ref(heap_id))
     }
 
-    /// Checks if an exception matches an `except` clause's exception type.
+    /// Checks if an exception matches an exception type for except clause matching.
     ///
-    /// `exc_type` must be either a single exception class, or a *flat* tuple of
-    /// exception classes. Returns `Ok(true)` if the exception matches, `Ok(false)`
-    /// if it doesn't, or `Err` if `exc_type` is not a valid exception type.
-    ///
-    /// This deliberately does **not** recurse into nested tuples. The exception
-    /// type handed to `except` is constructed at runtime, so a tuple could be
-    /// nested arbitrarily deeply regardless of source nesting limits; a recursive
-    /// matcher would overflow the host's native stack inside this single bytecode
-    /// instruction. Mirroring CPython's `check_except_type_valid` (the
-    /// `CHECK_EXC_MATCH` opcode), only one level of tuple is accepted: a nested
-    /// tuple element — or any non-exception value — raises
-    /// `TypeError: catching classes that do not inherit from BaseException is not
-    /// allowed`. Removing the recursion both keeps parity with CPython and
-    /// eliminates the unbounded-recursion footgun entirely, so no recursion-depth
-    /// or time bound is needed here.
-    ///
-    /// Like CPython, the *whole* tuple is validated rather than short-circuiting
-    /// on the first match: an invalid element raises the `TypeError` even when an
-    /// earlier element already matched (e.g. `except (TypeError, (ValueError,))`
-    /// raising `TypeError` still raises the `TypeError` about catching classes).
+    /// Validates that `exc_type` is a valid exception type (ExcType or tuple of ExcTypes).
+    /// Returns `Ok(true)` if exception matches, `Ok(false)` if not, or `Err` if exc_type is invalid.
     pub(super) fn check_exc_match(&self, exception: &Value, exc_type: &Value) -> Result<bool, RunError> {
         let exc_type_enum = exception.py_type(self);
+        self.check_exc_match_inner(exc_type_enum, exc_type)
+    }
+
+    /// Inner recursive helper for check_exc_match that handles tuples.
+    fn check_exc_match_inner(&self, exc_type_enum: Type, exc_type: &Value) -> Result<bool, RunError> {
         match exc_type {
-            // Single exception class.
+            // Valid exception type
             Value::Builtin(Builtins::ExcType(handler_type)) => {
-                Ok(Self::exc_matches_handler(exc_type_enum, *handler_type))
+                // Check if exception is an instance of handler_type
+                Ok(matches!(exc_type_enum, Type::Exception(et) if et.is_subclass_of(*handler_type)))
             }
-            // Flat tuple of exception classes. CPython does not descend into
-            // nested tuples in this position, so neither do we.
+            // Tuple of exception types
             Value::Ref(id) => {
                 if let HeapData::Tuple(tuple) = self.heap.get(*id) {
-                    let mut matched = false;
                     for v in tuple.as_slice() {
-                        match v {
-                            Value::Builtin(Builtins::ExcType(handler_type)) => {
-                                if !matched && Self::exc_matches_handler(exc_type_enum, *handler_type) {
-                                    matched = true;
-                                }
-                            }
-                            // A nested tuple or any non-exception value is
-                            // rejected exactly as CPython rejects it, even if a
-                            // previous element already matched.
-                            _ => return Err(ExcType::except_invalid_type_error()),
+                        if self.check_exc_match_inner(exc_type_enum, v)? {
+                            return Ok(true);
                         }
                     }
-                    Ok(matched)
+                    Ok(false)
                 } else {
-                    // A non-tuple heap value (e.g. an exception instance) is not
-                    // a valid exception type for an `except` clause.
+                    // Not a tuple - invalid exception type
                     Err(ExcType::except_invalid_type_error())
                 }
             }
-            // Any other value is invalid for an `except` clause.
+            // Any other type is invalid for except clause
             _ => Err(ExcType::except_invalid_type_error()),
         }
-    }
-
-    /// Returns whether a raised exception's type is caught by `handler_type`.
-    ///
-    /// Helper shared by the single-class and flat-tuple arms of
-    /// [`check_exc_match`]; the raised value only matches when its type is an
-    /// exception that is a subclass of the handler's class.
-    fn exc_matches_handler(exc_type_enum: Type, handler_type: ExcType) -> bool {
-        matches!(exc_type_enum, Type::Exception(et) if et.is_subclass_of(handler_type))
     }
 }

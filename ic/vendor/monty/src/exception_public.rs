@@ -1,8 +1,6 @@
 use std::{
-    collections::HashMap,
     error,
     fmt::{self, Write},
-    sync::Arc,
 };
 
 use crate::{
@@ -52,7 +50,7 @@ impl fmt::Display for MontyException {
             if repeat_count > REPEAT_FRAMES_SHOWN {
                 // Show first REPEAT_FRAMES_SHOWN frames, then collapse the rest
                 for j in 0..REPEAT_FRAMES_SHOWN {
-                    write!(f, "{}", self.traceback[i + j])?;
+                    write!(f, "{}", &self.traceback[i + j])?;
                 }
                 let collapsed = repeat_count - REPEAT_FRAMES_SHOWN;
                 writeln!(f, "  [Previous line repeated {collapsed} more times]")?;
@@ -60,7 +58,7 @@ impl fmt::Display for MontyException {
             } else {
                 // Show all frames in this group
                 for j in 0..repeat_count {
-                    write!(f, "{}", self.traceback[i + j])?;
+                    write!(f, "{}", &self.traceback[i + j])?;
                 }
                 i += repeat_count;
             }
@@ -85,22 +83,6 @@ impl MontyException {
         Self {
             exc_type,
             message,
-            traceback: vec![],
-        }
-    }
-
-    pub(crate) fn new_full(exc_type: ExcType, message: Option<String>, traceback: Vec<StackFrame>) -> Self {
-        Self {
-            exc_type,
-            message,
-            traceback,
-        }
-    }
-
-    pub(crate) fn runtime_error(err: impl fmt::Display) -> Self {
-        Self {
-            exc_type: ExcType::RuntimeError,
-            message: Some(err.to_string()),
             traceback: vec![],
         }
     }
@@ -161,6 +143,22 @@ impl MontyException {
             format!("{type_str}()")
         }
     }
+
+    pub(crate) fn new_full(exc_type: ExcType, message: Option<String>, traceback: Vec<StackFrame>) -> Self {
+        Self {
+            exc_type,
+            message,
+            traceback,
+        }
+    }
+
+    pub(crate) fn runtime_error(err: impl fmt::Display) -> Self {
+        Self {
+            exc_type: ExcType::RuntimeError,
+            message: Some(err.to_string()),
+            traceback: vec![],
+        }
+    }
 }
 
 /// Check if two stack frames are identical for the purpose of collapsing repeated frames.
@@ -191,16 +189,7 @@ pub struct StackFrame {
     /// The name of the frame (function name, or None for module-level code).
     pub frame_name: Option<String>,
     /// The source code line for preview in the traceback.
-    ///
-    /// Stored as `Arc<str>` rather than `String` so that consecutive frames
-    /// referencing the same source line — typical of recursion and tight
-    /// helper-function loops — share a single allocation. Without sharing, a
-    /// 1000-deep recursive call into code on a long line would clone the
-    /// entire line into each frame and amplify memory usage by the call
-    /// depth. Serialization roundtrips lose the sharing (each frame gets
-    /// its own `Arc`), but that is bounded by the wire size of the
-    /// traceback so does not regress the amplification.
-    pub preview_line: Option<Arc<str>>,
+    pub preview_line: Option<String>,
     /// Whether to hide the caret marker in the traceback for this frame.
     ///
     /// Set to `true` for:
@@ -246,10 +235,7 @@ impl fmt::Display for StackFrame {
                     4
                 };
                 f.write_str(&" ".repeat(caret_start))?;
-                // Always render at least one caret, even for zero-length ranges
-                // (e.g. a SyntaxError pointing just past the end of a truncated token).
-                let caret_len = (self.end.column - self.start.column).max(1) as usize;
-                writeln!(f, "{}", "~".repeat(caret_len))?;
+                writeln!(f, "{}", "~".repeat((self.end.column - self.start.column) as usize))?;
             }
         } else {
             f.write_char('\n')?;
@@ -264,7 +250,7 @@ impl StackFrame {
     /// Resolves the raw filename/frame-name `StringId`s via `interns` and
     /// expands the position's byte offsets to line/column and a preview
     /// line via `source_map`.
-    pub(crate) fn from_raw(f: &RawStackFrame, interns: &Interns, source_map: &mut SourceMap<'_>) -> Self {
+    pub(crate) fn from_raw(f: &RawStackFrame, interns: &Interns, source_map: &SourceMap<'_>) -> Self {
         let filename = interns.get_str(f.position.filename).to_string();
         let (start, end, preview_line) = source_map.resolve_range(f.position);
         Self {
@@ -282,11 +268,7 @@ impl StackFrame {
     ///
     /// Sets `hide_frame_name: true` because CPython's SyntaxError format
     /// omits the trailing `, in <module>` part.
-    pub(crate) fn from_position_syntax_error(
-        position: CodeRange,
-        filename: &str,
-        source_map: &mut SourceMap<'_>,
-    ) -> Self {
+    pub(crate) fn from_position_syntax_error(position: CodeRange, filename: &str, source_map: &SourceMap<'_>) -> Self {
         let (start, end, preview_line) = source_map.resolve_range(position);
         Self {
             filename: filename.to_string(),
@@ -304,7 +286,7 @@ impl StackFrame {
     /// Used for runtime-style errors raised outside the VM's frame tracking
     /// (e.g. parse-phase `NotImplementedError`) where caret markers and the
     /// `, in <module>` suffix are both shown.
-    pub(crate) fn from_position(position: CodeRange, filename: &str, source_map: &mut SourceMap<'_>) -> Self {
+    pub(crate) fn from_position(position: CodeRange, filename: &str, source_map: &SourceMap<'_>) -> Self {
         let (start, end, preview_line) = source_map.resolve_range(position);
         Self {
             filename: filename.to_string(),
@@ -321,7 +303,7 @@ impl StackFrame {
     ///
     /// Used for errors like `ImportError` and `ModuleNotFoundError`, where
     /// CPython shows the source preview line but no `~~~` carets beneath it.
-    pub(crate) fn from_position_no_caret(position: CodeRange, filename: &str, source_map: &mut SourceMap<'_>) -> Self {
+    pub(crate) fn from_position_no_caret(position: CodeRange, filename: &str, source_map: &SourceMap<'_>) -> Self {
         let (start, end, preview_line) = source_map.resolve_range(position);
         Self {
             filename: filename.to_string(),
@@ -391,15 +373,6 @@ pub struct SourceMap<'s> {
     /// Byte offset of the start of each line. Length equals the number of
     /// lines; `line_starts[0]` is always 0.
     line_starts: Vec<u32>,
-    /// Cache of preview lines, keyed by 0-based line index.
-    ///
-    /// Lets every `StackFrame` referencing the same source line share a
-    /// single `Arc<str>` allocation rather than each cloning the line into
-    /// its own `String`. This matters for deep recursion: without the
-    /// cache, a 1 MiB line referenced by 1000 frames would allocate ~1 GiB;
-    /// with the cache it allocates ~1 MiB. Built lazily — entries materialize
-    /// only as `resolve_range` actually requests them.
-    line_cache: HashMap<usize, Arc<str>>,
 }
 
 impl<'s> SourceMap<'s> {
@@ -418,34 +391,22 @@ impl<'s> SourceMap<'s> {
                 line_starts.push(start);
             }
         }
-        Self {
-            source,
-            line_starts,
-            line_cache: HashMap::new(),
-        }
+        Self { source, line_starts }
     }
 
     /// Resolves a `CodeRange` into `(start, end, preview_line)`.
     ///
     /// `preview_line` is `Some(line)` only when `start` and `end` lie on the
     /// same line — matching the previous semantics where multi-line ranges
-    /// have no single preview to highlight. The returned `Arc<str>` is
-    /// shared with any other frame in this traceback resolving to the same
-    /// line, so repeated lookups for the same line are O(1) and allocate
-    /// only on the first lookup.
-    pub(crate) fn resolve_range(&mut self, range: CodeRange) -> (CodeLoc, CodeLoc, Option<Arc<str>>) {
+    /// have no single preview to highlight.
+    pub(crate) fn resolve_range(&self, range: CodeRange) -> (CodeLoc, CodeLoc, Option<String>) {
         let (start_line_idx, start) = self.resolve_byte(range.start_byte);
         let (end_line_idx, end) = self.resolve_byte(range.end_byte);
-        let preview_line = (start_line_idx == end_line_idx).then(|| {
-            // Cache materializes lazily — first request for a given line allocates
-            // the `Arc<str>`, subsequent requests for the same line clone the Arc.
-            let line_text = self.line_text(start_line_idx);
-            Arc::clone(
-                self.line_cache
-                    .entry(start_line_idx)
-                    .or_insert_with(|| Arc::from(line_text)),
-            )
-        });
+        let preview_line = if start_line_idx == end_line_idx {
+            Some(self.line_text(start_line_idx).to_string())
+        } else {
+            None
+        };
         (start, end, preview_line)
     }
 

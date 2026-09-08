@@ -12,16 +12,13 @@
 [package]
 edition = "2024"
 name = "get-size2"
-version = "0.9.0"
+version = "0.7.4"
 authors = [
     "Denis Kerp",
     "Nicolas",
 ]
 build = false
-exclude = [
-    "examples/*",
-    "tests/*",
-]
+exclude = ["examples/*"]
 autolib = false
 autobins = false
 autoexamples = false
@@ -56,14 +53,11 @@ bytes = ["dep:bytes"]
 chrono = ["dep:chrono"]
 chrono-tz = ["dep:chrono-tz"]
 compact-str = ["dep:compact_str"]
-dashmap = ["dep:dashmap"]
 default = []
 derive = ["get-size-derive2"]
-half = ["dep:half"]
 hashbrown = ["dep:hashbrown"]
 indexmap = ["dep:indexmap"]
 ordermap = ["dep:ordermap"]
-parking_lot = ["dep:parking_lot"]
 smallvec = ["dep:smallvec"]
 thin-vec = ["dep:thin-vec"]
 url = ["dep:url"]
@@ -92,37 +86,22 @@ version = "0.9"
 optional = true
 default-features = false
 
-[dependencies.dashmap]
-version = "6"
-optional = true
-default-features = false
-
 [dependencies.get-size-derive2]
-version = "0.9.0"
+version = "0.7.4"
 optional = true
-
-[dependencies.half]
-version = "2"
-optional = true
-default-features = false
 
 [dependencies.hashbrown]
-version = "0.17"
+version = "0.16"
 optional = true
 default-features = false
 
 [dependencies.indexmap]
-version = "2.14"
+version = "2.10"
 optional = true
 default-features = false
 
 [dependencies.ordermap]
-version = "1.2"
-optional = true
-default-features = false
-
-[dependencies.parking_lot]
-version = "0.12"
+version = "1.0"
 optional = true
 default-features = false
 

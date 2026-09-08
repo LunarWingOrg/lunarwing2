@@ -11,9 +11,9 @@
 
 [package]
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.90"
 name = "monty"
-version = "0.0.18"
+version = "0.0.17"
 authors = ["Samuel Colvin <samuel@pydantic.dev>"]
 build = false
 autolib = false
@@ -40,7 +40,7 @@ repository = "https://github.com/pydantic/monty/"
 
 [features]
 memory-model-checks = []
-ref-count-return = ["test-hooks"]
+ref-count-return = []
 test-hooks = []
 
 [lib]
@@ -62,18 +62,6 @@ path = "tests/bytecode_limits.rs"
 [[test]]
 name = "error_locations"
 path = "tests/error_locations.rs"
-
-[[test]]
-name = "external_function_identity"
-path = "tests/external_function_identity.rs"
-
-[[test]]
-name = "file_error_paths"
-path = "tests/file_error_paths.rs"
-
-[[test]]
-name = "file_resource_tracking"
-path = "tests/file_resource_tracking.rs"
 
 [[test]]
 name = "fs"
@@ -144,16 +132,8 @@ name = "resource_limits"
 path = "tests/resource_limits.rs"
 
 [[test]]
-name = "security"
-path = "tests/security.rs"
-
-[[test]]
 name = "try_from"
 path = "tests/try_from.rs"
-
-[[test]]
-name = "with_test_cm"
-path = "tests/with_test_cm.rs"
 
 [dependencies]
 fancy-regex = "0.17.0"
@@ -166,6 +146,10 @@ speedate = "0.17.0"
 version = "0.8.0"
 features = ["serde"]
 
+[dependencies.bytemuck]
+version = "1.25.0"
+features = ["derive"]
+
 [dependencies.chrono]
 version = "0.4"
 features = ["serde"]
@@ -175,11 +159,8 @@ version = "2.9"
 features = ["serde"]
 
 [dependencies.jiter]
-version = "0.15.0"
+version = "0.13.0"
 features = ["num-bigint"]
-
-[dependencies.monty-macros]
-path = "../monty-macros"
 
 [dependencies.num-bigint]
 version = "0.4"
@@ -196,31 +177,28 @@ version = "1.1"
 features = ["alloc"]
 
 [dependencies.ruff_python_ast]
-git = "https://github.com/samuelcolvin/ruff.git"
-rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+git = "https://github.com/astral-sh/ruff.git"
+rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 package = "ruff_python_ast"
 
 [dependencies.ruff_python_parser]
-git = "https://github.com/samuelcolvin/ruff.git"
-rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+git = "https://github.com/astral-sh/ruff.git"
+rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 package = "ruff_python_parser"
 
 [dependencies.ruff_python_stdlib]
-git = "https://github.com/samuelcolvin/ruff.git"
-rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+git = "https://github.com/astral-sh/ruff.git"
+rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 package = "ruff_python_stdlib"
 
 [dependencies.ruff_text_size]
-git = "https://github.com/samuelcolvin/ruff.git"
-rev = "6aaa91ac2b269df1414954ccd5134f0e6f5c6d30"
+git = "https://github.com/astral-sh/ruff.git"
+rev = "6ded4bed1651e30b34dd04cdaa50c763036abb0d"
 package = "ruff_text_size"
 
 [dependencies.serde]
 version = "1.0"
-features = [
-    "derive",
-    "rc",
-]
+features = ["derive"]
 
 [dependencies.serde_json]
 version = "1.0"
@@ -270,8 +248,6 @@ check-cfg = [
     "cfg(heap_reader_compile_fail_test_double_get_mut)",
     "cfg(heap_reader_compile_fail_test_heap_mutation_while_reading)",
     "cfg(heap_reader_compile_fail_test_mutation_in_map_closure)",
-    "cfg(heap_reader_compile_fail_test_smuggle_vm)",
-    "cfg(heap_reader_compile_fail_test_smuggle_and_swap_reader)",
 ]
 
 [lints.rustdoc]

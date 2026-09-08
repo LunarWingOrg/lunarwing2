@@ -33,7 +33,6 @@ expression: suite
                                                 debug_text: Some(
                                                     DebugText {
                                                         leading: "",
-                                                        expression: "x",
                                                         trailing: "   =",
                                                     },
                                                 ),

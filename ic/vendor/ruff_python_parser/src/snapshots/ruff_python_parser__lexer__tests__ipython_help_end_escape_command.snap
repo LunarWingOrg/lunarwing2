@@ -172,8 +172,8 @@ expression: lex_jupyter_source(source)
     ),
     (
         IpyEscapeCommand {
-            value: "pwd?",
-            kind: Shell,
+            value: "pwd",
+            kind: Help,
         },
         127..132,
     ),

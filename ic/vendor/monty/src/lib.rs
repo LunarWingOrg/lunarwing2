@@ -13,7 +13,6 @@ mod expressions;
 pub mod fs;
 mod fstring;
 mod function;
-mod hash;
 mod heap_data;
 mod intern;
 mod io;
@@ -39,15 +38,9 @@ pub use crate::{
     exception_private::ExcType,
     exception_public::{CodeLoc, MontyException, StackFrame},
     io::{PrintStream, PrintWriter, PrintWriterCallback},
-    object::{
-        DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyFileHandle, MontyObject, MontyTimeDelta,
-        MontyTimeZone,
-    },
+    object::{DictPairs, InvalidInputError, MontyDate, MontyDateTime, MontyObject, MontyTimeDelta, MontyTimeZone},
     object_json::{JsonMontyArray, JsonMontyObject, JsonMontyPairs},
-    os::{
-        GetenvArgs, MkdirCallArgs, MontyPath, OpenCallArgs, OsFunctionCall, PathBytesDataArgs, PathStringDataArgs,
-        RenameCallArgs, dir_stat, file_stat, stat_result, symlink_stat,
-    },
+    os::{OsFunction, dir_stat, file_stat, stat_result, symlink_stat},
     repl::{
         MontyRepl, ReplContinuationMode, ReplFunctionCall, ReplNameLookup, ReplOsCall, ReplProgress,
         ReplResolveFutures, ReplStartError, detect_repl_continuation_mode,
@@ -59,5 +52,4 @@ pub use crate::{
     run_progress::{
         ExtFunctionResult, FunctionCall, NameLookup, NameLookupResult, OsCall, ResolveFutures, RunProgress,
     },
-    types::{file::FileMode, str::StringRepr},
 };

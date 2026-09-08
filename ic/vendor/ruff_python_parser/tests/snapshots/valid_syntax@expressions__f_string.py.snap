@@ -1,5 +1,6 @@
 ---
 source: crates/ruff_python_parser/tests/fixtures.rs
+input_file: crates/ruff_python_parser/resources/valid/expressions/f_string.py
 ---
 ## AST
 
@@ -607,7 +608,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "  ",
-                                                                expression: "foo",
                                                                 trailing: " =  ",
                                                             },
                                                         ),
@@ -660,7 +660,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "  ",
-                                                                expression: "foo",
                                                                 trailing: " =  ",
                                                             },
                                                         ),
@@ -727,7 +726,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "  ",
-                                                                expression: "foo",
                                                                 trailing: " =  ",
                                                             },
                                                         ),
@@ -800,7 +798,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "  ",
-                                                                expression: "1, 2",
                                                                 trailing: "  =  ",
                                                             },
                                                         ),
@@ -869,7 +866,6 @@ Module(
                                                                                             debug_text: Some(
                                                                                                 DebugText {
                                                                                                     leading: "",
-                                                                                                    expression: "3.1415",
                                                                                                     trailing: "=",
                                                                                                 },
                                                                                             ),
@@ -1395,7 +1391,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: " (  ",
-                                                                expression: "foo",
                                                                 trailing: " )  = ",
                                                             },
                                                         ),
@@ -1943,7 +1938,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "",
-                                                                expression: "x",
                                                                 trailing: " =",
                                                             },
                                                         ),
@@ -1996,7 +1990,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "    ",
-                                                                expression: "x",
                                                                 trailing: " = ",
                                                             },
                                                         ),
@@ -2049,7 +2042,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "",
-                                                                expression: "x",
                                                                 trailing: "=",
                                                             },
                                                         ),
@@ -2163,7 +2155,6 @@ Module(
                                                         debug_text: Some(
                                                             DebugText {
                                                                 leading: "",
-                                                                expression: "x",
                                                                 trailing: " = ",
                                                             },
                                                         ),

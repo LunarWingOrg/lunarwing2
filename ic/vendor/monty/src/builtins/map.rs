@@ -1,12 +1,12 @@
 //! Implementation of the map() builtin function.
 
-use std::{iter, mem};
+use std::iter;
 
 use crate::{
-    args::{ArgValues, FromArgs, KwargsValues},
+    args::{ArgValues, KwargsValues},
     bytecode::VM,
     defer_drop, defer_drop_mut,
-    exception_private::{ExcType, RunResult},
+    exception_private::{ExcType, RunResult, SimpleException},
     heap::{DropWithHeap, HeapData},
     resource::ResourceTracker,
     types::{List, MontyIter},
@@ -27,47 +27,31 @@ use crate::{
 /// map(pow, [2, 3], [3, 2])          # [8, 9]
 /// map(str, [1, 2, 3])               # ['1', '2', '3']
 /// ```
-pub fn builtin_map(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    // CPython's map() uses a bespoke arity message
-    // (`map() must have at least two arguments.`) rather than the generic
-    // "missing N required positional arguments" wording the macro would
-    // otherwise produce. Pre-check before delegating to MapArgs so we
-    // match byte-for-byte; cleanup is handled by the early-return drop.
-    //
-    // Only fire the arity check when no kwargs are present — otherwise
-    // `map(abs, bogus=1)` would report the arity error when CPython reports
-    // the unknown-kwarg error. Delegating to the macro produces the
-    // correct `got an unexpected keyword argument` message instead.
-    let kwargs_empty = match &args {
-        ArgValues::Kwargs(kwargs) => kwargs.is_empty(),
-        ArgValues::ArgsKargs { kwargs, .. } => kwargs.is_empty(),
-        _ => true,
-    };
-    if args.count() < 2 && kwargs_empty {
-        args.drop_with_heap(vm.heap);
-        return Err(ExcType::type_error_map_arity());
+pub fn builtin_map(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    let (positional, kwargs) = args.into_parts();
+    defer_drop_mut!(positional, vm);
+
+    kwargs.not_supported_yet("map", vm.heap)?;
+
+    if positional.len() < 2 {
+        return Err(SimpleException::new_msg(ExcType::TypeError, "map() must have at least two arguments.").into());
     }
-    let MapArgs {
-        function,
-        first_iterable,
-        extra_iterables,
-    } = MapArgs::from_args(args, vm)?;
+
+    let function = positional.next().unwrap();
     defer_drop!(function, vm);
 
+    let first_iterable = positional.next().expect("checked length above");
     let first_iter = MontyIter::new(first_iterable, vm)?;
     defer_drop_mut!(first_iter, vm);
 
-    let extra_iterators: Vec<MontyIter> = Vec::with_capacity(extra_iterables.len());
+    let extra_iterators: Vec<MontyIter> = Vec::with_capacity(positional.len());
     defer_drop_mut!(extra_iterators, vm);
 
-    for iterable in extra_iterables {
+    for iterable in positional {
         extra_iterators.push(MontyIter::new(iterable, vm)?);
     }
 
-    // `preallocation_hint` validates the requested capacity against the
-    // resource tracker and clamps it so an attacker-controlled iterable length
-    // cannot drive an unbounded native pre-allocation.
-    let mut out = Vec::with_capacity(first_iter.preallocation_hint(mem::size_of::<Value>(), vm)?);
+    let mut out = Vec::with_capacity(first_iter.size_hint(vm.heap));
 
     // map function over iterables until the shortest iter is exhausted
     match extra_iterators.as_mut_slice() {
@@ -113,20 +97,4 @@ pub fn builtin_map(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> Ru
 
     let heap_id = vm.heap.allocate(HeapData::List(List::new(out)))?;
     Ok(Value::Ref(heap_id))
-}
-
-/// Argument shape for `map(function, iterable, *iterables)`.
-///
-/// `function` and the first `iterable` are required; any further iterables
-/// are collected by `extra_iterables`. `map` doesn't accept kwargs, so the
-/// macro's default unknown-kwarg error path is exactly what we want.
-#[derive(FromArgs)]
-#[from_args(name = "map")]
-struct MapArgs {
-    #[from_args(pos_only)]
-    function: Value,
-    #[from_args(pos_only)]
-    first_iterable: Value,
-    #[from_args(varargs)]
-    extra_iterables: Vec<Value>,
 }

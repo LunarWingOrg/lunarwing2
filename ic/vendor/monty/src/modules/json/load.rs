@@ -9,10 +9,11 @@ use jiter::{Jiter, JiterError, JiterErrorType, JsonErrorType, NumberAny, NumberI
 
 use super::JsonStringCache;
 use crate::{
-    args::{ArgValues, FromArgs},
+    args::ArgValues,
     bytecode::VM,
+    defer_drop,
     exception_private::{ExcType, RunError, RunResult},
-    heap::{ContainsHeap, HeapData, HeapGuard, HeapReader},
+    heap::{ContainsHeap, DropWithHeap, HeapData, HeapGuard, HeapReader},
     resource::{ResourceError, ResourceTracker},
     types::{
         Dict, List, LongInt, PyTrait,
@@ -69,23 +70,34 @@ const JSON_RECURSION_LIMIT: usize = 200;
 /// CPython kwargs `cls`, `object_hook`, `parse_float`, `parse_int`,
 /// `parse_constant`, and `object_pairs_hook` are intentionally unsupported
 /// and will raise `TypeError` if passed.
-pub(super) fn call_loads(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
-    let JsonLoadsArgs { s } = JsonLoadsArgs::from_args(args, vm)?;
-    let mut data_guard = HeapGuard::new(s, vm);
+pub(super) fn call_loads(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    let (mut pos, kwargs) = args.into_parts();
+    if let Some((key, value)) = kwargs.into_iter().next() {
+        defer_drop!(key, vm);
+        defer_drop!(value, vm);
+        let Some(keyword_name) = key.as_either_str(vm.heap) else {
+            return Err(ExcType::type_error_kwargs_nonstring_key());
+        };
+        pos.drop_with_heap(vm);
+        return Err(ExcType::type_error_unexpected_keyword(
+            "loads",
+            keyword_name.as_str(vm.interns),
+        ));
+    }
+
+    let Some(data) = pos.next() else {
+        return Err(ExcType::type_error_missing_positional_with_names("loads", &["s"]));
+    };
+    if pos.len() != 0 {
+        let actual = pos.len() + 1;
+        data.drop_with_heap(vm);
+        pos.drop_with_heap(vm);
+        return Err(ExcType::type_error_too_many_positional("loads", 1, actual, 0));
+    }
+
+    let mut data_guard = HeapGuard::new(data, vm);
     let (data, vm) = data_guard.as_parts_mut();
     parse_json_input(data, vm)
-}
-
-/// Argument shape for `json.loads(s)`.
-///
-/// CPython exposes a handful of additional kwargs (`cls`, `object_hook`, …)
-/// that Monty intentionally does not implement; leaving them off this struct
-/// means the macro emits the standard "unexpected keyword" error for them.
-#[derive(FromArgs)]
-#[from_args(name = "loads")]
-struct JsonLoadsArgs {
-    #[from_args(pos_only)]
-    s: Value,
 }
 
 /// Parses a `json.loads()` input value and converts it into a Monty value.
@@ -93,7 +105,7 @@ struct JsonLoadsArgs {
 /// The parser works directly on the underlying byte slice. Decoded strings from
 /// `jiter` are copied into Monty's heap immediately before any further parser
 /// movement so borrowed tape-backed data never escapes.
-fn parse_json_input(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Value> {
+fn parse_json_input(value: &Value, vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
     let bytes: Cow<'_, [u8]> = match value {
         Value::InternString(string_id) => Cow::Borrowed(vm.interns.get_str(*string_id).as_bytes()),
         Value::InternBytes(bytes_id) => Cow::Borrowed(vm.interns.get_bytes(*bytes_id)),
@@ -115,7 +127,7 @@ fn parse_json_input(value: &Value, vm: &mut VM<'_, impl ResourceTracker>) -> Run
 ///
 /// Syntax errors are wrapped in `json.JSONDecodeError` using the same
 /// line/column/character suffix as CPython.
-fn parse_json_bytes(bytes: &[u8], vm: &mut VM<'_, impl ResourceTracker>) -> RunResult<Value> {
+fn parse_json_bytes(bytes: &[u8], vm: &mut VM<'_, '_, impl ResourceTracker>) -> RunResult<Value> {
     let mut jiter = Jiter::new(bytes).with_allow_inf_nan();
     // Take the cache out of the VM so we can pass it alongside &mut VM
     // without conflicting borrows. `mem::take` leaves `Default` in its place.
@@ -145,7 +157,7 @@ fn parse_json_value(
     jiter: &mut Jiter<'_>,
     depth: usize,
     cache: &mut JsonStringCache,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> ParseResult<Value> {
     let peek = jiter.peek()?;
     parse_json_value_from_peek(peek, jiter, depth, cache, vm)
@@ -160,7 +172,7 @@ fn parse_json_value_from_peek(
     jiter: &mut Jiter<'_>,
     depth: usize,
     cache: &mut JsonStringCache,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> ParseResult<Value> {
     match peek {
         Peek::Null => {
@@ -197,29 +209,24 @@ fn allocate_cached_string(
 
 /// Parses a JSON number into the corresponding Monty numeric value.
 ///
-/// Oversized integers that exceed Monty's digit limit are rejected with a `ValueError`
-fn parse_json_number(peek: Peek, jiter: &mut Jiter<'_>, vm: &mut VM<'_, impl ResourceTracker>) -> ParseResult<Value> {
+/// Integer tokens are counted directly from the source bytes so
+/// `INT_MAX_STR_DIGITS` errors report the same digit count as CPython without
+/// first allocating an oversized decimal string.
+fn parse_json_number(
+    peek: Peek,
+    jiter: &mut Jiter<'_>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
+) -> ParseResult<Value> {
     let start = jiter.current_index();
-    // Parse to bytes so that we can check the digit count before any BigInt allocation occurs.
-    let token = jiter.known_number_bytes(peek)?;
-    if is_json_integer_token(token) {
-        let digit_count = decimal_digit_count_ascii(token);
-        check_decimal_digit_count(digit_count).map_err(JsonLoadError::Run)?;
-    }
-    // `known_number_bytes` already validated the token, so `NumberAny::from_bytes`
-    // only re-parses the same byte range. Errors here are mapped back into the
-    // outer document's coordinate space so `json_error_to_run_error` reports
-    // the correct line/column.
-    let number = NumberAny::from_bytes(token, true).map_err(|error| {
-        JsonLoadError::Parse(JiterError {
-            error_type: JiterErrorType::JsonError(error.error_type),
-            index: start + error.index,
-        })
-    })?;
-    match number {
-        NumberAny::Int(NumberInt::Int(value)) => Ok(Value::Int(value)),
-        NumberAny::Int(NumberInt::BigInt(value)) => Ok(LongInt::new(value).into_value(vm.heap)?),
-        NumberAny::Float(value) => Ok(Value::Float(value)),
+    match jiter.known_number(peek) {
+        Ok(NumberAny::Int(NumberInt::Int(value))) => Ok(Value::Int(value)),
+        Ok(NumberAny::Int(NumberInt::BigInt(value))) => {
+            let digit_count = decimal_digit_count_ascii(jiter.slice_to_current(start));
+            check_decimal_digit_count(digit_count).map_err(JsonLoadError::Run)?;
+            Ok(LongInt::new(value).into_value(vm.heap)?)
+        }
+        Ok(NumberAny::Float(value)) => Ok(Value::Float(value)),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -231,7 +238,7 @@ fn parse_json_array(
     jiter: &mut Jiter<'_>,
     depth: usize,
     cache: &mut JsonStringCache,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> ParseResult<Value> {
     check_json_recursion_limit(jiter, depth)?;
 
@@ -274,7 +281,7 @@ fn parse_json_object(
     jiter: &mut Jiter<'_>,
     depth: usize,
     cache: &mut JsonStringCache,
-    vm: &mut VM<'_, impl ResourceTracker>,
+    vm: &mut VM<'_, '_, impl ResourceTracker>,
 ) -> ParseResult<Value> {
     check_json_recursion_limit(jiter, depth)?;
 

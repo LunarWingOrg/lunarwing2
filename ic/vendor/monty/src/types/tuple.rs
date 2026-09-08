@@ -15,7 +15,6 @@
 ///
 /// All tuple methods from Python's builtins are implemented.
 use std::{
-    cell::Cell,
     cmp::Ordering,
     collections::hash_map::DefaultHasher,
     fmt::Write,
@@ -32,7 +31,6 @@ use crate::{
     bytecode::{CallResult, VM},
     defer_drop,
     exception_private::{ExcType, RunResult},
-    hash::HashValue,
     heap::{DropWithHeap, Heap, HeapData, HeapId, HeapItem, HeapRead},
     intern::StaticStrings,
     resource::{ResourceError, ResourceTracker},
@@ -71,12 +69,6 @@ pub(crate) struct Tuple {
     /// True if any item in the tuple is a `Value::Ref`. Set at creation time
     /// since tuples are immutable.
     contains_refs: bool,
-    /// Lazily-computed Python hash. Tuples are immutable so this is
-    /// computed on first `py_hash` and reused thereafter. Skipped on
-    /// serde — recomputable from `items` and we don't want to lock the
-    /// snapshot format to the current hash function.
-    #[serde(skip)]
-    cached_hash: Cell<Option<HashValue>>,
 }
 
 impl Tuple {
@@ -93,11 +85,7 @@ impl Tuple {
     #[must_use]
     fn new(items: TupleVec) -> Self {
         let contains_refs = items.iter().any(|v| matches!(v, Value::Ref(_)));
-        Self {
-            items,
-            contains_refs,
-            cached_hash: Cell::new(None),
-        }
+        Self { items, contains_refs }
     }
 
     /// Returns a reference to the underlying SmallVec.
@@ -119,7 +107,7 @@ impl Tuple {
     ///
     /// - `tuple()` with no args returns an empty tuple (singleton)
     /// - `tuple(iterable)` creates a tuple from any iterable (list, tuple, range, str, bytes, dict)
-    pub fn init(vm: &mut VM<'_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
+    pub fn init(vm: &mut VM<'_, '_, impl ResourceTracker>, args: ArgValues) -> RunResult<Value> {
         let value = args.get_zero_one_arg("tuple", vm.heap)?;
         match value {
             None => {
@@ -175,12 +163,12 @@ pub fn allocate_tuple(
 
 impl<'h> HeapRead<'h, Tuple> {
     /// Clones the item at the given index with proper refcount management.
-    pub(crate) fn clone_item(&self, index: usize, vm: &mut VM<'h, impl ResourceTracker>) -> Value {
+    pub(crate) fn clone_item(&self, index: usize, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Value {
         self.get(vm.heap).items[index].clone_with_heap(vm)
     }
 
     /// Clones all items from this tuple with proper refcount management.
-    fn clone_all_items(&self, vm: &mut VM<'h, impl ResourceTracker>) -> TupleVec {
+    fn clone_all_items(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> TupleVec {
         let len = self.get(vm.heap).items.len();
         let mut result = TupleVec::with_capacity(len);
         for i in 0..len {
@@ -191,15 +179,15 @@ impl<'h> HeapRead<'h, Tuple> {
 }
 
 impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
-    fn py_type(&self, _vm: &VM<'h, impl ResourceTracker>) -> Type {
+    fn py_type(&self, _vm: &VM<'h, '_, impl ResourceTracker>) -> Type {
         Type::Tuple
     }
 
-    fn py_len(&self, vm: &VM<'h, impl ResourceTracker>) -> Option<usize> {
+    fn py_len(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize> {
         Some(self.get(vm.heap).items.len())
     }
 
-    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Value> {
+    fn py_getitem(&self, key: &Value, vm: &mut VM<'h, '_, impl ResourceTracker>) -> RunResult<Value> {
         // Check for slice first (Value::Ref pointing to HeapData::Slice)
         if let Value::Ref(key_id) = key
             && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
@@ -223,7 +211,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         Ok(self.clone_item(idx, vm))
     }
 
-    fn py_eq(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<bool, ResourceError> {
+    fn py_eq(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<bool, ResourceError> {
         let a_len = self.get(vm.heap).items.len();
         if a_len != other.get(vm.heap).items.len() {
             return Ok(false);
@@ -249,14 +237,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
     /// Identical to `NamedTuple::py_hash`, so a `Tuple` and a `NamedTuple` with
     /// the same elements hash equally — required because they compare equal
     /// (matching CPython, where `NamedTuple` is a `tuple` subclass).
-    ///
-    /// Caches the computed hash on first call. We only cache the `Some(_)`
-    /// outcome — `None` (unhashable child) is uncommon and skipping it
-    /// keeps the cache slot free of a 3-state encoding.
-    fn py_hash(&self, _self_id: HeapId, vm: &mut VM<'h, impl ResourceTracker>) -> RunResult<Option<HashValue>> {
-        if let Some(cached) = self.get(vm.heap).cached_hash.get() {
-            return Ok(Some(cached));
-        }
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
         let token = vm.heap.incr_recursion_depth()?;
         defer_drop!(token, vm);
         let len = self.get(vm.heap).items.len();
@@ -269,9 +254,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
                 None => return Ok(None),
             }
         }
-        let hash = HashValue::new(hasher.finish());
-        self.get(vm.heap).cached_hash.set(Some(hash));
-        Ok(Some(hash))
+        Ok(Some(hasher.finish()))
     }
 
     /// Lexicographic comparison for tuples.
@@ -282,7 +265,11 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
     /// `(1, 2) < (1, 2, 3)` is `True`.
     ///
     /// Returns `None` if any element pair is incomparable (e.g. `int` vs `str`).
-    fn py_cmp(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<Option<Ordering>, ResourceError> {
+    fn py_cmp(
+        &self,
+        other: &Self,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<Ordering>, ResourceError> {
         let a_len = self.get(vm.heap).items.len();
         let b_len = other.get(vm.heap).items.len();
         let min_len = a_len.min(b_len);
@@ -311,7 +298,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         Ok(Some(a_len.cmp(&b_len)))
     }
 
-    fn py_add(&self, other: &Self, vm: &mut VM<'h, impl ResourceTracker>) -> Result<Option<Value>, ResourceError> {
+    fn py_add(&self, other: &Self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> Result<Option<Value>, ResourceError> {
         let mut items = self.clone_all_items(vm);
         items.extend(other.clone_all_items(vm));
         Ok(Some(allocate_tuple(items, vm.heap)?))
@@ -320,7 +307,7 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
     fn py_call_attr(
         &mut self,
         _self_id: HeapId,
-        vm: &mut VM<'h, impl ResourceTracker>,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
         attr: &EitherStr,
         args: ArgValues,
     ) -> RunResult<CallResult> {
@@ -334,36 +321,17 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Tuple> {
         }
     }
 
-    fn py_bool(&self, vm: &mut VM<'h, impl ResourceTracker>) -> bool {
+    fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
         !self.get(vm.heap).items.is_empty()
     }
 
     fn py_repr_fmt(
         &self,
         f: &mut impl Write,
-        vm: &mut VM<'h, impl ResourceTracker>,
+        vm: &VM<'h, '_, impl ResourceTracker>,
         heap_ids: &mut AHashSet<HeapId>,
     ) -> RunResult<()> {
-        let len = self.get(vm.heap).as_slice().len();
-
-        if len == 1 {
-            // Special case for single-element tuples: include the trailing comma
-            //
-            // Match `repr_sequence_fmt`'s depth handling so nested one-element
-            // tuples can't bypass `max_recursion_depth` and overflow the stack.
-            let Ok(token) = vm.heap.incr_recursion_depth() else {
-                return Ok(f.write_str("...")?);
-            };
-            defer_drop!(token, vm);
-            write!(f, "(")?;
-            let item = self.clone_item(0, vm);
-            defer_drop!(item, vm);
-            item.py_repr_fmt(f, vm, heap_ids)?;
-            write!(f, ",)")?;
-            return Ok(());
-        }
-
-        repr_sequence_fmt('(', ')', len, |heap, i| &self.get(heap).as_slice()[i], f, vm, heap_ids)
+        repr_sequence_fmt('(', ')', &self.get(vm.heap).items, f, vm, heap_ids)
     }
 }
 
@@ -398,7 +366,7 @@ impl HeapItem for Tuple {
 fn tuple_index<'h>(
     tuple: &HeapRead<'h, Tuple>,
     args: ArgValues,
-    vm: &mut VM<'h, impl ResourceTracker>,
+    vm: &mut VM<'h, '_, impl ResourceTracker>,
 ) -> RunResult<Value> {
     let pos_args = args.into_pos_only("tuple.index", vm.heap)?;
     defer_drop!(pos_args, vm);
@@ -437,7 +405,7 @@ fn tuple_index<'h>(
 fn tuple_count<'h>(
     tuple: &HeapRead<'h, Tuple>,
     args: ArgValues,
-    vm: &mut VM<'h, impl ResourceTracker>,
+    vm: &mut VM<'h, '_, impl ResourceTracker>,
 ) -> RunResult<Value> {
     let value = args.get_one_arg("tuple.count", vm.heap)?;
     defer_drop!(value, vm);

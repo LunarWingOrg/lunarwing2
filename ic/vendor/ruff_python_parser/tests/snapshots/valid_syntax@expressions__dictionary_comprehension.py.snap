@@ -91,15 +91,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 23..42,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 24..26,
-                                        id: Name("x1"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 24..26,
+                                    id: Name("x1"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -145,31 +143,29 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 43..73,
-                            key: Some(
-                                BinOp(
-                                    ExprBinOp {
-                                        node_index: NodeIndex(None),
-                                        range: 44..49,
-                                        left: Name(
-                                            ExprName {
-                                                node_index: NodeIndex(None),
-                                                range: 44..45,
-                                                id: Name("x"),
-                                                ctx: Load,
-                                            },
-                                        ),
-                                        op: Add,
-                                        right: NumberLiteral(
-                                            ExprNumberLiteral {
-                                                node_index: NodeIndex(None),
-                                                range: 48..49,
-                                                value: Int(
-                                                    1,
-                                                ),
-                                            },
-                                        ),
-                                    },
-                                ),
+                            key: BinOp(
+                                ExprBinOp {
+                                    node_index: NodeIndex(None),
+                                    range: 44..49,
+                                    left: Name(
+                                        ExprName {
+                                            node_index: NodeIndex(None),
+                                            range: 44..45,
+                                            id: Name("x"),
+                                            ctx: Load,
+                                        },
+                                    ),
+                                    op: Add,
+                                    right: NumberLiteral(
+                                        ExprNumberLiteral {
+                                            node_index: NodeIndex(None),
+                                            range: 48..49,
+                                            value: Int(
+                                                1,
+                                            ),
+                                        },
+                                    ),
+                                },
                             ),
                             value: StringLiteral(
                                 ExprStringLiteral {
@@ -250,15 +246,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 74..122,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 75..76,
-                                        id: Name("b"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 75..76,
+                                    id: Name("b"),
+                                    ctx: Load,
+                                },
                             ),
                             value: BinOp(
                                 ExprBinOp {
@@ -381,15 +375,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 123..176,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 124..125,
-                                        id: Name("a"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 124..125,
+                                    id: Name("a"),
+                                    ctx: Load,
+                                },
                             ),
                             value: BinOp(
                                 ExprBinOp {
@@ -527,15 +519,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 177..231,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 178..179,
-                                        id: Name("a"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 178..179,
+                                    id: Name("a"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -657,15 +647,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 232..252,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 233..234,
-                                        id: Name("a"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 233..234,
+                                    id: Name("a"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -729,15 +717,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 391..416,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 392..393,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 392..393,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -791,15 +777,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 417..447,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 418..419,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 418..419,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -851,15 +835,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 448..477,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 449..450,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 449..450,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -938,15 +920,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 478..511,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 479..480,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 479..480,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -1009,15 +989,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 512..550,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 513..514,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 513..514,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {
@@ -1078,15 +1056,13 @@ Module(
                         ExprDictComp {
                             node_index: NodeIndex(None),
                             range: 551..588,
-                            key: Some(
-                                Name(
-                                    ExprName {
-                                        node_index: NodeIndex(None),
-                                        range: 552..553,
-                                        id: Name("x"),
-                                        ctx: Load,
-                                    },
-                                ),
+                            key: Name(
+                                ExprName {
+                                    node_index: NodeIndex(None),
+                                    range: 552..553,
+                                    id: Name("x"),
+                                    ctx: Load,
+                                },
                             ),
                             value: Name(
                                 ExprName {

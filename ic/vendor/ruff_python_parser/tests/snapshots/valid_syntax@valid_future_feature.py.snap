@@ -34,7 +34,6 @@ Module(
                         },
                     ],
                     level: 0,
-                    is_lazy: false,
                 },
             ),
         ],
