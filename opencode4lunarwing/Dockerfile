@@ -1,6 +1,12 @@
-# v1.18.29 resolves to this reviewed commit. Both must move together.
-ARG OPENCODE_VERSION=v1.18.29
-ARG OPENCODE_REF=16747470f976aca3d362ad730bcd3fe82ecc2c9a
+# v1.18.25 resolves to this reviewed commit. Both must move together.
+# PINNED BACK from v1.18.29: that release ships two regressions hit live on
+# brightdawn 2026-09-07 — (1) provider/model resolution crashes on config
+# model entries lacking the full metadata shape ("a.name" TypeError), and
+# (2) the ai-sdk stream path dies silently between "llm runtime selected"
+# and the first chunk. v1.18.25 is the last version proven end-to-end in
+# this worker. Re-bump only after both are fixed upstream.
+ARG OPENCODE_VERSION=v1.18.25
+ARG OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
 ARG DEBIAN_SNAPSHOT=20260906T000000Z
 ARG SOURCE_REVISION=unknown
 

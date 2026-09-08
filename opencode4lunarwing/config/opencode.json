@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "tensorzero/tensorzero::function_name::FrontierCODE",
+  "model": "tensorzero/tensorzero::function_name::lunarwing",
   "plugin": [
     "opencode-mem",
     "opencode-caveman",
@@ -13,15 +13,15 @@
       "name": "TensorZero",
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "apiKey": "{env:TENSORZERO_API_KEY}",
+        "apiKey": "unneeded",
         "baseURL": "http://192.168.1.157:3000/openai/v1/"
       },
       "models": {
-        "tensorzero::function_name::FrontierCODE": {
-          "name": "tensorzero::function_name::FrontierCODE",
+        "tensorzero::function_name::lunarwing": {
+          "name": "tensorzero::function_name::lunarwing",
 	  "tool_call": true,
 	  "limit": {
-		  "context": 859000,
+		  "context": 959000,
 		  "output": 131072
 	  }
         }

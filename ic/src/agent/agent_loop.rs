@@ -335,8 +335,8 @@ impl Agent {
 
     /// Pending-gate expiry (WI#111): resolved from
     /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
-    /// settings via `AgentConfig::resolve`, with the config-layer floor
-    /// applied (see `clamp_pending_gate_expiry_secs`).
+    /// settings via `AgentConfig::resolve`, with config-layer lower and upper
+    /// bounds applied (see `clamp_pending_gate_expiry_secs`).
     pub(crate) fn pending_gate_expiry(&self) -> ChronoDuration {
         ChronoDuration::seconds(
             clamp_pending_gate_expiry_secs(self.config.pending_gate_expiry_secs) as i64,
@@ -1843,8 +1843,8 @@ impl Agent {
                     return crate::bridge::handle_interrupt(self, message).await;
                 }
                 // Steer is an Engine V2 control on routed channels: the bridge
-                // answers authoritatively (queued into the running engine
-                // thread, or "nothing is running") — no legacy fallthrough.
+                // answers authoritatively (injected into a running engine thread
+                // or persisted for the next foreground turn) — no legacy fallthrough.
                 Submission::Steer { content } => {
                     return crate::bridge::handle_steer(self, message, content).await;
                 }
