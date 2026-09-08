@@ -5082,10 +5082,17 @@ mod tests {
 
         let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
         let mission_thread_id = mission.thread_history[0];
-        mgr.thread_manager
-            .join_thread(mission_thread_id)
-            .await
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let thread = store.load_thread(mission_thread_id).await.unwrap().unwrap();
+                if thread.state.is_terminal() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("spawned mission thread should finish");
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
