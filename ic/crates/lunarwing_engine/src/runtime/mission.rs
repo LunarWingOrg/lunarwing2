@@ -1223,7 +1223,9 @@ impl MissionManager {
                                 )
                                 .await
                             {
-                                debug!("event listener: failed to fire thread-start mission: {error}");
+                                debug!(
+                                    "event listener: failed to fire thread-start mission: {error}"
+                                );
                             }
                             continue;
                         };
