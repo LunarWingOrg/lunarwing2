@@ -421,7 +421,7 @@ async fn execute_code_with_skills_and_action_limit(
     let tracker = LimitedTracker::new(default_limits());
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runner.start(input_values, tracker, PrintWriter::Collect(&mut stdout))
+        runner.start(input_values, tracker, PrintWriter::CollectString(&mut stdout))
     }));
 
     let mut progress = match run_result {
@@ -577,7 +577,7 @@ async fn execute_code_with_skills_and_action_limit(
                 if let Some(ext_result) = sync_result {
                     // Sync resume for builtins
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                        call.resume(ext_result, PrintWriter::CollectString(&mut stdout))
                     })) {
                         Ok(Ok(p)) => progress = p,
                         Ok(Err(e)) => {
@@ -610,7 +610,7 @@ async fn execute_code_with_skills_and_action_limit(
                 // resume_pending and continue — no preflight needed.
                 if pending_futures.contains_key(&monty_call_id) {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        call.resume_pending(PrintWriter::Collect(&mut stdout))
+                        call.resume_pending(PrintWriter::CollectString(&mut stdout))
                     })) {
                         Ok(Ok(p)) => progress = p,
                         Ok(Err(e)) => {
@@ -710,7 +710,7 @@ async fn execute_code_with_skills_and_action_limit(
 
                         // Resume with pending future — Python gets ExternalFuture
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            call.resume_pending(PrintWriter::Collect(&mut stdout))
+                            call.resume_pending(PrintWriter::CollectString(&mut stdout))
                         })) {
                             Ok(Ok(p)) => progress = p,
                             Ok(Err(e)) => {
@@ -740,7 +740,7 @@ async fn execute_code_with_skills_and_action_limit(
                     PreflightResult::Denied(ext_result) => {
                         // Resume with error — Python sees an exception
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                            call.resume(ext_result, PrintWriter::CollectString(&mut stdout))
                         })) {
                             Ok(Ok(p)) => progress = p,
                             Ok(Err(e)) => {
@@ -824,7 +824,7 @@ async fn execute_code_with_skills_and_action_limit(
                 }
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    resolve.resume(resolution.results, PrintWriter::Collect(&mut stdout))
+                    resolve.resume(resolution.results, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -872,7 +872,7 @@ async fn execute_code_with_skills_and_action_limit(
                 };
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    lookup.resume(result, PrintWriter::Collect(&mut stdout))
+                    lookup.resume(result, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -907,7 +907,7 @@ async fn execute_code_with_skills_and_action_limit(
                     Some("OS operations are not permitted in CodeAct scripts".into()),
                 ));
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    os_call.resume(err, PrintWriter::Collect(&mut stdout))
+                    os_call.resume(err, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
