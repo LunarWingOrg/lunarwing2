@@ -194,14 +194,56 @@ async def _install_fake_eventsource(page):
     )
 
 
-async def test_done_without_response_reloads_history(page):
-    """WI#127 candidate 5 guard: Done arriving with no rendered response this
-    turn schedules a history reconcile instead of leaving a blank turn.
+async def test_stream_gap_reloads_history(page):
+    """A server-reported broadcast gap discards partial stream state and
+    immediately reloads persisted history."""
+    await _install_fake_eventsource(page)
+    await page.goto("/")
 
-    Simulates a lost final SSE response event: stream chunks arrive (direct
-    app.js state manipulation), then Done fires with no response event. The
-    guard must detect the missing render and call loadHistory() within its
-    1.5s grace window (stubbed to count invocations)."""
+    await page.evaluate(
+        """
+        () => {
+          window.__loadHistoryCalls = 0;
+          window.__realLoadHistory = window.loadHistory;
+          window.loadHistory = () => { window.__loadHistoryCalls += 1; };
+          markResponseRendered('test-thread');
+          getOrCreateStreamingMessage('test-thread');
+          _streamParts = ['incomplete streamed text'];
+        }
+        """
+    )
+
+    await page.evaluate(
+        """
+        () => window.__sseTarget.dispatch('stream_gap', {
+          missed_events: 4,
+        })
+        """
+    )
+
+    result = await page.evaluate(
+        """
+        () => ({
+          calls: window.__loadHistoryCalls,
+          streamCleared: _streamingMessage === null && _streamParts.length === 0,
+          responseMarkerCleared: !_responseRenderedAt.has('test-thread'),
+        })
+        """
+    )
+    assert result == {
+        "calls": 1,
+        "streamCleared": True,
+        "responseMarkerCleared": True,
+    }
+
+    await page.evaluate(
+        "() => { window.loadHistory = window.__realLoadHistory; }"
+    )
+
+
+async def test_done_without_response_reloads_history(page):
+    """Done without a terminal response reloads history even when live stream
+    text arrived before the terminal event."""
     await _install_fake_eventsource(page)
 
     await page.goto("/")
