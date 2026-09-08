@@ -10,6 +10,7 @@ use futures::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use crate::channels::web::types::SseEvent;
 
@@ -135,7 +136,13 @@ impl SseManager {
                     _ => None,                       // different user -> skip
                 }
             }
-            Err(_) => None,
+            Err(BroadcastStreamRecvError::Lagged(missed_events)) => {
+                tracing::warn!(
+                    missed_events,
+                    "Web event subscriber lagged; signaling stream gap"
+                );
+                Some(SseEvent::StreamGap { missed_events })
+            }
         });
 
         Some(CountedStream {
@@ -176,7 +183,13 @@ impl SseManager {
                     (Some(sub), Some(ev)) if sub == ev => Some(scoped.event),
                     _ => None,
                 },
-                Err(_) => None,
+                Err(BroadcastStreamRecvError::Lagged(missed_events)) => {
+                    tracing::warn!(
+                        missed_events,
+                        "Web event subscriber lagged; signaling stream gap"
+                    );
+                    Some(SseEvent::StreamGap { missed_events })
+                }
             })
             .filter_map(|event| {
                 let data = match serde_json::to_string(&event) {
@@ -193,6 +206,7 @@ impl SseManager {
                     SseEvent::ToolCompleted { .. } => "tool_completed",
                     SseEvent::ToolResult { .. } => "tool_result",
                     SseEvent::StreamChunk { .. } => "stream_chunk",
+                    SseEvent::StreamGap { .. } => "stream_gap",
                     SseEvent::Status { .. } => "status",
                     SseEvent::ApprovalNeeded { .. } => "approval_needed",
                     SseEvent::AuthRequired { .. } => "auth_required",
@@ -315,6 +329,22 @@ mod tests {
             SseEvent::Thinking { message, .. } => assert_eq!(message, "working"),
             _ => panic!("Expected Thinking event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_raw_signals_lag_and_continues() {
+        let manager = SseManager::new();
+        let mut stream = Box::pin(manager.subscribe_raw(None).expect("should subscribe"));
+
+        for _ in 0..257 {
+            manager.broadcast(SseEvent::Heartbeat);
+        }
+
+        assert!(matches!(
+            stream.next().await,
+            Some(SseEvent::StreamGap { missed_events: 1 })
+        ));
+        assert!(matches!(stream.next().await, Some(SseEvent::Heartbeat)));
     }
 
     #[tokio::test]
