@@ -615,6 +615,7 @@ write_tenant_lunarwing_env() {
   local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
   local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
+  local knowledge_sync_enabled knowledge_sync_cadence knowledge_sync_max_records knowledge_sync_max_bytes
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -656,6 +657,10 @@ write_tenant_lunarwing_env() {
   # One-shot knowledge seed: carry the flag only when it already exists (set
   # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
   knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
+  knowledge_sync_enabled="$(_env_existing "$path" KNOWLEDGE_SYNC_ENABLED)"
+  knowledge_sync_cadence="$(_env_existing "$path" KNOWLEDGE_SYNC_CADENCE_HOURS)"
+  knowledge_sync_max_records="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
+  knowledge_sync_max_bytes="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
   local vision_mode vision_external_url vision_token_existing
   vision_mode="$(tenant_vision_mode "$name")"
   vision_external_url="$(tenant_vision_external_url "$name")"
@@ -906,6 +911,14 @@ ENVEOF
       || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$path"
     [[ -z "$knowledge_seed_flag" ]] \
       || printf 'KNOWLEDGE_SEED_FROM_STUDY_MCP=%s\n' "$knowledge_seed_flag" >> "$path"
+    [[ -z "$knowledge_sync_enabled" ]] \
+      || printf 'KNOWLEDGE_SYNC_ENABLED=%s\n' "$knowledge_sync_enabled" >> "$path"
+    [[ -z "$knowledge_sync_cadence" ]] \
+      || printf 'KNOWLEDGE_SYNC_CADENCE_HOURS=%s\n' "$knowledge_sync_cadence" >> "$path"
+    [[ -z "$knowledge_sync_max_records" ]] \
+      || printf 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=%s\n' "$knowledge_sync_max_records" >> "$path"
+    [[ -z "$knowledge_sync_max_bytes" ]] \
+      || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$path"
   fi
   chown "$name:$name" "$path"
   say "wrote: $path"
