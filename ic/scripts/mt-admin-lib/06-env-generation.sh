@@ -111,21 +111,45 @@ study_notes_write_enabled() {  # <raw boolean>
   esac
 }
 
+publish_study_notes_generation() {  # <checkout home>
+  local home="$1" revision manifest tmp published_at
+  validate_study_notes_home "$home"
+  revision="$(git -C "$home" rev-parse --verify HEAD^{commit} 2>/dev/null)" \
+    || die "Study Notes checkout has no valid HEAD commit: $home"
+  [[ "$revision" =~ ^[0-9a-fA-F]{7,128}$ ]] \
+    || die "Study Notes checkout returned an invalid revision: $home"
+  published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  manifest="$home/.git/lunarwing-study-notes-generation.json"
+  tmp="$home/.git/.lunarwing-study-notes-generation.$$.tmp"
+  ( umask 022
+    printf '{"schema_version":1,"source_revision":"%s","published_at":"%s"}\n' \
+      "$revision" "$published_at" > "$tmp"
+  ) || die "failed to stage Study Notes generation manifest: $tmp"
+  chmod 0644 "$tmp"
+  mv -fT -- "$tmp" "$manifest" \
+    || die "failed to publish Study Notes generation manifest: $manifest"
+  say "published Study Notes generation: $revision"
+}
+
 sync_study_notes_checkout() {  # <checkout home>
   # Clone the shared lw2studymcp checkout when missing, or fast-forward an
   # existing clean git checkout to the latest upstream. A non-git directory or
   # a dirty checkout is never modified — the operator must repair it by hand.
-  local home="$1" parent
+  local home="$1" parent manifest
   validate_study_notes_path "$home" "Study Notes home"
   require_cmd git
   parent="$(dirname -- "$home")"
+  manifest="$home/.git/lunarwing-study-notes-generation.json"
   if [[ ! -d "$parent" ]]; then
     install -d -m 0755 -- "$parent" \
       || die "failed to create Study Notes parent directory: $parent"
   fi
-  # Serialize concurrent tenant adds racing to clone/update the shared checkout.
+  # Serialize concurrent updates and invalidate the publication barrier before
+  # mutating files. A tenant scan spanning an update therefore discards its
+  # pass when the before/after manifest check observes the missing/new marker.
   (
     flock -x 200
+    rm -f -- "$manifest"
     if [[ ! -e "$home" ]]; then
       say "cloning Study Notes MCP checkout: $STUDY_NOTES_REPO -> $home"
       git clone --quiet "$STUDY_NOTES_REPO" "$home" \
@@ -140,6 +164,7 @@ sync_study_notes_checkout() {  # <checkout home>
       git -C "$home" pull --ff-only --quiet \
         || die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
     fi
+    publish_study_notes_generation "$home"
   ) 200>"$parent/.study-notes-sync.lock"
 }
 
