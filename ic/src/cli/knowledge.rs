@@ -20,10 +20,22 @@ pub async fn run_knowledge_refresh_command(
                 "LW2STUDYMCP_HOME is required; configure a published Study Notes checkout first"
             )
         })?;
+    let session = crate::llm::create_session_manager(config.llm.session.clone()).await;
+    let embeddings = config
+        .embeddings
+        .create_provider(&config.llm.lunarwing_cloud.base_url, session);
     let db: Arc<dyn crate::db::Database> = crate::db::connect_from_config(&config.database)
         .await
         .map_err(|error| anyhow::anyhow!("{error:#}"))?;
-    let workspace = Workspace::new_with_db(&config.owner_id, db);
+    let mut workspace = Workspace::new_with_db(&config.owner_id, db);
+    if let Some(provider) = embeddings {
+        workspace = workspace.with_embeddings_cached(
+            provider,
+            crate::workspace::EmbeddingCacheConfig {
+                max_entries: config.embeddings.cache_size,
+            },
+        );
+    }
     let report =
         crate::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &sync, true).await;
 
