@@ -77,16 +77,20 @@
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
 
 21. [ ] **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
-    Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design.
+    Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design
+
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/130 - code in comments too look at
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-22. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
+23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
 
 ## Phase 5 - Documentation
 
-23. [ ] update all docs in docs/guides
-24. [ ] update all docs in docs/architecture
-25. [ ] first draft of release notes
+24. [ ] update all docs in docs/guides
+25. [ ] update all docs in docs/architecture
+26. [ ] first draft of release notes
+27. [ ] update readme in root of repo
+28. [x] (S) Reserved
 
 ---
