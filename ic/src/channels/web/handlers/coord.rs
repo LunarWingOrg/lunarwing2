@@ -45,6 +45,7 @@ pub const COORD_ADMIN_TOKEN_ENV: &str = "COORD_ADMIN_TOKEN";
 struct CoordAdminState {
     store: Arc<ViolationStore>,
     token: SecretString,
+    knowledge: Option<Arc<crate::hooks::coordination_knowledge::IngestDiagnostics>>,
 }
 
 #[derive(Serialize)]
@@ -63,6 +64,31 @@ struct ActionView {
     agent: String,
     action: &'static str,
     status: String,
+}
+
+#[derive(Serialize)]
+struct KnowledgeDropView {
+    reason: &'static str,
+    count: u64,
+}
+
+#[derive(Serialize)]
+struct KnowledgeDiagnosticsView {
+    dropped: Vec<KnowledgeDropView>,
+}
+
+async fn get_knowledge_diagnostics(
+    State(state): State<CoordAdminState>,
+) -> Json<KnowledgeDiagnosticsView> {
+    let dropped = state
+        .knowledge
+        .as_ref()
+        .map(|k| k.drop_counts())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(reason, count)| KnowledgeDropView { reason, count })
+        .collect();
+    Json(KnowledgeDiagnosticsView { dropped })
 }
 
 fn status_label(status: &ViolationStatus) -> String {
@@ -185,13 +211,41 @@ async fn enable_agent(
 
 /// Router for the coordination admin API (also used by tests).
 pub fn coord_admin_router(store: Arc<ViolationStore>, token: SecretString) -> Router {
-    let state = CoordAdminState { store, token };
+    let state = CoordAdminState {
+        store,
+        token,
+        knowledge: None,
+    };
     Router::new()
         .route("/coord/status", get(get_all_statuses))
         .route("/coord/status/{agent}", get(get_agent_status))
         .route("/coord/clear/{agent}", post(clear_agent))
         .route("/coord/disable/{agent}", post(disable_agent))
         .route("/coord/enable/{agent}", post(enable_agent))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
+        .with_state(state)
+}
+
+/// Router variant that also serves the knowledge-share ingest diagnostics
+/// (`GET /coord/knowledge`). Counts are body-free and monotonic; they carry
+/// no room content, sender identities, or credentials.
+pub fn coord_admin_router_with_knowledge(
+    store: Arc<ViolationStore>,
+    token: SecretString,
+    knowledge: Arc<crate::hooks::coordination_knowledge::IngestDiagnostics>,
+) -> Router {
+    let state = CoordAdminState {
+        store,
+        token,
+        knowledge: Some(knowledge),
+    };
+    Router::new()
+        .route("/coord/status", get(get_all_statuses))
+        .route("/coord/status/{agent}", get(get_agent_status))
+        .route("/coord/clear/{agent}", post(clear_agent))
+        .route("/coord/disable/{agent}", post(disable_agent))
+        .route("/coord/enable/{agent}", post(enable_agent))
+        .route("/coord/knowledge", get(get_knowledge_diagnostics))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth))
         .with_state(state)
 }
@@ -206,10 +260,25 @@ pub async fn start_coord_admin_server(
     token: SecretString,
     port: u16,
 ) -> Result<SocketAddr, std::io::Error> {
+    start_coord_admin_server_with_knowledge(store, token, port, None).await
+}
+
+/// [`start_coord_admin_server`] with optional knowledge-share ingest
+/// diagnostics; when supplied, `GET /coord/knowledge` reports bounded,
+/// body-free drop counters.
+pub async fn start_coord_admin_server_with_knowledge(
+    store: Arc<ViolationStore>,
+    token: SecretString,
+    port: u16,
+    knowledge: Option<Arc<crate::hooks::coordination_knowledge::IngestDiagnostics>>,
+) -> Result<SocketAddr, std::io::Error> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr().unwrap_or(addr);
-    let app = coord_admin_router(store, token);
+    let app = match knowledge {
+        Some(diagnostics) => coord_admin_router_with_knowledge(store, token, diagnostics),
+        None => coord_admin_router(store, token),
+    };
     tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             tracing::error!(error = %err, "Coordination admin server stopped unexpectedly");
