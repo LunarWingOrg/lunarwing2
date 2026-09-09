@@ -325,6 +325,14 @@ mission stays Active and resumes spawning at the next UTC day rather than
 going terminal. `mission_fire` reports the precise reason when nothing fires
 (terminal, paused, or budget exhausted).
 
+Webhook mission creation is idempotent for an active mission with the same
+project, owner, name, and webhook path. This prevents a retried creation turn
+from leaving duplicate records that all fire for one delivery. Response text
+can auto-complete a user mission only when it has explicit success criteria;
+open-ended missions require an explicit lifecycle action. Mission approach
+history retains the 50 most recent full outcomes, bounding persisted state.
+Concurrent learning-mission bootstrap serializes fix-pattern database seeding.
+
 `MissionManager::ensure_learning_missions()` provisions two baseline missions
 and, when `SKILL_SELF_IMPROVEMENT=true`, three additional skill-improvement
 missions. They are event-driven; not every mission runs after thread completion.

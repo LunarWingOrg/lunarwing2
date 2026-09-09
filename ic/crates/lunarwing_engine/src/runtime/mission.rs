@@ -59,6 +59,9 @@ const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
     "skill_maintenance",
 ];
 
+/// Keep persisted mission state bounded while retaining recent full outcomes.
+const MAX_APPROACH_HISTORY_ENTRIES: usize = 50;
+
 fn recent_conversation_thread_goals(threads: &[Thread], limit: usize) -> Vec<String> {
     // Stores are not required to return threads in chronological order (e.g.
     // `HybridStore::list_threads` iterates an in-memory HashMap), so sort by
@@ -199,6 +202,8 @@ pub struct MissionManager {
     /// Cancellation and handles for ticker, listener, and outcome watchers.
     task_cancel: CancellationToken,
     task_handles: Mutex<Vec<JoinHandle<()>>>,
+    mission_create_lock: Mutex<()>,
+    pattern_seed_lock: Mutex<()>,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -282,6 +287,8 @@ impl MissionManager {
             self_improvement_enabled: AtomicBool::new(crate::skill_self_improvement_enabled()),
             task_cancel: CancellationToken::new(),
             task_handles: Mutex::new(Vec::new()),
+            mission_create_lock: Mutex::new(()),
+            pattern_seed_lock: Mutex::new(()),
         }
     }
 
@@ -452,6 +459,28 @@ impl MissionManager {
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
         validate_webhook_cadence(&cadence)?;
+        let user_id = user_id.into();
+        let name = name.into();
+        let _create_guard = self.mission_create_lock.lock().await;
+        if let MissionCadence::Webhook { path, .. } = &cadence {
+            let existing = self
+                .store
+                .list_missions(project_id, &user_id)
+                .await?
+                .into_iter()
+                .find(|mission| {
+                    mission.status == MissionStatus::Active
+                        && mission.name == name
+                        && matches!(
+                            &mission.cadence,
+                            MissionCadence::Webhook { path: existing_path, .. }
+                                if existing_path == path
+                        )
+                });
+            if let Some(existing) = existing {
+                return Ok(existing.id);
+            }
+        }
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.notify_channels = notify_channels;
         refresh_next_fire_at(&mut mission, Utc::now())?;
@@ -1482,7 +1511,8 @@ impl MissionManager {
             )
             .await?;
 
-        // Seed the fix pattern database if it doesn't exist.
+        // Serialize check-and-seed so concurrent bootstrap calls cannot create duplicates.
+        let _seed_guard = self.pattern_seed_lock.lock().await;
         let docs = self.store.list_shared_memory_docs(project_id).await?;
         let has_patterns = docs.iter().any(|d| {
             d.title == FIX_PATTERN_DB_TITLE && d.tags.contains(&FIX_PATTERN_DB_TAG.to_string())
@@ -2171,6 +2201,7 @@ async fn process_mission_outcome_and_notify(
 
             // Check if goal achieved
             if !is_recurring_learning_mission(&mission)
+                && mission.success_criteria.is_some()
                 && (lower.contains("goal has been achieved: yes")
                     || lower.contains("goal achieved: yes")
                     || lower.contains("mission complete"))
@@ -2188,8 +2219,7 @@ async fn process_mission_outcome_and_notify(
                 }
             }
 
-            // Record approach (full response — LLM output is never truncated)
-            mission.approach_history.push(text.clone());
+            record_approach(&mut mission, text.clone());
             notify_response = Some(text.clone());
 
             // If this is a self-improvement mission, process structured output
@@ -2204,14 +2234,15 @@ async fn process_mission_outcome_and_notify(
         }
         ThreadOutcome::Completed { response: None } => {}
         ThreadOutcome::Failed { error, .. } => {
-            mission.approach_history.push(format!("FAILED: {error}"));
+            record_approach(&mut mission, format!("FAILED: {error}"));
             notify_response = Some(format!("Mission failed: {error}"));
             is_error = true;
         }
         ThreadOutcome::MaxIterations => {
-            mission
-                .approach_history
-                .push("Hit max iterations after final recovery".into());
+            record_approach(
+                &mut mission,
+                "Hit max iterations after final recovery".into(),
+            );
             notify_response = Some(
                 "Mission hit max iterations after final recovery; retry with narrower scope or a higher iteration limit"
                     .into(),
@@ -2238,6 +2269,17 @@ async fn process_mission_outcome_and_notify(
 
     mission.updated_at = chrono::Utc::now();
     store.save_mission(&mission).await
+}
+
+fn record_approach(mission: &mut Mission, approach: String) {
+    mission.approach_history.push(approach);
+    let excess = mission
+        .approach_history
+        .len()
+        .saturating_sub(MAX_APPROACH_HISTORY_ENTRIES);
+    if excess > 0 {
+        mission.approach_history.drain(..excess);
+    }
 }
 
 /// Check if a mission is the self-improvement mission.
@@ -2858,6 +2900,84 @@ mod tests {
         assert_eq!(mission.goal, "do the thing");
         assert_eq!(mission.status, MissionStatus::Active);
         assert_eq!(mission.project_id, project_id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_webhook_creation_is_idempotent() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let project_id = ProjectId::new();
+        let cadence = || MissionCadence::Webhook {
+            path: "shared-hook".into(),
+            secret: Some("secret".into()),
+        };
+
+        let (first, second) = tokio::join!(
+            mgr.create_mission(
+                project_id,
+                "test-user",
+                "same mission",
+                "same goal",
+                cadence(),
+                Vec::new(),
+            ),
+            mgr.create_mission(
+                project_id,
+                "test-user",
+                "same mission",
+                "same goal",
+                cadence(),
+                Vec::new(),
+            ),
+        );
+
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            store
+                .list_missions(project_id, "test-user")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn approach_history_keeps_only_recent_entries() {
+        let mut mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "bounded",
+            "bounded history",
+            MissionCadence::Manual,
+        );
+        for index in 0..=MAX_APPROACH_HISTORY_ENTRIES {
+            record_approach(&mut mission, format!("approach {index}"));
+        }
+
+        assert_eq!(mission.approach_history.len(), MAX_APPROACH_HISTORY_ENTRIES);
+        assert_eq!(mission.approach_history[0], "approach 1");
+        assert_eq!(mission.approach_history.last().unwrap(), "approach 50");
+    }
+
+    #[tokio::test]
+    async fn concurrent_self_improvement_bootstrap_seeds_one_pattern_doc() {
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let project_id = ProjectId::new();
+
+        let _ = tokio::join!(
+            mgr.ensure_self_improvement_mission(project_id, "test-user"),
+            mgr.ensure_self_improvement_mission(project_id, "test-user"),
+        );
+
+        let docs = store.list_shared_memory_docs(project_id).await.unwrap();
+        assert_eq!(
+            docs.iter()
+                .filter(|doc| doc.title == FIX_PATTERN_DB_TITLE)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -3950,6 +4070,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outcome_without_success_criteria_does_not_auto_complete() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "Open-ended Mission",
+            "Keep improving",
+            MissionCadence::Manual,
+        );
+        let id = mission.id;
+        store.save_mission(&mission).await.unwrap();
+
+        let outcome = ThreadOutcome::Completed {
+            response: Some("Mission complete. Goal achieved: yes".into()),
+        };
+        process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+            .await
+            .unwrap();
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert_eq!(mission.status, MissionStatus::Active);
+    }
+
+    #[tokio::test]
     async fn recurring_learning_mission_does_not_complete_from_response_text() {
         let store: Arc<dyn Store> = Arc::new(TestStore::new());
         let mut mission = Mission::new(
@@ -3992,7 +4136,8 @@ mod tests {
             "Coverage",
             "Increase coverage to 80%",
             MissionCadence::Manual,
-        );
+        )
+        .with_success_criteria("coverage >= 80%");
         let id = mission.id;
         store.save_mission(&mission).await.unwrap();
 

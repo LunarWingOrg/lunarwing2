@@ -65,8 +65,11 @@
 16. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
     Repo-contract PASS (27/27 emote tests, live public-surface checks on antelope/kestrel healthy). Remaining: the human acceptance step — fresh tenant, reply containing `*nickers softly* *flicks her tail*`, watch it animate. Cheap; could fold into any live session.
 
-17. [ ] **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
+17. [x] **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
     (a) orphaned mission_create records after failed turns sharing a webhook path (one fire matched 2 missions); (b) goal-phrase auto-complete trap for user-created missions; (c) `fix_pattern_database` re-seeding duplicates; (d) unbounded `approach_history`.
+    - DONE repo-side 2026-09-09 (`lucky`): active webhook mission creation is idempotent for matching project/owner/name/path, preventing retried failed creation turns from adding another firing record. Response text can auto-complete only missions with explicit success criteria; open-ended user missions remain Active.
+    - Serialized fix-pattern check-and-seed prevents concurrent bootstrap duplicates. Mission approach history now keeps the 50 most recent full outcomes and compacts oversized legacy histories on their next recorded outcome.
+    - Verified `cargo fmt --all -- --check`; all 92 mission-filtered engine tests; `cargo check -p lunarwing_engine`; and engine lib/test clippy with `-D warnings`.
 
 18. [ ] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
     Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
