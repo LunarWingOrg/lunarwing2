@@ -71,7 +71,11 @@
 18. [ ] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
     Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
 
-19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+19. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+    - DONE 2026-09-09 (`rarity/kimi-19-20260909-1501`): implemented the desktop-facing gateway voice API (WI#131). New `ic/src/channels/web/voice.rs` adds authenticated, bounded `/api/voice/{status,transcribe,synthesize}` routes behind the existing auth middleware; the gateway proxies the loopback LunarVoice sidecar and holds the `VOICE_AUTH_TOKEN` credential server-side (clients never see it).
+    - Bounds: base64 audio cap 24 MiB, synthesis text 10 000 chars, voice 64 chars, speed 0.5..=2.0, language 32 chars, `format` allowlisted; per-route body limits (32 MiB / 1 MiB) override the global 10 MiB; sidecar responses streamed with hard byte caps; per-user 10 req/60 s rate limit. Upstream URL reuses the shared `voice_endpoint` loopback-only invariants (HTTP, loopback host, no creds/query/path), extracted from the STT provider into a reusable builder.
+    - Wire contract documented in `docs/guides/GATEWAY_VOICE_API.md` (enabling via `TRANSCRIPTION_PROVIDER=lunarvoice` + `VOICE_AUTH_TOKEN`, endpoint/error taxonomy, desktop client flow). TTS note: the sidecar already ships `/v1/voice/synthesize` (`projects/voice-sidecar/src/api.rs`), so both STT and TTS proxy paths are live; synthesis requires the sidecar's TTS engine enabled (`VOICE_ENABLE_TTS`).
+    - Verified: `cargo check --tests` clean, `cargo fmt --check` clean, clippy `-D warnings` clean on touched surfaces, 8 new unit tests + 7 new E2E tests (`ic/tests/voice_gateway_integration.rs`, real gateway + mock sidecar incl. credential-flow and bounds) pass, plus adjacent suites (ws/multi-tenant/openai-compat/gateway-workflow integration) green.
 
 20. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
