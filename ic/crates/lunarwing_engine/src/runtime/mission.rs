@@ -442,6 +442,14 @@ impl MissionManager {
     }
 
     /// Create and persist a new mission. Returns the mission ID.
+    ///
+    /// Idempotent for retried creates: when the same user already has a
+    /// non-terminal mission with the same name in the same project, the
+    /// existing mission is returned instead of persisting a duplicate.
+    /// Goal #30 observed two failed `mission_create` attempts leaving two
+    /// Active missions on one webhook path, so a single fire matched both
+    /// (`missions_fired: 2`). Terminal (Completed/Failed) missions never
+    /// block re-creating a same-named mission.
     pub async fn create_mission(
         &self,
         project_id: ProjectId,
@@ -452,6 +460,23 @@ impl MissionManager {
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
         validate_webhook_cadence(&cadence)?;
+        let user_id = user_id.into();
+        let name = name.into();
+        // Dedupe against the user's own missions only — `find_by_name` also
+        // matches shared missions, and a user create must never adopt one.
+        if let Some(existing) = self
+            .store
+            .list_missions(project_id, &user_id)
+            .await?
+            .into_iter()
+            .find(|mission| mission.name == name && !mission.is_terminal())
+        {
+            debug!(
+                mission_id = %existing.id,
+                "mission create deduped onto existing non-terminal mission"
+            );
+            return Ok(existing.id);
+        }
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
         mission.notify_channels = notify_channels;
         refresh_next_fire_at(&mut mission, Utc::now())?;
@@ -3325,6 +3350,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fired.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_mission_dedupes_retried_creates_on_same_name() {
+        // Goal #30 orphaned-mission tracker item: two failed creation
+        // attempts persisted two Active missions on one webhook path, so one
+        // fire matched both. A retried create with the same name must return
+        // the existing mission, not persist a second record.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let first = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "audit",
+                "audit things",
+                MissionCadence::Webhook {
+                    path: "audit".into(),
+                    secret: Some("secret".into()),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let second = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "audit",
+                "audit things",
+                MissionCadence::Webhook {
+                    path: "audit".into(),
+                    secret: Some("secret".into()),
+                },
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second, "retried create must dedupe onto the existing mission");
+
+        let missions = store.list_missions(project, "test-user").await.unwrap();
+        assert_eq!(missions.len(), 1, "no duplicate mission records may persist");
+        assert_eq!(
+            mgr.fire_webhook_mission("audit", Some("secret"), serde_json::json!({}))
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "one webhook fire must match exactly one mission"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_mission_allows_recreate_after_terminal_mission() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let first = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "one-shot",
+                "done once",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        mgr.complete_mission(first).await.unwrap();
+
+        let second = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "one-shot",
+                "done again",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first, second, "terminal missions must not block re-creation");
+    }
+
+    #[tokio::test]
+    async fn create_mission_dedupe_does_not_adopt_shared_mission() {
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let mut shared = Mission::new(
+            project,
+            shared_owner_id(),
+            "shared-name",
+            "shared goal",
+            MissionCadence::Manual,
+        );
+        shared.metadata = serde_json::json!({MANAGED_RECURRING_METADATA_KEY: true});
+        let shared_id = shared.id;
+        store.save_mission(&shared).await.unwrap();
+
+        let own = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "shared-name",
+                "own goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(own, shared_id, "user create must not adopt a shared mission");
     }
 
     #[tokio::test]
