@@ -2202,7 +2202,10 @@ async fn start_fresh_tenant_weechat_adapter() -> (
             }),
         )
         // Fresh tenant: no IRC networks joined yet — zero buffers.
-        .route("/api/buffers", get(|| async { Json(serde_json::json!([])) }))
+        .route(
+            "/api/buffers",
+            get(|| async { Json(serde_json::json!([])) }),
+        )
         .route(
             "/api/config",
             get(|| async {
@@ -2244,10 +2247,7 @@ async fn start_fresh_tenant_weechat_adapter() -> (
                 },
             ),
         )
-        .route(
-            "/api/input",
-            post(|| async { StatusCode::NO_CONTENT }),
-        )
+        .route("/api/input", post(|| async { StatusCode::NO_CONTENT }))
         .with_state(Arc::clone(&state));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
