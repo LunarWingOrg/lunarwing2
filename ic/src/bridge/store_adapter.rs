@@ -12,6 +12,7 @@
 //! ├── orchestrator/v{N}.py                 (Python orchestrator versions)
 //! ├── orchestrator/failures.json
 //! ├── orchestrator/codeact-preamble-overlay.md  (runtime prompt patches)
+//! ├── orchestrator/fix-patterns.md         (fix pattern database, stable path)
 //! ├── missions/{slug}--{id8}.json
 //! ├── projects/{slug}--{id8}.json
 //! └── .runtime/                            (internal, not for browsing)
@@ -29,7 +30,7 @@ use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use lunarwing_engine::{
@@ -448,6 +449,67 @@ impl HybridStore {
                 }
             }
         }
+
+        self.consolidate_fix_pattern_docs(ws).await;
+    }
+
+    /// Collapse legacy fix-pattern duplicates onto the newest doc.
+    ///
+    /// Goal #30 tracker item (c): re-seeding bugs left tenants with several
+    /// `fix_pattern_database` docs under distinct DocIds. Keep the most
+    /// recently updated one, fold the others' pattern rows into it, write it
+    /// to the stable `engine/orchestrator/fix-patterns.md` path, and delete
+    /// the legacy files. Runs only when duplicates exist; a healthy tenant
+    /// pays one listing check.
+    async fn consolidate_fix_pattern_docs(&self, _ws: &Workspace) {
+        let (all_docs, doc_paths) = {
+            let docs = self.docs.read().await;
+            let paths = self.doc_paths.read().await;
+            (
+                docs.values()
+                    .filter(|d| d.title == FIX_PATTERN_TITLE)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                paths.clone(),
+            )
+        };
+        if all_docs.len() < 2 {
+            return;
+        }
+
+        let mut ordered = all_docs;
+        ordered.sort_by_key(|doc| std::cmp::Reverse(doc.updated_at));
+        let mut canonical = ordered
+            .first()
+            .cloned()
+            .expect("length checked >= 2 above; safety comment per policy");
+        for legacy in &ordered[1..] {
+            // Merge rows the canonical copy may be missing; content is a
+            // markdown table, so append wholesale — duplicate rows are
+            // harmless for recall and this is a one-time migration.
+            for line in legacy.content.lines() {
+                let row = line.trim();
+                if row.starts_with('|') && !canonical.content.contains(row) {
+                    canonical.content.push('\n');
+                    canonical.content.push_str(row);
+                }
+            }
+            if let Some(path) = doc_paths.get(&legacy.id) {
+                self.delete_workspace_file(path).await;
+            }
+            self.docs.write().await.remove(&legacy.id);
+            self.doc_paths.write().await.remove(&legacy.id);
+            debug!(doc_id = %legacy.id.0, "removed duplicate fix pattern doc");
+        }
+        canonical.updated_at = chrono::Utc::now();
+        if let Err(error) = self.save_memory_doc(&canonical).await {
+            warn!(%error, "failed to persist consolidated fix pattern database");
+            return;
+        }
+        info!(
+            merged = ordered.len() - 1,
+            "consolidated duplicate fix pattern database docs onto stable path"
+        );
     }
 
     async fn load_map<T, F, Fut>(&self, ws: &Workspace, directory: &str, on_value: F)
@@ -1030,10 +1092,12 @@ fn doc_workspace_path(doc: &MemoryDoc) -> String {
         return format!("{ORCHESTRATOR_PREFIX}/codeact-preamble-overlay.md");
     }
 
-    // Fix pattern database → engine/knowledge/notes/{slug}.md
+    // Fix pattern database → engine/orchestrator/fix-patterns.md
+    // Stable path (no --{id8} suffix): the doc is updated in place under one
+    // DocId, so a re-seed or rename can never fork a second file. Goal #30
+    // observed three distinct duplicates accumulating from id-suffixed paths.
     if doc.title == FIX_PATTERN_TITLE {
-        let slug = slugify(&doc.title, &id_str);
-        return format!("{KNOWLEDGE_PREFIX}/notes/{slug}.md");
+        return format!("{ORCHESTRATOR_PREFIX}/fix-patterns.md");
     }
 
     // Knowledge docs → engine/knowledge/{type}/{slug}.md
@@ -1159,6 +1223,16 @@ fn serialize_knowledge_doc(doc: &MemoryDoc) -> String {
     frontmatter.push_str(&format!("id: \"{}\"\n", doc.id.0));
     frontmatter.push_str(&format!("doc_type: \"{:?}\"\n", doc.doc_type));
     frontmatter.push_str(&format!("title: \"{}\"\n", doc.title.replace('"', "\\\"")));
+    // Ownership must round-trip. Goal #30 tracker item (c): without these,
+    // every reload rehydrated docs as user "legacy" under the nil project,
+    // so `list_shared_memory_docs` never found the fix pattern database and
+    // `ensure_self_improvement_mission` re-seeded it under a fresh DocId —
+    // each re-seed writing a new {slug}--{id8}.md duplicate.
+    frontmatter.push_str(&format!(
+        "owner: \"{}\"\n",
+        doc.user_id.replace('"', "\\\"")
+    ));
+    frontmatter.push_str(&format!("project: \"{}\"\n", doc.project_id.0));
     if !doc.tags.is_empty() {
         frontmatter.push_str(&format!(
             "tags: [{}]\n",
@@ -1207,6 +1281,21 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
     let id_str = yaml.get("id")?.as_str()?;
     let id = uuid::Uuid::parse_str(id_str).ok()?;
     let title = yaml.get("title")?.as_str()?.to_string();
+
+    // Ownership round-trips when present. Docs written before this field
+    // existed keep the legacy defaults ("legacy" user, nil project) — the
+    // same values they were previously rehydrated with unconditionally.
+    let user_id = yaml
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .unwrap_or("legacy")
+        .to_string();
+    let project_id = yaml
+        .get("project")
+        .and_then(|v| v.as_str())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())
+        .map(ProjectId)
+        .unwrap_or(ProjectId(uuid::Uuid::nil()));
 
     let doc_type_str = yaml
         .get("doc_type")
@@ -1257,11 +1346,12 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
         .cloned()
         .unwrap_or(serde_json::json!({}));
 
-    // project_id is not in frontmatter — use nil UUID (assigned at load time)
+    // project_id is not in frontmatter on legacy docs — nil UUID is only a
+    // fallback for files written before the field was persisted.
     Some(MemoryDoc {
         id: DocId(id),
-        project_id: ProjectId(uuid::Uuid::nil()),
-        user_id: "legacy".to_string(),
+        project_id,
+        user_id,
         doc_type,
         title,
         content: body.to_string(),
@@ -1907,6 +1997,58 @@ mod tests {
         );
     }
 
+    #[test]
+    fn knowledge_doc_frontmatter_round_trips_ownership() {
+        // Goal #30 tracker item (c): ownership must survive a reload, or the
+        // fix pattern database becomes invisible to list_shared_memory_docs
+        // and gets re-seeded under a fresh DocId on every startup.
+        let doc = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            "fix_pattern_database",
+            "| a | b | c |",
+        );
+        let serialized = serialize_knowledge_doc(&doc);
+        let restored = deserialize_knowledge_doc(&serialized).expect("round-trip parse");
+        assert_eq!(restored.user_id, doc.user_id);
+        assert_eq!(restored.project_id, doc.project_id);
+
+        // Legacy docs without the owner/project fields keep the old defaults.
+        let legacy = "---\n\
+id: \"00000000-0000-0000-0000-000000000001\"\n\
+doc_type: \"Note\"\n\
+title: \"old doc\"\n\
+---\n\nbody";
+        let restored = deserialize_knowledge_doc(legacy).expect("legacy parse");
+        assert_eq!(restored.user_id, "legacy");
+        assert_eq!(restored.project_id, ProjectId(uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn fix_pattern_doc_uses_stable_workspace_path() {
+        let doc = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert_eq!(
+            doc_workspace_path(&doc),
+            "engine/orchestrator/fix-patterns.md"
+        );
+        // Different DocIds must not fork different files.
+        let other = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert_eq!(doc_workspace_path(&doc), doc_workspace_path(&other));
+    }
+
     #[tokio::test]
     async fn cleanup_revokes_valid_leases_without_owner_threads() {
         let store = HybridStore::new(None);
@@ -2044,6 +2186,141 @@ mod tests {
         assert_eq!(
             reloaded_lease.revoked_reason.as_deref(),
             Some("owning thread reached terminal state")
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn fix_pattern_doc_survives_reload_without_reseed_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // Goal #30 tracker item (c): three distinct fix_pattern_database
+        // duplicates were observed accumulating on a live tenant. The shared
+        // doc must round-trip ownership so a reload still finds it, and the
+        // workspace path must be stable across saves.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project_id = ProjectId::new();
+
+        let mut doc = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| Tool X not found | alias | overlay |",
+        );
+        let original_id = doc.id;
+        store.save_memory_doc(&doc).await.unwrap();
+
+        // Update in place with a new row — same DocId, same path.
+        doc.content
+            .push_str("\n| NameError: x | prompt hint | overlay |");
+        doc.updated_at = chrono::Utc::now();
+        store.save_memory_doc(&doc).await.unwrap();
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found.len(),
+            1,
+            "reload must find exactly one fix pattern doc (got {found_len})",
+            found_len = found.len()
+        );
+        assert_eq!(found[0].id, original_id, "same DocId must round-trip");
+        assert!(found[0].content.contains("NameError"));
+        assert_eq!(found[0].user_id, shared_owner_id());
+
+        // A second reload after the first must still be exactly one doc.
+        let reloaded_again = HybridStore::new(Some(workspace));
+        reloaded_again.load_state_from_workspace().await.unwrap();
+        let count = reloaded_again
+            .list_shared_memory_docs(project_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .count();
+        assert_eq!(
+            count, 1,
+            "no re-seed duplicates may accumulate across reloads"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_merges_legacy_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-dupes.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-dupes-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+
+        // Simulate the legacy damage the way it actually exists on tenants:
+        // two id-suffixed files under engine/knowledge/notes/ written by the
+        // old path builder, each with distinct DocIds and different rows.
+        let older = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| older row | a | b |",
+        );
+        let mut newer = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| newer row | c | d |",
+        );
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(10);
+        for doc in [&older, &newer] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write legacy duplicate");
+        }
+
+        // Reload triggers consolidation.
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(found.len(), 1, "legacy duplicates must collapse to one doc");
+        assert_eq!(found[0].id, newer.id, "newest doc wins consolidation");
+        assert!(found[0].content.contains("newer row"));
+        assert!(
+            found[0].content.contains("older row"),
+            "unique rows from duplicates must be merged, not dropped"
         );
     }
 
