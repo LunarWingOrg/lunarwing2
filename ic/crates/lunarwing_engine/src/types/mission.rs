@@ -122,6 +122,12 @@ pub struct Mission {
     /// What the next thread should focus on (updated after each thread).
     pub current_focus: Option<String>,
     /// What approaches have been tried and what happened.
+    ///
+    /// Bounded to [`MAX_APPROACH_HISTORY`] entries with FIFO eviction (goal
+    /// #30 tracker item (d) — full FINAL responses were retained unboundedly,
+    /// growing the persisted record and every subsequent meta-prompt).
+    /// Evicted entries are summarized into `current_focus` by outcome
+    /// processing; the full thread transcripts remain on disk.
     pub approach_history: Vec<String>,
 
     // ── Progress tracking ──
@@ -169,6 +175,10 @@ pub struct Mission {
 /// Maximum number of processed trigger dedup keys retained per mission.
 /// Oldest keys are evicted FIFO once the cap is exceeded.
 pub const MAX_PROCESSED_TRIGGER_KEYS: usize = 512;
+
+/// Maximum number of approach-history entries retained per mission.
+/// Oldest entries are evicted FIFO once the cap is exceeded.
+pub const MAX_APPROACH_HISTORY: usize = 20;
 
 /// Derive a stable dedup key from a mission trigger payload.
 ///
@@ -244,6 +254,48 @@ impl Mission {
     pub fn record_thread(&mut self, thread_id: ThreadId) {
         self.thread_history.push(thread_id);
         self.updated_at = Utc::now();
+    }
+
+    /// Record an approach-outcome entry, evicting the oldest entries once
+    /// [`MAX_APPROACH_HISTORY`] is exceeded. Evicted entries are folded into
+    /// a compact summary line so early context is not silently lost — the
+    /// full thread transcripts remain on disk.
+    pub fn record_approach(&mut self, entry: impl Into<String>) {
+        self.approach_history.push(entry.into());
+        if self.approach_history.len() > MAX_APPROACH_HISTORY {
+            let overflow = self.approach_history.len() - MAX_APPROACH_HISTORY;
+            let evicted: Vec<String> = self.approach_history.drain(..overflow).collect();
+            self.summarize_evicted_approaches(&evicted);
+        }
+        self.updated_at = Utc::now();
+    }
+
+    /// Compress evicted approach entries into the mission's strategy state.
+    ///
+    /// Eviction only happens on long-lived missions (10 runs/day default),
+    /// so the summary prefix is capped to keep the stored record bounded.
+    fn summarize_evicted_approaches(&mut self, evicted: &[String]) {
+        if evicted.is_empty() {
+            return;
+        }
+        const SUMMARY_KEY: &str = "early_runs_summary";
+        let previous = self
+            .metadata
+            .get(SUMMARY_KEY)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let mut summary = format!(
+            "{previous}{} run(s) evicted from approach history (full transcripts on disk). ",
+            evicted.len()
+        );
+        // Keep the summary itself bounded regardless of how often eviction runs.
+        summary.truncate(500);
+        if !self.metadata.is_object() {
+            self.metadata = serde_json::json!({});
+        }
+        if let Some(metadata) = self.metadata.as_object_mut() {
+            metadata.insert(SUMMARY_KEY.to_string(), serde_json::Value::String(summary));
+        }
     }
 
     /// Whether a trigger payload with this dedup key was already processed.
@@ -376,6 +428,77 @@ mod tests {
         assert!(!mission.has_processed_trigger("src:a"));
         assert!(!mission.has_processed_trigger("src:k9"));
         assert!(mission.has_processed_trigger("src:k10"));
+    }
+
+    #[test]
+    fn approach_history_is_bounded_with_summary_of_evictions() {
+        // Goal #30 tracker item (d): full FINAL responses were retained
+        // unboundedly. The history must FIFO-cap and keep a compact summary
+        // of what was evicted.
+        let mut mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "bounded",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        for i in 0..MAX_APPROACH_HISTORY + 5 {
+            mission.record_approach(format!("run {i}"));
+        }
+        assert_eq!(mission.approach_history.len(), MAX_APPROACH_HISTORY);
+        // Oldest evicted FIFO: "run 0".."run 4" are gone, "run 5" remains.
+        assert!(!mission.approach_history.contains(&"run 4".to_string()));
+        assert_eq!(
+            mission.approach_history.first().map(String::as_str),
+            Some("run 5")
+        );
+        // The eviction count is summarized in metadata.
+        let summary = mission
+            .metadata
+            .get("early_runs_summary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(summary.contains("run(s) evicted"), "summary was: {summary}");
+    }
+
+    #[test]
+    fn approach_history_bound_survives_legacy_unbounded_records() {
+        // Missions persisted before the bound may carry more entries than
+        // MAX_APPROACH_HISTORY; deserialization keeps them intact and the
+        // next record_approach trims back to the cap.
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(mission).expect("serialize mission");
+        let oversized: Vec<String> = (0..MAX_APPROACH_HISTORY + 40)
+            .map(|i| format!("legacy run {i}"))
+            .collect();
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .insert(
+                "approach_history".to_string(),
+                serde_json::Value::Array(
+                    oversized
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            );
+
+        let mut restored: Mission =
+            serde_json::from_value(value).expect("deserialize oversized mission");
+        assert!(restored.approach_history.len() > MAX_APPROACH_HISTORY);
+        restored.record_approach("new run");
+        assert_eq!(restored.approach_history.len(), MAX_APPROACH_HISTORY);
+        assert_eq!(
+            restored.approach_history.last().map(String::as_str),
+            Some("new run")
+        );
     }
 
     #[test]

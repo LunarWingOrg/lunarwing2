@@ -2093,11 +2093,31 @@ fn build_meta_prompt(
         parts.push("\n## Current Focus\nThis is the first run. Start by understanding the goal and determining the first step.".into());
     }
 
-    // Approach history
+    // Approach history. Goal #30 tracker item (d): embedding every full FINAL
+    // response grew the prompt without bound on long-lived missions. The
+    // persisted history itself is FIFO-bounded (MAX_APPROACH_HISTORY); the
+    // prompt includes only the most recent entries, each capped in length —
+    // full transcripts stay on disk for recall.
     if !mission.approach_history.is_empty() {
+        const MAX_PROMPT_APPROACHES: usize = 5;
+        const MAX_APPROACH_CHARS: usize = 1000;
+        let history = &mission.approach_history;
+        let start = history.len().saturating_sub(MAX_PROMPT_APPROACHES);
+        let skipped = start;
         parts.push("\n## Previous Approaches".into());
-        for (i, approach) in mission.approach_history.iter().enumerate() {
-            parts.push(format!("{}. {approach}", i + 1));
+        if skipped > 0 {
+            parts.push(format!(
+                "({skipped} earlier run(s) omitted — see transcripts)"
+            ));
+        }
+        for (i, approach) in history[start..].iter().enumerate() {
+            let truncated: String = approach.chars().take(MAX_APPROACH_CHARS).collect();
+            let marker = if approach.chars().count() > MAX_APPROACH_CHARS {
+                "..."
+            } else {
+                ""
+            };
+            parts.push(format!("{}. {truncated}{marker}", skipped + i + 1));
         }
     }
 
@@ -2216,8 +2236,9 @@ async fn process_mission_outcome_and_notify(
                 }
             }
 
-            // Record approach (full response — LLM output is never truncated)
-            mission.approach_history.push(text.clone());
+            // Record approach (full response — LLM output is never truncated;
+            // the history itself is FIFO-bounded via record_approach)
+            mission.record_approach(text.clone());
             notify_response = Some(text.clone());
 
             // If this is a self-improvement mission, process structured output
@@ -2232,14 +2253,12 @@ async fn process_mission_outcome_and_notify(
         }
         ThreadOutcome::Completed { response: None } => {}
         ThreadOutcome::Failed { error, .. } => {
-            mission.approach_history.push(format!("FAILED: {error}"));
+            mission.record_approach(format!("FAILED: {error}"));
             notify_response = Some(format!("Mission failed: {error}"));
             is_error = true;
         }
         ThreadOutcome::MaxIterations => {
-            mission
-                .approach_history
-                .push("Hit max iterations after final recovery".into());
+            mission.record_approach("Hit max iterations after final recovery".to_string());
             notify_response = Some(
                 "Mission hit max iterations after final recovery; retry with narrower scope or a higher iteration limit"
                     .into(),
@@ -3457,10 +3476,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(first, second, "retried create must dedupe onto the existing mission");
+        assert_eq!(
+            first, second,
+            "retried create must dedupe onto the existing mission"
+        );
 
         let missions = store.list_missions(project, "test-user").await.unwrap();
-        assert_eq!(missions.len(), 1, "no duplicate mission records may persist");
+        assert_eq!(
+            missions.len(),
+            1,
+            "no duplicate mission records may persist"
+        );
         assert_eq!(
             mgr.fire_webhook_mission("audit", Some("secret"), serde_json::json!({}))
                 .await
@@ -3501,7 +3527,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(first, second, "terminal missions must not block re-creation");
+        assert_ne!(
+            first, second,
+            "terminal missions must not block re-creation"
+        );
     }
 
     #[tokio::test]
@@ -3532,7 +3561,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_ne!(own, shared_id, "user create must not adopt a shared mission");
+        assert_ne!(
+            own, shared_id,
+            "user create must not adopt a shared mission"
+        );
     }
 
     #[tokio::test]
@@ -4037,6 +4069,37 @@ mod tests {
     }
 
     #[test]
+    fn meta_prompt_caps_approach_history_entries_and_length() {
+        // Goal #30 tracker item (d): every full FINAL response used to be
+        // embedded in each meta-prompt. Only the most recent entries belong
+        // there, each capped in length.
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "long-lived",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        for i in 0..12 {
+            mission
+                .approach_history
+                .push(format!("run {i}: {}", "x".repeat(2000)));
+        }
+        let prompt = build_meta_prompt(&mission, &[], &None);
+
+        assert!(prompt.contains("7 earlier run(s) omitted"), "was: {prompt}");
+        assert!(!prompt.contains("run 4:"), "old entries must be omitted");
+        assert!(prompt.contains("run 11:"));
+        // Each retained entry is capped at 1000 chars + ellipsis.
+        let overlong = mission.approach_history[11].clone();
+        assert!(overlong.chars().count() > 1000);
+        let embedded: String = overlong.chars().take(1000).collect();
+        assert!(prompt.contains(&embedded));
+        assert!(!prompt.contains(&overlong[..1050]));
+    }
+
+    #[test]
     fn meta_prompt_neutralizes_role_tokens_in_untrusted_sections() {
         // Work item #79: the mission meta prompt embeds persisted memory docs,
         // prior LLM-authored focus/approach notes, and external trigger
@@ -4106,15 +4169,21 @@ mod tests {
         assert!(!declares_goal_achieved(
             "Accomplished: verified persistence. The prior thread said GOAL ACHIEVED: YES but I could not reproduce it."
         ));
-        assert!(!declares_goal_achieved("the mission complete check fired early"));
+        assert!(!declares_goal_achieved(
+            "the mission complete check fired early"
+        ));
         assert!(!declares_goal_achieved(
             "questions about whether the mission complete criteria hold remain"
         ));
         assert!(!declares_goal_achieved("Goal achieved: no"));
         assert!(!declares_goal_achieved("Goal achieved: not yet"));
-        assert!(!declares_goal_achieved("Goal achieved: yes, for this step only"));
+        assert!(!declares_goal_achieved(
+            "Goal achieved: yes, for this step only"
+        ));
         assert!(!declares_goal_achieved("Sub-goal achieved: yes"));
-        assert!(!declares_goal_achieved("Next focus: confirm goal achieved: yes eventually"));
+        assert!(!declares_goal_achieved(
+            "Next focus: confirm goal achieved: yes eventually"
+        ));
         assert!(!declares_goal_achieved(""));
     }
 
