@@ -6,7 +6,26 @@
 # Host-side source publication and operator controls for additive knowledge sync.
 # Sourced by ic/scripts/lunarwing-mt-admin.sh; do not execute directly.
 
-_install_knowledge_source_systemd_timer() {
+install_knowledge_sync_admin_snapshot() {
+  local root="${LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT:-/usr/local/lib/lunarwing-study-notes-sync}"
+  local releases="$root/releases" release current_tmp file
+  [[ "$root" == /* && "$root" =~ ^/[A-Za-z0-9._/-]+$ ]] \
+    || die "knowledge sync admin root must be an absolute safe path"
+  install -d -m 0755 -- "$releases"
+  release="$releases/$(date -u '+%Y%m%d%H%M%S')-$$"
+  install -d -m 0755 -- "$release/mt-admin-lib"
+  install -m 0755 -- "$SCRIPT_DIR/lunarwing-mt-admin.sh" "$release/lunarwing-mt-admin.sh"
+  for file in "$SCRIPT_DIR"/mt-admin-lib/*.sh; do
+    install -m 0755 -- "$file" "$release/mt-admin-lib/$(basename -- "$file")"
+  done
+  current_tmp="$root/.current.$$"
+  ln -s -- "$release" "$current_tmp"
+  mv -fT -- "$current_tmp" "$root/current"
+  printf '%s/lunarwing-mt-admin.sh\n' "$root/current"
+}
+
+_install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
+  local entrypoint="$1"
   local unit_dir="${LUNARWING_MT_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
   local service="$unit_dir/lunarwing-study-notes-sync.service"
   local timer="$unit_dir/lunarwing-study-notes-sync.timer"
@@ -21,7 +40,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$SCRIPT_DIR/lunarwing-mt-admin.sh sync-knowledge-sources
+ExecStart=$entrypoint sync-knowledge-sources
 TimeoutStartSec=30min
 EOF
   cat >"$timer" <<'EOF'
@@ -45,7 +64,8 @@ EOF
   say "Study Notes source refresh scheduled with systemd (hourly)"
 }
 
-_install_knowledge_source_cron() {
+_install_knowledge_source_cron() {  # <root-owned mt-admin entrypoint>
+  local entrypoint="$1"
   local command="" begin="# BEGIN lunarwing-study-notes-sync managed block"
   local end="# END lunarwing-study-notes-sync managed block" tmp
   command -v fcrontab >/dev/null 2>&1 && command="fcrontab"
@@ -56,7 +76,7 @@ _install_knowledge_source_cron() {
   "$command" -l 2>/dev/null | sed "/^${begin}$/,/^${end}$/d" >"$tmp" || true
   {
     printf '%s\n' "$begin"
-    printf '17 * * * * %s/lunarwing-mt-admin.sh sync-knowledge-sources\n' "$SCRIPT_DIR"
+    printf '17 * * * * %s sync-knowledge-sources\n' "$entrypoint"
     printf '%s\n' "$end"
   } >>"$tmp"
   if ! "$command" "$tmp"; then
@@ -69,10 +89,12 @@ _install_knowledge_source_cron() {
 }
 
 ensure_knowledge_source_scheduler() {
+  local entrypoint
+  entrypoint="$(install_knowledge_sync_admin_snapshot)"
   ensure_init_system
   case "$INIT_SYSTEM" in
-    systemd) _install_knowledge_source_systemd_timer ;;
-    openrc) _install_knowledge_source_cron ;;
+    systemd) _install_knowledge_source_systemd_timer "$entrypoint" ;;
+    openrc) _install_knowledge_source_cron "$entrypoint" ;;
     *) die "Study Notes source scheduling is unsupported for INIT_SYSTEM=$INIT_SYSTEM" ;;
   esac
 }
