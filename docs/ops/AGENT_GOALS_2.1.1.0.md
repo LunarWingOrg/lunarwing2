@@ -28,7 +28,11 @@
 
 3. [ ] Last attempt on branch: rarity/kimi-3-20260908-1201 - Original Task: **#127 — Web gateway "sometimes output doesn't load" (SSE delivery-loss + Done-wipes-stream)** `[bug,2.1.0.0]` - Client-side mitigation merged (history reload on Done/missing-final). REMAINING per #48 relnotes pass: **server-side gap signaling** and **stream-text reload** limitation. Audit reference: `references/sse-stream-loss-audit.md` (WI#127 composite bug: Lagged swallow server-side + client Done-guard). See previous goal file from aragents/kimil00p/v2.1.0.0 for more reference
 
-4. [ ] Last attempt on branch: aj/kimi-4-20260908-1201 - Original Task: **#126 — Investigate default mission behavior for thread start** - No goal item from aragents/kimil00p/v2.1.0.0 ever addressed it. Needs scoping before it's executable (investigation-shaped, not directive)
+4. [x] Last attempt on branch: aj/kimi-4-20260908-1201 - Original Task: **#126 — Investigate default mission behavior for thread start** - No goal item from aragents/kimil00p/v2.1.0.0 ever addressed it. Needs scoping before it's executable (investigation-shaped, not directive).
+    - DONE (item 4, re-landed 2026-09-09): prior attempt `aj/kimi-4-20260908-1201` completed the investigation but was never merged; re-verified all anchors against `fc5c936b2` and re-landed in `docs/ops/v2.1.1.0_GOAL4_WI126_THREAD_START_MISSION_SCOPE.md`.
+    - FINDINGS: no thread-start event producer (`Created -> Running` uses record-only `transition_to`, not broadcast) and no mission consumer (listener handles only terminal `Done`/`Failed`); public `event:thread_start` only matches message text; five managed missions seeded, none thread-start; no sanitize-memory mission exists in-tree.
+    - DECISION: keep the existing default fleet; add no default thread-start mission. An async mission trigger cannot satisfy WI#109's sanitize-before-execution requirement — WI#109 (item 9) needs a synchronous pre-execution sanitizer; scope A/B contracts in the doc.
+    - VERIFY: focused engine + daemon tests re-run and passed (6 tests: `fire_on_system_event_` x4, `events_are_recorded` x1, `mission_cadence_preserves_event_and_webhook_case` x1). No production code changed.
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
