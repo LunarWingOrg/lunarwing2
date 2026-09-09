@@ -1218,6 +1218,16 @@ impl AppBuilder {
                 });
             }
 
+            // Opt-in additive refresh uses an independent daemon cadence. The
+            // source checkout must be atomically published by mt-admin; the
+            // tenant only reads it and never mutates an existing knowledge path.
+            if let Some(sync) = self.config.knowledge_sync.to_workspace_config() {
+                let ws_sync = Arc::clone(ws);
+                tokio::spawn(crate::workspace::knowledge_sync::run_knowledge_sync_loop(
+                    ws_sync, sync,
+                ));
+            }
+
             if embeddings.is_some() {
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {
