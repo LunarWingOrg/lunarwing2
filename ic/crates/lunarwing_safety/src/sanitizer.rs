@@ -294,6 +294,13 @@ impl Default for Sanitizer {
 mod tests {
     use super::*;
 
+    /// Wall-clock guard for the hostile-input ("must not hang") tests — NOT a
+    /// micro-benchmark. The original 100ms was scheduler-sensitive and flaked
+    /// on loaded shared runners (CI `rust-test-lib`: a 100KB deeply-nested
+    /// payload measured 123ms on a 90%-full runner). 2000ms is far above
+    /// scheduling noise yet still catches a genuine O(n^2)-class regression.
+    const HOSTILE_INPUT_BUDGET_MS: u128 = 2000;
+
     #[test]
     fn test_detect_ignore_previous() {
         let sanitizer = Sanitizer::new();
@@ -453,8 +460,8 @@ mod tests {
             let _result = sanitizer.sanitize(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
-                "base64 pattern took {}ms on 100KB near-miss (threshold: 100ms)",
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
+                "base64 pattern took {}ms on 100KB near-miss (threshold: 2000ms)",
                 elapsed.as_millis()
             );
         }
@@ -470,7 +477,7 @@ mod tests {
             let _result = sanitizer.sanitize(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "eval pattern took {}ms on 100KB input",
                 elapsed.as_millis()
             );
@@ -487,7 +494,7 @@ mod tests {
             let _result = sanitizer.sanitize(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "exec pattern took {}ms on 100KB input",
                 elapsed.as_millis()
             );
@@ -505,7 +512,7 @@ mod tests {
             let _result = sanitizer.sanitize(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "null_byte pattern took {}ms on 100KB input",
                 elapsed.as_millis()
             );
@@ -522,7 +529,7 @@ mod tests {
             let _result = sanitizer.sanitize(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "Aho-Corasick scan took {}ms on 100KB clean input",
                 elapsed.as_millis()
             );
