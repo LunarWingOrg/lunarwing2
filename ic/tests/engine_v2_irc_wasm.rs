@@ -2171,3 +2171,162 @@ async fn real_weechat_component_keeps_interrupt_in_the_originating_dm() {
     fixture_task.abort();
     env.cleanup().await;
 }
+
+// ---------------------------------------------------------------------------
+// Fresh-tenant WeeChat repro (goals 2.1.1.0 item #14): the WASM channel traps
+// on every poll when the tenant runs the ws_adapter longpoll path with
+// dm_policy=open and zero IRC buffers. The fixtures above only exercise
+// connection_mode=http; this one mirrors the real tenant shape.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct WeechatAdapterState {
+    wait_requests: usize,
+    health_requests: usize,
+}
+
+async fn start_fresh_tenant_weechat_adapter() -> (
+    String,
+    Arc<Mutex<WeechatAdapterState>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let state = Arc::new(Mutex::new(WeechatAdapterState::default()));
+    let app = Router::new()
+        .route(
+            "/api/version",
+            get(|| async {
+                Json(serde_json::json!({
+                    "weechat_version": "4.10.0",
+                    "relay_api_version": "0.6.0"
+                }))
+            }),
+        )
+        // Fresh tenant: no IRC networks joined yet — zero buffers.
+        .route("/api/buffers", get(|| async { Json(serde_json::json!([])) }))
+        .route(
+            "/api/config",
+            get(|| async {
+                Json(serde_json::json!({
+                    "dm_policy": "open",
+                    "group_policy": "open",
+                    "allow_from": [],
+                    "networks": []
+                }))
+            }),
+        )
+        .route(
+            "/api/health",
+            get(
+                |State(state): State<Arc<Mutex<WeechatAdapterState>>>| async move {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .health_requests += 1;
+                    // The presence of event_cursor is what selects longpoll mode.
+                    Json(serde_json::json!({
+                        "status": "ok",
+                        "ws_connected": true,
+                        "event_cursor": 0
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/api/wait",
+            get(
+                |State(state): State<Arc<Mutex<WeechatAdapterState>>>| async move {
+                    state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .wait_requests += 1;
+                    // Heartbeat: no events pending.
+                    Json(serde_json::json!({"cursor": 0, "events": []}))
+                },
+            ),
+        )
+        .route(
+            "/api/input",
+            post(|| async { StatusCode::NO_CONTENT }),
+        )
+        .with_state(Arc::clone(&state));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fresh-tenant adapter fixture should bind");
+    let address = listener
+        .local_addr()
+        .expect("fixture address should resolve");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{address}"), state, task)
+}
+
+#[tokio::test]
+async fn real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls() {
+    let _serial = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(Some("weechat"));
+    lunarwing::bridge::reset_engine_state().await;
+
+    let (adapter_url, fixture, fixture_task) = start_fresh_tenant_weechat_adapter().await;
+    let root = repo_root();
+    let wasm_path = required_component(
+        root.join("lunarwing_weechat_wss/weechat_relay/target/wasm32-wasip2/release/weechat_relay_channel.wasm"),
+        "Build it with cargo component build --release --target wasm32-wasip2.",
+    );
+    let pairing_dir = tempfile::tempdir().expect("WeeChat pairing directory should be created");
+    let channel = load_real_channel(
+        "weechat",
+        &wasm_path,
+        &root.join("lunarwing_weechat_wss/weechat_relay/weechat.capabilities.json"),
+        serde_json::json!({
+            "display_name": "WeeChat",
+            "relay_url": adapter_url,
+            "relay_password": WEECHAT_PASSWORD_SENTINEL,
+            "connection_mode": "auto",
+            "ws_adapter_url": adapter_url,
+            "networks": [],
+            "dm_policy": "open",
+            "dm_policy_explicit": true,
+            "group_policy": "open",
+            "allow_from": [],
+            "max_chunk_length": 420,
+            "polling_enabled": false,
+            "poll_interval_seconds": 3
+        }),
+        Arc::new(PairingStore::with_base_dir(
+            pairing_dir.path().to_path_buf(),
+        )),
+        None,
+    )
+    .await;
+
+    channel
+        .call_on_start()
+        .await
+        .expect("WeeChat channel should start against the fresh-tenant adapter");
+
+    // The live trap recurred on every poll at ~30s cadence. Run several
+    // consecutive polls: any Trapped error here is the regression.
+    for attempt in 1..=4 {
+        channel
+            .call_on_poll()
+            .await
+            .unwrap_or_else(|error| panic!("WeeChat poll {attempt} failed: {error}"));
+    }
+
+    {
+        let state = fixture
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(state.health_requests >= 1, "adapter health never probed");
+        assert!(
+            state.wait_requests >= 2,
+            "longpoll /api/wait never exercised (wait_requests={})",
+            state.wait_requests
+        );
+    }
+
+    fixture_task.abort();
+    env.cleanup().await;
+}
