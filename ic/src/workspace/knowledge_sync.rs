@@ -266,10 +266,8 @@ pub async fn run_knowledge_sync_once(
 
 /// Run the independent daemon cadence until the process runtime shuts down.
 pub async fn run_knowledge_sync_loop(workspace: Arc<Workspace>, config: KnowledgeSyncConfig) {
-    let cadence_secs = u64::from(config.cadence_hours).saturating_mul(3_600);
-    let jitter_cap = (cadence_secs / 10).clamp(MIN_LOOP_DELAY_SECS, 300);
-    let jitter = deterministic_jitter_secs(workspace.user_id(), jitter_cap);
-    tokio::time::sleep(Duration::from_secs(jitter)).await;
+    let initial_delay = initial_delay_secs(&config, workspace.user_id());
+    tokio::time::sleep(Duration::from_secs(initial_delay)).await;
 
     loop {
         let report = run_knowledge_sync_once(&workspace, &config, false).await;
@@ -293,6 +291,37 @@ pub async fn run_knowledge_sync_loop(workspace: Arc<Workspace>, config: Knowledg
             report.next_run_after_secs.max(MIN_LOOP_DELAY_SECS),
         ))
         .await;
+    }
+}
+
+fn initial_delay_secs(config: &KnowledgeSyncConfig, identity: &str) -> u64 {
+    let cadence_secs = u64::from(config.cadence_hours).saturating_mul(3_600);
+    let jitter_cap = (cadence_secs / 10).clamp(MIN_LOOP_DELAY_SECS, 300);
+    let jitter = deterministic_jitter_secs(identity, jitter_cap);
+    let Ok(Some(state)) = load_state(&config.state_dir.join(SYNC_STATE_FILE)) else {
+        return jitter;
+    };
+    let scheduled = if state.consecutive_failures > 0 {
+        state.last_attempt_at.map(|attempt| {
+            (
+                attempt,
+                failure_delay_secs(config, state.consecutive_failures),
+            )
+        })
+    } else {
+        state.last_success_at.map(|success| (success, cadence_secs))
+    };
+    let Some((anchor, interval)) = scheduled else {
+        return jitter;
+    };
+    let elapsed = Utc::now().signed_duration_since(anchor).num_seconds();
+    let Ok(elapsed) = u64::try_from(elapsed) else {
+        return interval;
+    };
+    if elapsed >= interval {
+        jitter
+    } else {
+        interval - elapsed
     }
 }
 
@@ -384,7 +413,7 @@ fn record_failure(
         state.notes_added_last_run = import.notes_seeded;
         state.notes_deferred_last_run = import.notes_deferred;
     }
-    let delay = failure_backoff_secs(state.consecutive_failures);
+    let delay = failure_delay_secs(config, state.consecutive_failures);
     if let Err(error) = save_state(&config.state_dir.join(SYNC_STATE_FILE), &state) {
         tracing::warn!("knowledge sync: failed to save failure state: {error}");
     }
@@ -404,6 +433,15 @@ fn failure_backoff_secs(consecutive_failures: u32) -> u64 {
     let shift = consecutive_failures.saturating_sub(1).min(16);
     INITIAL_BACKOFF_SECS
         .saturating_mul(1_u64 << shift)
+        .min(MAX_BACKOFF_SECS)
+}
+
+fn failure_delay_secs(config: &KnowledgeSyncConfig, consecutive_failures: u32) -> u64 {
+    let backoff = failure_backoff_secs(consecutive_failures);
+    let jitter_cap = (backoff / 10).max(1);
+    let identity = config.source_home.to_string_lossy();
+    backoff
+        .saturating_add(deterministic_jitter_secs(&identity, jitter_cap))
         .min(MAX_BACKOFF_SECS)
 }
 
@@ -447,6 +485,33 @@ mod tests {
             deterministic_jitter_secs("alice", 300)
         );
         assert!(deterministic_jitter_secs("alice", 300) < 300);
+    }
+
+    #[test]
+    fn startup_delay_resumes_persisted_cadence_and_backoff() {
+        let state_dir = tempfile::tempdir().expect("state");
+        let config = KnowledgeSyncConfig {
+            enabled: true,
+            source_home: PathBuf::from("/source/alice"),
+            state_dir: state_dir.path().to_path_buf(),
+            cadence_hours: 1,
+            max_records_per_run: 1,
+            max_bytes_per_run: 1,
+        };
+        let mut state = KnowledgeSyncState {
+            schema_version: STATE_SCHEMA_VERSION,
+            last_success_at: Some(Utc::now()),
+            ..Default::default()
+        };
+        save_state(&state_dir.path().join(SYNC_STATE_FILE), &state).expect("success state");
+        assert!(initial_delay_secs(&config, "alice") > 3_500);
+
+        state.last_attempt_at = Some(Utc::now());
+        state.consecutive_failures = 2;
+        save_state(&state_dir.path().join(SYNC_STATE_FILE), &state).expect("failure state");
+        let delay = initial_delay_secs(&config, "alice");
+        assert!(delay >= failure_backoff_secs(2));
+        assert!(delay <= failure_delay_secs(&config, 2));
     }
 
     #[test]
