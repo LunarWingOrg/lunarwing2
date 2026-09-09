@@ -3,9 +3,15 @@
 //! Provides a range object that supports iteration over a sequence of integers
 //! with configurable start, stop, and step values.
 
-use std::{fmt::Write, mem};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem,
+};
 
 use ahash::AHashSet;
+use num_integer::div_ceil;
 
 use crate::{
     args::ArgValues,
@@ -66,22 +72,15 @@ impl Range {
     /// Returns the length of the range (number of elements it will yield).
     #[must_use]
     pub fn len(&self) -> usize {
-        if self.step > 0 {
-            if self.stop > self.start {
-                let len_i64 = (self.stop - self.start - 1) / self.step + 1;
-                usize::try_from(len_i64).expect("range length guaranteed non-negative")
-            } else {
-                0
-            }
-        } else {
-            // step < 0
-            if self.start > self.stop {
-                let len_i64 = (self.start - self.stop - 1) / (-self.step) + 1;
-                usize::try_from(len_i64).expect("range length guaranteed non-negative")
-            } else {
-                0
-            }
-        }
+        // self.stop - self.start could be up to i64::MAX - i64::MIN, which overflows i64,
+        // so we use i128 for the calculation to avoid overflow. The result then saturates at
+        // usize boundaries
+        let start = i128::from(self.start);
+        let stop = i128::from(self.stop);
+        let step = i128::from(self.step);
+
+        let len = div_ceil(stop - start, step);
+        len.max(0).try_into().unwrap_or(usize::MAX)
     }
 
     #[must_use]
@@ -152,9 +151,7 @@ impl Range {
     /// The new range has computed start, stop, and step values.
     fn getitem_slice(&self, slice: &super::Slice, heap: &Heap<impl ResourceTracker>) -> RunResult<Value> {
         let range_len = self.len();
-        let (start, stop, step) = slice
-            .indices(range_len)
-            .map_err(|()| ExcType::value_error_slice_step_zero())?;
+        let (start, stop, step) = slice.indices(range_len)?;
 
         // Calculate the new range parameters
         // new_start = self.start + start * self.step
@@ -162,34 +159,15 @@ impl Range {
         // new_stop needs to be computed based on the number of elements
 
         let new_step = self.step.saturating_mul(step);
-        let start_i64 = i64::try_from(start).expect("start index fits in i64");
-        let new_start = self.start.saturating_add(start_i64.saturating_mul(self.step));
+        let new_start = self.start.saturating_add(start.saturating_mul(self.step));
 
         // Calculate the number of elements in the sliced range
-        // try_from succeeds for non-negative step; step==0 rejected by slice.indices()
-        let num_elements = if let Ok(step_usize) = usize::try_from(step) {
-            // Forward iteration
-            if start >= stop {
-                0
-            } else {
-                ((stop - start - 1) / step_usize) + 1
-            }
-        } else {
-            // Backward iteration
-            let step_abs = usize::try_from(-step).expect("step is negative so -step is positive");
-            if stop > range_len {
-                // stop sentinel means "go to the beginning"
-                (start / step_abs) + 1
-            } else if start <= stop {
-                0
-            } else {
-                ((start - stop - 1) / step_abs) + 1
-            }
-        };
+        // The guarantee on slice.indices will be that stop and start can at most be range_len apart,
+        // so the subtraction won't overflow.
+        let num_elements = div_ceil(stop - start, step);
 
         // new_stop = new_start + num_elements * new_step
-        let num_elements_i64 = i64::try_from(num_elements).expect("num_elements fits in i64");
-        let new_stop = new_start.saturating_add(num_elements_i64.saturating_mul(new_step));
+        let new_stop = new_start.saturating_add(num_elements.saturating_mul(new_step));
 
         let new_range = Self::new(new_start, new_stop, new_step);
         Ok(Value::Ref(heap.allocate(HeapData::Range(new_range))?))
@@ -258,6 +236,16 @@ impl<'h> PyTrait<'h> for HeapRead<'h, Range> {
             return Ok(true); // Both empty
         }
         Ok(a.start == b.start && a.step == b.step)
+    }
+
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
+        let mut hasher = DefaultHasher::new();
+        self.get(vm.heap).hash(&mut hasher);
+        Ok(Some(hasher.finish()))
     }
 
     fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {

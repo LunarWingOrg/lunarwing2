@@ -90,6 +90,83 @@ assert_before \
   "ctr:alice stop --time 0 lunarwing-opencode-alice" \
   "systemctl:alice stop lunarwing-opencode-alice.service"
 
+test_pebble_quadlet_bounce_recovery() (
+  local systemctl_stop_fails="false"
+  local call index reset_index=-1 start_index=-1
+  local unit_stop_seen="false" container_stop_seen="false"
+
+  ensure_container_runtime() {
+    CONTAINER_RT="podman"
+    MT_ROOTLESS="true"
+  }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  ports_get() {
+    [[ "$2" == "pebble_wss" ]] && printf '19091\n'
+  }
+  _ensure_tenant_image() { return 0; }
+  _wait_user_manager() { :; }
+  tenant_quadlet_dir() { printf '%s/quadlets\n' "$fixture"; }
+  render_worker_quadlet() { :; }
+  _container_config_changed() { return 1; }
+  _store_container_hash() { :; }
+  _systemctl_user() {
+    CALLS+=("systemctl:$*")
+    [[ "$systemctl_stop_fails" != "true" || "${2:-}" != "stop" ]]
+  }
+  _ctr() {
+    CALLS+=("ctr:$*")
+    return 0
+  }
+
+  CALLS=()
+  stop_tenant_pebble alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "systemctl:alice stop lunarwing-pebble-alice.service" ]] \
+      && unit_stop_seen="true"
+    [[ "$call" == "ctr:alice stop lunarwing-pebble-alice" ]] \
+      && container_stop_seen="true"
+  done
+  if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" == "true" ]]; then
+    printf 'Pebble Quadlet stop did not prefer its systemd unit\n' >&2
+    return 1
+  fi
+
+  CALLS=()
+  start_tenant_pebble alice
+  for index in "${!CALLS[@]}"; do
+    case "${CALLS[$index]}" in
+      "systemctl:alice reset-failed lunarwing-pebble-alice.service") reset_index="$index" ;;
+      "systemctl:alice start lunarwing-pebble-alice.service") start_index="$index" ;;
+    esac
+  done
+  if (( reset_index < 0 || start_index <= reset_index )); then
+    printf 'Pebble Quadlet start did not clear failure state before restart\n' >&2
+    return 1
+  fi
+
+  systemctl_stop_fails="true"
+  unit_stop_seen="false"
+  container_stop_seen="false"
+  CALLS=()
+  stop_tenant_pebble alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "systemctl:alice stop lunarwing-pebble-alice.service" ]] \
+      && unit_stop_seen="true"
+    [[ "$call" == "ctr:alice stop lunarwing-pebble-alice" ]] \
+      && container_stop_seen="true"
+  done
+  if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" != "true" ]]; then
+    printf 'Pebble Quadlet stop omitted the container fallback\n' >&2
+    return 1
+  fi
+)
+
+if test_pebble_quadlet_bounce_recovery; then
+  printf 'PASS: Pebble Quadlet tenant bounce recovery\n'
+else
+  fail "Pebble Quadlet tenant bounce recovery"
+fi
+
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
 INIT_SYSTEM="openrc"

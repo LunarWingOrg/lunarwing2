@@ -24,10 +24,11 @@ use crate::{
     resource::{ResourceError, ResourceTracker, check_div_size, check_lshift_size, check_pow_size, check_repeat_size},
     types::{
         Bytes, LongInt, Property, PyTrait, Str, Type,
-        bytes::{bytes_repr_fmt, get_byte_at_index, get_bytes_slice},
+        bytes::{bytes_repr_fmt, get_byte_at_index},
         long_int::check_bits_str_digits_limit,
         path,
-        str::{allocate_char, get_char_at_index, get_str_slice, string_repr_fmt},
+        slice::slice_collect_iterator,
+        str::{allocate_char, get_char_at_index, string_repr_fmt},
         timedelta,
     },
 };
@@ -94,10 +95,10 @@ pub(crate) enum Value {
     Ref(HeapId),
 
     /// Sentinel value indicating this Value was properly cleaned up via `drop_with_heap`.
-    /// Only exists when `ref-count-panic` feature is enabled. Used to verify reference counting
+    /// Only exists when `memory-model-checks` feature is enabled. Used to verify reference counting
     /// correctness - if a `Ref` variant is dropped without calling `drop_with_heap`, the
     /// Drop impl will panic.
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     Dereferenced,
 }
 
@@ -109,8 +110,8 @@ pub(crate) const VALUE_SIZE: usize = mem::size_of::<Value>();
 
 /// Drop implementation that panics if a `Ref` variant is dropped without calling `drop_with_heap`.
 /// This helps catch reference counting bugs during development/testing.
-/// Only enabled when the `ref-count-panic` feature is active.
-#[cfg(feature = "ref-count-panic")]
+/// Only enabled when the `memory-model-checks` feature is active.
+#[cfg(feature = "memory-model-checks")]
 impl Drop for Value {
     fn drop(&mut self) {
         if let Self::Ref(id) = self {
@@ -143,7 +144,7 @@ impl PyTrait<'_> for Value {
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
             Self::Ref(id) => vm.heap.read(*id).py_type(vm),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
@@ -346,7 +347,7 @@ impl PyTrait<'_> for Value {
             Self::InternString(string_id) => !vm.interns.get_str(*string_id).is_empty(),
             Self::InternBytes(bytes_id) => !vm.interns.get_bytes(*bytes_id).is_empty(),
             Self::Ref(id) => vm.heap.read(*id).py_bool(vm),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
@@ -404,7 +405,7 @@ impl PyTrait<'_> for Value {
                     result
                 }
             }
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
     }
@@ -1304,12 +1305,8 @@ impl PyTrait<'_> for Value {
                     && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
                 {
                     let s = interns.get_str(*string_id);
-                    let char_count = s.chars().count();
-                    let (start, stop, step) = slice_obj
-                        .indices(char_count)
-                        .map_err(|()| ExcType::value_error_slice_step_zero())?;
-                    let result_str = get_str_slice(s, start, stop, step);
-                    let heap_id = vm.heap.allocate(HeapData::Str(Str::from(result_str)))?;
+                    let result_str = slice_collect_iterator(vm, slice_obj, s.chars(), |c| c)?;
+                    let heap_id = vm.heap.allocate(HeapData::Str(Str::from_boxed(result_str)))?;
                     return Ok(Self::Ref(heap_id));
                 }
 
@@ -1330,10 +1327,7 @@ impl PyTrait<'_> for Value {
                     && let HeapData::Slice(slice_obj) = vm.heap.get(*key_id)
                 {
                     let bytes = interns.get_bytes(*bytes_id);
-                    let (start, stop, step) = slice_obj
-                        .indices(bytes.len())
-                        .map_err(|()| ExcType::value_error_slice_step_zero())?;
-                    let result_bytes = get_bytes_slice(bytes, start, stop, step);
+                    let result_bytes = slice_collect_iterator(vm, slice_obj, bytes.iter(), |b| *b)?;
                     let heap_id = vm.heap.allocate(HeapData::Bytes(Bytes::new(result_bytes)))?;
                     return Ok(Self::Ref(heap_id));
                 }
@@ -1386,7 +1380,7 @@ impl Value {
             Self::Property(_) => Type::Property,
             Self::ExternalFuture(_) => Type::Coroutine,
             Self::Ref(_) => Type::NoneType, // callers should resolve Ref via HeapData::py_type()
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => Type::NoneType,
         }
     }
@@ -1436,7 +1430,7 @@ impl Value {
             Self::Property(p) => property_value_id(*p),
             // ExternalFutures get IDs based on their call_id
             Self::ExternalFuture(call_id) => external_future_value_id(*call_id),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot get id of Dereferenced object"),
         }
     }
@@ -1531,7 +1525,7 @@ impl Value {
             Self::InternString(_) | Self::InternBytes(_) | Self::InternLongInt(_) | Self::Ref(_) => {
                 unreachable!("covered above")
             }
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot access Dereferenced object"),
         }
         Ok(Some(hasher.finish()))
@@ -1723,29 +1717,33 @@ impl Value {
     /// On success, drops the old attribute value if one existed.
     pub fn py_set_attr(
         &self,
-        name_id: StringId,
+        name: &EitherStr,
         value: Self,
         vm: &mut VM<'_, '_, impl ResourceTracker>,
     ) -> RunResult<()> {
-        let attr_name = vm.interns.get_str(name_id);
-
         if let Self::Ref(heap_id) = self {
             match vm.heap.read(*heap_id) {
                 HeapReadOutput::Dataclass(mut dc) => {
-                    let old_value = dc.set_attr(Self::InternString(name_id), value, vm)?;
+                    let name_value = match name {
+                        EitherStr::Interned(string_id) => Self::InternString(*string_id),
+                        // TODO: should avoid needing to clone String via `EitherStr` - maybe
+                        // `EitherStr` should store a `HeapRead<Str>`?
+                        EitherStr::Heap(s) => Self::Ref(vm.heap.allocate(HeapData::Str(Str::from(s.to_owned())))?),
+                    };
+                    let old_value = dc.set_attr(name_value, value, vm)?;
                     old_value.drop_with_heap(vm);
                     Ok(())
                 }
                 other => {
                     let type_name = other.py_type(vm);
                     value.drop_with_heap(vm);
-                    Err(ExcType::attribute_error_no_setattr(type_name, attr_name))
+                    Err(ExcType::attribute_error_no_setattr(type_name, name.as_str(vm.interns)))
                 }
             }
         } else {
             let type_name = self.py_type(vm);
             value.drop_with_heap(vm);
-            Err(ExcType::attribute_error_no_setattr(type_name, attr_name))
+            Err(ExcType::attribute_error_no_setattr(type_name, name.as_str(vm.interns)))
         }
     }
 
@@ -1763,7 +1761,7 @@ impl Value {
             Self::Int(i) => Ok(*i),
             Self::Ref(heap_id) => {
                 if let HeapData::LongInt(li) = vm.heap.get(*heap_id) {
-                    li.to_i64().ok_or_else(ExcType::overflow_shift_count)
+                    li.to_i64().ok_or_else(ExcType::overflow_c_ssize_t)
                 } else {
                     let msg = format!("'{}' object cannot be interpreted as an integer", self.py_type(vm));
                     Err(SimpleException::new_msg(ExcType::TypeError, msg).into())
@@ -1847,7 +1845,7 @@ impl Value {
                         return Err(ExcType::value_error_negative_shift_count());
                     } else {
                         // Shift amount too large to fit in i64 - this would be astronomically large
-                        return Err(ExcType::overflow_shift_count());
+                        return Err(ExcType::overflow_c_ssize_t());
                     }
                 }
                 BitwiseOp::RShift => {
@@ -1920,17 +1918,17 @@ impl Value {
     /// # Important
     /// This method MUST be called before overwriting a namespace slot or discarding
     /// a value to prevent memory leaks.
-    #[cfg(not(feature = "ref-count-panic"))]
+    #[cfg(not(feature = "memory-model-checks"))]
     #[inline]
     pub fn drop_with_heap(self, heap: &mut impl ContainsHeap) {
         if let Self::Ref(id) = self {
             heap.heap_mut().dec_ref(id);
         }
     }
-    /// With `ref-count-panic` enabled, `Ref` variants are replaced with `Dereferenced` and
+    /// With `memory-model-checks` enabled, `Ref` variants are replaced with `Dereferenced` and
     /// the original is forgotten to prevent the Drop impl from panicking. Non-Ref variants
     /// are left unchanged since they don't trigger the Drop panic.
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     pub fn drop_with_heap(mut self, heap: &mut impl ContainsHeap) {
         let old = mem::replace(&mut self, Self::Dereferenced);
         if let Self::Ref(id) = &old {
@@ -1962,7 +1960,7 @@ impl Value {
             Self::Property(p) => Self::Property(*p),
             Self::ExternalFuture(call_id) => Self::ExternalFuture(*call_id),
             Self::Ref(_) => panic!("Ref clones must go through clone_with_heap to maintain refcounts"),
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             Self::Dereferenced => panic!("Cannot copy Dereferenced object"),
         }
     }
@@ -1970,7 +1968,7 @@ impl Value {
     /// Mark as Dereferenced to prevent Drop panic
     ///
     /// This should be called from `py_dec_ref_ids` methods only
-    #[cfg(feature = "ref-count-panic")]
+    #[cfg(feature = "memory-model-checks")]
     pub fn dec_ref_forget(&mut self) {
         let old = mem::replace(self, Self::Dereferenced);
         mem::forget(old);
@@ -1979,12 +1977,12 @@ impl Value {
     /// Pushes any contained `HeapId` onto the stack for reference counting.
     ///
     /// For `Value::Ref` variants, pushes the heap ID so the referenced object's
-    /// refcount can be decremented. When `ref-count-panic` is enabled, also marks
+    /// refcount can be decremented. When `memory-model-checks` is enabled, also marks
     /// this value as `Dereferenced` to prevent Drop panics.
     pub fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         if let Self::Ref(id) = self {
             stack.push(*id);
-            #[cfg(feature = "ref-count-panic")]
+            #[cfg(feature = "memory-model-checks")]
             self.dec_ref_forget();
         }
     }
