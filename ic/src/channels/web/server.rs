@@ -56,6 +56,9 @@ use crate::channels::web::types::*;
 use crate::channels::web::util::{
     build_turns_from_db_messages, reasoning_summary, truncate_preview,
 };
+use crate::channels::web::voice::{
+    voice_status_handler, voice_synthesize_handler, voice_transcribe_handler,
+};
 use crate::db::Database;
 use crate::extensions::ExtensionManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
@@ -396,6 +399,10 @@ pub struct GatewayState {
     pub ws_ping_interval_secs: u64,
     /// WebSocket idle timeout in seconds.
     pub ws_idle_timeout_secs: u64,
+    /// Desktop-facing voice API proxy (present when LunarVoice credential configured).
+    pub voice: Option<Arc<crate::channels::web::voice::VoiceApi>>,
+    /// Per-user rate limiter for voice endpoints (10 requests per 60 seconds).
+    pub voice_rate_limiter: PerUserRateLimiter,
 }
 
 /// Start the gateway HTTP server.
@@ -573,6 +580,20 @@ pub(super) async fn start_server_with_mascot(
         )
         // Gateway control plane
         .route("/api/gateway/status", get(gateway_status_handler))
+        // Desktop-facing voice API (WI#131): loopback LunarVoice proxy.
+        .route("/api/voice/status", get(voice_status_handler))
+        .route(
+            "/api/voice/transcribe",
+            post(voice_transcribe_handler).layer(DefaultBodyLimit::max(
+                crate::channels::web::voice::TRANSCRIBE_BODY_LIMIT,
+            )),
+        )
+        .route(
+            "/api/voice/synthesize",
+            post(voice_synthesize_handler).layer(DefaultBodyLimit::max(
+                crate::channels::web::voice::SYNTHESIZE_BODY_LIMIT,
+            )),
+        )
         // OpenAI-compatible API
         .route(
             "/v1/chat/completions",
@@ -3324,6 +3345,8 @@ mod tests {
             channel_manager: None,
             ws_ping_interval_secs: 30,
             ws_idle_timeout_secs: 120,
+            voice: None,
+            voice_rate_limiter: PerUserRateLimiter::new(10, 60),
         })
     }
 

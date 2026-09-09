@@ -24,6 +24,7 @@ pub mod server;
 pub mod sse;
 pub mod types;
 pub(crate) mod util;
+pub mod voice;
 pub mod ws;
 
 // Coordination admin API (Phase 3): localhost-only server started from main.
@@ -130,6 +131,8 @@ impl GatewayChannel {
             channel_manager: None,
             ws_ping_interval_secs: config.ws_ping_interval_secs,
             ws_idle_timeout_secs: config.ws_idle_timeout_secs,
+            voice: None,
+            voice_rate_limiter: server::PerUserRateLimiter::new(10, 60),
         });
 
         Self {
@@ -177,6 +180,8 @@ impl GatewayChannel {
             channel_manager: self.state.channel_manager.clone(),
             ws_ping_interval_secs: self.state.ws_ping_interval_secs,
             ws_idle_timeout_secs: self.state.ws_idle_timeout_secs,
+            voice: self.state.voice.clone(),
+            voice_rate_limiter: server::PerUserRateLimiter::new(10, 60),
         };
         mutate(&mut new_state);
         self.state = Arc::new(new_state);
@@ -287,6 +292,14 @@ impl GatewayChannel {
     /// Inject the LLM provider for OpenAI-compatible API proxy.
     pub fn with_llm_provider(mut self, llm: Arc<dyn crate::llm::LlmProvider>) -> Self {
         self.rebuild_state(|s| s.llm_provider = Some(llm));
+        self
+    }
+
+    /// Inject the desktop-facing voice API proxy (WI#131). The sidecar
+    /// credential is held server-side; clients authenticate with their
+    /// normal gateway bearer token.
+    pub fn with_voice_api(mut self, voice: Arc<self::voice::VoiceApi>) -> Self {
+        self.rebuild_state(|s| s.voice = Some(voice));
         self
     }
 
