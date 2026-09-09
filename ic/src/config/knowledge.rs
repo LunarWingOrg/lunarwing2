@@ -56,6 +56,104 @@ impl KnowledgeSweepConfig {
     }
 }
 
+/// Opt-in checkout-backed additive knowledge refresh configuration.
+#[derive(Debug, Clone)]
+pub struct KnowledgeSyncConfig {
+    /// Whether the independent cadence runner is enabled. Env:
+    /// `KNOWLEDGE_SYNC_ENABLED` (default: false).
+    pub enabled: bool,
+    /// Published Study Notes checkout. Env: `LW2STUDYMCP_HOME`.
+    pub source_home: Option<PathBuf>,
+    /// Hours between unchanged-generation checks. Env:
+    /// `KNOWLEDGE_SYNC_CADENCE_HOURS` (default: 6).
+    pub cadence_hours: u32,
+    /// New-note cap per pass. Env: `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN`
+    /// (default: 500).
+    pub max_records_per_run: u32,
+    /// Source byte cap per pass. Env: `KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN`
+    /// (default: 10 MiB).
+    pub max_bytes_per_run: usize,
+}
+
+impl Default for KnowledgeSyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            source_home: None,
+            cadence_hours: 6,
+            max_records_per_run: 500,
+            max_bytes_per_run: 10 * 1024 * 1024,
+        }
+    }
+}
+
+impl KnowledgeSyncConfig {
+    pub(crate) fn resolve() -> Result<Self, ConfigError> {
+        let config = Self {
+            enabled: parse_bool_env("KNOWLEDGE_SYNC_ENABLED", false)?,
+            source_home: std::env::var_os(crate::tools::mcp::config::STUDY_NOTES_HOME_ENV)
+                .map(PathBuf::from),
+            cadence_hours: parse_optional_env("KNOWLEDGE_SYNC_CADENCE_HOURS", 6)?,
+            max_records_per_run: parse_optional_env("KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN", 500)?,
+            max_bytes_per_run: parse_optional_env(
+                "KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN",
+                10 * 1024 * 1024,
+            )?,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (key, value) in [
+            (
+                "KNOWLEDGE_SYNC_CADENCE_HOURS",
+                u64::from(self.cadence_hours),
+            ),
+            (
+                "KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN",
+                u64::from(self.max_records_per_run),
+            ),
+            (
+                "KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN",
+                u64::try_from(self.max_bytes_per_run).unwrap_or(u64::MAX),
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::InvalidValue {
+                    key: key.to_string(),
+                    message: "must be greater than zero".to_string(),
+                });
+            }
+        }
+        if self.enabled && self.source_home.is_none() {
+            return Err(ConfigError::MissingRequired {
+                key: crate::tools::mcp::config::STUDY_NOTES_HOME_ENV.to_string(),
+                hint: "KNOWLEDGE_SYNC_ENABLED requires a published Study Notes checkout"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Convert an enabled config to the workspace runner type.
+    pub fn to_workspace_config(
+        &self,
+    ) -> Option<crate::workspace::knowledge_sync::KnowledgeSyncConfig> {
+        if !self.enabled {
+            return None;
+        }
+        Some(crate::workspace::knowledge_sync::KnowledgeSyncConfig {
+            enabled: true,
+            source_home: self.source_home.clone()?,
+            state_dir: lunarwing_base_dir(),
+            cadence_hours: self.cadence_hours,
+            max_records_per_run: self.max_records_per_run,
+            max_bytes_per_run: self.max_bytes_per_run,
+        })
+    }
+}
+
 /// One-shot study-notes knowledge seed configuration (new tenants only).
 ///
 /// Maps to `crate::workspace::knowledge_seed::KnowledgeSeedConfig`. The seed
@@ -111,6 +209,29 @@ mod tests {
         assert_eq!(config.stale_after_days, 30);
         assert_eq!(config.cadence_hours, 24);
         assert!(config.include_shared);
+    }
+
+    #[test]
+    fn sync_defaults_disabled_and_bounded() {
+        let config = KnowledgeSyncConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.cadence_hours, 6);
+        assert_eq!(config.max_records_per_run, 500);
+        assert_eq!(config.max_bytes_per_run, 10 * 1024 * 1024);
+        assert!(config.to_workspace_config().is_none());
+    }
+
+    #[test]
+    fn sync_validation_requires_positive_limits_and_source_when_enabled() {
+        let mut config = KnowledgeSyncConfig {
+            enabled: true,
+            ..KnowledgeSyncConfig::default()
+        };
+        assert!(config.validate().is_err());
+        config.source_home = Some(PathBuf::from("/var/cache/lunarwing/lw2studymcp"));
+        assert!(config.validate().is_ok());
+        config.max_records_per_run = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
