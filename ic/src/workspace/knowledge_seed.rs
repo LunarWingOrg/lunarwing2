@@ -910,6 +910,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn additive_import_respects_limits_and_never_overwrites() {
+            let (db, _db_dir) = crate::testing::test_db().await;
+            let workspace = Workspace::new_with_db("alice", db);
+            let fixture = tempfile::tempdir().expect("fixture");
+            let notes_dir = fixture.path().join(NOTES_DIR);
+            for topic in ["a.md", "b.md", "c.md"] {
+                write_note(
+                    &notes_dir,
+                    "rarity",
+                    topic,
+                    &format!("# {topic}\n\nsource body\n"),
+                );
+            }
+            let limits = KnowledgeImportLimits {
+                max_new_notes: 1,
+                max_new_bytes: 1_024,
+            };
+
+            let first = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(first.notes_seeded, 1);
+            assert_eq!(first.notes_deferred, 2);
+            workspace
+                .write("study-notes/rarity/a.md", "# Local\n\noperator edit\n")
+                .await
+                .expect("operator edit");
+            write_note(
+                &notes_dir,
+                "rarity",
+                "a.md",
+                "# Upstream changed\n\nnew source body\n",
+            );
+
+            let second = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(second.notes_seeded, 1);
+            assert_eq!(second.notes_skipped_existing, 1);
+            assert_eq!(second.notes_deferred, 1);
+            let third = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(third.notes_seeded, 1);
+            assert_eq!(third.notes_skipped_existing, 2);
+            assert_eq!(third.notes_deferred, 0);
+
+            let local = workspace
+                .read_primary("study-notes/rarity/a.md")
+                .await
+                .expect("local note");
+            assert!(local.content.contains("operator edit"));
+        }
+
+        #[tokio::test]
         async fn disabled_seed_is_a_noop() {
             let (db, _db_dir) = crate::testing::test_db().await;
             let workspace = Workspace::new_with_db("alice", db);
