@@ -163,7 +163,7 @@ async fn get_json(url: &str, token: &str) -> (StatusCode, Value) {
     let response = client.get(url).bearer_auth(token).send().await.unwrap();
     let status = response.status();
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
-    (status.into(), body)
+    (status, body)
 }
 
 async fn post_json(url: &str, token: &str, body: Value) -> (StatusCode, Value) {
@@ -177,7 +177,7 @@ async fn post_json(url: &str, token: &str, body: Value) -> (StatusCode, Value) {
         .unwrap();
     let status = response.status();
     let body = response.json::<Value>().await.unwrap_or(Value::Null);
-    (status.into(), body)
+    (status, body)
 }
 
 #[tokio::test]

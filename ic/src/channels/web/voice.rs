@@ -511,14 +511,16 @@ fn validate_transcribe_request(request: &VoiceTranscribeRequest) -> Result<(), H
             format!("format must be one of: {}", AUDIO_FORMATS.join(", ")),
         ));
     }
-    if let Some(language) = request.language.as_deref() {
-        if language.len() > 32 {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "language must be at most 32 characters".to_string(),
-            ));
-        }
+    if request
+        .language
+        .as_deref()
+        .is_some_and(|language| language.len() > 32)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "language must be at most 32 characters".to_string(),
+        ));
     }
     Ok(())
 }
@@ -539,23 +541,26 @@ fn validate_synthesize_request(request: &VoiceSynthesizeRequest) -> Result<Strin
             format!("text exceeds {} characters", MAX_SYNTH_TEXT_CHARS),
         ));
     }
-    if let Some(voice) = request.voice.as_deref() {
-        if voice.len() > 64 {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "voice must be at most 64 characters".to_string(),
-            ));
-        }
+    if request
+        .voice
+        .as_deref()
+        .is_some_and(|voice| voice.len() > 64)
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "voice must be at most 64 characters".to_string(),
+        ));
     }
-    if let Some(speed) = request.speed {
-        if !speed.is_finite() || !(0.5..=2.0).contains(&speed) {
-            return Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "bad_request",
-                "speed must be between 0.5 and 2.0".to_string(),
-            ));
-        }
+    if request
+        .speed
+        .is_some_and(|speed| !speed.is_finite() || !(0.5..=2.0).contains(&speed))
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "speed must be between 0.5 and 2.0".to_string(),
+        ));
     }
     Ok(text.to_string())
 }
