@@ -1648,3 +1648,147 @@ doctor() {
   say "passed: $pass, failed: $fail"
   [[ $fail -eq 0 ]]
 }
+
+# ── Coordination knowledge-share doctor ──────────────────────────────────────
+#
+# Read-only, init-agnostic validation of the coordination knowledge-share
+# (KNOW:) operator surface. Never prints secrets: bearer tokens, XMPP
+# passwords, and the COORD_ADMIN_TOKEN are read but only their presence/absence
+# is reported. Never rewrites room or trust policy — it reports mismatches and
+# recommended edits so the operator can decide.
+coord_doctor() {
+  ports_registry_init
+  local name="${1:-}"
+  name="$(sanitize_name "$name")"
+
+  if [[ -z "$name" ]]; then
+    say "usage: coord-doctor <tenant>"
+    return 2
+  fi
+  tenant_exists_in_registry "$name" || { say "tenant '$name' not in registry"; return 1; }
+
+  local env_dir bridge_env daemon_env
+  env_dir="$(tenant_env_dir "$name")"
+  daemon_env="$env_dir/lunarwing.env"
+  bridge_env="$env_dir/xmpp-bridge.env"
+
+  local pass=0 fail=0 warn=0
+  _c() {  # pass/fail gate
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then
+      printf '[PASS] %s\n' "$label"; pass=$((pass + 1))
+    else
+      printf '[FAIL] %s\n' "$label"; fail=$((fail + 1))
+    fi
+  }
+  _w() { printf '[WARN] %s\n' "$1"; warn=$((warn + 1)); }
+
+  say "=== Coordination knowledge-share doctor: $name ==="
+  say ""
+
+  # --- Daemon-side switches (read-only) -------------------------------------
+  local coord_enabled coord_channels share publish publishers
+  coord_enabled="$(_read_env_value "$daemon_env" COORD_ENABLED)"
+  coord_channels="$(_read_env_value "$daemon_env" COORD_CHANNELS)"
+  share="$(_read_env_value "$daemon_env" COORD_KNOWLEDGE_SHARE)"
+  publish="$(_read_env_value "$daemon_env" COORD_KNOWLEDGE_PUBLISH)"
+  publishers="$(_read_env_value "$daemon_env" COORD_KNOWLEDGE_PUBLISHERS)"
+
+  say "Daemon config (non-secret):"
+  say "  COORD_ENABLED         = ${coord_enabled:-<unset>}"
+  say "  COORD_CHANNELS        = ${coord_channels:-<unset>}"
+  say "  COORD_KNOWLEDGE_SHARE = ${share:-<unset>}"
+  say "  COORD_KNOWLEDGE_PUBLISH= ${publish:-<unset>}"
+  say ""
+  [[ "${coord_enabled:-false}" == "true" ]] || _w "COORD_ENABLED is not true; coordination is disabled"
+
+  if [[ "${share:-false}" == "true" ]]; then
+    if [[ -z "${publishers:-}" ]]; then
+      _w "COORD_KNOWLEDGE_SHARE=true but COORD_KNOWLEDGE_PUBLISHERS is empty (deny-all)"
+    else
+      say "  publishers (classified):"
+      local entry room_nick
+      while IFS=' ' read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if [[ "$entry" == */* ]]; then
+          room_nick="${entry%%/*}"
+          printf '    - %-40s exact occupant (room-wide equivalent: %s)\n' "$entry" "$room_nick"
+        else
+          printf '    - %-40s room-wide / user-bare\n' "$entry"
+        fi
+      done <<< "$(printf '%s' "$publishers" | tr ',' ' ')"
+      if printf '%s\n' "$publishers" | tr ',' '\n' | grep -qE '^[^/@]+@[^/@]+$'; then
+        _w "a user-bare JID (user@server) never matches a MUC occupant sender; use a full occupant (room@server/nick) or room bare JID (room@server)"
+      fi
+    fi
+  fi
+
+  # --- Bridge-side room join configuration ----------------------------------
+  local allow_rooms allow_rooms_json
+  allow_rooms="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS)"
+  allow_rooms_json="$(_read_env_value "$bridge_env" XMPP_ALLOW_ROOMS_JSON)"
+  say ""
+  say "Bridge config (non-secret):"
+  say "  XMPP_ALLOW_ROOMS      = ${allow_rooms:-<unset>}"
+  say "  XMPP_ALLOW_ROOMS_JSON = ${allow_rooms_json:-<unset>}"
+  if [[ "$allow_rooms_json" == "[]" || ( -z "${allow_rooms_json:-}" && -z "${allow_rooms:-}" ) ]]; then
+    _w "no MUC room configured: the daemon will drop all inbound groupchat (join + receive allowlist)"
+  fi
+
+  # --- Live bridge status (authenticated loopback, non-secret) ---------------
+  local bridge_port bridge_token
+  bridge_port="$(ports_get "$name" bridge)"
+  bridge_token="$(_read_env_value "$bridge_env" XMPP_BRIDGE_TOKEN)"
+  say ""
+  if [[ -n "$bridge_token" ]] && [[ -n "$bridge_port" ]]; then
+    local status configured_rooms rooms_with_presence
+    status="$(curl -sf --max-time 3 \
+      -H "Authorization: Bearer $bridge_token" \
+      "http://127.0.0.1:${bridge_port}/v1/status" 2>/dev/null)" || status=""
+    if [[ -n "$status" ]]; then
+      configured_rooms="$(printf '%s' "$status" | jq -r '.configured_rooms // empty | join(",")' 2>/dev/null)"
+      rooms_with_presence="$(printf '%s' "$status" | jq -r '.rooms_with_presence // empty | join(",")' 2>/dev/null)"
+      say "  bridge configured_rooms   = ${configured_rooms:-<none>}"
+      say "  bridge rooms_with_presence = ${rooms_with_presence:-<none>}"
+      if [[ -n "$rooms_with_presence" ]] && [[ -n "$configured_rooms" ]]; then
+        local cfg pres cfgj
+        for cfg in $configured_rooms; do
+          pres=0
+          for cfgj in $rooms_with_presence; do
+            [[ "$cfgj" == "$cfg" ]] && { pres=1; break; }
+          done
+          [[ "$pres" == "1" ]] || _w "room '$cfg' is configured but shows no presence (not joined yet?)"
+        done
+      fi
+    else
+      _w "bridge /v1/status unreachable on 127.0.0.1:${bridge_port} (bridge down or token mismatch)"
+    fi
+  else
+    _w "cannot query bridge status: missing bridge port or XMPP_BRIDGE_TOKEN"
+  fi
+
+  # --- Coord admin knowledge counters (optional, non-secret) -----------------
+  local admin_port admin_token
+  admin_port="$(_read_env_value "$daemon_env" COORD_ADMIN_PORT)"
+  admin_token="$(_read_env_value "$daemon_env" COORD_ADMIN_TOKEN)"
+  say ""
+  if [[ -n "$admin_token" ]] && [[ -n "$admin_port" ]]; then
+    local kstatus
+    kstatus="$(curl -sf --max-time 3 \
+      -H "Authorization: Bearer $admin_token" \
+      "http://127.0.0.1:${admin_port}/coord/knowledge" 2>/dev/null)" || kstatus=""
+    if [[ -n "$kstatus" ]]; then
+      say "  KNOW: ingest drop counters:"
+      printf '%s' "$kstatus" | jq -r '.dropped[]? | "    - \(.reason)=\(.count)"' 2>/dev/null \
+        || _w "coord/knowledge returned an unrecognized payload"
+    else
+      say "  (coord/knowledge not available; daemon may predate the diagnostics endpoint)"
+    fi
+  else
+    say "  (skipping coord/knowledge: missing COORD_ADMIN_PORT/TOKEN)"
+  fi
+
+  say ""
+  say "coord-doctor $name: passed=$pass failed=$fail warnings=$warn"
+  [[ $fail -eq 0 ]]
+}

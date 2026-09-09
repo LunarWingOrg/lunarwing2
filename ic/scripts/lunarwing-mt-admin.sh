@@ -443,6 +443,11 @@ Commands:
   status <name>                    Detailed status for one tenant
   tokens [name]                    Print gateway auth tokens (all or one)
   doctor                           System dependency and health checks
+  coord-doctor <name>              Read-only coordination knowledge-share
+                                   (KNOW:) validation: room join/receive
+                                   allowlists, publisher classification,
+                                   bridge presence, and ingest counters.
+                                   Prints no secrets; reports, never rewrites.
   setup-cgroups                    (OpenRC) Install pre-delegated tenant cgroup v2
                                    subtrees (docs/ops/PREDELEGATED_SUBTREE_CGROUPS.md):
                                    boot-time /etc/local.d/lunarwing-cgroups.start,
@@ -1370,6 +1375,10 @@ main() {
 
     doctor)
       doctor
+      ;;
+
+    coord-doctor)
+      coord_doctor "${1:-}"
       ;;
 
     setup-cgroups)
