@@ -140,9 +140,17 @@ impl KnowledgeSyncConfig {
     pub fn to_workspace_config(
         &self,
     ) -> Option<crate::workspace::knowledge_sync::KnowledgeSyncConfig> {
-        if !self.enabled {
-            return None;
-        }
+        self.enabled.then(|| self.workspace_config()).flatten()
+    }
+
+    /// Build the same config for an explicit operator-triggered refresh.
+    pub fn to_manual_workspace_config(
+        &self,
+    ) -> Option<crate::workspace::knowledge_sync::KnowledgeSyncConfig> {
+        self.workspace_config()
+    }
+
+    fn workspace_config(&self) -> Option<crate::workspace::knowledge_sync::KnowledgeSyncConfig> {
         Some(crate::workspace::knowledge_sync::KnowledgeSyncConfig {
             enabled: true,
             source_home: self.source_home.clone()?,
