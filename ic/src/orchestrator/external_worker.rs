@@ -896,8 +896,9 @@ async fn connect_and_handshake(
         }
     })?;
 
-    let mut req_builder =
-        http::Request::builder().uri(&uri).header("Sec-WebSocket-Protocol", SUBPROTOCOL);
+    let mut req_builder = http::Request::builder()
+        .uri(&uri)
+        .header("Sec-WebSocket-Protocol", SUBPROTOCOL);
 
     if let Some(token) = auth_token {
         req_builder = req_builder.header("Authorization", format!("Bearer {token}"));
