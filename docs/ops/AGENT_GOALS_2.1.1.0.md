@@ -39,17 +39,17 @@
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
-6. [ ] **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
+6. [ ] Please fix issues and try again: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/873 - aj/kimi-6-20260909-0600 See comments on original MR - Positive findings: no tenant lifecycle reimplementation, both systemd and OpenRC scheduler paths are covered, symlinks are rejected, imports are bounded/additive, and compile verification passed locally. Merge only after pipeline is green. - Fix according to comments in old MR as linked here - **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
 
 7. [x] (S) **#114 — feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - ( wait for 2.1.2 )
 
 8. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-9. [ ] Last attempt on branch: rarity/kimi-9-20260908-1802 - Original Task: **#109 — sanitize-memory mission registered Active but not firing on thread_start** `[bug,mission,sanitize-memory]` - Related scheduler work shipped (#94 warmup) but this firing bug itself is unaddressed. Real defect, needs repro
+9. [ ] See review findings of previous MR (posted as comment) and fix them - now closed - https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/872 and branch was: rarity/kimi-9-20260909-0601 (BEST REFERENCE TO USE) - Last attempt before that was on branch: rarity/kimi-9-20260908-1802 - Original Task: **#109 — sanitize-memory mission registered Active but not firing on thread_start** `[bug,mission,sanitize-memory]` - Related scheduler work shipped (#94 warmup) but this firing bug itself is unaddressed. Real defect, needs repro
 
-10. [ ] Work item #97 — Coordination knowledge sharing (production residual)** `[coordination,knowledge-sharing]` - Repo fix + 4/4 live matrix done (goals #13/#27/#37). REMAINING: (a) production sunburst/ruffles operator actions — set `XMPP_ALLOW_ROOMS_JSON`, `COORD_KNOWLEDGE_PUBLISHERS` full-occupant JIDs, restart both engines, re-test `KNOW:` wire path; (b) tracker body still carries the live-disproved user-bare recommendation — correct/close; (c) suggested hardening from #37: init-agnostic read-only mt-admin coordination doctor, bounded reason counters + empty-publisher startup warning, automated 4-case live matrix for release-sensitive changes, optional server-attested real-JID policy for non-anonymous MUCs - You may create multiple temporary testing tenants in order to test this properly. If you are successful in getting this whole thing to work, you must also write a guide in docs/guides on getting this set up correctly so it can be reproduced
+10. [ ] See failed attempt: aj/kimi-10-20260909-0900 and imagesSee comments on closed MR from last attempt: aj/kimi-10-20260909-0900 and https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/875 - See comments of old closed MR - Fix appropriately - Work item #97 — Coordination knowledge sharing (production residual)** `[coordination,knowledge-sharing]` - Repo fix + 4/4 live matrix done (goals #13/#27/#37). REMAINING: (a) production sunburst/ruffles operator actions — set `XMPP_ALLOW_ROOMS_JSON`, `COORD_KNOWLEDGE_PUBLISHERS` full-occupant JIDs, restart both engines, re-test `KNOW:` wire path; (b) tracker body still carries the live-disproved user-bare recommendation — correct/close; (c) suggested hardening from #37: init-agnostic read-only mt-admin coordination doctor, bounded reason counters + empty-publisher startup warning, automated 4-case live matrix for release-sensitive changes, optional server-attested real-JID policy for non-anonymous MUCs - You may create multiple temporary testing tenants in order to test this properly. If you are successful in getting this whole thing to work, you must also write a guide in docs/guides on getting this set up correctly so it can be reproduced
 
-11. [ ] **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
+11. [ ] see old attempt and upscale implementation here https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/874 and rarity/kimi-11-20260909-0901 - comments of old MR offer suggestions on improving - **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
 
 12. [x] (S) Mascot Design Art Project
 
@@ -57,7 +57,7 @@
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
 
-14. [ ] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - Traps on every poll on a fresh tenant; unique vs derpy/spitfire/dwarfstar; persists with IRC buffers pristine; prime suspect `dm_policy=open` path. Repro recipe in `docs/ops/v2.1.0.0_GOAL43_STEER_INTERRUPT_LIVE_RERUN_KI.md`. Also goal #9: test-only `dm_policy=open` was never made durable. FOLLOW-UP NOTE in doc: re-provision merlin per its Environment section when picking up (~15 min incl. build)
+14. [x] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - VERIFIED NOT REPRODUCIBLE on the current tree (2026-09-09, item-14 pass). Full live repro attempt on tenant `alpha` (real weechat 4.10 + real ws_adapter longpoll + fresh `dm_policy=open` via BOTH delivery paths: caps-file config edit AND durable `settings.extensions.weechat.setup_fields`, restart, sustained DM traffic incl. unicode/2KB payloads, adapter restart mid-stream, group-buffer path): zero traps across every poll for the whole window. Guest crate tests 63/63 pass; a new integration test (`real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls` in `ic/tests/engine_v2_irc_wasm.rs`) pins the fresh-tenant longpoll shape (auto mode, adapter `/api/health` with `event_cursor`, empty buffers, `dm_policy=open`) and passes. Finding: the trap does not reproduce with the goal-43 repro recipe on the 2.1.1 tree; the `dm_policy=open` correlation from goal #43 appears spurious (the guest never reads DM policy on a no-event poll — `do_longpoll`→`refresh_policy_config` only writes the value it read). Also closes the goal #9 residual: durable `dm_policy=open` via the settings store was verified working live (unpaired nick `nick:miniirc:peer43` admitted through `check_sender_allowed`), so the test-only edit gap is confirmed fixed by the CHPAR-005 `dm_policy_explicit` machinery. If the trap resurfaces, the next discriminating evidence to capture is the wasmtime backtrace (log `Polling callback failed` at DEBUG with `WASM_BACKTRACE_DETAILS=1`) plus a fuel/epoch check on the tenant engine — see `ic/src/channels/wasm/wrapper.rs` `map_wasm_error`.
 
 15. [x] (S) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
     `ThreadOutcome::Stopped` maps to the empty-string sentinel by !767 design, so engine-interrupt turns emit no terminal `response` event; mascot falls back to 30s idle timer instead of immediate idle. "Parity with legacy `Interrupted.` emission needs a tracker decision." Small polish, user-visible.
@@ -65,28 +65,32 @@
 16. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
     Repo-contract PASS (27/27 emote tests, live public-surface checks on antelope/kestrel healthy). Remaining: the human acceptance step — fresh tenant, reply containing `*nickers softly* *flicks her tail*`, watch it animate. Cheap; could fold into any live session.
 
-17. [ ] **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
-    (a) orphaned mission_create records after failed turns sharing a webhook path (one fire matched 2 missions); (b) goal-phrase auto-complete trap for user-created missions; (c) `fix_pattern_database` re-seeding duplicates; (d) unbounded `approach_history`.
+17. [ ] This goal had PARALLEL implementation - Rarity's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/876 and rarity/kimi-17-20260909-1201 - CMC's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/870 and branch= lucky - compare the two, read the comments on both of the closed MRs, and pick the better imeplementation (or combine the best aspects from each implementation). Regardless of what is decided, ensure CI/CD actually works - Original Task Description: **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
+    (a) orphaned mission_create records after failed turns sharing a webhook path (one fire matched 2 missions); (b) goal-phrase auto-complete trap for user-created missions; (c) `fix_pattern_database` re-seeding duplicates; (d) unbounded `approach_history`
 
 18. [ ] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
     Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
 
-19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+19. [ ] This goal had PARALLEL implementation - Rarity's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/878 and branch rarity/kimi-19-20260909-1501 - CMC's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/871 and branch= voce - compare the two, read the comments on both of the closed MRs, and pick the better imeplementation (or combine the best aspects from each implementation). Regardless of what is decided, ensure CI/CD actually works - Original Task Description: work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
 
 20. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
 
 21. [ ] **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
-    Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design.
+    Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design
+
+22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/130 - code in comments too look at
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-22. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
+23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
 
 ## Phase 5 - Documentation
 
-23. [ ] update all docs in docs/guides
-24. [ ] update all docs in docs/architecture
-25. [ ] first draft of release notes
+24. [ ] update all docs in docs/guides
+25. [ ] update all docs in docs/architecture
+26. [ ] first draft of release notes
+27. [ ] update readme in root of repo
+28. [x] (S) Reserved
 
 ---
