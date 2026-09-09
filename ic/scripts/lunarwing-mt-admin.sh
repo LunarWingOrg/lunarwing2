@@ -479,6 +479,10 @@ Environment:
                                    (empty = each tenant's local TensorZero proxy)
   LUNARWING_MT_GOTIFY_URL          Default Gotify server URL for new tenants
   LUNARWING_MT_GOTIFY_TITLE        Default Gotify notification title for new tenants
+  LUNARWING_MT_STUDY_NOTES_HOME    Default shared Study Notes checkout
+  LUNARWING_MT_STUDY_NOTES_REPO    Repository used when that checkout is first cloned
+  LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT
+                                   Root-owned snapshot directory used by the host scheduler
   LUNARWING_MT_BACKUP_DIR          Backup directory (default /var/lib/lunarwing-backups)
   LUNARWING_MT_BACKUP_KEEP         Keep last N dumps per tenant (default 7; 0 = keep all)
 
