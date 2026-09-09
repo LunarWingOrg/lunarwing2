@@ -39,7 +39,7 @@
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
-6. [ ] **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
+6. [ ] Please fix issues and try again: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/873 - aj/kimi-6-20260909-0600 See comments on original MR - Positive findings: no tenant lifecycle reimplementation, both systemd and OpenRC scheduler paths are covered, symlinks are rejected, imports are bounded/additive, and compile verification passed locally. Merge only after pipeline is green. - Fix according to comments in old MR as linked here - **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
 
 7. [x] (S) **#114 — feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - ( wait for 2.1.2 )
 
