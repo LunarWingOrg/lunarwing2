@@ -103,7 +103,7 @@ sudo ic/scripts/install-lunarwing-watchdog.sh
 ## 6. Update Integrations
 
 - LunarWing's Unix socket is `lunarwing.sock`. `IRONCLAW_SOCKET` remains a legacy fallback, but clients should move to the current socket setting.
-- External workers should negotiate the current LunarWing protocol; `ironclaw-agent-v1` is only a legacy compatibility subprotocol.
+- External workers must negotiate `lunarwing-agent-v1`; the `ironclaw-agent-v1` compatibility subprotocol has been removed and is no longer offered or accepted.
 - Rebuild and reinstall WASM extensions through the registry/build scripts instead of copying unknown old binaries.
 - Revalidate XMPP, WeeChat, DarkIRC, Gotify, webhooks, tunnels, and worker endpoints individually.
 - Recheck file ownership, directory modes, bearer authentication, and outbound URL restrictions.
