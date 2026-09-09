@@ -19,9 +19,13 @@ chmod +x "$fixture/bin/systemctl"
 PATH="$fixture/bin:$PATH"
 
 LUNARWING_MT_SYSTEMD_UNIT_DIR="$fixture/systemd"
+LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT="$fixture/admin"
+stable_entrypoint="$fixture/admin/current/lunarwing-mt-admin.sh"
 INIT_SYSTEM=systemd
 ensure_knowledge_source_scheduler
-grep -Fq "ExecStart=$SCRIPT_DIR/lunarwing-mt-admin.sh sync-knowledge-sources" \
+test -x "$stable_entrypoint"
+test -x "$fixture/admin/current/mt-admin-lib/14-knowledge-sync.sh"
+grep -Fq "ExecStart=$stable_entrypoint sync-knowledge-sources" \
   "$fixture/systemd/lunarwing-study-notes-sync.service"
 grep -Fq 'OnCalendar=hourly' "$fixture/systemd/lunarwing-study-notes-sync.timer"
 grep -Fqx 'daemon-reload' "$SYSTEMCTL_LOG"
@@ -41,7 +45,7 @@ _ensure_cron_runlevel() { :; }
 INIT_SYSTEM=openrc
 ensure_knowledge_source_scheduler
 ensure_knowledge_source_scheduler
-grep -Fq "17 * * * * $SCRIPT_DIR/lunarwing-mt-admin.sh sync-knowledge-sources" \
+grep -Fq "17 * * * * $stable_entrypoint sync-knowledge-sources" \
   "$FCRONTAB_STATE"
 [[ "$(grep -c '^# BEGIN lunarwing-study-notes-sync managed block$' "$FCRONTAB_STATE")" -eq 1 ]]
 [[ "$(grep -c '^# END lunarwing-study-notes-sync managed block$' "$FCRONTAB_STATE")" -eq 1 ]]
