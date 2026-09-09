@@ -23,6 +23,7 @@ pub mod fmt;
 mod hooks;
 #[cfg(feature = "import")]
 pub mod import;
+mod knowledge;
 mod logs;
 mod mcp;
 pub mod memory;
@@ -47,6 +48,7 @@ pub use doctor::run_doctor_command;
 pub use hooks::{HooksCommand, run_hooks_command};
 #[cfg(feature = "import")]
 pub use import::{ImportCommand, run_import_command};
+pub use knowledge::run_knowledge_refresh_command;
 pub use logs::{LogsCommand, run_logs_command};
 pub use mcp::{McpCommand, run_mcp_command};
 pub use memory::MemoryCommand;
@@ -219,6 +221,17 @@ pub enum Command {
         long_about = "Search, read, or write to memory.\nExample: lunarwing memory search 'query'"
     )]
     Memory(MemoryCommand),
+
+    /// Import missing notes from a published Study Notes checkout
+    #[command(
+        about = "Refresh tenant knowledge additively",
+        long_about = "Runs the same bounded, additive-only checkout refresh used by the daemon cadence. Existing knowledge paths are never changed."
+    )]
+    RefreshKnowledge {
+        /// Emit a machine-readable report
+        #[arg(long)]
+        json: bool,
+    },
 
     /// DM pairing (approve inbound requests from unknown senders)
     #[command(
