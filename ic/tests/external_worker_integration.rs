@@ -1002,7 +1002,10 @@ async fn legacy_only_worker_is_rejected() {
     .expect_err("expected connection failure against legacy-only worker");
 
     assert!(
-        matches!(err, OrchestratorError::ExternalWorkerConnectionFailed { .. }),
+        matches!(
+            err,
+            OrchestratorError::ExternalWorkerConnectionFailed { .. }
+        ),
         "got {err:?}"
     );
 }
