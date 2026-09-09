@@ -14,7 +14,7 @@ Persistent container worker for upstream Kimi Code CLI (MoonshotAI/kimi-code). T
 
 ## Protocol Compatibility
 
-The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1` still accepted for one deprecation cycle) is shared with Pebble and OpenCode workers. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
+The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and OpenCode workers. The legacy `ironclaw-agent-v1` alias has been removed and is not accepted. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
 
 ## Build Notes
 
