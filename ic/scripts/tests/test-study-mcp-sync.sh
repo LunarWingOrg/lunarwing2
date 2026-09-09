@@ -154,6 +154,26 @@ grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=true' "$(tenant_env_dir test4)/lunarwing.env"
 set_tenant_knowledge_sync test4 false
 grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=false' "$(tenant_env_dir test4)/lunarwing.env"
 
+# Manual refresh executes the tenant binary through the safe env-loader path,
+# without reaching into either init system or restarting the daemon.
+export REFRESH_LOG="$fixture/refresh.log"
+OPENRC_ENV_EXEC="$fixture/env-exec"
+cat >"$OPENRC_ENV_EXEC" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--env-file" && -n "$2" && "$3" == "--" ]] || exit 2
+shift 3
+exec "$@"
+EOF
+chmod +x "$OPENRC_ENV_EXEC"
+mkdir -p "$(tenant_repo test4)/target/release"
+cat >"$(tenant_repo test4)/target/release/lunarwing" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$REFRESH_LOG"
+EOF
+chmod +x "$(tenant_repo test4)/target/release/lunarwing"
+run_tenant_knowledge_refresh test4 false
+grep -Fqx -- '--no-onboard refresh-knowledge --json' "$REFRESH_LOG"
+
 # A scheduler installation failure cannot commit a new tenant opt-in.
 mkdir -p "$(tenant_env_dir test5)"
 printf 'LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_DEFAULT_HOME" \
