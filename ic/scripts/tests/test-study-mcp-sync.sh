@@ -154,6 +154,20 @@ grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=true' "$(tenant_env_dir test4)/lunarwing.env"
 set_tenant_knowledge_sync test4 false
 grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=false' "$(tenant_env_dir test4)/lunarwing.env"
 
+# A scheduler installation failure cannot commit a new tenant opt-in.
+mkdir -p "$(tenant_env_dir test5)"
+printf 'LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_DEFAULT_HOME" \
+  >"$(tenant_env_dir test5)/lunarwing.env"
+if ( ensure_knowledge_source_scheduler() { die "scheduler unavailable"; }
+     set_tenant_knowledge_sync test5 true ) 2>/dev/null; then
+  printf 'knowledge sync unexpectedly enabled without a scheduler\n' >&2
+  exit 1
+fi
+if grep -q '^KNOWLEDGE_SYNC_ENABLED=' "$(tenant_env_dir test5)/lunarwing.env"; then
+  printf 'failed scheduler install left a knowledge sync opt-in\n' >&2
+  exit 1
+fi
+
 # A failing sync is contained: the caller survives and the tenant stays unwired.
 mkdir -p "$(tenant_env_dir test2)"
 cat >"$(tenant_env_dir test2)/lunarwing.env" <<EOF
