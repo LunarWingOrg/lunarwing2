@@ -1197,35 +1197,36 @@ impl AppBuilder {
                 }
             }
 
-            // One-shot knowledge seed for newly provisioned tenants. mt-admin
-            // writes KNOWLEDGE_SEED_FROM_STUDY_MCP=1 only on the add-tenant
-            // path, so existing tenants are never (re)populated and existing
-            // notes are never overwritten. Runs in the background like the
-            // embeddings backfill; a state file makes it run at most once.
-            if let Some(seed) = self.config.knowledge_seed.to_workspace_config() {
-                let ws_seed = Arc::clone(ws);
+            // One-shot bootstrap and opt-in refresh share one task so a newly
+            // provisioned tenant always finishes its seed before the additive
+            // cadence can inspect the same paths.
+            let knowledge_seed = self.config.knowledge_seed.to_workspace_config();
+            let knowledge_sync = self.config.knowledge_sync.to_workspace_config();
+            if knowledge_seed.is_some() || knowledge_sync.is_some() {
+                let knowledge_workspace = Arc::clone(ws);
                 tokio::spawn(async move {
-                    let report =
-                        crate::workspace::knowledge_seed::run_knowledge_seed_once(&ws_seed, &seed)
-                            .await;
-                    if report.had_work() {
-                        tracing::info!(
-                            seeded = report.notes_seeded,
-                            skipped_existing = report.notes_skipped_existing,
-                            "Seeded tenant knowledge store from lw2studymcp checkout"
-                        );
+                    if let Some(seed) = knowledge_seed {
+                        let report = crate::workspace::knowledge_seed::run_knowledge_seed_once(
+                            &knowledge_workspace,
+                            &seed,
+                        )
+                        .await;
+                        if report.had_work() {
+                            tracing::info!(
+                                seeded = report.notes_seeded,
+                                skipped_existing = report.notes_skipped_existing,
+                                "Seeded tenant knowledge store from lw2studymcp checkout"
+                            );
+                        }
+                    }
+                    if let Some(sync) = knowledge_sync {
+                        crate::workspace::knowledge_sync::run_knowledge_sync_loop(
+                            knowledge_workspace,
+                            sync,
+                        )
+                        .await;
                     }
                 });
-            }
-
-            // Opt-in additive refresh uses an independent daemon cadence. The
-            // source checkout must be atomically published by mt-admin; the
-            // tenant only reads it and never mutates an existing knowledge path.
-            if let Some(sync) = self.config.knowledge_sync.to_workspace_config() {
-                let ws_sync = Arc::clone(ws);
-                tokio::spawn(crate::workspace::knowledge_sync::run_knowledge_sync_loop(
-                    ws_sync, sync,
-                ));
             }
 
             if embeddings.is_some() {
