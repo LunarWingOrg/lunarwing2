@@ -299,8 +299,8 @@ async fn seed_note(
 /// Enumerate importable note files, sorted for a deterministic pass order.
 ///
 /// Mirrors the lw2studymcp slug rules (lowercase, `_` → `-`, collapsed
-/// dashes). Dotfiles, non-Markdown files, invalid slugs, and the reserved
-/// coordination wire namespace are skipped.
+/// dashes). Dotfiles, non-Markdown files, symlinks, invalid slugs, and the
+/// reserved coordination wire namespace are skipped.
 fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
     let mut notes = Vec::new();
     let wire_prefix = format!("{WIRE_AGENT_PREFIX}-");
@@ -308,10 +308,13 @@ fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
         return notes;
     };
     for agent_entry in agents.flatten() {
-        let agent_dir = agent_entry.path();
-        if !agent_dir.is_dir() {
+        let Ok(agent_type) = agent_entry.file_type() else {
+            continue;
+        };
+        if !agent_type.is_dir() {
             continue;
         }
+        let agent_dir = agent_entry.path();
         let Some(raw_agent) = agent_entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -327,6 +330,12 @@ fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
             continue;
         };
         for file_entry in files.flatten() {
+            let Ok(file_type) = file_entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let file_name = file_entry.file_name();
             let Some(stem) = file_name.to_str().and_then(|name| name.strip_suffix(".md")) else {
                 continue;
@@ -701,6 +710,19 @@ mod tests {
         write(".hidden-agent", "hidden.md");
         write("rarity", "not-a-note.txt");
         std::fs::write(notes.join("loose-file.md"), "# T\n").expect("loose");
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside.md");
+            std::fs::write(&outside, "# Outside\n\nsecret\n").expect("outside");
+            std::os::unix::fs::symlink(&outside, notes.join("rarity/link.md"))
+                .expect("file symlink");
+            let outside_agent = dir.path().join("outside-agent");
+            std::fs::create_dir(&outside_agent).expect("outside agent");
+            std::fs::write(outside_agent.join("linked.md"), "# Linked\n\nsecret\n")
+                .expect("linked note");
+            std::os::unix::fs::symlink(&outside_agent, notes.join("linked-agent"))
+                .expect("directory symlink");
+        }
 
         let found = collect_note_files(&notes);
         let mut paths: Vec<String> = found
