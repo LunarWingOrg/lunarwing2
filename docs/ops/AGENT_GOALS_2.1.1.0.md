@@ -51,7 +51,7 @@
 
 11. [ ] **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
 
-12. [x] (S) Mascot Design
+12. [x] (S) Mascot Design Art Project
 
 13. [x] (S) Reserved for potential CI/CD issues
 
@@ -69,22 +69,24 @@
     (a) orphaned mission_create records after failed turns sharing a webhook path (one fire matched 2 missions); (b) goal-phrase auto-complete trap for user-created missions; (c) `fix_pattern_database` re-seeding duplicates; (d) unbounded `approach_history`.
 
 18. [ ] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
-    Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code.
+    Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
 
-19. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
+19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+
+20. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
 
-20. [ ] **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
+21. [ ] **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
     Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design.
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-21. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
+22. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
 
 ## Phase 5 - Documentation
 
-22. [ ] update all docs in docs/guides
-23. [ ] update all docs in docs/architecture
-24. [ ] first draft of release notes
+23. [ ] update all docs in docs/guides
+24. [ ] update all docs in docs/architecture
+25. [ ] first draft of release notes
 
 ---
