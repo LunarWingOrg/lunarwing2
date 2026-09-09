@@ -77,6 +77,18 @@ impl VoiceGatewayService {
     /// Returns an error when `service_url` is not loopback, uses a non-HTTP scheme,
     /// contains credentials/query/fragment, or contains a path.
     pub fn new(service_url: &str, auth_token: SecretString) -> Result<Self, VoiceGatewayError> {
+        Self::with_timeout(
+            service_url,
+            auth_token,
+            Duration::from_secs(VOICE_HTTP_TIMEOUT_SECS),
+        )
+    }
+
+    fn with_timeout(
+        service_url: &str,
+        auth_token: SecretString,
+        timeout: Duration,
+    ) -> Result<Self, VoiceGatewayError> {
         let mut base = Url::parse(service_url).map_err(|_| VoiceGatewayError::InvalidUrl)?;
         if base.scheme() != "http" {
             return Err(VoiceGatewayError::InvalidScheme);
@@ -106,7 +118,7 @@ impl VoiceGatewayService {
 
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(VOICE_HTTP_TIMEOUT_SECS))
+            .timeout(timeout)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -118,17 +130,6 @@ impl VoiceGatewayService {
             synthesize_url: base,
             auth_token,
         })
-    }
-
-    /// Create a proxy pointing both endpoints at the same sidecar served behind a
-    /// shared prefix — used in tests where a single mock router serves all sidecar paths.
-    #[cfg(test)]
-    pub fn for_testing(
-        service_url: &str,
-        auth_token: SecretString,
-    ) -> Result<Self, VoiceGatewayError> {
-        let service = Self::new(service_url, auth_token)?;
-        Ok(service)
     }
 
     async fn transcribe_request(
@@ -147,13 +148,7 @@ impl VoiceGatewayService {
         if !status.is_success() {
             return Err(VoiceProxyError::UpstreamStatus(status));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| VoiceProxyError::Upstream(err))?;
-        if bytes.len() > MAX_TRANSCRIBE_RESPONSE_BYTES {
-            return Err(VoiceProxyError::ResponseTooLarge);
-        }
+        let bytes = read_bounded_response(response, MAX_TRANSCRIBE_RESPONSE_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(VoiceProxyError::Decode)
     }
 
@@ -173,15 +168,30 @@ impl VoiceGatewayService {
         if !status.is_success() {
             return Err(VoiceProxyError::UpstreamStatus(status));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|err| VoiceProxyError::Upstream(err))?;
-        if bytes.len() > MAX_SYNTHESIZE_RESPONSE_BYTES {
-            return Err(VoiceProxyError::ResponseTooLarge);
-        }
+        let bytes = read_bounded_response(response, MAX_SYNTHESIZE_RESPONSE_BYTES).await?;
         serde_json::from_slice(&bytes).map_err(VoiceProxyError::Decode)
     }
+}
+
+async fn read_bounded_response(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> Result<Vec<u8>, VoiceProxyError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(VoiceProxyError::ResponseTooLarge);
+    }
+
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(VoiceProxyError::Upstream)? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(VoiceProxyError::ResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// Errors from the sidecar proxy layer.
@@ -204,7 +214,11 @@ pub enum VoiceProxyError {
 impl VoiceProxyError {
     fn into_http_error(self) -> (StatusCode, String) {
         match &self {
-            VoiceProxyError::Upstream(e) if e.is_connect() || e.is_timeout() || e.is_request() => (
+            VoiceProxyError::Upstream(e) if e.is_timeout() => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "Voice sidecar timed out".to_string(),
+            ),
+            VoiceProxyError::Upstream(e) if e.is_connect() || e.is_request() => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Voice sidecar unavailable".to_string(),
             ),
@@ -247,10 +261,10 @@ pub struct VoiceTranscribeRequest {
     #[serde(default = "default_transcribe_format")]
     pub format: String,
     /// BCP 47 language tag or "auto".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
     /// Transcription model override (uses sidecar default when absent).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
@@ -263,6 +277,18 @@ pub struct VoiceTranscribeResponse {
     pub language: String,
     /// Model identifier used for transcription.
     pub model: String,
+    /// Sidecar confidence score, when available.
+    pub confidence: Option<f32>,
+    /// Timestamped transcript segments returned by the sidecar.
+    pub segments: Vec<VoiceTranscriptSegment>,
+}
+
+/// Timestamped portion of a transcription result.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct VoiceTranscriptSegment {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub text: String,
 }
 
 fn default_transcribe_format() -> String {
@@ -275,8 +301,11 @@ pub struct VoiceSynthesizeRequest {
     /// Text to synthesize.
     pub text: String,
     /// Voice identifier (uses sidecar default when absent).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
+    /// Language hint (uses sidecar default when absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Speech speed multiplier in `[0.5, 2.0]`.
     #[serde(default = "default_synthesize_speed")]
     pub speed: f32,
@@ -287,6 +316,8 @@ pub struct VoiceSynthesizeRequest {
 pub struct VoiceSynthesizeResponse {
     /// Base64-encoded WAV bytes.
     pub audio: String,
+    /// Audio media format returned by the sidecar.
+    pub format: String,
     /// Sample rate in Hz.
     pub sample_rate: u32,
     /// Duration in milliseconds.
@@ -317,7 +348,7 @@ pub async fn voice_transcribe_handler(
         "Voice service not configured".to_string(),
     ))?;
 
-    let mut req = body;
+    let req = body;
     if req.audio.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -331,8 +362,7 @@ pub async fn voice_transcribe_handler(
         ));
     }
 
-    let sidecar_req = req.clone();
-    let result = voice.transcribe_request(&sidecar_req).await;
+    let result = voice.transcribe_request(&req).await;
     let response = match result {
         Ok(r) => r,
         Err(err) => return Err(err.into_http_error()),
@@ -351,6 +381,8 @@ pub async fn voice_transcribe_handler(
         text: response.text,
         language: response.language,
         model: response.model,
+        confidence: response.confidence,
+        segments: response.segments,
     }))
 }
 
@@ -372,7 +404,7 @@ pub async fn voice_synthesize_handler(
         "Voice service not configured".to_string(),
     ))?;
 
-    let mut req = body;
+    let req = body;
     let text_chars = req.text.chars().count();
     if text_chars == 0 {
         return Err((
@@ -412,6 +444,8 @@ pub async fn voice_synthesize_handler(
 
 #[cfg(test)]
 mod tests {
+    use axum::Router;
+
     use super::*;
     use crate::channels::web::server::GatewayState;
     use crate::channels::web::test_helpers::TestGatewayBuilder;
@@ -462,11 +496,79 @@ mod tests {
     }
 
     #[test]
+    fn absent_optional_fields_are_omitted_for_sidecar_defaults() {
+        let transcribe = VoiceTranscribeRequest {
+            audio: "aGk=".to_string(),
+            format: "wav".to_string(),
+            language: None,
+            model: None,
+        };
+        let transcribe = serde_json::to_value(transcribe).expect("serialize transcription");
+        assert!(transcribe.get("language").is_none());
+        assert!(transcribe.get("model").is_none());
+
+        let synthesize = VoiceSynthesizeRequest {
+            text: "hello".to_string(),
+            voice: None,
+            language: None,
+            speed: 1.0,
+        };
+        let synthesize = serde_json::to_value(synthesize).expect("serialize synthesis");
+        assert!(synthesize.get("voice").is_none());
+        assert!(synthesize.get("language").is_none());
+    }
+
+    #[test]
     fn test_builder_can_inject_voice_gateway() {
         let service = mock_voice_service("hello").expect("valid service");
         let state: Arc<GatewayState> = TestGatewayBuilder::new()
             .voice_gateway(Arc::new(service))
             .build();
         assert!(state.voice_gateway.is_some());
+    }
+
+    #[tokio::test]
+    async fn sidecar_timeout_maps_to_gateway_timeout() {
+        let app = Router::new().route(
+            "/v1/voice/transcribe",
+            axum::routing::post(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Json(serde_json::json!({
+                    "text": "late",
+                    "language": "en",
+                    "model": "mock",
+                    "confidence": null,
+                    "segments": []
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock sidecar");
+        let port = listener.local_addr().expect("sidecar address").port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve mock sidecar");
+        });
+        let service = VoiceGatewayService::with_timeout(
+            &format!("http://127.0.0.1:{port}"),
+            SecretString::from("token"),
+            Duration::from_millis(20),
+        )
+        .expect("voice service");
+        let request = VoiceTranscribeRequest {
+            audio: "aGk=".to_string(),
+            format: "wav".to_string(),
+            language: None,
+            model: None,
+        };
+
+        let error = service
+            .transcribe_request(&request)
+            .await
+            .expect_err("request should time out");
+        assert_eq!(error.into_http_error().0, StatusCode::GATEWAY_TIMEOUT);
+        server.abort();
     }
 }

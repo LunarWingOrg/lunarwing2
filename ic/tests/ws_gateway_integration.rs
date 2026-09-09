@@ -62,6 +62,8 @@ async fn start_test_server() -> (
         chat_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(30, 60),
         oauth_rate_limiter: lunarwing::channels::web::server::RateLimiter::new(10, 60),
         webhook_rate_limiter: lunarwing::channels::web::server::RateLimiter::new(10, 60),
+        voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(30, 60),
+        voice_gateway: None,
         registry_entries: Vec::new(),
         cost_guard: None,
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),

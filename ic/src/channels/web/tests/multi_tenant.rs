@@ -81,6 +81,8 @@ fn build_state(
         chat_rate_limiter: PerUserRateLimiter::new(30, 60),
         oauth_rate_limiter: RateLimiter::new(10, 60),
         webhook_rate_limiter: RateLimiter::new(10, 60),
+        voice_rate_limiter: PerUserRateLimiter::new(30, 60),
+        voice_gateway: None,
         registry_entries: Vec::new(),
         cost_guard: None,
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),

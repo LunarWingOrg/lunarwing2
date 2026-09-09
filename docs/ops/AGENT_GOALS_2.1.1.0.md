@@ -72,6 +72,9 @@
     Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
 
 19. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+    - REPO DONE 2026-09-09 (`voce`): added authenticated `POST /api/voice/transcribe` and `POST /api/voice/synthesize` gateway endpoints backed by loopback-only LunarVoice with server-held `VOICE_AUTH_TOKEN`; desktop clients never receive sidecar URL/token.
+    - Bounds: 8 MiB transcription and 4 KiB synthesis request bodies, 2,000-character synthesis text, 1 MiB/4 MiB streamed response caps, 3-second connect and 120-second total timeouts, per-user 30/60s rate limit, sidecar duration limits, and request-cancellation behavior documented in `docs/guides/VOICE_GATEWAY_API.md`.
+    - VERIFY: voice unit tests (6/6), real-gateway/mock-sidecar integration tests (8/8, including client cancellation), and focused auth test (1/1) pass. Remaining exit criterion before checking item: deploy current branch to one tenant and complete live transcription plus synthesis.
 
 20. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
