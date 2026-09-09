@@ -878,16 +878,18 @@ set_tenant_knowledge_sync() {  # <tenant> <true|false>
     true|false) : ;;
     *) die "knowledge sync state must be true or false" ;;
   esac
-  _env_set "$env_path" KNOWLEDGE_SYNC_ENABLED "$enabled"
   if [[ "$enabled" == "true" ]]; then
+    # Install the root-owned source scheduler before committing the tenant
+    # opt-in, so a failed scheduler install cannot leave a silently static source.
+    ensure_knowledge_source_scheduler
     [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS)" ]] \
       || _env_set "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS 6
     [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)" ]] \
       || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN 500
     [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)" ]] \
       || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN 10485760
-    ensure_knowledge_source_scheduler
   fi
+  _env_set "$env_path" KNOWLEDGE_SYNC_ENABLED "$enabled"
   say "additive knowledge sync for tenant '$name': $enabled"
 }
 
