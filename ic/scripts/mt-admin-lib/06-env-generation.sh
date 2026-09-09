@@ -114,7 +114,7 @@ study_notes_write_enabled() {  # <raw boolean>
 publish_study_notes_generation() {  # <checkout home>
   local home="$1" revision manifest tmp published_at
   validate_study_notes_home "$home"
-  revision="$(git -C "$home" rev-parse --verify HEAD^{commit} 2>/dev/null)" \
+  revision="$(git -C "$home" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
     || die "Study Notes checkout has no valid HEAD commit: $home"
   [[ "$revision" =~ ^[0-9a-fA-F]{7,128}$ ]] \
     || die "Study Notes checkout returned an invalid revision: $home"
