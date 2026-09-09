@@ -83,14 +83,15 @@
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked).
+23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
+24. [x] (S) Reserved
+25. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132
 
 ## Phase 5 - Documentation
 
-24. [ ] update all docs in docs/guides
-25. [ ] update all docs in docs/architecture
-26. [ ] first draft of release notes
-27. [ ] update readme in root of repo
-28. [x] (S) Reserved
+26. [ ] update all docs in docs/guides
+27. [ ] update all docs in docs/architecture
+28. [ ] first draft of release notes
+29. [x] (S) Updated README.md at root of repo
 
 ---
