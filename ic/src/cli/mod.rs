@@ -471,6 +471,16 @@ mod tests {
     }
 
     #[test]
+    fn refresh_knowledge_json_flag_parses() {
+        let cli = Cli::try_parse_from(["lunarwing", "refresh-knowledge", "--json"])
+            .expect("refresh command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::RefreshKnowledge { json: true })
+        ));
+    }
+
+    #[test]
     #[cfg(feature = "import")]
     fn test_help_output() {
         let mut cmd = Cli::command();
