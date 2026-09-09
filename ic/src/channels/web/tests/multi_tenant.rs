@@ -750,6 +750,9 @@ mod auth_enforcement {
             .route("/api/routines/{id}", get(authed_handler))
             .route("/api/routines/{id}/toggle", post(authed_handler))
             .route("/api/routines/{id}", delete(authed_handler))
+            // Voice API
+            .route("/api/voice/transcribe", post(authed_handler))
+            .route("/api/voice/synthesize", post(authed_handler))
             // Skills
             .route("/api/skills", get(authed_handler))
             .route("/api/skills/search", post(authed_handler))
@@ -825,6 +828,15 @@ mod auth_enforcement {
         assert_requires_auth(&app, Method::GET, &format!("/api/routines/{id}")).await;
         assert_requires_auth(&app, Method::POST, &format!("/api/routines/{id}/toggle")).await;
         assert_requires_auth(&app, Method::DELETE, &format!("/api/routines/{id}")).await;
+    }
+
+    #[tokio::test]
+    async fn test_voice_handlers_require_auth() {
+        let auth = MultiAuthState::single("secret-tok".to_string(), "user".to_string());
+        let app = auth_test_router(auth);
+
+        assert_requires_auth(&app, Method::POST, "/api/voice/transcribe").await;
+        assert_requires_auth(&app, Method::POST, "/api/voice/synthesize").await;
     }
 
     #[tokio::test]

@@ -863,6 +863,37 @@ async fn async_main() -> anyhow::Result<()> {
                 skills_max_context_tokens: config.skills.max_context_tokens,
             });
         }
+
+        // Desktop-facing voice API proxy: `config.transcription` holds the
+        // server-held sidecar URL + bearer token. Both must be present;
+        // when absent the voice endpoints return 503 (unconfigured).
+        match (
+            config.transcription.voice_service_url.clone(),
+            config.transcription.voice_auth_token.clone(),
+        ) {
+            (Some(url), Some(token)) => {
+                match lunarwing::channels::web::VoiceGatewayService::new(&url, token) {
+                    Ok(service) => {
+                        tracing::info!("Desktop voice API proxy configured");
+                        gw = gw.with_voice_gateway(service);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "VOICE_SERVICE_URL rejected; desktop voice endpoints offline");
+                    }
+                }
+            }
+            (None, Some(_)) => {
+                tracing::warn!(
+                    "VOICE_AUTH_TOKEN set without VOICE_SERVICE_URL; desktop voice API offline"
+                );
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    "VOICE_SERVICE_URL set without VOICE_AUTH_TOKEN; desktop voice API offline"
+                );
+            }
+            (None, None) => {}
+        }
         if config.sandbox.enabled {
             gw = gw.with_prompt_queue(Arc::clone(&prompt_queue));
         }

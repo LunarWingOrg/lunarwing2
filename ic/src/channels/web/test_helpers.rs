@@ -23,6 +23,7 @@ use crate::channels::web::ws::WsConnectionTracker;
 pub struct TestGatewayBuilder {
     msg_tx: Option<mpsc::Sender<IncomingMessage>>,
     llm_provider: Option<Arc<dyn crate::llm::LlmProvider>>,
+    voice_gateway: Option<Arc<crate::channels::web::handlers::voice::VoiceGatewayService>>,
     user_id: String,
 }
 
@@ -31,6 +32,7 @@ impl Default for TestGatewayBuilder {
         Self {
             msg_tx: None,
             llm_provider: None,
+            voice_gateway: None,
             user_id: "test-user".to_string(),
         }
     }
@@ -52,6 +54,15 @@ impl TestGatewayBuilder {
     /// Set the LLM provider (needed for OpenAI-compatible API tests).
     pub fn llm_provider(mut self, provider: Arc<dyn crate::llm::LlmProvider>) -> Self {
         self.llm_provider = Some(provider);
+        self
+    }
+
+    /// Set the voice gateway service (needed for voice API tests).
+    pub fn voice_gateway(
+        mut self,
+        gateway: Arc<crate::channels::web::handlers::voice::VoiceGatewayService>,
+    ) -> Self {
+        self.voice_gateway = Some(gateway);
         self
     }
 
@@ -88,6 +99,8 @@ impl TestGatewayBuilder {
             chat_rate_limiter: PerUserRateLimiter::new(30, 60),
             oauth_rate_limiter: RateLimiter::new(10, 60),
             webhook_rate_limiter: RateLimiter::new(10, 60),
+            voice_rate_limiter: PerUserRateLimiter::new(30, 60),
+            voice_gateway: self.voice_gateway,
             registry_entries: Vec::new(),
             cost_guard: None,
             routine_engine: Arc::new(tokio::sync::RwLock::new(None)),

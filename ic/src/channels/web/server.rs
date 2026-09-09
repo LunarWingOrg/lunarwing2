@@ -375,6 +375,10 @@ pub struct GatewayState {
     pub oauth_rate_limiter: RateLimiter,
     /// Rate limiter for webhook trigger endpoints (10 requests per 60 seconds).
     pub webhook_rate_limiter: RateLimiter,
+    /// Per-user rate limiter for voice endpoints (30 requests per 60 seconds per user).
+    pub voice_rate_limiter: PerUserRateLimiter,
+    /// Proxy to the loopback LunarVoice sidecar for the desktop voice API.
+    pub voice_gateway: Option<Arc<crate::channels::web::handlers::voice::VoiceGatewayService>>,
     /// Registry catalog entries for the available extensions API.
     /// Populated at startup from `registry/` manifests, independent of extension manager.
     pub registry_entries: Vec<crate::extensions::RegistryEntry>,
@@ -579,6 +583,19 @@ pub(super) async fn start_server_with_mascot(
             post(super::openai_compat::chat_completions_handler),
         )
         .route("/v1/models", get(super::openai_compat::models_handler))
+        // Voice API (desktop-facing proxy to loopback LunarVoice sidecar)
+        .route(
+            "/api/voice/transcribe",
+            post(super::handlers::voice::voice_transcribe_handler).route_layer(
+                DefaultBodyLimit::max(super::handlers::voice::VOICE_TRANSCRIBE_MAX_BODY_BYTES),
+            ),
+        )
+        .route(
+            "/api/voice/synthesize",
+            post(super::handlers::voice::voice_synthesize_handler).route_layer(
+                DefaultBodyLimit::max(super::handlers::voice::VOICE_SYNTHESIZE_MAX_BODY_BYTES),
+            ),
+        )
         .route_layer(middleware::from_fn_with_state(
             auth_state.clone(),
             auth_middleware,
