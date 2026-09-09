@@ -48,6 +48,7 @@ pub mod hygiene;
 pub mod knowledge;
 pub mod knowledge_seed;
 pub mod knowledge_sweep;
+pub mod knowledge_sync;
 pub mod layer;
 pub mod privacy;
 #[cfg(feature = "postgres")]
