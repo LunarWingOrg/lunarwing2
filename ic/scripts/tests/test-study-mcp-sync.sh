@@ -14,6 +14,7 @@ tenant_lw_root() { printf '%s/home/%s/lunarwing' "$fixture" "$1"; }
 tenant_env_dir() { printf '%s/env' "$(tenant_lw_root "$1")"; }
 tenant_state_dir() { printf '%s/state' "$(tenant_lw_root "$1")"; }
 tenant_exists_in_registry() { return 0; }
+require_root() { :; }
 chown() { :; }
 say() { :; }
 selinuxenabled() { return 1; }
@@ -167,6 +168,20 @@ if grep -q '^LW2STUDYMCP_HOME=' "$(tenant_env_dir test2)/lunarwing.env"; then
   printf 'Study Notes auto-configuration wired a tenant from a failed sync\n' >&2
   exit 1
 fi
+
+# The host scheduler entrypoint discovers enabled tenants and publishes their
+# configured source without touching disabled tenant settings.
+PORTS_REGISTRY="$fixture/ports.json"
+cat >"$PORTS_REGISTRY" <<'EOF'
+{"version":16,"tenants":{"test":{},"test3":{},"test4":{}}}
+EOF
+printf 'scheduled finding\n' > "$STUDY_NOTES_REPO/agent-notes-by-agent/test-agent/scheduled.md"
+git -C "$STUDY_NOTES_REPO" add -A
+git_commit "$STUDY_NOTES_REPO" scheduled
+sync_enabled_study_notes_sources
+grep -Fqx 'scheduled finding' \
+  "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/test-agent/scheduled.md"
+[[ "$(jq -r '.source_revision' "$manifest")" == "$(git -C "$STUDY_NOTES_REPO" rev-parse HEAD)" ]]
 
 # CLI surface pins: add-tenant(s) auto-configure flags and configure-study-mcp sync.
 # (SCRIPT_DIR is redefined by the sourced script to ic/scripts.)
