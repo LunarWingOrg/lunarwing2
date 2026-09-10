@@ -3729,6 +3729,15 @@ mod tests {
         started: tokio::sync::Barrier,
     }
 
+    /// A tool that rendezvouses once in flight, then waits for release.
+    ///
+    /// Lets a test prove an action (steer note, cancel, ...) was queued while
+    /// the tool future was genuinely pending, then finish the call normally.
+    struct BarrierReleaseEffects {
+        in_flight: tokio::sync::Barrier,
+        release: tokio::sync::Barrier,
+    }
+
     struct CountingEffects {
         actions: Vec<ActionDef>,
         executions: AtomicUsize,
@@ -3744,6 +3753,43 @@ mod tests {
             Self {
                 started: tokio::sync::Barrier::new(2),
             }
+        }
+    }
+
+    impl BarrierReleaseEffects {
+        fn new() -> Self {
+            Self {
+                in_flight: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectExecutor for BarrierReleaseEffects {
+        async fn execute_action(
+            &self,
+            action_name: &str,
+            _: serde_json::Value,
+            _: &CapabilityLease,
+            _: &ThreadExecutionContext,
+        ) -> Result<ActionResult, EngineError> {
+            self.in_flight.wait().await;
+            self.release.wait().await;
+            Ok(ActionResult {
+                call_id: String::new(),
+                action_name: action_name.to_string(),
+                output: serde_json::json!({"ok": true}),
+                is_error: false,
+                duration: Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _: &[CapabilityLease],
+        ) -> Result<Vec<ActionDef>, EngineError> {
+            Ok(vec![test_action_def("slow_tool")])
         }
     }
 
@@ -4258,6 +4304,105 @@ mod tests {
                 EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn injected_steer_note_waits_for_in_flight_tool_and_lands_at_next_boundary() {
+        // Mirrors the orchestrator loop's host-call order around one tool call:
+        // the steer note is queued while the tool future is still pending, then
+        // drained by the next `__check_signals__` poll. Contract (WI#105 scope
+        // decision): inject never cancels the in-flight tool and never reads as
+        // a stop; only ThreadSignal::Stop / the cancellation token can abort a
+        // tool (pinned by `cancelled_code_step_aborts_in_flight_tool`).
+        let code = concat!(
+            "result = __execute_action__('slow_tool', {}, call_id='slow')\n",
+            "signal = __check_signals__()\n",
+            "{'outcome': 'completed', 'response': 'done', 'state': {}}",
+        );
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        thread.transition_to(ThreadState::Running, None).unwrap();
+
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let effects = Arc::new(BarrierReleaseEffects::new());
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let (signal_tx, mut signal_rx) = signal_channel(16);
+        let token = CancellationToken::new();
+
+        // Queue the steer note only after the tool future is provably in
+        // flight (barrier rendezvous), then release the tool.
+        let steerer = {
+            let effects = Arc::clone(&effects);
+            let signal_tx = signal_tx.clone();
+            async move {
+                effects.in_flight.wait().await;
+                signal_tx
+                    .send(ThreadSignal::InjectMessage(ThreadMessage::user(
+                        "steer note queued mid-tool",
+                    )))
+                    .await
+                    .unwrap();
+                effects.release.wait().await;
+            }
+        };
+
+        let state = serde_json::json!({});
+        let run = execute_orchestrator(
+            code,
+            &mut thread,
+            &llm,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut signal_rx,
+            &token,
+            None,
+            None,
+            None,
+            &state,
+        );
+
+        let (result, ()) =
+            tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(run, steerer) })
+                .await
+                .expect("steer-during-tool run should finish promptly");
+
+        let result = result.expect("orchestrator should return Ok");
+        // The steer note did not stop or fail the thread.
+        assert!(matches!(
+            result.outcome,
+            ThreadOutcome::Completed {
+                response: Some(ref response),
+            } if response == "done"
+        ));
+        // The in-flight tool ran to completion despite the queued note.
+        assert!(thread.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                EventKind::ActionExecuted {
+                    action_name, ..
+                } if action_name == "slow_tool"
+            )
+        }));
+        // handle_check_signals appended the note to the durable transcript...
+        assert_eq!(thread.messages.len(), 2);
+        assert_eq!(thread.messages[0].role, MessageRole::User);
+        assert_eq!(thread.messages[0].content, "steer note queued mid-tool");
+        assert_eq!(thread.messages[1].role, MessageRole::Assistant);
+        // ...and returned an inject payload for the Python loop, not a stop.
+        // (The loop appends the same note to its working context from that
+        // payload — see default.py `__check_signals__` handling.)
     }
 
     #[tokio::test]

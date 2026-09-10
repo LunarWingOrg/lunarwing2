@@ -516,6 +516,15 @@ provider streams and tool futures before signaling the next loop boundary.
 when the conversation is idle or completing an interrupt, up to four notes are
 persisted on the conversation and injected into its next foreground turn,
 including resume from a waiting or suspended thread.
+
+Steer is deliberately **not** a tool-preemption control (the WI#105 scope
+decision, see `docs/ops/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md`).
+A note queued while a tool future is pending does not abort that call: the
+inject signal only surfaces at the next `__check_signals__` poll, after the
+in-flight tool's result. Only `/interrupt` (`ThreadSignal::Stop` / the run
+token) cancels an in-flight tool. To stop a long-running tool, interrupt; to
+redirect the turn afterward, steer — an interrupt followed by a steer note
+lands the note on the next turn.
 Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
 persist a duplicate terminal response.
