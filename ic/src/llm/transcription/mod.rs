@@ -9,7 +9,9 @@ mod lunarvoice;
 mod openai;
 
 pub use self::chat_completions::ChatCompletionsTranscriptionProvider;
-pub use self::lunarvoice::{LunarVoiceConfigError, LunarVoiceTranscriptionProvider};
+pub use self::lunarvoice::{
+    LunarVoiceConfigError, LunarVoiceTranscriptionProvider, synthesis_endpoint, voice_endpoint,
+};
 pub use self::openai::OpenAiWhisperProvider;
 
 use async_trait::async_trait;

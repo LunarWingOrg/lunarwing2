@@ -791,6 +791,12 @@ async fn async_main() -> anyhow::Result<()> {
     if let Some(ref gw_config) = config.channels.gateway {
         let mut gw = GatewayChannel::new(gw_config.clone(), config.owner_id.clone());
         gw = gw.with_llm_provider(Arc::clone(&components.llm));
+        if let Some(voice) =
+            lunarwing::channels::web::voice::VoiceApi::from_config(&config.transcription)
+                .map(std::sync::Arc::new)
+        {
+            gw = gw.with_voice_api(voice);
+        }
         if let Some(ref ws) = components.workspace {
             gw = gw.with_workspace(Arc::clone(ws));
         }
