@@ -302,18 +302,23 @@ EOF
 
 apply_prosody_credentials() { # <tenant>
   local tenant="$1"
-  local jid pass
+  local jid pass bundle
   jid="$tenant@$DOMAIN"
   pass="$(cat "$WORK/pass-$tenant")"
+  # SSL_CERT_FILE REPLACES the system roots for reqwest/rustls-native-certs
+  # (an empty result panics reqwest), so build a bundle: system bundle first,
+  # then the throwaway matrix CA.
+  bundle="$WORK/ca-bundle-$tenant.crt"
+  cat /etc/ssl/certs/ca-certificates.crt "$WORK/ca.crt" >"$bundle" 2>/dev/null \
+    || cat "$WORK/ca.crt" >"$bundle"
   # Both sides need the identity: the daemon's native XMPP channel (which
-  # POSTs /v1/configure) and any direct bridge run. SSL_CERT_FILE extends the
-  # rustls native roots with the throwaway matrix CA.
+  # POSTs /v1/configure) and any direct bridge run.
   set_env_value "$(tenant_env "$tenant")" XMPP_JID "$jid"
   set_env_value "$(tenant_env "$tenant")" XMPP_PASSWORD "$pass"
-  set_env_value "$(tenant_env "$tenant")" SSL_CERT_FILE "$WORK/ca.crt"
+  set_env_value "$(tenant_env "$tenant")" SSL_CERT_FILE "$bundle"
   set_env_value "$(tenant_bridge_env "$tenant")" XMPP_JID "$jid"
   set_env_value "$(tenant_bridge_env "$tenant")" XMPP_PASSWORD "$pass"
-  set_env_value "$(tenant_bridge_env "$tenant")" SSL_CERT_FILE "$WORK/ca.crt"
+  set_env_value "$(tenant_bridge_env "$tenant")" SSL_CERT_FILE "$bundle"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
