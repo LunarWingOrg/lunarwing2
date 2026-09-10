@@ -133,8 +133,7 @@ _deregister_worker_unit() {
 # ── External-worker config.toml generation ────────────────────────────────────
 #
 # External workers speak the lunarwing-agent-v1 WebSocket
-# protocol (legacy alias ironclaw-agent-v1 is still accepted for back-compat)
-# and are routed by the agent's `create_job(mode: "<worker>")` tool.
+# protocol and are routed by the agent's `create_job(mode: "<worker>")` tool.
 # The daemon discovers them from `[[sandbox.external_workers]]` blocks in
 # `config.toml` under the tenant's LUNARWING_BASE_DIR (the state dir). Without
 # this block the agent has nothing to route `create_job(mode: "<worker>")` to

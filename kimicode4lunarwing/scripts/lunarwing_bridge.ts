@@ -1,7 +1,6 @@
 /**
  * lunarwing_bridge.ts — WebSocket bridge between LunarWing agents and the
- * Kimi Code CLI. Implements the lunarwing-agent-v1 subprotocol
- * (legacy alias ironclaw-agent-v1 still accepted for one deprecation cycle).
+ * Kimi Code CLI. Implements the lunarwing-agent-v1 subprotocol.
  *
  * Supports two roles:
  *   server — listens for inbound agent connections (default)
@@ -19,7 +18,6 @@ import {
   validateTaskRequest,
   writeWsState,
   SUBPROTOCOL,
-  LEGACY_SUBPROTOCOL,
   WORKER_ID,
   WORKER_VERSION,
   type Envelope,
@@ -287,13 +285,10 @@ function startServer(): void {
         callback(false, 401, "Unauthorized")
       }
     },
-    // Validate subprotocol: accept the primary name or the legacy alias, and
-    // echo back the matched offered value (preferring the primary). Old
-    // daemons offer only the legacy name and reject an echo they never
-    // offered, so a static echo of the new name would break them.
+    // Validate subprotocol: accept only the primary name. The removed
+    // `ironclaw-agent-v1` alias is not accepted.
     handleProtocols: (protocols: Set<string>): string | false => {
       if (protocols.has(SUBPROTOCOL)) return SUBPROTOCOL
-      if (protocols.has(LEGACY_SUBPROTOCOL)) return LEGACY_SUBPROTOCOL
       return false
     },
   })
@@ -344,7 +339,7 @@ function startServer(): void {
     listening = true
     updateState()
     console.log(`[bridge] server listening on ws://${WS_BIND_HOST}:${WS_PORT}${WS_PATH}`)
-    console.log(`[bridge] subprotocol: ${SUBPROTOCOL} (legacy alias accepted: ${LEGACY_SUBPROTOCOL})`)
+    console.log(`[bridge] subprotocol: ${SUBPROTOCOL}`)
     console.log("[bridge] auth: enabled")
   })
   updateState()
@@ -374,7 +369,7 @@ async function startClient(): Promise<void> {
     }
 
     try {
-      const ws = new WebSocket(uri, [SUBPROTOCOL, LEGACY_SUBPROTOCOL], {
+      const ws = new WebSocket(uri, [SUBPROTOCOL], {
         headers,
         maxPayload: WS_MAX_PAYLOAD_BYTES,
       })

@@ -1,6 +1,5 @@
 //! WebSocket client for external workers speaking the `lunarwing-agent-v1`
-//! protocol (legacy alias `ironclaw-agent-v1` is still offered for workers
-//! built before the rename).
+//! protocol.
 //!
 //! External workers are persistent containers (Pebble, OpenCode, Kimi Code, etc.) that the
 //! orchestrator connects to on demand rather than creating per-job.
@@ -28,10 +27,6 @@ use crate::error::OrchestratorError;
 
 /// Primary WebSocket subprotocol spoken by external workers.
 pub const SUBPROTOCOL: &str = "lunarwing-agent-v1";
-
-/// Legacy subprotocol alias, still offered so workers built before the
-/// ironclaw -> lunarwing rename keep negotiating successfully.
-pub const SUBPROTOCOL_LEGACY: &str = "ironclaw-agent-v1";
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Envelope {
@@ -131,6 +126,34 @@ fn is_loopback(host: &str) -> bool {
         || host == "::1"
         || host == "[::1]"
         || host == "0.0.0.0"
+}
+
+/// Operator-facing explanation appended to a worker handshake rejection when
+/// the failure signature matches a subprotocol mismatch (HTTP 400 with no
+/// echoed `Sec-WebSocket-Protocol`), the visible symptom of the daemon
+/// running ahead of a still-legacy-only worker during a rolling upgrade.
+const LEGACY_SUBPROTOCOL_HINT: &str = "the worker rejected the WebSocket \
+     subprotocol offer; since 2.1.1 the daemon offers only `lunarwing-agent-v1` \
+     (the `ironclaw-agent-v1` alias was removed), so this is usually a worker \
+     container from an older release — recreate/upgrade worker containers in \
+     the same maintenance window as the daemon";
+
+/// Render a worker connect error, enriching the subprotocol-mismatch failure
+/// signature (HTTP 4xx rejection without an echoed subprotocol header) with
+/// the rolling-upgrade operator hint. Any other error keeps its plain
+/// `Display` form so unrelated failures stay unambiguous.
+fn describe_connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+
+    if let Error::Http(response) = error
+        && response.status().is_client_error()
+    {
+        let echoed_subprotocol = response.headers().get("sec-websocket-protocol").is_some();
+        if !echoed_subprotocol {
+            return format!("{error} ({LEGACY_SUBPROTOCOL_HINT})");
+        }
+    }
+    error.to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -901,13 +924,9 @@ async fn connect_and_handshake(
         }
     })?;
 
-    // Offer both subprotocol names, preferred name first (RFC 6455 order).
-    // New workers echo `lunarwing-agent-v1`; pre-rename workers echo the
-    // legacy alias — tungstenite accepts either since both are in the offer.
-    let mut req_builder = http::Request::builder().uri(&uri).header(
-        "Sec-WebSocket-Protocol",
-        format!("{SUBPROTOCOL}, {SUBPROTOCOL_LEGACY}"),
-    );
+    let mut req_builder = http::Request::builder()
+        .uri(&uri)
+        .header("Sec-WebSocket-Protocol", SUBPROTOCOL);
 
     if let Some(token) = auth_token {
         req_builder = req_builder.header("Authorization", format!("Bearer {token}"));
@@ -945,7 +964,7 @@ async fn connect_and_handshake(
     })?
     .map_err(|e| OrchestratorError::ExternalWorkerConnectionFailed {
         worker_name: worker_name.to_string(),
-        reason: e.to_string(),
+        reason: describe_connect_failure(&e),
     })?;
 
     let (write_half, mut read) = ws_stream.split();
@@ -1490,6 +1509,39 @@ mod tests {
     use super::*;
     use crate::config::LoadBalanceStrategy;
     use lunarwing_common::PromptContextRole;
+
+    #[test]
+    fn describe_connect_failure_enriches_subprotocol_rejection() {
+        use tokio_tungstenite::tungstenite::http::Response;
+
+        let rejected = tokio_tungstenite::tungstenite::Error::Http(
+            Response::builder()
+                .status(400)
+                .body(Some(Vec::new()))
+                .expect("valid http response"),
+        );
+        let reason = describe_connect_failure(&rejected);
+        assert!(
+            reason.contains("lunarwing-agent-v1"),
+            "hint should name the only offered subprotocol: {reason}"
+        );
+        assert!(
+            reason.contains("ironclaw-agent-v1"),
+            "hint should name the removed alias: {reason}"
+        );
+    }
+
+    #[test]
+    fn describe_connect_failure_keeps_other_errors_plain() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let io_error = Error::Io(std::io::Error::other("refused"));
+        assert_eq!(
+            describe_connect_failure(&io_error),
+            io_error.to_string(),
+            "non-HTTP failures must keep their plain display form"
+        );
+    }
 
     #[test]
     fn envelope_serialization() {
