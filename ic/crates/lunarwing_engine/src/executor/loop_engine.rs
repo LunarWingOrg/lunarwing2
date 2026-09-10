@@ -253,8 +253,12 @@ impl ExecutionLoop {
         let checkpoint = self.load_runtime_checkpoint();
 
         // Transition to Running if this is a fresh start or restart from a resumable state.
+        // Broadcast via `transition_to_broadcast` so subscribers (mission event
+        // listener, gateway SSE) observe the transition. Only a fresh start
+        // transitions from `Created`; resume paths enter from
+        // Waiting/Suspended, which thread-start consumers treat distinctly.
         if self.thread.state != ThreadState::Running {
-            self.thread.transition_to(ThreadState::Running, None)?;
+            self.transition_to_broadcast(ThreadState::Running, None)?;
         }
 
         // Pre-fetch shared memory docs once — used by both prompt overlay and
@@ -1853,6 +1857,35 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn fresh_start_transition_is_broadcast_in_order() {
+        // The Created -> Running transition must reach broadcast subscribers
+        // (mission listener, gateway SSE) as a ThreadStateChanged, before any
+        // later thread events, so consumers can treat it as a thread start.
+        let (exec, _tx) = make_loop(
+            vec![text_response("Hello!")],
+            vec![],
+            ThreadConfig::default(),
+        )
+        .await;
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel(32);
+        let mut exec = exec.with_event_tx(event_tx);
+
+        exec.run().await.unwrap();
+
+        let first = event_rx.try_recv().expect("start transition broadcast");
+        assert!(matches!(
+            first.kind,
+            EventKind::StateChanged {
+                from: ThreadState::Created,
+                to: ThreadState::Running,
+                ..
+            }
+        ));
+        // Ordering: no event for this thread may precede the start transition.
+        assert_eq!(first.thread_id, exec.thread.id);
     }
 
     // ── CodeAct / RLM tests ─────────────────────────────────
