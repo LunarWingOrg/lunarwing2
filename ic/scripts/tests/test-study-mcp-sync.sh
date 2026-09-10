@@ -155,7 +155,14 @@ set_tenant_knowledge_sync test4 false
 grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=false' "$(tenant_env_dir test4)/lunarwing.env"
 
 # Manual refresh executes the tenant binary through the safe env-loader path,
-# without reaching into either init system or restarting the daemon.
+# without reaching into either init system or restarting the daemon. The
+# registry fixture is created here (not later) so every registry-touching call
+# below — including run_tenant_knowledge_refresh — reads the fixture instead of
+# the host's /etc/lunarwing/ports.json, which does not exist on CI runners.
+PORTS_REGISTRY="$fixture/ports.json"
+cat >"$PORTS_REGISTRY" <<'EOF'
+{"version":16,"tenants":{"test":{},"test3":{},"test4":{}}}
+EOF
 export REFRESH_LOG="$fixture/refresh.log"
 OPENRC_ENV_EXEC="$fixture/env-exec"
 cat >"$OPENRC_ENV_EXEC" <<'EOF'
@@ -205,10 +212,6 @@ fi
 
 # The host scheduler entrypoint discovers enabled tenants and publishes their
 # configured source without touching disabled tenant settings.
-PORTS_REGISTRY="$fixture/ports.json"
-cat >"$PORTS_REGISTRY" <<'EOF'
-{"version":16,"tenants":{"test":{},"test3":{},"test4":{}}}
-EOF
 printf 'scheduled finding\n' > "$STUDY_NOTES_REPO/agent-notes-by-agent/test-agent/scheduled.md"
 git -C "$STUDY_NOTES_REPO" add -A
 git_commit "$STUDY_NOTES_REPO" scheduled
