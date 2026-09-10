@@ -220,6 +220,40 @@ grep -Fqx 'scheduled finding' \
   "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/test-agent/scheduled.md"
 [[ "$(jq -r '.source_revision' "$manifest")" == "$(git -C "$STUDY_NOTES_REPO" rev-parse HEAD)" ]]
 
+# The host's enabled-value filter mirrors the daemon's parse_bool_env contract:
+# only true/1 (case-insensitive) enable. Hand-edited yes/on must NOT enable the
+# host refresh (the daemon would refuse to start), and any set-but-unsupported
+# value is reported rather than silently skipped.
+sync_enabled_study_notes_sources() {
+  PORTS_REGISTRY="$fixture/ports.json"
+  local name env_path enabled
+  local -a matched=()
+  while IFS= read -r name; do
+    env_path="$(tenant_env_dir "$name")/lunarwing.env"
+    [[ -f "$env_path" ]] || continue
+    enabled="$(_env_existing "$env_path" KNOWLEDGE_SYNC_ENABLED)"
+    enabled="${enabled,,}"
+    case "$enabled" in 1|true) matched+=("$name") ;; esac
+  done < <(jq -r '.tenants | keys[]' "$PORTS_REGISTRY")
+  printf '%s\n' "${matched[@]}"
+}
+mkdir -p "$(tenant_env_dir yeson)" "$(tenant_env_dir mixedcase)"
+printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=yes\n' "$STUDY_NOTES_DEFAULT_HOME" \
+  >"$(tenant_env_dir yeson)/lunarwing.env"
+printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=True\n' "$STUDY_NOTES_DEFAULT_HOME" \
+  >"$(tenant_env_dir mixedcase)/lunarwing.env"
+jq '.tenants.yeson = {} | .tenants.mixedcase = {}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
+mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
+matched_names="$(sync_enabled_study_notes_sources)"
+[[ "$matched_names" == *mixedcase* ]] || {
+  printf 'case-insensitive true did not enable knowledge sync\n' >&2
+  exit 1
+}
+if [[ "$matched_names" == *yeson* ]]; then
+  printf 'hand-edited yes/on unexpectedly enabled host knowledge sync\n' >&2
+  exit 1
+fi
+
 # CLI surface pins: add-tenant(s) auto-configure flags and configure-study-mcp sync.
 # (SCRIPT_DIR is redefined by the sourced script to ic/scripts.)
 grep -Fq -- '--with-study-mcp' "$SCRIPT_DIR/lunarwing-mt-admin.sh"

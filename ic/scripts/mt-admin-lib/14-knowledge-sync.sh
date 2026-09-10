@@ -108,9 +108,18 @@ sync_enabled_study_notes_sources() {
     env_path="$(tenant_env_dir "$name")/lunarwing.env"
     [[ -f "$env_path" ]] || continue
     enabled="$(_env_existing "$env_path" KNOWLEDGE_SYNC_ENABLED)"
+    # Mirror the daemon's parse_bool_env contract exactly (case-insensitive
+    # true/1 only) so a hand-edited value can never leave the host scheduler
+    # refreshing a source the daemon refuses to start with (yes/on).
+    enabled="${enabled,,}"
     case "$enabled" in
-      1|true|TRUE|yes|YES|on|ON) ;;
-      *) continue ;;
+      1|true) ;;
+      "")
+        ;;
+      *)
+        say "WARNING: tenant '$name' has unsupported KNOWLEDGE_SYNC_ENABLED='$enabled' (expected true/1/false/0); skipping"
+        continue
+        ;;
     esac
     home="$(_env_existing "$env_path" LW2STUDYMCP_HOME)"
     [[ -n "$home" ]] \
