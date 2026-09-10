@@ -302,6 +302,13 @@ main() {
   "$MT_ADMIN" add-tenant "$TENANT_B" --docker-group >/dev/null || die "add-tenant $TENANT_B failed"
   CREATED_TENANTS+=("$TENANT_B")
 
+  # add-tenant provisions accounts/env/ports but does not compile; the units
+  # need release binaries. One build each (the second reuses the shared
+  # target cache), matching the release-only build policy.
+  step "building tenant binaries (release)"
+  "$MT_ADMIN" build-tenant "$TENANT_A" >/dev/null || die "build-tenant $TENANT_A failed"
+  "$MT_ADMIN" build-tenant "$TENANT_B" >/dev/null || die "build-tenant $TENANT_B failed"
+
   # Agent occupant nicks default to the tenant name.
   local nick_a="$TENANT_A" nick_b="$TENANT_B"
   local occupant_a="$ROOM/$nick_a" occupant_b="$ROOM/$nick_b"
