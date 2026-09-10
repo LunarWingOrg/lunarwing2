@@ -51,7 +51,7 @@
 
 10. [ ] Please re-attempt this. Last attempt was on: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/887 - comments dictate necessary and recommend fixes from previous attempt - Work item #97 — Coordination knowledge sharing (production residual)** `[coordination,knowledge-sharing]` - Repo fix + 4/4 live matrix done (goals #13/#27/#37). REMAINING: (a) production sunburst/ruffles operator actions — set `XMPP_ALLOW_ROOMS_JSON`, `COORD_KNOWLEDGE_PUBLISHERS` full-occupant JIDs, restart both engines, re-test `KNOW:` wire path; (b) tracker body still carries the live-disproved user-bare recommendation — correct/close; (c) suggested hardening from #37: init-agnostic read-only mt-admin coordination doctor, bounded reason counters + empty-publisher startup warning, automated 4-case live matrix for release-sensitive changes, optional server-attested real-JID policy for non-anonymous MUCs - You may create multiple temporary testing tenants in order to test this properly. If you are successful in getting this whole thing to work, you must also write a guide in docs/guides on getting this set up correctly so it can be reproduced
 
-11. [ ] Please re-attempt this: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/884 - feedback is in MR description. Even older attempt here: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/874 and rarity/kimi-11-20260909-0901 - comments of old MR offer suggestions on improving - **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
+11. [x] Please re-attempt this: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/884 - feedback is in MR description. Even older attempt here: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/874 and rarity/kimi-11-20260909-0901 - comments of old MR offer suggestions on improving - **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
 
 12. [x] (S) Mascot Design Art Project
 
@@ -91,12 +91,12 @@
     Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design
 
 22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/130 - code in comments too look at
+23. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 - see all comments and updates since time this was created. do not implicitly believe all claims being made by agents or humans. validate each prior to beginning work on proper engine hardening for this issue
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
-24. [x] (S) Reserved for CI/CD fixes
-25. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 - see all comments and updates since time this was created. do not implicitly believe all claims being made by agents or humans. validate each prior to beginning work on proper engine hardening for this issue
+24. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
+25. [x] (S) Reserved for CI/CD fixes
 
 ## Phase 5 - Documentation
 
