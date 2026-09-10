@@ -1541,7 +1541,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                     "properties": {
                         "name": {"type": "string", "description": "Short name for the mission/routine"},
                         "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds"},
+                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events (e.g. thread starts), which are reserved for engine-managed missions."},
                         "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 10 when omitted."}
@@ -7222,6 +7222,63 @@ mod tests {
             },
         );
         assert!(thread_event_to_app_events(&event, "thread-1").is_empty());
+    }
+
+    #[test]
+    fn thread_start_transition_maps_to_gateway_state_change_event() {
+        // The broadcast Created -> Running transition (the engine/thread_start
+        // producer) must surface on the gateway SSE stream as a
+        // thread_state_changed event so clients observe thread starts live.
+        let thread_id = lunarwing_engine::ThreadId::new();
+        let event = lunarwing_engine::ThreadEvent::new(
+            thread_id,
+            lunarwing_engine::EventKind::StateChanged {
+                from: lunarwing_engine::ThreadState::Created,
+                to: lunarwing_engine::ThreadState::Running,
+                reason: None,
+            },
+        );
+        let app_events = thread_event_to_app_events(&event, "thread-1");
+        assert_eq!(app_events.len(), 1);
+        assert!(matches!(
+            &app_events[0],
+            AppEvent::ThreadStateChanged {
+                thread_id,
+                from_state,
+                to_state,
+                ..
+            } if thread_id == "thread-1"
+                && from_state == "Created"
+                && to_state == "Running"
+        ));
+    }
+
+    #[test]
+    fn thread_resume_transition_maps_to_gateway_state_change_event() {
+        // Resume transitions (Waiting -> Running) ride the same broadcast and
+        // map to the same SSE event shape, distinguished from a fresh start by
+        // from_state so clients can tell starts from resumes.
+        let event = lunarwing_engine::ThreadEvent::new(
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::EventKind::StateChanged {
+                from: lunarwing_engine::ThreadState::Waiting,
+                to: lunarwing_engine::ThreadState::Running,
+                reason: Some("resumed".into()),
+            },
+        );
+        let app_events = thread_event_to_app_events(&event, "thread-1");
+        assert_eq!(app_events.len(), 1);
+        assert!(matches!(
+            &app_events[0],
+            AppEvent::ThreadStateChanged {
+                from_state,
+                to_state,
+                reason,
+                ..
+            } if from_state == "Waiting"
+                && to_state == "Running"
+                && reason.as_deref() == Some("resumed")
+        ));
     }
 
     #[test]
