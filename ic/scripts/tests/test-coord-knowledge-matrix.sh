@@ -307,10 +307,14 @@ apply_prosody_credentials() { # <tenant>
   pass="$(cat "$WORK/pass-$tenant")"
   # SSL_CERT_FILE REPLACES the system roots for reqwest/rustls-native-certs
   # (an empty result panics reqwest), so build a bundle: system bundle first,
-  # then the throwaway matrix CA.
-  bundle="$WORK/ca-bundle-$tenant.crt"
+  # then the throwaway matrix CA. The bundle must outlive $WORK teardown, so
+  # it lives in the tenant's env dir (root:tenant 0644) and is removed with
+  # the tenants.
+  bundle="$(tenant_home "$tenant")/lunarwing/env/matrix-ca-bundle.crt"
   cat /etc/ssl/certs/ca-certificates.crt "$WORK/ca.crt" >"$bundle" 2>/dev/null \
     || cat "$WORK/ca.crt" >"$bundle"
+  chown "$(stat -c '%U:%G' "$(tenant_env "$tenant")")" "$bundle"
+  chmod 0644 "$bundle"
   # Both sides need the identity: the daemon's native XMPP channel (which
   # POSTs /v1/configure) and any direct bridge run.
   set_env_value "$(tenant_env "$tenant")" XMPP_JID "$jid"
