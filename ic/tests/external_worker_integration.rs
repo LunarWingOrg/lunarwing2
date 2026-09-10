@@ -1001,12 +1001,12 @@ async fn legacy_only_worker_is_rejected() {
     .expect("test timed out")
     .expect_err("expected connection failure against legacy-only worker");
 
+    let OrchestratorError::ExternalWorkerConnectionFailed { ref reason, .. } = err else {
+        panic!("got {err:?}");
+    };
     assert!(
-        matches!(
-            err,
-            OrchestratorError::ExternalWorkerConnectionFailed { .. }
-        ),
-        "got {err:?}"
+        reason.contains("lunarwing-agent-v1") && reason.contains("ironclaw-agent-v1"),
+        "operator hint for the removed legacy subprotocol should surface in the failure reason: {reason}"
     );
 }
 
