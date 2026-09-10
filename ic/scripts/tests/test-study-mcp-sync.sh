@@ -91,7 +91,36 @@ if sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>/dev/null; then
   exit 1
 fi
 [[ ! -e "$manifest" ]]
+
+# A transient pull failure retains the last-good generation when HEAD still
+# matches the recorded revision: the published manifest survives (with its
+# original revision) and no stale last-good marker is left behind.
+# (the dirty-checkout path above leaves no manifest, so restore the checkout
+# and seed a last-good state from a fresh successful sync first)
 git -C "$STUDY_NOTES_DEFAULT_HOME" checkout -q -- study_notes_mcp.py
+sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
+retained_revision="$(jq -r '.source_revision' "$manifest")"
+# git pull reads the checkout's own origin, not STUDY_NOTES_REPO, so make the
+# remote itself unreachable to simulate a transient network failure.
+git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$fixture/nonexistent-origin.git"
+if sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>/dev/null; then
+  printf 'Study Notes sync unexpectedly succeeded with an unreachable upstream\n' >&2
+  exit 1
+fi
+[[ -f "$manifest" ]] || {
+  printf 'transient pull failure dropped the last-good generation manifest\n' >&2
+  exit 1
+}
+[[ "$(jq -r '.source_revision' "$manifest")" == "$retained_revision" ]] || {
+  printf 'retained manifest does not carry the last-good revision\n' >&2
+  exit 1
+}
+[[ ! -e "$STUDY_NOTES_DEFAULT_HOME/.git/.lunarwing-study-notes-generation.last-good" ]] || {
+  printf 'stale last-good marker left behind after restoration\n' >&2
+  exit 1
+}
+# Restore the reachable remote for the later provision/scheduler assertions.
+git -C "$STUDY_NOTES_DEFAULT_HOME" remote set-url origin "$STUDY_NOTES_REPO"
 
 # A non-git directory is never modified by the sync.
 mkdir -p "$fixture/not-git"

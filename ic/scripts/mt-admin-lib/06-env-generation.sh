@@ -135,11 +135,12 @@ sync_study_notes_checkout() {  # <checkout home>
   # Clone the shared lw2studymcp checkout when missing, or fast-forward an
   # existing clean git checkout to the latest upstream. A non-git directory or
   # a dirty checkout is never modified — the operator must repair it by hand.
-  local home="$1" parent manifest
+  local home="$1" parent manifest last_good
   validate_study_notes_path "$home" "Study Notes home"
   require_cmd git
   parent="$(dirname -- "$home")"
   manifest="$home/.git/lunarwing-study-notes-generation.json"
+  last_good="$home/.git/.lunarwing-study-notes-generation.last-good"
   if [[ ! -d "$parent" ]]; then
     install -d -m 0755 -- "$parent" \
       || die "failed to create Study Notes parent directory: $parent"
@@ -149,11 +150,34 @@ sync_study_notes_checkout() {  # <checkout home>
   # pass when the before/after manifest check observes the missing/new marker.
   (
     flock -x 200
+    # Keep the current manifest aside so a transient sync failure (e.g. a
+    # network blip during git pull) can restore the last-good generation
+    # instead of leaving tenants without any published one. Restoration only
+    # happens while HEAD still matches the recorded revision: a manifest
+    # claiming the old revision over moved-forward content would defeat the
+    # before/after scan barrier, so a partial move keeps the barrier down.
+    cp -f -- "$manifest" "$last_good" 2>/dev/null || true
+    restore_last_good_generation() {
+      local revision recorded
+      [[ -f "$last_good" ]] || return 0
+      revision="$(git -C "$home" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+      recorded="$(jq -r '.source_revision // empty' "$last_good" 2>/dev/null || true)"
+      if [[ -z "$revision" || "$revision" != "$recorded" ]]; then
+        rm -f -- "$last_good"
+        say "WARNING: Study Notes sync moved the checkout; last-good generation stays invalidated"
+        return 0
+      fi
+      if mv -f -- "$last_good" "$manifest"; then
+        say "retained last-good Study Notes generation after a failed sync"
+      else
+        say "WARNING: failed to restore the last-good Study Notes generation manifest"
+      fi
+    }
     rm -f -- "$manifest"
     if [[ ! -e "$home" ]]; then
       say "cloning Study Notes MCP checkout: $STUDY_NOTES_REPO -> $home"
       git clone --quiet "$STUDY_NOTES_REPO" "$home" \
-        || die "Study Notes clone failed: $STUDY_NOTES_REPO"
+        || { restore_last_good_generation; die "Study Notes clone failed: $STUDY_NOTES_REPO"; }
     else
       [[ -d "$home" ]] || die "Study Notes home is not a directory: $home"
       [[ -d "$home/.git" ]] \
@@ -161,9 +185,12 @@ sync_study_notes_checkout() {  # <checkout home>
       [[ -z "$(git -C "$home" status --porcelain 2>/dev/null)" ]] \
         || die "Study Notes checkout has local changes; refusing to sync: $home"
       say "syncing Study Notes MCP checkout to latest upstream: $home"
-      git -C "$home" pull --ff-only --quiet \
-        || die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
+      git -C "$home" pull --ff-only --quiet || {
+        restore_last_good_generation
+        die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
+      }
     fi
+    rm -f -- "$last_good"
     publish_study_notes_generation "$home"
   ) 200>"$parent/.study-notes-sync.lock"
 }
