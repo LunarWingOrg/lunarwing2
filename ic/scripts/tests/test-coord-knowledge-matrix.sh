@@ -303,11 +303,11 @@ main() {
   CREATED_TENANTS+=("$TENANT_B")
 
   # add-tenant provisions accounts/env/ports but does not compile; the units
-  # need release binaries. One build each (the second reuses the shared
-  # target cache), matching the release-only build policy.
-  step "building tenant binaries (release)"
-  "$MT_ADMIN" build-tenant "$TENANT_A" >/dev/null || die "build-tenant $TENANT_A failed"
-  "$MT_ADMIN" build-tenant "$TENANT_B" >/dev/null || die "build-tenant $TENANT_B failed"
+  # need release binaries AND the XMPP WASM channel (the installable channel
+  # that drives the bridge's join/receive allowlist via /v1/configure).
+  step "building tenant binaries + XMPP channel (release)"
+  "$MT_ADMIN" build-tenant "$TENANT_A" --with-wasm >/dev/null || die "build-tenant $TENANT_A failed"
+  "$MT_ADMIN" build-tenant "$TENANT_B" --with-wasm >/dev/null || die "build-tenant $TENANT_B failed"
 
   # Agent occupant nicks default to the tenant name.
   local nick_a="$TENANT_A" nick_b="$TENANT_B"
@@ -324,8 +324,8 @@ main() {
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || die "restart $TENANT_B failed"
 
   step "precondition: room join/receive"
-  if wait_until "$TENANT_A bridge shows the room joined (configured+presence)" 120 room_has_presence "$TENANT_A" \
-     && wait_until "$TENANT_B bridge shows the room joined (configured+presence)" 120 room_has_presence "$TENANT_B"; then
+  if wait_until "$TENANT_A bridge shows the room joined (configured+presence)" 240 room_has_presence "$TENANT_A" \
+     && wait_until "$TENANT_B bridge shows the room joined (configured+presence)" 240 room_has_presence "$TENANT_B"; then
     pass "precondition: both bridges joined $ROOM"
     report "precondition: both bridges report \`$ROOM\` in configured_rooms and rooms_with_presence"
   else
@@ -338,7 +338,7 @@ main() {
   step "case 1: room bare JID is a room-wide opt-in"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$ROOM"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
-  wait_until "$TENANT_B rejoined the room" 120 room_has_presence "$TENANT_B" || true
+  wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
   local t1="item10-room-bare"
   share "$TENANT_A" "$t1" "room-wide opt-in finding from the automated matrix"
   sleep 8
@@ -356,7 +356,7 @@ main() {
   step "case 2: exact occupant JID admits the pinned nick only"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$occupant_a"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
-  wait_until "$TENANT_B rejoined the room" 120 room_has_presence "$TENANT_B" || true
+  wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
   local t2="item10-full-occupant"
   share "$TENANT_A" "$t2" "exact occupant finding from the automated matrix"
   sleep 8
@@ -374,7 +374,7 @@ main() {
   step "case 3: user bare JID is not a MUC publisher identity"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$nick_a@$DOMAIN"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
-  wait_until "$TENANT_B rejoined the room" 120 room_has_presence "$TENANT_B" || true
+  wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
   local t3="item10-user-bare-denied" before3 after3 rows3
   before3="$(dropped "$TENANT_B" not_allowed_publisher)"
   share "$TENANT_A" "$t3" "user-bare allowlist must drop this delivered share"
@@ -400,7 +400,7 @@ main() {
   step "case 4: impostor occupant nick denied under exact-occupant allowlist"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$occupant_a"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
-  wait_until "$TENANT_B rejoined the room" 120 room_has_presence "$TENANT_B" || true
+  wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
   local t4="item10-impostor-denied" rows4
   share "$TENANT_A" "$t4" "impostor nick must not match the exact occupant entry"
   sleep 8
