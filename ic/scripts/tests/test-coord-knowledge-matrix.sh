@@ -89,6 +89,9 @@ cleanup() {
   fi
   podman rm -f "$PROSODY_NAME" >/dev/null 2>&1 || true
   sed -i '/item10-matrix-mark/d' /etc/hosts 2>/dev/null || true
+  # Shred throwaway credentials and keys; the dir vanishes with $WORK anyway.
+  find "$WORK" -type f \( -name 'pass-*' -o -name '*.key' -o -name '*.crt' \) \
+    -exec sh -c 'shred -u "$1" 2>/dev/null || true' _ {} \; 2>/dev/null || true
   rm -rf "$WORK"
   return $rc
 }
@@ -112,6 +115,7 @@ done
   command -v podman >/dev/null 2>&1 || die "docker (or podman aliased) required for the isolated Prosody"
 command -v jq >/dev/null 2>&1 || die "jq required"
 command -v curl >/dev/null 2>&1 || die "curl required"
+command -v openssl >/dev/null 2>&1 || die "openssl required (throwaway matrix CA)"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -241,12 +245,37 @@ start_prosody() {
   # matrix domain at loopback for this run and remove it at teardown.
   grep -q " item10-matrix-mark" /etc/hosts 2>/dev/null || \
     printf '127.0.0.1 %s # item10-matrix-mark\n' "$DOMAIN" >> /etc/hosts
+  # The XMPP stack is STARTTLS-mandatory and verifies the server certificate
+  # against the system roots, so mint a throwaway CA + server cert for the
+  # matrix domain and trust the CA process-wide via SSL_CERT_FILE (honored by
+  # rustls-native-certs). Secrets live only in the run-scoped $WORK dir and
+  # are shredded at teardown.
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout "$WORK/ca.key" \
+    -out "$WORK/ca.crt" -days 2 -subj "/CN=item10-matrix-ca" \
+    >/dev/null 2>&1 || die "openssl CA generation failed"
+  cat >"$WORK/server.ext" <<EOF
+subjectAltName=DNS:$DOMAIN,DNS:conference.$DOMAIN
+extendedKeyUsage=serverAuth
+EOF
+  openssl req -newkey rsa:2048 -nodes -keyout "$WORK/server.key" \
+    -out "$WORK/server.csr" -subj "/CN=$DOMAIN" >/dev/null 2>&1 \
+    || die "openssl CSR generation failed"
+  openssl x509 -req -in "$WORK/server.csr" -CA "$WORK/ca.crt" \
+    -CAkey "$WORK/ca.key" -CAcreateserial -out "$WORK/server.crt" \
+    -days 2 -extfile "$WORK/server.ext" >/dev/null 2>&1 \
+    || die "openssl server certificate signing failed"
+  mkdir -p "$WORK/certs"
+  cp "$WORK/server.crt" "$WORK/server.key" "$WORK/certs/"
   local cfg="$WORK/prosody.cfg.lua"
   cat >"$cfg" <<EOF
 VirtualHost "$DOMAIN"
   authentication = "internal_plain"
   allow_unencrypted_plain_auth = true
   c2s_require_encryption = false
+  ssl = {
+    certificate = "/etc/prosody/certs/matrix.crt",
+    key = "/etc/prosody/certs/matrix.key",
+  }
 
 Component "conference.$DOMAIN" "muc"
   muc_room_locking = false
@@ -258,6 +287,8 @@ EOF
   podman run -d --name "$PROSODY_NAME" \
     --network "host" \
     -v "$cfg:/etc/prosody/conf.d/$DOMAIN.cfg.lua:ro" \
+    -v "$WORK/certs/server.crt:/etc/prosody/certs/matrix.crt:ro" \
+    -v "$WORK/certs/server.key:/etc/prosody/certs/matrix.key:ro" \
     "$PROSODY_IMAGE" >/dev/null || die "prosody container failed to start"
   # Register the two tenant accounts inside the container.
   local tenant pass
@@ -275,11 +306,14 @@ apply_prosody_credentials() { # <tenant>
   jid="$tenant@$DOMAIN"
   pass="$(cat "$WORK/pass-$tenant")"
   # Both sides need the identity: the daemon's native XMPP channel (which
-  # POSTs /v1/configure) and any direct bridge run.
+  # POSTs /v1/configure) and any direct bridge run. SSL_CERT_FILE extends the
+  # rustls native roots with the throwaway matrix CA.
   set_env_value "$(tenant_env "$tenant")" XMPP_JID "$jid"
   set_env_value "$(tenant_env "$tenant")" XMPP_PASSWORD "$pass"
+  set_env_value "$(tenant_env "$tenant")" SSL_CERT_FILE "$WORK/ca.crt"
   set_env_value "$(tenant_bridge_env "$tenant")" XMPP_JID "$jid"
   set_env_value "$(tenant_bridge_env "$tenant")" XMPP_PASSWORD "$pass"
+  set_env_value "$(tenant_bridge_env "$tenant")" SSL_CERT_FILE "$WORK/ca.crt"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
