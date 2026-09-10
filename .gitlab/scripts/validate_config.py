@@ -235,6 +235,15 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     scan_script = "\n".join(merged.get(".worker-scan", {}).get("script", []))
     if ". ./worker-image.env" not in scan_script:
         errors.append("worker scan must reload candidate values from its artifact")
+    scan_artifacts = merged.get(".worker-scan", {}).get("artifacts", {})
+    if isinstance(scan_artifacts, dict):
+        reports = scan_artifacts.get("reports", {})
+        if not isinstance(reports, dict) or "container_scanning" not in reports:
+            errors.append("worker scan must emit a container_scanning report")
+        if "gl-container-scanning-report.json" not in str(reports.get("container_scanning", "")):
+            errors.append("worker scan container_scanning report path is unexpected")
+    else:
+        errors.append("worker scan must declare artifacts with a container_scanning report")
     promotion_helper = ROOT / ".gitlab/scripts/promote-worker-image.py"
     if not promotion_helper.is_file() or "candidate_metadata()" not in promotion_helper.read_text(
         encoding="utf-8"
@@ -310,6 +319,23 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         commands = "\n".join(script if isinstance(script, list) else [str(script)])
         if any(fragment not in commands for fragment in fragments):
             errors.append(f"{job_name} does not enforce its required backend test shape")
+
+    junit_jobs = {
+        "python-unit": ("junit-python.xml", ".gitlab/scripts/python_tests.py"),
+        "shell-harnesses": ("junit-shell.xml", ".gitlab/scripts/shell-harnesses-junit.sh"),
+    }
+    for job_name, (report, script_fragment) in junit_jobs.items():
+        job = merged.get(job_name, {})
+        if not isinstance(job, dict):
+            errors.append(f"{job_name} job missing")
+            continue
+        commands = "\n".join(job.get("script", []))
+        if script_fragment not in commands:
+            errors.append(f"{job_name} must run {script_fragment}")
+        artifacts = job.get("artifacts", {})
+        reports = artifacts.get("reports", {}) if isinstance(artifacts, dict) else {}
+        if not isinstance(reports, dict) or reports.get("junit") != report:
+            errors.append(f"{job_name} must report junit artifact {report}")
 
 
 def cache_policies(job: object) -> list[str]:
