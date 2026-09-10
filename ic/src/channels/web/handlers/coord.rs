@@ -480,6 +480,106 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// `/coord/knowledge` requires bearer auth exactly like every other
+    /// coordination admin route: no credentials and a wrong token both reject.
+    #[tokio::test]
+    async fn test_knowledge_diagnostics_route_requires_auth() {
+        let store = test_store();
+        let diagnostics = Arc::new(
+            crate::hooks::coordination_knowledge::IngestDiagnostics::default(),
+        );
+        let addr = match start_coord_admin_server_with_knowledge(
+            Arc::clone(&store),
+            SecretString::from(TEST_TOKEN.to_string()),
+            0,
+            Some(diagnostics),
+        )
+        .await
+        {
+            Ok(addr) => addr,
+            Err(err) => panic!("failed to start admin server: {err}"),
+        };
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let resp = match client.get(format!("{base}/coord/knowledge")).send().await {
+            Ok(r) => r,
+            Err(err) => panic!("unauthenticated GET /coord/knowledge failed: {err}"),
+        };
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        let resp = match client
+            .get(format!("{base}/coord/knowledge"))
+            .bearer_auth("wrong-token")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => panic!("wrong-token GET /coord/knowledge failed: {err}"),
+        };
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// `/coord/knowledge` reports the four stable, body-free drop counters
+    /// in enum declaration order, reflecting the shared diagnostics handle.
+    #[tokio::test]
+    async fn test_knowledge_diagnostics_route_reports_stable_shape() {
+        use crate::hooks::coordination_knowledge::IngestDropReason;
+
+        let store = test_store();
+        let diagnostics = Arc::new(
+            crate::hooks::coordination_knowledge::IngestDiagnostics::default(),
+        );
+        diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
+        diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
+        diagnostics.record_drop(IngestDropReason::GlobalRateLimited);
+        let addr = match start_coord_admin_server_with_knowledge(
+            Arc::clone(&store),
+            SecretString::from(TEST_TOKEN.to_string()),
+            0,
+            Some(Arc::clone(&diagnostics)),
+        )
+        .await
+        {
+            Ok(addr) => addr,
+            Err(err) => panic!("failed to start admin server: {err}"),
+        };
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+
+        let resp = match authed(&client, client.get(format!("{base}/coord/knowledge")))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => panic!("authorized GET /coord/knowledge failed: {err}"),
+        };
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(err) => panic!("invalid JSON from /coord/knowledge: {err}"),
+        };
+        let dropped = body["dropped"].as_array().cloned().unwrap_or_default();
+        let shape: Vec<(String, u64)> = dropped
+            .iter()
+            .map(|entry| {
+                (
+                    entry["reason"].as_str().unwrap_or_default().to_string(),
+                    entry["count"].as_u64().unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("invalid_sender".to_string(), 0),
+                ("not_allowed_publisher".to_string(), 2),
+                ("sender_rate_limited".to_string(), 0),
+                ("global_rate_limited".to_string(), 1),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn test_admin_server_status_and_actions() {
         let store = test_store();
