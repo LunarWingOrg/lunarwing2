@@ -148,10 +148,7 @@ fn describe_connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> St
     if let Error::Http(response) = error
         && response.status().is_client_error()
     {
-        let echoed_subprotocol = response
-            .headers()
-            .get("sec-websocket-protocol")
-            .is_some();
+        let echoed_subprotocol = response.headers().get("sec-websocket-protocol").is_some();
         if !echoed_subprotocol {
             return format!("{error} ({LEGACY_SUBPROTOCOL_HINT})");
         }
