@@ -1,6 +1,6 @@
 # Pebble Worker — Operational Guide
 
-The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding harness as a LunarWing external worker. It speaks the `lunarwing-agent-v1` WebSocket protocol (the legacy `ironclaw-agent-v1` alias is no longer accepted) and spawns `pebble prompt --output-format ndjson` per task.
+The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding harness as a LunarWing external worker. It speaks the `lunarwing-agent-v1` WebSocket protocol (the legacy `ironclaw-agent-v1` alias is no longer accepted) and spawns `pebble prompt --output-format ndjson` per task. Because the alias is gone, recreate/upgrade worker containers in the same maintenance window as the daemon (see the upgrade-ordering note in [`WORKER-CONTAINERS.md`](WORKER-CONTAINERS.md)).
 
 ## Single-Instance Setup
 
