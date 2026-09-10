@@ -106,7 +106,10 @@ Response:
 
 ### Errors
 
-Errors use a stable JSON shape:
+Errors use a stable JSON shape. Upstream (sidecar) failures are never
+forwarded verbatim — the sidecar's `detail` text is logged server-side and
+clients receive a generic `upstream_error` message, so a sidecar credential
+failure reads as a server problem, not a gateway-token problem.
 
 ```json
 { "error": "bad_request", "message": "speed must be between 0.5 and 2.0" }
@@ -118,8 +121,10 @@ Errors use a stable JSON shape:
 | `unauthorized` | 401 | Missing/invalid gateway bearer token (auth middleware) |
 | `payload_too_large` | 413 | Base64 audio exceeds `max_audio_b64_len` |
 | `rate_limited` | 429 | Per-user voice rate limit or sidecar rate limit |
-| `unavailable` | 503 | Voice API not configured (no `VOICE_AUTH_TOKEN`/provider) or sidecar TTS unavailable |
-| `upstream_error` | other | Sidecar failure; message summarizes the upstream status |
+| `unavailable` | 503 | Voice API not configured (no `VOICE_AUTH_TOKEN`/provider) |
+| `upstream_error` | 500 | Sidecar rejected the gateway credential (sidecar 401) |
+| `upstream_error` | 502 | Other sidecar failure (non-2xx status, unreachable, malformed/oversize response) |
+| `upstream_error` | 504 | Sidecar request timed out |
 
 ## Bounds and Security
 
@@ -134,6 +139,8 @@ Errors use a stable JSON shape:
   1 MiB synthesize) override the gateway's global 10 MiB limit.
 - **Response caps**: sidecar responses are streamed with hard byte caps
   (1 MiB transcription JSON, 64 MiB synthesis audio) before re-serialization.
+  Synthesis responses must declare `format: "wav"` — anything else is rejected
+  as an upstream contract violation rather than mislabeled audio.
 - **Rate limiting**: per-user `10 requests / 60 s` across voice endpoints, in
   addition to the sidecar's own rate limiter.
 - **Client model is fixed**: clients cannot choose the STT model; the gateway
