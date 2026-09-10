@@ -165,13 +165,38 @@ Scopes: reads span the caller's private scope plus the shared herd scope
   confidence, studied timestamp, source commit, tags, staleness thresholds).
   A JSON state file (`knowledge_seed_state.json` under the base dir, recording
   seeded/skipped/failed counts) makes the pass run at most once; note paths
-  that already exist are always skipped, so the store is never repopulated
-  and operator-authored notes are never overwritten. Per-note failures are
-  logged and recorded in the state file without blocking the marker, so
-  unimportable upstream notes cannot turn the one-shot seed into a per-boot
-  rescan. The env flag is written only on the add-tenant path —
-  never by `configure-study-mcp` or `upgrade-tenant` — so existing tenants
-  upgraded to a seed-capable binary are never seeded.
+  that already exist are always skipped, so the seed itself never repopulates
+  the store and operator-authored notes are never overwritten. Per-note
+  failures are logged and recorded in the state file without blocking the
+  marker, so unimportable upstream notes cannot turn the one-shot seed into a
+  per-boot rescan. The env flag is written only on the add-tenant path — never
+  by `configure-study-mcp` or `upgrade-tenant` — so existing tenants upgraded
+  to a seed-capable binary are never seeded.
+
+### Additive refresh (Phase 4)
+
+- **Published source generation** — mt-admin invalidates the generation marker,
+  fast-forwards a clean root-owned checkout under `flock`, validates its Study
+  Notes files, and atomically publishes
+  `.git/lunarwing-study-notes-generation.json`. A host-global systemd timer or
+  OpenRC cron entry updates every unique checkout used by an enabled tenant
+  hourly. A tenant pass reads the marker before and after its scan and rejects a
+  pass spanning an update.
+- **Independent daemon cadence** (`knowledge_sync`) — explicitly enabled by
+  `KNOWLEDGE_SYNC_ENABLED=true`; it does not depend on heartbeat or chat traffic.
+  The default cadence is six hours with deterministic startup jitter, a
+  cross-process single-flight lock, durable revision/failure state, and bounded
+  exponential failure backoff. Each pass imports at most 500 missing notes and
+  10 MiB by default. Existing paths are never changed or deleted.
+- `add-tenant --with-study-mcp` is the opt-in path for new tenants and enables
+  both the one-shot bootstrap and additive refresh. Existing tenants opt in with
+  `configure-study-mcp <tenant> --enable-knowledge-sync`, then restart once.
+  `refresh-knowledge <tenant> [--sync-source]` runs the same bounded importer
+  without a daemon restart; `sync-knowledge-sources` is the timer entrypoint.
+- This 2.1 fallback reports `mode=additive` and a Git source revision. It closes
+  the growing missing-note gap but does not claim hosted-store parity and does
+  not propagate upstream edits, lifecycle changes, or tombstones. A revisioned
+  hosted snapshot/delta contract remains the prerequisite for those operations.
 
 libSQL backend: implemented with FTS5 (`memory_chunks_fts`) and per-scope
 merge; note that FTS5 rank values are not comparable across scopes, so merged

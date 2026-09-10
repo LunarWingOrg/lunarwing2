@@ -14,9 +14,11 @@ tenant_lw_root() { printf '%s/home/%s/lunarwing' "$fixture" "$1"; }
 tenant_env_dir() { printf '%s/env' "$(tenant_lw_root "$1")"; }
 tenant_state_dir() { printf '%s/state' "$(tenant_lw_root "$1")"; }
 tenant_exists_in_registry() { return 0; }
+require_root() { :; }
 chown() { :; }
 say() { :; }
 selinuxenabled() { return 1; }
+ensure_knowledge_source_scheduler() { :; }
 sudo() {
   [[ "$1" == "-u" ]] || return 1
   shift 2
@@ -58,6 +60,10 @@ git_commit "$STUDY_NOTES_REPO" initial
 sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
 validate_study_notes_home "$STUDY_NOTES_DEFAULT_HOME"
 test -f "$fixture/shared/.study-notes-sync.lock"
+manifest="$STUDY_NOTES_DEFAULT_HOME/.git/lunarwing-study-notes-generation.json"
+test -f "$manifest"
+[[ "$(jq -r '.schema_version' "$manifest")" == "1" ]]
+[[ "$(jq -r '.source_revision' "$manifest")" == "$(git -C "$STUDY_NOTES_DEFAULT_HOME" rev-parse HEAD)" ]]
 python3 - "$STUDY_NOTES_DEFAULT_HOME/agent-notes.sqlite3" <<'PY'
 import sqlite3
 import sys
@@ -75,13 +81,16 @@ git_commit "$STUDY_NOTES_REPO" latest
 sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME"
 grep -Fqx 'latest finding' \
   "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/test-agent/new-topic.md"
+[[ "$(jq -r '.source_revision' "$manifest")" == "$(git -C "$STUDY_NOTES_REPO" rev-parse HEAD)" ]]
 
-# A dirty checkout is never modified by the sync.
+# A dirty checkout is never modified by the sync and its old publication is
+# invalidated so tenants cannot accept a generation while the source is unsafe.
 printf 'local edit\n' >> "$STUDY_NOTES_DEFAULT_HOME/study_notes_mcp.py"
 if sync_study_notes_checkout "$STUDY_NOTES_DEFAULT_HOME" 2>/dev/null; then
   printf 'Study Notes sync unexpectedly modified a dirty checkout\n' >&2
   exit 1
 fi
+[[ ! -e "$manifest" ]]
 git -C "$STUDY_NOTES_DEFAULT_HOME" checkout -q -- study_notes_mcp.py
 
 # A non-git directory is never modified by the sync.
@@ -104,9 +113,13 @@ if grep -q '^LW2STUDYMCP_ALLOW_WRITE=' "$(tenant_env_dir test)/lunarwing.env"; t
   exit 1
 fi
 
-# The add-tenant path arms the one-shot knowledge seed exactly once.
+# The add-tenant path arms the one-shot seed and opt-in additive cadence.
 grep -Fqx 'KNOWLEDGE_SEED_FROM_STUDY_MCP=1' "$(tenant_env_dir test)/lunarwing.env"
 [[ "$(grep -c '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test)/lunarwing.env")" -eq 1 ]]
+grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=true' "$(tenant_env_dir test)/lunarwing.env"
+grep -Fqx 'KNOWLEDGE_SYNC_CADENCE_HOURS=6' "$(tenant_env_dir test)/lunarwing.env"
+grep -Fqx 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=500' "$(tenant_env_dir test)/lunarwing.env"
+grep -Fqx 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=10485760' "$(tenant_env_dir test)/lunarwing.env"
 
 # Arming never clobbers an explicit operator opt-out.
 mkdir -p "$(tenant_env_dir test3)"
@@ -132,6 +145,48 @@ if grep -q '^KNOWLEDGE_SEED_FROM_STUDY_MCP=' "$(tenant_env_dir test4)/lunarwing.
   printf 'configure-study-mcp unexpectedly armed the knowledge seed\n' >&2
   exit 1
 fi
+if grep -q '^KNOWLEDGE_SYNC_ENABLED=' "$(tenant_env_dir test4)/lunarwing.env"; then
+  printf 'configure-study-mcp unexpectedly enabled knowledge sync\n' >&2
+  exit 1
+fi
+set_tenant_knowledge_sync test4 true
+grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=true' "$(tenant_env_dir test4)/lunarwing.env"
+set_tenant_knowledge_sync test4 false
+grep -Fqx 'KNOWLEDGE_SYNC_ENABLED=false' "$(tenant_env_dir test4)/lunarwing.env"
+
+# Manual refresh executes the tenant binary through the safe env-loader path,
+# without reaching into either init system or restarting the daemon.
+export REFRESH_LOG="$fixture/refresh.log"
+OPENRC_ENV_EXEC="$fixture/env-exec"
+cat >"$OPENRC_ENV_EXEC" <<'EOF'
+#!/usr/bin/env bash
+[[ "$1" == "--env-file" && -n "$2" && "$3" == "--" ]] || exit 2
+shift 3
+exec "$@"
+EOF
+chmod +x "$OPENRC_ENV_EXEC"
+mkdir -p "$(tenant_repo test4)/target/release"
+cat >"$(tenant_repo test4)/target/release/lunarwing" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$REFRESH_LOG"
+EOF
+chmod +x "$(tenant_repo test4)/target/release/lunarwing"
+run_tenant_knowledge_refresh test4 false
+grep -Fqx -- '--no-onboard refresh-knowledge --json' "$REFRESH_LOG"
+
+# A scheduler installation failure cannot commit a new tenant opt-in.
+mkdir -p "$(tenant_env_dir test5)"
+printf 'LW2STUDYMCP_HOME=%s\n' "$STUDY_NOTES_DEFAULT_HOME" \
+  >"$(tenant_env_dir test5)/lunarwing.env"
+if ( ensure_knowledge_source_scheduler() { die "scheduler unavailable"; }
+     set_tenant_knowledge_sync test5 true ) 2>/dev/null; then
+  printf 'knowledge sync unexpectedly enabled without a scheduler\n' >&2
+  exit 1
+fi
+if grep -q '^KNOWLEDGE_SYNC_ENABLED=' "$(tenant_env_dir test5)/lunarwing.env"; then
+  printf 'failed scheduler install left a knowledge sync opt-in\n' >&2
+  exit 1
+fi
 
 # A failing sync is contained: the caller survives and the tenant stays unwired.
 mkdir -p "$(tenant_env_dir test2)"
@@ -148,11 +203,28 @@ if grep -q '^LW2STUDYMCP_HOME=' "$(tenant_env_dir test2)/lunarwing.env"; then
   exit 1
 fi
 
+# The host scheduler entrypoint discovers enabled tenants and publishes their
+# configured source without touching disabled tenant settings.
+PORTS_REGISTRY="$fixture/ports.json"
+cat >"$PORTS_REGISTRY" <<'EOF'
+{"version":16,"tenants":{"test":{},"test3":{},"test4":{}}}
+EOF
+printf 'scheduled finding\n' > "$STUDY_NOTES_REPO/agent-notes-by-agent/test-agent/scheduled.md"
+git -C "$STUDY_NOTES_REPO" add -A
+git_commit "$STUDY_NOTES_REPO" scheduled
+sync_enabled_study_notes_sources
+grep -Fqx 'scheduled finding' \
+  "$STUDY_NOTES_DEFAULT_HOME/agent-notes-by-agent/test-agent/scheduled.md"
+[[ "$(jq -r '.source_revision' "$manifest")" == "$(git -C "$STUDY_NOTES_REPO" rev-parse HEAD)" ]]
+
 # CLI surface pins: add-tenant(s) auto-configure flags and configure-study-mcp sync.
 # (SCRIPT_DIR is redefined by the sourced script to ic/scripts.)
 grep -Fq -- '--with-study-mcp' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq -- '--study-mcp-home' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 grep -Fq -- '--sync) study_sync="true"; shift ;;' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+grep -Fq -- '--enable-knowledge-sync)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+grep -Fq 'refresh-knowledge)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
+grep -Fq 'sync-knowledge-sources)' "$SCRIPT_DIR/lunarwing-mt-admin.sh"
 # The add_tenant wiring call moved to the lifecycle library in the mt-admin split.
 grep -Fq 'provision_tenant_study_mcp "$name" "$study_mcp_home"' \
   "$SCRIPT_DIR/mt-admin-lib/04-tenant-lifecycle.sh"

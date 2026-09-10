@@ -212,6 +212,8 @@ source "$MT_ADMIN_LIB_DIR/11-postgres.sh"
 source "$MT_ADMIN_LIB_DIR/12-health-pipeline.sh"
 # shellcheck source=mt-admin-lib/13-cgroups-openrc.sh
 source "$MT_ADMIN_LIB_DIR/13-cgroups-openrc.sh"
+# shellcheck source=mt-admin-lib/14-knowledge-sync.sh
+source "$MT_ADMIN_LIB_DIR/14-knowledge-sync.sh"
 
 usage() {
   cat <<'EOF'
@@ -249,8 +251,9 @@ Commands:
                                    present and clean). Also arms a one-shot import
                                    of the synced checkout into the tenant's own
                                    knowledge store (KNOWLEDGE_SEED_FROM_STUDY_MCP=1,
-                                   first boot only; never re-populates or overwrites,
-                                   and upgrade-tenant never arms it).
+                                   first boot only) and enables bounded additive
+                                   refresh from hourly published checkout generations.
+                                   Existing knowledge paths are never overwritten.
     --study-mcp-home <path>        Use this checkout instead of the default shared one
                                    ($STUDY_NOTES_DEFAULT_HOME; still synced to latest)
     --opencode-model <model>       Override the opencode worker's LLM model
@@ -401,7 +404,14 @@ Commands:
                                    latest upstream (must be a clean git checkout)
     [--allow-write]                Enable approved core-agent writes using separate state
     [--state-home <absolute-path>]  State path (default: tenant lunarwing/study-notes-state)
-                                   (restart the tenant after configuration)
+    [--enable-knowledge-sync]      Enable additive refresh + host source scheduler
+    [--disable-knowledge-sync]     Disable the tenant daemon refresh cadence
+                                   (restart the tenant after configuration changes)
+
+  refresh-knowledge <name>         Run one bounded additive tenant import now
+    [--sync-source]                Fast-forward and publish its checkout first
+  sync-knowledge-sources           Refresh each unique source used by enabled tenants
+                                   (normally invoked by the host-global scheduler)
 
    configure-ssh <name>             Provision SSH harness for an existing tenant
      --host <host>                  SSH host (default: 127.0.0.1)
@@ -469,6 +479,10 @@ Environment:
                                    (empty = each tenant's local TensorZero proxy)
   LUNARWING_MT_GOTIFY_URL          Default Gotify server URL for new tenants
   LUNARWING_MT_GOTIFY_TITLE        Default Gotify notification title for new tenants
+  LUNARWING_MT_STUDY_NOTES_HOME    Default shared Study Notes checkout
+  LUNARWING_MT_STUDY_NOTES_REPO    Repository used when that checkout is first cloned
+  LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT
+                                   Root-owned snapshot directory used by the host scheduler
   LUNARWING_MT_BACKUP_DIR          Backup directory (default /var/lib/lunarwing-backups)
   LUNARWING_MT_BACKUP_KEEP         Keep last N dumps per tenant (default 7; 0 = keep all)
 
@@ -1185,13 +1199,19 @@ main() {
 
     configure-study-mcp)
       require_root
-      local name="" study_home="" study_state_home="" study_allow_write="false" study_sync="false"
+      local name="" study_home="" study_state_home="" study_allow_write="false" study_sync="false" knowledge_sync_mode=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --home) study_home="$2"; shift 2 ;;
           --state-home) study_state_home="$2"; shift 2 ;;
           --allow-write) study_allow_write="true"; shift ;;
           --sync) study_sync="true"; shift ;;
+          --enable-knowledge-sync)
+            [[ "$knowledge_sync_mode" != "false" ]] || die "knowledge sync enable/disable flags conflict"
+            knowledge_sync_mode="true"; shift ;;
+          --disable-knowledge-sync)
+            [[ "$knowledge_sync_mode" != "true" ]] || die "knowledge sync enable/disable flags conflict"
+            knowledge_sync_mode="false"; shift ;;
           -*)     die "unknown flag: $1" ;;
           *)
             if [[ -z "$name" ]]; then name="$1"; shift
@@ -1201,7 +1221,7 @@ main() {
         esac
       done
       [[ -n "$name" ]] \
-        || die "usage: configure-study-mcp <name> [--home <path>] [--sync] [--allow-write] [--state-home <path>]"
+        || die "usage: configure-study-mcp <name> [--home <path>] [--sync] [--allow-write] [--state-home <path>] [--enable-knowledge-sync|--disable-knowledge-sync]"
       # No --home: use the shared default checkout and always sync it to the
       # latest upstream first. An explicit --home stays operator-managed unless
       # --sync is also passed (then it must be a clean git checkout).
@@ -1213,6 +1233,31 @@ main() {
         sync_study_notes_checkout "$study_home"
       fi
       configure_study_mcp "$name" "$study_home" "$study_allow_write" "$study_state_home"
+      [[ -z "$knowledge_sync_mode" ]] \
+        || set_tenant_knowledge_sync "$name" "$knowledge_sync_mode"
+      ;;
+
+    refresh-knowledge)
+      require_root
+      local name="" sync_source="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --sync-source) sync_source="true"; shift ;;
+          -*) die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "usage: refresh-knowledge <name> [--sync-source]"
+      run_tenant_knowledge_refresh "$name" "$sync_source"
+      ;;
+
+    sync-knowledge-sources)
+      [[ $# -eq 0 ]] || die "usage: sync-knowledge-sources"
+      sync_enabled_study_notes_sources
       ;;
 
     configure-ssh)

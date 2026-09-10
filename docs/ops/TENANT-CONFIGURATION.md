@@ -367,23 +367,33 @@ If a Gotify server is available, configure it in `env/gotify.json`:
 
 The Gotify WASM tool reads this file at runtime. You can set the URL and title during tenant creation with `--gotify-url` and `--gotify-title`.
 
-## Study Notes / Knowledge Seeding
+## Study Notes / Knowledge Seeding and Refresh
 
-Two env keys in `env/lunarwing.env` control self-knowledge wiring:
+These env keys in `env/lunarwing.env` control self-knowledge wiring:
 
 ```bash
-LW2STUDYMCP_HOME=/var/cache/lunarwing/lw2studymcp   # Shared study-notes MCP checkout (read-only by default)
-KNOWLEDGE_SEED_FROM_STUDY_MCP=1                     # One-shot first-boot import of the ENTIRE shared base
-                                                # into this tenant's private knowledge store
+LW2STUDYMCP_HOME=/var/cache/lunarwing/lw2studymcp   # Root-managed, published checkout
+KNOWLEDGE_SEED_FROM_STUDY_MCP=1                     # One-shot first-boot import
+KNOWLEDGE_SYNC_ENABLED=true                         # Independent additive refresh cadence
+KNOWLEDGE_SYNC_CADENCE_HOURS=6
+KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=500
+KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=10485760
 ```
 
-Both are set by `add-tenant <name> --with-study-mcp`. The seed flag is written
-only on that provisioning path: `configure-study-mcp` never re-arms it and
-`upgrade-tenant` never touches it, so existing tenants are never populated or
-re-populated. The completed pass is recorded in
-`state/knowledge_seed_state.json`; deleting that file forces a safe re-seed
-(existing notes are never overwritten). Set the flag to `0` before first boot
-to opt out. Full guide:
+`add-tenant <name> --with-study-mcp` sets the checkout, seed flag, and bounded
+sync defaults. The seed flag is written only on that provisioning path:
+`configure-study-mcp` never re-arms it and `upgrade-tenant` never invents either
+opt-in. Existing tenants enable refresh explicitly with
+`configure-study-mcp <name> --sync --enable-knowledge-sync` and restart once.
+Set the seed flag to `0` before first boot to suppress bootstrap, or use
+`--disable-knowledge-sync` to stop periodic refresh.
+
+The one-shot state is `state/knowledge_seed_state.json`; additive cadence,
+revision, and failure/backoff state are in `state/knowledge_sync_state.json`.
+The host publishes a validated Git generation hourly through a systemd timer or
+OpenRC cron entry; tenant imports remain bounded, additive-only, and never
+replace existing paths. Run an immediate pass with
+`refresh-knowledge <name> [--sync-source]`. Full guide:
 [`../guides/TENANT_KNOWLEDGE_SEED.md`](../guides/TENANT_KNOWLEDGE_SEED.md).
 
 ## Runtime Behavior
