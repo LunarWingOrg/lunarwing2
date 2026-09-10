@@ -252,36 +252,48 @@ grep -Fqx 'scheduled finding' \
 # The host's enabled-value filter mirrors the daemon's parse_bool_env contract:
 # only true/1 (case-insensitive) enable. Hand-edited yes/on must NOT enable the
 # host refresh (the daemon would refuse to start), and any set-but-unsupported
-# value is reported rather than silently skipped.
-sync_enabled_study_notes_sources() {
-  PORTS_REGISTRY="$fixture/ports.json"
-  local name env_path enabled
-  local -a matched=()
-  while IFS= read -r name; do
-    env_path="$(tenant_env_dir "$name")/lunarwing.env"
-    [[ -f "$env_path" ]] || continue
-    enabled="$(_env_existing "$env_path" KNOWLEDGE_SYNC_ENABLED)"
-    enabled="${enabled,,}"
-    case "$enabled" in 1|true) matched+=("$name") ;; esac
-  done < <(jq -r '.tenants | keys[]' "$PORTS_REGISTRY")
-  printf '%s\n' "${matched[@]}"
-}
+# value is reported rather than silently skipped. The real
+# sync_enabled_study_notes_sources runs against the fixture registry isolated
+# above (a test-local override previously shadowed it and tripped shellcheck
+# SC2218 by being defined after its first invocation). Each tenant gets its own
+# fixture checkout so the enabled tenant's fast-forward and the skipped
+# tenant's untouched checkout are both observable.
 mkdir -p "$(tenant_env_dir yeson)" "$(tenant_env_dir mixedcase)"
-printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=yes\n' "$STUDY_NOTES_DEFAULT_HOME" \
+yeson_home="$fixture/shared/yeson"
+mixedcase_home="$fixture/shared/mixedcase"
+sync_study_notes_checkout "$yeson_home"
+sync_study_notes_checkout "$mixedcase_home"
+printf 'filter finding\n' > "$STUDY_NOTES_REPO/agent-notes-by-agent/test-agent/filter.md"
+git -C "$STUDY_NOTES_REPO" add -A
+git_commit "$STUDY_NOTES_REPO" filter
+yeson_revision="$(jq -r '.source_revision' "$yeson_home/.git/lunarwing-study-notes-generation.json")"
+printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=yes\n' "$yeson_home" \
   >"$(tenant_env_dir yeson)/lunarwing.env"
-printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=True\n' "$STUDY_NOTES_DEFAULT_HOME" \
+printf 'LW2STUDYMCP_HOME=%s\nKNOWLEDGE_SYNC_ENABLED=True\n' "$mixedcase_home" \
   >"$(tenant_env_dir mixedcase)/lunarwing.env"
 jq '.tenants.yeson = {} | .tenants.mixedcase = {}' "$PORTS_REGISTRY" >"$PORTS_REGISTRY.tmp"
 mv "$PORTS_REGISTRY.tmp" "$PORTS_REGISTRY"
-matched_names="$(sync_enabled_study_notes_sources)"
-[[ "$matched_names" == *mixedcase* ]] || {
+warnings="$(
+  say() { printf 'SAY: %s\n' "$*"; }
+  sync_enabled_study_notes_sources
+)"
+grep -Fqx 'filter finding' \
+  "$mixedcase_home/agent-notes-by-agent/test-agent/filter.md" || {
   printf 'case-insensitive true did not enable knowledge sync\n' >&2
   exit 1
 }
-if [[ "$matched_names" == *yeson* ]]; then
+[[ ! -e "$yeson_home/agent-notes-by-agent/test-agent/filter.md" ]] || {
   printf 'hand-edited yes/on unexpectedly enabled host knowledge sync\n' >&2
   exit 1
-fi
+}
+[[ "$(jq -r '.source_revision' "$yeson_home/.git/lunarwing-study-notes-generation.json")" == "$yeson_revision" ]] || {
+  printf 'skipped tenant checkout unexpectedly fast-forwarded\n' >&2
+  exit 1
+}
+[[ "$warnings" == *yeson* ]] || {
+  printf 'unsupported enable value was not reported\n' >&2
+  exit 1
+}
 
 # CLI surface pins: add-tenant(s) auto-configure flags and configure-study-mcp sync.
 # (SCRIPT_DIR is redefined by the sourced script to ic/scripts.)
