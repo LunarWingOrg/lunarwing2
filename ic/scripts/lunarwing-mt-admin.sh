@@ -143,6 +143,10 @@ STUDY_NOTES_CONTAINER_STATE_HOME="/var/lib/lw2studymcp"
 # so every new LunarWing starts with current knowledge of its own codebase.
 STUDY_NOTES_REPO="${LUNARWING_MT_STUDY_NOTES_REPO:-https://git.lunarwing.org/cmc/lw2studymcp.git}"
 STUDY_NOTES_DEFAULT_HOME="${LUNARWING_MT_STUDY_NOTES_HOME:-/var/cache/lunarwing/lw2studymcp}"
+# How many root-owned knowledge-scheduler snapshots to retain under
+# releases/ (the live one plus a rollback margin); older ones are pruned
+# after each scheduler install.
+KNOWLEDGE_SYNC_SNAPSHOT_KEEP="${LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP:-5}"
 OPENCODE_CONTAINER_UID="10001"
 OPENCODE_CONTAINER_GID="10001"
 OPENCODE_USERNS="keep-id:uid=${OPENCODE_CONTAINER_UID},gid=${OPENCODE_CONTAINER_GID}"

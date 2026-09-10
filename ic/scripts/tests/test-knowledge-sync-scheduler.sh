@@ -53,4 +53,19 @@ grep -Fq "17 * * * * $stable_entrypoint sync-knowledge-sources" \
 [[ "$(grep -c '^# BEGIN lunarwing-study-notes-sync managed block$' "$FCRONTAB_STATE")" -eq 1 ]]
 [[ "$(grep -c '^# END lunarwing-study-notes-sync managed block$' "$FCRONTAB_STATE")" -eq 1 ]]
 
+# Repeated installs keep only the newest releases: old timestamped snapshots
+# are pruned after the current symlink flips, and the live release survives.
+for _ in $(seq 1 $((KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 2))); do
+  ensure_knowledge_source_scheduler
+done
+release_count="$(find "$fixture/admin/releases" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+[[ "$release_count" -le "$((KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 1))" ]] || {
+  printf 'old knowledge sync snapshots were not pruned (%s left)\n' "$release_count" >&2
+  exit 1
+}
+[[ -x "$stable_entrypoint" ]] || {
+  printf 'pruning removed the live knowledge sync snapshot\n' >&2
+  exit 1
+}
+
 printf 'Knowledge sync scheduler tests passed\n'

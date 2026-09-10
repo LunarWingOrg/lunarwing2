@@ -21,7 +21,25 @@ install_knowledge_sync_admin_snapshot() {
   current_tmp="$root/.current.$$"
   ln -s -- "$release" "$current_tmp"
   mv -fT -- "$current_tmp" "$root/current"
+  _prune_knowledge_sync_snapshots "$releases" "$release"
   printf '%s/lunarwing-mt-admin.sh\n' "$root/current"
+}
+
+# Retain only the newest releases (the live one plus a small rollback margin).
+# Timestamped names sort lexically newest-last; pruning after the symlink flip
+# means the just-published release is always retained. Best-effort: an
+# unpurgeable stale release must never fail a scheduler install.
+_prune_knowledge_sync_snapshots() {  # <releases dir> <retained release path>
+  local releases="$1" retained="$2" count
+  [[ -d "$releases" ]] || return 0
+  count="$(find "$releases" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+  ((count <= KNOWLEDGE_SYNC_SNAPSHOT_KEEP + 1)) && return 0
+  while IFS= read -r file; do
+    [[ "$file" != "$retained" ]] || continue
+    rm -rf -- "$file" 2>/dev/null \
+      || say "WARNING: could not prune old knowledge sync snapshot: $file"
+  done < <(find "$releases" -mindepth 1 -maxdepth 1 -type d | sort | head -n -"$KNOWLEDGE_SYNC_SNAPSHOT_KEEP")
+  return 0
 }
 
 _install_knowledge_source_systemd_timer() {  # <root-owned mt-admin entrypoint>
