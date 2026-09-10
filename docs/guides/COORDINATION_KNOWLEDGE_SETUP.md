@@ -43,6 +43,12 @@ XMPP_ALLOW_ROOMS_JSON=["mepuhiy@conference.xmpp.sobe.world"]
 
 This makes the bridge join the room and accept its inbound groupchat. An empty list means the daemon drops all coordination room traffic before any hook runs.
 
+The daemon's native XMPP channel drives the bridge's join/receive allowlist through the bridge's `/v1/configure` call, so also set the CSV form in `lunarwing.env`:
+
+```
+XMPP_ALLOW_ROOMS=mepuhiy@conference.xmpp.sobe.world
+```
+
 ### 2. Publisher allowlist — each tenant lists the OTHER agent's occupant JID
 
 `sender_id` for groupchat is the **full occupant JID** (`room@server/nick`), so that is what the allowlist matches.
