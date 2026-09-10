@@ -333,7 +333,9 @@ async fn synthesize_validates_bounds_and_maps_upstream_unavailable() {
     assert_eq!(body["error"], json!("upstream_error"));
     assert_eq!(body["message"], json!("voice sidecar error (HTTP 503)"));
     assert!(
-        !body["message"].as_str().is_some_and(|m| m.contains("tts disabled")),
+        !body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("tts disabled")),
         "sidecar detail must not leak to clients"
     );
 }
@@ -380,7 +382,8 @@ async fn upstream_unauthorized_maps_to_gateway_500_without_detail_leak() {
 }
 
 #[tokio::test]
-async fn unreachable_sidecar_maps_to_bad_gateway() {    // Bind then immediately drop the listener to get a closed loopback port.
+async fn unreachable_sidecar_maps_to_bad_gateway() {
+    // Bind then immediately drop the listener to get a closed loopback port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
