@@ -72,6 +72,8 @@ async fn start_test_server() -> (
         channel_manager: None,
         ws_ping_interval_secs: 30,
         ws_idle_timeout_secs: 120,
+        voice: None,
+        voice_rate_limiter: lunarwing::channels::web::server::PerUserRateLimiter::new(10, 60),
     });
 
     let auth = lunarwing::channels::web::auth::MultiAuthState::single(
