@@ -21,8 +21,8 @@ set -euo pipefail
 #                                   different nick in the same room is dropped
 #
 # Topology (mirrors item 27, all loopback-isolated):
-#   - an isolated rootless Prosody container on 127.0.0.2:5222 with
-#     muc_room_locking=false and its own domain (default item10.127-0-0-2.nip.io);
+#   - an isolated rootless Prosody container published on a loopback-only host
+#     muc_room_locking=false and its own domain (default item10.matrix.localhost);
 #   - two throwaway LunarWing tenants created through lunarwing-mt-admin.sh
 #     (default names item10a/item10b; must not already exist);
 #   - KNOW: records submitted through each tenant's authenticated loopback
@@ -44,7 +44,7 @@ set -euo pipefail
 #   --skip-teardown  alias of --keep-tenants
 #   --tenant-a NAME  first throwaway tenant name (default item10a)
 #   --tenant-b NAME  second throwaway tenant name (default item10b)
-#   --domain DOMAIN  isolated XMPP domain (default item10.127-0-0-2.nip.io)
+#   --domain DOMAIN  isolated XMPP domain (default item10.matrix.localhost)
 #   --help           this help
 #
 # Environment:
@@ -59,11 +59,9 @@ MT_ADMIN="${MT_ADMIN:-$SCRIPT_DIR/../lunarwing-mt-admin.sh}"
 
 TENANT_A="${TENANT_A:-item10a}"
 TENANT_B="${TENANT_B:-item10b}"
-DOMAIN="${DOMAIN:-item10.127-0-0-2.nip.io}"
+DOMAIN="${DOMAIN:-item10.matrix.localhost}"
 ROOM="coord@conference.$DOMAIN"
 PROSODY_NAME="item10-prosody-$RANDOM"
-PROSODY_IP="127.0.0.2"
-PROSODY_PORT="${PROSODY_PORT:-5222}"
 PROSODY_IMAGE="${MATRIX_PROSODY_IMAGE:-docker.io/prosodyim/prosody:13.0}"
 WORK="$(mktemp -d /tmp/item10-matrix.XXXXXX)"
 KEEP_TENANTS=false
@@ -90,6 +88,7 @@ cleanup() {
     done
   fi
   podman rm -f "$PROSODY_NAME" >/dev/null 2>&1 || true
+  sed -i '/item10-matrix-mark/d' /etc/hosts 2>/dev/null || true
   rm -rf "$WORK"
   return $rc
 }
@@ -227,18 +226,21 @@ configure_tenant() { # <tenant> <agent-id> <publishers>
   set_env_value "$env" COORD_KNOWLEDGE_SHARE true
   set_env_value "$env" COORD_KNOWLEDGE_PUBLISH true
   set_env_value "$env" COORD_KNOWLEDGE_PUBLISHERS "$publishers"
-  # Room join/receive allowlist for the isolated MUC (WI#97 failures 1+2).
+  # WI#97 failures 1+2: the daemon reads XMPP_ALLOW_ROOMS (CSV) from
+  # lunarwing.env and drives the bridge's join/receive allowlist through
+  # /v1/configure; keep the bridge env JSON in sync for direct-bridge runs.
+  set_env_value "$env" XMPP_ALLOW_ROOMS "$ROOM"
   set_env_value "$bridge_env" XMPP_ALLOW_ROOMS_JSON "[\"$ROOM\"]"
-  # Point the tenant's bridge at the isolated Prosody; the occupant nick is
-  # the tenant's XMPP resource.
-  set_env_value "$bridge_env" XMPP_HOST "$PROSODY_IP"
-  set_env_value "$bridge_env" XMPP_PORT "$PROSODY_PORT"
 }
 
 # ── isolated Prosody ─────────────────────────────────────────────────────────
 
 start_prosody() {
-  step "isolated Prosody on $PROSODY_IP:$PROSODY_PORT (domain $DOMAIN)"
+  step "isolated Prosody (host net, loopback) domain $DOMAIN"
+  # The bridge resolves the JID domain with the system resolver; point the
+  # matrix domain at loopback for this run and remove it at teardown.
+  grep -q " item10-matrix-mark" /etc/hosts 2>/dev/null || \
+    printf '127.0.0.1 %s # item10-matrix-mark\n' "$DOMAIN" >> /etc/hosts
   local cfg="$WORK/prosody.cfg.lua"
   cat >"$cfg" <<EOF
 VirtualHost "$DOMAIN"
@@ -250,9 +252,11 @@ Component "conference.$DOMAIN" "muc"
   muc_room_locking = false
   restrict_room_creation = false
 EOF
+  # Host networking avoids rootless-port-publish quirks on this fleet; the
+  # container binds 5222/5269/5280 on the host, so restrict Prosody to the
+  # loopback-only config below and keep the domain unique per run.
   podman run -d --name "$PROSODY_NAME" \
-    --network "bridge" \
-    --ip "$PROSODY_IP" \
+    --network "host" \
     -v "$cfg:/etc/prosody/conf.d/$DOMAIN.cfg.lua:ro" \
     "$PROSODY_IMAGE" >/dev/null || die "prosody container failed to start"
   # Register the two tenant accounts inside the container.
@@ -267,8 +271,15 @@ EOF
 
 apply_prosody_credentials() { # <tenant>
   local tenant="$1"
-  set_env_value "$(tenant_bridge_env "$tenant")" XMPP_JID "$tenant@$DOMAIN"
-  set_env_value "$(tenant_bridge_env "$tenant")" XMPP_PASSWORD "$(cat "$WORK/pass-$tenant")"
+  local jid pass
+  jid="$tenant@$DOMAIN"
+  pass="$(cat "$WORK/pass-$tenant")"
+  # Both sides need the identity: the daemon's native XMPP channel (which
+  # POSTs /v1/configure) and any direct bridge run.
+  set_env_value "$(tenant_env "$tenant")" XMPP_JID "$jid"
+  set_env_value "$(tenant_env "$tenant")" XMPP_PASSWORD "$pass"
+  set_env_value "$(tenant_bridge_env "$tenant")" XMPP_JID "$jid"
+  set_env_value "$(tenant_bridge_env "$tenant")" XMPP_PASSWORD "$pass"
 }
 
 # ── main ─────────────────────────────────────────────────────────────────────
