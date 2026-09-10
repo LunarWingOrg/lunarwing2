@@ -39,7 +39,7 @@
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
-6. [ ] Please re-attempt this. last MR has comments with things that need to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/884 - Original task description: **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
+6. [ ] Please re-attempt this.... last MR has comments with things that need to be addressed: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/894 and branch is aj/kimi-6-20260910-1801 - Original task description: **#121 — Knowledge seeder produces a static snapshot; no refresh path from hosted study MCP** `[knowledge,low]` - Goal #44 from aragents/kimil00p/v2.1.0.0 DESIGNED the fix (cadence-runner topology, revisioned hosted delta feed preferred, 2.1 fallback = atomically-published checkout generation + additive scans) and explicitly deferred implementation to 2.1.1.0. **This is the headline design-to-build item.** Report: `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`
 
 7. [x] (S) **#114 — feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - ( wait for 2.1.2 )
 
@@ -55,58 +55,66 @@
 
 12. [x] (S) Reserved
 
-13. [ ] Follow up on item 11... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
+13. [ ] Follow up on goal item 11 above... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
 
-12. [x] (S) Mascot Design Art Project
+14. [x] (S) Mascot Design Art Project
 
-13. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box
+15. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
 
-14. [x] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - VERIFIED NOT REPRODUCIBLE on the current tree (2026-09-09, item-14 pass). Full live repro attempt on tenant `alpha` (real weechat 4.10 + real ws_adapter longpoll + fresh `dm_policy=open` via BOTH delivery paths: caps-file config edit AND durable `settings.extensions.weechat.setup_fields`, restart, sustained DM traffic incl. unicode/2KB payloads, adapter restart mid-stream, group-buffer path): zero traps across every poll for the whole window. Guest crate tests 63/63 pass; a new integration test (`real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls` in `ic/tests/engine_v2_irc_wasm.rs`) pins the fresh-tenant longpoll shape (auto mode, adapter `/api/health` with `event_cursor`, empty buffers, `dm_policy=open`) and passes. Finding: the trap does not reproduce with the goal-43 repro recipe on the 2.1.1 tree; the `dm_policy=open` correlation from goal #43 appears spurious (the guest never reads DM policy on a no-event poll — `do_longpoll`→`refresh_policy_config` only writes the value it read). Also closes the goal #9 residual: durable `dm_policy=open` via the settings store was verified working live (unpaired nick `nick:miniirc:peer43` admitted through `check_sender_allowed`), so the test-only edit gap is confirmed fixed by the CHPAR-005 `dm_policy_explicit` machinery. If the trap resurfaces, the next discriminating evidence to capture is the wasmtime backtrace (log `Polling callback failed` at DEBUG with `WASM_BACKTRACE_DETAILS=1`) plus a fuel/epoch check on the tenant engine — see `ic/src/channels/wasm/wrapper.rs` `map_wasm_error`.
+16. [x] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - VERIFIED NOT REPRODUCIBLE on the current tree (2026-09-09, item-14 pass). Full live repro attempt on tenant `alpha` (real weechat 4.10 + real ws_adapter longpoll + fresh `dm_policy=open` via BOTH delivery paths: caps-file config edit AND durable `settings.extensions.weechat.setup_fields`, restart, sustained DM traffic incl. unicode/2KB payloads, adapter restart mid-stream, group-buffer path): zero traps across every poll for the whole window. Guest crate tests 63/63 pass; a new integration test (`real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls` in `ic/tests/engine_v2_irc_wasm.rs`) pins the fresh-tenant longpoll shape (auto mode, adapter `/api/health` with `event_cursor`, empty buffers, `dm_policy=open`) and passes. Finding: the trap does not reproduce with the goal-43 repro recipe on the 2.1.1 tree; the `dm_policy=open` correlation from goal #43 appears spurious (the guest never reads DM policy on a no-event poll — `do_longpoll`→`refresh_policy_config` only writes the value it read). Also closes the goal #9 residual: durable `dm_policy=open` via the settings store was verified working live (unpaired nick `nick:miniirc:peer43` admitted through `check_sender_allowed`), so the test-only edit gap is confirmed fixed by the CHPAR-005 `dm_policy_explicit` machinery. If the trap resurfaces, the next discriminating evidence to capture is the wasmtime backtrace (log `Polling callback failed` at DEBUG with `WASM_BACKTRACE_DETAILS=1`) plus a fuel/epoch check on the tenant engine — see `ic/src/channels/wasm/wrapper.rs` `map_wasm_error`.
 
-15. [x] (S) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
+17. [x] (S) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
     `ThreadOutcome::Stopped` maps to the empty-string sentinel by !767 design, so engine-interrupt turns emit no terminal `response` event; mascot falls back to 30s idle timer instead of immediate idle. "Parity with legacy `Interrupted.` emission needs a tracker decision." Small polish, user-visible.
 
-16. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
+18. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
     Repo-contract PASS (27/27 emote tests, live public-surface checks on antelope/kestrel healthy). Remaining: the human acceptance step — fresh tenant, reply containing `*nickers softly* *flicks her tail*`, watch it animate. Cheap; could fold into any live session.
 
-17. [ ] Please re-attempt this. Previous closed MR which has comments with feedback: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/885 - Original Task Description: **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
+19. [ ] Please re-attempt this. Previous closed MR which has comments with feedback: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/885 - Original Task Description: **Mission tracker candidates from goal #30** (recorded in `docs/ops/v2.1.0.0_GOAL30_MISSION_MEMORY_RETRIEVAL.md`)
     (a) orphaned mission_create records after failed turns sharing a webhook path (one fire matched 2 missions); (b) goal-phrase auto-complete trap for user-created missions; (c) `fix_pattern_database` re-seeding duplicates; (d) unbounded `approach_history`
 
-18. [x] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
+20. [x] **Steer-as-tool-preemption contract clarification** (goal #41 finding on WI#105)
     Current steer = "inject after current step" contract; steer-as-tool-preemption is outside it. Needs tracker clarification or an explicit scope decision, not necessarily code
     - DONE 2026-09-10 (`aj/kimi-18-20260910-1224`), decision record: `docs/ops/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md`
     - SCOPE DECISION: steer stays an inject-after-current-step control; steer-as-tool-preemption is declined as a semantic change with no remaining demand. Grounds: tracker WI#105 is CLOSED (verified read-only via API, `closed_at 2026-09-05T00:53:37Z`), its interrupt half is fixed and live-verified (item 43 G1c: `/interrupt` during a 120s in-flight shell tool aborted ≤5s), and interrupt+steer composition already covers "stop this tool and redirect".
     - CONTRACT PINNED IN CODE: new regression test `injected_steer_note_waits_for_in_flight_tool_and_lands_at_next_boundary` (`ic/crates/lunarwing_engine/src/executor/orchestrator.rs`) proves a note queued mid-tool does not abort the tool, does not stop the thread, and lands as the next user message; complements `cancelled_code_step_aborts_in_flight_tool`. All 555 engine lib tests pass; touched-crate clippy `-D warnings` clean.
     - CONTRACT STATED IN DOCS: `docs/architecture/ENGINE-V2.md` Channel Routing section now states the exclusion explicitly (only `/interrupt` cancels an in-flight tool) and links the decision record.
 
-19. [x] This goal had PARALLEL implementation - Rarity's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/878 and branch rarity/kimi-19-20260909-1501 - CMC's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/871 and branch= voce - compare the two, read the comments on both of the closed MRs, and pick the better imeplementation (or combine the best aspects from each implementation). Regardless of what is decided, ensure CI/CD actually works - Original Task Description: work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
+21. [x] This goal had PARALLEL implementation - Rarity's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/878 and branch rarity/kimi-19-20260909-1501 - CMC's: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/871 and branch= voce - compare the two, read the comments on both of the closed MRs, and pick the better imeplementation (or combine the best aspects from each implementation). Regardless of what is decided, ensure CI/CD actually works - Original Task Description: work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 since desktop app progress cannot proceed without this being completed
     - DONE 2026-09-09 (`rarity/kimi-19-20260909-1501`): implemented the desktop-facing gateway voice API (WI#131). New `ic/src/channels/web/voice.rs` adds authenticated, bounded `/api/voice/{status,transcribe,synthesize}` routes behind the existing auth middleware; the gateway proxies the loopback LunarVoice sidecar and holds the `VOICE_AUTH_TOKEN` credential server-side (clients never see it).
     - Bounds: base64 audio cap 24 MiB, synthesis text 10 000 chars, voice 64 chars, speed 0.5..=2.0, language 32 chars, `format` allowlisted; per-route body limits (32 MiB / 1 MiB) override the global 10 MiB; sidecar responses streamed with hard byte caps; per-user 10 req/60 s rate limit. Upstream URL reuses the shared `voice_endpoint` loopback-only invariants (HTTP, loopback host, no creds/query/path), extracted from the STT provider into a reusable builder.
     - Wire contract documented in `docs/guides/GATEWAY_VOICE_API.md` (enabling via `TRANSCRIPTION_PROVIDER=lunarvoice` + `VOICE_AUTH_TOKEN`, endpoint/error taxonomy, desktop client flow). TTS note: the sidecar already ships `/v1/voice/synthesize` (`projects/voice-sidecar/src/api.rs`), so both STT and TTS proxy paths are live; synthesis requires the sidecar's TTS engine enabled (`VOICE_ENABLE_TTS`).
     - Verified: `cargo check --tests` clean, `cargo fmt --check` clean, clippy `-D warnings` clean on touched surfaces, 8 new unit tests + 7 new E2E tests (`ic/tests/voice_gateway_integration.rs`, real gateway + mock sidecar incl. credential-flow and bounds) pass, plus adjacent suites (ws/multi-tenant/openai-compat/gateway-workflow integration) green.
     - RECONCILED 2026-09-10 (`rarity/kimi-19-20260910-0901`): read both closed MRs' review comments. CMC's verdict: prefer !878 (server-selected model, stronger validation, capability-status endpoint, shared loopback invariants, structured error contract) and port !871's safer upstream error/timeout handling. Merged !878 then ported: sidecar 401 → 500 (never passthrough, clients would blame their gateway token), other upstream failures → 502, reqwest timeout preserved as error kind → 504, upstream `detail` logged server-side with generic client messages, synthesis `format` deserialized and enforced (`wav` only) instead of hardcoded. Also fixed the pipeline-3197 panic-policy failure: the checker's lexer read lifetimes (`'a`) as unterminated char literals, masking `#[cfg(test)] mod tests` and flagging test `assert!`s as production panics (`ic/scripts/check_no_panics.py`, pinned by self-test). Tests: 11 voice unit tests + 9 voice E2E tests green; clippy/fmt/panic-policy clean on the branch diff. Remaining (flagged by review, needs a live tenant): real transcription+synthesis round-trip before desktop goal #19 is fully signed off.
 
-20. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
+22. [ ] **Priority-control vs queued-prompt race** (goal #9, documented-not-fixed)
     "Remained expected semantics" — but if 2.1.1.0 touches control-path dispatch (steer/interrupt family), this is adjacent.
 
-21. [ ] Please re-attempt this. Last attempt was on: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/888 - comments with feedback - **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
+23. [ ] Please re-attempt this. Last attempt was on: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/888 - comments with feedback - **CI/CD validator gaps from GOAL32 review** (partial: goal #28 fixed the P0 set)
     Remaining non-P0 follow-ons from `docs/ops/v2.1.0.0_GOAL32_CI_CD_IMPROVEMENT_REVIEW.md`: validator doesn't check `WORKER_IMAGE_TAG`, OpenCode source ref, or pinned CI tool images; blocking clippy/architecture ratchets; reports/telemetry; classified standalone-crate and WASM matrices; artifact-safe mt-admin prerequisites before production CD. Daemon package publication + tenant deployment CD remain deferred by design
 
-22. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/130 - code in comments too look at
-23. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 - see all comments and updates since time this was created. do not implicitly believe all claims being made by agents or humans. validate each prior to beginning work on proper engine hardening for this issue
+24. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/130 - code in comments too must be looked at...
+25. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 - see all comments and updates since time this was created. do not implicitly believe all claims being made by agents or humans. validate each prior to beginning work on proper engine hardening for this issue
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-24. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
-25. [x] (S) Reserved for CI/CD fixes
+26. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
+27. [x] (S) Reserved for CI/CD fixes
 
 ## Phase 5 - Documentation
-
-26. [ ] update all docs in docs/guides
-27. [ ] update all docs in docs/architecture
-28. [ ] first draft of release notes
-29. [x] (S) Updated README.md at root of repo
+28. [x] (S) Reserved
+29. [x] (S) Reserved
+30. [x] (S) Reserved
+31. [x] (S) Reserved
+32. [x] (S) Reserved
+33. [x] (S) Reserved
+34. [x] (S) Reserved
+35. [x] (S) Reserved
+36. [x] (S) Reserved
+37. [ ] update all docs in docs/guides
+38. [ ] update all docs in docs/architecture
+39. [ ] first draft of release notes
+40. [x] (S) Updated README.md at root of repo
 
 ---
