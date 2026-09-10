@@ -180,11 +180,7 @@ impl VoiceProxyClient {
             return Err(VoiceProxyError::InvalidResponse);
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(VoiceProxyError::Request)?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(VoiceProxyError::Request)? {
             if bytes.len().saturating_add(chunk.len()) > max_bytes {
                 return Err(VoiceProxyError::InvalidResponse);
             }
@@ -514,9 +510,7 @@ fn map_proxy_error(error: VoiceProxyError) -> HandlerError {
         }
     }
     let message = match &error {
-        VoiceProxyError::Request(err) if err.is_timeout() => {
-            "voice sidecar timed out".to_string()
-        }
+        VoiceProxyError::Request(err) if err.is_timeout() => "voice sidecar timed out".to_string(),
         VoiceProxyError::Request(_) => "failed to contact voice sidecar".to_string(),
         VoiceProxyError::Upstream { status: 401, .. } => {
             "voice sidecar rejected the gateway credential".to_string()
@@ -830,7 +824,10 @@ mod tests {
         assert!(matches!(err, VoiceProxyError::Upstream { status: 401, .. }));
         let (status, body) = map_proxy_error(err);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(body.0.message, "voice sidecar rejected the gateway credential");
+        assert_eq!(
+            body.0.message,
+            "voice sidecar rejected the gateway credential"
+        );
     }
 
     #[tokio::test]
