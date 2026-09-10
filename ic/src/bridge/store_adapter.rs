@@ -12,7 +12,7 @@
 //! ├── orchestrator/v{N}.py                 (Python orchestrator versions)
 //! ├── orchestrator/failures.json
 //! ├── orchestrator/codeact-preamble-overlay.md  (runtime prompt patches)
-//! ├── orchestrator/fix-patterns.md         (fix pattern database, stable path)
+//! ├── orchestrator/fix-patterns--{id8}.md (fix pattern database, stable per-project path)
 //! ├── missions/{slug}--{id8}.json
 //! ├── projects/{slug}--{id8}.json
 //! └── .runtime/                            (internal, not for browsing)
@@ -37,6 +37,7 @@ use lunarwing_engine::{
     CapabilityLease, ConversationId, ConversationSurface, DocId, DocType, EngineError, LeaseId,
     MemoryDoc, Project, ProjectId, Step, Store, Thread, ThreadEvent, ThreadId, ThreadState,
     types::mission::{Mission, MissionId, MissionStatus},
+    types::shared_owner_id,
 };
 
 use crate::secrets::{CreateSecretParams, SecretsStore};
@@ -126,6 +127,10 @@ impl HybridStore {
             self.projects.write().await.insert(project.id, project);
         })
         .await;
+        // Consolidation runs after projects load so legacy-identity duplicates
+        // (nil project) can be adopted by the sole known project when one
+        // exists — otherwise the seeder would never find the canonical doc.
+        self.consolidate_fix_pattern_docs(ws).await;
         self.load_map(
             ws,
             CONVERSATIONS_PREFIX,
@@ -449,8 +454,6 @@ impl HybridStore {
                 }
             }
         }
-
-        self.consolidate_fix_pattern_docs(ws).await;
     }
 
     /// Collapse legacy fix-pattern duplicates onto the newest doc.
@@ -458,9 +461,20 @@ impl HybridStore {
     /// Goal #30 tracker item (c): re-seeding bugs left tenants with several
     /// `fix_pattern_database` docs under distinct DocIds. Keep the most
     /// recently updated one, fold the others' pattern rows into it, write it
-    /// to the stable `engine/orchestrator/fix-patterns.md` path, and delete
+    /// to the stable per-project `engine/orchestrator/fix-patterns--{project8}.md`
+    /// path, and delete
     /// the legacy files. Runs only when duplicates exist; a healthy tenant
     /// pays one listing check.
+    ///
+    /// Ownership normalization (MR !876 review): legacy files written before
+    /// ownership was persisted reload as user `legacy` under the nil project,
+    /// which `list_shared_memory_docs` cannot see — preserving that ownership
+    /// would leave the seeder free to reseed and overwrite the merged rows.
+    /// The fix-pattern database is always a shared doc (the engine seeds it
+    /// under `__shared__`), so duplicates in the legacy identity are
+    /// normalized to the shared owner before consolidation. When several
+    /// distinct real projects own duplicates, consolidation is skipped —
+    /// merging across project boundaries cannot pick a safe winner.
     async fn consolidate_fix_pattern_docs(&self, _ws: &Workspace) {
         let (all_docs, doc_paths) = {
             let docs = self.docs.read().await;
@@ -477,12 +491,51 @@ impl HybridStore {
             return;
         }
 
+        let real_projects: HashSet<ProjectId> = all_docs
+            .iter()
+            .filter(|d| !is_legacy_doc_identity(d))
+            .map(|d| d.project_id)
+            .collect();
+        let mut project_iter = real_projects.iter().copied();
+        let canonical_project = match (project_iter.next(), project_iter.next()) {
+            (Some(only), None) => Some(only),
+            (Some(_), Some(_)) => {
+                warn!(
+                    projects = real_projects.len(),
+                    "fix pattern duplicates span multiple projects; skipping consolidation"
+                );
+                return;
+            }
+            // All duplicates carry the legacy identity: adopt the sole known
+            // project (multi-tenant hosts load one project per store). With no
+            // known project there is nothing to anchor the doc to — skip.
+            (None, _) => {
+                let known: Vec<ProjectId> = self.projects.read().await.keys().copied().collect();
+                match known.len() {
+                    1 => Some(known[0]),
+                    _ => {
+                        warn!(
+                            known_projects = known.len(),
+                            "fix pattern duplicates carry no project identity; skipping consolidation"
+                        );
+                        return;
+                    }
+                }
+            }
+        };
+
         let mut ordered = all_docs;
         ordered.sort_by_key(|doc| std::cmp::Reverse(doc.updated_at));
-        let mut canonical = ordered
-            .first()
-            .cloned()
-            .expect("length checked >= 2 above; safety comment per policy");
+        let Some(mut canonical) = ordered.first().cloned() else {
+            warn!("fix pattern consolidation found no canonical doc");
+            return;
+        };
+        let Some(canonical_project) = canonical_project else {
+            warn!("fix pattern consolidation has no anchor project");
+            return;
+        };
+        canonical.user_id = shared_owner_id().to_string();
+        canonical.project_id = canonical_project;
         for legacy in &ordered[1..] {
             // Merge rows the canonical copy may be missing; content is a
             // markdown table, so append wholesale — duplicate rows are
@@ -1092,12 +1145,15 @@ fn doc_workspace_path(doc: &MemoryDoc) -> String {
         return format!("{ORCHESTRATOR_PREFIX}/codeact-preamble-overlay.md");
     }
 
-    // Fix pattern database → engine/orchestrator/fix-patterns.md
-    // Stable path (no --{id8} suffix): the doc is updated in place under one
-    // DocId, so a re-seed or rename can never fork a second file. Goal #30
-    // observed three distinct duplicates accumulating from id-suffixed paths.
+    // Fix pattern database → engine/orchestrator/fix-patterns--{project8}.md
+    // Stable path per project (no doc-id suffix): the doc is updated in place
+    // under one DocId, so a re-seed or rename can never fork a second file.
+    // Goal #30 observed three distinct duplicates accumulating from
+    // id-suffixed paths. Project-scoped so multiple projects on one store
+    // cannot overwrite each other's file.
     if doc.title == FIX_PATTERN_TITLE {
-        return format!("{ORCHESTRATOR_PREFIX}/fix-patterns.md");
+        let project8 = &doc.project_id.0.to_string()[..8];
+        return format!("{ORCHESTRATOR_PREFIX}/fix-patterns--{project8}.md");
     }
 
     // Knowledge docs → engine/knowledge/{type}/{slug}.md
@@ -1256,6 +1312,15 @@ fn serialize_knowledge_doc(doc: &MemoryDoc) -> String {
     frontmatter.push_str("---\n\n");
     frontmatter.push_str(&doc.content);
     frontmatter
+}
+
+/// Whether a doc carries the pre-ownership-persistence identity rehydrated
+/// from files written before `owner`/`project` frontmatter existed.
+///
+/// Such docs reload as user `legacy` under the nil project, invisible to
+/// `list_shared_memory_docs` — they must not anchor consolidation decisions.
+fn is_legacy_doc_identity(doc: &MemoryDoc) -> bool {
+    doc.user_id == "legacy" && doc.project_id == ProjectId(Uuid::nil())
 }
 
 /// Deserialize a frontmatter+markdown string back to a MemoryDoc.
@@ -2027,26 +2092,37 @@ title: \"old doc\"\n\
 
     #[test]
     fn fix_pattern_doc_uses_stable_workspace_path() {
+        let project = ProjectId::new();
         let doc = MemoryDoc::new(
-            ProjectId::new(),
+            project,
             "__shared__",
             DocType::Note,
             FIX_PATTERN_TITLE,
             "seed",
         );
+        let project8 = &project.0.to_string()[..8];
         assert_eq!(
             doc_workspace_path(&doc),
-            "engine/orchestrator/fix-patterns.md"
+            format!("engine/orchestrator/fix-patterns--{project8}.md")
         );
-        // Different DocIds must not fork different files.
+        // Different DocIds within one project must not fork different files.
         let other = MemoryDoc::new(
-            ProjectId::new(),
+            project,
             "__shared__",
             DocType::Note,
             FIX_PATTERN_TITLE,
             "seed",
         );
         assert_eq!(doc_workspace_path(&doc), doc_workspace_path(&other));
+        // Distinct projects get distinct files (no cross-project overwrite).
+        let foreign = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert_ne!(doc_workspace_path(&doc), doc_workspace_path(&foreign));
     }
 
     #[tokio::test]
@@ -2322,6 +2398,146 @@ title: \"old doc\"\n\
             found[0].content.contains("older row"),
             "unique rows from duplicates must be merged, not dropped"
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_normalizes_legacy_ownership() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // MR !876 review: legacy files without owner/project frontmatter
+        // reload as user "legacy" under the nil project. Consolidation must
+        // normalize that identity to the shared owner so the seeder's
+        // list_shared_memory_docs finds the canonical doc and never reseeds
+        // over the merged rows.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-legacy.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-legacy-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+        // A project record must exist so consolidation can adopt it as the
+        // anchor for legacy-identity duplicates (nil project on the docs).
+        let mut project = Project::new("test-user", "legacy-anchor", "anchor project");
+        project.id = project_id;
+        workspace
+            .write(
+                &project_path("legacy-anchor", project_id),
+                &serde_json::to_string(&project).expect("serialize project"),
+            )
+            .await
+            .expect("write project");
+
+        // Two docs rehydrated with the legacy identity: user "legacy", nil
+        // project — the shape every pre-ownership-persistence file reloads as.
+        let older = MemoryDoc::new(
+            ProjectId(uuid::Uuid::nil()),
+            "legacy",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| legacy older row | a | b |",
+        );
+        let mut newer = MemoryDoc::new(
+            ProjectId(uuid::Uuid::nil()),
+            "legacy",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| legacy newer row | c | d |",
+        );
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(10);
+        for doc in [&older, &newer] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write legacy-identity duplicate");
+        }
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "legacy-identity duplicates must collapse to one shared doc"
+        );
+        assert_eq!(
+            found[0].user_id,
+            shared_owner_id(),
+            "canonical doc must be normalized to the shared owner"
+        );
+        assert_eq!(
+            found[0].project_id, project_id,
+            "canonical doc must adopt the sole known project"
+        );
+        assert!(
+            found[0].content.contains("legacy older row"),
+            "merged rows must survive the ownership normalization"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_skips_cross_project_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // When duplicates are owned by distinct real projects, no single
+        // winner is safe: consolidation must be skipped entirely.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-xproj.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-xproj-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        let seed_store = HybridStore::new(Some(Arc::clone(&workspace)));
+        for (project, row) in [(project_a, "row a"), (project_b, "row b")] {
+            let doc = MemoryDoc::new(
+                project,
+                shared_owner_id(),
+                DocType::Note,
+                FIX_PATTERN_TITLE,
+                format!("| Trace pattern | Fix strategy |\n|---|---|\n| {row} | x | y |"),
+            );
+            seed_store.save_memory_doc(&doc).await.unwrap();
+        }
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        // Both per-project copies must survive untouched.
+        for project in [project_a, project_b] {
+            let count = reloaded
+                .list_shared_memory_docs(project)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|d| d.title == FIX_PATTERN_TITLE)
+                .count();
+            assert_eq!(
+                count, 1,
+                "cross-project duplicates must be left in place per project"
+            );
+        }
     }
 
     #[cfg(feature = "libsql")]
