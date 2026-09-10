@@ -55,7 +55,7 @@
 
 12. [x] (S) Mascot Design Art Project
 
-13. [x] (S) Reserved for potential CI/CD issues
+13. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
 
@@ -95,7 +95,7 @@
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
 23. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
-24. [x] (S) Reserved
+24. [x] (S) Reserved for CI/CD fixes
 25. [ ] Work on the proposed planned permanent fix for https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 - see all comments and updates since time this was created. do not implicitly believe all claims being made by agents or humans. validate each prior to beginning work on proper engine hardening for this issue
 
 ## Phase 5 - Documentation
