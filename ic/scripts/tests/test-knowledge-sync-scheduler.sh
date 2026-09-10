@@ -18,7 +18,9 @@ EOF
 chmod +x "$fixture/bin/systemctl"
 PATH="$fixture/bin:$PATH"
 
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 LUNARWING_MT_SYSTEMD_UNIT_DIR="$fixture/systemd"
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 LUNARWING_MT_KNOWLEDGE_SYNC_ADMIN_ROOT="$fixture/admin"
 stable_entrypoint="$fixture/admin/current/lunarwing-mt-admin.sh"
 INIT_SYSTEM=systemd
@@ -42,6 +44,7 @@ cp "$1" "$FCRONTAB_STATE"
 EOF
 chmod +x "$fixture/bin/fcrontab"
 _ensure_cron_runlevel() { :; }
+# shellcheck disable=SC2034  # Consumed by sourced mt-admin functions.
 INIT_SYSTEM=openrc
 ensure_knowledge_source_scheduler
 ensure_knowledge_source_scheduler
