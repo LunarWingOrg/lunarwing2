@@ -387,16 +387,46 @@ main() {
     finish
   fi
 
+  # The receiver polls the bridge queue lazily after startup; a share sent
+  # immediately after rejoin can be consumed before or after the hook swaps
+  # the allowlist. Wait for the receiver's poll loop to go quiet first: poll
+  # its bridge queue until it stops draining, THEN share, then poll for rows.
+  settle_receiver() { # <tenant>
+    local prev cur tries=0
+    prev="$(bridge_status_json "$1" | jq -r '.queued_messages // -1' 2>/dev/null || echo -1)"
+    while (( tries < 20 )); do
+      sleep 3
+      cur="$(bridge_status_json "$1" | jq -r '.queued_messages // -1' 2>/dev/null || echo -1)"
+      [[ "$cur" == "0" && "$prev" == "0" ]] && return 0
+      prev="$cur"
+      tries=$((tries + 1))
+    done
+    return 0
+  }
+
+  # Poll the receiver's knowledge rows for a topic until the expected count
+  # appears or the deadline passes; echoes the last observed count.
+  await_rows() { # <tenant> <topic> <expected>
+    local tenant="$1" topic="$2" expected="$3" rows="" deadline
+    deadline=$(( $(date +%s) + 45 ))
+    while (( $(date +%s) < deadline )); do
+      rows="$(knowledge_rows "$tenant" "$topic")"
+      [[ "$rows" == "$expected" ]] && break
+      sleep 3
+    done
+    printf '%s' "${rows:--1}"
+  }
+
   # ── Case 1: room-wide opt-in (room bare JID) ────────────────────────────
   step "case 1: room bare JID is a room-wide opt-in"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$ROOM"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
   wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
+  settle_receiver "$TENANT_B"
   local t1="item10-room-bare"
   share "$TENANT_A" "$t1" "room-wide opt-in finding from the automated matrix"
-  sleep 8
   local rows1
-  rows1="$(knowledge_rows "$TENANT_B" "$t1")"
+  rows1="$(await_rows "$TENANT_B" "$t1" 1)"
   if [[ "$rows1" != "-1" ]] && (( rows1 == 1 )); then
     pass "case 1: exactly one row on $TENANT_B for $t1"
     report "case 1 PASS: room-bare allowlist ingested $t1 (1 row)"
@@ -410,11 +440,11 @@ main() {
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$occupant_a"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
   wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
+  settle_receiver "$TENANT_B"
   local t2="item10-full-occupant"
   share "$TENANT_A" "$t2" "exact occupant finding from the automated matrix"
-  sleep 8
   local rows2
-  rows2="$(knowledge_rows "$TENANT_B" "$t2")"
+  rows2="$(await_rows "$TENANT_B" "$t2" 1)"
   if [[ "$rows2" != "-1" ]] && (( rows2 == 1 )); then
     pass "case 2: exactly one row on $TENANT_B for $t2"
     report "case 2 PASS: exact-occupant allowlist ingested $t2 (1 row)"
@@ -428,12 +458,12 @@ main() {
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$nick_a@$DOMAIN"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
   wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
+  settle_receiver "$TENANT_B"
   local t3="item10-user-bare-denied" before3 after3 rows3
   before3="$(dropped "$TENANT_B" not_allowed_publisher)"
   share "$TENANT_A" "$t3" "user-bare allowlist must drop this delivered share"
-  sleep 8
+  rows3="$(await_rows "$TENANT_B" "$t3" 0)"
   after3="$(dropped "$TENANT_B" not_allowed_publisher)"
-  rows3="$(knowledge_rows "$TENANT_B" "$t3")"
   if [[ "$rows3" == "0" ]]; then
     pass "case 3: zero rows written under the user-bare allowlist"
   else
@@ -449,18 +479,22 @@ main() {
     report "case 3 PASS(rows): delivered share dropped (rows=0; counter not observable pre-upgrade)"
   fi
 
-  # ── Case 4: same-room impostor nick denied ──────────────────────────────
-  step "case 4: impostor occupant nick denied under exact-occupant allowlist"
+  # ── Case 4: same-room occupant denied under exact-occupant allowlist ────
+  # The exact entry names only A's occupant. B is in the same room but B's
+  # occupant JID is not on B's own allowlist, so a share authored by B itself
+  # is the genuine same-room-refusal probe (an "impostor" via A's bridge is
+  # indistinguishable from A: the bridge stamps its own resource).
+  step "case 4: other same-room occupant denied under exact-occupant allowlist"
   set_env_value "$(tenant_env "$TENANT_B")" COORD_KNOWLEDGE_PUBLISHERS "$occupant_a"
   "$MT_ADMIN" restart-tenant "$TENANT_B" >/dev/null || true
   wait_until "$TENANT_B rejoined the room" 180 room_has_presence "$TENANT_B" || true
+  settle_receiver "$TENANT_B"
   local t4="item10-impostor-denied" rows4
-  share "$TENANT_A" "$t4" "impostor nick must not match the exact occupant entry"
-  sleep 8
-  rows4="$(knowledge_rows "$TENANT_B" "$t4")"
+  share "$TENANT_B" "$t4" "same-room occupant not on the exact occupant allowlist"
+  rows4="$(await_rows "$TENANT_B" "$t4" 0)"
   if [[ "$rows4" == "0" ]]; then
-    pass "case 4: zero rows for the impostor nick"
-    report "case 4 PASS: impostor nick dropped (rows=0)"
+    pass "case 4: zero rows for the non-allowlisted same-room occupant"
+    report "case 4 PASS: same-room occupant dropped (rows=0)"
   else
     fail "case 4: expected 0 rows, got ${rows4:-?}"
     report "case 4 FAIL: rows=${rows4:-?}"
