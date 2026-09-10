@@ -105,11 +105,12 @@ rust-msrv-check:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check --locked
 
-# Owner: core maintainers. Block after one clean runner baseline proves zero warnings.
+# Owner: core maintainers. Blocking since 2026-09-10 (goals 2.1.1.0 item 21):
+# all-features zero-warning Clippy is green on the default branch and locally.
 rust-clippy-all:
   extends:
     - .rust-job
-    - .observational-job
+    - .full-validation-context
   stage: check
   needs:
     - cargo-metadata

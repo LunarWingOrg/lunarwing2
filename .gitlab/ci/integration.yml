@@ -31,12 +31,15 @@ cavepony-wasm:
     - bash .gitlab/scripts/cargo-ci.sh build -j2 --release --target wasm32-wasip2 --manifest-path tools-src/cavepony/Cargo.toml
     - bash .gitlab/scripts/cargo-ci.sh test -j2 --locked --test wit_compat cavepony_component_actions_fit_ten_million_fuel -- --exact
 
-# Owner: architecture maintainers. Block after current heuristic violations are fixed.
+# Architecture boundaries: blocking changed-line/hard-violation ratchet since
+# 2026-09-10 (goals 2.1.1.0 item 21). The script exits non-zero only for NEW
+# hard violations vs the pipeline base; the full-tree debt counts it prints
+# above them remain informational warnings for gradual cleanup.
 architecture-boundaries:
   extends:
     - .shell-job
-    - .observational-job
-  stage: observe
+    - .full-validation-context
+  stage: test
   needs: []
   script:
     - bash ic/scripts/check-boundaries.sh
