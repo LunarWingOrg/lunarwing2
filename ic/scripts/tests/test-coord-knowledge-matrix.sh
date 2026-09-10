@@ -166,13 +166,19 @@ room_has_presence() { # <tenant>
 # The occupant nick is whoever the sender tenant connects as; the matrix only
 # controls the room and body here.
 share() { # <tenant> <topic> <finding>
-  local tenant="$1" topic="$2" finding="$3"
+  local tenant="$1" topic="$2" finding="$3" payload
+  payload="$(jq -nc \
+    --arg target "$ROOM" \
+    --arg body "KNOW: $topic | $finding" \
+    --arg meta '{"xmpp_type":"groupchat","xmpp_room":"'"$ROOM"'"}' \
+    '{target: $target, content: $body, metadata_json: $meta}')" \
+    || { fail "share($tenant, $topic): payload build failed"; return 1; }
   curl -sf --max-time 10 -X POST \
     -H "Authorization: Bearer $(bridge_token "$tenant")" \
     -H "Content-Type: application/json" \
-    -d "$(jq -nc --arg target "$ROOM" --arg body "KNOW: $topic | $finding" \
-        '{target: $target, content: $body, metadata_json: "{\"xmpp_type\":\"groupchat\",\"xmpp_room\":\"'\''"$target"'\''\"}"}')" \
-    "http://127.0.0.1:$(bridge_port "$tenant")/v1/messages/send" >/dev/null
+    -d "$payload" \
+    "http://127.0.0.1:$(bridge_port "$tenant")/v1/messages/send" >/dev/null \
+    || { fail "share($tenant, $topic): bridge send failed"; return 1; }
 }
 
 # Body-free drop counter value from the receiver's coord admin endpoint
