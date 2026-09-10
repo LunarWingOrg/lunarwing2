@@ -63,6 +63,17 @@ rust-check-all-features:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
+# Standalone (non-workspace) deliverables from .gitlab/deliverables.json:
+# locked offline metadata verification per classified unit so a stale
+# lockfile or classification fails before artifacts consume it.
+standalone-deliverables:
+  extends: .rust-job
+  stage: check
+  needs: []
+  script:
+    - bash .gitlab/scripts/standalone-deliverables.sh
+
+
 wasm-channel-test-artifacts:
   extends: .rust-job
   stage: check
