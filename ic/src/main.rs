@@ -16,8 +16,8 @@ use lunarwing::{
         web::log_layer::LogBroadcaster,
     },
     cli::{
-        Cli, Command, run_acp_command, run_mcp_command, run_pairing_command, run_service_command,
-        run_status_command, run_tool_command,
+        Cli, Command, run_acp_command, run_knowledge_refresh_command, run_mcp_command,
+        run_pairing_command, run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     gate::violation_store::{ViolationStore, ViolationStoreConfig},
@@ -179,6 +179,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Memory(mem_cmd)) => {
             init_cli_tracing();
             return lunarwing::cli::run_memory_command(mem_cmd).await;
+        }
+        Some(Command::RefreshKnowledge { json }) => {
+            init_cli_tracing();
+            return run_knowledge_refresh_command(cli.config.as_deref(), *json).await;
         }
         Some(Command::Pairing(pairing_cmd)) => {
             init_cli_tracing();
