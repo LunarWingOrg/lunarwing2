@@ -53,6 +53,10 @@
 
 11. [x] Please re-attempt this: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/884 - feedback is in MR description. Even older attempt here: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/874 and rarity/kimi-11-20260909-0901 - comments of old MR offer suggestions on improving - **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
 
+12. [x] (S) Reserved
+
+13. [ ] Follow up on item 11... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
+
 12. [x] (S) Mascot Design Art Project
 
 13. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box
