@@ -129,6 +129,19 @@ struct TranscribeResponse {
 }
 
 fn transcription_endpoint(service_url: &str) -> Result<Url, LunarVoiceConfigError> {
+    voice_endpoint(service_url, "/v1/voice/transcribe")
+}
+
+pub fn synthesis_endpoint(service_url: &str) -> Result<Url, LunarVoiceConfigError> {
+    voice_endpoint(service_url, "/v1/voice/synthesize")
+}
+
+/// Build a LunarVoice sidecar endpoint URL from a loopback base URL.
+///
+/// Shared by the STT provider and the gateway voice proxy (WI#131). Enforces
+/// the same invariants for every LunarVoice caller: plain HTTP, loopback host
+/// only, no credentials/query/fragment, and no caller-supplied path.
+pub fn voice_endpoint(service_url: &str, path: &str) -> Result<Url, LunarVoiceConfigError> {
     let mut url = Url::parse(service_url).map_err(|_| LunarVoiceConfigError::InvalidUrl)?;
     if url.scheme() != "http" {
         return Err(LunarVoiceConfigError::InvalidScheme);
@@ -152,7 +165,7 @@ fn transcription_endpoint(service_url: &str) -> Result<Url, LunarVoiceConfigErro
     if url.path() != "/" {
         return Err(LunarVoiceConfigError::InvalidPath);
     }
-    url.set_path("/v1/voice/transcribe");
+    url.set_path(path);
     Ok(url)
 }
 
@@ -172,5 +185,17 @@ mod tests {
         assert!(transcription_endpoint("https://127.0.0.1:8090").is_err());
         assert!(transcription_endpoint("http://192.168.1.5:8090").is_err());
         assert!(transcription_endpoint("http://127.0.0.1:8090/path").is_err());
+    }
+
+    #[test]
+    fn synthesis_endpoint_reuses_loopback_invariants() {
+        assert_eq!(
+            synthesis_endpoint("http://127.0.0.1:8090")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:8090/v1/voice/synthesize"
+        );
+        assert!(synthesis_endpoint("https://localhost:8090").is_err());
+        assert!(synthesis_endpoint("http://example.com").is_err());
     }
 }

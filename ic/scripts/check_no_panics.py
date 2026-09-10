@@ -127,8 +127,30 @@ def sanitize_line(line: str, state: LexerState) -> str:
             i += 1
             continue
         if ch == "'":
-            # This can misclassify lifetimes like `'a` as char literals. That only
-            # risks false negatives by masking later code on the same line.
+            # Distinguish char literals (`'a'`) from lifetimes (`'a`): a
+            # lifetime is `'` + identifier start where the following char is
+            # not a closing quote. Treating lifetimes as char literals masked
+            # code after them (false negatives) and desynced the lexer.
+            if i + 2 < len(chars) and chars[i + 1] != "'" and chars[i + 2] == "'":
+                # Char literal like 'a' or '\n' (escape handled below).
+                if chars[i + 1] == "\\":
+                    state.in_char = True
+                    state.char_escape = False
+                    i += 2
+                    continue
+                i += 3
+                continue
+            if i + 3 < len(chars) and chars[i + 1] == "\\" and chars[i + 3] == "'":
+                # Escaped char literal like '\n'.
+                state.in_char = True
+                state.char_escape = False
+                i += 2
+                continue
+            if i + 1 < len(chars) and (chars[i + 1].isalnum() or chars[i + 1] == "_"):
+                # Lifetime like 'a or 'callback: skip both characters.
+                out[i] = ch
+                i += 1
+                continue
             state.in_char = True
             i += 1
             continue
@@ -424,6 +446,29 @@ class CheckNoPanicsTests(unittest.TestCase):
         contexts = line_test_contexts(lines)
 
         self.assertTrue(all(contexts))
+
+    def test_lifetime_before_test_module_does_not_mask_it(self) -> None:
+        # A lifetime in production code (e.g. a struct with `'a`) must not be
+        # lexed as an unterminated char literal, which used to desync the
+        # lexer and hide the `#[cfg(test)] mod tests` boundary — flagging
+        # test-only asserts as production panics.
+        lines = [
+            "struct SidecarRequest<'a> {\n",
+            "    audio: &'a str,\n",
+            "}\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn it_works() {\n",
+            "        assert!(true);\n",
+            "    }\n",
+            "}\n",
+        ]
+
+        contexts = line_test_contexts(lines)
+
+        self.assertFalse(any(contexts[:4]))
+        self.assertTrue(all(contexts[4:]))
 
 
 if __name__ == "__main__":
