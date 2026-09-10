@@ -199,6 +199,9 @@ pub struct MissionManager {
     /// Cancellation and handles for ticker, listener, and outcome watchers.
     task_cancel: CancellationToken,
     task_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Serializes the create_mission check-then-save sequence so concurrent
+    /// same-name creates cannot both pass the dedupe check.
+    mission_create_lock: Mutex<()>,
 }
 
 fn normalize_cron_expression(expression: &str) -> String {
@@ -282,6 +285,7 @@ impl MissionManager {
             self_improvement_enabled: AtomicBool::new(crate::skill_self_improvement_enabled()),
             task_cancel: CancellationToken::new(),
             task_handles: Mutex::new(Vec::new()),
+            mission_create_lock: Mutex::new(()),
         }
     }
 
@@ -462,6 +466,10 @@ impl MissionManager {
         validate_webhook_cadence(&cadence)?;
         let user_id = user_id.into();
         let name = name.into();
+        // Serialize the check-then-save sequence so concurrent creates of the
+        // same name cannot both pass the dedupe check (MR !876 review,
+        // pattern ported from !870's mission_create_lock).
+        let _create_guard = self.mission_create_lock.lock().await;
         // Dedupe against the user's own missions only — `find_by_name` also
         // matches shared missions, and a user create must never adopt one.
         if let Some(existing) = self
@@ -471,10 +479,18 @@ impl MissionManager {
             .into_iter()
             .find(|mission| mission.name == name && !mission.is_terminal())
         {
-            debug!(
-                mission_id = %existing.id,
-                "mission create deduped onto existing non-terminal mission"
-            );
+            let goal = goal.into();
+            if existing.goal != goal || existing.cadence != cadence {
+                warn!(
+                    mission_id = %existing.id,
+                    "mission create deduped onto existing non-terminal mission with a different goal or cadence"
+                );
+            } else {
+                debug!(
+                    mission_id = %existing.id,
+                    "mission create deduped onto existing non-terminal mission"
+                );
+            }
             return Ok(existing.id);
         }
         let mut mission = Mission::new(project_id, user_id, name, goal, cadence);
@@ -3494,6 +3510,57 @@ mod tests {
                 .len(),
             1,
             "one webhook fire must match exactly one mission"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_mission_creates_of_same_name_dedupe_to_one() {
+        // MR !876 review: the list/check/save dedupe sequence must be
+        // serialized, or two concurrent creates of the same name can both
+        // pass the check and persist duplicates (pattern ported from !870).
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager(Arc::clone(&store) as Arc<dyn Store>));
+        let project = ProjectId::new();
+        let cadence = || MissionCadence::Webhook {
+            path: "shared-hook".into(),
+            secret: Some("secret".into()),
+        };
+
+        let (first, second, third) = tokio::join!(
+            mgr.create_mission(
+                project,
+                "test-user",
+                "same mission",
+                "same goal",
+                cadence(),
+                Vec::new(),
+            ),
+            mgr.create_mission(
+                project,
+                "test-user",
+                "same mission",
+                "same goal",
+                cadence(),
+                Vec::new(),
+            ),
+            mgr.create_mission(
+                project,
+                "test-user",
+                "same mission",
+                "same goal",
+                cadence(),
+                Vec::new(),
+            ),
+        );
+
+        let ids = [first.unwrap(), second.unwrap(), third.unwrap()];
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(ids[1], ids[2]);
+        let missions = store.list_missions(project, "test-user").await.unwrap();
+        assert_eq!(
+            missions.len(),
+            1,
+            "concurrent creates must persist exactly one mission"
         );
     }
 
