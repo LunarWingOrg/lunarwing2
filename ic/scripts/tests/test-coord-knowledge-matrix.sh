@@ -266,6 +266,10 @@ EOF
     || die "openssl server certificate signing failed"
   mkdir -p "$WORK/certs"
   cp "$WORK/server.crt" "$WORK/server.key" "$WORK/certs/"
+  # Prosody runs as uid 100 in the container; a root-owned 0600 key cannot be
+  # read, TLS fails to load, and the bridge then sees "no TLS available".
+  # The key is a throwaway, run-scoped secret shredded at teardown.
+  chmod 0644 "$WORK/certs/server.key" "$WORK/certs/server.crt"
   local cfg="$WORK/prosody.cfg.lua"
   cat >"$cfg" <<EOF
 VirtualHost "$DOMAIN"
