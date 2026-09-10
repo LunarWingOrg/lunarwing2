@@ -8,6 +8,8 @@
 //!   server-held credential
 //! - Bounds are enforced (oversize audio, bad format, empty/long text,
 //!   invalid speed, body limit)
+//! - Upstream failures map to stable gateway errors without leaking sidecar
+//!   detail (401 -> 500, other statuses -> 502, timeout -> 504)
 
 use std::sync::Arc;
 
@@ -319,14 +321,85 @@ async fn synthesize_validates_bounds_and_maps_upstream_unavailable() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // A valid request flows to the sidecar; the mock reports TTS disabled,
-    // which must surface as an upstream error (not a gateway 200).
+    // which must surface as a generic upstream error (not a gateway 200, not
+    // a verbatim 503, and without leaking the sidecar's detail text).
     let (status, body) = post_json(
         &format!("http://{addr}/api/voice/synthesize"),
         AUTH_TOKEN,
         json!({"text": "hello", "voice": "af_heart", "speed": 1.0}),
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "body: {body}");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    assert_eq!(body["error"], json!("upstream_error"));
+    assert_eq!(body["message"], json!("voice sidecar error (HTTP 503)"));
+    assert!(
+        !body["message"].as_str().is_some_and(|m| m.contains("tts disabled")),
+        "sidecar detail must not leak to clients"
+    );
+}
+
+#[tokio::test]
+async fn upstream_unauthorized_maps_to_gateway_500_without_detail_leak() {
+    let app = Router::new().route(
+        "/v1/voice/transcribe",
+        post(|| async {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "unauthorized", "detail": "bad sidecar token"})),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let api = VoiceApi::from_config(&voice_config(&format!("http://{addr}")))
+        .map(Arc::new)
+        .expect("voice api should construct");
+    let gateway = start_gateway(Some(api)).await;
+
+    // A sidecar 401 is a server-side credential problem: it must surface as
+    // 500 (not 401, which would read as a failed gateway token) and must not
+    // leak the sidecar's detail text.
+    let (status, body) = post_json(
+        &format!("http://{gateway}/api/voice/transcribe"),
+        AUTH_TOKEN,
+        json!({"audio": "AAAA", "format": "wav"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], json!("upstream_error"));
+    assert_eq!(
+        body["message"],
+        json!("voice sidecar rejected the gateway credential")
+    );
+}
+
+#[tokio::test]
+async fn unreachable_sidecar_maps_to_bad_gateway() {    // Bind then immediately drop the listener to get a closed loopback port.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let api = VoiceApi::from_config(&voice_config(&format!("http://{addr}")))
+        .map(Arc::new)
+        .expect("voice api should construct for loopback url");
+    let gateway = start_gateway(Some(api)).await;
+
+    let (status, body) = post_json(
+        &format!("http://{gateway}/api/voice/transcribe"),
+        AUTH_TOKEN,
+        json!({"audio": "AAAA", "format": "wav"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    assert_eq!(body["error"], json!("upstream_error"));
 }
 
 #[tokio::test]

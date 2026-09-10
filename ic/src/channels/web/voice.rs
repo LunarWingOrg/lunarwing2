@@ -40,7 +40,7 @@ const AUDIO_FORMATS: [&str; 9] = [
 #[derive(Debug, thiserror::Error)]
 enum VoiceProxyError {
     #[error("voice request failed: {0}")]
-    Request(String),
+    Request(#[source] reqwest::Error),
     #[error("voice service returned an invalid response")]
     InvalidResponse,
     #[error("voice service error (HTTP {status}): {detail}")]
@@ -50,10 +50,15 @@ enum VoiceProxyError {
 impl VoiceProxyError {
     fn gateway_status(&self) -> StatusCode {
         match self {
-            Self::Request(_) | Self::InvalidResponse => StatusCode::BAD_GATEWAY,
-            Self::Upstream { status, .. } => {
-                StatusCode::from_u16(*status).unwrap_or(StatusCode::BAD_GATEWAY)
-            }
+            Self::Request(error) if error.is_timeout() => StatusCode::GATEWAY_TIMEOUT,
+            Self::Request(_) => StatusCode::BAD_GATEWAY,
+            Self::InvalidResponse => StatusCode::BAD_GATEWAY,
+            // Upstream statuses are never forwarded verbatim: a sidecar 401
+            // would read as a gateway-token failure, so it maps to 500 and
+            // everything else to 502 (429 handled separately in
+            // `map_proxy_error`).
+            Self::Upstream { status: 401, .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Upstream { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 }
@@ -70,15 +75,27 @@ pub struct VoiceProxyClient {
     model: String,
 }
 
+/// Timeout for calls to the loopback sidecar (mirrors the STT provider).
+const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl VoiceProxyClient {
     pub fn new(
         service_url: &str,
         auth_token: SecretString,
         model: &str,
     ) -> Result<Self, crate::llm::transcription::LunarVoiceConfigError> {
+        Self::with_timeout(service_url, auth_token, model, SIDECAR_REQUEST_TIMEOUT)
+    }
+
+    fn with_timeout(
+        service_url: &str,
+        auth_token: SecretString,
+        model: &str,
+        timeout: Duration,
+    ) -> Result<Self, crate::llm::transcription::LunarVoiceConfigError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(120))
+            .timeout(timeout)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -114,7 +131,19 @@ impl VoiceProxyClient {
         let bytes = self
             .send_bounded(&self.synthesize, &request, MAX_SYNTHESIZE_RESPONSE_BYTES)
             .await?;
-        serde_json::from_slice(&bytes).map_err(|_| VoiceProxyError::InvalidResponse)
+        let response: SidecarSynthesizeResponse =
+            serde_json::from_slice(&bytes).map_err(|_| VoiceProxyError::InvalidResponse)?;
+        // The sidecar always emits WAV; enforce it so a contract drift (a new
+        // format, a misconfigured proxy) surfaces as an upstream error rather
+        // than mislabeled audio reaching desktop clients.
+        if response.format != "wav" {
+            tracing::error!(
+                format = %response.format,
+                "LunarVoice synthesis returned an unexpected audio format"
+            );
+            return Err(VoiceProxyError::InvalidResponse);
+        }
+        Ok(response)
     }
 
     /// POST JSON to the sidecar and read the body with a hard byte cap.
@@ -131,7 +160,7 @@ impl VoiceProxyClient {
             .json(body)
             .send()
             .await
-            .map_err(|error| VoiceProxyError::Request(error.to_string()))?;
+            .map_err(VoiceProxyError::Request)?;
         let status = response.status();
         if !status.is_success() {
             let detail = response
@@ -154,7 +183,7 @@ impl VoiceProxyClient {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|error| VoiceProxyError::Request(error.to_string()))?
+            .map_err(VoiceProxyError::Request)?
         {
             if bytes.len().saturating_add(chunk.len()) > max_bytes {
                 return Err(VoiceProxyError::InvalidResponse);
@@ -317,6 +346,8 @@ struct SidecarSynthesizeRequest<'a> {
 struct SidecarSynthesizeResponse {
     audio: String,
     #[serde(default)]
+    format: String,
+    #[serde(default)]
     sample_rate: u32,
     #[serde(default)]
     duration_ms: u64,
@@ -460,23 +491,44 @@ pub async fn voice_synthesize_handler(
 }
 
 fn map_proxy_error(error: VoiceProxyError) -> HandlerError {
-    if let VoiceProxyError::Upstream { status, detail } = &error {
+    // Log the full error (including upstream detail) server-side; clients get
+    // a stable generic message and never see sidecar internals.
+    tracing::warn!(error = %error, "LunarVoice proxy request failed");
+    if let VoiceProxyError::Upstream { status, .. } = &error {
         match StatusCode::from_u16(*status) {
             Ok(StatusCode::TOO_MANY_REQUESTS) => {
                 return error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     "rate_limited",
-                    detail.clone(),
+                    "voice sidecar rate limited".to_string(),
                 );
             }
             Ok(StatusCode::BAD_REQUEST) => {
-                return error_response(StatusCode::BAD_REQUEST, "bad_request", detail.clone());
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "bad_request",
+                    "voice sidecar rejected the request".to_string(),
+                );
             }
             _ => {}
         }
     }
-    tracing::warn!(error = %error, "LunarVoice proxy request failed");
-    error_response(error.gateway_status(), "upstream_error", error.to_string())
+    let message = match &error {
+        VoiceProxyError::Request(err) if err.is_timeout() => {
+            "voice sidecar timed out".to_string()
+        }
+        VoiceProxyError::Request(_) => "failed to contact voice sidecar".to_string(),
+        VoiceProxyError::Upstream { status: 401, .. } => {
+            "voice sidecar rejected the gateway credential".to_string()
+        }
+        VoiceProxyError::Upstream { status, .. } => {
+            format!("voice sidecar error (HTTP {status})")
+        }
+        VoiceProxyError::InvalidResponse => {
+            "voice sidecar returned an unexpected response".to_string()
+        }
+    };
+    error_response(error.gateway_status(), "upstream_error", message)
 }
 
 fn validate_transcribe_request(request: &VoiceTranscribeRequest) -> Result<(), HandlerError> {
@@ -739,5 +791,126 @@ mod tests {
             .unwrap();
         assert_eq!(response.audio, "UklGRg==");
         assert_eq!(response.sample_rate, 24000);
+    }
+
+    #[tokio::test]
+    async fn proxy_maps_sidecar_401_to_gateway_500_with_generic_message() {
+        use axum::routing::post;
+
+        let sidecar = axum::Router::new().route(
+            "/v1/voice/transcribe",
+            post(|| async {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({"error": "unauthorized", "detail": "bad token"})),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, sidecar).await.unwrap();
+        });
+
+        let client = VoiceProxyClient::new(
+            &format!("http://{}", addr),
+            SecretString::from("secret"),
+            "whisper-tiny",
+        )
+        .unwrap();
+        let err = client
+            .transcribe(SidecarTranscribeRequest {
+                audio: "AAAA",
+                format: "wav",
+                language: "auto",
+                model: "whisper-tiny",
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VoiceProxyError::Upstream { status: 401, .. }));
+        let (status, body) = map_proxy_error(err);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.0.message, "voice sidecar rejected the gateway credential");
+    }
+
+    #[tokio::test]
+    async fn proxy_maps_timeout_to_gateway_504() {
+        use std::time::Duration;
+
+        use axum::routing::post;
+
+        let sidecar = axum::Router::new().route(
+            "/v1/voice/transcribe",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                (StatusCode::OK, Json(serde_json::json!({"text": "late"})))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, sidecar).await.unwrap();
+        });
+
+        let client = VoiceProxyClient::with_timeout(
+            &format!("http://{}", addr),
+            SecretString::from("secret"),
+            "whisper-tiny",
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let err = client
+            .transcribe(SidecarTranscribeRequest {
+                audio: "AAAA",
+                format: "wav",
+                language: "auto",
+                model: "whisper-tiny",
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, VoiceProxyError::Request(e) if e.is_timeout()));
+        assert_eq!(err.gateway_status(), StatusCode::GATEWAY_TIMEOUT);
+        let (status, body) = map_proxy_error(err);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(body.0.message, "voice sidecar timed out");
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_synthesis_format_drift() {
+        use axum::routing::post;
+
+        let sidecar = axum::Router::new().route(
+            "/v1/voice/synthesize",
+            post(|| async {
+                Json(serde_json::json!({
+                    "audio": "UklGRg==",
+                    "format": "mp3",
+                    "sample_rate": 24000,
+                    "duration_ms": 1000,
+                    "voice": "af_heart",
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, sidecar).await.unwrap();
+        });
+
+        let client = VoiceProxyClient::new(
+            &format!("http://{}", addr),
+            SecretString::from("secret"),
+            "whisper-tiny",
+        )
+        .unwrap();
+        let err = client
+            .synthesize(SidecarSynthesizeRequest {
+                text: "hello",
+                voice: "",
+                speed: 1.0,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, VoiceProxyError::InvalidResponse));
     }
 }
