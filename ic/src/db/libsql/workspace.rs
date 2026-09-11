@@ -540,13 +540,14 @@ impl WorkspaceStore for LibSqlBackend {
                 .await
                 .map_err(|e| WorkspaceError::SearchFailed {
                     reason: format!("Document lookup failed: {e}"),
-                })?
-            {
-                Some(row) => get_text(&row, 0).parse::<Uuid>().map_err(|e| {
-                    WorkspaceError::SearchFailed {
-                        reason: format!("Malformed document id in memory_documents: {e}"),
-                    }
-                })?,
+                })? {
+                Some(row) => {
+                    get_text(&row, 0)
+                        .parse::<Uuid>()
+                        .map_err(|e| WorkspaceError::SearchFailed {
+                            reason: format!("Malformed document id in memory_documents: {e}"),
+                        })?
+                }
                 None => {
                     return Err(WorkspaceError::DocumentNotFound {
                         doc_type: path.to_string(),
