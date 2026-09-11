@@ -29,15 +29,13 @@ XML_DISALLOWED_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def _xml_safe(text: object) -> str:
-    """Strip ANSI escapes and XML-disallowed control characters."""
+    """Strip ANSI escapes and XML-disallowed control characters.
+
+    Used for every text serialized into the document: attributes, failure
+    messages, skip reasons, and captured system-out, so no harness byte
+    sequence can produce invalid XML character data.
+    """
     return XML_DISALLOWED_RE.sub("", ANSI_ESCAPE_RE.sub("", str(text)))
-
-
-def _strip_ansi(text: object) -> str:
-    """Strip ANSI escapes only; system-out capture drops malformed bytes."""
-    if not isinstance(text, str):
-        return str(text)
-    return ANSI_ESCAPE_RE.sub("", text)
 
 
 def record(
@@ -135,7 +133,7 @@ def write(path: pathlib.Path, records: Iterable[dict]) -> None:
                 ET.SubElement(case, "skipped", {})
         captured = entry.get("system_out", "")
         if captured:
-            ET.SubElement(case, "system-out").text = _strip_ansi(captured[-200_000:])
+            ET.SubElement(case, "system-out").text = _xml_safe(captured[-200_000:])
     ET.indent(root)
     path.parent.mkdir(parents=True, exist_ok=True)
     ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
