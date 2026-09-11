@@ -328,6 +328,81 @@ fn ingest_stripe(path: &str) -> usize {
     (hash as usize) % INGEST_LOCK_STRIPES
 }
 
+/// Why an inbound `KNOW:` share did not become a note. Kept as a bounded,
+/// body-free reason set so ingest diagnostics can be counted without ever
+/// exposing room message content or sender credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IngestDropReason {
+    /// `sender_id` was missing, overlong, or carried control bytes.
+    InvalidSender,
+    /// Sender is not on the operator-configured publisher allowlist.
+    NotAllowedPublisher,
+    /// Per-sender hourly budget exhausted.
+    SenderRateLimited,
+    /// Daemon-wide hourly budget exhausted.
+    GlobalRateLimited,
+}
+
+impl IngestDropReason {
+    fn label(self) -> &'static str {
+        match self {
+            Self::InvalidSender => "invalid_sender",
+            Self::NotAllowedPublisher => "not_allowed_publisher",
+            Self::SenderRateLimited => "sender_rate_limited",
+            Self::GlobalRateLimited => "global_rate_limited",
+        }
+    }
+}
+
+/// Saturating per-reason drop counters shared between the hook and the
+/// coordination admin status surface. Counts are monotonic diagnostics only;
+/// they never gate ingestion.
+#[derive(Debug, Default)]
+pub struct IngestDiagnostics {
+    invalid_sender: std::sync::atomic::AtomicU64,
+    not_allowed_publisher: std::sync::atomic::AtomicU64,
+    sender_rate_limited: std::sync::atomic::AtomicU64,
+    global_rate_limited: std::sync::atomic::AtomicU64,
+}
+
+impl IngestDiagnostics {
+    /// Record one drop of the given reason. Saturates at `u64::MAX` rather
+    /// than wrapping, so a long-lived counter can never under-report.
+    pub fn record_drop(&self, reason: IngestDropReason) {
+        let counter = match reason {
+            IngestDropReason::InvalidSender => &self.invalid_sender,
+            IngestDropReason::NotAllowedPublisher => &self.not_allowed_publisher,
+            IngestDropReason::SenderRateLimited => &self.sender_rate_limited,
+            IngestDropReason::GlobalRateLimited => &self.global_rate_limited,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current per-reason drop counts as `(label, count)` pairs, ordered by
+    /// the enum declaration.
+    pub fn drop_counts(&self) -> Vec<(&'static str, u64)> {
+        use std::sync::atomic::Ordering::Relaxed;
+        [
+            (IngestDropReason::InvalidSender, &self.invalid_sender),
+            (
+                IngestDropReason::NotAllowedPublisher,
+                &self.not_allowed_publisher,
+            ),
+            (
+                IngestDropReason::SenderRateLimited,
+                &self.sender_rate_limited,
+            ),
+            (
+                IngestDropReason::GlobalRateLimited,
+                &self.global_rate_limited,
+            ),
+        ]
+        .into_iter()
+        .map(|(reason, counter)| (reason.label(), counter.load(Relaxed)))
+        .collect()
+    }
+}
+
 /// Priority 13 — ingest `KNOW:` shares from coordination channels into the
 /// daemon-local shared knowledge scope. It is fail-open and side-effect-only:
 /// room routing is never modified or rejected.
@@ -336,6 +411,9 @@ pub struct KnowledgeShareHook {
     workspace: Arc<Workspace>,
     limits: KnowledgeShareLimits,
     max_message_chars: usize,
+    /// Bounded, body-free ingest diagnostics surfaced by the coordination
+    /// admin status endpoint.
+    pub diagnostics: Arc<IngestDiagnostics>,
     /// Per-path striped locks serializing write-then-metadata pairs so two
     /// concurrent shares for the same note cannot interleave into mismatched
     /// content/metadata states, while shares for different paths proceed
@@ -359,6 +437,7 @@ impl KnowledgeShareHook {
             workspace,
             limits,
             max_message_chars: DEFAULT_MAX_MESSAGE_LENGTH,
+            diagnostics: Arc::new(IngestDiagnostics::default()),
             ingest_locks: Arc::new((0..INGEST_LOCK_STRIPES).map(|_| Mutex::new(())).collect()),
             global_window: Arc::new(Mutex::new(Vec::new())),
             global_max_per_hour: global_max_per_hour_from_env(),
@@ -368,6 +447,13 @@ impl KnowledgeShareHook {
     /// Apply the room's configured single-message character cap.
     pub fn with_max_message_chars(mut self, max_message_chars: usize) -> Self {
         self.max_message_chars = max_message_chars.max(1);
+        self
+    }
+
+    /// Replace the internal diagnostics with an externally owned handle so
+    /// hook drops and a status surface observe the same counters.
+    pub fn with_shared_diagnostics(mut self, shared: Arc<IngestDiagnostics>) -> Self {
+        self.diagnostics = shared;
         self
     }
 
@@ -525,6 +611,8 @@ impl Hook for KnowledgeShareHook {
         // A missing, overlong, or control-bearing actor cannot provide safe
         // provenance. Never fall back to the tenant owner scope.
         let Some(sender) = sender_id.as_deref().and_then(usable_sender) else {
+            self.diagnostics
+                .record_drop(IngestDropReason::InvalidSender);
             tracing::warn!("coordination knowledge share ignored: invalid or missing sender_id");
             return Ok(HookOutcome::ok());
         };
@@ -533,6 +621,8 @@ impl Hook for KnowledgeShareHook {
         // knowledge scope, so unlisted senders are ignored without affecting
         // room traffic.
         if !self.limits.is_allowed_publisher(sender) {
+            self.diagnostics
+                .record_drop(IngestDropReason::NotAllowedPublisher);
             tracing::debug!(
                 sender,
                 "coordination knowledge share from non-allowlisted sender ignored"
@@ -547,6 +637,8 @@ impl Hook for KnowledgeShareHook {
             .try_consume_rate_limit(&key, self.limits.max_per_hour, INGEST_WINDOW)
             .await
         {
+            self.diagnostics
+                .record_drop(IngestDropReason::SenderRateLimited);
             tracing::warn!(
                 sender,
                 topic = %message.topic,
@@ -556,6 +648,8 @@ impl Hook for KnowledgeShareHook {
             return Ok(HookOutcome::ok());
         }
         if !self.try_consume_global_limit().await {
+            self.diagnostics
+                .record_drop(IngestDropReason::GlobalRateLimited);
             tracing::warn!(
                 sender,
                 topic = %message.topic,
@@ -767,6 +861,40 @@ mod tests {
         };
         assert!(user_bare.is_allowed_publisher("ruffles@xmpp.sobe.world"));
         assert!(!user_bare.is_allowed_publisher("mepuhiy@conference.xmpp.sobe.world/ruffles"));
+    }
+
+    #[test]
+    fn ingest_diagnostics_count_is_monotonic_and_labeled() {
+        let diagnostics = IngestDiagnostics::default();
+        diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
+        diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
+        diagnostics.record_drop(IngestDropReason::InvalidSender);
+        let counts: std::collections::HashMap<_, _> =
+            diagnostics.drop_counts().into_iter().collect();
+        assert_eq!(counts["not_allowed_publisher"], 2);
+        assert_eq!(counts["invalid_sender"], 1);
+        assert_eq!(counts["sender_rate_limited"], 0);
+        assert_eq!(counts["global_rate_limited"], 0);
+        assert_eq!(counts.len(), 4);
+    }
+
+    #[test]
+    fn ingest_diagnostics_labels_are_stable_and_full() {
+        let diagnostics = IngestDiagnostics::default();
+        let labels: Vec<&str> = diagnostics
+            .drop_counts()
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "invalid_sender",
+                "not_allowed_publisher",
+                "sender_rate_limited",
+                "global_rate_limited",
+            ]
+        );
     }
 
     #[cfg(feature = "libsql")]
