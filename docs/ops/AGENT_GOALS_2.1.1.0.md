@@ -130,7 +130,7 @@
 27. [x] (S) Reserved for CI/CD fixes
 
 ## Phase 5 - Documentation
-28. [x] (S) Reserved
+28. [ ] take a look at any documentation that should be updated and update necessary documentation
 29. [x] (S) Reserved
 30. [x] (S) Reserved
 31. [x] (S) Reserved
