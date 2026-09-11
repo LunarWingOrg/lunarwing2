@@ -1,0 +1,272 @@
+{
+  "schema": 1,
+  "comment": "Canonical classification of every tracked non-vendor Cargo.lock root (GOAL32 P1.4). CI validation fails when a lockfile is missing from this manifest, an entry points at a missing manifest/lockfile, or a classified production unit loses its CI coverage. status: production | experimental | fixture | mirror | retired | staging.",
+  "deliverables": [
+    {
+      "name": "lunarwing-daemon-workspace",
+      "status": "production",
+      "owner": "core",
+      "manifest": "ic/Cargo.toml",
+      "lockfile": "ic/Cargo.lock",
+      "targets": ["lunarwing", "lunarwing_common", "lunarwing_safety", "lunarwing_skills", "lunarwing_engine", "lunarwing_health_metrics"],
+      "ci": ["rust-check-default", "rust-check-postgres", "rust-check-libsql", "rust-check-all-features", "rust-test-lib", "rust-test-libsql", "rust-test-postgres-integration", "rustfmt", "rust-clippy-all", "cargo-deny", "cargo-metadata", "rust-msrv-check"],
+      "triggers": ["ic/**", ".cargo/config.toml"]
+    },
+    {
+      "name": "xmpp-bridge",
+      "status": "production",
+      "owner": "core",
+      "manifest": "ic/bridges/xmpp-bridge/Cargo.toml",
+      "lockfile": "ic/bridges/xmpp-bridge/Cargo.lock",
+      "targets": ["xmpp-bridge"],
+      "ci": ["shell-harnesses"],
+      "triggers": ["ic/bridges/xmpp-bridge/**"]
+    },
+    {
+      "name": "xmpp-channel-wasm",
+      "status": "production",
+      "owner": "channels",
+      "manifest": "ic/channels-src/xmpp/Cargo.toml",
+      "lockfile": "ic/channels-src/xmpp/Cargo.lock",
+      "targets": ["xmpp-channel"],
+      "ci": ["wasm-channel-test-artifacts"],
+      "triggers": ["ic/channels-src/xmpp/**", "lunarwing_weechat_wss/channel.wit"]
+    },
+    {
+      "name": "multica-channel-wasm",
+      "status": "production",
+      "owner": "channels",
+      "manifest": "ic/channels-src/multica/Cargo.toml",
+      "lockfile": "ic/channels-src/multica/Cargo.lock",
+      "targets": ["multica-channel"],
+      "ci": ["registry-json"],
+      "triggers": ["ic/channels-src/multica/**"]
+    },
+    {
+      "name": "cavepony-wasm",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/cavepony/Cargo.toml",
+      "lockfile": "ic/tools-src/cavepony/Cargo.lock",
+      "targets": ["cavepony"],
+      "ci": ["cavepony-wasm"],
+      "triggers": ["ic/tools-src/cavepony/**"]
+    },
+    {
+      "name": "gitlab-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/gitlab/Cargo.toml",
+      "lockfile": "ic/tools-src/gitlab/Cargo.lock",
+      "targets": ["gitlab-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/gitlab/**"]
+    },
+    {
+      "name": "llm-context-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/llm-context/Cargo.toml",
+      "lockfile": "ic/tools-src/llm-context/Cargo.lock",
+      "targets": ["llm-context-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/llm-context/**"]
+    },
+    {
+      "name": "multica-bridge-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/multica-bridge/Cargo.toml",
+      "lockfile": "ic/tools-src/multica-bridge/Cargo.lock",
+      "targets": ["multica-bridge-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/multica-bridge/**"]
+    },
+    {
+      "name": "ssh-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/ssh/Cargo.toml",
+      "lockfile": "ic/tools-src/ssh/Cargo.lock",
+      "targets": ["ssh-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/ssh/**"]
+    },
+    {
+      "name": "vision-analyze-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/vision-analyze/Cargo.toml",
+      "lockfile": "ic/tools-src/vision-analyze/Cargo.lock",
+      "targets": ["vision-analyze-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/vision-analyze/**"]
+    },
+    {
+      "name": "voice-transcribe-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/voice-transcribe/Cargo.toml",
+      "lockfile": "ic/tools-src/voice-transcribe/Cargo.lock",
+      "targets": ["voice-transcribe-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/voice-transcribe/**"]
+    },
+    {
+      "name": "web-search-wasm-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/tools-src/web-search/Cargo.toml",
+      "lockfile": "ic/tools-src/web-search/Cargo.lock",
+      "targets": ["web-search-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/tools-src/web-search/**"]
+    },
+    {
+      "name": "unix-socket-client",
+      "status": "production",
+      "owner": "core",
+      "manifest": "ic/unix-socket-client/Cargo.toml",
+      "lockfile": "ic/unix-socket-client/Cargo.lock",
+      "targets": ["unix-socket-client"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/unix-socket-client/**"]
+    },
+    {
+      "name": "gotify-tool",
+      "status": "production",
+      "owner": "tools",
+      "manifest": "ic/lunarwing-gotify-tool/Cargo.toml",
+      "lockfile": "ic/lunarwing-gotify-tool/Cargo.lock",
+      "targets": ["gotify-tool"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["ic/lunarwing-gotify-tool/**"]
+    },
+    {
+      "name": "test-echo-tool",
+      "status": "fixture",
+      "owner": "core",
+      "manifest": "ic/tests/fixtures/test-echo-tool/Cargo.toml",
+      "lockfile": "ic/tests/fixtures/test-echo-tool/Cargo.lock",
+      "targets": ["test-echo-tool"],
+      "ci": [],
+      "triggers": ["ic/tests/fixtures/test-echo-tool/**"]
+    },
+    {
+      "name": "openclaw-xmpp-bridge-port",
+      "status": "staging",
+      "owner": "ports",
+      "manifest": "ic/openclaw-ports/xmpp/bridge/Cargo.toml",
+      "lockfile": "ic/openclaw-ports/xmpp/bridge/Cargo.lock",
+      "targets": ["openclaw-xmpp-bridge-contract"],
+      "ci": [],
+      "comment": "OpenClaw port staging work; keep edits inside ic/openclaw-ports/ per AGENTS.md",
+      "triggers": ["ic/openclaw-ports/**"]
+    },
+    {
+      "name": "weechat-relay-channel-wasm",
+      "status": "production",
+      "owner": "channels",
+      "manifest": "lunarwing_weechat_wss/weechat_relay/Cargo.toml",
+      "lockfile": "lunarwing_weechat_wss/weechat_relay/Cargo.lock",
+      "targets": ["weechat-relay-channel"],
+      "ci": ["wasm-channel-test-artifacts", "shell-harnesses"],
+      "triggers": ["lunarwing_weechat_wss/**"]
+    },
+    {
+      "name": "darkirc-channel",
+      "status": "production",
+      "owner": "channels",
+      "manifest": "darkirc_channel_for_lunarwing/darkirc/Cargo.toml",
+      "lockfile": "darkirc_channel_for_lunarwing/darkirc/Cargo.lock",
+      "targets": ["darkirc-channel"],
+      "ci": ["python-unit"],
+      "triggers": ["darkirc_channel_for_lunarwing/**"]
+    },
+    {
+      "name": "pebble-worker-upstream",
+      "status": "mirror",
+      "owner": "workers",
+      "manifest": "pebble/Cargo.toml",
+      "lockfile": "pebble/Cargo.lock",
+      "targets": [],
+      "comment": "Upstream Pebble mirror pinned at HEAD/v0.5.0; built inside pebble4lunarwing images, never shipped from this tree directly",
+      "ci": [],
+      "triggers": []
+    },
+    {
+      "name": "pebble4lunarwing",
+      "status": "production",
+      "owner": "workers",
+      "manifest": "pebble4lunarwing/Cargo.toml",
+      "lockfile": "pebble4lunarwing/Cargo.lock",
+      "targets": ["pebble4lunarwing"],
+      "ci": ["shell-harnesses"],
+      "triggers": ["pebble4lunarwing/**", "pebble/**"]
+    },
+    {
+      "name": "voice-sidecar",
+      "status": "production",
+      "owner": "sidecars",
+      "manifest": "projects/voice-sidecar/Cargo.toml",
+      "lockfile": "projects/voice-sidecar/Cargo.lock",
+      "targets": ["lunarwing-voice-sidecar"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["projects/voice-sidecar/**"]
+    },
+    {
+      "name": "ocr-sidecar",
+      "status": "production",
+      "owner": "sidecars",
+      "manifest": "projects/ocr-sidecar/Cargo.toml",
+      "lockfile": "projects/ocr-sidecar/Cargo.lock",
+      "targets": ["lunarwing-ocr-sidecar"],
+      "ci": ["standalone-deliverables"],
+      "triggers": ["projects/ocr-sidecar/**"]
+    },
+    {
+      "name": "gotify-tool-repo-root-copy",
+      "status": "retired",
+      "owner": "tools",
+      "manifest": "lunarwing-gotify-tool/Cargo.toml",
+      "lockfile": "lunarwing-gotify-tool/Cargo.lock",
+      "targets": [],
+      "comment": "Historical root-level copy; the canonical build lives at ic/lunarwing-gotify-tool",
+      "ci": [],
+      "triggers": []
+    },
+    {
+      "name": "gotify-tool-wasm-reference-copy",
+      "status": "retired",
+      "owner": "tools",
+      "manifest": "gotify-wasm/lunarwing-gotify-tool/Cargo.toml",
+      "lockfile": "gotify-wasm/lunarwing-gotify-tool/Cargo.lock",
+      "targets": [],
+      "comment": "Historical reference copy; the canonical build lives at ic/lunarwing-gotify-tool",
+      "ci": [],
+      "triggers": []
+    },
+    {
+      "name": "unix-socket-client-repo-copy",
+      "status": "retired",
+      "owner": "core",
+      "manifest": "git-lunarwing-unix-socket-client-repo/Cargo.toml",
+      "lockfile": "git-lunarwing-unix-socket-client-repo/Cargo.lock",
+      "targets": [],
+      "comment": "Historical standalone repo copy; canonical path is ic/unix-socket-client",
+      "ci": [],
+      "triggers": []
+    },
+    {
+      "name": "unix-socket-client-replv2-copy",
+      "status": "retired",
+      "owner": "core",
+      "manifest": "replv2git/git-lunarwing-unix-socket-client-repo/Cargo.toml",
+      "lockfile": "replv2git/git-lunarwing-unix-socket-client-repo/Cargo.lock",
+      "targets": [],
+      "comment": "Historical replv2 scratch copy; canonical path is ic/unix-socket-client",
+      "ci": [],
+      "triggers": []
+    }
+  ]
+}
