@@ -2204,7 +2204,9 @@ fn build_meta_prompt(
         let skipped = start;
         parts.push("\n## Previous Approaches".into());
         if skipped > 0 {
-            parts.push(format!("({skipped} earlier run(s) omitted — see transcripts)"));
+            parts.push(format!(
+                "({skipped} earlier run(s) omitted — see transcripts)"
+            ));
         }
         for (i, approach) in history[start..].iter().enumerate() {
             let truncated: String = approach.chars().take(MAX_APPROACH_CHARS).collect();
@@ -4409,13 +4411,17 @@ mod tests {
         assert!(!declares_goal_achieved(
             "Accomplished: verified persistence. The prior thread said GOAL ACHIEVED: YES but I could not reproduce it."
         ));
-        assert!(!declares_goal_achieved("the mission complete check fired early"));
+        assert!(!declares_goal_achieved(
+            "the mission complete check fired early"
+        ));
         assert!(!declares_goal_achieved(
             "questions about whether the mission complete criteria hold remain"
         ));
         assert!(!declares_goal_achieved("Goal achieved: no"));
         assert!(!declares_goal_achieved("Goal achieved: not yet"));
-        assert!(!declares_goal_achieved("Goal achieved: yes, for this step only"));
+        assert!(!declares_goal_achieved(
+            "Goal achieved: yes, for this step only"
+        ));
         assert!(!declares_goal_achieved("Sub-goal achieved: yes"));
         assert!(!declares_goal_achieved(
             "Next focus: confirm goal achieved: yes eventually"

@@ -88,6 +88,11 @@ pub struct HybridStore {
     doc_paths: RwLock<HashMap<DocId, String>>,
     workspace: Option<Arc<Workspace>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
+    /// Test-only hook: when set, the next `save_memory_doc` fails once, forcing
+    /// the consolidation migration to prove it never deletes legacy sources
+    /// before the canonical write has succeeded (MR !885 review).
+    #[cfg(test)]
+    fail_next_doc_save: std::sync::atomic::AtomicBool,
 }
 
 impl HybridStore {
@@ -114,6 +119,8 @@ impl HybridStore {
             doc_paths: RwLock::new(HashMap::new()),
             workspace,
             secrets_store,
+            #[cfg(test)]
+            fail_next_doc_save: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1780,6 +1787,16 @@ impl Store for HybridStore {
             }
         }
 
+        #[cfg(test)]
+        if self
+            .fail_next_doc_save
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(EngineError::Store {
+                reason: "injected doc save failure".to_string(),
+            });
+        }
+
         self.docs.write().await.insert(doc.id, doc.clone());
         self.persist_doc(doc).await;
         Ok(())
@@ -2049,6 +2066,107 @@ mod tests {
                 mission_dir("default--project", "Daily report", id)
             )
         );
+    }
+
+    #[test]
+    fn knowledge_doc_frontmatter_round_trips_ownership() {
+        // Goal #30 tracker item (c): ownership must survive a reload, or the
+        // fix pattern database becomes invisible to list_shared_memory_docs
+        // and gets re-seeded under a fresh DocId on every startup.
+        let doc = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            "fix_pattern_database",
+            "| a | b | c |",
+        );
+        let serialized = serialize_knowledge_doc(&doc);
+        let restored = deserialize_knowledge_doc(&serialized).expect("round-trip parse");
+        assert_eq!(restored.user_id, doc.user_id);
+        assert_eq!(restored.project_id, doc.project_id);
+
+        // Legacy docs without the owner/project fields keep the old defaults.
+        let legacy = "---\n\
+id: \"00000000-0000-0000-0000-000000000001\"\n\
+doc_type: \"Note\"\n\
+title: \"old doc\"\n\
+---\n\nbody";
+        let restored = deserialize_knowledge_doc(legacy).expect("legacy parse");
+        assert_eq!(restored.user_id, "legacy");
+        assert_eq!(restored.project_id, ProjectId(uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn fix_pattern_doc_uses_stable_workspace_path() {
+        let project = ProjectId::new();
+        let doc = MemoryDoc::new(
+            project,
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        let project8 = &project.0.to_string()[..8];
+        assert_eq!(
+            doc_workspace_path(&doc),
+            format!("engine/orchestrator/fix-patterns--{project8}.md")
+        );
+        // Different DocIds within one project must not fork different files.
+        let other = MemoryDoc::new(
+            project,
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert_eq!(doc_workspace_path(&doc), doc_workspace_path(&other));
+        // Distinct projects get distinct files (no cross-project overwrite).
+        let foreign = MemoryDoc::new(
+            ProjectId::new(),
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert_ne!(doc_workspace_path(&doc), doc_workspace_path(&foreign));
+    }
+
+    #[test]
+    fn fix_pattern_candidate_requires_shared_identity_or_tag() {
+        // MR !885 review: title alone must not mark a doc for consolidation —
+        // an unrelated user document named fix_pattern_database would be
+        // absorbed and its file deleted.
+        let project = ProjectId::new();
+        let user_doc = MemoryDoc::new(project, "alice", DocType::Note, FIX_PATTERN_TITLE, "mine");
+        assert!(
+            !is_fix_pattern_doc(&user_doc),
+            "untagged user-owned doc must not be a consolidation candidate"
+        );
+
+        let shared = MemoryDoc::new(
+            project,
+            "__shared__",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "seed",
+        );
+        assert!(is_fix_pattern_doc(&shared));
+
+        let tagged = MemoryDoc::new(project, "alice", DocType::Note, FIX_PATTERN_TITLE, "mine")
+            .with_tags(vec![FIX_PATTERN_TAG.to_string()]);
+        assert!(is_fix_pattern_doc(&tagged));
+
+        let legacy = MemoryDoc::new(
+            ProjectId(uuid::Uuid::nil()),
+            "legacy",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "old",
+        );
+        assert!(is_fix_pattern_doc(&legacy));
+
+        let unrelated = MemoryDoc::new(project, "alice", DocType::Note, "other title", "mine");
+        assert!(!is_fix_pattern_doc(&unrelated));
     }
 
     #[tokio::test]
@@ -2869,5 +2987,449 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn fix_pattern_doc_survives_reload_without_reseed_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // Goal #30 tracker item (c): three distinct fix_pattern_database
+        // duplicates were observed accumulating on a live tenant. The shared
+        // doc must round-trip ownership so a reload still finds it, and the
+        // workspace path must be stable across saves.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let project_id = ProjectId::new();
+
+        let mut doc = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| Tool X not found | alias | overlay |",
+        );
+        let original_id = doc.id;
+        store.save_memory_doc(&doc).await.unwrap();
+
+        // Update in place with a new row — same DocId, same path.
+        doc.content
+            .push_str("\n| NameError: x | prompt hint | overlay |");
+        doc.updated_at = chrono::Utc::now();
+        store.save_memory_doc(&doc).await.unwrap();
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found.len(),
+            1,
+            "reload must find exactly one fix pattern doc (got {found_len})",
+            found_len = found.len()
+        );
+        assert_eq!(found[0].id, original_id, "same DocId must round-trip");
+        assert!(found[0].content.contains("NameError"));
+        assert_eq!(found[0].user_id, shared_owner_id());
+
+        // A second reload after the first must still be exactly one doc.
+        let reloaded_again = HybridStore::new(Some(workspace));
+        reloaded_again.load_state_from_workspace().await.unwrap();
+        let count = reloaded_again
+            .list_shared_memory_docs(project_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .count();
+        assert_eq!(
+            count, 1,
+            "no re-seed duplicates may accumulate across reloads"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_merges_legacy_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-dupes.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-dupes-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+
+        // Simulate the legacy damage the way it actually exists on tenants:
+        // two id-suffixed files under engine/knowledge/notes/ written by the
+        // old path builder, each with distinct DocIds and different rows.
+        let older = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| older row | a | b |",
+        );
+        let mut newer = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| newer row | c | d |",
+        );
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(10);
+        for doc in [&older, &newer] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write legacy duplicate");
+        }
+
+        // Reload triggers consolidation.
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(found.len(), 1, "legacy duplicates must collapse to one doc");
+        assert_eq!(found[0].id, newer.id, "newest doc wins consolidation");
+        assert!(found[0].content.contains("newer row"));
+        assert!(
+            found[0].content.contains("older row"),
+            "unique rows from duplicates must be merged, not dropped"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_normalizes_legacy_ownership() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // MR !876 review: legacy files without owner/project frontmatter
+        // reload as user "legacy" under the nil project. Consolidation must
+        // normalize that identity to the shared owner so the seeder's
+        // list_shared_memory_docs finds the canonical doc and never reseeds
+        // over the merged rows.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-legacy.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-legacy-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+        // A project record must exist so consolidation can adopt it as the
+        // anchor for legacy-identity duplicates (nil project on the docs).
+        let mut project = Project::new("test-user", "legacy-anchor", "anchor project");
+        project.id = project_id;
+        workspace
+            .write(
+                &project_path("legacy-anchor", project_id),
+                &serde_json::to_string(&project).expect("serialize project"),
+            )
+            .await
+            .expect("write project");
+
+        // Two docs rehydrated with the legacy identity: user "legacy", nil
+        // project — the shape every pre-ownership-persistence file reloads as.
+        let older = MemoryDoc::new(
+            ProjectId(uuid::Uuid::nil()),
+            "legacy",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| legacy older row | a | b |",
+        );
+        let mut newer = MemoryDoc::new(
+            ProjectId(uuid::Uuid::nil()),
+            "legacy",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy | Location pattern |\n|---|---|---|\n| legacy newer row | c | d |",
+        );
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(10);
+        for doc in [&older, &newer] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write legacy-identity duplicate");
+        }
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "legacy-identity duplicates must collapse to one shared doc"
+        );
+        assert_eq!(
+            found[0].user_id,
+            shared_owner_id(),
+            "canonical doc must be normalized to the shared owner"
+        );
+        assert_eq!(
+            found[0].project_id, project_id,
+            "canonical doc must adopt the sole known project"
+        );
+        assert!(
+            found[0].content.contains("legacy older row"),
+            "merged rows must survive the ownership normalization"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_skips_cross_project_duplicates() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // When duplicates are owned by distinct real projects, no single
+        // winner is safe: consolidation must be skipped entirely.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-xproj.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-xproj-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+        let seed_store = HybridStore::new(Some(Arc::clone(&workspace)));
+        for (project, row) in [(project_a, "row a"), (project_b, "row b")] {
+            let doc = MemoryDoc::new(
+                project,
+                shared_owner_id(),
+                DocType::Note,
+                FIX_PATTERN_TITLE,
+                format!("| Trace pattern | Fix strategy |\n|---|---|\n| {row} | x | y |"),
+            );
+            seed_store.save_memory_doc(&doc).await.unwrap();
+        }
+
+        let reloaded = HybridStore::new(Some(workspace));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        // Both per-project copies must survive untouched.
+        for project in [project_a, project_b] {
+            let count = reloaded
+                .list_shared_memory_docs(project)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|d| d.title == FIX_PATTERN_TITLE)
+                .count();
+            assert_eq!(
+                count, 1,
+                "cross-project duplicates must be left in place per project"
+            );
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_keeps_legacy_sources_on_write_failure() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // MR !885 review (blocking): a canonical write failure must leave every
+        // legacy source intact — no files deleted, no map entries dropped — so
+        // the next startup can retry the whole migration. Persist before delete
+        // is the invariant.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-fail.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-fail-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+
+        let older = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy |\n|---|---|\n| older row | a | b |",
+        );
+        let mut newer = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern | Fix strategy |\n|---|---|\n| newer row | c | d |",
+        );
+        newer.updated_at = older.updated_at + chrono::Duration::seconds(10);
+        let mut paths = Vec::new();
+        for doc in [&older, &newer] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write legacy duplicate");
+            paths.push(path);
+        }
+
+        // Reload with the canonical save forced to fail: the write-to-stable-
+        // path step must fail, so nothing may be deleted.
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded
+            .fail_next_doc_save
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        for path in &paths {
+            assert!(
+                workspace.read(path).await.is_ok(),
+                "legacy file must survive a failed consolidation: {path}"
+            );
+        }
+        assert_eq!(
+            reloaded.docs.read().await.len(),
+            2,
+            "both legacy docs must remain in memory after a failed save"
+        );
+
+        // A second reload with no injected failure completes the migration,
+        // proving the retry path works from the intact legacy state.
+        let retry = HybridStore::new(Some(workspace));
+        retry.load_state_from_workspace().await.unwrap();
+        let shared = retry.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(found.len(), 1, "retry must consolidate to one doc");
+        assert!(found[0].content.contains("older row"));
+        assert!(found[0].content.contains("newer row"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn consolidate_fix_pattern_ignores_unrelated_same_title_docs() {
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use lunarwing_engine::types::shared_owner_id;
+
+        // MR !885 review: title-only matching would absorb and delete an
+        // unrelated user document that happens to share the title. Only the
+        // shared/tagged doc may be consolidated; the user's file must survive
+        // every reload untouched.
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-title.db"))
+            .await
+            .expect("libsql backend");
+        backend.run_migrations().await.expect("migrations");
+        let workspace = Arc::new(Workspace::new_with_db(
+            "fix-patterns-title-test",
+            Arc::new(backend) as Arc<dyn Database>,
+        ));
+        let project_id = ProjectId::new();
+
+        // A shared (candidate) doc and a user-owned same-title doc, written as
+        // legacy id-suffixed files like the damage on live tenants. The user
+        // doc is newer, so title-only consolidation would pick it as the
+        // canonical doc, delete both legacy files, and re-own the merged rows
+        // to `__shared__` — destroying the user's document.
+        let shared_doc = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "| Trace pattern |\n|---|\n| shared row |",
+        );
+        let mut user_doc = MemoryDoc::new(
+            project_id,
+            "alice",
+            DocType::Note,
+            FIX_PATTERN_TITLE,
+            "personal notes about fix patterns",
+        );
+        user_doc.updated_at = shared_doc.updated_at + chrono::Duration::seconds(10);
+        let mut user_path = String::new();
+        for doc in [&shared_doc, &user_doc] {
+            let short = &doc.id.0.to_string()[..8];
+            let path = format!("{KNOWLEDGE_PREFIX}/notes/fix-pattern-database--{short}.md");
+            workspace
+                .write(&path, &serialize_knowledge_doc(doc))
+                .await
+                .expect("write same-title doc");
+            if doc.id == user_doc.id {
+                user_path = path;
+            }
+        }
+
+        let reloaded = HybridStore::new(Some(Arc::clone(&workspace)));
+        reloaded.load_state_from_workspace().await.unwrap();
+
+        // The user's doc survives in memory and on disk, untouched.
+        let loaded = reloaded
+            .load_memory_doc(user_doc.id)
+            .await
+            .unwrap()
+            .expect("user doc must survive reload in memory");
+        assert_eq!(loaded.user_id, "alice");
+        assert_eq!(loaded.content, user_doc.content);
+        let file = workspace
+            .read(&user_path)
+            .await
+            .expect("user doc file must survive consolidation");
+        assert!(
+            file.content.contains("personal notes about fix patterns"),
+            "file was: {}",
+            file.content
+        );
+
+        // The shared candidate also survives (one candidate is not a duplicate
+        // set — consolidation requires at least two candidates).
+        let shared = reloaded.list_shared_memory_docs(project_id).await.unwrap();
+        let found: Vec<_> = shared
+            .iter()
+            .filter(|d| d.title == FIX_PATTERN_TITLE)
+            .collect();
+        assert_eq!(found.len(), 1, "exactly the shared doc counts as shared");
+        assert_eq!(found[0].id, shared_doc.id);
     }
 }
