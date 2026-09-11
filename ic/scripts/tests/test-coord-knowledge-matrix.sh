@@ -52,7 +52,9 @@ set -euo pipefail
 #   MATRIX_PROSODY_IMAGE  Prosody image (default docker.io/prosodyim/prosody:13.0)
 #   MATRIX_PERSIST    path to write the matrix report markdown (optional)
 #
-# Exit codes: 0 = all cases passed, 1 = at least one case failed.
+# Exit codes: 0 = all cases passed (or SKIPPED because a prerequisite such as
+# the container runtime is unavailable on this host), 1 = at least one case
+# failed.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MT_ADMIN="${MT_ADMIN:-$SCRIPT_DIR/../lunarwing-mt-admin.sh}"
@@ -110,12 +112,24 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# The matrix is a live harness that needs a container runtime (rootless
+# Prosody) plus standard tooling. CI runners without a container runtime must
+# skip cleanly instead of failing the shell-harnesses gate (MR !887 finding
+# F2), so missing prerequisites emit a SKIPPED marker and exit 0 rather than
+# FATAL. Only the root/mt-admin checks below remain fatal: they guard against
+# operational misuse on a real host, not a bare environment.
+missing=()
+command -v podman >/dev/null 2>&1 || missing+=("podman (or docker aliased as podman)")
+command -v jq >/dev/null 2>&1 || missing+=("jq")
+command -v curl >/dev/null 2>&1 || missing+=("curl")
+command -v openssl >/dev/null 2>&1 || missing+=("openssl")
+if ((${#missing[@]} > 0)); then
+  say "SKIPPED: requires ${missing[*]}"
+  exit 0
+fi
+
 [[ $EUID -eq 0 ]] || die "run as root: tenant lifecycle goes through $MT_ADMIN"
 [[ -x "$MT_ADMIN" ]] || die "mt-admin not found/executable: $MT_ADMIN"
-  command -v podman >/dev/null 2>&1 || die "docker (or podman aliased) required for the isolated Prosody"
-command -v jq >/dev/null 2>&1 || die "jq required"
-command -v curl >/dev/null 2>&1 || die "curl required"
-command -v openssl >/dev/null 2>&1 || die "openssl required (throwaway matrix CA)"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -278,6 +292,11 @@ EOF
   chmod 0644 "$WORK/certs/server.key" "$WORK/certs/server.crt"
   local cfg="$WORK/prosody.cfg.lua"
   cat >"$cfg" <<EOF
+-- Loopback-only binding: with --network host the container publishes
+-- 5222/5269/5280 on every host interface unless pinned here. Global options
+-- must precede the first VirtualHost/Component (prosody portmanager).
+interfaces = { "127.0.0.1" }
+
 VirtualHost "$DOMAIN"
   authentication = "internal_plain"
   allow_unencrypted_plain_auth = true
@@ -292,8 +311,9 @@ Component "conference.$DOMAIN" "muc"
   restrict_room_creation = false
 EOF
   # Host networking avoids rootless-port-publish quirks on this fleet; the
-  # container binds 5222/5269/5280 on the host, so restrict Prosody to the
-  # loopback-only config below and keep the domain unique per run.
+  # container shares the host netns, so the loopback-only `interfaces` pin in
+  # the config above is what keeps 5222/5269/5280 off the real interfaces
+  # while tenants (host user units) still reach the domain via /etc/hosts.
   podman run -d --name "$PROSODY_NAME" \
     --network "host" \
     -v "$cfg:/etc/prosody/conf.d/$DOMAIN.cfg.lua:ro" \

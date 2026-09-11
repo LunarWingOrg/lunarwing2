@@ -450,13 +450,6 @@ impl KnowledgeShareHook {
         self
     }
 
-    /// Shared handle to this hook's ingest diagnostics, for the coordination
-    /// admin status surface. The hook keeps its own clone; counts are the
-    /// same atomic counters.
-    pub fn diagnostics_handle(&self) -> Arc<IngestDiagnostics> {
-        Arc::clone(&self.diagnostics)
-    }
-
     /// Replace the internal diagnostics with an externally owned handle so
     /// hook drops and a status surface observe the same counters.
     pub fn with_shared_diagnostics(mut self, shared: Arc<IngestDiagnostics>) -> Self {
