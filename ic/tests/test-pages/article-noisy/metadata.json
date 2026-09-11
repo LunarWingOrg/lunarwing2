@@ -1,0 +1,10 @@
+{
+  "check_expected": true,
+  "url": "https://example.com/test-pages/article-noisy/",
+  "contains": [
+    "Article Extraction",
+    "extraction sentinel",
+    "three paragraphs",
+    "determinate ending"
+  ]
+}

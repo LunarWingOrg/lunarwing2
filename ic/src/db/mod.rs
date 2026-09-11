@@ -993,6 +993,16 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<MemoryChunk>, WorkspaceError>;
+
+    /// List document ids whose chunk projection is stale (content changed,
+    /// chunks not rebuilt — `indexed_at IS NULL`). Used by the repair sweep
+    /// that heals crash-stranded documents (WI#132 hardening item 2).
+    async fn list_stale_index_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>, WorkspaceError>;
     async fn hybrid_search(
         &self,
         user_id: &str,

@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Synthetic Noisy Page</title>
+</head>
+<body>
+  <div class="masthead">
+    <h2 class="site-name">Synthetic News Network</h2>
+    <nav class="nav-primary">
+      <ul>
+        <li><a href="/world">World</a></li>
+        <li><a href="/tech">Tech</a></li>
+        <li><a href="/sports">Sports</a></li>
+        <li><a href="/weather">Weather</a></li>
+      </ul>
+    </nav>
+  </div>
+  <div class="breaking-banner">
+    <p>BREAKING: this banner is navigation-adjacent junk and must be stripped.</p>
+  </div>
+  <main>
+    <article>
+      <h1>Synthetic Noisy Page: Article Extraction</h1>
+      <p class="byline">By Fixture Reporter</p>
+      <p>The purpose of this fixture is readability's junk-stripping behavior.
+      The page wraps a normal article in the kind of container clutter that
+      real pages carry: a masthead, a primary navigation list, a breaking-news
+      banner, a sidebar of related links, and a footer of legal links. Only
+      the article body below should survive extraction.</p>
+      <p>The article itself contains three paragraphs. This first one
+      introduces the topic with enough plain text to satisfy the extractor's
+      content threshold. It mentions the <strong>extraction sentinel</strong>
+      phrase used by the assertions.</p>
+      <p>The second paragraph includes a related-links block that sits inside
+      the article container but outside the content column. A converter that
+      fails to strip it would leak the sidebar strings into the output.</p>
+      <aside class="related">
+        <h3>Related stories</h3>
+        <ul>
+          <li><a href="/related/one">Sidebar story one marker</a></li>
+          <li><a href="/related/two">Sidebar story two marker</a></li>
+          <li><a href="/related/three">Sidebar story three marker</a></li>
+        </ul>
+      </aside>
+      <p>The third and final paragraph closes with a sign-off sentence so the
+      extracted article has a determinate ending.</p>
+    </article>
+  </main>
+  <footer class="site-footer">
+    <p><a href="/legal">Legal</a> | <a href="/accessibility">Accessibility</a> | <a href="/advertise">Advertise</a></p>
+    <p>Footer junk marker text that must be stripped.</p>
+  </footer>
+</body>
+</html>
