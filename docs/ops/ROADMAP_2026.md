@@ -5,6 +5,7 @@
 |---------|--------|
 | Beta version of Desktop/Mobile companion applications for LunarWing | v2.1.2.0 |
 | Durable cross-channel attachments — a file sent on one channel stays retrievable from all other channels and the WebUI via a shared attachment store | v2.1.2.0 |
+| LunarVision Polish | v2.1.3.0 |
 | LunarHub extension marketplace — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.1.4.0 |
 | Full Production-Grade Desktop/Mobile companion applications for LunarWing (first version in 2.1.2.0) | v2.1.4.0 |
 | LunarHub polish | v2.1.5.0 |

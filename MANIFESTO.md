@@ -26,4 +26,4 @@ We are a small group with very opinionated backgrounds in technology. Our own op
 
 Addendum: We believe that locally sourced inference with open weight models is the present AND future. While the engineers of LunarWing still have a lot to learn about tuning models or developing custom clients to accomodate specialized models, we still believe that we should prioritize LOCAL inference in our project. We believe our underlying philosophical beliefs meshes perfectly with utilizing your own hardware on your own network, utilizing models that you can control.
 
-All external contributions, whether that be time, toil, or treasure, is done so on a voluntary basis. If you wish to contribute code, please see the various documents related to contributing to the project.
+All external contributions, whether that be time, toil, or treasure, is done so on a voluntary basis. If you wish to contribute code, please see the various documents related to contributing to the project. docs/guides is a good place to start
