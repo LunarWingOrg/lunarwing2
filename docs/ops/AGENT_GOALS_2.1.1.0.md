@@ -140,7 +140,11 @@
     - DONE 2026-09-11 (`aj/kimi-34-20260911-2101`): materialized `CONTRIBUTOR-ONBOARDING.md` from `baud/contributor-onboarding-doc` into `docs/guides/` (per the docs/README contributing rules: "how to do something" → guides) and indexed it in the `docs/README.md` guides table.
     - Link fixes for the new location: the two policy links (`CODE-CONTRIBUTION-POLICY.md`, `AI-CODE-CONTRIBUTION-POLICY.md`) now resolve within `docs/guides/`, and the three `AGENTS.md` links now point at `../../AGENTS.md` (repo root). All referenced targets verified to exist.
     - Commits: ae628d792 (doc), 9ea128a80 (README index).
-35. [ ] review open work items
+35. [x] review open work items
+    - DONE 2026-09-11 (`rarity/kimi-35-20260911-2100`): live tracker queried at 21:17 UTC — 14 open issues (#86, #97, #109, #113, #114, #121, #122, #126, #127, #130, #131, #132, #133, #134); full report `docs/ops/v2.1.1.0_OPEN_WORK_ITEMS_STATUS.md`.
+    - Disposition: 7 repository-complete awaiting tracker closure (#86, #97, #121, #126, #127, #130, #131); #109 split (scope-A thread_start plumbing landed, sanitize-before-execution = scope B unaddressed); #132 hardening 1/2/4 landed with residuals; #114 deferred to 2.1.2.0 by tracker label; #113/#122 not actionable as written; #133/#134 confirmed actionable — OpenRC stop-then-start-pg window re-starts podman writer containers (mt-admin `stop-writers`/`writers-active` quiescence path is bypassed) — owned by item 36.
+    - No production source change; no tenant touched (read-only audit).
+
 36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/133 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/134 (same issue)
 37. [ ] update all docs in docs/guides
 38. [x] update all docs in docs/architecture
