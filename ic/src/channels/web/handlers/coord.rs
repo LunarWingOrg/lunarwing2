@@ -485,9 +485,8 @@ mod tests {
     #[tokio::test]
     async fn test_knowledge_diagnostics_route_requires_auth() {
         let store = test_store();
-        let diagnostics = Arc::new(
-            crate::hooks::coordination_knowledge::IngestDiagnostics::default(),
-        );
+        let diagnostics =
+            Arc::new(crate::hooks::coordination_knowledge::IngestDiagnostics::default());
         let addr = match start_coord_admin_server_with_knowledge(
             Arc::clone(&store),
             SecretString::from(TEST_TOKEN.to_string()),
@@ -527,9 +526,8 @@ mod tests {
         use crate::hooks::coordination_knowledge::IngestDropReason;
 
         let store = test_store();
-        let diagnostics = Arc::new(
-            crate::hooks::coordination_knowledge::IngestDiagnostics::default(),
-        );
+        let diagnostics =
+            Arc::new(crate::hooks::coordination_knowledge::IngestDiagnostics::default());
         diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
         diagnostics.record_drop(IngestDropReason::NotAllowedPublisher);
         diagnostics.record_drop(IngestDropReason::GlobalRateLimited);
