@@ -136,6 +136,16 @@ registry paths to the allowlist when adopting option 2.
 - Fixture-only shell harnesses for mt-admin rendering, build policy, and health.
 - `python-unit`, `shell-harnesses`, and `cavepony-wasm` (cavepony version assert
   + `wit_compat` test) are all required jobs; failures block merge.
+- Blocking ratchets: `rust-clippy-all` (all-features, `-D warnings`) and
+  `architecture-boundaries` (changed-line hard violations only; printed
+  full-tree debt counts stay informational). Both run in the full-validation
+  context since goals 2.1.1.0 item 23.
+- `standalone-deliverables` verifies locked Cargo metadata for every unit
+  classified in `.gitlab/deliverables.json`; an unclassified tracked lockfile
+  fails `ci-config` validation.
+- JUnit reports: `python-unit` emits `junit-python.xml`, `shell-harnesses`
+  emits `junit-shell.xml`; the worker scan emits a GitLab
+  `container_scanning` report alongside its blocking CRITICAL gate.
 - cargo-deny and redacted current-tree Gitleaks scans.
 - One Rust job per runner host: `limit = 1` in runner `config.toml` is a hard
   constraint, verified in the activation checklist (§6). Parallel jobs contend for
@@ -157,15 +167,16 @@ scan gate again.
 
 ## Observational jobs
 
-These run on default-branch and scheduled pipelines with `allow_failure: true`:
+These run with `allow_failure: true`:
 
 - `rust-msrv-check`: becomes blocking once the declared MSRV (1.96.1) is confirmed
   green, closing the plan §15.5 reconciliation.
-- `rust-clippy-all`: becomes blocking after a clean-runner baseline passes.
-- `architecture-boundaries`: becomes blocking after current heuristic and real
-  violations are fixed.
 - `secret-history`: scheduled only; becomes blocking after historical findings
   are reviewed.
+
+Formerly observational, now blocking (goals 2.1.1.0 item 23): `rust-clippy-all`
+(clean all-features baseline landed) and `architecture-boundaries` (changed-line
+hard-violation ratchet; the script reserves its exit code for regressions).
 
 Each job names its owner and removal condition in `.gitlab/ci/*.yml`. Do not add
 new permanent `allow_failure` jobs.
@@ -354,9 +365,10 @@ Open **Build > Pipeline schedules > New schedule**:
 - Variables: none.
 - Owner: a maintained service/operator account, not a departing individual.
 
-Run it once manually. Confirm `rust-clippy-all`, `architecture-boundaries`, and
-`secret-history` appear as observational jobs. This schedule must not receive
-production secrets or use deployment runners.
+Run it once manually. Confirm `rust-clippy-all` and `architecture-boundaries`
+appear as blocking jobs and `rust-msrv-check` and `secret-history` as
+observational jobs. This schedule must not receive production secrets or use
+deployment runners.
 
 ### 6. Activation evidence
 

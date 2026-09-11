@@ -43,3 +43,6 @@ tests/fixtures/llm_traces/live/github_dev_workflow_full_loop.log
 
 # Local venv for the hermes_kawarimi import tooling (psycopg2 etc.)
 /.venv-kawarimi/
+
+# Generated CI JUnit reports (junit-python.xml, junit-shell.xml)
+junit-*.xml
