@@ -238,7 +238,25 @@ pub async fn run_knowledge_sync_once(
         tracing::warn!("knowledge sync: source generation changed during additive scan");
         return record_failure(config, state, "source_changed", Some(import));
     }
-    if import.skipped || import.notes_failed > 0 {
+    if import.skipped {
+        // A healthy skip (e.g. no notes dir yet) is not a failure: it must not
+        // grow the failure/backoff counters.
+        state.notes_added_last_run = import.notes_seeded;
+        state.notes_deferred_last_run = import.notes_deferred;
+        if let Err(error) = save_state(&config.state_dir.join(SYNC_STATE_FILE), &state) {
+            tracing::warn!("knowledge sync: failed to save skipped pass: {error}");
+        }
+        let mut report = KnowledgeSyncReport::skipped("import_skipped", cadence_secs);
+        report.source_revision = Some(generation.source_revision);
+        report.notes_found = import.notes_found;
+        report.notes_added = import.notes_seeded;
+        report.notes_existing = import.notes_skipped_existing;
+        report.notes_deferred = import.notes_deferred;
+        report.notes_failed = import.notes_failed;
+        report.bytes_added = import.bytes_seeded;
+        return report;
+    }
+    if import.notes_failed > 0 {
         return record_failure(config, state, "note_import_failed", Some(import));
     }
 
@@ -387,7 +405,11 @@ fn save_state(path: &Path, state: &KnowledgeSyncState) -> Result<(), String> {
     };
     std::fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
     let json = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
-    let temp = parent.join(format!(".{SYNC_STATE_FILE}.{}.tmp", std::process::id()));
+    let nonce = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let temp = parent.join(format!(
+        ".{SYNC_STATE_FILE}.{}.{nonce}.tmp",
+        std::process::id()
+    ));
     let mut file = File::create(&temp).map_err(|error| format!("{}: {error}", temp.display()))?;
     file.write_all(&json)
         .and_then(|()| file.sync_all())
