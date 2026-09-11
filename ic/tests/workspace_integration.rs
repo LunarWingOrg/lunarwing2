@@ -693,7 +693,9 @@ async fn test_knowledge_sync_refresh_additive_on_postgres() {
         )
         .expect("note");
     }
-    let manifest = fixture.path().join(".git/lunarwing-study-notes-generation.json");
+    let manifest = fixture
+        .path()
+        .join(".git/lunarwing-study-notes-generation.json");
     std::fs::create_dir_all(manifest.parent().expect("git dir")).expect("git dir");
     std::fs::write(
         manifest,
@@ -718,18 +720,21 @@ async fn test_knowledge_sync_refresh_additive_on_postgres() {
     };
 
     // Bounded passes: one note per run, then the unchanged-generation skip.
-    let first = lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
-        .await;
+    let first =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
     assert!(first.successful);
     assert_eq!(first.notes_added, 1);
     assert_eq!(first.notes_deferred, 1);
-    let second = lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
-        .await;
+    let second =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
     assert!(second.successful);
     assert_eq!(second.notes_added, 1);
     assert_eq!(second.notes_deferred, 0);
-    let unchanged = lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
-        .await;
+    let unchanged =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
     assert!(unchanged.skipped);
     assert_eq!(unchanged.skip_reason, Some("source_unchanged"));
 
@@ -740,7 +745,9 @@ async fn test_knowledge_sync_refresh_additive_on_postgres() {
         .expect("operator edit");
     std::fs::write(notes.join("c.md"), "# c\n\nsource c\n").expect("new note");
     std::fs::write(
-        fixture.path().join(".git/lunarwing-study-notes-generation.json"),
+        fixture
+            .path()
+            .join(".git/lunarwing-study-notes-generation.json"),
         serde_json::json!({
             "schema_version": 1,
             "source_revision": "bbbbbbbbbbbb",
@@ -749,8 +756,9 @@ async fn test_knowledge_sync_refresh_additive_on_postgres() {
         .to_string(),
     )
     .expect("manifest refresh");
-    let refreshed = lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
-        .await;
+    let refreshed =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
     assert!(refreshed.successful);
     assert_eq!(refreshed.notes_added, 1);
     let local = workspace
@@ -758,10 +766,12 @@ async fn test_knowledge_sync_refresh_additive_on_postgres() {
         .await
         .expect("local note");
     assert!(local.content.contains("operator edit"));
-    assert!(workspace
-        .read_primary("study-notes/rarity/c.md")
-        .await
-        .is_ok());
+    assert!(
+        workspace
+            .read_primary("study-notes/rarity/c.md")
+            .await
+            .is_ok()
+    );
 
     cleanup_user(&pool, user_id).await;
 }
