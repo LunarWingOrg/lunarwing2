@@ -62,6 +62,36 @@ struct QueuedMessage {
     parallel_key: Option<ParallelMessageKey>,
 }
 
+/// Identity of a user's conversation lane.
+///
+/// A priority control cancels only queued turns for the same channel, user,
+/// and conversation scope: a different thread, room, or sender is never
+/// affected by an interrupt the user aimed at one lane.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct LaneKey {
+    channel: String,
+    user_id: String,
+    scope: Option<String>,
+}
+
+impl LaneKey {
+    pub(super) fn from_message(message: &IncomingMessage) -> Self {
+        Self {
+            channel: message.channel.clone(),
+            user_id: message.user_id.clone(),
+            scope: message.conversation_scope().map(str::to_string),
+        }
+    }
+
+    fn from_parallel(key: &ParallelMessageKey) -> Self {
+        Self {
+            channel: key.group.channel.clone(),
+            user_id: key.group.user_id.clone(),
+            scope: Some(key.scope.clone()),
+        }
+    }
+}
+
 impl QueuedMessage {
     fn new(message: IncomingMessage, allow_parallel: bool) -> Self {
         let parallel_key = allow_parallel
@@ -95,6 +125,8 @@ pub(super) struct MessageScheduler {
     active_parallel: HashSet<ParallelMessageKey>,
     active_group: Option<ParallelMessageGroup>,
     exclusive_active: bool,
+    /// Conversation lane of the currently active exclusive message.
+    active_lane: Option<LaneKey>,
     capacity: usize,
     max_parallel: usize,
 }
@@ -110,6 +142,7 @@ impl MessageScheduler {
             active_parallel: HashSet::new(),
             active_group: None,
             exclusive_active: false,
+            active_lane: None,
             capacity,
             max_parallel: max_parallel.max(1),
         }
@@ -170,6 +203,7 @@ impl MessageScheduler {
             self.active_parallel.insert(key.clone());
         } else {
             self.exclusive_active = true;
+            self.active_lane = Some(LaneKey::from_message(&queued.message));
         }
 
         ScheduledMessage {
@@ -188,7 +222,37 @@ impl MessageScheduler {
             }
         } else {
             self.exclusive_active = false;
+            self.active_lane = None;
         }
+    }
+
+    /// Whether a message in `lane` is currently being handled.
+    fn lane_is_active(&self, lane: &LaneKey) -> bool {
+        if self.exclusive_active {
+            return self.active_lane.as_ref() == Some(lane);
+        }
+        self.active_parallel
+            .iter()
+            .any(|key| LaneKey::from_parallel(key) == *lane)
+    }
+
+    /// Cancel queued messages in one conversation lane.
+    ///
+    /// Used by priority controls: an interrupt that overtakes a queued prompt
+    /// must stop that prompt from running afterward, or the user gets
+    /// "Nothing to interrupt." followed by the very turn they cancelled
+    /// (goal #9 documented-not-fixed race). A lane with an active turn keeps
+    /// its queued follow-ups — the engine stops the running turn and the
+    /// follow-ups still run afterward, preserving the pinned interrupt-ack
+    /// ordering. Returns the number of queued messages removed.
+    pub(super) fn cancel_lane(&mut self, lane: &LaneKey) -> usize {
+        if self.lane_is_active(lane) {
+            return 0;
+        }
+        let before = self.queue.len();
+        self.queue
+            .retain(|queued| LaneKey::from_message(&queued.message) != *lane);
+        before - self.queue.len()
     }
 
     pub(super) fn has_active(&self) -> bool {
@@ -204,7 +268,7 @@ impl MessageScheduler {
 mod tests {
     use crate::channels::IncomingMessage;
 
-    use super::{MessageScheduler, is_priority_control};
+    use super::{LaneKey, MessageScheduler, is_priority_control};
 
     fn message(content: &str) -> IncomingMessage {
         IncomingMessage::new("gateway", "user", content)
@@ -235,6 +299,88 @@ mod tests {
         assert!(!is_priority_control(&message("/steer")));
         assert!(!is_priority_control(&message("/steering the topic")));
         assert!(!is_priority_control(&message("please steer left")));
+    }
+
+    #[test]
+    fn cancel_lane_removes_only_the_matching_conversation_lane() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(8, 1);
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "first"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("user", "two", "second"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("other", "one", "other-user"), true)
+                .is_none()
+        );
+
+        // Interrupt aimed at thread "one" for user "user": cancels only that
+        // lane, leaving thread "two" and the other user's turn untouched.
+        let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 1);
+
+        let first = scheduler.next_ready().expect("thread two is ready");
+        assert_eq!(first.message.content, "second");
+        scheduler.complete(&first.ticket);
+
+        let second = scheduler.next_ready().expect("other user is ready");
+        assert_eq!(second.message.content, "other-user");
+        scheduler.complete(&second.ticket);
+
+        assert!(scheduler.is_drained());
+    }
+
+    #[test]
+    fn cancel_lane_without_scope_matches_unscoped_messages_only() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(4, 1);
+        assert!(scheduler.defer(message("plain"), false).is_none());
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "scoped"), true)
+                .is_none()
+        );
+
+        // An unscoped interrupt (no thread id) cancels only the unscoped
+        // queued message.
+        let lane = LaneKey::from_message(&message("/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 1);
+
+        let next = scheduler.next_ready().expect("scoped message remains");
+        assert_eq!(next.message.content, "scoped");
+    }
+
+    #[test]
+    fn cancel_lane_keeps_queued_followups_behind_an_active_turn() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(4, 1);
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "first"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "second"), true)
+                .is_none()
+        );
+
+        // Dispatch the first message: the lane is now active.
+        let first = scheduler.next_ready().expect("first message is ready");
+
+        // An interrupt while the turn runs must not eat the queued follow-up:
+        // the engine stops the running turn and the follow-up runs afterward
+        // (pinned by the interrupt-ack ordering integration test).
+        let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 0);
+
+        scheduler.complete(&first.ticket);
+        let second = scheduler.next_ready().expect("follow-up still queued");
+        assert_eq!(second.message.content, "second");
     }
 
     #[test]
