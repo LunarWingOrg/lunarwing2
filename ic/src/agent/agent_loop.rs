@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::agent::context_monitor::ContextMonitor;
 use crate::agent::dispatch::{
-    DEFERRED_QUEUE_FULL_RESPONSE, DispatchTicket, MessageScheduler, allows_parallel_dispatch,
-    is_priority_control,
+    DEFERRED_QUEUE_FULL_RESPONSE, DispatchTicket, LaneKey, MessageScheduler,
+    allows_parallel_dispatch, is_priority_control,
 };
 use crate::agent::heartbeat::spawn_heartbeat_with_sweep;
 use crate::agent::routine_engine::{RoutineEngine, spawn_cron_ticker};
@@ -1217,6 +1217,34 @@ impl Agent {
                 incoming = message_stream.next(), if channels_open => {
                     match incoming {
                         Some(incoming) if is_priority_control(&incoming) => {
+                            // Priority controls overtake the message scheduler
+                            // by design. An interrupt that overtakes a queued
+                            // prompt must also cancel that prompt in the
+                            // scheduler, or the user gets "Nothing to
+                            // interrupt." followed by the very turn they
+                            // cancelled (goal #9 documented-not-fixed race).
+                            //
+                            // Only when the lane has no active engine thread:
+                            // with one running, the engine stops it and queued
+                            // follow-ups must still run afterward (pinned by
+                            // `queued_same_thread_message_starts_after_interrupt_acknowledgement`).
+                            if matches!(
+                                SubmissionParser::parse(&incoming.content),
+                                Submission::Interrupt
+                            ) && crate::bridge::should_route_to_engine_v2(&incoming.channel)
+                                && !crate::bridge::has_active_engine_thread(&incoming).await
+                            {
+                                let lane = LaneKey::from_message(&incoming);
+                                let cancelled = scheduler.cancel_lane(&lane);
+                                if cancelled > 0 {
+                                    tracing::debug!(
+                                        channel = %incoming.channel,
+                                        user = %incoming.user_id,
+                                        cancelled,
+                                        "priority interrupt cancelled queued prompt(s)"
+                                    );
+                                }
+                            }
                             self.handle_priority_interrupt(incoming).await;
                         }
                         Some(incoming) => {

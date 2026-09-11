@@ -62,6 +62,28 @@ struct QueuedMessage {
     parallel_key: Option<ParallelMessageKey>,
 }
 
+/// Identity of a user's conversation lane.
+///
+/// A priority control cancels only queued turns for the same channel, user,
+/// and conversation scope: a different thread, room, or sender is never
+/// affected by an interrupt the user aimed at one lane.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct LaneKey {
+    channel: String,
+    user_id: String,
+    scope: Option<String>,
+}
+
+impl LaneKey {
+    pub(super) fn from_message(message: &IncomingMessage) -> Self {
+        Self {
+            channel: message.channel.clone(),
+            user_id: message.user_id.clone(),
+            scope: message.conversation_scope().map(str::to_string),
+        }
+    }
+}
+
 impl QueuedMessage {
     fn new(message: IncomingMessage, allow_parallel: bool) -> Self {
         let parallel_key = allow_parallel
@@ -191,6 +213,19 @@ impl MessageScheduler {
         }
     }
 
+    /// Cancel queued messages in one conversation lane.
+    ///
+    /// Used by priority controls: an interrupt that overtakes a queued prompt
+    /// must stop that prompt from running afterward, or the user gets
+    /// "Nothing to interrupt." followed by the very turn they cancelled.
+    /// Returns the number of queued messages removed.
+    pub(super) fn cancel_lane(&mut self, lane: &LaneKey) -> usize {
+        let before = self.queue.len();
+        self.queue
+            .retain(|queued| LaneKey::from_message(&queued.message) != *lane);
+        before - self.queue.len()
+    }
+
     pub(super) fn has_active(&self) -> bool {
         self.exclusive_active || !self.active_parallel.is_empty()
     }
@@ -204,7 +239,7 @@ impl MessageScheduler {
 mod tests {
     use crate::channels::IncomingMessage;
 
-    use super::{MessageScheduler, is_priority_control};
+    use super::{LaneKey, MessageScheduler, is_priority_control};
 
     fn message(content: &str) -> IncomingMessage {
         IncomingMessage::new("gateway", "user", content)
@@ -235,6 +270,60 @@ mod tests {
         assert!(!is_priority_control(&message("/steer")));
         assert!(!is_priority_control(&message("/steering the topic")));
         assert!(!is_priority_control(&message("please steer left")));
+    }
+
+    #[test]
+    fn cancel_lane_removes_only_the_matching_conversation_lane() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(8, 1);
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "first"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("user", "two", "second"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("other", "one", "other-user"), true)
+                .is_none()
+        );
+
+        // Interrupt aimed at thread "one" for user "user": cancels only that
+        // lane, leaving thread "two" and the other user's turn untouched.
+        let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 1);
+
+        let first = scheduler.next_ready().expect("thread two is ready");
+        assert_eq!(first.message.content, "second");
+        scheduler.complete(&first.ticket);
+
+        let second = scheduler.next_ready().expect("other user is ready");
+        assert_eq!(second.message.content, "other-user");
+        scheduler.complete(&second.ticket);
+
+        assert!(scheduler.is_drained());
+    }
+
+    #[test]
+    fn cancel_lane_without_scope_matches_unscoped_messages_only() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(4, 1);
+        assert!(scheduler.defer(message("plain"), false).is_none());
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "scoped"), true)
+                .is_none()
+        );
+
+        // An unscoped interrupt (no thread id) cancels only the unscoped
+        // queued message.
+        let lane = LaneKey::from_message(&message("/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 1);
+
+        let next = scheduler.next_ready().expect("scoped message remains");
+        assert_eq!(next.message.content, "scoped");
     }
 
     #[test]
