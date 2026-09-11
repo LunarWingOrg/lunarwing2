@@ -128,7 +128,8 @@
 35. [x] (S) Reserved
 36. [x] (S) Reserved
 37. [ ] update all docs in docs/guides
-38. [ ] update all docs in docs/architecture
+38. [x] update all docs in docs/architecture
+    - DONE 2026-09-11 (`aj/kimi-38-20260911-0901`): all 10 docs revalidated against the current tree and refreshed for 2.1.1.0; commits 2893371ac, db5042101, 681afc271, 7c2738e77, 322793465, 985a4fd4a, acd60896d. ENGINE-V2.md: best-effort engine `thread_start` event dispatch (item 9/WI#109 scope A) + revalidation header + `ENGINE_V2_CHANNELS` routing-policy correction (an earlier `ENGINE_V2_CHANNELS=none` "opt-out" note was wrong — `engine_v2_channel_allowed` treats `none` as an ignored unknown entry; the only durable opt-out is `ENGINE_V2=false`; the false claim was also removed from TENANT-CONFIGURATION.md and the mt-admin env template header). SEMANTIC-MEMORY-SEARCH.md: additive knowledge refresh cadence (item 6/WI#121, `KNOWLEDGE_SYNC_*` envs, mt-admin `14-knowledge-sync.sh`) + file/env tables + header. SELF_HEAL_*: `--with-study-mcp` knowledge-sync wiring in the add-tenant flow, `llm-streams` suite note, fresh revalidation dates. SSH_AGENT_HARNESS/SSH_DELIVERY_MECHANISMS: re-stamped both revalidation dates (all paths/russh/limits verified current). WEECHAT/IRC/XMPP/ATOMICBOOL: revalidation stamps, `dm_policy` default verified against `channels-src/weechat` (both pairing), XMPP limits/MIME/body-limit re-verified, AtomicBool defer decision re-confirmed.
 39. [ ] first draft of release notes
 40. [x] (S) Updated README.md at root of repo
 

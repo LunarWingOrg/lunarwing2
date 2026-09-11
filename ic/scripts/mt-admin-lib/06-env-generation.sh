@@ -875,8 +875,10 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # Engine V2 (parallel execution path with streaming, gates, missions).
 # ENGINE_V2_CHANNELS is the comma-separated allowlist of non-gateway channels
 # routed through Engine V2 (eligible: xmpp, weechat, darkirc) — on by default
-# for all tenants; an existing value is preserved on re-render. Set
-# ENGINE_V2=false or ENGINE_V2_CHANNELS=none to opt out durably.
+# for all tenants; an existing value is preserved on re-render. There is no
+# opt-out value: an entry like "none" is an ignored unknown entry, and the
+# gateway keeps routing while ENGINE_V2=true. ENGINE_V2=false is the only
+# durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
 

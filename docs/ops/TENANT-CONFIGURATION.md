@@ -274,8 +274,10 @@ Existing tenants whose env lacks these keys gain the defaults on the next
 upgrade/rebuild/re-render. An operator-set value is never overwritten:
 `write_tenant_lunarwing_env` preserves both `ENGINE_V2` and
 `ENGINE_V2_CHANNELS` across re-runs. An empty `ENGINE_V2_CHANNELS=` counts as
-unset (the default returns on re-render); use `ENGINE_V2_CHANNELS=none` or
-`ENGINE_V2=false` for a durable opt-out.
+unset (the default returns on re-render). The only durable opt-out is
+`ENGINE_V2=false`: a value like `ENGINE_V2_CHANNELS=none` is an ignored
+unknown entry — the gateway and any allowlisted channels keep routing while
+`ENGINE_V2=true`.
 
 The gateway always uses Engine V2 when `ENGINE_V2=true`; other channels stay
 on the legacy engine unless explicitly allowlisted. The only eligible

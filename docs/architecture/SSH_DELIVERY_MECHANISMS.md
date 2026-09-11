@@ -1,6 +1,6 @@
 # SSH Delivery Mechanisms
 
-**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-08-25.
+**Status:** As-built (all three mechanisms shipped). Revalidated against source 2026-09-11.
 **Core design:** [`SSH_AGENT_HARNESS.md`](SSH_AGENT_HARNESS.md) — the per-tenant bridge, agent socket, secrets, and host-key verifier that all three mechanisms share.
 **Operator setup:** [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 
