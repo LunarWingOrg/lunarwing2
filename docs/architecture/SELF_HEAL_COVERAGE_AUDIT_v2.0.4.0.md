@@ -103,3 +103,7 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > `bash tests/run-all.sh --list` rather than copying a suite count into tooling.
 > The audit's detection/remedy table still describes the self-heal pipeline
 > itself.
+>
+> **Update (2026-09-11, v2.1.1.0):** the `ORDER` list is unchanged at 14
+> suites; `llm-streams` (registered since v2.0.9.0) covers the LLM stream
+> integrity healthpoint (`health-llm-streams.sh`).
