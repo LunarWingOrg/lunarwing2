@@ -53,11 +53,14 @@
   script:
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
+    - trivy image --format gitlab --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always
     expire_in: 30 days
+    reports:
+      container_scanning: gl-container-scanning-report.json
     paths:
       - worker-vulnerabilities.json
       - worker-sbom.cdx.json
