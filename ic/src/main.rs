@@ -16,15 +16,12 @@ use lunarwing::{
         web::log_layer::LogBroadcaster,
     },
     cli::{
-        Cli, Command, run_acp_command, run_mcp_command, run_pairing_command, run_service_command,
-        run_status_command, run_tool_command,
+        Cli, Command, run_acp_command, run_knowledge_refresh_command, run_mcp_command,
+        run_pairing_command, run_service_command, run_status_command, run_tool_command,
     },
     config::Config,
     gate::violation_store::{ViolationStore, ViolationStoreConfig},
-    hooks::{
-        CoordinationHookConfig, CoordinationPromptPolicy, bootstrap_hooks,
-        register_coordination_hooks_with_knowledge,
-    },
+    hooks::{CoordinationHookConfig, CoordinationPromptPolicy, bootstrap_hooks},
     llm::create_session_manager,
     orchestrator::{ReaperConfig, SandboxReaper},
     pairing::PairingStore,
@@ -179,6 +176,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Memory(mem_cmd)) => {
             init_cli_tracing();
             return lunarwing::cli::run_memory_command(mem_cmd).await;
+        }
+        Some(Command::RefreshKnowledge { json }) => {
+            init_cli_tracing();
+            return run_knowledge_refresh_command(cli.config.as_deref(), *json).await;
         }
         Some(Command::Pairing(pairing_cmd)) => {
             init_cli_tracing();
@@ -721,13 +722,18 @@ async fn async_main() -> anyhow::Result<()> {
         } else {
             None
         };
-    let coordination_summary = register_coordination_hooks_with_knowledge(
-        &components.hooks,
-        coordination_config.clone(),
-        coordination_store.clone(),
-        coordination_knowledge_workspace,
-    )
-    .await;
+    let coordination_knowledge_diagnostics = coordination_config.is_actionable().then(|| {
+        std::sync::Arc::new(lunarwing::hooks::coordination_knowledge::IngestDiagnostics::default())
+    });
+    let coordination_summary =
+        lunarwing::hooks::coordination::register_coordination_hooks_with_knowledge_diagnostics(
+            &components.hooks,
+            coordination_config.clone(),
+            coordination_store.clone(),
+            coordination_knowledge_workspace,
+            coordination_knowledge_diagnostics.clone(),
+        )
+        .await;
     if coordination_summary.hooks > 0 {
         tracing::info!(
             hooks = coordination_summary.hooks,
@@ -742,7 +748,14 @@ async fn async_main() -> anyhow::Result<()> {
         match lunarwing::channels::web::coord_admin_token_from_env() {
             Some(token) => {
                 let port = lunarwing::channels::web::coord_admin_port_from_env();
-                match lunarwing::channels::web::start_coord_admin_server(store, token, port).await {
+                match lunarwing::channels::web::start_coord_admin_server_with_knowledge(
+                    store,
+                    token,
+                    port,
+                    coordination_knowledge_diagnostics.clone(),
+                )
+                .await
+                {
                     Ok(addr) => tracing::info!(%addr, "Coordination admin endpoints listening"),
                     Err(err) => tracing::warn!(
                         error = %err,

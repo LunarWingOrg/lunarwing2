@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import json
 import pathlib
 import re
 import sys
@@ -17,6 +18,12 @@ CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
+KIMI_CLI_LOCK = ROOT / "kimicode4lunarwing" / "kimi-cli" / "package-lock.json"
+PEBBLE_DOCKERFILE = ROOT / "pebble4lunarwing" / "Dockerfile"
+WORKER_BUILD_SCRIPT = ROOT / ".gitlab" / "scripts" / "build-worker-image.sh"
+DELIVERABLES = ROOT / ".gitlab" / "deliverables.json"
+DELIVERABLE_STATUSES = {"production", "experimental", "fixture", "mirror", "retired", "staging"}
+DELIVERABLE_REQUIRED_KEYS = ("name", "status", "owner", "manifest", "lockfile", "targets", "ci", "triggers")
 EXPECTED_RUST_VERSION = "1.96.1"
 EXPECTED_NORMAL_DEBUG = "line-tables-only"
 RELEASE_TAG_PREDICATE = r"^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$"
@@ -228,6 +235,15 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
     scan_script = "\n".join(merged.get(".worker-scan", {}).get("script", []))
     if ". ./worker-image.env" not in scan_script:
         errors.append("worker scan must reload candidate values from its artifact")
+    scan_artifacts = merged.get(".worker-scan", {}).get("artifacts", {})
+    if isinstance(scan_artifacts, dict):
+        reports = scan_artifacts.get("reports", {})
+        if not isinstance(reports, dict) or "container_scanning" not in reports:
+            errors.append("worker scan must emit a container_scanning report")
+        elif "gl-container-scanning-report.json" not in str(reports.get("container_scanning", "")):
+            errors.append("worker scan container_scanning report path is unexpected")
+    else:
+        errors.append("worker scan must declare artifacts with a container_scanning report")
     promotion_helper = ROOT / ".gitlab/scripts/promote-worker-image.py"
     if not promotion_helper.is_file() or "candidate_metadata()" not in promotion_helper.read_text(
         encoding="utf-8"
@@ -304,6 +320,23 @@ def validate_test_shapes(merged: dict, errors: list[str]) -> None:
         if any(fragment not in commands for fragment in fragments):
             errors.append(f"{job_name} does not enforce its required backend test shape")
 
+    junit_jobs = {
+        "python-unit": ("junit-python.xml", ".gitlab/scripts/python_tests.py"),
+        "shell-harnesses": ("junit-shell.xml", ".gitlab/scripts/shell-harnesses-junit.sh"),
+    }
+    for job_name, (report, script_fragment) in junit_jobs.items():
+        job = merged.get(job_name, {})
+        if not isinstance(job, dict):
+            errors.append(f"{job_name} job missing")
+            continue
+        commands = "\n".join(job.get("script", []))
+        if script_fragment not in commands:
+            errors.append(f"{job_name} must run {script_fragment}")
+        artifacts = job.get("artifacts", {})
+        reports = artifacts.get("reports", {}) if isinstance(artifacts, dict) else {}
+        if not isinstance(reports, dict) or reports.get("junit") != report:
+            errors.append(f"{job_name} must report junit artifact {report}")
+
 
 def cache_policies(job: object) -> list[str]:
     if not isinstance(job, dict):
@@ -343,6 +376,189 @@ def validate_cache_trust(merged: dict, defaults: dict, errors: list[str]) -> Non
         )
         if any(fragment not in condition for fragment in required):
             errors.append("rust-cache-refresh must require a protected default-branch push")
+
+
+def extract_arg_default(text: str, arg: str) -> str | None:
+    match = re.search(rf"^ARG {arg}=(\S+)", text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def validate_worker_versions(errors: list[str]) -> None:
+    """Cross-check worker version pins: Dockerfile ARG defaults, the build
+    script's build_args, and Kimi's committed npm lockfile must agree."""
+    build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
+    pebble_text = PEBBLE_DOCKERFILE.read_text(encoding="utf-8")
+    opencode_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
+    kimi_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
+
+    canonical_refs = {
+        "PEBBLE_REF": extract_arg_default(pebble_text, "PEBBLE_REF"),
+        "OPENCODE_REF": extract_arg_default(opencode_text, "OPENCODE_REF"),
+        "OPENCODE_VERSION": extract_arg_default(opencode_text, "OPENCODE_VERSION"),
+        "KIMI_CODE_VERSION": extract_arg_default(kimi_text, "KIMI_CODE_VERSION"),
+    }
+    for arg, value in canonical_refs.items():
+        if not value:
+            errors.append(f"worker Dockerfiles missing canonical {arg} default")
+        elif not re.search(rf"{arg}={re.escape(value)}\b", build_script):
+            errors.append(
+                f"build-worker-image.sh {arg}={value!r} differs from the Dockerfile "
+                "canonical declaration"
+            )
+
+    for arg in ("OPENCODE_REF", "PEBBLE_REF"):
+        value = canonical_refs.get(arg) or ""
+        if not re.fullmatch(r"[0-9a-f]{40}", value):
+            errors.append(f"{arg} must pin a full 40-hex-char commit, got {value!r}")
+
+    kimi_version = canonical_refs.get("KIMI_CODE_VERSION") or ""
+    if not KIMI_CLI_LOCK.is_file():
+        errors.append("kimicode4lunarwing/kimi-cli/package-lock.json missing")
+    else:
+        try:
+            lock = json.loads(KIMI_CLI_LOCK.read_text(encoding="utf-8"))
+            pinned = lock.get("packages", {}).get("", {}).get("dependencies", {}).get(
+                "@moonshot-ai/kimi-code"
+            )
+        except json.JSONDecodeError:
+            pinned = None
+            errors.append("kimicode4lunarwing/kimi-cli/package-lock.json is not valid JSON")
+        if pinned != kimi_version:
+            errors.append(
+                "kimi-cli/package-lock.json pins @moonshot-ai/kimi-code "
+                f"{pinned!r} != Dockerfile KIMI_CODE_VERSION {kimi_version!r}"
+            )
+
+
+def collect_tracked_lockfiles() -> set[str]:
+    tracked = set()
+    for lockfile in ROOT.glob("**/Cargo.lock"):
+        relative = lockfile.relative_to(ROOT).as_posix()
+        if relative.startswith("ic/vendor/"):
+            continue
+        tracked.add(relative)
+    return tracked
+
+
+def safe_relative_path(path: object) -> str | None:
+    """Reject absolute or repository-escaping paths before any filesystem use."""
+    if not isinstance(path, str) or not path:
+        return None
+    normalized = pathlib.PurePosixPath(path)
+    if normalized.is_absolute() or ".." in normalized.parts:
+        return None
+    return path
+
+
+def validate_deliverables_manifest(merged: dict, errors: list[str]) -> None:
+    if not DELIVERABLES.is_file():
+        errors.append(".gitlab/deliverables.json missing")
+        return
+    try:
+        data = json.loads(DELIVERABLES.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        errors.append(f".gitlab/deliverables.json is not valid JSON: {error}")
+        return
+    if data.get("schema") != 1:
+        errors.append(".gitlab/deliverables.json schema must be 1")
+        return
+    entries = data.get("deliverables")
+    if not isinstance(entries, list) or not entries:
+        errors.append(".gitlab/deliverables.json must contain a non-empty deliverables list")
+        return
+
+    known_jobs = {
+        name
+        for name, value in merged.items()
+        if isinstance(value, dict) and not name.startswith(".")
+    }
+    seen_names: set[str] = set()
+    seen_lockfiles: dict[str, str] = {}
+    for entry in entries:
+        name = entry.get("name", "<unnamed>")
+        for key in DELIVERABLE_REQUIRED_KEYS:
+            if key not in entry:
+                errors.append(f"deliverable {name!r} missing key {key!r}")
+        if name in seen_names:
+            errors.append(f"deliverable {name!r} is declared twice")
+        seen_names.add(name)
+        status = entry.get("status")
+        if status not in DELIVERABLE_STATUSES:
+            errors.append(
+                f"deliverable {name!r} has unknown status {status!r}; "
+                f"expected one of {sorted(DELIVERABLE_STATUSES)}"
+            )
+        for key in ("manifest", "lockfile"):
+            path = entry.get(key)
+            safe = safe_relative_path(path)
+            if safe is None:
+                errors.append(f"deliverable {name!r} {key} {path!r} is not a safe repository path")
+            elif not (ROOT / safe).is_file():
+                errors.append(f"deliverable {name!r} {key} {path!r} does not exist")
+        lockfile = entry.get("lockfile")
+        if isinstance(lockfile, str):
+            if lockfile in seen_lockfiles:
+                errors.append(
+                    f"deliverable {name!r} and {seen_lockfiles[lockfile]!r} share "
+                    f"lockfile {lockfile}"
+                )
+            seen_lockfiles[lockfile] = name
+        ci = entry.get("ci")
+        if status == "production" and not ci:
+            errors.append(
+                f"production deliverable {name!r} must declare at least one CI job"
+            )
+        if isinstance(ci, list):
+            for job in ci:
+                if not isinstance(job, str) or not job:
+                    errors.append(f"deliverable {name!r} ci entry {job!r} is not a job name")
+                elif job not in known_jobs:
+                    errors.append(
+                        f"deliverable {name!r} references unknown CI job {job!r}"
+                    )
+
+    tracked = collect_tracked_lockfiles()
+    unclassified = sorted(tracked - set(seen_lockfiles))
+    if unclassified:
+        errors.append(
+            "tracked Cargo.lock roots missing from .gitlab/deliverables.json: "
+            f"{unclassified}"
+        )
+    vanished = sorted(set(seen_lockfiles) - tracked)
+    if vanished:
+        errors.append(
+            f".gitlab/deliverables.json classifies lockfiles that are not tracked: {vanished}"
+        )
+
+
+def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors: list[str]) -> None:
+    trust_sensitive = ("CI_LINT_IMAGE", "CI_RUST_IMAGE", "CI_GITLEAKS_IMAGE")
+    for name in trust_sensitive:
+        value = variables.get(name, "")
+        if not value:
+            errors.append(f"defaults.yml must declare {name}")
+        elif not IMAGE_PATTERN.search(value):
+            errors.append(f"{name}={value!r} is not digest-pinned")
+
+    literal_images = {
+        ".worker-candidate": "docker.io/moby/buildkit:v0.25.1-rootless@sha256:0c0ce4929976ace509f7a53878303504b2de8857829aea4932af9f7325a30f51",
+        ".worker-scan": "docker.io/aquasec/trivy:0.74.0@sha256:62b1e65e8869bc4b4c6aa4fa2b21595256c7c2f6018a9d9ad61caf87187c1969",
+        ".worker-promotion": "docker.io/library/python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b",
+    }
+    for template_name, expected in literal_images.items():
+        image = image_name(merged.get(template_name, {}).get("image"))
+        if image != expected:
+            errors.append(
+                f"{template_name} image {image!r} differs from the reviewed pin {expected!r}"
+            )
+
+    pg_service = merged.get("rust-test-postgres-integration", {}).get("services", [])
+    if not any(
+        isinstance(service, dict)
+        and service.get("name", "").startswith("docker.io/pgvector/pgvector:pg16@sha256:")
+        for service in pg_service
+    ):
+        errors.append("rust-test-postgres-integration must use a digest-pinned pgvector service")
 
 
 def main() -> int:
@@ -417,6 +633,9 @@ def main() -> int:
     validate_worker_publication(merged_config, errors)
     validate_test_shapes(merged_config, errors)
     validate_cache_trust(merged_config, defaults, errors)
+    validate_worker_versions(errors)
+    validate_deliverables_manifest(merged_config, errors)
+    validate_ci_tool_image_pins(merged_config, merged_variables, errors)
     rust_image = extract_rust_image(defaults, ".rust-job", merged_variables)
     msrv_image = extract_rust_image(defaults, ".rust-msrv-job", merged_variables)
     if rust_image is None:

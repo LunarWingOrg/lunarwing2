@@ -26,6 +26,9 @@ pub use router::{
     EngineStepInfo,
     EngineThreadDetail,
     EngineThreadInfo,
+    // Interrupt acknowledgement text shared with the dispatch layer
+    INTERRUPTED_RESPONSE,
+    NOTHING_TO_INTERRUPT_RESPONSE,
     SkillProposal,
     SkillPublishResult,
     // Action handlers

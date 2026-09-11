@@ -87,7 +87,7 @@ turn. Set `wait: true` only for short tasks that must return synchronously.
 
 ## Protocol
 
-Speaks `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1` still accepted for one deprecation cycle). See `agent_comm_protocol.json` for the full spec.
+Speaks the `lunarwing-agent-v1` WebSocket subprotocol (the legacy `ironclaw-agent-v1` alias is no longer accepted). See `agent_comm_protocol.json` for the full spec.
 
 ## Environment Variables
 

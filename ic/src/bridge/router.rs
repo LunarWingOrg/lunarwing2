@@ -36,6 +36,11 @@ pub fn is_engine_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// User-visible acknowledgement for a successful interrupt.
+pub const INTERRUPTED_RESPONSE: &str = "Interrupted.";
+/// User-visible acknowledgement when no running turn could be interrupted.
+pub const NOTHING_TO_INTERRUPT_RESPONSE: &str = "Nothing to interrupt.";
+
 /// Non-gateway channels that may opt in to Engine V2 via `ENGINE_V2_CHANNELS`.
 const ENGINE_V2_OPT_IN_CHANNELS: [&str; 3] = ["xmpp", "darkirc", "weechat"];
 
@@ -2826,9 +2831,9 @@ async fn interrupt_engine_conversation(
             debug!(%error, "engine v2: failed to persist interrupted-turn marker");
         }
         debug!(stopped, discarded, "engine v2: interrupted scoped state");
-        Ok(Some("Interrupted.".into()))
+        Ok(Some(INTERRUPTED_RESPONSE.into()))
     } else {
-        Ok(Some("Nothing to interrupt.".into()))
+        Ok(Some(NOTHING_TO_INTERRUPT_RESPONSE.into()))
     }
 }
 

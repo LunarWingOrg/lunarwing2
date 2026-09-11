@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Synthetic Standard Article</title>
+  <meta property="og:title" content="Synthetic Standard Article">
+</head>
+<body>
+  <header>
+    <nav><a href="/home">Home</a> <a href="/topics">Topics</a> <a href="/about">About</a></nav>
+  </header>
+  <main>
+    <article>
+      <h1>Synthetic Standard Article</h1>
+      <p class="byline">By Test Author | <time datetime="2026-09-01">September 1, 2026</time></p>
+      <p>This synthetic fixture replaces a real-world homepage snapshot so the
+      tree carries no third-party text as an anchor. It exercises the plain
+      article path of the readability extractor: a title, a byline, and body
+      paragraphs with inline formatting such as <strong>bold emphasis</strong>
+      and <em>italic emphasis</em>.</p>
+      <p>The second paragraph verifies that relative links resolve against the
+      page URL. See the <a href="/docs/reference">reference documentation</a>
+      and the <a href="https://example.org/external">external example site</a>
+      for contrast.</p>
+      <h2>Section One: Lists</h2>
+      <p>Ordered lists convert to markdown numbering. The items below are
+      stable tokens used by the golden file.</p>
+      <ol>
+        <li>First numbered item</li>
+        <li>Second numbered item</li>
+        <li>Third numbered item</li>
+      </ol>
+      <p>Unordered lists convert to bullets:</p>
+      <ul>
+        <li>Alpha bullet</li>
+        <li>Beta bullet</li>
+        <li>Gamma bullet</li>
+      </ul>
+      <h2>Section Two: Quotes</h2>
+      <blockquote>
+        <p>This blockquote must survive conversion as a markdown quote block.</p>
+      </blockquote>
+      <p>Inline code such as <code>convert_html_to_markdown</code> converts to
+      backticks. A final paragraph closes the article body.</p>
+      <figure>
+        <img src="/img/fixture-chart.png" alt="Fixture chart">
+        <figcaption>Figure 1: the fixture chart caption</figcaption>
+      </figure>
+    </article>
+  </main>
+  <footer>
+    <p>Synthetic footer navigation: <a href="/privacy">Privacy</a> <a href="/terms">Terms</a></p>
+  </footer>
+</body>
+</html>

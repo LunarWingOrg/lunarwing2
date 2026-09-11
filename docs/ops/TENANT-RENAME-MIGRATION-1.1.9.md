@@ -26,8 +26,9 @@ Unit files are static: `git pull` never rewrites them. To bridge the gap,
 `lunarwing_weechat_wss`, `darkirc_channel_for_ironclaw` →
 `darkirc_channel_for_lunarwing`). Their originally planned v2.0.0 removal did
 not occur: both symlinks remain in the v2.0.4 tree. The WebSocket transition is
-likewise still compatible: the daemon offers `lunarwing-agent-v1` and legacy
-`ironclaw-agent-v1`, and current workers accept both. Treat these as temporary
+no longer compatible: since v2.1.1 the daemon offers only `lunarwing-agent-v1`
+and all workers accept only that name; the legacy `ironclaw-agent-v1` alias
+has been removed. Treat the symlinks as temporary
 upgrade aliases, not as permission to defer unit regeneration indefinitely.
 
 ## Per-tenant flow

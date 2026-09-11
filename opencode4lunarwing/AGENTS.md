@@ -14,7 +14,7 @@ Persistent container worker for upstream opencode. The WebSocket bridge is TypeS
 
 ## Protocol Compatibility
 
-The `lunarwing-agent-v1` WebSocket subprotocol (legacy alias `ironclaw-agent-v1` still accepted for one deprecation cycle) is shared with Pebble and Kimi Code workers. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
+The `lunarwing-agent-v1` WebSocket subprotocol is shared with Pebble and Kimi Code workers. The legacy `ironclaw-agent-v1` alias has been removed and is not accepted. Changes to `agent_comm_protocol.json` or envelope format must stay backward-compatible or be coordinated across all workers.
 
 ## Build Notes
 

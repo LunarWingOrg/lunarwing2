@@ -93,6 +93,15 @@ pub async fn compact_messages(
         .find(|m| m.role == MessageRole::System)
         .cloned();
 
+    // The summary is LLM output that replaces real history. Label it
+    // explicitly and neutralize role-token openers so a fabricated summary
+    // cannot masquerade as engine-authored history or forge a chat-template
+    // boundary downstream (WI#132 item 1, compaction-laundering seam).
+    let summary_text = format!(
+        "[Compaction summary — LLM-generated, replaces earlier conversation history]\n\n{}",
+        lunarwing_safety::neutralize_role_token_openers(&summary_text)
+    );
+
     // Build compacted history
     let mut compacted = Vec::new();
     if let Some(sys) = system_msg {

@@ -133,8 +133,7 @@ _deregister_worker_unit() {
 # ── External-worker config.toml generation ────────────────────────────────────
 #
 # External workers speak the lunarwing-agent-v1 WebSocket
-# protocol (legacy alias ironclaw-agent-v1 is still accepted for back-compat)
-# and are routed by the agent's `create_job(mode: "<worker>")` tool.
+# protocol and are routed by the agent's `create_job(mode: "<worker>")` tool.
 # The daemon discovers them from `[[sandbox.external_workers]]` blocks in
 # `config.toml` under the tenant's LUNARWING_BASE_DIR (the state dir). Without
 # this block the agent has nothing to route `create_job(mode: "<worker>")` to
@@ -867,6 +866,32 @@ arm_tenant_knowledge_seed() {  # <tenant>
   chmod 600 "$env_path"
 }
 
+set_tenant_knowledge_sync() {  # <tenant> <true|false>
+  local name="$1" enabled="$2" env_path
+  name="$(sanitize_name "$name")"
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path"
+  [[ -n "$(_env_existing "$env_path" LW2STUDYMCP_HOME)" ]] \
+    || die "configure Study Notes MCP before enabling knowledge sync for '$name'"
+  case "$enabled" in
+    true|false) : ;;
+    *) die "knowledge sync state must be true or false" ;;
+  esac
+  if [[ "$enabled" == "true" ]]; then
+    # Install the root-owned source scheduler before committing the tenant
+    # opt-in, so a failed scheduler install cannot leave a silently static source.
+    ensure_knowledge_source_scheduler
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS 6
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN 500
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN 10485760
+  fi
+  _env_set "$env_path" KNOWLEDGE_SYNC_ENABLED "$enabled"
+  say "additive knowledge sync for tenant '$name': $enabled"
+}
+
 provision_tenant_study_mcp() {  # <tenant> [checkout home]
   # Auto-configuration used by add-tenant --with-study-mcp: always sync the
   # shared checkout to the latest upstream first, then wire it in read-only
@@ -879,6 +904,7 @@ provision_tenant_study_mcp() {  # <tenant> [checkout home]
     sync_study_notes_checkout "$home"
     configure_study_mcp "$name" "$home" false ""
     arm_tenant_knowledge_seed "$name"
+    set_tenant_knowledge_sync "$name" true
   )
 }
 

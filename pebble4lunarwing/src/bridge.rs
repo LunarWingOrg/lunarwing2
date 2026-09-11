@@ -174,14 +174,12 @@ async fn upgrade_websocket(
 }
 
 /// Pick the subprotocol to echo from a comma-separated client offer.
-/// Prefers the primary name; old daemons that only offer the legacy
-/// `ironclaw-agent-v1` alias still connect and get that value echoed back.
+/// Only the primary `lunarwing-agent-v1` name is accepted; the removed
+/// `ironclaw-agent-v1` alias is not.
 fn negotiate_subprotocol(offer: &str) -> Option<&'static str> {
     let offered: Vec<&str> = offer.split(',').map(str::trim).collect();
     if offered.contains(&protocol::SUBPROTOCOL) {
         Some(protocol::SUBPROTOCOL)
-    } else if offered.contains(&protocol::LEGACY_SUBPROTOCOL) {
-        Some(protocol::LEGACY_SUBPROTOCOL)
     } else {
         None
     }
@@ -244,13 +242,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiate_prefers_primary_when_both_offered() {
+    fn negotiate_prefers_primary() {
         assert_eq!(
-            negotiate_subprotocol("lunarwing-agent-v1, ironclaw-agent-v1"),
-            Some(protocol::SUBPROTOCOL)
-        );
-        assert_eq!(
-            negotiate_subprotocol("ironclaw-agent-v1, lunarwing-agent-v1"),
+            negotiate_subprotocol("lunarwing-agent-v1"),
             Some(protocol::SUBPROTOCOL)
         );
     }
@@ -264,10 +258,18 @@ mod tests {
     }
 
     #[test]
-    fn negotiate_echoes_legacy_for_old_daemons() {
+    fn negotiate_ignores_legacy_alias() {
+        // The `ironclaw-agent-v1` alias was removed: an old daemon offering
+        // only that name must be rejected, and it must not shadow the
+        // primary name when both appear.
+        assert_eq!(negotiate_subprotocol("ironclaw-agent-v1"), None);
         assert_eq!(
-            negotiate_subprotocol("ironclaw-agent-v1"),
-            Some(protocol::LEGACY_SUBPROTOCOL)
+            negotiate_subprotocol("lunarwing-agent-v1, ironclaw-agent-v1"),
+            Some(protocol::SUBPROTOCOL)
+        );
+        assert_eq!(
+            negotiate_subprotocol("ironclaw-agent-v1, lunarwing-agent-v1"),
+            Some(protocol::SUBPROTOCOL)
         );
     }
 

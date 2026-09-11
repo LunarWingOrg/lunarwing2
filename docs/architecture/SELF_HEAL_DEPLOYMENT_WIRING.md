@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-08-25)
+**Date:** 2026-06-13 (revalidated 2026-09-11)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -149,7 +149,13 @@ the final step of tenant provisioning (unless `--no-health` is passed). The full
    image if it is missing. A successful new-tenant Study Notes setup also appends
    `KNOWLEDGE_SEED_FROM_STUDY_MCP=1`; first daemon startup then imports the synced
    notes once without overwriting existing paths. `configure-study-mcp` and
-   `upgrade-tenant` do not arm that seed.
+   `upgrade-tenant` do not arm that seed. `--with-study-mcp` additionally
+   enables the additive knowledge refresh cadence
+   (`KNOWLEDGE_SYNC_ENABLED=true` plus its cadence/bound defaults) and installs
+   the root-owned source scheduler (mt-admin module `14-knowledge-sync.sh`) so
+   the published checkout keeps advancing; `configure-study-mcp
+   --enable-knowledge-sync` / `--disable-knowledge-sync` toggle an existing
+   tenant's cadence.
 6. Start the per-tenant PostgreSQL container
 7. Render the per-tenant init units (`lunarwing-<name>`, `xmpp-bridge-<name>`,
    `lunarwing-proxy-<name>`, weechat adapter, …)
