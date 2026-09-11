@@ -6,8 +6,12 @@ import pathlib
 import sys
 import unittest
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import junit_report as junit
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+REPORT_PATH = ROOT / "junit-python.xml"
 ROOT_SUITES = [
     "lunarwing_mt_onboard.tests",
     "lunarwing_mt_onboard.export_tests",
@@ -38,7 +42,7 @@ def import_from(path: pathlib.Path):
         sys.path.remove(str(path))
 
 
-def run_suite(label: str, modules: list[str]) -> tuple[bool, int, int]:
+def run_suite(label: str, modules: list[str], records: list[dict]) -> tuple[bool, int, int]:
     suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
     count = suite.countTestCases()
     if count == 0:
@@ -47,20 +51,31 @@ def run_suite(label: str, modules: list[str]) -> tuple[bool, int, int]:
 
     print(f"\n=== {label}: {count} tests ===")
     result = unittest.TextTestRunner(verbosity=2).run(suite)
+    records.extend(
+        junit.suite_records(
+            label,
+            result.failures + result.errors,
+            result.skipped,
+            count,
+        )
+    )
     return result.wasSuccessful(), count, len(result.skipped)
 
 
 def main() -> int:
     sys.path.insert(0, str(ROOT))
-    ok, total, skipped = run_suite("onboarding, web, and Kawarimi", ROOT_SUITES)
+    records: list[dict] = []
+    ok, total, skipped = run_suite("onboarding, web, and Kawarimi", ROOT_SUITES, records)
 
     adapter = ROOT / "darkirc_channel_for_lunarwing" / "darkirc" / "adapter"
     with import_from(adapter):
         adapter_ok, adapter_total, adapter_skipped = run_suite(
             "DarkIRC adapter",
             ["test_split", "test_adapter_integration", "test_outbox"],
+            records,
         )
 
+    junit.write(REPORT_PATH, records)
     total += adapter_total
     skipped += adapter_skipped
     if skipped:
