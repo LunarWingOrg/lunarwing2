@@ -2,6 +2,10 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
+**Revalidated against source 2026-09-11 (v2.1.1.0).** Pipeline structure,
+limits, tools, schema/migrations, and env vars were re-checked; the additive
+knowledge refresh cadence (item 6/WI#121) is now documented in Step 6.
+
 The system lives in `ic/src/workspace/`. General memory is exposed through
 `memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
 `ic/src/tools/builtin/memory.rs`; source-verified codebase knowledge is an
