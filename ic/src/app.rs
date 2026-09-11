@@ -1230,8 +1230,23 @@ impl AppBuilder {
             }
 
             if embeddings.is_some() {
+                // Heal crash-stranded memory index projections before the
+                // embedding backfill so repaired chunks get embedded in the
+                // same pass (WI#132 hardening item 2).
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {
+                    match ws_bg.repair_stale_index(100).await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                repaired = count,
+                                "Repaired stale memory index projections at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to repair stale memory index: {}", e);
+                        }
+                    }
                     match ws_bg.backfill_embeddings().await {
                         Ok(count) if count > 0 => {
                             tracing::debug!("Backfilled embeddings for {} chunks", count);
@@ -1239,6 +1254,24 @@ impl AppBuilder {
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!("Failed to backfill embeddings: {}", e);
+                        }
+                    }
+                });
+            } else {
+                // Desync repair does not need the embedding provider for
+                // chunk generation — run it even without embeddings.
+                let ws_bg = Arc::clone(ws);
+                tokio::spawn(async move {
+                    match ws_bg.repair_stale_index(100).await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                repaired = count,
+                                "Repaired stale memory index projections at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to repair stale memory index: {}", e);
                         }
                     }
                 });

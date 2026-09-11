@@ -143,7 +143,9 @@ impl Repository {
         let conn = self.conn().await?;
 
         conn.execute(
-            "UPDATE memory_documents SET content = $2, updated_at = NOW() WHERE id = $1",
+            // Content-only update: mark the chunk projection stale so the
+            // repair sweep re-chunks even if the follow-up reindex never runs.
+            "UPDATE memory_documents SET content = $2, updated_at = NOW(), indexed_at = NULL WHERE id = $1",
             &[&id, &content],
         )
         .await
@@ -169,7 +171,8 @@ impl Repository {
                 UPDATE memory_documents
                 SET content = CASE WHEN content = '' THEN $2
                               ELSE content || $3 || $2 END,
-                    updated_at = NOW()
+                    updated_at = NOW(),
+                    indexed_at = NULL
                 WHERE id = $1
                 RETURNING content
                 "#,
@@ -190,14 +193,28 @@ impl Repository {
         agent_id: Option<Uuid>,
         path: &str,
     ) -> Result<(), WorkspaceError> {
-        let conn = self.conn().await?;
+        let mut conn = self.conn().await?;
+        let tx = conn
+            .transaction()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Failed to start transaction: {e}"),
+            })?;
 
         // First get the document to delete its chunks
         let doc = self.get_document_by_path(user_id, agent_id, path).await?;
-        self.delete_chunks(doc.id).await?;
+        tx.execute(
+            "DELETE FROM memory_chunks WHERE document_id = $1",
+            &[&doc.id],
+        )
+        .await
+        .map_err(|e| WorkspaceError::ChunkingFailed {
+            reason: format!("Delete chunks failed: {e}"),
+        })?;
 
-        // Delete the document
-        conn.execute(
+        // Delete the document in the SAME transaction: a crash mid-delete
+        // must not strand chunkless content rows or orphan chunk rows.
+        tx.execute(
             r#"
             DELETE FROM memory_documents
             WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2 AND path = $3
@@ -206,8 +223,14 @@ impl Repository {
         )
         .await
         .map_err(|e| WorkspaceError::SearchFailed {
-            reason: format!("Delete failed: {}", e),
+            reason: format!("Delete failed: {e}"),
         })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Commit failed: {e}"),
+            })?;
 
         Ok(())
     }
@@ -486,7 +509,7 @@ impl Repository {
         lock_document_chunks(&tx, id).await?;
 
         tx.execute(
-            "UPDATE memory_documents SET content = $2, updated_at = NOW() WHERE id = $1",
+            "UPDATE memory_documents SET content = $2, updated_at = NOW(), indexed_at = NOW() WHERE id = $1",
             &[&id, &content],
         )
         .await
@@ -547,6 +570,17 @@ impl Repository {
             })?;
 
         lock_document_chunks(&tx, document_id).await?;
+
+        tx.execute(
+            // Chunk projection rebuilt: stamp the outbox marker in the same
+            // transaction so the repair sweep stops tracking this document.
+            "UPDATE memory_documents SET indexed_at = NOW() WHERE id = $1",
+            &[&document_id],
+        )
+        .await
+        .map_err(|e| WorkspaceError::ChunkingFailed {
+            reason: format!("Stamp indexed_at failed: {e}"),
+        })?;
 
         tx.execute(
             "DELETE FROM memory_chunks WHERE document_id = $1",
@@ -649,6 +683,41 @@ impl Repository {
                 created_at: row.get("created_at"),
             })
             .collect())
+    }
+
+    /// List documents whose chunk projection is stale: content changed
+    /// (non-empty) but chunks were never rebuilt (`indexed_at IS NULL`).
+    ///
+    /// Engine runtime state is excluded — those documents are intentionally
+    /// zero-chunk (`is_search_indexable_path`) and must never enter search.
+    pub async fn list_stale_index_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>, WorkspaceError> {
+        let conn = self.conn().await?;
+
+        let rows = conn
+            .query(
+                r#"
+                SELECT id
+                FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2
+                  AND indexed_at IS NULL
+                  AND content <> ''
+                  AND NOT (path = 'engine/.runtime' OR path LIKE 'engine/.runtime/%')
+                ORDER BY updated_at DESC
+                LIMIT $3
+                "#,
+                &[&user_id, &agent_id, &(limit as i64)],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Stale index query failed: {}", e),
+            })?;
+
+        Ok(rows.iter().map(|row| row.get("id")).collect())
     }
 
     // ==================== Search Operations ====================

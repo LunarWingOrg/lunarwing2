@@ -989,6 +989,27 @@ CREATE INDEX IF NOT EXISTS idx_memory_documents_study_notes
     WHERE json_extract(metadata, '$.provenance') = 'study-note';
 "#,
     ),
+    (
+        27,
+        "memory_index_outbox",
+        // WI#132 hardening item 2 (mirrors PostgreSQL V27): `indexed_at` is
+        // the outbox marker for the append->reindex two-phase write. NULL =
+        // content changed, chunk projection stale.
+        //
+        // Backfill: existing documents are considered indexed (indexed_at =
+        // updated_at) so an upgrade does not trigger a mass re-chunk /
+        // re-embed; only writes after the migration participate in the
+        // outbox protocol.
+        r#"
+ALTER TABLE memory_documents ADD COLUMN indexed_at TEXT;
+
+UPDATE memory_documents SET indexed_at = updated_at WHERE indexed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_memory_documents_stale_index
+    ON memory_documents (updated_at)
+    WHERE indexed_at IS NULL;
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
