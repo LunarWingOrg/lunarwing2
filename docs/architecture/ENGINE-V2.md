@@ -335,6 +335,17 @@ while preserving operator pauses and mission history. When the
 `SKILL_SELF_IMPROVEMENT` gate is off, the gated missions are paused with a
 gate-driven marker; re-enabling the toggle resumes exactly those missions,
 while missions paused by an operator stay paused.
+
+The event listener also dispatches a best-effort `thread_start` event on the
+initial `Created -> Running` transition of top-level Foreground threads only
+(item 9, WI#109 scope A). Mission and Research threads and child threads never
+dispatch, so mission recursion and research fan-out cannot re-trigger the
+event. The payload carries `source_thread_id`, `project_id`, `thread_type`, and
+`goal`. This is asynchronous plumbing, not a synchronous pre-execution hook —
+WI#109's sanitize-before-execution requirement remains open as scope B (see
+`docs/ops/v2.1.1.0_GOAL4_WI126_THREAD_START_MISSION_SCOPE.md`). `mission_create`
+cadence descriptions document that `event:<pattern>` is text-matching, not an
+engine-lifecycle subscription.
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -490,7 +501,8 @@ eligible; `ENGINE_V2_CHANNELS` can additionally select the exact names `xmpp`,
 `darkirc`, and `weechat`. Values are comma-separated, trimmed, and matched
 case-insensitively by exact channel name. Empty and unknown values are ignored.
 `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS` is another env var
-example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`
+example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`. `ENGINE_V2_CHANNELS=none`
+opts out durably, like `ENGINE_V2=false`.
 
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each

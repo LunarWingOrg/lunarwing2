@@ -298,6 +298,23 @@ overwrites an existing path. `knowledge_seed_state.json` records a completed
 pass (including per-note failures), so later restarts do not repopulate the
 store. `configure-study-mcp` and `upgrade-tenant` do not arm this seed.
 
+The additive refresh path (item 6, WI#121) replaces the static-snapshot
+limitation of the seed. A host-side scheduler (`ensure_knowledge_source_scheduler`,
+mt-admin module `14-knowledge-sync.sh`) fast-forwards the published Study Notes
+checkout and writes a generation manifest
+(`.git/lunarwing-study-notes-generation.json`) only after a clean,
+validated checkout. Tenant daemons poll that manifest on their own cadence
+(`KNOWLEDGE_SYNC_ENABLED`, default false; `KNOWLEDGE_SYNC_CADENCE_HOURS`,
+default 6; `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN`, default 500;
+`KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN`, default 10 MiB) and import missing paths
+through the same parser as the one-shot seed. Existing paths are never changed,
+so locally authored or edited notes remain authoritative; genuine import
+failures back off while healthy skips do not. `configure-study-mcp
+--enable-knowledge-sync` / `--disable-knowledge-sync` toggle the tenant
+cadence, and `refresh-knowledge <tenant> [--sync-source]` triggers a pass
+manually. This fallback reports Git-bounded additive freshness; it is not an
+exact mirror of the hosted Study Notes database.
+
 ## Database Schema
 
 ### PostgreSQL
@@ -422,6 +439,10 @@ SearchConfig {
 | `KNOWLEDGE_SWEEP_INCLUDE_SHARED` | `true` | Sweep the shared herd scope as well as private scope |
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP` | `false` | Arm the one-shot new-tenant checkout import |
 | `LW2STUDYMCP_HOME` | None | Checkout source required by the one-shot seed |
+| `KNOWLEDGE_SYNC_ENABLED` | `false` | Enable the additive checkout-backed refresh cadence |
+| `KNOWLEDGE_SYNC_CADENCE_HOURS` | `6` | Minimum hours between generation checks |
+| `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN` | `500` | New-note cap per bounded pass |
+| `KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN` | `10485760` | Source byte cap per bounded pass |
 
 Sources: `ic/src/config/embeddings.rs`, `ic/src/config/search.rs`,
 `ic/src/config/knowledge.rs`
@@ -496,6 +517,8 @@ code guarantees these structural properties rather than fixed latency targets:
 | `ic/src/workspace/knowledge.rs` | Study-notes metadata, queries, private/shared scopes |
 | `ic/src/workspace/knowledge_sweep.rs` | Aging-note lifecycle sweep and stranded wire-note reap |
 | `ic/src/workspace/knowledge_seed.rs` | One-shot import from a synced lw2studymcp checkout |
+| `ic/src/workspace/knowledge_sync.rs` | Additive checkout-backed refresh cadence (generation manifest polling) |
+| `ic/scripts/mt-admin-lib/14-knowledge-sync.sh` | Host-side source publication scheduler and operator controls |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
 | `ic/src/tools/builtin/memory.rs` | Agent-facing memory search/read/write/tree tools |
