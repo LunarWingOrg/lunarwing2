@@ -44,6 +44,7 @@ How-to guides, build instructions, and setup walkthroughs.
 
 | File | Description |
 |------|-------------|
+| [`CONTRIBUTOR-ONBOARDING.md`](guides/CONTRIBUTOR-ONBOARDING.md) | Contributor onboarding: shortest path from clone to merged MR, current freeze status, contribution tiers, review expectations, AI-policy compliance |
 | [`MT-ADMIN-QUICKSTART.md`](guides/MT-ADMIN-QUICKSTART.md) | Init-agnostic multi-tenant provisioning and lifecycle quickstart |
 | [`CREATE_TENANT_NEW_SCRIPT.md`](guides/CREATE_TENANT_NEW_SCRIPT.md) | Full-featured tenant convenience wrapper |
 | [`TENANT_KNOWLEDGE_SEED.md`](guides/TENANT_KNOWLEDGE_SEED.md) | Seeding a new tenant's knowledge store with the full lw2studymcp study-notes base (`--with-study-mcp` one-shot import) |

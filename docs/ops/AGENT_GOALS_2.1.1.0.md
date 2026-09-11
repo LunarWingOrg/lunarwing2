@@ -136,7 +136,10 @@
 31. [x] (S) Reserved
 32. [x] (S) Reserved
 33. [x] (S) Reserved
-34. [ ] Add contributor onboarding document from Baud to the appropriate place and link it within docs readme. the original document was made in the branch: baud/contributor-onboarding-doc
+34. [x] Add contributor onboarding document from Baud to the appropriate place and link it within docs readme. the original document was made in the branch: baud/contributor-onboarding-doc
+    - DONE 2026-09-11 (`aj/kimi-34-20260911-2101`): materialized `CONTRIBUTOR-ONBOARDING.md` from `baud/contributor-onboarding-doc` into `docs/guides/` (per the docs/README contributing rules: "how to do something" → guides) and indexed it in the `docs/README.md` guides table.
+    - Link fixes for the new location: the two policy links (`CODE-CONTRIBUTION-POLICY.md`, `AI-CODE-CONTRIBUTION-POLICY.md`) now resolve within `docs/guides/`, and the three `AGENTS.md` links now point at `../../AGENTS.md` (repo root). All referenced targets verified to exist.
+    - Commits: ae628d792 (doc), 9ea128a80 (README index).
 35. [ ] review open work items
 36. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/133 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/134 (same issue)
 37. [ ] update all docs in docs/guides
