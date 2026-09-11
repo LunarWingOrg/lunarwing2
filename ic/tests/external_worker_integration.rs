@@ -1109,11 +1109,11 @@ async fn auth_wrong_token_rejected() {
     .expect("test timed out")
     .expect_err("expected connection failure (rejected auth)");
 
+    let OrchestratorError::ExternalWorkerConnectionFailed { ref reason, .. } = err else {
+        panic!("got {err:?}");
+    };
     assert!(
-        matches!(
-            err,
-            OrchestratorError::ExternalWorkerConnectionFailed { .. }
-        ),
-        "got {err:?}"
+        !reason.contains("ironclaw-agent-v1"),
+        "auth rejection must not carry the worker-upgrade hint (see !893 follow-up): {reason}"
     );
 }
