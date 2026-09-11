@@ -2038,8 +2038,10 @@ async fn handle_save_memory_doc(
     // `pending_patch`/`pending_prune` bypassing propose-then-approval. Note
     // `source` also defaults to `Authored` when absent, so omission alone
     // would grant protection; forcing `extracted` closes that hole too.
-    // Lifecycle fields (deprecated_at, archived_at, ...) are self-scoped to
-    // this doc and left as supplied.
+    // Note this also strips `pending_patch`/`pending_prune` instead of
+    // passing them through: those are SkillTracker's propose-then-approve
+    // staging fields, and a mission-supplied doc can stage neither (any
+    // such keys are dropped above).
     if doc_type == DocType::Skill {
         if let Some(obj) = doc.metadata.as_object_mut() {
             obj.remove("pending_patch");

@@ -996,6 +996,10 @@ CREATE INDEX IF NOT EXISTS idx_memory_documents_study_notes
         // the outbox marker for the append->reindex two-phase write. NULL =
         // content changed, chunk projection stale.
         //
+        // Marked as idempotent (see IDEMPOTENT_ADD_COLUMN_MIGRATIONS):
+        // SQLite does not support IF NOT EXISTS for ADD COLUMN, so the
+        // runner checks pragma_table_info before executing the ALTER.
+        //
         // Backfill: existing documents are considered indexed (indexed_at =
         // updated_at) so an upgrade does not trigger a mass re-chunk /
         // re-embed; only writes after the migration participate in the
@@ -1021,6 +1025,7 @@ const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] = &[
     (20, "reflex_patterns", "embedding_model"),
     (18, "routines", "retry_max_retries"),
     (25, "tool_capabilities", "approval_policy"),
+    (27, "memory_documents", "indexed_at"),
 ];
 
 /// Check whether `table` already contains `column` via `pragma_table_info`.

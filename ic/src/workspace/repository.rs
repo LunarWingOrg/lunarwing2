@@ -201,11 +201,33 @@ impl Repository {
                 reason: format!("Failed to start transaction: {e}"),
             })?;
 
-        // First get the document to delete its chunks
-        let doc = self.get_document_by_path(user_id, agent_id, path).await?;
+        // Resolve the document id INSIDE the transaction: a lookup on a
+        // separate pool connection could race a concurrent delete, making
+        // both DELETEs below no-ops while this call still reports success
+        // for a document that no longer exists (MR !899 review finding).
+        let doc_id: Option<Uuid> = tx
+            .query_opt(
+                r#"
+                SELECT id FROM memory_documents
+                WHERE user_id = $1 AND agent_id IS NOT DISTINCT FROM $2 AND path = $3
+                "#,
+                &[&user_id, &agent_id, &path],
+            )
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: format!("Document lookup failed: {e}"),
+            })?
+            .map(|row| row.get("id"));
+        let Some(doc_id) = doc_id else {
+            return Err(WorkspaceError::DocumentNotFound {
+                doc_type: path.to_string(),
+                user_id: user_id.to_string(),
+            });
+        };
+
         tx.execute(
             "DELETE FROM memory_chunks WHERE document_id = $1",
-            &[&doc.id],
+            &[&doc_id],
         )
         .await
         .map_err(|e| WorkspaceError::ChunkingFailed {

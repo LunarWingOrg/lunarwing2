@@ -503,8 +503,6 @@ impl WorkspaceStore for LibSqlBackend {
         agent_id: Option<Uuid>,
         path: &str,
     ) -> Result<(), WorkspaceError> {
-        let doc = self.get_document_by_path(user_id, agent_id, path).await?;
-
         // Chunk delete and document-row delete run in ONE transaction on ONE
         // connection: a crash mid-delete must not strand chunkless content
         // rows (feeds the "0-byte index" symptom) or orphan chunk rows
@@ -522,16 +520,51 @@ impl WorkspaceStore for LibSqlBackend {
                 reason: format!("Failed to start transaction: {e}"),
             })?;
 
+        // Resolve the document id INSIDE the transaction: a lookup on a
+        // separate connection could race a concurrent delete, making both
+        // DELETEs below no-ops while this call still reports success for a
+        // document that no longer exists (MR !899 review finding).
+        let agent_id_str = agent_id.map(|id| id.to_string());
+        let doc_id = {
+            let mut rows = tx
+                .query(
+                    "SELECT id FROM memory_documents WHERE user_id = ?1 AND agent_id IS ?2 AND path = ?3",
+                    params![user_id, agent_id_str.as_deref(), path],
+                )
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Document lookup failed: {e}"),
+                })?;
+            match rows
+                .next()
+                .await
+                .map_err(|e| WorkspaceError::SearchFailed {
+                    reason: format!("Document lookup failed: {e}"),
+                })?
+            {
+                Some(row) => get_text(&row, 0).parse::<Uuid>().map_err(|e| {
+                    WorkspaceError::SearchFailed {
+                        reason: format!("Malformed document id in memory_documents: {e}"),
+                    }
+                })?,
+                None => {
+                    return Err(WorkspaceError::DocumentNotFound {
+                        doc_type: path.to_string(),
+                        user_id: user_id.to_string(),
+                    });
+                }
+            }
+        };
+
         tx.execute(
             "DELETE FROM memory_chunks WHERE document_id = ?1",
-            params![doc.id.to_string()],
+            params![doc_id.to_string()],
         )
         .await
         .map_err(|e| WorkspaceError::SearchFailed {
             reason: format!("Delete chunks failed: {e}"),
         })?;
 
-        let agent_id_str = agent_id.map(|id| id.to_string());
         tx.execute(
             "DELETE FROM memory_documents WHERE user_id = ?1 AND agent_id IS ?2 AND path = ?3",
             params![user_id, agent_id_str.as_deref(), path],
@@ -1187,7 +1220,19 @@ impl WorkspaceStore for LibSqlBackend {
                 reason: format!("Stale index query failed: {}", e),
             })?
         {
-            ids.push(get_text(&row, 0).parse().unwrap_or_default());
+            // Loud skip: a malformed id must not silently map to Uuid::nil
+            // (reindex would then fail per-pass forever while the doc stays
+            // stranded). Skip + warn so the sweep keeps healing the rest
+            // (MR !899 review finding).
+            match get_text(&row, 0).parse::<Uuid>() {
+                Ok(id) => ids.push(id),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "list_stale_index_documents: skipping document with malformed id"
+                    );
+                }
+            }
         }
         Ok(ids)
     }
