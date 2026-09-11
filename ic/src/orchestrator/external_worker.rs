@@ -129,7 +129,7 @@ fn is_loopback(host: &str) -> bool {
 }
 
 /// Operator-facing explanation appended to a worker handshake rejection when
-/// the failure signature matches a subprotocol mismatch (HTTP 400 with no
+/// the failure signature matches a subprotocol mismatch (HTTP 400/426 with no
 /// echoed `Sec-WebSocket-Protocol`), the visible symptom of the daemon
 /// running ahead of a still-legacy-only worker during a rolling upgrade.
 const LEGACY_SUBPROTOCOL_HINT: &str = "the worker rejected the WebSocket \
@@ -139,14 +139,19 @@ const LEGACY_SUBPROTOCOL_HINT: &str = "the worker rejected the WebSocket \
      the same maintenance window as the daemon";
 
 /// Render a worker connect error, enriching the subprotocol-mismatch failure
-/// signature (HTTP 4xx rejection without an echoed subprotocol header) with
-/// the rolling-upgrade operator hint. Any other error keeps its plain
-/// `Display` form so unrelated failures stay unambiguous.
+/// signature (HTTP 400/426 rejection without an echoed subprotocol header)
+/// with the rolling-upgrade operator hint. Any other error keeps its plain
+/// `Display` form so unrelated failures — e.g. an auth rejection (401) with no
+/// echoed protocol — stay unambiguous.
 fn describe_connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
     use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::http::StatusCode;
 
     if let Error::Http(response) = error
-        && response.status().is_client_error()
+        && matches!(
+            response.status(),
+            StatusCode::BAD_REQUEST | StatusCode::UPGRADE_REQUIRED
+        )
     {
         let echoed_subprotocol = response.headers().get("sec-websocket-protocol").is_some();
         if !echoed_subprotocol {
@@ -1540,6 +1545,46 @@ mod tests {
             describe_connect_failure(&io_error),
             io_error.to_string(),
             "non-HTTP failures must keep their plain display form"
+        );
+    }
+
+    #[test]
+    fn describe_connect_failure_keeps_auth_rejection_plain() {
+        // Regression test for the !893 follow-up review: an auth rejection
+        // (401, no echoed subprotocol) must NOT carry the rolling-upgrade
+        // hint — the operator's real problem is a mismatched AGENT_AUTH_TOKEN,
+        // not a stale worker container.
+        use tokio_tungstenite::tungstenite::http::Response;
+
+        let rejected = tokio_tungstenite::tungstenite::Error::Http(
+            Response::builder()
+                .status(401)
+                .body(Some(Vec::new()))
+                .expect("valid http response"),
+        );
+        let reason = describe_connect_failure(&rejected);
+        assert!(
+            !reason.contains("ironclaw-agent-v1"),
+            "auth rejection must not carry the worker-upgrade hint: {reason}"
+        );
+    }
+
+    #[test]
+    fn describe_connect_failure_enriches_upgrade_required_rejection() {
+        // 426 Upgrade Required is the other protocol-mismatch status the
+        // heuristic recognizes; it must still get the operator hint.
+        use tokio_tungstenite::tungstenite::http::Response;
+
+        let rejected = tokio_tungstenite::tungstenite::Error::Http(
+            Response::builder()
+                .status(426)
+                .body(Some(Vec::new()))
+                .expect("valid http response"),
+        );
+        let reason = describe_connect_failure(&rejected);
+        assert!(
+            reason.contains("ironclaw-agent-v1"),
+            "426 rejection should carry the worker-upgrade hint: {reason}"
         );
     }
 
