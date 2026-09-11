@@ -289,6 +289,12 @@ impl HeartbeatRunner {
                         "heartbeat: memory hygiene deleted stale documents"
                     );
                 }
+                // Periodic repair of crash-stranded memory index projections
+                // (WI#132 hardening item 2). Bounded per pass; failures are
+                // logged inside repair_stale_index.
+                if let Err(e) = hygiene_workspace.repair_stale_index(50).await {
+                    tracing::warn!("heartbeat: memory index repair failed: {e}");
+                }
             });
 
             // Run the study-notes stale sweep in the background too. Same

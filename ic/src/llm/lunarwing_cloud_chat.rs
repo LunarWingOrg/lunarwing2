@@ -985,15 +985,26 @@ impl From<ChatMessage> for ChatCompletionMessage {
                 .collect()
         });
 
-        let content = if role == "assistant" && tool_calls.is_some() && msg.content.is_empty() {
+        // System content is the highest-authority role; neutralize role-token
+        // openers as a final backstop (idempotent on already-neutralized
+        // content) so explicit-message paths cannot relay untrusted retrieved
+        // content into the system role (WI#132 item 1).
+        let empty_content = msg.content.is_empty();
+        let text_content = if role == "system" {
+            lunarwing_safety::neutralize_role_token_openers(&msg.content)
+        } else {
+            msg.content
+        };
+
+        let content = if role == "assistant" && tool_calls.is_some() && empty_content {
             None
         } else if !msg.content_parts.is_empty() {
             // Build multimodal content array: text + image parts
-            let mut parts = vec![crate::llm::ContentPart::Text { text: msg.content }];
+            let mut parts = vec![crate::llm::ContentPart::Text { text: text_content }];
             parts.extend(msg.content_parts);
             Some(MessageContent::Parts(parts))
         } else {
-            Some(MessageContent::Text(msg.content))
+            Some(MessageContent::Text(text_content))
         };
 
         Self {

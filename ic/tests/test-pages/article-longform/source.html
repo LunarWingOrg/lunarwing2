@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Synthetic Longform Article</title>
+</head>
+<body>
+  <main>
+    <article>
+      <h1>Synthetic Longform Article</h1>
+      <p class="byline">By Longform Fixture</p>
+      <p>Longform pages stress the converter with deeply nested structure and
+      repeated section patterns. This fixture is deterministic: every string
+      below is generated for the test and appears in no external source. The
+      opening paragraph establishes the article frame that readability
+      scores.</p>
+      <h2>Part I: Nested Sections</h2>
+      <p>Nested headings must flatten to markdown heading levels in document
+      order. This paragraph sits under Part I and contains
+      <strong>bold</strong>, <em>italic</em>, and a
+      <a href="https://example.org/link-target">cross-reference link</a>.</p>
+      <h3>Part I.A: Subsection</h3>
+      <p>The subsection text verifies third-level headings. It also carries a
+      long line to exercise paragraph wrapping behavior in the markdown
+      emitter, padded with stable filler words: alpha bravo charlie delta
+      echo foxtrot golf hotel india juliet kilo.</p>
+      <h3>Part I.B: Another Subsection</h3>
+      <p>A second subsection under the same parent confirms that repeated
+      heading patterns do not confuse the sectioning.</p>
+      <h2>Part II: Block Elements</h2>
+      <p>This part mixes blockquote and list elements in alternation.</p>
+      <blockquote>
+        <p>First quotation from a synthetic interview subject.</p>
+      </blockquote>
+      <ul>
+        <li>List item one follows a quote</li>
+        <li>List item two with <em>emphasis</em></li>
+      </ul>
+      <blockquote>
+        <p>Second quotation closes the block-element sequence.</p>
+      </blockquote>
+      <h2>Part III: Closing</h2>
+      <p>The closing paragraph ends the longform fixture with a stable
+      sign-off phrase used by the golden assertions.</p>
+    </article>
+  </main>
+</body>
+</html>
