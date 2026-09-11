@@ -6,9 +6,11 @@ knowledge base — the [lw2studymcp](https://git.lunarwing.org/cmc/lw2studymcp.g
 study-notes MCP checkout — imported into the tenant's own, private knowledge
 store on first boot.
 
-Seeding is designed for **new tenants only**. It runs exactly once, never
-overwrites anything, and never re-populates a store that was already seeded.
-Existing tenants upgraded to a seed-capable binary are never seeded.
+Seeding is designed for **new tenants only**. It runs exactly once and never
+overwrites anything. Tenants provisioned with `--with-study-mcp` also opt in to
+a separate additive refresh cadence that imports newly published paths without
+changing existing notes. Existing tenants upgraded to a seed-capable binary are
+neither seeded nor opted in automatically.
 
 ## What the tenant gets
 
@@ -48,13 +50,13 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-tenant <name>
 ```
 
 On the daemon's first startup, a background task imports every note from the
-synced checkout into the tenant's private knowledge store. No further operator
-action is required.
+synced checkout into the tenant's private knowledge store. The host source
+scheduler and tenant cadence then keep adding newly published paths.
 
 ## What `--with-study-mcp` actually does
 
 `add-tenant --with-study-mcp` runs `provision_tenant_study_mcp`
-(`ic/scripts/mt-admin-lib/09-worker-config.sh:871`), which performs three steps:
+(`ic/scripts/mt-admin-lib/09-worker-config.sh`), which performs four steps:
 
 1. **Syncs the shared lw2studymcp checkout to the latest upstream** — cloned
    when missing, fast-forwarded when present and clean. Defaults:
@@ -69,12 +71,17 @@ action is required.
    `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` to the tenant's
    `/home/<tenant>/lunarwing/env/lunarwing.env`. This is idempotent (never
    appended twice) and preserves an operator's explicit `=0` opt-out.
+4. **Enables additive refresh** with `KNOWLEDGE_SYNC_ENABLED=true` and bounded
+   defaults, then installs one host-global hourly scheduler. systemd uses a
+   persistent timer; OpenRC uses the available fcron/crontab implementation.
 
 Failure of the study-notes provisioning is **non-fatal**: the base tenant is
-still provisioned, and you can recover later with:
+still provisioned. Recover and explicitly opt the existing tenant into refresh:
 
 ```bash
-sudo ic/scripts/lunarwing-mt-admin.sh configure-study-mcp <name> --sync
+sudo ic/scripts/lunarwing-mt-admin.sh configure-study-mcp <name> --sync \
+  --enable-knowledge-sync
+sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <name>
 ```
 
 ## What happens on first boot
@@ -99,6 +106,52 @@ As of the August 2026 verification run that was ~1,249 notes out of ~1,267
 checkout files; the remainder were skipped for documented reasons
 (invalid topic slugs, empty upstream bodies).
 
+## How automatic refresh works
+
+The hosted Study Notes service does not yet expose an immutable snapshot plus
+ordered delta feed. LunarWing therefore uses the documented 2.1 fallback:
+
+1. Once per hour, the host scheduler finds each unique checkout referenced by a
+   tenant with `KNOWLEDGE_SYNC_ENABLED=true`.
+2. mt-admin removes the old publication marker, fast-forwards the clean checkout
+   under its existing `flock`, validates the expected database, notes tree,
+   scripts, and skill, then atomically writes
+   `.git/lunarwing-study-notes-generation.json` with the Git revision. A
+   transient fast-forward failure (e.g. network blip) restores the last-good
+   publication when HEAD still matches its recorded revision; a dirty checkout
+   or one that moved forward keeps the barrier down. Only `true`/`1`
+   (case-insensitive) enable sync — the same values the daemon accepts — so a
+   hand-edited `yes`/`on` cannot leave the host refreshing a source the daemon
+   refuses to start with. Root-owned scheduler snapshots are pruned to the
+   newest five releases (`LUNARWING_MT_KNOWLEDGE_SYNC_SNAPSHOT_KEEP`).
+3. Each tenant daemon independently checks on its configured cadence (six hours
+   by default, with deterministic startup jitter). When the revision changes it
+   scans the checkout and imports only missing paths.
+4. The daemon writes `knowledge_sync_state.json` under its state directory with
+   the completed revision, attempt/success timestamps, backoff state, and last
+   run counts. A cross-process lock collapses daemon and CLI runs.
+
+The default pass caps are 500 new notes and 10 MiB. Deferred records are picked
+up in bounded follow-up passes. Failures keep the last good native corpus and
+retry with exponential backoff. The source marker is checked before and after a
+scan, so a pass crossing a host update is rejected and safely replayed.
+
+This mode is deliberately labeled `additive`: it imports new paths, but does not
+apply upstream edits, status changes, supersedure, tombstones, or deletions. It
+reports a Git revision rather than claiming exact parity with the hosted MCP.
+Those complete semantics require the revisioned hosted delta contract described
+in `docs/ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`.
+
+Run a bounded pass immediately without restarting the daemon:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh refresh-knowledge <name> --sync-source
+```
+
+Omit `--sync-source` to consume the currently published generation. The command
+prints the same JSON report used by automation. To publish all enabled sources
+without importing directly, run `sync-knowledge-sources`.
+
 ## Safety invariants
 
 - **New tenants only.** The env flag is written exclusively on the
@@ -107,11 +160,11 @@ checkout files; the remainder were skipped for documented reasons
   never touches env, so an existing tenant upgraded onto a seed-capable
   binary is never populated; env regeneration only carries an existing value
   forward (including an explicit operator `=0` opt-out).
-- **Runs exactly once per tenant.** A state file
+- **The bootstrap runs exactly once per tenant.** A state file
   (`knowledge_seed_state.json`, see below) is written once the pass has walked
-  every discovered note; later startups skip the pass entirely, so the store
-  is never repopulated — even if the shared checkout gains new notes later.
-- **Never overwrites.** A note whose workspace path already exists is skipped
+  every discovered note; later startups skip that bootstrap entirely. The
+  separate refresh cadence can still add paths published afterward.
+- **Never overwrites.** Both bootstrap and refresh skip a note whose workspace path already exists
   byte-for-byte, so operator-authored notes survive even a forced re-seed. The
   only writes to existing paths repair a previous seed pass's own stranded
   rows (a byte-for-byte seeded body missing provenance metadata gets the
@@ -185,33 +238,29 @@ After provisioning and the first `start-tenant`:
   `study-notes/` documents. Verified live on both systemd and Gentoo/OpenRC
   hosts (see the verification records below).
 - **`configure-study-mcp` never arms the seed.** It wires (or re-syncs) the
-  shared read-only MCP only. Use it to recover a tenant whose auto-provisioning
-  step failed: `configure-study-mcp <name> --sync`.
-- **Opting out:** remove the `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` line (or set it
-  to `0`) from the tenant env before the first boot. An explicit `=0` written
-  by an operator is preserved by `arm_tenant_knowledge_seed` and by later env
-  regeneration.
-- **Seeding an existing, long-lived tenant** is possible but unusual: re-run
-  `add-tenant <name> --with-study-mcp` to arm the flag. The pass is safe — it
-  runs at most once and never overwrites an existing note — but curated stores
-  keep their operator-authored notes untouched; seeding only adds what is
-  missing.
-- **Forcing a full re-seed:** delete
-  `/home/<tenant>/lunarwing/state/knowledge_seed_state.json` and restart the
-  tenant. This is safe precisely because existing notes are never overwritten:
-  only notes missing from the store are imported, and a previous pass's own
-  stranded rows are repaired.
+  shared read-only MCP only unless `--enable-knowledge-sync` is supplied. That
+  flag opts an existing tenant into additive refresh without pretending it is a
+  new-tenant bootstrap; restart once to start the daemon cadence.
+- **Opting out:** set `KNOWLEDGE_SEED_FROM_STUDY_MCP=0` before the first boot to
+  suppress bootstrap. Disable ongoing refresh with
+  `configure-study-mcp <name> --home <current-home> --disable-knowledge-sync`
+  and restart. Env regeneration preserves both choices.
+- **Populating an existing, long-lived tenant:** configure and publish the
+  checkout, enable sync, then run `refresh-knowledge <name>`. The same additive
+  importer fills missing paths while curated/operator-authored paths remain
+  untouched; deleting the seed marker or impersonating a new add is unnecessary.
 
 ## Troubleshooting
 
 | Symptom | Meaning | Action |
 |---------|---------|--------|
-| No flag in tenant env | Provisioned without `--with-study-mcp`, or it failed non-fatally | Re-run `add-tenant <name> --with-study-mcp`, or `configure-study-mcp <name> --sync` plus manual flag |
+| No flag in tenant env | Provisioned without `--with-study-mcp`, or it failed non-fatally | Use `configure-study-mcp <name> --sync --enable-knowledge-sync`, restart, then `refresh-knowledge <name>` |
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP=1` present but no seed log | `LW2STUDYMCP_HOME` unset, or checkout missing (double-check warning in daemon log) | `configure-study-mcp <name> --sync` |
 | `knowledge seed: ... not found; will retry on next startup` | Checkout directory missing at startup | Re-sync via `configure-study-mcp <name> --sync`, then restart the tenant |
-| `N note(s) failed ... seed is complete and will not rerun` | Upstream junk notes (empty bodies, invalid slugs) counted in the state file | Nothing; expected for known upstream junk |
-| Daemon restarted mid-import | No marker written; import resumes from scratch | Nothing; already-imported notes are skipped |
-| Notes stale in tenant store relative to updated shared checkout | Seed is intentionally one-shot | Delete `knowledge_seed_state.json` and restart to force a safe re-seed of missing notes |
+| `N note(s) failed ... seed is complete and will not rerun` | Upstream junk notes (empty bodies, invalid slugs) counted in the state file | Correct or remove malformed source notes; additive refresh reports failures and retries |
+| Daemon restarted mid-import | No seed marker written; bootstrap resumes from scratch | Nothing; already-imported notes are skipped |
+| `source_unavailable` refresh report | No validated generation is published, often after a failed/dirty checkout update | Repair the checkout, then run `refresh-knowledge <name> --sync-source` |
+| Refresh succeeds but an upstream edit is absent | Additive mode never replaces an existing path | Expected; wait for the hosted revisioned-delta implementation or resolve manually |
 
 ## Related documents
 
@@ -225,6 +274,8 @@ After provisioning and the first `start-tenant`:
   mechanism design record + Gentoo/OpenRC live verification
 - [`../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md`](../ops/v2.0.9.0_GOAL4_KNOWLEDGE_SEED_SYSTEMD.md) —
   systemd live verification (including the upgraded-tenant negative case)
+- [`../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md`](../ops/v2.1.0.0_KNOWLEDGE_STORE_RESYNC_OPTIONS.md) —
+  refresh architecture, safety invariants, and hosted-delta follow-up
 - Implementation: `ic/src/workspace/knowledge_seed.rs`,
-  `ic/src/config/knowledge.rs`, `ic/scripts/mt-admin-lib/09-worker-config.sh`
-  (`provision_tenant_study_mcp`, `arm_tenant_knowledge_seed`)
+  `ic/src/workspace/knowledge_sync.rs`, `ic/src/config/knowledge.rs`, and
+  `ic/scripts/mt-admin-lib/{06-env-generation,09-worker-config,14-knowledge-sync}.sh`

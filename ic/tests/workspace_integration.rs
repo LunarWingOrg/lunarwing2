@@ -674,3 +674,104 @@ async fn test_multi_scope_append_stays_in_primary() {
     cleanup_user(&pool, shared_id).await;
     cleanup_user(&pool, alice_id).await;
 }
+
+#[tokio::test]
+async fn test_knowledge_sync_refresh_additive_on_postgres() {
+    let pool = get_pool().await;
+    let user_id = "test_knowledge_sync";
+    cleanup_user(&pool, user_id).await;
+
+    // Published-generation fixture: two notes plus the manifest the daemon's
+    // load_generation() requires (schema 1, 12+ hex-digit source revision).
+    let fixture = tempfile::tempdir().expect("fixture");
+    let notes = fixture.path().join("agent-notes-by-agent/rarity");
+    std::fs::create_dir_all(&notes).expect("notes dir");
+    for topic in ["a", "b"] {
+        std::fs::write(
+            notes.join(format!("{topic}.md")),
+            format!("# {topic}\n\nsource {topic}\n"),
+        )
+        .expect("note");
+    }
+    let manifest = fixture
+        .path()
+        .join(".git/lunarwing-study-notes-generation.json");
+    std::fs::create_dir_all(manifest.parent().expect("git dir")).expect("git dir");
+    std::fs::write(
+        manifest,
+        serde_json::json!({
+            "schema_version": 1,
+            "source_revision": "aaaaaaaaaaaa",
+            "published_at": "2026-09-09T00:00:00Z",
+        })
+        .to_string(),
+    )
+    .expect("manifest");
+
+    let workspace = Workspace::new(user_id, pool.clone());
+    let state_dir = tempfile::tempdir().expect("state");
+    let config = lunarwing::workspace::knowledge_sync::KnowledgeSyncConfig {
+        enabled: true,
+        source_home: fixture.path().to_path_buf(),
+        state_dir: state_dir.path().to_path_buf(),
+        cadence_hours: 6,
+        max_records_per_run: 1,
+        max_bytes_per_run: 1_024,
+    };
+
+    // Bounded passes: one note per run, then the unchanged-generation skip.
+    let first =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
+    assert!(first.successful);
+    assert_eq!(first.notes_added, 1);
+    assert_eq!(first.notes_deferred, 1);
+    let second =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
+    assert!(second.successful);
+    assert_eq!(second.notes_added, 1);
+    assert_eq!(second.notes_deferred, 0);
+    let unchanged =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
+    assert!(unchanged.skipped);
+    assert_eq!(unchanged.skip_reason, Some("source_unchanged"));
+
+    // Local operator edits are never overwritten by a later generation.
+    workspace
+        .write("study-notes/rarity/a.md", "# Local\n\noperator edit\n")
+        .await
+        .expect("operator edit");
+    std::fs::write(notes.join("c.md"), "# c\n\nsource c\n").expect("new note");
+    std::fs::write(
+        fixture
+            .path()
+            .join(".git/lunarwing-study-notes-generation.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "source_revision": "bbbbbbbbbbbb",
+            "published_at": "2026-09-09T01:00:00Z",
+        })
+        .to_string(),
+    )
+    .expect("manifest refresh");
+    let refreshed =
+        lunarwing::workspace::knowledge_sync::run_knowledge_sync_once(&workspace, &config, false)
+            .await;
+    assert!(refreshed.successful);
+    assert_eq!(refreshed.notes_added, 1);
+    let local = workspace
+        .read_primary("study-notes/rarity/a.md")
+        .await
+        .expect("local note");
+    assert!(local.content.contains("operator edit"));
+    assert!(
+        workspace
+            .read_primary("study-notes/rarity/c.md")
+            .await
+            .is_ok()
+    );
+
+    cleanup_user(&pool, user_id).await;
+}
