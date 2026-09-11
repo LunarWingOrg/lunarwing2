@@ -3184,6 +3184,24 @@ mod runtime_index_tests {
             "document row must be gone"
         );
     }
+
+    /// Deleting a path that does not exist must fail loudly with
+    /// DocumentNotFound — the in-tx lookup must not silently report success
+    /// for a document that is already gone (MR !899 review finding).
+    #[tokio::test]
+    async fn delete_missing_document_returns_not_found() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("delete-missing-user", db.clone());
+
+        let err = workspace
+            .delete("notes/never-existed.md")
+            .await
+            .expect_err("delete of a missing path must fail");
+        assert!(
+            matches!(err, WorkspaceError::DocumentNotFound { .. }),
+            "expected DocumentNotFound, got: {err:?}"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "libsql"))]
