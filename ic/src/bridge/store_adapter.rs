@@ -2992,23 +2992,14 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn fix_pattern_doc_survives_reload_without_reseed_duplicates() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
         // Goal #30 tracker item (c): three distinct fix_pattern_database
         // duplicates were observed accumulating on a live tenant. The shared
         // doc must round-trip ownership so a reload still finds it, and the
         // workspace path must be stable across saves.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-test", db));
         let store = HybridStore::new(Some(Arc::clone(&workspace)));
         let project_id = ProjectId::new();
 
@@ -3064,19 +3055,10 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn consolidate_fix_pattern_merges_legacy_duplicates() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-dupes.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-dupes-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-dupes-test", db));
         let project_id = ProjectId::new();
 
         // Simulate the legacy damage the way it actually exists on tenants:
@@ -3127,8 +3109,6 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn consolidate_fix_pattern_normalizes_legacy_ownership() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
         // MR !876 review: legacy files without owner/project frontmatter
@@ -3136,15 +3116,8 @@ title: \"old doc\"\n\
         // normalize that identity to the shared owner so the seeder's
         // list_shared_memory_docs finds the canonical doc and never reseeds
         // over the merged rows.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-legacy.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-legacy-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-legacy-test", db));
         let project_id = ProjectId::new();
         // A project record must exist so consolidation can adopt it as the
         // anchor for legacy-identity duplicates (nil project on the docs).
@@ -3215,21 +3188,12 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn consolidate_fix_pattern_skips_cross_project_duplicates() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
         // When duplicates are owned by distinct real projects, no single
         // winner is safe: consolidation must be skipped entirely.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-xproj.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-xproj-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-xproj-test", db));
 
         let project_a = ProjectId::new();
         let project_b = ProjectId::new();
@@ -3267,23 +3231,14 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn consolidate_fix_pattern_keeps_legacy_sources_on_write_failure() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
         // MR !885 review (blocking): a canonical write failure must leave every
         // legacy source intact — no files deleted, no map entries dropped — so
         // the next startup can retry the whole migration. Persist before delete
         // is the invariant.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-fail.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-fail-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-fail-test", db));
         let project_id = ProjectId::new();
 
         let older = MemoryDoc::new(
@@ -3349,23 +3304,14 @@ title: \"old doc\"\n\
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn consolidate_fix_pattern_ignores_unrelated_same_title_docs() {
-        use crate::db::Database;
-        use crate::db::libsql::LibSqlBackend;
         use lunarwing_engine::types::shared_owner_id;
 
         // MR !885 review: title-only matching would absorb and delete an
         // unrelated user document that happens to share the title. Only the
         // shared/tagged doc may be consolidated; the user's file must survive
         // every reload untouched.
-        let temp_dir = tempfile::tempdir().expect("tempdir");
-        let backend = LibSqlBackend::new_local(&temp_dir.path().join("fix-patterns-title.db"))
-            .await
-            .expect("libsql backend");
-        backend.run_migrations().await.expect("migrations");
-        let workspace = Arc::new(Workspace::new_with_db(
-            "fix-patterns-title-test",
-            Arc::new(backend) as Arc<dyn Database>,
-        ));
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("fix-patterns-title-test", db));
         let project_id = ProjectId::new();
 
         // A shared (candidate) doc and a user-owned same-title doc, written as
