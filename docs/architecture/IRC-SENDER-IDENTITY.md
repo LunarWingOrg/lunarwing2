@@ -1,5 +1,13 @@
 # IRC Sender Identity
 
+**Revalidated against source 2026-09-11 (v2.1.1.0).** Principal formats
+(`darkirc:nick:<case-folded-nick>`, `account:<network>:…` /
+`nick:<network>:…`, `weechat:dm:v2:<principal>`,
+`weechat:group:<network>:<target>`), the owner-actor settings, and the
+migration/retention policy below were re-checked against
+`ic/channels-src/{darkirc,weechat}` and `ic/src/extensions/manager.rs` and
+still hold.
+
 LunarWing treats IRC sender identity as a routing and continuity hint, not as
 cryptographic proof of a person. DarkIRC and WeeChat use versioned,
 case-normalized principals so pairing, owner recognition, and Engine V2

@@ -1,5 +1,11 @@
 # XMPP File Transfer Support
 
+**Revalidated against source 2026-09-11 (v2.1.1.0).** Every limit in the
+table below, the MIME allowlist, the WIT interface (`ic/wit/channel.wit`,
+`store-attachment-data`), the bridge body limit (`MAX_SEND_BODY_BYTES` 70 MiB,
+send route only), and the LunarVision enrichment bounds were re-checked
+against the current tree and still hold.
+
 ## Overview
 
 LunarWing supports file transfers over XMPP in both directions, in DMs and group chats (including OMEMO-encrypted):
