@@ -3,13 +3,14 @@
 #### Inspired by: 
 
 * Manifesto for a Democratic Civilization Part 3 by Abdullah Öcalan
+* Democracy in America by Alexis de Tocqueville
 * Agorism in the 21st Century, Volumes I and II
 * https://www.gnu.org/philosophy/philosophy.html
 * https://dark.fi/manifesto.html
 * Thus Spoke Zarathustra by Friedrich Nietzsche
-* Proofs, Arguments, and Zero-Knowledge by Justin Thaler.
+* Proofs, Arguments, and Zero-Knowledge by Justin Thaler
 
-##### LunarWing is NOT a corporate startup with VC Seed Funding. We DO NOT sell access to LLMs and we are NOT NearAI or affiliated with NearAI. See README.md for more information.
+##### LunarWing is NOT a corporate startup with VC Seed Funding. We DO NOT sell access to LLMs. We are NOT NearAI or affiliated with NearAI. See README.md for more information.
 
 ##### LunarWing supports autonomous political formations.
 
@@ -23,4 +24,6 @@ We won't force users to NOT use proprietary channels maintained by third party c
 
 We are a small group with very opinionated backgrounds in technology. Our own opinions and philosophy will have an impact on this project going forward. Our opinions, experience, and philosophy affect the overall direction and focus of the project.
 
-Addendum: We believe that local inference with open weight models is the future. While the engineers of LunarWing still have a lot to learn about tuning models or developing custom clients to accomodate specialized models, we still believe that we should prioritize LOCAL inference in our project. We believe our underlying philosophical beliefs meshes perfectly with utilizing your own hardware on your own network, utilizing models that you can control. 
+Addendum: We believe that locally sourced inference with open weight models is the present AND future. While the engineers of LunarWing still have a lot to learn about tuning models or developing custom clients to accomodate specialized models, we still believe that we should prioritize LOCAL inference in our project. We believe our underlying philosophical beliefs meshes perfectly with utilizing your own hardware on your own network, utilizing models that you can control.
+
+All external contributions, whether that be time, toil, or treasure, is done so on a voluntary basis. If you wish to contribute code, please see the various documents related to contributing to the project.
