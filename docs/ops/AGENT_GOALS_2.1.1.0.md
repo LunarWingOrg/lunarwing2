@@ -55,7 +55,10 @@
 
 12. [x] (S) Reserved
 
-13. [ ] Follow up on goal item 11 above... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
+13. [x] Follow up on goal item 11 above... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
+    - DONE 2026-09-11 (`rarity/kimi-13-20260911-0302`): read the !893 follow-up review (note 2723, non-blocking, fix-forward). Finding: `describe_connect_failure` appended the rolling-upgrade/subprotocol-removal hint to any HTTP 4xx rejection lacking an echoed `Sec-WebSocket-Protocol`, so a worker auth rejection (401, mismatched `AGENT_AUTH_TOKEN`) misleadingly surfaced "recreate/upgrade your worker container" guidance.
+    - Fix: narrowed the heuristic in `ic/src/orchestrator/external_worker.rs` to statuses that actually indicate a protocol mismatch (400 Bad Request / 426 Upgrade Required, no echoed subprotocol); all other failures keep their plain message. Unit tests pin 401-plain and 426-hint behavior; `auth_wrong_token_rejected` integration test now asserts the failure reason carries no upgrade hint.
+    - Verified: 4 `describe_connect_failure` unit tests, `auth_wrong_token_rejected` + `legacy_only_worker_is_rejected` integration tests pass; rustfmt clean; clippy `-D warnings` clean on lib + touched integration test.
 
 14. [x] (S) Mascot Design Art Project
 
