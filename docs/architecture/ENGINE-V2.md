@@ -512,6 +512,11 @@ Approval, authentication, interrupt, steer, clear, and new-thread controls use
 the same user and engine-conversation scope as ordinary input. This includes
 non-UUID XMPP, DarkIRC, and WeeChat scope keys. `/interrupt` cancels in-flight
 provider streams and tool futures before signaling the next loop boundary.
+When an interrupt overtakes a prompt still queued in the daemon's message
+scheduler (no engine thread yet), the queued prompt is cancelled in its
+conversation lane and the user gets `Interrupted.`; queued follow-ups behind a
+running turn are kept — the engine stops the running turn and the follow-ups
+run afterward.
 `/steer <note>` injects into a running thread at its next model-call boundary;
 when the conversation is idle or completing an interrupt, up to four notes are
 persisted on the conversation and injected into its next foreground turn,

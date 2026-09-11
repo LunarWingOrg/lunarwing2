@@ -1223,17 +1223,14 @@ impl Agent {
                             // scheduler, or the user gets "Nothing to
                             // interrupt." followed by the very turn they
                             // cancelled (goal #9 documented-not-fixed race).
-                            //
-                            // Only when the lane has no active engine thread:
-                            // with one running, the engine stops it and queued
-                            // follow-ups must still run afterward (pinned by
+                            // A lane with an active turn keeps its queued
+                            // follow-ups: the interrupt stops the running turn
+                            // and the follow-ups still run afterward (pinned by
                             // `queued_same_thread_message_starts_after_interrupt_acknowledgement`).
                             if matches!(
                                 SubmissionParser::parse(&incoming.content),
                                 Submission::Interrupt
-                            ) && crate::bridge::should_route_to_engine_v2(&incoming.channel)
-                                && !crate::bridge::has_active_engine_thread(&incoming).await
-                            {
+                            ) {
                                 let lane = LaneKey::from_message(&incoming);
                                 let cancelled = scheduler.cancel_lane(&lane);
                                 if cancelled > 0 {
@@ -1243,6 +1240,10 @@ impl Agent {
                                         cancelled,
                                         "priority interrupt cancelled queued prompt(s)"
                                     );
+                                    let result =
+                                        Ok(Some(crate::bridge::INTERRUPTED_RESPONSE.to_string()));
+                                    let _ = self.deliver_message_result(&incoming, result).await;
+                                    continue 'message_loop;
                                 }
                             }
                             self.handle_priority_interrupt(incoming).await;

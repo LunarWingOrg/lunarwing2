@@ -82,6 +82,14 @@ impl LaneKey {
             scope: message.conversation_scope().map(str::to_string),
         }
     }
+
+    fn from_parallel(key: &ParallelMessageKey) -> Self {
+        Self {
+            channel: key.group.channel.clone(),
+            user_id: key.group.user_id.clone(),
+            scope: Some(key.scope.clone()),
+        }
+    }
 }
 
 impl QueuedMessage {
@@ -117,6 +125,8 @@ pub(super) struct MessageScheduler {
     active_parallel: HashSet<ParallelMessageKey>,
     active_group: Option<ParallelMessageGroup>,
     exclusive_active: bool,
+    /// Conversation lane of the currently active exclusive message.
+    active_lane: Option<LaneKey>,
     capacity: usize,
     max_parallel: usize,
 }
@@ -132,6 +142,7 @@ impl MessageScheduler {
             active_parallel: HashSet::new(),
             active_group: None,
             exclusive_active: false,
+            active_lane: None,
             capacity,
             max_parallel: max_parallel.max(1),
         }
@@ -192,6 +203,7 @@ impl MessageScheduler {
             self.active_parallel.insert(key.clone());
         } else {
             self.exclusive_active = true;
+            self.active_lane = Some(LaneKey::from_message(&queued.message));
         }
 
         ScheduledMessage {
@@ -210,16 +222,33 @@ impl MessageScheduler {
             }
         } else {
             self.exclusive_active = false;
+            self.active_lane = None;
         }
+    }
+
+    /// Whether a message in `lane` is currently being handled.
+    fn lane_is_active(&self, lane: &LaneKey) -> bool {
+        if self.exclusive_active {
+            return self.active_lane.as_ref() == Some(lane);
+        }
+        self.active_parallel
+            .iter()
+            .any(|key| LaneKey::from_parallel(key) == *lane)
     }
 
     /// Cancel queued messages in one conversation lane.
     ///
     /// Used by priority controls: an interrupt that overtakes a queued prompt
     /// must stop that prompt from running afterward, or the user gets
-    /// "Nothing to interrupt." followed by the very turn they cancelled.
-    /// Returns the number of queued messages removed.
+    /// "Nothing to interrupt." followed by the very turn they cancelled
+    /// (goal #9 documented-not-fixed race). A lane with an active turn keeps
+    /// its queued follow-ups — the engine stops the running turn and the
+    /// follow-ups still run afterward, preserving the pinned interrupt-ack
+    /// ordering. Returns the number of queued messages removed.
     pub(super) fn cancel_lane(&mut self, lane: &LaneKey) -> usize {
+        if self.lane_is_active(lane) {
+            return 0;
+        }
         let before = self.queue.len();
         self.queue
             .retain(|queued| LaneKey::from_message(&queued.message) != *lane);
@@ -324,6 +353,34 @@ mod tests {
 
         let next = scheduler.next_ready().expect("scoped message remains");
         assert_eq!(next.message.content, "scoped");
+    }
+
+    #[test]
+    fn cancel_lane_keeps_queued_followups_behind_an_active_turn() {
+        let mut scheduler = MessageScheduler::with_limits_for_test(4, 1);
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "first"), true)
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .defer(thread_message("user", "one", "second"), true)
+                .is_none()
+        );
+
+        // Dispatch the first message: the lane is now active.
+        let first = scheduler.next_ready().expect("first message is ready");
+
+        // An interrupt while the turn runs must not eat the queued follow-up:
+        // the engine stops the running turn and the follow-up runs afterward
+        // (pinned by the interrupt-ack ordering integration test).
+        let lane = LaneKey::from_message(&thread_message("user", "one", "/interrupt"));
+        assert_eq!(scheduler.cancel_lane(&lane), 0);
+
+        scheduler.complete(&first.ticket);
+        let second = scheduler.next_ready().expect("follow-up still queued");
+        assert_eq!(second.message.content, "second");
     }
 
     #[test]
