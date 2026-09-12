@@ -2826,7 +2826,9 @@ mod runtime_index_tests {
             .await
             .expect("search before purge");
         assert!(
-            before.iter().any(|r| r.document_path == legacy_mission_path),
+            before
+                .iter()
+                .any(|r| r.document_path == legacy_mission_path),
             "legacy mission chunks must be searchable before the purge: {before:?}"
         );
 

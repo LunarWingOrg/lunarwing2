@@ -427,10 +427,7 @@ mod tests {
             "projects/foo/missions/bar/mission.json",
             "engine/projects/mission.json",
         ] {
-            assert!(
-                !is_mission_path(path),
-                "path should not be mission: {path}"
-            );
+            assert!(!is_mission_path(path), "path should not be mission: {path}");
             assert!(
                 is_search_indexable_path(path),
                 "path should be indexed: {path}"

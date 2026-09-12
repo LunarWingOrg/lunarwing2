@@ -1162,17 +1162,12 @@ mod tests {
 
     #[test]
     fn memory_search_output_labels_engine_internal_docs() {
-        let engine_doc = search_result(
-            "engine/knowledge/summaries/id.json",
-            "engine summary",
-            0.9,
-        );
+        let engine_doc = search_result("engine/knowledge/summaries/id.json", "engine summary", 0.9);
         let user_doc = search_result("notes/example.md", "user note", 0.8);
         let output = build_memory_search_output("useful", vec![engine_doc, user_doc]);
 
         assert_eq!(
-            output["results"][0]["provenance"],
-            "engine_internal",
+            output["results"][0]["provenance"], "engine_internal",
             "engine-internal docs must carry a provenance label"
         );
         assert!(
