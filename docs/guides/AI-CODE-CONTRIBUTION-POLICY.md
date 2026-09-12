@@ -3,6 +3,10 @@
 **Effective Date:** September 15th, 2026
 **Last Updated:** August 19th, 2026 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
 
+**Revalidated 2026-09-12 (v2.1.1.0).** Policy text reviewed; no changes were
+needed. The companion human policy (`CODE-CONTRIBUTION-POLICY.md`) had its
+stale `src/*/CLAUDE.md` references corrected to the `ic/` tree in this pass.
+
 ## 1. Core Rule: Closed-Weight Models Prohibited for Code Generation
 
 Code produced by proprietary, closed-weight models — including but not limited to those accessed exclusively via vendor APIs where the model weights are not publicly available — will no longer be accepted. This includes code generated through services that do not provide downloadable, inspectable model weights.
