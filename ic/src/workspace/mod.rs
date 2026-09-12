@@ -526,6 +526,25 @@ impl WorkspaceStorage {
         }
     }
 
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
+                    .await
+            }
+            Self::Db(db) => {
+                db.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
+                    .await
+            }
+        }
+    }
+
     async fn hybrid_search(
         &self,
         user_id: &str,
@@ -2168,6 +2187,31 @@ impl Workspace {
             );
         }
         Ok(repaired)
+    }
+
+    /// Purge legacy search chunks for mission-goal documents.
+    ///
+    /// Mission `mission.json` files became non-indexable (WI#135 hardening),
+    /// but chunks created before the fix persist in `memory_chunks` and remain
+    /// searchable. This idempotent sweep deletes them; on a clean system it is
+    /// a no-op. Runs at boot BEFORE the embedding backfill so freed budget is
+    /// not spent re-embedding chunks about to be deleted.
+    pub async fn purge_mission_index_chunks(&self) -> Result<u64, WorkspaceError> {
+        let purged = self
+            .storage
+            .purge_chunks_for_path_pattern(
+                &self.user_id,
+                self.agent_id,
+                "engine/projects/%/missions/%/mission.json",
+            )
+            .await?;
+        if purged > 0 {
+            tracing::info!(
+                purged,
+                "purge_mission_index_chunks: removed legacy mission-goal search chunks"
+            );
+        }
+        Ok(purged)
     }
 
     // ==================== Seeding ====================
