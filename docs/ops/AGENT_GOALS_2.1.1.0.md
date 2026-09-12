@@ -146,7 +146,7 @@
     - Added `Workspace::purge_mission_index_chunks` (idempotent) over a new `Database::purge_chunks_for_path_pattern` implemented on BOTH backends (PostgreSQL `DELETE ... USING` + libSQL subquery `DELETE`), wired at boot BEFORE the embedding backfill (both embedding and non-embedding branches) and on the heartbeat hygiene pass — removes pre-fix legacy chunks. No schema change.
     - Provenance belt-and-suspenders: `build_memory_search_output` (`ic/src/tools/builtin/memory.rs`) labels any `engine/**` result with `"provenance": "engine_internal"`, mirroring the `untrusted_memory_retrieval` seam from WI#132. FTS nonce-tokenizer secondary finding (WI#135) explicitly deferred to a separate item, not coupled here.
     - Verified: `cargo check` green on default + libsql-only feature combos; clippy `-D warnings` clean on `lunarwing` lib+tests; rustfmt clean; `workspace::` 217 tests green (incl. new `mission_goals_persist_without_entering_search` and `purge_mission_index_chunks_removes_legacy_chunks_and_is_idempotent`), `workspace::document` 14 tests, `tools::builtin::memory` 23 tests, `lunarwing_engine` mission 107 + store_adapter tests green.
-30. [x] (S) Reserved
+30. [ ] see item goal 11 on the desktop repo and see if we can address any SSE issues still outstanding here....
 31. [x] (S) Reserved
 32. [x] (S) Reserved
 33. [ ] followup for item 36. see: docs/ops/v2.1.1.0-ITEM-36-FOLLOWUP.md for info
