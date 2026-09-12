@@ -2,6 +2,10 @@
 
 There is currently **no maintained, production-safe cross-backend importer** from an arbitrary IronClaw/libSQL database into LunarWing's multi-tenant PostgreSQL schema.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** The archived guide,
+the three legacy helper scripts, and the recommended fresh-tenant/ETL paths
+were re-checked; the unsupported status and all referenced paths are current.
+
 The previous guide has been archived at [`history/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md`](history/MIGRATE_IRONCLAW_LIBSQL_TO_MT.md). Do not execute its CSV and SQL snippets against a current tenant. They hardcode an old table/column set, expose a fixed PostgreSQL connection pattern, disable constraints, assume the historical V18 schema, and do not preserve newer user, owner-scope, extension, reflex, document-version, approval-policy, and runtime-exclusion semantics.
 
 The helper files `ic/scripts/export-libsql.sh`, `ic/scripts/import-to-pg.sh`, and `ic/scripts/reimport-fixes.sh` are legacy one-off scripts, not an MT-admin import contract. They contain deployment-specific defaults and must not be treated as a supported migrator.

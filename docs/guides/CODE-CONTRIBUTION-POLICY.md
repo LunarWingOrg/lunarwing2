@@ -8,7 +8,7 @@ LunarWing is privacy-first, security-first, and self-hosting-first. We prefer op
 
 ## 2. What this policy covers
 
-This policy applies to all code merged into the `lunarwing2` repository. It does not replace subsystem specs (`src/*/CLAUDE.md`, `docs/architecture/`, `docs/specs/`); it sits above them. Read the relevant subsystem spec before changing a complex area.
+This policy applies to all code merged into the `lunarwing2` repository. It does not replace subsystem specs (`ic/src/*/CLAUDE.md`, `docs/architecture/`, `docs/specs/`); it sits above them. Read the relevant subsystem spec before changing a complex area.
 
 ## 3. Code generation with AI
 
@@ -100,7 +100,7 @@ See [`AI-CODE-CONTRIBUTION-POLICY.md`](./AI-CODE-CONTRIBUTION-POLICY.md) for the
 ## 13. Where to get help
 
 - Architecture specs: `docs/architecture/`
-- Subsystem specs: `src/*/CLAUDE.md`
+- Subsystem specs: `ic/src/*/CLAUDE.md`
 - Testing guide: `docs/guides/TESTING_GUIDE.md`
 - Debug logging: `docs/guides/DEBUG_LOG.md`
 - Multi-tenant quickstart: `docs/guides/MT-ADMIN-QUICKSTART.md`
