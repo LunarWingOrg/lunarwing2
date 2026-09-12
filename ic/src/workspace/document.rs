@@ -67,9 +67,43 @@ pub fn is_engine_runtime_path(path: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Check whether a normalized path is a mission-goal document
+/// (`engine/projects/{project}/missions/{mission}/mission.json`).
+///
+/// The check is deliberately strict: `missions.json`,
+/// `missions/{id}/other.json`, missing/empty segments, and trailing extra
+/// segments are NOT mission-goal documents, so they remain indexable. A
+/// mission directory literally named `missions` does match (the nested
+/// `missions/missions/mission.json` case).
+pub fn is_mission_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    // Prefix `engine/projects/{project}` with a non-empty project segment.
+    if segments.next() != Some("engine")
+        || segments.next() != Some("projects")
+        || matches!(segments.next(), None | Some(""))
+    {
+        return false;
+    }
+    // `missions/{mission}` with a non-empty mission-id segment...
+    if segments.next() != Some("missions") || matches!(segments.next(), None | Some("")) {
+        return false;
+    }
+    // ...followed by exactly the `mission.json` basename.
+    segments.next() == Some("mission.json") && segments.next().is_none()
+}
+
 /// Check whether a normalized workspace path should have search chunks.
 pub fn is_search_indexable_path(path: &str) -> bool {
-    !is_engine_runtime_path(path)
+    !is_engine_runtime_path(path) && !is_mission_path(path)
+}
+
+/// Check whether a normalized path is engine-internal state.
+///
+/// Unlike [`is_search_indexable_path`], this is NOT a search filter: other
+/// engine-internal documents (e.g. `engine/knowledge/summaries/*`) remain
+/// searchable, but they are expected to be surfaced with a provenance label.
+pub fn is_engine_internal_path(path: &str) -> bool {
+    path == "engine" || path.starts_with("engine/")
 }
 
 /// A memory document stored in the database.
@@ -362,6 +396,71 @@ mod tests {
             assert!(
                 is_search_indexable_path(path),
                 "path should be indexed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mission_goal_paths_are_not_search_indexable() {
+        // WI#135 hardening: mission.json goal documents cross projects must
+        // never be search-indexed across the tenant/project scope.
+        for path in [
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/projects/my--project/missions/canary-alpha-xq7--id/mission.json",
+            "engine/projects/foo/missions/missions/mission.json",
+        ] {
+            assert!(is_mission_path(path), "path should be mission: {path}");
+            assert!(
+                !is_search_indexable_path(path),
+                "path should be excluded: {path}"
+            );
+        }
+
+        for path in [
+            "engine/knowledge/summaries/id.json",
+            "engine/projects/foo/project.json",
+            "engine/projects/foo/missions.json",
+            "engine/projects/foo/missions/bar/other.json",
+            "engine/projects/foo/missions/bar/mission.json/extra",
+            "engine/projects/foo/missions//mission.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "projects/foo/missions/bar/mission.json",
+            "engine/projects/mission.json",
+        ] {
+            assert!(
+                !is_mission_path(path),
+                "path should not be mission: {path}"
+            );
+            assert!(
+                is_search_indexable_path(path),
+                "path should be indexed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_internal_path_classification() {
+        for path in [
+            "engine",
+            "engine/knowledge/summaries/id.json",
+            "engine/projects/id/project.json",
+            "engine/.runtime/threads/active/id.json",
+        ] {
+            assert!(
+                is_engine_internal_path(path),
+                "path should be engine-internal: {path}"
+            );
+        }
+
+        for path in [
+            paths::MEMORY,
+            "daily/2026-07-23.md",
+            "projects/engine/notes.md",
+            "notengine/x.md",
+        ] {
+            assert!(
+                !is_engine_internal_path(path),
+                "path should not be engine-internal: {path}"
             );
         }
     }
