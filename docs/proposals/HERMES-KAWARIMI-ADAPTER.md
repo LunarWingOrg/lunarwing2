@@ -43,8 +43,8 @@ MappedAgent   (owner-agnostic LunarWing rows)
    │  loader.py     (--apply only)
    ▼
 mt-admin add-tenant + build-tenant + install-wasm   (empty tenant)
-   → start-tenant (daemon runs migrations = SCHEMA) → stop-tenant (PG stops too)
-   → start-pg → populate live DB + encrypt secrets
+   → start-tenant (daemon runs migrations = SCHEMA) → stop-writers (verified quiescence)
+   → stop-tenant (PG stops too) → start-pg → populate live DB + encrypt secrets
    → start-tenant (if --start) else leave STAGED with PostgreSQL running
 ```
 
