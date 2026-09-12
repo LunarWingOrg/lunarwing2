@@ -159,9 +159,10 @@ def _planned_steps(plan: ImportPlan) -> list[str]:
     final = f"start-tenant {plan.tenant}" if plan.start else "leave STAGED (stopped)"
     return [
         f"1. add-tenant {plan.tenant} --no-health (+ workers) + build-tenant + install-wasm",
-        "2. start-tenant (create DB schema via migrations) then stop-tenant",
-        "3. populate memory_documents / conversations / settings + encrypt secrets",
-        f"4. {final}",
+        "2. start-tenant (create DB schema via migrations)",
+        "3. stop-writers (verified writer quiescence) then stop-tenant",
+        "4. populate memory_documents / conversations / settings + encrypt secrets",
+        f"5. {final}",
     ]
 
 
