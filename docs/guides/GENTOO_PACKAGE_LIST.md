@@ -3,6 +3,9 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Gentoo + OpenRC** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
+**Revalidated 2026-09-12 (v2.1.1.0).** Package set re-checked against the
+current mt-admin prerequisite probes; no changes were needed.
+
 This list reflects what an actual Gentoo/OpenRC/Podman MT bring-up required. Atoms are Gentoo
 package names; adjust for your profile (e.g. `clang` moved to `llvm-core/` on newer profiles).
 
