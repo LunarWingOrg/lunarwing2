@@ -140,7 +140,7 @@
     - `docs/ops/MULTITENANCY-PRODUCTION.md`: added LunarVoice units to the systemd and OpenRC per-tenant services tables.
     - `docs/ops/TENANT-CONFIGURATION.md`: added a LunarVoice configuration section (install/activate/deactivate-voice, registry ports, gateway API link).
     - Commits: 058119e45, a29f97d40, d8f7c893d, aae057483, f3b60e878, 91c40e356, b68c0b2af, 02681ba1d.
-29. [x] (S) Reserved
+29. [ ] Further engine hardening is necessary.  See https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/136 - You may create a temporary test tenant after creating a fix to verify the issue has been fixed
 30. [x] (S) Reserved
 31. [x] (S) Reserved
 32. [x] (S) Reserved
