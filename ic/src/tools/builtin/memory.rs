@@ -19,7 +19,9 @@ use async_trait::async_trait;
 
 use crate::context::JobContext;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
-use crate::workspace::{SearchResult, Workspace, is_engine_runtime_path, normalize_path, paths};
+use crate::workspace::{
+    SearchResult, Workspace, is_engine_internal_path, is_engine_runtime_path, normalize_path, paths,
+};
 
 const MAX_MEMORY_TOOL_OUTPUT_BYTES: usize = 8_000;
 const MAX_MEMORY_SEARCH_CONTENT_JSON_BYTES: usize = 2_000;
@@ -190,13 +192,21 @@ fn build_memory_search_output(query: &str, results: Vec<SearchResult>) -> serde_
     for result in results {
         let path = truncate_for_json(&result.document_path, MAX_MEMORY_PATH_JSON_BYTES);
         truncated |= path != result.document_path;
-        let item = serde_json::json!({
+        let mut item = serde_json::json!({
             "content": "",
             "score": result.score,
             "path": path,
             "document_id": result.document_id.to_string(),
             "is_hybrid_match": result.is_hybrid(),
         });
+        // WI#135 hardening: engine-internal documents that legitimately
+        // appear in results (e.g. engine/knowledge/summaries) carry a hard
+        // provenance label so they are never silently ordinary-looking
+        // memory. Mission goal documents are already excluded from the
+        // index; this is the belt-and-suspenders layer.
+        if is_engine_internal_path(&result.document_path) {
+            item["provenance"] = serde_json::Value::String("engine_internal".to_string());
+        }
         output_results.push(item);
 
         // An empty JSON string occupies two bytes. The remaining whole-output
@@ -1148,6 +1158,27 @@ mod tests {
         assert_eq!(output["truncated"], false);
         assert_eq!(output["results"][0]["content"], "small useful memory");
         assert_eq!(output["results"][0]["path"], "notes/example.md");
+    }
+
+    #[test]
+    fn memory_search_output_labels_engine_internal_docs() {
+        let engine_doc = search_result(
+            "engine/knowledge/summaries/id.json",
+            "engine summary",
+            0.9,
+        );
+        let user_doc = search_result("notes/example.md", "user note", 0.8);
+        let output = build_memory_search_output("useful", vec![engine_doc, user_doc]);
+
+        assert_eq!(
+            output["results"][0]["provenance"],
+            "engine_internal",
+            "engine-internal docs must carry a provenance label"
+        );
+        assert!(
+            output["results"][1].get("provenance").is_none(),
+            "user docs must not carry the engine-internal label"
+        );
     }
 
     #[test]
