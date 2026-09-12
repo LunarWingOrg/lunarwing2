@@ -5,6 +5,11 @@ custom tunnel commands. Managed Cloudflare Tunnel, ngrok, and Tailscale provider
 externally managed service from any vendor remains supported through a static
 HTTPS `TUNNEL_URL`.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** `TUNNEL_URL` precedence,
+`TUNNEL_CUSTOM_COMMAND`, and the V24 settings scrub were re-checked against
+`ic/src/config/tunnel.rs` and `ic/migrations/V24__remove_legacy_tunnel_settings.sql`;
+no changes were needed.
+
 ## Before Upgrading
 
 1. Stop the previous LunarWing process cleanly so its managed child process can
