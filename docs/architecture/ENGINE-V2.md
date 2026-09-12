@@ -521,6 +521,12 @@ the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
 empty responses, persists compatibility history, and calls
 `ChannelManager::respond()` once with the original incoming metadata.
 
+If a gateway SSE or WebSocket subscriber falls behind and the broadcast ring
+drops events it would have received, the subscription converts the lag into an
+explicit `stream_gap` event (carrying the missed-event count) instead of
+silently swallowing it; the browser clears partial live-stream state and
+reloads persisted history on receipt (WI#127 server-side gap signaling).
+
 Rate-metered channels (DarkIRC) carry a host-side message budget
 (`ic/src/channels/budget.rs`). The bridge injects the budget's guidance into
 new engine threads via `ThreadConfig::channel_context` (rendered as a

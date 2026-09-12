@@ -10,6 +10,7 @@ every **active** file is listed below. Archived material lives under
 * Updated on July 20th, 2026 to reconcile the complete proposal index with current source and tests at revision `50c8f99`.*
 * Updated on July 28th, 2026 to reconcile this index with the current documentation tree.*
 * Updated on August 5th, 2026 after the v2.0.4.0 guide audit and archival pass.*
+* Updated on September 12th, 2026 for the v2.1.1.0 pre-release pass: indexed all releases through v2.1.0.0, added the missing guides (voice API, coordination knowledge, mascot, contribution policies) and the self-heal coverage audit to the index, removed a duplicated bugs paragraph and a stray duplicate archive line.*
 
 ## Companion applications
 
@@ -34,6 +35,7 @@ System design and technical architecture documents (the authoritative specs).
 | [`WEECHAT-CHANNEL-ARCHITECTURE.md`](architecture/WEECHAT-CHANNEL-ARCHITECTURE.md) | WeeChat channel: components, message flow, ingestion/latency, config precedence, known issues |
 | [`XMPP_FILE_TRANSFERS.md`](architecture/XMPP_FILE_TRANSFERS.md) | XMPP file transfer (XEP-0363/0066/0454): inbound/outbound, OMEMO, limits |
 | [`SELF_HEAL_DEPLOYMENT_WIRING.md`](architecture/SELF_HEAL_DEPLOYMENT_WIRING.md) | How the infra health-check + self-heal pipeline is installed/scheduled (host-level, auto-scheduled by add-tenant as of v1.1.9) |
+| [`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md`](architecture/SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md) | v2.0.4.0 self-heal coverage audit record |
 | [`ATOMICBOOL_DEEPER_PROPAGATION.md`](architecture/ATOMICBOOL_DEEPER_PROPAGATION.md) | Design note: deeper AtomicBool suppression-flag propagation (deferred) |
 
 ---
@@ -66,6 +68,10 @@ How-to guides, build instructions, and setup walkthroughs.
 | [`FEDORA_PACKAGE_LIST.md`](guides/FEDORA_PACKAGE_LIST.md) | Fedora MT host packages and Python tooling dependencies |
 | [`ARCHLINUX_PACKAGE_LIST.md`](guides/ARCHLINUX_PACKAGE_LIST.md) | Arch Linux MT host packages and Python tooling dependencies |
 | [`GENTOO_PACKAGE_LIST.md`](guides/GENTOO_PACKAGE_LIST.md) | Gentoo/OpenRC MT packages and rootless Podman prerequisites |
+| [`GATEWAY_VOICE_API.md`](guides/GATEWAY_VOICE_API.md) | Desktop-facing gateway voice API: authenticated, bounded `/api/voice/{status,transcribe,synthesize}` proxy to the LunarVoice sidecar (WI#131) |
+| [`COORDINATION_KNOWLEDGE_SETUP.md`](guides/COORDINATION_KNOWLEDGE_SETUP.md) | Cross-tenant `KNOW:` knowledge sharing over XMPP MUC: production setup, env vars, live verification |
+| [`EMOTING_MASCOT.md`](guides/EMOTING_MASCOT.md) | Emoting mascot widget (web gateway): sprite animation for roleplay action phrases |
+| [`CODE-CONTRIBUTION-POLICY.md`](guides/CODE-CONTRIBUTION-POLICY.md) | Canonical code contribution policy (tiers, review expectations, conventions) |
 | [`AI-CODE-CONTRIBUTION-POLICY.md`](guides/AI-CODE-CONTRIBUTION-POLICY.md) | AI code contribution policy (effective August 15th, 2026) |
 | [`darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_BUILD_GUIDE.md) | DarkIRC registry, daemon, tenant, and contact-key build/deploy guide |
 | [`darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md`](guides/darkirc_channel_for_lunarwing/DARKIRC_MT_ADAPTER.md) | Current per-tenant DarkIRC adapter architecture |
@@ -349,14 +355,12 @@ Dated implementation plans and design specs produced by the superpowers agentic 
 
 ### 📦 [`releases/`](releases/)
 
-Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v1.1.8, latest: RELEASE-v1.1.8.md).
+Release notes and changelogs (immutable historical records). See [`releases/README.md`](releases/README.md) for the full index (v1.0.7 → v2.1.0.0, latest: RELEASE-v2.1.0.0.md).
 
 ---
 
 ### 🐛 [`bugs/`](bugs/)
 
-A maintained Open/Fixed bug tracker. The full index is **[`bugs/README.md`](bugs/README.md)**.
-Open bugs live in `bugs/`; resolved bugs are retained under [`bugs/history/`](bugs/history/).
 A maintained Open/Fixed bug tracker. The full index is **[`bugs/README.md`](bugs/README.md)** —
 it lists bug docs (Open + Fixed-retained-for-history) plus the two 1.1.4 multi-tenant
 pre-release issue logs under [`bugs/history/`](bugs/history/)
@@ -384,7 +388,6 @@ Internal notes, drafts, and working documents — incomplete or in-progress by n
 ### 📝 Top-level docs
 
 There are currently no top-level files in `docs/` outside the subdirectories above.
-- [`history/`](internal/history/) — superseded LunarWing docs relocated here during the reorg, by source area: `architecture/`, `guides/`, `internal/`, `proposals/`, `archive/`. See [`history/README.md`](internal/history/README.md).
 
 ---
 

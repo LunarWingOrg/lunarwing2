@@ -1,16 +1,18 @@
 # MCP Additions Status
 
-> **Current status (2026-08-11): PARTIAL.** HTTP/HTTPS, host-local stdio, Unix,
+> **Current status (2026-09-12, v2.1.0.0 tree): PARTIAL.** HTTP/HTTPS, host-local stdio, Unix,
 > stateful MCP-over-WASM, and dedicated/shared gateway adapters are implemented
 > behind one internal closed built-in dispatch registry. Owner-scoped secret references,
 > diagnostics, explicit lifecycle operations, safe stdio/WASM crash recovery,
-> operator-pinned package provenance, and opt-in host OS sandboxing are also
+> operator-pinned package provenance, opt-in host OS sandboxing, and the
+> marketplace trust primitives (ed25519 publisher signatures, signed dependency
+> lockfiles, signed revocation lists enforced at load/activation) are also
 > implemented. Core Docker jobs support explicit worker-local stdio placement with
 > immutable owner-scoped snapshots, separate credential grants, provenance checks,
 > atomic tool registration, and bounded teardown.
-> Automatic package installation, publisher signatures
-> and dependency locking, device-level sandboxing, mandatory default sandbox
-> profiles, and a bundled shared gateway service remain unimplemented.
+> Automatic package installation, the signed-package marketplace install/upgrade
+> CLI flow, device-level sandboxing, mandatory default sandbox
+> profiles, and cross-daemon gateway HA remain unimplemented.
 
 For the concise checkpoint, remaining-validation list, and deferred-work summary,
 see [`MCP_OVERALL_STATUS.md`](MCP_OVERALL_STATUS.md).

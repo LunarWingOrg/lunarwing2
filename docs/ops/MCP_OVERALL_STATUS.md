@@ -1,9 +1,14 @@
 # MCP Overall Status
 
-**Status as of 2026-08-11:** MCP work is partial overall. Part 1 host-local
-lifecycle, the internal built-in runtime-dispatch boundary, stateful MCP-over-WASM,
-dedicated/shared gateway client placement, and core Docker job-worker placement
-are implemented. Package, marketplace, and remaining sandbox hardening stay open.
+**Status as of 2026-09-12 (v2.1.0.0 tree):** MCP work is partial overall. Part 1
+host-local lifecycle, the internal built-in runtime-dispatch boundary, stateful
+MCP-over-WASM, dedicated/shared gateway client placement, core Docker
+job-worker placement, and the Part 2 marketplace trust primitives (ed25519
+publisher signatures, signed dependency lockfiles, revocation enforcement,
+operator-pinned digests) are implemented and shipped through v2.0.8.0. Remaining:
+automatic package installation, the signed-package marketplace *install flow*,
+device-level sandboxing beyond the current baseline, cross-daemon HA, and
+persistent external-worker MCP activation.
 
 ## Part 1 Status
 
@@ -17,7 +22,6 @@ Implemented scope includes:
 - Explicit install, activate, deactivate, update, remove, auth, and diagnostics paths.
 - Owner-scoped secret references with restricted child environment inheritance.
 - Whole-runtime stdio and trapped-WASM recovery with fresh config and secret resolution.
-- Owner-scoped secret references with restricted child environment inheritance.
 - HTTP header secret references (`header_secrets` / `--secret-header`): owner-scoped
   resolution at activation for static-credential HTTP servers, with explicit
   OAuth suppression while configured.
@@ -46,7 +50,9 @@ Implemented through 2026-08-11:
   or subscriptions through its MCP client surface. Source WAT coverage validates
   protocol envelopes, state, pagination, calls, limits, timeout, traps, and replacement.
 - Client initialization advertises empty capabilities, strictly classifies inbound
-  envelopes, and negotiates exactly `2024-11-05`. Discovery follows bounded pagination.
+  envelopes, and requests protocol revision `2024-11-05` while also accepting
+  `2025-03-26` from servers that answer with it (as of v2.0.8.0). Discovery follows
+  bounded pagination.
   Negotiated `tools.listChanged` signals flow through stream and persistent HTTP GET/SSE
   transports, including gateways, into generation-safe atomic wrapper refresh.
 - Later-revision canonical tool annotations deserialize with spec defaults but remain

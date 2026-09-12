@@ -81,6 +81,11 @@ sudo ic/scripts/lunarwing-mt-admin.sh stop-worker <name> pebble
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 ```
 
+Since v2.1.1.0 (work item #128), a Pebble stop/restart shuts down the owning
+systemd user unit first (with a container-stop fallback) and clears any
+`StartLimitBurst` lockout before restarting, so a tenant bounce no longer
+leaves the tenant without its Pebble worker.
+
 ### Per-Tenant Configuration
 
 Use the supported configuration command; it writes the tenant-owned

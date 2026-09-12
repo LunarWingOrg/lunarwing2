@@ -458,6 +458,7 @@ manager. `loginctl enable-linger` keeps them running after logout.
 | `lunarwing-proxy-<name>.service` | `--enable-proxy` selected |
 | `lunarwing-darkirc-<name>.service` and `lunarwing-darkirc-adapter-<name>.service` | `--enable-darkirc` selected |
 | `lunarwing-pg-<name>.service`, `lunarwing-vision-<name>.service`, and selected worker units | Rootless Podman Quadlets after their containers are provisioned; LunarVision uses a managed `podman wait` user-unit fallback when the installed Podman is too old for the emitted Quadlet contract |
+| `lunarwing-voice-<name>.service` | LunarVoice activated (`install-voice` + `activate-voice`); rootless Podman Quadlet with the same managed fallback as LunarVision |
 | `lunarwing-workloads.slice` and `lunarwing-build.slice` | Always; resource bounds for agent and operator workloads |
 
 LunarVision publishes the registry `vision_service` and `vision_health` ports to
@@ -484,12 +485,14 @@ journalctl --user -u lunarwing-<name>.service -f
 OpenRC scripts live in `/etc/init.d/`; the baseline is
 `lunarwing-<name>`, `xmpp-bridge-<name>`, and `lunarwing-pg-<name>`.
 WeeChat and its adapter are present by default. Proxy and DarkIRC scripts are
-rendered only when selected, while LunarVision and selected Pebble/OpenCode/Kimi
-workers get container services when provisioned. Rootless Podman PostgreSQL,
-LunarVision, and worker containers also get `<container>-sup` babysitter
-services. For LunarVision, `lunarwing-vision-<name>` provides health-aware status
-and `lunarwing-vision-<name>-sup` restarts a crashed container within seconds;
-the host self-heal pipeline remains the bounded backstop.
+rendered only when selected, while LunarVision, LunarVoice, and selected
+Pebble/OpenCode/Kimi workers get container services when provisioned. Rootless
+Podman PostgreSQL, LunarVision, LunarVoice, and worker containers also get
+`<container>-sup` babysitter services. For LunarVision,
+`lunarwing-vision-<name>` provides health-aware status and
+`lunarwing-vision-<name>-sup` restarts a crashed container within seconds; the
+host self-heal pipeline remains the bounded backstop. LunarVoice follows the
+same pattern: `lunarwing-voice-<name>` pairs with a `-sup` crash supervisor.
 
 The process services use `supervise-daemon` with the tenant identity. Dependency
 wiring starts PostgreSQL and enabled sidecars before the main daemon. The main

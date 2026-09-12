@@ -130,7 +130,16 @@
 27. [x] (S) Reserved for CI/CD fixes
 
 ## Phase 5 - Documentation
-28. [ ] take a look at any documentation that should be updated and update necessary documentation
+28. [x] take a look at any documentation that should be updated and update necessary documentation
+    - DONE 2026-09-12 (`aj/kimi-28-20260912-0600`): general documentation sweep outside the item-37/38 guides/architecture passes. Fixed stale indexes and status docs, and recorded shipped 2.1.1.0 behavior in the ops docs.
+    - `docs/releases/README.md`: index stopped at v1.1.8 while 11 newer release notes exist — added v1.1.9.0 through v2.1.0.0 rows (codename, date, one-line summary) and fixed the dangling CHANGELOG-AGENTS link to `../internal/`.
+    - `docs/README.md`: releases pointer updated to v2.1.0.0; added missing guides (GATEWAY_VOICE_API, COORDINATION_KNOWLEDGE_SETUP, EMOTING_MASCOT, CODE-CONTRIBUTION-POLICY) and SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0 to the index; removed a duplicated bugs paragraph and a stray duplicate archive line.
+    - `docs/ops/MCP_OVERALL_STATUS.md` + `MCP_ADDITIONS.md`: status headers claimed marketplace/signatures were still open, contradicting the v2.0.8.0 release notes and the same files' implemented sections; headers reconciled, duplicate bullet removed, protocol negotiation corrected (accepts 2025-03-26).
+    - `docs/ops/PEBBLE-WORKER.md`: documented the WI#128 restart-parity fix (stop owning user unit first, clear StartLimitBurst).
+    - `docs/architecture/ENGINE-V2.md`: documented WI#127 `stream_gap` SSE/WebSocket lag signaling.
+    - `docs/ops/MULTITENANCY-PRODUCTION.md`: added LunarVoice units to the systemd and OpenRC per-tenant services tables.
+    - `docs/ops/TENANT-CONFIGURATION.md`: added a LunarVoice configuration section (install/activate/deactivate-voice, registry ports, gateway API link).
+    - Commits: 058119e45, a29f97d40, d8f7c893d, aae057483, f3b60e878, 91c40e356, b68c0b2af, 02681ba1d.
 29. [x] (S) Reserved
 30. [x] (S) Reserved
 31. [x] (S) Reserved

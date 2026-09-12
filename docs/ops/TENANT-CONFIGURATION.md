@@ -162,6 +162,24 @@ carried by `export-tenant.sh`. After importing a tenant on another host, run
 See [`../guides/VISION_OCR_SIDECAR.md`](../guides/VISION_OCR_SIDECAR.md) for the
 remote ingress and endpoint contract.
 
+## LunarVoice Configuration
+
+LunarVoice (local sherpa-onnx speech-to-text sidecar) is opt-in per tenant and
+managed through mt-admin:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh install-voice <tenant> --model-manifest <trusted.json>
+sudo ic/scripts/lunarwing-mt-admin.sh activate-voice <tenant>
+sudo ic/scripts/lunarwing-mt-admin.sh deactivate-voice <tenant>   # restores prior transcription provider
+```
+
+Activation requires verified STT artifacts, publishes the registry
+`voice_service`/`voice_health` ports, health-gates the sidecar, and sets
+`TRANSCRIPTION_PROVIDER=lunarvoice` in the daemon environment. The gateway-side
+voice API (desktop clients) is documented in
+[`../guides/GATEWAY_VOICE_API.md`](../guides/GATEWAY_VOICE_API.md); sidecar
+configuration and deployment live in `projects/voice-sidecar/README.md`.
+
 ## XMPP Configuration
 
 XMPP settings in `lunarwing.env` control how the tenant connects to the XMPP network:
