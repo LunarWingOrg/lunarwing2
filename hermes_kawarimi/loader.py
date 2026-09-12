@@ -5,12 +5,20 @@ PostgreSQL stays up):
 
     1. add-tenant --no-health  + build-tenant + install-wasm   (empty tenant)
     2. start-tenant            -> daemon runs migrations + onboard = SCHEMA
-    3. stop-tenant             -> daemon down (mt-admin stop-tenant also stops
+    3. stop-writers            -> verified writer quiescence (WI#133/#134)
+    4. stop-tenant             -> daemon down (mt-admin stop-tenant also stops
        start-pg                PostgreSQL, so bring PG back up PG-only; the
                                   daemon stays down)
-    4. populate                -> INSERT rows + encrypt secrets, no daemon racing
-    5. start-tenant (if --start) else leave STAGED (daemon stopped, data in
+    5. populate                -> INSERT rows + encrypt secrets, no daemon racing
+    6. start-tenant (if --start) else leave STAGED (daemon stopped, data in
        place; PG left running, mirroring import-tenant.sh's staged state)
+
+Why stop-writers before stop-tenant: on OpenRC a container with a restart
+policy (or a -sup babysitter still registered) can be respawned by the runtime
+after stop-tenant's stop calls. stop-writers is the only mt-admin path that
+additionally verifies quiescence with tenant_writers_active and fails if any
+writer survived, so the populate step can never run against a tenant whose
+sidecars/workers are still writing.
 
 Why start-then-stop for the schema: LunarWing creates its schema via the
 daemon's refinery runner at first boot (``ic/src/app.rs`` run_migrations +
@@ -160,7 +168,12 @@ def run_import(
     master_key = env["SECRETS_MASTER_KEY"]
     owner_id = env["LUNARWING_OWNER_ID"]
 
-    # 2. create the schema by booting the daemon once, then 3. stop it.
+    # 2. create the schema by booting the daemon once, then 3. quiesce writers
+    # and 4. stop the tenant. stop-writers is the only mt-admin path that
+    # verifies writer quiescence (tenant_writers_active) and fails if any
+    # writer survived — without it, OpenRC restart policies / -sup babysitters
+    # can respawn writer containers during the PG-only populate window
+    # (WI#133/#134). stop-tenant itself also verifies quiescence now.
     if not phase([mt, "start-tenant", plan.tenant]):
         result.error = "start-tenant failed (needed to create the DB schema)"
         return result
@@ -168,6 +181,9 @@ def run_import(
         _wait_for_schema(db_url)
     except TimeoutError as exc:
         result.error = str(exc)
+        return result
+    if not phase([mt, "stop-writers", plan.tenant]):
+        result.error = "stop-writers failed (writers must be quiesced before populate)"
         return result
     if not phase([mt, "stop-tenant", plan.tenant]):
         result.error = "stop-tenant failed (before populate)"

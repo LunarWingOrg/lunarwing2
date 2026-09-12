@@ -959,6 +959,20 @@ stop_tenant() {
   stop_tenant_kimi "$name"
   stop_tenant_postgres "$name"
 
+  # WI#133/#134: stopping must be verified, not assumed. On OpenRC a container
+  # with a restart policy (or a -sup babysitter still registered) can be
+  # respawned by the runtime after the stop calls above; on any init an
+  # unclassifiable writer state must not pass silently. Fail loudly instead of
+  # leaving a tenant whose writers are live while its daemon and PostgreSQL
+  # are down (the "no quiesce active writers" condition).
+  local writer_rc=0
+  tenant_writers_active "$name" || writer_rc=$?
+  case "$writer_rc" in
+    0) die "tenant '$name' still has active writers after stop" ;;
+    1) ;;
+    *) die "could not verify writer quiescence for tenant '$name' after stop" ;;
+  esac
+
   # Shutdown must not be blocked by malformed legacy config or an unsafe
   # rollback path. Retire Nanocode only after every supported service is down.
   retire_tenant_nanocode "$name" \

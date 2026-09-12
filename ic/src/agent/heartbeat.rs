@@ -295,6 +295,12 @@ impl HeartbeatRunner {
                 if let Err(e) = hygiene_workspace.repair_stale_index(50).await {
                     tracing::warn!("heartbeat: memory index repair failed: {e}");
                 }
+                // Idempotent purge of legacy mission-goal chunks (WI#135):
+                // catches rows created by pre-fix builds that boot did not
+                // see (e.g. a doc written after boot by an old worker).
+                if let Err(e) = hygiene_workspace.purge_mission_index_chunks().await {
+                    tracing::warn!("heartbeat: mission index purge failed: {e}");
+                }
             });
 
             // Run the study-notes stale sweep in the background too. Same

@@ -1230,11 +1230,25 @@ impl AppBuilder {
             }
 
             if embeddings.is_some() {
-                // Heal crash-stranded memory index projections before the
+                // Purge legacy mission-goal chunks (WI#135) and heal
+                // crash-stranded memory index projections before the
                 // embedding backfill so repaired chunks get embedded in the
-                // same pass (WI#132 hardening item 2).
+                // same pass and freed budget is not spent re-embedding
+                // chunks about to be deleted (WI#132 hardening item 2).
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {
+                    match ws_bg.purge_mission_index_chunks().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                purged = count,
+                                "Purged legacy mission-goal search chunks at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to purge mission index chunks: {}", e);
+                        }
+                    }
                     match ws_bg.repair_stale_index(100).await {
                         Ok(count) if count > 0 => {
                             tracing::info!(
@@ -1258,10 +1272,23 @@ impl AppBuilder {
                     }
                 });
             } else {
-                // Desync repair does not need the embedding provider for
-                // chunk generation — run it even without embeddings.
+                // Desync repair and the legacy mission-chunk purge do not
+                // need the embedding provider — run them even without
+                // embeddings.
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {
+                    match ws_bg.purge_mission_index_chunks().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                purged = count,
+                                "Purged legacy mission-goal search chunks at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to purge mission index chunks: {}", e);
+                        }
+                    }
                     match ws_bg.repair_stale_index(100).await {
                         Ok(count) if count > 0 => {
                             tracing::info!(

@@ -1003,6 +1003,19 @@ pub trait WorkspaceStore: Send + Sync {
         agent_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<Uuid>, WorkspaceError>;
+
+    /// Delete every chunk whose document path matches `path_pattern`
+    /// (SQL `LIKE` semantics) for the given user scope.
+    ///
+    /// Used by the WI#135 repair sweep to purge legacy mission-goal chunks
+    /// indexed before mission paths became non-indexable. Idempotent: on a
+    /// clean system it is a no-op.
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError>;
     async fn hybrid_search(
         &self,
         user_id: &str,

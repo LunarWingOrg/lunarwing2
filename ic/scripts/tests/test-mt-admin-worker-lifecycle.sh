@@ -356,6 +356,10 @@ retire_tenant_nanocode() {
 }
 die() { return 1; }
 
+# WI#133/#134: stop_tenant now verifies writer quiescence after shutdown.
+WRITERS_ACTIVE_RC=1
+tenant_writers_active() { return "$WRITERS_ACTIVE_RC"; }
+
 INIT_SYSTEM="systemd"
 CALLS=()
 stop_tenant alice
@@ -366,9 +370,54 @@ assert_before "stop-opencode:alice" "retire-nanocode:alice"
 assert_before "stop-kimi:alice" "retire-nanocode:alice"
 assert_before "stop-postgres:alice" "retire-nanocode:alice"
 
+# A writer still active after the shutdown sequence must fail the stop, and
+# the quiescence check must run before Nanocode retirement. The stubbed die
+# only returns, so these cases run in a subshell whose die actually exits —
+# matching production — and retirement is tracked via a file marker.
+retire_tenant_nanocode() {
+  : >"$fixture/retire-ran"
+  CALLS+=("retire-nanocode:$1")
+  [[ "$RETIRE_FAILURE" != "true" ]]
+}
+rm -f "$fixture/retire-ran"
+
+WRITERS_ACTIVE_RC=0
+CALLS=()
+if (die() { exit 1; }; stop_tenant alice) >/dev/null 2>&1; then
+  fail "stop succeeded despite an active writer after shutdown"
+else
+  printf 'PASS: active writer after shutdown fails the stop\n'
+fi
+if [[ -e "$fixture/retire-ran" ]]; then
+  fail "Nanocode retirement ran despite an active writer"
+else
+  printf 'PASS: retirement skipped while a writer is still active\n'
+fi
+
+# An unclassifiable writer state must also fail loudly, never pass silently.
+rm -f "$fixture/retire-ran"
+WRITERS_ACTIVE_RC=2
+CALLS=()
+if (die() { exit 1; }; stop_tenant alice) >/dev/null 2>&1; then
+  fail "stop succeeded despite unverifiable writer state"
+else
+  printf 'PASS: unverifiable writer state fails the stop\n'
+fi
+if [[ -e "$fixture/retire-ran" ]]; then
+  fail "Nanocode retirement ran despite unverifiable writer state"
+else
+  printf 'PASS: retirement skipped while writer state is unverifiable\n'
+fi
+
+retire_tenant_nanocode() {
+  CALLS+=("retire-nanocode:$1")
+  [[ "$RETIRE_FAILURE" != "true" ]]
+}
+
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
+WRITERS_ACTIVE_RC=1
 RETIRE_FAILURE="true"
 CALLS=()
 if stop_tenant alice >/dev/null 2>&1; then

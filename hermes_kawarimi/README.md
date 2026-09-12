@@ -21,15 +21,22 @@ HermesAgentSnapshot            neutral in-memory IR
 MappedAgent                    owner-agnostic LunarWing rows
    │  loader.py    (--apply only)
    ▼
-mt-admin add/build/start → schema → stop → start-pg → populate live DB + secrets
+mt-admin add/build/start → schema → stop-writers → stop → start-pg → populate live DB + secrets
 ```
 
 **Why start-then-stop for schema:** LunarWing creates its schema via the daemon's
 refinery runner at first boot (`ic/src/app.rs`), and `V1__initial.sql` uses bare
 `CREATE TABLE`, so hand-applying SQL would collide. The loader boots the tenant
-once to create the schema, stops the daemon, then re-ups PostgreSQL only
-(`mt-admin start-pg` — `stop-tenant` stops PG too) and populates with no daemon
-racing.
+once to create the schema, quiesces the writers, stops the daemon, then re-ups
+PostgreSQL only (`mt-admin start-pg` — `stop-tenant` stops PG too) and populates
+with no daemon racing.
+
+**Why stop-writers before stop-tenant:** on OpenRC, writer containers with a
+restart policy (or a `-sup` babysitter still registered) can be respawned by the
+runtime right after `stop-tenant`'s stop calls. `stop-writers` is the only
+mt-admin path that additionally verifies quiescence (`tenant_writers_active`)
+and fails if any writer survived, so populate can never race a live writer
+(WI#133/#134).
 
 **Owner-scope safety:** every row is written under the freshly-provisioned
 tenant's `LUNARWING_OWNER_ID`, so the `KAWARIMI-OWNER-SCOPE-CONTINUITY`
