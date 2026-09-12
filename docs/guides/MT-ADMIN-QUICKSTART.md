@@ -4,6 +4,12 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** Every referenced mt-admin
+subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
+`patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
+`tokens`, WeeChat bootstrap recovery) was re-checked against
+`ic/scripts/lunarwing-mt-admin.sh`; no changes were needed.
+
 ## 1. Install Host Prerequisites
 
 Required for the core MT flow:

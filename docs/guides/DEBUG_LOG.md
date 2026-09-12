@@ -2,6 +2,11 @@
 
 LunarWing emits structured events through `tracing`. Do not rely on source line numbers when diagnosing a release; log locations move as the runtime changes.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** Default filter
+(`lunarwing=info,tower_http=warn`), runtime level endpoints, and the
+init-agnostic MT diagnostics path were re-checked against the current tree;
+no changes were needed.
+
 ## Choose a Log Level
 
 The web gateway initializes the filter from `RUST_LOG`. Its default is:

@@ -3,6 +3,9 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Arch Linux + systemd** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
+**Revalidated 2026-09-12 (v2.1.1.0).** Package set re-checked against the
+current mt-admin prerequisite probes; no changes were needed.
+
 This is the Arch equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the operational
 notes there (port registry, per-tenant rustup, doctor output, etc.) apply unchanged. On Arch the
 init system is systemd, so tenant units are `systemctl --user` units under each tenant account
