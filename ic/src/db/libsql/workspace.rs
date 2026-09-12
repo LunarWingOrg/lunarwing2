@@ -1238,6 +1238,35 @@ impl WorkspaceStore for LibSqlBackend {
         Ok(ids)
     }
 
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        let conn = self
+            .connect()
+            .await
+            .map_err(|e| WorkspaceError::SearchFailed {
+                reason: e.to_string(),
+            })?;
+        let agent_id_str = agent_id.map(|id| id.to_string());
+        conn.execute(
+            r#"
+            DELETE FROM memory_chunks
+            WHERE document_id IN (
+                SELECT id FROM memory_documents
+                WHERE user_id = ?1 AND agent_id IS ?2 AND path LIKE ?3
+            )
+            "#,
+            params![user_id, agent_id_str.as_deref(), path_pattern],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Purge chunks for path pattern failed: {e}"),
+        })
+    }
+
     async fn hybrid_search(
         &self,
         user_id: &str,

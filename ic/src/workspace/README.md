@@ -35,6 +35,7 @@ workspace/
 │       ├── README.md
 │       └── notes.md
 ├── engine/.runtime/       <- Internal Engine recovery state (persisted, not search-indexed)
+├── engine/projects/       <- Mission goals under */missions/*/mission.json (persisted, not search-indexed)
 └── ...
 ```
 
@@ -80,10 +81,14 @@ Four tools for LLM use:
 - **`memory_read`** - Read bounded pages from a file by path
 - **`memory_tree`** - View a bounded workspace tree (depth parameter, default 1)
 
-`memory_search` excludes internal `engine/.runtime/**` documents. Each returned
-snippet is bounded to 2,000 JSON-encoded bytes, and the complete result remains
-valid JSON bounded to 8,000 serialized bytes. Queries are limited to 1,024
-UTF-8 bytes before embedding or database search.
+`memory_search` excludes internal `engine/.runtime/**` documents and mission-goal
+documents (`engine/projects/*/missions/*/mission.json`, WI#135 hardening). Each
+returned snippet is bounded to 2,000 JSON-encoded bytes, and the complete result
+remains valid JSON bounded to 8,000 serialized bytes. Queries are limited to
+1,024 UTF-8 bytes before embedding or database search. Other engine-internal
+documents that legitimately appear in results (for example
+`engine/knowledge/summaries/*`) carry an explicit `"provenance":
+"engine_internal"` label so they are never silently ordinary-looking memory.
 
 All agent-facing memory tools reserve `engine/.runtime/**`: writes and direct
 reads are rejected, and tree listings hide the subtree. Direct `Workspace` APIs
@@ -287,4 +292,10 @@ Documents are chunked for search indexing:
 - Minimum chunk size: 50 words (tiny trailing chunks merge with previous)
 
 Internal Engine state under `engine/.runtime/**` is stored as normal workspace
-documents for restart recovery but receives no chunks or embeddings.
+documents for restart recovery but receives no chunks or embeddings. The same
+holds for mission-goal documents under
+`engine/projects/*/missions/*/mission.json` (WI#135): they stay readable via
+`read()`/`list()` (mission hydration reads documents, not chunks) but never
+enter search. Legacy chunks created by pre-fix builds are removed by the
+idempotent `purge_mission_index_chunks()` sweep that runs at boot (before the
+embedding backfill) and on the heartbeat hygiene pass.

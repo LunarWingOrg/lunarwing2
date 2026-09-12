@@ -58,8 +58,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    WorkspaceFileContent, is_engine_runtime_path, is_identity_path, is_search_indexable_path,
-    merge_workspace_entries, paths,
+    WorkspaceFileContent, is_engine_internal_path, is_engine_runtime_path, is_identity_path,
+    is_mission_path, is_search_indexable_path, merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -521,6 +521,25 @@ impl WorkspaceStorage {
             }
             Self::Db(db) => {
                 db.list_stale_index_documents(user_id, agent_id, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
+                    .await
+            }
+            Self::Db(db) => {
+                db.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
                     .await
             }
         }
@@ -2170,6 +2189,31 @@ impl Workspace {
         Ok(repaired)
     }
 
+    /// Purge legacy search chunks for mission-goal documents.
+    ///
+    /// Mission `mission.json` files became non-indexable (WI#135 hardening),
+    /// but chunks created before the fix persist in `memory_chunks` and remain
+    /// searchable. This idempotent sweep deletes them; on a clean system it is
+    /// a no-op. Runs at boot BEFORE the embedding backfill so freed budget is
+    /// not spent re-embedding chunks about to be deleted.
+    pub async fn purge_mission_index_chunks(&self) -> Result<u64, WorkspaceError> {
+        let purged = self
+            .storage
+            .purge_chunks_for_path_pattern(
+                &self.user_id,
+                self.agent_id,
+                "engine/projects/%/missions/%/mission.json",
+            )
+            .await?;
+        if purged > 0 {
+            tracing::info!(
+                purged,
+                "purge_mission_index_chunks: removed legacy mission-goal search chunks"
+            );
+        }
+        Ok(purged)
+    }
+
     // ==================== Seeding ====================
 
     /// Seed any missing core identity files in the workspace.
@@ -2710,6 +2754,108 @@ mod runtime_index_tests {
                 .content
                 .contains(appended_term)
         );
+    }
+
+    #[tokio::test]
+    async fn mission_goals_persist_without_entering_search() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let mission_path = "engine/projects/foo/missions/canary-alpha-xq7/mission.json";
+        let shared_term = "missiongoalsentinel";
+
+        workspace
+            .write("notes/searchable.md", &format!("searchable {shared_term}"))
+            .await
+            .expect("write searchable document");
+        workspace
+            .write(
+                mission_path,
+                &format!(r#"{{"goal":"{shared_term}","steps":[]}}"#),
+            )
+            .await
+            .expect("write mission goal document");
+
+        let mission = workspace
+            .read(mission_path)
+            .await
+            .expect("read mission goal");
+        assert!(mission.content.contains(shared_term));
+        assert!(
+            workspace
+                .list_all()
+                .await
+                .expect("list workspace")
+                .contains(&mission_path.to_string())
+        );
+
+        let results = workspace
+            .search(shared_term, 10)
+            .await
+            .expect("search workspace");
+        assert_eq!(results.len(), 1, "mission goals must never be searchable");
+        assert_eq!(results[0].document_path, "notes/searchable.md");
+    }
+
+    #[tokio::test]
+    async fn purge_mission_index_chunks_removes_legacy_chunks_and_is_idempotent() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("purge-user", db.clone());
+        let legacy_mission_path = "engine/projects/foo/missions/bar/mission.json";
+        let project_path = "engine/projects/foo/project.json";
+        let sentinel = "legacymissionchunksentinel";
+
+        // Simulate pre-fix state: a mission goal document that DID get chunks.
+        let mission_doc = db
+            .get_or_create_document_by_path("purge-user", None, legacy_mission_path)
+            .await
+            .expect("create legacy mission doc");
+        db.update_document(mission_doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
+            .await
+            .expect("write legacy mission content");
+        db.replace_chunks(mission_doc.id, &[(0, format!("goal {sentinel}"), None)])
+            .await
+            .expect("insert legacy mission chunks");
+
+        // Positive control: project.json chunks must survive the purge.
+        workspace
+            .write(project_path, &format!(r#"{{"name":"{sentinel}"}}"#))
+            .await
+            .expect("write project doc");
+
+        let before = workspace
+            .search(sentinel, 10)
+            .await
+            .expect("search before purge");
+        assert!(
+            before
+                .iter()
+                .any(|r| r.document_path == legacy_mission_path),
+            "legacy mission chunks must be searchable before the purge: {before:?}"
+        );
+
+        let purged = workspace
+            .purge_mission_index_chunks()
+            .await
+            .expect("first purge");
+        assert!(purged >= 1, "first purge must remove legacy chunks");
+
+        let after = workspace
+            .search(sentinel, 10)
+            .await
+            .expect("search after purge");
+        assert!(
+            after.iter().all(|r| r.document_path != legacy_mission_path),
+            "mission goal must be gone from search after purge: {after:?}"
+        );
+        assert!(
+            after.iter().any(|r| r.document_path == project_path),
+            "project.json chunks must survive the purge: {after:?}"
+        );
+
+        let second = workspace
+            .purge_mission_index_chunks()
+            .await
+            .expect("second purge");
+        assert_eq!(second, 0, "repeat purge must be a no-op");
     }
 
     #[tokio::test]

@@ -742,6 +742,31 @@ impl Repository {
         Ok(rows.iter().map(|row| row.get("id")).collect())
     }
 
+    /// Delete every chunk whose document path matches `path_pattern` for the
+    /// given user scope (WI#135 legacy-chunk purge). Idempotent.
+    pub async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        let conn = self.conn().await?;
+        conn.execute(
+            r#"
+            DELETE FROM memory_chunks c
+            USING memory_documents d
+            WHERE d.id = c.document_id
+              AND d.user_id = $1 AND d.agent_id IS NOT DISTINCT FROM $2
+              AND d.path LIKE $3
+            "#,
+            &[&user_id, &agent_id, &path_pattern],
+        )
+        .await
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Purge chunks for path pattern failed: {e}"),
+        })
+    }
+
     // ==================== Search Operations ====================
 
     /// Perform hybrid search combining FTS and vector similarity.
