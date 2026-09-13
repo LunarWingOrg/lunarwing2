@@ -169,9 +169,10 @@ class RunImportSequenceTest(unittest.TestCase):
     def test_stop_writers_failure_blocks_populate(self) -> None:
         """WI#133/#134: populate must never run unless writers are quiesced.
 
-        stop-writers is the only mt-admin path that verifies quiescence
-        (tenant_writers_active) and fails if any writer survived; a failed
-        stop-writers must abort before stop-tenant/start-pg/populate.
+        stop-writers verifies quiescence (tenant_writers_active) and fails if
+        any writer survived; a failed stop-writers must abort before
+        stop-tenant/start-pg/populate. (stop-tenant re-verifies too; since
+        WI#137 both poll over a bounded window for async supervisor teardown.)
         """
         result, verbs = self._run_failure_path(
             ImportPlan(tenant="t1", apply=True),

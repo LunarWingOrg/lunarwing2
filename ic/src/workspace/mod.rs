@@ -2189,26 +2189,38 @@ impl Workspace {
         Ok(repaired)
     }
 
-    /// Purge legacy search chunks for mission-goal documents.
+    /// Purge legacy search chunks for mission-family documents.
     ///
     /// Mission `mission.json` files became non-indexable (WI#135 hardening),
-    /// but chunks created before the fix persist in `memory_chunks` and remain
-    /// searchable. This idempotent sweep deletes them; on a clean system it is
-    /// a no-op. Runs at boot BEFORE the embedding backfill so freed budget is
-    /// not spent re-embedding chunks about to be deleted.
+    /// and the whole `engine/projects/{p}/missions/**` subtree plus the
+    /// tenant-wide `missions.json` listing followed (WI#136 adjacency fix),
+    /// but chunks created before those fixes persist in `memory_chunks` and
+    /// remain searchable. This idempotent sweep deletes them; on a clean
+    /// system it is a no-op. Runs at boot BEFORE the embedding backfill so
+    /// freed budget is not spent re-embedding chunks about to be deleted.
+    ///
+    /// The SQL `LIKE` patterns intentionally mirror `is_mission_path`'s
+    /// exclusion set. `%` matches across `/` in both backends, so the
+    /// subtree pattern can over-match a hypothetical multi-segment project
+    /// path; those documents are engine-internal either way (provenance
+    /// labeled), so over-purging is acceptable.
     pub async fn purge_mission_index_chunks(&self) -> Result<u64, WorkspaceError> {
-        let purged = self
-            .storage
-            .purge_chunks_for_path_pattern(
-                &self.user_id,
-                self.agent_id,
-                "engine/projects/%/missions/%/mission.json",
-            )
-            .await?;
+        let mut purged = 0u64;
+        for pattern in [
+            "engine/projects/%/missions/%",      // missions/ subtree, any suffix
+            "engine/projects/%/missions",        // bare missions dir document
+            "engine/projects/%/missions.json",   // tenant-wide listing
+            "engine/projects/%/missions.json.%", // suffixed listing variants
+        ] {
+            purged += self
+                .storage
+                .purge_chunks_for_path_pattern(&self.user_id, self.agent_id, pattern)
+                .await?;
+        }
         if purged > 0 {
             tracing::info!(
                 purged,
-                "purge_mission_index_chunks: removed legacy mission-goal search chunks"
+                "purge_mission_index_chunks: removed legacy mission search chunks"
             );
         }
         Ok(purged)
@@ -2759,33 +2771,44 @@ mod runtime_index_tests {
     #[tokio::test]
     async fn mission_goals_persist_without_entering_search() {
         let (workspace, _temp_dir) = create_test_workspace().await;
-        let mission_path = "engine/projects/foo/missions/canary-alpha-xq7/mission.json";
         let shared_term = "missiongoalsentinel";
 
         workspace
             .write("notes/searchable.md", &format!("searchable {shared_term}"))
             .await
             .expect("write searchable document");
-        workspace
-            .write(
-                mission_path,
-                &format!(r#"{{"goal":"{shared_term}","steps":[]}}"#),
-            )
-            .await
-            .expect("write mission goal document");
 
-        let mission = workspace
-            .read(mission_path)
-            .await
-            .expect("read mission goal");
-        assert!(mission.content.contains(shared_term));
-        assert!(
+        // WI#136 adjacency fix: the whole missions/ subtree (any suffix) plus
+        // the tenant-wide missions.json listing must stay un-indexed.
+        let mission_family_paths = [
+            "engine/projects/foo/missions/canary-alpha-xq7/mission.json",
+            "engine/projects/foo/missions/canary-adj/mission.json.bak",
+            "engine/projects/foo/missions/canary-adj/other.json",
+            "engine/projects/foo/missions.json",
+        ];
+        for path in mission_family_paths {
             workspace
-                .list_all()
+                .write(path, &format!(r#"{{"goal":"{shared_term}","steps":[]}}"#))
                 .await
-                .expect("list workspace")
-                .contains(&mission_path.to_string())
-        );
+                .expect("write mission-family document");
+
+            let stored = workspace
+                .read(path)
+                .await
+                .expect("read mission-family document");
+            assert!(
+                stored.content.contains(shared_term),
+                "mission-family documents must remain stored and servable: {path}"
+            );
+            assert!(
+                workspace
+                    .list_all()
+                    .await
+                    .expect("list workspace")
+                    .contains(&path.to_string()),
+                "mission-family documents must remain listed: {path}"
+            );
+        }
 
         let results = workspace
             .search(shared_term, 10)
@@ -2800,20 +2823,32 @@ mod runtime_index_tests {
         let (db, _temp_dir) = create_test_database().await;
         let workspace = Workspace::new_with_db("purge-user", db.clone());
         let legacy_mission_path = "engine/projects/foo/missions/bar/mission.json";
+        // WI#136 adjacency bypass artifacts: exact-basename purge left these
+        // indexed even after the mission.json de-index.
+        let adjacent_bak_path = "engine/projects/foo/missions/canary-adj/mission.json.bak";
+        let adjacent_other_path = "engine/projects/foo/missions/canary-adj/other.json";
+        let missions_listing_path = "engine/projects/foo/missions.json";
         let project_path = "engine/projects/foo/project.json";
         let sentinel = "legacymissionchunksentinel";
 
         // Simulate pre-fix state: a mission goal document that DID get chunks.
-        let mission_doc = db
-            .get_or_create_document_by_path("purge-user", None, legacy_mission_path)
-            .await
-            .expect("create legacy mission doc");
-        db.update_document(mission_doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
-            .await
-            .expect("write legacy mission content");
-        db.replace_chunks(mission_doc.id, &[(0, format!("goal {sentinel}"), None)])
-            .await
-            .expect("insert legacy mission chunks");
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            let doc = db
+                .get_or_create_document_by_path("purge-user", None, legacy_path)
+                .await
+                .expect("create legacy mission-family doc");
+            db.update_document(doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
+                .await
+                .expect("write legacy mission content");
+            db.replace_chunks(doc.id, &[(0, format!("goal {sentinel}"), None)])
+                .await
+                .expect("insert legacy mission chunks");
+        }
 
         // Positive control: project.json chunks must survive the purge.
         workspace
@@ -2825,27 +2860,39 @@ mod runtime_index_tests {
             .search(sentinel, 10)
             .await
             .expect("search before purge");
-        assert!(
-            before
-                .iter()
-                .any(|r| r.document_path == legacy_mission_path),
-            "legacy mission chunks must be searchable before the purge: {before:?}"
-        );
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            assert!(
+                before.iter().any(|r| r.document_path == legacy_path),
+                "legacy mission-family chunks must be searchable before the purge: {before:?}"
+            );
+        }
 
         let purged = workspace
             .purge_mission_index_chunks()
             .await
             .expect("first purge");
-        assert!(purged >= 1, "first purge must remove legacy chunks");
+        assert!(purged >= 4, "first purge must remove legacy chunks");
 
         let after = workspace
             .search(sentinel, 10)
             .await
             .expect("search after purge");
-        assert!(
-            after.iter().all(|r| r.document_path != legacy_mission_path),
-            "mission goal must be gone from search after purge: {after:?}"
-        );
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            assert!(
+                after.iter().all(|r| r.document_path != legacy_path),
+                "mission-family path must be gone from search after purge: {legacy_path}"
+            );
+        }
         assert!(
             after.iter().any(|r| r.document_path == project_path),
             "project.json chunks must survive the purge: {after:?}"

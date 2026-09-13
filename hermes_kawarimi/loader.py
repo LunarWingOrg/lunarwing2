@@ -15,10 +15,12 @@ PostgreSQL stays up):
 
 Why stop-writers before stop-tenant: on OpenRC a container with a restart
 policy (or a -sup babysitter still registered) can be respawned by the runtime
-after stop-tenant's stop calls. stop-writers is the only mt-admin path that
-additionally verifies quiescence with tenant_writers_active and fails if any
-writer survived, so the populate step can never run against a tenant whose
-sidecars/workers are still writing.
+after stop-tenant's stop calls. stop-writers verifies quiescence with
+tenant_writers_active and fails if any writer survived, so the populate step
+can never run against a tenant whose sidecars/workers are still writing.
+stop-tenant performs the same verification itself (WI#133/#134); since WI#137
+both paths poll the check over a bounded window because supervise-daemon
+teardown is asynchronous.
 
 Why start-then-stop for the schema: LunarWing creates its schema via the
 daemon's refinery runner at first boot (``ic/src/app.rs`` run_migrations +
@@ -169,11 +171,12 @@ def run_import(
     owner_id = env["LUNARWING_OWNER_ID"]
 
     # 2. create the schema by booting the daemon once, then 3. quiesce writers
-    # and 4. stop the tenant. stop-writers is the only mt-admin path that
-    # verifies writer quiescence (tenant_writers_active) and fails if any
-    # writer survived — without it, OpenRC restart policies / -sup babysitters
-    # can respawn writer containers during the PG-only populate window
-    # (WI#133/#134). stop-tenant itself also verifies quiescence now.
+    # and 4. stop the tenant. stop-writers verifies writer quiescence
+    # (tenant_writers_active) and fails if any writer survived — without it,
+    # OpenRC restart policies / -sup babysitters can respawn writer containers
+    # during the PG-only populate window (WI#133/#134). stop-tenant performs
+    # the same verification itself; since WI#137 both paths poll over a
+    # bounded window (supervise-daemon teardown is asynchronous).
     if not phase([mt, "start-tenant", plan.tenant]):
         result.error = "start-tenant failed (needed to create the DB schema)"
         return result
