@@ -1287,6 +1287,17 @@ impl Agent {
                 &tool_calls,
             )
             .await;
+            // Terminal signal so SSE/WS clients stop streaming and reconcile
+            // instead of hanging with no response event (WI#127 residual,
+            // resumed-response path).
+            let _ = self
+                .channels
+                .send_status(
+                    &message.channel,
+                    StatusUpdate::Status("Rejected".into()),
+                    &message.metadata,
+                )
+                .await;
             return Ok(SubmissionResult::Suppressed);
         };
 
