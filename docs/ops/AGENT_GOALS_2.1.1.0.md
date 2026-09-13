@@ -151,7 +151,7 @@
     - Verified: `cargo check -j12` green (4m39s, no warnings); `cargo clippy --lib -- -D warnings` green (3m30s, zero warnings); `node --check` on app.js and `py_compile` on the e2e test pass. E2E browser run needs a full binary build (forbidden on this host); the new test mirrors the existing Done-reconciliation tests byte-for-byte in structure.
 31. [x] (S) Reserved
 32. [x] (S) Reserved
-33. [ ] followup for item 36. see: docs/ops/v2.1.1.0-ITEM-36-FOLLOWUP.md for info
+33. [x] followup for item 36. see: docs/ops/v2.1.1.0-ITEM-36-FOLLOWUP.md for info
 34. [x] Add contributor onboarding document from Baud to the appropriate place and link it within docs readme. the original document was made in the branch: baud/contributor-onboarding-doc
     - DONE 2026-09-11 (`aj/kimi-34-20260911-2101`): materialized `CONTRIBUTOR-ONBOARDING.md` from `baud/contributor-onboarding-doc` into `docs/guides/` (per the docs/README contributing rules: "how to do something" → guides) and indexed it in the `docs/README.md` guides table.
     - Link fixes for the new location: the two policy links (`CODE-CONTRIBUTION-POLICY.md`, `AI-CODE-CONTRIBUTION-POLICY.md`) now resolve within `docs/guides/`, and the three `AGENTS.md` links now point at `../../AGENTS.md` (repo root). All referenced targets verified to exist.
