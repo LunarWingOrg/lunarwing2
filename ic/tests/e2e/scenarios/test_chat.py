@@ -292,6 +292,60 @@ async def test_done_without_response_reloads_history(page):
     )
 
 
+async def test_rejected_without_response_reloads_history(page):
+    """A Rejected terminal status (suppressed response, WI#127 residual)
+    clears the streaming snapshot, re-enables input, and reloads history."""
+    await _install_fake_eventsource(page)
+
+    await page.goto("/")
+
+    await page.evaluate(
+        """
+        () => {
+          window.__loadHistoryCalls = 0;
+          window.__realLoadHistory = window.loadHistory;
+          window.loadHistory = (...args) => { window.__loadHistoryCalls += 1; };
+
+          const container = document.getElementById('chat-messages');
+          container.replaceChildren();
+
+          getOrCreateStreamingMessage('test-thread');
+          _streamParts = ['partial answer that WILL be lost'];
+          _streamBuffer = '';
+        }
+        """
+    )
+
+    await page.evaluate(
+        """
+        () => window.__sseTarget.dispatch('status', {
+          thread_id: 'test-thread',
+          message: 'Rejected',
+        })
+        """
+    )
+
+    # Guard schedules loadHistory after its 1.5s grace period.
+    await page.wait_for_function(
+        "() => window.__loadHistoryCalls >= 1",
+        timeout=5000,
+    )
+
+    result = await page.evaluate(
+        """
+        () => ({
+          calls: window.__loadHistoryCalls,
+          streamCleared: _streamingMessage === null && _streamParts.length === 0,
+        })
+        """
+    )
+    assert result == {"calls": 1, "streamCleared": True}
+
+    await page.evaluate(
+        "() => { window.loadHistory = window.__realLoadHistory; }"
+    )
+
+
 async def test_done_after_response_does_not_reload_history(page):
     """Healthy path: response event arrives and renders (markResponseRendered
     fires inside the real handler), so the Done guard must NOT schedule a
