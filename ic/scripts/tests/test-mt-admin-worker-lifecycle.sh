@@ -506,6 +506,7 @@ test_writers_active_broken_runtime_fails_closed() (
   eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
   sanitize_name() { printf '%s' "$1"; }
   tenant_exists_in_registry() { return 0; }
+  # shellcheck disable=SC2034  # read by the eval'd tenant_writers_active body
   ensure_init_system() { INIT_SYSTEM="systemd"; }
   tenant_proxy_enabled() { return 1; }
   tenant_weechat_enabled() { return 1; }
