@@ -2191,18 +2191,28 @@ impl Workspace {
 
     /// Purge legacy search chunks for mission-goal documents.
     ///
-    /// Mission `mission.json` files became non-indexable (WI#135 hardening),
-    /// but chunks created before the fix persist in `memory_chunks` and remain
-    /// searchable. This idempotent sweep deletes them; on a clean system it is
-    /// a no-op. Runs at boot BEFORE the embedding backfill so freed budget is
-    /// not spent re-embedding chunks about to be deleted.
+    /// Everything under a mission directory (`engine/projects/*/missions/*`)
+    /// plus the project-level `missions.json` manifest became non-indexable
+    /// (WI#135 hardening), but chunks created before the fix persist in
+    /// `memory_chunks` and remain searchable. This idempotent sweep deletes
+    /// them; on a clean system it is a no-op. Runs at boot BEFORE the embedding
+    /// backfill so freed budget is not spent re-embedding chunks about to be
+    /// deleted.
     pub async fn purge_mission_index_chunks(&self) -> Result<u64, WorkspaceError> {
-        let purged = self
+        let mut purged = self
             .storage
             .purge_chunks_for_path_pattern(
                 &self.user_id,
                 self.agent_id,
-                "engine/projects/%/missions/%/mission.json",
+                "engine/projects/%/missions/%",
+            )
+            .await?;
+        purged += self
+            .storage
+            .purge_chunks_for_path_pattern(
+                &self.user_id,
+                self.agent_id,
+                "engine/projects/%/missions.json",
             )
             .await?;
         if purged > 0 {
@@ -2800,20 +2810,31 @@ mod runtime_index_tests {
         let (db, _temp_dir) = create_test_database().await;
         let workspace = Workspace::new_with_db("purge-user", db.clone());
         let legacy_mission_path = "engine/projects/foo/missions/bar/mission.json";
+        // Adjacent artifact inside the mission directory: carries the same goal
+        // text and must be purged too (subtree exclusion, WI#135 MEDIUM).
+        let legacy_artifact_path = "engine/projects/foo/missions/bar/mission.json.bak";
+        // Project-level manifest named in the same WI#136 comment.
+        let legacy_manifest_path = "engine/projects/foo/missions.json";
         let project_path = "engine/projects/foo/project.json";
         let sentinel = "legacymissionchunksentinel";
 
-        // Simulate pre-fix state: a mission goal document that DID get chunks.
-        let mission_doc = db
-            .get_or_create_document_by_path("purge-user", None, legacy_mission_path)
-            .await
-            .expect("create legacy mission doc");
-        db.update_document(mission_doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
-            .await
-            .expect("write legacy mission content");
-        db.replace_chunks(mission_doc.id, &[(0, format!("goal {sentinel}"), None)])
-            .await
-            .expect("insert legacy mission chunks");
+        // Simulate pre-fix state: mission-goal documents that DID get chunks.
+        for legacy_path in [
+            legacy_mission_path,
+            legacy_artifact_path,
+            legacy_manifest_path,
+        ] {
+            let mission_doc = db
+                .get_or_create_document_by_path("purge-user", None, legacy_path)
+                .await
+                .expect("create legacy mission doc");
+            db.update_document(mission_doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
+                .await
+                .expect("write legacy mission content");
+            db.replace_chunks(mission_doc.id, &[(0, format!("goal {sentinel}"), None)])
+                .await
+                .expect("insert legacy mission chunks");
+        }
 
         // Positive control: project.json chunks must survive the purge.
         workspace
@@ -2836,15 +2857,19 @@ mod runtime_index_tests {
             .purge_mission_index_chunks()
             .await
             .expect("first purge");
-        assert!(purged >= 1, "first purge must remove legacy chunks");
+        assert!(purged >= 3, "first purge must remove legacy chunks");
 
         let after = workspace
             .search(sentinel, 10)
             .await
             .expect("search after purge");
         assert!(
-            after.iter().all(|r| r.document_path != legacy_mission_path),
-            "mission goal must be gone from search after purge: {after:?}"
+            after.iter().all(|r| {
+                r.document_path != legacy_mission_path
+                    && r.document_path != legacy_artifact_path
+                    && r.document_path != legacy_manifest_path
+            }),
+            "mission goals and artifacts must be gone from search after purge: {after:?}"
         );
         assert!(
             after.iter().any(|r| r.document_path == project_path),
