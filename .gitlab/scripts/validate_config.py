@@ -54,6 +54,7 @@ EXPECTED_INCLUDES = [
     "/.gitlab/ci/security.yml",
     "/.gitlab/ci/containers.yml",
 ]
+EXPECTED_STAGES = ("validate", "check", "test", "security", "containers")
 IMAGE_PATTERN = re.compile(r"@sha256:[0-9a-f]{64}$")
 DIGEST_PATTERN = re.compile(r"sha256:([0-9a-f]{64})")
 DIRECT_CARGO_PATTERN = re.compile(r"(?:^|[;&|]\s*|\s)cargo(?:\s|$)")
@@ -561,9 +562,48 @@ def validate_ci_tool_image_pins(merged: dict, variables: dict[str, str], errors:
         errors.append("rust-test-postgres-integration must use a digest-pinned pgvector service")
 
 
+def validate_stage_consistency(root: dict, errors: list[str]) -> None:
+    """Root `stages` must be a superset of every job/template `stage:` so a
+    job pointing at a stage GitLab does not know about is rejected here, at
+    validation time, instead of failing the whole pipeline after push."""
+    stages = root.get("stages")
+    if not isinstance(stages, list) or not stages:
+        errors.append(".gitlab-ci.yml must declare a non-empty stages list")
+        return
+
+    if tuple(stages) != EXPECTED_STAGES:
+        errors.append(f"root stages differ from expected order/names: {stages}")
+
+    unknown_stages = set()
+    for include in EXPECTED_INCLUDES:
+        path = ROOT / include.lstrip("/")
+        if not path.is_file():
+            continue
+        config = load_yaml(path)
+        for name, entry in config.items():
+            if not isinstance(entry, dict):
+                continue
+            stage = entry.get("stage")
+            if not isinstance(stage, str):
+                continue
+            if stage not in stages:
+                unknown_stages.add(f"{path.relative_to(ROOT)}:{name} -> {stage}")
+            elif stage.startswith("."):
+                errors.append(
+                    f"{path.relative_to(ROOT)}:{name} declares dotted stage {stage!r}"
+                )
+
+    if unknown_stages:
+        errors.append(
+            "jobs reference stages missing from the root stages list: "
+            + ", ".join(sorted(unknown_stages))
+        )
+
+
 def main() -> int:
     errors: list[str] = []
     root = load_yaml(ROOT_CONFIG)
+    validate_stage_consistency(root, errors)
     includes = [item.get("local") for item in root.get("include", [])]
     if includes != EXPECTED_INCLUDES:
         errors.append(f"root includes differ from expected order: {includes}")
