@@ -80,6 +80,13 @@
   interruptible: false
   retry: 0
   timeout: 30m
+  before_script:
+    # Pre-flight the registry auth realm from the job container (not BuildKit):
+    # a broken/misconfigured realm would otherwise only surface as a cryptic
+    # "realm is not a trusted HTTPS origin" after the multi-hour candidate and
+    # scan jobs already ran. Timing out here keeps the failure cheap and
+    # intentional, before any manifest is touched.
+    - python3 .gitlab/scripts/registry-realm-smoke.py
   script:
     - python3 .gitlab/scripts/promote-worker-image.py promote
   artifacts:
