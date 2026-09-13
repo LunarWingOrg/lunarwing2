@@ -716,23 +716,25 @@ function connectSSE() {
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
-      if (data.message === 'Done' || data.message === 'Awaiting approval') {
+      if (data.message === 'Done' || data.message === 'Awaiting approval' || data.message === 'Rejected') {
         clearStreamingSnapshot(data.thread_id);
       }
       if (data.thread_id) debouncedLoadThreads();
       return;
     }
-    // "Done" and "Awaiting approval" are terminal signals from the agent:
-    // the agentic loop finished, so re-enable input as a safety net in case
-    // the response SSE event is empty or lost.
+    // "Done", "Awaiting approval", and "Rejected" are terminal signals from
+    // the agent: the agentic loop finished, so re-enable input as a safety net
+    // in case the response SSE event is empty or lost.
     // Status text is not displayed — inline activity cards handle visual feedback.
-    if (data.message === 'Done' || data.message === 'Awaiting approval') {
+    if (data.message === 'Done' || data.message === 'Awaiting approval' || data.message === 'Rejected') {
+      const isTerminal = data.message === 'Done' || data.message === 'Rejected';
       finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       enableChatInput();
-      if (data.message === 'Done' && data.thread_id) {
-        // Done normally precedes the final response. Stream chunks are live
-        // work, not proof that the authoritative response arrived, so always
+      if (isTerminal && data.thread_id) {
+        // Done normally precedes the final response, and Rejected means the
+        // response was suppressed (no assistant row to render). Stream chunks
+        // are live work, not proof that the authoritative response arrived, so
         // reconcile after the grace period when no response rendered.
         setTimeout(() => {
           if (isCurrentThread(data.thread_id) && !didRenderResponse(data.thread_id)) {

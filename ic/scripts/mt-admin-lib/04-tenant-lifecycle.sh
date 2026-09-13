@@ -353,6 +353,18 @@ tenant_writers_active() {
     done < <(tenant_writer_services "$name")
   fi
 
+  # WI#133/#134 follow-up: the respawn defect this check defends against needs a
+  # working container runtime. When none is present (uninstalled, broken, or a
+  # daemon-only tenant), zero writer containers can exist or respawn, so absence
+  # is "quiesced" — not "unclassifiable". Still fail closed when a runtime exists
+  # but its introspection fails (a live runtime could respawn writers).
+  local rt
+  rt="$(detect_container_runtime 2>/dev/null || true)"
+  if [[ -z "$rt" ]]; then
+    return 1
+  fi
+  # Reuse the result so _ctr's own ensure_container_runtime does not re-detect.
+  CONTAINER_RT="$rt"
   ensure_container_runtime || return 2
   names="$(_ctr "$name" ps -a --format '{{.Names}}' 2>/dev/null)" || return 2
   while IFS= read -r container; do
