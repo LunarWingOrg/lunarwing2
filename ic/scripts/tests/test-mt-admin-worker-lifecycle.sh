@@ -6,6 +6,12 @@ MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
+# Preserve the real implementation before later blocks stub it. The
+# WI#133/#134 tenant_writers_active container-branch tests at the bottom of
+# this file restore it via eval so they exercise the REAL classification logic
+# (last function definition wins in bash — a global stub would shadow it).
+_TWA_REAL_DEF="$(declare -f tenant_writers_active)"
+
 failures=0
 CALLS=()
 fixture="$(mktemp -d)"
@@ -464,6 +470,67 @@ CONTAINER_RT="docker"
 CALLS=()
 _reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
 assert_no_call "ctr:alice inspect -f {{json .Config.Healthcheck}} lunarwing-opencode-alice"
+
+# WI#133/#134 follow-up: tenant_writers_active's container branch must treat an
+# absent container runtime as quiesced (no writers can exist or respawn), while a
+# present-but-broken runtime still fails closed (a live runtime could respawn).
+test_writers_active_no_runtime_is_quiesced() (
+  set +e  # tenant_writers_active is EXPECTED to return non-zero here; set -e would abort the harness
+  eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_exists_in_registry() { return 0; }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 1; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { :; }
+  tenant_worker_enabled() { return 1; }
+  _systemctl_user() { printf 'inactive\n'; }
+  detect_container_runtime() { return 1; }  # no runtime
+  _ctr() { return 1; }  # must never be reached when runtime is absent
+
+  tenant_writers_active alice
+  local rc=$?
+  if [[ "$rc" == "0" ]]; then
+    printf 'no-runtime: tenant_writers_active reported a writer (0)\n' >&2
+    return 1
+  fi
+  if [[ "$rc" != "1" ]]; then
+    printf 'no-runtime: expected quiesced (1), got %s\n' "$rc" >&2
+    return 1
+  fi
+)
+
+test_writers_active_broken_runtime_fails_closed() (
+  set +e  # non-zero returns are expected classification results here, not failures
+  eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_exists_in_registry() { return 0; }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 1; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { :; }
+  tenant_worker_enabled() { return 1; }
+  _systemctl_user() { printf 'inactive\n'; }
+  detect_container_runtime() { printf '%s' "podman"; }  # runtime present
+  ensure_container_runtime() { return 1; }              # ...but introspection broken
+  _ctr() { return 1; }
+
+  tenant_writers_active alice
+  local rc=$?
+  if [[ "$rc" == "0" ]]; then
+    printf 'broken-runtime: expected unclassifiable (2), got success (0)\n' >&2
+    return 1
+  fi
+  if [[ "$rc" != "2" ]]; then
+    printf 'broken-runtime: expected unclassifiable (2), got %s\n' "$rc" >&2
+    return 1
+  fi
+)
+
+test_writers_active_no_runtime_is_quiesced
+test_writers_active_broken_runtime_fails_closed
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
