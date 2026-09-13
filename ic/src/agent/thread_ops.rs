@@ -706,6 +706,17 @@ impl Agent {
                         &tool_calls,
                     )
                     .await;
+                    // Emit a terminal status so SSE/WS clients stop streaming
+                    // and reconcile instead of hanging in a live-work state
+                    // with no response event ever arriving (WI#127 residual).
+                    let _ = self
+                        .channels
+                        .send_status(
+                            &message.channel,
+                            StatusUpdate::Status("Rejected".into()),
+                            &message.metadata,
+                        )
+                        .await;
                     return Ok(SubmissionResult::Suppressed);
                 };
 
