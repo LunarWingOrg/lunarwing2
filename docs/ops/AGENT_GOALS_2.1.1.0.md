@@ -54,7 +54,7 @@
 
 11. [x] Please re-attempt this: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/884 - feedback is in MR description. Even older attempt here: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/874 and rarity/kimi-11-20260909-0901 - comments of old MR offer suggestions on improving - **#86 — rm unsupported v1 websocket protocol** - Explicitly flagged unaddressed by goal #41 findings. Removal work; check what still speaks v1 before cutting
 
-12. [ ] fix issue with ci/cd if any exist. You may reference the following pipelines for failures: #3427 and #3099
+12. [ ] failure. REJECTED. last attempt: aj/kimi-12-20260913-0602 - Original Task: Fix issue with ci/cd if any exist. You may reference the following pipelines for failures: #3427 and #3099
 
 13. [x] Follow up on goal item 11 above... see comment(s) on closed MR: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/893
     - DONE 2026-09-11 (`rarity/kimi-13-20260911-0302`): read the !893 follow-up review (note 2723, non-blocking, fix-forward). Finding: `describe_connect_failure` appended the rolling-upgrade/subprotocol-removal hint to any HTTP 4xx rejection lacking an echoed `Sec-WebSocket-Protocol`, so a worker auth rejection (401, mismatched `AGENT_AUTH_TOKEN`) misleadingly surfaced "recreate/upgrade your worker container" guidance.
