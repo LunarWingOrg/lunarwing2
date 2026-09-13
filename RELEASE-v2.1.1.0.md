@@ -282,7 +282,8 @@ test tenant (restart, stop, start, and a real export all clean).
 ### LunarVoice Parakeet STT (voice sidecar)
 
 The LunarVoice sidecar gains NVIDIA NeMo Parakeet TDT 0.6B int8 as an STT
-engine, replacing `whisper-tiny` as an option. `TransducerConfig` carries
+engine, added alongside the existing `whisper-tiny` option (which remains the
+default; select Parakeet via `VOICE_STT_MODEL`). `TransducerConfig` carries
 the `nemo_transducer` model type for the Parakeet branch (NeMo-2.x decoder
 input names abort the generic transducer path), and sherpa-rs is pinned to
 the upstream master revision vendoring sherpa-onnx v1.12.15, which accepts
