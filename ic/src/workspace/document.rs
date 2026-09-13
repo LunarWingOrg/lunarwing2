@@ -67,13 +67,21 @@ pub fn is_engine_runtime_path(path: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Check whether a normalized path is a mission-goal document
-/// (`engine/projects/{project}/missions/{mission}/mission.json`).
+/// Check whether a normalized path is a mission-goal document, lives inside a
+/// mission directory (`engine/projects/{project}/missions/{mission}/...`), or
+/// is the project-level mission manifest
+/// (`engine/projects/{project}/missions.json`).
 ///
-/// The check is deliberately strict: `missions.json`,
-/// `missions/{id}/other.json`, missing/empty segments, and trailing extra
-/// segments are NOT mission-goal documents, so they remain indexable. A
-/// mission directory literally named `missions` does match (the nested
+/// The check excludes the entire mission-directory subtree, not just the exact
+/// `mission.json` basename. A mission-goal document written to any adjacent,
+/// still-indexable artifact — `mission.json.bak`, `other.json`, or any other
+/// trailing segments — carries the same goal text and must not become
+/// search-indexable. The project-level `missions.json` manifest is excluded for
+/// the same reason.
+///
+/// Missing/empty segments are NOT a match, so nothing above the mission
+/// directory (e.g. `engine/projects/foo/project.json`) is affected. A mission
+/// directory literally named `missions` does match (the nested
 /// `missions/missions/mission.json` case).
 pub fn is_mission_path(path: &str) -> bool {
     let mut segments = path.split('/');
@@ -84,12 +92,16 @@ pub fn is_mission_path(path: &str) -> bool {
     {
         return false;
     }
-    // `missions/{mission}` with a non-empty mission-id segment...
-    if segments.next() != Some("missions") || matches!(segments.next(), None | Some("")) {
-        return false;
+    match segments.next() {
+        // Project-level manifest: `engine/projects/{project}/missions.json`.
+        Some("missions.json") => segments.next().is_none(),
+        // Mission directory subtree: `missions/{mission}` with a non-empty
+        // mission-id segment. Any remaining segments (including `mission.json`,
+        // `.bak` variants, or other artifacts) fall inside the mission
+        // directory and are excluded as well.
+        Some("missions") => !matches!(segments.next(), None | Some("")),
+        _ => false,
     }
-    // ...followed by exactly the `mission.json` basename.
-    segments.next() == Some("mission.json") && segments.next().is_none()
 }
 
 /// Check whether a normalized workspace path should have search chunks.
@@ -402,12 +414,19 @@ mod tests {
 
     #[test]
     fn test_mission_goal_paths_are_not_search_indexable() {
-        // WI#135 hardening: mission.json goal documents cross projects must
-        // never be search-indexed across the tenant/project scope.
+        // WI#135 hardening: mission-goal documents cross projects must
+        // never be search-indexed across the tenant/project scope. The whole
+        // mission-directory subtree is excluded, so adjacent artifacts
+        // (backups, renamed files, extra segments) cannot leak goal text.
         for path in [
             "engine/projects/foo/missions/bar/mission.json",
             "engine/projects/my--project/missions/canary-alpha-xq7--id/mission.json",
             "engine/projects/foo/missions/missions/mission.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/other.json",
+            "engine/projects/foo/missions/bar/mission.json/extra",
+            "engine/projects/foo/missions/bar/notes/2026-09-13.md",
+            "engine/projects/foo/missions.json",
         ] {
             assert!(is_mission_path(path), "path should be mission: {path}");
             assert!(
@@ -419,13 +438,11 @@ mod tests {
         for path in [
             "engine/knowledge/summaries/id.json",
             "engine/projects/foo/project.json",
-            "engine/projects/foo/missions.json",
-            "engine/projects/foo/missions/bar/other.json",
-            "engine/projects/foo/missions/bar/mission.json/extra",
             "engine/projects/foo/missions//mission.json",
-            "engine/projects/foo/missions/bar/mission.json.bak",
             "projects/foo/missions/bar/mission.json",
             "engine/projects/mission.json",
+            "engine/projects/foo/missions",
+            "engine/projects/foo/missions/",
         ] {
             assert!(!is_mission_path(path), "path should not be mission: {path}");
             assert!(
