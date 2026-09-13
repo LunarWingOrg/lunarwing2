@@ -147,11 +147,18 @@ def sanitize_line(line: str, state: LexerState) -> str:
                 i += 2
                 continue
             if i + 1 < len(chars) and (chars[i + 1].isalnum() or chars[i + 1] == "_"):
-                # Lifetime like 'a or 'callback: skip both characters.
+                # Lifetime like 'a or 'callback: leave the quote and the label
+                # visible in the code so a lifetime-delineated type never
+                # hides a following struct body — swallowing the quote as an
+                # unterminated char literal used to desync the brace count.
                 out[i] = ch
                 i += 1
                 continue
-            state.in_char = True
+            # Any other quote (e.g. a stray apostrophe in a macro or a
+            # mismatched closer) cannot be classified without a full parser.
+            # Emit it and move on rather than entering a char-literal state
+            # that would swallow the rest of the file.
+            out[i] = ch
             i += 1
             continue
 
@@ -169,6 +176,55 @@ def is_test_item(line: str, pending_test_attr: bool) -> tuple[bool, bool]:
     kind, name = match.groups()
     named_tests_module = kind == "mod" and name == "tests"
     return True, pending_test_attr or named_tests_module
+
+
+def brace_based_panic_scan(lines: list[str]) -> set[int]:
+    """Fallback line ranges for parse-sensitive guards that cannot classify
+    source structure reliably. Returns line numbers (1-based) inside the body
+    of a test attribute (`#[test]`, `#[cfg(test)]`, `#[tokio::test]`, …) —
+    matching the production/test boundary the checker enforces.
+
+    Whenever a test attribute is seen, the first following line containing
+    `{` opens the body; the body extends until its closing `}` balances the
+    brace count. A bare `mod tests {` counts as a body opener even without a
+    test attribute, so wrapped test modules stay unmarked for panics.
+    """
+    marked_lines: set[int] = set()
+    lexer = LexerState()
+    depth = 0
+    pending_attr = False
+
+    for line_no, raw in enumerate(lines, start=1):
+        code = sanitize_line(raw, lexer)
+        stripped = code.strip()
+
+        if depth > 0:
+            marked_lines.add(line_no)
+            depth += code.count("{") - code.count("}")
+            if depth <= 0:
+                depth = 0
+            continue
+
+        if TEST_ATTR_PATTERN.match(stripped):
+            pending_attr = True
+            continue
+
+        if pending_attr:
+            pending_attr = False
+            if "{" in code:
+                depth = 1
+                marked_lines.add(line_no)
+                continue
+            if stripped and stripped.endswith(";"):
+                continue
+            pending_attr = True
+            continue
+
+        if "{" in code and re.match(r"^\s*mod\s+tests\b", stripped):
+            depth = 1
+            marked_lines.add(line_no)
+
+    return marked_lines
 
 
 def line_test_contexts(lines: list[str]) -> list[bool]:
@@ -266,13 +322,14 @@ def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
 
         lines = source_path.read_text(encoding="utf-8").splitlines()
         contexts = line_test_contexts(lines)
+        test_context_lines = brace_based_panic_scan(lines)
         lexer = LexerState()
         sanitized = [sanitize_line(line, lexer) for line in lines]
 
         for line_no in sorted(added_lines):
             if line_no < 1 or line_no > len(lines):
                 continue
-            if contexts[line_no - 1]:
+            if contexts[line_no - 1] or line_no in test_context_lines:
                 continue
             if "// safety:" in lines[line_no - 1]:
                 continue
@@ -280,6 +337,22 @@ def collect_violations(base: str, head: str) -> list[tuple[str, int, str]]:
                 violations.append((str(path), line_no, lines[line_no - 1].rstrip()))
 
     return violations
+
+
+def report(violations: list[tuple[str, int, str]]) -> int:
+    if not violations:
+        print("OK: No panic-inducing calls in changed production code.")
+        return 0
+
+    print("::error::Found panic-style calls outside test-only Rust code.")
+    print("Production code must use proper error handling instead of panicking.")
+    print("Suppress false positives with an inline '// safety: <reason>' comment.")
+    print("")
+    for path, line_no, line in violations[:20]:
+        print(f"{path}:{line_no}: {line}")
+    print("")
+    print(f"Total: {len(violations)} violation(s)")
+    return 1
 
 
 def main() -> int:
@@ -298,19 +371,7 @@ def main() -> int:
         parser.error("--base is required unless --self-test is used")
 
     violations = collect_violations(args.base, args.head)
-    if not violations:
-        print("OK: No panic-inducing calls in changed production code.")
-        return 0
-
-    print("::error::Found panic-style calls outside test-only Rust code.")
-    print("Production code must use proper error handling instead of panicking.")
-    print("Suppress false positives with an inline '// safety: <reason>' comment.")
-    print("")
-    for path, line_no, line in violations[:20]:
-        print(f"{path}:{line_no}: {line}")
-    print("")
-    print(f"Total: {len(violations)} violation(s)")
-    return 1
+    return report(violations)
 
 
 class CheckNoPanicsTests(unittest.TestCase):
@@ -469,6 +530,110 @@ class CheckNoPanicsTests(unittest.TestCase):
 
         self.assertFalse(any(contexts[:4]))
         self.assertTrue(all(contexts[4:]))
+
+    def test_stray_quote_does_not_swallow_following_code(self) -> None:
+        # A quote the lexer cannot classify (e.g. a stray apostrophe in a
+        # macro argument) must not open an unterminated char-literal state:
+        # that used to swallow every following line, desyncing the brace
+        # count so test bodies were flagged as production panics.
+        lines = [
+            "macro_rules! odd { ($x:expr) => { $x } }\n",
+            "odd!(');\n",
+            "#[test]\n",
+            "fn it_works() {\n",
+            "    assert!(true);\n",
+            "}\n",
+        ]
+
+        contexts = line_test_contexts(lines)
+
+        self.assertTrue(contexts[3])
+        self.assertTrue(contexts[4])
+
+    def test_brace_scan_marks_test_attribute_bodies(self) -> None:
+        lines = [
+            "#[test]\n",
+            "fn it_works() {\n",
+            "    assert!(true);\n",
+            "}\n",
+            "fn prod() {\n",
+            '    value.expect("boom");\n',
+            "}\n",
+        ]
+
+        marked = brace_based_panic_scan(lines)
+
+        self.assertEqual(marked, {2, 3, 4})
+
+    def test_brace_scan_marks_nested_test_bodies(self) -> None:
+        lines = [
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    #[test]\n",
+            "    fn it_works() {\n",
+            "        assert!(true);\n",
+            "    }\n",
+            "}\n",
+            "fn prod() {\n",
+            '    value.expect("boom");\n',
+            "}\n",
+        ]
+
+        marked = brace_based_panic_scan(lines)
+
+        self.assertEqual(marked, {2, 3, 4, 5, 6, 7})
+
+    def test_brace_scan_marks_bare_tests_module(self) -> None:
+        lines = [
+            "mod tests {\n",
+            "    fn helper() {\n",
+            "        assert!(true);\n",
+            "    }\n",
+            "}\n",
+            "fn prod() {\n",
+            '    value.expect("boom");\n',
+            "}\n",
+        ]
+
+        marked = brace_based_panic_scan(lines)
+
+        self.assertEqual(marked, {1, 2, 3, 4, 5})
+
+    def test_collect_violations_uses_brace_scan_fallback(self) -> None:
+        source_text = (
+            "macro_rules! odd { ($x:expr) => { $x } }\n"
+            "odd!(');\n"
+            "#[test]\n"
+            "fn it_works() {\n"
+            "    assert!(true);\n"
+            "}\n"
+            "fn prod() {\n"
+            '    value.expect("boom");\n'
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            project_root = pathlib.Path(directory)
+            source = project_root / "src" / "example.rs"
+            source.parent.mkdir()
+            source.write_text(source_text, encoding="utf-8")
+
+            with (
+                mock.patch(f"{__name__}.PROJECT_ROOT", project_root),
+                mock.patch(
+                    f"{__name__}.changed_rust_files",
+                    return_value=[pathlib.Path("src/example.rs")],
+                ),
+                mock.patch(
+                    f"{__name__}.added_lines_for_file",
+                    return_value={2, 4, 5, 8},
+                ),
+            ):
+                violations = collect_violations("base", "head")
+
+        self.assertEqual(
+            violations,
+            [("src/example.rs", 8, '    value.expect("boom");')],
+        )
 
 
 if __name__ == "__main__":

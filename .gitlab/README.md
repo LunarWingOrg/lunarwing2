@@ -140,9 +140,19 @@ registry paths to the allowlist when adopting option 2.
   `architecture-boundaries` (changed-line hard violations only; printed
   full-tree debt counts stay informational). Both run in the full-validation
   context since goals 2.1.1.0 item 23.
+- The changed-line panic policy (`panic-policy` job) checks `ic/src` and
+  `ic/crates` only; test bodies are excluded via the `#[test]`-attribute and
+  `mod tests` walk in `ic/scripts/check_no_panics.py`.
 - `standalone-deliverables` verifies locked Cargo metadata for every unit
   classified in `.gitlab/deliverables.json`; an unclassified tracked lockfile
   fails `ci-config` validation.
+- `ci-config` validation rejects jobs whose `stage:` is missing from the root
+  `stages` list, so stage renames/removals fail at validation time instead of
+  killing the whole pipeline after push.
+- Worker promotion runs a 15-second registry auth-realm smoke test
+  (`.gitlab/scripts/registry-realm-smoke.py`) before the promote script, so a
+  broken realm fails cheaply instead of after the multi-hour candidate and
+  scan jobs.
 - JUnit reports: `python-unit` emits `junit-python.xml`, `shell-harnesses`
   emits `junit-shell.xml`; the worker scan emits a GitLab
   `container_scanning` report alongside its blocking CRITICAL gate.
