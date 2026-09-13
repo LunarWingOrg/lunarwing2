@@ -67,14 +67,18 @@ pub fn is_engine_runtime_path(path: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-/// Check whether a normalized path is a mission-goal document
-/// (`engine/projects/{project}/missions/{mission}/mission.json`).
+/// Check whether a normalized path belongs to the mission-goal family
+/// (`engine/projects/{project}/missions/**`, any depth or suffix, plus the
+/// tenant-wide `engine/projects/{project}/missions.json` listing).
 ///
-/// The check is deliberately strict: `missions.json`,
-/// `missions/{id}/other.json`, missing/empty segments, and trailing extra
-/// segments are NOT mission-goal documents, so they remain indexable. A
-/// mission directory literally named `missions` does match (the nested
-/// `missions/missions/mission.json` case).
+/// The exclusion covers the whole `missions/` subtree — not just the
+/// `mission.json` basename — because mission goal text persists to adjacent
+/// artifacts (`mission.json.bak`, per-mission `other.json`) that stay
+/// otherwise indexable and leak goals across missions (WI#135/WI#136). The
+/// top-level `missions.json` listing (and its suffixed variants) also
+/// carries goal text, so it is excluded too. `engine/projects/{project}`
+/// paths that are NOT mission-family (e.g. `project.json`) remain
+/// indexable, as does everything outside `engine/projects/**`.
 pub fn is_mission_path(path: &str) -> bool {
     let mut segments = path.split('/');
     // Prefix `engine/projects/{project}` with a non-empty project segment.
@@ -84,12 +88,16 @@ pub fn is_mission_path(path: &str) -> bool {
     {
         return false;
     }
-    // `missions/{mission}` with a non-empty mission-id segment...
-    if segments.next() != Some("missions") || matches!(segments.next(), None | Some("")) {
-        return false;
+    match segments.next() {
+        // The whole `missions/` subtree — any file, any depth, any suffix.
+        Some("missions") => true,
+        // The tenant-wide listing plus its suffixed variants (final segment
+        // only): `missions.json`, `missions.json.bak`, ...
+        Some(name) if name == "missions.json" || name.starts_with("missions.json.") => {
+            segments.next().is_none()
+        }
+        _ => false,
     }
-    // ...followed by exactly the `mission.json` basename.
-    segments.next() == Some("mission.json") && segments.next().is_none()
 }
 
 /// Check whether a normalized workspace path should have search chunks.
@@ -402,12 +410,23 @@ mod tests {
 
     #[test]
     fn test_mission_goal_paths_are_not_search_indexable() {
-        // WI#135 hardening: mission.json goal documents cross projects must
-        // never be search-indexed across the tenant/project scope.
+        // WI#135/WI#136 hardening: the whole mission subtree (any suffix or
+        // depth) plus the tenant-wide missions.json listing must never be
+        // search-indexed across the tenant/project scope. Adjacent artifacts
+        // (mission.json.bak, other.json) carried live-exploited goal-text
+        // leaks (comment 2941 on WI#136).
         for path in [
             "engine/projects/foo/missions/bar/mission.json",
             "engine/projects/my--project/missions/canary-alpha-xq7--id/mission.json",
             "engine/projects/foo/missions/missions/mission.json",
+            "engine/projects/foo/missions/bar/other.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/mission.json/extra",
+            "engine/projects/foo/missions/mission.json",
+            "engine/projects/foo/missions.json",
+            "engine/projects/foo/missions.json.bak",
+            "engine/projects/foo/missions",
+            "engine/projects/foo/missions//mission.json",
         ] {
             assert!(is_mission_path(path), "path should be mission: {path}");
             assert!(
@@ -419,11 +438,9 @@ mod tests {
         for path in [
             "engine/knowledge/summaries/id.json",
             "engine/projects/foo/project.json",
-            "engine/projects/foo/missions.json",
-            "engine/projects/foo/missions/bar/other.json",
-            "engine/projects/foo/missions/bar/mission.json/extra",
-            "engine/projects/foo/missions//mission.json",
-            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missionstuff.json",
+            "engine/projects/foo/missions-overview/bar/mission.json",
+            "engine/projects/foo/missions.json/envelope",
             "projects/foo/missions/bar/mission.json",
             "engine/projects/mission.json",
         ] {
