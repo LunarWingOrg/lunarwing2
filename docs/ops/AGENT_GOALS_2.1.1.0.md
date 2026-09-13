@@ -127,7 +127,7 @@
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
 26. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
-27. [x] (S) Reserved for CI/CD fixes
+27. [ ] further engine hardening needed. see work item 136. MEDIUM | master + kimil00p | ic/src/workspace/document.rs:74-96 (commits 8bfb9a3e1, 62e562964) Mission-path exclusion is exact-string only, so mission goal text remains exposed in adjacent, still-indexable artifacts. is_mission_path matches exactly engine/projects/{p}/missions/{m}/mission.json; a mission doc written to  .../mission.json.bak, .../other.json, or engine/projects/{p}/missions.json stays fully searchable, and the docs' own commit trail confirms goal text carries in-band nonce prefixes. Exploit path: agent (or a poisoned worker) writes goal text to engine/projects/foo/missions/bar/mission.json.bak → gets chunked → memory_search returns it cross-mission, defeating the WI#135 isolation goal. Fix: exclude the whole engine/projects//missions/* subtree (or mask mission-directory content) rather than exact-basename
 
 ## Phase 5 - Documentation
 28. [x] take a look at any documentation that should be updated and update necessary documentation
