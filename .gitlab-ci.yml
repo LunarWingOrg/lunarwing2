@@ -13,4 +13,3 @@ stages:
   - test
   - security
   - containers
-  - observe
