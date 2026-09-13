@@ -346,9 +346,16 @@ tenant_writers_active() {
       rc=0
       state="$(rc-service "$service" status 2>&1)" || rc=$?
       case "$state" in
-        # WI#137: a crashed supervised service is not writing (supervise-daemon
-        # gave up respawning); the container branch below is authoritative for
-        # the containers themselves.
+        # WI#137: the WeeChat unit reports "session is up" / "session is not
+        # running" instead of the standard started/stopped wording. "not
+        # running" must classify as STOPPED — the substring "running" alone
+        # made every stopped WeeChat tenant (starforce) report an active
+        # writer forever. Mirror openrc_service_state's special case.
+        *"session is up"*) return 0 ;;
+        *"session is not running"*) ;;
+        # A crashed supervised service is not writing (supervise-daemon gave
+        # up respawning); the container branch below is authoritative for the
+        # containers themselves.
         *stopped*|*inactive*|*dead*|*crashed*) ;;
         # Transitional states (supervise-daemon teardown is asynchronous) still
         # count as active so the bounded quiesce-wait keeps polling until they
