@@ -313,10 +313,10 @@ stop_tenant_writers() {
   done < <(tenant_writer_containers "$name")
 
   writer_rc=0
-  tenant_writers_active "$name" || writer_rc=$?
+  await_writer_quiescence "$name" || writer_rc=$?
   case "$writer_rc" in
-    0) die "tenant '$name' still has active writers after stop" ;;
-    1) ;;
+    0) ;;
+    1) die "tenant '$name' still has active writers after stop" ;;
     *) die "could not verify writer quiescence for tenant '$name'" ;;
   esac
   say "tenant writers stopped for $name (PostgreSQL left running)"
@@ -346,8 +346,14 @@ tenant_writers_active() {
       rc=0
       state="$(rc-service "$service" status 2>&1)" || rc=$?
       case "$state" in
-        *stopped*|*inactive*|*dead*) ;;
-        *started*|*running*|*active*) return 0 ;;
+        # WI#137: a crashed supervised service is not writing (supervise-daemon
+        # gave up respawning); the container branch below is authoritative for
+        # the containers themselves.
+        *stopped*|*inactive*|*dead*|*crashed*) ;;
+        # Transitional states (supervise-daemon teardown is asynchronous) still
+        # count as active so the bounded quiesce-wait keeps polling until they
+        # settle instead of misclassifying a mid-stop service as quiesced.
+        *started*|*running*|*active*|*starting*|*stopping*) return 0 ;;
         *) [[ "$rc" -eq 3 ]] || return 2 ;;
       esac
     done < <(tenant_writer_services "$name")
@@ -375,6 +381,37 @@ tenant_writers_active() {
     [[ "$running" == false ]] || return 2
   done < <(tenant_writer_containers "$name")
   return 1
+}
+
+# WI#137: supervise-daemon teardown is asynchronous — after the stop sequence a
+# writer container can still report Running=true for a few seconds while its
+# supervisor finishes killing it, which made the immediate quiescence check die
+# with "still has active writers" on healthy OpenRC stops. Poll the check for a
+# bounded window (1s interval, default 30s deadline, env-overridable) and only
+# fail when a writer is STILL active after the deadline. Unclassifiable state
+# (rc 2) keeps failing closed immediately: a live runtime could respawn writers.
+#
+# Returns 0 when quiesced within the window, 1 when writers stayed active, and
+# 2 when state could not be classified.
+await_writer_quiescence() {
+  local name="$1" interval="${LUNARWING_MT_QUIESCE_INTERVAL:-1}" \
+    deadline="${LUNARWING_MT_QUIESCE_DEADLINE:-30}" rc=0 elapsed=0
+  name="$(sanitize_name "$name")"
+  while true; do
+    rc=0
+    tenant_writers_active "$name" || rc=$?
+    case "$rc" in
+      0) ;;
+      1) return 0 ;;
+      *) return 2 ;;
+    esac
+    if (( elapsed >= deadline )); then
+      say "tenant '$name' still has active writers after ${deadline}s of quiesce polling" >&2
+      return 1
+    fi
+    sleep "$interval"
+    elapsed=$((elapsed + interval))
+  done
 }
 
 tenant_writers_probe_status() {
@@ -976,12 +1013,15 @@ stop_tenant() {
   # respawned by the runtime after the stop calls above; on any init an
   # unclassifiable writer state must not pass silently. Fail loudly instead of
   # leaving a tenant whose writers are live while its daemon and PostgreSQL
-  # are down (the "no quiesce active writers" condition).
+  # are down (the "no quiesce active writers" condition). WI#137: the check is
+  # polled over a bounded window because supervise-daemon teardown is
+  # asynchronous — a writer mid-teardown reports active for a few seconds
+  # after a healthy stop.
   local writer_rc=0
-  tenant_writers_active "$name" || writer_rc=$?
+  await_writer_quiescence "$name" || writer_rc=$?
   case "$writer_rc" in
-    0) die "tenant '$name' still has active writers after stop" ;;
-    1) ;;
+    0) ;;
+    1) die "tenant '$name' still has active writers after stop" ;;
     *) die "could not verify writer quiescence for tenant '$name' after stop" ;;
   esac
 

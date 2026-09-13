@@ -9,8 +9,11 @@ source "$MT_ADMIN"
 # Preserve the real implementation before later blocks stub it. The
 # WI#133/#134 tenant_writers_active container-branch tests at the bottom of
 # this file restore it via eval so they exercise the REAL classification logic
-# (last function definition wins in bash — a global stub would shadow it).
+# (last function definition wins in bash — a global stub would shadow it). The
+# WI#137 poller tests restore await_writer_quiescence the same way; only its
+# tenant_writers_active dependency is stubbed per-case.
 _TWA_REAL_DEF="$(declare -f tenant_writers_active)"
+_AWAIT_QUIESCE_REAL_DEF="$(declare -f await_writer_quiescence)"
 
 failures=0
 CALLS=()
@@ -363,7 +366,19 @@ retire_tenant_nanocode() {
 die() { return 1; }
 
 # WI#133/#134: stop_tenant now verifies writer quiescence after shutdown.
+# The quiescence verdict is polled through await_writer_quiescence (WI#137);
+# stub the poller here so these fail-loud contract tests stay instant — the
+# real poller gets its own bounded-window tests at the bottom of this file.
 WRITERS_ACTIVE_RC=1
+await_writer_quiescence() {
+  # Convert the old tenant_writers_active stub convention (1 = quiesced) to the
+  # poller's convention (0 = quiesced, 1 = still active, 2 = unclassifiable).
+  case "$WRITERS_ACTIVE_RC" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
 tenant_writers_active() { return "$WRITERS_ACTIVE_RC"; }
 
 INIT_SYSTEM="systemd"
@@ -532,6 +547,79 @@ test_writers_active_broken_runtime_fails_closed() (
 
 test_writers_active_no_runtime_is_quiesced
 test_writers_active_broken_runtime_fails_closed
+
+# ── WI#137: bounded quiesce-wait for async supervise-daemon teardown ──────────
+# The poller must tolerate a writer that reports active for a few seconds after
+# a healthy stop (async supervisor teardown), fail only after the deadline when
+# it NEVER settles, and fail closed immediately on unclassifiable state.
+test_quiesce_wait_active_then_settled() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"  # restore the real poller (the global stub shadows it)
+  local polls=0
+  sleep() { polls=$((polls + 1)); }
+  tenant_writers_active() {
+    polls=$((polls + 1))
+    [[ "$polls" -le 2 ]] && return 0
+    return 1
+  }
+  sanitize_name() { printf '%s' "$1"; }
+  await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "0" ]]; then
+    printf 'active-then-settled: expected quiesced (0), got %s\n' "$rc" >&2
+    return 1
+  fi
+  if [[ "$polls" -lt 3 ]]; then
+    printf 'active-then-settled: expected >=3 polls, got %s\n' "$polls" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_never_settles_fails_after_deadline() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"
+  local polls=0 slept=0
+  sleep() { slept=$((slept + 1)); }
+  tenant_writers_active() { polls=$((polls + 1)); return 0; }
+  sanitize_name() { printf '%s' "$1"; }
+  LUNARWING_MT_QUIESCE_INTERVAL=1 LUNARWING_MT_QUIESCE_DEADLINE=5 \
+    await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "1" ]]; then
+    printf 'never-settles: expected active-after-deadline (1), got %s\n' "$rc" >&2
+    return 1
+  fi
+  # 6 polls (t=0..5) with a 1s interval and a 5s deadline.
+  if [[ "$polls" != "6" || "$slept" != "5" ]]; then
+    printf 'never-settles: expected 6 polls/5 sleeps, got polls=%s slept=%s\n' \
+      "$polls" "$slept" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_unclassifiable_fails_closed() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"
+  local polls=0 slept=0
+  sleep() { slept=$((slept + 1)); }
+  tenant_writers_active() { polls=$((polls + 1)); return 2; }
+  sanitize_name() { printf '%s' "$1"; }
+  await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "2" ]]; then
+    printf 'unclassifiable: expected fail-closed (2), got %s\n' "$rc" >&2
+    return 1
+  fi
+  if [[ "$polls" != "1" || "$slept" != "0" ]]; then
+    printf 'unclassifiable: expected single poll and no sleep, got polls=%s slept=%s\n' \
+      "$polls" "$slept" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_active_then_settled
+test_quiesce_wait_never_settles_fails_after_deadline
+test_quiesce_wait_unclassifiable_fails_closed
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"
