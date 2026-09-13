@@ -2,7 +2,7 @@
 
 ## Codename: Zanshin (残心)
 
-**Release date** 2026-09-XX (draft)
+**Release date** 2026-09-13
 
 >After the cut, the mind stays
 >
