@@ -62,7 +62,8 @@
     - All three new findings are fixed in source at 14ccfdd23: #135/#136 mission-goal index exclusion (subtree + purge sweep + provenance labels, live canary acceptance on tracker); #137 bounded OpenRC writer-quiesce wait + status-classification fix. #114 has open draft MR !855 (podman sandbox).
     - No 2.1.2.0 code blockers among open items; remaining work is tracker housekeeping plus operator/live residuals on #97/#131/#137. Report: docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md.
 19. [ ] update all docs in docs/guides
-20. [ ] update all docs in docs/architecture
+20. [x] update all docs in docs/architecture
+    - DONE 2026-09-12 (aj/kimi-20-20260914-0600): all 10 architecture docs revalidated against the 2.1.2.0 tree. SEMANTIC-MEMORY-SEARCH gained the WI#132 `indexed_at` outbox (V27) + repair sweep and the WI#135/WI#136 mission-subtree `missions.json` index exclusion; ENGINE-V2 gained WI#132 authenticity hardening (retrieval/compaction labeling + neutralization) and dropped the dead `executor/context.rs` from its module map; SELF_HEAL_DEPLOYMENT_WIRING gained the 2.1.2.0 `stop_tenant` writer-quiescence notes (WI#133/#134/#135/#137). The remaining docs were date-stamped after confirming no substantive change: SELF_HEAL_COVERAGE_AUDIT (ORDER unchanged at 14 suites), ATOMICBOOL_DEEPER_PROPAGATION (anchors unchanged, defer stands), SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS, IRC-SENDER-IDENTITY, WEECHAT-CHANNEL-ARCHITECTURE (registry 0.2.9 bump only).
 21. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes)
 
 ---
