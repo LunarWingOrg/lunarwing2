@@ -39,7 +39,7 @@
 
 7. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-8. [ ] investigate cargo deny failure in ci/cd pipeline and fix please
+8. [ ] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
 
 9. [x] (S) Mascot Design Art Project
 
