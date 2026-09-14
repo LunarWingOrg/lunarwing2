@@ -817,6 +817,24 @@ mod tests {
                     }
                 }),
             ),
+            (
+                "attachment_store",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["list", "read"],
+                            "description": "Operation to perform"
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Attachment path to read (required for action 'read')"
+                        }
+                    },
+                    "required": ["action"]
+                }),
+            ),
         ];
 
         let mut failures = Vec::new();

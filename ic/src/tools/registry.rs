@@ -18,8 +18,8 @@ use crate::tools::builder::{
     BuildSoftwareTool, BuilderConfig, LlmSoftwareBuilder, SoftwareBuilder,
 };
 use crate::tools::builtin::{
-    ApplyPatchTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool, HttpTool,
-    JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, KnowledgeGetTopicTool,
+    ApplyPatchTool, AttachmentStoreTool, CancelJobTool, CreateJobTool, EchoTool, ExtensionInfoTool,
+    HttpTool, JobEventsTool, JobPromptTool, JobStatusTool, JsonTool, KnowledgeGetTopicTool,
     KnowledgeListStaleTool, KnowledgeListTopicsTool, KnowledgeSearchTool, KnowledgeStatsTool,
     KnowledgeSubmitNoteTool, KnowledgeUpdateStatusTool, ListDirTool, ListJobsTool, MemoryReadTool,
     MemorySearchTool, MemoryTreeTool, MemoryWriteTool, PromptQueue, ReadFileTool, ShellTool,
@@ -54,6 +54,7 @@ const PROTECTED_TOOL_NAMES: &[&str] = &[
     "memory_write",
     "memory_read",
     "memory_tree",
+    "attachment_store",
     "knowledge_search",
     "knowledge_get_topic",
     "knowledge_list_topics",
@@ -508,9 +509,10 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemorySearchTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(MemoryWriteTool::new(Arc::clone(&resolver))));
         self.register_sync(Arc::new(MemoryReadTool::new(Arc::clone(&resolver))));
-        self.register_sync(Arc::new(MemoryTreeTool::new(resolver)));
+        self.register_sync(Arc::new(MemoryTreeTool::new(Arc::clone(&resolver))));
+        self.register_sync(Arc::new(AttachmentStoreTool::new(resolver)));
 
-        tracing::debug!("Registered 4 memory tools");
+        tracing::debug!("Registered 5 memory tools");
     }
 
     /// Register memory tools with a fixed workspace (backward compatibility).
@@ -527,9 +529,12 @@ impl ToolRegistry {
         self.register_sync(Arc::new(MemoryReadTool::from_workspace(Arc::clone(
             &workspace,
         ))));
-        self.register_sync(Arc::new(MemoryTreeTool::from_workspace(workspace)));
+        self.register_sync(Arc::new(MemoryTreeTool::from_workspace(Arc::clone(
+            &workspace,
+        ))));
+        self.register_sync(Arc::new(AttachmentStoreTool::from_workspace(workspace)));
 
-        tracing::debug!("Registered 4 memory tools");
+        tracing::debug!("Registered 5 memory tools");
     }
 
     /// Register Study-Notes knowledge tools with a workspace resolver.

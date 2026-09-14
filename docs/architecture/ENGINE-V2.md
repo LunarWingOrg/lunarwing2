@@ -606,6 +606,14 @@ sanitized effective text but never image bytes or data URLs. Consequently, a
 process restart preserves attachment descriptions and extracted text but not
 visual bytes; an image must be resent if visual analysis is needed afterward.
 
+Separately from engine state, the host-side durable attachment store
+(`crate::agent::attachment_store`) persists every inbound attachment —
+sanitized metadata, extracted text, and bounded inline bytes (base64, capped
+per attachment) — into workspace documents under `attachments/<channel>/...`
+so a file sent on one channel stays retrievable from all other channels and
+the WebUI. Stored documents go through the normal workspace write path
+(prompt-injection scan, search indexing).
+
 Attachment count, MIME, per-file, and aggregate limits remain owned by the
 ingress channel/host implementations. Attachments on approval, interrupt, and
 credential replies stay on those control paths and are not added to model
@@ -640,7 +648,9 @@ Thread messages, steps, and events are **never deleted** from the engine
 workspace store. Runtime JSON lives under `engine/.runtime/`; knowledge and
 orchestrator artifacts live in human-readable paths under `engine/`. Raw
 attachment bytes are the deliberate exception: only sanitized attachment text
-is durable, while provider-bound image parts remain transient. The router also
+is durable, while provider-bound image parts remain transient — except for the
+bounded inline copies persisted by the durable cross-channel attachment store
+under `attachments/` (see Attachment Input). The router also
 dual-writes V1-compatible conversation history to the relational database.
 
 Webhook mission documents contain only versioned secret references. Plaintext

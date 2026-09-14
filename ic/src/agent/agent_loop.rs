@@ -1373,6 +1373,9 @@ impl Agent {
             document_extraction.process(&mut message).await;
         }
         self.store_extracted_documents(&message).await;
+        if let Some(workspace) = &self.deps.workspace {
+            crate::agent::attachment_store::store_attachments(workspace, &message).await;
+        }
         message
     }
 
