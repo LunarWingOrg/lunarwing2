@@ -57,7 +57,8 @@
 14. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
 
 ## Phase 5 - Documentation
-15. [ ] take a look at any documentation that should be updated and update necessary documentation
+15. [x] take a look at any documentation that should be updated and update necessary documentation
+    - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0).
 16. [x] (S) Reserved for something else
 17. [x] (S) Reserved for something else
 18. [x] review open work items
