@@ -2,12 +2,15 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-**Revalidated against source 2026-09-11 (v2.1.1.0).** Module map, gate types,
+**Revalidated against source 2026-09-12 (v2.1.2.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree; updates for 2.1.1.0 include the
 best-effort `thread_start` event dispatch (item 9/WI#109 scope A) and the
 `ENGINE_V2_CHANNELS` routing-policy clarification (there is no `none`
-opt-out; unknown entries are ignored).
+opt-out; unknown entries are ignored). Updates for 2.1.2.0 include the
+WI#132 authenticity hardening (labeled/neutralized memory retrieval,
+compaction summaries, and system-role content) and the removal of the dead
+`executor/context.rs` module.
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
@@ -70,7 +73,6 @@ ic/crates/lunarwing_engine/src/
     loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
     structured.rs         Tier 0: structured tool call execution
     scripting.rs          Tier 1: embedded Python via Monty (CodeAct/RLM)
-    context.rs            Context builder (messages + actions from leases + memory docs)
     compaction.rs         Context compaction when approaching model context limit
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
@@ -205,6 +207,30 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   bounded correction before terminal delivery through shared channels such as XMPP.
 - Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
+
+### Authenticity hardening (WI#132)
+
+Memory-retrieval and compaction content is LLM-adjacent data, so it is labeled
+and neutralized before it can masquerade as engine-authored state:
+
+- `__retrieve_docs__` is the live retrieval path (the dead `executor/context.rs`
+  doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
+  projected false assurance). Its handler neutralizes role-token openers in
+  returned doc content and stamps each doc with
+  `"provenance": "untrusted_memory_retrieval"` so consumers cannot mistake it
+  for engine content.
+- Compaction summaries are LLM output that replaces real history. The summary
+  is prefixed with an explicit `[Compaction summary — LLM-generated, replaces
+  earlier conversation history]` label and its role-token openers are
+  neutralized before it is inserted as an assistant message (compaction
+  laundering seam).
+- Both LLM adapters (`ic/src/llm/rig_adapter.rs`,
+  `ic/src/llm/lunarwing_cloud_chat.rs`) neutralize role-token openers in
+  system-role content as a final backstop (idempotent on already-neutralized
+  content).
+- The engine-internal `memory_search` tool labels its results with
+  `"provenance": "engine_internal"` so they are never silently
+  ordinary-looking memory.
 
 ### Failure Recovery
 
@@ -580,6 +606,14 @@ sanitized effective text but never image bytes or data URLs. Consequently, a
 process restart preserves attachment descriptions and extracted text but not
 visual bytes; an image must be resent if visual analysis is needed afterward.
 
+Separately from engine state, the host-side durable attachment store
+(`crate::agent::attachment_store`) persists every inbound attachment —
+sanitized metadata, extracted text, and bounded inline bytes (base64, capped
+per attachment) — into workspace documents under `attachments/<channel>/...`
+so a file sent on one channel stays retrievable from all other channels and
+the WebUI. Stored documents go through the normal workspace write path
+(prompt-injection scan, search indexing).
+
 Attachment count, MIME, per-file, and aggregate limits remain owned by the
 ingress channel/host implementations. Attachments on approval, interrupt, and
 credential replies stay on those control paths and are not added to model
@@ -614,7 +648,9 @@ Thread messages, steps, and events are **never deleted** from the engine
 workspace store. Runtime JSON lives under `engine/.runtime/`; knowledge and
 orchestrator artifacts live in human-readable paths under `engine/`. Raw
 attachment bytes are the deliberate exception: only sanitized attachment text
-is durable, while provider-bound image parts remain transient. The router also
+is durable, while provider-bound image parts remain transient — except for the
+bounded inline copies persisted by the durable cross-channel attachment store
+under `attachments/` (see Attachment Input). The router also
 dual-writes V1-compatible conversation history to the relational database.
 
 Webhook mission documents contain only versioned secret references. Plaintext

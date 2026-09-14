@@ -1,5 +1,6 @@
 //! Built-in tools that come with the agent.
 
+pub(crate) mod attachment_store;
 mod echo;
 pub mod extension_tools;
 mod file;
@@ -20,6 +21,7 @@ mod ssh_git;
 mod time;
 mod tool_info;
 
+pub use attachment_store::AttachmentStoreTool;
 pub use echo::EchoTool;
 pub use extension_tools::{
     ExtensionInfoTool, ToolActivateTool, ToolAuthTool, ToolDeactivateTool, ToolInstallTool,
