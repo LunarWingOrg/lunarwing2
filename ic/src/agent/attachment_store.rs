@@ -143,18 +143,25 @@ fn render_attachment(message: &IncomingMessage, attachment: &IncomingAttachment)
         return None;
     }
 
-    if body.len() > MAX_DOCUMENT_BYTES {
-        tracing::warn!(
-            attachment_id = %attachment.id,
-            channel = %message.channel,
-            bytes = body.len(),
-            max = MAX_DOCUMENT_BYTES,
-            "attachment document exceeds size cap; persisting metadata only"
-        );
-        body.truncate(MAX_DOCUMENT_BYTES);
-    }
+    truncate_to_document_cap(&mut body);
 
     Some(body)
+}
+
+/// Cap a rendered attachment document at `MAX_DOCUMENT_BYTES` on a UTF-8 char
+/// boundary. `String::truncate` panics on a non-boundary index, and the body
+/// can end mid multi-byte character (extracted text is capped in chars, not
+/// bytes), so round the cut point down to a boundary first.
+fn truncate_to_document_cap(body: &mut String) {
+    if body.len() > MAX_DOCUMENT_BYTES {
+        tracing::warn!(
+            bytes = body.len(),
+            max = MAX_DOCUMENT_BYTES,
+            "attachment document exceeds size cap; truncating on char boundary"
+        );
+        let end = crate::util::floor_char_boundary(body, MAX_DOCUMENT_BYTES);
+        body.truncate(end);
+    }
 }
 
 /// Persist all attachments on a message into the durable attachment store.
@@ -269,6 +276,19 @@ mod tests {
         let attachment = test_attachment("empty-1", AttachmentKind::Document);
         let message = test_message("web", vec![attachment]);
         assert!(render_attachment(&message, &message.attachments[0]).is_none());
+    }
+
+    #[test]
+    fn oversized_document_cap_truncates_on_char_boundary() {
+        // 1,999,999 single-byte chars + one 2-byte char crosses the 6MB cap
+        // with the boundary landing mid-character.
+        let mut body = "x".repeat(MAX_DOCUMENT_BYTES - 1);
+        body.push('é');
+        assert_eq!(body.len(), MAX_DOCUMENT_BYTES + 1);
+        truncate_to_document_cap(&mut body);
+        assert!(body.len() <= MAX_DOCUMENT_BYTES);
+        assert!(body.is_char_boundary(body.len()));
+        assert_eq!(body.chars().last(), Some('x'));
     }
 
     #[test]
