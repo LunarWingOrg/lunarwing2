@@ -35,11 +35,11 @@
 
 5. [x] (S) **#122 — New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
-6. [ ] **#114 — feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - See:  generic-podman-sandbox/concept-branch/v2.1.2.0 for reference
+6. [ ] **#114 — feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - See:  generic-podman-sandbox/concept-branch/v2.1.2.0 for reference; this is the design i have gone with and what i want. any further suggestions are welcome but must be documented
 
 7. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-8. [ ] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
+8. [x] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
 
 9. [x] (S) Mascot Design Art Project
 
@@ -60,7 +60,7 @@
 
 ## Phase 5 - Documentation
 15. [x] take a look at any documentation that should be updated and update necessary documentation
-    - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0).
+    - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0)
 16. [x] (S) Reserved for something else
 17. [x] (S) Reserved for something else
 18. [x] review open work items
@@ -70,7 +70,7 @@
 19. [ ] update all docs in docs/guides
 20. [x] update all docs in docs/architecture
     - DONE 2026-09-12 (aj/kimi-20-20260914-0600): all 10 architecture docs revalidated against the 2.1.2.0 tree. SEMANTIC-MEMORY-SEARCH gained the WI#132 `indexed_at` outbox (V27) + repair sweep and the WI#135/WI#136 mission-subtree `missions.json` index exclusion; ENGINE-V2 gained WI#132 authenticity hardening (retrieval/compaction labeling + neutralization) and dropped the dead `executor/context.rs` from its module map; SELF_HEAL_DEPLOYMENT_WIRING gained the 2.1.2.0 `stop_tenant` writer-quiescence notes (WI#133/#134/#135/#137). The remaining docs were date-stamped after confirming no substantive change: SELF_HEAL_COVERAGE_AUDIT (ORDER unchanged at 14 suites), ATOMICBOOL_DEEPER_PROPAGATION (anchors unchanged, defer stands), SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS, IRC-SENDER-IDENTITY, WEECHAT-CHANNEL-ARCHITECTURE (registry 0.2.9 bump only).
-21. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes)
+21. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
 
 ---
 
