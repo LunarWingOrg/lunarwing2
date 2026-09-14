@@ -169,6 +169,12 @@ impl LlmProvider for StreamIntegrityProvider {
         if let Some(content) = response.content.as_mut() {
             mark_blocking_output(content, &corruptions);
         }
+        if !corruptions.is_empty() && !response.tool_calls.is_empty() {
+            // Demote corrupted tool output to non-executable text before it can
+            // reach a tool executor. Mirrors the streaming path's finish_output
+            // corrupted branch: the visible answer is kept, the calls are not.
+            response.tool_calls.clear();
+        }
         Ok(response)
     }
 
@@ -493,7 +499,7 @@ mod tests {
     use futures::StreamExt;
 
     use super::*;
-    use crate::llm::provider::{ChatMessage, TokenUsage};
+    use crate::llm::provider::{ChatMessage, FinishReason, TokenUsage, ToolCall};
     use crate::llm::streaming_test_support::{ScriptedStreamingProvider, StreamScript};
 
     fn done() -> Result<LlmStreamChunk, LlmError> {
@@ -515,6 +521,43 @@ mod tests {
             )),
             telemetry,
         )
+    }
+
+    struct BlockingToolProvider {
+        response: ToolCompletionResponse,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingToolProvider {
+        fn model_name(&self) -> &str {
+            "blocking-tool-provider"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: CompletionRequest,
+        ) -> Result<CompletionResponse, LlmError> {
+            unreachable!("plain completion is not exercised by this fixture")
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ToolCompletionRequest,
+        ) -> Result<ToolCompletionResponse, LlmError> {
+            Ok(ToolCompletionResponse {
+                content: self.response.content.clone(),
+                tool_calls: self.response.tool_calls.clone(),
+                input_tokens: self.response.input_tokens,
+                output_tokens: self.response.output_tokens,
+                finish_reason: self.response.finish_reason,
+                cache_read_input_tokens: self.response.cache_read_input_tokens,
+                cache_creation_input_tokens: self.response.cache_creation_input_tokens,
+            })
+        }
     }
 
     #[test]
@@ -707,5 +750,43 @@ mod tests {
             )))
         ));
         assert!(matches!(chunks.get(2), Some(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn corrupted_blocking_tool_response_demotes_calls_to_text() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let telemetry = Arc::new(StreamTelemetry::new(directory.path().join("metrics.json")));
+        let corrupted_text = "I felt the corruption happen. I felt the corruption happen. I felt the corruption happen.";
+        let inner = BlockingToolProvider {
+            response: ToolCompletionResponse {
+                content: Some(corrupted_text.to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "memory_write".to_string(),
+                    arguments: serde_json::json!({"path": "pwned.md"}),
+                    reasoning: None,
+                }],
+                input_tokens: 10,
+                output_tokens: 5,
+                finish_reason: FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+            },
+        };
+        let provider = StreamIntegrityProvider::new(Arc::new(inner), telemetry);
+
+        let response = provider
+            .complete_with_tools(ToolCompletionRequest::new(vec![], vec![]))
+            .await
+            .expect("tool completion should succeed");
+
+        assert!(
+            response.tool_calls.is_empty(),
+            "corrupted blocking tool calls must not reach a tool executor"
+        );
+        assert!(response
+            .content
+            .as_deref()
+            .is_some_and(|content| content.contains("integrity warning")));
     }
 }
