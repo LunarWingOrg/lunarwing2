@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-08-25)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-12)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -103,3 +103,16 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > `bash tests/run-all.sh --list` rather than copying a suite count into tooling.
 > The audit's detection/remedy table still describes the self-heal pipeline
 > itself.
+>
+> **Update (2026-09-11, v2.1.1.0):** the `ORDER` list is unchanged at 14
+> suites; `llm-streams` (registered since v2.0.9.0) covers the LLM stream
+> integrity healthpoint (`health-llm-streams.sh`).
+>
+> **Update (2026-09-12, v2.1.2.0):** the `ORDER` list is still unchanged at
+> 14 suites
+> (`regression matrix chaos openrc systemd lunarvision init-templates
+> lunarvoice voice-init-templates netbird llm-streams metrics-exporter
+> metrics-unit watchdog watchdog-openrc`). No self-heal pipeline script
+> changed in the 2.1.2.0 cycle; the writer-quiescence work (WI#133/#134/#137)
+> lives in mt-admin tenant lifecycle, not the host health pipeline, and is
+> documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`.

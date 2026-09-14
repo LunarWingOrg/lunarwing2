@@ -2,6 +2,13 @@
 
 LunarWing provides persistent memory for agents with hybrid search combining full-text search (BM25-style keyword matching) and vector search (cosine similarity on embeddings). Results are fused using Reciprocal Rank Fusion (RRF) to produce a single ranked list.
 
+**Revalidated against source 2026-09-12 (v2.1.2.0).** Pipeline structure,
+limits, tools, schema/migrations, and env vars were re-checked; the additive
+knowledge refresh cadence (item 6/WI#121) is now documented in Step 6, the
+WI#132 memory-index outbox (`indexed_at`, V27, repair sweep) is documented in
+Step 1, and the mission-subtree index exclusion (WI#135/WI#136) is documented
+in Step 1.
+
 The system lives in `ic/src/workspace/`. General memory is exposed through
 `memory_search`, `memory_write`, `memory_read`, and `memory_tree` in
 `ic/src/tools/builtin/memory.rs`; source-verified codebase knowledge is an
@@ -61,10 +68,32 @@ workspace.write(path, content)
 chunk replacement in one transaction, so search does not observe a new document
 body with stale chunks. Appends use an atomic database append and then reindex.
 
+The append path commits content first and re-chunks in a separate transaction
+(`Workspace::append` -> `append_document` -> `reindex_document`). A crash
+between the two strands the document zero-chunked forever, so chunk-driven
+search under-reports content that `ws.read` still serves in full (the Sep-2026
+Kageho "0 vs 6671" symptom). Migration V27 adds the `indexed_at` outbox marker:
+`NULL` = content changed but chunks not yet rebuilt; non-`NULL` = projection
+current. It is set to `NULL` in the same statement that commits content
+(append/content-only update) and stamped `NOW()` inside the transaction that
+replaces chunks. A repair sweep (`Workspace::repair_stale_index`, limit-bounded)
+re-chunks stranded documents; the daemon runs it at startup -- before the
+embedding backfill -- and the heartbeat hygiene pass repeats it. V27 backfills
+existing documents as indexed (`indexed_at = updated_at`), so an upgrade does
+not trigger a mass re-chunk/re-embed.
+
 Engine recovery files under `engine/.runtime/**` remain in `memory_documents` so
 threads, checkpoints, events, and leases survive restarts. They receive an empty
 chunk set and therefore cannot enter FTS or vector search. Migration V23 removes
 chunks created for these paths by older versions without deleting source documents.
+The same exclusion covers the mission-directory subtree
+`engine/projects/{project}/missions/**` (any depth or suffix, not just
+`mission.json`) and the project-level `engine/projects/{project}/missions.json`
+manifest (WI#135/WI#136): everything under a mission directory stays readable via
+`read()`/`list()` -- mission hydration reads documents, not chunks -- but never
+enters search. Legacy chunks from pre-fix builds are removed by the idempotent
+`purge_mission_index_chunks()` sweep (boot, before the embedding backfill, and
+heartbeat hygiene); its SQL `LIKE` patterns mirror `is_mission_path`.
 
 ### System-Prompt Write Guard
 
@@ -298,6 +327,23 @@ overwrites an existing path. `knowledge_seed_state.json` records a completed
 pass (including per-note failures), so later restarts do not repopulate the
 store. `configure-study-mcp` and `upgrade-tenant` do not arm this seed.
 
+The additive refresh path (item 6, WI#121) replaces the static-snapshot
+limitation of the seed. A host-side scheduler (`ensure_knowledge_source_scheduler`,
+mt-admin module `14-knowledge-sync.sh`) fast-forwards the published Study Notes
+checkout and writes a generation manifest
+(`.git/lunarwing-study-notes-generation.json`) only after a clean,
+validated checkout. Tenant daemons poll that manifest on their own cadence
+(`KNOWLEDGE_SYNC_ENABLED`, default false; `KNOWLEDGE_SYNC_CADENCE_HOURS`,
+default 6; `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN`, default 500;
+`KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN`, default 10 MiB) and import missing paths
+through the same parser as the one-shot seed. Existing paths are never changed,
+so locally authored or edited notes remain authoritative; genuine import
+failures back off while healthy skips do not. `configure-study-mcp
+--enable-knowledge-sync` / `--disable-knowledge-sync` toggle the tenant
+cadence, and `refresh-knowledge <tenant> [--sync-source]` triggers a pass
+manually. This fallback reports Git-bounded additive freshness; it is not an
+exact mirror of the hosted Study Notes database.
+
 ## Database Schema
 
 ### PostgreSQL
@@ -305,7 +351,8 @@ store. `configure-study-mcp` and `upgrade-tenant` do not arm this seed.
 **`memory_documents`** table:
 - `id` (UUID), `user_id` (TEXT), `agent_id` (UUID, nullable)
 - `path` (TEXT), `content` (TEXT)
-- `created_at`, `updated_at` (TIMESTAMPTZ), `metadata` (JSONB)
+- `created_at`, `updated_at` (TIMESTAMPTZ), `metadata` (JSONB),
+  `indexed_at` (TIMESTAMPTZ, nullable — index outbox marker; see Step 1)
 - Unique constraint: `UNIQUE NULLS NOT DISTINCT (user_id, agent_id, path)`;
   migration V21 fixed duplicate primary-scope paths when `agent_id` is `NULL`
 
@@ -332,12 +379,18 @@ Key migrations:
   for persisted Engine runtime state
 - `V26__study_notes_knowledge.sql`: partial PostgreSQL index for study-note
   provenance/topic metadata filters
+- `V27__memory_index_outbox.sql`: adds `memory_documents.indexed_at` (outbox
+  marker plus partial stale-index index) for the append->reindex two-phase
+  repair sweep
+- Legacy purge sweeps are code, not migrations: `purge_mission_index_chunks()`
+  (mission subtree/manifest chunks) and `repair_stale_index()` (stranded
+  content) with `engine/.runtime/**` exclusion pinned by V23
 
 ### libSQL
 
 Schema mirrors PostgreSQL with SQL dialect translation:
 - `UUID` -> `TEXT`
-- `TIMESTAMPTZ` -> `TEXT` (ISO-8601)
+- `TIMESTAMPTZ` -> `TEXT` (ISO-8601), including `indexed_at` (V27 mirror)
 - `JSONB` -> `TEXT` (JSON string)
 - `VECTOR` -> `BLOB` in the base schema; when `EMBEDDING_ENABLED=true` is present
   in the process environment, startup `ensure_vector_index()` rebuilds the
@@ -422,6 +475,10 @@ SearchConfig {
 | `KNOWLEDGE_SWEEP_INCLUDE_SHARED` | `true` | Sweep the shared herd scope as well as private scope |
 | `KNOWLEDGE_SEED_FROM_STUDY_MCP` | `false` | Arm the one-shot new-tenant checkout import |
 | `LW2STUDYMCP_HOME` | None | Checkout source required by the one-shot seed |
+| `KNOWLEDGE_SYNC_ENABLED` | `false` | Enable the additive checkout-backed refresh cadence |
+| `KNOWLEDGE_SYNC_CADENCE_HOURS` | `6` | Minimum hours between generation checks |
+| `KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN` | `500` | New-note cap per bounded pass |
+| `KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN` | `10485760` | Source byte cap per bounded pass |
 
 Sources: `ic/src/config/embeddings.rs`, `ic/src/config/search.rs`,
 `ic/src/config/knowledge.rs`
@@ -496,6 +553,8 @@ code guarantees these structural properties rather than fixed latency targets:
 | `ic/src/workspace/knowledge.rs` | Study-notes metadata, queries, private/shared scopes |
 | `ic/src/workspace/knowledge_sweep.rs` | Aging-note lifecycle sweep and stranded wire-note reap |
 | `ic/src/workspace/knowledge_seed.rs` | One-shot import from a synced lw2studymcp checkout |
+| `ic/src/workspace/knowledge_sync.rs` | Additive checkout-backed refresh cadence (generation manifest polling) |
+| `ic/scripts/mt-admin-lib/14-knowledge-sync.sh` | Host-side source publication scheduler and operator controls |
 | `ic/src/workspace/layer.rs` | Memory layers (scoped access, sensitivity classification) |
 | `ic/src/workspace/privacy.rs` | Privacy classifier trait for sensitive content detection |
 | `ic/src/tools/builtin/memory.rs` | Agent-facing memory search/read/write/tree tools |
@@ -512,3 +571,4 @@ code guarantees these structural properties rather than fixed latency targets:
 | `ic/migrations/V21__fix_null_agent_id_unique_constraint.sql` | Primary-scope path uniqueness fix |
 | `ic/migrations/V23__exclude_engine_runtime_from_search.sql` | Remove legacy Engine runtime search chunks |
 | `ic/migrations/V26__study_notes_knowledge.sql` | Study-notes knowledge layer |
+| `ic/migrations/V27__memory_index_outbox.sql` | `indexed_at` outbox + partial stale-index index |

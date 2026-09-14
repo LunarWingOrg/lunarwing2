@@ -278,6 +278,14 @@ fn has_excessive_repetition(s: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Wall-clock guard for the hostile-input ("must not hang") tests — NOT a
+    /// micro-benchmark. The original 100ms was scheduler-sensitive and flaked
+    /// on loaded shared runners (CI `rust-test-lib`: a 100KB deeply-nested
+    /// payload measured 123ms on a 90%-full runner). 2000ms is far above
+    /// scheduling noise yet still catches a genuine O(n^2)-class regression,
+    /// which would blow past seconds.
+    const HOSTILE_INPUT_BUDGET_MS: u128 = 2000;
+
     #[test]
     fn test_valid_input() {
         let validator = Validator::new();
@@ -486,7 +494,7 @@ mod tests {
             let _result = validator.validate(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "validate() took {}ms on 100KB input",
                 elapsed.as_millis()
             );
@@ -501,7 +509,7 @@ mod tests {
             let result = validator.validate(&payload);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "repetition check took {}ms on 100KB",
                 elapsed.as_millis()
             );
@@ -528,7 +536,7 @@ mod tests {
             let _result = validator.validate_tool_params(&value);
             let elapsed = start.elapsed();
             assert!(
-                elapsed.as_millis() < 100,
+                elapsed.as_millis() < HOSTILE_INPUT_BUDGET_MS,
                 "tool_params validation took {}ms on wide JSON",
                 elapsed.as_millis()
             );

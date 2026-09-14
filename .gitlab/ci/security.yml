@@ -21,7 +21,7 @@ secret-history:
   extends:
     - .gitleaks-job
     - .observational-job
-  stage: observe
+  stage: security
   needs: []
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule"'

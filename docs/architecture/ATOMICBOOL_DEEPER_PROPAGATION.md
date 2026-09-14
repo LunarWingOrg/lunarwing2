@@ -1,10 +1,10 @@
 # AtomicBool Deeper Propagation - Future Work
 
 **Date:** 2026-05-19  
-**Status:** Design Note - Not Implemented (revalidated 2026-08-25)
+**Status:** Design Note - Not Implemented (revalidated 2026-09-12, v2.1.2.0)
 **Related:** [RESPONSE_SUPPRESSION_IMPLEMENTATION.md](../internal/history/architecture/RESPONSE_SUPPRESSION_IMPLEMENTATION.md), [HANDLE_MESSAGE_FIX.md](../internal/history/architecture/HANDLE_MESSAGE_FIX.md)
 
-## Current State (revalidated 2026-08-25)
+## Current State (revalidated 2026-09-12, v2.1.2.0)
 
 `agent_loop.rs::run()` creates one `Arc<AtomicBool>` for the active inbound
 message and passes it to `handle_message()`. On the legacy ordinary-user-input
@@ -192,6 +192,8 @@ spawned work:
 - **2026-05-19:** Decision to defer deeper propagation, document for future revisit
 - **By 2026-07-28:** A 30-second hard-abort fallback bounds the top-level task's ghost-output window; deeper propagation remains deferred
 - **2026-08-25:** Re-audit found unguarded auto-compaction, `ChatDelegate`, approval-resume, and Engine V2 status paths; corrected this note without changing the defer decision
+- **2026-09-11 (v2.1.1.0):** re-verified symbol anchors (`HARD_KILL_GRACE_SECS` = 30 in `agent_loop.rs`; suppression flag still created per inbound message) — no scope change; defer decision stands
+- **2026-09-12 (v2.1.2.0):** re-verified symbol anchors again (`HARD_KILL_GRACE_SECS` still 30; suppression flag still created per inbound message) — no scope change; defer decision stands
 - **TBD:** When user feedback or telemetry indicates ghost notifications are a real problem
 
 ---

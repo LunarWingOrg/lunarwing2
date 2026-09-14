@@ -2,6 +2,11 @@
 
 Use these checks to validate the SSH paths described in [`../architecture/SSH_DELIVERY_MECHANISMS.md`](../architecture/SSH_DELIVERY_MECHANISMS.md). Setup and recovery procedures live in [`../ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md).
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** The four delivery paths
+(built-in `ssh`, `ssh_git`, WASM `ssh`, worker SSH), the `[[ssh.hosts]]`
+allowlist, and the WASM `ssh.allowed_hosts` capability were re-checked against
+the current tree; no changes were needed.
+
 All SSH tools accept a host from the configured `[[ssh.hosts]]` allowlist. Replace `<ssh-host>` below with that exact configured host value; an arbitrary IP or hostname is rejected even when it is reachable.
 
 ## Prerequisites

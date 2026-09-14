@@ -228,6 +228,67 @@ async fn aborting_agent_task_cancels_the_active_handler() {
 }
 
 #[tokio::test]
+async fn interrupt_overtaking_a_queued_prompt_cancels_it_and_acknowledges() {
+    let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(None);
+    lunarwing::bridge::reset_engine_state().await;
+
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(FirstPendingThenReplyLlm::new(Arc::clone(&dropped)));
+    let llm: Arc<dyn LlmProvider> = provider.clone();
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(llm)
+        .build()
+        .await;
+    let first_thread_id = Uuid::new_v4();
+    let queued_thread_id = Uuid::new_v4();
+
+    // User one's turn starts and parks on a pending LLM call.
+    rig.send_incoming(gateway_message_for_user(
+        "user-one",
+        first_thread_id,
+        "first",
+    ))
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), provider.first_started.notified())
+        .await
+        .expect("first provider call should start");
+
+    // A different user is a fairness barrier, so user two's prompt queues
+    // behind the active turn instead of running.
+    rig.send_incoming(gateway_message_for_user(
+        "user-two",
+        queued_thread_id,
+        "queued prompt",
+    ))
+    .await;
+
+    // The interrupt overtakes the queue. Goal #9 race: it used to answer
+    // "Nothing to interrupt." and the queued prompt ran anyway. Now the
+    // queued prompt is cancelled and the user gets an honest acknowledgement.
+    rig.send_incoming(gateway_message_for_user(
+        "user-two",
+        queued_thread_id,
+        "/interrupt",
+    ))
+    .await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(2)).await;
+    assert_eq!(responses[0].content, "Interrupted.");
+
+    // Release user one's turn; it completes normally.
+    provider.release_first.notify_one();
+    let responses = rig.wait_for_responses(2, Duration::from_secs(2)).await;
+    assert_eq!(responses[1].content, "late-first-response");
+
+    // The cancelled prompt never reached the provider.
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+    rig.shutdown_and_wait().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn queued_same_thread_message_starts_after_interrupt_acknowledgement() {
     let _env_lock = ENGINE_V2_ENV_LOCK.lock().await;
     let env = EngineV2EnvGuard::enable(None);

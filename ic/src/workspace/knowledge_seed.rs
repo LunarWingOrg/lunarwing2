@@ -72,15 +72,37 @@ pub struct KnowledgeSeedConfig {
     pub state_dir: PathBuf,
 }
 
-/// Summary of one seed pass.
+/// Limits for one additive checkout-import pass.
+#[derive(Debug, Clone, Copy)]
+pub struct KnowledgeImportLimits {
+    /// Maximum new notes written during one pass.
+    pub max_new_notes: u32,
+    /// Maximum source bytes represented by new notes during one pass.
+    pub max_new_bytes: usize,
+}
+
+impl KnowledgeImportLimits {
+    fn unlimited() -> Self {
+        Self {
+            max_new_notes: u32::MAX,
+            max_new_bytes: usize::MAX,
+        }
+    }
+}
+
+/// Summary of one seed or additive refresh pass.
 #[derive(Debug, Default)]
 pub struct KnowledgeSeedReport {
     /// Note files discovered under `agent-notes-by-agent/`.
     pub notes_found: u32,
     /// Notes newly written into the knowledge store.
     pub notes_seeded: u32,
+    /// Source bytes represented by newly written notes.
+    pub bytes_seeded: usize,
     /// Notes skipped because their workspace path already existed.
     pub notes_skipped_existing: u32,
+    /// Missing notes deferred by per-pass limits.
+    pub notes_deferred: u32,
     /// Notes that failed to parse or write (see logs).
     pub notes_failed: u32,
     /// Whether the pass was skipped (disabled, already seeded, no checkout).
@@ -115,8 +137,9 @@ struct NoteFile {
 
 /// Result of importing a single note.
 enum SeedOutcome {
-    Seeded,
+    Seeded(usize),
     AlreadyExists,
+    Deferred,
 }
 
 /// Run the one-shot seed when enabled and not yet completed.
@@ -144,31 +167,20 @@ pub async fn run_knowledge_seed_once(
             ..Default::default()
         };
     }
-    let notes_dir = config.source_home.join(NOTES_DIR);
-    if !notes_dir.is_dir() {
+
+    let report = run_additive_knowledge_import(
+        workspace,
+        &config.source_home,
+        KnowledgeImportLimits::unlimited(),
+    )
+    .await;
+    if report.skipped {
         tracing::warn!(
-            "knowledge seed: {} not found; will retry on next startup",
-            notes_dir.display()
+            "knowledge seed: source notes not found under {}; will retry on next startup",
+            config.source_home.display()
         );
-        return KnowledgeSeedReport {
-            skipped: true,
-            ..Default::default()
-        };
+        return report;
     }
-
-    let mut report = KnowledgeSeedReport::default();
-    for note in collect_note_files(&notes_dir) {
-        report.notes_found += 1;
-        match seed_note(workspace, &note).await {
-            Ok(SeedOutcome::Seeded) => report.notes_seeded += 1,
-            Ok(SeedOutcome::AlreadyExists) => report.notes_skipped_existing += 1,
-            Err(error) => {
-                report.notes_failed += 1;
-                tracing::warn!("knowledge seed: {}: {error}", note.path.display());
-            }
-        }
-    }
-
     if report.notes_failed > 0 {
         tracing::warn!(
             "knowledge seed: {} note(s) failed (recorded in {}); seed is complete and will not rerun",
@@ -180,10 +192,61 @@ pub async fn run_knowledge_seed_once(
     report
 }
 
+/// Add missing checkout notes without changing any existing workspace path.
+///
+/// This is shared by the first-boot seed and the periodic additive synchronizer.
+/// Per-pass limits count only new writes, so repeated bounded passes eventually
+/// traverse the entire source even when earlier paths already exist.
+pub async fn run_additive_knowledge_import(
+    workspace: &Workspace,
+    source_home: &Path,
+    limits: KnowledgeImportLimits,
+) -> KnowledgeSeedReport {
+    let notes_dir = source_home.join(NOTES_DIR);
+    if !notes_dir.is_dir() {
+        return KnowledgeSeedReport {
+            skipped: true,
+            ..Default::default()
+        };
+    }
+
+    let mut report = KnowledgeSeedReport::default();
+    for note in collect_note_files(&notes_dir) {
+        report.notes_found = report.notes_found.saturating_add(1);
+        let remaining_bytes = limits.max_new_bytes.saturating_sub(report.bytes_seeded);
+        let allow_new_note = report.notes_seeded < limits.max_new_notes;
+        match seed_note(workspace, &note, allow_new_note, remaining_bytes).await {
+            Ok(SeedOutcome::Seeded(bytes)) => {
+                report.notes_seeded = report.notes_seeded.saturating_add(1);
+                report.bytes_seeded = report.bytes_seeded.saturating_add(bytes);
+            }
+            Ok(SeedOutcome::AlreadyExists) => {
+                report.notes_skipped_existing = report.notes_skipped_existing.saturating_add(1);
+            }
+            Ok(SeedOutcome::Deferred) => {
+                report.notes_deferred = report.notes_deferred.saturating_add(1);
+            }
+            Err(error) => {
+                report.notes_failed = report.notes_failed.saturating_add(1);
+                tracing::warn!("knowledge import: {}: {error}", note.path.display());
+            }
+        }
+    }
+    report
+}
+
 /// Import one checkout note into the private knowledge store.
-async fn seed_note(workspace: &Workspace, note: &NoteFile) -> Result<SeedOutcome, String> {
+async fn seed_note(
+    workspace: &Workspace,
+    note: &NoteFile,
+    allow_new_note: bool,
+    remaining_bytes: usize,
+) -> Result<SeedOutcome, String> {
+    let path = note_path(&note.agent, &note.topic);
+    let existing = workspace.read_primary(&path).await.ok();
     let raw =
         std::fs::read_to_string(&note.path).map_err(|error| format!("read failed: {error}"))?;
+    let source_bytes = raw.len();
     let (metadata_json, markdown) = split_note(&raw)?;
     let (title, body) = extract_title(markdown, &note.topic);
     if title.len() > MAX_TITLE_BYTES {
@@ -196,25 +259,18 @@ async fn seed_note(workspace: &Workspace, note: &NoteFile) -> Result<SeedOutcome
         return Err(format!("body exceeds {MAX_CONTENT_BYTES} UTF-8 bytes"));
     }
     let meta = build_meta(&note.agent, &note.topic, &title, metadata_json.as_ref())?;
-
-    let path = note_path(&note.agent, &note.topic);
     let markdown = render_note_markdown(&title, &body);
-    if let Ok(existing) = workspace.read_primary(&path).await {
-        // A path that already exists is never overwritten. Two crash shapes
-        // of a previous seed pass are repaired instead:
+
+    if let Some(existing) = existing {
         if KnowledgeNoteMeta::from_metadata_json(&existing.metadata).is_some() {
             return Ok(SeedOutcome::AlreadyExists);
         }
         if existing.content == markdown {
-            // Stranded between the content and metadata commits: the exact
-            // seeded body without provenance metadata — repair metadata only.
             workspace
                 .set_document_metadata(&path, &meta.to_metadata_json())
                 .await
                 .map_err(|error| format!("metadata repair failed: {error}"))?;
         } else if existing.content.trim().is_empty() {
-            // Stranded between document creation and the content commit: an
-            // empty placeholder row — fill in body and metadata.
             workspace
                 .write(&path, &markdown)
                 .await
@@ -226,6 +282,9 @@ async fn seed_note(workspace: &Workspace, note: &NoteFile) -> Result<SeedOutcome
         }
         return Ok(SeedOutcome::AlreadyExists);
     }
+    if !allow_new_note || source_bytes > remaining_bytes {
+        return Ok(SeedOutcome::Deferred);
+    }
     workspace
         .write(&path, &markdown)
         .await
@@ -234,14 +293,14 @@ async fn seed_note(workspace: &Workspace, note: &NoteFile) -> Result<SeedOutcome
         .set_document_metadata(&path, &meta.to_metadata_json())
         .await
         .map_err(|error| format!("metadata write failed: {error}"))?;
-    Ok(SeedOutcome::Seeded)
+    Ok(SeedOutcome::Seeded(source_bytes))
 }
 
 /// Enumerate importable note files, sorted for a deterministic pass order.
 ///
 /// Mirrors the lw2studymcp slug rules (lowercase, `_` → `-`, collapsed
-/// dashes). Dotfiles, non-Markdown files, invalid slugs, and the reserved
-/// coordination wire namespace are skipped.
+/// dashes). Dotfiles, non-Markdown files, symlinks, invalid slugs, and the
+/// reserved coordination wire namespace are skipped.
 fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
     let mut notes = Vec::new();
     let wire_prefix = format!("{WIRE_AGENT_PREFIX}-");
@@ -249,10 +308,13 @@ fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
         return notes;
     };
     for agent_entry in agents.flatten() {
-        let agent_dir = agent_entry.path();
-        if !agent_dir.is_dir() {
+        let Ok(agent_type) = agent_entry.file_type() else {
+            continue;
+        };
+        if !agent_type.is_dir() {
             continue;
         }
+        let agent_dir = agent_entry.path();
         let Some(raw_agent) = agent_entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -268,6 +330,12 @@ fn collect_note_files(notes_dir: &Path) -> Vec<NoteFile> {
             continue;
         };
         for file_entry in files.flatten() {
+            let Ok(file_type) = file_entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let file_name = file_entry.file_name();
             let Some(stem) = file_name.to_str().and_then(|name| name.strip_suffix(".md")) else {
                 continue;
@@ -642,6 +710,19 @@ mod tests {
         write(".hidden-agent", "hidden.md");
         write("rarity", "not-a-note.txt");
         std::fs::write(notes.join("loose-file.md"), "# T\n").expect("loose");
+        #[cfg(unix)]
+        {
+            let outside = dir.path().join("outside.md");
+            std::fs::write(&outside, "# Outside\n\nsecret\n").expect("outside");
+            std::os::unix::fs::symlink(&outside, notes.join("rarity/link.md"))
+                .expect("file symlink");
+            let outside_agent = dir.path().join("outside-agent");
+            std::fs::create_dir(&outside_agent).expect("outside agent");
+            std::fs::write(outside_agent.join("linked.md"), "# Linked\n\nsecret\n")
+                .expect("linked note");
+            std::os::unix::fs::symlink(&outside_agent, notes.join("linked-agent"))
+                .expect("directory symlink");
+        }
 
         let found = collect_note_files(&notes);
         let mut paths: Vec<String> = found
@@ -848,6 +929,55 @@ mod tests {
                 .expect("operator doc");
             assert!(operator.content.contains("operator edits"));
             assert!(KnowledgeNoteMeta::from_metadata_json(&operator.metadata).is_none());
+        }
+
+        #[tokio::test]
+        async fn additive_import_respects_limits_and_never_overwrites() {
+            let (db, _db_dir) = crate::testing::test_db().await;
+            let workspace = Workspace::new_with_db("alice", db);
+            let fixture = tempfile::tempdir().expect("fixture");
+            let notes_dir = fixture.path().join(NOTES_DIR);
+            for topic in ["a.md", "b.md", "c.md"] {
+                write_note(
+                    &notes_dir,
+                    "rarity",
+                    topic,
+                    &format!("# {topic}\n\nsource body\n"),
+                );
+            }
+            let limits = KnowledgeImportLimits {
+                max_new_notes: 1,
+                max_new_bytes: 1_024,
+            };
+
+            let first = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(first.notes_seeded, 1);
+            assert_eq!(first.notes_deferred, 2);
+            workspace
+                .write("study-notes/rarity/a.md", "# Local\n\noperator edit\n")
+                .await
+                .expect("operator edit");
+            write_note(
+                &notes_dir,
+                "rarity",
+                "a.md",
+                "# Upstream changed\n\nnew source body\n",
+            );
+
+            let second = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(second.notes_seeded, 1);
+            assert_eq!(second.notes_skipped_existing, 1);
+            assert_eq!(second.notes_deferred, 1);
+            let third = run_additive_knowledge_import(&workspace, fixture.path(), limits).await;
+            assert_eq!(third.notes_seeded, 1);
+            assert_eq!(third.notes_skipped_existing, 2);
+            assert_eq!(third.notes_deferred, 0);
+
+            let local = workspace
+                .read_primary("study-notes/rarity/a.md")
+                .await
+                .expect("local note");
+            assert!(local.content.contains("operator edit"));
         }
 
         #[tokio::test]

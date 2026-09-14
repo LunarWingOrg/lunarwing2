@@ -133,8 +133,7 @@ _deregister_worker_unit() {
 # ── External-worker config.toml generation ────────────────────────────────────
 #
 # External workers speak the lunarwing-agent-v1 WebSocket
-# protocol (legacy alias ironclaw-agent-v1 is still accepted for back-compat)
-# and are routed by the agent's `create_job(mode: "<worker>")` tool.
+# protocol and are routed by the agent's `create_job(mode: "<worker>")` tool.
 # The daemon discovers them from `[[sandbox.external_workers]]` blocks in
 # `config.toml` under the tenant's LUNARWING_BASE_DIR (the state dir). Without
 # this block the agent has nothing to route `create_job(mode: "<worker>")` to
@@ -867,6 +866,32 @@ arm_tenant_knowledge_seed() {  # <tenant>
   chmod 600 "$env_path"
 }
 
+set_tenant_knowledge_sync() {  # <tenant> <true|false>
+  local name="$1" enabled="$2" env_path
+  name="$(sanitize_name "$name")"
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path"
+  [[ -n "$(_env_existing "$env_path" LW2STUDYMCP_HOME)" ]] \
+    || die "configure Study Notes MCP before enabling knowledge sync for '$name'"
+  case "$enabled" in
+    true|false) : ;;
+    *) die "knowledge sync state must be true or false" ;;
+  esac
+  if [[ "$enabled" == "true" ]]; then
+    # Install the root-owned source scheduler before committing the tenant
+    # opt-in, so a failed scheduler install cannot leave a silently static source.
+    ensure_knowledge_source_scheduler
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_CADENCE_HOURS 6
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN 500
+    [[ -n "$(_env_existing "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)" ]] \
+      || _env_set "$env_path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN 10485760
+  fi
+  _env_set "$env_path" KNOWLEDGE_SYNC_ENABLED "$enabled"
+  say "additive knowledge sync for tenant '$name': $enabled"
+}
+
 provision_tenant_study_mcp() {  # <tenant> [checkout home]
   # Auto-configuration used by add-tenant --with-study-mcp: always sync the
   # shared checkout to the latest upstream first, then wire it in read-only
@@ -879,6 +904,7 @@ provision_tenant_study_mcp() {  # <tenant> [checkout home]
     sync_study_notes_checkout "$home"
     configure_study_mcp "$name" "$home" false ""
     arm_tenant_knowledge_seed "$name"
+    set_tenant_knowledge_sync "$name" true
   )
 }
 
@@ -1364,19 +1390,21 @@ start_tenant_pebble() {
   ensure_init_system
   if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
     _wait_user_manager "$name"
-    local quadlet_file
+    local quadlet_file pebble_service
+    pebble_service="lunarwing-pebble-${name}.service"
     quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-pebble-${name}.container"
     render_worker_quadlet "$name" pebble 8443
     _systemctl_user "$name" daemon-reload 2>/dev/null || true
     if _container_config_changed "$name" "lunarwing-pebble-${name}" "$quadlet_file"; then
-      _recreate_quadlet_container "$name" "lunarwing-pebble-${name}.service" "lunarwing-pebble-${name}"
+      _recreate_quadlet_container "$name" "$pebble_service" "lunarwing-pebble-${name}"
     fi
-    if _systemctl_user "$name" start "lunarwing-pebble-${name}.service" >/dev/null 2>&1; then
+    _systemctl_user "$name" reset-failed "$pebble_service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$pebble_service" >/dev/null 2>&1; then
       _store_container_hash "$name" "lunarwing-pebble-${name}" "$quadlet_file"
-      say "pebble worker ready via quadlet (lunarwing-pebble-${name}.service, WSS port $wss_port)"
+      say "pebble worker ready via quadlet ($pebble_service, WSS port $wss_port)"
     else
-      say "WARNING: lunarwing-pebble-${name}.service failed to start" >&2
-      _systemctl_user "$name" status "lunarwing-pebble-${name}.service" --no-pager >&2 || true
+      say "WARNING: $pebble_service failed to start" >&2
+      _systemctl_user "$name" status "$pebble_service" --no-pager >&2 || true
     fi
     return 0
   fi
@@ -1483,6 +1511,12 @@ stop_tenant_pebble() {
     _deregister_babysitter "$container_name"
     rc-service "$container_name" stop >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"
+  elif [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] \
+      && podman_supports_quadlet; then
+    if _systemctl_user "$name" stop "${container_name}.service" >/dev/null 2>&1 \
+        || _ctr "$name" stop "$container_name" >/dev/null 2>&1; then
+      say "pebble worker stopped ($container_name)"
+    fi
   elif _ctr "$name" inspect "$container_name" &>/dev/null; then
     _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
     say "pebble worker stopped ($container_name)"

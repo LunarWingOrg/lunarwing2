@@ -111,25 +111,73 @@ study_notes_write_enabled() {  # <raw boolean>
   esac
 }
 
+publish_study_notes_generation() {  # <checkout home>
+  local home="$1" revision manifest tmp published_at
+  validate_study_notes_home "$home"
+  revision="$(git -C "$home" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || die "Study Notes checkout has no valid HEAD commit: $home"
+  [[ "$revision" =~ ^[0-9a-fA-F]{7,128}$ ]] \
+    || die "Study Notes checkout returned an invalid revision: $home"
+  published_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  manifest="$home/.git/lunarwing-study-notes-generation.json"
+  tmp="$home/.git/.lunarwing-study-notes-generation.$$.tmp"
+  ( umask 022
+    printf '{"schema_version":1,"source_revision":"%s","published_at":"%s"}\n' \
+      "$revision" "$published_at" > "$tmp"
+  ) || die "failed to stage Study Notes generation manifest: $tmp"
+  chmod 0644 "$tmp"
+  mv -fT -- "$tmp" "$manifest" \
+    || die "failed to publish Study Notes generation manifest: $manifest"
+  say "published Study Notes generation: $revision"
+}
+
 sync_study_notes_checkout() {  # <checkout home>
   # Clone the shared lw2studymcp checkout when missing, or fast-forward an
   # existing clean git checkout to the latest upstream. A non-git directory or
   # a dirty checkout is never modified — the operator must repair it by hand.
-  local home="$1" parent
+  local home="$1" parent manifest last_good
   validate_study_notes_path "$home" "Study Notes home"
   require_cmd git
   parent="$(dirname -- "$home")"
+  manifest="$home/.git/lunarwing-study-notes-generation.json"
+  last_good="$home/.git/.lunarwing-study-notes-generation.last-good"
   if [[ ! -d "$parent" ]]; then
     install -d -m 0755 -- "$parent" \
       || die "failed to create Study Notes parent directory: $parent"
   fi
-  # Serialize concurrent tenant adds racing to clone/update the shared checkout.
+  # Serialize concurrent updates and invalidate the publication barrier before
+  # mutating files. A tenant scan spanning an update therefore discards its
+  # pass when the before/after manifest check observes the missing/new marker.
   (
     flock -x 200
+    # Keep the current manifest aside so a transient sync failure (e.g. a
+    # network blip during git pull) can restore the last-good generation
+    # instead of leaving tenants without any published one. Restoration only
+    # happens while HEAD still matches the recorded revision: a manifest
+    # claiming the old revision over moved-forward content would defeat the
+    # before/after scan barrier, so a partial move keeps the barrier down.
+    cp -f -- "$manifest" "$last_good" 2>/dev/null || true
+    restore_last_good_generation() {
+      local revision recorded
+      [[ -f "$last_good" ]] || return 0
+      revision="$(git -C "$home" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)"
+      recorded="$(jq -r '.source_revision // empty' "$last_good" 2>/dev/null || true)"
+      if [[ -z "$revision" || "$revision" != "$recorded" ]]; then
+        rm -f -- "$last_good"
+        say "WARNING: Study Notes sync moved the checkout; last-good generation stays invalidated"
+        return 0
+      fi
+      if mv -f -- "$last_good" "$manifest"; then
+        say "retained last-good Study Notes generation after a failed sync"
+      else
+        say "WARNING: failed to restore the last-good Study Notes generation manifest"
+      fi
+    }
+    rm -f -- "$manifest"
     if [[ ! -e "$home" ]]; then
       say "cloning Study Notes MCP checkout: $STUDY_NOTES_REPO -> $home"
       git clone --quiet "$STUDY_NOTES_REPO" "$home" \
-        || die "Study Notes clone failed: $STUDY_NOTES_REPO"
+        || { restore_last_good_generation; die "Study Notes clone failed: $STUDY_NOTES_REPO"; }
     else
       [[ -d "$home" ]] || die "Study Notes home is not a directory: $home"
       [[ -d "$home/.git" ]] \
@@ -137,9 +185,13 @@ sync_study_notes_checkout() {  # <checkout home>
       [[ -z "$(git -C "$home" status --porcelain 2>/dev/null)" ]] \
         || die "Study Notes checkout has local changes; refusing to sync: $home"
       say "syncing Study Notes MCP checkout to latest upstream: $home"
-      git -C "$home" pull --ff-only --quiet \
-        || die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
+      git -C "$home" pull --ff-only --quiet || {
+        restore_last_good_generation
+        die "Study Notes checkout could not fast-forward to latest: $home (repair or remove it)"
+      }
     fi
+    rm -f -- "$last_good"
+    publish_study_notes_generation "$home"
   ) 200>"$parent/.study-notes-sync.lock"
 }
 
@@ -590,6 +642,7 @@ write_tenant_lunarwing_env() {
   local coord_enabled coord_agent_id coord_agent_aliases coord_responder_roster coord_channels coord_admin_users coord_admin_token coord_admin_port
   local coord_knowledge_share coord_knowledge_publish coord_knowledge_publishers coord_knowledge_max_per_hour coord_knowledge_global_max_per_hour coord_knowledge_min_chars
   local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
+  local knowledge_sync_enabled knowledge_sync_cadence knowledge_sync_max_records knowledge_sync_max_bytes
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
@@ -631,6 +684,10 @@ write_tenant_lunarwing_env() {
   # One-shot knowledge seed: carry the flag only when it already exists (set
   # solely on the add-tenant path), so upgraded pre-seed tenants stay unarmed.
   knowledge_seed_flag="$(_env_existing "$path" KNOWLEDGE_SEED_FROM_STUDY_MCP)"
+  knowledge_sync_enabled="$(_env_existing "$path" KNOWLEDGE_SYNC_ENABLED)"
+  knowledge_sync_cadence="$(_env_existing "$path" KNOWLEDGE_SYNC_CADENCE_HOURS)"
+  knowledge_sync_max_records="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN)"
+  knowledge_sync_max_bytes="$(_env_existing "$path" KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN)"
   local vision_mode vision_external_url vision_token_existing
   vision_mode="$(tenant_vision_mode "$name")"
   vision_external_url="$(tenant_vision_external_url "$name")"
@@ -818,8 +875,10 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # Engine V2 (parallel execution path with streaming, gates, missions).
 # ENGINE_V2_CHANNELS is the comma-separated allowlist of non-gateway channels
 # routed through Engine V2 (eligible: xmpp, weechat, darkirc) — on by default
-# for all tenants; an existing value is preserved on re-render. Set
-# ENGINE_V2=false or ENGINE_V2_CHANNELS=none to opt out durably.
+# for all tenants; an existing value is preserved on re-render. There is no
+# opt-out value: an entry like "none" is an ignored unknown entry, and the
+# gateway keeps routing while ENGINE_V2=true. ENGINE_V2=false is the only
+# durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
 
@@ -881,6 +940,14 @@ ENVEOF
       || printf 'LW2STUDYMCP_ALLOW_WRITE=%s\n' "$study_notes_allow_write" >> "$path"
     [[ -z "$knowledge_seed_flag" ]] \
       || printf 'KNOWLEDGE_SEED_FROM_STUDY_MCP=%s\n' "$knowledge_seed_flag" >> "$path"
+    [[ -z "$knowledge_sync_enabled" ]] \
+      || printf 'KNOWLEDGE_SYNC_ENABLED=%s\n' "$knowledge_sync_enabled" >> "$path"
+    [[ -z "$knowledge_sync_cadence" ]] \
+      || printf 'KNOWLEDGE_SYNC_CADENCE_HOURS=%s\n' "$knowledge_sync_cadence" >> "$path"
+    [[ -z "$knowledge_sync_max_records" ]] \
+      || printf 'KNOWLEDGE_SYNC_MAX_RECORDS_PER_RUN=%s\n' "$knowledge_sync_max_records" >> "$path"
+    [[ -z "$knowledge_sync_max_bytes" ]] \
+      || printf 'KNOWLEDGE_SYNC_MAX_BYTES_PER_RUN=%s\n' "$knowledge_sync_max_bytes" >> "$path"
   fi
   chown "$name:$name" "$path"
   say "wrote: $path"

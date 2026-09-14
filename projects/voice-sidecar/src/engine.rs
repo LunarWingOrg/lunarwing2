@@ -215,6 +215,11 @@ fn load_stt(config: &Config) -> Result<Option<Arc<Mutex<SttRecognizer>>>, Engine
             SttRecognizer::Whisper(recognizer)
         }
         crate::config::SttEngineKind::Parakeet => {
+            // Parakeet NeMo-2.x exports (e.g. parakeet-tdt-0.6b-v2) must go
+            // through sherpa-onnx's nemo_transducer impl: their decoders carry
+            // NeMo-2.x input names (targets/states.1/...) instead of the
+            // generic transducer x/h/c, and only that impl feeds them
+            // correctly. The generic impl aborts mid-inference.
             let recognizer = sherpa_rs::transducer::TransducerRecognizer::new(
                 sherpa_rs::transducer::TransducerConfig {
                     encoder: display_path(&config.stt_encoder),
@@ -223,6 +228,7 @@ fn load_stt(config: &Config) -> Result<Option<Arc<Mutex<SttRecognizer>>>, Engine
                     tokens: display_path(&config.stt_tokens),
                     num_threads: config.num_threads,
                     provider: Some("cpu".into()),
+                    model_type: String::from("nemo_transducer"),
                     ..Default::default()
                 },
             )

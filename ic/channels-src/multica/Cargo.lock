@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "multica-channel"
-version = "2.1.0"
+version = "2.1.2"
 dependencies = [
  "serde",
  "serde_json",

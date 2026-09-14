@@ -27,6 +27,7 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "memory_search",
     "memory_read",
     "memory_tree",
+    "attachment_store",
     "time",
     "echo",
     "json",
@@ -155,6 +156,7 @@ mod tests {
             make_tool("memory_search"),
             make_tool("memory_read"),
             make_tool("memory_tree"),
+            make_tool("attachment_store"),
             make_tool("time"),
             make_tool("echo"),
             make_tool("json"),
@@ -194,6 +196,7 @@ mod tests {
         assert!(!kept_names.contains(&"memory_write"));
         assert!(kept_names.contains(&"memory_search"));
         assert!(kept_names.contains(&"memory_read"));
+        assert!(kept_names.contains(&"attachment_store"));
         assert!(kept_names.contains(&"time"));
         assert_eq!(result.min_trust, SkillTrust::Installed);
     }

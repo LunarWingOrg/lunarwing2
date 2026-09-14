@@ -48,6 +48,7 @@ pub mod hygiene;
 pub mod knowledge;
 pub mod knowledge_seed;
 pub mod knowledge_sweep;
+pub mod knowledge_sync;
 pub mod layer;
 pub mod privacy;
 #[cfg(feature = "postgres")]
@@ -57,8 +58,8 @@ mod search;
 pub use chunker::{ChunkConfig, chunk_document};
 pub use document::{
     DocumentVersion, IDENTITY_PATHS, MemoryChunk, MemoryDocument, VersionSummary, WorkspaceEntry,
-    WorkspaceFileContent, is_engine_runtime_path, is_identity_path, is_search_indexable_path,
-    merge_workspace_entries, paths,
+    WorkspaceFileContent, is_engine_internal_path, is_engine_runtime_path, is_identity_path,
+    is_mission_path, is_search_indexable_path, merge_workspace_entries, paths,
 };
 pub use embedding_cache::{CachedEmbeddingProvider, EmbeddingCacheConfig};
 pub use embeddings::{
@@ -125,6 +126,17 @@ fn is_system_prompt_file(path: &str) -> bool {
         .iter()
         .any(|p| path.eq_ignore_ascii_case(p))
         || path.to_ascii_lowercase().starts_with(LOREBOOK_DIR_PREFIX)
+        || is_daily_log_file(path)
+}
+
+/// Daily logs are LLM-appended files injected into every system prompt
+/// ("Today's Notes" / "Yesterday's Notes"), which makes them a prompt-write
+/// surface: they must get the same injection scan as the other
+/// prompt-visible files (WI#132 item 1, daily-log scan gap — the incident's
+/// contamination persisted via dailies).
+fn is_daily_log_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.starts_with("daily/") && lower.ends_with(".md")
 }
 
 fn is_lorebook_json_file(path: &str) -> bool {
@@ -490,6 +502,44 @@ impl WorkspaceStorage {
             }
             Self::Db(db) => {
                 db.get_chunks_without_embeddings(user_id, agent_id, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn list_stale_index_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.list_stale_index_documents(user_id, agent_id, limit)
+                    .await
+            }
+            Self::Db(db) => {
+                db.list_stale_index_documents(user_id, agent_id, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        match self {
+            #[cfg(feature = "postgres")]
+            Self::Repo(repo) => {
+                repo.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
+                    .await
+            }
+            Self::Db(db) => {
+                db.purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
                     .await
             }
         }
@@ -957,7 +1007,7 @@ impl Workspace {
         }
         validate_prompt_write(&path, content)?;
         let prompt_visible = is_system_prompt_file(&path);
-        let document_id = {
+        let (document_id, pre_append_content) = {
             let doc = self
                 .storage
                 .get_or_create_document_by_path(&self.user_id, self.agent_id, &path)
@@ -966,7 +1016,7 @@ impl Workspace {
                 let candidate = appended_content(&doc.content, content, "\n");
                 validate_prompt_write(&path, &candidate)?;
             }
-            doc.id
+            (doc.id, doc.content)
         };
 
         {
@@ -975,12 +1025,54 @@ impl Workspace {
                 .append_document(document_id, content, "\n")
                 .await?;
             // Catch injection patterns split across prompt-visible appends.
-            if prompt_visible {
-                validate_prompt_write(&path, &new_content)?;
+            if prompt_visible && let Err(e) = validate_prompt_write(&path, &new_content) {
+                {
+                    // The content committed before the scan could complete.
+                    // Compensate: restore the pre-append content and rebuild
+                    // the chunk projection atomically so rejected content
+                    // does not persist. A concurrent append landing inside
+                    // this window is lost — accepted: prompt-visible files
+                    // are low-frequency and injection removal wins.
+                    let prepared = self
+                        .prepare_chunks_for_path(&path, &pre_append_content)
+                        .await;
+                    if let Err(restore_err) = self
+                        .storage
+                        .update_document_and_replace_chunks(
+                            document_id,
+                            &pre_append_content,
+                            &prepared,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %path,
+                            error = %restore_err,
+                            "workspace append rejected post-commit but compensation failed; \
+                             purged content may remain"
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %path,
+                            "workspace append rejected post-commit; content reverted"
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
 
-        self.reindex_document(document_id).await?;
+        // The append is durable at this point. Reindex failure is a degraded
+        // search projection, not a lost write: report it, mark it for the
+        // repair sweep, and return Ok so callers (or the LLM retrying a tool
+        // call) do not duplicate already-committed content.
+        if let Err(e) = self.reindex_document(document_id).await {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "workspace append committed but re-index failed; repair sweep will heal"
+            );
+        }
         Ok(())
     }
 
@@ -1113,7 +1205,7 @@ impl Workspace {
         }
         validate_prompt_write(&path, content)?;
         let prompt_visible = is_system_prompt_file(&path);
-        let document_id = {
+        let (document_id, pre_append_content) = {
             let doc = self
                 .storage
                 .get_or_create_document_by_path(&scope, self.agent_id, &path)
@@ -1122,18 +1214,53 @@ impl Workspace {
                 let candidate = appended_content(&doc.content, content, "\n\n");
                 validate_prompt_write(&path, &candidate)?;
             }
-            doc.id
+            (doc.id, doc.content)
         };
         {
             let new_content = self
                 .storage
                 .append_document(document_id, content, "\n\n")
                 .await?;
-            if prompt_visible {
-                validate_prompt_write(&path, &new_content)?;
+            if prompt_visible && let Err(e) = validate_prompt_write(&path, &new_content) {
+                {
+                    // Content committed before the scan completed — revert to
+                    // the pre-append content (same tradeoff as `append`).
+                    let prepared = self
+                        .prepare_chunks_for_path(&path, &pre_append_content)
+                        .await;
+                    if let Err(restore_err) = self
+                        .storage
+                        .update_document_and_replace_chunks(
+                            document_id,
+                            &pre_append_content,
+                            &prepared,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            path = %path,
+                            error = %restore_err,
+                            "layer append rejected post-commit but compensation failed; \
+                             purged content may remain"
+                        );
+                    } else {
+                        tracing::warn!(
+                            path = %path,
+                            "layer append rejected post-commit; content reverted"
+                        );
+                    }
+                    return Err(e);
+                }
             }
         }
-        self.reindex_document(document_id).await?;
+        // Content is durable; a failed reindex is healed by the repair sweep.
+        if let Err(e) = self.reindex_document(document_id).await {
+            tracing::warn!(
+                path = %path,
+                error = %e,
+                "layer append committed but re-index failed; repair sweep will heal"
+            );
+        }
         let document = self.storage.get_document_by_id(document_id).await?;
         Ok(WriteResult {
             document,
@@ -1395,7 +1522,13 @@ impl Workspace {
             format!("{}\n\n{}", doc.content, entry)
         };
         self.storage.update_document(doc.id, &new_content).await?;
-        self.reindex_document(doc.id).await?;
+        // Content is durable; a failed reindex is healed by the repair sweep.
+        if let Err(e) = self.reindex_document(doc.id).await {
+            tracing::warn!(
+                error = %e,
+                "memory append committed but re-index failed; repair sweep will heal"
+            );
+        }
         Ok(())
     }
 
@@ -2016,6 +2149,83 @@ impl Workspace {
         Ok(())
     }
 
+    /// Heal documents whose chunk projection is stale (content committed but
+    /// the follow-up reindex never ran — crash/kill between the two phases of
+    /// the append path). Chunk-driven search and listings then under-report
+    /// or hide content that reads still serve in full (WI#132 hardening
+    /// item 2, the Sep-2026 "0 vs 6671" memory-index desync).
+    ///
+    /// Bounded per call (`limit`); newest-first so freshly stranded documents
+    /// heal first. Returns the number of documents re-indexed. Documents on
+    /// non-indexable paths are filtered out by the storage query itself.
+    pub async fn repair_stale_index(&self, limit: usize) -> Result<usize, WorkspaceError> {
+        let stale_ids = self
+            .storage
+            .list_stale_index_documents(&self.user_id, self.agent_id, limit)
+            .await?;
+
+        let mut repaired = 0usize;
+        for id in stale_ids {
+            match self.reindex_document(id).await {
+                Ok(()) => repaired += 1,
+                Err(e) => {
+                    // One bad document must not block the sweep; leave it
+                    // stale (it stays marked for the next pass).
+                    tracing::warn!(
+                        document_id = %id,
+                        error = %e,
+                        "repair_stale_index: failed to re-index stranded document"
+                    );
+                }
+            }
+        }
+
+        if repaired > 0 {
+            tracing::info!(
+                repaired,
+                "repair_stale_index: healed stale memory index projections"
+            );
+        }
+        Ok(repaired)
+    }
+
+    /// Purge legacy search chunks for mission-family documents.
+    ///
+    /// Mission `mission.json` files became non-indexable (WI#135 hardening),
+    /// and the whole `engine/projects/{p}/missions/**` subtree plus the
+    /// tenant-wide `missions.json` listing followed (WI#136 adjacency fix),
+    /// but chunks created before those fixes persist in `memory_chunks` and
+    /// remain searchable. This idempotent sweep deletes them; on a clean
+    /// system it is a no-op. Runs at boot BEFORE the embedding backfill so
+    /// freed budget is not spent re-embedding chunks about to be deleted.
+    ///
+    /// The SQL `LIKE` patterns intentionally mirror `is_mission_path`'s
+    /// exclusion set. `%` matches across `/` in both backends, so the
+    /// subtree pattern can over-match a hypothetical multi-segment project
+    /// path; those documents are engine-internal either way (provenance
+    /// labeled), so over-purging is acceptable.
+    pub async fn purge_mission_index_chunks(&self) -> Result<u64, WorkspaceError> {
+        let mut purged = 0u64;
+        for pattern in [
+            "engine/projects/%/missions/%",      // missions/ subtree, any suffix
+            "engine/projects/%/missions",        // bare missions dir document
+            "engine/projects/%/missions.json",   // tenant-wide listing
+            "engine/projects/%/missions.json.%", // suffixed listing variants
+        ] {
+            purged += self
+                .storage
+                .purge_chunks_for_path_pattern(&self.user_id, self.agent_id, pattern)
+                .await?;
+        }
+        if purged > 0 {
+            tracing::info!(
+                purged,
+                "purge_mission_index_chunks: removed legacy mission search chunks"
+            );
+        }
+        Ok(purged)
+    }
+
     // ==================== Seeding ====================
 
     /// Seed any missing core identity files in the workspace.
@@ -2383,7 +2593,9 @@ mod tests {
             ("lorebooks/fantasy.json", true),
             ("lorebooks/WORLD.JSON", true),
             ("notes/foo.md", false),
-            ("daily/2024-01-01.md", false),
+            ("daily/2024-01-01.md", true),
+            ("daily/2024-01-01.txt", false),
+            ("dailylogs/2024-01-01.md", false),
             ("projects/readme.md", false),
         ];
         for (path, expected) in cases {
@@ -2554,6 +2766,143 @@ mod runtime_index_tests {
                 .content
                 .contains(appended_term)
         );
+    }
+
+    #[tokio::test]
+    async fn mission_goals_persist_without_entering_search() {
+        let (workspace, _temp_dir) = create_test_workspace().await;
+        let shared_term = "missiongoalsentinel";
+
+        workspace
+            .write("notes/searchable.md", &format!("searchable {shared_term}"))
+            .await
+            .expect("write searchable document");
+
+        // WI#136 adjacency fix: the whole missions/ subtree (any suffix) plus
+        // the tenant-wide missions.json listing must stay un-indexed.
+        let mission_family_paths = [
+            "engine/projects/foo/missions/canary-alpha-xq7/mission.json",
+            "engine/projects/foo/missions/canary-adj/mission.json.bak",
+            "engine/projects/foo/missions/canary-adj/other.json",
+            "engine/projects/foo/missions.json",
+        ];
+        for path in mission_family_paths {
+            workspace
+                .write(path, &format!(r#"{{"goal":"{shared_term}","steps":[]}}"#))
+                .await
+                .expect("write mission-family document");
+
+            let stored = workspace
+                .read(path)
+                .await
+                .expect("read mission-family document");
+            assert!(
+                stored.content.contains(shared_term),
+                "mission-family documents must remain stored and servable: {path}"
+            );
+            assert!(
+                workspace
+                    .list_all()
+                    .await
+                    .expect("list workspace")
+                    .contains(&path.to_string()),
+                "mission-family documents must remain listed: {path}"
+            );
+        }
+
+        let results = workspace
+            .search(shared_term, 10)
+            .await
+            .expect("search workspace");
+        assert_eq!(results.len(), 1, "mission goals must never be searchable");
+        assert_eq!(results[0].document_path, "notes/searchable.md");
+    }
+
+    #[tokio::test]
+    async fn purge_mission_index_chunks_removes_legacy_chunks_and_is_idempotent() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("purge-user", db.clone());
+        let legacy_mission_path = "engine/projects/foo/missions/bar/mission.json";
+        // WI#136 adjacency bypass artifacts: exact-basename purge left these
+        // indexed even after the mission.json de-index.
+        let adjacent_bak_path = "engine/projects/foo/missions/canary-adj/mission.json.bak";
+        let adjacent_other_path = "engine/projects/foo/missions/canary-adj/other.json";
+        let missions_listing_path = "engine/projects/foo/missions.json";
+        let project_path = "engine/projects/foo/project.json";
+        let sentinel = "legacymissionchunksentinel";
+
+        // Simulate pre-fix state: a mission goal document that DID get chunks.
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            let doc = db
+                .get_or_create_document_by_path("purge-user", None, legacy_path)
+                .await
+                .expect("create legacy mission-family doc");
+            db.update_document(doc.id, &format!(r#"{{"goal":"{sentinel}"}}"#))
+                .await
+                .expect("write legacy mission content");
+            db.replace_chunks(doc.id, &[(0, format!("goal {sentinel}"), None)])
+                .await
+                .expect("insert legacy mission chunks");
+        }
+
+        // Positive control: project.json chunks must survive the purge.
+        workspace
+            .write(project_path, &format!(r#"{{"name":"{sentinel}"}}"#))
+            .await
+            .expect("write project doc");
+
+        let before = workspace
+            .search(sentinel, 10)
+            .await
+            .expect("search before purge");
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            assert!(
+                before.iter().any(|r| r.document_path == legacy_path),
+                "legacy mission-family chunks must be searchable before the purge: {before:?}"
+            );
+        }
+
+        let purged = workspace
+            .purge_mission_index_chunks()
+            .await
+            .expect("first purge");
+        assert!(purged >= 4, "first purge must remove legacy chunks");
+
+        let after = workspace
+            .search(sentinel, 10)
+            .await
+            .expect("search after purge");
+        for legacy_path in [
+            legacy_mission_path,
+            adjacent_bak_path,
+            adjacent_other_path,
+            missions_listing_path,
+        ] {
+            assert!(
+                after.iter().all(|r| r.document_path != legacy_path),
+                "mission-family path must be gone from search after purge: {legacy_path}"
+            );
+        }
+        assert!(
+            after.iter().any(|r| r.document_path == project_path),
+            "project.json chunks must survive the purge: {after:?}"
+        );
+
+        let second = workspace
+            .purge_mission_index_chunks()
+            .await
+            .expect("second purge");
+        assert_eq!(second, 0, "repeat purge must be a no-op");
     }
 
     #[tokio::test]
@@ -2884,6 +3233,167 @@ mod runtime_index_tests {
         let entries = crate::lorebook::load_lorebook_entries(&workspace).await;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "Safe legacy lore.");
+    }
+    // ==================== WI#132 item 2: index outbox + repair ====================
+
+    #[tokio::test]
+    async fn append_marks_index_projection_stale_then_fresh() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("outbox-user", db.clone());
+
+        let doc = db
+            .get_or_create_document_by_path("outbox-user", None, "notes/outbox.md")
+            .await
+            .expect("create doc");
+
+        // Crash simulation: commit content via append_document alone — this
+        // is exactly the state left when the process dies between the append
+        // and its reindex (indexed_at NULL, content non-empty, zero chunks).
+        db.append_document(doc.id, "outboxhealsentinel", "\n")
+            .await
+            .expect("append content");
+
+        let stale = db
+            .list_stale_index_documents("outbox-user", None, 10)
+            .await
+            .expect("list stale");
+        assert_eq!(stale, vec![doc.id], "appended content must be marked stale");
+
+        let results = workspace
+            .search("outboxhealsentinel", 10)
+            .await
+            .expect("search before repair");
+        assert!(results.is_empty(), "stranded doc is invisible to search");
+
+        let repaired = workspace
+            .repair_stale_index(10)
+            .await
+            .expect("repair sweep");
+        assert_eq!(repaired, 1);
+
+        let stale_after = db
+            .list_stale_index_documents("outbox-user", None, 10)
+            .await
+            .expect("list stale after repair");
+        assert!(
+            stale_after.is_empty(),
+            "repair must clear the outbox marker"
+        );
+
+        let results = workspace
+            .search("outboxhealsentinel", 10)
+            .await
+            .expect("search after repair");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].document_path, "notes/outbox.md");
+    }
+
+    #[tokio::test]
+    async fn successful_append_clears_stale_marker() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("fresh-user", db.clone());
+
+        workspace
+            .append("notes/fresh.md", "freshappendsentinel")
+            .await
+            .expect("append");
+
+        let stale = db
+            .list_stale_index_documents("fresh-user", None, 10)
+            .await
+            .expect("list stale");
+        assert!(
+            stale.is_empty(),
+            "a completed append (content + reindex) must not be stale"
+        );
+        let results = workspace
+            .search("freshappendsentinel", 10)
+            .await
+            .expect("search");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn repair_sweep_skips_engine_runtime_and_empty_docs() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("skip-user", db.clone());
+
+        // Runtime path: content without chunks is intentional, must never
+        // be "repaired" into search.
+        let runtime_doc = db
+            .get_or_create_document_by_path(
+                "skip-user",
+                None,
+                "engine/.runtime/threads/active/state.json",
+            )
+            .await
+            .expect("create runtime doc");
+        db.append_document(runtime_doc.id, r#"{"k":"v"}"#, "\n")
+            .await
+            .expect("append runtime content");
+
+        // Empty doc: nothing to chunk.
+        db.get_or_create_document_by_path("skip-user", None, "notes/empty.md")
+            .await
+            .expect("create empty doc");
+
+        let stale = db
+            .list_stale_index_documents("skip-user", None, 10)
+            .await
+            .expect("list stale");
+        assert!(
+            stale.is_empty(),
+            "runtime and empty docs must not be flagged stale: {stale:?}"
+        );
+
+        let repaired = workspace.repair_stale_index(10).await.expect("repair");
+        assert_eq!(repaired, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_document_and_chunks_together() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("delete-user", db.clone());
+
+        workspace
+            .write("notes/deleteme.md", "deletesmokesentinel body text")
+            .await
+            .expect("write doc");
+        let results = workspace
+            .search("deletesmokesentinel", 10)
+            .await
+            .expect("search before delete");
+        assert_eq!(results.len(), 1);
+
+        workspace.delete("notes/deleteme.md").await.expect("delete");
+
+        let results = workspace
+            .search("deletesmokesentinel", 10)
+            .await
+            .expect("search after delete");
+        assert!(results.is_empty(), "chunks must be removed with the doc");
+        assert!(
+            workspace.read("notes/deleteme.md").await.is_err(),
+            "document row must be gone"
+        );
+    }
+
+    /// Deleting a path that does not exist must fail loudly with
+    /// DocumentNotFound — the in-tx lookup must not silently report success
+    /// for a document that is already gone (MR !899 review finding).
+    #[tokio::test]
+    async fn delete_missing_document_returns_not_found() {
+        let (db, _temp_dir) = create_test_database().await;
+        let workspace = Workspace::new_with_db("delete-missing-user", db.clone());
+
+        let err = workspace
+            .delete("notes/never-existed.md")
+            .await
+            .expect_err("delete of a missing path must fail");
+        assert!(
+            matches!(err, WorkspaceError::DocumentNotFound { .. }),
+            "expected DocumentNotFound, got: {err:?}"
+        );
     }
 }
 

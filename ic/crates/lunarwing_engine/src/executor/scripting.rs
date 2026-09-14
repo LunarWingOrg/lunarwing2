@@ -421,7 +421,11 @@ async fn execute_code_with_skills_and_action_limit(
     let tracker = LimitedTracker::new(default_limits());
 
     let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        runner.start(input_values, tracker, PrintWriter::Collect(&mut stdout))
+        runner.start(
+            input_values,
+            tracker,
+            PrintWriter::CollectString(&mut stdout),
+        )
     }));
 
     let mut progress = match run_result {
@@ -577,7 +581,7 @@ async fn execute_code_with_skills_and_action_limit(
                 if let Some(ext_result) = sync_result {
                     // Sync resume for builtins
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                        call.resume(ext_result, PrintWriter::CollectString(&mut stdout))
                     })) {
                         Ok(Ok(p)) => progress = p,
                         Ok(Err(e)) => {
@@ -610,7 +614,7 @@ async fn execute_code_with_skills_and_action_limit(
                 // resume_pending and continue — no preflight needed.
                 if pending_futures.contains_key(&monty_call_id) {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        call.resume_pending(PrintWriter::Collect(&mut stdout))
+                        call.resume_pending(PrintWriter::CollectString(&mut stdout))
                     })) {
                         Ok(Ok(p)) => progress = p,
                         Ok(Err(e)) => {
@@ -710,7 +714,7 @@ async fn execute_code_with_skills_and_action_limit(
 
                         // Resume with pending future — Python gets ExternalFuture
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            call.resume_pending(PrintWriter::Collect(&mut stdout))
+                            call.resume_pending(PrintWriter::CollectString(&mut stdout))
                         })) {
                             Ok(Ok(p)) => progress = p,
                             Ok(Err(e)) => {
@@ -740,7 +744,7 @@ async fn execute_code_with_skills_and_action_limit(
                     PreflightResult::Denied(ext_result) => {
                         // Resume with error — Python sees an exception
                         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            call.resume(ext_result, PrintWriter::Collect(&mut stdout))
+                            call.resume(ext_result, PrintWriter::CollectString(&mut stdout))
                         })) {
                             Ok(Ok(p)) => progress = p,
                             Ok(Err(e)) => {
@@ -824,7 +828,7 @@ async fn execute_code_with_skills_and_action_limit(
                 }
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    resolve.resume(resolution.results, PrintWriter::Collect(&mut stdout))
+                    resolve.resume(resolution.results, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -872,7 +876,7 @@ async fn execute_code_with_skills_and_action_limit(
                 };
 
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    lookup.resume(result, PrintWriter::Collect(&mut stdout))
+                    lookup.resume(result, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -907,7 +911,7 @@ async fn execute_code_with_skills_and_action_limit(
                     Some("OS operations are not permitted in CodeAct scripts".into()),
                 ));
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    os_call.resume(err, PrintWriter::Collect(&mut stdout))
+                    os_call.resume(err, PrintWriter::CollectString(&mut stdout))
                 })) {
                     Ok(Ok(p)) => progress = p,
                     Ok(Err(e)) => {
@@ -2026,6 +2030,27 @@ async fn handle_save_memory_doc(
             .with_tags(tags);
     doc.metadata = metadata;
 
+    // Trust-boundary: mission-supplied metadata is untrusted. Skill docs get
+    // their trust-bearing lifecycle fields forced to the mission-mintable
+    // values so a mission (or poisoned memory it read) cannot mint
+    // `trust: "installed"` / `source: "authored"` — the exact fields
+    // SkillTracker's demote/prune protections refuse to touch — nor stage
+    // `pending_patch`/`pending_prune` bypassing propose-then-approval. Note
+    // `source` also defaults to `Authored` when absent, so omission alone
+    // would grant protection; forcing `extracted` closes that hole too.
+    // Note this also strips `pending_patch`/`pending_prune` instead of
+    // passing them through: those are SkillTracker's propose-then-approve
+    // staging fields, and a mission-supplied doc can stage neither (any
+    // such keys are dropped above).
+    if doc_type == DocType::Skill {
+        if let Some(obj) = doc.metadata.as_object_mut() {
+            obj.remove("pending_patch");
+            obj.remove("pending_prune");
+        }
+        doc.metadata["trust"] = serde_json::json!("trusted");
+        doc.metadata["source"] = serde_json::json!("extracted");
+    }
+
     let doc_id = doc.id.0.to_string();
     if let Err(error) = store.save_memory_doc(&doc).await {
         debug!(%error, "__save_memory_doc__: failed to save");
@@ -2654,6 +2679,86 @@ FINAL(doc_id)
                 .is_empty(),
             "shared doc must not be user-scoped"
         );
+    }
+
+    #[tokio::test]
+    async fn save_memory_doc_forces_skill_trust_fields() {
+        // WI#132 item 1 (skill-trust minting seam): a mission (or poisoned
+        // memory it read) must not mint `trust: "installed"` or
+        // `source: "authored"` — the fields SkillTracker's demote/prune
+        // protections refuse to touch — nor stage pending_patch/pending_prune
+        // bypassing propose-then-approval. `source` defaults to Authored when
+        // omitted, so both the explicit-mint and omission holes close.
+        let store = Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "mint skill",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        let ctx = make_exec_context(&thread);
+        let effects: Arc<dyn EffectExecutor> = Arc::new(MockEffects::new(vec![], vec![]));
+        let leases = LeaseManager::new();
+        let policy = PolicyEngine::new();
+
+        let code = r#"
+doc_id = __save_memory_doc__(
+    "skill:hardened",
+    "Do the hardened thing.",
+    doc_type="skill",
+    tags=["skill", "test"],
+    metadata={
+        "name": "hardened",
+        "trust": "installed",
+        "source": "authored",
+        "pending_patch": {"staged": True},
+        "pending_prune": {"staged": True},
+        "version": 1,
+    },
+)
+FINAL(doc_id)
+"#;
+        execute_code(
+            code,
+            &thread,
+            &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &effects,
+            &leases,
+            &policy,
+            &ctx,
+            &[],
+            &serde_json::json!({}),
+            Some(&(Arc::clone(&store) as Arc<dyn crate::traits::store::Store>)),
+        )
+        .await
+        .unwrap();
+
+        let docs = store
+            .list_memory_docs(thread.project_id, "test-user")
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        let meta = &docs[0].metadata;
+        assert_eq!(meta["trust"], serde_json::json!("trusted"));
+        assert_eq!(meta["source"], serde_json::json!("extracted"));
+        assert!(meta.get("pending_patch").is_none());
+        assert!(meta.get("pending_prune").is_none());
+        // Benign metadata survives untouched.
+        assert_eq!(meta.get("version"), Some(&serde_json::json!(1)));
+        assert_eq!(meta.get("name"), Some(&serde_json::json!("hardened")));
+
+        // Deserialization must yield the protected-against-nothing shape the
+        // SkillTracker expects (extracted + trusted = demote/prune eligible).
+        let parsed: lunarwing_skills::v2::V2SkillMetadata =
+            serde_json::from_value(docs[0].metadata.clone()).unwrap();
+        assert_eq!(parsed.trust, lunarwing_skills::SkillTrust::Trusted);
+        assert_eq!(
+            parsed.source,
+            lunarwing_skills::v2::V2SkillSource::Extracted
+        );
+        assert!(parsed.pending_patch.is_none());
+        assert!(parsed.pending_prune.is_none());
     }
 
     #[tokio::test]

@@ -1,0 +1,13 @@
+{
+  "check_expected": true,
+  "url": "https://example.com/test-pages/article-longform/",
+  "contains": [
+    "Synthetic Longform Article",
+    "Part I.A: Subsection",
+    "alpha bravo charlie delta",
+    "First quotation",
+    "List item one follows a quote",
+    "Second quotation",
+    "sign-off phrase"
+  ]
+}

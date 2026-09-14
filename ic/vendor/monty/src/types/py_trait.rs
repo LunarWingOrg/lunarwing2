@@ -95,6 +95,29 @@ pub trait PyTrait<'h> {
     /// Returns `None` if the type doesn't support `len()`.
     fn py_len(&self, vm: &VM<'h, '_, impl ResourceTracker>) -> Option<usize>;
 
+    /// Computes the hash for this Python value, used for dict and set keys.
+    ///
+    /// Returns `Ok(Some(hash))` for hashable types, `Ok(None)` for unhashable
+    /// types (such as `list` and `dict`), or `Err(ResourceError::Recursion)` if
+    /// the recursion limit is exceeded while hashing nested containers.
+    ///
+    /// Container implementations should track recursion depth via
+    /// `heap.incr_recursion_depth()` and recurse through `Value::py_hash` for
+    /// nested values, which dispatches via `Heap::get_or_compute_hash` so that
+    /// the per-entry hash cache is shared.
+    ///
+    /// `self_id` is the heap ID of this value; it is required for types like
+    /// `Cell` that hash by identity. Most implementations ignore it.
+    ///
+    /// The default implementation returns `Ok(None)` (unhashable).
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        _vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
+        Ok(None)
+    }
+
     /// Python equality comparison (`==`).
     ///
     /// For containers, this performs element-wise comparison using the heap
@@ -286,7 +309,7 @@ pub trait PyTrait<'h> {
         // `py_call_attr` takes ownership of the argument bundle. Implementations that
         // do not recognize the attribute still need to release those values before
         // reporting `AttributeError`, otherwise method calls on unsupported types leak
-        // references on the error path (caught by `ref-count-panic`).
+        // references on the error path (caught by `memory-model-checks`).
         args.drop_with_heap(vm);
         Err(ExcType::attribute_error(self.py_type(vm), attr.as_str(vm.interns)))
     }

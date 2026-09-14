@@ -697,50 +697,45 @@ function connectSSE() {
   eventSource.addEventListener('stream_chunk', (e) => {
     const data = JSON.parse(e.data);
     window.LunarMascot?.onAgentEvent?.('working', {});
+    if (data.thread_id) _responseRenderedAt.delete(data.thread_id);
     if (!isCurrentThread(data.thread_id)) return;
     getOrCreateStreamingMessage(data.thread_id);
     _streamBuffer += data.content || '';
     scheduleStreamRender();
   });
 
+  eventSource.addEventListener('stream_gap', () => {
+    if (currentThreadId) {
+      _responseRenderedAt.delete(currentThreadId);
+      clearStreamingSnapshot(currentThreadId);
+      loadHistory();
+    }
+    debouncedLoadThreads();
+  });
+
   eventSource.addEventListener('status', (e) => {
     const data = JSON.parse(e.data);
     if (!isCurrentThread(data.thread_id)) {
-      if (data.message === 'Done' || data.message === 'Awaiting approval') {
+      if (data.message === 'Done' || data.message === 'Awaiting approval' || data.message === 'Rejected') {
         clearStreamingSnapshot(data.thread_id);
       }
       if (data.thread_id) debouncedLoadThreads();
       return;
     }
-    // "Done" and "Awaiting approval" are terminal signals from the agent:
-    // the agentic loop finished, so re-enable input as a safety net in case
-    // the response SSE event is empty or lost.
+    // "Done", "Awaiting approval", and "Rejected" are terminal signals from
+    // the agent: the agentic loop finished, so re-enable input as a safety net
+    // in case the response SSE event is empty or lost.
     // Status text is not displayed — inline activity cards handle visual feedback.
-    if (data.message === 'Done' || data.message === 'Awaiting approval') {
-      // Server ordering note: the gateway broadcasts "Done" BEFORE the final
-      // "response" event (thread_ops sends Done immediately after persisting,
-      // while the response is delivered later via agent_loop's channel send).
-      // On a healthy stream the response event arrives moments after Done and
-      // renders via addMessage below. But if that response event is lost
-      // (SSE BroadcastStream Lagged is swallowed as None in sse.rs — the
-      // keepalive keeps the connection looking healthy), the accumulated
-      // stream buffer would be wiped by finishStreamingWork with nothing
-      // rendered and no recovery path: the exact "sometimes output doesn't
-      // load" symptom (WI#127 candidate 5).
-      //
-      // Guard: snapshot what arrived this turn BEFORE the wipe. If no final
-      // response event has rendered by the time Done is processed, schedule a
-      // history reload shortly after — the persisted response is in the DB
-      // (persist_assistant_response runs server-side before Done), so a
-      // reload restores the turn even when the live event was lost.
-      const sawResponseThisTurn = _streamParts.length > 0 || _streamBuffer.length > 0;
+    if (data.message === 'Done' || data.message === 'Awaiting approval' || data.message === 'Rejected') {
+      const isTerminal = data.message === 'Done' || data.message === 'Rejected';
       finishStreamingWork(data.thread_id);
       finalizeActivityGroup();
       enableChatInput();
-      if (data.message === 'Done' && !sawResponseThisTurn && data.thread_id) {
-        // The final "response" event may still be in flight (Done is
-        // broadcast first). Give it a grace period; if it truly never
-        // arrived, reconcile from persisted history.
+      if (isTerminal && data.thread_id) {
+        // Done normally precedes the final response, and Rejected means the
+        // response was suppressed (no assistant row to render). Stream chunks
+        // are live work, not proof that the authoritative response arrived, so
+        // reconcile after the grace period when no response rendered.
         setTimeout(() => {
           if (isCurrentThread(data.thread_id) && !didRenderResponse(data.thread_id)) {
             loadHistory();
@@ -933,6 +928,7 @@ function sendMessage() {
   const content = input.value.trim();
   if (!content && stagedImages.length === 0) return;
 
+  _responseRenderedAt.delete(currentThreadId);
   _chatAutoScroll = true;
   const userMsg = addMessage('user', content || '(images attached)');
   input.value = '';
@@ -1454,12 +1450,9 @@ function scheduleStreamRender() {
   });
 }
 
-// --- WI#127 candidate-5 guard: response-rendered tracking -------------------
-// Per-thread record that a terminal "response" SSE event arrived and rendered.
-// Used by the "Done" handler: Done is broadcast BEFORE the response event, so
-// a short grace window distinguishes "response still in flight" from
-// "response lost (SSE Lagged swallowed it)" — lost events trigger a
-// loadHistory() reconcile instead of a permanently blank turn.
+// --- Response-delivery reconciliation --------------------------------------
+// Done is broadcast before the final response. Track recent terminal responses
+// so a missing response or an explicit stream gap can reconcile from history.
 const _responseRenderedAt = new Map();
 
 function markResponseRendered(threadId) {

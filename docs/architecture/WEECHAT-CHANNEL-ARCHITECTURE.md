@@ -4,6 +4,12 @@ How LunarWing connects to IRC through WeeChat: the components, the end-to-end me
 flow, the ingestion/latency model, the configuration-precedence rules (and the trap they
 create), and the known issues with their fix status.
 
+**Revalidated against source 2026-09-12 (v2.1.2.0).** All component paths, limits,
+and fix statuses below were re-checked against the current tree; the only change
+is the `dm_policy` default note in §4 (see below). The 2.1.2.0 release bumped the
+channel crate and its registry entry (`ic/registry/channels/weechat.json`) to
+0.2.9; no component paths, limits, or fix statuses changed.
+
 > **Why this doc exists.** A multi-hour debugging session upgrading the `sunburst` tenant
 > showed that message delivery through this channel has several independent, *invisible*
 > failure modes, and that the "WebSocket adapter" was actually drained by slow HTTP polling
@@ -338,7 +344,7 @@ sudo env PGSSLMODE=disable psql "$PGURL" -c \
    WHERE key='extensions.weechat.setup_fields';"
 ```
 
-> **Note:** WeeChat's new-install `dm_policy` default is now `pairing` (previously `pairing` was the documented safe default while the implementation defaulted to `open`; see rationale in this section). Operators who intentionally want open DMs should set `"dm_policy":"open"` explicitly in their adapter config or `setup_fields` row.
+> **Note:** WeeChat's new-install `dm_policy` default is now `pairing` (previously `pairing` was the documented safe default while the implementation defaulted to `open`; see rationale in this section). Operators who intentionally want open DMs should set `"dm_policy":"open"` explicitly in their adapter config or `setup_fields` row. Verified 2026-09-11: `default_dm_policy()` in `channels-src/weechat/src/lib.rs` returns `pairing`, the shipped caps default is `pairing`, and the item-16 live check confirmed `dm_policy=open` set durably via the settings store admits unpaired senders.
 
 Then restart the daemon so `on_start` re-resolves.
 

@@ -35,6 +35,7 @@ workspace/
 │       ├── README.md
 │       └── notes.md
 ├── engine/.runtime/       <- Internal Engine recovery state (persisted, not search-indexed)
+├── engine/projects/       <- Mission goals under */missions/*/ (persisted, not search-indexed)
 └── ...
 ```
 
@@ -80,10 +81,17 @@ Four tools for LLM use:
 - **`memory_read`** - Read bounded pages from a file by path
 - **`memory_tree`** - View a bounded workspace tree (depth parameter, default 1)
 
-`memory_search` excludes internal `engine/.runtime/**` documents. Each returned
-snippet is bounded to 2,000 JSON-encoded bytes, and the complete result remains
-valid JSON bounded to 8,000 serialized bytes. Queries are limited to 1,024
-UTF-8 bytes before embedding or database search.
+`memory_search` excludes internal `engine/.runtime/**` documents, the
+mission-directory subtree (`engine/projects/*/missions/*/**`, WI#135
+hardening), and the project-level `missions.json` manifest, so mission goal
+text stays out of the index even when written to adjacent artifacts like
+`mission.json.bak`. Each
+returned snippet is bounded to 2,000 JSON-encoded bytes, and the complete result
+remains valid JSON bounded to 8,000 serialized bytes. Queries are limited to
+1,024 UTF-8 bytes before embedding or database search. Other engine-internal
+documents that legitimately appear in results (for example
+`engine/knowledge/summaries/*`) carry an explicit `"provenance":
+"engine_internal"` label so they are never silently ordinary-looking memory.
 
 All agent-facing memory tools reserve `engine/.runtime/**`: writes and direct
 reads are rejected, and tree listings hide the subtree. Direct `Workspace` APIs
@@ -165,13 +173,38 @@ Scopes: reads span the caller's private scope plus the shared herd scope
   confidence, studied timestamp, source commit, tags, staleness thresholds).
   A JSON state file (`knowledge_seed_state.json` under the base dir, recording
   seeded/skipped/failed counts) makes the pass run at most once; note paths
-  that already exist are always skipped, so the store is never repopulated
-  and operator-authored notes are never overwritten. Per-note failures are
-  logged and recorded in the state file without blocking the marker, so
-  unimportable upstream notes cannot turn the one-shot seed into a per-boot
-  rescan. The env flag is written only on the add-tenant path —
-  never by `configure-study-mcp` or `upgrade-tenant` — so existing tenants
-  upgraded to a seed-capable binary are never seeded.
+  that already exist are always skipped, so the seed itself never repopulates
+  the store and operator-authored notes are never overwritten. Per-note
+  failures are logged and recorded in the state file without blocking the
+  marker, so unimportable upstream notes cannot turn the one-shot seed into a
+  per-boot rescan. The env flag is written only on the add-tenant path — never
+  by `configure-study-mcp` or `upgrade-tenant` — so existing tenants upgraded
+  to a seed-capable binary are never seeded.
+
+### Additive refresh (Phase 4)
+
+- **Published source generation** — mt-admin invalidates the generation marker,
+  fast-forwards a clean root-owned checkout under `flock`, validates its Study
+  Notes files, and atomically publishes
+  `.git/lunarwing-study-notes-generation.json`. A host-global systemd timer or
+  OpenRC cron entry updates every unique checkout used by an enabled tenant
+  hourly. A tenant pass reads the marker before and after its scan and rejects a
+  pass spanning an update.
+- **Independent daemon cadence** (`knowledge_sync`) — explicitly enabled by
+  `KNOWLEDGE_SYNC_ENABLED=true`; it does not depend on heartbeat or chat traffic.
+  The default cadence is six hours with deterministic startup jitter, a
+  cross-process single-flight lock, durable revision/failure state, and bounded
+  exponential failure backoff. Each pass imports at most 500 missing notes and
+  10 MiB by default. Existing paths are never changed or deleted.
+- `add-tenant --with-study-mcp` is the opt-in path for new tenants and enables
+  both the one-shot bootstrap and additive refresh. Existing tenants opt in with
+  `configure-study-mcp <tenant> --enable-knowledge-sync`, then restart once.
+  `refresh-knowledge <tenant> [--sync-source]` runs the same bounded importer
+  without a daemon restart; `sync-knowledge-sources` is the timer entrypoint.
+- This 2.1 fallback reports `mode=additive` and a Git source revision. It closes
+  the growing missing-note gap but does not claim hosted-store parity and does
+  not propagate upstream edits, lifecycle changes, or tombstones. A revisioned
+  hosted snapshot/delta contract remains the prerequisite for those operations.
 
 libSQL backend: implemented with FTS5 (`memory_chunks_fts`) and per-scope
 merge; note that FTS5 rank values are not comparable across scopes, so merged
@@ -262,4 +295,12 @@ Documents are chunked for search indexing:
 - Minimum chunk size: 50 words (tiny trailing chunks merge with previous)
 
 Internal Engine state under `engine/.runtime/**` is stored as normal workspace
-documents for restart recovery but receives no chunks or embeddings.
+documents for restart recovery but receives no chunks or embeddings. The same
+holds for the mission-directory subtree `engine/projects/*/missions/*/**` and
+the project-level `engine/projects/*/missions.json` manifest (WI#135):
+everything under a mission directory — not just the exact `mission.json`
+basename — stays readable via `read()`/`list()` (mission hydration reads
+documents, not chunks) but never enters search. Legacy chunks created by
+pre-fix builds are removed by the idempotent
+`purge_mission_index_chunks()` sweep that runs at boot (before the embedding
+backfill) and on the heartbeat hygiene pass.

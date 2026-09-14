@@ -63,6 +63,17 @@ rust-check-all-features:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked --all-features
 
+# Standalone (non-workspace) deliverables from .gitlab/deliverables.json:
+# locked offline metadata verification per classified unit so a stale
+# lockfile or classification fails before artifacts consume it. Parsing is
+# Python-only (no jq), so the job runs on the standard Rust bootstrap.
+standalone-deliverables:
+  extends: .rust-job
+  stage: check
+  needs: []
+  script:
+    - python3 .gitlab/scripts/standalone-deliverables.py
+
 wasm-channel-test-artifacts:
   extends: .rust-job
   stage: check
@@ -94,11 +105,12 @@ rust-msrv-check:
   script:
     - bash .gitlab/scripts/cargo-ci.sh check --locked
 
-# Owner: core maintainers. Block after one clean runner baseline proves zero warnings.
+# Owner: core maintainers. Blocking since 2026-09-11 (goals 2.1.1.0 item 23):
+# all-features zero-warning Clippy is green on the default branch and locally.
 rust-clippy-all:
   extends:
     - .rust-job
-    - .observational-job
+    - .full-validation-context
   stage: check
   needs:
     - cargo-metadata

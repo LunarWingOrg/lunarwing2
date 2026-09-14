@@ -8,6 +8,11 @@ LunarWing's DarkIRC integration has three components:
 
 Multi-tenant deployments use one daemon and adapter per tenant. Sharing a daemon would share DarkIRC key material and is not a supported isolation model.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** Registry manifest,
+capability file (3000 ms poll floor, loopback allowlist, `pairing` DM default),
+and the `darkirc-contact prepare/respond/complete` exchange commands were
+re-checked against the current tree; no changes were needed.
+
 ## Source Layout
 
 From the repository root:

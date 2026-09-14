@@ -1,0 +1,15 @@
+{
+  "check_expected": true,
+  "url": "https://example.com/test-pages/article-standard/",
+  "contains": [
+    "Synthetic Standard Article",
+    "no third-party text as an anchor",
+    "reference documentation",
+    "external example site",
+    "First numbered item",
+    "Gamma bullet",
+    "markdown quote block",
+    "convert_html_to_markdown",
+    "fixture chart caption"
+  ]
+}

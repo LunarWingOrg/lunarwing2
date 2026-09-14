@@ -1207,6 +1207,28 @@ pub async fn register_coordination_hooks_with_knowledge(
     violations: Option<Arc<ViolationStore>>,
     knowledge_workspace: Option<Arc<crate::workspace::Workspace>>,
 ) -> HookRegistrationSummary {
+    register_coordination_hooks_with_knowledge_diagnostics(
+        registry,
+        config,
+        violations,
+        knowledge_workspace,
+        None,
+    )
+    .await
+}
+
+/// [`register_coordination_hooks_with_knowledge`] with an optional shared
+/// ingest-diagnostics handle. When the knowledge-share hook registers, the
+/// supplied handle receives the same counters the hook increments, so an
+/// operator-facing status surface can report bounded drop reasons without
+/// ever touching message bodies.
+pub async fn register_coordination_hooks_with_knowledge_diagnostics(
+    registry: &Arc<HookRegistry>,
+    config: CoordinationHookConfig,
+    violations: Option<Arc<ViolationStore>>,
+    knowledge_workspace: Option<Arc<crate::workspace::Workspace>>,
+    diagnostics: Option<Arc<crate::hooks::coordination_knowledge::IngestDiagnostics>>,
+) -> HookRegistrationSummary {
     let mut summary = HookRegistrationSummary::default();
     if !config.is_actionable() {
         if config.enabled {
@@ -1284,17 +1306,26 @@ pub async fn register_coordination_hooks_with_knowledge(
 
     if config.knowledge_share_enabled {
         match knowledge_workspace {
-            Some(workspace) => hooks.push((
-                Arc::new(
-                    crate::hooks::coordination_knowledge::KnowledgeShareHook::new(
-                        state,
-                        workspace,
-                        crate::hooks::coordination_knowledge::KnowledgeShareLimits::from_env(),
-                    )
-                    .with_max_message_chars(config.max_message_length),
-                ),
-                13,
-            )),
+            Some(workspace) => {
+                let limits = crate::hooks::coordination_knowledge::KnowledgeShareLimits::from_env();
+                // Empty must keep denying all publishers; this only makes the
+                // silent deny-all combination visible to the operator.
+                if limits.publishers.is_empty() {
+                    tracing::warn!(
+                        "COORD_KNOWLEDGE_SHARE=true but COORD_KNOWLEDGE_PUBLISHERS is empty; \
+                         every KNOW: share will be ignored (deny-all). List full occupant JIDs \
+                         (room@server/nick) or a room bare JID (room@server)"
+                    );
+                }
+                let mut hook = crate::hooks::coordination_knowledge::KnowledgeShareHook::new(
+                    state, workspace, limits,
+                )
+                .with_max_message_chars(config.max_message_length);
+                if let Some(shared) = diagnostics {
+                    hook = hook.with_shared_diagnostics(Arc::clone(&shared));
+                }
+                hooks.push((Arc::new(hook), 13))
+            }
             None => {
                 tracing::warn!(
                     "COORD_KNOWLEDGE_SHARE=true but no database-backed shared workspace is \

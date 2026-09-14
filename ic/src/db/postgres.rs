@@ -856,6 +856,28 @@ impl WorkspaceStore for PgBackend {
             .await
     }
 
+    async fn list_stale_index_documents(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>, WorkspaceError> {
+        self.repo
+            .list_stale_index_documents(user_id, agent_id, limit)
+            .await
+    }
+
+    async fn purge_chunks_for_path_pattern(
+        &self,
+        user_id: &str,
+        agent_id: Option<Uuid>,
+        path_pattern: &str,
+    ) -> Result<u64, WorkspaceError> {
+        self.repo
+            .purge_chunks_for_path_pattern(user_id, agent_id, path_pattern)
+            .await
+    }
+
     async fn hybrid_search(
         &self,
         user_id: &str,

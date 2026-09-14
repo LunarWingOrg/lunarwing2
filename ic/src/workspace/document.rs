@@ -67,9 +67,51 @@ pub fn is_engine_runtime_path(path: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+/// Check whether a normalized path belongs to the mission-goal family
+/// (`engine/projects/{project}/missions/**`, any depth or suffix, plus the
+/// tenant-wide `engine/projects/{project}/missions.json` listing).
+///
+/// The exclusion covers the whole `missions/` subtree — not just the
+/// `mission.json` basename — because mission goal text persists to adjacent
+/// artifacts (`mission.json.bak`, per-mission `other.json`) that stay
+/// otherwise indexable and leak goals across missions (WI#135/WI#136). The
+/// top-level `missions.json` listing (and its suffixed variants) also
+/// carries goal text, so it is excluded too. `engine/projects/{project}`
+/// paths that are NOT mission-family (e.g. `project.json`) remain
+/// indexable, as does everything outside `engine/projects/**`.
+pub fn is_mission_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    // Prefix `engine/projects/{project}` with a non-empty project segment.
+    if segments.next() != Some("engine")
+        || segments.next() != Some("projects")
+        || matches!(segments.next(), None | Some(""))
+    {
+        return false;
+    }
+    match segments.next() {
+        // The whole `missions/` subtree — any file, any depth, any suffix.
+        Some("missions") => true,
+        // The tenant-wide listing plus its suffixed variants (final segment
+        // only): `missions.json`, `missions.json.bak`, ...
+        Some(name) if name == "missions.json" || name.starts_with("missions.json.") => {
+            segments.next().is_none()
+        }
+        _ => false,
+    }
+}
+
 /// Check whether a normalized workspace path should have search chunks.
 pub fn is_search_indexable_path(path: &str) -> bool {
-    !is_engine_runtime_path(path)
+    !is_engine_runtime_path(path) && !is_mission_path(path)
+}
+
+/// Check whether a normalized path is engine-internal state.
+///
+/// Unlike [`is_search_indexable_path`], this is NOT a search filter: other
+/// engine-internal documents (e.g. `engine/knowledge/summaries/*`) remain
+/// searchable, but they are expected to be surfaced with a provenance label.
+pub fn is_engine_internal_path(path: &str) -> bool {
+    path == "engine" || path.starts_with("engine/")
 }
 
 /// A memory document stored in the database.
@@ -362,6 +404,77 @@ mod tests {
             assert!(
                 is_search_indexable_path(path),
                 "path should be indexed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mission_goal_paths_are_not_search_indexable() {
+        // WI#135/WI#136 hardening: the whole mission subtree (any suffix or
+        // depth) plus the tenant-wide missions.json listing must never be
+        // search-indexed across the tenant/project scope. Adjacent artifacts
+        // (mission.json.bak, other.json) carried live-exploited goal-text
+        // leaks (comment 2941 on WI#136).
+        for path in [
+            "engine/projects/foo/missions/bar/mission.json",
+            "engine/projects/my--project/missions/canary-alpha-xq7--id/mission.json",
+            "engine/projects/foo/missions/missions/mission.json",
+            "engine/projects/foo/missions/bar/other.json",
+            "engine/projects/foo/missions/bar/mission.json.bak",
+            "engine/projects/foo/missions/bar/mission.json/extra",
+            "engine/projects/foo/missions/mission.json",
+            "engine/projects/foo/missions.json",
+            "engine/projects/foo/missions.json.bak",
+            "engine/projects/foo/missions",
+            "engine/projects/foo/missions//mission.json",
+        ] {
+            assert!(is_mission_path(path), "path should be mission: {path}");
+            assert!(
+                !is_search_indexable_path(path),
+                "path should be excluded: {path}"
+            );
+        }
+
+        for path in [
+            "engine/knowledge/summaries/id.json",
+            "engine/projects/foo/project.json",
+            "engine/projects/foo/missionstuff.json",
+            "engine/projects/foo/missions-overview/bar/mission.json",
+            "engine/projects/foo/missions.json/envelope",
+            "projects/foo/missions/bar/mission.json",
+            "engine/projects/mission.json",
+        ] {
+            assert!(!is_mission_path(path), "path should not be mission: {path}");
+            assert!(
+                is_search_indexable_path(path),
+                "path should be indexed: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_engine_internal_path_classification() {
+        for path in [
+            "engine",
+            "engine/knowledge/summaries/id.json",
+            "engine/projects/id/project.json",
+            "engine/.runtime/threads/active/id.json",
+        ] {
+            assert!(
+                is_engine_internal_path(path),
+                "path should be engine-internal: {path}"
+            );
+        }
+
+        for path in [
+            paths::MEMORY,
+            "daily/2026-07-23.md",
+            "projects/engine/notes.md",
+            "notengine/x.md",
+        ] {
+            assert!(
+                !is_engine_internal_path(path),
+                "path should not be engine-internal: {path}"
             );
         }
     }

@@ -1224,30 +1224,70 @@ impl AppBuilder {
                 }
             }
 
-            // One-shot knowledge seed for newly provisioned tenants. mt-admin
-            // writes KNOWLEDGE_SEED_FROM_STUDY_MCP=1 only on the add-tenant
-            // path, so existing tenants are never (re)populated and existing
-            // notes are never overwritten. Runs in the background like the
-            // embeddings backfill; a state file makes it run at most once.
-            if let Some(seed) = self.config.knowledge_seed.to_workspace_config() {
-                let ws_seed = Arc::clone(ws);
+            // One-shot bootstrap and opt-in refresh share one task so a newly
+            // provisioned tenant always finishes its seed before the additive
+            // cadence can inspect the same paths.
+            let knowledge_seed = self.config.knowledge_seed.to_workspace_config();
+            let knowledge_sync = self.config.knowledge_sync.to_workspace_config();
+            if knowledge_seed.is_some() || knowledge_sync.is_some() {
+                let knowledge_workspace = Arc::clone(ws);
                 tokio::spawn(async move {
-                    let report =
-                        crate::workspace::knowledge_seed::run_knowledge_seed_once(&ws_seed, &seed)
-                            .await;
-                    if report.had_work() {
-                        tracing::info!(
-                            seeded = report.notes_seeded,
-                            skipped_existing = report.notes_skipped_existing,
-                            "Seeded tenant knowledge store from lw2studymcp checkout"
-                        );
+                    if let Some(seed) = knowledge_seed {
+                        let report = crate::workspace::knowledge_seed::run_knowledge_seed_once(
+                            &knowledge_workspace,
+                            &seed,
+                        )
+                        .await;
+                        if report.had_work() {
+                            tracing::info!(
+                                seeded = report.notes_seeded,
+                                skipped_existing = report.notes_skipped_existing,
+                                "Seeded tenant knowledge store from lw2studymcp checkout"
+                            );
+                        }
+                    }
+                    if let Some(sync) = knowledge_sync {
+                        crate::workspace::knowledge_sync::run_knowledge_sync_loop(
+                            knowledge_workspace,
+                            sync,
+                        )
+                        .await;
                     }
                 });
             }
 
             if embeddings.is_some() {
+                // Purge legacy mission-goal chunks (WI#135) and heal
+                // crash-stranded memory index projections before the
+                // embedding backfill so repaired chunks get embedded in the
+                // same pass and freed budget is not spent re-embedding
+                // chunks about to be deleted (WI#132 hardening item 2).
                 let ws_bg = Arc::clone(ws);
                 tokio::spawn(async move {
+                    match ws_bg.purge_mission_index_chunks().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                purged = count,
+                                "Purged legacy mission-goal search chunks at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to purge mission index chunks: {}", e);
+                        }
+                    }
+                    match ws_bg.repair_stale_index(100).await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                repaired = count,
+                                "Repaired stale memory index projections at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to repair stale memory index: {}", e);
+                        }
+                    }
                     match ws_bg.backfill_embeddings().await {
                         Ok(count) if count > 0 => {
                             tracing::debug!("Backfilled embeddings for {} chunks", count);
@@ -1255,6 +1295,37 @@ impl AppBuilder {
                         Ok(_) => {}
                         Err(e) => {
                             tracing::warn!("Failed to backfill embeddings: {}", e);
+                        }
+                    }
+                });
+            } else {
+                // Desync repair and the legacy mission-chunk purge do not
+                // need the embedding provider — run them even without
+                // embeddings.
+                let ws_bg = Arc::clone(ws);
+                tokio::spawn(async move {
+                    match ws_bg.purge_mission_index_chunks().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                purged = count,
+                                "Purged legacy mission-goal search chunks at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to purge mission index chunks: {}", e);
+                        }
+                    }
+                    match ws_bg.repair_stale_index(100).await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                repaired = count,
+                                "Repaired stale memory index projections at boot"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to repair stale memory index: {}", e);
                         }
                     }
                 });

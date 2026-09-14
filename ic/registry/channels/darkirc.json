@@ -2,7 +2,7 @@
   "name": "darkirc",
   "display_name": "DarkIRC Channel",
   "kind": "channel",
-  "version": "0.1.6",
+  "version": "0.1.8",
   "wit_version": "0.3.0",
   "description": "DarkIRC P2P anonymous IRC channel via local adapter",
   "keywords": [

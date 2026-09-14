@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::runtime::manager::ThreadManager;
 use crate::runtime::messaging::ThreadOutcome;
@@ -99,16 +99,34 @@ impl ConversationManager {
             return Ok(conv_id);
         }
 
-        // Create new conversation
+        // Create new conversation. The scoped `channel:scope` keys handed over
+        // by the bridge should already have a surface (bootstrap or a prior
+        // turn); creating on a scoped miss means earlier turns on that scope
+        // are unreachable, so surface it loudly instead of failing silently.
         let conv = ConversationSurface::new(channel, user_id);
         let conv_id = conv.id;
 
         let mut convs = self.conversations.write().await;
         let mut index = self.channel_user_index.write().await;
+        // Re-check under the write lock: two concurrent first messages on the
+        // same key would otherwise each create a surface and orphan one,
+        // losing its history while reads keep succeeding.
+        if let Some(&existing) = index.get(&key) {
+            return Ok(existing);
+        }
         convs.insert(conv_id, conv.clone());
         index.insert(key, conv_id);
         self.store.save_conversation(&conv).await?;
 
+        if channel.contains(':') {
+            warn!(
+                conversation_id = %conv_id,
+                channel,
+                user_id,
+                "created conversation for scoped key on miss; prior turns on \
+                 this scope are not linked to the new surface"
+            );
+        }
         debug!(conversation_id = %conv_id, channel, user_id, "created conversation");
         Ok(conv_id)
     }

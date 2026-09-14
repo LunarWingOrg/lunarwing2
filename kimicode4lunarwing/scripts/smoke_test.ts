@@ -52,7 +52,7 @@ async function checkWebSocket(): Promise<boolean> {
       headers["Authorization"] = `Bearer ${AUTH_TOKEN}`
     }
 
-    const ws = new WebSocket(uri, ["lunarwing-agent-v1", "ironclaw-agent-v1"], { headers })
+    const ws = new WebSocket(uri, ["lunarwing-agent-v1"], { headers })
     const timeout = setTimeout(() => {
       console.error(`[smoke] websocket: timeout`)
       ws.close()

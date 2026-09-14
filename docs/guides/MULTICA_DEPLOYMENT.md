@@ -7,6 +7,11 @@ LunarWing ships two registry extensions for Multica/Lunartica:
 
 This integration is available on the current LunarWing source tree; it is not tied to the retired `1.1.0-new-lunartica` branch.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** The 30-second
+`poll_interval_ms` clamp, token-presence polling gate, and channel startup
+behavior were re-checked against `ic/channels-src/multica/src/lib.rs`;
+referenced skill, manifests, and smoke-test scripts are present.
+
 ## Prerequisites
 
 - A reachable Multica/Lunartica server and workspace UUID.

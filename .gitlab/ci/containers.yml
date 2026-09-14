@@ -53,11 +53,14 @@
   script:
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
+    - trivy image --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --ignorefile "$CI_PROJECT_DIR/.gitlab/trivy-ignore" --exit-code 1 --severity CRITICAL --format json --output worker-vulnerabilities.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
     - trivy image --format cyclonedx --output worker-sbom.cdx.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
   artifacts:
     when: always
     expire_in: 30 days
+    reports:
+      container_scanning: gl-container-scanning-report.json
     paths:
       - worker-vulnerabilities.json
       - worker-sbom.cdx.json
@@ -77,6 +80,13 @@
   interruptible: false
   retry: 0
   timeout: 30m
+  before_script:
+    # Pre-flight the registry auth realm from the job container (not BuildKit):
+    # a broken/misconfigured realm would otherwise only surface as a cryptic
+    # "realm is not a trusted HTTPS origin" after the multi-hour candidate and
+    # scan jobs already ran. Timing out here keeps the failure cheap and
+    # intentional, before any manifest is touched.
+    - python3 .gitlab/scripts/registry-realm-smoke.py
   script:
     - python3 .gitlab/scripts/promote-worker-image.py promote
   artifacts:

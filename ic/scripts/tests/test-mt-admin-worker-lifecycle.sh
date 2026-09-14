@@ -6,6 +6,15 @@ MT_ADMIN="$SCRIPT_DIR/../lunarwing-mt-admin.sh"
 # shellcheck source=../lunarwing-mt-admin.sh
 source "$MT_ADMIN"
 
+# Preserve the real implementation before later blocks stub it. The
+# WI#133/#134 tenant_writers_active container-branch tests at the bottom of
+# this file restore it via eval so they exercise the REAL classification logic
+# (last function definition wins in bash — a global stub would shadow it). The
+# WI#137 poller tests restore await_writer_quiescence the same way; only its
+# tenant_writers_active dependency is stubbed per-case.
+_TWA_REAL_DEF="$(declare -f tenant_writers_active)"
+_AWAIT_QUIESCE_REAL_DEF="$(declare -f await_writer_quiescence)"
+
 failures=0
 CALLS=()
 fixture="$(mktemp -d)"
@@ -89,6 +98,83 @@ assert_before \
 assert_before \
   "ctr:alice stop --time 0 lunarwing-opencode-alice" \
   "systemctl:alice stop lunarwing-opencode-alice.service"
+
+test_pebble_quadlet_bounce_recovery() (
+  local systemctl_stop_fails="false"
+  local call index reset_index=-1 start_index=-1
+  local unit_stop_seen="false" container_stop_seen="false"
+
+  ensure_container_runtime() {
+    CONTAINER_RT="podman"
+    MT_ROOTLESS="true"
+  }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  ports_get() {
+    [[ "$2" == "pebble_wss" ]] && printf '19091\n'
+  }
+  _ensure_tenant_image() { return 0; }
+  _wait_user_manager() { :; }
+  tenant_quadlet_dir() { printf '%s/quadlets\n' "$fixture"; }
+  render_worker_quadlet() { :; }
+  _container_config_changed() { return 1; }
+  _store_container_hash() { :; }
+  _systemctl_user() {
+    CALLS+=("systemctl:$*")
+    [[ "$systemctl_stop_fails" != "true" || "${2:-}" != "stop" ]]
+  }
+  _ctr() {
+    CALLS+=("ctr:$*")
+    return 0
+  }
+
+  CALLS=()
+  stop_tenant_pebble alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "systemctl:alice stop lunarwing-pebble-alice.service" ]] \
+      && unit_stop_seen="true"
+    [[ "$call" == "ctr:alice stop lunarwing-pebble-alice" ]] \
+      && container_stop_seen="true"
+  done
+  if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" == "true" ]]; then
+    printf 'Pebble Quadlet stop did not prefer its systemd unit\n' >&2
+    return 1
+  fi
+
+  CALLS=()
+  start_tenant_pebble alice
+  for index in "${!CALLS[@]}"; do
+    case "${CALLS[$index]}" in
+      "systemctl:alice reset-failed lunarwing-pebble-alice.service") reset_index="$index" ;;
+      "systemctl:alice start lunarwing-pebble-alice.service") start_index="$index" ;;
+    esac
+  done
+  if (( reset_index < 0 || start_index <= reset_index )); then
+    printf 'Pebble Quadlet start did not clear failure state before restart\n' >&2
+    return 1
+  fi
+
+  systemctl_stop_fails="true"
+  unit_stop_seen="false"
+  container_stop_seen="false"
+  CALLS=()
+  stop_tenant_pebble alice
+  for call in "${CALLS[@]}"; do
+    [[ "$call" == "systemctl:alice stop lunarwing-pebble-alice.service" ]] \
+      && unit_stop_seen="true"
+    [[ "$call" == "ctr:alice stop lunarwing-pebble-alice" ]] \
+      && container_stop_seen="true"
+  done
+  if [[ "$unit_stop_seen" != "true" || "$container_stop_seen" != "true" ]]; then
+    printf 'Pebble Quadlet stop omitted the container fallback\n' >&2
+    return 1
+  fi
+)
+
+if test_pebble_quadlet_bounce_recovery; then
+  printf 'PASS: Pebble Quadlet tenant bounce recovery\n'
+else
+  fail "Pebble Quadlet tenant bounce recovery"
+fi
 
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
@@ -279,6 +365,22 @@ retire_tenant_nanocode() {
 }
 die() { return 1; }
 
+# WI#133/#134: stop_tenant now verifies writer quiescence after shutdown.
+# The quiescence verdict is polled through await_writer_quiescence (WI#137);
+# stub the poller here so these fail-loud contract tests stay instant — the
+# real poller gets its own bounded-window tests at the bottom of this file.
+WRITERS_ACTIVE_RC=1
+await_writer_quiescence() {
+  # Convert the old tenant_writers_active stub convention (1 = quiesced) to the
+  # poller's convention (0 = quiesced, 1 = still active, 2 = unclassifiable).
+  case "$WRITERS_ACTIVE_RC" in
+    1) return 0 ;;
+    0) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+tenant_writers_active() { return "$WRITERS_ACTIVE_RC"; }
+
 INIT_SYSTEM="systemd"
 CALLS=()
 stop_tenant alice
@@ -289,9 +391,54 @@ assert_before "stop-opencode:alice" "retire-nanocode:alice"
 assert_before "stop-kimi:alice" "retire-nanocode:alice"
 assert_before "stop-postgres:alice" "retire-nanocode:alice"
 
+# A writer still active after the shutdown sequence must fail the stop, and
+# the quiescence check must run before Nanocode retirement. The stubbed die
+# only returns, so these cases run in a subshell whose die actually exits —
+# matching production — and retirement is tracked via a file marker.
+retire_tenant_nanocode() {
+  : >"$fixture/retire-ran"
+  CALLS+=("retire-nanocode:$1")
+  [[ "$RETIRE_FAILURE" != "true" ]]
+}
+rm -f "$fixture/retire-ran"
+
+WRITERS_ACTIVE_RC=0
+CALLS=()
+if (die() { exit 1; }; stop_tenant alice) >/dev/null 2>&1; then
+  fail "stop succeeded despite an active writer after shutdown"
+else
+  printf 'PASS: active writer after shutdown fails the stop\n'
+fi
+if [[ -e "$fixture/retire-ran" ]]; then
+  fail "Nanocode retirement ran despite an active writer"
+else
+  printf 'PASS: retirement skipped while a writer is still active\n'
+fi
+
+# An unclassifiable writer state must also fail loudly, never pass silently.
+rm -f "$fixture/retire-ran"
+WRITERS_ACTIVE_RC=2
+CALLS=()
+if (die() { exit 1; }; stop_tenant alice) >/dev/null 2>&1; then
+  fail "stop succeeded despite unverifiable writer state"
+else
+  printf 'PASS: unverifiable writer state fails the stop\n'
+fi
+if [[ -e "$fixture/retire-ran" ]]; then
+  fail "Nanocode retirement ran despite unverifiable writer state"
+else
+  printf 'PASS: retirement skipped while writer state is unverifiable\n'
+fi
+
+retire_tenant_nanocode() {
+  CALLS+=("retire-nanocode:$1")
+  [[ "$RETIRE_FAILURE" != "true" ]]
+}
+
 # Override consumed by sourced stop_tenant dispatcher.
 # shellcheck disable=SC2034
 INIT_SYSTEM="openrc"
+WRITERS_ACTIVE_RC=1
 RETIRE_FAILURE="true"
 CALLS=()
 if stop_tenant alice >/dev/null 2>&1; then
@@ -338,6 +485,193 @@ CONTAINER_RT="docker"
 CALLS=()
 _reconcile_openrc_podman_healthcheck alice lunarwing-opencode-alice
 assert_no_call "ctr:alice inspect -f {{json .Config.Healthcheck}} lunarwing-opencode-alice"
+
+# WI#133/#134 follow-up: tenant_writers_active's container branch must treat an
+# absent container runtime as quiesced (no writers can exist or respawn), while a
+# present-but-broken runtime still fails closed (a live runtime could respawn).
+test_writers_active_no_runtime_is_quiesced() (
+  set +e  # tenant_writers_active is EXPECTED to return non-zero here; set -e would abort the harness
+  eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_exists_in_registry() { return 0; }
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 1; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { :; }
+  tenant_worker_enabled() { return 1; }
+  _systemctl_user() { printf 'inactive\n'; }
+  detect_container_runtime() { return 1; }  # no runtime
+  _ctr() { return 1; }  # must never be reached when runtime is absent
+
+  tenant_writers_active alice
+  local rc=$?
+  if [[ "$rc" == "0" ]]; then
+    printf 'no-runtime: tenant_writers_active reported a writer (0)\n' >&2
+    return 1
+  fi
+  if [[ "$rc" != "1" ]]; then
+    printf 'no-runtime: expected quiesced (1), got %s\n' "$rc" >&2
+    return 1
+  fi
+)
+
+test_writers_active_broken_runtime_fails_closed() (
+  set +e  # non-zero returns are expected classification results here, not failures
+  eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_exists_in_registry() { return 0; }
+  # shellcheck disable=SC2034  # read by the eval'd tenant_writers_active body
+  ensure_init_system() { INIT_SYSTEM="systemd"; }
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 1; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { :; }
+  tenant_worker_enabled() { return 1; }
+  _systemctl_user() { printf 'inactive\n'; }
+  detect_container_runtime() { printf '%s' "podman"; }  # runtime present
+  ensure_container_runtime() { return 1; }              # ...but introspection broken
+  _ctr() { return 1; }
+
+  tenant_writers_active alice
+  local rc=$?
+  if [[ "$rc" == "0" ]]; then
+    printf 'broken-runtime: expected unclassifiable (2), got success (0)\n' >&2
+    return 1
+  fi
+  if [[ "$rc" != "2" ]]; then
+    printf 'broken-runtime: expected unclassifiable (2), got %s\n' "$rc" >&2
+    return 1
+  fi
+)
+
+test_writers_active_no_runtime_is_quiesced
+test_writers_active_broken_runtime_fails_closed
+
+# ── WI#137: OpenRC WeeChat status wording ─────────────────────────────────────
+# The WeeChat unit reports "session is up" / "session is not running" instead of
+# the standard started/stopped wording. "not running" must classify as STOPPED —
+# the bare *running* substring made every stopped WeeChat tenant (starforce)
+# report an active writer forever. A live "session is up" must classify ACTIVE.
+test_writers_active_openrc_weechat_wording() (
+  set +e  # tenant_writers_active returns non-zero for quiesced; that is the point
+  eval "$_TWA_REAL_DEF"  # restore the real impl (a global stub later in this file would otherwise shadow it)
+  sanitize_name() { printf '%s' "$1"; }
+  tenant_exists_in_registry() { return 0; }
+  # shellcheck disable=SC2034  # read by the eval'd tenant_writers_active body
+  ensure_init_system() { INIT_SYSTEM="openrc"; }
+  tenant_proxy_enabled() { return 1; }
+  tenant_weechat_enabled() { return 0; }
+  tenant_darkirc_enabled() { return 1; }
+  tenant_vision_external() { :; }
+  tenant_worker_enabled() { return 1; }
+  OPENRC_INITD_DIR="$fixture/init.d"
+  mkdir -p "$OPENRC_INITD_DIR"
+  local svc
+  while IFS= read -r svc; do
+    printf '#!/bin/sh\n' >"$OPENRC_INITD_DIR/$svc"
+    chmod +x "$OPENRC_INITD_DIR/$svc"
+  done < <(tenant_writer_services alice)
+
+  # Stopped WeeChat: "session is not running" -> quiesced (1), not active (0).
+  WEECHAT_STATUS='* WeeChat (alice) session is not running'
+  rc-service() { printf '%s\n' "$WEECHAT_STATUS"; return 1; }
+  detect_container_runtime() { return 1; }
+  tenant_writers_active alice
+  local rc=$?
+  if [[ "$rc" == "0" ]]; then
+    printf 'weechat-stopped: "session is not running" reported an active writer (0)\n' >&2
+    return 1
+  fi
+  if [[ "$rc" != "1" ]]; then
+    printf 'weechat-stopped: expected quiesced (1), got %s\n' "$rc" >&2
+    return 1
+  fi
+
+  # Running WeeChat: "session is up" -> active (0).
+  WEECHAT_STATUS='* WeeChat (alice) session is up'
+  rc-service() { printf '%s\n' "$WEECHAT_STATUS"; return 0; }
+  tenant_writers_active alice
+  rc=$?
+  if [[ "$rc" != "0" ]]; then
+    printf 'weechat-running: "session is up" was not classified active (got %s)\n' "$rc" >&2
+    return 1
+  fi
+)
+
+# ── WI#137: bounded quiesce-wait for async supervise-daemon teardown ──────────
+# The poller must tolerate a writer that reports active for a few seconds after
+# a healthy stop (async supervisor teardown), fail only after the deadline when
+# it NEVER settles, and fail closed immediately on unclassifiable state.
+test_quiesce_wait_active_then_settled() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"  # restore the real poller (the global stub shadows it)
+  local polls=0
+  sleep() { polls=$((polls + 1)); }
+  tenant_writers_active() {
+    polls=$((polls + 1))
+    [[ "$polls" -le 2 ]] && return 0
+    return 1
+  }
+  sanitize_name() { printf '%s' "$1"; }
+  await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "0" ]]; then
+    printf 'active-then-settled: expected quiesced (0), got %s\n' "$rc" >&2
+    return 1
+  fi
+  if [[ "$polls" -lt 3 ]]; then
+    printf 'active-then-settled: expected >=3 polls, got %s\n' "$polls" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_never_settles_fails_after_deadline() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"
+  local polls=0 slept=0
+  sleep() { slept=$((slept + 1)); }
+  tenant_writers_active() { polls=$((polls + 1)); return 0; }
+  sanitize_name() { printf '%s' "$1"; }
+  LUNARWING_MT_QUIESCE_INTERVAL=1 LUNARWING_MT_QUIESCE_DEADLINE=5 \
+    await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "1" ]]; then
+    printf 'never-settles: expected active-after-deadline (1), got %s\n' "$rc" >&2
+    return 1
+  fi
+  # 6 polls (t=0..5) with a 1s interval and a 5s deadline.
+  if [[ "$polls" != "6" || "$slept" != "5" ]]; then
+    printf 'never-settles: expected 6 polls/5 sleeps, got polls=%s slept=%s\n' \
+      "$polls" "$slept" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_unclassifiable_fails_closed() (
+  set +e
+  eval "$_AWAIT_QUIESCE_REAL_DEF"
+  local polls=0 slept=0
+  sleep() { slept=$((slept + 1)); }
+  tenant_writers_active() { polls=$((polls + 1)); return 2; }
+  sanitize_name() { printf '%s' "$1"; }
+  await_writer_quiescence alice
+  local rc=$?
+  if [[ "$rc" != "2" ]]; then
+    printf 'unclassifiable: expected fail-closed (2), got %s\n' "$rc" >&2
+    return 1
+  fi
+  if [[ "$polls" != "1" || "$slept" != "0" ]]; then
+    printf 'unclassifiable: expected single poll and no sleep, got polls=%s slept=%s\n' \
+      "$polls" "$slept" >&2
+    return 1
+  fi
+)
+
+test_quiesce_wait_active_then_settled
+test_quiesce_wait_never_settles_fails_after_deadline
+test_quiesce_wait_unclassifiable_fails_closed
+test_writers_active_openrc_weechat_wording
 
 if [[ "$failures" -ne 0 ]]; then
   printf 'RESULT: %d failure(s)\n' "$failures"

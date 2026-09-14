@@ -15,7 +15,12 @@
 ///
 /// This type is used for `sys.version_info` and similar structured tuples where
 /// named access improves usability and readability.
-use std::{fmt::Write, mem};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fmt::Write,
+    hash::{Hash, Hasher},
+    mem,
+};
 
 use ahash::AHashSet;
 
@@ -230,6 +235,28 @@ impl<'h> PyTrait<'h> for HeapRead<'h, NamedTuple> {
         Ok(true)
     }
 
+    /// Hashes by element only (not by class name), matching `Tuple::py_hash`
+    /// so a `NamedTuple` and a `Tuple` with equal elements share the same hash.
+    fn py_hash(
+        &self,
+        _self_id: HeapId,
+        vm: &mut VM<'h, '_, impl ResourceTracker>,
+    ) -> Result<Option<u64>, ResourceError> {
+        let token = vm.heap.incr_recursion_depth()?;
+        defer_drop!(token, vm);
+        let len = self.get(vm.heap).len();
+        let mut hasher = DefaultHasher::new();
+        for i in 0..len {
+            let item = self.clone_item(i, vm);
+            defer_drop!(item, vm);
+            match item.py_hash(vm)? {
+                Some(h) => h.hash(&mut hasher),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(hasher.finish()))
+    }
+
     fn py_bool(&self, vm: &mut VM<'h, '_, impl ResourceTracker>) -> bool {
         self.get(vm.heap).len() > 0
     }
@@ -286,7 +313,7 @@ impl HeapItem for NamedTuple {
     /// Pushes all heap IDs contained in this named tuple onto the stack.
     ///
     /// Called during garbage collection to decrement refcounts of nested values.
-    /// When `ref-count-panic` is enabled, also marks all Values as Dereferenced.
+    /// When `memory-model-checks` is enabled, also marks all Values as Dereferenced.
     fn py_dec_ref_ids(&mut self, stack: &mut Vec<HeapId>) {
         // Skip iteration if no refs - GC optimization for tuples of primitives
         if !self.contains_refs {
@@ -295,7 +322,7 @@ impl HeapItem for NamedTuple {
         for obj in &mut self.items {
             if let Value::Ref(id) = obj {
                 stack.push(*id);
-                #[cfg(feature = "ref-count-panic")]
+                #[cfg(feature = "memory-model-checks")]
                 obj.dec_ref_forget();
             }
         }

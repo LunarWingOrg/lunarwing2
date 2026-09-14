@@ -71,11 +71,14 @@ class SchemaWaitSecondsTest(unittest.TestCase):
 
 
 class RunImportSequenceTest(unittest.TestCase):
-    """The populate window must be daemon-down + PG-up.
+    """The populate window must be writer-quiesced + daemon-down + PG-up.
 
-    Regression test: mt-admin's stop-tenant also stops PostgreSQL, so the
+    Regression tests: mt-admin's stop-tenant also stops PostgreSQL, so the
     loader must issue start-pg after stop-tenant and before populate,
-    otherwise the populate connection is refused.
+    otherwise the populate connection is refused. And since WI#133/#134,
+    stop-writers must run before stop-tenant so the populate step can never
+    race a writer container respawned by an OpenRC restart policy or
+    babysitter.
     """
 
     def _run_phases(self, plan: ImportPlan) -> list[str]:
@@ -157,10 +160,32 @@ class RunImportSequenceTest(unittest.TestCase):
                 "build-tenant",
                 "install-wasm",
                 "start-tenant",
+                "stop-writers",
                 "stop-tenant",
                 "start-pg",
             ],
         )
+
+    def test_stop_writers_failure_blocks_populate(self) -> None:
+        """WI#133/#134: populate must never run unless writers are quiesced.
+
+        stop-writers verifies quiescence (tenant_writers_active) and fails if
+        any writer survived; a failed stop-writers must abort before
+        stop-tenant/start-pg/populate. (stop-tenant re-verifies too; since
+        WI#137 both poll over a bounded window for async supervisor teardown.)
+        """
+        result, verbs = self._run_failure_path(
+            ImportPlan(tenant="t1", apply=True),
+            fail_on=("stop-writers", 1),
+        )
+
+        self.assertEqual(
+            result.error,
+            "stop-writers failed (writers must be quiesced before populate)",
+        )
+        self.assertEqual(verbs, ["add-tenant", "build-tenant", "install-wasm", "start-tenant", "stop-writers"])
+        self.assertNotIn("stop-tenant", verbs)
+        self.assertNotIn("start-pg", verbs)
 
     def test_start_after_populate_when_requested(self) -> None:
         verbs = self._run_phases(ImportPlan(tenant="t1", apply=True, start=True))

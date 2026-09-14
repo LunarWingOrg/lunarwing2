@@ -2,11 +2,15 @@
 //!
 //! - [`ExecutionLoop`] — core loop replacing `run_agentic_loop()`
 //! - [`structured`] — Tier 0 action execution (structured tool calls)
-//! - [`context`] — context building for LLM calls
 //! - [`intent`] — tool intent nudge detection
+//!
+//! Historical note (WI#132): `executor::context` (dead `build_step_context`
+//! / `format_docs_as_context` doc-neutralizer) was removed — its only callers
+//! were tests, so it projected false assurance while the live retrieval path
+//! (`__retrieve_docs__`) returned raw doc content. The live seams are
+//! neutralized at the handler and the LLM adapter instead.
 
 pub mod compaction;
-pub mod context;
 mod llm_stream;
 pub mod loop_engine;
 pub mod orchestrator;

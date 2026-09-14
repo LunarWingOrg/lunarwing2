@@ -2,6 +2,16 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
+**Revalidated against source 2026-09-12 (v2.1.2.0).** Module map, gate types,
+mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
+re-checked against the current tree; updates for 2.1.1.0 include the
+best-effort `thread_start` event dispatch (item 9/WI#109 scope A) and the
+`ENGINE_V2_CHANNELS` routing-policy clarification (there is no `none`
+opt-out; unknown entries are ignored). Updates for 2.1.2.0 include the
+WI#132 authenticity hardening (labeled/neutralized memory retrieval,
+compaction summaries, and system-role content) and the removal of the dead
+`executor/context.rs` module.
+
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
 keeps other channels on the legacy path unless an eligible channel name is
@@ -63,7 +73,6 @@ ic/crates/lunarwing_engine/src/
     loop_engine.rs        ExecutionLoop (core loop replacing run_agentic_loop)
     structured.rs         Tier 0: structured tool call execution
     scripting.rs          Tier 1: embedded Python via Monty (CodeAct/RLM)
-    context.rs            Context builder (messages + actions from leases + memory docs)
     compaction.rs         Context compaction when approaching model context limit
     prompt.rs             System prompt construction (CodeAct preamble/postamble)
     trace.rs              Execution trace recording and retrospective analysis
@@ -198,6 +207,30 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   bounded correction before terminal delivery through shared channels such as XMPP.
 - Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
+
+### Authenticity hardening (WI#132)
+
+Memory-retrieval and compaction content is LLM-adjacent data, so it is labeled
+and neutralized before it can masquerade as engine-authored state:
+
+- `__retrieve_docs__` is the live retrieval path (the dead `executor/context.rs`
+  doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
+  projected false assurance). Its handler neutralizes role-token openers in
+  returned doc content and stamps each doc with
+  `"provenance": "untrusted_memory_retrieval"` so consumers cannot mistake it
+  for engine content.
+- Compaction summaries are LLM output that replaces real history. The summary
+  is prefixed with an explicit `[Compaction summary — LLM-generated, replaces
+  earlier conversation history]` label and its role-token openers are
+  neutralized before it is inserted as an assistant message (compaction
+  laundering seam).
+- Both LLM adapters (`ic/src/llm/rig_adapter.rs`,
+  `ic/src/llm/lunarwing_cloud_chat.rs`) neutralize role-token openers in
+  system-role content as a final backstop (idempotent on already-neutralized
+  content).
+- The engine-internal `memory_search` tool labels its results with
+  `"provenance": "engine_internal"` so they are never silently
+  ordinary-looking memory.
 
 ### Failure Recovery
 
@@ -335,6 +368,17 @@ while preserving operator pauses and mission history. When the
 `SKILL_SELF_IMPROVEMENT` gate is off, the gated missions are paused with a
 gate-driven marker; re-enabling the toggle resumes exactly those missions,
 while missions paused by an operator stay paused.
+
+The event listener also dispatches a best-effort `thread_start` event on the
+initial `Created -> Running` transition of top-level Foreground threads only
+(item 9, WI#109 scope A). Mission and Research threads and child threads never
+dispatch, so mission recursion and research fan-out cannot re-trigger the
+event. The payload carries `source_thread_id`, `project_id`, `thread_type`, and
+`goal`. This is asynchronous plumbing, not a synchronous pre-execution hook —
+WI#109's sanitize-before-execution requirement remains open as scope B (see
+`docs/ops/v2.1.1.0_GOAL4_WI126_THREAD_START_MISSION_SCOPE.md`). `mission_create`
+cadence descriptions document that `event:<pattern>` is text-matching, not an
+engine-lifecycle subscription.
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
@@ -490,7 +534,10 @@ eligible; `ENGINE_V2_CHANNELS` can additionally select the exact names `xmpp`,
 `darkirc`, and `weechat`. Values are comma-separated, trimmed, and matched
 case-insensitively by exact channel name. Empty and unknown values are ignored.
 `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS` is another env var
-example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`
+example: `ENGINE_V2_MODEL_RECOVERY_ATTEMPTS=2`. Note there is no opt-out
+value: any entry that is not one of the eligible channel names — including
+something like `none` — is simply ignored, and the gateway always routes
+while `ENGINE_V2=true`. The only durable opt-out is `ENGINE_V2=false`.
 
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each
@@ -499,6 +546,12 @@ current WIT has no message-editing contract. Completed terminal text returns to
 the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
 empty responses, persists compatibility history, and calls
 `ChannelManager::respond()` once with the original incoming metadata.
+
+If a gateway SSE or WebSocket subscriber falls behind and the broadcast ring
+drops events it would have received, the subscription converts the lag into an
+explicit `stream_gap` event (carrying the missed-event count) instead of
+silently swallowing it; the browser clears partial live-stream state and
+reloads persisted history on receipt (WI#127 server-side gap signaling).
 
 Rate-metered channels (DarkIRC) carry a host-side message budget
 (`ic/src/channels/budget.rs`). The bridge injects the budget's guidance into
@@ -512,10 +565,24 @@ Approval, authentication, interrupt, steer, clear, and new-thread controls use
 the same user and engine-conversation scope as ordinary input. This includes
 non-UUID XMPP, DarkIRC, and WeeChat scope keys. `/interrupt` cancels in-flight
 provider streams and tool futures before signaling the next loop boundary.
+When an interrupt overtakes a prompt still queued in the daemon's message
+scheduler (no engine thread yet), the queued prompt is cancelled in its
+conversation lane and the user gets `Interrupted.`; queued follow-ups behind a
+running turn are kept — the engine stops the running turn and the follow-ups
+run afterward.
 `/steer <note>` injects into a running thread at its next model-call boundary;
 when the conversation is idle or completing an interrupt, up to four notes are
 persisted on the conversation and injected into its next foreground turn,
 including resume from a waiting or suspended thread.
+
+Steer is deliberately **not** a tool-preemption control (the WI#105 scope
+decision, see `docs/ops/v2.1.1.0_GOAL18_WI105_STEER_PREEMPTION_CONTRACT.md`).
+A note queued while a tool future is pending does not abort that call: the
+inject signal only surfaces at the next `__check_signals__` poll, after the
+in-flight tool's result. Only `/interrupt` (`ThreadSignal::Stop` / the run
+token) cancels an in-flight tool. To stop a long-running tool, interrupt; to
+redirect the turn afterward, steer — an interrupt followed by a steer note
+lands the note on the next turn.
 Approval and auth prompts are statuses; gate pauses, auth pauses, and stopped
 turns return an empty no-reply sentinel so the outer handler does not send or
 persist a duplicate terminal response.
@@ -538,6 +605,14 @@ boundary. Durable engine state, traces, and V1 compatibility history retain the
 sanitized effective text but never image bytes or data URLs. Consequently, a
 process restart preserves attachment descriptions and extracted text but not
 visual bytes; an image must be resent if visual analysis is needed afterward.
+
+Separately from engine state, the host-side durable attachment store
+(`crate::agent::attachment_store`) persists every inbound attachment —
+sanitized metadata, extracted text, and bounded inline bytes (base64, capped
+per attachment) — into workspace documents under `attachments/<channel>/...`
+so a file sent on one channel stays retrievable from all other channels and
+the WebUI. Stored documents go through the normal workspace write path
+(prompt-injection scan, search indexing).
 
 Attachment count, MIME, per-file, and aggregate limits remain owned by the
 ingress channel/host implementations. Attachments on approval, interrupt, and
@@ -573,7 +648,9 @@ Thread messages, steps, and events are **never deleted** from the engine
 workspace store. Runtime JSON lives under `engine/.runtime/`; knowledge and
 orchestrator artifacts live in human-readable paths under `engine/`. Raw
 attachment bytes are the deliberate exception: only sanitized attachment text
-is durable, while provider-bound image parts remain transient. The router also
+is durable, while provider-bound image parts remain transient — except for the
+bounded inline copies persisted by the durable cross-channel attachment store
+under `attachments/` (see Attachment Input). The router also
 dual-writes V1-compatible conversation history to the relational database.
 
 Webhook mission documents contain only versioned secret references. Plaintext
@@ -609,8 +686,8 @@ ENGINE_V2_CHANNELS=            # Gateway only (runtime default)
 ENGINE_V2_CHANNELS=xmpp        # Add XMPP
 ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 # Multi-tenant lunarwing.env default: ENGINE_V2_CHANNELS=xmpp,weechat,darkirc
-# (existing tenant values preserved on re-render; ENGINE_V2=false or
-#  ENGINE_V2_CHANNELS=none opts out durably)
+# (existing tenant values preserved on re-render; ENGINE_V2=false is the only
+#  durable opt-out — a value like `none` is an ignored unknown entry)
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)

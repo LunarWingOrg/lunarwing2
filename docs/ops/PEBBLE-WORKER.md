@@ -1,6 +1,6 @@
 # Pebble Worker — Operational Guide
 
-The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding harness as a LunarWing external worker. It speaks the `lunarwing-agent-v1` WebSocket protocol (legacy alias `ironclaw-agent-v1` still accepted) and spawns `pebble prompt --output-format ndjson` per task.
+The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding harness as a LunarWing external worker. It speaks the `lunarwing-agent-v1` WebSocket protocol (the legacy `ironclaw-agent-v1` alias is no longer accepted) and spawns `pebble prompt --output-format ndjson` per task. Because the alias is gone, recreate/upgrade worker containers in the same maintenance window as the daemon (see the upgrade-ordering note in [`WORKER-CONTAINERS.md`](WORKER-CONTAINERS.md)).
 
 ## Single-Instance Setup
 
@@ -80,6 +80,11 @@ sudo ic/scripts/lunarwing-mt-admin.sh start-worker <name> pebble
 sudo ic/scripts/lunarwing-mt-admin.sh stop-worker <name> pebble
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker <name> pebble
 ```
+
+Since v2.1.1.0 (work item #128), a Pebble stop/restart shuts down the owning
+systemd user unit first (with a container-stop fallback) and clears any
+`StartLimitBurst` lockout before restarting, so a tenant bounce no longer
+leaves the tenant without its Pebble worker.
 
 ### Per-Tenant Configuration
 

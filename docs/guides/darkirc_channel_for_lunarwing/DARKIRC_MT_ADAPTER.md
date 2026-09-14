@@ -2,6 +2,10 @@
 
 **Status:** As-built. LunarWing provisions a dedicated DarkIRC daemon and HTTP adapter for every DarkIRC-enabled tenant.
 
+**Revalidated against source 2026-09-12 (v2.1.1.0).** Per-tenant topology,
+mt-admin ownership commands, adapter env contract, and the 3000 ms polling
+floor were re-checked against the current tree; no changes were needed.
+
 This document describes the adapter boundary. Operational contact-key exchange and recovery procedures are in [`../../ops/DARKIRC-MULTITENANT.md`](../../ops/DARKIRC-MULTITENANT.md); build and installation steps are in [`DARKIRC_BUILD_GUIDE.md`](DARKIRC_BUILD_GUIDE.md).
 
 ## Per-Tenant Topology

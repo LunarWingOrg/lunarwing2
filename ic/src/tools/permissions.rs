@@ -43,9 +43,9 @@ fn seeded_default_permission_canonical(canonical_tool_name: &str) -> Option<Perm
     match canonical_tool_name {
         // LunarWing keeps tool_activate and http as AskEachTime (conservative default).
         "echo" | "time" | "json" | "memory_search" | "memory_read" | "memory_write"
-        | "memory_tree" | "tool_list" | "tool_info" | "tool_search" | "skill_list"
-        | "skill_search" | "list_jobs" | "job_status" | "job_events" | "image_analyze"
-        | "message" => Some(PermissionState::AlwaysAllow),
+        | "memory_tree" | "attachment_store" | "tool_list" | "tool_info" | "tool_search"
+        | "skill_list" | "skill_search" | "list_jobs" | "job_status" | "job_events"
+        | "image_analyze" | "message" => Some(PermissionState::AlwaysAllow),
         "shell"
         | "read_file"
         | "write_file"
