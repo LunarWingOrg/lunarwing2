@@ -92,7 +92,7 @@ fn validate_memory_search_query(query: &str) -> Result<(), ToolError> {
     Ok(())
 }
 
-fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError> {
+pub(crate) fn normalize_memory_tool_path(path: &str) -> Result<String, ToolError> {
     let normalized = normalize_path(path);
     if is_engine_runtime_path(&normalized) {
         return Err(ToolError::NotAuthorized(
