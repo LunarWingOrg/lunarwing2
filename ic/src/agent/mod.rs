@@ -12,6 +12,7 @@
 
 mod agent_loop;
 pub mod agentic_loop;
+pub(crate) mod attachment_store;
 pub(crate) mod attachments;
 mod commands;
 pub mod compaction;
