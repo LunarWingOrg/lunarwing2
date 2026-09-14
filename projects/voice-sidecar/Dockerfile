@@ -9,6 +9,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY native-libs /app/native-libs
+ENV SHERPA_LIB_PATH=/app/native-libs/linux-x64
 RUN cargo build --release
 
 FROM debian:bookworm-slim
