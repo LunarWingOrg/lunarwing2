@@ -784,9 +784,11 @@ mod tests {
             response.tool_calls.is_empty(),
             "corrupted blocking tool calls must not reach a tool executor"
         );
-        assert!(response
-            .content
-            .as_deref()
-            .is_some_and(|content| content.contains("integrity warning")));
+        assert!(
+            response
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains("integrity warning"))
+        );
     }
 }
