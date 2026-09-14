@@ -1,8 +1,8 @@
 {
   "name": "lunarwing-kimi-code-cli",
-  "version": "0.41.0",
+  "version": "0.42.0",
   "private": true,
   "dependencies": {
-    "@moonshot-ai/kimi-code": "0.41.0"
+    "@moonshot-ai/kimi-code": "0.42.0"
   }
 }

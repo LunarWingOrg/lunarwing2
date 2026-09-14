@@ -1,6 +1,6 @@
 [package]
 name = "lunarwing_health_metrics"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 rust-version = "1.96.1"
 description = "Optional loopback-only Prometheus listener for LunarWing healthpoint metrics"
