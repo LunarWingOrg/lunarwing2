@@ -57,7 +57,10 @@
 15. [ ] take a look at any documentation that should be updated and update necessary documentation
 16. [x] (S) Reserved for something else
 17. [x] (S) Reserved for something else
-18. [ ] review open work items
+18. [x] review open work items
+    - Live tracker query 2026-09-14 00:03 UTC: 14 open issues (#97, #109, #113, #114, #121, #122, #126, #127, #130, #131, #132, #135, #136, #137). Since the v2.1.1.0 audit, #86/#133/#134 closed and #135/#136/#137 opened.
+    - All three new findings are fixed in source at 14ccfdd23: #135/#136 mission-goal index exclusion (subtree + purge sweep + provenance labels, live canary acceptance on tracker); #137 bounded OpenRC writer-quiesce wait + status-classification fix. #114 has open draft MR !855 (podman sandbox).
+    - No 2.1.2.0 code blockers among open items; remaining work is tracker housekeeping plus operator/live residuals on #97/#131/#137. Report: docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md.
 19. [ ] update all docs in docs/guides
 20. [ ] update all docs in docs/architecture
 21. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes)
