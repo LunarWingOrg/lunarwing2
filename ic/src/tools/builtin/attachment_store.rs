@@ -178,7 +178,11 @@ mod tests {
             "attachments/xmpp/file-1/report.pdf.md"
         );
         assert!(normalize_attachment_path("MEMORY.md").is_err());
-        assert!(normalize_attachment_path("../attachments/x").is_err());
+        // `..` segments clamp at the workspace root, so this stays inside the store.
+        assert_eq!(
+            normalize_attachment_path("../attachments/x").unwrap(),
+            "attachments/x"
+        );
         assert!(normalize_attachment_path("attachments/../MEMORY.md").is_err());
     }
 

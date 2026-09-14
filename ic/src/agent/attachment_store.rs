@@ -40,11 +40,12 @@ const MAX_EXTRACTED_TEXT_CHARS: usize = 2 * 1024 * 1024;
 /// Sanitize a channel-supplied attachment ID into a safe path segment.
 ///
 /// The ID is channel-controlled input, so it is stripped to alphanumerics,
-/// `-`, `_`, and `.` and bounded before being embedded in a workspace path.
+/// `-`, and `_` and bounded before being embedded in a workspace path. Dots
+/// are excluded so IDs cannot smuggle hidden or traversal-adjacent segments.
 fn sanitize_id(id: &str) -> String {
     let cleaned: String = id
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
         .take(MAX_ATTACHMENT_ID_CHARS)
         .collect();
     if cleaned.is_empty() {
@@ -74,6 +75,7 @@ fn sanitize_filename(filename: Option<&str>) -> String {
 pub fn attachment_path(channel: &str, id: &str, filename: &str) -> String {
     let channel = sanitize_id(channel);
     let id = sanitize_id(id);
+    let filename = sanitize_filename(Some(filename));
     format!("{ATTACHMENT_DIR}/{channel}/{id}/{filename}.md")
 }
 
@@ -127,6 +129,13 @@ fn render_attachment(message: &IncomingMessage, attachment: &IncomingAttachment)
         body.push_str("## Raw data (base64)\n\n");
         body.push_str(&encoded);
         body.push('\n');
+        has_content = true;
+    } else if !attachment.data.is_empty() {
+        body.push_str(&format!(
+            "[Raw data omitted: {} bytes exceeds the {} byte inline limit]\n\n",
+            attachment.data.len(),
+            MAX_INLINE_DATA_BYTES
+        ));
         has_content = true;
     }
 
@@ -210,6 +219,7 @@ mod tests {
         assert_eq!(sanitize_id("../../etc/passwd"), "etcpasswd");
         assert_eq!(sanitize_id("a/b\\c"), "abc");
         assert_eq!(sanitize_id(""), "attachment");
+        assert_eq!(sanitize_id("..."), "attachment");
         let long = "x".repeat(1000);
         assert_eq!(sanitize_id(&long).len(), MAX_ATTACHMENT_ID_CHARS);
     }
@@ -230,7 +240,6 @@ mod tests {
         let path = attachment_path("../../etc", "../passwd", "..");
         assert_eq!(path, "attachments/etc/passwd/unnamed.md");
     }
-
     #[test]
     fn document_with_extracted_text_is_rendered() {
         let mut attachment = test_attachment("doc-1", AttachmentKind::Document);
@@ -251,7 +260,8 @@ mod tests {
         let message = test_message("signal", vec![attachment]);
 
         let body = render_attachment(&message, &message.attachments[0]).unwrap();
-        assert!(body.contains("/wj/"));
+        // base64 of [0xFF, 0xD8, 0xFF] is "/9j/"
+        assert!(body.contains("/9j/"));
     }
 
     #[test]
@@ -269,6 +279,7 @@ mod tests {
 
         let body = render_attachment(&message, &message.attachments[0]).unwrap();
         assert!(!body.contains("## Raw data"));
+        assert!(body.contains("Raw data omitted"));
         assert!(body.contains("\"size_bytes\": 42"));
     }
 
