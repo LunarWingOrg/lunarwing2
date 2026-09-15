@@ -26,7 +26,7 @@ sha2 = "0.10"
 # metadata" at transducer decoder init). Master vendors sherpa-onnx v1.12.15,
 # which supports parakeet-tdt-0.6b/0.6b-v2. API surface for our four call sites
 # (whisper/transducer/tts/silero_vad) is unchanged.
-sherpa-rs = { git = "https://github.com/thewh1teagle/sherpa-rs", rev = "857bedd35ec5215c65b4911fdadca31f403b6f6b", default-features = false, features = ["download-binaries", "tts"], optional = true }
+sherpa-rs = { git = "https://github.com/thewh1teagle/sherpa-rs", rev = "857bedd35ec5215c65b4911fdadca31f403b6f6b", default-features = false, features = ["tts"], optional = true }
 subtle = "2"
 tempfile = "3"
 thiserror = "2"

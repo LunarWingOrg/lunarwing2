@@ -1,0 +1,3 @@
+cb3d244eb794c698cdd5bd1ebac41c57e9b4353b998aeb287b7f53e1799acf77  linux-x64/lib/libonnxruntime.so
+8129d83cbd18f840e407d0e209d11bcf7eac42c67e5bb92f62ac9384852f102a  linux-x64/lib/libsherpa-onnx-c-api.so
+0956f8120189876d50b0c2f00aae2fcdbf37b866fcc0c1e54d042a5b33ff1d50  linux-x64/lib/libsherpa-onnx-cxx-api.so
