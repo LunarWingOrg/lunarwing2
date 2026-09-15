@@ -309,16 +309,14 @@ pub async fn run_knowledge_sweep_loop(
     let cadence_secs = u64::from(config.cadence_hours).saturating_mul(3_600);
     let jitter_cap = (cadence_secs / 10).clamp(MIN_LOOP_DELAY_SECS, 300);
     let jitter = shared_deterministic_jitter_secs(workspace.user_id(), jitter_cap);
-    tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;    let poll_secs = cadence_secs.clamp(3_600, 6 * 3_600);
+    tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;
+    let poll_secs = cadence_secs.clamp(3_600, 6 * 3_600);
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
     ticker.tick().await; // Skip immediate first tick; startup jitter covered above.
     loop {
-        let report = run_knowledge_sweep_if_due(
-            workspace.as_ref(),
-            shared_workspace.as_deref(),
-            &config,
-        )
-        .await;
+        let report =
+            run_knowledge_sweep_if_due(workspace.as_ref(), shared_workspace.as_deref(), &config)
+                .await;
         if report.had_work() {
             tracing::info!(
                 notes_scanned = report.notes_scanned,
@@ -542,6 +540,44 @@ mod tests {
             assert!(!first.skipped);
             let second = run_knowledge_sweep_if_due(&alice, None, &config).await;
             assert!(second.skipped);
+        }
+
+        #[tokio::test]
+        async fn sweep_covers_stores_larger_than_one_page() {
+            // WI#121 defect (a) regression: the old fixed KNOWLEDGE_SCAN_CAP
+            // window meant notes older than the cap were invisible to every
+            // sweep. The paginated scan must reach notes deep in the store.
+            let (db, _dir) = crate::testing::test_db().await;
+            let alice = Workspace::new_with_db("alice", db);
+
+            let old = Utc::now() - chrono::Duration::days(90);
+            // More notes than one scan page; every one is aging and active.
+            let total = crate::workspace::KNOWLEDGE_SCAN_PAGE + 50;
+            for i in 0..total {
+                submit_note(
+                    &alice,
+                    "kimi-1",
+                    &format!("topic-{i:04}"),
+                    Some(old),
+                    KnowledgeStatus::Active,
+                )
+                .await;
+            }
+
+            let (scanned, marked) = sweep_scope(&alice, "alice", 30).await.expect("sweep");
+
+            assert_eq!(scanned, u32::try_from(total).expect("fits"));
+            assert_eq!(marked, u32::try_from(total).expect("fits"));
+            // Oldest-page notes (beyond the former 1,000-row cap window the
+            // pre-fix sweep would have seen) are now swept too.
+            assert_eq!(
+                note_status(&alice, "kimi-1", "topic-0000").await,
+                KnowledgeStatus::Stale
+            );
+            assert_eq!(
+                note_status(&alice, "kimi-1", &format!("topic-{:04}", total - 1),).await,
+                KnowledgeStatus::Stale
+            );
         }
 
         #[tokio::test]

@@ -68,11 +68,11 @@ pub use embeddings::{
 pub use knowledge::{
     KNOWLEDGE_DIR, KNOWLEDGE_PROVENANCE, KNOWLEDGE_SCAN_MAX_NOTES, KNOWLEDGE_SCAN_PAGE,
     KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta, KnowledgeNoteRow,
-    KnowledgeScopeCount, KnowledgeSearchHit, KnowledgeStats, KnowledgeStatus, KnowledgeTopicSummary,
-    MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS,
-    MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, WIRE_AGENT_PREFIX,
-    WIRE_NOTE_SENTINEL, is_incomplete_wire_write, is_knowledge_path, is_valid_slug, note_path,
-    render_note_markdown, render_wire_note_markdown, summarize_topics,
+    KnowledgeScopeCount, KnowledgeSearchHit, KnowledgeStats, KnowledgeStatus,
+    KnowledgeTopicSummary, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES,
+    MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES,
+    WIRE_AGENT_PREFIX, WIRE_NOTE_SENTINEL, is_incomplete_wire_write, is_knowledge_path,
+    is_valid_slug, note_path, render_note_markdown, render_wire_note_markdown, summarize_topics,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
@@ -672,7 +672,10 @@ impl WorkspaceStorage {
                 repo.knowledge_list_notes(user_ids, agent_id, limit, before)
                     .await
             }
-            Self::Db(db) => db.knowledge_list_notes(user_ids, agent_id, limit, before).await,
+            Self::Db(db) => {
+                db.knowledge_list_notes(user_ids, agent_id, limit, before)
+                    .await
+            }
         }
     }
 }
@@ -2116,9 +2119,9 @@ impl Workspace {
                 );
                 break;
             }
-            cursor = page.last().map(|row| {
-                (row.updated_at, row.path.clone(), row.scope.clone())
-            });
+            cursor = page
+                .last()
+                .map(|row| (row.updated_at, row.path.clone(), row.scope.clone()));
             let page_len = page.len();
             rows.extend(page);
             if rows.len() >= KNOWLEDGE_SCAN_MAX_NOTES {

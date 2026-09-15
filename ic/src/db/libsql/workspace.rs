@@ -2492,7 +2492,10 @@ mod tests {
             assert_eq!(second_page.len(), 1);
             // No overlap between pages.
             for row in &second_page {
-                assert_ne!((row.scope.as_str(), row.path.as_str()), (last.scope.as_str(), last.path.as_str()));
+                assert_ne!(
+                    (row.scope.as_str(), row.path.as_str()),
+                    (last.scope.as_str(), last.path.as_str())
+                );
             }
 
             // The paged scan reconstructs the full store: 2 + 1 = 3 rows.
@@ -2500,7 +2503,10 @@ mod tests {
                 "shared",
                 std::sync::Arc::new(backend) as std::sync::Arc<dyn crate::db::Database>,
             );
-            let all = workspace.knowledge_scan_all(&scopes()).await.expect("scan all");
+            let all = workspace
+                .knowledge_scan_all(&scopes())
+                .await
+                .expect("scan all");
             assert_eq!(all.len(), 3);
         }
     }
