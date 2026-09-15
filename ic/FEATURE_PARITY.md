@@ -455,8 +455,8 @@ This document tracks feature parity between LunarWing (Rust implementation) and 
 | SSRF IPv6 transition bypass block | ✅ | ❌ | Block IPv4-mapped IPv6 bypasses |
 | Cron webhook SSRF guard | ✅ | ❌ | SSRF checks on webhook delivery |
 | Loopback-first | ✅ | 🚧 | HTTP binds 0.0.0.0 |
-| Docker sandbox | ✅ | ✅ | Orchestrator/worker containers |
-| Podman support | ✅ | ❌ | Alternative to Docker |
+| Docker sandbox | ✅ | ✅ | Generic sandbox (shell tool) + orchestrator/worker containers |
+| Podman support | ✅ | ✅ | Generic sandbox drives the podman CLI directly (rootless, no daemon socket); worker jobs also work over a podman Docker-compatible socket |
 | WASM sandbox | ❌ | ✅ | LunarWing innovation |
 | Sandbox env sanitization | ✅ | 🚧 | Shell tool scrubs env vars (secret detection); docker container env sanitization partial |
 | Tool policies | ✅ | ✅ | |

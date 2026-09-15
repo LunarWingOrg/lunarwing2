@@ -2632,28 +2632,40 @@ impl SetupWizard {
 
     /// Step 8: Docker Sandbox -- check Docker installation and availability.
     async fn step_docker_sandbox(&mut self) -> Result<(), SetupError> {
-        print_info("LunarWing can execute code, run builds, and use tools inside Docker");
-        print_info("containers. This keeps your system safe -- commands from the LLM run");
-        print_info("in an isolated sandbox with no access to your credentials, limited");
-        print_info("filesystem access, and network traffic restricted to an allowlist.");
+        print_info("LunarWing can execute code, run builds, and use tools inside containers");
+        print_info("(podman preferred, docker supported). This keeps your system safe --");
+        print_info("commands from the LLM run in an isolated sandbox with no access to your");
+        print_info("credentials, limited filesystem access, and network traffic restricted");
+        print_info("to an allowlist.");
         println!();
-        print_info("Without Docker, code execution tools (shell, file write) run directly");
-        print_info("on your machine with no isolation.");
+        print_info("Without a container runtime, code execution tools (shell, file write) run");
+        print_info("directly on your machine with no isolation.");
         println!();
 
-        if !confirm("Enable Docker sandbox?", false).map_err(SetupError::Io)? {
+        if !confirm("Enable container sandbox?", false).map_err(SetupError::Io)? {
             self.settings.sandbox.enabled = false;
             print_info("Sandbox disabled. You can enable it later with SANDBOX_ENABLED=true.");
             return Ok(());
         }
 
-        // Check Docker availability
-        let detection = crate::sandbox::detect::check_docker().await;
+        // Check availability: podman first (the generic sandbox drives its CLI
+        // directly — no daemon needed), then docker (daemon socket).
+        let podman = crate::sandbox::detect::check_podman().await;
+        let using_podman = podman.status.is_ok();
+        let detection = if using_podman {
+            podman
+        } else {
+            crate::sandbox::detect::check_docker().await
+        };
 
         match detection.status {
             crate::sandbox::detect::DockerStatus::Available => {
                 self.settings.sandbox.enabled = true;
-                print_success("Docker is installed and running. Sandbox enabled.");
+                if using_podman {
+                    print_success("Podman CLI is available. Sandbox enabled (podman runtime).");
+                } else {
+                    print_success("Docker is installed and running. Sandbox enabled.");
+                }
             }
             crate::sandbox::detect::DockerStatus::NotInstalled
             | crate::sandbox::detect::DockerStatus::NotRunning => {
@@ -2661,43 +2673,40 @@ impl SetupWizard {
                 let not_installed =
                     detection.status == crate::sandbox::detect::DockerStatus::NotInstalled;
                 if not_installed {
-                    print_error("Docker is not installed.");
+                    print_error("No container runtime found (neither podman nor docker).");
+                    print_info(crate::sandbox::podman_install_hint());
                     print_info(detection.platform.install_hint());
                 } else {
-                    print_error("Docker is installed but not running.");
+                    print_error("A container runtime was found but is not usable.");
                     print_info(detection.platform.start_hint());
                 }
                 println!();
 
                 let retry_prompt = if not_installed {
-                    "Retry after installing Docker?"
+                    "Retry after installing a runtime?"
                 } else {
-                    "Retry after starting Docker?"
+                    "Retry after starting the runtime?"
                 };
                 if confirm(retry_prompt, false).map_err(SetupError::Io)? {
-                    let retry = crate::sandbox::detect::check_docker().await;
+                    let retry_podman = crate::sandbox::detect::check_podman().await;
+                    let retry = if retry_podman.status.is_ok() {
+                        retry_podman
+                    } else {
+                        crate::sandbox::detect::check_docker().await
+                    };
                     if retry.status.is_ok() {
                         self.settings.sandbox.enabled = true;
-                        print_success(if not_installed {
-                            "Docker is now available. Sandbox enabled."
-                        } else {
-                            "Docker is now running. Sandbox enabled."
-                        });
+                        print_success("Container runtime is now available. Sandbox enabled.");
                     } else {
                         self.settings.sandbox.enabled = false;
-                        print_info(if not_installed {
-                            "Docker still not available. Sandbox disabled for now."
-                        } else {
-                            "Docker still not responding. Sandbox disabled for now."
-                        });
+                        print_info("Runtime still not available. Sandbox disabled for now.");
                     }
                 } else {
                     self.settings.sandbox.enabled = false;
-                    print_info(if not_installed {
-                        "Sandbox disabled. Install Docker and set SANDBOX_ENABLED=true later."
-                    } else {
-                        "Sandbox disabled. Start Docker and set SANDBOX_ENABLED=true later."
-                    });
+                    print_info(
+                        "Sandbox disabled. Install podman or docker and set \
+                         SANDBOX_ENABLED=true later.",
+                    );
                 }
             }
             crate::sandbox::detect::DockerStatus::Disabled => {
