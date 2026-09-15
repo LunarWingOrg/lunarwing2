@@ -27,58 +27,88 @@
     - Added the built-in `attachment_store` tool (list/read) registered alongside memory tools in both single-user and multi-tenant paths, protected from dynamic shadowing, read-only under skill attenuation, seeded AlwaysAllow in permissions, and schema-validated. Paths are confined to `attachments/`; engine runtime state stays inaccessible.
     - Verified: clippy `-D warnings` clean; full lib test suite 5026 passed / 0 failed (incl. 12 new tests across the store and tool); rustfmt clean. Docs updated in `docs/architecture/ENGINE-V2.md` (attachment input + data retention sections).
 
+4. [ ] **Reconcile or delete the dead gate structs in `ic/src/gate/approval.rs`** `[med,architecture,security]` - All four structs (`ApprovalGate`, `AuthenticationGate`, `HookGate`, `RateLimitGate`) have ZERO production call sites; production approval/auth/hook checks run inline in `bridge/effect_adapter.rs`. Dangerous drift: the dead `ApprovalGate` auto-allows `http`/`http_request` when credentials exist for the host (approval.rs:76-85) — the opposite of the live path (`http.rs::requires_approval` → `UnlessAutoApproved`; "credential presence alone does NOT bypass approval"), and the dead `HookGate` collapses `HookOutcome::Continue{modified}` to `Allow`, discarding hook parameter rewrites. Either delete the file or reconcile it with the live policy before a future migration wires in weakened semantics.
+    - Source: study-notes review queue finding `gate/approval` (MED); re-verified open at HEAD `605c58b6fd` 2026-09-15 (no `XxxGate::new` call sites exist; file unchanged at 294 lines). See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
 ## Phase 2 — Features & Polish
 
-4. [x] Address the work item #128 — mt-admin restart parity: pebble worker unit stopped but never restarted** `[bug,mt-admin,2.1.0.0]` - NEW since ship. Any tenant bounce leaves the tenant without its Pebble worker. Small, sharp, operator-visible. Good early quick-win.
+5. [x] Address the work item #128 — mt-admin restart parity: pebble worker unit stopped but never restarted** `[bug,mt-admin,2.1.0.0]` - NEW since ship. Any tenant bounce leaves the tenant without its Pebble worker. Small, sharp, operator-visible. Good early quick-win.
     - Pebble Quadlet shutdown now stops the owning systemd user unit first, with a container-stop fallback, and startup clears any `StartLimitBurst` lockout before restarting.
     - Regression coverage exercises the stop/start bounce ordering and fallback; `scripts/check-mt-admin.sh` plus `scripts/tests/test-mt-admin-worker-lifecycle.sh` passed.
 
-5. [x] (S) New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
+6. [x] (S) New human supervised LunarVision test** - Unaddressed. Human-in-the-loop acceptance testing for LunarVision
 
-6. [ ] feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - See:  generic-podman-sandbox/concept-branch/v2.1.2.0 for reference; this is the design i have gone with and what i want. any further suggestions are welcome but must be documented
+7. [ ] feature: generic sandbox — podman impl** `[low]` - Never addressed. Sandbox abstraction has docker; podman impl missing - See:  generic-podman-sandbox/concept-branch/v2.1.2.0 for reference; this is the design i have gone with and what i want. any further suggestions are welcome but must be documented
 
-7. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
+8. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-8. [x] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
+9. [x] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
 
-9. [x] (S) Mascot Design Art Project
+10. [x] (S) Mascot Design Art Project
 
-10. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box (i dont even remember what this was for)
+11. [x] (S) Reserved for note for human about checkpoint #3 for manual test tenant box (i dont even remember what this was for)
 
-11. [ ] look into the work items: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/126 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/109 - address any issues if they are still present and document what you did
+12. [ ] look into the work items: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/126 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/109 - address any issues if they are still present and document what you did
 
-12. [ ] update kimicode external worker - update kimicode cli version to 0.43.0
+13. [ ] update kimicode external worker - update kimicode cli version to 0.43.0
+
+14. [ ] **Pebble worker: mid-task `cancel` envelope is never received (cancellation is a no-op)** `[med,worker,pebble]` - `dispatch_task(...)` is `.await`ed inline inside the WS read loop (pebble4lunarwing/src/bridge.rs:111), so the loop is parked for the entire task; mid-task user cancels and daemon timeout-cancels queue unread until the daemon drops the socket — tasks always run to the full 60-min default timeout, with `kill_on_drop(true)` as the only cleanup. Fix shape: keep the read loop live like the kimi bridge does (`void handleTaskRequest(...)`), delivering cancel via a oneshot. Tracker: WI#101.
+    - Source: study-notes review queue finding `pebble worker: cancel envelope`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+15. [ ] **Pebble worker: confine `project_dir` used as subprocess cwd** `[med,worker,pebble,security]` - `spawn_pebble` (pebble4lunarwing/src/executor.rs:106-110) uses `request.context.project_dir.unwrap_or(workspace_root)` directly as `current_dir` with no path confinement — under the default `PEBBLE_PERMISSION_MODE=danger-full-access`, a daemon-supplied project_dir points the pebble CLI at ANY host directory (native-mode quick-start gets no boundary at all). Port kimi's `resolveWorkspacePath` + workspace-root overlap check.
+    - Source: study-notes review queue finding `pebble worker: unconfined project_dir`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+16. [ ] **Knowledge stale sweep can never run at scale or on default tenants** `[med,knowledge]` - Two compounding defects (WI#121): (a) the sweep and every `knowledge_list_notes` consumer see only the 1,000 most-recently-updated notes (`KNOWLEDGE_SCAN_CAP`, ic/src/workspace/knowledge.rs:45) — a seeded tenant permanently exceeds the window, so the oldest notes fall outside every sweep; (b) the sweep only runs inside the heartbeat loop (ic/src/agent/heartbeat.rs:304) which mt-admin renders `HEARTBEAT_ENABLED=false` for every tenant (ic/scripts/mt-admin-lib/06-env-generation.sh:826) — a vanilla tenant never sweeps at all. Size the WI#121 refresh/cursor design against the cap; consider a heartbeat-independent sweep path.
+    - Source: study-notes review queue finding `knowledge/sweep-scan-cap`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+17. [ ] **Fix `.registry.json` sidecar path mismatch in v1→v2 skill migration** `[med,skills]` - Writer puts the sidecar inside the skill dir (`user_dir/<name>/.registry.json`, ic/src/channels/web/handlers/skills.rs:259) but the reader does `p.parent()?` (ic/src/bridge/skill_migration.rs:177-184), looking one level too high at the skills ROOT — registry provenance is silently never read, so catalog-pulled skills are excluded from update checks and the registry-installed migration dedup guard can never fire (stale filesystem skills re-import on every restart). One-line fix: join on the dir directly (optional parent() fallback); add the missing sidecar-path test.
+    - Source: study-notes review queue finding `skills .registry.json sidecar`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+18. [ ] **Clamp declarative hook priorities below the native security hooks** `[med,hooks,security]` - `RuleHook::from_config` / `OutboundWebhookConfig::from_config` return `config.priority.unwrap_or(...)` with no floor (ic/src/hooks/bundled.rs:438,569) — workspace `hooks/*.hook.json` files and plugin capabilities can declare `priority: 1` and run ahead of the native coordination + secret-detection hooks (entropy detector is priority 5); hooks run lowest-first and `Reject` short-circuits, so a low-priority rule can preempt coordination enforcement or strip content before secret detection runs. Add an explicit floor (e.g. declarative rules ≥ 26) or make an explicit trust-tier decision.
+    - Source: study-notes review queue finding `hooks/priority-clamping`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+19. [ ] **multica-bridge: credential `format` field silently dropped — Authorization header lacks `Bearer ` prefix** `[med,wasm,bug]` - The sidecar declares `"format": "Bearer ${secret}"` (ic/tools-src/multica-bridge/multica-bridge.capabilities.json:138) but `CredentialLocationSchema` has no `format` field and no `deny_unknown_fields`, so serde drops it silently and the injector sends the RAW token (`CredentialLocation::Header{prefix:None}`, credential_injector.rs:300-307) → 401 on token-gated Multica routes. Fix: set `"prefix": "Bearer "` in the caps JSON (the runtime already supports `Header{prefix}`), and consider warn-logging unknown capability fields.
+    - Source: study-notes review queue finding `wasm/http multica format`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+20. [ ] **MCP gateway data plane follows upstream redirects without re-validation** `[med,security,mcp]` - `GatewayState.client` is built with only connect/read timeouts (ic/src/tools/mcp/gateway_control.rs:451-454); reqwest's default `Policy::limited(10)` follows 30x to any Location — a trusted-but-compromised HTTPS upstream can pivot the gateway (host network namespace) to loopback/plain-HTTP internal targets and relay responses back, bypassing the module's own "upstreams must be HTTPS" invariant. Fix: `redirect(Policy::none())` on the gateway client (MCP clients retry; SSE streams don't need redirects) or re-validate each hop.
+    - Source: study-notes review queue finding `mcp/gateway-redirect`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+21. [ ] **CustomTunnel: placeholder URL committed silently; health_check reports dead child healthy** `[med,tunnel]` - `CustomTunnel::start()` initializes `public_url` to `http://{host}:{port}` (ic/src/tunnel/custom.rs:75) and commits it with zero warnings when no URL is extracted within the 15s scan window — the bogus URL is injected into WASM channel config and the OAuth redirect base (webhooks point at `http://0.0.0.0:8080` until restart), bypassing `validate_public_url`'s HTTPS requirement. Also fix `health_check()` liveness (`child.id().is_some()` at custom.rs:155-165 reports spontaneously-dead children healthy — use `try_wait()` like netbird) and wire tunnel supervision (`Tunnel::health_check` has zero production callers).
+    - Source: study-notes review queue finding `tunnel`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
+
+22. [ ] **LunarVoice: add Rust↔shell language-table parity guard** `[med,voice,config]` - Rust `WHISPER_LANGUAGE_CODES` (99 codes, projects/voice-sidecar/src/config.rs:10) and the shell twin `_voice_validate_stt_language` (100 codes incl `auto`, ic/scripts/mt-admin-lib/02-containers.sh:1119) agree only by author discipline — the 2026-08-31 yue add/revert (54s apart) edited the Rust table twice without the shell side ever being consulted. Drift symptom: `mt-admin configure-voice --stt-language X` succeeds but the tenant sidecar fails at boot with `InvalidSttLanguage`. Add a test diffing the sorted token lists.
+    - Source: study-notes review queue finding `lunarvoice language-table parity`; re-verified open at HEAD `605c58b6fd` 2026-09-15. See KB: `ajhkp/medium-findings-reverification-605c58b6fd`.
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
-13. [x] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - VERIFIED NOT REPRODUCIBLE on the current tree (2026-09-09, item-14 pass). Full live repro attempt on tenant `alpha` (real weechat 4.10 + real ws_adapter longpoll + fresh `dm_policy=open` via BOTH delivery paths: caps-file config edit AND durable `settings.extensions.weechat.setup_fields`, restart, sustained DM traffic incl. unicode/2KB payloads, adapter restart mid-stream, group-buffer path): zero traps across every poll for the whole window. Guest crate tests 63/63 pass; a new integration test (`real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls` in `ic/tests/engine_v2_irc_wasm.rs`) pins the fresh-tenant longpoll shape (auto mode, adapter `/api/health` with `event_cursor`, empty buffers, `dm_policy=open`) and passes. Finding: the trap does not reproduce with the goal-43 repro recipe on the 2.1.1 tree; the `dm_policy=open` correlation from goal #43 appears spurious (the guest never reads DM policy on a no-event poll — `do_longpoll`→`refresh_policy_config` only writes the value it read). Also closes the goal #9 residual: durable `dm_policy=open` via the settings store was verified working live (unpaired nick `nick:miniirc:peer43` admitted through `check_sender_allowed`), so the test-only edit gap is confirmed fixed by the CHPAR-005 `dm_policy_explicit` machinery. If the trap resurfaces, the next discriminating evidence to capture is the wasmtime backtrace (log `Polling callback failed` at DEBUG with `WASM_BACKTRACE_DETAILS=1`) plus a fuel/epoch check on the tenant engine — see `ic/src/channels/wasm/wrapper.rs` `map_wasm_error`.
+23. [x] **WeeChat WASM channel trap on fresh tenants** (goal #43, W1/W2 SKIPPED) - VERIFIED NOT REPRODUCIBLE on the current tree (2026-09-09, item-14 pass). Full live repro attempt on tenant `alpha` (real weechat 4.10 + real ws_adapter longpoll + fresh `dm_policy=open` via BOTH delivery paths: caps-file config edit AND durable `settings.extensions.weechat.setup_fields`, restart, sustained DM traffic incl. unicode/2KB payloads, adapter restart mid-stream, group-buffer path): zero traps across every poll for the whole window. Guest crate tests 63/63 pass; a new integration test (`real_weechat_component_does_not_trap_on_fresh_tenant_longpoll_polls` in `ic/tests/engine_v2_irc_wasm.rs`) pins the fresh-tenant longpoll shape (auto mode, adapter `/api/health` with `event_cursor`, empty buffers, `dm_policy=open`) and passes. Finding: the trap does not reproduce with the goal-43 repro recipe on the 2.1.1 tree; the `dm_policy=open` correlation from goal #43 appears spurious (the guest never reads DM policy on a no-event poll — `do_longpoll`→`refresh_policy_config` only writes the value it read). Also closes the goal #9 residual: durable `dm_policy=open` via the settings store was verified working live (unpaired nick `nick:miniirc:peer43` admitted through `check_sender_allowed`), so the test-only edit gap is confirmed fixed by the CHPAR-005 `dm_policy_explicit` machinery. If the trap resurfaces, the next discriminating evidence to capture is the wasmtime backtrace (log `Polling callback failed` at DEBUG with `WASM_BACKTRACE_DETAILS=1`) plus a fuel/epoch check on the tenant engine — see `ic/src/channels/wasm/wrapper.rs` `map_wasm_error`.
 
-14. [x] (S) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
+24. [x] (S) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
     `ThreadOutcome::Stopped` maps to the empty-string sentinel by !767 design, so engine-interrupt turns emit no terminal `response` event; mascot falls back to 30s idle timer instead of immediate idle. "Parity with legacy `Interrupted.` emission needs a tracker decision." Small polish, user-visible
 
-15. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
+25. [x] (S) **WI#107 mascot: final human-visible browser animation check** (goal #45)
     Repo-contract PASS (27/27 emote tests, live public-surface checks on antelope/kestrel healthy). Remaining: the human acceptance step — fresh tenant, reply containing `*nickers softly* *flicks her tail*`, watch it animate. Cheap; could fold into any live session
 
 ## Phase 4 — Carried Known-Issues from RELEASE-v2.1.0.0.md (candidates, weigh each)
 
-16. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
+26. [x] (S) **DarkIRC Stages B–D** — still disabled behind separate acceptance gates (deferred per 2.1 board; do NOT resurrect unasked)
 
 ## Phase 5 - Miscellaneous
 
-17. [ ] opencode 2 external worker exploration. see docs/ops/opencode2extworkerideaandissuesandpotentialplan.md and come up with a plan (not implementation) for a possible addition of a new external worker, opencode2 - you can put it in docs/plans or docs/proposals
+27. [ ] opencode 2 external worker exploration. see docs/ops/opencode2extworkerideaandissuesandpotentialplan.md and come up with a plan (not implementation) for a possible addition of a new external worker, opencode2 - you can put it in docs/plans or docs/proposals
 
 ## Phase 6 - Documentation
-18. [x] take a look at any documentation that should be updated and update necessary documentation
+28. [x] take a look at any documentation that should be updated and update necessary documentation
     - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0)
-19. [x] (S) Reserved for something else
-20. [x] (S) Reserved for human to start dedicated testing sessions and other related tasks
-21. [x] review open work items
+29. [x] (S) Reserved for something else
+30. [x] (S) Reserved for human to start dedicated testing sessions and other related tasks
+31. [x] review open work items
     - Live tracker query 2026-09-14 00:03 UTC: 14 open issues (#97, #109, #113, #114, #121, #122, #126, #127, #130, #131, #132, #135, #136, #137). Since the v2.1.1.0 audit, #86/#133/#134 closed and #135/#136/#137 opened.
     - All three new findings are fixed in source at 14ccfdd23: #135/#136 mission-goal index exclusion (subtree + purge sweep + provenance labels, live canary acceptance on tracker); #137 bounded OpenRC writer-quiesce wait + status-classification fix. #114 has open draft MR !855 (podman sandbox).
     - No 2.1.2.0 code blockers among open items; remaining work is tracker housekeeping plus operator/live residuals on #97/#131/#137. Report: docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md.
-22. [ ] update all docs in docs/guides
-23. [x] update all docs in docs/architecture
+32. [ ] update all docs in docs/guides
+33. [x] update all docs in docs/architecture
     - DONE 2026-09-12 (aj/kimi-20-20260914-0600): all 10 architecture docs revalidated against the 2.1.2.0 tree. SEMANTIC-MEMORY-SEARCH gained the WI#132 `indexed_at` outbox (V27) + repair sweep and the WI#135/WI#136 mission-subtree `missions.json` index exclusion; ENGINE-V2 gained WI#132 authenticity hardening (retrieval/compaction labeling + neutralization) and dropped the dead `executor/context.rs` from its module map; SELF_HEAL_DEPLOYMENT_WIRING gained the 2.1.2.0 `stop_tenant` writer-quiescence notes (WI#133/#134/#135/#137). The remaining docs were date-stamped after confirming no substantive change: SELF_HEAL_COVERAGE_AUDIT (ORDER unchanged at 14 suites), ATOMICBOOL_DEEPER_PROPAGATION (anchors unchanged, defer stands), SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS, IRC-SENDER-IDENTITY, WEECHAT-CHANNEL-ARCHITECTURE (registry 0.2.9 bump only).
-24. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
+34. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
 
 ---
 
