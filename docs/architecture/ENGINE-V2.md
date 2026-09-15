@@ -385,7 +385,11 @@ loaded checkpoint **before** the `Running` transition and the first model
 call. Tier 1 keys (`time`, `date`, `datetime`) are always removed; Tier 2
 keys (`web_search`, `http`, `shell`) are removed only when older than 30
 minutes, judged by a `_cached_at` RFC 3339 timestamp inside the value (values
-without a valid timestamp are never purged). When anything is purged, the
+without a valid timestamp are never purged). The Python orchestrator stamps
+`_cached_at` onto Tier 2 dict outputs at the persisted-state write site
+(`stamp_cached_at`, `orchestrator/default.py`, mirroring
+`TIER2_STALE_STATE_KEYS`), so Tier 2 aging is fully effective; scalar
+outputs stay un-stamped and un-purged (fail-open). When anything is purged, the
 sanitized state is written back to `runtime_checkpoint.persisted_state` and a
 bounded `sanitized_at` marker is stamped on the thread metadata for
 observability. This is a deterministic synchronous hook at the execution
