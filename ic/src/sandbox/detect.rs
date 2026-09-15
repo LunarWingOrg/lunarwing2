@@ -144,12 +144,7 @@ pub async fn check_docker() -> DockerDetection {
 fn docker_binary_exists() -> bool {
     #[cfg(unix)]
     {
-        std::process::Command::new("which")
-            .arg("docker")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        binary_on_path("docker")
     }
     #[cfg(windows)]
     {
@@ -160,6 +155,61 @@ fn docker_binary_exists() -> bool {
             .status()
             .is_ok_and(|s| s.success())
     }
+}
+
+/// Check whether a binary exists on PATH (`which` on Unix, `where` on Windows).
+fn binary_on_path(bin: &str) -> bool {
+    #[cfg(unix)]
+    let lookup = "which";
+    #[cfg(windows)]
+    let lookup = "where";
+    std::process::Command::new(lookup)
+        .arg(bin)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Check whether the podman CLI is installed and usable.
+///
+/// Podman has no daemon, so "running" means the CLI itself responds
+/// (`podman --version` succeeds — the generic sandbox drives the CLI
+/// directly, mirroring the mt-admin external-worker pattern). Status
+/// meanings reuse [`DockerStatus`]: `Available` = CLI usable,
+/// `NotRunning` = installed but broken/uninvokable.
+pub async fn check_podman() -> DockerDetection {
+    let platform = Platform::current();
+
+    if !binary_on_path("podman") {
+        return DockerDetection {
+            status: DockerStatus::NotInstalled,
+            platform,
+        };
+    }
+
+    let output = tokio::process::Command::new("podman")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+
+    match output {
+        Ok(output) if output.status.success() => DockerDetection {
+            status: DockerStatus::Available,
+            platform,
+        },
+        _ => DockerDetection {
+            status: DockerStatus::NotRunning,
+            platform,
+        },
+    }
+}
+
+/// Installation guidance for podman.
+pub fn podman_install_hint() -> &'static str {
+    "Install podman: https://podman.io/docs/installation (Gentoo: emerge app-containers/podman)"
 }
 
 #[cfg(windows)]
@@ -230,6 +280,15 @@ mod tests {
         match result.status {
             DockerStatus::Available | DockerStatus::NotInstalled | DockerStatus::NotRunning => {}
             DockerStatus::Disabled => panic!("check_docker should never return Disabled"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_podman_returns_valid_status() {
+        let result = check_podman().await;
+        match result.status {
+            DockerStatus::Available | DockerStatus::NotInstalled | DockerStatus::NotRunning => {}
+            DockerStatus::Disabled => panic!("check_podman should never return Disabled"),
         }
     }
 }

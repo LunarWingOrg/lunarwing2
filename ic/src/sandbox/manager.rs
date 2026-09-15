@@ -1,9 +1,9 @@
-//! Main sandbox manager coordinating proxy and containers.
+//! Main sandbox manager coordinating the network proxy and container runner.
 //!
 //! The `SandboxManager` is the primary entry point for sandboxed execution.
 //! It coordinates:
-//! - Docker container creation and lifecycle
-//! - HTTP proxy for network access control
+//! - Container lifecycle via the podman/docker CLI runner (no daemon socket)
+//! - HTTP proxy for network access control (proxy network mode)
 //! - Credential injection for API calls
 //! - Resource limits and timeouts
 //!
@@ -17,14 +17,9 @@
 //! │         │                                                                  │
 //! │         ▼                                                                  │
 //! │   ┌──────────────┐     ┌──────────────┐     ┌──────────────────────────┐  │
-//! │   │ Start Proxy  │────▶│ Create       │────▶│ Execute & Collect Output │  │
+//! │   │ Start Proxy  │────▶│ Run          │────▶│ Collect Output & Cleanup │  │
 //! │   │ (if needed)  │     │ Container    │     │                          │  │
 //! │   └──────────────┘     └──────────────┘     └──────────────────────────┘  │
-//! │                                                        │                   │
-//! │                                                        ▼                   │
-//! │                                              ┌──────────────────────────┐  │
-//! │                                              │ Cleanup Container        │  │
-//! │                                              └──────────────────────────┘  │
 //! └───────────────────────────────────────────────────────────────────────────┘
 //! ```
 
@@ -35,10 +30,8 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use bollard::Docker;
-
-use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxPolicy};
-use crate::sandbox::container::{ContainerOutput, ContainerRunner, connect_docker};
+use crate::sandbox::cli_runner::{CliRunner, ExecParams};
+use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
 use crate::sandbox::error::{Result, SandboxError};
 use crate::sandbox::proxy::{HttpProxy, NetworkProxyBuilder};
 
@@ -59,8 +52,8 @@ pub struct ExecOutput {
     pub truncated: bool,
 }
 
-impl From<ContainerOutput> for ExecOutput {
-    fn from(c: ContainerOutput) -> Self {
+impl From<crate::sandbox::container::ContainerOutput> for ExecOutput {
+    fn from(c: crate::sandbox::container::ContainerOutput) -> Self {
         let output = if c.stderr.is_empty() {
             c.stdout.clone()
         } else if c.stdout.is_empty() {
@@ -81,10 +74,14 @@ impl From<ContainerOutput> for ExecOutput {
 }
 
 /// Main sandbox manager.
+///
+/// BOUNDARY: this manager powers the generic (shell-tool) sandbox via the
+/// podman/docker CLI runner. It is intentionally NOT connected to the
+/// orchestrator's worker-container path (`ContainerJobManager`, bollard).
 pub struct SandboxManager {
     config: SandboxConfig,
     proxy: Arc<RwLock<Option<HttpProxy>>>,
-    docker: Arc<RwLock<Option<Docker>>>,
+    runner: Arc<RwLock<Option<Arc<CliRunner>>>>,
     initialized: std::sync::atomic::AtomicBool,
 }
 
@@ -94,7 +91,7 @@ impl SandboxManager {
         Self {
             config,
             proxy: Arc::new(RwLock::new(None)),
-            docker: Arc::new(RwLock::new(None)),
+            runner: Arc::new(RwLock::new(None)),
             initialized: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -104,19 +101,18 @@ impl SandboxManager {
         Self::new(SandboxConfig::default())
     }
 
-    /// Check if the sandbox is available (Docker running, etc.).
+    /// Check if the sandbox is available (container runtime CLI present).
     pub async fn is_available(&self) -> bool {
         if !self.config.enabled {
             return false;
         }
 
-        match connect_docker().await {
-            Ok(docker) => docker.ping().await.is_ok(),
-            Err(_) => false,
-        }
+        CliRunner::detect(self.config.runtime, self.config.image.clone())
+            .await
+            .is_ok()
     }
 
-    /// Initialize the sandbox (connect to Docker, start proxy).
+    /// Initialize the sandbox (detect runtime CLI, verify image, start proxy).
     pub async fn initialize(&self) -> Result<()> {
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
@@ -128,40 +124,26 @@ impl SandboxManager {
             });
         }
 
-        // Connect to Docker
-        let docker = connect_docker().await?;
+        // Detect the runtime CLI (podman preferred, docker fallback)
+        let runner =
+            Arc::new(CliRunner::detect(self.config.runtime, self.config.image.clone()).await?);
 
-        // Check if Docker is responsive
-        docker
-            .ping()
-            .await
-            .map_err(|e| SandboxError::DockerNotAvailable {
-                reason: e.to_string(),
-            })?;
-
-        // Check for / pull image using a temporary runner
-        let checker = ContainerRunner::new(
-            docker.clone(),
-            self.config.image.clone(),
-            self.config.proxy_port,
-        );
-        if !checker.image_exists().await {
+        // Check for / pull the image
+        if !runner.image_exists().await {
             if self.config.auto_pull_image {
-                checker.pull_image().await?;
+                runner.pull_image().await?;
             } else {
-                return Err(SandboxError::ContainerCreationFailed {
-                    reason: format!(
-                        "image {} not found and auto_pull is disabled",
-                        self.config.image
-                    ),
+                return Err(SandboxError::ImageUnavailable {
+                    image: self.config.image.clone(),
+                    reason: "image not found locally and auto-pull is disabled".to_string(),
                 });
             }
         }
 
-        *self.docker.write().await = Some(docker);
+        *self.runner.write().await = Some(runner);
 
-        // Start the network proxy if we're using a sandboxed policy
-        if self.config.policy.is_sandboxed() {
+        // Start the network proxy only for sandboxed policies in proxy mode.
+        if self.config.policy.is_sandboxed() && self.config.network == SandboxNetworkMode::Proxy {
             let proxy = NetworkProxyBuilder::from_config(&self.config)
                 .build_and_start(self.config.proxy_port)
                 .await?;
@@ -172,7 +154,16 @@ impl SandboxManager {
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        tracing::info!("Sandbox initialized");
+        // Resolve the runtime name before the macro: the read guard's await
+        // inside `tracing::info!` field position would make the future !Send.
+        let runtime_bin = self
+            .runner
+            .read()
+            .await
+            .as_ref()
+            .map(|r| r.runtime().binary())
+            .unwrap_or("unknown");
+        tracing::info!(runtime = runtime_bin, "Sandbox initialized");
         Ok(())
     }
 
@@ -289,15 +280,14 @@ impl SandboxManager {
             0
         };
 
-        let docker =
-            self.docker
+        let runner =
+            self.runner
                 .read()
                 .await
                 .clone()
-                .ok_or_else(|| SandboxError::DockerNotAvailable {
-                    reason: "Docker connection not initialized".to_string(),
+                .ok_or_else(|| SandboxError::RuntimeNotAvailable {
+                    reason: "container runtime not initialized".to_string(),
                 })?;
-        let runner = ContainerRunner::new(docker, self.config.image.clone(), proxy_port);
 
         let limits = ResourceLimits {
             memory_bytes: self.config.memory_limit_mb * 1024 * 1024,
@@ -306,7 +296,17 @@ impl SandboxManager {
             max_output_bytes: 64 * 1024,
         };
 
-        let container_output = runner.execute(command, cwd, policy, &limits, env).await?;
+        let container_output = runner
+            .execute(ExecParams {
+                command,
+                working_dir: cwd,
+                policy,
+                limits: &limits,
+                env: &env,
+                network: self.config.network,
+                proxy_port,
+            })
+            .await?;
         Ok(container_output.into())
     }
 
@@ -439,13 +439,15 @@ impl Drop for SandboxManager {
 
 /// Check whether a sandbox error is transient and worth retrying.
 ///
-/// Transient errors are those caused by Docker daemon glitches, container
+/// Transient errors are those caused by runtime glitches, container
 /// creation race conditions, or container start failures — not by command
 /// execution failures, timeouts, or policy violations.
 fn is_transient_sandbox_error(err: &SandboxError) -> bool {
     matches!(
         err,
         SandboxError::DockerNotAvailable { .. }
+            | SandboxError::RuntimeNotAvailable { .. }
+            | SandboxError::ImageUnavailable { .. }
             | SandboxError::ContainerCreationFailed { .. }
             | SandboxError::ContainerStartFailed { .. }
     )
@@ -505,6 +507,18 @@ impl SandboxManagerBuilder {
         self
     }
 
+    /// Set the container runtime (default: auto — podman preferred).
+    pub fn runtime(mut self, runtime: crate::sandbox::config::SandboxRuntime) -> Self {
+        self.config.runtime = runtime;
+        self
+    }
+
+    /// Set the network egress mode for sandboxed policies.
+    pub fn network(mut self, network: SandboxNetworkMode) -> Self {
+        self.config.network = network;
+        self
+    }
+
     /// Add domains to the network allowlist.
     pub fn allow_domains(mut self, domains: Vec<String>) -> Self {
         self.config.network_allowlist.extend(domains);
@@ -533,6 +547,7 @@ impl Default for SandboxManagerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::ContainerOutput;
 
     #[test]
     fn test_exec_output_from_container_output() {
@@ -681,6 +696,17 @@ mod tests {
         assert!(super::is_transient_sandbox_error(
             &SandboxError::DockerNotAvailable {
                 reason: "daemon restarting".to_string()
+            }
+        ));
+        assert!(super::is_transient_sandbox_error(
+            &SandboxError::RuntimeNotAvailable {
+                reason: "cli went missing".to_string()
+            }
+        ));
+        assert!(super::is_transient_sandbox_error(
+            &SandboxError::ImageUnavailable {
+                image: "img".to_string(),
+                reason: "registry flake".to_string()
             }
         ));
         assert!(super::is_transient_sandbox_error(

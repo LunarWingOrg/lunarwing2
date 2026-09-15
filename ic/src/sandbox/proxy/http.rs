@@ -228,7 +228,7 @@ async fn handle_request(
     match decision {
         NetworkDecision::Deny { reason } => {
             tracing::info!("Proxy: blocked {} {} - {}", method, uri, reason);
-            Ok(error_response(StatusCode::FORBIDDEN, reason))
+            Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason)))
         }
         NetworkDecision::Allow | NetworkDecision::AllowWithCredentials { .. } => {
             // Forward the request
@@ -273,7 +273,7 @@ async fn handle_connect(
 
     if let NetworkDecision::Deny { reason } = decision {
         tracing::info!("Proxy: blocked CONNECT {} - {}", host, reason);
-        return error_response(StatusCode::FORBIDDEN, reason);
+        return error_response(StatusCode::FORBIDDEN, deny_body(reason));
     }
 
     tracing::debug!("Proxy: allowing CONNECT to {}", target_addr);
@@ -503,6 +503,14 @@ fn error_response(status: StatusCode, message: String) -> Response<BoxBody<Bytes
     )
 }
 
+/// Body for policy denials. The `sandbox-proxy denied:` prefix is a stable
+/// contract so an agent reading command output inside a sandboxed container
+/// can tell a proxy denial apart from an error served by the remote service
+/// (pinned by test).
+fn deny_body(reason: String) -> String {
+    format!("sandbox-proxy denied: {reason}")
+}
+
 /// Create an empty body.
 fn empty_body() -> BoxBody<Bytes, Infallible> {
     Empty::<Bytes>::new().map_err(|_| unreachable!()).boxed()
@@ -552,5 +560,15 @@ mod tests {
 
         let resp = error_response(StatusCode::FORBIDDEN, "denied".to_string());
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The deny prefix is a contract consumed by sandboxed agents reading
+    /// command output: it must always identify the proxy as the denier.
+    #[test]
+    fn test_deny_body_carries_proxy_prefix() {
+        assert_eq!(
+            deny_body("domain not in allowlist: evil.example".to_string()),
+            "sandbox-proxy denied: domain not in allowlist: evil.example"
+        );
     }
 }
