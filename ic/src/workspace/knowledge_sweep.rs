@@ -24,6 +24,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::lunarwing_base_dir;
+use crate::workspace::knowledge_sync::shared_deterministic_jitter_secs;
 use crate::workspace::{
     KNOWLEDGE_DIR, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, WIRE_AGENT_PREFIX, Workspace,
     is_incomplete_wire_write,
@@ -284,8 +285,6 @@ impl Drop for RunningGuard {
         RUNNING.store(false, Ordering::SeqCst);
     }
 }
-
-use crate::workspace::knowledge_sync::shared_deterministic_jitter_secs;
 
 /// Minimum delay between sweep loop iterations, even on failure.
 const MIN_LOOP_DELAY_SECS: u64 = 60;
