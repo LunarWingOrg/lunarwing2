@@ -59,6 +59,31 @@ MODEL_RECOVERY_POLICY = {
 # Defined before run_loop so they are in scope when called.
 
 
+# Tier 2 cached tool-output keys (work item #109 scope B). Mirrors
+# TIER2_STALE_STATE_KEYS in the Rust pre-execution sanitizer
+# (ic/crates/lunarwing_engine/src/executor/loop_engine.rs): the sanitizer
+# purges these persisted-state keys when older than 30 minutes, judged by
+# the `_cached_at` RFC 3339 timestamp stamped into the value. Only dict
+# outputs are stamped — replacing scalar outputs (e.g. plain-text tool
+# results) would change what repl code reads back, so unstamped values
+# stay un-purged (fail-open, per the sanitizer contract). The timestamp
+# comes from the host (`__execute_code_step__` result records carry
+# `completed_at`): Monty has no clock (OS calls are blocked), so the
+# orchestrator must not call datetime.now() itself.
+TIER2_CACHE_KEYS = ("web_search", "http", "shell")
+
+
+def stamp_cached_at(action_name, output, completed_at):
+    """Stamp `_cached_at` (host-provided RFC 3339 UTC) onto Tier 2 tool-output dicts."""
+    if action_name not in TIER2_CACHE_KEYS or not isinstance(output, dict):
+        return output
+    if not isinstance(completed_at, str) or not completed_at:
+        return output
+    stamped = dict(output)
+    stamped["_cached_at"] = completed_at
+    return stamped
+
+
 def extract_final(text):
     """Extract FINAL() content from text. Returns None if not found."""
     idx = text.find("FINAL(")
@@ -1324,7 +1349,11 @@ def run_loop(context, goal, actions, state, config):
                 state["step_" + str(step) + "_return"] = result["return_value"]
                 state["last_return"] = result["return_value"]
             for r in result.get("action_results", []):
-                state[r.get("action_name", "unknown")] = r.get("output")
+                state[r.get("action_name", "unknown")] = stamp_cached_at(
+                    r.get("action_name", "unknown"),
+                    r.get("output"),
+                    r.get("completed_at"),
+                )
 
             # Format output for next LLM context
             output = format_output(result)

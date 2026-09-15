@@ -14,7 +14,7 @@ use crate::context::JobContext;
 use crate::tools::builtin::memory::WorkspaceResolver;
 use crate::tools::tool::{Tool, ToolError, ToolOutput, require_str};
 use crate::workspace::{
-    KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta,
+    KNOWLEDGE_SCAN_MAX_NOTES, KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta,
     KnowledgeNoteRow, KnowledgeStats, KnowledgeStatus, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES,
     MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS,
     MAX_TITLE_BYTES, is_valid_slug, note_path, render_note_markdown, summarize_topics,
@@ -986,7 +986,7 @@ impl Tool for KnowledgeListStaleTool {
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
         let rows = workspace
-            .knowledge_list_notes(&scopes, KNOWLEDGE_SCAN_CAP)
+            .knowledge_scan_all(&scopes)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
 
@@ -1071,14 +1071,14 @@ impl Tool for KnowledgeStatsTool {
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
         let rows = workspace
-            .knowledge_list_notes(&scopes, KNOWLEDGE_SCAN_CAP)
+            .knowledge_scan_all(&scopes)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
 
         let stats = KnowledgeStats::from_rows(&scopes, &rows);
         let mut output = serde_json::to_value(&stats)
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge stats failed: {e}")))?;
-        output["scan_capped"] = serde_json::Value::Bool(rows.len() >= KNOWLEDGE_SCAN_CAP);
+        output["scan_capped"] = serde_json::Value::Bool(rows.len() >= KNOWLEDGE_SCAN_MAX_NOTES);
         Ok(ToolOutput::success(output, start.elapsed()))
     }
 
@@ -1142,7 +1142,7 @@ impl Tool for KnowledgeListTopicsTool {
 
         let workspace = self.resolver.resolve(&ctx.user_id).await;
         let rows = workspace
-            .knowledge_list_notes(&scopes, KNOWLEDGE_SCAN_CAP)
+            .knowledge_scan_all(&scopes)
             .await
             .map_err(|e| ToolError::ExecutionFailed(format!("Knowledge scan failed: {e}")))?;
 

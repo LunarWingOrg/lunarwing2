@@ -1,6 +1,65 @@
-//! Configuration for the Docker execution sandbox.
+//! Configuration for the sandbox execution subsystem (podman-first, docker fallback).
 
 use std::time::Duration;
+
+/// Which container runtime the generic sandbox should drive.
+///
+/// The sandbox shells out to the runtime CLI (`podman run` / `docker run`),
+/// mirroring the rootless podman pattern used by the mt-admin external
+/// workers — no daemon socket is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxRuntime {
+    /// Prefer podman; fall back to docker when only docker is installed.
+    #[default]
+    Auto,
+    /// Podman only.
+    Podman,
+    /// Docker only.
+    Docker,
+}
+
+impl std::str::FromStr for SandboxRuntime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "auto" => Ok(SandboxRuntime::Auto),
+            "podman" => Ok(SandboxRuntime::Podman),
+            "docker" => Ok(SandboxRuntime::Docker),
+            _ => Err(format!(
+                "invalid sandbox runtime '{s}', expected 'auto', 'podman', or 'docker'"
+            )),
+        }
+    }
+}
+
+/// Network egress mode for sandboxed policies (`ReadOnly`/`WorkspaceWrite`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxNetworkMode {
+    /// Route egress through the validating HTTP proxy (allowlist + credential
+    /// injection). Advisory: enforced via `http_proxy`/`https_proxy` env vars
+    /// set in the container, so a process that ignores proxy env vars can
+    /// still reach the network directly.
+    #[default]
+    Proxy,
+    /// Hard network isolation: containers run with `--network none`. No
+    /// egress at all, kernel-enforced; the proxy is not started.
+    None,
+}
+
+impl std::str::FromStr for SandboxNetworkMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "proxy" | "allowlist" => Ok(SandboxNetworkMode::Proxy),
+            "none" | "off" => Ok(SandboxNetworkMode::None),
+            _ => Err(format!(
+                "invalid sandbox network mode '{s}', expected 'proxy' or 'none'"
+            )),
+        }
+    }
+}
 
 /// Configuration for the sandbox system.
 #[derive(Debug, Clone)]
@@ -24,18 +83,22 @@ pub struct SandboxConfig {
     pub cpu_shares: u32,
     /// Network allowlist for proxied requests.
     pub network_allowlist: Vec<String>,
-    /// Docker image to use for the sandbox.
+    /// Container image to use for the sandbox.
     pub image: String,
     /// Whether to auto-pull the image if not found.
     pub auto_pull_image: bool,
     /// Port for the HTTP proxy (0 = auto-assign).
     pub proxy_port: u16,
+    /// Container runtime to drive (default: auto — podman preferred).
+    pub runtime: SandboxRuntime,
+    /// Network egress mode for sandboxed policies (default: proxy).
+    pub network: SandboxNetworkMode,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: true, // Startup check disables gracefully if Docker unavailable
+            enabled: true, // Startup check disables gracefully if runtime unavailable
             policy: SandboxPolicy::ReadOnly,
             allow_full_access: false,
             timeout: Duration::from_secs(120),
@@ -45,6 +108,8 @@ impl Default for SandboxConfig {
             image: "lunarwing-worker:latest".to_string(),
             auto_pull_image: true,
             proxy_port: 0,
+            runtime: SandboxRuntime::Auto,
+            network: SandboxNetworkMode::Proxy,
         }
     }
 }
@@ -57,11 +122,15 @@ impl Default for SandboxConfig {
 /// ├─────────────────┬──────────────────┬────────────────────────────────┤
 /// │ Policy          │ Filesystem       │ Network                        │
 /// ├─────────────────┼──────────────────┼────────────────────────────────┤
-/// │ ReadOnly        │ /workspace (ro)  │ Proxied (allowlist only)       │
-/// │ WorkspaceWrite  │ /workspace (rw)  │ Proxied (allowlist only)       │
+/// │ ReadOnly        │ /workspace (ro)  │ Proxy allowlist or none        │
+/// │ WorkspaceWrite  │ /workspace (rw)  │ Proxy allowlist or none        │
 /// │ FullAccess      │ Full host        │ Full network (DANGER)          │
 /// └─────────────────┴──────────────────┴────────────────────────────────┘
 /// ```
+///
+/// For sandboxed policies the egress mode comes from
+/// [`SandboxNetworkMode`]: `Proxy` (default, allowlist via the HTTP proxy)
+/// or `None` (`--network none`, kernel-enforced isolation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
     /// Read-only access to workspace, proxied network.
@@ -229,5 +298,50 @@ mod tests {
         assert!(allowlist.contains(&"crates.io".to_string()));
         assert!(allowlist.contains(&"registry.npmjs.org".to_string()));
         assert!(allowlist.contains(&"github.com".to_string()));
+    }
+
+    #[test]
+    fn test_runtime_parsing() {
+        assert_eq!(
+            "auto".parse::<SandboxRuntime>().unwrap(),
+            SandboxRuntime::Auto
+        );
+        assert_eq!(
+            "podman".parse::<SandboxRuntime>().unwrap(),
+            SandboxRuntime::Podman
+        );
+        assert_eq!(
+            "docker".parse::<SandboxRuntime>().unwrap(),
+            SandboxRuntime::Docker
+        );
+        assert!("containerd".parse::<SandboxRuntime>().is_err());
+    }
+
+    #[test]
+    fn test_network_mode_parsing() {
+        assert_eq!(
+            "proxy".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::Proxy
+        );
+        assert_eq!(
+            "allowlist".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::Proxy
+        );
+        assert_eq!(
+            "none".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::None
+        );
+        assert_eq!(
+            "off".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::None
+        );
+        assert!("everything".parse::<SandboxNetworkMode>().is_err());
+    }
+
+    #[test]
+    fn test_config_defaults_tiered_network() {
+        let config = SandboxConfig::default();
+        assert_eq!(config.runtime, SandboxRuntime::Auto);
+        assert_eq!(config.network, SandboxNetworkMode::Proxy);
     }
 }

@@ -1,10 +1,34 @@
-//! Docker execution sandbox for secure command execution.
+//! Generic execution sandbox for secure command execution (podman-first).
 //!
 //! This module provides a complete sandboxing solution for running untrusted commands:
-//! - **Container isolation**: Commands run in ephemeral Docker containers
-//! - **Network proxy**: All network traffic goes through a validating proxy
+//! - **Container isolation**: Commands run in ephemeral containers driven by the
+//!   `podman` (preferred) or `docker` CLI — no daemon socket required, mirroring
+//!   the rootless pattern the mt-admin external-worker tooling uses
+//! - **Network proxy**: In proxy mode, network traffic goes through a validating
+//!   proxy (advisory: env-var based); in `none` mode, containers get no network
+//!   at all (kernel-enforced via `--network none`)
 //! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
+//!
+//! # BOUNDARY: generic sandbox vs. orchestrator worker containers
+//!
+//! There are TWO container subsystems in this codebase. Do not mix them:
+//!
+//! - **This module** (`crate::sandbox`): the *generic sandbox*. It runs one
+//!   short-lived hardened container per command via the podman/docker CLI
+//!   ([`cli_runner::CliRunner`]) and is consumed by the shell tool's
+//!   fail-closed execution path. Containers are labeled
+//!   [`cli_runner::SANDBOX_CONTAINER_LABEL`] (`lunarwing.sandbox`).
+//! - **The orchestrator** (`crate::orchestrator::job_manager::ContainerJobManager`):
+//!   the *live worker path*. It creates long-lived per-job worker containers
+//!   over the Docker-compatible API via bollard (`connect_docker`), with job
+//!   auth tokens, the orchestrator HTTP API, and the `lunarwing.job_id` label
+//!   namespace.
+//!
+//! Never wire `SandboxManager`/`CliRunner` into the orchestrator, and never
+//! route shell execution through `ContainerJobManager`. The ONLY shared
+//! component is the reaper (`crate::orchestrator::SandboxReaper`), which
+//! scans both label namespaces separately.
 //!
 //! # Architecture
 //!
@@ -15,26 +39,24 @@
 //! │  ┌─────────────────────────────────────────────────────────────────────┐    │
 //! │  │                        SandboxManager                                │    │
 //! │  │                                                                      │    │
-//! │  │  • Coordinates container creation and execution                     │    │
-//! │  │  • Manages proxy lifecycle                                          │    │
-//! │  │  • Enforces resource limits                                         │    │
+//! │  │  • Coordinates container execution (CLI runner)                      │    │
+//! │  │  • Manages proxy lifecycle (proxy network mode only)                 │    │
+//! │  │  • Enforces resource limits                                          │    │
 //! │  └─────────────────────────────────────────────────────────────────────┘    │
 //! │           │                              │                                   │
 //! │           ▼                              ▼                                   │
 //! │  ┌──────────────────┐          ┌───────────────────┐                        │
-//! │  │   Container      │          │   Network Proxy   │                        │
-//! │  │   Runner         │          │                   │                        │
+//! │  │   CLI Runner     │          │   Network Proxy   │                        │
+//! │  │  (podman/docker) │          │                   │                        │
 //! │  │                  │          │  • Allowlist      │                        │
-//! │  │  • Create        │◀────────▶│  • Credentials    │                        │
-//! │  │  • Execute       │          │  • Logging        │                        │
-//! │  │  • Cleanup       │          │                   │                        │
+//! │  │  • podman run    │◀────────▶│  • Credentials    │                        │
+//! │  │  • kill/rm       │          │  • Logging        │                        │
 //! │  └──────────────────┘          └───────────────────┘                        │
 //! │           │                              │                                   │
 //! │           ▼                              ▼                                   │
 //! │  ┌──────────────────┐          ┌───────────────────┐                        │
-//! │  │     Docker       │          │     Internet      │                        │
-//! │  │                  │          │   (allowed hosts) │                        │
-//! │  └──────────────────┘          └───────────────────┘                        │
+//! │  │   Containers     │          │     Internet      │                        │
+//! │  │  (--rm, labeled) │          │   (allowed hosts) │                        │
 //! └─────────────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -42,8 +64,8 @@
 //!
 //! | Policy | Filesystem | Network | Use Case |
 //! |--------|------------|---------|----------|
-//! | `ReadOnly` | Read workspace | Proxied | Explore code, fetch docs |
-//! | `WorkspaceWrite` | Read/write workspace | Proxied | Build software, run tests |
+//! | `ReadOnly` | Read workspace | Proxy allowlist or none | Explore code, fetch docs |
+//! | `WorkspaceWrite` | Read/write workspace | Proxy allowlist or none | Build software, run tests |
 //! | `FullAccess` | Full host | Full | Direct execution (no sandbox) |
 //!
 //! # Example
@@ -78,13 +100,15 @@
 //! # Security Properties
 //!
 //! - **No credentials in containers**: Environment variables with secrets never enter containers
-//! - **Network isolation**: All traffic routes through the proxy (validated domains only)
-//! - **Non-root execution**: Containers run as UID 1000
+//! - **Network isolation**: Proxy mode routes traffic through the proxy (validated
+//!   domains only — advisory, env-var based); `none` mode removes the network entirely
+//! - **Non-root execution**: Containers run as UID 1000 (keep-id userns where supported)
 //! - **Read-only root**: Container filesystem is read-only (except workspace mount)
 //! - **Capability dropping**: All Linux capabilities dropped, only essential ones added back
-//! - **Auto-cleanup**: Containers are removed after execution (--rm + explicit cleanup)
+//! - **Auto-cleanup**: Containers are removed after execution (--rm + kill-on-timeout + reaper)
 //! - **Timeout enforcement**: Commands are killed after the timeout
 
+pub mod cli_runner;
 pub mod config;
 pub mod container;
 pub mod detect;
@@ -92,9 +116,16 @@ pub mod error;
 pub mod manager;
 pub mod proxy;
 
-pub use config::{ResourceLimits, SandboxConfig, SandboxPolicy};
+pub use cli_runner::{
+    CliRunner, ContainerRuntime, KeepIdMode, SANDBOX_CONTAINER_LABEL, inflight_sandbox_containers,
+};
+pub use config::{
+    ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy, SandboxRuntime,
+};
 pub use container::{ContainerOutput, ContainerRunner, connect_docker};
-pub use detect::{DockerDetection, DockerStatus, Platform, check_docker};
+pub use detect::{
+    DockerDetection, DockerStatus, Platform, check_docker, check_podman, podman_install_hint,
+};
 pub use error::{Result, SandboxError};
 pub use manager::{ExecOutput, SandboxManager, SandboxManagerBuilder};
 pub use proxy::{

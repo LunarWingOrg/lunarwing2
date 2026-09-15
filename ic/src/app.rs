@@ -1033,6 +1033,33 @@ impl AppBuilder {
             tools.register_dev_tools();
         }
 
+        // Generic podman sandbox wiring for the shell tool (fail-closed).
+        //
+        // Production (!allow_local_tools): the sandbox IS the isolation that
+        // makes local execution safe, so the shell tool is registered with
+        // the sandbox manager even though the dev-tools gate above did not
+        // fire. Only the sandboxed `shell` tool is added — the other dev
+        // tools (ReadFile/WriteFile/ListDir/ApplyPatch) stay behind
+        // `allow_local_tools`.
+        //
+        // Dev mode (ALLOW_LOCAL_TOOLS=1) keeps direct host execution by
+        // default; SANDBOX_ENFORCE=true forces the sandbox anyway (the
+        // registration above then replaces the plain shell tool).
+        let sandbox_shell = self.config.sandbox.enabled
+            && (!self.config.agent.allow_local_tools || self.config.sandbox.enforce);
+        if sandbox_shell {
+            let manager = Arc::new(crate::sandbox::SandboxManager::new(
+                self.config.sandbox.to_sandbox_config(),
+            ));
+            let policy = manager.config().policy;
+            tools.register_sandboxed_shell(manager, policy);
+        } else if self.config.sandbox.enabled && self.config.agent.allow_local_tools {
+            tracing::info!(
+                "Sandbox enabled but dev mode (ALLOW_LOCAL_TOOLS) is active: shell tool runs \
+                 directly on the host; set SANDBOX_ENFORCE=true to force the sandbox"
+            );
+        }
+
         Ok((
             mcp_session_manager,
             mcp_process_manager,
@@ -1226,6 +1253,31 @@ impl AppBuilder {
                         )
                         .await;
                     }
+                });
+            }
+
+            // Heartbeat-independent knowledge stale sweep (WI#121): MT renders
+            // disable the heartbeat entirely, so the sweep needs its own
+            // cadence. `run_knowledge_sweep_if_due`'s state file plus the
+            // global RUNNING guard keep this safe alongside the heartbeat
+            // path on single-node hosts.
+            if self.config.knowledge_sweep.enabled {
+                let sweep_workspace = Arc::clone(ws);
+                let sweep_config = self.config.knowledge_sweep.to_workspace_config();
+                let sweep_store = self.db.clone();
+                tokio::spawn(async move {
+                    let shared = sweep_store.map(|db| {
+                        Arc::new(Workspace::new_with_db(
+                            crate::workspace::KNOWLEDGE_SHARED_SCOPE,
+                            db,
+                        ))
+                    });
+                    crate::workspace::knowledge_sweep::run_knowledge_sweep_loop(
+                        sweep_workspace,
+                        shared,
+                        sweep_config,
+                    )
+                    .await;
                 });
             }
 

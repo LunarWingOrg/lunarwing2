@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::StatusCode;
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -12,6 +14,49 @@ use tokio_tungstenite::WebSocketStream;
 use crate::executor::{self, ExecutorConfig, ExecutorEvent};
 use crate::health::WorkerState;
 use crate::protocol::{self, Envelope, TaskRequest};
+use crate::workspace_path;
+
+/// Active workspaces across every connection, mirroring the kimi bridge's
+/// `activeWorkspaces` map: a workspace subtree may only be modified by one
+/// task at a time so concurrent tasks cannot race each other's files.
+#[derive(Default)]
+pub struct WorkspaceRegistry {
+    workspaces: Mutex<HashMap<PathBuf, String>>,
+}
+
+impl WorkspaceRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically claim `workspace`: rejects with the existing owner's task
+    /// id when an overlapping workspace is already registered, otherwise
+    /// records `task_id` as the owner. Holding the lock across the overlap
+    /// check and the insert closes the check-then-act window that would
+    /// otherwise let two concurrent dispatches both claim the same subtree.
+    async fn try_register(&self, workspace: PathBuf, task_id: &str) -> Result<(), String> {
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(owner) = workspaces
+            .iter()
+            .find(|(active, _)| workspace_path::workspace_paths_overlap(active, &workspace))
+            .map(|(_, owner)| owner.clone())
+        {
+            return Err(owner);
+        }
+        workspaces.insert(workspace, task_id.to_string());
+        Ok(())
+    }
+
+    async fn unregister(&self, workspace: &Path, task_id: &str) {
+        let mut workspaces = self.workspaces.lock().await;
+        if workspaces
+            .get(workspace)
+            .is_some_and(|owner| owner == task_id)
+        {
+            workspaces.remove(workspace);
+        }
+    }
+}
 
 pub struct BridgeConfig {
     pub bind_host: String,
@@ -59,14 +104,16 @@ pub async fn run(
     eprintln!("[bridge] listening on ws://{addr}{}", config.ws_path);
 
     let config = Arc::new(config);
+    let registry = Arc::new(WorkspaceRegistry::new());
 
     loop {
         let (stream, peer) = listener.accept().await?;
         eprintln!("[bridge] connection from {peer}");
         let config = Arc::clone(&config);
         let state = Arc::clone(&state);
+        let registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &config, &state).await {
+            if let Err(e) = handle_connection(stream, &config, &state, &registry).await {
                 eprintln!("[bridge] connection error: {e}");
             }
             state.decrement_connections();
@@ -79,6 +126,7 @@ async fn handle_connection(
     stream: TcpStream,
     config: &BridgeConfig,
     state: &WorkerState,
+    registry: &Arc<WorkspaceRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ws = upgrade_websocket(stream, &config.ws_path, config.auth_token.as_deref()).await?;
     state.increment_connections();
@@ -108,7 +156,7 @@ async fn handle_connection(
 
         match envelope.msg_type.as_str() {
             "task_request" => {
-                dispatch_task(envelope, config, &mut write, &mut active_cancel).await?;
+                dispatch_task(envelope, config, &mut write, &mut active_cancel, registry).await?;
             }
             "cancel" => {
                 if let Some(tx) = active_cancel.take() {
@@ -197,12 +245,60 @@ async fn dispatch_task<S>(
     config: &BridgeConfig,
     write: &mut S,
     active_cancel: &mut Option<oneshot::Sender<()>>,
+    registry: &Arc<WorkspaceRegistry>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: futures_util::Sink<Message> + Unpin,
     <S as futures_util::Sink<Message>>::Error: std::error::Error + Send + Sync + 'static,
 {
     let request: TaskRequest = serde_json::from_value(envelope.payload)?;
+
+    // Resolve and confine the project dir before spawning anything: a
+    // daemon-supplied path that escapes WORKSPACE_ROOT must fail closed with
+    // an error envelope instead of pointing the pebble CLI at an arbitrary
+    // host directory.
+    let requested_dir = request
+        .context
+        .project_dir
+        .clone()
+        .unwrap_or_else(|| config.workspace_root.clone());
+    let workspace = match workspace_path::resolve_workspace_path(
+        &requested_dir,
+        std::path::Path::new(&config.workspace_root),
+    ) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!(
+                "[bridge] task {}: rejected workspace path '{}': {e}",
+                request.task_id, requested_dir
+            );
+            let rejection =
+                protocol::result_envelope(&request.task_id, "error", "", Some(&e.to_string()), 0);
+            let json = serde_json::to_string(&rejection)?;
+            write.send(Message::Text(json.into())).await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(owner) = registry
+        .try_register(workspace.clone(), &request.task_id)
+        .await
+    {
+        let error = format!(
+            "Workspace {} is already being modified by task {owner}. \
+             Cancel or finish that task before dispatching another task to this workspace.",
+            workspace.display()
+        );
+        eprintln!(
+            "[bridge] task {}: rejected, workspace owned by {owner}",
+            request.task_id
+        );
+        let rejection = protocol::result_envelope(&request.task_id, "error", "", Some(&error), 0);
+        let json = serde_json::to_string(&rejection)?;
+        write.send(Message::Text(json.into())).await?;
+        return Ok(());
+    }
+
     eprintln!("[bridge] task {}: starting", request.task_id);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -216,9 +312,15 @@ where
         workspace_root: config.workspace_root.clone(),
     };
 
-    tokio::spawn(async move {
-        executor::run_task(&exec_config, &request, event_tx, cancel_rx).await;
-    });
+    {
+        let registry = Arc::clone(registry);
+        let workspace = workspace.clone();
+        let request = request.clone();
+        tokio::spawn(async move {
+            executor::run_task(&exec_config, &request, event_tx, cancel_rx).await;
+            registry.unregister(&workspace, &request.task_id).await;
+        });
+    }
 
     while let Some(event) = event_rx.recv().await {
         let env = match &event {
@@ -240,6 +342,69 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registry_rejects_overlapping_workspaces_and_frees_on_unregister() {
+        let registry = WorkspaceRegistry::new();
+        let project = PathBuf::from("/workspace/project");
+
+        assert!(registry
+            .try_register(project.clone(), "task-1")
+            .await
+            .is_ok());
+        assert_eq!(
+            registry
+                .try_register(PathBuf::from("/workspace/project/src"), "task-2")
+                .await,
+            Err("task-1".to_string())
+        );
+        assert!(registry
+            .try_register(PathBuf::from("/workspace/other"), "task-2")
+            .await
+            .is_ok());
+
+        // Unregister under a different task id must not free the workspace.
+        registry.unregister(&project, "task-other").await;
+        assert_eq!(
+            registry.try_register(project.clone(), "task-3").await,
+            Err("task-1".to_string())
+        );
+
+        registry.unregister(&project, "task-1").await;
+        assert!(registry.try_register(project, "task-4").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_claims_are_atomic_under_concurrency() {
+        // The overlap check and the insert share one critical section, so
+        // concurrent dispatches racing on the same subtree must yield exactly
+        // one winner; losers report that winner as the owner.
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let registry = Arc::clone(&registry);
+                let workspace = PathBuf::from("/workspace/shared");
+                tokio::spawn(
+                    async move { registry.try_register(workspace, &format!("task-{i}")).await },
+                )
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(handles).await;
+        let mut owners: Vec<String> = Vec::new();
+        let mut winners = 0;
+        for result in results {
+            match result.expect("join") {
+                Ok(()) => winners += 1,
+                Err(owner) => owners.push(owner),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one concurrent claim may win");
+        assert!(
+            owners.iter().all(|owner| owner == &owners[0]),
+            "every loser must report the same owner"
+        );
+    }
 
     #[test]
     fn negotiate_prefers_primary() {

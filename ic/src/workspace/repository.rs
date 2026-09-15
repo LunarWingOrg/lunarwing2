@@ -1261,30 +1261,60 @@ impl Repository {
     /// Scan study-note metadata (no content) across scopes, newest first.
     ///
     /// Rows whose metadata no longer parses as a study note are skipped.
+    /// `before` continues the scan strictly below the `(updated_at, path,
+    /// user_id)` keyset cursor so full-store paged scans can exceed any single
+    /// query's row limit.
     pub async fn knowledge_list_notes(
         &self,
         user_ids: &[String],
         agent_id: Option<Uuid>,
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
         let conn = self.conn().await?;
-        let rows = conn
-            .query(
-                r#"
-                SELECT user_id AS scope, path, metadata, updated_at
-                FROM memory_documents
-                WHERE user_id = ANY($1)
-                  AND agent_id IS NOT DISTINCT FROM $2
-                  AND metadata ->> 'provenance' = 'study-note'
-                ORDER BY updated_at DESC
-                LIMIT $3
-                "#,
-                &[&user_ids, &agent_id, &(limit as i64)],
-            )
-            .await
-            .map_err(|e| WorkspaceError::SearchFailed {
-                reason: format!("Knowledge list query failed: {e}"),
-            })?;
+        let rows = match before {
+            None => {
+                conn.query(
+                    r#"
+                    SELECT user_id AS scope, path, metadata, updated_at
+                    FROM memory_documents
+                    WHERE user_id = ANY($1)
+                      AND agent_id IS NOT DISTINCT FROM $2
+                      AND metadata ->> 'provenance' = 'study-note'
+                    ORDER BY updated_at DESC, path DESC, user_id DESC
+                    LIMIT $3
+                    "#,
+                    &[&user_ids, &agent_id, &(limit as i64)],
+                )
+                .await
+            }
+            Some((cursor_ts, cursor_path, cursor_scope)) => {
+                conn.query(
+                    r#"
+                    SELECT user_id AS scope, path, metadata, updated_at
+                    FROM memory_documents
+                    WHERE user_id = ANY($1)
+                      AND agent_id IS NOT DISTINCT FROM $2
+                      AND metadata ->> 'provenance' = 'study-note'
+                      AND (updated_at, path, user_id) < ($3, $4, $5)
+                    ORDER BY updated_at DESC, path DESC, user_id DESC
+                    LIMIT $6
+                    "#,
+                    &[
+                        &user_ids,
+                        &agent_id,
+                        cursor_ts,
+                        &cursor_path,
+                        &cursor_scope,
+                        &(limit as i64),
+                    ],
+                )
+                .await
+            }
+        }
+        .map_err(|e| WorkspaceError::SearchFailed {
+            reason: format!("Knowledge list query failed: {e}"),
+        })?;
         Ok(rows
             .iter()
             .filter_map(|row| {

@@ -1,7 +1,14 @@
 //! Container lifecycle management for sandboxed jobs.
 //!
-//! Extends the existing `SandboxManager` infrastructure to support persistent
-//! containers with their own agent loops (as opposed to ephemeral per-command containers).
+//! # BOUNDARY (do not cross)
+//!
+//! This is the orchestrator's **live worker path**: persistent per-job worker
+//! containers with their own agent loops, created over the Docker-compatible
+//! API via bollard and labeled `lunarwing.job_id`. It is NOT the generic
+//! sandbox — that is `crate::sandbox` (podman/docker CLI runner, ephemeral
+//! per-command containers labeled `lunarwing.sandbox`, consumed by the shell
+//! tool). Despite the historical doc note below, this module shares only
+//! `connect_docker()` with the sandbox module; never merge the two paths.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

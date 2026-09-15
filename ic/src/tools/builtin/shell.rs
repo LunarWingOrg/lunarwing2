@@ -549,6 +549,35 @@ fn has_command_token(lower: &str, token: &str) -> bool {
     false
 }
 
+/// Build the structured failure envelope for sandboxed execution errors.
+///
+/// Fail-closed is only useful if the agent can tell WHAT failed: a contained
+/// agent must be able to distinguish "the proxy denied my egress" from "the
+/// sandbox itself is down", and must always know that nothing ran on the
+/// host. The `[sandbox:<kind>]` prefix and `SandboxError::kind()` values are
+/// a stable contract (pinned by tests).
+fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
+    let kind = err.kind();
+    let class = match kind {
+        "sandbox_unavailable" => "sandbox unavailable (container runtime missing or unusable)",
+        "image_unavailable" => "sandbox image unavailable",
+        "network_blocked" => "network egress denied by the sandbox proxy",
+        "proxy_error" => "sandbox network proxy failure",
+        "timeout" => "sandboxed command timed out",
+        "resource_limit_exceeded" => "sandbox resource limit exceeded",
+        "execution_failed" => "command failed inside the sandbox container",
+        "credential_injection_failed" => "sandbox proxy credential injection failed",
+        _ => "sandboxed execution failed",
+    };
+    let mut message = format!(
+        "[sandbox:{kind}] {class}: {err}. The command was contained and did NOT run on the host."
+    );
+    if let Some(hint) = err.remediation_hint() {
+        message.push_str(format!(" Hint: {hint}.").as_str());
+    }
+    ToolError::Sandbox(message)
+}
+
 /// Shell command execution tool.
 pub struct ShellTool {
     /// Working directory for commands (if None, uses job's working dir or cwd).
@@ -658,8 +687,11 @@ impl ShellTool {
                 let combined = truncate_output(&output.output);
                 Ok((combined, output.exit_code))
             }
-            Ok(Err(e)) => Err(ToolError::ExecutionFailed(format!("Sandbox error: {}", e))),
-            Err(_) => Err(ToolError::Timeout(timeout)),
+            Ok(Err(e)) => Err(sandbox_error_envelope(&e)),
+            Err(_) => Err(ToolError::Sandbox(format!(
+                "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
+                 the container was killed and nothing ran on the host"
+            ))),
         }
     }
 
@@ -1533,5 +1565,56 @@ mod tests {
         assert_eq!(r2, RiskLevel::High); // safety: test code
         let r3 = classify_command_risk("DROP table users;");
         assert_eq!(r3, RiskLevel::High); // safety: test code
+    }
+
+    // ── sandbox failure envelope (shape pinned per error class) ──────────
+
+    fn envelope_message(err: &crate::sandbox::SandboxError) -> String {
+        match sandbox_error_envelope(err) {
+            ToolError::Sandbox(msg) => msg,
+            other => panic!("expected ToolError::Sandbox, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_envelope_distinguishes_sandbox_down_from_proxy_denied() {
+        let down = envelope_message(&crate::sandbox::SandboxError::RuntimeNotAvailable {
+            reason: "neither `podman` nor `docker` found on PATH".to_string(),
+        });
+        assert!(down.starts_with("[sandbox:sandbox_unavailable]"), "{down}");
+        assert!(down.contains("did NOT run on the host"), "{down}");
+        assert!(down.contains("Hint:"), "{down}");
+
+        let denied = envelope_message(&crate::sandbox::SandboxError::NetworkBlocked {
+            reason: "domain not in allowlist: evil.example".to_string(),
+        });
+        assert!(denied.starts_with("[sandbox:network_blocked]"), "{denied}");
+        assert!(denied.contains("proxy"), "{denied}");
+        assert!(!denied.contains("Hint:"), "{denied}");
+
+        assert_ne!(
+            down.split(']').next().unwrap(),
+            denied.split(']').next().unwrap()
+        );
+    }
+
+    #[test]
+    fn sandbox_envelope_covers_image_timeout_and_execution() {
+        let image = envelope_message(&crate::sandbox::SandboxError::ImageUnavailable {
+            image: "lunarwing-worker:latest".to_string(),
+            reason: "not found locally".to_string(),
+        });
+        assert!(image.starts_with("[sandbox:image_unavailable]"), "{image}");
+
+        let timeout = envelope_message(&crate::sandbox::SandboxError::Timeout(
+            std::time::Duration::from_secs(30),
+        ));
+        assert!(timeout.starts_with("[sandbox:timeout]"), "{timeout}");
+
+        let exec = envelope_message(&crate::sandbox::SandboxError::ExecutionFailed {
+            reason: "exit code 1".to_string(),
+        });
+        assert!(exec.starts_with("[sandbox:execution_failed]"), "{exec}");
+        assert!(exec.contains("did NOT run on the host"), "{exec}");
     }
 }

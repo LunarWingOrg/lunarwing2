@@ -474,6 +474,12 @@ fn deterministic_jitter_secs(identity: &str, cap: u64) -> u64 {
     hash % cap.max(1)
 }
 
+/// Deterministic startup jitter shared by the knowledge cadence loops, so
+/// tenants on one host stagger their background passes.
+pub fn shared_deterministic_jitter_secs(identity: &str, cap: u64) -> u64 {
+    deterministic_jitter_secs(identity, cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
