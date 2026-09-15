@@ -51,4 +51,6 @@ the study-notes knowledge layer. Study notes are ordinary `memory_documents`
 rows tagged `metadata->>'provenance' = 'study-note'`; FTS runs on the existing
 `memory_chunks` tsvector (PostgreSQL) / `memory_chunks_fts` FTS5 (libSQL).
 Both backends are implemented; migration V26 adds the partial metadata index
-on each side.
+on each side. `knowledge_list_notes` takes a `(updated_at, path, user_id)`
+keyset cursor so `Workspace::knowledge_scan_all` can page through the whole
+store instead of a fixed most-recent window (WI#121).
