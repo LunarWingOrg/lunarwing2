@@ -13,7 +13,7 @@
 edition = "2021"
 rust-version = "1.71"
 name = "rustls-webpki"
-version = "0.103.14"
+version = "0.103.15"
 build = false
 include = [
     "Cargo.toml",
@@ -60,7 +60,10 @@ license = "ISC"
 repository = "https://github.com/rustls/webpki"
 
 [package.metadata.docs.rs]
-all-features = true
+features = [
+    "aws-lc-rs",
+    "ring",
+]
 rustdoc-args = [
     "--cfg",
     "webpki_docsrs",
