@@ -1085,12 +1085,16 @@ pub trait WorkspaceStore: Send + Sync {
 
     /// Scan study-note metadata (no content) across scopes, newest first.
     ///
-    /// Used by stale detection and statistics; bounded by `limit`.
+    /// Used by stale detection and statistics; bounded by `limit`. `before`
+    /// continues the scan strictly below the `(updated_at, path, user_id)`
+    /// keyset cursor, enabling full-store paged scans that exceed one query's
+    /// row limit.
     async fn knowledge_list_notes(
         &self,
         user_ids: &[String],
         agent_id: Option<Uuid>,
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, crate::error::WorkspaceError>;
 
     //
