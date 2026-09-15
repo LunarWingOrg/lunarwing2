@@ -306,17 +306,53 @@ Implicit. The listener is a raw `TcpListener` (not axum) inside a `tokio::time::
 
 **Source:** `src/sandbox/proxy/http.rs`, `src/sandbox/proxy/allowlist.rs`, `src/sandbox/proxy/policy.rs`
 
+### Runtime model (generic podman sandbox)
+
+The generic sandbox executes commands from the `shell` tool in ephemeral
+hardened containers driven by the **podman (preferred) or docker CLI** — no
+daemon API socket is required (`src/sandbox/cli_runner.rs`). This is the same
+rootless-CLI pattern the mt-admin external-worker tooling uses, and it keeps
+the sandbox usable on OpenRC hosts where no `podman system service` socket
+exists.
+
+> **BOUNDARY:** the generic sandbox (`src/sandbox/`, CLI runner,
+> `lunarwing.sandbox` container labels) is separate from the orchestrator's
+> live worker-container path (`src/orchestrator/job_manager.rs`, bollard,
+> `lunarwing.job_id` labels). The two must not be wired together; the reaper
+> (`src/orchestrator/reaper.rs`) is the only shared component.
+
+### Network egress tiers
+
+Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
+`SANDBOX_NETWORK` / `[sandbox].network`:
+
+| Mode | Mechanism | Enforcement |
+|------|-----------|-------------|
+| `proxy` (default) | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
+| `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+
+In proxy mode the container is pointed at the proxy via
+`http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns
+maps that alias to the host's loopback, so the proxy's `127.0.0.1` bind is
+reachable) or `http://host.docker.internal:<port>` plus
+`--add-host host.docker.internal:host-gateway` on the docker CLI fallback.
+FullAccess keeps full, unsandboxed network.
+
+Policy denials returned by the proxy carry the stable body prefix
+`sandbox-proxy denied: <reason>` so a sandboxed agent reading command output
+can attribute the failure to the proxy rather than the remote service.
+
 ### Bind Address
 
 Always binds to **`127.0.0.1`** (localhost only). Port is OS-assigned (port `0`, ephemeral). Falls back to `[::1]` (IPv6 loopback) if IPv4 is unavailable.
 
 Both IPv4 and IPv6 loopback addresses are security-equivalent — they are only reachable from the local machine.
 
-**Reference:** `src/sandbox/proxy/http.rs` — `SandboxProxy::start()`, `TcpListener::bind("127.0.0.1:0")`
+**Reference:** `src/sandbox/proxy/http.rs` — `HttpProxy::start()`, `TcpListener::bind("127.0.0.1:0")`
 
 ### Purpose
 
-Acts as an HTTP/HTTPS proxy for Docker sandbox containers. Containers are configured with `http_proxy` / `https_proxy` environment variables pointing to this proxy, so all outbound HTTP traffic is routed through it.
+Acts as an HTTP/HTTPS proxy for sandbox containers. Containers are configured with `http_proxy` / `https_proxy` environment variables pointing to this proxy, so outbound HTTP traffic is routed through it (see the advisory-enforcement caveat above).
 
 ### Domain Allowlisting
 
@@ -354,21 +390,28 @@ The proxy strips hop-by-hop headers to prevent header-based attacks: `connection
 
 **Reference:** `src/sandbox/proxy/http.rs` — `is_hop_by_hop_header()`
 
-### Docker Container Security
+### Container Security
 
-Containers that use the proxy are configured with defense-in-depth:
+Containers that the generic sandbox spawns (`podman run`/`docker run`) are configured with defense-in-depth:
 
 | Control | Setting | Reference |
 |---------|---------|-----------|
-| Capabilities | Drop ALL, add only CHOWN | `src/sandbox/container.rs` — `cap_drop` / `cap_add` |
-| Privilege escalation | `no-new-privileges:true` | `src/sandbox/container.rs` — `security_opt` |
-| Root filesystem | Read-only (except FullAccess policy) | `src/sandbox/container.rs` — `readonly_rootfs` |
-| User | Non-root (UID 1000:1000) | `src/sandbox/container.rs` — `user` field |
-| Network | Bridge mode (isolated) | `src/sandbox/container.rs` — `network_mode` |
-| Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/container.rs` — `tmpfs` block |
-| Auto-remove | Enabled | `src/sandbox/container.rs` — `auto_remove` |
-| Output limits | Configurable max stdout/stderr | `src/sandbox/container.rs` — `collect_logs()` |
-| Timeout | Enforced with forced container removal | `src/sandbox/container.rs` — `tokio::time::timeout` in `run()` |
+| Capabilities | Drop ALL, add only CHOWN | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Privilege escalation | `no-new-privileges` | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Root filesystem | Read-only | `src/sandbox/cli_runner.rs` — `--read-only` |
+| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5) | `src/sandbox/cli_runner.rs` — `KeepIdMode` |
+| Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
+| Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Auto-remove | `--rm` + kill-by-name on timeout + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `src/orchestrator/reaper.rs` |
+| Labels | `lunarwing.sandbox=<RFC3339 created>` for the reaper | `src/sandbox/cli_runner.rs` — `SANDBOX_CONTAINER_LABEL` |
+| Output limits | Capped stdout/stderr collection (UTF-8-safe) | `src/sandbox/cli_runner.rs` — `CappedBuf` |
+| Timeout | Enforced with process-tree kill + `podman kill` | `src/sandbox/cli_runner.rs` — `run_container()` |
+
+Fail-closed semantics: when the sandbox is enabled and the runtime CLI or
+image is unavailable, shell commands **error** with a structured
+`[sandbox:<kind>]` envelope (see `SandboxError::kind()`) instead of silently
+running on the host.
 
 ### Graceful Shutdown
 
