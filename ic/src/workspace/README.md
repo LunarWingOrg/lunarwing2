@@ -150,12 +150,19 @@ Scopes: reads span the caller's private scope plus the shared herd scope
   addition to the self-declared `agent` slug, so shared notes keep
   attribution. Legacy notes without these fields still parse.
 - **Stale sweep** (`knowledge_sweep`) — a cadence-guarded background pass
-  (heartbeat-driven, same pattern as memory hygiene) marks `active` notes
-  `stale` once `studied_at` (falling back to the document update time) is
-  older than `KNOWLEDGE_STALE_AFTER_DAYS` (default 30). Cadence:
-  `KNOWLEDGE_SWEEP_CADENCE_HOURS` (default 24); the shared herd scope is
-  swept too unless `KNOWLEDGE_SWEEP_INCLUDE_SHARED=false`; the whole sweep
-  can be disabled with `KNOWLEDGE_SWEEP_ENABLED=false`.
+  marks `active` notes `stale` once `studied_at` (falling back to the document
+  update time) is older than `KNOWLEDGE_STALE_AFTER_DAYS` (default 30). The
+  pass pages through the entire store with a keyset cursor (500-row pages,
+  100k safety ceiling), so stores larger than any single query window are
+  fully covered (WI#121). Cadence: `KNOWLEDGE_SWEEP_CADENCE_HOURS`
+  (default 24); the shared herd scope is swept too unless
+  `KNOWLEDGE_SWEEP_INCLUDE_SHARED=false`; the whole sweep can be disabled
+  with `KNOWLEDGE_SWEEP_ENABLED=false`. It runs from two trigger paths:
+  inside the heartbeat loop (single-node hosts) and from an independent
+  daemon cadence spawned at startup (WI#121: multi-tenant renders set
+  `HEARTBEAT_ENABLED=false`, so the heartbeat path alone never fires there).
+  A global in-process guard plus a shared cadence state file keep the two
+  paths from double-sweeping.
 - **Kawarimi migration** — notes are ordinary `memory_documents` rows, so
   they travel with the tenant `pg_dump -Fc` → `pg_restore` bundle and the
   owner-scope rekey (see `docs/ops/MT-MACHINE-MIGRATION.md`).
