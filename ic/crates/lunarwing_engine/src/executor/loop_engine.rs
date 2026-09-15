@@ -25,12 +25,72 @@ use crate::types::thread::{Thread, ThreadState};
 pub(crate) const RUNTIME_CHECKPOINT_METADATA_KEY: &str = "runtime_checkpoint";
 pub(crate) const INITIAL_PERSISTED_STATE_METADATA_KEY: &str = "initial_persisted_state";
 
+/// Metadata key recording the UTC timestamp of the last pre-execution
+/// sanitization pass (work item #109 scope B). Written only when a sanitized
+/// checkpoint is persisted; absent means the checkpoint has not been
+/// sanitized on this revision.
+pub(crate) const SANITIZED_AT_METADATA_KEY: &str = "sanitized_at";
+
+/// Cached tool-output keys purged unconditionally before execution
+/// (work item #109 scope B, Tier 1). These are write-only caches: the
+/// orchestrator stores tool outputs under the action name and step-return
+/// slots, but the model repl reads them back as stale values.
+const TIER1_STALE_STATE_KEYS: &[&str] = &["time", "date", "datetime"];
+
+/// Cached tool-output keys purged only when older than the age threshold
+/// (work item #109 scope B, Tier 2). Web/http/shell results are expensive
+/// to recompute, so fresh values survive; stale ones are dropped.
+const TIER2_STALE_STATE_KEYS: &[&str] = &["web_search", "http", "shell"];
+
+/// Maximum age for Tier 2 cached tool outputs before they are purged.
+const TIER2_MAX_AGE: chrono::Duration = chrono::Duration::minutes(30);
+
 /// Persisted state from a prior execution, used to resume threads.
 /// The Python orchestrator manages loop counters internally; Rust only
 /// needs the opaque `persisted_state` blob to hand back on resume.
 #[derive(Default)]
 struct RuntimeCheckpoint {
     persisted_state: serde_json::Value,
+}
+
+/// Purge stale cached tool output from a checkpoint's persisted state
+/// (work item #109 scope B).
+///
+/// This is the synchronous pre-execution sanitizer: it runs after checkpoint
+/// loading and before the first model call, so the first inference of every
+/// thread sees sanitized state. Tier 1 keys (`time`, `date`, `datetime`) are
+/// always removed; Tier 2 keys (`web_search`, `http`, `shell`) are removed
+/// only when older than [`TIER2_MAX_AGE`]. The returned counter reports how
+/// many keys were purged, for bounded observability.
+fn sanitize_checkpoint_state(
+    state: &mut serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> usize {
+    let Some(object) = state.as_object_mut() else {
+        return 0;
+    };
+    let mut purged = 0;
+    for key in TIER1_STALE_STATE_KEYS {
+        if object.remove(*key).is_some() {
+            purged += 1;
+        }
+    }
+    for key in TIER2_STALE_STATE_KEYS {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        let Some(ts) = value.get("_cached_at").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(cached_at) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        if now.signed_duration_since(cached_at) > TIER2_MAX_AGE {
+            object.remove(*key);
+            purged += 1;
+        }
+    }
+    purged
 }
 
 /// The core execution loop for a thread.
@@ -250,7 +310,33 @@ impl ExecutionLoop {
     /// Run the execution loop to completion.
     pub async fn run(&mut self) -> Result<ThreadOutcome, EngineError> {
         let mut persisted_event_count = self.thread.events.len();
-        let checkpoint = self.load_runtime_checkpoint();
+        let mut checkpoint = self.load_runtime_checkpoint();
+
+        // Synchronous pre-execution sanitization (work item #109 scope B):
+        // purge stale cached tool output from the persisted state before the
+        // first model call, so the first inference of every thread sees
+        // sanitized state. Runs before the Running transition so a failure
+        // here cannot strand a thread that already reported itself running.
+        let purged = sanitize_checkpoint_state(&mut checkpoint.persisted_state, chrono::Utc::now());
+        if purged > 0 {
+            if let Some(metadata) = self.thread.metadata.as_object_mut() {
+                metadata.insert(
+                    RUNTIME_CHECKPOINT_METADATA_KEY.into(),
+                    serde_json::json!({
+                        "persisted_state": checkpoint.persisted_state.clone(),
+                    }),
+                );
+                metadata.insert(
+                    SANITIZED_AT_METADATA_KEY.into(),
+                    serde_json::json!(chrono::Utc::now().to_rfc3339()),
+                );
+            }
+            debug!(
+                thread_id = %self.thread.id,
+                purged,
+                "sanitized stale cached tool output from checkpoint state"
+            );
+        }
 
         // Transition to Running if this is a fresh start or restart from a resumable state.
         // Broadcast via `transition_to_broadcast` so subscribers (mission event
@@ -2605,6 +2691,179 @@ mod tests {
                 .metadata
                 .get(crate::runtime::skill_feedback::ACTIVE_SKILL_DOC_IDS_METADATA_KEY),
             Some(&serde_json::json!([skill_id]))
+        );
+    }
+
+    // ── Pre-execution state sanitization (work item #109 scope B) ──
+
+    fn checkpoint_metadata(state: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            RUNTIME_CHECKPOINT_METADATA_KEY: {
+                "persisted_state": state,
+                "nudge_count": 0,
+                "consecutive_errors": 0,
+                "compaction_count": 0,
+            }
+        })
+    }
+
+    #[test]
+    fn sanitizer_purges_tier1_keys_unconditionally() {
+        let mut state = serde_json::json!({
+            "time": "2026-01-01T00:00:00Z",
+            "date": "2026-01-01",
+            "datetime": "stale",
+            "web_search": {"_cached_at": chrono::Utc::now().to_rfc3339()},
+            "keep": "fresh",
+        });
+        let purged = sanitize_checkpoint_state(&mut state, chrono::Utc::now());
+        assert_eq!(purged, 3);
+        assert!(state.get("time").is_none());
+        assert!(state.get("date").is_none());
+        assert!(state.get("datetime").is_none());
+        assert!(state.get("web_search").is_some(), "fresh Tier 2 survives");
+        assert_eq!(state.get("keep"), Some(&serde_json::json!("fresh")));
+    }
+
+    #[test]
+    fn sanitizer_purges_tier2_keys_only_when_stale() {
+        let now = chrono::Utc::now();
+        let stale_ts = (now - chrono::Duration::hours(2)).to_rfc3339();
+        let fresh_ts = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let mut state = serde_json::json!({
+            "web_search": {"_cached_at": stale_ts},
+            "http": {"_cached_at": fresh_ts},
+            "shell": {"_cached_at": stale_ts},
+        });
+        let purged = sanitize_checkpoint_state(&mut state, now);
+        assert_eq!(purged, 2);
+        assert!(state.get("web_search").is_none());
+        assert!(state.get("shell").is_none());
+        assert!(state.get("http").is_some(), "fresh Tier 2 survives");
+    }
+
+    #[test]
+    fn sanitizer_keeps_tier2_without_timestamp_or_bad_timestamp() {
+        let mut state = serde_json::json!({
+            "web_search": {"no": "timestamp"},
+            "http": {"_cached_at": "not-a-date"},
+        });
+        let purged = sanitize_checkpoint_state(&mut state, chrono::Utc::now());
+        assert_eq!(purged, 0, "missing/malformed timestamps are never purged");
+        assert!(state.get("web_search").is_some());
+        assert!(state.get("http").is_some());
+    }
+
+    #[test]
+    fn sanitizer_ignores_non_object_state() {
+        let mut state = serde_json::json!("not an object");
+        assert_eq!(sanitize_checkpoint_state(&mut state, chrono::Utc::now()), 0);
+    }
+
+    #[tokio::test]
+    async fn run_sanitizes_checkpoint_before_first_model_call() {
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let state = serde_json::json!({
+            "time": "2026-01-01T00:00:00Z",
+            "date": "2026-01-01",
+            "web_search": {"_cached_at": stale_ts},
+            "http": {"_cached_at": stale_ts},
+            "shell": {"_cached_at": stale_ts},
+            "last_return": "keep",
+        });
+        let llm = Arc::new(MockLlm::new(vec![text_response("FINAL('done')")]));
+        let (exec, _signal_tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let mut exec = exec.with_store(Arc::new(crate::tests::InMemoryStore::new()));
+        exec.thread.metadata = checkpoint_metadata(state);
+
+        let outcome = exec.run().await.expect("run should complete");
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        // Terminal cleanup removes the checkpoint itself, but the sanitization
+        // marker survives as bounded observability on the thread record.
+        assert!(
+            exec.thread
+                .metadata
+                .get(SANITIZED_AT_METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "sanitized_at marker should be written"
+        );
+        assert!(
+            exec.thread
+                .metadata
+                .get(RUNTIME_CHECKPOINT_METADATA_KEY)
+                .is_none(),
+            "completed runs clear the runtime checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_sanitizes_checkpoint_before_first_repl_step() {
+        // The first model call returns a repl block; the nested VM must see
+        // the sanitized state, proving sanitization precedes inference.
+        let stale_ts = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let state = serde_json::json!({
+            "time": "2026-01-01T00:00:00Z",
+            "date": "2026-01-01",
+            "web_search": {"_cached_at": stale_ts},
+            "http": {"_cached_at": stale_ts},
+            "shell": {"_cached_at": stale_ts},
+            "last_return": "keep",
+        });
+        let code = "assert 'time' not in state and 'date' not in state\n"
+            .to_string()
+            + "assert 'web_search' not in state and 'http' not in state\n"
+            + "assert 'shell' not in state and state['last_return'] == 'keep'\n"
+            + "FINAL('sanitized')";
+        let llm = Arc::new(MockLlm::new(vec![LlmOutput {
+            response: LlmResponse::Code {
+                code,
+                content: None,
+            },
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 10,
+                ..Default::default()
+            },
+            finish_reason: "stop".to_string(),
+        }]));
+        let (exec, _signal_tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let mut exec = exec.with_store(Arc::new(crate::tests::InMemoryStore::new()));
+        exec.thread.metadata = checkpoint_metadata(state);
+
+        let outcome = exec.run().await.expect("run should complete");
+
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Completed { response: Some(r) } if r == "sanitized"
+        ));
+        assert!(
+            exec.thread
+                .metadata
+                .get(SANITIZED_AT_METADATA_KEY)
+                .is_some(),
+            "sanitized_at marker should be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_leaves_clean_checkpoint_untouched() {
+        let state = serde_json::json!({"trigger_payload": {"source_thread_id": "src-1"}});
+        let llm = Arc::new(MockLlm::new(vec![text_response("FINAL('done')")]));
+        let (exec, _signal_tx) = make_loop_with_llm(llm, Vec::new(), ThreadConfig::default()).await;
+        let mut exec = exec.with_store(Arc::new(crate::tests::InMemoryStore::new()));
+        exec.thread.metadata = checkpoint_metadata(state);
+
+        let outcome = exec.run().await.expect("run should complete");
+
+        assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+        assert!(
+            exec.thread
+                .metadata
+                .get(SANITIZED_AT_METADATA_KEY)
+                .is_none(),
+            "no marker when nothing was purged"
         );
     }
 }
