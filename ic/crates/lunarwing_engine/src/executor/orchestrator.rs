@@ -955,6 +955,9 @@ async fn handle_execute_code_step(
             }
             thread.updated_at = chrono::Utc::now();
 
+            // Single clock read for the whole step — see the completed_at
+            // comment on the action_results mapping below.
+            let completed_at = chrono::Utc::now().to_rfc3339();
             let action_results: Vec<serde_json::Value> = result
                 .action_results
                 .iter()
@@ -964,6 +967,13 @@ async fn handle_execute_code_step(
                         "output": r.output,
                         "is_error": r.is_error,
                         "duration_ms": r.duration.as_millis(),
+                        // RFC 3339 UTC completion time, consumed by the
+                        // orchestrator's `stamp_cached_at` (work item #109
+                        // scope B): Monty has no clock, so the host provides
+                        // the timestamp the Tier 2 sanitizer ages by. All
+                        // results in one step completed within this step, so
+                        // a single now() is truthful to step granularity.
+                        "completed_at": completed_at.clone(),
                     })
                 })
                 .collect();
@@ -2844,6 +2854,74 @@ mod tests {
         ));
     }
 
+    // ── Tier 2 `_cached_at` stamping (work item #109 scope B) ───────
+    //
+    // `stamp_cached_at` feeds the Rust pre-execution sanitizer's Tier 2
+    // aging (TIER2_STALE_STATE_KEYS in loop_engine.rs): stamped dicts are
+    // purged when older than 30 minutes, judged by the RFC 3339 timestamp
+    // the host hands to the orchestrator via `__execute_code_step__`
+    // result records (`completed_at`).
+
+    #[test]
+    fn tier2_stamp_cached_at_stamps_tier2_dict_outputs() {
+        let stamped = eval_python_value(
+            r#"stamp_cached_at("shell", {"output": "hi", "exit_code": 0}, "2026-09-15T10:00:00+00:00")"#,
+        );
+        let MontyObject::Dict(pairs) = stamped else {
+            panic!("expected dict");
+        };
+        let mut original_keys: Vec<String> = Vec::new();
+        let mut ts: Option<String> = None;
+        for (k, v) in &pairs {
+            match (k, v) {
+                (MontyObject::String(k), MontyObject::String(v)) if k == "_cached_at" => {
+                    ts = Some(v.clone());
+                }
+                (MontyObject::String(k), _) => original_keys.push(k.clone()),
+                _ => {}
+            }
+        }
+        assert!(
+            original_keys.contains(&"output".to_string()),
+            "{original_keys:?}"
+        );
+        assert!(
+            original_keys.contains(&"exit_code".to_string()),
+            "{original_keys:?}"
+        );
+        let ts = ts.expect("_cached_at should be stamped onto Tier 2 dict output");
+        assert_eq!(ts, "2026-09-15T10:00:00+00:00");
+        chrono::DateTime::parse_from_rfc3339(&ts)
+            .expect("stamped _cached_at must parse as RFC 3339 for the Rust sanitizer");
+    }
+
+    #[test]
+    fn tier2_stamp_cached_at_leaves_scalars_and_other_keys_untouched() {
+        // Scalar outputs are never wrapped — repl code reads them unchanged
+        // and the sanitizer leaves them un-purged (fail-open).
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("shell", "plain text", "2026-09-15T10:00:00+00:00") == "plain text""#
+        ));
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("time", "2026-01-01T00:00:00Z", "2026-09-15T10:00:00+00:00") == "2026-01-01T00:00:00Z""#
+        ));
+        // Non-Tier-2 keys are never stamped, even when dict-shaped.
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("last_return", {"a": 1}, "2026-09-15T10:00:00+00:00") == {"a": 1}"#
+        ));
+        // Tier 2 dict keeps its fields plus the stamp.
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("http", {"status": 200}, "2026-09-15T10:00:00+00:00")["status"] == 200 and stamp_cached_at("http", {"status": 200}, "2026-09-15T10:00:00+00:00")["_cached_at"] == "2026-09-15T10:00:00+00:00""#
+        ));
+        // Missing/malformed host timestamps: never stamped (fail-open).
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("http", {"status": 200}, None) == {"status": 200}"#
+        ));
+        assert!(eval_python_bool(
+            r#"stamp_cached_at("http", {"status": 200}, "") == {"status": 200}"#
+        ));
+    }
+
     #[test]
     fn orchestrator_action_call_wire_shape_round_trips_to_thread_messages() {
         let value = serde_json::json!([
@@ -4233,6 +4311,91 @@ mod tests {
                     if error.contains("Tool call limit reached")
             )
         }));
+    }
+
+    #[tokio::test]
+    async fn execute_code_step_result_records_carry_rfc3339_completed_at() {
+        // Host side of the Tier 2 stamping contract (work item #109 scope B):
+        // every action result handed to the orchestrator carries an RFC 3339
+        // `completed_at`, which the Python `stamp_cached_at` copies into the
+        // persisted-state value the sanitizer ages by.
+        let mut thread = Thread::new(
+            "goal",
+            ThreadType::Foreground,
+            ProjectId::new(),
+            "user",
+            ThreadConfig::default(),
+        );
+        let effects = Arc::new(CountingEffects {
+            actions: vec![test_action_def("echo")],
+            executions: AtomicUsize::new(0),
+        });
+        let effects_dyn: Arc<dyn EffectExecutor> = effects.clone();
+        let llm: Arc<dyn LlmBackend> = Arc::new(PendingStreamLlm);
+        let leases = Arc::new(LeaseManager::new());
+        leases
+            .grant(thread.id, "tools", GrantedActions::All, None, None)
+            .await
+            .unwrap();
+        let policy = Arc::new(PolicyEngine::new());
+        let args = [
+            MontyObject::String("result = await echo()".into()),
+            json_to_monty(&serde_json::json!({})),
+        ];
+        let mut actions_this_step = 0;
+
+        let result = handle_execute_code_step(
+            &args,
+            &[],
+            &mut thread,
+            &llm,
+            &effects_dyn,
+            &leases,
+            &policy,
+            &mut actions_this_step,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let ExtFunctionResult::Return(value) = result else {
+            panic!("expected return value from code step");
+        };
+        let MontyObject::Dict(pairs) = value else {
+            panic!("expected result dict");
+        };
+        let mut action_results = None;
+        for (k, v) in &pairs {
+            if let (MontyObject::String(k), MontyObject::List(items)) = (k, v)
+                && k == "action_results"
+            {
+                action_results = Some(items.clone());
+            }
+        }
+        let action_results =
+            action_results.expect("__execute_code_step__ result must expose action_results");
+        assert!(
+            !action_results.is_empty(),
+            "expected at least one action result"
+        );
+        for item in action_results {
+            let MontyObject::Dict(entry) = item else {
+                panic!("expected dict per action result");
+            };
+            let mut completed_at = None;
+            for (k, v) in &entry {
+                if let (MontyObject::String(k), MontyObject::String(v)) = (k, v)
+                    && k == "completed_at"
+                {
+                    completed_at = Some(v.clone());
+                }
+            }
+            let completed_at =
+                completed_at.expect("action result must carry completed_at for Tier 2 stamping");
+            chrono::DateTime::parse_from_rfc3339(&completed_at)
+                .expect("completed_at must parse as RFC 3339 for the Rust sanitizer");
+        }
     }
 
     #[tokio::test]
