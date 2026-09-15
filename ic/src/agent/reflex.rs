@@ -500,7 +500,7 @@ impl ReflexRouter {
 
         let mut candidates: Vec<(String, f64)> = Vec::new();
 
-        for (pattern, _tool) in patterns.iter() {
+        for pattern in patterns.keys() {
             // Skip empty / very short patterns
             if pattern.len() < 3 {
                 continue;
