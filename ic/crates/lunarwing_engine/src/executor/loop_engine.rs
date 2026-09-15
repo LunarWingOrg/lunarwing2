@@ -2811,8 +2811,7 @@ mod tests {
             "shell": {"_cached_at": stale_ts},
             "last_return": "keep",
         });
-        let code = "assert 'time' not in state and 'date' not in state\n"
-            .to_string()
+        let code = "assert 'time' not in state and 'date' not in state\n".to_string()
             + "assert 'web_search' not in state and 'http' not in state\n"
             + "assert 'shell' not in state and state['last_return'] == 'keep'\n"
             + "FINAL('sanitized')";
