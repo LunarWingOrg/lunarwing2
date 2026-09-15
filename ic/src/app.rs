@@ -1256,6 +1256,31 @@ impl AppBuilder {
                 });
             }
 
+            // Heartbeat-independent knowledge stale sweep (WI#121): MT renders
+            // disable the heartbeat entirely, so the sweep needs its own
+            // cadence. `run_knowledge_sweep_if_due`'s state file plus the
+            // global RUNNING guard keep this safe alongside the heartbeat
+            // path on single-node hosts.
+            if self.config.knowledge_sweep.enabled {
+                let sweep_workspace = Arc::clone(ws);
+                let sweep_config = self.config.knowledge_sweep.to_workspace_config();
+                let sweep_store = self.db.clone();
+                tokio::spawn(async move {
+                    let shared = sweep_store.map(|db| {
+                        Arc::new(Workspace::new_with_db(
+                            crate::workspace::KNOWLEDGE_SHARED_SCOPE,
+                            db,
+                        ))
+                    });
+                    crate::workspace::knowledge_sweep::run_knowledge_sweep_loop(
+                        sweep_workspace,
+                        shared,
+                        sweep_config,
+                    )
+                    .await;
+                });
+            }
+
             if embeddings.is_some() {
                 // Purge legacy mission-goal chunks (WI#135) and heal
                 // crash-stranded memory index projections before the

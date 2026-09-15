@@ -985,9 +985,10 @@ impl WorkspaceStore for PgBackend {
         user_ids: &[String],
         agent_id: Option<Uuid>,
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
         self.repo
-            .knowledge_list_notes(user_ids, agent_id, limit)
+            .knowledge_list_notes(user_ids, agent_id, limit, before)
             .await
     }
 

@@ -17,7 +17,7 @@ use crate::workspace::{
     VersionSummary, WorkspaceEntry, WorkspaceFileContent, fuse_results,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 /// Resolve the embedding dimension from environment variables.
 ///
@@ -1610,6 +1610,7 @@ impl WorkspaceStore for LibSqlBackend {
         user_ids: &[String],
         agent_id: Option<Uuid>,
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
         let conn = self
             .connect()
@@ -1627,10 +1628,20 @@ impl WorkspaceStore for LibSqlBackend {
                     FROM memory_documents
                     WHERE user_id = ?1 AND agent_id IS ?2
                       AND json_extract(metadata, '$.provenance') = 'study-note'
-                    ORDER BY updated_at DESC
+                      AND (?4 IS NULL OR (updated_at < ?4
+                           OR (updated_at = ?4 AND (path < ?5
+                               OR (path = ?5 AND user_id < ?6)))))
+                    ORDER BY updated_at DESC, path DESC, user_id DESC
                     LIMIT ?3
                     "#,
-                    params![scope.as_str(), agent_str.as_deref(), limit as i64],
+                    params![
+                        scope.as_str(),
+                        agent_str.as_deref(),
+                        limit as i64,
+                        before.map(|(ts, _, _)| fmt_ts(ts)),
+                        before.map(|(_, path, _)| path),
+                        before.map(|(_, _, scope)| scope),
+                    ],
                 )
                 .await
                 .map_err(|e| WorkspaceError::SearchFailed {
@@ -1656,7 +1667,12 @@ impl WorkspaceStore for LibSqlBackend {
                 });
             }
         }
-        notes.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
+        notes.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| b.path.cmp(&a.path))
+                .then_with(|| b.scope.cmp(&a.scope))
+        });
         notes.truncate(limit);
         Ok(notes)
     }
@@ -2434,7 +2450,7 @@ mod tests {
         async fn list_notes_returns_metadata_rows() {
             let (backend, _dir) = seeded_backend().await;
             let rows = backend
-                .knowledge_list_notes(&scopes(), None, 100)
+                .knowledge_list_notes(&scopes(), None, 100, None)
                 .await
                 .expect("knowledge_list_notes");
             assert_eq!(rows.len(), 3);
@@ -2449,6 +2465,43 @@ mod tests {
             assert_eq!(stats.active, 1);
             assert_eq!(stats.stale, 1);
             assert_eq!(stats.needs_verification, 1);
+        }
+
+        #[tokio::test]
+        async fn list_notes_keyset_pages_below_cursor() {
+            let (backend, _dir) = seeded_backend().await;
+            let first_page = backend
+                .knowledge_list_notes(&scopes(), None, 2, None)
+                .await
+                .expect("first page");
+            assert_eq!(first_page.len(), 2);
+            // Ordering is total (updated_at, path, scope) so the page boundary
+            // is unambiguous.
+            assert!(first_page[0].updated_at >= first_page[1].updated_at);
+
+            let last = &first_page[1];
+            let second_page = backend
+                .knowledge_list_notes(
+                    &scopes(),
+                    None,
+                    2,
+                    Some((&last.updated_at, &last.path, &last.scope)),
+                )
+                .await
+                .expect("second page");
+            assert_eq!(second_page.len(), 1);
+            // No overlap between pages.
+            for row in &second_page {
+                assert_ne!((row.scope.as_str(), row.path.as_str()), (last.scope.as_str(), last.path.as_str()));
+            }
+
+            // The paged scan reconstructs the full store: 2 + 1 = 3 rows.
+            let workspace = crate::workspace::Workspace::new_with_db(
+                "shared",
+                std::sync::Arc::new(backend) as std::sync::Arc<dyn crate::db::Database>,
+            );
+            let all = workspace.knowledge_scan_all(&scopes()).await.expect("scan all");
+            assert_eq!(all.len(), 3);
         }
     }
 }

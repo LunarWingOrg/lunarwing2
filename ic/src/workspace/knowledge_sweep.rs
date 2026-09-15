@@ -17,6 +17,7 @@
 //! hygiene pass guard, so overlapping heartbeat ticks cannot double-mark.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
@@ -24,8 +25,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::bootstrap::lunarwing_base_dir;
 use crate::workspace::{
-    KNOWLEDGE_DIR, KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, WIRE_AGENT_PREFIX,
-    Workspace, is_incomplete_wire_write,
+    KNOWLEDGE_DIR, KNOWLEDGE_SHARED_SCOPE, KnowledgeStatus, WIRE_AGENT_PREFIX, Workspace,
+    is_incomplete_wire_write,
 };
 
 /// Minimum age before a stranded wire note is reaped. Ingest tasks finish in
@@ -206,9 +207,7 @@ async fn sweep_scope(
     stale_after_days: u32,
 ) -> Result<(u32, u32), crate::workspace::WorkspaceError> {
     let scopes = vec![scope.to_string()];
-    let rows = workspace
-        .knowledge_list_notes(&scopes, KNOWLEDGE_SCAN_CAP)
-        .await?;
+    let rows = workspace.knowledge_scan_all(&scopes).await?;
     let mut scanned = 0u32;
     let mut marked = 0u32;
     for row in &rows {
@@ -283,6 +282,52 @@ struct RunningGuard;
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+use crate::workspace::knowledge_sync::shared_deterministic_jitter_secs;
+
+/// Minimum delay between sweep loop iterations, even on failure.
+const MIN_LOOP_DELAY_SECS: u64 = 60;
+
+/// Run the stale sweep on an independent daemon cadence until the process
+/// runtime shuts down.
+///
+/// WI#121 defect (b): the sweep previously ran only inside the heartbeat
+/// loop, and multi-tenant renders set `HEARTBEAT_ENABLED=false` for every
+/// tenant, so a vanilla tenant never swept at all. This loop is
+/// heartbeat-independent (same shape as the `knowledge_sync` cadence): it
+/// sleeps with deterministic startup jitter, then re-checks the sweep every
+/// hour — `run_knowledge_sweep_if_due`'s own cadence state file makes the
+/// extra checks cheap no-ops. Safe to run alongside the heartbeat path; the
+/// global `RUNNING` guard serializes actual sweep passes.
+pub async fn run_knowledge_sweep_loop(
+    workspace: Arc<Workspace>,
+    shared_workspace: Option<Arc<Workspace>>,
+    config: KnowledgeSweepConfig,
+) {
+    let cadence_secs = u64::from(config.cadence_hours).saturating_mul(3_600);
+    let jitter_cap = (cadence_secs / 10).clamp(MIN_LOOP_DELAY_SECS, 300);
+    let jitter = shared_deterministic_jitter_secs(workspace.user_id(), jitter_cap);
+    tokio::time::sleep(std::time::Duration::from_secs(jitter)).await;    let poll_secs = cadence_secs.clamp(3_600, 6 * 3_600);
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+    ticker.tick().await; // Skip immediate first tick; startup jitter covered above.
+    loop {
+        let report = run_knowledge_sweep_if_due(
+            workspace.as_ref(),
+            shared_workspace.as_deref(),
+            &config,
+        )
+        .await;
+        if report.had_work() {
+            tracing::info!(
+                notes_scanned = report.notes_scanned,
+                notes_marked_stale = report.notes_marked_stale,
+                stranded_removed = report.stranded_removed,
+                "knowledge sweep loop: pass complete"
+            );
+        }
+        ticker.tick().await;
     }
 }
 

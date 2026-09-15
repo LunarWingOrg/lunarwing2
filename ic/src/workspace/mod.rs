@@ -66,13 +66,13 @@ pub use embeddings::{
     EmbeddingProvider, LunarWingCloudEmbeddings, MockEmbeddings, OllamaEmbeddings, OpenAiEmbeddings,
 };
 pub use knowledge::{
-    KNOWLEDGE_DIR, KNOWLEDGE_PROVENANCE, KNOWLEDGE_SCAN_CAP, KNOWLEDGE_SHARED_SCOPE,
-    KnowledgeFilter, KnowledgeNoteMeta, KnowledgeNoteRow, KnowledgeScopeCount, KnowledgeSearchHit,
-    KnowledgeStats, KnowledgeStatus, KnowledgeTopicSummary, MAX_COMMIT_BYTES, MAX_CONTENT_BYTES,
-    MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS, MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS,
-    MAX_TITLE_BYTES, WIRE_AGENT_PREFIX, WIRE_NOTE_SENTINEL, is_incomplete_wire_write,
-    is_knowledge_path, is_valid_slug, note_path, render_note_markdown, render_wire_note_markdown,
-    summarize_topics,
+    KNOWLEDGE_DIR, KNOWLEDGE_PROVENANCE, KNOWLEDGE_SCAN_MAX_NOTES, KNOWLEDGE_SCAN_PAGE,
+    KNOWLEDGE_SHARED_SCOPE, KnowledgeFilter, KnowledgeNoteMeta, KnowledgeNoteRow,
+    KnowledgeScopeCount, KnowledgeSearchHit, KnowledgeStats, KnowledgeStatus, KnowledgeTopicSummary,
+    MAX_COMMIT_BYTES, MAX_CONTENT_BYTES, MAX_SLUG_BYTES, MAX_STALE_AFTER_DAYS,
+    MAX_STATUS_REASON_BYTES, MAX_TAG_BYTES, MAX_TAGS, MAX_TITLE_BYTES, WIRE_AGENT_PREFIX,
+    WIRE_NOTE_SENTINEL, is_incomplete_wire_write, is_knowledge_path, is_valid_slug, note_path,
+    render_note_markdown, render_wire_note_markdown, summarize_topics,
 };
 #[cfg(feature = "postgres")]
 pub use repository::Repository;
@@ -94,7 +94,7 @@ pub struct WriteResult {
 
 use std::sync::Arc;
 
-use chrono::{NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 #[cfg(feature = "postgres")]
 use deadpool_postgres::Pool;
 use unicode_normalization::UnicodeNormalization;
@@ -664,11 +664,15 @@ impl WorkspaceStorage {
         user_ids: &[String],
         agent_id: Option<Uuid>,
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<crate::workspace::KnowledgeNoteRow>, WorkspaceError> {
         match self {
             #[cfg(feature = "postgres")]
-            Self::Repo(repo) => repo.knowledge_list_notes(user_ids, agent_id, limit).await,
-            Self::Db(db) => db.knowledge_list_notes(user_ids, agent_id, limit).await,
+            Self::Repo(repo) => {
+                repo.knowledge_list_notes(user_ids, agent_id, limit, before)
+                    .await
+            }
+            Self::Db(db) => db.knowledge_list_notes(user_ids, agent_id, limit, before).await,
         }
     }
 }
@@ -2054,15 +2058,83 @@ impl Workspace {
 
     /// Scan study-note metadata (no content) across scopes, newest first.
     ///
-    /// Used by stale detection and statistics; bounded by `limit`.
+    /// Used by stale detection and statistics; bounded by `limit`. Pass
+    /// `before = Some((updated_at, path, scope))` to continue a paged scan
+    /// strictly below that keyset cursor.
     pub async fn knowledge_list_notes(
         &self,
         scopes: &[String],
         limit: usize,
+        before: Option<(&DateTime<Utc>, &str, &str)>,
     ) -> Result<Vec<KnowledgeNoteRow>, WorkspaceError> {
         self.storage
-            .knowledge_list_notes(scopes, self.agent_id, limit)
+            .knowledge_list_notes(scopes, self.agent_id, limit, before)
             .await
+    }
+
+    /// Scan the full study-notes metadata set across scopes, newest first.
+    ///
+    /// Pages through the store with an `(updated_at, path, scope)` keyset
+    /// cursor so a store larger than one page is still covered — the fixed
+    /// `KNOWLEDGE_SCAN_CAP` window that silently hid the oldest notes is gone.
+    /// The scan is bounded by [`KNOWLEDGE_SCAN_MAX_NOTES`] to protect the
+    /// sweep and the knowledge tools from pathologically large stores.
+    pub async fn knowledge_scan_all(
+        &self,
+        scopes: &[String],
+    ) -> Result<Vec<KnowledgeNoteRow>, WorkspaceError> {
+        let mut rows: Vec<KnowledgeNoteRow> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut cursor: Option<(DateTime<Utc>, String, String)> = None;
+        loop {
+            let page = self
+                .storage
+                .knowledge_list_notes(
+                    scopes,
+                    self.agent_id,
+                    KNOWLEDGE_SCAN_PAGE,
+                    cursor
+                        .as_ref()
+                        .map(|(ts, path, scope)| (ts, path.as_str(), scope.as_str())),
+                )
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            // Progress guard: if a page yields no unseen rows (possible when
+            // legacy mixed timestamp formats make the keyset cursor re-return
+            // the same boundary row), stop instead of looping forever.
+            let fresh = page
+                .iter()
+                .filter(|row| seen.insert((row.scope.clone(), row.path.clone())))
+                .count();
+            if fresh == 0 {
+                tracing::debug!(
+                    scanned = rows.len(),
+                    "knowledge scan: page made no progress; stopping paged scan"
+                );
+                break;
+            }
+            cursor = page.last().map(|row| {
+                (row.updated_at, row.path.clone(), row.scope.clone())
+            });
+            let page_len = page.len();
+            rows.extend(page);
+            if rows.len() >= KNOWLEDGE_SCAN_MAX_NOTES {
+                tracing::warn!(
+                    notes = rows.len(),
+                    max = KNOWLEDGE_SCAN_MAX_NOTES,
+                    "knowledge scan: full-store scan hit the safety ceiling"
+                );
+                break;
+            }
+            if page_len < KNOWLEDGE_SCAN_PAGE {
+                break;
+            }
+        }
+        rows.shrink_to_fit();
+        Ok(rows)
     }
 
     /// Replace the metadata JSON of a document in the primary scope.
