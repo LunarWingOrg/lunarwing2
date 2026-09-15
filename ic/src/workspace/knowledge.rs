@@ -41,8 +41,13 @@ pub const MAX_STATUS_REASON_BYTES: usize = 1_000;
 /// Maximum per-note staleness threshold in days, matching the canonical
 /// lw2studymcp metadata model.
 pub const MAX_STALE_AFTER_DAYS: u32 = 36_500;
-/// Hard cap on notes scanned for stale/statistics evaluation.
-pub const KNOWLEDGE_SCAN_CAP: usize = 1_000;
+/// Rows fetched per page by full-store knowledge metadata scans.
+pub const KNOWLEDGE_SCAN_PAGE: usize = 500;
+/// Hard ceiling on rows returned by a full-store knowledge metadata scan.
+/// Bounds the sweep and the knowledge tools on pathologically large stores
+/// while still covering two orders of magnitude more than a single bounded
+/// list ever could.
+pub const KNOWLEDGE_SCAN_MAX_NOTES: usize = 100_000;
 
 /// Lifecycle status of a study note.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
