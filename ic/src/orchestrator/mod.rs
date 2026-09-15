@@ -1,5 +1,16 @@
 //! Orchestrator for managing sandboxed worker containers.
 //!
+//! # BOUNDARY (do not cross)
+//!
+//! This module is the **live worker path**: per-job worker containers created
+//! over the Docker-compatible API via bollard (`job_manager.rs`, containers
+//! labeled `lunarwing.job_id`). It is NOT the generic sandbox — that lives in
+//! `crate::sandbox` (podman/docker CLI runner, `lunarwing.sandbox` labels,
+//! consumed by the shell tool). Never wire `SandboxManager`/`CliRunner` into
+//! the orchestrator, and never route shell execution through
+//! `ContainerJobManager`. The ONLY shared component is the reaper
+//! (`reaper.rs`), which scans both label namespaces separately.
+//!
 //! The orchestrator runs in the main agent process and provides:
 //! - An internal HTTP API for worker communication (LLM proxy, status, secrets)
 //! - Per-job bearer token authentication
