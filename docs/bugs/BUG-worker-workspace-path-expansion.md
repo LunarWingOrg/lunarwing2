@@ -1,8 +1,9 @@
 # Worker workspace path expansion
 
-> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-25).**
-> Structured worker project directories now normalize `~`; prompt text and the
-> Pebble executor still pass user-supplied paths without that normalization.
+> **Status: PARTIALLY-FIXED (verified against current source on 2026-08-25;
+> Pebble project_dir confinement added 2026-09-15).** Structured worker
+> project directories now normalize `~`; prompt text and the executor still
+> pass user-supplied paths without that normalization.
 
 This consolidates `BUG-opencode-worker-tilde-expansion.md`. Historical Nanocode
 coverage became obsolete when that worker was retired.
@@ -44,17 +45,21 @@ The original user prompt puts `~/.lunarwing/...` in `request.prompt`. The
 OpenCode executor forwards that prompt unchanged
 (`opencode4lunarwing/scripts/opencode_task_executor.ts:228,231-238`;
 `lunarwing_runtime.ts:63-109`), so the helper cannot rewrite paths generated
-later by the worker. Pebble likewise uses `request.context.project_dir`
-directly as its process working directory
-(`pebble4lunarwing/src/executor.rs:103-126`, key lines `:108-112,123`). The
-daemon also forwards `project_dir` to workers verbatim
-(`ic/src/orchestrator/external_worker.rs:100-114`). No `HOME=/workspace`
-override is present in the opencode image (`opencode4lunarwing/Dockerfile`:
-non-root user with home `/home/opencode` at `:184-189`, `USER 10001:10001` at
-`:230`, no `ENV HOME`).
+later by the worker. No `HOME=/workspace` override is present in the opencode
+image (`opencode4lunarwing/Dockerfile`: non-root user with home
+`/home/opencode` at `:184-189`, `USER 10001:10001` at `:230`, no `ENV HOME`).
 
-Therefore the structured-directory bug is fixed, but the broader prompt-driven
-symptom remains possible. Pebble still needs an explicit normalization decision.
+The Pebble side is now confined (2026-09-15, v2.1.2.0 goal #18):
+`pebble4lunarwing/src/workspace_path.rs` ports kimi's
+`resolveWorkspacePath`/`workspacePathsOverlap`, the bridge rejects a
+`project_dir` that escapes `WORKSPACE_ROOT` with an error envelope before
+spawning and enforces one-task-per-workspace-subtree, and `spawn_pebble`
+re-resolves the path fail-closed as defense in depth. Prompt-text paths
+remain un-normalized on every worker, exactly as before.
+
+The daemon also forwards `project_dir` to workers verbatim
+(`ic/src/orchestrator/external_worker.rs:100-114`); confinement is therefore
+enforced on the worker side, which is the enforcement point that matters.
 
 ## Verification record
 

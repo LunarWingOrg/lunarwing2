@@ -2,6 +2,31 @@
 
 The Pebble worker (`pebble4lunarwing/`) integrates the Pebble agentic coding harness as a LunarWing external worker. It speaks the `lunarwing-agent-v1` WebSocket protocol (the legacy `ironclaw-agent-v1` alias is no longer accepted) and spawns `pebble prompt --output-format ndjson` per task. Because the alias is gone, recreate/upgrade worker containers in the same maintenance window as the daemon (see the upgrade-ordering note in [`WORKER-CONTAINERS.md`](WORKER-CONTAINERS.md)).
 
+## Workspace Confinement
+
+The daemon-supplied `context.project_dir` is never used verbatim as the
+subprocess working directory. Both the bridge and the executor resolve it
+through `src/workspace_path.rs` (a port of the kimi worker's
+`workspace_path.ts`):
+
+- `~` and `~/...` map under `WORKSPACE_ROOT`; relative paths join it.
+- The candidate is canonicalized through the filesystem, so `..` segments
+  and symlinks are resolved before the check.
+- A resolved path that escapes `WORKSPACE_ROOT` is rejected fail-closed:
+  the bridge answers with a `task_result` error envelope
+  (`Workspace path escapes WORKSPACE_ROOT: ...`) and `spawn_pebble`
+  refuses to spawn (defense in depth).
+- One task at a time owns a workspace subtree: a second task whose
+  project dir overlaps (equal to, parent of, or child of) an in-flight
+  task's workspace is rejected until the first finishes or is cancelled.
+  This mirrors the kimi bridge's `activeWorkspaces` guard and applies
+  across worker connections.
+
+This matters most under the default `PEBBLE_PERMISSION_MODE=danger-full-access`,
+where an unconfined `project_dir` would otherwise point the pebble CLI at
+any host directory (the native-mode quick-start has no container boundary
+at all).
+
 ## Single-Instance Setup
 
 ### Native (no Docker)

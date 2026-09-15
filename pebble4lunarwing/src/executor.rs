@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Instant;
 
@@ -39,7 +40,11 @@ pub async fn run_task(
 
     let mut child = match spawn_pebble(config, request) {
         Ok(child) => {
-            eprintln!("[exec] {}: spawned pebble pid={:?}", request.task_id, child.id());
+            eprintln!(
+                "[exec] {}: spawned pebble pid={:?}",
+                request.task_id,
+                child.id()
+            );
             child
         }
         Err(e) => {
@@ -103,11 +108,15 @@ fn spawn_pebble(
     config: &ExecutorConfig,
     request: &protocol::TaskRequest,
 ) -> Result<tokio::process::Child, std::io::Error> {
-    let work_dir = request
+    let requested_dir = request
         .context
         .project_dir
         .as_deref()
         .unwrap_or(&config.workspace_root);
+    let work_dir = crate::workspace_path::resolve_workspace_path(
+        requested_dir,
+        Path::new(&config.workspace_root),
+    )?;
 
     let mut cmd = Command::new(&config.pebble_bin);
     cmd.args([
@@ -524,11 +533,53 @@ mod tests {
         let mut output = String::new();
         let mut final_message = None;
 
-        let outcome = process_json_line("working on it", "task-1", &tx, &mut output, &mut final_message);
+        let outcome = process_json_line(
+            "working on it",
+            "task-1",
+            &tx,
+            &mut output,
+            &mut final_message,
+        );
 
         assert!(outcome.is_none());
         assert_eq!(output, "working on it\n");
         assert!(final_message.is_none());
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn spawn_rejects_project_dir_escaping_workspace_root() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let prefix = format!("pebble-exec-{}-{unique}", std::process::id());
+        let root = std::env::temp_dir().join(format!("{prefix}-root"));
+        let outside = std::env::temp_dir().join(format!("{prefix}-outside"));
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+
+        let config = ExecutorConfig {
+            pebble_bin: "pebble".to_string(),
+            model: "m".to_string(),
+            permission_mode: "danger-full-access".to_string(),
+            workspace_root: root.to_str().expect("utf-8 path").to_string(),
+        };
+        let mut req = request("task", vec![]);
+        req.context.project_dir = Some(outside.to_str().expect("utf-8 path").to_string());
+
+        // The escape check runs before the pebble binary is resolved or
+        // spawned, so confinement fails closed even though the binary itself
+        // would not resolve.
+        let err = spawn_pebble(&config, &req).expect_err("must reject escaping project_dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string()
+                .contains("Workspace path escapes WORKSPACE_ROOT"),
+            "unexpected error: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

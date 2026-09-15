@@ -2,6 +2,7 @@ mod bridge;
 mod executor;
 mod health;
 mod protocol;
+mod workspace_path;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
