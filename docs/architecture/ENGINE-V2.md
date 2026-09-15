@@ -375,10 +375,24 @@ initial `Created -> Running` transition of top-level Foreground threads only
 dispatch, so mission recursion and research fan-out cannot re-trigger the
 event. The payload carries `source_thread_id`, `project_id`, `thread_type`, and
 `goal`. This is asynchronous plumbing, not a synchronous pre-execution hook —
-WI#109's sanitize-before-execution requirement remains open as scope B (see
-`docs/ops/v2.1.1.0_GOAL4_WI126_THREAD_START_MISSION_SCOPE.md`). `mission_create`
+`mission_create`
 cadence descriptions document that `event:<pattern>` is text-matching, not an
 engine-lifecycle subscription.
+
+WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
+(item 11): `ExecutionLoop::run` purges stale cached tool output from the
+loaded checkpoint **before** the `Running` transition and the first model
+call. Tier 1 keys (`time`, `date`, `datetime`) are always removed; Tier 2
+keys (`web_search`, `http`, `shell`) are removed only when older than 30
+minutes, judged by a `_cached_at` RFC 3339 timestamp inside the value (values
+without a valid timestamp are never purged). When anything is purged, the
+sanitized state is written back to `runtime_checkpoint.persisted_state` and a
+bounded `sanitized_at` marker is stamped on the thread metadata for
+observability. This is a deterministic synchronous hook at the execution
+boundary — not a mission trigger — so it applies to every thread type
+including Mission threads, and the first inference (and every repl-code step)
+sees sanitized state. See `docs/ops/v2.1.2.0_WI109_WI126_SANITIZE_MEMORY.md`
+for the full verification record.
 Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
