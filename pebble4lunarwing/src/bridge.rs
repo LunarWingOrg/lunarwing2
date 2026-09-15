@@ -29,19 +29,22 @@ impl WorkspaceRegistry {
         Self::default()
     }
 
-    async fn owner_of_overlapping(&self, workspace: &Path) -> Option<String> {
-        let workspaces = self.workspaces.lock().await;
-        workspaces
+    /// Atomically claim `workspace`: rejects with the existing owner's task
+    /// id when an overlapping workspace is already registered, otherwise
+    /// records `task_id` as the owner. Holding the lock across the overlap
+    /// check and the insert closes the check-then-act window that would
+    /// otherwise let two concurrent dispatches both claim the same subtree.
+    async fn try_register(&self, workspace: PathBuf, task_id: &str) -> Result<(), String> {
+        let mut workspaces = self.workspaces.lock().await;
+        if let Some(owner) = workspaces
             .iter()
-            .find(|(active, _)| workspace_path::workspace_paths_overlap(active, workspace))
-            .map(|(_, task_id)| task_id.clone())
-    }
-
-    async fn register(&self, workspace: PathBuf, task_id: &str) {
-        self.workspaces
-            .lock()
-            .await
-            .insert(workspace, task_id.to_string());
+            .find(|(active, _)| workspace_path::workspace_paths_overlap(active, &workspace))
+            .map(|(_, owner)| owner.clone())
+        {
+            return Err(owner);
+        }
+        workspaces.insert(workspace, task_id.to_string());
+        Ok(())
     }
 
     async fn unregister(&self, workspace: &Path, task_id: &str) {
@@ -277,7 +280,10 @@ where
         }
     };
 
-    if let Some(owner) = registry.owner_of_overlapping(&workspace).await {
+    if let Err(owner) = registry
+        .try_register(workspace.clone(), &request.task_id)
+        .await
+    {
         let error = format!(
             "Workspace {} is already being modified by task {owner}. \
              Cancel or finish that task before dispatching another task to this workspace.",
@@ -292,7 +298,6 @@ where
         write.send(Message::Text(json.into())).await?;
         return Ok(());
     }
-    registry.register(workspace.clone(), &request.task_id).await;
 
     eprintln!("[bridge] task {}: starting", request.task_id);
 
@@ -343,29 +348,62 @@ mod tests {
         let registry = WorkspaceRegistry::new();
         let project = PathBuf::from("/workspace/project");
 
-        registry.register(project.clone(), "task-1").await;
+        assert!(registry
+            .try_register(project.clone(), "task-1")
+            .await
+            .is_ok());
         assert_eq!(
             registry
-                .owner_of_overlapping(&PathBuf::from("/workspace/project/src"))
+                .try_register(PathBuf::from("/workspace/project/src"), "task-2")
                 .await,
-            Some("task-1".to_string())
+            Err("task-1".to_string())
         );
-        assert_eq!(
-            registry
-                .owner_of_overlapping(&PathBuf::from("/workspace/other"))
-                .await,
-            None
-        );
+        assert!(registry
+            .try_register(PathBuf::from("/workspace/other"), "task-2")
+            .await
+            .is_ok());
 
         // Unregister under a different task id must not free the workspace.
         registry.unregister(&project, "task-other").await;
         assert_eq!(
-            registry.owner_of_overlapping(&project).await,
-            Some("task-1".to_string())
+            registry.try_register(project.clone(), "task-3").await,
+            Err("task-1".to_string())
         );
 
         registry.unregister(&project, "task-1").await;
-        assert_eq!(registry.owner_of_overlapping(&project).await, None);
+        assert!(registry.try_register(project, "task-4").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn registry_claims_are_atomic_under_concurrency() {
+        // The overlap check and the insert share one critical section, so
+        // concurrent dispatches racing on the same subtree must yield exactly
+        // one winner; losers report that winner as the owner.
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let registry = Arc::clone(&registry);
+                let workspace = PathBuf::from("/workspace/shared");
+                tokio::spawn(
+                    async move { registry.try_register(workspace, &format!("task-{i}")).await },
+                )
+            })
+            .collect();
+
+        let results = futures_util::future::join_all(handles).await;
+        let mut owners: Vec<String> = Vec::new();
+        let mut winners = 0;
+        for result in results {
+            match result.expect("join") {
+                Ok(()) => winners += 1,
+                Err(owner) => owners.push(owner),
+            }
+        }
+        assert_eq!(winners, 1, "exactly one concurrent claim may win");
+        assert!(
+            owners.iter().all(|owner| owner == &owners[0]),
+            "every loser must report the same owner"
+        );
     }
 
     #[test]

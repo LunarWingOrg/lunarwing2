@@ -28,7 +28,18 @@ pub(crate) fn expand_workspace_path(path: &str, workspace_root: &Path) -> PathBu
 
 pub(crate) fn resolve_workspace_path(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
     let canonical_root = workspace_root.canonicalize()?;
-    let candidate = expand_workspace_path(path, &canonical_root).canonicalize()?;
+    // A daemon-supplied dir that does not exist (or is not traversable)
+    // surfaces as a bare OS error like ENOENT; re-wrap it with the requested
+    // path so the rejection envelope tells the operator what failed, while
+    // preserving the original error kind for programmatic matching.
+    let candidate = expand_workspace_path(path, &canonical_root)
+        .canonicalize()
+        .map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("project_dir '{path}' could not be resolved under WORKSPACE_ROOT: {e}"),
+            )
+        })?;
     if candidate.strip_prefix(&canonical_root).is_ok() {
         Ok(candidate)
     } else {
@@ -127,6 +138,20 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn resolve_wraps_missing_path_error_with_requested_path() {
+        let root = temp_root("resolve-missing");
+
+        let err = resolve_workspace_path("does-not-exist", &root).expect_err("missing dir");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains("project_dir 'does-not-exist'"),
+            "error should carry the requested path: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
