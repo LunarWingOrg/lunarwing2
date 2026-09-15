@@ -823,7 +823,7 @@ impl Default for WasmSettings {
     }
 }
 
-/// Docker sandbox configuration.
+/// Sandbox configuration (podman-first generic sandbox + worker settings).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxSettings {
     /// Whether the Docker sandbox is enabled.
@@ -833,6 +833,20 @@ pub struct SandboxSettings {
     /// Sandbox policy: "readonly", "workspace_write", or "full_access".
     #[serde(default = "default_sandbox_policy")]
     pub policy: String,
+
+    /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
+    #[serde(default = "default_sandbox_runtime")]
+    pub runtime: String,
+
+    /// Network egress mode for sandboxed policies: "proxy" (allowlist HTTP
+    /// proxy) or "none" (`--network none`, hard isolation).
+    #[serde(default = "default_sandbox_network")]
+    pub network: String,
+
+    /// Force sandboxed shell execution even when ALLOW_LOCAL_TOOLS (dev mode)
+    /// is set. Default false: dev boxes keep direct host execution.
+    #[serde(default)]
+    pub enforce: bool,
 
     /// Command timeout in seconds.
     #[serde(default = "default_sandbox_timeout")]
@@ -903,6 +917,14 @@ fn default_sandbox_policy() -> String {
     "readonly".to_string()
 }
 
+fn default_sandbox_runtime() -> String {
+    "auto".to_string()
+}
+
+fn default_sandbox_network() -> String {
+    "proxy".to_string()
+}
+
 fn default_sandbox_timeout() -> u64 {
     120
 }
@@ -924,6 +946,9 @@ impl Default for SandboxSettings {
         Self {
             enabled: true,
             policy: default_sandbox_policy(),
+            runtime: default_sandbox_runtime(),
+            network: default_sandbox_network(),
+            enforce: false,
             timeout_secs: default_sandbox_timeout(),
             memory_limit_mb: default_sandbox_memory(),
             cpu_shares: default_sandbox_cpu_shares(),
