@@ -63,7 +63,6 @@ pub struct TaskResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[allow(dead_code)]
 pub struct CancelPayload {
     pub task_id: String,
 }
@@ -144,6 +143,15 @@ pub fn result_envelope(
 
 pub fn pong_envelope() -> Envelope {
     create_envelope("pong", serde_json::json!({}))
+}
+
+pub fn cancel_envelope(task_id: &str) -> Envelope {
+    create_envelope(
+        "cancel",
+        CancelPayload {
+            task_id: task_id.to_string(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -261,5 +269,15 @@ mod tests {
         assert!(req.context.conversation_history.is_empty());
         assert_eq!(req.context.user_id, "");
         assert!(req.context.metadata.is_empty());
+    }
+
+    #[test]
+    fn cancel_envelope_round_trips_with_task_id() {
+        let env = cancel_envelope("task-789");
+        let json = serde_json::to_string(&env).unwrap();
+        let parsed: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.msg_type, "cancel");
+        let payload: CancelPayload = serde_json::from_value(parsed.payload).unwrap();
+        assert_eq!(payload.task_id, "task-789");
     }
 }
