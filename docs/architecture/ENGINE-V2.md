@@ -379,6 +379,16 @@ event. The payload carries `source_thread_id`, `project_id`, `thread_type`, and
 cadence descriptions document that `event:<pattern>` is text-matching, not an
 engine-lifecycle subscription.
 
+WI#143 / WI#109 follow-ups closed the "born-dead cadence" gap: the bridge
+cadence grammar gained `system:<source>/<event_type>` (e.g.
+`system:engine/thread_start`) as the way to subscribe to engine lifecycle
+events, and `create_mission`/`update_mission` reject an `OnEvent` cadence whose
+pattern is exactly a known system event type (`thread_start`,
+`thread_completed_with_issues`, `thread_completed_with_learnings`,
+`conversation_insights_due`) — such a mission could never fire as intended.
+Mission listings surface `last_fired_at` / `never_fired` so an "Active" status
+cannot be mistaken for a dispatching one (registry honesty).
+
 WI#109 scope B (synchronous pre-execution sanitation) landed in 2.1.2.0
 (item 11): `ExecutionLoop::run` purges stale cached tool output from the
 loaded checkpoint **before** the `Running` transition and the first model
