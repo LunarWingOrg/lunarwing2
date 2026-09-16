@@ -27,6 +27,28 @@ where an unconfined `project_dir` would otherwise point the pebble CLI at
 any host directory (the native-mode quick-start has no container boundary
 at all).
 
+## Cancellation
+
+The bridge keeps its WebSocket read loop live for the whole lifetime of a
+connection: task handling is spawned, never awaited inline, and all
+outbound envelopes (progress, results, pongs) flow through an internal
+channel drained by a single writer task. A mid-task `cancel` envelope from
+the daemon is therefore received while the pebble subprocess is still
+running, not after it finishes.
+
+Cancels are keyed by `task_id` (a per-connection map of oneshot channels,
+mirroring the kimi bridge's `activeTasks`). On cancel the executor kills
+the subprocess and the task handler emits a `task_result` envelope with
+status `cancelled`. A cancel for an unknown or already-finished task is
+logged and ignored. When the daemon cancels, it stops reading after
+sending the envelope, so the worker's result envelope may go undelivered —
+the subprocess teardown is what actually reclaims the resources, and
+`kill_on_drop` remains the backstop if the connection drops first.
+
+Before v2.1.2.0 the read loop was parked inside the running task, so
+mid-task cancels queued unread and every task ran to its full timeout
+(work item #101).
+
 ## Single-Instance Setup
 
 ### Native (no Docker)
