@@ -55,6 +55,8 @@ SANDBOX_ALLOW_FULL_ACCESS=true
 
 Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and downgrades `full_access` to `workspace_write`. The sandbox manager also refuses unapproved full-access execution. This policy bypasses Docker entirely; it is not a more permissive container mode.
 
+Even under `full_access`, the child environment is scrubbed: commands inherit only the allowlisted OS/toolchain variables (the same list the unsandboxed shell tool uses), never daemon credentials such as `DATABASE_URL` or the `SANDBOX_*` launcher variables themselves.
+
 Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, and `SANDBOX_EXTRA_DOMAINS`. Keep the proxy domain allowlist minimal.
 
 ## 3. Keep or Change Approval Behavior

@@ -311,6 +311,13 @@ impl SandboxManager {
     }
 
     /// Execute a command directly on the host (no sandbox).
+    ///
+    /// The child environment is scrubbed to the same safe allowlist the shell
+    /// tool's direct path uses (CWE-200): the daemon's full environment —
+    /// including `DATABASE_URL` and other credentials — is never inherited by
+    /// agent-invoked processes, even under the double-opt-in `FullAccess`
+    /// policy (WI#141). Caller-provided `env` entries are applied on top of
+    /// the scrubbed base.
     async fn execute_direct(
         &self,
         command: &str,
@@ -330,10 +337,23 @@ impl SandboxManager {
         };
 
         cmd.current_dir(cwd);
-        cmd.envs(env);
+        // Scrub environment to prevent secret leakage (CWE-200). Only
+        // known-safe variables are forwarded; everything else (DB URLs, API
+        // keys, session tokens, sandbox launcher vars) is stripped.
+        cmd.env_clear();
+        for var in crate::tools::builtin::shell::SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        // If the spawner synthesized XDG_RUNTIME_DIR for `systemd-run --user`,
+        // re-apply it after the scrub or the user bus is unreachable.
         if let Some(dir) = spawner.xdg_runtime_dir() {
             cmd.env("XDG_RUNTIME_DIR", dir);
         }
+        // Caller-provided env (e.g. credentials fetched by the worker runtime)
+        // is explicitly provided and safe to forward on top of the scrubbed base.
+        cmd.envs(env);
         // wait_with_output only captures piped stdio (unlike Command::output,
         // which pipes implicitly): set the pipes explicitly or output is empty.
         cmd.stdin(std::process::Stdio::null())
@@ -689,6 +709,86 @@ mod tests {
         let output = result.unwrap();
         assert!(output.truncated);
         assert!(output.stdout.len() <= 32 * 1024);
+    }
+
+    // ── WI#141: FullAccess direct execution must scrub the environment ──
+
+    async fn full_access_manager() -> SandboxManager {
+        SandboxManager::new(SandboxConfig {
+            enabled: true,
+            policy: SandboxPolicy::FullAccess,
+            allow_full_access: true,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_direct_execution_scrubs_daemon_secrets_from_env() {
+        // WI#141 repro: `env | grep DATABASE_URL` from an agent shell under
+        // full_access policy leaked the postgres connection string.
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: test-only, ENV_MUTEX held (single-threaded runtime).
+        unsafe {
+            std::env::set_var("DATABASE_URL", "postgres://lunarwing:hunter2@127.0.0.1/db");
+            std::env::set_var("SANDBOX_POLICY", "full_access");
+            std::env::set_var("SANDBOX_ALLOW_FULL_ACCESS", "true");
+        }
+
+        let manager = full_access_manager().await;
+        let result = manager
+            .execute("env", Path::new("."), HashMap::new())
+            .await
+            .expect("direct execution");
+
+        assert!(
+            !result.stdout.contains("hunter2"),
+            "DATABASE_URL password leaked through FullAccess direct execution"
+        );
+        assert!(
+            !result.stdout.contains("postgres://"),
+            "DATABASE_URL leaked through FullAccess direct execution"
+        );
+        assert!(
+            !result.stdout.contains("SANDBOX_POLICY"),
+            "SANDBOX_POLICY launcher var leaked into the agent shell env"
+        );
+        assert!(
+            !result.stdout.contains("SANDBOX_ALLOW_FULL_ACCESS"),
+            "SANDBOX_ALLOW_FULL_ACCESS launcher var leaked into the agent shell env"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_direct_execution_forwards_safe_vars_and_caller_env() {
+        let _guard = crate::config::helpers::lock_env();
+        // SAFETY: test-only, ENV_MUTEX held (single-threaded runtime).
+        unsafe { std::env::set_var("LUNARWING_TEST_141_SECRET", "leaky") };
+
+        let manager = full_access_manager().await;
+        let mut env = HashMap::new();
+        env.insert(
+            "LUNARWING_TEST_141_PASSTHROUGH".to_string(),
+            "ok".to_string(),
+        );
+        let result = manager.execute("env", Path::new("."), env).await;
+
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        // Allowlist vars survive the scrub...
+        assert!(
+            output.stdout.contains("PATH="),
+            "PATH must survive scrubbing"
+        );
+        // ...caller-provided env is applied on top...
+        assert!(
+            output.stdout.contains("LUNARWING_TEST_141_PASSTHROUGH=ok"),
+            "caller env must be forwarded on top of the scrubbed base"
+        );
+        // ...and everything else from the daemon env is dropped.
+        assert!(
+            !output.stdout.contains("LUNARWING_TEST_141_SECRET"),
+            "non-allowlisted daemon env must be scrubbed"
+        );
     }
 
     #[test]
