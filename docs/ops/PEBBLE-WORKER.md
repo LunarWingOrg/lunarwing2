@@ -40,10 +40,12 @@ Cancels are keyed by `task_id` (a per-connection map of oneshot channels,
 mirroring the kimi bridge's `activeTasks`). On cancel the executor kills
 the subprocess and the task handler emits a `task_result` envelope with
 status `cancelled`. A cancel for an unknown or already-finished task is
-logged and ignored. When the daemon cancels, it stops reading after
-sending the envelope, so the worker's result envelope may go undelivered —
-the subprocess teardown is what actually reclaims the resources, and
-`kill_on_drop` remains the backstop if the connection drops first.
+logged and ignored. Since WI#149 the daemon waits bounded (3s) for that
+terminal `task_result` (or socket close) after sending the cancel envelope
+on both the user-cancel and timeout paths, so the ack is normally
+delivered and consumed; if the deadline expires — a worker from before
+the WI#101 read-loop fix — the daemon proceeds with teardown and
+`kill_on_drop` remains the backstop.
 
 Before v2.1.2.0 the read loop was parked inside the running task, so
 mid-task cancels queued unread and every task ran to its full timeout

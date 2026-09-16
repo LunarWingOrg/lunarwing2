@@ -581,8 +581,56 @@ impl ExternalWorkerManager {
     }
 
     /// Gracefully drain the pool (send WS Close frames, bounded per-connection).
+    ///
+    /// WI#149: in-flight tasks get a bounded cancel handoff first. Every active
+    /// handle is signalled, then we wait (bounded) for the task runners to
+    /// finish — each runner now returns only after the worker's terminal frame,
+    /// socket close, or the ack deadline — before idle pool connections are
+    /// closed. Without this, daemon shutdown could tear sockets down while a
+    /// mid-task cancel was still racing the worker's ack.
     pub async fn drain_pool(&self) {
+        self.cancel_active_tasks_for_shutdown().await;
         self.pool.drain().await;
+    }
+
+    /// Signal cancel on every active handle and wait bounded for the task
+    /// runners to complete their cancel handoff. Runners remove their handle
+    /// after `run_external_task` returns, so an empty map means every in-flight
+    /// task finished its handoff (ack observed, socket closed, or deadline).
+    async fn cancel_active_tasks_for_shutdown(&self) {
+        {
+            let handles = self.active_handles.read().await;
+            if handles.is_empty() {
+                return;
+            }
+            tracing::info!(
+                count = handles.len(),
+                "Shutdown: signalling cancel to in-flight external worker tasks"
+            );
+            for handle in handles.values() {
+                handle.cancel();
+            }
+        }
+
+        // One full handoff window (bounded cancel send + ack wait) plus slack
+        // for runner bookkeeping.
+        let handoff = CANCEL_SEND_TIMEOUT + CANCEL_ACK_TIMEOUT + Duration::from_secs(1);
+        let drained = tokio::time::timeout(handoff, async {
+            while !self.active_handles.read().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok();
+
+        if drained {
+            tracing::debug!("Shutdown: external worker cancel handoff complete");
+        } else {
+            tracing::warn!(
+                remaining = self.active_handles.read().await.len(),
+                "Shutdown: external worker cancel handoff window expired with task(s) still in flight; proceeding"
+            );
+        }
     }
 }
 
@@ -777,8 +825,21 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsWrite = futures::stream::SplitSink<WsStream, tokio_tungstenite::tungstenite::Message>;
+type WsRead = futures::stream::SplitStream<WsStream>;
 
 const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long the daemon waits for a worker's terminal frame (`task_result` for
+/// the cancelled job) or socket close after sending a `cancel` envelope before
+/// tearing the connection down (WI#149). Workers that received the WI#101
+/// read-loop fix ack promptly; pre-fix workers just hit this deadline.
+const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Scheduling margin subtracted when capping the user-cancel ack wait to the
+/// remaining task budget, so the inner deadline reliably fires before the
+/// outer task timeout drops the future (a cancel racing the last seconds of
+/// the task window must still resolve as `Cancelled`, not `TimedOut`).
+const CANCEL_ACK_TASK_MARGIN: Duration = Duration::from_millis(50);
 
 pub struct PooledConnection {
     pub stream: WsStream,
@@ -1122,6 +1183,7 @@ async fn run_external_task(
     let task_timeout = Duration::from_millis(timeout_ms);
     let mut accumulated_output = String::new();
     let mut cancel_rx = cancel_rx;
+    let task_start = tokio::time::Instant::now();
 
     let result = tokio::time::timeout(task_timeout, async {
         loop {
@@ -1222,6 +1284,29 @@ async fn run_external_task(
                 }
                 _ = wait_for_cancellation(&mut cancel_rx) => {
                     send_cancel_envelope(&mut write, job_id).await;
+                    // Bounded handoff (WI#149): wait for the worker's terminal
+                    // frame (a `task_result` for this job) or socket close
+                    // before returning, so the cancel actually reaches a live
+                    // read loop instead of racing connection teardown. The
+                    // worker's ack, when observed, is authoritative for the
+                    // cancel bookkeeping; the timeout expiry is the fallback
+                    // for pre-WI#101 workers that never ack.
+                    //
+                    // The wait is capped to the task's remaining budget so a
+                    // cancel racing the last seconds of the task window still
+                    // resolves as Cancelled — the outer deadline must not drop
+                    // this future mid-handoff and misreport TimedOut.
+                    let elapsed = tokio::time::Instant::now()
+                        .saturating_duration_since(task_start)
+                        + CANCEL_ACK_TASK_MARGIN;
+                    let ack_budget = task_timeout
+                        .saturating_sub(elapsed)
+                        .min(CANCEL_ACK_TIMEOUT);
+                    if let Some(result) =
+                        wait_for_cancel_ack(&mut read, job_id, worker_name, ack_budget).await
+                    {
+                        return Ok(result);
+                    }
                     return Ok(ExternalTaskResult {
                         status: ExternalTaskStatus::Cancelled,
                         output: accumulated_output.clone(),
@@ -1241,6 +1326,10 @@ async fn run_external_task(
             // dropping the socket. Its own deadline is defense in depth, not the
             // daemon's only cancellation mechanism.
             send_cancel_envelope(&mut write, job_id).await;
+            // Bounded handoff on the timeout path too (WI#149): give the worker
+            // the same window to acknowledge before the connection is torn
+            // down, so its cancel processing isn't racing socket cleanup.
+            let _ = wait_for_cancel_ack(&mut read, job_id, worker_name, CANCEL_ACK_TIMEOUT).await;
             return Err(OrchestratorError::ExternalWorkerTimeout {
                 worker_name: worker_name.to_string(),
                 job_id,
@@ -1379,6 +1468,81 @@ async fn send_cancel_envelope(write: &mut WsWrite, job_id: Uuid) {
     .is_err()
     {
         tracing::warn!(%job_id, "Timed out sending external worker cancellation");
+    }
+}
+
+/// Wait bounded for the worker's terminal frame after a cancel envelope
+/// (WI#149). Consumes frames until a `task_result` envelope for `job_id`
+/// arrives (returned to the caller so the worker's own cancel status/output
+/// wins), the socket closes (worker done; handoff complete), or the deadline
+/// expires (pre-WI#101 worker that never acks — proceed with teardown).
+///
+/// Frame parsing is best-effort by design: progress/pong frames are skipped,
+/// and malformed frames don't abort the wait, since all we need is either the
+/// terminal frame or the socket's end.
+async fn wait_for_cancel_ack(
+    read: &mut WsRead,
+    job_id: Uuid,
+    worker_name: &str,
+    budget: Duration,
+) -> Option<ExternalTaskResult> {
+    let deadline = tokio::time::timeout(budget, async {
+        loop {
+            let msg = read.next().await?;
+            let ws_msg = match msg {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+            if ws_msg.is_close() || ws_msg.is_ping() || ws_msg.is_pong() {
+                continue;
+            }
+            let Ok(text) = ws_msg.to_text() else {
+                continue;
+            };
+            let Ok(env) = serde_json::from_str::<Envelope>(text) else {
+                continue;
+            };
+            if env.msg_type != "task_result" {
+                continue;
+            }
+            let payload: TaskResultPayload = match serde_json::from_value(env.payload) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if payload.task_id != job_id.to_string() {
+                continue;
+            }
+            let status = match payload.status.as_str() {
+                "success" => ExternalTaskStatus::Success,
+                "cancelled" => ExternalTaskStatus::Cancelled,
+                "timed_out" => ExternalTaskStatus::TimedOut,
+                _ => ExternalTaskStatus::Failed,
+            };
+            return Some(ExternalTaskResult {
+                status,
+                output: payload.output,
+                error: payload.error,
+                duration_ms: payload.duration_ms,
+            });
+        }
+    })
+    .await;
+
+    match deadline {
+        // Inner loop returned: either the terminal frame (Some) or socket
+        // close/error (None). Both complete the handoff.
+        Ok(inner) => inner,
+        // Deadline expired without a terminal frame: handoff window exhausted,
+        // fall back to daemon-side cancel bookkeeping.
+        Err(_) => {
+            tracing::debug!(
+                %job_id,
+                worker = worker_name,
+                budget_ms = budget.as_millis() as u64,
+                "External worker did not ack cancel within the handoff window; proceeding"
+            );
+            None
+        }
     }
 }
 
