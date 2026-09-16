@@ -986,7 +986,7 @@ start_tenant() {
   # its only guards are "port allocated" (always true) and "image present"
   # (host-wide). See tenant_worker_enabled / PER_TENANT_WORKER_GATING.md.
   local _w
-  for _w in pebble opencode kimi; do
+  for _w in pebble opencode kimi opencode2; do
     if tenant_worker_enabled "$name" "$_w" \
         && { [[ "$INIT_SYSTEM" != "openrc" ]] || tenant_worker_desired_running "$name" "$_w"; }; then
       "start_tenant_${_w}" "$name"
