@@ -614,8 +614,10 @@ write_tenant_lunarwing_env() {
   local kimi_model="${12:-}"
   local kimi_base_url="${13:-}"
   local kimi_api_key="${14:-}"
+  local opencode2_model="${15:-}"
+  local opencode2_base_url="${16:-}"
 
-  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port
+  local path gateway_port http_port bridge_port pg_port proxy_port weechat_port weechat_adapter_port orchestrator_port pebble_wss_port opencode_wss_port kimi_wss_port opencode2_wss_port
   path="$(tenant_env_dir "$name")/lunarwing.env"
   gateway_port="$(ports_get "$name" gateway)"
   http_port="$(ports_get "$name" http)"
@@ -628,6 +630,7 @@ write_tenant_lunarwing_env() {
   pebble_wss_port="$(ports_get "$name" pebble_wss)"
   opencode_wss_port="$(ports_get "$name" opencode_wss)"
   kimi_wss_port="$(ports_get "$name" kimi_wss)"
+  opencode2_wss_port="$(ports_get "$name" opencode2_wss)"
 
   local state_dir run_dir
   state_dir="$(tenant_state_dir "$name")"
@@ -678,6 +681,8 @@ write_tenant_lunarwing_env() {
   [[ -n "$kimi_model" ]]        || kimi_model="$(_env_existing "$path" KIMI_MODEL)"
   [[ -n "$kimi_base_url" ]]     || kimi_base_url="$(_env_existing "$path" KIMI_BASE_URL)"
   [[ -n "$kimi_api_key" ]]      || kimi_api_key="$(_env_existing "$path" KIMI_API_KEY)"
+  [[ -n "$opencode2_model" ]]    || opencode2_model="$(_env_existing "$path" OPENCODE2_MODEL)"
+  [[ -n "$opencode2_base_url" ]] || opencode2_base_url="$(_env_existing "$path" OPENCODE2_BASE_URL)"
   study_notes_home="$(_env_existing "$path" LW2STUDYMCP_HOME)"
   study_notes_state_home="$(_env_existing "$path" LW2STUDYMCP_STATE_HOME)"
   study_notes_allow_write="$(_env_existing "$path" LW2STUDYMCP_ALLOW_WRITE)"
@@ -859,6 +864,9 @@ OPENCODE_WSS_PORT=$opencode_wss_port
 # Kimi worker (WebSocket port for agent communication)
 KIMI_WSS_PORT=$kimi_wss_port
 
+# OpenCode 2 worker (WebSocket port for agent communication)
+OPENCODE2_WSS_PORT=$opencode2_wss_port
+
 # Pebble worker (WebSocket port for agent communication)
 PEBBLE_WSS_PORT=$pebble_wss_port
 
@@ -931,6 +939,8 @@ ENVEOF
   [[ -n "$kimi_base_url" ]]     && printf 'KIMI_BASE_URL=%s\n'     "$kimi_base_url"     >> "$path"
   [[ -n "$kimi_api_key" ]] \
     && printf 'KIMI_API_KEY=%s\n' "$(_quote_env_value "$kimi_api_key")" >> "$path"
+  [[ -n "$opencode2_model" ]]    && printf '\nOPENCODE2_MODEL=%s\n'    "$opencode2_model"     >> "$path"
+  [[ -n "$opencode2_base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$opencode2_base_url" >> "$path"
   if [[ -n "$study_notes_home" ]]; then
     printf '\n# Shared LunarWing Study Notes MCP\nLW2STUDYMCP_HOME=%s\n' \
       "$study_notes_home" >> "$path"
@@ -2083,6 +2093,17 @@ patch_tenant_env() {
     fi
   fi
 
+  local opencode2_wss_port
+  opencode2_wss_port="$(ports_get "$name" opencode2_wss)" || true
+  if [[ -n "$opencode2_wss_port" ]]; then
+    if grep -q '^OPENCODE2_WSS_PORT=' "$env_path"; then
+      say "OPENCODE2_WSS_PORT already set in $env_path (skipping)"
+    else
+      printf '\n# OpenCode 2 worker (WebSocket port for agent communication)\nOPENCODE2_WSS_PORT=%s\n' "$opencode2_wss_port" >>"$env_path"
+      say "added OPENCODE2_WSS_PORT=$opencode2_wss_port to $env_path"
+    fi
+  fi
+
   local weechat_adapter_port
   weechat_adapter_port="$(ports_get "$name" weechat_adapter)"
   if [[ -n "$weechat_adapter_port" ]]; then
@@ -2147,6 +2168,7 @@ patch_tenant_env() {
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
   ensure_external_worker_config "$name" "kimi" "kimi_wss"
+  ensure_external_worker_config "$name" "opencode2" "opencode2_wss"
 }
 
 extract_host_from_url() {

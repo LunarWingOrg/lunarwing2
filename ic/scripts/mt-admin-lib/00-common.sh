@@ -284,7 +284,7 @@ tenant_weechat_enabled() {
   [[ "$val" != "false" ]]
 }
 
-# Whether a supported external worker (pebble|opencode|kimi) is selected for this
+# Whether a supported external worker (pebble|opencode|kimi|opencode2) is selected for this
 # tenant. The selection is persisted at add-tenant into
 # .tenants[<name>].workers.<worker> and gates start_tenant_<worker> — otherwise a
 # tenant would start every worker whose SHARED host image happens to exist,
