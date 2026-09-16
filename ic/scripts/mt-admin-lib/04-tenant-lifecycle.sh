@@ -241,7 +241,7 @@ tenant_writer_services() {
     printf '%s\n' "lunarwing-vision-${name}"
   fi
   local worker
-  for worker in pebble opencode kimi; do
+  for worker in pebble opencode kimi opencode2; do
     if tenant_worker_enabled "$name" "$worker"; then
       printf '%s\n' "lunarwing-${worker}-${name}"
       [[ "$INIT_SYSTEM" != openrc ]] || printf '%s\n' "lunarwing-${worker}-${name}-sup"
@@ -251,7 +251,7 @@ tenant_writer_services() {
 
 tenant_writer_containers() {
   local name="$1" worker
-  for worker in pebble opencode kimi; do
+  for worker in pebble opencode kimi opencode2; do
     printf 'lunarwing-%s-%s\n' "$worker" "$name"
   done
   tenant_vision_external "$name" || printf 'lunarwing-vision-%s\n' "$name"
@@ -292,7 +292,7 @@ stop_tenant_writers() {
     done < <(tenant_writer_services "$name")
   fi
 
-  for worker in pebble opencode kimi; do
+  for worker in pebble opencode kimi opencode2; do
     stop_worker "$name" "$worker"
   done
   stop_tenant_vision "$name"
@@ -504,6 +504,9 @@ add_tenant() {
   local darkirc_scope_override="${23:-}"
   local with_study_mcp="${24:-false}"
   local study_mcp_home="${25:-}"
+  local with_opencode2="${26:-false}"
+  local opencode2_model="${27:-}"
+  local opencode2_base_url="${28:-}"
 
   name="$(sanitize_name "$name")"
   [[ -n "$name" ]] || die "invalid tenant name"
@@ -515,8 +518,8 @@ add_tenant() {
   # unit and could mask a real outage as `skipped`), so forbid such names at the
   # source. (weechat-* also covers weechat-adapter-*.)
   case "$name" in
-    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|weechat-*)
-      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/weechat-/weechat-adapter-); choose another name" ;;
+    pg-*|proxy-*|nanocode-*|pebble-*|opencode-*|kimi-*|opencode2-*|weechat-*)
+      die "tenant name '$name' collides with a reserved per-service unit prefix (pg-/proxy-/nanocode-/pebble-/opencode-/kimi-/opencode2-/weechat-/weechat-adapter-); choose another name" ;;
   esac
 
   # Resolve after sanitize_name so a preserved/default JID keys off the real name.
@@ -534,8 +537,8 @@ add_tenant() {
 
   ports_registry_init
   local base_port workers_json
-  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s}' \
-    "$with_pebble" "$with_opencode" "$with_kimi")"
+  workers_json="$(printf '{"nanocode":false,"pebble":%s,"opencode":%s,"kimi":%s,"opencode2":%s}' \
+    "$with_pebble" "$with_opencode" "$with_kimi" "$with_opencode2")"
   base_port="$(ports_allocate "$name" "$enable_darkirc" "$enable_proxy" "$workers_json" "$darkirc_scope_override")"
   say ""
 
@@ -554,7 +557,7 @@ add_tenant() {
   say "--- Generating environment files ---"
   write_tenant_vision_env "$name" >/dev/null
   write_tenant_voice_env "$name" >/dev/null
-  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key"
+  write_tenant_lunarwing_env "$name" "$xmpp_jid" "$xmpp_password" "$tensorzero_url" "$llm_api_key" "$llm_base_url" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$opencode2_model" "$opencode2_base_url"
   write_tenant_bridge_env "$name" "$xmpp_jid" "$xmpp_password" "$xmpp_allow_from"
   if [[ "$enable_proxy" == "true" ]]; then
     write_tenant_proxy_env "$name" "$tensorzero_url"
@@ -572,6 +575,7 @@ add_tenant() {
   ensure_external_worker_config "$name" "pebble" "pebble_wss"
   ensure_external_worker_config "$name" "opencode" "opencode_wss"
   ensure_external_worker_config "$name" "kimi" "kimi_wss"
+  ensure_external_worker_config "$name" "opencode2" "opencode2_wss"
 
   # WeeChat relay auto-bootstrap: write a dedicated minimal weechat.env, then
   # attempt a one-shot relay configuration. Non-fatal: a degraded WeeChat setup
@@ -674,11 +678,12 @@ add_tenant() {
   say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  opencode2_wss:    $(ports_get "$name" opencode2_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  weechat_adapter:  $(ports_get "$name" weechat_adapter)"
   say "  darkirc:          $( [[ "$enable_darkirc" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-darkirc to enable)" )"
   say "  proxy:            $( [[ "$enable_proxy" == "true" ]] && echo "enabled" || echo "disabled (pass --enable-proxy to enable)" )"
-  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi to select)" )"
+  say "  workers:          $( _selected="$( [[ "$with_pebble" == "true" ]] && printf 'pebble '; [[ "$with_opencode" == "true" ]] && printf 'opencode '; [[ "$with_kimi" == "true" ]] && printf 'kimi '; [[ "$with_opencode2" == "true" ]] && printf 'opencode2 ' )"; [[ -n "$_selected" ]] && echo "${_selected% }" || echo "none (pass --with-pebble/--with-opencode/--with-kimi/--with-opencode2 to select)" )"
   say "  ssh:              $( [[ "$DEFAULT_SSH_ENABLED" == "true" && "$SSH_OPT_OUT" != "true" ]] && echo "enabled (key upload + activation handled by start-tenant)" || echo "disabled (pass --no-ssh)" )"
   say "  weechat relay:    $weechat_bootstrap_ok"
   say "  study mcp:        $study_mcp_bootstrap_ok"
@@ -1013,6 +1018,7 @@ stop_tenant() {
   stop_tenant_pebble "$name"
   stop_tenant_opencode "$name"
   stop_tenant_kimi "$name"
+  stop_tenant_opencode2 "$name"
   stop_tenant_postgres "$name"
 
   # WI#133/#134: stopping must be verified, not assumed. On OpenRC a container
@@ -1419,7 +1425,11 @@ upgrade_tenant_locked() {
   if tenant_worker_enabled "$name" kimi; then
     with_kimi="true"
   fi
-  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" \
+  local with_opencode2="false"
+  if tenant_worker_enabled "$name" opencode2; then
+    with_opencode2="true"
+  fi
+  build_tenant "$name" "true" "false" "$with_opencode" "$with_kimi" "false" "true" "$with_opencode2" \
     || die "build failed for $name; aborting upgrade (tenant left stopped at $target_commit; fix the build and re-run upgrade-tenant)"
 
   if [[ "$do_render" == "true" ]]; then
@@ -1488,6 +1498,7 @@ status_tenant() {
   say "  nanocode_wss:     $(ports_get "$name" nanocode_wss) (reserved legacy slot)"
   say "  pebble_wss:       $(ports_get "$name" pebble_wss)"
   say "  opencode_wss:     $(ports_get "$name" opencode_wss)"
+  say "  opencode2_wss:    $(ports_get "$name" opencode2_wss)"
   say "  kimi_wss:         $(ports_get "$name" kimi_wss)"
   say "  vision_service:   $(ports_get "$name" vision_service)"
   say "  vision_health:    $(ports_get "$name" vision_health)"
@@ -1529,6 +1540,15 @@ status_tenant() {
     say "OpenCode worker: stopped ($opencode_container)"
   else
     say "OpenCode worker: not created"
+  fi
+
+  local opencode2_container="lunarwing-opencode2-$name"
+  if _ctr "$name" inspect -f '{{.State.Running}}' "$opencode2_container" 2>/dev/null | grep -q true; then
+    say "OpenCode 2 worker: running ($opencode2_container, WSS port $(ports_get "$name" opencode2_wss))"
+  elif _ctr "$name" inspect "$opencode2_container" &>/dev/null; then
+    say "OpenCode 2 worker: stopped ($opencode2_container)"
+  else
+    say "OpenCode 2 worker: not created"
   fi
 
   local kimi_container="lunarwing-kimi-$name"
@@ -1798,6 +1818,8 @@ doctor() {
   _check "pebble worker Dockerfile exists" test -f "$LUNARWING_ROOT/pebble4lunarwing/Dockerfile"
   _check "opencode worker dir exists" test -d "$LUNARWING_ROOT/opencode4lunarwing"
   _check "opencode worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode4lunarwing/Dockerfile"
+  _check "opencode2 worker dir exists" test -d "$LUNARWING_ROOT/opencode2.4lunarwing"
+  _check "opencode2 worker Dockerfile exists" test -f "$LUNARWING_ROOT/opencode2.4lunarwing/Dockerfile"
   _check "kimi worker dir exists" test -d "$LUNARWING_ROOT/kimicode4lunarwing"
   _check "kimi worker Dockerfile exists" test -f "$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
 
