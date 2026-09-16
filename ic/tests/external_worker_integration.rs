@@ -76,6 +76,20 @@ enum MockBehavior {
     WaitForCancel {
         messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
     },
+    /// WI#101-style worker with a live read loop: on `task_request` hold the
+    /// task open; when the daemon's cancel envelope arrives, wait `ack_delay_ms`
+    /// then ack with a `task_result` echoing the real task_id (WI#149 path).
+    /// Every inbound envelope is forwarded to `messages` so tests can observe
+    /// what the worker saw and in what order.
+    CancelAck {
+        messages: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
+        ack_status: String,
+        ack_delay_ms: u64,
+    },
+    /// Pre-WI#101 worker: receives the cancel envelope but never acks and
+    /// never closes the socket (read loop parked inside the task). Drives the
+    /// daemon's bounded-deadline fallback (WI#149).
+    CancelNoAck,
     /// Complete the WebSocket upgrade but close without sending `ready`
     /// (drives a protocol error).
     CloseBeforeReady,
@@ -386,6 +400,51 @@ async fn handle_connection(
                 }
                 return;
             }
+            MockBehavior::CancelAck {
+                ref messages,
+                ref ack_status,
+                ack_delay_ms,
+            } => {
+                // WI#101 shape: the read loop stays live while the task is
+                // parked, so the cancel envelope arrives mid-task and the
+                // worker acks with a real task_result. The task_request was
+                // already consumed by the outer loop and is handed in here.
+                let _ = messages.send(req_envelope.clone());
+                let task_id = req_envelope["payload"]["task_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let Ok(msg_env) = serde_json::from_str::<serde_json::Value>(text) else {
+                        continue;
+                    };
+                    if msg_env.get("type").and_then(|value| value.as_str()) != Some("cancel") {
+                        continue;
+                    }
+                    let _ = messages.send(msg_env);
+                    tokio::time::sleep(Duration::from_millis(ack_delay_ms)).await;
+                    let ack = envelope(
+                        "task_result",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "status": ack_status,
+                            "output": "",
+                            "error": null,
+                            "duration_ms": 0,
+                        }),
+                    );
+                    let _ = ws.send(Message::Text(ack.into())).await;
+                    return;
+                }
+            }
+            MockBehavior::CancelNoAck => {
+                // Pre-WI#101 shape: the cancel envelope queues unread (read
+                // loop parked inside the task); never ack, never close.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
             MockBehavior::CloseBeforeReady => unreachable!("handled above"),
         }
     }
@@ -436,6 +495,223 @@ async fn closed_port_url() -> String {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn cancel_ack_is_awaited_before_socket_teardown() {
+    // WI#149 regression: after sending a cancel envelope mid-task, the daemon
+    // must wait (bounded) for the worker's terminal frame before returning.
+    // The worker delays its ack by 400ms; the pre-WI#149 fire-and-forget
+    // daemon would return immediately, so the caller would receive the
+    // daemon-side fallback result ("Cancelled by user" error) instead of the
+    // worker's own ack (error null).
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CancelAck {
+        messages: message_tx,
+        ack_status: "cancelled".to_string(),
+        ack_delay_ms: 400,
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+
+    let mgr_c = mgr.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        mgr_c.cancel_task(job_id).await;
+    });
+
+    let start = std::time::Instant::now();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    let elapsed = start.elapsed();
+
+    assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+    // The fallback result carries error "Cancelled by user"; the worker ack
+    // carries error null. Distinguishing them proves the terminal frame was
+    // consumed rather than raced past.
+    assert!(
+        res.error.is_none(),
+        "expected the worker's ack result, got the daemon fallback: {res:?}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "daemon returned before the worker's ack: {elapsed:?}"
+    );
+
+    // Ordering sanity: the worker saw the task_request, then the cancel.
+    let first = message_rx.recv().await.expect("task_request captured");
+    assert_eq!(first["type"], "task_request");
+    let second = message_rx.recv().await.expect("cancel captured");
+    assert_eq!(second["type"], "cancel");
+    assert_eq!(second["payload"]["task_id"], job_id.to_string());
+}
+
+#[tokio::test]
+async fn cancel_ack_timeout_falls_back_to_daemon_result() {
+    // WI#149 fallback: a pre-WI#101 worker that never acks must not hang the
+    // cancel path — the bounded deadline (3s) expires and the daemon-side
+    // Cancelled result is returned.
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CancelNoAck).await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+
+    let mgr_c = mgr.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        mgr_c.cancel_task(job_id).await;
+    });
+
+    let start = std::time::Instant::now();
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(10_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+    let elapsed = start.elapsed();
+
+    assert_eq!(res.status, ExternalTaskStatus::Cancelled);
+    assert_eq!(res.error.as_deref(), Some("Cancelled by user"));
+    // The wait happened (>= 2.5s of the 3s deadline) and is bounded (well
+    // under the 15s test bound; the no-ack worker parks for 30s).
+    assert!(
+        elapsed >= Duration::from_millis(2_500),
+        "ack deadline wait did not happen: {elapsed:?}"
+    );
+    assert!(
+        elapsed < TEST_BOUND,
+        "ack deadline wait is not bounded: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn timeout_path_awaits_cancel_ack_before_return() {
+    // WI#149: the timeout branch must also give the worker the bounded ack
+    // window after sending its cancel envelope. The task deadline (300ms)
+    // fires first, then the worker acks 300ms after receiving the cancel; the
+    // daemon still returns ExternalWorkerTimeout, but only after consuming the
+    // worker's ack — never immediately at the deadline.
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CancelAck {
+        messages: message_tx,
+        ack_status: "cancelled".to_string(),
+        ack_delay_ms: 300,
+    })
+    .await;
+    let mgr = ExternalWorkerManager::new(vec![config_for(&url)]);
+    let job_id = Uuid::new_v4();
+
+    let start = std::time::Instant::now();
+    let err = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(300),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect_err("expected ExternalWorkerTimeout");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(err, OrchestratorError::ExternalWorkerTimeout { .. }),
+        "got {err:?}"
+    );
+    // Cancel sent at the 300ms deadline, worker acks 300ms later; returning
+    // only at ~600ms proves the daemon waited for the ack instead of tearing
+    // down at the deadline.
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "timeout path returned before the worker's ack: {elapsed:?}"
+    );
+
+    // The worker saw the task_request first, then the cancel.
+    let first = message_rx.recv().await.expect("task_request captured");
+    assert_eq!(first["type"], "task_request");
+    let second = message_rx.recv().await.expect("cancel captured");
+    assert_eq!(second["type"], "cancel");
+    assert_eq!(second["payload"]["task_id"], job_id.to_string());
+}
+
+#[tokio::test]
+async fn drain_pool_awaits_inflight_cancel_handoff() {
+    // WI#149 shutdown handoff: drain_pool must signal cancel on every in-flight
+    // task and wait for the runner's handoff before closing idle pool
+    // connections. The worker delays its ack 500ms after the cancel; by the
+    // time drain_pool returns, the cancel must have been received and the ack
+    // consumed. The pre-WI#149 drain never signalled in-flight tasks at all,
+    // so no cancel would ever reach the worker.
+    let (message_tx, mut message_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CancelAck {
+        messages: message_tx,
+        ack_status: "cancelled".to_string(),
+        ack_delay_ms: 500,
+    })
+    .await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+
+    // Dispatch a hanging task fire-and-forget (in-flight).
+    let dispatched = mgr
+        .execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(30_000),
+            false,
+            TaskContext::default(),
+        )
+        .await
+        .expect("dispatch async task");
+    assert!(dispatched.is_none(), "fire-and-forget returns no result");
+
+    // Let the runner connect, dispatch, and park on the task.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    timeout(TEST_BOUND, mgr.drain_pool())
+        .await
+        .expect("drain timed out");
+
+    // The worker must have received the task_request AND the cancel (forwarded
+    // before its 500ms-delayed ack, which itself preceded the runner's return,
+    // which drain waited for). Under the old drain the cancel was never sent.
+    let first = message_rx
+        .try_recv()
+        .expect("task_request must have reached the worker before drain returned");
+    assert_eq!(first["type"], "task_request");
+    let second = message_rx
+        .try_recv()
+        .expect("cancel must have reached the worker before drain returned");
+    assert_eq!(second["type"], "cancel");
+    assert_eq!(second["payload"]["task_id"], job_id.to_string());
+}
 
 #[tokio::test]
 async fn happy_path_success_with_progress() {
