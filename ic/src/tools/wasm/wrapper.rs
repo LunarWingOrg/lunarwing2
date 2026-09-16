@@ -1012,15 +1012,19 @@ impl WasmToolSchemas {
     /// Derive a compact advertised schema from the full discovery schema.
     ///
     /// Collects properties from top-level `properties` and from
-    /// `oneOf`/`anyOf`/`allOf` variants. Keeps only properties that are in
-    /// the top-level `required` array or carry an `enum`/`const` constraint.
-    /// For properties defined via `const` across multiple variants (e.g.
-    /// `"action": {"const": "get_repo"}` in each `oneOf` branch), the `const`
-    /// values are merged into a single `enum` array.
+    /// `oneOf`/`anyOf`/`allOf` variants. Keeps properties that are in the
+    /// top-level `required` array, carry an `enum`/`const` constraint, or are
+    /// required by at least one combinator variant. For properties defined
+    /// via `const` across multiple variants (e.g. `"action": {"const":
+    /// "get_repo"}` in each `oneOf` branch), the `const` values are merged
+    /// into a single `enum` array.
     ///
-    /// Variant-level `required` fields (e.g. `owner`, `repo` required within
-    /// each `oneOf` variant but not top-level) are intentionally omitted from
-    /// the compact schema — the LLM can discover them via
+    /// Variant-required fields are kept (flattened, not marked top-level
+    /// `required`, since different variants require different fields): a
+    /// discriminated-union tool whose advertised schema collapses to just the
+    /// `action` discriminator trains models to emit action-only calls the
+    /// guest then rejects ("missing field `project`" — work items #73.4 and
+    /// #150). Optional variant fields stay discoverable via
     /// `tool_info(detail: "schema")`.
     ///
     /// At most `MAX_COMPACT_PROPERTIES` properties are collected to bound
@@ -1028,7 +1032,7 @@ impl WasmToolSchemas {
     fn compact_schema(discovery: &serde_json::Value) -> serde_json::Value {
         const MAX_COMPACT_PROPERTIES: usize = 100;
 
-        let required: std::collections::HashSet<String> = discovery
+        let top_level_required: std::collections::HashSet<String> = discovery
             .get("required")
             .and_then(|r| r.as_array())
             .map(|arr| {
@@ -1037,6 +1041,12 @@ impl WasmToolSchemas {
                     .collect()
             })
             .unwrap_or_default();
+        // Union of top-level and variant-required property names. Kept
+        // properties are filtered by this set, but only `top_level_required`
+        // is emitted as top-level `required` — different variants require
+        // different fields, so marking the union required would misdescribe
+        // every other variant.
+        let mut required = top_level_required.clone();
 
         // Collect properties from top-level and oneOf/anyOf/allOf variants.
         // For properties with `const` across variants, merge into an `enum`.
@@ -1056,6 +1066,16 @@ impl WasmToolSchemas {
         for key in ["oneOf", "anyOf", "allOf"] {
             if let Some(variants) = discovery.get(key).and_then(|v| v.as_array()) {
                 for variant in variants {
+                    // Any field a variant demands must stay visible to the
+                    // LLM, or discriminated-union calls arrive without it and
+                    // the guest rejects them with "missing field" errors.
+                    if let Some(variant_required) =
+                        variant.get("required").and_then(|r| r.as_array())
+                    {
+                        for name in variant_required.iter().filter_map(|v| v.as_str()) {
+                            required.insert(name.to_string());
+                        }
+                    }
                     if let Some(props) = variant.get("properties").and_then(|p| p.as_object()) {
                         for (k, v) in props {
                             if all_properties.len() >= MAX_COMPACT_PROPERTIES
@@ -1103,7 +1123,7 @@ impl WasmToolSchemas {
             return Self::permissive_schema();
         }
 
-        let kept_required: Vec<serde_json::Value> = required
+        let kept_required: Vec<serde_json::Value> = top_level_required
             .iter()
             .filter(|name| kept.contains_key(name.as_str()))
             .map(|name| serde_json::Value::String(name.clone()))
@@ -1135,15 +1155,14 @@ impl WasmToolSchemas {
     /// Whether the compact advertised schema omits fields that discovery
     /// combinator variants require.
     ///
-    /// Discriminated-union tools (oneOf/anyOf with a const discriminator,
-    /// e.g. the gitlab tool's internally-tagged action enum) compact to
-    /// just the discriminator property: variant-level required fields
-    /// (`project`, `title`, …) are intentionally dropped from the
-    /// advertised schema. Because the compact schema still has a typed
-    /// property it is not "permissive", so without this check no
-    /// tool_info hint is shown and the LLM emits discriminator-only
-    /// calls the guest then rejects ("missing field `project`" —
-    /// work item #73).
+    /// `compact_schema` keeps variant-required fields, so this normally
+    /// returns false for discriminated-union tools. It stays as a fallback
+    /// for schemas where compaction could not preserve every variant-required
+    /// field (e.g. the property-count cap, or an explicit schema override):
+    /// because such a compact schema still has typed properties it is not
+    /// "permissive", so without this check no tool_info hint is shown and the
+    /// LLM emits discriminator-only calls the guest then rejects ("missing
+    /// field `project`" — work items #73 and #150).
     fn advertised_omits_variant_required(&self) -> bool {
         let advertised_props = self
             .advertised
@@ -1538,11 +1557,11 @@ impl Tool for WasmToolWrapper {
     /// Compose the tool schema for LLM function calling.
     ///
     /// When the advertised schema is permissive (no typed properties), or when
-    /// it omits fields that discovery combinator variants require (e.g. a
-    /// discriminated-union tool compacted to just its `action` discriminator),
-    /// appends a hint to the description directing the LLM to call `tool_info`
-    /// for the full parameter schema. This keeps the raw description clean
-    /// while still guiding the LLM.
+    /// it omits fields that discovery combinator variants require (possible
+    /// for oversized schemas or explicit overrides, since `compact_schema`
+    /// keeps variant-required fields), appends a hint to the description
+    /// directing the LLM to call `tool_info` for the full parameter schema.
+    /// This keeps the raw description clean while still guiding the LLM.
     fn schema(&self) -> crate::tools::tool::ToolSchema {
         let needs_schema_hint = self.schemas.is_advertised_permissive()
             || self.schemas.advertised_omits_variant_required();
@@ -2767,22 +2786,29 @@ mod tests {
             props.contains_key("state"),
             "state should be kept (has enum)"
         );
-        // owner/repo: not in top-level required, no enum → intentionally dropped
-        // (variant-level required is omitted; discoverable via tool_info)
-        assert!(!props.contains_key("owner"), "owner should be dropped");
-        assert!(!props.contains_key("repo"), "repo should be dropped");
+        // owner/repo: variant-required → kept (WI#150: dropping them trains
+        // action-only calls the guest rejects with "missing field" errors).
+        // They stay out of top-level `required` since only some variants need them.
+        assert!(
+            props.contains_key("owner"),
+            "owner should be kept (variant-required)"
+        );
+        assert!(
+            props.contains_key("repo"),
+            "repo should be kept (variant-required)"
+        );
         assert_eq!(compacted["additionalProperties"], true);
         assert_eq!(compacted["required"], serde_json::json!(["action"]));
     }
 
-    /// Regression for work item #73 (gitlab tool): a discriminated-union
-    /// discovery schema compacts to just the `action` discriminator. The
-    /// advertised schema then under-describes the real payload, so the LLM
-    /// must be told to fetch the full schema via tool_info — otherwise it
-    /// emits action-only calls that the guest rejects ("missing field
+    /// Regression for work items #73 (gitlab tool) and #150: a
+    /// discriminated-union discovery schema must NOT compact to just the
+    /// `action` discriminator. Variant-required fields (`project`, `title`)
+    /// stay in the advertised schema so the model emits complete calls
+    /// instead of action-only calls the guest rejects ("missing field
     /// `project`").
     #[tokio::test]
-    async fn test_discriminated_union_schema_gets_tool_info_hint() {
+    async fn test_discriminated_union_advertises_variant_required_fields() {
         let discovery_schema = serde_json::json!({
             "type": "object",
             "oneOf": [
@@ -2805,16 +2831,27 @@ mod tests {
         });
 
         let schemas = super::WasmToolSchemas::new(discovery_schema.clone());
-        // Compact advertised schema keeps only the discriminator.
         let advertised = schemas.advertised();
         let props = advertised["properties"].as_object().unwrap();
         assert!(props.contains_key("action"));
-        assert!(!props.contains_key("project"));
-        // ...and is not permissive, yet still omits variant-required fields.
-        assert!(!schemas.is_advertised_permissive());
-        assert!(schemas.advertised_omits_variant_required());
+        assert!(
+            props.contains_key("project"),
+            "variant-required project must be advertised: {props:?}"
+        );
+        assert!(
+            props.contains_key("title"),
+            "variant-required title must be advertised: {props:?}"
+        );
+        // The variant-required union is NOT top-level required: only some
+        // variants demand `title`, so requiring it globally would misdescribe
+        // the others.
+        assert!(advertised.get("required").is_none());
 
-        // The composed LLM-facing schema must carry the tool_info hint.
+        // ...and since nothing variant-required is omitted, the omission
+        // detector no longer fires.
+        assert!(!schemas.is_advertised_permissive());
+        assert!(!schemas.advertised_omits_variant_required());
+
         let runtime = Arc::new(WasmToolRuntime::new(WasmRuntimeConfig::for_testing()).unwrap());
         let prepared = runtime
             .prepare("gitlab", b"\0asm\x0d\0\x01\0", None)
@@ -2825,12 +2862,73 @@ mod tests {
         wrapper.schemas = super::WasmToolSchemas::new(discovery_schema);
         wrapper.description = "Manage GitLab".to_string();
 
+        // Advertised schema reaches the LLM verbatim through schema().
         let schema = wrapper.schema();
-        assert!(
-            schema.description.contains("tool_info"),
-            "discriminated-union tools must advertise the tool_info hint: {}",
-            schema.description
-        );
+        assert_eq!(schema.parameters, advertised);
+    }
+
+    /// WI#150 shape (real gitlab tool schema): 33 internally-tagged oneOf
+    /// variants where every non-trivial variant requires `project` (plus
+    /// `query`, `iid`, `title`, ...). The advertised schema must surface
+    /// those fields so models emit complete calls; before this fix it
+    /// collapsed to `action`-only and agents saw "missing field `project`".
+    #[test]
+    fn test_compact_schema_keeps_variant_required_union_across_many_variants() {
+        let variants: Vec<serde_json::Value> = [
+            ("current_user", vec![]),
+            ("search_projects", vec!["query"]),
+            ("search_issues", vec!["project", "query"]),
+            ("get_issue", vec!["project", "iid"]),
+            ("create_issue", vec!["project", "title"]),
+            ("create_or_update_file", vec!["project", "path", "branch", "content", "commit_message"]),
+            ("approve_merge_request", vec!["project", "iid", "sha"]),
+        ]
+        .into_iter()
+        .map(|(action, required)| {
+            let mut properties = serde_json::Map::new();
+            properties.insert("action".into(), serde_json::json!({ "const": action }));
+            for field in &required {
+                properties.insert(
+                    (*field).to_string(),
+                    serde_json::json!({ "type": if *field == "iid" { "integer" } else { "string" } }),
+                );
+            }
+            let mut variant_required: Vec<serde_json::Value> =
+                vec![serde_json::json!("action")];
+            variant_required.extend(required.iter().map(|f| serde_json::json!(f)));
+            serde_json::json!({
+                "type": "object",
+                "properties": properties,
+                "required": variant_required,
+            })
+        })
+        .collect();
+
+        let compacted = super::WasmToolSchemas::compact_schema(&serde_json::json!({
+            "oneOf": variants
+        }));
+        let props = compacted["properties"].as_object().unwrap();
+        let action_enum_len = props["action"]["enum"].as_array().unwrap().len();
+        assert_eq!(action_enum_len, 7, "action consts merge into one enum");
+        for field in [
+            "project",
+            "query",
+            "iid",
+            "title",
+            "path",
+            "branch",
+            "content",
+            "commit_message",
+            "sha",
+        ] {
+            assert!(
+                props.contains_key(field),
+                "variant-required `{field}` must be advertised (WI#150): {props:?}"
+            );
+        }
+        // No top-level required: variants disagree on which fields apply.
+        assert!(compacted.get("required").is_none());
+        assert_eq!(compacted["additionalProperties"], true);
     }
 
     #[test]
