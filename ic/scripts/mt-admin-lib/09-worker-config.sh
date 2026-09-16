@@ -710,7 +710,11 @@ configure_opencode2() {
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
 
-  local tmp
+  local tmp existing_model existing_base_url
+  existing_model="$(_read_env_value "$env_path" OPENCODE2_MODEL)"
+  existing_base_url="$(_read_env_value "$env_path" OPENCODE2_BASE_URL)"
+  [[ -n "$model" ]] || model="$existing_model"
+  [[ -n "$base_url" ]] || base_url="$existing_base_url"
   tmp="$(mktemp)"
   grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' "$env_path" >"$tmp" || true
   [[ -n "$model" ]]    && printf 'OPENCODE2_MODEL=%s\n'    "$model"    >>"$tmp"
