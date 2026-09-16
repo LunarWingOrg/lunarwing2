@@ -220,6 +220,10 @@ ensure_external_worker_config() {
     say "kimi worker not selected for $name (skipping external-worker config)"
     return 0
   fi
+  if [[ "$worker" == "opencode2" ]] && ! tenant_worker_enabled "$name" opencode2; then
+    say "opencode2 worker not selected for $name (skipping external-worker config)"
+    return 0
+  fi
   state_dir="$(tenant_state_dir "$name")"
   env_path="$(tenant_env_dir "$name")/lunarwing.env"
   config_path="$state_dir/config.toml"
@@ -692,6 +696,38 @@ configure_opencode() {
   fi
 }
 
+configure_opencode2() {
+  local name="$1"
+  local model="${2:-}"
+  local base_url="${3:-}"
+
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  [[ -n "$model" || -n "$base_url" ]] \
+    || die "configure-opencode2: pass --model <model> and/or --base-url <url>"
+
+  local env_path
+  env_path="$(tenant_env_dir "$name")/lunarwing.env"
+  [[ -f "$env_path" ]] || die "env file not found: $env_path (run add-tenant first)"
+
+  local tmp
+  tmp="$(mktemp)"
+  grep -v -e '^OPENCODE2_MODEL=' -e '^OPENCODE2_BASE_URL=' "$env_path" >"$tmp" || true
+  [[ -n "$model" ]]    && printf 'OPENCODE2_MODEL=%s\n'    "$model"    >>"$tmp"
+  [[ -n "$base_url" ]] && printf 'OPENCODE2_BASE_URL=%s\n' "$base_url" >>"$tmp"
+  cat "$tmp" >"$env_path"
+  rm -f "$tmp"
+  chown "$name:$name" "$env_path"
+  chmod 600 "$env_path"
+  say "opencode2 LLM overrides written to $env_path for tenant '$name'"
+
+  local container_name="lunarwing-opencode2-$name"
+  if _ctr "$name" inspect "$container_name" &>/dev/null 2>&1; then
+    say "note: restart the opencode2 worker to pick up the new config:"
+    say "  sudo $0 stop-tenant $name && sudo $0 start-tenant $name"
+  fi
+}
+
 snapshot_sqlite_database() {  # <source> <destination>
   require_cmd python3
   python3 - "$1" "$2" <<'PY'
@@ -1112,6 +1148,180 @@ stop_tenant_opencode() {
   fi
 }
 
+start_tenant_opencode2() {
+  local name="$1"
+  ensure_container_runtime
+
+  local launch_contract=""
+  local -a userns_args=()
+  if [[ "$CONTAINER_RT" == "podman" && "$MT_ROOTLESS" == "true" ]]; then
+    launch_contract="$OPENCODE2_ROOTLESS_LAUNCH_CONTRACT"
+    userns_args=(--userns "$OPENCODE2_USERNS")
+  fi
+
+  local wss_port container_name worker_dir
+  wss_port="$(ports_get "$name" opencode2_wss)" || true
+  container_name="lunarwing-opencode2-$name"
+  worker_dir="${LUNARWING_ROOT}/opencode2.4lunarwing"
+
+  if [[ -z "$wss_port" ]]; then
+    say "no opencode2_wss port allocated for $name (skipping opencode2 worker)"
+    return 0
+  fi
+
+  if ! _ensure_tenant_image "$name" lunarwing-worker-opencode2:latest; then
+    say "opencode2 worker image not available; run 'build-opencode2-worker' first (skipping)"
+    return 0
+  fi
+  local image_user
+  image_user="$(_ctr "$name" image inspect --format '{{.Config.User}}' \
+    lunarwing-worker-opencode2:latest 2>/dev/null || true)"
+  case "$image_user" in
+    "$OPENCODE2_CONTAINER_UID"|"$OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID") ;;
+    *)
+      die "opencode2 worker image has user '${image_user:-unset}', expected $OPENCODE2_CONTAINER_UID:$OPENCODE2_CONTAINER_GID; rebuild it"
+      ;;
+  esac
+
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "systemd" && "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
+    _wait_user_manager "$name"
+    local service="lunarwing-opencode2-${name}.service"
+    local quadlet_file
+    quadlet_file="$(tenant_quadlet_dir "$name")/lunarwing-opencode2-${name}.container"
+    render_worker_quadlet "$name" opencode2 8443
+    _systemctl_user "$name" daemon-reload 2>/dev/null || true
+    if _container_config_changed "$name" "lunarwing-opencode2-${name}" "$quadlet_file"; then
+      _recreate_quadlet_container "$name" "$service" "lunarwing-opencode2-${name}"
+    fi
+    _systemctl_user "$name" reset-failed "$service" >/dev/null 2>&1 || true
+    if _systemctl_user "$name" start "$service" >/dev/null 2>&1; then
+      _store_container_hash "$name" "lunarwing-opencode2-${name}" "$quadlet_file"
+      say "opencode2 worker ready via quadlet ($service, WSS port $wss_port)"
+    else
+      say "WARNING: $service failed to start" >&2
+      _systemctl_user "$name" status "$service" --no-pager --full >&2 || true
+    fi
+    return 0
+  fi
+
+  local -a healthcheck_args=()
+  if _openrc_podman_uses_init_health; then
+    _reconcile_openrc_podman_healthcheck "$name" "$container_name"
+    healthcheck_args=(--no-healthcheck)
+  fi
+
+  if _ctr "$name" inspect "$container_name" &>/dev/null; then
+    local env_file_for_hash
+    env_file_for_hash="$(tenant_env_dir "$name")/lunarwing.env"
+    if _container_config_changed \
+        "$name" "$container_name" "$env_file_for_hash" "$launch_contract"; then
+      say "config changed for $container_name; force-recreating"
+      _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+      _ctr "$name" rm -f "$container_name" >/dev/null 2>&1 || true
+    elif _ctr "$name" inspect -f '{{.State.Running}}' "$container_name" 2>/dev/null | grep -q true; then
+      say "opencode2 worker already running ($container_name, WSS port $wss_port)"
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$launch_contract"
+      _register_worker_unit "$name" opencode2
+      return 0
+    else
+      say "starting existing opencode2 worker container $container_name"
+      _ctr "$name" start "$container_name" >/dev/null
+      _store_container_hash \
+        "$name" "$container_name" "$env_file_for_hash" "$launch_contract"
+      _register_worker_unit "$name" opencode2
+      say "opencode2 worker ready ($container_name, WSS port $wss_port)"
+      return 0
+    fi
+  fi
+
+  if ! _ctr "$name" inspect "$container_name" &>/dev/null; then
+    say "creating opencode2 worker container $container_name on WSS port $wss_port"
+
+    local tenant_env_path
+    tenant_env_path="$(tenant_env_dir "$name")/lunarwing.env"
+
+    local worker_env_path
+    worker_env_path="$(tenant_env_dir "$name")/opencode2.env"
+
+    local -a env_flags=()
+    if [[ -f "$tenant_env_path" ]]; then
+      local gateway_token
+      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
+      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
+
+      local llm_api_key
+      llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
+      [[ -n "$llm_api_key" ]] && env_flags+=(-e "TENSORZERO_API_KEY=$llm_api_key")
+
+      local oc2_model oc2_base_url
+      oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
+      [[ -n "$oc2_model" ]] && env_flags+=(-e "OPENCODE2_MODEL=$oc2_model")
+      oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+      [[ -n "$oc2_base_url" ]] && env_flags+=(-e "OPENCODE2_BASE_URL=$oc2_base_url")
+    fi
+
+    if [[ -f "$worker_env_path" ]]; then
+      env_flags+=(--env-file "$worker_env_path")
+    fi
+
+    local workspace_dir
+    workspace_dir="$(prepare_worker_workspace "$name" opencode2)"
+
+    local -a restart_arg=()
+    [[ "$MT_ROOTLESS" == "true" ]] || restart_arg=(--restart unless-stopped)
+    local -a health_publish=()
+    local host_health_port
+    host_health_port="$(ports_get "$name" opencode2_health)" || true
+    [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
+    local ssh_agent_socket
+    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
+    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    _ctr "$name" run -d \
+      --name "$container_name" \
+      "${healthcheck_args[@]}" \
+      "${userns_args[@]}" \
+      -e LUNARWING_WORKER_ID="worker-opencode2-${name}" \
+      -e WS_PORT="$wss_port" \
+      -e HEALTH_PORT="8443" \
+      -e OPENCODE_MODE=websocket \
+      -e WS_ROLE=server \
+      -e WS_BIND_HOST=0.0.0.0 \
+      -e WS_PATH=/ws/agent \
+      "${env_flags[@]}" \
+      "${ssh_mount[@]}" \
+      "${study_notes_mount[@]}" \
+      -p "127.0.0.1:${wss_port}:${wss_port}" \
+      "${health_publish[@]}" \
+      -v "$workspace_dir:/workspace:z" \
+      "${restart_arg[@]}" \
+      lunarwing-worker-opencode2:latest \
+      --mode websocket >/dev/null
+    _store_container_hash \
+      "$name" "$container_name" "$(tenant_env_dir "$name")/lunarwing.env" \
+      "$launch_contract"
+  fi
+
+  _register_worker_unit "$name" opencode2
+  say "opencode2 worker ready ($container_name, WSS port $wss_port)"
+}
+
+stop_tenant_opencode2() {
+  local name="$1"
+  ensure_container_runtime
+
+  local container_name="lunarwing-opencode2-$name"
+  ensure_init_system
+  if [[ "$INIT_SYSTEM" == "openrc" && -f "/etc/init.d/${container_name}" ]]; then
+    _deregister_babysitter "$container_name"
+    rc-service "$container_name" stop >/dev/null 2>&1 || true
+    say "opencode2 worker stopped ($container_name)"
+  elif _ctr "$name" inspect "$container_name" &>/dev/null; then
+    _ctr "$name" stop "$container_name" >/dev/null 2>&1 || true
+    say "opencode2 worker stopped ($container_name)"
+  fi
+}
 # ── Kimi Code worker container ────────────────────────────────────────────────
 
 prepare_worker_workspace() {
@@ -1127,6 +1337,10 @@ prepare_worker_workspace() {
     kimi)
       container_uid="$KIMI_CONTAINER_UID"
       container_gid="$KIMI_CONTAINER_GID"
+      ;;
+    opencode2)
+      container_uid="$OPENCODE2_CONTAINER_UID"
+      container_gid="$OPENCODE2_CONTAINER_GID"
       ;;
     *) die "unsupported private worker workspace: $worker" ;;
   esac
@@ -1526,8 +1740,8 @@ stop_tenant_pebble() {
 require_worker_name() {
   case "${1:-}" in
     nanocode) die "Nanocode worker is retired" ;;
-    pebble|opencode|kimi) ;;
-    *) die "unknown worker '${1:-}'; expected pebble, opencode, or kimi" ;;
+    pebble|opencode|kimi|opencode2) ;;
+    *) die "unknown worker '${1:-}'; expected pebble, opencode, kimi, or opencode2" ;;
   esac
 }
 
