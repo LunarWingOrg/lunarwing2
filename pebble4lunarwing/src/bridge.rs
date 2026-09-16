@@ -321,7 +321,7 @@ async fn dispatch_task(
             );
             send_result(
                 out_tx,
-                protocol::result_envelope(&request.task_id, "error", "", Some(&e.to_string()), 0),
+                &protocol::result_envelope(&request.task_id, "error", "", Some(&e.to_string()), 0),
             );
             return;
         }
@@ -342,7 +342,7 @@ async fn dispatch_task(
         );
         send_result(
             out_tx,
-            protocol::result_envelope(&request.task_id, "error", "", Some(&error), 0),
+            &protocol::result_envelope(&request.task_id, "error", "", Some(&error), 0),
         );
         return;
     }
@@ -385,7 +385,7 @@ async fn dispatch_task(
     }
 }
 
-fn send_result(out_tx: &Outbound, envelope: Envelope) {
+fn send_result(out_tx: &Outbound, envelope: &Envelope) {
     match serde_json::to_string(&envelope) {
         Ok(json) => {
             if out_tx.send(Message::Text(json.into())).is_err() {
@@ -499,5 +499,175 @@ mod tests {
     fn negotiate_rejects_unknown_offers() {
         assert_eq!(negotiate_subprotocol(""), None);
         assert_eq!(negotiate_subprotocol("some-other-proto"), None);
+    }
+
+    fn test_config() -> BridgeConfig {
+        BridgeConfig {
+            bind_host: "127.0.0.1".to_string(),
+            ws_port: 0,
+            ws_path: "/ws/agent".to_string(),
+            health_port: 0,
+            auth_token: None,
+            worker_id: "worker-test".to_string(),
+            pebble_bin: "/nonexistent-pebble".to_string(),
+            model: "m".to_string(),
+            permission_mode: "default".to_string(),
+            workspace_root: workspace_root_str(),
+        }
+    }
+
+    fn workspace_root_str() -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("pebble-bridge-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create workspace root");
+        root.to_str().expect("utf-8 path").to_string()
+    }
+
+    fn request_envelope(task_id: &str, project_dir: Option<&str>) -> Envelope {
+        protocol::create_envelope(
+            "task_request",
+            protocol::TaskRequest {
+                task_id: task_id.to_string(),
+                prompt: "work".to_string(),
+                context: protocol::TaskContext {
+                    project_dir: project_dir.map(String::from),
+                    ..Default::default()
+                },
+                timeout_ms: Some(30_000),
+            },
+        )
+    }
+
+    async fn next_envelope(rx: &mut mpsc::UnboundedReceiver<Message>) -> Envelope {
+        let timeout = std::time::Duration::from_secs(5);
+        let msg = tokio::time::timeout(timeout, rx.recv())
+            .await
+            .expect("envelope within timeout")
+            .expect("channel open");
+        let Message::Text(text) = msg else {
+            panic!("expected text message, got {msg:?}");
+        };
+        serde_json::from_str::<Envelope>(text.as_str()).expect("valid envelope JSON")
+    }
+
+    #[tokio::test]
+    async fn cancel_fires_the_matching_tasks_channel() {
+        let mut cancels = HashMap::new();
+        let (tx_a, mut rx_a) = oneshot::channel();
+        let (tx_b, mut rx_b) = oneshot::channel();
+        cancels.insert("task-a".to_string(), tx_a);
+        cancels.insert("task-b".to_string(), tx_b);
+
+        cancel_task(&protocol::cancel_envelope("task-a"), &mut cancels);
+
+        assert!(rx_a.try_recv().is_ok(), "task-a cancel must fire");
+        assert!(
+            rx_b.try_recv().is_err(),
+            "task-b cancel must not fire from task-a's envelope"
+        );
+        assert!(cancels.contains_key("task-b"), "task-b stays registered");
+        assert!(!cancels.contains_key("task-a"), "task-a entry consumed");
+    }
+
+    #[tokio::test]
+    async fn cancel_for_unknown_task_is_ignored() {
+        let mut cancels = HashMap::new();
+        let (tx, mut rx) = oneshot::channel();
+        cancels.insert("task-live".to_string(), tx);
+
+        cancel_task(&protocol::cancel_envelope("task-ghost"), &mut cancels);
+
+        assert!(rx.try_recv().is_err(), "no cancel may fire");
+        assert!(cancels.contains_key("task-live"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_returns_without_waiting_for_the_task() {
+        // Regression for WI#101: dispatch must come back to the read loop
+        // immediately. `pebble_bin` points at a nonexistent binary, so the
+        // executor's result (a spawn-failure error envelope) arrives later
+        // through the outbound channel, never inline.
+        let root = test_config();
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut cancels = HashMap::new();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        dispatch_task(
+            request_envelope("task-1", Some(&root.workspace_root)),
+            &root,
+            &out_tx,
+            &mut cancels,
+            &registry,
+        )
+        .await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "dispatch must not await the task"
+        );
+
+        // The executor still reports the spawn failure asynchronously.
+        let result = next_envelope(&mut out_rx).await;
+        assert_eq!(result.msg_type, "task_result");
+        let payload: protocol::TaskResult =
+            serde_json::from_value(result.payload).expect("task_result payload");
+        assert_eq!(payload.task_id, "task-1");
+        assert_eq!(payload.status, "error");
+        assert!(payload.error.is_some());
+
+        // Workspace claim is released once the task handler finishes.
+        let workspace = std::path::PathBuf::from(
+            std::path::Path::new(&root.workspace_root)
+                .canonicalize()
+                .expect("canonical root")
+                .to_str()
+                .expect("utf-8")
+                .to_string(),
+        );
+        for _ in 0..50 {
+            if registry
+                .try_register(workspace.clone(), "task-next")
+                .await
+                .is_ok()
+            {
+                registry.unregister(&workspace, "task-next").await;
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("workspace claim was never released after the task finished");
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejecting_escaping_project_dir_leaves_no_cancel_entry() {
+        let root = test_config();
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let mut cancels = HashMap::new();
+
+        let outside = std::env::temp_dir().join("pebble-bridge-outside-escape");
+        std::fs::create_dir_all(&outside).expect("create outside dir");
+        let outside_str = outside.to_str().expect("utf-8 path").to_string();
+
+        dispatch_task(
+            request_envelope("task-escape", Some(&outside_str)),
+            &root,
+            &out_tx,
+            &mut cancels,
+            &registry,
+        )
+        .await;
+
+        let rejection = next_envelope(&mut out_rx).await;
+        assert_eq!(rejection.msg_type, "task_result");
+        let payload: protocol::TaskResult =
+            serde_json::from_value(rejection.payload).expect("task_result payload");
+        assert_eq!(payload.status, "error");
+        assert!(payload.error.as_deref().unwrap_or("").contains("escapes"));
+        assert!(cancels.is_empty(), "rejected task must register no cancel");
+        std::fs::remove_dir_all(&outside).ok();
     }
 }

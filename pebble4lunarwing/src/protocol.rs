@@ -145,6 +145,9 @@ pub fn pong_envelope() -> Envelope {
     create_envelope("pong", serde_json::json!({}))
 }
 
+/// Test-only: the worker receives `cancel` envelopes from the daemon and
+/// never sends one, so the constructor exists just for round-trip coverage.
+#[cfg(test)]
 pub fn cancel_envelope(task_id: &str) -> Envelope {
     create_envelope(
         "cancel",
