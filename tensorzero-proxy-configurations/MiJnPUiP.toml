@@ -1,0 +1,1907 @@
+# TensorZero Gateway Configuration
+# Last updated Sep 15 2026 19:49
+# Latest Change: switched FrontierDEEP entrypoint to ds_v41_flash_nanogpt_tee (TEE/deepseek-v4.1-flash via nanogpt)
+# Prior Change: rebuilt FrontierCODEBlind fallbacks (kimi_k3_tee_chutes, qwen38_max_nanogpt)
+# Earlier Change: added new FrontierDEEP function
+# Special thanks to Sweetiebot, Volta, and Baud
+
+[gateway]
+bind_address = "0.0.0.0:3000"
+global_outbound_http_timeout_ms = 2000000
+# Explicitly enable asynchronous observability writes (default in TensorZero 2026.4.1+).
+observability.async_writes = true
+
+[object_storage]
+# No persistent storage needed; required to be explicit before accepting image/file inputs.
+type = "disabled"
+
+[models.glm52_tee_chutes]
+routing = ["chutes"]
+[models.glm52_tee_chutes.timeouts.streaming]
+ttft_ms = 90000
+total_ms = 1800000
+[models.glm52_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "zai-org/GLM-5.2-TEE"
+type = "openai"
+
+[models.glm52_coding_zai]
+routing = ["zai_coding"]
+[models.glm52_coding_zai.timeouts.streaming]
+ttft_ms = 199000
+total_ms = 1800000
+[models.glm52_coding_zai.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_coding_zai.providers.zai_coding]
+api_base = "https://api.z.ai/api/coding/paas/v4/"
+api_key_location = "env::GLM_CODING_API_KEY"
+model_name = "glm-5.2"
+type = "openai"
+extra_body = [
+  { pointer = "/reasoning_effort", value = "max" },
+  { pointer = "/thinking", value = { type = "enabled" } }
+]
+
+[models.glm53_coding_zai]
+routing = ["zai_coding"]
+[models.glm53_coding_zai.timeouts.streaming]
+ttft_ms = 199000
+total_ms = 1800000
+[models.glm53_coding_zai.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_coding_zai.providers.zai_coding]
+api_base = "https://api.z.ai/api/coding/paas/v4/"
+api_key_location = "env::GLM_CODING_API_KEY"
+model_name = "glm-5.3"
+type = "openai"
+extra_body = [
+  { pointer = "/reasoning_effort", value = "max" },
+  { pointer = "/thinking", value = { type = "enabled" } }
+]
+
+
+[models.deepseek_v32_tee_chutes]
+routing = ["chutes"]
+[models.deepseek_v32_tee_chutes.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.deepseek_v32_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.deepseek_v32_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "deepseek-ai/DeepSeek-V3.2-TEE"
+type = "openai"
+
+[models.minimax_m25_tee_chutes]
+routing = ["chutes"]
+[models.minimax_m25_tee_chutes.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.minimax_m25_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.minimax_m25_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "MiniMaxAI/MiniMax-M2.5-TEE"
+type = "openai"
+
+[models.qwen36_27b_tee_chutes]
+routing = ["chutes"]
+[models.qwen36_27b_tee_chutes.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.qwen36_27b_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen36_27b_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "Qwen/Qwen3.6-27B-TEE"
+type = "openai"
+
+[models.qwen38_27b_tee_chutes]
+routing = ["chutes"]
+[models.qwen38_27b_tee_chutes.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.qwen38_27b_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "Qwen/Qwen3.8-27B-TEE"
+type = "openai"
+
+[models.ds_native]
+routing = ["deepseek"]
+
+[models.ds_native.timeouts.streaming]
+ttft_ms = 7000
+total_ms = 1800000
+[models.ds_native.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_native.providers.deepseek]
+api_base = "https://api.deepseek.com/v1/"
+api_key_location = "env::DEEPSEEK_API_KEY"
+model_name = "deepseek-chat"
+type = "openai"
+
+[models.ds4_deepseek]
+routing = ["deepseek"]
+
+[models.ds4_deepseek.timeouts.streaming]
+ttft_ms = 7000
+total_ms = 1800000
+[models.ds4_deepseek.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds4_deepseek.providers.deepseek]
+api_base = "https://api.deepseek.com/v1/"
+api_key_location = "env::DEEPSEEK_API_KEY"
+model_name = "deepseek-v4-pro"
+type = "openai"
+
+[models.ds_v4_flash_vision_deepseek]
+routing = ["deepseek"]
+
+[models.ds_v4_flash_vision_deepseek.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_vision_deepseek.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_vision_deepseek.providers.deepseek]
+api_base = "https://api.deepseek.com/v1/"
+api_key_location = "env::DEEPSEEK_API_KEY"
+model_name = "deepseek-v4-flash-vision-exp"
+type = "openai"
+
+[models.ds_v4_flash_nanogpt]
+routing = ["nanogpt"]
+
+[models.ds_v4_flash_nanogpt.timeouts.streaming]
+ttft_ms = 19000
+total_ms = 1800000
+[models.ds_v4_flash_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash"
+type = "openai"
+
+[models.ds_v4_flash_vision_nanogpt]
+routing = ["nanogpt"]
+
+[models.ds_v4_flash_vision_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_vision_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_vision_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-vision-exp"
+type = "openai"
+
+[models.ds_v4_pro_cheaper_nanogpt]
+routing = ["nanogpt"]
+
+[models.ds_v4_pro_cheaper_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_pro_cheaper_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_cheaper_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-pro-cheaper"
+type = "openai"
+
+[models.ds_v4_flash_nanogpt_tee]
+routing = ["nanogpt"]
+
+[models.ds_v4_flash_nanogpt_tee.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/deepseek-v4-flash"
+type = "openai"
+
+[models.ds_v4_pro_nanogpt_tee_thinking]
+routing = ["nanogpt"]
+
+[models.ds_v4_pro_nanogpt_tee_thinking.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_pro_nanogpt_tee_thinking.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_nanogpt_tee_thinking.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/deepseek-v4-pro:thinking"
+type = "openai"
+
+[models.ds_v4_pro_nanogpt_thinking]
+routing = ["nanogpt"]
+
+[models.ds_v4_pro_nanogpt_thinking.timeouts.streaming]
+ttft_ms = 299000
+total_ms = 1800000
+[models.ds_v4_pro_nanogpt_thinking.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_nanogpt_thinking.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-pro:thinking"
+type = "openai"
+
+[models.ds32_nanogpt]
+routing = ["nanogpt"]
+
+[models.ds32_nanogpt.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.ds32_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds32_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v3.2"
+type = "openai"
+
+[models.qwen235b_nanogpt_tee]
+routing = ["nanogpt"]
+
+[models.qwen235b_nanogpt_tee.timeouts.streaming]
+ttft_ms = 59000
+total_ms = 1800000
+[models.qwen235b_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen235b_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "Qwen/Qwen3-235B-A22B-Instruct-2507-TEE"
+type = "openai"
+
+[models.qwen397b_chutes_tee]
+routing = ["chutes"]
+
+[models.qwen397b_chutes_tee.timeouts.streaming]
+ttft_ms = 455000
+total_ms = 1800000
+[models.qwen397b_chutes_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen397b_chutes_tee.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "Qwen/Qwen3.5-397B-A17B-TEE"
+type = "openai"
+
+[models.qwen397b_nanogpt]
+routing = ["nanogpt"]
+
+[models.qwen397b_nanogpt.timeouts.streaming]
+ttft_ms = 450000
+total_ms = 1800000
+[models.qwen397b_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen397b_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen/qwen3.5-397b-a17b"
+type = "openai"
+
+[models.qwen397b_nanogpt_tee]
+routing = ["nanogpt"]
+
+[models.qwen397b_nanogpt_tee.timeouts.streaming]
+ttft_ms = 455000
+total_ms = 1800000
+[models.qwen397b_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen397b_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/qwen3.5-397b-a17b"
+type = "openai"
+
+[models.glm_nontee_redundant]
+routing = ["nanogpt_turbo", "nanogpt_zai"]
+
+[models.glm_nontee_redundant.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.glm_nontee_redundant.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm_nontee_redundant.providers.nanogpt_turbo]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "z-ai/glm-5-turbo"
+type = "openai"
+
+[models.glm_nontee_redundant.providers.nanogpt_zai]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "zai-org/glm-5"
+type = "openai"
+
+[models.gpt51_codex_nanogpt]
+routing = ["nanogpt"]
+
+[models.gpt51_codex_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt51_codex_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt51_codex_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "openai/gpt-5.1-codex"
+type = "openai"
+
+[models.minimax_m21_nanogpt]
+routing = ["nanogpt"]
+
+[models.minimax_m21_nanogpt.timeouts.streaming]
+ttft_ms = 55000
+total_ms = 1800000
+[models.minimax_m21_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.minimax_m21_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "minimax/minimax-m2.1"
+type = "openai"
+
+[models.gemma4_26b_heretic_local]
+routing = ["local_4090"]
+[models.gemma4_26b_heretic_local.timeouts.streaming]
+ttft_ms = 30000
+total_ms = 1800000
+[models.gemma4_26b_heretic_local.timeouts.non_streaming]
+total_ms = 1800000
+[models.gemma4_26b_heretic_local.providers.local_4090]
+api_base = "http://192.168.1.187:5555/v1/"
+api_key_location = "none"
+model_name = "gemma4-26b-a4b-q4km-128k"
+type = "openai"
+
+[models.qwen36_27b_huihui_local]
+routing = ["local_4090"]
+[models.qwen36_27b_huihui_local.timeouts.streaming]
+ttft_ms = 79000
+total_ms = 1800000
+[models.qwen36_27b_huihui_local.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen36_27b_huihui_local.providers.local_4090]
+api_base = "http://192.168.1.187:5555/v1/"
+api_key_location = "none"
+model_name = "qwen36-27b-huihui-q6k-128k-ik-optimized"
+type = "openai"
+
+[models.qwen38_27b_heretic_local]
+routing = ["local_4090"]
+[models.qwen38_27b_heretic_local.timeouts.streaming]
+ttft_ms = 299000
+total_ms = 1800000
+[models.qwen38_27b_heretic_local.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_heretic_local.providers.local_4090]
+api_base = "http://192.168.1.187:5556/v1/"
+api_key_location = "none"
+model_name = "qwen38-27b-heretic-q5_k_m-128k-ik-optimized"
+type = "openai"
+
+[models.qwen36_35b_uncensored_nanogpt_tee]
+routing = ["nanogpt"]
+[models.qwen36_35b_uncensored_nanogpt_tee.timeouts.streaming]
+ttft_ms = 90000
+total_ms = 1800000
+[models.qwen36_35b_uncensored_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen36_35b_uncensored_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/qwen3.6-35b-a3b-uncensored"
+type = "openai"
+
+[models.gemma4_26b_uncensored_nanogpt_tee]
+routing = ["nanogpt"]
+[models.gemma4_26b_uncensored_nanogpt_tee.timeouts.streaming]
+ttft_ms = 39000
+total_ms = 1800000
+[models.gemma4_26b_uncensored_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.gemma4_26b_uncensored_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/gemma-4-26b-a4b-uncensored"
+type = "openai"
+
+[models.gpt_54_llmai]
+routing = ["llmai"]
+[models.gpt_54_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt_54_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt_54_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "gpt-5.4"
+type = "openai"
+
+[models.gpt_54_openai]
+routing = ["openai"]
+[models.gpt_54_openai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt_54_openai.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt_54_openai.providers.openai]
+api_base = "https://api.openai.com/v1/"
+api_key_location = "env::OPENAI_API_KEY"
+model_name = "gpt-5.4"
+type = "openai"
+
+[models.glm52_haimaker]
+routing = ["haimaker"]
+[models.glm52_haimaker.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm52_haimaker.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_haimaker.providers.haimaker]
+api_base = "https://api.haimaker.ai/v1/"
+api_key_location = "env::HAIMAKER_API_KEY"
+model_name = "z-ai/glm-5.2"
+type = "openai"
+
+[models.fugu_ultra_haimaker]
+routing = ["haimaker"]
+[models.fugu_ultra_haimaker.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.fugu_ultra_haimaker.timeouts.non_streaming]
+total_ms = 1800000
+[models.fugu_ultra_haimaker.providers.haimaker]
+api_base = "https://api.haimaker.ai/v1/"
+api_key_location = "env::HAIMAKER_API_KEY"
+model_name = "sakana/fugu-ultra"
+type = "openai"
+
+[models.gpt_54_haimaker]
+routing = ["haimaker"]
+[models.gpt_54_haimaker.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt_54_haimaker.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt_54_haimaker.providers.haimaker]
+api_base = "https://api.haimaker.ai/v1/"
+api_key_location = "env::HAIMAKER_API_KEY"
+model_name = "openai/gpt-5.4"
+type = "openai"
+
+[models.glm53_haimaker]
+routing = ["haimaker"]
+[models.glm53_haimaker.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm53_haimaker.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_haimaker.providers.haimaker]
+api_base = "https://api.haimaker.ai/v1/"
+api_key_location = "env::HAIMAKER_API_KEY"
+model_name = "z-ai/glm-5.3"
+type = "openai"
+
+[models.qwen36_plus_llmai]
+routing = ["llmai"]
+[models.qwen36_plus_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen36_plus_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen36_plus_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "qwen3.6-plus"
+type = "openai"
+
+[models.ds_v4_pro_llmai]
+routing = ["llmai"]
+[models.ds_v4_pro_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_pro_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "deepseek-v4-pro"
+type = "openai"
+
+[models.mimo_v25_pro_llmai]
+routing = ["llmai"]
+[models.mimo_v25_pro_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.mimo_v25_pro_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.mimo_v25_pro_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "mimo-v2.5-pro"
+type = "openai"
+
+[models.mimo_v25_pro_crof_nanogpt]
+routing = ["nanogpt"]
+[models.mimo_v25_pro_crof_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.mimo_v25_pro_crof_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.mimo_v25_pro_crof_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "xiaomi/mimo-v2.5-pro-crof"
+type = "openai"
+
+[models.glm51_llmai]
+routing = ["llmai"]
+[models.glm51_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm51_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm51_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "glm-5.1"
+type = "openai"
+
+[models.qwen35_122b_a10b_nanogpt_tee]
+routing = ["nanogpt"]
+[models.qwen35_122b_a10b_nanogpt_tee.timeouts.streaming]
+ttft_ms = 70000
+total_ms = 1800000
+[models.qwen35_122b_a10b_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen35_122b_a10b_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/qwen3.5-122b-a10b"
+type = "openai"
+
+[models.ds_v4_flash_llmai]
+routing = ["llmai"]
+[models.ds_v4_flash_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "deepseek-v4-flash"
+type = "openai"
+
+[models.minimax_m3_llmai]
+routing = ["llmai"]
+[models.minimax_m3_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.minimax_m3_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.minimax_m3_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "minimax-m3"
+type = "openai"
+
+[models.gpt_55_llmai]
+routing = ["llmai"]
+[models.gpt_55_llmai.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt_55_llmai.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt_55_llmai.providers.llmai]
+api_base = "https://api.llmai.dev/v1/"
+api_key_location = "env::LLMAI_API_KEY"
+model_name = "gpt-5.5"
+type = "openai"
+
+[models.glm52_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.glm52_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm52_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "zai-org/glm-5.2:thinking"
+type = "openai"
+
+[models.glm52_nanogpt_tee]
+routing = ["nanogpt"]
+[models.glm52_nanogpt_tee.timeouts.streaming]
+ttft_ms = 68000
+total_ms = 1800000
+[models.glm52_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/glm-5.2"
+type = "openai"
+
+[models.glm53_flash_nanogpt_tee]
+routing = ["nanogpt"]
+[models.glm53_flash_nanogpt_tee.timeouts.streaming]
+ttft_ms = 90000
+total_ms = 1800000
+[models.glm53_flash_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_flash_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/glm-5.3-flash"
+type = "openai"
+
+[models.glm53_nanogpt_tee]
+routing = ["nanogpt"]
+[models.glm53_nanogpt_tee.timeouts.streaming]
+ttft_ms = 90000
+total_ms = 1800000
+[models.glm53_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/glm-5.3"
+type = "openai"
+
+[models.glm53_nanogpt_zai]
+routing = ["nanogpt"]
+[models.glm53_nanogpt_zai.timeouts.streaming]
+ttft_ms = 90000
+total_ms = 1800000
+[models.glm53_nanogpt_zai.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_nanogpt_zai.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "z-ai/glm-5.3"
+type = "openai"
+
+[models.glm53_flash_nanogpt]
+routing = ["nanogpt"]
+[models.glm53_flash_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm53_flash_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_flash_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "z-ai/glm-5.3-flash"
+type = "openai"
+
+[models.glm53_flash_uncensored_nanogpt]
+routing = ["nanogpt"]
+[models.glm53_flash_uncensored_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm53_flash_uncensored_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_flash_uncensored_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "z-ai/glm-5.3-flash-uncensored"
+type = "openai"
+
+[models.glm51_nanogpt_tee]
+routing = ["nanogpt"]
+[models.glm51_nanogpt_tee.timeouts.streaming]
+ttft_ms = 88000
+total_ms = 1800000
+[models.glm51_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm51_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/glm-5.1"
+type = "openai"
+
+[models.glm52_thinking_nanogpt_tee]
+routing = ["nanogpt"]
+[models.glm52_thinking_nanogpt_tee.timeouts.streaming]
+ttft_ms = 98000
+total_ms = 1800000
+[models.glm52_thinking_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_thinking_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/glm-5.2:thinking"
+type = "openai"
+
+[models.longcat2_nanogpt]
+routing = ["nanogpt"]
+[models.longcat2_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.longcat2_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.longcat2_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "longcat-2.0"
+type = "openai"
+
+[models.nemotron3_ultra_550b_nanogpt]
+routing = ["nanogpt"]
+[models.nemotron3_ultra_550b_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.nemotron3_ultra_550b_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.nemotron3_ultra_550b_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "nvidia/nemotron-3-ultra-550b-a55b"
+type = "openai"
+
+[models.qwen38_max_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_max_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen38_max_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_max_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen3.8-max"
+type = "openai"
+
+[models.aion30_nanogpt]
+routing = ["nanogpt"]
+[models.aion30_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.aion30_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.aion30_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "aion-labs/aion-3.0"
+type = "openai"
+
+[models.fugu_ultra_v11_nanogpt]
+routing = ["nanogpt"]
+[models.fugu_ultra_v11_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.fugu_ultra_v11_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.fugu_ultra_v11_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "sakana/fugu-ultra-v1.1"
+type = "openai"
+
+[models.fugu_max_nanogpt]
+routing = ["nanogpt"]
+[models.fugu_max_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.fugu_max_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.fugu_max_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "sakana/fugu-max"
+type = "openai"
+
+[models.longcat2_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.longcat2_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.longcat2_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.longcat2_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "longcat-2.0:thinking"
+type = "openai"
+
+[models.glm52_phala]
+routing = ["phala"]
+[models.glm52_phala.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm52_phala.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_phala.providers.phala]
+api_base = "https://inference.phala.com/v1/"
+api_key_location = "env::PHALA_API_KEY"
+model_name = "z-ai/glm-5.2"
+type = "openai"
+
+[models.glm53_phala]
+routing = ["phala"]
+[models.glm53_phala.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm53_phala.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm53_phala.providers.phala]
+api_base = "https://inference.phala.com/v1/"
+api_key_location = "env::PHALA_API_KEY"
+model_name = "z-ai/glm-5.3"
+type = "openai"
+
+[models.glm52_tinfoil]
+routing = ["tinfoil"]
+[models.glm52_tinfoil.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.glm52_tinfoil.timeouts.non_streaming]
+total_ms = 1800000
+[models.glm52_tinfoil.providers.tinfoil]
+api_base = "https://inference.tinfoil.sh/v1/"
+api_key_location = "env::TINFOIL_API_KEY"
+model_name = "glm-5-2"
+type = "openai"
+
+[models.grok45_nanogpt]
+routing = ["nanogpt"]
+[models.grok45_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.grok45_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.grok45_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "x-ai/grok-4.5"
+type = "openai"
+
+[models.gpt55_nanogpt]
+routing = ["nanogpt"]
+[models.gpt55_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt55_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt55_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "openai/gpt-5.5"
+type = "openai"
+
+[models.claude_fable_51_nanogpt]
+routing = ["nanogpt"]
+[models.claude_fable_51_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.claude_fable_51_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.claude_fable_51_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "anthropic/claude-fable-5.1"
+type = "openai"
+
+[models.mercury_25_preview_nanogpt]
+routing = ["nanogpt"]
+[models.mercury_25_preview_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.mercury_25_preview_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.mercury_25_preview_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "inception/mercury-2.5-preview"
+type = "openai"
+
+[models.nemotron_35_lightning_nanogpt]
+routing = ["nanogpt"]
+[models.nemotron_35_lightning_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.nemotron_35_lightning_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.nemotron_35_lightning_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "nvidia/nemotron-3.5-lightning"
+type = "openai"
+
+[models.claude_opus_48_nanogpt]
+routing = ["nanogpt"]
+[models.claude_opus_48_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.claude_opus_48_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.claude_opus_48_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "anthropic/claude-opus-4.8"
+type = "openai"
+
+[models.claude_opus_46_nanogpt]
+routing = ["nanogpt"]
+[models.claude_opus_46_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.claude_opus_46_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.claude_opus_46_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "anthropic/claude-opus-4.6"
+type = "openai"
+
+[models.claude_sonnet_46_nanogpt]
+routing = ["nanogpt"]
+[models.claude_sonnet_46_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.claude_sonnet_46_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.claude_sonnet_46_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "anthropic/claude-sonnet-4.6"
+type = "openai"
+
+[models.doubao_seed_21_pro_nanogpt]
+routing = ["nanogpt"]
+[models.doubao_seed_21_pro_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.doubao_seed_21_pro_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.doubao_seed_21_pro_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "bytedance/doubao-seed-2.1-pro"
+type = "openai"
+
+[models.gpt56_luna_nanogpt]
+routing = ["nanogpt"]
+[models.gpt56_luna_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gpt56_luna_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.gpt56_luna_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "openai/gpt-5.6-luna"
+type = "openai"
+
+[models.hy4_preview_nanogpt]
+routing = ["nanogpt"]
+[models.hy4_preview_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.hy4_preview_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.hy4_preview_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "tencent/hy4-preview"
+type = "openai"
+
+[models.ds_v4_flash_latest_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_flash_latest_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_latest_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_latest_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-latest"
+type = "openai"
+
+[models.ds_v4_flash_0731_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_flash_0731_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-0731:thinking"
+type = "openai"
+
+[models.ds_v4_flash_0731_cheaper_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_flash_0731_cheaper_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_cheaper_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_cheaper_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-0731-cheaper"
+type = "openai"
+
+[models.ds_v4_flash_0731_cheaper_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_flash_0731_cheaper_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_cheaper_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_cheaper_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-0731-cheaper:thinking"
+type = "openai"
+
+[models.ds_v4_flash_0731_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_flash_0731_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-0731"
+type = "openai"
+
+[models.gemma4_31b_gembrain_heretic_nanogpt]
+routing = ["nanogpt"]
+[models.gemma4_31b_gembrain_heretic_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gemma4_31b_gembrain_heretic_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.gemma4_31b_gembrain_heretic_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "Gemma-4-31B-Gembrain-uncensored-heretic"
+type = "openai"
+
+[models.gemma4_31b_it_nanogpt_tee]
+routing = ["nanogpt"]
+[models.gemma4_31b_it_nanogpt_tee.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.gemma4_31b_it_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.gemma4_31b_it_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/gemma-4-31b-it"
+type = "openai"
+
+[models.qwen35_27b_blossom_v64_nanogpt]
+routing = ["nanogpt"]
+[models.qwen35_27b_blossom_v64_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen35_27b_blossom_v64_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen35_27b_blossom_v64_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "Qwen3.5-27B-Blossom-V6.4-Derestricted"
+type = "openai"
+
+[models.qwen35_27b_dark_nexus_v30_nanogpt]
+routing = ["nanogpt"]
+[models.qwen35_27b_dark_nexus_v30_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen35_27b_dark_nexus_v30_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen35_27b_dark_nexus_v30_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "Qwen3.5-27B-Dark-Nexus-v3.0-Derestricted"
+type = "openai"
+
+[models.kimi_k3_tee_chutes]
+routing = ["chutes"]
+[models.kimi_k3_tee_chutes.timeouts.streaming]
+ttft_ms = 95000
+total_ms = 1800000
+[models.kimi_k3_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k3_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "moonshotai/Kimi-K3-TEE"
+type = "openai"
+
+
+[models.ds_v4_flash_0731_tee_chutes]
+routing = ["chutes"]
+[models.ds_v4_flash_0731_tee_chutes.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_tee_chutes.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_tee_chutes.providers.chutes]
+api_base = "https://llm.chutes.ai/v1/"
+api_key_location = "env::CHUTES_AI_API_KEY"
+model_name = "deepseek-ai/DeepSeek-V4-Flash-0731-TEE"
+type = "openai"
+
+[models.ds_v4_flash_0731_phala]
+routing = ["phala"]
+[models.ds_v4_flash_0731_phala.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_flash_0731_phala.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_flash_0731_phala.providers.phala]
+api_base = "https://inference.phala.com/v1/"
+api_key_location = "env::PHALA_API_KEY"
+model_name = "deepseek/deepseek-v4-flash-0731"
+type = "openai"
+
+[models.kimi_k3_phala]
+routing = ["phala"]
+[models.kimi_k3_phala.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.kimi_k3_phala.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k3_phala.providers.phala]
+api_base = "https://inference.phala.com/v1/"
+api_key_location = "env::PHALA_API_KEY"
+model_name = "moonshotai/kimi-k3"
+type = "openai"
+
+[models.ds_v4_pro_0813_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v4_pro_0813_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4-pro-0813"
+type = "openai"
+
+[models.kimi_k3_tinfoil]
+routing = ["tinfoil"]
+[models.kimi_k3_tinfoil.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.kimi_k3_tinfoil.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k3_tinfoil.providers.tinfoil]
+api_base = "https://inference.tinfoil.sh/v1/"
+api_key_location = "env::TINFOIL_API_KEY"
+model_name = "kimi-k3"
+type = "openai"
+
+
+[models.ds_v4_pro_0813_nanogpt_tee]
+routing = ["nanogpt"]
+[models.ds_v4_pro_0813_nanogpt_tee.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/deepseek-v4-pro-0813"
+type = "openai"
+
+[models.ds_v4_pro_0813_nanogpt_tee_thinking]
+routing = ["nanogpt"]
+[models.ds_v4_pro_0813_nanogpt_tee_thinking.timeouts.streaming]
+ttft_ms = 98000
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt_tee_thinking.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v4_pro_0813_nanogpt_tee_thinking.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/deepseek-v4-pro-0813:thinking"
+type = "openai"
+
+[models.qwen38_27b_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_27b_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen38_27b_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen3.8-27b"
+type = "openai"
+
+[models.qwen38_27b_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_27b_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 98000
+total_ms = 1800000
+[models.qwen38_27b_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen3.8-27b:thinking"
+type = "openai"
+
+[models.qwen38_27b_uncensored_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_27b_uncensored_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen38_27b_uncensored_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_uncensored_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen/qwen3.8-27b-uncensored"
+type = "openai"
+
+[models.qwen38_flash_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_flash_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen38_flash_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_flash_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "alibaba/qwen3.8-flash"
+type = "openai"
+
+[models.qwen38_27b_obliterated_nanogpt]
+routing = ["nanogpt"]
+[models.qwen38_27b_obliterated_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.qwen38_27b_obliterated_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.qwen38_27b_obliterated_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "qwen/qwen3.8-27b-obliterated"
+type = "openai"
+
+[models.abliterated_model_large_nanogpt]
+routing = ["nanogpt"]
+[models.abliterated_model_large_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.abliterated_model_large_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.abliterated_model_large_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "abliterated-model-large"
+type = "openai"
+
+[models.kimi_k27_code_nanogpt_tee]
+routing = ["nanogpt"]
+[models.kimi_k27_code_nanogpt_tee.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.kimi_k27_code_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k27_code_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/kimi-k2.7-code"
+type = "openai"
+
+[models.kimi_k3_nanogpt_tee]
+routing = ["nanogpt"]
+[models.kimi_k3_nanogpt_tee.timeouts.streaming]
+ttft_ms = 95000
+total_ms = 1800000
+[models.kimi_k3_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k3_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/kimi-k3"
+type = "openai"
+
+[models.kimi_k3_nanogpt]
+routing = ["nanogpt"]
+[models.kimi_k3_nanogpt.timeouts.streaming]
+ttft_ms = 95000
+total_ms = 1800000
+[models.kimi_k3_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.kimi_k3_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "moonshotai/kimi-k3"
+type = "openai"
+
+[models.ds_v41_flash_thinking_nanogpt]
+routing = ["nanogpt"]
+[models.ds_v41_flash_thinking_nanogpt.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v41_flash_thinking_nanogpt.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v41_flash_thinking_nanogpt.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "deepseek/deepseek-v4.1-flash:thinking"
+type = "openai"
+
+[models.ds_v41_flash_nanogpt_tee]
+routing = ["nanogpt"]
+[models.ds_v41_flash_nanogpt_tee.timeouts.streaming]
+ttft_ms = 50000
+total_ms = 1800000
+[models.ds_v41_flash_nanogpt_tee.timeouts.non_streaming]
+total_ms = 1800000
+[models.ds_v41_flash_nanogpt_tee.providers.nanogpt]
+api_base = "https://nano-gpt.com/api/v1/"
+api_key_location = "env::NANOGPT_API_KEY"
+model_name = "TEE/deepseek-v4.1-flash"
+type = "openai"
+
+[functions.FrontierE]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierE.experimentation]
+type = "static"
+candidate_variants = {kimi_k3_tee_chutes = 0.675, qwen38_27b_uncensored_ng_entry = 0.225, glm53_flash_nanogpt_tee_entry = 0.10}
+fallback_variants = ["qwen38_27b_tee_chutes_fallback"]
+
+[functions.FrontierE.variants.kimi_k3_tee_chutes]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierE.variants.qwen38_27b_uncensored_ng_entry]
+type = "chat_completion"
+model = "qwen38_27b_uncensored_nanogpt"
+
+[functions.FrontierE.variants.glm53_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt_tee"
+
+[functions.FrontierE.variants.qwen38_27b_tee_chutes_fallback]
+type = "chat_completion"
+model = "qwen38_27b_tee_chutes"
+
+[functions.FrontierCODE]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierCODE.experimentation]
+type = "static"
+candidate_variants = {glm53_flash_nanogpt_entry = 0.01, glm53_nanogpt_tee_entry = 0.005, glm53_flash_uncensored_nanogpt_entry = 0.005, glm53_coding_zai_entry = 0.98}
+fallback_variants = ["ds_v41_flash_nanogpt_tee_fallback", "kimi_k3_tee_chutes_fallback", "kimi_k3_nanogpt_fallback", "ds_v4_pro_0813_nanogpt_fallback", "ds_v4_flash_0731_tee_chutes_fallback", "ds_v4_flash_vision_deepseek_fallback"]
+
+[functions.FrontierCODE.variants.kimi_k3_nanogpt_fallback]
+type = "chat_completion"
+model = "kimi_k3_nanogpt"
+
+[functions.FrontierCODE.variants.ds_v41_flash_nanogpt_tee_fallback]
+type = "chat_completion"
+model = "ds_v41_flash_nanogpt_tee"
+
+[functions.FrontierCODE.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierCODE.variants.glm53_flash_nanogpt_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt"
+
+[functions.FrontierCODE.variants.glm53_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_nanogpt_tee"
+
+[functions.FrontierCODE.variants.glm53_flash_uncensored_nanogpt_entry]
+type = "chat_completion"
+model = "glm53_flash_uncensored_nanogpt"
+
+[functions.FrontierCODE.variants.glm53_coding_zai_entry]
+type = "chat_completion"
+model = "glm53_coding_zai"
+
+[functions.FrontierCODE.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierCODE.variants.ds_v4_flash_0731_tee_chutes_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.FrontierCODE.variants.ds_v4_flash_vision_deepseek_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_vision_deepseek"
+
+[functions.FrontierDEEP]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierDEEP.experimentation]
+type = "static"
+candidate_variants = {ds_v41_flash_nanogpt_tee_entry = 1.00}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds_v4_flash_0731_tee_chutes_fallback", "ds_v4_flash_vision_deepseek_fallback"]
+
+[functions.FrontierDEEP.variants.ds_v41_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "ds_v41_flash_nanogpt_tee"
+
+[functions.FrontierDEEP.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierDEEP.variants.ds_v4_flash_0731_tee_chutes_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.FrontierDEEP.variants.ds_v4_flash_vision_deepseek_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_vision_deepseek"
+
+[functions.FrontierCODEVP]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierCODEVP.experimentation]
+type = "static"
+candidate_variants = {glm53_flash_nanogpt_entry = 1.00}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds_v4_flash_0731_tee_chutes_fallback", "ds_v4_flash_vision_deepseek_fallback"]
+
+[functions.FrontierCODEVP.variants.glm53_flash_nanogpt_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt"
+
+[functions.FrontierCODEVP.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierCODEVP.variants.ds_v4_flash_0731_tee_chutes_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.FrontierCODEVP.variants.ds_v4_flash_vision_deepseek_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_vision_deepseek"
+
+[functions.FrontierCODEBlind]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierCODEBlind.experimentation]
+type = "static"
+candidate_variants = {glm53_coding_zai = 1.00}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "kimi_k3_tee_chutes_fallback", "qwen38_max_nanogpt_fallback"]
+
+[functions.FrontierCODEBlind.variants.glm53_coding_zai]
+type = "chat_completion"
+model = "glm53_coding_zai"
+
+[functions.FrontierCODEBlind.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierCODEBlind.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierCODEBlind.variants.qwen38_max_nanogpt_fallback]
+type = "chat_completion"
+model = "qwen38_max_nanogpt"
+
+[functions.FrontierCODEK]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierCODEK.experimentation]
+type = "static"
+candidate_variants = {kimi_k3_tee_chutes_entry = 1.00}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds_v4_flash_0731_tee_chutes_fallback", "ds_v4_flash_vision_deepseek_fallback"]
+
+[functions.FrontierCODEK.variants.kimi_k3_tee_chutes_entry]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierCODEK.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierCODEK.variants.ds_v4_flash_0731_tee_chutes_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.FrontierCODEK.variants.ds_v4_flash_vision_deepseek_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_vision_deepseek"
+
+[functions.FrontierCODEQ]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierCODEQ.experimentation]
+type = "static"
+candidate_variants = {qwen38_max_nanogpt_entry = 1.00}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds_v4_flash_0731_tee_chutes_fallback", "ds_v4_flash_vision_deepseek_fallback"]
+
+[functions.FrontierCODEQ.variants.qwen38_max_nanogpt_entry]
+type = "chat_completion"
+model = "qwen38_max_nanogpt"
+
+[functions.FrontierCODEQ.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.FrontierCODEQ.variants.ds_v4_flash_0731_tee_chutes_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.FrontierCODEQ.variants.ds_v4_flash_vision_deepseek_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_vision_deepseek"
+
+[functions.volta]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.volta.experimentation]
+type = "static"
+candidate_variants = { qwen38_27b_heretic_local_entry = 0.99, qwen38_27b_uncensored_ng_entry = 0.0003, glm53_flash_uncensored_nanogpt_entry = 0.0097 }
+fallback_variants = ["qwen38_27b_obliterated_ng_fallback", "gemma4_26b_uncensored_tee_ng_fallback"]
+
+[functions.volta.variants.qwen38_27b_heretic_local_entry]
+type = "chat_completion"
+model = "qwen38_27b_heretic_local"
+
+[functions.volta.variants.qwen38_27b_uncensored_ng_entry]
+type = "chat_completion"
+model = "qwen38_27b_uncensored_nanogpt"
+
+[functions.volta.variants.glm53_flash_uncensored_nanogpt_entry]
+type = "chat_completion"
+model = "glm53_flash_uncensored_nanogpt"
+
+[functions.volta.variants.qwen38_27b_obliterated_ng_fallback]
+type = "chat_completion"
+model = "qwen38_27b_obliterated_nanogpt"
+
+[functions.volta.variants.gemma4_26b_uncensored_tee_ng_fallback]
+type = "chat_completion"
+model = "gemma4_26b_uncensored_nanogpt_tee"
+
+[functions.FrontierTEEC]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierTEEC.experimentation]
+type = "static"
+candidate_variants = {qwen397b_chutes_tee = 0.90, glm53_flash_nanogpt_tee_entry = 0.10}
+fallback_variants = ["ds_v4_pro_tee_thinking_fallback", "ds_v4_flash_tee_fallback"]
+
+[functions.FrontierTEEC.variants.qwen397b_chutes_tee]
+type = "chat_completion"
+model = "qwen397b_chutes_tee"
+
+[functions.FrontierTEEC.variants.glm53_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt_tee"
+
+[functions.FrontierTEEC.variants.ds_v4_pro_tee_thinking_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_nanogpt_tee_thinking"
+
+[functions.FrontierTEEC.variants.ds_v4_flash_tee_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_nanogpt_tee"
+
+[functions.FrontierTEED]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierTEED.experimentation]
+type = "static"
+candidate_variants = {glm52_tee_chutes = 0.01, glm53_flash_nanogpt_tee_entry = 0.99}
+fallback_variants = ["kimi_k3_nanogpt_tee_fallback", "kimi_k3_phala_fallback", "kimi_k3_tee_chutes_fallback", "ds_v4_pro_tee_thinking_fallback", "ds_v4_flash_tee_fallback"]
+
+[functions.FrontierTEED.variants.glm53_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt_tee"
+
+[functions.FrontierTEED.variants.kimi_k3_nanogpt_tee_fallback]
+type = "chat_completion"
+model = "kimi_k3_nanogpt_tee"
+
+[functions.FrontierTEED.variants.kimi_k3_phala_fallback]
+type = "chat_completion"
+model = "kimi_k3_phala"
+
+[functions.FrontierTEED.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierTEED.variants.glm52_tee_chutes]
+type = "chat_completion"
+model = "glm52_tee_chutes"
+
+[functions.FrontierTEED.variants.ds_v4_pro_tee_thinking_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_nanogpt_tee_thinking"
+
+[functions.FrontierTEED.variants.ds_v4_flash_tee_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_nanogpt_tee"
+
+
+[functions.FrontierTEEP]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierTEEP.experimentation]
+type = "static"
+candidate_variants = { glm53_haimaker_entry = 0.01, glm53_flash_nanogpt_tee_entry = 0.99 }
+fallback_variants = ["kimi_k3_tee_chutes_fallback", "ds_v4_flash_0731_tee_fallback"]
+
+[functions.FrontierTEEP.variants.glm53_haimaker_entry]
+type = "chat_completion"
+model = "glm53_haimaker"
+
+[functions.FrontierTEEP.variants.glm53_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt_tee"
+
+[functions.FrontierTEEP.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierTEEP.variants.ds_v4_flash_0731_tee_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_0731_tee_chutes"
+
+[functions.ruffles]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.ruffles.experimentation]
+type = "static"
+candidate_variants = { glm53_haimaker_entry = 0.0001, glm52_haimaker_entry = 0.0001, glm52_tee_chutes_entry = 0.02, ds_v4_pro_0813_ng_tee_entry = 0.0795, qwen38_27b_ng_entry = 0.0001, mimo_v25_pro_crof_ng_entry = 0.0008, nemotron_35_lightning_nanogpt_entry = 0.0001, nemotron3_ultra_550b_nanogpt_entry = 0.0093, longcat2_nanogpt_entry = 0.59, ds_v41_flash_nanogpt_tee_entry = 0.15, fugu_max_nanogpt_entry = 0.15 }
+fallback_variants = ["fugu_ultra_v11_nanogpt_fallback", "qwen397b_tee_chutes_fallback"]
+
+[functions.ruffles.variants.glm53_haimaker_entry]
+type = "chat_completion"
+model = "glm53_haimaker"
+
+[functions.ruffles.variants.glm52_haimaker_entry]
+type = "chat_completion"
+model = "glm52_haimaker"
+
+[functions.ruffles.variants.glm52_tee_chutes_entry]
+type = "chat_completion"
+model = "glm52_tee_chutes"
+
+[functions.ruffles.variants.ds_v4_pro_0813_ng_tee_entry]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt_tee"
+
+[functions.ruffles.variants.qwen38_27b_ng_entry]
+type = "chat_completion"
+model = "qwen38_27b_nanogpt"
+
+[functions.ruffles.variants.mimo_v25_pro_crof_ng_entry]
+type = "chat_completion"
+model = "mimo_v25_pro_crof_nanogpt"
+
+[functions.ruffles.variants.nemotron_35_lightning_nanogpt_entry]
+type = "chat_completion"
+model = "nemotron_35_lightning_nanogpt"
+
+[functions.ruffles.variants.nemotron3_ultra_550b_nanogpt_entry]
+type = "chat_completion"
+model = "nemotron3_ultra_550b_nanogpt"
+
+[functions.ruffles.variants.longcat2_nanogpt_entry]
+type = "chat_completion"
+model = "longcat2_nanogpt"
+
+[functions.ruffles.variants.ds_v41_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "ds_v41_flash_nanogpt_tee"
+
+[functions.ruffles.variants.fugu_max_nanogpt_entry]
+type = "chat_completion"
+model = "fugu_max_nanogpt"
+
+[functions.ruffles.variants.fugu_ultra_v11_nanogpt_fallback]
+type = "chat_completion"
+model = "fugu_ultra_v11_nanogpt"
+
+[functions.ruffles.variants.qwen397b_tee_chutes_fallback]
+type = "chat_completion"
+model = "qwen397b_chutes_tee"
+
+[functions.FrontierTEE]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.FrontierTEE.experimentation]
+type = "static"
+candidate_variants = {glm52_tee_chutes = 0.77679, glm52_nanogpt_tee = 0.03852, glm52_thinking_nanogpt_tee = 0.08469, glm53_flash_nanogpt_tee_entry = 0.10}
+fallback_variants = ["kimi_k3_nanogpt_tee_fallback", "kimi_k3_phala_fallback", "kimi_k3_tee_chutes_fallback", "ds_v4_pro_tee_thinking_fallback", "ds_v4_flash_tee_fallback", "ds_v32_tee_chutes_fallback"]
+
+[functions.FrontierTEE.variants.kimi_k3_nanogpt_tee_fallback]
+type = "chat_completion"
+model = "kimi_k3_nanogpt_tee"
+
+[functions.FrontierTEE.variants.kimi_k3_phala_fallback]
+type = "chat_completion"
+model = "kimi_k3_phala"
+
+[functions.FrontierTEE.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.FrontierTEE.variants.glm52_nanogpt_tee]
+type = "chat_completion"
+model = "glm52_nanogpt_tee"
+
+[functions.FrontierTEE.variants.glm52_thinking_nanogpt_tee]
+type = "chat_completion"
+model = "glm52_thinking_nanogpt_tee"
+
+[functions.FrontierTEE.variants.glm52_tee_chutes]
+type = "chat_completion"
+model = "glm52_tee_chutes"
+
+[functions.FrontierTEE.variants.glm53_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_flash_nanogpt_tee"
+
+[functions.FrontierTEE.variants.ds_v4_pro_tee_thinking_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_nanogpt_tee_thinking"
+
+[functions.FrontierTEE.variants.ds_v4_flash_tee_fallback]
+type = "chat_completion"
+model = "ds_v4_flash_nanogpt_tee"
+
+[functions.FrontierTEE.variants.ds_v32_tee_chutes_fallback]
+type = "chat_completion"
+model = "deepseek_v32_tee_chutes"
+
+[functions.kageho]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.kageho.experimentation]
+type = "static"
+candidate_variants = { kimi_k3_phala_entry = 0.75, glm53_phala_entry = 0.25 }
+fallback_variants = ["ds_v41_flash_nanogpt_tee_fallback", "kimi_k3_tee_chutes_fallback"]
+
+[functions.kageho.variants.kimi_k3_phala_entry]
+type = "chat_completion"
+model = "kimi_k3_phala"
+
+[functions.kageho.variants.glm53_phala_entry]
+type = "chat_completion"
+model = "glm53_phala"
+
+[functions.kageho.variants.ds_v41_flash_nanogpt_tee_fallback]
+type = "chat_completion"
+model = "ds_v41_flash_nanogpt_tee"
+
+[functions.kageho.variants.kimi_k3_tee_chutes_fallback]
+type = "chat_completion"
+model = "kimi_k3_tee_chutes"
+
+[functions.lunarwing]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.lunarwing.experimentation]
+type = "static"
+candidate_variants = {glm53_nanogpt_tee_entry = 0.01, kimi_k3_nanogpt_tee_entry = 0.99}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds4_deepseek_fallback"]
+
+[functions.lunarwing.variants.glm53_nanogpt_tee_entry]
+type = "chat_completion"
+model = "glm53_nanogpt_tee"
+
+[functions.lunarwing.variants.kimi_k3_nanogpt_tee_entry]
+type = "chat_completion"
+model = "kimi_k3_nanogpt_tee"
+
+[functions.lunarwing.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.lunarwing.variants.ds4_deepseek_fallback]
+type = "chat_completion"
+model = "ds4_deepseek"
+
+[functions.sunburst]
+type = "chat"
+parallel_tool_calls = true
+
+[functions.sunburst.experimentation]
+type = "static"
+candidate_variants = {qwen38_max_nanogpt = 0.015, ds_v4_flash_latest_nanogpt = 0.135196, ds_v4_flash_0731_thinking_nanogpt = 0.115882, ds_v4_flash_0731_cheaper_nanogpt = 0.096568, ds_v4_flash_0731_cheaper_thinking_nanogpt = 0.077255, ds_v4_flash_0731_nanogpt = 0.251079, ds_v4_flash_nanogpt_tee = 0.135196, ds_v41_flash_nanogpt_tee_entry = 0.173824}
+fallback_variants = ["ds_v4_pro_0813_nanogpt_fallback", "ds4_deepseek_fallback"]
+
+[functions.sunburst.variants.qwen38_max_nanogpt]
+type = "chat_completion"
+model = "qwen38_max_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_latest_nanogpt]
+type = "chat_completion"
+model = "ds_v4_flash_latest_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_0731_thinking_nanogpt]
+type = "chat_completion"
+model = "ds_v4_flash_0731_thinking_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_0731_cheaper_nanogpt]
+type = "chat_completion"
+model = "ds_v4_flash_0731_cheaper_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_0731_cheaper_thinking_nanogpt]
+type = "chat_completion"
+model = "ds_v4_flash_0731_cheaper_thinking_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_0731_nanogpt]
+type = "chat_completion"
+model = "ds_v4_flash_0731_nanogpt"
+
+[functions.sunburst.variants.ds_v4_flash_nanogpt_tee]
+type = "chat_completion"
+model = "ds_v4_flash_nanogpt_tee"
+
+[functions.sunburst.variants.ds_v41_flash_nanogpt_tee_entry]
+type = "chat_completion"
+model = "ds_v41_flash_nanogpt_tee"
+
+[functions.sunburst.variants.ds_v4_pro_0813_nanogpt_fallback]
+type = "chat_completion"
+model = "ds_v4_pro_0813_nanogpt"
+
+[functions.sunburst.variants.ds4_deepseek_fallback]
+type = "chat_completion"
+model = "ds4_deepseek"
+
+[metrics.task_success]
+type = "boolean"
+optimize = "max"
+level = "episode"
+
