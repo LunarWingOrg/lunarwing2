@@ -1201,6 +1201,103 @@ restart_tenant() {
   start_tenant "$name"
 }
 
+# Classifies a failed tenant podman probe: returns 0 when the output matches
+# the rootless userns join-machinery failure (WI#142) — podman's pause/conmon
+# join path fails before it can re-exec into the existing user namespace.
+_podman_userns_join_failure() {  # <probe-output>
+  local out="$1"
+  grep -q "cannot re-exec process to join the existing user namespace" <<<"$out" \
+    || grep -q "failed to reexec: Permission denied" <<<"$out" \
+    || grep -q "Try running .*podman system migrate" <<<"$out"
+}
+
+# Repair a tenant's broken rootless-podman user-namespace pairing (WI#142).
+#
+# Symptom: every `podman` invocation as the tenant — including the agent's
+# tool-shell commands inside the workload scopes — fails with
+# "cannot re-exec process to join the existing user namespace" (or the
+# "... Try running 'podman system migrate'" wrapper): the pause/conmon
+# processes live in a user namespace the tenant can no longer join. Known
+# triggers: rootless state left by a previous uid holder, state created under
+# a foreign euid (host-side podman run against tenant dirs), or podman stacks
+# created inside a context (daemon-forked workload scope) whose namespace
+# pairing other contexts cannot rejoin. See
+# docs/bugs/BUG-workload-scope-podman-userns.md.
+#
+# Sequence, under the tenant lifecycle lock:
+#   probe (healthy -> no-op) -> stop tenant (kills the conmons holding the
+#   broken pairing; init-agnostic) -> stale pause.pid cleanup ->
+#   `podman system migrate` as the tenant (resets the userns pairing; with
+#   containers stopped this no longer has anything to kill) -> start tenant
+#   (recreates pg/vision/voice/daemon/workers in a clean, tenant-owned
+#   userns) -> verify probe.
+#
+# The stop/start cycle is deliberate: conmons already running inside the
+# foreign userns cannot be stopped by tenant podman (the same join failure),
+# so the init system must stop them. Quadlet/OpenRC units recreate the
+# sidecars on the way back up.
+repair_tenant_podman_userns() {
+  local name="$1"
+  name="$(sanitize_name "$name")"
+  tenant_exists_in_registry "$name" || die "tenant '$name' not found in registry"
+  ensure_container_runtime
+  [[ "$MT_ROOTLESS" == "true" && "$CONTAINER_RT" == "podman" ]] \
+    || die "fix-podman-userns only applies to rootless podman tenants ('$name' uses $CONTAINER_RT)"
+  with_tenant_lifecycle_lock "$name" _repair_tenant_podman_userns_locked "$name"
+}
+
+_repair_tenant_podman_userns_locked() {
+  local name="$1"
+  local probe rc=0
+
+  rc=0
+  probe="$(_ctr "$name" ps 2>&1)" || rc=$?
+  if (( rc == 0 )); then
+    say "rootless podman probe OK for $name; userns pairing is healthy, nothing to repair"
+    return 0
+  fi
+  say "rootless podman probe failed for $name (rc=$rc):"
+  printf '%s\n' "$probe"
+  if ! _podman_userns_join_failure "$probe"; then
+    # Not the userns-join signature. Still try the cheap, side-effect-free
+    # pause.pid cleanup; anything beyond that needs a human looking at the
+    # error (storage corruption, registry auth, ...) rather than a
+    # stop/migrate/start cycle.
+    clean_stale_pause_pid "$name"
+    rc=0
+    probe="$(_ctr "$name" ps 2>&1)" || rc=$?
+    if (( rc == 0 )); then
+      say "podman OK for $name after stale pause.pid cleanup"
+      return 0
+    fi
+    die "podman for '$name' fails with an error that is not the userns-join signature; inspect the output above before repairing manually"
+  fi
+
+  say "userns join failure confirmed for $name; repairing (stop -> cleanup -> migrate -> start)"
+
+  stop_tenant "$name"
+  clean_stale_pause_pid "$name"
+
+  say "running 'podman system migrate' as $name (resets the rootless userns pairing) ..."
+  rc=0
+  probe="$(_ctr "$name" system migrate 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    say "WARNING: 'podman system migrate' failed for $name (rc=$rc); continuing with cleanup only" >&2
+    printf '%s\n' "$probe" >&2
+  fi
+
+  start_tenant "$name"
+
+  rc=0
+  probe="$(_ctr "$name" ps 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    say "podman probe still failing after repair for $name:" >&2
+    printf '%s\n' "$probe" >&2
+    die "rootless podman userns repair did not recover tenant '$name'; rebooting the tenant host (or the tenant user manager) is the remaining remedy"
+  fi
+  say "rootless podman userns repair complete for $name (probe OK)"
+}
+
 darkirc_managed_state_exists() {
   local state_root
   state_root="$(tenant_state_dir "$1")/darkirc/key-exchange"

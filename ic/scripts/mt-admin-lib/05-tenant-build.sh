@@ -21,6 +21,48 @@
 
 # ── User management ──────────────────────────────────────────────────────────
 
+# Remove the tenant's rootless pause.pid when it is stale or foreign-owned:
+# an empty/corrupt file, a dead pid, or a pid since REUSED by another user's
+# process (host-ns /proc owner != tenant uid). A LIVE pause process owned by
+# the tenant is kept (the "user already exists" resume path re-runs
+# ensure_rootless_prereqs against a live tenant). Everything else is stale: a
+# stale pause.pid makes EVERY podman call — including `podman system migrate`
+# and the first pg container start — fail with "cannot re-exec process to
+# join the existing user namespace" (the v1.1.4 O1 fault; see
+# docs/bugs/history/OPENRC-MT-1.1.4-ISSUES.md and
+# docs/bugs/BUG-workload-scope-podman-userns.md).
+#
+# The tenant's pause process (catatonit) runs as the tenant uid in the host
+# ns, so /proc/<pid> ownership distinguishes it reliably. A bare `kill -0`
+# (we run as root) would read a reused pid as "alive" and wrongly keep the
+# stale file, leaving the fault unfixed.
+#
+# Shared by provisioning (ensure_rootless_prereqs) and the WI#142 runtime
+# repair verb (`fix-podman-userns`).
+#
+# <runtime_dir> (optional) overrides the /run/user/<uid> root; tests use it to
+# exercise the stale/foreign/keep branches against a fixture dir.
+clean_stale_pause_pid() {
+  local name="$1" uid="${2:-}" runtime_dir="${3:-}"
+  if [[ -z "$uid" ]]; then
+    uid="$(id -u "$name" 2>/dev/null)" || return 0
+  fi
+  if [[ -z "$runtime_dir" ]]; then
+    runtime_dir="/run/user/$uid"
+  fi
+  local pause_pid pause_owner
+  pause_pid="$runtime_dir/libpod/tmp/pause.pid"
+  if [[ -f "$pause_pid" ]]; then
+    pause_owner="$(cat "$pause_pid" 2>/dev/null || true)"
+    if [[ -z "$pause_owner" ]] \
+       || ! kill -0 "$pause_owner" 2>/dev/null \
+       || [[ "$(stat -c %u "/proc/$pause_owner" 2>/dev/null || echo -1)" != "$uid" ]]; then
+      rm -f "$pause_pid" 2>/dev/null || true
+      say "removed stale or foreign-owned pause.pid for $name (uid $uid)"
+    fi
+  fi
+}
+
 # Provision rootless-podman prerequisites for a tenant user. Idempotent: skips
 # anything already present, never overlaps existing subordinate-id ranges.
 ensure_rootless_prereqs() {
@@ -52,33 +94,26 @@ ensure_rootless_prereqs() {
   # A freshly (re)created tenant may REUSE a uid whose previous holder left
   # rootless-podman runtime state behind in /run/user/$uid: that dir is created by
   # `install -d` above (not by a login session), so logind/elogind never reaps it
-  # when the prior tenant is removed (see remove_tenant_user). A stale libpod
-  # pause.pid then makes EVERY podman call — including the `system migrate` just
-  # below, and the first pg container start in add-tenant — fail with
-  # "cannot re-exec process to join the existing user namespace". Clear it so podman
-  # spawns a fresh pause process — but KEEP it when it points to a live process
-  # actually OWNED BY THIS tenant (its own running pause process on the "user
-  # already exists" resume path, where ensure_rootless_prereqs re-runs from
-  # create_tenant_user against a live tenant). Everything else is stale: an
-  # empty/corrupt file, a dead pid, OR a pid since REUSED by another user's process
-  # (host-ns owner != tenant uid) — a bare `kill -0` (we run as root) would read
-  # that reused pid as "alive" and wrongly keep the stale file, leaving the O1 fault
-  # unfixed. The tenant's pause process (catatonit) runs as the tenant uid in the
-  # host ns, so /proc/<pid> ownership distinguishes it reliably.
-  local pause_pid pause_owner
-  pause_pid="/run/user/$uid/libpod/tmp/pause.pid"
-  if [[ -f "$pause_pid" ]]; then
-    pause_owner="$(cat "$pause_pid" 2>/dev/null || true)"
-    if [[ -z "$pause_owner" ]] \
-       || ! kill -0 "$pause_owner" 2>/dev/null \
-       || [[ "$(stat -c %u "/proc/$pause_owner" 2>/dev/null || echo -1)" != "$uid" ]]; then
-      rm -f "$pause_pid" 2>/dev/null || true
-    fi
-  fi
+  # when the prior tenant is removed (see remove_tenant_user). Clear stale state
+  # so podman spawns a fresh pause process instead of failing on every call.
+  clean_stale_pause_pid "$name" "$uid"
 
   # One-time rootless storage init (safe to re-run after subid changes).
   sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
     "$CONTAINER_RT" system migrate >/dev/null 2>&1 || true
+  # Pre-warm the rootless userns pairing from the operator context (WI#142).
+  # `system migrate` leaves NO pause process, so the tenant's user namespace
+  # would otherwise be born by whichever podman invocation runs first — on
+  # agent-driven tenants that is a tool shell inside a daemon-forked workload
+  # scope, whose mount-namespace context later podman invocations (login
+  # shells, mt-admin, other scopes) can fail to rejoin. Creating the pause
+  # process here, from a plain host context, gives every later invocation —
+  # in any context — a joinable, tenant-owned pairing from the start.
+  # Best-effort: a failure here warns and the tenant still provisions.
+  if ! sudo -u "$name" env HOME="$home" XDG_RUNTIME_DIR="/run/user/$uid" \
+        "$CONTAINER_RT" ps >/dev/null 2>&1; then
+    say "WARNING: could not pre-warm the rootless podman userns for $name; the first podman call will create it in its own context (see docs/bugs/BUG-workload-scope-podman-userns.md)" >&2
+  fi
   say "rootless prerequisites ready for $name (subuid/subgid, /run/user/$uid, storage)"
 }
 
