@@ -1607,7 +1607,7 @@ status_tenant() {
     fi
     # PostgreSQL and workers use Quadlet only when the Podman version supports it.
     if [[ "$MT_ROOTLESS" == "true" ]] && podman_supports_quadlet; then
-      svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}")
+      svcs+=("lunarwing-pg-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}")
     fi
     local svc state
     for svc in "${svcs[@]}"; do
@@ -1625,6 +1625,7 @@ status_tenant() {
     fi
     rc_svcs+=("lunarwing-pebble-${name}" "lunarwing-pebble-${name}-sup" \
               "lunarwing-opencode-${name}" "lunarwing-opencode-${name}-sup" \
+              "lunarwing-opencode2-${name}" "lunarwing-opencode2-${name}-sup" \
               "lunarwing-kimi-${name}" "lunarwing-kimi-${name}-sup")
     if tenant_voice_enabled "$name"; then
       rc_svcs+=("lunarwing-voice-${name}")
