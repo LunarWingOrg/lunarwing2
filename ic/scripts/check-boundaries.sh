@@ -285,7 +285,7 @@ echo "--- Check 5: No silent test-skip patterns ---"
 skip_results=""
 for test_file in "${changed_tests[@]}"; do
     [ -f "$test_file" ] || continue
-    file_skips=$(grep -n 'try_connect\|is_available.*return\|is_none.*return\|is_err.*return.*//.*skip' \
+    file_skips=$(grep -n 'try_connect\|is_available.*\breturn\b\|is_none.*\breturn\b\|is_err.*\breturn\b.*//.*skip' \
         "$test_file" || true)
     if [ -n "$file_skips" ]; then
         skip_results+="${test_file}:${file_skips}"$'\n'
