@@ -174,12 +174,15 @@ struct RegistrySidecar {
 /// `None` if the sidecar is absent or unreadable (best-effort — a missing
 /// sidecar just means the skill is locally-authored).
 fn read_registry_sidecar(source: &SkillSource) -> Option<RegistrySidecar> {
-    let dir = match source {
-        SkillSource::Workspace(p) | SkillSource::User(p) | SkillSource::Installed(p) => {
-            p.parent()?
-        }
+    let path = match source {
+        SkillSource::Workspace(p) | SkillSource::User(p) | SkillSource::Installed(p) => p,
         SkillSource::Bundled(_) => return None, // bundled skills ship with the app
     };
+    // Skill sources record the skill's own directory (e.g.
+    // <skills_root>/<name>), which is where the install-time writer places
+    // the sidecar. Join directly; fall back to the parent only for legacy
+    // file-shaped sources (a path ending in SKILL.md).
+    let dir = if path.is_file() { path.parent()? } else { path };
     let sidecar = dir.join(".registry.json");
     let contents = std::fs::read_to_string(&sidecar).ok()?;
     serde_json::from_str(&contents).ok()
@@ -234,5 +237,108 @@ mod tests {
         assert_eq!(meta.trust, SkillTrust::Trusted);
         assert!(meta.code_snippets.is_empty());
         assert!(!meta.content_hash.is_empty());
+    }
+
+    /// Regression: the install-time writer puts `.registry.json` inside the
+    /// skill's own directory (`<skills_root>/<name>/.registry.json`), but the
+    /// reader used `parent()` — one level too high, so provenance was never
+    /// read. Source paths record the skill directory (registry.rs
+    /// `make_source(path)` / `prepare_install_to_disk`), so the reader must
+    /// join on the dir directly.
+    #[test]
+    fn test_registry_sidecar_read_from_skill_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Layout mirroring skills_install_handler: skills_root/<name>/ with
+        // SKILL.md and the sidecar written next to it.
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# my-skill").unwrap();
+        std::fs::write(
+            skill_dir.join(".registry.json"),
+            serde_json::json!({
+                "registry_url": "https://registry.example.com",
+                "slug": "acme/my-skill",
+                "publisher": "acme",
+                "version": "1.2.3",
+                "content_hash": "abc123",
+                "pulled_at": "2026-09-16T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let provenance =
+            read_registry_sidecar(&SkillSource::User(skill_dir.clone())).expect("sidecar read");
+        assert_eq!(provenance.registry_url, "https://registry.example.com");
+        assert_eq!(provenance.slug.as_deref(), Some("acme/my-skill"));
+        assert_eq!(provenance.publisher.as_deref(), Some("acme"));
+        assert_eq!(provenance.version.as_deref(), Some("1.2.3"));
+        assert_eq!(provenance.content_hash, "abc123");
+
+        // Provenance must reach the migrated doc's metadata (the end-to-end
+        // contract the mismatch silently broke).
+        let mut skill = make_v1_skill("my-skill", "Test prompt content");
+        skill.source = SkillSource::User(skill_dir);
+        let doc = v1_skill_to_memory_doc(&skill, ProjectId::new());
+        let meta: V2SkillMetadata = serde_json::from_value(doc.metadata).unwrap();
+        assert_eq!(
+            meta.registry_url.as_deref(),
+            Some("https://registry.example.com")
+        );
+        assert_eq!(meta.registry_slug.as_deref(), Some("acme/my-skill"));
+        assert_eq!(meta.registry_publisher.as_deref(), Some("acme"));
+        assert_eq!(meta.registry_version.as_deref(), Some("1.2.3"));
+        assert!(meta.pulled_at.is_some());
+        assert_eq!(meta.registry_content_hash.as_deref(), Some("abc123"));
+    }
+
+    /// A sidecar placed one level too high (the old buggy reader's target)
+    /// must NOT be picked up, and a missing sidecar stays None.
+    #[test]
+    fn test_registry_sidecar_missing_or_misplaced() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "# my-skill").unwrap();
+        // Sidecar at the skills ROOT (old reader's wrong target): ignored.
+        std::fs::write(
+            tmp.path().join(".registry.json"),
+            serde_json::json!({
+                "registry_url": "https://registry.example.com",
+                "content_hash": "abc123",
+                "pulled_at": "2026-09-16T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(read_registry_sidecar(&SkillSource::User(skill_dir.clone())).is_none());
+
+        // No sidecar anywhere: None (locally-authored skill).
+        assert!(read_registry_sidecar(&SkillSource::User(skill_dir)).is_none());
+    }
+
+    /// Legacy file-shaped source (a path ending in SKILL.md) falls back to the
+    /// parent directory, preserving pre-fix behavior for any such paths.
+    #[test]
+    fn test_registry_sidecar_legacy_file_shaped_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_md, "# my-skill").unwrap();
+        std::fs::write(
+            skill_dir.join(".registry.json"),
+            serde_json::json!({
+                "registry_url": "https://registry.example.com",
+                "content_hash": "abc123",
+                "pulled_at": "2026-09-16T00:00:00Z",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let provenance = read_registry_sidecar(&SkillSource::User(skill_md)).expect("sidecar read");
+        assert_eq!(provenance.registry_url, "https://registry.example.com");
     }
 }
