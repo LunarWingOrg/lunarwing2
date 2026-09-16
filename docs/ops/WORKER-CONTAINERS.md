@@ -101,6 +101,15 @@ Agent-facing dispatch uses `create_job(mode: "opencode2")`; the daemon
 side is fully generic (one more `[[sandbox.external_workers]]` entry —
 zero Rust changes).
 
+Workspace confinement mirrors the kimi/pebble workers: the bridge
+resolves the daemon-supplied `project_dir` against `WORKSPACE_ROOT`
+(canonicalized; `..` and symlink escapes are rejected with a
+`task_result` error envelope before anything spawns), and one task at a
+time owns a workspace subtree — `workspacePathsOverlap`, so symlink
+aliases of the same tree collide. The v2 session permissions ruleset
+currently grants `read/write/shell: *`; the confinement is the boundary
+that ruleset would enforce if it is ever scoped.
+
 Multi-tenant worker configuration sets the task deadline to `3600000ms` (one hour), configurable for new tenant entries with `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS`. Re-running mt-admin migrates exact legacy `300000ms` entries; set `LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false` to preserve an intentional five-minute value. External jobs default to asynchronous dispatch (`wait=false`) so they outlive the current conversation turn; completion and progress remain available through job events/status. Explicit `wait=true` remains available for short tasks, but synchronous execution is still bounded by the parent conversation deadline.
 
 ## Kimi Code Worker
