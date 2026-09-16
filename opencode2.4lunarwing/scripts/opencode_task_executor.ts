@@ -27,7 +27,7 @@ import {
   DEFAULT_TIMEOUT_MS,
 } from "./lunarwing_runtime"
 import { extractAssistantText, opencodeErrorMessage } from "./opencode_result"
-import { expandWorkspacePath } from "./workspace_path"
+import { resolveWorkspacePath } from "./workspace_path"
 
 const OPENCODE_HOST = process.env.OPENCODE_SERVE_HOST || "127.0.0.1"
 const OPENCODE_PORT = process.env.OPENCODE_SERVE_PORT || "4096"
@@ -495,5 +495,5 @@ async function fetchAssistantText(sdk: OpenCodeClient, sessionID: string): Promi
 }
 
 export function resolveWorkDir(path: string): string {
-  return expandWorkspacePath(path, WORKSPACE_ROOT)
+  return resolveWorkspacePath(path, WORKSPACE_ROOT)
 }

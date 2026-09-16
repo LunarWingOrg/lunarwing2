@@ -7,8 +7,6 @@
  *   client — connects outbound to a hub
  */
 
-import { resolve } from "node:path"
-
 import {
   createEnvelope,
   parseEnvelope,
@@ -27,7 +25,7 @@ process.on("unhandledRejection", (reason) => {
   console.error("[bridge] unhandledRejection (surviving):", reason)
 })
 import { executeTask } from "./opencode_task_executor"
-import { expandWorkspacePath } from "./workspace_path"
+import { resolveWorkspacePath, workspacePathsOverlap } from "./workspace_path"
 
 // ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -50,7 +48,7 @@ const activeTasks = new Map<string, ActiveTask>()
 const activeWorkspaces = new Map<string, string>()
 
 function taskWorkspace(request: TaskRequest): string {
-  return resolve(expandWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT))
+  return resolveWorkspacePath(request.context?.project_dir || WORKSPACE_ROOT, WORKSPACE_ROOT)
 }
 
 function abortSocketTasks(socket: BridgeSocket): void {
@@ -133,9 +131,26 @@ async function handleTaskRequest(
     return
   }
 
-  const workspace = taskWorkspace(request)
-  const workspaceTask = activeWorkspaces.get(workspace)
-  if (workspaceTask) {
+  let workspace: string
+  try {
+    workspace = taskWorkspace(request)
+  } catch (error) {
+    const result = createEnvelope("task_result", {
+      task_id: request.task_id,
+      status: "error",
+      output: "",
+      error: error instanceof Error ? error.message : "Invalid workspace path",
+      duration_ms: 0,
+    })
+    ws.send(JSON.stringify(result))
+    console.warn(`[bridge] task ${request.task_id}: rejected invalid workspace path`)
+    return
+  }
+  const workspaceOwner = [...activeWorkspaces.entries()].find(([active]) =>
+    workspacePathsOverlap(active, workspace),
+  )
+  if (workspaceOwner) {
+    const [, workspaceTask] = workspaceOwner
     const result = createEnvelope("task_result", {
       task_id: request.task_id,
       status: "error",
