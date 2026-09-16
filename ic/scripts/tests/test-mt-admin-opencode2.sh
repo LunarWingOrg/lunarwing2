@@ -117,6 +117,8 @@ assert_not_contains "$v1_quadlet" 'OPENCODE2_MODEL' 'v1 quadlet does not leak op
 rm -f "$env_file.bak"
 
 # ── workspace ownership ──────────────────────────────────────────────────────
+# Override consumed by sourced workspace preparation.
+# shellcheck disable=SC2034
 MT_ROOTLESS=false
 CHOWN_CALL=''
 prepare_worker_workspace root opencode2 >/dev/null
@@ -146,6 +148,8 @@ fi
 
 # ── builder contract ────────────────────────────────────────────────────────
 mkdir -p "$fixture/target/opencode2.4lunarwing"
+# Override consumed by the sourced container helpers.
+# shellcheck disable=SC2034
 CONTAINER_RT=docker
 ensure_container_runtime() { :; }
 docker() { BUILD_CALL="$*"; }
