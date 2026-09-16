@@ -360,6 +360,11 @@ Commands:
   migration-export-boundary <name> [export options]
                                   Run export under retained lifecycle/DarkIRC locks
   restart-tenant <name>           Stop then start
+  fix-podman-userns <name>        Repair a broken rootless podman userns pairing
+                                  (WI#142: "cannot re-exec process to join the
+                                  existing user namespace"). Probe -> stop ->
+                                  pause.pid cleanup -> system migrate -> start.
+                                  No-op when the podman probe is healthy.
   start-pg <name>                 Start only the tenant's PostgreSQL (daemon stays down)
   stop-pg <name>                  Stop only the tenant's PostgreSQL
   start-worker <name> <worker>    Start one enabled external worker
@@ -975,6 +980,13 @@ main() {
       [[ -n "${1:-}" ]] || die "usage: restart-tenant <name>"
       _lifecycle_name="$(sanitize_name "$1")"
       with_tenant_lifecycle_lock "$_lifecycle_name" restart_tenant "$_lifecycle_name"
+      ;;
+
+    fix-podman-userns)
+      require_root
+      [[ -n "${1:-}" ]] || die "usage: fix-podman-userns <name>"
+      _lifecycle_name="$(sanitize_name "$1")"
+      with_tenant_lifecycle_lock "$_lifecycle_name" repair_tenant_podman_userns "$_lifecycle_name"
       ;;
 
     stop-writers)

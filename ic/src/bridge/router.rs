@@ -1546,7 +1546,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                     "properties": {
                         "name": {"type": "string", "description": "Short name for the mission/routine"},
                         "goal": {"type": "string", "description": "What this mission should accomplish each run"},
-                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events (e.g. thread starts), which are reserved for engine-managed missions."},
+                        "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
                         "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 10 when omitted."}
@@ -4452,6 +4452,11 @@ pub struct EngineMissionInfo {
     /// True when today's daily thread budget is spent; the mission stays
     /// Active and resumes spawning at the next UTC day.
     pub budget_exhausted: bool,
+    /// Last thread spawn time (RFC 3339). Registry honesty (work item #143):
+    /// an "Active" mission that has never fired surfaces as `never_fired`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+    pub never_fired: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -4527,6 +4532,8 @@ fn mission_to_info(m: &lunarwing_engine::types::mission::Mission) -> EngineMissi
         threads_today: m.threads_today,
         max_threads_per_day: m.max_threads_per_day,
         budget_exhausted: m.max_threads_per_day > 0 && m.threads_today >= m.max_threads_per_day,
+        last_fired_at: m.last_fired_at.map(|dt| dt.to_rfc3339()),
+        never_fired: m.last_fired_at.is_none(),
         created_at: m.created_at.to_rfc3339(),
         updated_at: m.updated_at.to_rfc3339(),
     }

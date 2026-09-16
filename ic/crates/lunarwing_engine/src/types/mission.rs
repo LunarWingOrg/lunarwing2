@@ -170,7 +170,27 @@ pub struct Mission {
     pub updated_at: DateTime<Utc>,
     /// When the next thread should be spawned (for Cron cadence).
     pub next_fire_at: Option<DateTime<Utc>>,
+    /// When this mission last spawned a thread (UTC). `None` means the
+    /// mission has never fired. Surfaced in mission listings so an "Active"
+    /// status cannot be mistaken for a dispatching one (registry honesty,
+    /// work item #143 / WI#109 follow-up).
+    #[serde(default)]
+    pub last_fired_at: Option<DateTime<Utc>>,
 }
+
+/// System event types the engine emits via `fire_on_system_event` (source
+/// `engine`). User-facing cadence strings cannot subscribe to these with
+/// `event:<pattern>` — that matches channel-message text, which never equals
+/// a lifecycle event — so an `OnEvent` pattern equal to one of these names is
+/// a mis-registration (the mission could never fire as intended) and is
+/// rejected at `create_mission`/`update_mission` (work item #143 / WI#109
+/// follow-up). `system:<source>/<event_type>` is the subscribing grammar.
+pub const KNOWN_SYSTEM_EVENT_TYPES: &[&str] = &[
+    "thread_start",
+    "thread_completed_with_issues",
+    "thread_completed_with_learnings",
+    "conversation_insights_due",
+];
 
 /// Maximum number of processed trigger dedup keys retained per mission.
 /// Oldest keys are evicted FIFO once the cap is exceeded.
@@ -234,6 +254,7 @@ impl Mission {
             created_at: now,
             updated_at: now,
             next_fire_at: None,
+            last_fired_at: None,
         }
     }
 
@@ -253,6 +274,7 @@ impl Mission {
     /// Record a thread that was spawned for this mission.
     pub fn record_thread(&mut self, thread_id: ThreadId) {
         self.thread_history.push(thread_id);
+        self.last_fired_at = Some(Utc::now());
         self.updated_at = Utc::now();
     }
 

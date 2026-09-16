@@ -474,6 +474,7 @@ impl MissionManager {
         notify_channels: Vec<String>,
     ) -> Result<MissionId, EngineError> {
         validate_webhook_cadence(&cadence)?;
+        validate_cadence_event_registration(&cadence)?;
         let user_id = user_id.into();
         let name = name.into();
         // Serialize the check-then-save sequence so concurrent creates of the
@@ -581,6 +582,7 @@ impl MissionManager {
             {
                 *secret = existing_secret.clone();
             }
+            validate_cadence_event_registration(&cadence)?;
             mission.cadence = cadence;
             refresh_next_fire_at(&mut mission, Utc::now())?;
         }
@@ -2010,6 +2012,28 @@ fn validate_webhook_cadence(cadence: &MissionCadence) -> Result<(), EngineError>
     {
         return Err(EngineError::Effect {
             reason: "webhook cadence requires non-empty webhook_secret".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject `OnEvent` cadences whose pattern is exactly a known system event
+/// type (WI#109 follow-up, work item #143). `event:<pattern>` matches
+/// channel-message text, so such a mission can never fire the lifecycle
+/// event its author intended — it is born dead ("Active, zero traffic").
+/// The subscribing grammar is `system:<source>/<event_type>`.
+fn validate_cadence_event_registration(cadence: &MissionCadence) -> Result<(), EngineError> {
+    if let MissionCadence::OnEvent { event_pattern } = cadence
+        && crate::types::mission::KNOWN_SYSTEM_EVENT_TYPES
+            .iter()
+            .any(|event_type| event_type.eq_ignore_ascii_case(event_pattern))
+    {
+        return Err(EngineError::Effect {
+            reason: format!(
+                "event pattern '{event_pattern}' is an engine lifecycle event; \
+                 'event:<pattern>' matches channel-message text and would never fire. \
+                 Use 'system:engine/{event_pattern}' to subscribe to it"
+            ),
         });
     }
     Ok(())
@@ -3846,6 +3870,177 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(first, second, "terminal holder must not block re-claim");
+    }
+
+    #[tokio::test]
+    async fn create_mission_rejects_on_event_pattern_naming_a_system_event() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        for pattern in crate::types::mission::KNOWN_SYSTEM_EVENT_TYPES {
+            let result = mgr
+                .create_mission(
+                    project,
+                    "test-user",
+                    format!("born-dead-{pattern}"),
+                    "goal",
+                    MissionCadence::OnEvent {
+                        event_pattern: (*pattern).to_string(),
+                    },
+                    Vec::new(),
+                )
+                .await;
+            assert!(
+                matches!(result, Err(EngineError::Effect { .. })),
+                "OnEvent pattern '{pattern}' must be rejected, got: {result:?}"
+            );
+        }
+
+        // Case-insensitive: the channel matcher lowercases event text, so an
+        // uppercase copy of a system event name is equally born dead.
+        let result = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "born-dead-uppercase",
+                "goal",
+                MissionCadence::OnEvent {
+                    event_pattern: "THREAD_START".to_string(),
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::Effect { .. })));
+
+        // A pattern that merely contains a system event name is ordinary
+        // channel-text matching — still allowed (lint is exact-name only).
+        mgr.create_mission(
+            project,
+            "test-user",
+            "substring-pattern",
+            "goal",
+            MissionCadence::OnEvent {
+                event_pattern: "thread_start today".to_string(),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+
+        // The subscribing grammar itself remains available.
+        mgr.create_mission(
+            project,
+            "test-user",
+            "proper-subscriber",
+            "goal",
+            MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "thread_start".into(),
+            },
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_mission_rejects_system_event_on_event_cadence_but_spares_unrelated_updates() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        // Legacy born-dead mission persisted directly (create now rejects it).
+        let id = MissionId::new();
+        let mut legacy = Mission::new(
+            project,
+            "test-user",
+            "legacy-sanitize-memory",
+            "goal",
+            MissionCadence::OnEvent {
+                event_pattern: "thread_start".to_string(),
+            },
+        );
+        legacy.id = id;
+        store.save_mission(&legacy).await.unwrap();
+        mgr.active.write().await.push(id);
+
+        // An unrelated update (rename) must keep working on the legacy row.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                name: Some("renamed".to_string()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        // Updating the cadence into another system-event-named OnEvent is
+        // rejected...
+        let result = mgr
+            .update_mission(
+                id,
+                "test-user",
+                MissionUpdate {
+                    cadence: Some(MissionCadence::OnEvent {
+                        event_pattern: "conversation_insights_due".to_string(),
+                    }),
+                    ..MissionUpdate::default()
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::Effect { .. })));
+
+        // ...while migrating it to the subscribing grammar is allowed.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                cadence: Some(MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "thread_start".into(),
+                }),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn fire_mission_stamps_last_fired_at() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let project = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project,
+                "test-user",
+                "fired-stamp",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission.last_fired_at.is_none(),
+            "a freshly created mission has never fired"
+        );
+
+        let thread_id = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(thread_id.is_some());
+
+        let mission = mgr.get_mission(id).await.unwrap().unwrap();
+        assert!(
+            mission.last_fired_at.is_some(),
+            "a successful fire must stamp last_fired_at"
+        );
     }
 
     #[tokio::test]

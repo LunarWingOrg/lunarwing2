@@ -429,6 +429,8 @@ impl EffectBridgeAdapter {
                                 "threads_today": m.threads_today,
                                 "max_threads_per_day": m.max_threads_per_day,
                                 "budget_exhausted": budget_exhausted,
+                                "last_fired_at": m.last_fired_at.map(|dt| dt.to_rfc3339()),
+                                "never_fired": m.last_fired_at.is_none(),
                             })
                         })
                         .collect();
@@ -1088,6 +1090,27 @@ fn parse_cadence(
     if (5..=7).contains(&field_count) {
         return cron_cadence(value, trimmed.to_string());
     }
+    // `system:` subscribes to structured engine lifecycle events; keep it
+    // visually distinct from `event:`, which matches channel-message text
+    // (WI#109 follow-up, work item #143).
+    if normalized.starts_with("system:") {
+        let rest = trimmed["system:".len()..].trim();
+        let (source, event_type) = rest.split_once('/').ok_or_else(|| {
+            invalid_cadence(value, "system cadence must be system:<source>/<event_type>")
+        })?;
+        let source = source.trim();
+        let event_type = event_type.trim();
+        if source.is_empty() || event_type.is_empty() {
+            return Err(invalid_cadence(
+                value,
+                "system cadence must be system:<source>/<event_type> with non-empty source and event_type",
+            ));
+        }
+        return Ok(MissionCadence::OnSystemEvent {
+            source: source.to_string(),
+            event_type: event_type.to_string(),
+        });
+    }
     if normalized.starts_with("event:") {
         let event_pattern = trimmed["event:".len()..].trim();
         if event_pattern.is_empty() {
@@ -1113,7 +1136,7 @@ fn parse_cadence(
 
     Err(invalid_cadence(
         value,
-        "expected manual, hourly, daily, <N>m, <N>h, a cron expression, event:<pattern>, or webhook:<path>",
+        "expected manual, hourly, daily, <N>m, <N>h, a cron expression, event:<pattern>, system:<source>/<event_type>, or webhook:<path>",
     ))
 }
 
@@ -1260,6 +1283,50 @@ mod tests {
     }
 
     #[test]
+    fn system_cadence_parses_to_on_system_event() {
+        assert!(matches!(
+            parse_cadence("system:engine/thread_start").expect("system cadence"),
+            lunarwing_engine::MissionCadence::OnSystemEvent { source, event_type }
+                if source == "engine" && event_type == "thread_start"
+        ));
+        // Source and event_type preserve case (matching is exact downstream).
+        assert!(matches!(
+            parse_cadence("system:Engine/Thread_Start").expect("system cadence"),
+            lunarwing_engine::MissionCadence::OnSystemEvent { source, event_type }
+                if source == "Engine" && event_type == "Thread_Start"
+        ));
+        // The prefix is matched case-insensitively like the other cadences.
+        assert!(matches!(
+            parse_cadence("System:engine/thread_start").expect("system cadence"),
+            lunarwing_engine::MissionCadence::OnSystemEvent { .. }
+        ));
+    }
+
+    #[test]
+    fn system_cadence_stays_distinct_from_event_cadence() {
+        // `event:` must keep its channel-text meaning; only `system:`
+        // subscribes to engine lifecycle events (WI#109 follow-up).
+        assert!(matches!(
+            parse_cadence("event:engine/thread_start").expect("event cadence"),
+            lunarwing_engine::MissionCadence::OnEvent { event_pattern }
+                if event_pattern == "engine/thread_start"
+        ));
+    }
+
+    #[test]
+    fn system_cadence_requires_source_and_event_type() {
+        for value in [
+            "system:",
+            "system:/",
+            "system:engine",
+            "system:engine/",
+            "system:/thread_start",
+        ] {
+            assert!(parse_cadence(value).is_err(), "{value} should be rejected");
+        }
+    }
+
+    #[test]
     fn webhook_cadence_requires_and_retains_explicit_secret() {
         assert!(parse_cadence_with_secret("webhook:Build/Ready", None).is_err());
         assert!(matches!(
@@ -1280,6 +1347,11 @@ mod tests {
             "*/10 * * * * *",
             "event:",
             "webhook:",
+            "system:",
+            "system:/",
+            "system:engine",
+            "system:engine/",
+            "system:/thread_start",
             "é",
         ] {
             assert!(parse_cadence(value).is_err(), "{value} should be rejected");

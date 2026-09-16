@@ -14,7 +14,7 @@ LunarWing is a self-hosted, privacy-focused AI agent runtime written in Rust. It
 - [Documentation index](docs/README.md)
 - [Community guide](COMMUNITY.md) · [Project manifesto](MANIFESTO.md)
 - [Canonical source on GitLab](https://git.lunarwing.org/lunarwing/lunarwing2)
-- Companion applications: [LunarWing Desktop](https://git.lunarwing.org/lunarwing/lunarwing2desktop) · [LunarWing Android](https://git.lunarwing.org/lunarwing/lunarwing2droid)
+- Companion application Repositories (PRE-ALPHA): [LunarWing Desktop](https://git.lunarwing.org/lunarwing/lunarwing2desktop) · [LunarWing Android](https://git.lunarwing.org/lunarwing/lunarwing2droid)
 - [IRC: #lunarwing on Libera.Chat](https://web.libera.chat/?channel=#lunarwing)
 - [AGPL-3.0-or-later license](LICENSE)
 
