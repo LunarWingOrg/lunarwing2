@@ -30,6 +30,12 @@ tenant_run_dir() { printf '%s/run\n' "$fixture"; }
 tenant_exists_in_registry() { return 0; }
 _ctr() { return 1; }
 chown() { CHOWN_CALL="$*"; }
+# CI containers run with no-new-privileges, so real sudo dies mid-harness;
+# strip the `-u <tenant>` prefix and run the wrapped command directly.
+sudo() {
+  if [[ "${1:-}" == "-u" ]]; then shift 2; fi
+  command "$@"
+}
 say() { :; }
 sanitize_name() { printf '%s' "$1"; }
 
