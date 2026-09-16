@@ -835,6 +835,12 @@ const CANCEL_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// read-loop fix ack promptly; pre-fix workers just hit this deadline.
 const CANCEL_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Scheduling margin subtracted when capping the user-cancel ack wait to the
+/// remaining task budget, so the inner deadline reliably fires before the
+/// outer task timeout drops the future (a cancel racing the last seconds of
+/// the task window must still resolve as `Cancelled`, not `TimedOut`).
+const CANCEL_ACK_TASK_MARGIN: Duration = Duration::from_millis(50);
+
 pub struct PooledConnection {
     pub stream: WsStream,
     pub worker_id: String,
@@ -1177,6 +1183,7 @@ async fn run_external_task(
     let task_timeout = Duration::from_millis(timeout_ms);
     let mut accumulated_output = String::new();
     let mut cancel_rx = cancel_rx;
+    let task_start = tokio::time::Instant::now();
 
     let result = tokio::time::timeout(task_timeout, async {
         loop {
@@ -1284,7 +1291,19 @@ async fn run_external_task(
                     // worker's ack, when observed, is authoritative for the
                     // cancel bookkeeping; the timeout expiry is the fallback
                     // for pre-WI#101 workers that never ack.
-                    if let Some(result) = wait_for_cancel_ack(&mut read, job_id, worker_name).await
+                    //
+                    // The wait is capped to the task's remaining budget so a
+                    // cancel racing the last seconds of the task window still
+                    // resolves as Cancelled — the outer deadline must not drop
+                    // this future mid-handoff and misreport TimedOut.
+                    let elapsed = tokio::time::Instant::now()
+                        .saturating_duration_since(task_start)
+                        + CANCEL_ACK_TASK_MARGIN;
+                    let ack_budget = task_timeout
+                        .saturating_sub(elapsed)
+                        .min(CANCEL_ACK_TIMEOUT);
+                    if let Some(result) =
+                        wait_for_cancel_ack(&mut read, job_id, worker_name, ack_budget).await
                     {
                         return Ok(result);
                     }
@@ -1310,7 +1329,7 @@ async fn run_external_task(
             // Bounded handoff on the timeout path too (WI#149): give the worker
             // the same window to acknowledge before the connection is torn
             // down, so its cancel processing isn't racing socket cleanup.
-            let _ = wait_for_cancel_ack(&mut read, job_id, worker_name).await;
+            let _ = wait_for_cancel_ack(&mut read, job_id, worker_name, CANCEL_ACK_TIMEOUT).await;
             return Err(OrchestratorError::ExternalWorkerTimeout {
                 worker_name: worker_name.to_string(),
                 job_id,
@@ -1465,8 +1484,9 @@ async fn wait_for_cancel_ack(
     read: &mut WsRead,
     job_id: Uuid,
     worker_name: &str,
+    budget: Duration,
 ) -> Option<ExternalTaskResult> {
-    let deadline = tokio::time::timeout(CANCEL_ACK_TIMEOUT, async {
+    let deadline = tokio::time::timeout(budget, async {
         loop {
             let msg = read.next().await?;
             let ws_msg = match msg {
@@ -1518,8 +1538,8 @@ async fn wait_for_cancel_ack(
             tracing::debug!(
                 %job_id,
                 worker = worker_name,
-                "External worker did not ack cancel within {:?}; proceeding",
-                CANCEL_ACK_TIMEOUT
+                budget_ms = budget.as_millis() as u64,
+                "External worker did not ack cancel within the handoff window; proceeding"
             );
             None
         }

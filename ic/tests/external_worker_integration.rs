@@ -714,6 +714,51 @@ async fn drain_pool_awaits_inflight_cancel_handoff() {
 }
 
 #[tokio::test]
+async fn cancel_racing_task_deadline_still_resolves_cancelled() {
+    // WI#149 edge: a user cancel arriving in the last seconds of the task
+    // window must still resolve as Cancelled. The ack wait runs inside the
+    // outer task-timeout future, so without capping the wait to the remaining
+    // task budget the outer deadline would drop the future mid-handoff and
+    // misreport TimedOut. The worker never acks (worst case: the full
+    // remaining budget is consumed by the fallback).
+    let (url, _count) = spawn_mock_worker_async(MockBehavior::CancelNoAck).await;
+    let mgr = Arc::new(ExternalWorkerManager::new(vec![config_for(&url)]));
+    let job_id = Uuid::new_v4();
+
+    let mgr_c = mgr.clone();
+    tokio::spawn(async move {
+        // Task window is 2s; cancel at 1.5s leaves 500ms of budget — under
+        // the 3s ack deadline, so the fallback must engage, bounded by the
+        // remaining task budget rather than the full ack deadline.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        mgr_c.cancel_task(job_id).await;
+    });
+
+    let res = timeout(
+        TEST_BOUND,
+        mgr.execute_task(
+            job_id,
+            "mock",
+            "task",
+            Some(2_000),
+            true,
+            TaskContext::default(),
+        ),
+    )
+    .await
+    .expect("test timed out")
+    .expect("execute_task errored")
+    .expect("expected result");
+
+    assert_eq!(
+        res.status,
+        ExternalTaskStatus::Cancelled,
+        "cancel must win over the expiring task deadline"
+    );
+    assert_eq!(res.error.as_deref(), Some("Cancelled by user"));
+}
+
+#[tokio::test]
 async fn happy_path_success_with_progress() {
     let (url, _count) = spawn_mock_worker_async(MockBehavior::Success {
         progress: vec!["Hello ".to_string(), "world".to_string()],
