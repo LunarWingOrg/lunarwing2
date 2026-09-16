@@ -90,6 +90,7 @@
     - Verified: new `ic/scripts/tests/test-mt-admin-fix-podman-userns.sh` (probe no-op, stop→cleanup→migrate→start ordering, dead/foreign/live pause.pid branches, non-join failures never stop the tenant, failing-migrate tolerated, classifier signatures) passes; `check-mt-admin.sh` shellcheck green; full mt-admin test battery re-run green (add-tenant-env-flags, cleanup-legacy-weechat, gateway-wait, health-interval, kimi, openrc-status, port-collision, workload-isolation-rendering). Docs: `docs/bugs/BUG-workload-scope-podman-userns.md` (root cause chain, why the launcher-side fix is deferred, operator guidance).
 24. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/143
 25. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/149
+26. [ ] possible regression since 2.0.9.0 - https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/150 - investigate and fix if necessary - gitlab tool wasm issues
 
 ## Phase 6 - Documentation
 26. [x] take a look at any documentation that should be updated and update necessary documentation
