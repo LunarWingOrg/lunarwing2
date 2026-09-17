@@ -4,6 +4,11 @@ Cross-tenant knowledge sharing lets independent LunarWing daemons exchange durab
 
 This guide is the production setup for the configuration that was live-disproved in work item #97 (bare user JIDs never match) and re-verified on 2026-09-10 with full occupant JIDs.
 
+**Revalidated against source 2026-09-17 (v2.1.2.0).** The `KNOW:` wire format,
+`needs-verification` ingestion semantics, publisher allowlist shapes, and the
+`coordination_knowledge` hook were re-checked against `ic/src/hooks/coordination_knowledge.rs`;
+no changes were needed.
+
 ## Wire format
 
 ```text

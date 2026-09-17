@@ -28,21 +28,21 @@ When in doubt about where a change belongs, read [`AGENTS.md`](../../AGENTS.md) 
 
 ## 2. What's hot lava right now (freeze status)
 
-**Current state (updated 2026-09-11, target release 2.1.1):**
+**Current state (updated 2026-09-17, target release 2.1.2.0):**
 
-- A **repo-wide engine hardening MR** is in active review. It touches ~40 files across the
-  engine and runtime. Until it merges and lands, **do not open MRs against engine internals**
-  without asking first. Rebase pain will be real; conflicting drive-by edits will be closed
-  without ceremony.
-- **Mission-thread memory pollution fix** is a release blocker for 2.1.1 and staged apart from
-  the hardening MR. Same guidance: ask before touching the agent memory paths.
+- v2.1.1.0 (Zanshin) shipped: the repo-wide engine hardening MR (WI#132) and the
+  mission-thread memory pollution fix have landed. Normal review tiers apply to
+  engine internals again — but `ic/src/agent/`, `ic/src/db/`, `ic/src/secrets/`,
+  gateway, sandboxing, and approvals are still Tier 3 by default (§3).
+- The v2.1.2.0 pre-release checklist is being worked through
+  (`docs/ops/AGENT_GOALS_2.1.2.0.md`). Areas under active change include the
+  generic podman-first sandbox, the external-worker cancel protocol, and the
+  knowledge sweep cadence. Check the checklist before opening MRs there.
 - **Kawarimi export testing under OpenRC** is being re-worked due to an open-write detection
   difference vs systemd. OpenRC contributors *with kawarimi export expertise* are welcome →
   ask in `#lunarwing`.
 
-These three items are why we keep saying "ask first" right now. When 2.1.1 ships, this
-section will shrink dramatically. We'll keep it updated — if the text above looks old,
-assume it is.
+We'll keep this updated — if the text above looks old, assume it is.
 
 ## 3. Good first contributions (the fast lane)
 
@@ -88,10 +88,10 @@ The core review team is small. Reviews are done by **humans plus orchestrator ag
 
 - **Tier 1 diffs** go fast. Hours to a day.
 - **Tier 2** goes through at least one design pass.
-- **Tier 3** requires 2+ approvals and may sit for days while the engine hardening MR
-  clears the queue. **That's the correct behavior.** Please don't bump MRs.
+- **Tier 3** requires 2+ approvals and may sit for days while larger MRs
+  clear the queue. **That's the correct behavior.** Please don't bump MRs.
 
-While the hardening MR is in flight, even Tier 1 reviews may be slower than usual. Land
+During pre-release checklist crunches, even Tier 1 reviews may be slower than usual. Land
 small, land patient.
 
 ## 6. Contributing as (or with) an agent
@@ -133,4 +133,4 @@ have you find out after 6 hours of work.
 
 ---
 
-*Last updated: 2026-09-11. Update §2 whenever freeze status changes.*
+*Last updated: 2026-09-17. Update §2 whenever freeze status changes.*
