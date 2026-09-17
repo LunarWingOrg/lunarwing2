@@ -4,6 +4,9 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use lunarwing_engine::types::repl::{
+    ReplArgumentCorruption, extract_repl_code, is_repl_action, validate_repl_arguments,
+};
 use rust_decimal::Decimal;
 
 use crate::llm::error::LlmError;
@@ -12,6 +15,7 @@ use crate::llm::provider::{
     LlmStreamObservation, ModelMetadata, OutputCorruptionKind, StreamFailureReason,
     ToolCompletionRequest, ToolCompletionResponse,
 };
+use crate::llm::repl_arguments::ReplArgumentGuard;
 use crate::llm::stream_telemetry::{StreamTelemetry, classify_stream_failure};
 
 const MAX_DETECTION_BYTES: usize = 1_048_576;
@@ -34,10 +38,14 @@ impl StreamIntegrityProvider {
         started_at: Instant,
         result: Result<T, LlmError>,
         content: impl Fn(&T) -> Option<&str>,
+        validate: impl Fn(&T) -> Result<(), ReplArgumentCorruption>,
     ) -> Result<(T, Vec<OutputCorruptionKind>), LlmError> {
         self.telemetry.record_started(provider).await;
         match result {
             Ok(response) => {
+                if let Err(signature) = validate(&response) {
+                    return Err(reject_repl_arguments(&self.telemetry, provider, signature).await);
+                }
                 let corruptions = content(&response)
                     .map(detect_output_corruption)
                     .unwrap_or_default();
@@ -94,6 +102,7 @@ fn error_provider(error: &LlmError) -> Option<&str> {
         LlmError::RequestFailed { provider, .. }
         | LlmError::RateLimited { provider, .. }
         | LlmError::InvalidResponse { provider, .. }
+        | LlmError::ReplArgumentCorruption { provider, .. }
         | LlmError::ModelNotAvailable { provider, .. }
         | LlmError::AuthFailed { provider }
         | LlmError::SessionExpired { provider }
@@ -134,9 +143,13 @@ impl LlmProvider for StreamIntegrityProvider {
             .unwrap_or(&fallback_provider)
             .to_string();
         let (mut response, corruptions) = self
-            .record_blocking_result(&provider, started_at, result, |response| {
-                Some(response.content.as_str())
-            })
+            .record_blocking_result(
+                &provider,
+                started_at,
+                result,
+                |response| Some(response.content.as_str()),
+                |response| extract_repl_code(&response.content).map(|_| ()),
+            )
             .await?;
         mark_blocking_output(&mut response.content, &corruptions);
         Ok(response)
@@ -162,9 +175,13 @@ impl LlmProvider for StreamIntegrityProvider {
             .unwrap_or(&fallback_provider)
             .to_string();
         let (mut response, corruptions) = self
-            .record_blocking_result(&provider, started_at, result, |response| {
-                response.content.as_deref()
-            })
+            .record_blocking_result(
+                &provider,
+                started_at,
+                result,
+                |response| response.content.as_deref(),
+                validate_tool_response,
+            )
             .await?;
         if let Some(content) = response.content.as_mut() {
             mark_blocking_output(content, &corruptions);
@@ -219,9 +236,11 @@ struct IntegrityStreamState<'a> {
     started_at: Instant,
     first_chunk_at: Option<Duration>,
     detection_text: String,
+    repl_arguments: ReplArgumentGuard,
     pending: VecDeque<Result<LlmStreamChunk, LlmError>>,
     saw_done: bool,
     emitted_eof_observation: bool,
+    rejected: bool,
 }
 
 fn integrity_stream<'a>(
@@ -237,9 +256,11 @@ fn integrity_stream<'a>(
         started_at,
         first_chunk_at: None,
         detection_text: String::new(),
+        repl_arguments: ReplArgumentGuard::default(),
         pending: VecDeque::new(),
         saw_done: false,
         emitted_eof_observation: false,
+        rejected: false,
     };
     futures::stream::unfold(state, next_integrity_item).boxed()
 }
@@ -249,6 +270,9 @@ async fn next_integrity_item<'a>(
 ) -> Option<(Result<LlmStreamChunk, LlmError>, IntegrityStreamState<'a>)> {
     if let Some(item) = state.pending.pop_front() {
         return Some((item, state));
+    }
+    if state.rejected {
+        return None;
     }
 
     match state.stream.next().await {
@@ -303,13 +327,32 @@ async fn handle_stream_chunk<'a>(
             append_detection_text(&mut state.detection_text, delta);
             Some((Ok(chunk), state))
         }
-        LlmStreamChunk::ToolCallDelta { .. } => {
+        LlmStreamChunk::ToolCallDelta {
+            index,
+            name,
+            args_delta,
+            ..
+        } => {
             record_first_chunk(&mut state);
+            state
+                .repl_arguments
+                .push(*index, name.as_deref(), args_delta);
             Some((Ok(chunk), state))
         }
         LlmStreamChunk::Observation(_) => Some((Ok(chunk), state)),
         LlmStreamChunk::Done { .. } => {
             record_first_chunk(&mut state);
+            let validation = if state.repl_arguments.has_calls() {
+                state.repl_arguments.validate()
+            } else {
+                extract_repl_code(&state.detection_text).map(|_| ())
+            };
+            if let Err(signature) = validation {
+                let error =
+                    reject_repl_arguments(&state.telemetry, &state.provider, signature).await;
+                state.rejected = true;
+                return Some((Err(error), state));
+            }
             let corruptions = detect_output_corruption(&state.detection_text);
             log_corruptions(&state.provider, &corruptions);
             state
@@ -334,6 +377,37 @@ async fn handle_stream_chunk<'a>(
             state.saw_done = true;
             state.pending.pop_front().map(|item| (item, state))
         }
+    }
+}
+
+fn validate_tool_response(response: &ToolCompletionResponse) -> Result<(), ReplArgumentCorruption> {
+    if response.tool_calls.is_empty() {
+        extract_repl_code(response.content.as_deref().unwrap_or_default())?;
+    }
+    for call in &response.tool_calls {
+        if is_repl_action(&call.name) {
+            validate_repl_arguments(&call.arguments)?;
+        }
+    }
+    Ok(())
+}
+
+async fn reject_repl_arguments(
+    telemetry: &StreamTelemetry,
+    provider: &str,
+    signature: ReplArgumentCorruption,
+) -> LlmError {
+    // Only bounded metadata: never put generated code or arguments in logs.
+    tracing::warn!(
+        provider,
+        error_class = "repl_argument_corruption",
+        corruption_signature = %signature,
+        "Rejected corrupted REPL arguments before execution"
+    );
+    telemetry.record_repl_argument_corruption(provider).await;
+    LlmError::ReplArgumentCorruption {
+        provider: provider.to_string(),
+        signature,
     }
 }
 
@@ -750,6 +824,131 @@ mod tests {
             )))
         ));
         assert!(matches!(chunks.get(2), Some(Err(_))));
+    }
+
+    #[tokio::test]
+    async fn repl_argument_corruption_is_counted_once_and_never_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.json");
+        let telemetry = Arc::new(StreamTelemetry::new(path.clone()));
+        for args in [
+            "null".to_string(),
+            "{\"code\": </think>print(1)}".to_string(),
+            serde_json::json!({"code": "</think>result = await mission_list()\nprint(result)\n</arg_value>"}).to_string(),
+            serde_json::json!({"code": "print(1)\n```repl\nprint(2)"}).to_string(),
+        ] {
+            let mut items = vec![Ok(LlmStreamChunk::TextDelta("Drafting a call.".into()))];
+            // One-byte chunks exercise splits inside tags, JSON escapes, and
+            // fences; a second call verifies per-index isolation.
+            items.push(Ok(LlmStreamChunk::ToolCallDelta {
+                index: 1, id: Some("other".into()), name: Some("memory_write".into()),
+                args_delta: serde_json::json!({"content": "</think> ```repl"}).to_string(),
+            }));
+            items.push(Ok(LlmStreamChunk::ToolCallDelta {
+                index: 0, id: Some("repl-call".into()), name: Some("repl".into()), args_delta: String::new(),
+            }));
+            for ch in args.chars() {
+                items.push(Ok(LlmStreamChunk::ToolCallDelta { index: 0, id: None, name: None, args_delta: ch.to_string() }));
+            }
+            items.push(done());
+            let provider = test_provider(vec![StreamScript::Items(items)], telemetry.clone());
+            let chunks = provider.complete_stream(CompletionRequest::new(vec![])).await.unwrap().collect::<Vec<_>>().await;
+            assert!(matches!(chunks.last(), Some(Err(LlmError::ReplArgumentCorruption { .. }))));
+            assert!(!chunks.iter().any(|chunk| matches!(chunk, Ok(LlmStreamChunk::Done { .. }))));
+        }
+        let metrics: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            metrics["providers"]["test-provider"]["repl_argument_corruption_total"],
+            4
+        );
+        assert_eq!(
+            metrics["providers"]["test-provider"]["streams_completed_total"],
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn repl_text_drafts_reject_but_quoted_markers_pass() {
+        let directory = tempfile::tempdir().unwrap();
+        let telemetry = Arc::new(StreamTelemetry::new(directory.path().join("metrics.json")));
+        for (text, rejected) in [
+            ("```repl\nprint(1)\n```repl\nprint(2)\n```", true),
+            ("```repl\n</think>print(1)\n```", true),
+            (
+                "```repl\nprint('</think>', '```repl', '</arg_value>')\n```",
+                false,
+            ),
+        ] {
+            let items = text
+                .chars()
+                .map(|ch| Ok(LlmStreamChunk::TextDelta(ch.to_string())))
+                .chain([done()])
+                .collect();
+            let provider = test_provider(vec![StreamScript::Items(items)], telemetry.clone());
+            let chunks = provider
+                .complete_stream(CompletionRequest::new(vec![]))
+                .await
+                .unwrap()
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(
+                matches!(
+                    chunks.last(),
+                    Some(Err(LlmError::ReplArgumentCorruption { .. }))
+                ),
+                rejected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_and_fallback_repl_arguments_are_guarded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metrics.json");
+        let telemetry = Arc::new(StreamTelemetry::new(path.clone()));
+        let provider = StreamIntegrityProvider::new(
+            Arc::new(BlockingToolProvider {
+                response: ToolCompletionResponse {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "bad".into(),
+                        name: "repl".into(),
+                        arguments: serde_json::Value::Null,
+                        reasoning: None,
+                    }],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    finish_reason: FinishReason::ToolUse,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                },
+            }),
+            telemetry,
+        );
+        assert!(matches!(
+            provider
+                .complete_with_tools(ToolCompletionRequest::new(vec![], vec![]))
+                .await,
+            Err(LlmError::ReplArgumentCorruption {
+                signature: ReplArgumentCorruption::MissingCode,
+                ..
+            })
+        ));
+        let chunks = provider
+            .complete_with_tools_stream(ToolCompletionRequest::new(vec![], vec![]))
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(LlmError::ReplArgumentCorruption { .. }))
+        ));
+        let metrics: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            metrics["providers"]["blocking-tool-provider"]["repl_argument_corruption_total"],
+            2
+        );
     }
 
     #[tokio::test]

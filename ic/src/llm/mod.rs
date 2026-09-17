@@ -16,6 +16,7 @@ mod provider;
 mod reasoning;
 pub mod recording;
 pub mod registry;
+mod repl_arguments;
 pub mod response_cache;
 pub mod retry;
 mod rig_adapter;

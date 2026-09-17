@@ -32,6 +32,7 @@ write_snapshot() {
       "stream_aborts_total": 2,
       "decode_failures_total": 2,
       "corruption_total": 1,
+      "repl_argument_corruption_total": 4,
       "ttfc_samples_total": 6,
       "ttfc_sum_ms": 900,
       "ttfc_max_ms": 400,
@@ -72,6 +73,7 @@ run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha HE
 assert_eq "$RC" "1" "S3: recent provider issue exits degraded"
 assert_eq "$(jq -r '.status' <<<"$OUT")" "degraded" "S3: recent issue status degraded"
 assert_eq "$(jq -r '.metrics.instances[0].corruption_total' <<<"$OUT")" "1" "S3: tenant corruption aggregate exposed"
+assert_eq "$(jq -r '.metrics.instances[0].repl_argument_corruption_total' <<<"$OUT")" "4" "S3: tenant REPL corruption aggregate exposed"
 
 printf '{not-json' > "$snapshot"
 run_check HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha
@@ -97,6 +99,7 @@ exposition="$(cat "$ROOT/metrics.prom")"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 3' "S5: retries export with provider and tenant labels"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_decode_failures_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 2' "S5: decode failures export"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_corruption_repeated_phrase_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 1' "S5: corruption signature exports"
+assert_contains "$exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' "S5: REPL corruption exports with tenant and provider labels"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_ttfc_max_ms{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 400' "S5: TTFC exports"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

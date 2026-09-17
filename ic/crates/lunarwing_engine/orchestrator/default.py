@@ -47,6 +47,7 @@ MODEL_RECOVERY_POLICY = {
     "context_overflow": {"max_attempts": 2, "shrink": [0.60, 0.35]},
     "transient": {"max_attempts": 2},
     "invalid_output": {"max_attempts": 1},
+    "repl_argument_corruption": {"max_attempts": 1},
     "rate_limited": {"max_attempts": 0},
     "unavailable": {"max_attempts": 1},
     "authentication": {"max_attempts": 0},

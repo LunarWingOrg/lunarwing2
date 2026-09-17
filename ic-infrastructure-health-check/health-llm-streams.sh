@@ -46,6 +46,7 @@ add_snapshot() {
           stream_aborts_total: ([.providers[]?.stream_aborts_total // 0] | add // 0),
           decode_failures_total: ([.providers[]?.decode_failures_total // 0] | add // 0),
           corruption_total: ([.providers[]?.corruption_total // 0] | add // 0),
+          repl_argument_corruption_total: ([.providers[]?.repl_argument_corruption_total // 0] | add // 0),
           last_issue_unix_seconds: ([.providers[]?.last_issue_unix_seconds // 0] | max // 0)
         }' <<<"$snapshot")"
     instances="$(jq -c --argjson item "$instance" '. + [$item]' <<<"$instances")"
@@ -61,6 +62,7 @@ add_snapshot() {
           stream_aborts_total: (.value.stream_aborts_total // 0),
           decode_failures_total: (.value.decode_failures_total // 0),
           corruption_total: (.value.corruption_total // 0),
+          repl_argument_corruption_total: (.value.repl_argument_corruption_total // 0),
           ttfc_samples_total: (.value.ttfc_samples_total // 0),
           ttfc_sum_ms: (.value.ttfc_sum_ms // 0),
           ttfc_max_ms: (.value.ttfc_max_ms // 0),
