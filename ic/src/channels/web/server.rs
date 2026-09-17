@@ -455,6 +455,7 @@ pub(super) async fn start_server_with_mascot(
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
         .route("/api/chat/approval", post(chat_approval_handler))
+        .route("/api/chat/pending-gates", get(chat_pending_gates_handler))
         .route("/api/chat/auth-token", post(chat_auth_token_handler))
         .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
         .route("/api/chat/events", get(chat_events_handler))
@@ -1425,6 +1426,46 @@ async fn chat_send_handler(
             status: "accepted",
         }),
     ))
+}
+
+/// List every live pending gate for the authenticated user (WI#164).
+///
+/// Approval/auth prompts are broadcast over SSE with no replay; a client that
+/// connects after the prompt was emitted (reconnect, refresh, second tab) can
+/// never see it. This read-only endpoint is the recovery surface: poll it on
+/// connect to re-render any prompt still awaiting a decision.
+async fn chat_pending_gates_handler(
+    _state: State<Arc<GatewayState>>,
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<Json<super::types::PendingGatesResponse>, (StatusCode, String)> {
+    let views = crate::bridge::list_engine_pending_gates(&user.user_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(
+                user_id = %user.user_id,
+                %error,
+                "Failed to list pending engine gates"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to list pending gates".to_string(),
+            )
+        })?;
+
+    Ok(Json(super::types::PendingGatesResponse {
+        gates: views
+            .into_iter()
+            .map(|view| super::types::PendingGateInfo {
+                request_id: view.request_id,
+                thread_id: view.thread_id,
+                gate_name: view.gate_name,
+                tool_name: view.tool_name,
+                description: view.description,
+                parameters: view.parameters,
+                resume_kind: serde_json::to_value(view.resume_kind).unwrap_or_default(),
+            })
+            .collect(),
+    }))
 }
 
 async fn chat_approval_handler(

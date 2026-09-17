@@ -111,6 +111,25 @@ pub struct PendingApprovalInfo {
     pub parameters: String,
 }
 
+/// Work item #164: full listing of a user's live pending gates so a
+/// (re)connecting client can re-render approval/auth prompts that were only
+/// ever broadcast over the lossy SSE channel.
+#[derive(Debug, Serialize)]
+pub struct PendingGatesResponse {
+    pub gates: Vec<PendingGateInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PendingGateInfo {
+    pub request_id: String,
+    pub thread_id: String,
+    pub gate_name: String,
+    pub tool_name: String,
+    pub description: String,
+    pub parameters: String,
+    pub resume_kind: serde_json::Value,
+}
+
 // --- Approval ---
 
 #[derive(Debug, Deserialize)]
