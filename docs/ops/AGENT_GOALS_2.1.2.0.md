@@ -1,6 +1,6 @@
 # PRE-RELEASE CHECKLIST for LunarWing v2.1.2.0
 
-## Codename: UNKNOWN
+## Codename: Yoroi (鎧, armor)
 
 **Open TODOs (v2.1.2.0) — To be done before release**
 
@@ -122,7 +122,7 @@
     - DONE 2026-09-17 (`aj/kimi-34-20260917-0000`): all 31 current guides under `docs/guides/` (everything outside `history/`) revalidated against the 2.1.2.0 tree. Substantive updates: MT-ADMIN-QUICKSTART gained the new `fix-podman-userns` repair command (WI#142) with a pointer to `docs/bugs/BUG-workload-scope-podman-userns.md`; ENABLING_DEV_TOOLS rewritten for the generic podman-first sandbox (`SANDBOX_RUNTIME`/`SANDBOX_NETWORK`/`SANDBOX_ENFORCE`, reaper knobs, tiered egress, WI#141 env scrub); CONTRIBUTOR-ONBOARDING freeze status refreshed (2.1.1 shipped, hardening/pollution MRs landed); TESTING_GUIDE gained the durable cross-channel attachment tier (item #3 `attachment_store`) plus sandbox runtime/network checks and the worker cancel-ack note (WI#149); TENANT_KNOWLEDGE_SEED notes the sweep rework (keyset pagination, heartbeat-independent `KNOWLEDGE_SWEEP_ENABLED` cadence, no more 1,000-note cap). The remaining 25 guides were fact-checked against source (registry versions 0.1.8/0.1.11/0.2.9/0.1.14, gotify default URL, multica clamp, voice port 8090, tunnel V24, embeddings cache, `lunarwing-agent-v1`-only subprotocol, migration chain through V27, emote sprites, ssh allowlist, coordination hook) and date-stamped 2026-09-17 with a v2.1.2.0 note; MIGRATE_IRONCLAW_TO_LUNARWING, GATEWAY_VOICE_API, COORDINATION_KNOWLEDGE_SETUP, and CODE-CONTRIBUTION-POLICY gained their first revalidation stamps. Docs-only change; no code touched.
 43. [x] update all docs in docs/architecture
     - DONE 2026-09-12 (aj/kimi-20-20260914-0600): all 10 architecture docs revalidated against the 2.1.2.0 tree. SEMANTIC-MEMORY-SEARCH gained the WI#132 `indexed_at` outbox (V27) + repair sweep and the WI#135/WI#136 mission-subtree `missions.json` index exclusion; ENGINE-V2 gained WI#132 authenticity hardening (retrieval/compaction labeling + neutralization) and dropped the dead `executor/context.rs` from its module map; SELF_HEAL_DEPLOYMENT_WIRING gained the 2.1.2.0 `stop_tenant` writer-quiescence notes (WI#133/#134/#135/#137). The remaining docs were date-stamped after confirming no substantive change: SELF_HEAL_COVERAGE_AUDIT (ORDER unchanged at 14 suites), ATOMICBOOL_DEEPER_PROPAGATION (anchors unchanged, defer stands), SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS, IRC-SENDER-IDENTITY, WEECHAT-CHANNEL-ARCHITECTURE (registry 0.2.9 bump only).
-44. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
+44. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - the codename for this release is: Yoroi (鎧, armor)
 45. [ ] a repass of goal 34 since more changes have been made
 46. [ ] a repass of goal 35 since more changes have been made since especially with external worker stuff
 47. [ ] a repass of goal 36 since more changes have been made since especially with external worker stuff
