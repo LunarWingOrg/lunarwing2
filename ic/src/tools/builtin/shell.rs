@@ -70,6 +70,10 @@ use crate::tools::tool::{
 /// Maximum output size before truncation (64KB).
 const MAX_OUTPUT_SIZE: usize = 64 * 1024;
 
+const TRUNCATED_OUTPUT_WARNING: &str = "[output truncated] Captured output is incomplete. Do not use \
+    it as a complete file or payload. Redirect output to a file and use a file-aware tool, or read \
+    smaller chunks.";
+
 /// Default command timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -578,6 +582,47 @@ fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
     ToolError::Sandbox(message)
 }
 
+/// Keep capture completeness separate from the command's actual exit status.
+struct ShellCommandOutput {
+    output: String,
+    exit_code: i64,
+    truncated: bool,
+}
+
+impl ShellCommandOutput {
+    fn new(output: String, exit_code: i64, capture_truncated: bool) -> Self {
+        let truncated = capture_truncated || output.len() > MAX_OUTPUT_SIZE;
+        let mut output = truncate_output(&output);
+        if truncated {
+            // Prefix rather than suffix: later tool-history/display limits may
+            // retain only the beginning of the output (WI#162).
+            output = format!("{TRUNCATED_OUTPUT_WARNING}\n\n{output}");
+        }
+        Self {
+            output,
+            exit_code,
+            truncated,
+        }
+    }
+}
+
+/// Capture a bounded prefix while draining the whole pipe to prevent deadlocks.
+/// Count discarded bytes so an exactly-full capture is not a false positive.
+async fn read_shell_output<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+) -> std::io::Result<(String, bool)> {
+    let Some(mut pipe) = pipe else {
+        return Ok((String::new(), false));
+    };
+    let mut buf = Vec::new();
+    (&mut pipe)
+        .take(MAX_OUTPUT_SIZE as u64)
+        .read_to_end(&mut buf)
+        .await?;
+    let discarded = tokio::io::copy(&mut pipe, &mut tokio::io::sink()).await?;
+    Ok((String::from_utf8_lossy(&buf).into_owned(), discarded > 0))
+}
+
 /// Shell command execution tool.
 pub struct ShellTool {
     /// Working directory for commands (if None, uses job's working dir or cwd).
@@ -668,7 +713,7 @@ impl ShellTool {
         cmd: &str,
         workdir: &Path,
         timeout: Duration,
-    ) -> Result<(String, i64), ToolError> {
+    ) -> Result<ShellCommandOutput, ToolError> {
         // Override sandbox config timeout if needed
         let result = tokio::time::timeout(timeout, async {
             sandbox
@@ -683,10 +728,11 @@ impl ShellTool {
         .await;
 
         match result {
-            Ok(Ok(output)) => {
-                let combined = truncate_output(&output.output);
-                Ok((combined, output.exit_code))
-            }
+            Ok(Ok(output)) => Ok(ShellCommandOutput::new(
+                output.output,
+                output.exit_code,
+                output.truncated,
+            )),
             Ok(Err(e)) => Err(sandbox_error_envelope(&e)),
             Err(_) => Err(ToolError::Sandbox(format!(
                 "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
@@ -702,7 +748,7 @@ impl ShellTool {
         workdir: &PathBuf,
         timeout: Duration,
         extra_env: &HashMap<String, String>,
-    ) -> Result<(String, i32), ToolError> {
+    ) -> Result<ShellCommandOutput, ToolError> {
         // Build command through the workload spawner: fresh process group +
         // kill_on_drop always, systemd scope isolation when available (BUG-005).
         let spawner = crate::tools::process::workload_spawner().await;
@@ -754,38 +800,13 @@ impl ShellTool {
         let stderr_handle = child.stderr.take();
 
         let result = tokio::time::timeout(timeout, async {
-            let stdout_fut = async {
-                if let Some(mut out) = stdout_handle {
-                    let mut buf = Vec::new();
-                    (&mut out)
-                        .take(MAX_OUTPUT_SIZE as u64)
-                        .read_to_end(&mut buf)
-                        .await
-                        .ok();
-                    // Drain any remaining output so the child does not block
-                    tokio::io::copy(&mut out, &mut tokio::io::sink()).await.ok();
-                    String::from_utf8_lossy(&buf).to_string()
-                } else {
-                    String::new()
-                }
-            };
-
-            let stderr_fut = async {
-                if let Some(mut err) = stderr_handle {
-                    let mut buf = Vec::new();
-                    (&mut err)
-                        .take(MAX_OUTPUT_SIZE as u64)
-                        .read_to_end(&mut buf)
-                        .await
-                        .ok();
-                    tokio::io::copy(&mut err, &mut tokio::io::sink()).await.ok();
-                    String::from_utf8_lossy(&buf).to_string()
-                } else {
-                    String::new()
-                }
-            };
-
-            let (stdout, stderr, wait_result) = tokio::join!(stdout_fut, stderr_fut, child.wait());
+            let (stdout, stderr, wait_result) = tokio::join!(
+                read_shell_output(stdout_handle),
+                read_shell_output(stderr_handle),
+                child.wait(),
+            );
+            let (stdout, stdout_truncated) = stdout?;
+            let (stderr, stderr_truncated) = stderr?;
             let status = wait_result?;
 
             // Combine output
@@ -797,14 +818,18 @@ impl ShellTool {
                 format!("{}\n\n--- stderr ---\n{}", stdout, stderr)
             };
 
-            Ok::<_, std::io::Error>((output, status.code().unwrap_or(-1)))
+            Ok::<_, std::io::Error>(ShellCommandOutput::new(
+                output,
+                i64::from(status.code().unwrap_or(-1)),
+                stdout_truncated || stderr_truncated,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((output, code))) => {
+            Ok(Ok(output)) => {
                 guard.disarm();
-                Ok((truncate_output(&output), code))
+                Ok(output)
             }
             Ok(Err(e)) => Err(ToolError::ExecutionFailed(format!(
                 "Command execution failed: {}",
@@ -825,7 +850,7 @@ impl ShellTool {
         workdir: Option<&str>,
         timeout: Option<u64>,
         extra_env: &HashMap<String, String>,
-    ) -> Result<(String, i64), ToolError> {
+    ) -> Result<ShellCommandOutput, ToolError> {
         // Check for blocked commands
         if let Some(reason) = self.is_blocked(cmd) {
             return Err(ToolError::NotAuthorized(format!(
@@ -864,10 +889,8 @@ impl ShellTool {
         }
 
         // Only execute directly when no sandbox was configured at all.
-        let (output, code) = self
-            .execute_direct(cmd, &cwd, timeout_duration, extra_env)
-            .await?;
-        Ok((output, code as i64))
+        self.execute_direct(cmd, &cwd, timeout_duration, extra_env)
+            .await
     }
 }
 
@@ -886,7 +909,9 @@ impl Tool for ShellTool {
     fn description(&self) -> &str {
         "Execute shell commands. Use for running builds, tests, git operations, and other CLI tasks. \
          Commands run in a subprocess with captured output. Long-running commands have a timeout. \
-         When Docker sandbox is enabled, commands run in isolated containers for security."
+         When Docker sandbox is enabled, commands run in isolated containers for security. \
+         Output is bounded; truncated=true and a warning mean the captured data is incomplete, \
+         even if success=true. Use files or smaller chunks for large payloads."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -921,7 +946,7 @@ impl Tool for ShellTool {
         let timeout = params.get("timeout").and_then(|v| v.as_u64());
 
         let start = std::time::Instant::now();
-        let (output, exit_code) = self
+        let output = self
             .execute_command(command, workdir, timeout, &ctx.extra_env)
             .await?;
         let duration = start.elapsed();
@@ -929,10 +954,12 @@ impl Tool for ShellTool {
         let sandboxed = self.sandbox.is_some();
 
         let result = serde_json::json!({
-            "output": output,
-            "exit_code": exit_code,
-            "success": exit_code == 0,
-            "sandboxed": sandboxed
+            "output": output.output,
+            "exit_code": output.exit_code,
+            "success": output.exit_code == 0,
+            "sandboxed": sandboxed,
+            "truncated": output.truncated,
+            "warning": output.truncated.then_some(TRUNCATED_OUTPUT_WARNING),
         });
 
         Ok(ToolOutput::success(result, duration))
@@ -1427,8 +1454,111 @@ mod tests {
             .unwrap();
 
         let output = result.result.get("output").unwrap().as_str().unwrap();
-        assert_eq!(output.len(), MAX_OUTPUT_SIZE);
+        assert!(output.starts_with(TRUNCATED_OUTPUT_WARNING));
+        assert_eq!(result.result["truncated"], true);
+        assert_eq!(result.result["warning"], TRUNCATED_OUTPUT_WARNING);
+        assert_eq!(
+            output.len(),
+            MAX_OUTPUT_SIZE + TRUNCATED_OUTPUT_WARNING.len() + 2
+        );
         assert_eq!(result.result.get("exit_code").unwrap().as_i64().unwrap(), 0);
+    }
+
+    /// Check the public result, not just the sandbox's internal truncated flag.
+    /// FullAccess takes the sandbox-manager path without requiring containers.
+    async fn assert_output_capture_contract(tool: ShellTool, stream_limit: usize) {
+        let ctx = JobContext::default();
+        for (stdout_bytes, stderr_bytes, exit_code, truncated) in [
+            (0, 0, 0, false),
+            (30000, 0, 0, false),
+            (stream_limit, 0, 0, false),
+            (stream_limit + 1, 0, 0, true),
+            (0, stream_limit, 7, false),
+            (0, stream_limit + 1, 7, true),
+            // Both streams individually fit, but the combined display does not.
+            (32768, 32768, 0, true),
+            // Exceed both pipe buffers; drain both to EOF without deadlocking.
+            (131072, 131072, 7, true),
+        ] {
+            let command = format!(
+                "python3 -c \"import sys; sys.stdout.write('A' * {stdout_bytes}); \
+                 sys.stderr.write('B' * {stderr_bytes}); sys.exit({exit_code})\""
+            );
+            let result = tool
+                .execute(serde_json::json!({"command": command}), &ctx)
+                .await
+                .unwrap()
+                .result;
+            assert_eq!(result["exit_code"], exit_code);
+            assert_eq!(result["success"], exit_code == 0);
+            assert_eq!(result["truncated"], truncated, "{command}");
+            let output = result["output"].as_str().unwrap();
+            if truncated {
+                assert_eq!(result["warning"], TRUNCATED_OUTPUT_WARNING);
+                assert!(output.starts_with(TRUNCATED_OUTPUT_WARNING));
+                assert!(output.len() < MAX_OUTPUT_SIZE + 512);
+                // A downstream prefix-only preview must retain the signal too.
+                let serialized = serde_json::to_string(&result).unwrap();
+                assert!(serialized[..256].contains("[output truncated]"));
+            } else {
+                assert!(result["warning"].is_null());
+                let expected = if stdout_bytes == 0 {
+                    "B".repeat(stderr_bytes)
+                } else {
+                    "A".repeat(stdout_bytes)
+                };
+                assert_eq!(output, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_direct_output_capture_contract() {
+        assert_output_capture_contract(
+            ShellTool::new().with_timeout(Duration::from_secs(10)),
+            MAX_OUTPUT_SIZE,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_output_capture_contract() {
+        let sandbox = Arc::new(SandboxManager::new(crate::sandbox::SandboxConfig {
+            policy: SandboxPolicy::FullAccess,
+            allow_full_access: true,
+            ..Default::default()
+        }));
+        assert_output_capture_contract(
+            ShellTool::new()
+                .with_sandbox(sandbox)
+                .with_sandbox_policy(SandboxPolicy::FullAccess)
+                .with_timeout(Duration::from_secs(10)),
+            32768,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_multibyte_output_truncation_is_signalled() {
+        let tool = ShellTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "command": "python3 -c \"import sys; sys.stdout.write('€' * 30000)\""
+                }),
+                &JobContext::default(),
+            )
+            .await
+            .unwrap()
+            .result;
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["exit_code"], 0);
+        assert!(
+            result["output"]
+                .as_str()
+                .unwrap()
+                .starts_with(TRUNCATED_OUTPUT_WARNING)
+        );
     }
 
     #[tokio::test]

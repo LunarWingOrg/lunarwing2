@@ -13,9 +13,13 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use lunarwing::context::JobContext;
 use lunarwing::sandbox::{SandboxConfig, SandboxManager, SandboxNetworkMode, SandboxPolicy};
+use lunarwing::tools::Tool;
+use lunarwing::tools::builtin::ShellTool;
 
 fn gate_open() -> bool {
     if std::env::var("LUNARWING_E2E_PODMAN_TESTS")
@@ -79,6 +83,55 @@ async fn podman_echo_executes_in_container() {
         "stdout: {}",
         out.stdout
     );
+
+    mgr.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn podman_shell_reports_output_truncation() {
+    if !gate_open() {
+        return;
+    }
+    let dir = scratch_dir("truncation");
+    let mgr = Arc::new(manager(
+        SandboxPolicy::ReadOnly,
+        SandboxNetworkMode::None,
+        Duration::from_secs(60),
+    ));
+    mgr.initialize().await.expect("initialize");
+    let tool = ShellTool::new()
+        .with_sandbox(mgr.clone())
+        .with_working_dir(dir.clone());
+
+    for (bytes, redirect, exit_code, truncated) in [
+        (32768, "", 0, false),
+        (40000, "", 0, true),
+        (32768, ">&2", 7, false),
+        (40000, ">&2", 7, true),
+    ] {
+        let command =
+            format!("head -c {bytes} /dev/zero | tr '\\000' A {redirect}; exit {exit_code}");
+        let result = tool
+            .execute(
+                serde_json::json!({"command": command}),
+                &JobContext::default(),
+            )
+            .await
+            .expect("execute shell")
+            .result;
+        assert_eq!(result["exit_code"], exit_code);
+        assert_eq!(result["success"], exit_code == 0);
+        assert_eq!(result["truncated"], truncated);
+        let output = result["output"].as_str().expect("output");
+        if truncated {
+            assert!(output.starts_with("[output truncated]"));
+            assert!(result["warning"].as_str().unwrap().contains("incomplete"));
+        } else {
+            assert_eq!(output, "A".repeat(bytes));
+            assert!(result["warning"].is_null());
+        }
+    }
 
     mgr.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

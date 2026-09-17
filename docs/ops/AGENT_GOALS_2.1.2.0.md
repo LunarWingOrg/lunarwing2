@@ -103,7 +103,10 @@
 30. [ ] create CI/CD pipeline jobs for opencode2 - we only have kimi, pebble, opencode rn
 31. [ ] Last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/998 and branch was rarity/kimi-31-20260917-0601 - REJECTED - Feedback: see comments on MR linked for feedback and what needs to be addresed - re-attempt - Original Task Description: Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/164 - comments must be read as well, attached as images (BOTH NOW TRANSCRIBED AS COMMENT)
 32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/163
-33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/162
+33. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/162
+    - DONE repo-side 2026-09-17 (`a/goal33/v2.1.2.0`): confirmed that `ShellTool` discarded the sandbox manager's existing `truncated` flag (32,768 bytes per stream), while its direct path silently discarded drained bytes beyond 65,536 per stream. Both paths now return `truncated` plus `warning`, and partial output starts with `[output truncated]` so prefix-only previews retain the signal. Combined-display clipping is also flagged; exact-limit captures stay complete. Real command exit codes / `success` semantics are preserved, and direct pipe read errors fail explicitly.
+    - Verified: `cargo check --locked --lib --tests`; 38/38 shell tests and 12/12 sandbox-manager tests; targeted lib + Podman integration Clippy with `-D warnings`; workspace rustfmt and diff checks. Regression coverage includes exact/over-limit stdout and stderr, combined clipping, large dual-stream draining, UTF-8, and nonzero exits. Added a gated real-container regression (compile-checked, not executed here).
+    - LIVE ACCEPTANCE PENDING: session `NoNewPrivileges` prevents sudo provisioning; user explicitly opted to run the privileged commands later. Fresh-tenant provisioning/build and gateway/REPL acceptance instructions, including uncommitted-fix transfer, are in `docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md`. No live tenant or voice transcription success is claimed; the voice comment's older sub-32KiB failure is not explained by this cap.
 34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
 35. [x] (S) Reserved4otherworkitems
 36. [ ] investigate https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 and create document in docs/ops detailing status of voice api as it stands in relation to the description of the work item
@@ -131,4 +134,3 @@
 50. [x] (S) RESERVED
 
 ---
-
