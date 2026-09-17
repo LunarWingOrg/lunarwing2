@@ -169,7 +169,7 @@ def validate_pipeline_context() -> tuple[str, str, str]:
     if not RELEASE_TAG_RE.fullmatch(release_tag):
         raise RuntimeError(f"release tag {release_tag!r} does not match release policy")
     worker = promotion_tag.removeprefix(f"{release_tag}-")
-    if worker not in {"pebble", "opencode", "kimi"}:
+    if worker not in {"pebble", "opencode", "opencode2", "kimi"}:
         raise RuntimeError("worker promotion tag does not match the release tag")
     return source_sha, release_tag, promotion_tag
 
