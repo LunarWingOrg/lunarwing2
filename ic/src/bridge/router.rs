@@ -1454,6 +1454,11 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         agent.safety().clone(),
         agent.hooks().clone(),
     ));
+    // Work item #164: honor the resolved global auto-approve setting on
+    // engine-routed turns, exactly like the v1 dispatcher does.
+    effect_adapter
+        .set_globally_auto_approved(agent.auto_approve_tools())
+        .await;
     if let Some(store) = agent.deps.store.clone() {
         effect_adapter.set_settings_store_from_db(store).await;
     }
