@@ -333,6 +333,14 @@ impl Agent {
         self.config.max_tool_iterations
     }
 
+    /// Global auto-approve setting shared by both execution engines (work item
+    /// #164: Engine V2 used to hardcode `false` here, so
+    /// `AGENT_AUTO_APPROVE_TOOLS=true` / `agent.auto_approve_tools` never
+    /// applied to engine-routed turns).
+    pub(crate) fn auto_approve_tools(&self) -> bool {
+        self.config.auto_approve_tools
+    }
+
     /// Pending-gate expiry (WI#111): resolved from
     /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
     /// settings via `AgentConfig::resolve`, with config-layer lower and upper
