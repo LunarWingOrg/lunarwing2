@@ -406,11 +406,18 @@ Phase 1 scope and exit criteria are defined in
 ```bash
 python3 .gitlab/scripts/validate_config.py
 bash .gitlab/scripts/shell-syntax.sh
-bash .gitlab/scripts/shellcheck.sh
+bash .gitlab/scripts/install-shellcheck.sh && PATH="$PWD/.ci-bin:$PATH" bash .gitlab/scripts/shellcheck.sh
 python3 .gitlab/scripts/python_syntax.py
 python3 .gitlab/scripts/registry_json.py
 taskset -c 0-5 cargo fmt --manifest-path ic/Cargo.toml --all -- --check
 ```
+
+The shellcheck scan requires ShellCheck **0.11.0+** (the project floor since
+MR !988 — Debian bookworm's apt 0.9.0 false-flags SC2218 on the mt-admin
+harnesses). `install-shellcheck.sh` installs a checksum-pinned 0.11.0 into
+`.ci-bin`; CI jobs do the same and prepend it to PATH. The installer needs
+`curl`, `sha256sum`, and `xz` to unpack the upstream `.tar.xz` — CI images get
+them from `bootstrap-shell.sh` (`xz-utils`).
 
 GitLab CI Lint remains required. Generic YAML parsing cannot validate merged
 GitLab semantics, runner availability, protected variables, or project-level

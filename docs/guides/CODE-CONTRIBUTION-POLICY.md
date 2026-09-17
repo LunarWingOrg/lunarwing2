@@ -2,6 +2,11 @@
 
 This document is the single canonical reference for how code is contributed to LunarWing. It consolidates conventions that were previously scattered across `AGENTS.md`, the GitLab CI, subsystem specs, and guide documents. When this policy disagrees with an older document, this one wins.
 
+**Revalidated 2026-09-17 (v2.1.2.0).** Policy text and referenced paths were
+re-checked against the current tree; no changes were needed (the
+`ic/src/*/CLAUDE.md` subsystem-spec glob currently resolves for `db`; other
+subsystem specs live in `docs/` as flagged in `AGENTS.md`).
+
 ## 1. Project values
 
 LunarWing is privacy-first, security-first, and self-hosting-first. We prefer open-weight models and local inference, we support user choice, and we do not expose secrets to any model or third-party service. See `MANIFESTO.md` and `README.md` for the full philosophy.

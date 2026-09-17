@@ -31,7 +31,7 @@ ports_registry_init() {
       registry_needs_repair="true"
     fi
   fi
-  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "16" || "$registry_needs_repair" == "true" ]]; then
+  if [[ ! -f "$PORTS_REGISTRY" || "$registry_version" != "17" || "$registry_needs_repair" == "true" ]]; then
     acquire_ports_lock
   fi
 
@@ -276,6 +276,7 @@ ports_migrate() {
   if [[ "$current_version" -lt 14 ]]; then ports_migrate_v14; fi
   if [[ "$current_version" -lt 15 ]]; then ports_migrate_v15; fi
   if [[ "$current_version" -lt 16 ]]; then ports_migrate_v16; fi
+  if [[ "$current_version" -lt 17 ]]; then ports_migrate_v17; fi
 }
 
 # v15 -> v16: allocate a host-global `health_metrics` slot for the optional
@@ -306,6 +307,41 @@ ports_migrate_v16() {
   chmod 0644 "$tmp"
   mv "$tmp" "$PORTS_REGISTRY"
   say "port registry migrated to v16 (host-global health_metrics slot: $(jq -r '.health_metrics_port' "$PORTS_REGISTRY"))"
+}
+
+# v16 -> v17: add a dedicated two-port range for the OpenCode 2 worker
+# (opencode2_wss + opencode2_health). Every existing range is full (the
+# extended block exhausted its slots at v13, kimi took 30000-39999 at v12,
+# voice took 40000-49999 at v15, health_metrics took 50000 at v16), so a new
+# range starting at 51000 keeps every live tenant port stable — same
+# non-disruptive pattern as the kimi (v12) and voice (v15) migrations.
+# v2 is opt-in per tenant; the worker stays disabled (.workers.opencode2 =
+# false) until explicitly selected.
+ports_migrate_v17() {
+  local tmp
+  tmp="$(mktemp "$PORTS_REGISTRY.tmp.XXXXXX")"
+  jq '
+    .version = 17
+    | .opencode2_range = ((.opencode2_range) // {"start": 51000, "end": 51999})
+    | .opencode2_block_size = ((.opencode2_block_size) // 2)
+    | ( .range.start // 10000 ) as $rstart
+    | ( .opencode2_range.start ) as $ostart
+    | .tenants |= with_entries(
+        .value |= (
+          if .base_port then
+            ( .base_port - $rstart + $ostart ) as $obase
+            | .opencode2_base = ((.opencode2_base) // $obase)
+            | .opencode2_ports = ((.opencode2_ports) // {
+                opencode2_wss: ($obase + 0),
+                opencode2_health: ($obase + 1)
+              })
+          else . end
+        )
+      )
+  ' "$PORTS_REGISTRY" >"$tmp"
+  chmod 0644 "$tmp"
+  mv "$tmp" "$PORTS_REGISTRY"
+  say "port registry migrated to v17 (opencode2_wss + opencode2_health dedicated in range 51000-51999)"
 }
 
 # v8 -> v9: rename extended_ports.reserved_5 -> vision_service.
@@ -606,7 +642,7 @@ ports_allocate() {
     # as darkirc/proxy: re-running `add-tenant <existing> --with-<worker>` turns a
     # worker on; omitting the flag never turns one off (disabling is manual).
     local _w
-    for _w in pebble opencode kimi; do
+    for _w in pebble opencode kimi opencode2; do
       if [[ "$(jq -r --arg w "$_w" '.[$w] // false' <<<"$workers_json" 2>/dev/null)" == "true" ]]; then
         ports_enable_worker "$name" "$_w"
       fi
@@ -640,8 +676,9 @@ ports_allocate() {
       nanocode: false,
       pebble:   (.pebble   // false),
       opencode: (.opencode // false),
-      kimi:     (.kimi     // false)
-    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false}')"
+      kimi:     (.kimi     // false),
+      opencode2: (.opencode2 // false)
+    }' <<<"$workers_json" 2>/dev/null || echo '{"nanocode":false,"pebble":false,"opencode":false,"kimi":false,"opencode2":false}')"
   local darkirc_scope=""
   if [[ "$enable_darkirc" == true ]]; then
     darkirc_scope="${requested_darkirc_scope:-$(generate_unique_darkirc_scope_id)}"
@@ -652,9 +689,11 @@ ports_allocate() {
     | ( .extended_block_size // 10 ) as $ebs
     | ( .kimi_range.start // 30000 ) as $kstart
     | ( .voice_range.start // 40000 ) as $vstart
+    | ( .opencode2_range.start // 51000 ) as $ostart
     | ( $base - $rstart + $estart ) as $ebase
     | ( $base - $rstart + $kstart ) as $kbase
     | ( $base - $rstart + $vstart ) as $vbase
+    | ( $base - $rstart + $ostart ) as $obase
     | .tenants[$name] = {
         base_port: $base,
         user: $name,
@@ -702,6 +741,11 @@ ports_allocate() {
         voice_ports: {
           voice_service: ($vbase + 0),
           voice_health: ($vbase + 1)
+        },
+        opencode2_base: $obase,
+        opencode2_ports: {
+          opencode2_wss: ($obase + 0),
+          opencode2_health: ($obase + 1)
         }
       }
   ' "$PORTS_REGISTRY" >"$tmp"
@@ -973,7 +1017,7 @@ ports_set_weechat() {
   say "weechat for tenant '$name': $current -> $enabled" >&2
 }
 
-# Mark a supported external worker (pebble|opencode|kimi) enabled for a tenant
+# Mark a supported external worker (pebble|opencode|kimi|opencode2) enabled for a tenant
 # (one-directional: false -> true). Idempotent. Used by ports_allocate()'s resume
 # path so `add-tenant <existing> --with-<worker>` flips the registry, mirroring
 # ports_enable_darkirc/proxy. Ensures a .workers object exists on older tenant
@@ -982,7 +1026,7 @@ ports_enable_worker() {
   local name="$1" worker="$2"
   require_cmd jq
     case "$worker" in
-    pebble|opencode|kimi) ;;
+    pebble|opencode|kimi|opencode2) ;;
     *) die "ports_enable_worker: unknown worker '$worker'" ;;
   esac
   # ISSUE-012 (follow-up): same locked read-modify-rename pattern as
@@ -1021,7 +1065,7 @@ ports_set_worker_desired_running() {
   local name="$1" worker="$2" desired="$3"
   require_cmd jq
   case "$worker" in
-    pebble|opencode|kimi) ;;
+    pebble|opencode|kimi|opencode2) ;;
     *) die "ports_set_worker_desired_running: unknown worker '$worker'" ;;
   esac
   case "$desired" in true|false) ;; *) die "worker desired_running must be true or false" ;; esac
@@ -1112,6 +1156,11 @@ ports_get() {
     return 0
   fi
   port="$(jq -r ".tenants[\"$name\"].voice_ports.$port_name // empty" "$PORTS_REGISTRY")"
+  if [[ -n "$port" ]]; then
+    printf '%s' "$port"
+    return 0
+  fi
+  port="$(jq -r ".tenants[\"$name\"].opencode2_ports.$port_name // empty" "$PORTS_REGISTRY")"
   if [[ -n "$port" ]]; then
     printf '%s' "$port"
     return 0

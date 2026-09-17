@@ -3,7 +3,7 @@
 **Effective Date:** September 15th, 2026
 **Last Updated:** August 19th, 2026 *(Added exceptions for documentation and non-generative cybersecurity analysis)*
 
-**Revalidated 2026-09-12 (v2.1.1.0).** Policy text reviewed; no changes were
+**Revalidated 2026-09-17 (v2.1.2.0).** Policy text reviewed; no changes were
 needed. The companion human policy (`CODE-CONTRIBUTION-POLICY.md`) had its
 stale `src/*/CLAUDE.md` references corrected to the `ic/` tree in this pass.
 

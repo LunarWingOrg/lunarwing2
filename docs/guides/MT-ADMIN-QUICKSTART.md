@@ -4,11 +4,12 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-12 (v2.1.1.0).** Every referenced mt-admin
+**Revalidated against source 2026-09-17 (v2.1.2.0).** Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
 `tokens`, WeeChat bootstrap recovery) was re-checked against
-`ic/scripts/lunarwing-mt-admin.sh`; no changes were needed.
+`ic/scripts/lunarwing-mt-admin.sh`; no changes were needed beyond adding the
+v2.1.2.0 `fix-podman-userns` repair command below.
 
 ## 1. Install Host Prerequisites
 
@@ -116,6 +117,7 @@ Build optional shared components before starting tenants that require them:
 sudo ic/scripts/lunarwing-mt-admin.sh build-darkirc
 sudo ic/scripts/lunarwing-mt-admin.sh build-pebble-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode-worker
+sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-kimi-worker
 sudo ic/scripts/lunarwing-mt-admin.sh build-vision-sidecar
 ```
@@ -131,6 +133,14 @@ sudo ic/scripts/lunarwing-mt-admin.sh doctor
 ```
 
 The exact service graph depends on selected features. Core LunarWing, PostgreSQL, XMPP, optional proxy, WeeChat, adapter, DarkIRC, LunarVision, orchestrator, and workers must not be summarized as a fixed service count.
+
+On rootless-podman hosts, a tenant can start failing with `cannot re-exec process to join the existing user namespace` (WI#142 — stale userns pairing after tenant churn; see [`../bugs/BUG-workload-scope-podman-userns.md`](../bugs/BUG-workload-scope-podman-userns.md)). Repair through MT admin rather than manual `podman system migrate` as root:
+
+```bash
+sudo ic/scripts/lunarwing-mt-admin.sh fix-podman-userns ruffles
+```
+
+The command probes first and is a no-op on a healthy pairing; on the join signature it stops the tenant, cleans stale `pause.pid` state, runs `podman system migrate` as the tenant user, and restarts with health-gated sidecar recreation.
 
 If a component fails, keep using MT admin to inspect the tenant and then read the init-appropriate logs. Do not bypass a failed `start-tenant` by manually starting a partial OpenRC or systemd graph; either fix/disable the failing optional component through supported configuration or rerender/reconcile the tenant.
 

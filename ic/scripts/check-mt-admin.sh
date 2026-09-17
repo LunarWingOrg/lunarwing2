@@ -2,7 +2,9 @@
 #
 # Shellcheck gate for lunarwing-mt-admin.sh and its mt-admin-lib/ modules (T7).
 # Fails if any warning-or-above issue is found. Run manually, in CI, or as a
-# pre-commit hook. Install shellcheck separately (e.g. `pacman -S shellcheck`).
+# pre-commit hook. Install shellcheck separately — the project floor is 0.11.0
+# (Debian bookworm's apt 0.9.0 is too old; CI installs a checksum-pinned
+# 0.11.0 via .gitlab/scripts/install-shellcheck.sh).
 #
 set -euo pipefail
 
@@ -13,7 +15,7 @@ if [[ -d "$SCRIPT_DIR/mt-admin-lib" ]]; then
 fi
 
 command -v shellcheck >/dev/null 2>&1 || {
-  echo "error: shellcheck is required (install: pacman -S shellcheck / apt install shellcheck)" >&2
+  echo "error: shellcheck >= 0.11.0 is required (install: pacman -S shellcheck / apt install shellcheck / .gitlab/scripts/install-shellcheck.sh)" >&2
   exit 2
 }
 

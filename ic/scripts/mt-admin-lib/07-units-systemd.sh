@@ -425,7 +425,7 @@ EOF
 render_worker_quadlet() {
   local name="$1" worker="$2" health_port="${3:-8443}"
   case "$worker" in
-    pebble|opencode|kimi) ;;
+    pebble|opencode|kimi|opencode2) ;;
     *) die "unsupported external worker '$worker'" ;;
   esac
   local qdir wss_port workspace_dir env_dir tenant_env_path worker_env_path host_health_port
@@ -439,12 +439,12 @@ render_worker_quadlet() {
   worker_env_path="$env_dir/${worker}.env"
   workspace_dir="$(tenant_lw_root "$name")/${worker}-workspace"
   mkdir -p "$workspace_dir"
-  if [[ "$worker" == "kimi" || "$worker" == "opencode" ]]; then
+  if [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
     workspace_dir="$(prepare_worker_workspace "$name" "$worker")"
   else
     chown "$name:$name" "$workspace_dir"
   fi
-  [[ "$worker" == "kimi" || "$worker" == "opencode" ]] || chmod 777 "$workspace_dir"
+  [[ "$worker" == "kimi" || "$worker" == "opencode" || "$worker" == "opencode2" ]] || chmod 777 "$workspace_dir"
   [[ "$worker" != "kimi" ]] || runtime_env_path="$(write_kimi_runtime_env "$name")"
   [[ -z "$runtime_env_path" ]] \
     || runtime_env_hash="$(sha256sum "$runtime_env_path" | cut -d' ' -f1)"
@@ -470,7 +470,7 @@ render_worker_quadlet() {
   local ssh_agent_socket
   ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
   local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
-  if [[ "$worker" == "opencode" ]]; then
+  if [[ "$worker" == "opencode" || "$worker" == "opencode2" ]]; then
     study_notes_home="$(tenant_study_notes_home "$name")"
     [[ -z "$study_notes_home" ]] || validate_study_notes_home "$study_notes_home"
     if [[ -n "$study_notes_home" ]]; then
@@ -518,6 +518,8 @@ EOF
       printf 'UserNS=%s\n' "$OPENCODE_USERNS"
     elif [[ "$worker" == "kimi" ]]; then
       printf 'UserNS=%s\n' "$KIMI_USERNS"
+    elif [[ "$worker" == "opencode2" ]]; then
+      printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
     fi
     # SSH agent socket mount + env (always included — the daemon creates the
     # socket at startup; if SSH isn't configured, the socket won't exist and
@@ -535,18 +537,26 @@ EOF
     elif [[ "$worker" == "opencode" ]]; then
       printf 'Environment=OPENCODE_MODE=websocket\n'
       printf 'Environment=WS_ROLE=server\n'
+    elif [[ "$worker" == "opencode2" ]]; then
+      printf 'Environment=OPENCODE_MODE=websocket\n'
+      printf 'Environment=WS_ROLE=server\n'
     elif [[ "$worker" == "kimi" ]]; then
       printf 'Environment=KIMI_MODE=websocket\n'
       printf 'Environment=WS_ROLE=server\n'
     fi
     [[ "$worker" == "kimi" || -z "$agent_token" ]] \
       || printf 'Environment=AGENT_AUTH_TOKEN=%s\n' "$agent_token"
-    [[ "$worker" == "opencode" && -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
+    [[ "$worker" == "opencode" || "$worker" == "opencode2" ]] && [[ -n "$tz_key" ]] && printf 'Environment=TENSORZERO_API_KEY=%s\n' "$tz_key"
     local oc_model oc_base_url
     oc_model="$(_read_env_value "$tenant_env_path" OPENCODE_MODEL)"
     oc_base_url="$(_read_env_value "$tenant_env_path" OPENCODE_BASE_URL)"
     [[ "$worker" == "opencode" && -n "$oc_model" ]] && printf 'Environment=OPENCODE_MODEL=%s\n' "$oc_model"
     [[ "$worker" == "opencode" && -n "$oc_base_url" ]] && printf 'Environment=OPENCODE_BASE_URL=%s\n' "$oc_base_url"
+    local oc2_model oc2_base_url
+    oc2_model="$(_read_env_value "$tenant_env_path" OPENCODE2_MODEL)"
+    oc2_base_url="$(_read_env_value "$tenant_env_path" OPENCODE2_BASE_URL)"
+    [[ "$worker" == "opencode2" && -n "$oc2_model" ]] && printf 'Environment=OPENCODE2_MODEL=%s\n' "$oc2_model"
+    [[ "$worker" == "opencode2" && -n "$oc2_base_url" ]] && printf 'Environment=OPENCODE2_BASE_URL=%s\n' "$oc2_base_url"
     if [[ -n "$runtime_env_path" ]]; then
       printf '# RuntimeEnvHash=%s\n' "$runtime_env_hash"
       printf 'EnvironmentFile=%s\n' "$runtime_env_path"
@@ -554,7 +564,7 @@ EOF
     # Operator override file (optional). EnvironmentFile= has existed since the
     # Quadlet 4.4 debut, so it is safe at our >= 4.6 floor.
     [[ -f "$worker_env_path" ]] && printf 'EnvironmentFile=%s\n' "$worker_env_path"
-    [[ "$worker" == "opencode" || "$worker" == "kimi" ]] && printf 'Exec=--mode websocket\n'
+    [[ "$worker" == "opencode" || "$worker" == "kimi" || "$worker" == "opencode2" ]] && printf 'Exec=--mode websocket\n'
     cat <<EOF
 HealthCmd=curl -sf http://127.0.0.1:${health_port}/${health_path} || exit 1
 HealthInterval=15s
@@ -912,7 +922,7 @@ stop_tenant_systemd() {
   local uid
   uid="$(id -u "$name" 2>/dev/null)" || return 0
 
-  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
+  for svc in "lunarwing-${name}.service" "xmpp-bridge-${name}.service" "lunarwing-proxy-${name}.service" "lunarwing-weechat-adapter-${name}.service" "lunarwing-weechat-${name}.service" "lunarwing-darkirc-adapter-${name}.service" "lunarwing-darkirc-${name}.service" "lunarwing-nanocode-${name}.service" "lunarwing-pebble-${name}.service" "lunarwing-opencode-${name}.service" "lunarwing-opencode2-${name}.service" "lunarwing-kimi-${name}.service" "lunarwing-vision-${name}.service" "lunarwing-voice-${name}.service" "lunarwing-pg-${name}.service"; do
     if _systemctl_user "$name" is-active --quiet "$svc" 2>/dev/null; then
       _systemctl_user "$name" stop "$svc"
       say "stopped $svc"
@@ -942,6 +952,7 @@ uninstall_tenant_systemd() {
         "$qdir/lunarwing-nanocode-${name}.container" \
         "$qdir/lunarwing-pebble-${name}.container" \
         "$qdir/lunarwing-opencode-${name}.container" \
+        "$qdir/lunarwing-opencode2-${name}.container" \
         "$qdir/lunarwing-kimi-${name}.container" \
         "$qdir/lunarwing-vision-${name}.container" \
         "$qdir/lunarwing-voice-${name}.container"
@@ -949,7 +960,7 @@ uninstall_tenant_systemd() {
     # Retirement preserves stopped Nanocode containers for rollback and manual
     # recovery. Supported workers remain disposable because their state lives
     # in bind-mounted workspaces.
-    for w in pebble opencode kimi; do
+    for w in pebble opencode kimi opencode2; do
       _ctr "$name" rm -f "lunarwing-${w}-${name}" >/dev/null 2>&1 || true
     done
     _ctr "$name" rm -f "lunarwing-vision-${name}" >/dev/null 2>&1 || true

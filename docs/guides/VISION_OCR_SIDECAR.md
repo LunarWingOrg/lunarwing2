@@ -2,7 +2,7 @@
 
 The service in `projects/ocr-sidecar/` provides Tesseract OCR and optional vision-language analysis for LunarWing. The daemon uses it automatically for inbound image attachments when `VISION_SERVICE_URL` is configured; the `vision-analyze` WASM tool uses the same host-injected service URL and credential.
 
-**Revalidated against source 2026-09-12 (v2.1.1.0).** Canonical doc links,
+**Revalidated against source 2026-09-17 (v2.1.2.0).** Canonical doc links,
 endpoint table, `configure-vision-external`/`configure-vision-local` mt-admin
 commands, and the ports-registry guidance were re-checked against the current
 tree; no changes were needed.

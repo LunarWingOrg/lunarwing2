@@ -472,6 +472,7 @@ build_tenant() {
   local with_kimi="${5:-false}"
   local with_toolchains="${6:-false}"
   local require_wasm="${7:-false}"
+  local with_opencode2="${8:-false}"
   local repo
   repo="$(tenant_repo "$name")"
 
@@ -543,6 +544,12 @@ build_tenant() {
     say ""
     say "=== Building kimi worker image ==="
     build_kimi_worker "false" "$with_toolchains" "" "$(tenant_lw_root "$name")"
+  fi
+
+  if [[ "$with_opencode2" == "true" ]]; then
+    say ""
+    say "=== Building opencode2 worker image ==="
+    build_opencode2_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"
   fi
 
   # After a rebuild, the tenant will be restarted with the new binary. If the
@@ -986,11 +993,12 @@ ensure_darkirc_release() {
     || die "DarkIRC release remained invalid after rebuild"
 }
 
-shared_worker_source_root() {  # <names> <with-opencode> <with-kimi>
-  local names="$1" with_opencode="$2" with_kimi="$3"
+shared_worker_source_root() {  # <names> <with-opencode> <with-kimi> <with-opencode2>
+  local names="$1" with_opencode="$2" with_kimi="$3" with_opencode2="${4:-false}"
   local name root commit dirty expected_commit="" selected_root=""
   local -a worker_paths=()
   [[ "$with_opencode" != "true" ]] || worker_paths+=(opencode4lunarwing)
+  [[ "$with_opencode2" != "true" ]] || worker_paths+=(opencode2.4lunarwing)
   [[ "$with_kimi" != "true" ]] || worker_paths+=(kimicode4lunarwing)
   while IFS= read -r name; do
     [[ -n "$name" ]] || continue
@@ -1018,6 +1026,7 @@ build_all() {
   local with_opencode="${3:-false}"
   local with_kimi="${4:-false}"
   local with_toolchains="${5:-false}"
+  local with_opencode2="${6:-false}"
   local names
   names="$(all_tenant_names)"
 
@@ -1027,8 +1036,8 @@ build_all() {
   fi
 
   local worker_source_root=""
-  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" ]]; then
-    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi")"
+  if [[ "$with_opencode" == "true" || "$with_kimi" == "true" || "$with_opencode2" == "true" ]]; then
+    worker_source_root="$(shared_worker_source_root "$names" "$with_opencode" "$with_kimi" "$with_opencode2")"
   fi
 
   if [[ "$with_pebble" == "true" ]]; then
@@ -1047,6 +1056,12 @@ build_all() {
     say ""
     say "=== Building kimi worker image ==="
     build_kimi_worker "false" "$with_toolchains" "" "$worker_source_root"
+  fi
+
+  if [[ "$with_opencode2" == "true" ]]; then
+    say ""
+    say "=== Building opencode2 worker image ==="
+    build_opencode2_worker "false" "$with_toolchains" "$worker_source_root"
   fi
 
   while IFS= read -r name; do
@@ -1128,6 +1143,47 @@ build_opencode_worker() {
   fi
 
   say "opencode worker image built: lunarwing-worker-opencode:latest [$toolchain_desc]"
+}
+
+build_opencode2_worker() {
+  local no_cache="${1:-false}"
+  local with_toolchains="${2:-false}"
+  local source_root="${3:-$LUNARWING_ROOT}"
+  local opencode2_dir="${source_root}/opencode2.4lunarwing"
+
+  [[ -d "$opencode2_dir" ]] || die "opencode2 worker dir not found at $opencode2_dir"
+
+  ensure_container_runtime
+
+  local toolchain_desc="slim (no toolchains)"
+  [[ "$with_toolchains" == "true" ]] && toolchain_desc="fat (with Rust/Go/C++ toolchains)"
+  say "building opencode2 worker Docker image [$toolchain_desc] ..."
+
+  local -a cache_args=()
+  [[ "$no_cache" == "true" ]] && cache_args=(--no-cache)
+
+  local -a toolchain_args=()
+  [[ "$with_toolchains" == "true" ]] && toolchain_args=(--build-arg WITH_TOOLCHAINS=true)
+
+  if [[ "$CONTAINER_RT" == "podman" ]]; then
+    local -a layer_args=()
+    if [[ "$no_cache" == "true" ]]; then
+      # Same dangling-layer hygiene as the v1 worker builder; the v2 build is
+      # an equally large Bun compile.
+      say "pruning dangling Podman images before uncached OpenCode 2 build ..."
+      if ! podman image prune -f >/dev/null; then
+        say "WARNING: failed to prune dangling Podman images; continuing build" >&2
+      fi
+      layer_args=(--layers=false)
+    fi
+    podman build "${cache_args[@]}" "${layer_args[@]}" "${toolchain_args[@]}" --network=host --format docker -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+      || die "opencode2 worker image build failed"
+  else
+    docker build "${cache_args[@]}" "${toolchain_args[@]}" -t lunarwing-worker-opencode2:latest "$opencode2_dir" \
+      || die "opencode2 worker image build failed"
+  fi
+
+  say "opencode2 worker image built: lunarwing-worker-opencode2:latest [$toolchain_desc]"
 }
 
 build_kimi_worker() {

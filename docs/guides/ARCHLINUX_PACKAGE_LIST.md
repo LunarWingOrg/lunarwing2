@@ -3,8 +3,9 @@
 Packages needed to run a live LunarWing multi-tenant deployment on **Arch Linux + systemd** via
 `ic/scripts/lunarwing-mt-admin.sh`, including the infra health-check + self-heal pipeline.
 
-**Revalidated 2026-09-12 (v2.1.1.0).** Package set re-checked against the
-current mt-admin prerequisite probes; no changes were needed.
+**Revalidated 2026-09-17 (v2.1.2.0).** Package set re-checked against the
+current mt-admin prerequisite probes; no changes were needed (the v2.1.2.0
+sandbox rework added no new host packages — podman was already required).
 
 This is the Arch equivalent of [`GENTOO_PACKAGE_LIST.md`](GENTOO_PACKAGE_LIST.md); the operational
 notes there (port registry, per-tenant rustup, doctor output, etc.) apply unchanged. On Arch the
