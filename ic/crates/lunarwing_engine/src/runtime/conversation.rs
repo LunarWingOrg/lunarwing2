@@ -131,6 +131,46 @@ impl ConversationManager {
         Ok(conv_id)
     }
 
+    /// Find an existing conversation for a channel+user pair without creating.
+    ///
+    /// Memory first; on a miss the persisted store is consulted and a hit is
+    /// hydrated into the in-memory index (work item #164: read paths used to
+    /// see only the in-memory map while `get_or_create_conversation` also
+    /// consulted the store — after a restart that raced `bootstrap_user`,
+    /// every message minted a fresh conversation_id, orphaning pending gates
+    /// keyed on the old surface). Misses stay misses: nothing is created.
+    pub async fn find_conversation(
+        &self,
+        channel: &str,
+        user_id: &str,
+    ) -> Option<ConversationSurface> {
+        let key = (channel.to_string(), user_id.to_string());
+        {
+            let index = self.channel_user_index.read().await;
+            if let Some(&conv_id) = index.get(&key) {
+                let convs = self.conversations.read().await;
+                if let Some(conv) = convs.get(&conv_id) {
+                    return Some(conv.clone());
+                }
+            }
+        }
+
+        let persisted = self
+            .store
+            .list_conversations(user_id)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|conv| conv.channel == channel)?;
+        let conv_id = persisted.id;
+
+        let mut convs = self.conversations.write().await;
+        let mut index = self.channel_user_index.write().await;
+        convs.insert(conv_id, persisted.clone());
+        index.insert(key, conv_id);
+        Some(persisted)
+    }
+
     /// Persist a steer note until the conversation's next foreground turn.
     ///
     /// Returns `false` when the bounded pending-note queue is full.
@@ -882,6 +922,59 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(c1, c3); // different channel → different conversation
+    }
+
+    // Work item #164: read paths must hydrate a persisted conversation when
+    // the in-memory index missed (restart racing bootstrap_user), instead of
+    // reporting "no conversation" while get_or_create would have found one —
+    // that asymmetry minted a fresh conversation_id per message and orphaned
+    // pending gates keyed on the old surface.
+    #[tokio::test]
+    async fn find_conversation_hydrates_from_store_after_memory_miss() {
+        let (tm, cm) = make_conv_manager();
+        let original = cm
+            .get_or_create_conversation("gateway:thread-abc", "user1")
+            .await
+            .unwrap();
+
+        // Simulate the restart race: memory index loses the surface while the
+        // store still has it.
+        cm.channel_user_index.write().await.clear();
+        cm.conversations.write().await.clear();
+
+        let found = cm
+            .find_conversation("gateway:thread-abc", "user1")
+            .await
+            .expect("persisted surface must be found");
+        assert_eq!(found.id, original);
+
+        // And the hydration is durable: a subsequent create call reuses it
+        // rather than minting a new surface.
+        let recreated = cm
+            .get_or_create_conversation("gateway:thread-abc", "user1")
+            .await
+            .unwrap();
+        assert_eq!(recreated, original);
+    }
+
+    #[tokio::test]
+    async fn find_conversation_miss_creates_nothing() {
+        let (_, cm) = make_conv_manager();
+        assert!(
+            cm.find_conversation("gateway:never-seen", "user1")
+                .await
+                .is_none()
+        );
+        // Still nothing persisted by the read.
+        let store_ids: Vec<ConversationId> = cm
+            .store
+            .list_conversations("user1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|conv| conv.id)
+            .collect();
+        assert!(store_ids.is_empty());
     }
 
     #[tokio::test]
