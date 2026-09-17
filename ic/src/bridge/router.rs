@@ -241,15 +241,35 @@ async fn insert_and_notify_pending_gate(
     message: &IncomingMessage,
     pending: PendingGate,
 ) -> Result<Option<String>, Error> {
+    insert_and_notify_pending_gate_with(
+        &state.pending_gates,
+        state.sse.as_deref(),
+        channels,
+        message,
+        pending,
+    )
+    .await
+}
+
+/// Core of [`insert_and_notify_pending_gate`] over explicit stores so callers
+/// outside the global engine state (the late-outcome watcher) share the exact
+/// same persistence and notification behavior.
+async fn insert_and_notify_pending_gate_with(
+    pending_gates: &crate::gate::store::PendingGateStore,
+    sse: Option<&SseManager>,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    message: &IncomingMessage,
+    pending: PendingGate,
+) -> Result<Option<String>, Error> {
     let display_parameters = gate_display_parameters(&pending);
 
-    if let Err(error) = state.pending_gates.insert(pending.clone()).await {
-        let existing = state
-            .pending_gates
+    if let Err(error) = pending_gates.insert(pending.clone()).await {
+        let existing = pending_gates
             .list_for_user(&pending.user_id)
             .await
             .into_iter()
             .find(|gate| gate.thread_id == pending.thread_id);
+
         let existing_request_id = existing
             .as_ref()
             .map(|gate| gate.request_id.to_string())
@@ -289,7 +309,7 @@ async fn insert_and_notify_pending_gate(
 
     // GateRequired is a structural engine-gate event with no `StatusUpdate`
     // equivalent, so it stays on the direct SSE path.
-    if let Some(ref sse) = state.sse {
+    if let Some(sse) = sse {
         sse.broadcast_for_user(
             &message.user_id,
             AppEvent::GateRequired {
@@ -814,7 +834,7 @@ async fn resolve_user_project(
 /// Persistent engine state that lives across messages.
 struct EngineState {
     thread_manager: Arc<ThreadManager>,
-    conversation_manager: ConversationManager,
+    conversation_manager: Arc<ConversationManager>,
     effect_adapter: Arc<EffectBridgeAdapter>,
     store: Arc<dyn Store>,
     default_project_id: lunarwing_engine::ProjectId,
@@ -1702,7 +1722,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         }
     };
 
-    let conversation_manager = ConversationManager::new(Arc::clone(&thread_manager), store.clone());
+    let conversation_manager = Arc::new(ConversationManager::new(
+        Arc::clone(&thread_manager),
+        store.clone(),
+    ));
     if let Err(e) = conversation_manager
         .bootstrap_user(&agent.deps.owner_id)
         .await
@@ -3669,6 +3692,11 @@ struct LateOutcomeWatch {
     user_id: String,
     channel: String,
     conversation_scope: Option<String>,
+    /// Enough of the original request to persist a late gate through the
+    /// normal pending-gate path (MR !998 review, P1): gates reached after the
+    /// initial wait must be approvable like any other, which requires the
+    /// source message context `persist_and_notify_thread_gate` consumes.
+    message: IncomingMessage,
 }
 
 /// Keep waiting for a turn that outlived `await_thread_outcome`'s budget and
@@ -3677,71 +3705,170 @@ struct LateOutcomeWatch {
 ///
 /// Mirrors `spawn_expired_gate_outcome_watcher`: poll-then-join so `/interrupt`
 /// stays effective, record the outcome in the conversation, then deliver the
-/// reply through the channel, SSE, and v1 history. A second budget pass gives
-/// up and joins to avoid an unbounded leak.
+/// reply through the channel, SSE, and v1 history. A late gate persists through
+/// the normal pending-gate path so it stays approvable. A second budget pass
+/// stops the thread (bounded, still visible to `/interrupt` while it unwinds)
+/// and joins with a hard cap instead of an unbounded await.
 fn spawn_late_outcome_watcher(
     watch: LateOutcomeWatch,
     channels: std::sync::Arc<crate::channels::ChannelManager>,
     mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) {
     tokio::spawn(async move {
-        let Some(lock) = ENGINE_STATE.get() else {
-            return;
+        // Clone the handles the watcher needs, then release the state read
+        // guard: the poll loop below can run for the full watch budget and the
+        // guard must not be held across it (MR !998 review, P2).
+        let handles = {
+            let Some(lock) = ENGINE_STATE.get() else {
+                return;
+            };
+            let guard = lock.read().await;
+            let Some(state) = guard.as_ref() else {
+                return;
+            };
+            LateOutcomeHandles {
+                thread_manager: Arc::clone(&state.thread_manager),
+                conversation_manager: Arc::clone(&state.conversation_manager),
+                pending_gates: Arc::clone(&state.pending_gates),
+                effect_adapter: Arc::clone(&state.effect_adapter),
+                pending_gate_expiry: state.pending_gate_expiry,
+                sse: state.sse.clone(),
+                db: state.db.clone(),
+            }
         };
-        let guard = lock.read().await;
-        let Some(state) = guard.as_ref() else {
-            return;
-        };
+        await_late_outcome(&handles, watch, &channels, &mut event_rx).await;
+    });
+}
 
-        const WATCH_TIMEOUT_SECS: u64 =
-            lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(WATCH_TIMEOUT_SECS);
+/// Immutable handles out of `EngineState` so the detached watcher does not pin
+/// the global state read guard while it polls for the late outcome.
+struct LateOutcomeHandles {
+    thread_manager: Arc<ThreadManager>,
+    conversation_manager: Arc<ConversationManager>,
+    pending_gates: Arc<crate::gate::store::PendingGateStore>,
+    effect_adapter: Arc<EffectBridgeAdapter>,
+    pending_gate_expiry: chrono::Duration,
+    sse: Option<Arc<SseManager>>,
+    db: Option<Arc<dyn Database>>,
+}
 
-        // Poll-then-join like `await_thread_outcome`: joining a live thread
-        // would remove it from the running map and hide it from /interrupt.
-        while state.thread_manager.is_running(watch.thread_id).await {
-            if tokio::time::Instant::now() >= deadline {
+/// How long the watcher waits after the caller's budget expired before it
+/// force-stops the turn: one more orchestrator budget plus delivery grace.
+const LATE_WATCH_TIMEOUT_SECS: u64 =
+    lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
+
+fn late_outcome_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + std::time::Duration::from_secs(LATE_WATCH_TIMEOUT_SECS)
+}
+
+/// Poll the late thread until it finishes or the second budget expires; on the
+/// second budget stop the thread so the final join stays bounded and the task
+/// remains visible to `/interrupt` while it unwinds.
+async fn poll_then_stop_or_finish(
+    handles: &LateOutcomeHandles,
+    watch: &LateOutcomeWatch,
+    deadline: tokio::time::Instant,
+) {
+    // Poll-then-join like `await_thread_outcome`: joining a live thread would
+    // remove it from the running map and hide it from /interrupt.
+    while handles.thread_manager.is_running(watch.thread_id).await {
+        if tokio::time::Instant::now() >= deadline {
+            // Second budget exhausted. An unbounded join here would hide a
+            // genuinely stuck task from /interrupt while the watcher hangs on
+            // its handle (MR !998 review, P2). Stop instead: cancellation
+            // drops in-flight provider/tool work, the stop signal unwinds the
+            // loop between steps, and the thread stays in the running map
+            // until it actually ends. The join below is bounded either way.
+            tracing::warn!(
+                thread_id = %watch.thread_id,
+                timeout_secs = LATE_WATCH_TIMEOUT_SECS,
+                "late-outcome watcher timed out — stopping the thread to avoid an unbounded join"
+            );
+            if let Err(error) = handles
+                .thread_manager
+                .stop_thread(watch.thread_id, &watch.user_id)
+                .await
+            {
                 tracing::warn!(
                     thread_id = %watch.thread_id,
-                    timeout_secs = WATCH_TIMEOUT_SECS,
-                    "late-outcome watcher timed out — joining to avoid a leak"
-                );
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-
-        let outcome = match state.thread_manager.join_thread(watch.thread_id).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                debug!(
-                    thread_id = %watch.thread_id,
                     %error,
-                    "late-outcome watcher failed to join thread"
+                    "late-outcome watcher failed to stop the thread"
                 );
-                return;
             }
-        };
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
 
-        if let Err(error) = state
-            .conversation_manager
-            .record_thread_outcome(watch.conversation_id, watch.thread_id, &outcome)
-            .await
-        {
+/// How long the final join may block after a force-stop before the watcher
+/// gives up and reports the leak instead of hanging forever.
+const LATE_JOIN_GRACE_SECS: u64 = 60;
+
+/// Wait for a late turn to finish (or stop it past the second budget), record
+/// the outcome, and deliver it to the conversation, channel, SSE, and v1
+/// history. Gates persist through the normal pending-gate path.
+async fn await_late_outcome(
+    handles: &LateOutcomeHandles,
+    watch: LateOutcomeWatch,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    event_rx: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+) {
+    let deadline = late_outcome_deadline();
+    poll_then_stop_or_finish(handles, &watch, deadline).await;
+
+    let joined = tokio::time::timeout(
+        std::time::Duration::from_secs(LATE_JOIN_GRACE_SECS),
+        handles.thread_manager.join_thread(watch.thread_id),
+    )
+    .await;
+    let outcome = match joined {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
             debug!(
                 thread_id = %watch.thread_id,
                 %error,
-                "late-outcome watcher failed to record outcome"
+                "late-outcome watcher failed to join thread"
             );
+            return;
         }
+        Err(_) => {
+            tracing::error!(
+                thread_id = %watch.thread_id,
+                join_grace_secs = LATE_JOIN_GRACE_SECS,
+                "late-outcome watcher join exceeded its grace — thread leaked, abandoning delivery"
+            );
+            return;
+        }
+    };
 
-        let tid_str = watch.thread_id.to_string();
-        if let ThreadOutcome::GatePaused { .. } = outcome {
-            // A late gate cannot prompt through this watcher (it needs the
-            // full gate persistence path); surface it as a status instead so
-            // the user knows the turn is waiting on them.
-            if let Some(ref sse) = state.sse {
+    if let Err(error) = handles
+        .conversation_manager
+        .record_thread_outcome(watch.conversation_id, watch.thread_id, &outcome)
+        .await
+    {
+        debug!(
+            thread_id = %watch.thread_id,
+            %error,
+            "late-outcome watcher failed to record outcome"
+        );
+    }
+
+    let tid_str = watch.thread_id.to_string();
+    if let ThreadOutcome::GatePaused { .. } = outcome {
+        // A gate reached after the initial wait must land in the pending-gate
+        // store like any other, or it can never be approved or resumed (MR
+        // !998 review, P1). Rebuild the per-outcome gate through the same
+        // persistence + notification path the normal flow uses.
+        if let Err(error) =
+            persist_and_notify_late_thread_gate(handles, channels, &watch, outcome).await
+        {
+            tracing::warn!(
+                thread_id = %watch.thread_id,
+                %error,
+                "late-outcome watcher failed to persist late gate — falling back to a status notice"
+            );
+            if let Some(ref sse) = handles.sse {
                 sse.broadcast_for_user(
                     &watch.user_id,
                     AppEvent::Status {
@@ -3750,60 +3877,190 @@ fn spawn_late_outcome_watcher(
                     },
                 );
             }
-            return;
         }
+        return;
+    }
 
-        let text = thread_outcome_response(&outcome).unwrap_or_default();
-        if text.is_empty() {
-            return;
-        }
+    let text = thread_outcome_response(&outcome).unwrap_or_default();
+    if text.is_empty() {
+        return;
+    }
 
-        // v1 history so the late reply shows up in the history API too.
-        if let Some(ref db) = state.db {
-            let v1_conv_id = match &watch.conversation_scope {
-                Some(scope) => db
-                    .get_or_create_scoped_conversation(&watch.channel, &watch.user_id, scope)
-                    .await
-                    .ok(),
-                None => db
-                    .get_or_create_assistant_conversation(&watch.user_id, &watch.channel)
-                    .await
-                    .ok(),
-            };
-            if let Some(cid) = v1_conv_id
-                && let Err(error) = db.add_conversation_message(cid, "assistant", &text).await
-            {
-                tracing::warn!(%error, "failed to persist late Engine V2 reply");
-            }
-        }
-
-        if let Err(error) = channels
-            .broadcast(
-                &watch.channel,
-                &watch.user_id,
-                OutgoingResponse::text(text.clone()),
-            )
-            .await
+    // v1 history so the late reply shows up in the history API too.
+    if let Some(ref db) = handles.db {
+        let v1_conv_id = match &watch.conversation_scope {
+            Some(scope) => db
+                .get_or_create_scoped_conversation(&watch.channel, &watch.user_id, scope)
+                .await
+                .ok(),
+            None => db
+                .get_or_create_assistant_conversation(&watch.user_id, &watch.channel)
+                .await
+                .ok(),
+        };
+        if let Some(cid) = v1_conv_id
+            && let Err(error) = db.add_conversation_message(cid, "assistant", &text).await
         {
-            debug!(
-                channel = %watch.channel,
-                %error,
-                "failed to deliver late outcome to channel"
-            );
+            tracing::warn!(%error, "failed to persist late Engine V2 reply");
         }
+    }
 
-        if let Some(ref sse) = state.sse {
-            sse.broadcast_for_user(
-                &watch.user_id,
-                AppEvent::Response {
-                    content: text,
-                    thread_id: tid_str,
-                },
-            );
-        }
-        // Drain the retained receiver so its buffer does not pin events.
-        while let Ok(_evt) = event_rx.try_recv() {}
-    });
+    if let Err(error) = channels
+        .broadcast(
+            &watch.channel,
+            &watch.user_id,
+            OutgoingResponse::text(text.clone()),
+        )
+        .await
+    {
+        debug!(
+            channel = %watch.channel,
+            %error,
+            "failed to deliver late outcome to channel"
+        );
+    }
+
+    if let Some(ref sse) = handles.sse {
+        sse.broadcast_for_user(
+            &watch.user_id,
+            AppEvent::Response {
+                content: text,
+                thread_id: tid_str,
+            },
+        );
+    }
+    // Drain the retained receiver so its buffer does not pin events.
+    while let Ok(_evt) = event_rx.try_recv() {}
+}
+
+/// Persist and notify a gate that arrived after `await_thread_outcome`'s
+/// budget, mirroring `persist_and_notify_thread_gate` (WI#164 / MR !998 P1):
+/// the gate must be approvable through the normal handlers, appear in the
+/// pending-gates API, and prompt on its source channel.
+async fn persist_and_notify_late_thread_gate(
+    handles: &LateOutcomeHandles,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    watch: &LateOutcomeWatch,
+    outcome: ThreadOutcome,
+) -> Result<(), Error> {
+    let ThreadOutcome::GatePaused {
+        gate_name,
+        action_name,
+        call_id,
+        parameters,
+        resume_kind,
+        resume_output,
+    } = outcome
+    else {
+        return Err(engine_err(
+            "late gate outcome",
+            "expected ThreadOutcome::GatePaused",
+        ));
+    };
+
+    if shared_channel_blocks_gate(&watch.message, &resume_kind) {
+        finalize_late_silently_stopped_thread(handles, watch).await?;
+        let notice = format!(
+            "Tool '{}' requires approval and cannot run in shared channels. Ask the user to message me directly (DM) to use this tool.",
+            action_name
+        );
+        deliver_late_gate_notice(handles, channels, watch, notice).await;
+        return Ok(());
+    }
+
+    let redacted_params = if let Some(tool) = handles.effect_adapter.tools().get(&action_name).await
+    {
+        crate::tools::redact_params(&parameters, tool.sensitive_params())
+    } else {
+        parameters.clone()
+    };
+
+    let pending = PendingGate {
+        request_id: uuid::Uuid::new_v4(),
+        gate_name: gate_name.clone(),
+        user_id: watch.user_id.clone(),
+        thread_id: watch.thread_id,
+        conversation_id: watch.conversation_id,
+        source_channel: watch.channel.clone(),
+        action_name: action_name.clone(),
+        call_id,
+        parameters,
+        display_parameters: Some(redacted_params),
+        description: format!(
+            "Tool '{}' requires {} (gate: {gate_name})",
+            action_name,
+            resume_kind.kind_name()
+        ),
+        resume_kind,
+        created_at: chrono::Utc::now(),
+        expires_at: chrono::Utc::now() + handles.pending_gate_expiry,
+        original_message: None,
+        resume_output,
+    };
+    insert_and_notify_pending_gate_with(
+        &handles.pending_gates,
+        handles.sse.as_deref(),
+        channels,
+        &watch.message,
+        pending,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// `finalize_silently_stopped_thread` over the detached watcher's handles.
+async fn finalize_late_silently_stopped_thread(
+    handles: &LateOutcomeHandles,
+    watch: &LateOutcomeWatch,
+) -> Result<(), Error> {
+    handles
+        .thread_manager
+        .finalize_waiting_thread_as_stopped(watch.thread_id, &watch.user_id)
+        .await
+        .map_err(|error| engine_err("finalize stopped thread", error))?;
+    handles
+        .conversation_manager
+        .record_thread_outcome(
+            watch.conversation_id,
+            watch.thread_id,
+            &ThreadOutcome::Stopped,
+        )
+        .await
+        .map_err(|error| engine_err("untrack stopped thread", error))
+}
+
+/// Deliver a terminal notice for a late gate the watcher could not persist
+/// (shared-channel block): channel broadcast plus SSE, mirroring the normal
+/// path's return-text semantics for that branch.
+async fn deliver_late_gate_notice(
+    handles: &LateOutcomeHandles,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    watch: &LateOutcomeWatch,
+    notice: String,
+) {
+    if let Err(error) = channels
+        .broadcast(
+            &watch.channel,
+            &watch.user_id,
+            OutgoingResponse::text(notice.clone()),
+        )
+        .await
+    {
+        debug!(
+            channel = %watch.channel,
+            %error,
+            "failed to deliver late gate notice to channel"
+        );
+    }
+    if let Some(ref sse) = handles.sse {
+        sse.broadcast_for_user(
+            &watch.user_id,
+            AppEvent::Response {
+                content: notice,
+                thread_id: watch.thread_id.to_string(),
+            },
+        );
+    }
 }
 
 async fn handle_user_message_with_event_receiver(
@@ -3900,6 +4157,7 @@ async fn await_thread_outcome(
                             user_id: message.user_id.clone(),
                             channel: message.channel.clone(),
                             conversation_scope: message.conversation_scope().map(String::from),
+                            message: message.clone(),
                         },
                         Arc::clone(&agent.channels),
                         event_rx,
@@ -6782,6 +7040,277 @@ mod tests {
         );
     }
 
+    /// Handles out of a test `EngineState` for driving `await_late_outcome`
+    /// directly (the spawned watcher reads the global engine state, which unit
+    /// tests do not install).
+    fn late_outcome_handles(state: &EngineState) -> LateOutcomeHandles {
+        LateOutcomeHandles {
+            thread_manager: Arc::clone(&state.thread_manager),
+            conversation_manager: Arc::clone(&state.conversation_manager),
+            pending_gates: Arc::clone(&state.pending_gates),
+            effect_adapter: Arc::clone(&state.effect_adapter),
+            pending_gate_expiry: state.pending_gate_expiry,
+            sse: state.sse.clone(),
+            db: state.db.clone(),
+        }
+    }
+
+    /// Captured `send_status` deliveries (approval prompts ride this path,
+    /// not `broadcast`).
+    type StatusCapture = Arc<TokioMutex<Vec<crate::channels::StatusUpdate>>>;
+
+    struct RecordingStatusChannel {
+        statuses: StatusCapture,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::channels::Channel for RecordingStatusChannel {
+        fn name(&self) -> &str {
+            "gateway"
+        }
+        async fn start(
+            &self,
+        ) -> Result<crate::channels::MessageStream, crate::error::ChannelError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel::<IncomingMessage>(1);
+            Ok(Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx)))
+        }
+        async fn respond(
+            &self,
+            _msg: &IncomingMessage,
+            _response: crate::channels::OutgoingResponse,
+        ) -> Result<(), crate::error::ChannelError> {
+            Ok(())
+        }
+        async fn send_status(
+            &self,
+            status: crate::channels::StatusUpdate,
+            _metadata: &serde_json::Value,
+        ) -> Result<(), crate::error::ChannelError> {
+            self.statuses.lock().await.push(status);
+            Ok(())
+        }
+        async fn broadcast(
+            &self,
+            _user_id: &str,
+            _response: crate::channels::OutgoingResponse,
+        ) -> Result<(), crate::error::ChannelError> {
+            Ok(())
+        }
+        async fn health_check(&self) -> Result<(), crate::error::ChannelError> {
+            Ok(())
+        }
+    }
+
+    /// MR !998 review P1: a gate reached after `await_thread_outcome`'s budget
+    /// must land in the pending-gate store (approvable through the normal
+    /// handlers, visible to the pending-gates API) instead of being reduced to
+    /// a fire-and-forget status notice.
+    #[tokio::test]
+    async fn late_outcome_watcher_persists_gate_paused_as_pending_gate() {
+        use futures::StreamExt;
+
+        let store = Arc::new(TestStore::new());
+        let mut state = make_expected_test_state(store.clone());
+        let gates = Arc::new(crate::gate::store::PendingGateStore::in_memory());
+        state.pending_gates = Arc::clone(&gates);
+        let sse = Arc::new(SseManager::new());
+        let mut sse_events = sse
+            .subscribe_raw(Some("alice".to_string()))
+            .expect("SSE subscription should be available");
+        state.sse = Some(sse);
+        let handles = late_outcome_handles(&state);
+
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let statuses: StatusCapture = Arc::new(TokioMutex::new(Vec::new()));
+        channels
+            .add(Box::new(RecordingStatusChannel {
+                statuses: Arc::clone(&statuses),
+            }))
+            .await;
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let message = IncomingMessage::new("gateway", "alice", "run the tool")
+            .with_conversation_scope("thread-late");
+        let watch = LateOutcomeWatch {
+            thread_id: thread.id,
+            conversation_id: state
+                .conversation_manager
+                .get_or_create_conversation("gateway:thread-late", "alice")
+                .await
+                .unwrap(),
+            user_id: "alice".into(),
+            channel: "gateway".into(),
+            conversation_scope: Some("thread-late".into()),
+            message,
+        };
+
+        let outcome = ThreadOutcome::GatePaused {
+            gate_name: "approval".into(),
+            action_name: "shell".into(),
+            call_id: format!("call-{}", thread.id),
+            parameters: serde_json::json!({"cmd": "ls"}),
+            resume_kind: lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+            resume_output: None,
+        };
+
+        persist_and_notify_late_thread_gate(&handles, &channels, &watch, outcome)
+            .await
+            .expect("late gate should persist");
+
+        // The gate is in the store, keyed like any other, and approvable
+        // through the normal resolution path.
+        let listed = gates.list_for_user("alice").await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].thread_id, thread.id);
+        assert_eq!(listed[0].action_name, "shell");
+        assert_eq!(listed[0].source_channel, "gateway");
+        assert_eq!(
+            listed[0].description,
+            "Tool 'shell' requires approval (gate: approval)"
+        );
+
+        // The gateway was notified with the structural GateRequired event.
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), sse_events.next())
+            .await
+            .expect("GateRequired should be broadcast")
+            .expect("SSE stream should remain open");
+        assert!(matches!(
+            event,
+            crate::channels::web::types::SseEvent::GateRequired { ref tool_name, .. }
+                if tool_name == "shell"
+        ));
+
+        // The channel saw the approval prompt (status path, not the old
+        // generic status notice).
+        let delivered = statuses.lock().await;
+        assert!(
+            delivered
+                .iter()
+                .any(|status| matches!(status, crate::channels::StatusUpdate::ApprovalNeeded { tool_name, .. } if tool_name == "shell")),
+            "approval prompt should reach the source channel: {delivered:?}"
+        );
+    }
+
+    /// MR !998 review P2: past the second budget the watcher must stop the
+    /// thread (visible to `/interrupt` until it unwinds) and join with a hard
+    /// cap — never an unbounded join on a possibly-stuck task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_outcome_watcher_stops_stuck_thread_instead_of_unbounded_join() {
+        use std::time::Duration;
+
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+        let handles = late_outcome_handles(&state);
+
+        // A thread whose run future never finishes: spawn a real engine thread
+        // whose LLM blocks forever, then drive the watcher with a shrunken
+        // deadline by calling its poll/join body with an already-past deadline
+        // is not possible with the const; instead prove the mechanism — the
+        // watcher stops the thread and the join resolves as Stopped promptly.
+        struct BlockingLlm;
+        #[async_trait::async_trait]
+        impl lunarwing_engine::LlmBackend for BlockingLlm {
+            async fn complete(
+                &self,
+                _: &[lunarwing_engine::ThreadMessage],
+                _: &[lunarwing_engine::ActionDef],
+                _: &lunarwing_engine::LlmCallConfig,
+            ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+                futures::future::pending::<()>().await;
+                unreachable!("pending future never resolves")
+            }
+            fn model_name(&self) -> &str {
+                "blocking"
+            }
+        }
+        struct BlockingEffects;
+        #[async_trait::async_trait]
+        impl lunarwing_engine::EffectExecutor for BlockingEffects {
+            async fn execute_action(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &lunarwing_engine::CapabilityLease,
+                _: &lunarwing_engine::ThreadExecutionContext,
+            ) -> Result<lunarwing_engine::ActionResult, lunarwing_engine::EngineError> {
+                unreachable!()
+            }
+            async fn available_actions(
+                &self,
+                _: &[lunarwing_engine::CapabilityLease],
+            ) -> Result<Vec<lunarwing_engine::ActionDef>, lunarwing_engine::EngineError>
+            {
+                Ok(vec![])
+            }
+        }
+
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let blocking_tm = Arc::new(ThreadManager::new(
+            Arc::new(BlockingLlm),
+            Arc::new(BlockingEffects),
+            store_dyn.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mut thread = lunarwing_engine::Thread::new(
+            "stuck",
+            lunarwing_engine::ThreadType::Foreground,
+            state.default_project_id,
+            "alice",
+            ThreadConfig::default(),
+        );
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Running, None)
+            .unwrap();
+        thread
+            .transition_to(lunarwing_engine::ThreadState::Waiting, None)
+            .unwrap();
+        store_dyn.save_thread(&thread).await.unwrap();
+        let thread_id = thread.id;
+        blocking_tm
+            .resume_thread(thread.id, "alice".to_string(), None, None, None)
+            .await
+            .expect("resume should spawn the blocking run");
+        assert!(blocking_tm.is_running(thread_id).await);
+
+        let mut blocking_handles = handles;
+        blocking_handles.thread_manager = blocking_tm;
+        let watch = LateOutcomeWatch {
+            thread_id,
+            conversation_id: lunarwing_engine::ConversationId::new(),
+            user_id: "alice".into(),
+            channel: "gateway".into(),
+            conversation_scope: None,
+            message: IncomingMessage::new("gateway", "alice", "stuck"),
+        };
+
+        // Drive the real watcher poll body with a deadline that has already
+        // passed: it must stop the still-running thread (bounded, interrupt-
+        // visible) instead of blocking on an unbounded join.
+        let started = std::time::Instant::now();
+        poll_then_stop_or_finish(
+            &blocking_handles,
+            &watch,
+            tokio::time::Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+
+        let joined = tokio::time::timeout(
+            Duration::from_secs(30),
+            blocking_handles.thread_manager.join_thread(thread_id),
+        )
+        .await
+        .expect("bounded join must resolve after stop");
+        assert!(started.elapsed() < Duration::from_secs(30));
+        assert!(matches!(
+            joined.expect("thread should join"),
+            ThreadOutcome::Stopped
+        ));
+    }
+
     #[tokio::test]
     async fn resolve_pending_gate_detects_ambiguity_without_thread_hint() {
         let store = crate::gate::store::PendingGateStore::in_memory();
@@ -7047,7 +7576,7 @@ mod tests {
             Arc::new(PolicyEngine::new()),
         ));
 
-        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+        let cm = Arc::new(ConversationManager::new(Arc::clone(&tm), store_dyn.clone()));
 
         EngineState {
             thread_manager: tm,
@@ -8532,7 +9061,7 @@ mod tests {
             Arc::new(PolicyEngine::new()),
         ));
 
-        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+        let cm = Arc::new(ConversationManager::new(Arc::clone(&tm), store_dyn.clone()));
 
         EngineState {
             thread_manager: tm,
