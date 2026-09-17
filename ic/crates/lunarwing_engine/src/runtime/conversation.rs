@@ -145,13 +145,19 @@ impl ConversationManager {
         user_id: &str,
     ) -> Option<ConversationSurface> {
         let key = (channel.to_string(), user_id.to_string());
-        {
+        // Lock order across this type is conversations → index (bootstrap_user,
+        // get_or_create_conversation). Holding the index guard while awaiting
+        // the conversations guard inverts that order and can deadlock against
+        // a concurrent create/hydration, so release it before reading the
+        // conversation surface (MR !998 review, P1).
+        let indexed = {
             let index = self.channel_user_index.read().await;
-            if let Some(&conv_id) = index.get(&key) {
-                let convs = self.conversations.read().await;
-                if let Some(conv) = convs.get(&conv_id) {
-                    return Some(conv.clone());
-                }
+            index.get(&key).copied()
+        };
+        if let Some(conv_id) = indexed {
+            let convs = self.conversations.read().await;
+            if let Some(conv) = convs.get(&conv_id) {
+                return Some(conv.clone());
             }
         }
 
@@ -975,6 +981,53 @@ mod tests {
             .map(|conv| conv.id)
             .collect();
         assert!(store_ids.is_empty());
+    }
+
+    // MR !998 review P1: find_conversation must not hold the index read guard
+    // while awaiting the conversations guard. The established lock order is
+    // conversations → index (bootstrap_user, get_or_create_conversation); a
+    // concurrent find (index → conversations) and create/hydration
+    // (conversations → index) used to wait on each other forever. This test
+    // interleaves a lookup against a creation holding the conversations write
+    // lock and fails (times out) if the lookup inverts the order again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn find_conversation_does_not_deadlock_against_concurrent_create() {
+        let (_, cm) = make_conv_manager();
+        let cm = std::sync::Arc::new(cm);
+        let cm2 = std::sync::Arc::clone(&cm);
+
+        // Seed the index for the key, then park a writer on the conversations
+        // lock so the lookup's conversations read must queue behind it.
+        let conv_id = cm
+            .get_or_create_conversation("web", "user1")
+            .await
+            .unwrap();
+
+        let conversations_guard = cm.conversations.write().await;
+        let lookup = tokio::spawn(async move {
+            // With the inverted order this awaits the conversations lock while
+            // still holding the index read guard; the assertion below then
+            // needs the index lock and both tasks block forever.
+            cm2.find_conversation("web", "user1").await
+        });
+
+        // Give the lookup a chance to (wrongly) park on conversations while
+        // holding index; then prove index is still reachable.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let index = cm.channel_user_index.try_read().expect(
+            "index lock must stay reachable while find_conversation resolves; \
+             inverted lock order would deadlock here",
+        );
+        assert_eq!(index.get(&("web".to_string(), "user1".to_string())), Some(&conv_id));
+        drop(index);
+        drop(conversations_guard);
+
+        let found = tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
+            .await
+            .expect("find_conversation must complete once conversations is released")
+            .expect("lookup task must not panic")
+            .expect("indexed conversation must be found");
+        assert_eq!(found.id, conv_id);
     }
 
     #[tokio::test]
