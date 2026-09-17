@@ -101,8 +101,7 @@
 28. [ ] Last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/997 and branch was aj/kimi-28-20260917-0600 - REJECTED - Feedback: see comments on MR linked for feedback and what needs to be addresed - re-attempt - Original Task Description: Fix CI/CD issues - use #3742 now as reference pipeline - if no issues have happened, feel free to find 5 suggested ways to improve CI/CD as a whole and do your usual work with this goal in mind
 29. [x] (S) reminder to ask sb about name ideas
 30. [ ] create CI/CD pipeline jobs for opencode2 - we only have kimi, pebble, opencode rn
-31. [ ] Last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/998 and branch was rarity/kimi-31-20260917-0601 - REJECTED - Feedback: see comments on MR linked for feedback and what needs to be addresed - re-attempt - Original Task Description: Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/164 - comments must be read as well, attached as images (BOTH NOW TRANSCRIBED AS COMMENT)
-32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/163
+31. [ ] Last attempt: https://git.lunarwing.org/lunarwing/lunarwing2/-/merge_requests/998 and branch was rarity/kimi-31-20260917-0601 - REJECTED - Feedback: see comments on MR linked for feedback and what needs to be addresed - re-attempt - Original Task Description: Work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/164 - comments must be read as well, attached as images (BOTH NOW TRANSCRIBED AS COMMENT)32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/163
 33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/162
 34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
 35. [x] (S) Reserved4otherworkitems
