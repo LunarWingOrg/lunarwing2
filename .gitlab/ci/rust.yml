@@ -110,6 +110,10 @@ rust-msrv-check:
     - .rust-msrv-job
     - .observational-job
   stage: check
+  # Compiles the lunarwing lib on the same runner host; joins the compile
+  # resource group so an overlapping MSRV check cannot OOM-kill a blocking
+  # job (the OOM killer picks the biggest process, not the guilty one).
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   timeout: 2h
