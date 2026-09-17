@@ -998,10 +998,7 @@ mod tests {
 
         // Seed the index for the key, then park a writer on the conversations
         // lock so the lookup's conversations read must queue behind it.
-        let conv_id = cm
-            .get_or_create_conversation("web", "user1")
-            .await
-            .unwrap();
+        let conv_id = cm.get_or_create_conversation("web", "user1").await.unwrap();
 
         let conversations_guard = cm.conversations.write().await;
         let lookup = tokio::spawn(async move {
@@ -1018,7 +1015,10 @@ mod tests {
             "index lock must stay reachable while find_conversation resolves; \
              inverted lock order would deadlock here",
         );
-        assert_eq!(index.get(&("web".to_string(), "user1".to_string())), Some(&conv_id));
+        assert_eq!(
+            index.get(&("web".to_string(), "user1".to_string())),
+            Some(&conv_id)
+        );
         drop(index);
         drop(conversations_guard);
 
