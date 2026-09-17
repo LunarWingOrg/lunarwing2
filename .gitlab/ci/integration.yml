@@ -30,6 +30,11 @@ cavepony-wasm:
     - .rust-job
     - .full-validation-context
   stage: test
+  # The wit_compat step compiles the lunarwing lib test binary (the same
+  # giant-crates rustc as the check/test jobs), so this job shares the
+  # project-wide compile resource group — without it an overlapping pipeline
+  # can still OOM-kill rustc (MR !997 review P2).
+  resource_group: rust-compile-16gb
   variables:
     CAVEPONY_EXPECTED_VERSION: "0.4.2"
     CAVEPONY_WASM_REQUIRED: "1"
