@@ -109,6 +109,7 @@
 32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/163
 33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/162
 34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
+    - IN PROGRESS 2026-09-17 (`a/goal34/v2.1.2.0`): fixed name-only/final argument assembly and CodeAct nested-fence truncation; added pre-execution REPL argument validation, a distinct bounded repair failure, and `repl_argument_corruption_total` in tenant-aware stream telemetry. Passed: engine 592/592, LLM/provider 598/598, bridge 13/13, real HTTP/SSE integration 6/6, health/export 18/18, clippy `-D warnings`, rustfmt, and targeted ShellCheck. Fresh live-tenant verification is still blocked by this session's `NoNewPrivileges` restriction on sudo; goal remains unchecked. Evidence and prepared host helper: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 35. [x] (S) Reserved4otherworkitems
 36. [ ] investigate https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 and create document in docs/ops detailing status of voice api as it stands in relation to the description of the work item
 37. [x] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
@@ -135,4 +136,3 @@
 50. [x] (S) RESERVED
 
 ---
-

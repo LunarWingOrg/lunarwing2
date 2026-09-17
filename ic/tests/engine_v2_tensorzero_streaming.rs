@@ -503,6 +503,67 @@ async fn fragmented_tool_fields_reconstruct_one_action_and_structured_result() {
     env.cleanup().await;
 }
 
+#[tokio::test]
+async fn corrupted_repl_arguments_recover_through_real_sse_without_executing() {
+    for arguments in [
+        "null".to_string(),
+        "{\"code\": </think>poisoned-draft}".to_string(),
+        json!({"code": "</think>print('poisoned-draft')\n</arg_value>"}).to_string(),
+        json!({"code": "print('poisoned-draft')\n```repl\nprint(2)"}).to_string(),
+    ] {
+        assert_repl_recovery_over_sse(&arguments).await;
+    }
+}
+
+async fn assert_repl_recovery_over_sse(arguments: &str) {
+    let _lock = ENGINE_V2_ENV_LOCK.lock().await;
+    let env = EngineV2EnvGuard::enable(Some("gateway"));
+    lunarwing::bridge::reset_engine_state().await;
+    let mut corrupted = vec![tool_delta(Some("bad-repl"), Some("repl"), Some(""), None)];
+    for character in arguments.chars() {
+        corrupted.push(tool_delta(None, None, Some(&character.to_string()), None));
+    }
+    corrupted.extend([
+        tool_delta(None, None, None, Some("tool_calls")),
+        usage_chunk(10, 5),
+        SseFrame::done(),
+    ]);
+    let fixture = TensorZeroFixture::start(vec![
+        corrupted,
+        fragmented_tool_script(),
+        terminal_script("repl-repaired", 13, 4),
+    ])
+    .await;
+    let executions = Arc::new(AtomicUsize::new(0));
+    let rig = TestRigBuilder::new()
+        .with_channel_name("gateway")
+        .with_llm(fixture.provider())
+        .with_extra_tools(vec![Arc::new(EchoTool {
+            executions: executions.clone(),
+        })])
+        .build()
+        .await;
+    let thread_id = Uuid::new_v4();
+    register_gateway_thread(&rig, thread_id).await;
+    rig.send_incoming(gateway_message(
+        thread_id,
+        "run the echo tool, recovering any malformed draft",
+    ))
+    .await;
+    let responses = rig.wait_for_responses(1, Duration::from_secs(15)).await;
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0].content, "repl-repaired");
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.request_count(), 3);
+    let requests = fixture.captured_requests();
+    let repair_messages = requests[1]["messages"].to_string();
+    assert!(repair_messages.contains("REPL argument corruption"));
+    assert!(!repair_messages.contains("poisoned-draft"));
+    assert!(!repair_messages.contains("bad-repl"));
+    rig.shutdown_and_wait().await;
+    env.cleanup().await;
+}
+
 async fn assert_strict_stream_failure(script: Vec<SseFrame>) {
     let _lock = ENGINE_V2_ENV_LOCK.lock().await;
     let env = EngineV2EnvGuard::enable(Some("gateway"));

@@ -39,10 +39,11 @@ pub(crate) const MAX_RETRY_AFTER_SECS: u64 = 3600;
 /// `SessionRenewalFailed`, `Http`, `Io`.
 ///
 /// Non-retryable: `AuthFailed`, `SessionExpired`, `ContextLengthExceeded`,
-/// `ModelNotAvailable`, `Json`.
+/// `ModelNotAvailable`, `Json`, `ReplArgumentCorruption`.
 /// - `SessionExpired` — handled by session renewal layer, not by retry
 /// - `ModelNotAvailable` — the model won't appear between attempts
 /// - `Json` — a serde parse bug, not a transient failure
+/// - `ReplArgumentCorruption` — the engine owns the bounded, model-visible repair
 ///
 /// See also `circuit_breaker::is_transient()` which answers a different
 /// question: "does this error indicate the backend is degraded?"
@@ -58,6 +59,7 @@ pub(crate) fn is_retryable(err: &LlmError) -> bool {
         | LlmError::SessionExpired { .. }
         | LlmError::ContextLengthExceeded { .. }
         | LlmError::ModelNotAvailable { .. }
+        | LlmError::ReplArgumentCorruption { .. }
         | LlmError::Json(_) => false,
     }
 }

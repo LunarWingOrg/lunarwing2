@@ -4,6 +4,9 @@ use futures::StreamExt;
 
 use crate::traits::llm::{LlmOutput, LlmStream, LlmStreamChunk, ProviderStreamObservation};
 use crate::types::error::{EngineError, ModelFailureKind};
+use crate::types::repl::{
+    ReplArgumentCorruption, extract_repl_code, is_repl_action, validate_repl_arguments,
+};
 use crate::types::step::{ActionCall, LlmResponse, TokenUsage};
 
 pub(super) struct LlmStreamCollection {
@@ -117,6 +120,7 @@ impl StreamAccumulator {
         let response = if corrupted {
             LlmResponse::Text(self.text)
         } else if self.tool_calls.is_empty() {
+            extract_repl_code(&self.text)?;
             LlmResponse::from_text(self.text)
         } else {
             let mut calls = Vec::with_capacity(self.tool_calls.len());
@@ -143,10 +147,16 @@ impl ToolCallAccumulator {
             .name
             .ok_or_else(|| llm_error(format!("tool call at index {index} is missing a name")))?;
         let parameters = serde_json::from_str(&self.arguments).map_err(|error| {
+            if is_repl_action(&action_name) {
+                return EngineError::from(ReplArgumentCorruption::InvalidJson);
+            }
             llm_error(format!(
                 "tool call at index {index} has invalid JSON arguments: {error}"
             ))
         })?;
+        if is_repl_action(&action_name) {
+            validate_repl_arguments(&parameters)?;
+        }
         Ok(ActionCall {
             id,
             action_name,
