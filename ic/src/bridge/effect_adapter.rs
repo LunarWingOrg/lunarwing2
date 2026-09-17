@@ -39,6 +39,10 @@ pub struct EffectBridgeAdapter {
     hooks: Arc<HookRegistry>,
     /// Per-user tools approved with "always" for this process lifetime.
     auto_approved: RwLock<HashSet<(String, String)>>,
+    /// Global auto-approve flag from `AGENT_AUTO_APPROVE_TOOLS` /
+    /// `agent.auto_approve_tools` — mirrors the v1 dispatcher's use of
+    /// `AgentConfig::auto_approve_tools` (work item #164).
+    globally_auto_approved: RwLock<bool>,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
     /// Per-user per-tool sliding window rate limiter.
@@ -63,12 +67,23 @@ impl EffectBridgeAdapter {
             safety,
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
+            globally_auto_approved: RwLock::new(false),
             settings_store: RwLock::new(None),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
             coordination_gate: RwLock::new(None),
         }
+    }
+
+    /// Set the global auto-approve flag from agent config (work item #164).
+    pub async fn set_globally_auto_approved(&self, enabled: bool) {
+        *self.globally_auto_approved.write().await = enabled;
+    }
+
+    /// Read the global auto-approve flag.
+    async fn globally_auto_approved(&self) -> bool {
+        *self.globally_auto_approved.read().await
     }
 
     /// Mark a tool as auto-approved for one user (user said "always").
@@ -681,8 +696,13 @@ impl EffectBridgeAdapter {
 
             let allow_always = tool.allows_always_approval(&parameters);
             let user_auto_approved = permission_state == Some(PermissionState::AlwaysAllow);
+            let globally_auto_approved = self.globally_auto_approved().await;
             if !approval_already_granted
-                && requirement.needs_prompt_with_user_grant(false, user_auto_approved, allow_always)
+                && requirement.needs_prompt_with_user_grant(
+                    globally_auto_approved,
+                    user_auto_approved,
+                    allow_always,
+                )
             {
                 // Credential presence alone does NOT bypass approval.
                 // Credentials indicate the call *can* be authenticated, not
@@ -1800,6 +1820,58 @@ FINAL(echoed + "|" + http_result["error"])"#,
             )
             .await;
         assert!(matches!(bob_result, Err(EngineError::GatePaused { .. })));
+    }
+
+    // Work item #164: the global auto-approve flag (AGENT_AUTO_APPROVE_TOOLS)
+    // must apply to engine-routed turns — it used to be hardcoded false.
+    #[tokio::test]
+    async fn globally_auto_approved_bypasses_unless_auto_approved_gate() {
+        use lunarwing_safety::SafetyConfig;
+
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ApprovalTestTool)).await;
+        let adapter = EffectBridgeAdapter::new(
+            tools,
+            Arc::new(SafetyLayer::new(&SafetyConfig {
+                max_output_length: 10_000,
+                injection_check_enabled: false,
+            })),
+            Arc::new(HookRegistry::default()),
+        );
+
+        // Baseline: without the flag the UnlessAutoApproved tool pauses.
+        let mut ctx = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_flag_off"));
+        ctx.user_id = "carol".to_string();
+        let paused = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &ctx,
+            )
+            .await;
+        assert!(matches!(paused, Err(EngineError::GatePaused { .. })));
+
+        // With the flag set (init_engine wires it from agent config), the
+        // same invocation runs without a gate.
+        adapter.set_globally_auto_approved(true).await;
+        let mut ctx_on = exec_ctx(lunarwing_engine::ThreadId::new(), Some("call_flag_on"));
+        ctx_on.user_id = "carol".to_string();
+        let approved = adapter
+            .execute_action(
+                "approval_test",
+                serde_json::json!({"value": "x"}),
+                &lease(),
+                &ctx_on,
+            )
+            .await;
+        assert!(matches!(
+            approved,
+            Ok(ActionResult {
+                is_error: false,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

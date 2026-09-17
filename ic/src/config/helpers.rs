@@ -77,6 +77,11 @@ fn runtime_overrides() -> &'static Mutex<HashMap<String, String>> {
 
 fn aliased_env_keys(key: &str) -> (&str, Option<&str>) {
     match key {
+        // Work item #164: tenant envs historically set the bare spelling; the
+        // prefixed spelling stays preferred when both are present.
+        "AGENT_AUTO_APPROVE_TOOLS" | "AUTO_APPROVE_TOOLS" => {
+            ("AGENT_AUTO_APPROVE_TOOLS", Some("AUTO_APPROVE_TOOLS"))
+        }
         "IRONCLAW_OAUTH_CALLBACK_URL" | "LUNARWING_OAUTH_CALLBACK_URL" => (
             "LUNARWING_OAUTH_CALLBACK_URL",
             Some("IRONCLAW_OAUTH_CALLBACK_URL"),
@@ -541,6 +546,42 @@ mod tests {
         match old_ironclaw {
             Some(val) => unsafe { std::env::set_var("IRONCLAW_OWNER_ID", val) },
             None => unsafe { std::env::remove_var("IRONCLAW_OWNER_ID") },
+        }
+    }
+
+    // Work item #164: tenant envs set the bare `AUTO_APPROVE_TOOLS` spelling;
+    // config resolution must read it as a legacy alias of
+    // `AGENT_AUTO_APPROVE_TOOLS`, with the prefixed spelling preferred.
+    #[test]
+    fn auto_approve_tools_legacy_alias_is_read_and_prefers_prefixed() {
+        let _guard = lock_env();
+        let old_prefixed = std::env::var("AGENT_AUTO_APPROVE_TOOLS").ok();
+        let old_bare = std::env::var("AUTO_APPROVE_TOOLS").ok();
+
+        // Bare spelling alone resolves.
+        unsafe {
+            std::env::remove_var("AGENT_AUTO_APPROVE_TOOLS");
+            std::env::set_var("AUTO_APPROVE_TOOLS", "true");
+        }
+        assert_eq!(
+            optional_env("AGENT_AUTO_APPROVE_TOOLS").unwrap(),
+            Some("true".to_string())
+        );
+
+        // Prefixed spelling wins when both are present.
+        unsafe { std::env::set_var("AGENT_AUTO_APPROVE_TOOLS", "false") };
+        assert_eq!(
+            optional_env("AGENT_AUTO_APPROVE_TOOLS").unwrap(),
+            Some("false".to_string())
+        );
+
+        match old_prefixed {
+            Some(val) => unsafe { std::env::set_var("AGENT_AUTO_APPROVE_TOOLS", val) },
+            None => unsafe { std::env::remove_var("AGENT_AUTO_APPROVE_TOOLS") },
+        }
+        match old_bare {
+            Some(val) => unsafe { std::env::set_var("AUTO_APPROVE_TOOLS", val) },
+            None => unsafe { std::env::remove_var("AUTO_APPROVE_TOOLS") },
         }
     }
 
