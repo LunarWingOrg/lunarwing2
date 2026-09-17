@@ -60,6 +60,56 @@ The default image is slim and does not contain Rust, Go, or C/C++ toolchains. Bu
 
 Agent-facing dispatch uses `create_job(title: "...", description: "...", mode: "opencode")` in both legacy and Engine V2 chat paths. `opencode` is a named job execution backend, not an extension, MCP server, skill, routine, or SSH host; no registry search or installation is involved.
 
+## OpenCode 2 Worker (opencode2)
+
+The OpenCode **2** lane, run as a separate external worker per
+`docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md`. v1 stays the default and
+keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
+2.0.x patch stack settles. Do not configure both lanes on the same
+tenant during the transition (agent routing confusion — plan §5).
+
+**Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
+**v2.0.5** at reviewed full commit
+`79169fe966d58fb0e0a5e41133716184a0ab4ca6`; the v2 bridge uses
+`@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
+v2 config file is `config/opencode2.json` (`providers` map,
+`settings.baseURL`, `package`). Container UID/GID is **10003**
+(opencode 10001, kimi 10002) so both opencode lanes keep separate
+userns identities on one host.
+
+```bash
+cd opencode2.4lunarwing
+docker build -t lunarwing-worker-opencode2:latest .
+
+# Select the worker per tenant, then build the shared image via mt-admin
+sudo ic/scripts/lunarwing-mt-admin.sh add-tenant <name> --with-opencode2
+sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker
+
+# Or build the shared image as part of a per-tenant build
+sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode2
+
+# Include Rust, Go, and C/C++ compilers for build/test jobs
+sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker --with-toolchains
+```
+
+Per-tenant overrides: `configure-opencode2 <name> [--model <m>]
+[--base-url <url>]` (written as `OPENCODE2_MODEL`/`OPENCODE2_BASE_URL`).
+Ports come from the dedicated registry range 51000-51999
+(`opencode2_wss`/`opencode2_health`, ports-registry v17); units are
+`lunarwing-opencode2-<tenant>` (systemd quadlet + OpenRC `-sup`).
+Agent-facing dispatch uses `create_job(mode: "opencode2")`; the daemon
+side is fully generic (one more `[[sandbox.external_workers]]` entry —
+zero Rust changes).
+
+Workspace confinement mirrors the kimi/pebble workers: the bridge
+resolves the daemon-supplied `project_dir` against `WORKSPACE_ROOT`
+(canonicalized; `..` and symlink escapes are rejected with a
+`task_result` error envelope before anything spawns), and one task at a
+time owns a workspace subtree — `workspacePathsOverlap`, so symlink
+aliases of the same tree collide. The v2 session permissions ruleset
+currently grants `read/write/shell: *`; the confinement is the boundary
+that ruleset would enforce if it is ever scoped.
+
 Multi-tenant worker configuration sets the task deadline to `3600000ms` (one hour), configurable for new tenant entries with `LUNARWING_MT_EXTERNAL_WORKER_TIMEOUT_MS`. Re-running mt-admin migrates exact legacy `300000ms` entries; set `LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false` to preserve an intentional five-minute value. External jobs default to asynchronous dispatch (`wait=false`) so they outlive the current conversation turn; completion and progress remain available through job events/status. Explicit `wait=true` remains available for short tasks, but synchronous execution is still bounded by the parent conversation deadline.
 
 ## Kimi Code Worker

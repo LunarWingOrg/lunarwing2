@@ -55,10 +55,13 @@ architecture-boundaries:
     - bash ic/scripts/check-boundaries.sh
 
 # Owner: operations maintainers. The repository warning baseline is zero, so
-# shellcheck is a blocking validation gate on every pipeline.
+# shellcheck is a blocking validation gate on every pipeline. ShellCheck is
+# pinned to 0.11.0 via a checksum-pinned download (MR !988) — the Debian
+# bookworm apt package is 0.9.0, below the project floor.
 shellcheck:
   extends: .shell-job
   stage: validate
   needs: []
   script:
-    - bash .gitlab/scripts/shellcheck.sh
+    - bash .gitlab/scripts/install-shellcheck.sh
+    - PATH="$CI_PROJECT_DIR/.ci-bin:$PATH" bash .gitlab/scripts/shellcheck.sh

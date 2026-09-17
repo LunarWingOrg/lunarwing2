@@ -157,6 +157,15 @@ KIMI_CONTAINER_GID="10002"
 KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
 KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS}"
 
+# OpenCode 2 worker lane (docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md).
+# Distinct UID so opencode (10001) and opencode2 (10003) on one tenant keep
+# separate userns identities; must stay in sync with the image's non-root
+# user in opencode2.4lunarwing/Dockerfile.
+OPENCODE2_CONTAINER_UID="10003"
+OPENCODE2_CONTAINER_GID="10003"
+OPENCODE2_USERNS="keep-id:uid=${OPENCODE2_CONTAINER_UID},gid=${OPENCODE2_CONTAINER_GID}"
+OPENCODE2_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE2_USERNS}"
+
 # ── Library sourcing ─────────────────────────────────────────────────────────
 #
 # mt-admin is split into sourced libraries under mt-admin-lib/ (structure kept
@@ -247,6 +256,9 @@ Commands:
     --with-pebble                  Select the pebble worker for this tenant (as above)
     --with-opencode                Select the opencode worker for this tenant (as above)
     --with-kimi                    Select the kimi worker for this tenant (as above)
+    --with-opencode2               Select the OpenCode 2 worker for this tenant
+                                   (v2 lane; keep off tenants that already run
+                                   the proven v1 opencode worker)
     --with-study-mcp               Auto-configure the shared lw2studymcp Study Notes
                                    MCP for this tenant (read-only) so it starts with
                                    knowledge of the LunarWing codebase. The shared
@@ -264,6 +276,10 @@ Commands:
                                    (written to lunarwing.env as OPENCODE_MODEL)
     --opencode-base-url <url>      Override the opencode worker's TensorZero baseURL
                                    (written to lunarwing.env as OPENCODE_BASE_URL)
+    --opencode2-model <model>      Override the OpenCode 2 worker's LLM model
+                                   (written to lunarwing.env as OPENCODE2_MODEL)
+    --opencode2-base-url <url>     Override the OpenCode 2 worker's TensorZero baseURL
+                                   (written to lunarwing.env as OPENCODE2_BASE_URL)
     --kimi-model <model>           Override the kimi worker's LLM model
                                    (written to lunarwing.env as KIMI_MODEL)
     --kimi-base-url <url>          Override the kimi worker's API base URL
@@ -293,6 +309,7 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-opencode2               Also build the OpenCode 2 worker Docker image
     --with-toolchains              Include toolchains in selected pebble, opencode,
                                    and kimi worker images (default: slim)
 
@@ -301,6 +318,7 @@ Commands:
     --with-pebble                  Also build the pebble worker Docker image
     --with-opencode                Also build the opencode worker Docker image
     --with-kimi                    Also build the kimi worker Docker image
+    --with-opencode2               Also build the OpenCode 2 worker Docker image
     --with-toolchains              Include toolchains in selected pebble, opencode,
                                    and kimi worker images (default: slim)
 
@@ -318,6 +336,10 @@ Commands:
     --no-cache                     Force a full rebuild without container cache
     --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
     --kimi-code-version <version>  Override kimi-code package version
+
+  build-opencode2-worker           Build the OpenCode 2 worker Docker image
+    --no-cache                     Force a full rebuild without Docker cache
+    --with-toolchains              Include Rust/Go/C++ toolchains (default: slim)
 
   build-vision-sidecar             Build the LunarVision OCR sidecar Docker image
   configure-vision-external <name> Use an operator-managed remote LunarVision instance
@@ -371,7 +393,7 @@ Commands:
   stop-worker <name> <worker>     Gracefully stop one external worker
   restart-worker <name> <worker>  Restart one external worker
   kill-worker <name> <worker>     Emergency zero-grace stop; leaves worker stopped
-                                   Workers: pebble, opencode, kimi
+                                   Workers: pebble, opencode, kimi, opencode2
   render-units <name>             Re-render a tenant's service units from the current
                                   generator (no restart; applies init-script changes)
   upgrade-tenant <name> --target <ref>
@@ -396,6 +418,11 @@ Commands:
   configure-opencode <name>        Set opencode worker LLM overrides for a tenant
     --model <model>                TensorZero model (OPENCODE_MODEL; any string)
     --base-url <url>               TensorZero baseURL (OPENCODE_BASE_URL; full URL)
+                                   (restart the worker after: stop-tenant && start-tenant)
+
+  configure-opencode2 <name>       Set OpenCode 2 worker LLM overrides for a tenant
+    --model <model>                TensorZero model (OPENCODE2_MODEL; any string)
+    --base-url <url>               TensorZero baseURL (OPENCODE2_BASE_URL; full URL)
                                    (restart the worker after: stop-tenant && start-tenant)
 
   configure-kimi <name>            Set kimi worker LLM overrides for a tenant
@@ -531,7 +558,7 @@ main() {
   case "$command_name" in
     add-tenant)
       require_root
-      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home=""
+      local name="" docker_group="false" xmpp_jid="" xmpp_password="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" darkirc_scope_override="" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -546,6 +573,7 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-opencode2)  with_opencode2="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
           --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
           --xmpp-password)   xmpp_password="$2"; shift 2 ;;
@@ -556,6 +584,8 @@ main() {
           --gotify-title)    gotify_title="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
+          --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
           --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
           --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
@@ -575,12 +605,12 @@ main() {
       # Leave empty when --xmpp-jid is absent: add_tenant preserves the tenant's
       # existing JID and only defaults to <name>@xmpp.localhost on a first write.
       name="$(sanitize_name "$name")"
-      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home"
+      with_tenant_lifecycle_lock "$name" add_tenant "$name" "$docker_group" "$xmpp_jid" "$xmpp_password" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "$darkirc_scope_override" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url"
       ;;
 
     add-tenants)
       require_root
-      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_study_mcp="false" study_mcp_home=""
+      local names_csv="" docker_group="false" xmpp_domain="" tz_url="$DEFAULT_TENSORZERO_URL" gotify_url="$DEFAULT_GOTIFY_URL" gotify_title="$DEFAULT_GOTIFY_TITLE" llm_api_key="" llm_base_url="$DEFAULT_LLM_BASE_URL" enable_darkirc="false" enable_proxy="false" llm_model="" gateway_host="" xmpp_allow_from="" opencode_model="" opencode_base_url="" opencode2_model="" opencode2_base_url="" kimi_model="" kimi_base_url="" kimi_api_key="" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_study_mcp="false" study_mcp_home=""
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --docker-group)    docker_group="true"; shift ;;
@@ -594,6 +624,7 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-opencode2)  with_opencode2="true"; shift ;;
           --with-study-mcp)  with_study_mcp="true"; shift ;;
           --study-mcp-home)  [[ $# -ge 2 ]] || die "--study-mcp-home requires a value"; study_mcp_home="$2"; shift 2 ;;
           --llm-api-key)     llm_api_key="$2"; shift 2 ;;
@@ -603,6 +634,8 @@ main() {
           --gotify-title)    gotify_title="$2"; shift 2 ;;
           --opencode-model)    opencode_model="$2"; shift 2 ;;
           --opencode-base-url) opencode_base_url="$2"; shift 2 ;;
+          --opencode2-model)    [[ $# -ge 2 ]] || die "--opencode2-model requires a value"; opencode2_model="$2"; shift 2 ;;
+          --opencode2-base-url) [[ $# -ge 2 ]] || die "--opencode2-base-url requires a value"; opencode2_base_url="$2"; shift 2 ;;
           --kimi-model)        kimi_model="$2"; shift 2 ;;
           --kimi-base-url)     kimi_base_url="$2"; shift 2 ;;
           --kimi-api-key-file) kimi_api_key="$(_read_secret_file "$2" "Kimi API key")"; shift 2 ;;
@@ -631,7 +664,7 @@ main() {
         # Empty --xmpp-domain -> empty JID, so add_tenant preserves an existing one.
         local sjid=""
         if [[ -n "$xmpp_domain" ]]; then sjid="${sname}@${xmpp_domain}"; fi
-        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "" "$with_study_mcp" "$study_mcp_home"
+        with_tenant_lifecycle_lock "$sname" add_tenant "$sname" "$docker_group" "$sjid" "" "$tz_url" "$gotify_url" "$gotify_title" "$llm_api_key" "$llm_base_url" "$enable_darkirc" "$enable_proxy" "$llm_model" "$gateway_host" "$xmpp_allow_from" "$opencode_model" "$opencode_base_url" "$with_pebble" "$with_opencode" "$with_kimi" "$kimi_model" "$kimi_base_url" "$kimi_api_key" "" "$with_study_mcp" "$study_mcp_home" "$with_opencode2" "$opencode2_model" "$opencode2_base_url"
       done
       ;;
 
@@ -656,7 +689,7 @@ main() {
 
     build-tenant)
       require_root
-      local name="" with_wasm="false" require_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
+      local name="" with_wasm="false" require_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
@@ -665,6 +698,7 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-opencode2)  with_opencode2="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)
@@ -674,14 +708,14 @@ main() {
             ;;
         esac
       done
-      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-opencode] [--with-kimi] [--with-toolchains]"
+      [[ -n "$name" ]] || die "usage: build-tenant <name> [--with-wasm] [--require-wasm] [--with-pebble] [--with-opencode] [--with-kimi] [--with-opencode2] [--with-toolchains]"
       [[ "$require_wasm" != "true" || "$with_wasm" == "true" ]] || die "--require-wasm requires --with-wasm"
-      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm"
+      build_tenant "$(sanitize_name "$name")" "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$require_wasm" "$with_opencode2"
       ;;
 
     build-all)
       require_root
-      local with_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_toolchains="false"
+      local with_wasm="false" with_pebble="false" with_opencode="false" with_kimi="false" with_opencode2="false" with_toolchains="false"
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --with-wasm)       with_wasm="true"; shift ;;
@@ -689,12 +723,13 @@ main() {
           --with-pebble)     with_pebble="true"; shift ;;
           --with-opencode)   with_opencode="true"; shift ;;
           --with-kimi)       with_kimi="true"; shift ;;
+          --with-opencode2)  with_opencode2="true"; shift ;;
           --with-toolchains) with_toolchains="true"; shift ;;
           -*)                die "unknown flag: $1" ;;
           *)                 die "unexpected argument: $1" ;;
         esac
       done
-      build_all "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains"
+      build_all "$with_wasm" "$with_pebble" "$with_opencode" "$with_kimi" "$with_toolchains" "$with_opencode2"
       ;;
 
     build-darkirc)
@@ -749,6 +784,21 @@ main() {
         esac
       done
       build_opencode_worker "$no_cache" "$with_toolchains"
+      ;;
+
+    build-opencode2-worker)
+      require_root
+      local no_cache="false"
+      local with_toolchains="false"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --no-cache)         no_cache="true"; shift ;;
+          --with-toolchains)  with_toolchains="true"; shift ;;
+          -*)                 die "unknown flag: $1" ;;
+          *)                  die "unexpected argument: $1" ;;
+        esac
+      done
+      build_opencode2_worker "$no_cache" "$with_toolchains"
       ;;
 
     build-kimi-worker)
@@ -1032,7 +1082,7 @@ main() {
 
     start-worker|stop-worker|restart-worker|kill-worker)
       require_root
-      [[ $# -eq 2 ]] || die "usage: $command_name <name> <pebble|opencode|kimi>"
+      [[ $# -eq 2 ]] || die "usage: $command_name <name> <pebble|opencode|kimi|opencode2>"
       case "$command_name" in
         start-worker) start_worker "$1" "$2" ;;
         stop-worker) stop_worker "$1" "$2" ;;
@@ -1195,6 +1245,25 @@ main() {
       done
       [[ -n "$name" ]] || die "usage: configure-opencode <name> [--model <model>] [--base-url <url>]"
       configure_opencode "$name" "$oc_model" "$oc_base_url"
+      ;;
+
+    configure-opencode2)
+      require_root
+      local name="" oc2_model="" oc2_base_url=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --model)    oc2_model="$2"; shift 2 ;;
+          --base-url) oc2_base_url="$2"; shift 2 ;;
+          -*)         die "unknown flag: $1" ;;
+          *)
+            if [[ -z "$name" ]]; then name="$1"; shift
+            else die "unexpected argument: $1"
+            fi
+            ;;
+        esac
+      done
+      [[ -n "$name" ]] || die "usage: configure-opencode2 <name> [--model <model>] [--base-url <url>]"
+      configure_opencode2 "$name" "$oc2_model" "$oc2_base_url"
       ;;
 
     configure-kimi)

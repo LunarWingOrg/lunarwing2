@@ -1291,7 +1291,7 @@ start_tenant_openrc() {
   # Remove stale worker supervision for unselected or intentionally stopped
   # workers. Selected running workers register/start their own units after the
   # daemon is ready, preserving the SSH-agent socket ordering.
-  for worker in pebble opencode kimi; do
+  for worker in pebble opencode kimi opencode2; do
     if tenant_worker_openrc_stop_requested "$name" "$worker"; then
       openrc_worker_stop_disable "$name" "$worker" \
         || die "failed to disable OpenRC worker $worker for tenant '$name'"
@@ -1350,7 +1350,7 @@ stop_tenant_openrc() {
     _openrc_stop_service "lunarwing-darkirc-${name}" || stop_failed=true
   fi
   # Container babysitters must stop before their containers or they immediately respawn them.
-  for worker in nanocode pebble opencode kimi vision voice; do
+  for worker in nanocode pebble opencode kimi opencode2 vision voice; do
     _openrc_stop_service_if_installed "lunarwing-${worker}-${name}-sup" || stop_failed=true
   done
   _openrc_stop_service_if_installed "lunarwing-vision-${name}" || stop_failed=true
@@ -1406,7 +1406,7 @@ cleanup_legacy_weechat_openrc() {
 
 uninstall_tenant_openrc() {
   local name="$1"
-  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
+  for svc in "lunarwing-${name}" "xmpp-bridge-${name}" "lunarwing-proxy-${name}" "lunarwing-weechat-adapter-${name}" "lunarwing-weechat-${name}" "lunarwing-darkirc-adapter-${name}" "lunarwing-darkirc-${name}" "lunarwing-pg-${name}" "lunarwing-nanocode-${name}" "lunarwing-pebble-${name}" "lunarwing-opencode-${name}" "lunarwing-opencode2-${name}" "lunarwing-kimi-${name}" "lunarwing-vision-${name}" "lunarwing-voice-${name}" "lunarwing-pg-${name}-sup" "lunarwing-nanocode-${name}-sup" "lunarwing-pebble-${name}-sup" "lunarwing-opencode-${name}-sup" "lunarwing-opencode2-${name}-sup" "lunarwing-kimi-${name}-sup" "lunarwing-vision-${name}-sup" "lunarwing-voice-${name}-sup"; do
     rc-update del "$svc" default 2>/dev/null || true
     rm -f "$OPENRC_INITD_DIR/$svc" "$OPENRC_CONFD_DIR/$svc"
   done
