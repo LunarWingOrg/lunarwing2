@@ -6,10 +6,12 @@ LunarWing controls local filesystem and shell tools through three separate layer
 2. **Sandbox policy** limits filesystem and network access.
 3. **Tool permission** decides whether an invocation runs, asks for approval, or is disabled.
 
-**Revalidated against source 2026-09-12 (v2.1.1.0).** `ALLOW_LOCAL_TOOLS`,
+**Revalidated against source 2026-09-17 (v2.1.2.0).** `ALLOW_LOCAL_TOOLS`,
 `AGENT_AUTO_APPROVE_TOOLS`, and the `full_access` double opt-in
 (`SANDBOX_ALLOW_FULL_ACCESS`) were re-checked against the config resolver and
-sandbox manager; no changes were needed.
+sandbox manager. Updated for the v2.1.2.0 generic podman-first sandbox: new
+`SANDBOX_RUNTIME` / `SANDBOX_NETWORK` / `SANDBOX_ENFORCE` knobs and the
+scrubbed `full_access` child environment (WI#141).
 
 Use the narrowest access that satisfies the task. `full_access` combined with automatic approval lets model output execute directly on the host with the LunarWing service account's privileges.
 
@@ -31,7 +33,7 @@ sudo ic/scripts/lunarwing-mt-admin.sh restart-tenant <tenant>
 
 ## 2. Select a Sandbox Policy
 
-The default is an enabled read-only container sandbox:
+The default is an enabled read-only container sandbox. Since v2.1.2.0 the sandbox is generic and podman-first: it drives the container runtime CLI directly (no daemon socket required, so rootless podman and OpenRC hosts work), preferring podman and falling back to docker. Select the runtime explicitly with `SANDBOX_RUNTIME=auto|podman|docker`.
 
 | Policy | Filesystem | Network | Execution |
 | --- | --- | --- | --- |
@@ -53,11 +55,13 @@ SANDBOX_POLICY=full_access
 SANDBOX_ALLOW_FULL_ACCESS=true
 ```
 
-Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and downgrades `full_access` to `workspace_write`. The sandbox manager also refuses unapproved full-access execution. This policy bypasses Docker entirely; it is not a more permissive container mode.
+Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and downgrades `full_access` to `workspace_write`. The sandbox manager also refuses unapproved full-access execution. This policy bypasses the container entirely; it is not a more permissive container mode.
 
 Even under `full_access`, the child environment is scrubbed: commands inherit only the allowlisted OS/toolchain variables (the same list the unsandboxed shell tool uses), never daemon credentials such as `DATABASE_URL` or the `SANDBOX_*` launcher variables themselves.
 
-Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, and `SANDBOX_EXTRA_DOMAINS`. Keep the proxy domain allowlist minimal.
+Container egress is tiered through `SANDBOX_NETWORK` (new in v2.1.2.0): `proxy` (default) routes HTTP through the allowlist proxy via `host.containers.internal`, with denied responses prefixed `sandbox-proxy denied:`; `none` passes `--network none` for full network isolation. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
+
+Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal.
 
 ## 3. Keep or Change Approval Behavior
 
