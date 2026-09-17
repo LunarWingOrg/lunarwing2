@@ -2,9 +2,11 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-12 (v2.1.1.0).** Referenced ops runbook,
+**Revalidated against source 2026-09-17 (v2.1.2.0).** Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
-re-checked against the current tree; no changes were needed.
+re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
+attachment tier below; worker cancellation now exercises the cancel-ack
+handoff (bounded ~3s wait for the worker's terminal `task_result`).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -40,6 +42,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 - [ ] **XMPP direct message** — send and receive text; verify pairing/owner policy.
 - [ ] **XMPP room** — send and receive MUC traffic; verify sender attribution.
 - [ ] **XMPP attachments** — exercise the configured upload path and verify size/auth limits.
+- [ ] **Durable cross-channel attachments** (v2.1.2.0) — send a file on one channel, then verify it is retrievable from another via the `attachment_store` tool (list/read under `attachments/<channel>/…` in workspace memory).
 - [ ] **WeeChat WSS** — connect relay and adapter, exchange messages, then reconnect after a service restart.
 - [ ] **DarkIRC** — verify the tenant adapter, contact-key boundary, delivery, and health reporting.
 - [ ] **WASM channels** — install, configure, activate, poll, and remove a disposable extension.
@@ -57,7 +60,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 
 ## Tools, Extensions, and Skills
 
-- [ ] Read, write, list, patch, and shell behavior matches the active sandbox policy.
+- [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` proxy/none).
 - [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
 - [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
 - [ ] Secret list/delete operations never return secret values.
