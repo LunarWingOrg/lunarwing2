@@ -17,6 +17,7 @@ WORKSPACE_MANIFEST = ROOT / "ic" / "Cargo.toml"
 CARGO_CONFIG = ROOT / ".cargo" / "config.toml"
 DEFAULTS = ROOT / ".gitlab" / "ci" / "defaults.yml"
 OPENCODE_DOCKERFILE = ROOT / "opencode4lunarwing" / "Dockerfile"
+OPENCODE2_DOCKERFILE = ROOT / "opencode2.4lunarwing" / "Dockerfile"
 KIMI_DOCKERFILE = ROOT / "kimicode4lunarwing" / "Dockerfile"
 KIMI_CLI_LOCK = ROOT / "kimicode4lunarwing" / "kimi-cli" / "package-lock.json"
 PEBBLE_DOCKERFILE = ROOT / "pebble4lunarwing" / "Dockerfile"
@@ -44,7 +45,7 @@ FULL_VALIDATION_JOBS = (
     "cavepony-wasm",
     "cargo-deny",
 )
-WORKER_NAMES = ("pebble", "opencode", "kimi")
+WORKER_NAMES = ("pebble", "opencode", "opencode2", "kimi")
 EXPECTED_INCLUDES = [
     "/.gitlab/ci/workflow.yml",
     "/.gitlab/ci/defaults.yml",
@@ -263,7 +264,7 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         ):
             if fragment not in helper_text:
                 errors.append(f"worker candidate helper lacks reproducibility control {fragment}")
-    for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "kimicode4lunarwing"):
+    for worker_dir in ("pebble4lunarwing", "opencode4lunarwing", "opencode2.4lunarwing", "kimicode4lunarwing"):
         dockerfile = (ROOT / worker_dir / "Dockerfile").read_text(encoding="utf-8")
         if "ARG SOURCE_REVISION" not in dockerfile or (
             'org.opencontainers.image.revision="${SOURCE_REVISION}"' not in dockerfile
@@ -390,29 +391,35 @@ def validate_worker_versions(errors: list[str]) -> None:
     build_script = WORKER_BUILD_SCRIPT.read_text(encoding="utf-8")
     pebble_text = PEBBLE_DOCKERFILE.read_text(encoding="utf-8")
     opencode_text = OPENCODE_DOCKERFILE.read_text(encoding="utf-8")
+    opencode2_text = OPENCODE2_DOCKERFILE.read_text(encoding="utf-8")
     kimi_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
 
-    canonical_refs = {
-        "PEBBLE_REF": extract_arg_default(pebble_text, "PEBBLE_REF"),
-        "OPENCODE_REF": extract_arg_default(opencode_text, "OPENCODE_REF"),
-        "OPENCODE_VERSION": extract_arg_default(opencode_text, "OPENCODE_VERSION"),
-        "KIMI_CODE_VERSION": extract_arg_default(kimi_text, "KIMI_CODE_VERSION"),
-    }
-    for arg, value in canonical_refs.items():
+    canonical_pins = (
+        ("PEBBLE_REF", pebble_text, "PEBBLE_REF"),
+        ("OPENCODE_REF", opencode_text, "OPENCODE_REF"),
+        ("OPENCODE_VERSION", opencode_text, "OPENCODE_VERSION"),
+        ("OPENCODE2_REF", opencode2_text, "OPENCODE_REF"),
+        ("OPENCODE2_VERSION", opencode2_text, "OPENCODE_VERSION"),
+        ("KIMI_CODE_VERSION", kimi_text, "KIMI_CODE_VERSION"),
+    )
+    for label, dockerfile_text, arg_name in canonical_pins:
+        value = extract_arg_default(dockerfile_text, arg_name)
         if not value:
-            errors.append(f"worker Dockerfiles missing canonical {arg} default")
-        elif not re.search(rf"{arg}={re.escape(value)}\b", build_script):
+            errors.append(f"worker Dockerfiles missing canonical {label} default")
+        elif not re.search(rf"{arg_name}={re.escape(value)}\b", build_script):
             errors.append(
-                f"build-worker-image.sh {arg}={value!r} differs from the Dockerfile "
-                "canonical declaration"
+                f"build-worker-image.sh {arg_name}={value!r} differs from the "
+                f"Dockerfile {label} canonical declaration"
             )
 
-    for arg in ("OPENCODE_REF", "PEBBLE_REF"):
-        value = canonical_refs.get(arg) or ""
+    for label, dockerfile_text, arg_name in canonical_pins:
+        if arg_name not in ("OPENCODE_REF", "PEBBLE_REF"):
+            continue
+        value = extract_arg_default(dockerfile_text, arg_name) or ""
         if not re.fullmatch(r"[0-9a-f]{40}", value):
-            errors.append(f"{arg} must pin a full 40-hex-char commit, got {value!r}")
+            errors.append(f"{label} must pin a full 40-hex-char commit, got {value!r}")
 
-    kimi_version = canonical_refs.get("KIMI_CODE_VERSION") or ""
+    kimi_version = extract_arg_default(kimi_text, "KIMI_CODE_VERSION") or ""
     if not KIMI_CLI_LOCK.is_file():
         errors.append("kimicode4lunarwing/kimi-cli/package-lock.json missing")
     else:
@@ -706,6 +713,19 @@ def main() -> int:
             )
     else:
         errors.append("opencode4lunarwing/Dockerfile missing")
+
+    if OPENCODE2_DOCKERFILE.is_file():
+        dockerfile_text = OPENCODE2_DOCKERFILE.read_text(encoding="utf-8")
+        toolchain_match = re.search(r"--default-toolchain\s+([^\s\\]+)", dockerfile_text)
+        if not toolchain_match:
+            errors.append("opencode2.4lunarwing/Dockerfile missing default Rust toolchain")
+        elif toolchain_match.group(1) != EXPECTED_RUST_VERSION:
+            errors.append(
+                "opencode2.4lunarwing/Dockerfile Rust toolchain "
+                f"{toolchain_match.group(1)!r} != expected {EXPECTED_RUST_VERSION!r}"
+            )
+    else:
+        errors.append("opencode2.4lunarwing/Dockerfile missing")
 
     if KIMI_DOCKERFILE.is_file():
         dockerfile_text = KIMI_DOCKERFILE.read_text(encoding="utf-8")
