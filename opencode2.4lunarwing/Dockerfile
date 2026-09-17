@@ -58,7 +58,7 @@ RUN bun run build -- --single
 # bridge only needs the client package source (its exports map points at
 # src/*.ts, so the whole src tree travels).
 RUN set -e; \
-    set -- dist/opencode-*/bin/opencode; \
+    set -- dist/*/bin/opencode; \
     [ "$#" -eq 1 ] && [ -x "$1" ]; \
     install -D -m 0755 "$1" /out/bin/opencode; \
     install -d /out/client; \
