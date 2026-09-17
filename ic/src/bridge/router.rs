@@ -3662,6 +3662,150 @@ impl Drop for AwaitThreadCancellationGuard {
     }
 }
 
+/// Identity of a turn whose outcome a detached watcher must deliver (WI#164).
+struct LateOutcomeWatch {
+    thread_id: lunarwing_engine::ThreadId,
+    conversation_id: lunarwing_engine::ConversationId,
+    user_id: String,
+    channel: String,
+    conversation_scope: Option<String>,
+}
+
+/// Keep waiting for a turn that outlived `await_thread_outcome`'s budget and
+/// deliver its outcome when it lands — the turn is no longer abandoned at the
+/// 610s cliff.
+///
+/// Mirrors `spawn_expired_gate_outcome_watcher`: poll-then-join so `/interrupt`
+/// stays effective, record the outcome in the conversation, then deliver the
+/// reply through the channel, SSE, and v1 history. A second budget pass gives
+/// up and joins to avoid an unbounded leak.
+fn spawn_late_outcome_watcher(
+    watch: LateOutcomeWatch,
+    channels: std::sync::Arc<crate::channels::ChannelManager>,
+    mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
+) {
+    tokio::spawn(async move {
+        let Some(lock) = ENGINE_STATE.get() else {
+            return;
+        };
+        let guard = lock.read().await;
+        let Some(state) = guard.as_ref() else {
+            return;
+        };
+
+        const WATCH_TIMEOUT_SECS: u64 =
+            lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(WATCH_TIMEOUT_SECS);
+
+        // Poll-then-join like `await_thread_outcome`: joining a live thread
+        // would remove it from the running map and hide it from /interrupt.
+        while state.thread_manager.is_running(watch.thread_id).await {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    thread_id = %watch.thread_id,
+                    timeout_secs = WATCH_TIMEOUT_SECS,
+                    "late-outcome watcher timed out — joining to avoid a leak"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        let outcome = match state.thread_manager.join_thread(watch.thread_id).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                debug!(
+                    thread_id = %watch.thread_id,
+                    %error,
+                    "late-outcome watcher failed to join thread"
+                );
+                return;
+            }
+        };
+
+        if let Err(error) = state
+            .conversation_manager
+            .record_thread_outcome(watch.conversation_id, watch.thread_id, &outcome)
+            .await
+        {
+            debug!(
+                thread_id = %watch.thread_id,
+                %error,
+                "late-outcome watcher failed to record outcome"
+            );
+        }
+
+        let tid_str = watch.thread_id.to_string();
+        if let ThreadOutcome::GatePaused { .. } = outcome {
+            // A late gate cannot prompt through this watcher (it needs the
+            // full gate persistence path); surface it as a status instead so
+            // the user knows the turn is waiting on them.
+            if let Some(ref sse) = state.sse {
+                sse.broadcast_for_user(
+                    &watch.user_id,
+                    AppEvent::Status {
+                        message: "A turn that ran long is now waiting on your approval — check pending approvals.".into(),
+                        thread_id: Some(tid_str),
+                    },
+                );
+            }
+            return;
+        }
+
+        let text = thread_outcome_response(&outcome).unwrap_or_default();
+        if text.is_empty() {
+            return;
+        }
+
+        // v1 history so the late reply shows up in the history API too.
+        if let Some(ref db) = state.db {
+            let v1_conv_id = match &watch.conversation_scope {
+                Some(scope) => db
+                    .get_or_create_scoped_conversation(&watch.channel, &watch.user_id, scope)
+                    .await
+                    .ok(),
+                None => db
+                    .get_or_create_assistant_conversation(&watch.user_id, &watch.channel)
+                    .await
+                    .ok(),
+            };
+            if let Some(cid) = v1_conv_id
+                && let Err(error) = db.add_conversation_message(cid, "assistant", &text).await
+            {
+                tracing::warn!(%error, "failed to persist late Engine V2 reply");
+            }
+        }
+
+        if let Err(error) = channels
+            .broadcast(
+                &watch.channel,
+                &watch.user_id,
+                OutgoingResponse::text(text.clone()),
+            )
+            .await
+        {
+            debug!(
+                channel = %watch.channel,
+                %error,
+                "failed to deliver late outcome to channel"
+            );
+        }
+
+        if let Some(ref sse) = state.sse {
+            sse.broadcast_for_user(
+                &watch.user_id,
+                AppEvent::Response {
+                    content: text,
+                    thread_id: tid_str,
+                },
+            );
+        }
+        // Drain the retained receiver so its buffer does not pin events.
+        while let Ok(_evt) = event_rx.try_recv() {}
+    });
+}
+
 async fn handle_user_message_with_event_receiver(
     state: &EngineState,
     request: EngineMessageRequest<'_>,
@@ -3740,9 +3884,29 @@ async fn await_thread_outcome(
                     tracing::warn!(
                         thread_id = %thread_id,
                         timeout_secs = OUTCOME_TIMEOUT_SECS,
-                        "await_thread_outcome timed out — breaking to avoid hang"
+                        "await_thread_outcome timed out — detaching watcher to deliver the late outcome"
                     );
-                    break;
+                    // Work item #164: the thread is still running past the
+                    // orchestrator budget. Killing it here destroyed finished
+                    // work; blocking on join re-introduced the hang. Instead:
+                    // let the turn keep running under a detached watcher that
+                    // records and delivers the outcome whenever it lands, and
+                    // release this caller with a notice.
+                    cancellation_guard.disarm();
+                    spawn_late_outcome_watcher(
+                        LateOutcomeWatch {
+                            thread_id,
+                            conversation_id: conv_id,
+                            user_id: message.user_id.clone(),
+                            channel: message.channel.clone(),
+                            conversation_scope: message.conversation_scope().map(String::from),
+                        },
+                        Arc::clone(&agent.channels),
+                        event_rx,
+                    );
+                    return Ok(Some(format!(
+                        "This turn is still running after {OUTCOME_TIMEOUT_SECS}s — I'll deliver its result here as soon as it finishes. You can also watch progress in the activity stream."
+                    )));
                 }
             }
         }
