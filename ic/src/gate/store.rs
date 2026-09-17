@@ -353,22 +353,44 @@ impl PendingGateStore {
     }
 
     /// Restore pending gates from persistent storage on startup.
+    ///
+    /// Expired gates encountered here are pruned from persistence (work item
+    /// #164: they used to be skipped in memory but left on disk forever — no
+    /// other cleanup path could ever reach them, so restarts accumulated
+    /// zombie gates in `pending-gates.json` indefinitely).
     /// Returns the number of non-expired gates restored.
     pub async fn restore_from_persistence(&self) -> Result<usize, GateStoreError> {
         let Some(ref persistence) = self.persistence else {
             return Ok(0);
         };
         let gates = persistence.load_all().await?;
+        let mut expired_keys = Vec::new();
         let mut count = 0;
-        let mut inner = self.inner.lock().await;
-        for gate in gates {
-            if gate.is_expired() {
-                continue;
+        {
+            let mut inner = self.inner.lock().await;
+            for gate in gates {
+                if gate.is_expired() {
+                    expired_keys.push(gate.key());
+                    continue;
+                }
+                let key = gate.key();
+                inner.by_request_id.insert(gate.request_id, key.clone());
+                inner.by_key.insert(key, gate);
+                count += 1;
             }
-            let key = gate.key();
-            inner.by_request_id.insert(gate.request_id, key.clone());
-            inner.by_key.insert(key, gate);
-            count += 1;
+        }
+        // Persistence I/O happens outside the store lock, mirroring insert()
+        // and take_verified(). A failed prune is logged, not fatal: the gate
+        // stays on disk and is retried on the next restart.
+        for key in expired_keys {
+            if let Err(error) = persistence.remove(&key).await {
+                tracing::warn!(
+                    user_id = %key.user_id,
+                    thread_id = %key.thread_id,
+                    %error,
+                    "failed to prune expired gate from persistence during restore"
+                );
+            }
         }
         Ok(count)
     }
@@ -965,6 +987,65 @@ mod tests {
             thread_id: tid_expired,
         };
         assert!(store.peek(&key_expired).await.is_none());
+    }
+
+    // Work item #164: expired gates must be PRUNED from persistence during
+    // restore, not merely skipped in memory — otherwise disk zombies survive
+    // every restart forever (4 gates from 2026-07-14 observed on a live
+    // tenant, 64+ days past expiry).
+    #[tokio::test]
+    async fn test_restore_from_persistence_prunes_expired_from_disk() {
+        use std::sync::Mutex as StdMutex;
+
+        struct TrackingPersistence {
+            gates: StdMutex<Vec<PendingGate>>,
+            removed: StdMutex<Vec<PendingGateKey>>,
+        }
+
+        #[async_trait]
+        impl GatePersistence for TrackingPersistence {
+            async fn save(&self, gate: &PendingGate) -> Result<(), GateStoreError> {
+                self.gates.lock().unwrap().push(gate.clone());
+                Ok(())
+            }
+            async fn remove(&self, key: &PendingGateKey) -> Result<(), GateStoreError> {
+                self.removed.lock().unwrap().push(key.clone());
+                self.gates.lock().unwrap().retain(|gate| gate.key() != *key);
+                Ok(())
+            }
+            async fn load_all(&self) -> Result<Vec<PendingGate>, GateStoreError> {
+                Ok(self.gates.lock().unwrap().clone())
+            }
+        }
+
+        let tid_valid = ThreadId::new();
+        let tid_zombie = ThreadId::new();
+        let valid = sample_gate_with("user1", tid_valid, "web", 300);
+        let zombie = sample_gate_with("user1", tid_zombie, "web", -10);
+
+        let tracking = Arc::new(TrackingPersistence {
+            gates: StdMutex::new(vec![valid.clone(), zombie]),
+            removed: StdMutex::new(Vec::new()),
+        });
+        let persistence: Arc<dyn GatePersistence> = Arc::clone(&tracking) as _;
+        let store = PendingGateStore::new(Some(persistence));
+        assert_eq!(store.restore_from_persistence().await.unwrap(), 1);
+
+        // The expired gate was pruned from the backing store...
+        assert_eq!(tracking.removed.lock().unwrap().len(), 1);
+        let remaining: Vec<PendingGate> = tracking.load_all().await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].request_id, valid.request_id);
+
+        // ...and a second restore finds nothing left to prune.
+        let tracking2 = Arc::new(TrackingPersistence {
+            gates: StdMutex::new(remaining),
+            removed: StdMutex::new(Vec::new()),
+        });
+        let persistence2: Arc<dyn GatePersistence> = Arc::clone(&tracking2) as _;
+        let store2 = PendingGateStore::new(Some(persistence2));
+        assert_eq!(store2.restore_from_persistence().await.unwrap(), 1);
+        assert!(tracking2.removed.lock().unwrap().is_empty());
     }
 
     // ── Reserved channel names ───────────────────────────────
