@@ -29,6 +29,7 @@ pub use router::{
     get_engine_pending_gate,
     get_engine_project,
     get_engine_thread,
+    list_engine_pending_gates,
     // Action handlers
     handle_approval,
     handle_clear,
