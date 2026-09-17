@@ -69,8 +69,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.4** at reviewed full commit
-`466b3e594d3df396a57340249590a70c5c358c8a`; the v2 bridge uses
+**v2.0.5** at reviewed full commit
+`79169fe966d58fb0e0a5e41133716184a0ab4ca6`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
