@@ -227,9 +227,14 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # resolve — the client build above is best-effort, so verify the exact import
 # the worker depends on.
 RUN cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
-# ${OPENCODE_VERSION#v}: the pin carries a leading v, but `opencode --version`
-# prints the bare semver injected at build time above — tolerate either form.
-RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION#v}" \
+# `opencode --version` prints "opencode v<semver>" (name + v + version baked
+# in at build time above). Compare against exactly that, and LOG the actual
+# value on mismatch — a bare `test` fails this step with zero output, which
+# made this lane's repeated silent build failures painful to diagnose.
+RUN actual="$(/usr/local/bin/opencode --version)" \
+    && expected="opencode v${OPENCODE_VERSION#v}" \
+    && { [ "$actual" = "$expected" ] \
+         || { echo "FATAL: opencode --version reported '$actual', expected '$expected'" >&2; exit 1; }; } \
     && cd /app \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
