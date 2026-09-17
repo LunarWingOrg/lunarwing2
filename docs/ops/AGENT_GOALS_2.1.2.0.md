@@ -101,28 +101,34 @@
 28. [ ] fix CI/CD issues - use #3708 as reference pipeline
 29. [x] (S) reminder to ask sb about name ideas
 30. [ ] create CI/CD pipeline jobs for opencode2 - we only have kimi, pebble, opencode rn
-31. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/164 - comments must be read as well, attached as images
+31. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/164 - comments must be read as well, attached as images (BOTH NOW TRANSCRIBED AS COMMENT)
+32. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/163
+33. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/162
+34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
+35. [x] (S) Reserved
+36. [ ] investigate https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 and create document in docs/ops detailing status of voice api as it stands in relation to the description of the work item
+37. [ ] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
 
 ## Phase 6 - Documentation
-32. [x] take a look at any documentation that should be updated and update necessary documentation
+38. [x] take a look at any documentation that should be updated and update necessary documentation
     - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0)
-33. [x] (S) Reserved for human to evaluate his progress on his own tasks AND to start dedicated testing sessions and other related tasks
-34. [x] update opencode2 external worker to 2.0.5
-35. [x] review open work items
+39. [x] (S) Reserved for human to evaluate his progress on his own tasks AND to start dedicated testing sessions and other related tasks
+40. [x] update opencode2 external worker to 2.0.5
+41. [x] review open work items
     - Live tracker query 2026-09-14 00:03 UTC: 14 open issues (#97, #109, #113, #114, #121, #122, #126, #127, #130, #131, #132, #135, #136, #137). Since the v2.1.1.0 audit, #86/#133/#134 closed and #135/#136/#137 opened.
     - All three new findings are fixed in source at 14ccfdd23: #135/#136 mission-goal index exclusion (subtree + purge sweep + provenance labels, live canary acceptance on tracker); #137 bounded OpenRC writer-quiesce wait + status-classification fix. #114 has open draft MR !855 (podman sandbox).
     - No 2.1.2.0 code blockers among open items; remaining work is tracker housekeeping plus operator/live residuals on #97/#131/#137. Report: docs/ops/v2.1.2.0_OPEN_WORK_ITEMS_STATUS.md
-36. [x] update all docs in docs/guides
+42. [x] update all docs in docs/guides
     - DONE 2026-09-17 (`aj/kimi-34-20260917-0000`): all 31 current guides under `docs/guides/` (everything outside `history/`) revalidated against the 2.1.2.0 tree. Substantive updates: MT-ADMIN-QUICKSTART gained the new `fix-podman-userns` repair command (WI#142) with a pointer to `docs/bugs/BUG-workload-scope-podman-userns.md`; ENABLING_DEV_TOOLS rewritten for the generic podman-first sandbox (`SANDBOX_RUNTIME`/`SANDBOX_NETWORK`/`SANDBOX_ENFORCE`, reaper knobs, tiered egress, WI#141 env scrub); CONTRIBUTOR-ONBOARDING freeze status refreshed (2.1.1 shipped, hardening/pollution MRs landed); TESTING_GUIDE gained the durable cross-channel attachment tier (item #3 `attachment_store`) plus sandbox runtime/network checks and the worker cancel-ack note (WI#149); TENANT_KNOWLEDGE_SEED notes the sweep rework (keyset pagination, heartbeat-independent `KNOWLEDGE_SWEEP_ENABLED` cadence, no more 1,000-note cap). The remaining 25 guides were fact-checked against source (registry versions 0.1.8/0.1.11/0.2.9/0.1.14, gotify default URL, multica clamp, voice port 8090, tunnel V24, embeddings cache, `lunarwing-agent-v1`-only subprotocol, migration chain through V27, emote sprites, ssh allowlist, coordination hook) and date-stamped 2026-09-17 with a v2.1.2.0 note; MIGRATE_IRONCLAW_TO_LUNARWING, GATEWAY_VOICE_API, COORDINATION_KNOWLEDGE_SETUP, and CODE-CONTRIBUTION-POLICY gained their first revalidation stamps. Docs-only change; no code touched.
-37. [x] update all docs in docs/architecture
+43. [x] update all docs in docs/architecture
     - DONE 2026-09-12 (aj/kimi-20-20260914-0600): all 10 architecture docs revalidated against the 2.1.2.0 tree. SEMANTIC-MEMORY-SEARCH gained the WI#132 `indexed_at` outbox (V27) + repair sweep and the WI#135/WI#136 mission-subtree `missions.json` index exclusion; ENGINE-V2 gained WI#132 authenticity hardening (retrieval/compaction labeling + neutralization) and dropped the dead `executor/context.rs` from its module map; SELF_HEAL_DEPLOYMENT_WIRING gained the 2.1.2.0 `stop_tenant` writer-quiescence notes (WI#133/#134/#135/#137). The remaining docs were date-stamped after confirming no substantive change: SELF_HEAL_COVERAGE_AUDIT (ORDER unchanged at 14 suites), ATOMICBOOL_DEEPER_PROPAGATION (anchors unchanged, defer stands), SSH_AGENT_HARNESS, SSH_DELIVERY_MECHANISMS, XMPP_FILE_TRANSFERS, IRC-SENDER-IDENTITY, WEECHAT-CHANNEL-ARCHITECTURE (registry 0.2.9 bump only).
-38. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
-39. [ ] a repass of goal 34 since more changes have been made
-40. [ ] a repass of goal 35 since more changes have been made since especially with external worker stuff
-41. [ ] a repass of goal 36 since more changes have been made since especially with external worker stuff
-42. [x] (S) reserved
-43. [x] (S) reserved
-44. [x] (S) RESERVED
+44. [ ] create draft of release notes - at: `RELEASE-v2.1.2.0.md` at the repo root, modeled on the `docs/releases/RELEASE-v2.1.0.0.md` structure (Overview, Highlights, Compatibility, Changes, Upgrade Notes) - we will come back later and refine this later on....
+45. [ ] a repass of goal 34 since more changes have been made
+46. [ ] a repass of goal 35 since more changes have been made since especially with external worker stuff
+47. [ ] a repass of goal 36 since more changes have been made since especially with external worker stuff
+48. [x] (S) reserved
+49. [x] (S) reserved
+50. [x] (S) RESERVED
 
 ---
 
