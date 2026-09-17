@@ -1933,6 +1933,39 @@ pub async fn get_engine_pending_gate(
     }
 }
 
+/// List every live (non-expired) pending gate for a user, newest first.
+///
+/// Work item #164: approval/auth prompts were fire-and-forget over the lossy
+/// SSE broadcast (256-event buffer, no replay). This read-only listing is the
+/// reconnect re-render surface — a client that (re)connects polls it to
+/// recover any prompt it never saw.
+pub async fn list_engine_pending_gates(
+    user_id: &str,
+) -> Result<Vec<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        return Ok(Vec::new());
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        return Ok(Vec::new());
+    };
+
+    let mut gates: Vec<_> = state
+        .pending_gates
+        .list_for_user(user_id)
+        .await
+        .into_iter()
+        .map(|gate| {
+            (
+                gate.created_at,
+                crate::gate::pending::PendingGateView::from(&gate),
+            )
+        })
+        .collect();
+    gates.sort_by_key(|(created_at, _)| std::cmp::Reverse(*created_at));
+    Ok(gates.into_iter().map(|(_, view)| view).collect())
+}
+
 pub async fn resolve_engine_auth_callback(
     user_id: &str,
     credential_name: &str,
@@ -6685,6 +6718,49 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert!(remaining.iter().any(|gate| gate.thread_id == thread_b));
         drop(guard);
+        *lock.write().await = None;
+    }
+
+    // Work item #164: reconnect recovery surface — every live gate for the
+    // user must be listable (newest first), and other users' gates must not
+    // leak into the listing.
+    #[tokio::test]
+    async fn list_engine_pending_gates_returns_user_gates_newest_first() {
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let older = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let mut newer = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval {
+                allow_always: false,
+            },
+        );
+        newer.created_at = older.created_at + chrono::Duration::seconds(30);
+        let other_user = sample_pending_gate(
+            "bob",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Approval { allow_always: true },
+        );
+        let newer_request_id = newer.request_id.to_string();
+        state.pending_gates.insert(older).await.unwrap();
+        state.pending_gates.insert(newer).await.unwrap();
+        state.pending_gates.insert(other_user).await.unwrap();
+
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+        *lock.write().await = Some(state);
+
+        let listed = list_engine_pending_gates("alice").await.unwrap();
+        assert_eq!(listed.len(), 2, "only alice's gates must be listed");
+        assert_eq!(listed[0].request_id, newer_request_id, "newest gate first");
+
         *lock.write().await = None;
     }
 
