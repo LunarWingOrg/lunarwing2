@@ -581,6 +581,10 @@ function connectSSE() {
       // restores any response still streaming for this thread.
       loadHistory();
     }
+    // Re-render approval/auth prompts that were broadcast while no SSE client
+    // was attached (the stream has no replay). Deduplicates against cards the
+    // live events already created.
+    loadPendingGates();
     sseHasConnectedBefore = true;
     window.LunarMascot?.onAgentEvent?.('open', {});
   };
@@ -2136,6 +2140,53 @@ function setAuthFlowPending(pending, instructions) {
     input.disabled = false;
     btn.disabled = false;
   }
+}
+
+// Recovery surface for approval/auth prompts (WI#164): prompts are broadcast
+// over SSE with no replay, so a client connecting after one was emitted
+// (reconnect, refresh, second tab) never sees it. This fetches every live
+// pending gate for the user and re-renders it through the same handlers the
+// live events use, deduplicating against cards already on screen.
+function loadPendingGates() {
+  apiFetch('/api/chat/pending-gates').then((data) => {
+    const gates = data.gates || [];
+    for (const gate of gates) {
+      // ResumeKind serializes as an externally-tagged enum:
+      // {"Approval":{...}} / {"Authentication":{...}} / {"External":{...}}.
+      const auth = gate.resume_kind && gate.resume_kind.Authentication;
+      if (auth) {
+        const existing = getAuthCard(auth.credential_name)
+          || getConfigureOverlay(auth.credential_name);
+        if (existing) continue;
+        handleAuthRequired({
+          extension_name: auth.credential_name,
+          instructions: auth.instructions,
+          auth_url: auth.auth_url || null,
+        });
+        continue;
+      }
+      const approval = gate.resume_kind && gate.resume_kind.Approval;
+      if (!approval) continue; // External gates have no interactive card.
+      // Approval cards render into the chat container: only for this thread,
+      // deduplicated against cards the live events already created.
+      const card = document.querySelector(
+        '.approval-card[data-request-id="' + CSS.escape(gate.request_id) + '"]'
+      );
+      if (card) continue;
+      const hasThread = !!gate.thread_id;
+      if (hasThread && !isCurrentThread(gate.thread_id)) continue;
+      showApproval({
+        request_id: gate.request_id,
+        thread_id: gate.thread_id || null,
+        tool_name: gate.tool_name,
+        description: gate.description,
+        parameters: gate.parameters,
+        allow_always: approval.allow_always,
+      });
+    }
+  }).catch(() => {
+    // Gates stay recoverable via the next reconnect; do not block chat.
+  });
 }
 
 function loadHistory(before) {
