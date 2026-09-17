@@ -136,9 +136,10 @@ error: could not compile `lunarwing` (lib test)
 This is the **kernel OOM killer**, not a code defect: rustc compiling the
 `lunarwing` lib alone approaches the 16 GB runner ceiling, and two of those
 compiles on one host exceed it. Evidence: pipelines #3654 (`rust-clippy-all`),
-#3702 (`rust-check-postgres`), and #3707 (`rust-check-postgres` +
-`rust-check-libsql`) all died this way while an overlapping pipeline's
-identical compile ran on the same runner host — job traces show the same
+#3702 (`rust-check-postgres`), #3707 (`rust-check-postgres` +
+`rust-check-libsql`), and #3742 (`rust-test-lib`) all died this way while an
+overlapping pipeline's identical compile ran on the same runner host — job
+traces show the same
 system ID (`lunarwing-rust-docker`, `r_dLo2MDLTpMm2`) serving build slots
 `concurrent-0`, `concurrent-1`, and `concurrent-3` simultaneously, i.e. the
 documented `limit = 1` runner contract had drifted at the host.
@@ -148,8 +149,11 @@ Two independent guards, both required:
 1. **Repo-side (enforced here):** every job that compiles the `lunarwing` lib
    carries `resource_group: rust-compile-16gb`. GitLab queues same-group jobs
    project-wide, so overlapping pipelines can never run two giant-crates
-   compiles at once, whatever the runner concurrency setting is. Cheaper jobs
-   (rustfmt, cargo-metadata, MSRV check, wasm artifacts) are not in the group.
+   compiles at once, whatever the runner concurrency setting is. That includes
+   the MSRV check (same lib compile under the pinned toolchain) and
+   `cavepony-wasm`, whose `wit_compat` step compiles the lunarwing lib test
+   binary (MR !997 review). Cheaper jobs (rustfmt, cargo-metadata, wasm
+   channel artifacts) are not in the group.
 2. **Host-side (runner config):** keep `limit = 1` (see §6 runner setup). The
    resource group cannot see non-project load on the host, so the per-host
    limit remains the real fence for anything outside this repository.
