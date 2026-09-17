@@ -107,7 +107,7 @@
 34. [ ] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
 35. [x] (S) Reserved4otherworkitems
 36. [ ] investigate https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/131 and create document in docs/ops detailing status of voice api as it stands in relation to the description of the work item
-37. [ ] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
+37. [x] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
 
 ## Phase 6 - Documentation
 38. [x] take a look at any documentation that should be updated and update necessary documentation
