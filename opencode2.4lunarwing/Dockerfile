@@ -52,7 +52,13 @@ RUN bun run build || echo "WARNING: @opencode/client build reported errors (impo
 WORKDIR /build/opencode/packages/cli
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).
-RUN bun run build -- --single
+# Inject the pinned release version (sans leading v) into the build env:
+# upstream's build script takes OPENCODE_VERSION/CHANNEL from the environment,
+# and without it derives a preview version from `git branch --show-current` —
+# EMPTY on this detached-HEAD checkout — producing a bogus preview version
+# (0.0.0--<timestamp>) baked into the binary, which then fails the
+# runtime-stage version check below.
+RUN OPENCODE_VERSION="${OPENCODE_VERSION#v}" bun run build -- --single
 
 # Keep cross-stage artifacts small. The compiled binary is standalone; the
 # bridge only needs the client package source (its exports map points at
@@ -221,7 +227,9 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # resolve — the client build above is best-effort, so verify the exact import
 # the worker depends on.
 RUN cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
-RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION}" \
+# ${OPENCODE_VERSION#v}: the pin carries a leading v, but `opencode --version`
+# prints the bare semver injected at build time above — tolerate either form.
+RUN test "$(/usr/local/bin/opencode --version)" = "${OPENCODE_VERSION#v}" \
     && cd /app \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
