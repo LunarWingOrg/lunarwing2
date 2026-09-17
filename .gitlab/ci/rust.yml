@@ -1,6 +1,13 @@
 rust-check-default:
   extends: .rust-job
   stage: check
+  # Every job that compiles the lunarwing lib (the giant-crates rustc) shares
+  # one project-wide resource group: overlapping pipelines on the single
+  # 16 GB rust runner host OOM-killed rustc (kernel signal 9) in pipelines
+  # #3654/#3702/#3707 while the documented `limit = 1` runner contract had
+  # drifted (traces show concurrent-0..3 slots on one system ID). See the
+  # "Rust runner memory budget" section of .gitlab/README.md.
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   script:
@@ -9,6 +16,7 @@ rust-check-default:
 rust-cache-refresh:
   extends: .rust-job
   stage: check
+  resource_group: rust-compile-16gb
   needs:
     - job: rust-check-default
       artifacts: false
@@ -38,6 +46,7 @@ rust-check-postgres:
     - .rust-job
     - .full-validation-context
   stage: check
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   script:
@@ -48,6 +57,7 @@ rust-check-libsql:
     - .rust-job
     - .full-validation-context
   stage: check
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   script:
@@ -58,6 +68,7 @@ rust-check-all-features:
     - .rust-job
     - .full-validation-context
   stage: check
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   script:
@@ -99,6 +110,10 @@ rust-msrv-check:
     - .rust-msrv-job
     - .observational-job
   stage: check
+  # Compiles the lunarwing lib on the same runner host; joins the compile
+  # resource group so an overlapping MSRV check cannot OOM-kill a blocking
+  # job (the OOM killer picks the biggest process, not the guilty one).
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   timeout: 2h
@@ -112,6 +127,7 @@ rust-clippy-all:
     - .rust-job
     - .full-validation-context
   stage: check
+  resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
   timeout: 2h
@@ -121,6 +137,7 @@ rust-clippy-all:
 rust-test-lib:
   extends: .rust-job
   stage: test
+  resource_group: rust-compile-16gb
   needs:
     - job: rust-check-default
       artifacts: false
@@ -138,6 +155,7 @@ rust-test-libsql:
     - .rust-job
     - .full-validation-context
   stage: test
+  resource_group: rust-compile-16gb
   needs:
     - job: rust-check-libsql
       artifacts: false
@@ -157,6 +175,7 @@ rust-test-postgres-integration:
     - .rust-job
     - .full-validation-context
   stage: test
+  resource_group: rust-compile-16gb
   needs:
     - job: rust-check-postgres
       artifacts: false

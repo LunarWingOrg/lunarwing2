@@ -849,7 +849,9 @@ fn llm_error_result(
         EngineError::Llm { kind, .. } => kind,
         _ => ModelFailureKind::Internal,
     };
-    let provider_observation = if observations.is_empty() {
+    let provider_observation = if kind == ModelFailureKind::ReplArgumentCorruption {
+        observation_context(&[ProviderStreamObservation::Corrupted])
+    } else if observations.is_empty() {
         observation_context(&[ProviderStreamObservation::Aborted])
     } else {
         observation_context(observations)
@@ -858,7 +860,11 @@ fn llm_error_result(
     ExtFunctionResult::Return(json_to_monty(&serde_json::json!({
         "type": "model_error",
         "kind": kind.as_str(),
-        "recoverable": retry_safe && kind.is_recoverable(),
+        // Integrity rejection happens before any action dispatch. Unlike a
+        // transport failure after partial text, a fresh draft is safe even
+        // when some of the rejected text was already streamed to the UI.
+        "recoverable": (retry_safe || kind == ModelFailureKind::ReplArgumentCorruption)
+            && kind.is_recoverable(),
         "instruction": kind.recovery_instruction(),
         "terminal_message": kind.terminal_message(),
         "provider_observation": provider_observation,

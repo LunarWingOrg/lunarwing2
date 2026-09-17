@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use base64::Engine;
 use futures::StreamExt;
+use lunarwing_engine::types::repl::{extract_repl_code, is_repl_action, validate_repl_arguments};
 use lunarwing_engine::{
     ActionDef, EngineError, LlmBackend, LlmCallConfig, LlmOutput, LlmResponse, ModelFailureKind,
     ThreadMessage, TokenUsage, TransientContentPart,
@@ -90,6 +91,7 @@ fn classify_provider_error(error: &LlmError) -> ModelFailureKind {
     match error {
         LlmError::RateLimited { .. } => ModelFailureKind::RateLimited,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => ModelFailureKind::InvalidOutput,
+        LlmError::ReplArgumentCorruption { .. } => ModelFailureKind::ReplArgumentCorruption,
         LlmError::ContextLengthExceeded { .. } => ModelFailureKind::ContextOverflow,
         LlmError::ModelNotAvailable { .. } => ModelFailureKind::Unavailable,
         LlmError::AuthFailed { .. } | LlmError::SessionExpired { .. } => {
@@ -181,8 +183,9 @@ fn map_stream_chunk(chunk: crate::llm::LlmStreamChunk) -> lunarwing_engine::LlmS
     }
 }
 
-fn map_completion_response(response: CompletionResponse) -> LlmOutput {
-    LlmOutput {
+fn map_completion_response(response: CompletionResponse) -> Result<LlmOutput, EngineError> {
+    extract_repl_code(&response.content)?;
+    Ok(LlmOutput {
         response: LlmResponse::from_text(response.content),
         usage: map_usage_fields(
             response.input_tokens,
@@ -191,10 +194,10 @@ fn map_completion_response(response: CompletionResponse) -> LlmOutput {
             response.cache_creation_input_tokens,
         ),
         finish_reason: response.finish_reason.as_str().to_string(),
-    }
+    })
 }
 
-fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
+fn map_tool_response(response: ToolCompletionResponse) -> Result<LlmOutput, EngineError> {
     let usage = map_usage_fields(
         response.input_tokens,
         response.output_tokens,
@@ -204,8 +207,14 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
     let finish_reason = response.finish_reason.as_str().to_string();
 
     let llm_response = if response.tool_calls.is_empty() {
+        extract_repl_code(response.content.as_deref().unwrap_or_default())?;
         LlmResponse::from_text(response.content.unwrap_or_default())
     } else {
+        for call in &response.tool_calls {
+            if is_repl_action(&call.name) {
+                validate_repl_arguments(&call.arguments)?;
+            }
+        }
         // Consume FINAL pseudo-actions (provider-mangled CodeAct syntax)
         // before they can enter tool history as unleasable actions.
         LlmResponse::from_action_calls(
@@ -222,11 +231,11 @@ fn map_tool_response(response: ToolCompletionResponse) -> LlmOutput {
         )
     };
 
-    LlmOutput {
+    Ok(LlmOutput {
         response: llm_response,
         usage,
         finish_reason,
-    }
+    })
 }
 
 #[async_trait::async_trait]
@@ -243,13 +252,13 @@ impl LlmBackend for LlmBridgeAdapter {
             BridgeRequest::Plain(request) => provider
                 .complete(request)
                 .await
-                .map(map_completion_response)
-                .map_err(map_provider_error),
+                .map_err(map_provider_error)
+                .and_then(map_completion_response),
             BridgeRequest::Tools(request) => provider
                 .complete_with_tools(request)
                 .await
-                .map(map_tool_response)
-                .map_err(map_provider_error),
+                .map_err(map_provider_error)
+                .and_then(map_tool_response),
         }
     }
 

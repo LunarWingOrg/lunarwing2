@@ -28,6 +28,37 @@ See `tools-src/` for examples.
 
 The main agent provides generic infrastructure; tools are self-contained units that declare their requirements through capabilities files.
 
+### Shell output completeness (WI#162)
+
+The built-in `shell` result includes `output`, `exit_code`, `success`,
+`sandboxed`, **`truncated`**, and **`warning`**. `success` describes the command's
+exit status (`exit_code == 0`); it does **not** promise complete captured output.
+When either stream or the combined display is clipped, `truncated` is `true`,
+`warning` explains recovery, and `output` starts with `[output truncated]`.
+The prefix remains visible in bounded tool-history previews. Complete captures
+have `truncated: false` and `warning: null`.
+
+Current capture limits are bytes, not characters:
+
+- Sandbox-manager execution (including explicitly allowed `full_access`):
+  32,768 bytes per stream, from a 65,536-byte budget split between stdout/stderr.
+- Direct developer shell: 65,536 bytes per stream, then a 65,536-byte
+  combined head/tail display limit. Display markers add a small amount of text.
+- Exactly filling a stream's limit is not truncation; additional output is.
+
+These are internal limits, not a `SANDBOX_MAX_OUTPUT_BYTES` environment setting.
+For large file contents/base64 payloads, write to a file and use an input path
+supported by the consuming tool, or collect verified bounded chunks. Never
+forward marked output (including its marker) as a complete payload. Both direct
+pipes continue draining after the capture limit, and pipe read errors fail the
+invocation rather than reporting a complete capture.
+
+For container execution, a file intended for later calls must be in an approved
+persistent workspace (`workspace_write` permits writes there); the ephemeral
+container's `/tmp` does not survive the command.
+
+Fresh-tenant acceptance steps: [WI#162 verification](../../../docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md).
+
 ### What Goes in Tools (capabilities.json)
 
 - API endpoints the tool needs (HTTP allowlist)

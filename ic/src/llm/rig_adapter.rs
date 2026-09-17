@@ -524,7 +524,7 @@ where
     upstream: RigStreamingCompletionResponse<R>,
     provider: String,
     indexes: HashMap<String, usize>,
-    seen_deltas: HashSet<String>,
+    seen_argument_deltas: HashSet<String>,
     next_index: usize,
     saw_tool: bool,
     terminal: bool,
@@ -539,7 +539,7 @@ where
             upstream,
             provider,
             indexes: HashMap::new(),
-            seen_deltas: HashSet::new(),
+            seen_argument_deltas: HashSet::new(),
             next_index: 0,
             saw_tool: false,
             terminal: false,
@@ -564,10 +564,14 @@ where
     ) -> LlmStreamChunk {
         let index = self.index_for(&internal_call_id);
         self.saw_tool = true;
-        self.seen_deltas.insert(internal_call_id);
         let (name, args_delta) = match content {
             ToolCallDeltaContent::Name(name) => (Some(name), String::new()),
-            ToolCallDeltaContent::Delta(delta) => (None, delta),
+            ToolCallDeltaContent::Delta(delta) => {
+                if !delta.is_empty() {
+                    self.seen_argument_deltas.insert(internal_call_id);
+                }
+                (None, delta)
+            }
         };
         LlmStreamChunk::ToolCallDelta {
             index,
@@ -584,11 +588,11 @@ where
     ) -> LlmStreamChunk {
         self.saw_tool = true;
         let index = self.index_for(&internal_call_id);
-        if self.seen_deltas.contains(&internal_call_id) {
+        if self.seen_argument_deltas.contains(&internal_call_id) {
             return LlmStreamChunk::ToolCallDelta {
                 index,
                 id: (!tool_call.id.is_empty()).then_some(tool_call.id),
-                name: None,
+                name: Some(tool_call.function.name),
                 args_delta: String::new(),
             };
         }
@@ -1166,6 +1170,144 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(indexes, vec![0, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn name_only_delta_preserves_final_repl_arguments() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_1".into(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Name("repl".into()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Delta(String::new()),
+            }),
+            Ok(RawStreamingChoice::ToolCall(
+                RawStreamingToolCall::new(
+                    "call_1".into(),
+                    "repl".into(),
+                    serde_json::json!({"code": "print(1)"}),
+                )
+                .with_internal_call_id("internal_1".into()),
+            )),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let arguments = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { args_delta, .. }) => Some(args_delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments).unwrap(),
+            serde_json::json!({"code": "print(1)"})
+        );
+    }
+
+    #[tokio::test]
+    async fn argument_delta_preserves_final_call_name_without_duplicating_arguments() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_1".into(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Delta("{\"code\":\"print(1)\"}".into()),
+            }),
+            Ok(RawStreamingChoice::ToolCall(
+                RawStreamingToolCall::new(
+                    "call_1".into(),
+                    "repl".into(),
+                    serde_json::json!({"code": "print(1)"}),
+                )
+                .with_internal_call_id("internal_1".into()),
+            )),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let names = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { name, .. }) => name.as_deref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["repl"]);
+        let arguments = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { args_delta, .. }) => Some(args_delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(arguments, "{\"code\":\"print(1)\"}");
+    }
+
+    #[tokio::test]
+    async fn reasoning_deltas_never_enter_repl_arguments() {
+        let model = ScriptedCompletionModel::new(vec![
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: "call_1".into(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Name("repl".into()),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Delta("{\"code\":\"print(".into()),
+            }),
+            Ok(RawStreamingChoice::ReasoningDelta {
+                id: None,
+                reasoning: "Wait— </think> ```repl </arg_value>".into(),
+            }),
+            Ok(RawStreamingChoice::ToolCallDelta {
+                id: String::new(),
+                internal_call_id: "internal_1".into(),
+                content: ToolCallDeltaContent::Delta("1)\"}".into()),
+            }),
+            Ok(RawStreamingChoice::FinalResponse(
+                TestStreamingResponse::new(8, 4, 0),
+            )),
+        ]);
+        let adapter = RigAdapter::new(model, "test-model");
+        let chunks = adapter
+            .complete_with_tools_stream(tool_stream_request())
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await;
+        let arguments = chunks
+            .iter()
+            .filter_map(|item| match item {
+                Ok(LlmStreamChunk::ToolCallDelta { args_delta, .. }) => Some(args_delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(arguments, "{\"code\":\"print(1)\"}");
+        assert!(
+            !chunks
+                .iter()
+                .any(|item| matches!(item, Ok(LlmStreamChunk::TextDelta(_))))
+        );
     }
 
     #[tokio::test]

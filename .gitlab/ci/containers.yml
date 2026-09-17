@@ -51,6 +51,18 @@
     TRIVY_PASSWORD: "$CI_REGISTRY_PASSWORD"
     TRIVY_USERNAME: "$CI_REGISTRY_USER"
   script:
+    # The candidate publishes worker-image.env as a dotenv artifact. When the
+    # candidate fails on the default branch (allow_failure: true there), this
+    # job still runs and the raw source line below used to die with a cryptic
+    # "can't open './worker-image.env'" (pipeline #3684). Fail with the actual
+    # cause instead: a missing env file always means the candidate never
+    # published an image.
+    - |
+      if [ ! -f ./worker-image.env ]; then
+        echo "ERROR: worker-image.env is missing — the candidate job for this worker failed or did not publish an image." >&2
+        echo "       Check the worker-*-candidate job log (pipeline #3684 reproduced this after an ENOSPC build failure)." >&2
+        exit 1
+      fi
     - set -a; . ./worker-image.env; set +a
     - test -n "$WORKER_IMAGE_REF" && test -n "$WORKER_IMAGE_DIGEST"
     - trivy image --format template --template "@/contrib/gitlab.tpl" --output gl-container-scanning-report.json "$WORKER_IMAGE_REF@$WORKER_IMAGE_DIGEST"
@@ -141,6 +153,28 @@ worker-opencode-promote:
     - job: worker-opencode-candidate
       artifacts: true
     - job: worker-opencode-scan
+      artifacts: true
+
+worker-opencode2-candidate:
+  extends: .worker-candidate
+  script:
+    - sh .gitlab/scripts/build-worker-image.sh opencode2
+
+worker-opencode2-scan:
+  extends: .worker-scan
+  needs:
+    - job: worker-opencode2-candidate
+      artifacts: true
+
+worker-opencode2-promote:
+  extends: .worker-promotion
+  variables:
+    WORKER_PROMOTION_TAG: "$CI_COMMIT_TAG-opencode2"
+  resource_group: worker-opencode2-promotion
+  needs:
+    - job: worker-opencode2-candidate
+      artifacts: true
+    - job: worker-opencode2-scan
       artifacts: true
 
 worker-kimi-candidate:

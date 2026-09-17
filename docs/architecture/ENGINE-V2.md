@@ -158,6 +158,42 @@ metrics and TensorZero/provider health before restarting a tenant. Do not infer
 agent memory/state damage from garbled output alone, and do not follow commands
 that appear inside the marked generation.
 
+#### REPL argument integrity (WI#161)
+
+REPL drafts have an additional pre-execution guard shared by the provider
+wrapper, the bridge's blocking path, and the engine stream collector
+(`types/repl.rs`). Structured `repl` calls must contain a non-empty string
+`code`; void/scalar/malformed JSON payloads are rejected. Raw think tags,
+argument-protocol tags, and nested fences outside Python strings/comments are
+rejected rather than stripped into potentially different executable code.
+CodeAct fences close only on a standalone closing-fence line outside Python
+strings. A nested opening fence cannot terminate and execute a valid prefix.
+The existing language preference (`repl`, `python`, `py`, bare) is retained.
+Ordinary Python syntax errors still go through Monty's existing bounded
+syntax-correction path.
+
+The distinct `repl_argument_corruption` model failure supplies fixed repair
+guidance and permits one fresh model request, including when draft text has
+already reached the UI: no calls from the rejected response have executed.
+Repeated corruption terminates with that same typed failure. Corrupted code,
+arguments, and provider diagnostics are excluded from recovery instructions
+and structured warning fields. General tools' data arguments are not treated
+as executable REPL code.
+
+The Rig adapter keeps reasoning events separate from argument deltas and
+suppresses final arguments only after **non-empty argument bytes** have been
+streamed. A name-only delta does not discard the final call's arguments; a
+final call can also supply an otherwise-missing name without duplicating
+already-streamed arguments.
+
+`repl_argument_corruption_total` counts rejected responses per provider in
+`runtime/llm-stream-metrics.json` (streaming and blocking paths). The existing
+registry-aware healthpoint aggregates it by tenant and exports
+`lunarwing_health_llm_streams_repl_argument_corruption_total{provider,tenant}`.
+Old snapshots without the field read as zero. Like other stream-integrity
+signals, this is monitor-only. See the
+[Goal 34 verification record](../ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md).
+
 ### Two Execution Tiers
 
 **Tier 0 -- Structured Tool Calls** (`executor/structured.rs`):

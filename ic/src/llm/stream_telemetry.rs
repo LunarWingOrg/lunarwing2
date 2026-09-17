@@ -42,6 +42,8 @@ struct ProviderStreamMetrics {
     stream_aborts_total: u64,
     decode_failures_total: u64,
     corruption_total: u64,
+    #[serde(default)]
+    repl_argument_corruption_total: u64,
     ttfc_samples_total: u64,
     ttfc_sum_ms: u64,
     ttfc_max_ms: u64,
@@ -125,6 +127,16 @@ impl StreamTelemetry {
         if let Some(duration) = ttfc {
             record_ttfc(metrics, duration);
         }
+        metrics.last_issue_unix_seconds = unix_timestamp();
+        snapshot.updated_at_unix_seconds = unix_timestamp();
+        self.persist(&snapshot).await;
+    }
+
+    pub(crate) async fn record_repl_argument_corruption(&self, provider: &str) {
+        let mut snapshot = self.snapshot.lock().await;
+        let metrics = provider_metrics(&mut snapshot, provider);
+        metrics.repl_argument_corruption_total =
+            metrics.repl_argument_corruption_total.saturating_add(1);
         metrics.last_issue_unix_seconds = unix_timestamp();
         snapshot.updated_at_unix_seconds = unix_timestamp();
         self.persist(&snapshot).await;
@@ -218,6 +230,7 @@ pub(crate) fn classify_stream_failure(error: &LlmError) -> StreamFailureReason {
     match error {
         LlmError::RateLimited { .. } => StreamFailureReason::RateLimited,
         LlmError::InvalidResponse { .. } | LlmError::Json(_) => StreamFailureReason::InvalidOutput,
+        LlmError::ReplArgumentCorruption { .. } => StreamFailureReason::InvalidOutput,
         LlmError::RequestFailed { .. } | LlmError::Http(_) | LlmError::Io(_) => {
             StreamFailureReason::Transport
         }

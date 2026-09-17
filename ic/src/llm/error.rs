@@ -17,6 +17,12 @@ pub enum LlmError {
     #[error("Invalid response from {provider}: {reason}")]
     InvalidResponse { provider: String, reason: String },
 
+    #[error("REPL argument corruption from {provider}: {signature}")]
+    ReplArgumentCorruption {
+        provider: String,
+        signature: lunarwing_engine::types::repl::ReplArgumentCorruption,
+    },
+
     #[error("Context length exceeded: {used} tokens used, {limit} allowed")]
     ContextLengthExceeded { used: usize, limit: usize },
 
@@ -57,6 +63,7 @@ impl LlmError {
             }
             Self::RateLimited { .. } => "rate_limited",
             Self::InvalidResponse { .. } | Self::Json(_) => "invalid_output",
+            Self::ReplArgumentCorruption { .. } => "repl_argument_corruption",
             Self::ContextLengthExceeded { .. } => "context_overflow",
             Self::ModelNotAvailable { .. } => "unavailable",
             Self::AuthFailed { .. } | Self::SessionExpired { .. } => "authentication",
@@ -95,6 +102,9 @@ impl LlmError {
             "invalid_output" => Some(
                 "Model failure observation: the previous provider response was invalid. Repair the response shape and continue without repeating completed work.",
             ),
+            "repl_argument_corruption" => Some(
+                lunarwing_engine::ModelFailureKind::ReplArgumentCorruption.recovery_instruction(),
+            ),
             "context_overflow" => Some(
                 "Model failure observation: the context overflowed after compaction. Use the remaining context, finish concisely, and do not reconstruct dropped details.",
             ),
@@ -116,6 +126,9 @@ impl LlmError {
             }
             "invalid_output" => {
                 "The model returned invalid output after one repair attempt. Retry with another model or review provider compatibility."
+            }
+            "repl_argument_corruption" => {
+                lunarwing_engine::ModelFailureKind::ReplArgumentCorruption.terminal_message()
             }
             "context_overflow" => {
                 "The model context remained too large after bounded recovery. Start a new thread, reduce context, or use a larger-context model."

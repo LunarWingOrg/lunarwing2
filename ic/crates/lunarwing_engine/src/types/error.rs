@@ -16,6 +16,7 @@ pub enum ModelFailureKind {
     Transient,
     RateLimited,
     InvalidOutput,
+    ReplArgumentCorruption,
     ContextOverflow,
     Unavailable,
     Authentication,
@@ -29,6 +30,7 @@ impl ModelFailureKind {
             Self::Transient => "transient",
             Self::RateLimited => "rate_limited",
             Self::InvalidOutput => "invalid_output",
+            Self::ReplArgumentCorruption => "repl_argument_corruption",
             Self::ContextOverflow => "context_overflow",
             Self::Unavailable => "unavailable",
             Self::Authentication => "authentication",
@@ -42,6 +44,7 @@ impl ModelFailureKind {
             "transient" => Some(Self::Transient),
             "rate_limited" => Some(Self::RateLimited),
             "invalid_output" => Some(Self::InvalidOutput),
+            "repl_argument_corruption" => Some(Self::ReplArgumentCorruption),
             "context_overflow" => Some(Self::ContextOverflow),
             "unavailable" => Some(Self::Unavailable),
             "authentication" => Some(Self::Authentication),
@@ -68,6 +71,9 @@ impl ModelFailureKind {
             }
             Self::InvalidOutput => {
                 "Model failure observation: the previous provider response was invalid. Repair response shape and continue without repeating completed work."
+            }
+            Self::ReplArgumentCorruption => {
+                "REPL argument corruption: the previous draft was rejected before execution; no tools in that response ran. Emit a fresh, complete Python REPL block or valid structured tool arguments. Keep reasoning, think tags, XML argument tags, and nested fences out of executable code."
             }
             Self::ContextOverflow => {
                 "Model failure observation: context overflowed and older context was removed. Use remaining context, finish concisely, and do not reconstruct dropped details."
@@ -98,6 +104,9 @@ impl ModelFailureKind {
             }
             Self::InvalidOutput => {
                 "The model returned invalid output after one repair attempt. Retry with another model or review provider compatibility."
+            }
+            Self::ReplArgumentCorruption => {
+                "The model repeatedly returned corrupted REPL arguments. The affected responses were not executed. Retry with another model or review provider output."
             }
             Self::ContextOverflow => {
                 "The model context remained too large after bounded recovery. Start a new thread, reduce context, or use a larger-context model."

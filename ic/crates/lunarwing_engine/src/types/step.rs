@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::types::repl::extract_repl_code;
 use crate::types::thread::ThreadId;
 
 /// Strongly-typed step identifier.
@@ -108,7 +109,7 @@ pub enum LlmResponse {
 impl LlmResponse {
     /// Classify provider text as plain assistant output or executable CodeAct.
     pub fn from_text(text: String) -> Self {
-        match extract_code_block(&text) {
+        match extract_repl_code(&text).ok().flatten() {
             Some(code) => Self::Code {
                 code,
                 content: Some(text),
@@ -232,51 +233,6 @@ fn format_final_call(answer: &str) -> String {
     } else {
         format!("FINAL(\"\"\"{answer}\"\"\")")
     }
-}
-
-/// Extract Python code from fenced code blocks in an LLM response.
-fn extract_code_block(text: &str) -> Option<String> {
-    let mut all_code = Vec::new();
-
-    for marker in ["```repl", "```python", "```py", "```"] {
-        let mut search_from = 0;
-        while let Some(start) = text[search_from..].find(marker) {
-            let abs_start = search_from + start;
-            let after_marker = abs_start + marker.len();
-
-            if marker == "```" && text[after_marker..].starts_with(|c: char| c.is_alphabetic()) {
-                let lang: String = text[after_marker..]
-                    .chars()
-                    .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-                    .collect();
-                if !["repl", "python", "py"].contains(&lang.as_str()) {
-                    search_from = after_marker;
-                    continue;
-                }
-            }
-
-            let code_start = text[after_marker..]
-                .find('\n')
-                .map(|offset| after_marker + offset + 1)
-                .unwrap_or(after_marker);
-
-            if let Some(end) = text[code_start..].find("```") {
-                let code = text[code_start..code_start + end].trim();
-                if !code.is_empty() {
-                    all_code.push(code.to_string());
-                }
-                search_from = code_start + end + 3;
-            } else {
-                break;
-            }
-        }
-
-        if !all_code.is_empty() {
-            break;
-        }
-    }
-
-    (!all_code.is_empty()).then(|| all_code.join("\n\n"))
 }
 
 /// A request from the LLM to execute a capability action.

@@ -1391,6 +1391,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn corrupted_repl_draft_recovers_without_executing_a_prefix() {
+        // The first line is valid and effectful. The old fence extractor
+        // treated the nested opener as a closer and could execute that prefix.
+        let draft = "```repl\nawait test_tool()\n```repl\n</think>print('tainted')\n```";
+        let llm = Arc::new(StreamingMockLlm::new(vec![
+            vec![
+                Ok(LlmStreamChunk::TextDelta(draft.into())),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+            vec![
+                Ok(LlmStreamChunk::TextDelta(
+                    "```repl\nFINAL('recovered safely')\n```".into(),
+                )),
+                Ok(LlmStreamChunk::Done {
+                    usage: None,
+                    finish_reason: "stop".into(),
+                }),
+            ],
+        ]));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        let outcome = exec.run().await.unwrap();
+        assert!(
+            matches!(outcome, ThreadOutcome::Completed { response: Some(text) } if text == "recovered safely")
+        );
+        assert!(!exec.thread.events.iter().any(|event| matches!(
+            event.kind,
+            EventKind::ActionExecuted { .. } | EventKind::ActionFailed { .. }
+        )));
+        let requests = llm.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|message| message.content.contains("REPL argument corruption"))
+        );
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|message| message.content.contains("tainted"))
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_repl_corruption_stops_after_one_repair() {
+        let llm = Arc::new(StreamingMockLlm::new(
+            (0..2)
+                .map(|_| {
+                    vec![
+                        Ok(LlmStreamChunk::ToolCallDelta {
+                            index: 0,
+                            id: Some("bad-call".into()),
+                            name: Some("repl".into()),
+                            args_delta: "null".into(),
+                        }),
+                        Ok(LlmStreamChunk::Done {
+                            usage: None,
+                            finish_reason: "tool_calls".into(),
+                        }),
+                    ]
+                })
+                .collect(),
+        ));
+        let (mut exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        let outcome = exec.run().await.unwrap();
+        assert!(matches!(
+            outcome,
+            ThreadOutcome::Failed {
+                kind: ThreadFailureKind::Model(
+                    crate::types::error::ModelFailureKind::ReplArgumentCorruption
+                ),
+                ..
+            }
+        ));
+        assert_eq!(llm.requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn transient_model_failure_gets_one_safe_recovery_request() {
         let diagnostic = "upstream diagnostic with private provider details";
         let llm = Arc::new(ResultMockLlm::new(vec![

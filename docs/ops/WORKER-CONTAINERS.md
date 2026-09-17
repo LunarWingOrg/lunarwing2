@@ -92,6 +92,15 @@ sudo ic/scripts/lunarwing-mt-admin.sh build-tenant <name> --with-opencode2
 sudo ic/scripts/lunarwing-mt-admin.sh build-opencode2-worker --with-toolchains
 ```
 
+CI publication matches the other workers: on protected release tags and
+protected default-branch pushes, `worker-opencode2-candidate` builds the
+image through `.gitlab/scripts/build-worker-image.sh opencode2` (same
+reproducible-candidate + clean-rebuild digest contract), `worker-opencode2-scan`
+runs the Trivy CRITICAL gate + SBOM, and `worker-opencode2-promote` publishes
+the immutable `$CI_COMMIT_TAG-opencode2` tag. `ci-config` cross-checks the
+`OPENCODE_VERSION`/`OPENCODE_REF` ARG defaults against the build script and
+the Rust toolchain pin.
+
 Per-tenant overrides: `configure-opencode2 <name> [--model <m>]
 [--base-url <url>]` (written as `OPENCODE2_MODEL`/`OPENCODE2_BASE_URL`).
 Ports come from the dedicated registry range 51000-51999

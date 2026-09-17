@@ -11,7 +11,7 @@ set -eu
 : "${CI_REGISTRY_USER:?}"
 
 if [ "$#" -ne 1 ]; then
-    echo "usage: build-worker-image.sh pebble|opencode|kimi" >&2
+    echo "usage: build-worker-image.sh pebble|opencode|opencode2|kimi" >&2
     exit 2
 fi
 
@@ -35,6 +35,17 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         source_ref=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
         build_args="OPENCODE_VERSION=v1.18.25
 OPENCODE_REF=cb7d8b2f5e44876ef98b661dc10590c915af3a9f
+WITH_TOOLCHAINS=false
+SOURCE_REVISION=$CI_COMMIT_SHA"
+        ;;
+    opencode2)
+        image_name=worker-opencode2
+        context=opencode2.4lunarwing
+        dockerfile_dir=opencode2.4lunarwing
+        input_files=opencode2.4lunarwing/Dockerfile
+        source_ref=79169fe966d58fb0e0a5e41133716184a0ab4ca6
+        build_args="OPENCODE_VERSION=v2.0.5
+OPENCODE_REF=79169fe966d58fb0e0a5e41133716184a0ab4ca6
 WITH_TOOLCHAINS=false
 SOURCE_REVISION=$CI_COMMIT_SHA"
         ;;
