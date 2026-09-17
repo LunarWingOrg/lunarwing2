@@ -3498,6 +3498,35 @@ mod tests {
         assert!(!app_js.contains("finalizeStreamingMessage(data.thread_id, data.content)"));
     }
 
+    /// WI#164 / MR !998 P2: the pending-gates recovery endpoint must be wired
+    /// into the client — SSE connect fetches it and re-renders approval and
+    /// auth prompts (deduplicated), or reconnects still miss fire-and-forget
+    /// prompts that were broadcast while no client was attached.
+    #[test]
+    fn chat_ui_recovers_pending_gates_on_sse_connect() {
+        let app_js = include_str!("static/app.js");
+        assert!(
+            app_js.contains("apiFetch('/api/chat/pending-gates')"),
+            "client must fetch the pending-gates recovery endpoint"
+        );
+        assert!(
+            app_js.contains("loadPendingGates();"),
+            "SSE connect must run the pending-gates recovery"
+        );
+        assert!(
+            app_js.contains("gate.resume_kind.Authentication"),
+            "auth-kind gates must re-render through the auth prompt path"
+        );
+        assert!(
+            app_js.contains("gate.resume_kind.Approval"),
+            "approval-kind gates must re-render through showApproval"
+        );
+        assert!(
+            app_js.contains("data-request-id=\"' + CSS.escape(gate.request_id)"),
+            "recovered approval cards must dedupe against live cards by request id"
+        );
+    }
+
     /// Build a test router with just the OAuth callback route.
     fn test_oauth_router(state: Arc<GatewayState>) -> Router {
         Router::new()
