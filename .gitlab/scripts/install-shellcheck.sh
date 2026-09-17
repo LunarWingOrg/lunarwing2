@@ -24,6 +24,13 @@ if [[ $(uname -m) != "x86_64" ]]; then
     exit 1
 fi
 
+for tool in curl sha256sum xz; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        echo "ERROR: shellcheck installer requires '$tool' (CI: xz-utils via bootstrap-shell.sh)" >&2
+        exit 1
+    fi
+done
+
 curl --fail --location --silent --show-error "$url" --output "$temp_dir/$archive"
 printf '%s  %s\n' "$checksum" "$temp_dir/$archive" | sha256sum --check
 tar -xJf "$temp_dir/$archive" -C "$temp_dir"
