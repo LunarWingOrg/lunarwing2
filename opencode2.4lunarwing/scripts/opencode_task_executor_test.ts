@@ -29,7 +29,7 @@ function makeSdk(options: MockOptions = {}) {
     if (requestOptions?.signal) signals.push(requestOptions.signal)
   }
   const stream = async function* () {
-    if (options.pendingEvents) {
+    if (options.pendingEvents || options.pendingSubscribe) {
       await new Promise(() => {})
     }
     for (const event of options.events ?? [

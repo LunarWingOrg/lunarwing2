@@ -204,6 +204,16 @@ case "$MODE" in
   websocket)
     log "Mode: WebSocket — starting opencode headless server"
 
+    # v2 serve mandates Basic auth: without an explicit password it mints a
+    # random one (persisted in service.json) that the separate bridge process
+    # can never learn — every bridge call then 401s, surfacing downstream as
+    # SDK ClientError("UnsupportedContentType") at task ingestion (WI#167).
+    # Serve ADOPTS OPENCODE_PASSWORD (or legacy OPENCODE_SERVER_PASSWORD); the
+    # bridge reads OPENCODE_SERVER_PASSWORD for its Authorization header.
+    # Export one shared per-boot secret so server and bridge always agree.
+    : "${OPENCODE_PASSWORD:=${OPENCODE_SERVER_PASSWORD:-$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')}}"
+    export OPENCODE_PASSWORD OPENCODE_SERVER_PASSWORD="$OPENCODE_PASSWORD"
+
     cd "$WORKSPACE_ROOT"
     "$OPENCODE_BIN" serve \
       --port "$OPENCODE_SERVE_PORT" \
