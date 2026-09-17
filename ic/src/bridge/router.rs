@@ -2027,10 +2027,14 @@ fn gate_channel_matches(pending: &PendingGate, responding_channel: &str) -> bool
 
 /// Read-only lookup of the engine conversation for a message's scoped key.
 ///
-/// Uses [`engine_conversation_key`] and `list_conversations`, so it never
-/// creates state (unlike `get_or_create_conversation`). Required for DarkIRC and
-/// WeeChat whose scopes (`darkirc:dm:...`, `weechat:group:...`) are not UUIDs
-/// and therefore cannot be matched by `parse_scope_uuid`.
+/// Delegates to `ConversationManager::find_conversation`, which checks the
+/// in-memory index, then the persisted store (hydrating on hit), so read
+/// paths agree with `get_or_create_conversation` after restarts — work item
+/// #164: the asymmetry used to mint a fresh conversation per message when the
+/// bootstrap race lost the surface, orphaning pending gates. Never creates
+/// state. Required for DarkIRC and WeeChat whose scopes (`darkirc:dm:...`,
+/// `weechat:group:...`) are not UUIDs and therefore cannot be matched by
+/// `parse_scope_uuid`.
 async fn find_engine_conversation_for_message(
     state: &EngineState,
     message: &IncomingMessage,
@@ -2038,10 +2042,8 @@ async fn find_engine_conversation_for_message(
     let key = engine_conversation_key(message);
     state
         .conversation_manager
-        .list_conversations(&message.user_id)
+        .find_conversation(&key, &message.user_id)
         .await
-        .into_iter()
-        .find(|conversation| conversation.channel == key)
 }
 
 async fn scoped_pending_gates(
@@ -2169,12 +2171,19 @@ async fn matching_engine_approval_gate(
 /// Non-UUID channel scopes must resolve through the engine conversation key;
 /// treating them as an absent thread hint can consume a credential from another
 /// conversation owned by the same user.
+///
+/// Work item #164: when the gateway scope key misses (e.g. after a daemon
+/// restart raced the conversation bootstrap, producing a fresh conversation_id
+/// per message), the conversation-keyed lookup cannot see the gate at all.
+/// A UUID scope that parses as an engine ThreadId with exactly one matching
+/// auth gate is used as a fallback — mirroring `has_scoped_pending_gate` —
+/// so the gate still resolves by its stable thread identity.
 async fn matching_engine_auth_gate(
     state: &EngineState,
     message: &IncomingMessage,
 ) -> PendingGateResolution {
     let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
-        return PendingGateResolution::None;
+        return PendingGateResolution::thread_fallback_auth(state, message).await;
     };
     let mut matches: Vec<PendingGate> = state
         .pending_gates
@@ -2192,11 +2201,46 @@ async fn matching_engine_auth_gate(
         .collect();
 
     match matches.len() {
-        0 => PendingGateResolution::None,
+        0 => PendingGateResolution::thread_fallback_auth(state, message).await,
         1 => matches.pop().map_or(PendingGateResolution::None, |gate| {
             PendingGateResolution::Resolved(Box::new(gate))
         }),
         _ => PendingGateResolution::Ambiguous,
+    }
+}
+
+impl PendingGateResolution {
+    /// Resolve exactly-one auth gate by engine ThreadId scope, independent of
+    /// the (unstable) conversation identity. Zero matches fall through as
+    /// `None`; two or more stay `Ambiguous` rather than guessing.
+    async fn thread_fallback_auth(
+        state: &EngineState,
+        message: &IncomingMessage,
+    ) -> PendingGateResolution {
+        let Some(thread_id) = parse_engine_thread_id(message.conversation_scope()) else {
+            return PendingGateResolution::None;
+        };
+        let mut matches: Vec<PendingGate> = state
+            .pending_gates
+            .list_for_user(&message.user_id)
+            .await
+            .into_iter()
+            .filter(|gate| {
+                gate.thread_id == thread_id
+                    && matches!(
+                        gate.resume_kind,
+                        lunarwing_engine::ResumeKind::Authentication { .. }
+                    )
+                    && gate_channel_matches(gate, &message.channel)
+            })
+            .collect();
+        match matches.len() {
+            0 => PendingGateResolution::None,
+            1 => matches.pop().map_or(PendingGateResolution::None, |gate| {
+                PendingGateResolution::Resolved(Box::new(gate))
+            }),
+            _ => PendingGateResolution::Ambiguous,
+        }
     }
 }
 
@@ -8949,6 +8993,74 @@ mod tests {
             matches!(auth_group, PendingGateResolution::Resolved(_)),
             "group scope should find its own auth gate"
         );
+    }
+
+    // Work item #164: when the conversation-keyed lookup misses (restart
+    // raced the bootstrap and a fresh surface was minted), an auth gate must
+    // still resolve via its stable engine ThreadId scope — mirroring
+    // `has_scoped_pending_gate`'s fallback. Without this the auth flow fell
+    // through and never resolved.
+    #[tokio::test]
+    async fn auth_gate_resolves_by_thread_id_when_conversation_lookup_misses() {
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store);
+
+        let scope = "gateway:93fb03c0-fd73-4ca6-b8ab-97fb14c8ab2a";
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation(scope, "alice")
+            .await
+            .unwrap();
+
+        let gate = gate_in_conversation(
+            "alice",
+            "gateway",
+            conv,
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "paste token".into(),
+                auth_url: None,
+            },
+        );
+        let gate_thread = gate.thread_id;
+        state.pending_gates.insert(gate).await.unwrap();
+
+        // Simulate the drift: the scope key now resolves to a DIFFERENT
+        // surface than the one the gate was created against (fresh
+        // conversation minted on a bootstrap race).
+        let drifted = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:drifted-scope", "alice")
+            .await
+            .unwrap();
+        assert_ne!(drifted, conv);
+
+        // A message whose scope parses as the gate's own engine ThreadId must
+        // still resolve the gate even though the conversation lookup cannot.
+        let msg = IncomingMessage::new("gateway", "alice", "tok glpat-...")
+            .with_conversation_scope(gate_thread.to_string());
+        let resolved = matching_engine_auth_gate(&state, &msg).await;
+        assert!(
+            matches!(resolved, PendingGateResolution::Resolved(_)),
+            "auth gate must resolve via thread_id fallback when conversation identity drifted"
+        );
+
+        // A scope that parses as a different thread_id resolves nothing.
+        let other = IncomingMessage::new("gateway", "alice", "tok glpat-...")
+            .with_conversation_scope(lunarwing_engine::ThreadId::new().to_string());
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &other).await,
+            PendingGateResolution::None
+        ));
+
+        // Zero-match conversation lookups with non-thread scopes still fall
+        // through as None (no thread hint to fall back on).
+        let no_hint = IncomingMessage::new("gateway", "alice", "tok glpat-...")
+            .with_conversation_scope("darkirc:dm:nobody");
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &no_hint).await,
+            PendingGateResolution::None
+        ));
     }
 
     // ── Phase 5: DarkIRC / WeeChat live thread scope isolation ──
