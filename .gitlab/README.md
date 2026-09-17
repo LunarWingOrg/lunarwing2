@@ -122,6 +122,60 @@ Permanent mitigations, in order of preference:
 If runner image allowlists are enabled (see above), add the mirrored
 registry paths to the allowlist when adopting option 2.
 
+## Rust runner memory budget (OOM / signal 9)
+
+Symptom — a Rust check/clippy/test job fails with no compiler diagnostic at
+all, only:
+
+```
+sccache: Compile terminated by signal 9
+error: could not compile `lunarwing` (lib test)
+  ... process didn't exit successfully: .../rustc ... (exit status: 2)
+```
+
+This is the **kernel OOM killer**, not a code defect: rustc compiling the
+`lunarwing` lib alone approaches the 16 GB runner ceiling, and two of those
+compiles on one host exceed it. Evidence: pipelines #3654 (`rust-clippy-all`),
+#3702 (`rust-check-postgres`), and #3707 (`rust-check-postgres` +
+`rust-check-libsql`) all died this way while an overlapping pipeline's
+identical compile ran on the same runner host — job traces show the same
+system ID (`lunarwing-rust-docker`, `r_dLo2MDLTpMm2`) serving build slots
+`concurrent-0`, `concurrent-1`, and `concurrent-3` simultaneously, i.e. the
+documented `limit = 1` runner contract had drifted at the host.
+
+Two independent guards, both required:
+
+1. **Repo-side (enforced here):** every job that compiles the `lunarwing` lib
+   carries `resource_group: rust-compile-16gb`. GitLab queues same-group jobs
+   project-wide, so overlapping pipelines can never run two giant-crates
+   compiles at once, whatever the runner concurrency setting is. Cheaper jobs
+   (rustfmt, cargo-metadata, MSRV check, wasm artifacts) are not in the group.
+2. **Host-side (runner config):** keep `limit = 1` (see §6 runner setup). The
+   resource group cannot see non-project load on the host, so the per-host
+   limit remains the real fence for anything outside this repository.
+
+Recovery: rerun the failed job — nothing in the tree is broken. If failures
+persist, check the runner host for concurrent build slots (`docker ps | grep
+concurrent-` on the runner host) and restore `limit = 1` before anything else.
+
+## container-build runner disk (ENOSPC)
+
+Symptom — `worker-*-candidate` fails inside BuildKit with:
+
+```
+error: failed to write /build/pebble/target/release/deps/...: No space left on device (os error 28)
+```
+
+and every downstream `worker-*-scan` then fails within seconds with the
+explicit `worker-image.env is missing — the candidate job for this worker
+failed or did not publish an image` guard (added after pipeline #3684, where
+the raw error was a bare `can't open './worker-image.env'`).
+
+This is runner-host disk exhaustion on the `container-build` tag. Recovery:
+free space on that host (prune dangling images/build cache), then re-run the
+candidate job — the scan can only succeed after a candidate publishes
+`worker-image.env`.
+
 ## Required jobs
 
 - CI composition, shell syntax, shellcheck, Python syntax, registry JSON, version
@@ -164,6 +218,12 @@ registry paths to the allowlist when adopting option 2.
   the 16 GB runner for four-way check jobs; `-j6` in AGENTS.md is the local-dev
   budget. Normal test jobs retain line tables only; libSQL test jobs omit debug
   info entirely to avoid OOM near 16 GB.
+- Rust runner memory budget (cross-pipeline guard): every job that compiles the
+  `lunarwing` lib — the giant-crates rustc/clippy-driver invocation — shares the
+  project-wide `rust-compile-16gb` resource group, so only one such compile runs
+  at a time **across all pipelines**, not just within one. This is the repo-side
+  half of the runner budget; `limit = 1` in the runner `config.toml` is the
+  host-side half. See "Rust runner memory budget" below for why both are needed.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
