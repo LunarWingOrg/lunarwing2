@@ -2267,6 +2267,16 @@ function loadHistory(before) {
       // Re-render pending approval card if the thread is awaiting approval
       if (data.pending_approval) {
         showApproval(data.pending_approval);
+      } else {
+        // MR !1002 review P2: `loadPendingGates()` may have rendered a
+        // recovered approval card while this history request was in flight,
+        // and `replaceChildren` above just erased it. The legacy
+        // `pending_approval` field does not reliably restore an Engine V2
+        // gate, so re-fetch the pending-gate list after the DOM replacement
+        // and re-render through the same deduplicating path. This covers both
+        // response orderings: gates-then-history (card erased, re-rendered
+        // here) and history-then-gates (card rendered once, deduped).
+        loadPendingGates();
       }
       if (preservedScrollTop !== null && !_chatAutoScroll) {
         container.scrollTop = preservedScrollTop;
