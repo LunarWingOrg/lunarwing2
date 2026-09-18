@@ -101,6 +101,36 @@ the immutable `$CI_COMMIT_TAG-opencode2` tag. `ci-config` cross-checks the
 `OPENCODE_VERSION`/`OPENCODE_REF` ARG defaults against the build script and
 the Rust toolchain pin.
 
+The opencode2 worker applies a checked build-profile patch to the pinned
+upstream CLI script: `splitting: false` and `bytecode: false`. This avoids
+split-chunk identifiers and ahead-of-time bytecode in the shipped executable;
+it keeps upstream version injection, plugins, and artifact verification. Bun
+parses the bundled source at startup instead, so startup time may increase.
+The patch fails if either expected upstream setting is missing or duplicated,
+requiring review when upgrading OpenCode. Executable bytes are not rewritten.
+
+Image self-tests use `/tmp/opencode2-build-tests`, removed by an EXIT trap in
+the same Docker `RUN`, and disable Python bytecode writes. The workspace-path
+test also removes its own `oc2-ws-*` directory in `finally` for local runs.
+These address the two reported sources of opencode2 digest drift: per-build
+chunk IDs in the executable and leftover randomly named test workspaces.
+The candidate versus uncached-rebuild **whole-image digest comparison remains
+mandatory**; a passing binary check alone does not establish image reproducibility.
+
+Verification (2026-09-18): built upstream commit
+`79169fe966d58fb0e0a5e41133716184a0ab4ca6` with Bun 1.4.2 extracted from the
+Dockerfile's pinned amd64 image, using `OPENCODE_VERSION=2.0.5 bun run build --
+--single` in fresh build processes. Original-profile binaries differed in 3,295
+bytes, including the reported random-prefix `C00000184`-style chunk keys.
+Two patched-profile builds were byte-identical (`cmp`), SHA-256
+`9f71bc51e6d778b0cceec8626a98d4815f3620e4f928358b403e4895f66baf69`.
+This is host-build evidence, not a portable expected image/binary checksum.
+The patched executable passed `--version` (`opencode v2.0.5`) and `serve --help`.
+Bridge executor, result, workspace-path, build-profile, and study-notes tests
+passed; workspace cleanup was also checked with an injected assertion failure.
+Full image digest verification remains with CI: local Podman could not unpack
+the base image because this account lacks sufficient subordinate UID/GID mappings.
+
 Per-tenant overrides: `configure-opencode2 <name> [--model <m>]
 [--base-url <url>]` (written as `OPENCODE2_MODEL`/`OPENCODE2_BASE_URL`).
 Ports come from the dedicated registry range 51000-51999

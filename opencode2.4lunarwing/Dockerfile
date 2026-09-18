@@ -50,6 +50,10 @@ WORKDIR /build/opencode/packages/client
 RUN bun run build || echo "WARNING: @opencode/client build reported errors (import-verified in runtime stage)"
 
 WORKDIR /build/opencode/packages/cli
+COPY scripts/prepare_reproducible_build.py /build/prepare_reproducible_build.py
+# Single-bundle source compilation avoids per-build chunk IDs/bytecode in the
+# executable. Fail closed if the pinned upstream build options have drifted.
+RUN python3 /build/prepare_reproducible_build.py script/build.ts
 # Build only the native platform target (mirrors the v1 worker's --single
 # rationale; the image is distributed same-host via podman save|load).
 # Inject the pinned release version (sans leading v) into the build env:
@@ -231,7 +235,11 @@ RUN cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof
 # in at build time above). Compare against exactly that, and LOG the actual
 # value on mismatch — a bare `test` fails this step with zero output, which
 # made this lane's repeated silent build failures painful to diagnose.
-RUN actual="$(/usr/local/bin/opencode --version)" \
+RUN set -eu; \
+    export TMPDIR=/tmp/opencode2-build-tests PYTHONDONTWRITEBYTECODE=1; \
+    mkdir -p "$TMPDIR"; \
+    trap 'rm -rf /tmp/opencode2-build-tests' EXIT; \
+    actual="$(/usr/local/bin/opencode --version)" \
     && expected="opencode v${OPENCODE_VERSION#v}" \
     && { [ "$actual" = "$expected" ] \
          || { echo "FATAL: opencode --version reported '$actual', expected '$expected'" >&2; exit 1; }; } \
@@ -239,6 +247,7 @@ RUN actual="$(/usr/local/bin/opencode --version)" \
     && bun scripts/path_expand_test.ts \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
+    && python3 scripts/prepare_reproducible_build_test.py \
     && python3 scripts/study_notes_config_test.py
 
 # ── XDG directories for opencode state ────────────────────────

@@ -42,7 +42,9 @@ SOURCE_REVISION=$CI_COMMIT_SHA"
         image_name=worker-opencode2
         context=opencode2.4lunarwing
         dockerfile_dir=opencode2.4lunarwing
-        input_files=opencode2.4lunarwing/Dockerfile
+        input_files='opencode2.4lunarwing/Dockerfile
+opencode2.4lunarwing/scripts/prepare_reproducible_build.py
+opencode2.4lunarwing/scripts/path_expand_test.ts'
         source_ref=79169fe966d58fb0e0a5e41133716184a0ab4ca6
         build_args="OPENCODE_VERSION=v2.0.5
 OPENCODE_REF=79169fe966d58fb0e0a5e41133716184a0ab4ca6
