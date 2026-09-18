@@ -3712,6 +3712,7 @@ struct LateOutcomeWatch {
 fn spawn_late_outcome_watcher(
     watch: LateOutcomeWatch,
     channels: std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: Arc<crate::hooks::HookRegistry>,
     mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) {
     tokio::spawn(async move {
@@ -3736,7 +3737,7 @@ fn spawn_late_outcome_watcher(
                 db: state.db.clone(),
             }
         };
-        await_late_outcome(&handles, watch, &channels, &mut event_rx).await;
+        await_late_outcome(&handles, watch, &channels, &hooks, &mut event_rx).await;
     });
 }
 
@@ -3812,6 +3813,7 @@ async fn await_late_outcome(
     handles: &LateOutcomeHandles,
     watch: LateOutcomeWatch,
     channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    hooks: &Arc<crate::hooks::HookRegistry>,
     event_rx: &mut tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
 ) {
     let deadline = late_outcome_deadline();
@@ -3822,7 +3824,7 @@ async fn await_late_outcome(
         handles.thread_manager.join_thread(watch.thread_id),
     )
     .await;
-    let outcome = match joined {
+    let mut outcome = match joined {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => {
             debug!(
@@ -3841,18 +3843,6 @@ async fn await_late_outcome(
             return;
         }
     };
-
-    if let Err(error) = handles
-        .conversation_manager
-        .record_thread_outcome(watch.conversation_id, watch.thread_id, &outcome)
-        .await
-    {
-        debug!(
-            thread_id = %watch.thread_id,
-            %error,
-            "late-outcome watcher failed to record outcome"
-        );
-    }
 
     let tid_str = watch.thread_id.to_string();
     if let ThreadOutcome::GatePaused { .. } = outcome {
@@ -3879,6 +3869,78 @@ async fn await_late_outcome(
             }
         }
         return;
+    }
+
+    // MR !1002 review P1: a late response must honor the same transform/suppression
+    // contract as a normally-completed turn. The normal path applies
+    // `transform_response` to the `Completed{response}` text *before*
+    // `record_thread_outcome`, so engine conversation history and outbound delivery
+    // both see transformed (or suppressed) content. Mirror that ordering here:
+    // transform the outcome text first, suppress on reject/hook-error by clearing
+    // it, and only then record and deliver. The auth-fallback exception matches the
+    // normal completion path so credential prompts are never mangled.
+    let is_auth_fallback = matches!(
+        &outcome,
+        ThreadOutcome::Completed {
+            response: Some(text),
+        } if text.contains("authentication_required")
+    );
+    if !is_auth_fallback
+        && let ThreadOutcome::Completed {
+            response: Some(text),
+        } = &mut outcome
+    {
+        // Snapshot the pre-hook text: `std::mem::take` empties the outcome field
+        // while the hook runs, and the unmodified/continue arms must restore it.
+        let original = std::mem::take(text);
+        let event = crate::hooks::HookEvent::ResponseTransform {
+            user_id: watch.user_id.clone(),
+            thread_id: tid_str.clone(),
+            response: original,
+            channel: Some(watch.channel.clone()),
+            policy_scope: crate::channels::routing_target_from_metadata(&watch.message.metadata),
+        };
+        match hooks.run(&event).await {
+            Err(error) => {
+                tracing::warn!(
+                    channel = %watch.channel,
+                    user = %watch.user_id,
+                    %error,
+                    "Response transform failed closed on late outcome; suppressing response"
+                );
+                text.clear();
+            }
+            Ok(crate::hooks::HookOutcome::Reject { reason }) => {
+                tracing::debug!(
+                    channel = %watch.channel,
+                    user = %watch.user_id,
+                    reason = %reason,
+                    "Response transform rejected late outcome; suppressing response"
+                );
+                text.clear();
+            }
+            Ok(crate::hooks::HookOutcome::Continue {
+                modified: Some(transformed),
+            }) => *text = transformed,
+            Ok(crate::hooks::HookOutcome::Continue { modified: None }) => {
+                // Preserve the original (pre-hook) response text.
+                if let crate::hooks::HookEvent::ResponseTransform { response, .. } = event {
+                    *text = response;
+                }
+            }
+        }
+    }
+
+    if let Err(error) = handles
+        .conversation_manager
+        .record_thread_outcome(watch.conversation_id, watch.thread_id, &outcome)
+        .await
+    {
+        debug!(
+            thread_id = %watch.thread_id,
+            %error,
+            "late-outcome watcher failed to record outcome"
+        );
     }
 
     let text = thread_outcome_response(&outcome).unwrap_or_default();
@@ -4160,6 +4222,7 @@ async fn await_thread_outcome(
                             message: message.clone(),
                         },
                         Arc::clone(&agent.channels),
+                        Arc::clone(agent.hooks()),
                         event_rx,
                     );
                     return Ok(Some(format!(
@@ -7309,6 +7372,265 @@ mod tests {
             joined.expect("thread should join"),
             ThreadOutcome::Stopped
         ));
+    }
+
+    /// Test hooks for the MR !1002 review P1 regression coverage: modify,
+    /// reject, and fail-closed variants bound to `TransformResponse`.
+    struct TransformModifyHook;
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for TransformModifyHook {
+        fn name(&self) -> &str {
+            "transform-modify-test"
+        }
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::TransformResponse]
+        }
+        async fn execute(
+            &self,
+            event: &crate::hooks::HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<crate::hooks::HookOutcome, crate::hooks::HookError> {
+            let crate::hooks::HookEvent::ResponseTransform { response, .. } = event else {
+                return Ok(crate::hooks::HookOutcome::ok());
+            };
+            Ok(crate::hooks::HookOutcome::modify(format!(
+                "[transformed] {response}"
+            )))
+        }
+    }
+
+    struct TransformRejectHook;
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for TransformRejectHook {
+        fn name(&self) -> &str {
+            "transform-reject-test"
+        }
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::TransformResponse]
+        }
+        async fn execute(
+            &self,
+            _event: &crate::hooks::HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<crate::hooks::HookOutcome, crate::hooks::HookError> {
+            Ok(crate::hooks::HookOutcome::reject("test suppression"))
+        }
+    }
+
+    struct TransformFailClosedHook;
+    #[async_trait::async_trait]
+    impl crate::hooks::Hook for TransformFailClosedHook {
+        fn name(&self) -> &str {
+            "transform-fail-closed-test"
+        }
+        fn hook_points(&self) -> &[crate::hooks::HookPoint] {
+            &[crate::hooks::HookPoint::TransformResponse]
+        }
+        fn failure_mode(&self) -> crate::hooks::HookFailureMode {
+            crate::hooks::HookFailureMode::FailClosed
+        }
+        async fn execute(
+            &self,
+            _event: &crate::hooks::HookEvent,
+            _ctx: &crate::hooks::HookContext,
+        ) -> Result<crate::hooks::HookOutcome, crate::hooks::HookError> {
+            Err(crate::hooks::HookError::ExecutionFailed {
+                reason: "test hook failure".into(),
+            })
+        }
+    }
+
+    /// Drive `await_late_outcome` with a real thread that completes with the
+    /// given response text: the watcher polls until the thread finishes, joins
+    /// it, then records and delivers (the transform hooks under test run on
+    /// that path).
+    async fn drive_late_outcome_with_completed_thread(
+        hooks: Arc<crate::hooks::HookRegistry>,
+        response_text: &str,
+    ) -> (
+        Vec<(String, OutgoingResponse)>,
+        Option<lunarwing_engine::ConversationSurface>,
+    ) {
+        use crate::testing::RecordingBroadcastChannel;
+
+        let store = Arc::new(TestStore::new());
+        let state = make_expected_test_state(store.clone());
+
+        // A thread manager whose LLM answers with the fixed text, so the
+        // resumed thread completes promptly with `Completed { response }`.
+        struct FixedTextLlm {
+            text: String,
+        }
+        #[async_trait::async_trait]
+        impl lunarwing_engine::LlmBackend for FixedTextLlm {
+            async fn complete(
+                &self,
+                _: &[lunarwing_engine::ThreadMessage],
+                _: &[lunarwing_engine::ActionDef],
+                _: &lunarwing_engine::LlmCallConfig,
+            ) -> Result<lunarwing_engine::LlmOutput, lunarwing_engine::EngineError> {
+                Ok(lunarwing_engine::LlmOutput {
+                    response: lunarwing_engine::LlmResponse::Text(self.text.clone()),
+                    usage: lunarwing_engine::TokenUsage::default(),
+                    finish_reason: "stop".to_string(),
+                })
+            }
+            fn model_name(&self) -> &str {
+                "fixed-text"
+            }
+        }
+        struct NoopEffects;
+        #[async_trait::async_trait]
+        impl lunarwing_engine::EffectExecutor for NoopEffects {
+            async fn execute_action(
+                &self,
+                _: &str,
+                _: serde_json::Value,
+                _: &lunarwing_engine::CapabilityLease,
+                _: &lunarwing_engine::ThreadExecutionContext,
+            ) -> Result<lunarwing_engine::ActionResult, lunarwing_engine::EngineError> {
+                unreachable!()
+            }
+            async fn available_actions(
+                &self,
+                _: &[lunarwing_engine::CapabilityLease],
+            ) -> Result<Vec<lunarwing_engine::ActionDef>, lunarwing_engine::EngineError>
+            {
+                Ok(vec![])
+            }
+        }
+
+        let store_dyn: Arc<dyn Store> = store.clone();
+        let fixed_tm = Arc::new(ThreadManager::new(
+            Arc::new(FixedTextLlm {
+                text: response_text.to_string(),
+            }),
+            Arc::new(NoopEffects),
+            store_dyn.clone(),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mut handles = late_outcome_handles(&state);
+        handles.thread_manager = Arc::clone(&fixed_tm);
+
+        let channels = std::sync::Arc::new(crate::channels::ChannelManager::new());
+        let (recorder, broadcasts) = RecordingBroadcastChannel::new("gateway");
+        channels.add(Box::new(recorder)).await;
+
+        let thread = save_waiting_thread(&store, state.default_project_id, "alice").await;
+        let conversation_id = state
+            .conversation_manager
+            .get_or_create_conversation("gateway:thread-late", "alice")
+            .await
+            .unwrap();
+        let watch = LateOutcomeWatch {
+            thread_id: thread.id,
+            conversation_id,
+            user_id: "alice".into(),
+            channel: "gateway".into(),
+            conversation_scope: Some("thread-late".into()),
+            message: IncomingMessage::new("gateway", "alice", "run it")
+                .with_conversation_scope("thread-late"),
+        };
+
+        fixed_tm
+            .resume_thread(thread.id, "alice".to_string(), None, None, None)
+            .await
+            .expect("resume should spawn the completing run");
+
+        let mut event_rx = fixed_tm.subscribe_events();
+        await_late_outcome(&handles, watch, &channels, &hooks, &mut event_rx).await;
+
+        let delivered = broadcasts.lock().await.clone();
+        let conversation = state.conversation_manager.get_conversation(conversation_id).await;
+        (delivered, conversation)
+    }
+
+    /// MR !1002 review P1: a late response that a TransformResponse hook
+    /// modifies must be recorded and delivered in its transformed form.
+    #[tokio::test]
+    async fn late_outcome_applies_transform_hook_before_record_and_delivery() {
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+        hooks.register(Arc::new(TransformModifyHook)).await;
+
+        let (delivered, conversation) = drive_late_outcome_with_completed_thread(
+            Arc::clone(&hooks),
+            "raw reply",
+        )
+        .await;
+
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].1.content, "[transformed] raw reply");
+        let conversation = conversation.expect("conversation should exist");
+        let agent_entries: Vec<&str> = conversation
+            .entries
+            .iter()
+            .filter(|e| matches!(e.sender, lunarwing_engine::EntrySender::Agent { .. }))
+            .map(|e| e.content.as_str())
+            .collect();
+        assert_eq!(agent_entries, vec!["[transformed] raw reply"]);
+    }
+
+    /// MR !1002 review P1: a late response rejected (or failed) by a
+    /// TransformResponse hook must be suppressed — neither recorded as
+    /// assistant output nor delivered to the channel.
+    #[tokio::test]
+    async fn late_outcome_suppresses_rejected_response_from_history_and_delivery() {
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+        hooks.register(Arc::new(TransformRejectHook)).await;
+
+        let (delivered, conversation) = drive_late_outcome_with_completed_thread(
+            Arc::clone(&hooks),
+            "secret reply",
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "rejected late response must not be delivered: {delivered:?}"
+        );
+        let conversation = conversation.expect("conversation should exist");
+        let agent_entries: Vec<&str> = conversation
+            .entries
+            .iter()
+            .filter(|e| matches!(e.sender, lunarwing_engine::EntrySender::Agent { .. }))
+            .map(|e| e.content.as_str())
+            .collect();
+        assert!(
+            agent_entries.is_empty(),
+            "rejected late response must not be recorded as assistant output: {agent_entries:?}"
+        );
+    }
+
+    /// MR !1002 review P1: a failing fail-closed hook suppresses the late
+    /// response exactly like a rejection.
+    #[tokio::test]
+    async fn late_outcome_suppresses_failed_hook_response() {
+        let hooks = Arc::new(crate::hooks::HookRegistry::default());
+        hooks.register(Arc::new(TransformFailClosedHook)).await;
+
+        let (delivered, conversation) = drive_late_outcome_with_completed_thread(
+            Arc::clone(&hooks),
+            "untrusted reply",
+        )
+        .await;
+
+        assert!(
+            delivered.is_empty(),
+            "fail-closed late response must not be delivered: {delivered:?}"
+        );
+        let conversation = conversation.expect("conversation should exist");
+        let agent_entries: Vec<&str> = conversation
+            .entries
+            .iter()
+            .filter(|e| matches!(e.sender, lunarwing_engine::EntrySender::Agent { .. }))
+            .map(|e| e.content.as_str())
+            .collect();
+        assert!(
+            agent_entries.is_empty(),
+            "fail-closed late response must not be recorded: {agent_entries:?}"
+        );
     }
 
     #[tokio::test]
