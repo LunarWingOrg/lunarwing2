@@ -98,6 +98,8 @@ struct Rig {
     _db_disk: tempfile::TempDir,
 }
 
+// Keep the helper's test-only boundary explicit for per-file CI source checks.
+#[cfg(test)]
 impl Rig {
     async fn new(response: Option<&str>, policy: Option<Policy>) -> Self {
         let store = Arc::new(TestStore::new());
