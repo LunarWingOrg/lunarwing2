@@ -369,6 +369,42 @@ ExecutionMode:
 4. User responds with `GateResolution`
 5. Thread resumes with the result injected as a message
 
+The authenticated `GET /api/chat/pending-gates` endpoint exposes the caller's
+non-expired `PendingGateView` records, including redacted display parameters and
+typed approval/auth requirements. Clients can reconcile after reconnect or
+`stream_gap`; SSE itself remains a bounded, ephemeral stream. The browser keeps
+gate state independently of the history DOM, so either history/snapshot response
+order preserves the prompt. Live gate events supersede in-flight snapshots;
+resolved request IDs cannot be resurrected by stale responses. Engine startup
+unavailability and transient recovery failures are retried. Authentication is by
+bearer header (query-token fallback is reserved for streaming routes).
+
+Recovered authentication controls send both `request_id` and `thread_id` to
+`POST /api/chat/auth-token` and `POST /api/chat/auth-cancel`. The pair is optional
+for legacy clients, but an explicitly supplied pair must match a live auth gate
+owned by the caller and its credential name; partial identities return 400 and
+stale/mismatched identities return 409. Cancellation atomically takes that gate,
+finalizes its waiting thread, persists removal, and emits `gate_resolved`.
+Token configuration queues a process-local, secret-wrapped control payload for
+the selected gate. Dispatch revalidates the gate before resolution; credentials
+never become ordinary chat input if the gate expires or changes while queued.
+The browser waits for cancellation confirmation before tombstoning its cache,
+and for a resolution event or authoritative snapshot after token submission.
+Extension-wide auth completion cannot dismiss a different pending request for
+the same extension.
+
+Startup restore removes expired gates from disk as well as skipping them in
+memory; pruning failure is logged and never revives an expired approval.
+Conversation lookups and creation share a store-backed hydration path, using
+the same conversations-before-index lock order and rechecking after I/O. Auth
+resolution accepts an exact UUID thread hint as a fallback while still enforcing
+user ownership, source/trusted channel checks, and ambiguity rejection.
+
+Engine V2's effect adapter consumes resolved `auto_approve_tools` configuration.
+It only bypasses `UnlessAutoApproved`: disabled tools, `Always` requirements,
+shared-channel rules, and supervised mode retain their gates. See
+`docs/guides/ENABLING_DEV_TOOLS.md` for environment aliases and diagnostics.
+
 ## Learning Missions
 
 ### Mission Scheduling
@@ -606,10 +642,32 @@ while `ENGINE_V2=true`. The only durable opt-out is `ENGINE_V2=false`.
 Engine `ResponseDelta` events flow through
 `ChannelManager::send_status(StatusUpdate::StreamChunk)`. The gateway maps each
 chunk to SSE. WASM channels deliberately treat chunks as a no-op because the
-current WIT has no message-editing contract. Completed terminal text returns to
-the agent's outer outbound handler, which applies `BeforeOutbound`, suppresses
-empty responses, persists compatibility history, and calls
-`ChannelManager::respond()` once with the original incoming metadata.
+current WIT has no message-editing contract. `router/outcome.rs` transforms
+completed terminal text before recording engine and compatibility history. The
+agent's outbound handler then uses the shared `ResponseDelivery` path:
+`BeforeOutbound`, suppress-empty, optional coordination coalescing, and
+`ChannelManager::respond()` with the original incoming metadata.
+
+At the initial 610-second outcome deadline, delivery transfers to an owned late
+watcher, retaining the engine event receiver and original reply route. The caller
+returns an empty sentinel and emits a waiting status, not a terminal reply. The
+thread stays interruptible in `ThreadManager` while the watcher drains progress.
+On completion it joins once and uses the same transform, history, authentication
+fallback, and durable gate handling as an on-time result. Authentication-marker
+text is subject to response hooks; only a valid credential request in the
+transformed output becomes an auth gate. It is not recorded as assistant prose.
+
+The watcher has a second 600-second budget, then requests stop with a bounded
+60-second grace and reports a terminal timeout if its stop succeeds. It never
+joins a still-running handle, which would hide it from
+`/interrupt`. Cancellation failure reports an error and leaves the live handle
+addressable. These are in-process delivery guarantees; the watcher is not a
+durable cross-restart outbox.
+
+Engine `message` tool calls receive execution-local `notify_thread_id`; gateway
+calls also carry their execution's user/channel instead of mutable conversation
+defaults. Proactive gateway delivery therefore meets the channel's required
+thread-routing contract.
 
 If a gateway SSE or WebSocket subscriber falls behind and the broadcast ring
 drops events it would have received, the subscription converts the lag into an

@@ -1,5 +1,9 @@
 //! Engine v2 router — handles user messages via the engine when enabled.
 
+pub(crate) mod auth;
+mod outcome;
+use outcome::await_thread_outcome;
+
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::RwLock;
@@ -812,9 +816,10 @@ async fn resolve_user_project(
 }
 
 /// Persistent engine state that lives across messages.
+#[derive(Clone)]
 struct EngineState {
     thread_manager: Arc<ThreadManager>,
-    conversation_manager: ConversationManager,
+    conversation_manager: Arc<ConversationManager>,
     effect_adapter: Arc<EffectBridgeAdapter>,
     store: Arc<dyn Store>,
     default_project_id: lunarwing_engine::ProjectId,
@@ -1449,11 +1454,14 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         Some(agent.cheap_llm().clone()),
     ));
 
-    let effect_adapter = Arc::new(EffectBridgeAdapter::new(
-        agent.tools().clone(),
-        agent.safety().clone(),
-        agent.hooks().clone(),
-    ));
+    let effect_adapter = Arc::new(
+        EffectBridgeAdapter::new(
+            agent.tools().clone(),
+            agent.safety().clone(),
+            agent.hooks().clone(),
+        )
+        .with_auto_approve_tools(agent.auto_approve_tools()),
+    );
     if let Some(store) = agent.deps.store.clone() {
         effect_adapter.set_settings_store_from_db(store).await;
     }
@@ -1697,7 +1705,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         }
     };
 
-    let conversation_manager = ConversationManager::new(Arc::clone(&thread_manager), store.clone());
+    let conversation_manager = Arc::new(ConversationManager::new(
+        Arc::clone(&thread_manager),
+        store.clone(),
+    ));
     if let Err(e) = conversation_manager
         .bootstrap_user(&agent.deps.owner_id)
         .await
@@ -1928,6 +1939,31 @@ pub async fn get_engine_pending_gate(
     }
 }
 
+/// Recover live approval/auth prompts lost during a gateway disconnect.
+pub async fn list_engine_pending_gates(
+    user_id: &str,
+) -> Result<Vec<crate::gate::pending::PendingGateView>, Error> {
+    let Some(lock) = ENGINE_STATE.get() else {
+        if is_engine_v2_enabled() {
+            return Err(engine_err("pending gates", "engine is still initializing"));
+        }
+        return Ok(Vec::new());
+    };
+    let guard = lock.read().await;
+    let Some(state) = guard.as_ref() else {
+        if is_engine_v2_enabled() {
+            return Err(engine_err("pending gates", "engine is still initializing"));
+        }
+        return Ok(Vec::new());
+    };
+    let mut gates = state.pending_gates.list_for_user(user_id).await;
+    gates.sort_by_key(|gate| std::cmp::Reverse((gate.created_at, gate.request_id)));
+    Ok(gates
+        .iter()
+        .map(crate::gate::pending::PendingGateView::from)
+        .collect())
+}
+
 pub async fn resolve_engine_auth_callback(
     user_id: &str,
     credential_name: &str,
@@ -2027,7 +2063,7 @@ fn gate_channel_matches(pending: &PendingGate, responding_channel: &str) -> bool
 
 /// Read-only lookup of the engine conversation for a message's scoped key.
 ///
-/// Uses [`engine_conversation_key`] and `list_conversations`, so it never
+/// Uses [`engine_conversation_key`] and a store-backed lookup, so it never
 /// creates state (unlike `get_or_create_conversation`). Required for DarkIRC and
 /// WeeChat whose scopes (`darkirc:dm:...`, `weechat:group:...`) are not UUIDs
 /// and therefore cannot be matched by `parse_scope_uuid`.
@@ -2036,12 +2072,17 @@ async fn find_engine_conversation_for_message(
     message: &IncomingMessage,
 ) -> Option<lunarwing_engine::ConversationSurface> {
     let key = engine_conversation_key(message);
-    state
+    match state
         .conversation_manager
-        .list_conversations(&message.user_id)
+        .find_conversation(&key, &message.user_id)
         .await
-        .into_iter()
-        .find(|conversation| conversation.channel == key)
+    {
+        Ok(conversation) => conversation,
+        Err(error) => {
+            tracing::warn!(%error, "engine conversation lookup failed");
+            None
+        }
+    }
 }
 
 async fn scoped_pending_gates(
@@ -2173,16 +2214,18 @@ async fn matching_engine_auth_gate(
     state: &EngineState,
     message: &IncomingMessage,
 ) -> PendingGateResolution {
-    let Some(conversation) = find_engine_conversation_for_message(state, message).await else {
-        return PendingGateResolution::None;
-    };
+    let conversation = find_engine_conversation_for_message(state, message).await;
+    let thread_hint = parse_engine_thread_id(message.conversation_scope());
     let mut matches: Vec<PendingGate> = state
         .pending_gates
         .list_for_user(&message.user_id)
         .await
         .into_iter()
         .filter(|gate| {
-            gate.conversation_id == conversation.id
+            (conversation
+                .as_ref()
+                .is_some_and(|conv| gate.conversation_id == conv.id)
+                || thread_hint == Some(gate.thread_id))
                 && matches!(
                     gate.resume_kind,
                     lunarwing_engine::ResumeKind::Authentication { .. }
@@ -2549,22 +2592,7 @@ pub async fn resolve_gate(
         }
 
         lunarwing_engine::GateResolution::Cancelled => {
-            if let Some(ref sse) = state.sse {
-                sse.broadcast_for_user(
-                    &message.user_id,
-                    AppEvent::GateResolved {
-                        request_id: pending.request_id.to_string(),
-                        gate_name: pending.gate_name.clone(),
-                        tool_name: pending.action_name.clone(),
-                        resolution: "cancelled".into(),
-                        message: "Gate cancelled.".into(),
-                        thread_id: Some(pending.thread_id.to_string()),
-                    },
-                );
-            }
-            // Gate-paused threads are persisted as Waiting and are absent from
-            // the running map, so finalize them directly instead of signalling.
-            finalize_silently_stopped_pending_thread(state, &pending).await?;
+            auth::cancel_pending_gate(state, &pending).await?;
             return Ok(Some("Cancelled.".into()));
         }
 
@@ -2627,6 +2655,7 @@ pub async fn resolve_gate(
                         // attachments are control-path input and must not be
                         // grafted onto the original user request during retry.
                         attachments: Vec::new(),
+                        auth_gate_submission: None,
                         ..message.clone()
                     };
                     drop(guard);
@@ -3607,268 +3636,6 @@ async fn handle_user_message_with_event_receiver(
     Ok((thread_id, event_rx))
 }
 
-async fn await_thread_outcome(
-    agent: &Agent,
-    state: &EngineState,
-    message: &IncomingMessage,
-    conv_id: lunarwing_engine::ConversationId,
-    thread_id: lunarwing_engine::ThreadId,
-    mut event_rx: tokio::sync::broadcast::Receiver<lunarwing_engine::ThreadEvent>,
-) -> Result<Option<String>, Error> {
-    const OUTCOME_TIMEOUT_SECS: u64 =
-        lunarwing_engine::executor::orchestrator::ORCHESTRATOR_TIMEOUT_SECS + 10;
-
-    let tid_str = thread_id.to_string();
-    let mut cancellation_guard = AwaitThreadCancellationGuard::new(
-        Arc::clone(&state.thread_manager),
-        thread_id,
-        message.user_id.clone(),
-    );
-
-    // Allow the orchestrator's full runtime plus cleanup/event delivery grace.
-    let deadline =
-        tokio::time::Instant::now() + std::time::Duration::from_secs(OUTCOME_TIMEOUT_SECS);
-
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                match event {
-                    Ok(ref evt) if evt.thread_id == thread_id => {
-                        deliver_thread_event(agent, state, message, &tid_str, evt).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            thread_id = %thread_id,
-                            skipped,
-                            "engine event receiver lagged"
-                        );
-                    }
-                    _ => {}
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if !state.thread_manager.is_running(thread_id).await {
-                    for event in drain_pending_thread_events(&mut event_rx, thread_id) {
-                        deliver_thread_event(agent, state, message, &tid_str, &event).await;
-                    }
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        thread_id = %thread_id,
-                        timeout_secs = OUTCOME_TIMEOUT_SECS,
-                        "await_thread_outcome timed out — breaking to avoid hang"
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    let mut outcome = state
-        .thread_manager
-        .join_thread(thread_id)
-        .await
-        .map_err(|e| engine_err("join error", e))?;
-    cancellation_guard.disarm();
-
-    let is_auth_fallback = matches!(
-        &outcome,
-        ThreadOutcome::Completed {
-            response: Some(text),
-        } if text.contains("authentication_required")
-    );
-    if !is_auth_fallback
-        && let ThreadOutcome::Completed {
-            response: Some(text),
-        } = &mut outcome
-    {
-        match agent
-            .transform_response(message, &tid_str, std::mem::take(text))
-            .await
-        {
-            Some(transformed) => *text = transformed,
-            None => text.clear(),
-        }
-    }
-
-    state
-        .conversation_manager
-        .record_thread_outcome(conv_id, thread_id, &outcome)
-        .await
-        .map_err(|e| engine_err("conversation error", e))?;
-
-    let should_load_tool_history = match &outcome {
-        ThreadOutcome::Completed {
-            response: Some(text),
-        } => !text.is_empty(),
-        ThreadOutcome::MaxIterations | ThreadOutcome::Failed { .. } => true,
-        ThreadOutcome::Completed { response: None }
-        | ThreadOutcome::Stopped
-        | ThreadOutcome::GatePaused { .. } => false,
-    };
-    let tool_calls_json = if should_load_tool_history {
-        load_tool_calls_json(&state.store, thread_id).await
-    } else {
-        None
-    };
-
-    // Helper: write the outcome response to the v1 DB so the history API
-    // shows it correctly for all outcomes that produce a response.
-    let write_v1_response = |db: &Arc<dyn crate::db::Database>, text: &str| {
-        let db = Arc::clone(db);
-        let scope = message.conversation_scope().map(String::from);
-        let user_id = message.user_id.clone();
-        let channel = message.channel.clone();
-        let text = text.to_string();
-        let tool_calls_json = tool_calls_json.clone();
-        async move {
-            let v1_conv_id = if let Some(ref scope) = scope {
-                db.get_or_create_scoped_conversation(&channel, &user_id, scope)
-                    .await
-                    .ok()
-            } else {
-                db.get_or_create_assistant_conversation(&user_id, &channel)
-                    .await
-                    .ok()
-            };
-            if let Some(cid) = v1_conv_id {
-                if let Some(ref json) = tool_calls_json
-                    && let Err(error) = db.add_conversation_message(cid, "tool_calls", json).await
-                {
-                    tracing::warn!(%error, "failed to persist Engine V2 tool history");
-                }
-                if let Err(error) = db.add_conversation_message(cid, "assistant", &text).await {
-                    tracing::warn!(%error, "failed to persist Engine V2 assistant history");
-                }
-            }
-        }
-    };
-
-    // Terminal text is delivered once through the normal outbound handler
-    // (the outer agent loop calls ChannelManager::respond with the returned
-    // result), not a direct SSE Response here — emitting both would double-send
-    // on the gateway (Phase 5).
-
-    // A Completed response that requests authentication enters auth mode via a
-    // side-effectful early return; the prompt itself is not persisted to v1
-    // history. This is a defense-in-depth safety net — the pre-flight auth gate
-    // should catch most cases before execution.
-    if let ThreadOutcome::Completed {
-        response: Some(ref text),
-    } = outcome
-        && text.contains("authentication_required")
-    {
-        debug!(
-            thread_id = %thread_id,
-            "text-based auth fallback triggered — pre-flight gate did not catch this"
-        );
-
-        // Extract credential name from the response text and validate
-        // it against the expected pattern (alphanumeric + underscores).
-        let cred_name = text
-            .split("credential_name")
-            .nth(1)
-            .and_then(|s| {
-                // Handle both JSON ("credential_name":"foo") and prose
-                s.split(&['"', '\'', '`'][..])
-                    .find(|seg| !seg.is_empty() && !seg.contains(':') && !seg.contains(' '))
-            })
-            .filter(|name| {
-                // Reject names that don't look like valid credential identifiers
-                !name.is_empty()
-                    && name.len() <= 64
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            })
-            .unwrap_or("unknown")
-            .to_string();
-
-        // Look up setup instructions via AuthManager (or fall back to inline lookup)
-        let setup_hint = state
-            .auth_manager
-            .as_ref()
-            .and_then(|mgr| mgr.get_setup_instructions(&cred_name))
-            .unwrap_or_else(|| format!("Provide your {} token", cred_name));
-
-        let pending = PendingGate {
-            request_id: uuid::Uuid::new_v4(),
-            gate_name: "authentication".into(),
-            user_id: message.user_id.clone(),
-            thread_id,
-            conversation_id: conv_id,
-            source_channel: message.channel.clone(),
-            action_name: "authentication_fallback".into(),
-            call_id: format!("fallback-auth-{thread_id}"),
-            parameters: serde_json::json!({ "credential_name": cred_name }),
-            display_parameters: None,
-            description: format!("Authentication required for '{}'.", cred_name),
-            resume_kind: lunarwing_engine::ResumeKind::Authentication {
-                credential_name: cred_name.clone(),
-                instructions: setup_hint.clone(),
-                auth_url: None,
-            },
-            created_at: chrono::Utc::now(),
-            expires_at: chrono::Utc::now() + state.pending_gate_expiry,
-            original_message: Some(message.content.clone()),
-            resume_output: None,
-        };
-        if let Err(e) = state.pending_gates.insert(pending).await {
-            tracing::debug!(error = %e, "failed to store fallback auth gate");
-        }
-
-        // Show auth prompt via channel
-        let _ = agent
-            .channels
-            .send_status(
-                &message.channel,
-                StatusUpdate::AuthRequired {
-                    extension_name: cred_name.clone(),
-                    instructions: Some(setup_hint.clone()),
-                    auth_url: None,
-                    setup_url: None,
-                },
-                &message.metadata,
-            )
-            .await;
-
-        // `GatewayChannel::send_status(AuthRequired)` is now the single gateway
-        // mapping for auth prompts, so there is no direct SSE broadcast here.
-        // The empty sentinel avoids a duplicate terminal prompt on any channel.
-        return Ok(Some(String::new()));
-    }
-
-    // Completed (non-auth), Stopped, MaxIterations, and Failed map to their
-    // terminal response via `thread_outcome_response`. Stopped yields the empty
-    // sentinel so no terminal reply or history row is committed for a user stop.
-    let result = match outcome {
-        gate @ ThreadOutcome::GatePaused { .. } => {
-            persist_and_notify_thread_gate(
-                &agent.channels,
-                state,
-                message,
-                conv_id,
-                thread_id,
-                gate,
-            )
-            .await
-        }
-        other => Ok(thread_outcome_response(&other)),
-    };
-
-    // Write the response to the v1 DB for all outcomes that produce a
-    // non-empty response so the history endpoint shows the correct state. The
-    // empty sentinel (e.g. a stopped turn) writes no assistant row.
-    if let Ok(Some(ref text)) = result
-        && !text.is_empty()
-        && let Some(ref db) = state.db
-    {
-        write_v1_response(db, text).await;
-    }
-
-    result
-}
-
 /// Build the per-event status metadata for channel delivery.
 ///
 /// For the gateway, this extends the original incoming metadata with the engine
@@ -3891,7 +3658,7 @@ fn engine_status_metadata(message: &IncomingMessage, thread_id: &str) -> serde_j
 }
 
 async fn deliver_thread_event(
-    agent: &Agent,
+    channels: &Arc<crate::channels::ChannelManager>,
     state: &EngineState,
     message: &IncomingMessage,
     thread_id: &str,
@@ -3903,7 +3670,7 @@ async fn deliver_thread_event(
     // structural events with no status equivalent still go through the direct
     // SSE `AppEvent` path below.
     let status_metadata = engine_status_metadata(message, thread_id);
-    forward_event_to_channel(event, &agent.channels, &message.channel, &status_metadata).await;
+    forward_event_to_channel(event, channels, &message.channel, &status_metadata).await;
     if let Some(sse) = state.sse.as_ref() {
         for app_event in thread_event_to_app_events(event, thread_id) {
             sse.broadcast_for_user(&message.user_id, app_event);
@@ -5891,7 +5658,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
 
-    static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
+    pub(super) static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> =
+        LazyLock::new(|| TokioMutex::new(()));
 
     #[test]
     fn channel_constraints_compose_without_empty_sections() {
@@ -5915,7 +5683,7 @@ mod tests {
         assert!(config.shared_conversation);
     }
 
-    struct TestStore {
+    pub(super) struct TestStore {
         conversations: TokioRwLock<Vec<lunarwing_engine::ConversationSurface>>,
         threads: TokioRwLock<HashMap<lunarwing_engine::ThreadId, lunarwing_engine::Thread>>,
         docs: TokioRwLock<HashMap<lunarwing_engine::DocId, lunarwing_engine::MemoryDoc>>,
@@ -5926,7 +5694,7 @@ mod tests {
     }
 
     impl TestStore {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             Self {
                 conversations: TokioRwLock::new(Vec::new()),
                 threads: TokioRwLock::new(HashMap::new()),
@@ -6167,7 +5935,7 @@ mod tests {
         }
     }
 
-    fn sample_pending_gate(
+    pub(super) fn sample_pending_gate(
         user_id: &str,
         thread_id: lunarwing_engine::ThreadId,
         resume_kind: lunarwing_engine::ResumeKind,
@@ -6224,7 +5992,7 @@ mod tests {
     }
 
     /// Build a Waiting thread parked as if paused on a gate.
-    async fn save_waiting_thread(
+    pub(super) async fn save_waiting_thread(
         store: &TestStore,
         project_id: lunarwing_engine::ProjectId,
         user_id: &str,
@@ -6640,6 +6408,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_gates_http_recovery_is_authenticated_scoped_and_redacted() {
+        use crate::channels::web::auth::{CombinedAuthState, MultiAuthState, auth_middleware};
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            http::{Request, StatusCode},
+            middleware,
+            routing::get,
+        };
+        use tower::ServiceExt;
+
+        let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        let kind = lunarwing_engine::ResumeKind::Approval {
+            allow_always: false,
+        };
+        let mut alice =
+            sample_pending_gate("alice", lunarwing_engine::ThreadId::new(), kind.clone());
+        alice.parameters = serde_json::json!({"token":"must-not-leak"});
+        alice.display_parameters = Some(serde_json::json!({"token":"[REDACTED]"}));
+        let request_id = alice.request_id;
+        state.pending_gates.insert(alice).await.unwrap();
+        state
+            .pending_gates
+            .insert(sample_pending_gate(
+                "bob",
+                lunarwing_engine::ThreadId::new(),
+                kind.clone(),
+            ))
+            .await
+            .unwrap();
+        let mut expired = sample_pending_gate("alice", lunarwing_engine::ThreadId::new(), kind);
+        expired.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1);
+        state.pending_gates.insert(expired).await.unwrap();
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = Some(state);
+        let auth: CombinedAuthState =
+            MultiAuthState::single("test-token".into(), "alice".into()).into();
+        let app = Router::new()
+            .route(
+                "/api/chat/pending-gates",
+                get(crate::channels::web::server::chat_pending_gates_handler),
+            )
+            .route_layer(middleware::from_fn_with_state(auth, auth_middleware));
+        for uri in [
+            "/api/chat/pending-gates",
+            "/api/chat/pending-gates?token=test-token",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/chat/pending-gates?user_id=bob")
+                    .header("Authorization", "Bearer test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let body = to_bytes(response.into_body(), 8192).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["gates"].as_array().unwrap().len(), 1);
+        assert_eq!(json["gates"][0]["request_id"], request_id.to_string());
+        assert!(!String::from_utf8_lossy(&body).contains("must-not-leak"));
+        assert!(String::from_utf8_lossy(&body).contains("[REDACTED]"));
+        *lock.write().await = None;
+    }
+
+    #[tokio::test]
+    async fn auth_thread_fallback_preserves_user_channel_and_ambiguity_checks() {
+        let state = make_expected_test_state(Arc::new(TestStore::new()));
+        let gate = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "gitlab".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        let tid = gate.thread_id;
+        let source = gate.source_channel.clone();
+        state.pending_gates.insert(gate).await.unwrap();
+        let message = IncomingMessage::new(&source, "alice", "credential")
+            .with_conversation_scope(tid.to_string());
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &message).await,
+            PendingGateResolution::Resolved(_)
+        ));
+        let mut wrong = message.clone();
+        wrong.user_id = "bob".into();
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &wrong).await,
+            PendingGateResolution::None
+        ));
+        wrong = message.clone();
+        wrong.channel = "untrusted-channel".into();
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &wrong).await,
+            PendingGateResolution::None
+        ));
+        let conv = state
+            .conversation_manager
+            .get_or_create_conversation(&engine_conversation_key(&message), "alice")
+            .await
+            .unwrap();
+        let mut other = sample_pending_gate(
+            "alice",
+            lunarwing_engine::ThreadId::new(),
+            lunarwing_engine::ResumeKind::Authentication {
+                credential_name: "other".into(),
+                instructions: "token".into(),
+                auth_url: None,
+            },
+        );
+        other.conversation_id = conv;
+        state.pending_gates.insert(other).await.unwrap();
+        assert!(matches!(
+            matching_engine_auth_gate(&state, &message).await,
+            PendingGateResolution::Ambiguous
+        ));
+    }
+
+    #[tokio::test]
     async fn clear_engine_pending_auth_without_hint_clears_all_auth_gates() {
         let _guard = ENGINE_STATE_TEST_LOCK.lock().await;
         let store = Arc::new(TestStore::new());
@@ -6690,7 +6590,7 @@ mod tests {
     // ── /expected command tests ─────────────────────────────────
 
     /// Build a minimal EngineState backed by a TestStore for /expected tests.
-    fn make_expected_test_state(store: Arc<TestStore>) -> EngineState {
+    pub(super) fn make_expected_test_state(store: Arc<TestStore>) -> EngineState {
         use lunarwing_engine::{
             CapabilityRegistry, ConversationManager, LeaseManager, PolicyEngine, ThreadManager,
         };
@@ -6758,7 +6658,7 @@ mod tests {
             Arc::new(PolicyEngine::new()),
         ));
 
-        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+        let cm = Arc::new(ConversationManager::new(Arc::clone(&tm), store_dyn.clone()));
 
         EngineState {
             thread_manager: tm,
@@ -8243,7 +8143,7 @@ mod tests {
             Arc::new(PolicyEngine::new()),
         ));
 
-        let cm = ConversationManager::new(Arc::clone(&tm), store_dyn.clone());
+        let cm = Arc::new(ConversationManager::new(Arc::clone(&tm), store_dyn.clone()));
 
         EngineState {
             thread_manager: tm,

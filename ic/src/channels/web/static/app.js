@@ -93,6 +93,11 @@ let pairingPollInterval = null;
 let unreadThreads = new Map(); // thread_id -> unread count
 let _loadThreadsTimer = null;
 let _historyRequestSequence = 0;
+let _pendingGateRequestSequence = 0;
+let _pendingGateRevision = 0;
+let _pendingGateRetryTimer = null;
+let _pendingGates = new Map();
+const _resolvedGateRequests = new Set();
 const JOB_EVENTS_CAP = 500;
 const MEMORY_SEARCH_QUERY_MAX_LENGTH = 100;
 let stagedImages = [];
@@ -276,6 +281,11 @@ function handleAuthExpiry() {
   _authExpired = true;
   sessionStorage.removeItem('lunarwing_token');
   token = '';
+  _pendingGateRequestSequence++;
+  _pendingGateRevision++;
+  _pendingGates.clear();
+  _resolvedGateRequests.clear();
+  if (_pendingGateRetryTimer) { clearTimeout(_pendingGateRetryTimer); _pendingGateRetryTimer = null; }
   if (eventSource) { eventSource.close(); eventSource = null; }
   if (logEventSource) { logEventSource.close(); logEventSource = null; }
   if (gatewayStatusInterval) { clearInterval(gatewayStatusInterval); gatewayStatusInterval = null; }
@@ -581,6 +591,7 @@ function connectSSE() {
       // restores any response still streaming for this thread.
       loadHistory();
     }
+    loadPendingGates();
     sseHasConnectedBefore = true;
     window.LunarMascot?.onAgentEvent?.('open', {});
   };
@@ -710,6 +721,7 @@ function connectSSE() {
       clearStreamingSnapshot(currentThreadId);
       loadHistory();
     }
+    loadPendingGates();
     debouncedLoadThreads();
   });
 
@@ -752,6 +764,7 @@ function connectSSE() {
 
   eventSource.addEventListener('approval_needed', (e) => {
     const data = JSON.parse(e.data);
+    rememberPendingGate({ ...data, resume_kind: { Approval: { allow_always: data.allow_always } } });
     const hasThread = !!data.thread_id;
     const forCurrentThread = !hasThread || isCurrentThread(data.thread_id);
 
@@ -769,6 +782,15 @@ function connectSSE() {
 
   eventSource.addEventListener('auth_required', (e) => {
     handleAuthRequired(JSON.parse(e.data));
+  });
+
+  eventSource.addEventListener('gate_required', (e) => {
+    rememberPendingGate(JSON.parse(e.data));
+    // The companion approval_needed/auth_required event owns live rendering.
+  });
+
+  eventSource.addEventListener('gate_resolved', (e) => {
+    forgetPendingGate(JSON.parse(e.data).request_id);
   });
 
   eventSource.addEventListener('auth_completed', (e) => {
@@ -1780,6 +1802,7 @@ function humanizeToolName(rawName) {
 }
 
 function showApproval(data) {
+  if (_resolvedGateRequests.has(data.request_id)) return;
   // Avoid duplicate cards on reconnect/history refresh.
   const existing = document.querySelector('.approval-card[data-request-id="' + CSS.escape(data.request_id) + '"]');
   if (existing) return;
@@ -1902,9 +1925,17 @@ function showJobCard(data) {
 // --- Auth card ---
 
 function handleAuthRequired(data) {
-  if (data.auth_url) {
+  // Live legacy auth events may accompany an engine gate. Retain the exact
+  // current-thread identity rather than resolving an extension-wide singleton.
+  if (!data.request_id) {
+    const gates = Array.from(_pendingGates.values()).filter((gate) =>
+      isCurrentThread(gate.thread_id) &&
+      gate.resume_kind?.Authentication?.credential_name === data.extension_name);
+    if (gates.length === 1) data = { ...data, request_id: gates[0].request_id, thread_id: gates[0].thread_id };
+  }
+  if (data.auth_url || data.request_id) {
     setAuthFlowPending(true, data.instructions);
-    // OAuth flow: show the global auth prompt with an OAuth button + optional token paste field.
+    // Engine gates request a credential directly, including non-OAuth gates.
     showAuthCard(data);
   } else {
     if (getConfigureOverlay(data.extension_name)) return;
@@ -1917,16 +1948,23 @@ function handleAuthRequired(data) {
 
 function handleAuthCompleted(data) {
   showToast(data.message, data.success ? 'success' : 'error');
+  const card = getAuthCard(data.extension_name);
+  if (card && card.getAttribute('data-request-id')) {
+    // Extension-wide completion cannot resolve a particular engine request.
+    if (!data.success) showAuthCardError(data.extension_name, data.message);
+    loadPendingGates();
+    return;
+  }
   // Dismiss only the matching extension's UI so stale prompts are cleared.
   removeAuthCard(data.extension_name);
   closeConfigureModal(data.extension_name);
   if (!data.success) {
-    setAuthFlowPending(false);
+    setAuthFlowPending(!!getAuthCard() || !!getConfigureOverlay());
     if (currentTab === 'extensions') loadExtensions();
     enableChatInput();
     return;
   }
-  setAuthFlowPending(false);
+  setAuthFlowPending(!!getAuthCard() || !!getConfigureOverlay());
   if (currentTab === 'settings') refreshCurrentSettingsTab();
   enableChatInput();
 }
@@ -1968,12 +2006,14 @@ function showAuthCard(data) {
   overlay.className = 'auth-overlay';
   overlay.setAttribute('data-extension-name', data.extension_name);
   overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) cancelAuth(data.extension_name);
+    if (e.target === overlay) cancelAuth(data.extension_name, data);
   });
 
   const card = document.createElement('div');
   card.className = 'auth-card auth-modal';
   card.setAttribute('data-extension-name', data.extension_name);
+  if (data.request_id) card.setAttribute('data-request-id', data.request_id);
+  if (data.thread_id) card.setAttribute('data-thread-id', data.thread_id);
 
   const header = document.createElement('div');
   header.className = 'auth-header';
@@ -2023,7 +2063,7 @@ function showAuthCard(data) {
     || I18n.t('auth.extensionTokenPlaceholder')
     || I18n.t('auth.tokenPlaceholder');
   tokenInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
+    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value, data);
   });
   tokenRow.appendChild(tokenInput);
   card.appendChild(tokenRow);
@@ -2041,12 +2081,12 @@ function showAuthCard(data) {
   const submitBtn = document.createElement('button');
   submitBtn.className = 'auth-submit';
   submitBtn.textContent = I18n.t('btn.submit');
-  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value));
+  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value, data));
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'auth-cancel';
   cancelBtn.textContent = I18n.t('btn.cancel');
-  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name));
+  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name, data));
 
   actions.appendChild(submitBtn);
   actions.appendChild(cancelBtn);
@@ -2071,7 +2111,7 @@ function removeAuthCard(extensionName) {
   }
 }
 
-function submitAuthToken(extensionName, tokenValue) {
+function submitAuthToken(extensionName, tokenValue, gate = {}) {
   if (!tokenValue || !tokenValue.trim()) return;
 
   // Disable submit button while in flight
@@ -2083,34 +2123,50 @@ function submitAuthToken(extensionName, tokenValue) {
 
   apiFetch('/api/chat/auth-token', {
     method: 'POST',
-    body: { extension_name: extensionName, token: tokenValue.trim() },
+    body: { extension_name: extensionName, token: tokenValue.trim(),
+      request_id: gate.request_id, thread_id: gate.thread_id },
   }).then((result) => {
     if (result.success) {
-      // Close immediately for responsiveness; the authoritative success UX
-      // (toast + extensions refresh) still comes from auth_completed SSE.
-      removeAuthCard(extensionName);
-      enableChatInput();
+      // A queued engine resume is not yet a resolution. Its SSE event or the
+      // authoritative snapshot removes this exact gate, even after reconnect.
+      if (gate.request_id) loadPendingGates();
+      else {
+        removeAuthCard(extensionName);
+        enableChatInput();
+      }
     } else {
-      showAuthCardError(extensionName, result.message);
+      showAuthCardError(extensionName, result.message, gate.request_id);
     }
   }).catch((err) => {
-    showAuthCardError(extensionName, 'Failed: ' + err.message);
+    showAuthCardError(extensionName, 'Failed: ' + err.message, gate.request_id);
   });
 }
 
-function cancelAuth(extensionName) {
-  apiFetch('/api/chat/auth-cancel', {
+function cancelAuth(extensionName, gate = {}) {
+  const card = getAuthCard(extensionName);
+  if (card) card.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  return apiFetch('/api/chat/auth-cancel', {
     method: 'POST',
-    body: { extension_name: extensionName },
-  }).catch(() => {});
-  removeAuthCard(extensionName);
-  setAuthFlowPending(false);
-  enableChatInput();
+    body: { extension_name: extensionName, request_id: gate.request_id, thread_id: gate.thread_id },
+  }).then((result) => {
+    if (!result.success) {
+      showAuthCardError(extensionName, result.message, gate.request_id);
+      return;
+    }
+    if (gate.request_id) forgetPendingGate(gate.request_id);
+    else {
+      removeAuthCard(extensionName);
+      setAuthFlowPending(false);
+      enableChatInput();
+    }
+  }).catch((err) => {
+    showAuthCardError(extensionName, 'Failed: ' + err.message, gate.request_id);
+  });
 }
 
-function showAuthCardError(extensionName, message) {
+function showAuthCardError(extensionName, message, requestId) {
   const card = getAuthCard(extensionName);
-  if (!card) return;
+  if (!card || (requestId && card.getAttribute('data-request-id') !== requestId)) return;
   // Re-enable buttons
   const btns = card.querySelectorAll('button');
   btns.forEach((b) => { b.disabled = false; });
@@ -2136,6 +2192,87 @@ function setAuthFlowPending(pending, instructions) {
     input.disabled = false;
     btn.disabled = false;
   }
+}
+
+function rememberPendingGate(gate) {
+  if (!gate.request_id || _resolvedGateRequests.has(gate.request_id)) return;
+  _pendingGateRevision++;
+  _pendingGates.set(gate.request_id, { ..._pendingGates.get(gate.request_id), ...gate });
+}
+
+function forgetPendingGate(requestId) {
+  const gate = _pendingGates.get(requestId);
+  _pendingGateRevision++;
+  _pendingGates.delete(requestId);
+  _resolvedGateRequests.add(requestId);
+  // Bound the stale-response tombstones for long-lived browser sessions.
+  if (_resolvedGateRequests.size > 256) {
+    _resolvedGateRequests.delete(_resolvedGateRequests.values().next().value);
+  }
+  const card = queryByDataAttribute('.approval-card', 'data-request-id', requestId);
+  if (card) card.remove();
+  const auth = gate && gate.resume_kind && gate.resume_kind.Authentication;
+  const authCard = auth && getAuthCard(auth.credential_name);
+  if (authCard && authCard.getAttribute('data-request-id') === requestId) {
+    removeAuthCard(auth.credential_name);
+  } else if (auth && !Array.from(_pendingGates.values()).some((pending) =>
+    pending.resume_kind?.Authentication?.credential_name === auth.credential_name)) {
+    removeAuthCard(auth.credential_name);
+    closeConfigureModal(auth.credential_name);
+  }
+  if (auth && !getAuthCard() && !getConfigureOverlay()) {
+    setAuthFlowPending(false);
+    enableChatInput();
+  }
+}
+
+function renderPendingGates() {
+  for (const gate of _pendingGates.values()) {
+    if (gate.thread_id && !isCurrentThread(gate.thread_id)) continue;
+    const approval = gate.resume_kind && gate.resume_kind.Approval;
+    if (approval) {
+      showApproval({ ...gate, allow_always: approval.allow_always });
+    }
+    const auth = gate.resume_kind && gate.resume_kind.Authentication;
+    const card = auth && getAuthCard(auth.credential_name);
+    if (auth && (!card || card.getAttribute('data-request-id') !== gate.request_id)) {
+      handleAuthRequired({
+        extension_name: auth.credential_name,
+        instructions: auth.instructions,
+        auth_url: auth.auth_url || null,
+        request_id: gate.request_id,
+        thread_id: gate.thread_id,
+      });
+    }
+  }
+}
+
+function loadPendingGates() {
+  if (_pendingGateRetryTimer) { clearTimeout(_pendingGateRetryTimer); _pendingGateRetryTimer = null; }
+  const sequence = ++_pendingGateRequestSequence;
+  const revision = _pendingGateRevision;
+  return apiFetch('/api/chat/pending-gates').then((data) => {
+    if (sequence !== _pendingGateRequestSequence) return;
+    // A live gate event supersedes an older snapshot, even if its HTTP reply
+    // arrives later. Reconcile again rather than resurrect a resolved prompt.
+    if (revision !== _pendingGateRevision) return loadPendingGates();
+    const snapshot = new Map((data.gates || [])
+      .filter((gate) => !_resolvedGateRequests.has(gate.request_id))
+      .map((gate) => [gate.request_id, gate]));
+    for (const gate of _pendingGates.values()) {
+      // Only the engine snapshot is authoritative for engine gates. Legacy
+      // approval cards still recover through history.pending_approval.
+      if (gate.gate_name && !snapshot.has(gate.request_id)) forgetPendingGate(gate.request_id);
+    }
+    _pendingGates = snapshot;
+    renderPendingGates();
+  }).catch(() => {
+    // Startup recovery or a transient HTTP failure must not require another
+    // SSE disconnect before a still-pending approval becomes visible.
+    if (sequence === _pendingGateRequestSequence && token && eventSource) {
+      _pendingGateRetryTimer = setTimeout(loadPendingGates, 2000);
+    }
+  });
 }
 
 function loadHistory(before) {
@@ -2217,6 +2354,10 @@ function loadHistory(before) {
       if (data.pending_approval) {
         showApproval(data.pending_approval);
       }
+      // Cached/live gates survive the DOM replacement regardless of which
+      // recovery request returned first. Refresh on thread switches as well.
+      renderPendingGates();
+      loadPendingGates();
       if (preservedScrollTop !== null && !_chatAutoScroll) {
         container.scrollTop = preservedScrollTop;
       }

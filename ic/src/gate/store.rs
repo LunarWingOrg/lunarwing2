@@ -353,6 +353,7 @@ impl PendingGateStore {
     }
 
     /// Restore pending gates from persistent storage on startup.
+    /// Prune expired disk entries too: the memory-only sweeper cannot see them.
     /// Returns the number of non-expired gates restored.
     pub async fn restore_from_persistence(&self) -> Result<usize, GateStoreError> {
         let Some(ref persistence) = self.persistence else {
@@ -360,12 +361,21 @@ impl PendingGateStore {
         };
         let gates = persistence.load_all().await?;
         let mut count = 0;
-        let mut inner = self.inner.lock().await;
         for gate in gates {
-            if gate.is_expired() {
+            let key = gate.key();
+            let _reservation = self.key_locks.reserve(&key).await;
+            let mut inner = self.inner.lock().await;
+            // A concurrent insert is newer than this startup snapshot.
+            if inner.by_key.contains_key(&key) {
                 continue;
             }
-            let key = gate.key();
+            if gate.is_expired() {
+                drop(inner);
+                if let Err(error) = persistence.remove(&key).await {
+                    tracing::warn!(%error, "failed to prune expired persisted gate during restore");
+                }
+                continue;
+            }
             inner.by_request_id.insert(gate.request_id, key.clone());
             inner.by_key.insert(key, gate);
             count += 1;
@@ -967,8 +977,27 @@ mod tests {
         assert!(store.peek(&key_expired).await.is_none());
     }
 
-    // ── Reserved channel names ───────────────────────────────
+    #[tokio::test]
+    async fn restore_prunes_expired_gates_from_real_file_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let persistence = Arc::new(crate::gate::persistence::FileGatePersistence::new(
+            dir.path().join("pending-gates.json"),
+        ));
+        let live = sample_gate_with("alice", ThreadId::new(), "gateway", 300);
+        let expired = sample_gate_with("alice", ThreadId::new(), "gateway", -60);
+        persistence.save(&live).await.unwrap();
+        persistence.save(&expired).await.unwrap();
+        for _ in 0..2 {
+            let store = PendingGateStore::new(Some(persistence.clone()));
+            assert_eq!(store.restore_from_persistence().await.unwrap(), 1);
+            let disk = persistence.load_all().await.unwrap();
+            assert_eq!(disk.len(), 1);
+            assert_eq!(disk[0].request_id, live.request_id);
+            assert!(store.peek(&expired.key()).await.is_none());
+        }
+    }
 
+    // ── Reserved channel names ───────────────────────────────
     #[test]
     fn test_wasm_channel_cannot_register_as_bootstrap() {
         // Regression: aa151d9f

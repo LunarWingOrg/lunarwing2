@@ -58,6 +58,9 @@ impl ConversationManager {
         let mut index = self.channel_user_index.write().await;
 
         for conversation in conversations {
+            if index.contains_key(&(conversation.channel.clone(), conversation.user_id.clone())) {
+                continue;
+            }
             index.insert(
                 (conversation.channel.clone(), conversation.user_id.clone()),
                 conversation.id,
@@ -74,29 +77,9 @@ impl ConversationManager {
         channel: &str,
         user_id: &str,
     ) -> Result<ConversationId, EngineError> {
-        // Check index first
         let key = (channel.to_string(), user_id.to_string());
-        {
-            let index = self.channel_user_index.read().await;
-            if let Some(conv_id) = index.get(&key) {
-                return Ok(*conv_id);
-            }
-        }
-
-        // Check persisted conversations for this user/channel.
-        if let Some(conv) = self
-            .store
-            .list_conversations(user_id)
-            .await?
-            .into_iter()
-            .find(|conv| conv.channel == channel)
-        {
-            let conv_id = conv.id;
-            let mut convs = self.conversations.write().await;
-            let mut index = self.channel_user_index.write().await;
-            convs.insert(conv_id, conv);
-            index.insert(key, conv_id);
-            return Ok(conv_id);
+        if let Some(conv) = self.find_conversation(channel, user_id).await? {
+            return Ok(conv.id);
         }
 
         // Create new conversation. The scoped `channel:scope` keys handed over
@@ -114,9 +97,9 @@ impl ConversationManager {
         if let Some(&existing) = index.get(&key) {
             return Ok(existing);
         }
-        convs.insert(conv_id, conv.clone());
-        index.insert(key, conv_id);
         self.store.save_conversation(&conv).await?;
+        convs.insert(conv_id, conv);
+        index.insert(key, conv_id);
 
         if channel.contains(':') {
             warn!(
@@ -129,6 +112,39 @@ impl ConversationManager {
         }
         debug!(conversation_id = %conv_id, channel, user_id, "created conversation");
         Ok(conv_id)
+    }
+
+    /// Find and hydrate an existing surface without creating one. Read and
+    /// create paths share this lookup so approvals survive a cold memory cache.
+    pub async fn find_conversation(
+        &self,
+        channel: &str,
+        user_id: &str,
+    ) -> Result<Option<ConversationSurface>, EngineError> {
+        let key = (channel.to_string(), user_id.to_string());
+        {
+            // Every path taking both locks uses conversations -> index.
+            let convs = self.conversations.read().await;
+            let index = self.channel_user_index.read().await;
+            if let Some(conv) = index.get(&key).and_then(|id| convs.get(id)) {
+                return Ok(Some(conv.clone()));
+            }
+        }
+
+        let persisted = self.store.list_conversations(user_id).await?;
+        let mut convs = self.conversations.write().await;
+        let mut index = self.channel_user_index.write().await;
+        // A concurrent create/bootstrap/lookup may have hydrated and updated
+        // the surface during I/O. Never overwrite it with the older snapshot.
+        if let Some(conv) = index.get(&key).and_then(|id| convs.get(id)) {
+            return Ok(Some(conv.clone()));
+        }
+        let Some(conv) = persisted.into_iter().find(|conv| conv.channel == channel) else {
+            return Ok(None);
+        };
+        index.insert(key, conv.id);
+        convs.insert(conv.id, conv.clone());
+        Ok(Some(conv))
     }
 
     /// Persist a steer note until the conversation's next foreground turn.
@@ -910,6 +926,85 @@ mod tests {
         // Wait for thread to complete
         let outcome = tm.join_thread(tid).await.unwrap();
         assert!(matches!(outcome, ThreadOutcome::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn find_conversation_recovers_persisted_scope_without_creating() {
+        let (_, cm) = make_conv_manager();
+        let original = cm
+            .get_or_create_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap();
+        cm.conversations.write().await.clear();
+        cm.channel_user_index.write().await.clear();
+        let found = cm
+            .find_conversation("gateway:thread-a", "alice")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, original);
+        assert_eq!(
+            cm.get_or_create_conversation("gateway:thread-a", "alice")
+                .await
+                .unwrap(),
+            original
+        );
+        assert!(
+            cm.find_conversation("gateway:thread-a", "bob")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            cm.find_conversation("gateway:other", "alice")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(cm.store.list_conversations("alice").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_conversation_does_not_hold_index_while_waiting_for_conversations() {
+        let (_, cm) = make_conv_manager();
+        let id = cm.get_or_create_conversation("web", "alice").await.unwrap();
+        let conversations = cm.conversations.write().await;
+        let mut lookup = Box::pin(cm.find_conversation("web", "alice"));
+        // Poll the actual lookup into its lock wait, then require a WRITE lock:
+        // another read lock would not detect the old read/write inversion.
+        assert!(futures::poll!(&mut lookup).is_pending());
+        let index = cm
+            .channel_user_index
+            .try_write()
+            .expect("lookup must not retain index");
+        drop(index);
+        drop(conversations);
+        let found = tokio::time::timeout(std::time::Duration::from_secs(1), lookup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, id);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_lookups_and_creates_keep_one_surface() {
+        let (_, cm) = make_conv_manager();
+        let cm = Arc::new(cm);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let cm = Arc::clone(&cm);
+            tasks.spawn(async move {
+                cm.find_conversation("web", "alice").await.unwrap();
+                cm.get_or_create_conversation("web", "alice").await.unwrap()
+            });
+        }
+        let mut ids = std::collections::HashSet::new();
+        while let Some(id) = tasks.join_next().await {
+            ids.insert(id.unwrap());
+        }
+        assert_eq!(ids.len(), 1);
+        assert_eq!(cm.store.list_conversations("alice").await.unwrap().len(), 1);
     }
 
     #[tokio::test]
