@@ -9,7 +9,9 @@ const vm = require('node:vm');
 const source = fs.readFileSync(process.argv[2], 'utf8');
 const names = ['connectSSE', 'isCurrentThread', 'loadHistory', 'loadPendingGates',
   'renderPendingGates', 'rememberPendingGate', 'forgetPendingGate',
-  'showApproval', 'humanizeToolName', 'queryByDataAttribute'];
+  'showApproval', 'humanizeToolName', 'queryByDataAttribute', 'handleAuthRequired',
+  'handleAuthCompleted', 'showAuthCard', 'removeAuthCard', 'getAuthOverlay', 'getAuthCard',
+  'getConfigureOverlay', 'submitAuthToken', 'cancelAuth', 'showAuthCardError', 'setAuthFlowPending'];
 const functions = names.map(name => {
   const match = source.match(new RegExp('^function ' + name + '\\([^]*?^}', 'm'));
   assert(match, `missing shipped function ${name}`);
@@ -19,6 +21,7 @@ const functions = names.map(name => {
 class Element {
   constructor(fragment = false) {
     this.fragment = fragment; this.children = []; this.attrs = {}; this.style = {};
+    this.listeners = {}; this.tagName = '';
     this.className = ''; this.scrollTop = 0;
     this.classList = { add() {}, remove() {}, contains() { return false; } };
   }
@@ -31,28 +34,40 @@ class Element {
   replaceChildren(...children) { this.children = []; children.forEach(child => this.appendChild(child)); }
   setAttribute(key, value) { this.attrs[key] = value; }
   getAttribute(key) { return this.attrs[key]; }
-  addEventListener() {}
+  addEventListener(name, fn) { this.listeners[name] = fn; }
+  focus() {}
+  matches(selector) {
+    const match = selector.match(/^([.\w-]+)(?:\[([^=]+)="([^"]*)"\])?$/);
+    if (!match) return false;
+    const [, name, attr, value] = match;
+    const kind = name.startsWith('.') ? this.className.split(' ').includes(name.slice(1)) : this.tagName === name;
+    return kind && (!attr || this.attrs[attr] === value);
+  }
+  querySelectorAll(selector) {
+    return this.children.flatMap(child => [child, ...child.querySelectorAll('*')])
+      .filter(child => selector === '*' || child.matches(selector));
+  }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  closest(selector) { return this.matches(selector) ? this : this.parent?.closest(selector); }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); }
 }
 
 function harness() {
   const chat = new Element();
+  const body = new Element(); body.appendChild(chat);
   const elements = new Map([['chat-messages', chat]]);
   const requests = [];
-  const authCards = new Map();
   const document = {
+    body,
     getElementById(id) {
       if (id === 'connection-banner') return null;
       if (!elements.has(id)) elements.set(id, new Element());
       return elements.get(id);
     },
-    createElement: () => new Element(),
+    createElement(tag) { const element = new Element(); element.tagName = tag; return element; },
     createDocumentFragment: () => new Element(true),
-    querySelectorAll(selector) { return chat.children.filter(child => child.className === selector.slice(1)); },
-    querySelector(selector) {
-      const match = selector.match(/\.approval-card\[data-request-id="([^"]+)"\]/);
-      return match ? chat.children.find(child => child.attrs['data-request-id'] === match[1]) || null : null;
-    },
+    querySelectorAll: selector => body.querySelectorAll(selector),
+    querySelector: selector => body.querySelector(selector),
   };
   class EventSource {
     constructor() { this.handlers = {}; }
@@ -71,20 +86,20 @@ function harness() {
     _streamingThreadId: null, _streamSnapshots: new Map(), _chatAutoScroll: true, _responseRenderedAt: new Map(),
     _connectionLostTimer: null, _connectionLostAt: null, _reconnectAttempts: 0, isRestarting: false,
     hasMore: false, oldestTimestamp: null, loadingOlder: false, unreadThreads: new Map(),
-    apiFetch(url) { return new Promise((resolve, reject) => requests.push({ url, resolve, reject })); },
+    apiFetch(url, options) { return new Promise((resolve, reject) => requests.push({ url, options, resolve, reject })); },
     hasActiveStreamForThread: () => false,
     renderSkeleton: () => new Element(), createMessageElement: () => new Element(),
     createToolCallsSummaryElement: () => new Element(), createReasoningSummaryElement: () => new Element(),
-    getAuthCard: name => authCards.get(name), getConfigureOverlay: () => null,
-    handleAuthRequired(data) { authCards.set(data.extension_name, data); },
-    removeAuthCard(name) { authCards.delete(name); }, closeConfigureModal() {},
+    closeConfigureModal() {}, showConfigureModal() { throw new Error('engine gate must retain its credential controls'); },
   });
   for (const name of ['clearSuggestionChips', 'resetStreamingState', 'stashStreamingState',
     'resetActivityState', 'maybeInsertTimeSeparator', 'showWelcomeCard', 'showActivityThinking',
     'scheduleChatScrollToBottom', 'removeScrollSpinner', 'finalizeActivityGroup',
-    'debouncedLoadThreads', 'refreshCurrentSettingsTab', 'clearStreamingSnapshot']) context[name] = () => {};
+    'debouncedLoadThreads', 'refreshCurrentSettingsTab', 'clearStreamingSnapshot',
+    'enableChatInput', 'showToast', 'loadExtensions']) context[name] = () => {};
   vm.runInContext(functions, context);
-  return { context, requests, authCards,
+  return { context, requests,
+    authCard: () => document.querySelector('.auth-card'),
     cards: () => chat.children.filter(child => child.className === 'approval-card'),
     request(part) {
       const index = requests.findIndex(request => request.url.includes(part));
@@ -97,6 +112,11 @@ function harness() {
 const approval = (id = 'gate-a', thread = 'thread-a') => ({
   request_id: id, thread_id: thread, gate_name: 'approval', tool_name: 'shell', description: 'Run command',
   parameters: '{"command":"echo ok"}', resume_kind: { Approval: { allow_always: false } },
+});
+const auth = (id = 'auth-a', thread = 'thread-a', url = null) => ({
+  request_id: id, thread_id: thread, gate_name: 'authentication', resume_kind: { Authentication: {
+    credential_name: 'gitlab', instructions: 'Paste token', auth_url: url,
+  } },
 });
 const history = { turns: [{ user_input: 'hi', response: null, state: 'Processing' }], pending_approval: null };
 const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImmediate); };
@@ -162,7 +182,7 @@ const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImm
       } },
     }] }); await flush();
     assert.equal(h.cards().length, 0, 'other thread approval must not leak into current chat');
-    assert.equal(h.authCards.get('gitlab').instructions, 'Paste token');
+    assert.equal(h.authCard().querySelector('.auth-instructions').textContent, 'Paste token');
     h.context.currentThreadId = 'thread-b'; h.context.loadHistory();
     h.request('history').resolve(history); await flush();
     assert.equal(h.cards().length, 1, 'thread switch recovers cached approval after history render');
@@ -170,7 +190,7 @@ const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImm
     assert.equal(h.cards().length, 1, 'failed refresh must preserve known pending state');
     h.context.loadPendingGates();
     h.request('pending-gates').resolve({ gates: [approval('gate-b', 'thread-b')] }); await flush();
-    assert.equal(h.authCards.size, 0, 'offline auth completion must clear its prompt');
+    assert.equal(h.authCard(), null, 'offline auth completion must clear its prompt');
     console.log('PASS auth recovery, thread isolation/switch, failed refresh');
   }
 
@@ -193,6 +213,73 @@ const flush = async () => { for (let i = 0; i < 4; i++) await new Promise(setImm
     h.request('pending-gates').resolve({ gates: [approval()] }); await flush();
     assert.equal(h.cards().length, 1);
     console.log('PASS stream-gap recovery fetches gates independently');
+  }
+  for (const url of [null, 'https://example.test/oauth']) {
+    const h = harness();
+    h.context.loadPendingGates();
+    h.request('pending-gates').resolve({ gates: [auth('auth-a', 'thread-a', url), approval('gate-b', 'thread-b')] });
+    await flush();
+    const card = h.authCard();
+    assert.equal(card.getAttribute('data-request-id'), 'auth-a');
+    card.querySelector('input').value = ' credential ';
+    card.querySelector('.auth-submit').listeners.click();
+    const submit = h.request('auth-token');
+    assert.deepEqual(JSON.parse(JSON.stringify(submit.options.body)), {
+      extension_name: 'gitlab', token: 'credential', request_id: 'auth-a', thread_id: 'thread-a',
+    });
+    submit.resolve({ success: true, activated: true }); await flush();
+    assert.equal(h.context._pendingGates.size, 2, 'queue acceptance must not resolve a gate');
+    h.request('pending-gates').resolve({ gates: [approval('gate-b', 'thread-b')] }); await flush();
+    assert.equal(h.authCard(), null);
+    console.log(`PASS recovered ${url ? 'OAuth' : 'token-only'} auth retains identity through submit`);
+  }
+
+  {
+    const h = harness();
+    h.context.loadPendingGates(); h.request('pending-gates').resolve({ gates: [auth()] }); await flush();
+    h.context.loadPendingGates(); const stale = h.request('pending-gates');
+    h.authCard().querySelector('.auth-cancel').listeners.click();
+    const cancel = h.request('auth-cancel');
+    assert.deepEqual(JSON.parse(JSON.stringify(cancel.options.body)), {
+      extension_name: 'gitlab', request_id: 'auth-a', thread_id: 'thread-a',
+    });
+    assert(h.authCard(), 'keep prompt until backend confirms cancellation');
+    cancel.resolve({ success: true }); await flush();
+    stale.resolve({ gates: [auth()] }); await flush();
+    h.request('pending-gates').resolve({ gates: [auth()] }); await flush();
+    h.context.renderPendingGates();
+    assert.equal(h.authCard(), null, 'cancelled prompt must not reappear');
+    assert.equal(h.context._pendingGates.size, 0);
+    console.log('PASS confirmed cancellation tombstones stale snapshots');
+  }
+
+  {
+    const h = harness();
+    h.context.loadPendingGates(); h.request('pending-gates').resolve({ gates: [auth()] }); await flush();
+    h.authCard().querySelector('.auth-cancel').listeners.click();
+    h.request('auth-cancel').reject(new Error('offline')); await flush();
+    assert.equal(h.context._pendingGates.size, 1);
+    assert.equal(h.authCard().querySelector('.auth-cancel').disabled, false);
+    assert.match(h.authCard().querySelector('.auth-error').textContent, /offline/);
+    console.log('PASS failed cancellation retains retryable prompt');
+  }
+
+  for (const credential of ['gitlab', 'other']) {
+    const h = harness();
+    const sibling = auth('auth-b', 'thread-b');
+    sibling.resume_kind.Authentication.credential_name = credential;
+    h.context.loadPendingGates();
+    h.request('pending-gates').resolve({ gates: [auth(), sibling] }); await flush();
+    h.authCard().querySelector('.auth-cancel').listeners.click();
+    const cancel = h.request('auth-cancel');
+    h.context.currentThreadId = 'thread-b'; h.context.renderPendingGates();
+    cancel.resolve({ success: true }); await flush();
+    assert.equal(h.authCard().getAttribute('data-request-id'), 'auth-b');
+    h.context.handleAuthCompleted({ extension_name: 'gitlab', success: true });
+    assert.equal(h.authCard().getAttribute('data-request-id'), 'auth-b', 'extension completion must not dismiss another gate');
+    assert.equal(h.context._pendingGates.size, 1);
+    assert.equal(h.context.authFlowPending, true, 'remaining prompt must retain auth mode');
+    console.log(`PASS delayed cancellation and completion preserve ${credential} sibling`);
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });
 NODE

@@ -379,6 +379,20 @@ resolved request IDs cannot be resurrected by stale responses. Engine startup
 unavailability and transient recovery failures are retried. Authentication is by
 bearer header (query-token fallback is reserved for streaming routes).
 
+Recovered authentication controls send both `request_id` and `thread_id` to
+`POST /api/chat/auth-token` and `POST /api/chat/auth-cancel`. The pair is optional
+for legacy clients, but an explicitly supplied pair must match a live auth gate
+owned by the caller and its credential name; partial identities return 400 and
+stale/mismatched identities return 409. Cancellation atomically takes that gate,
+finalizes its waiting thread, persists removal, and emits `gate_resolved`.
+Token configuration queues a process-local, secret-wrapped control payload for
+the selected gate. Dispatch revalidates the gate before resolution; credentials
+never become ordinary chat input if the gate expires or changes while queued.
+The browser waits for cancellation confirmation before tombstoning its cache,
+and for a resolution event or authoritative snapshot after token submission.
+Extension-wide auth completion cannot dismiss a different pending request for
+the same extension.
+
 Startup restore removes expired gates from disk as well as skipping them in
 memory; pruning failure is logged and never revives an expired approval.
 Conversation lookups and creation share a store-backed hydration path, using

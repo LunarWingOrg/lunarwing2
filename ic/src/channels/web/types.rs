@@ -1333,12 +1333,17 @@ pub struct SkillInstallRequest {
 pub struct AuthTokenRequest {
     pub extension_name: String,
     pub token: String,
+    /// Exact recovered gate identity. Both IDs must be supplied together.
+    pub request_id: Option<Uuid>,
+    pub thread_id: Option<Uuid>,
 }
 
 /// Request to cancel an in-progress auth flow.
 #[derive(Debug, Deserialize)]
 pub struct AuthCancelRequest {
     pub extension_name: String,
+    pub request_id: Option<Uuid>,
+    pub thread_id: Option<Uuid>,
 }
 
 // --- WebSocket ---

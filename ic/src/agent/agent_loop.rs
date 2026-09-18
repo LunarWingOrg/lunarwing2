@@ -1671,6 +1671,12 @@ impl Agent {
             return Ok(Some(String::new()));
         }
 
+        // Dedicated HTTP credentials stay outside submission parsing, inbound
+        // hooks and history, even if their gate expired while queued.
+        if let Some(submission) = &message.auth_gate_submission {
+            return crate::bridge::router::auth::submit(self, message, submission).await;
+        }
+
         // Set message tool context for this turn (current channel and target)
         // For Signal, use signal_target from metadata (group:ID or phone number),
         // otherwise fall back to user_id
@@ -2193,6 +2199,7 @@ pub(super) fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMess
         timezone: message.timezone.clone(),
         attachments: Vec::new(),
         is_internal: message.is_internal,
+        auth_gate_submission: None,
     }
 }
 

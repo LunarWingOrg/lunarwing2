@@ -1,5 +1,6 @@
 //! Engine v2 router — handles user messages via the engine when enabled.
 
+pub(crate) mod auth;
 mod outcome;
 use outcome::await_thread_outcome;
 
@@ -2591,22 +2592,7 @@ pub async fn resolve_gate(
         }
 
         lunarwing_engine::GateResolution::Cancelled => {
-            if let Some(ref sse) = state.sse {
-                sse.broadcast_for_user(
-                    &message.user_id,
-                    AppEvent::GateResolved {
-                        request_id: pending.request_id.to_string(),
-                        gate_name: pending.gate_name.clone(),
-                        tool_name: pending.action_name.clone(),
-                        resolution: "cancelled".into(),
-                        message: "Gate cancelled.".into(),
-                        thread_id: Some(pending.thread_id.to_string()),
-                    },
-                );
-            }
-            // Gate-paused threads are persisted as Waiting and are absent from
-            // the running map, so finalize them directly instead of signalling.
-            finalize_silently_stopped_pending_thread(state, &pending).await?;
+            auth::cancel_pending_gate(state, &pending).await?;
             return Ok(Some("Cancelled.".into()));
         }
 
@@ -2669,6 +2655,7 @@ pub async fn resolve_gate(
                         // attachments are control-path input and must not be
                         // grafted onto the original user request during retry.
                         attachments: Vec::new(),
+                        auth_gate_submission: None,
                         ..message.clone()
                     };
                     drop(guard);
@@ -5671,7 +5658,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{Mutex as TokioMutex, Notify, RwLock as TokioRwLock};
 
-    static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
+    pub(super) static ENGINE_STATE_TEST_LOCK: LazyLock<TokioMutex<()>> =
+        LazyLock::new(|| TokioMutex::new(()));
 
     #[test]
     fn channel_constraints_compose_without_empty_sections() {
@@ -5947,7 +5935,7 @@ mod tests {
         }
     }
 
-    fn sample_pending_gate(
+    pub(super) fn sample_pending_gate(
         user_id: &str,
         thread_id: lunarwing_engine::ThreadId,
         resume_kind: lunarwing_engine::ResumeKind,

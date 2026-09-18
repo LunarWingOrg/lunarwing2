@@ -1925,9 +1925,17 @@ function showJobCard(data) {
 // --- Auth card ---
 
 function handleAuthRequired(data) {
-  if (data.auth_url) {
+  // Live legacy auth events may accompany an engine gate. Retain the exact
+  // current-thread identity rather than resolving an extension-wide singleton.
+  if (!data.request_id) {
+    const gates = Array.from(_pendingGates.values()).filter((gate) =>
+      isCurrentThread(gate.thread_id) &&
+      gate.resume_kind?.Authentication?.credential_name === data.extension_name);
+    if (gates.length === 1) data = { ...data, request_id: gates[0].request_id, thread_id: gates[0].thread_id };
+  }
+  if (data.auth_url || data.request_id) {
     setAuthFlowPending(true, data.instructions);
-    // OAuth flow: show the global auth prompt with an OAuth button + optional token paste field.
+    // Engine gates request a credential directly, including non-OAuth gates.
     showAuthCard(data);
   } else {
     if (getConfigureOverlay(data.extension_name)) return;
@@ -1940,16 +1948,23 @@ function handleAuthRequired(data) {
 
 function handleAuthCompleted(data) {
   showToast(data.message, data.success ? 'success' : 'error');
+  const card = getAuthCard(data.extension_name);
+  if (card && card.getAttribute('data-request-id')) {
+    // Extension-wide completion cannot resolve a particular engine request.
+    if (!data.success) showAuthCardError(data.extension_name, data.message);
+    loadPendingGates();
+    return;
+  }
   // Dismiss only the matching extension's UI so stale prompts are cleared.
   removeAuthCard(data.extension_name);
   closeConfigureModal(data.extension_name);
   if (!data.success) {
-    setAuthFlowPending(false);
+    setAuthFlowPending(!!getAuthCard() || !!getConfigureOverlay());
     if (currentTab === 'extensions') loadExtensions();
     enableChatInput();
     return;
   }
-  setAuthFlowPending(false);
+  setAuthFlowPending(!!getAuthCard() || !!getConfigureOverlay());
   if (currentTab === 'settings') refreshCurrentSettingsTab();
   enableChatInput();
 }
@@ -1991,12 +2006,14 @@ function showAuthCard(data) {
   overlay.className = 'auth-overlay';
   overlay.setAttribute('data-extension-name', data.extension_name);
   overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) cancelAuth(data.extension_name);
+    if (e.target === overlay) cancelAuth(data.extension_name, data);
   });
 
   const card = document.createElement('div');
   card.className = 'auth-card auth-modal';
   card.setAttribute('data-extension-name', data.extension_name);
+  if (data.request_id) card.setAttribute('data-request-id', data.request_id);
+  if (data.thread_id) card.setAttribute('data-thread-id', data.thread_id);
 
   const header = document.createElement('div');
   header.className = 'auth-header';
@@ -2046,7 +2063,7 @@ function showAuthCard(data) {
     || I18n.t('auth.extensionTokenPlaceholder')
     || I18n.t('auth.tokenPlaceholder');
   tokenInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value);
+    if (e.key === 'Enter') submitAuthToken(data.extension_name, tokenInput.value, data);
   });
   tokenRow.appendChild(tokenInput);
   card.appendChild(tokenRow);
@@ -2064,12 +2081,12 @@ function showAuthCard(data) {
   const submitBtn = document.createElement('button');
   submitBtn.className = 'auth-submit';
   submitBtn.textContent = I18n.t('btn.submit');
-  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value));
+  submitBtn.addEventListener('click', () => submitAuthToken(data.extension_name, tokenInput.value, data));
 
   const cancelBtn = document.createElement('button');
   cancelBtn.className = 'auth-cancel';
   cancelBtn.textContent = I18n.t('btn.cancel');
-  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name));
+  cancelBtn.addEventListener('click', () => cancelAuth(data.extension_name, data));
 
   actions.appendChild(submitBtn);
   actions.appendChild(cancelBtn);
@@ -2094,7 +2111,7 @@ function removeAuthCard(extensionName) {
   }
 }
 
-function submitAuthToken(extensionName, tokenValue) {
+function submitAuthToken(extensionName, tokenValue, gate = {}) {
   if (!tokenValue || !tokenValue.trim()) return;
 
   // Disable submit button while in flight
@@ -2106,34 +2123,50 @@ function submitAuthToken(extensionName, tokenValue) {
 
   apiFetch('/api/chat/auth-token', {
     method: 'POST',
-    body: { extension_name: extensionName, token: tokenValue.trim() },
+    body: { extension_name: extensionName, token: tokenValue.trim(),
+      request_id: gate.request_id, thread_id: gate.thread_id },
   }).then((result) => {
     if (result.success) {
-      // Close immediately for responsiveness; the authoritative success UX
-      // (toast + extensions refresh) still comes from auth_completed SSE.
-      removeAuthCard(extensionName);
-      enableChatInput();
+      // A queued engine resume is not yet a resolution. Its SSE event or the
+      // authoritative snapshot removes this exact gate, even after reconnect.
+      if (gate.request_id) loadPendingGates();
+      else {
+        removeAuthCard(extensionName);
+        enableChatInput();
+      }
     } else {
-      showAuthCardError(extensionName, result.message);
+      showAuthCardError(extensionName, result.message, gate.request_id);
     }
   }).catch((err) => {
-    showAuthCardError(extensionName, 'Failed: ' + err.message);
+    showAuthCardError(extensionName, 'Failed: ' + err.message, gate.request_id);
   });
 }
 
-function cancelAuth(extensionName) {
-  apiFetch('/api/chat/auth-cancel', {
+function cancelAuth(extensionName, gate = {}) {
+  const card = getAuthCard(extensionName);
+  if (card) card.querySelectorAll('button').forEach((button) => { button.disabled = true; });
+  return apiFetch('/api/chat/auth-cancel', {
     method: 'POST',
-    body: { extension_name: extensionName },
-  }).catch(() => {});
-  removeAuthCard(extensionName);
-  setAuthFlowPending(false);
-  enableChatInput();
+    body: { extension_name: extensionName, request_id: gate.request_id, thread_id: gate.thread_id },
+  }).then((result) => {
+    if (!result.success) {
+      showAuthCardError(extensionName, result.message, gate.request_id);
+      return;
+    }
+    if (gate.request_id) forgetPendingGate(gate.request_id);
+    else {
+      removeAuthCard(extensionName);
+      setAuthFlowPending(false);
+      enableChatInput();
+    }
+  }).catch((err) => {
+    showAuthCardError(extensionName, 'Failed: ' + err.message, gate.request_id);
+  });
 }
 
-function showAuthCardError(extensionName, message) {
+function showAuthCardError(extensionName, message, requestId) {
   const card = getAuthCard(extensionName);
-  if (!card) return;
+  if (!card || (requestId && card.getAttribute('data-request-id') !== requestId)) return;
   // Re-enable buttons
   const btns = card.querySelectorAll('button');
   btns.forEach((b) => { b.disabled = false; });
@@ -2179,10 +2212,17 @@ function forgetPendingGate(requestId) {
   const card = queryByDataAttribute('.approval-card', 'data-request-id', requestId);
   if (card) card.remove();
   const auth = gate && gate.resume_kind && gate.resume_kind.Authentication;
-  if (auth && !Array.from(_pendingGates.values()).some((pending) =>
+  const authCard = auth && getAuthCard(auth.credential_name);
+  if (authCard && authCard.getAttribute('data-request-id') === requestId) {
+    removeAuthCard(auth.credential_name);
+  } else if (auth && !Array.from(_pendingGates.values()).some((pending) =>
     pending.resume_kind?.Authentication?.credential_name === auth.credential_name)) {
     removeAuthCard(auth.credential_name);
     closeConfigureModal(auth.credential_name);
+  }
+  if (auth && !getAuthCard() && !getConfigureOverlay()) {
+    setAuthFlowPending(false);
+    enableChatInput();
   }
 }
 
@@ -2194,11 +2234,14 @@ function renderPendingGates() {
       showApproval({ ...gate, allow_always: approval.allow_always });
     }
     const auth = gate.resume_kind && gate.resume_kind.Authentication;
-    if (auth && !getAuthCard(auth.credential_name) && !getConfigureOverlay(auth.credential_name)) {
+    const card = auth && getAuthCard(auth.credential_name);
+    if (auth && (!card || card.getAttribute('data-request-id') !== gate.request_id)) {
       handleAuthRequired({
         extension_name: auth.credential_name,
         instructions: auth.instructions,
         auth_url: auth.auth_url || null,
+        request_id: gate.request_id,
+        thread_id: gate.thread_id,
       });
     }
   }

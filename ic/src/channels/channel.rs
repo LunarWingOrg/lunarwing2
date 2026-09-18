@@ -97,6 +97,8 @@ pub struct IncomingMessage {
     /// monitor) and must bypass the normal user-input pipeline. This field is
     /// not settable via metadata, so external channels cannot spoof it.
     pub(crate) is_internal: bool,
+    /// Dedicated gateway credential control; never parsed as chat input.
+    pub(crate) auth_gate_submission: Option<crate::bridge::router::auth::AuthGateSubmission>,
 }
 
 impl IncomingMessage {
@@ -122,6 +124,7 @@ impl IncomingMessage {
             timezone: None,
             attachments: Vec::new(),
             is_internal: false,
+            auth_gate_submission: None,
         }
     }
 
