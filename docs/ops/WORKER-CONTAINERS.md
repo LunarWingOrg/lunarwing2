@@ -117,6 +117,28 @@ chunk IDs in the executable and leftover randomly named test workspaces.
 The candidate versus uncached-rebuild **whole-image digest comparison remains
 mandatory**; a passing binary check alone does not establish image reproducibility.
 
+The build-time self-test `RUN` steps also run under a throwaway
+`HOME`/XDG environment rooted inside the trap-cleaned `/tmp/opencode2-build-tests`
+tree, with `/root/.bun`, `/root/.local`, `/root/.cache`, and `/root/.config`
+leak tripwires that fail the build. This is the work-item-#177 root cause fix:
+OpenCode 2 appends a line stamped with the wall-clock time and a random run ID
+(`timestamp=... run=...`) to `$HOME/.local/share/opencode/log/opencode.log` on
+EVERY start — including `opencode --version` — so with the default root HOME
+each build baked a unique log file into the runtime layer and the candidate
+versus rebuild digests could never match (every opencode2 candidate job since
+the lane landed failed the gate, e.g. pipelines #3862 and #3880; the v1 worker
+is unaffected because opencode 1.x does not write that log). The compiled
+executable itself was verified byte-identical across two patched-profile
+builds, so the log was the only nondeterministic content in the image.
+
+On a candidate/rebuild digest mismatch, `build-worker-image.sh` now also
+prints a best-effort registry-side diagnosis before failing: it fetches both
+pushed manifests with the job's registry credentials (busybox `wget` against
+the GitLab `jwt/auth` token endpoint), reports both config digests and layer
+counts, and diffs the layer digests — or, when all layers match, the two image
+configs — pinpointing the first differing entry from the job log alone, which
+is the layer-level comparison work item #177 called for.
+
 Verification (2026-09-18): built upstream commit
 `79169fe966d58fb0e0a5e41133716184a0ab4ca6` with Bun 1.4.2 extracted from the
 Dockerfile's pinned amd64 image, using `OPENCODE_VERSION=2.0.5 bun run build --
@@ -130,6 +152,21 @@ Bridge executor, result, workspace-path, build-profile, and study-notes tests
 passed; workspace cleanup was also checked with an injected assertion failure.
 Full image digest verification remains with CI: local Podman could not unpack
 the base image because this account lacks sufficient subordinate UID/GID mappings.
+
+Goal-35 verification (2026-09-18): the #177 root cause was reproduced
+host-side with the pinned Bun — two full self-test sequences with a scratch
+HOME produced identical trees except `~/.local/share/opencode/log/opencode.log`
+(unique `timestamp=`/`run=` values), while the patched-profile CLI binaries
+built back-to-back were byte-identical (`80e50218...`), bun's transpiler caches
+were byte-identical, and the base image disables bun's runtime caches
+(`BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`). The fixed `RUN` shape (throwaway
+HOME/XDG + trap) ran the full self-test sequence twice leaving zero files
+anywhere, so nothing per-run can reach the image layer. The mismatch-diagnosis
+helper was exercised inside a sandbox running the pinned buildkit image's
+busybox: token-failure, layer-diff, and config-diff paths all degrade or
+report correctly. The definitive candidate-vs-rebuild gate rerun happens on
+the next protected master pipeline (container jobs only exist on protected
+refs).
 
 Per-tenant overrides: `configure-opencode2 <name> [--model <m>]
 [--base-url <url>]` (written as `OPENCODE2_MODEL`/`OPENCODE2_BASE_URL`).

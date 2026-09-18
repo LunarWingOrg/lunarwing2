@@ -122,6 +122,79 @@ metadata_digest() {
     awk -F'"' '/"containerimage.digest"/ { print $4; exit }' "$1"
 }
 
+# Best-effort layer-level diagnosis for a candidate/rebuild digest mismatch
+# (work item #177): fetch both manifests from the project registry with the
+# job's registry credentials, then report whether the divergence is in the
+# layer digests or the image config, and print a diff pinpointing the first
+# differing entry. Nothing here may mask the real failure, so every step is
+# guarded and the function only ever emits informational output.
+print_reproducibility_diagnosis() {
+    _diag_image=$1
+    _diag_cand_tag=$2
+    _diag_rebuild_tag=$3
+    _diag_full="${CI_REGISTRY_IMAGE}/${_diag_image}"
+    case "$_diag_full" in
+        "$CI_REGISTRY"/*) _diag_repo=${_diag_full#"$CI_REGISTRY"/} ;;
+        *) _diag_repo=$_diag_full ;;
+    esac
+    echo "INFO: fetching candidate and rebuild manifests from the registry for a layer-level comparison (best effort)" >&2
+    _diag_auth=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')
+    _diag_token=$(wget -q -T 30 -O - \
+        --header "Authorization: Basic ${_diag_auth}" \
+        "https://${CI_SERVER_HOST}/jwt/auth?service=container_registry&scope=repository:${_diag_repo}:pull" \
+        2>/dev/null | sed -n 's/.*"token" *: *"\([^"]*\)".*/\1/p') || _diag_token=""
+    if [ -z "$_diag_token" ]; then
+        echo "WARN: could not obtain a registry pull token — diagnosis unavailable" >&2
+        return 0
+    fi
+    _diag_manifest() {
+        wget -q -T 30 -O - \
+            --header "Authorization: Bearer ${_diag_token}" \
+            --header 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://${CI_REGISTRY}/v2/${_diag_repo}/manifests/$1" 2>/dev/null || return 1
+    }
+    _diag_cand_manifest=$(_diag_manifest "$_diag_cand_tag") || _diag_cand_manifest=""
+    _diag_rebuild_manifest=$(_diag_manifest "$_diag_rebuild_tag") || _diag_rebuild_manifest=""
+    if [ -z "$_diag_cand_manifest" ] || [ -z "$_diag_rebuild_manifest" ]; then
+        echo "WARN: could not fetch the candidate/rebuild manifests — diagnosis unavailable" >&2
+        return 0
+    fi
+    # Docker manifests serialize the config descriptor before the layers, so
+    # the first digest is the config digest and the rest are the layers.
+    _diag_cand_digests=$(printf '%s\n' "$_diag_cand_manifest" | grep -o '"digest" *: *"sha256:[0-9a-f]*"' | sed 's/.*"sha256:/sha256:/;s/"$//')
+    _diag_rebuild_digests=$(printf '%s\n' "$_diag_rebuild_manifest" | grep -o '"digest" *: *"sha256:[0-9a-f]*"' | sed 's/.*"sha256:/sha256:/;s/"$//')
+    _diag_cand_config=$(printf '%s\n' "$_diag_cand_digests" | sed -n '1p')
+    _diag_rebuild_config=$(printf '%s\n' "$_diag_rebuild_digests" | sed -n '1p')
+    _diag_cand_layers=$(printf '%s\n' "$_diag_cand_digests" | sed '1d' | grep -c .)
+    _diag_rebuild_layers=$(printf '%s\n' "$_diag_rebuild_digests" | sed '1d' | grep -c .)
+    echo "INFO: candidate config ${_diag_cand_config} (${_diag_cand_layers} layers); rebuild config ${_diag_rebuild_config} (${_diag_rebuild_layers} layers)" >&2
+    _diag_tmp=$(mktemp -d /tmp/worker-diagnosis.XXXXXX) || return 0
+    printf '%s\n' "$_diag_cand_digests" | sed '1d' >"$_diag_tmp/candidate-layers"
+    printf '%s\n' "$_diag_rebuild_digests" | sed '1d' >"$_diag_tmp/rebuild-layers"
+    if diff -q "$_diag_tmp/candidate-layers" "$_diag_tmp/rebuild-layers" >/dev/null; then
+        echo "INFO: all layer digests are identical — the divergence is in the image config" >&2
+        _diag_cand_config_json=$(wget -q -T 30 -O - \
+            --header "Authorization: Bearer ${_diag_token}" \
+            "https://${CI_REGISTRY}/v2/${_diag_repo}/blobs/${_diag_cand_config}" 2>/dev/null) || _diag_cand_config_json=""
+        _diag_rebuild_config_json=$(wget -q -T 30 -O - \
+            --header "Authorization: Bearer ${_diag_token}" \
+            "https://${CI_REGISTRY}/v2/${_diag_repo}/blobs/${_diag_rebuild_config}" 2>/dev/null) || _diag_rebuild_config_json=""
+        if [ -n "$_diag_cand_config_json" ] && [ -n "$_diag_rebuild_config_json" ]; then
+            printf '%s' "$_diag_cand_config_json" | tr ',' '\n' >"$_diag_tmp/candidate-config"
+            printf '%s' "$_diag_rebuild_config_json" | tr ',' '\n' >"$_diag_tmp/rebuild-config"
+            echo "INFO: image config diff (one field per line)" >&2
+            diff -u "$_diag_tmp/candidate-config" "$_diag_tmp/rebuild-config" >&2 || true
+        else
+            echo "WARN: could not fetch the image configs for diffing" >&2
+        fi
+    else
+        echo "INFO: layer digest diff follows (hunk headers are 1-based layer indexes, counting from the first image layer)" >&2
+        diff -u "$_diag_tmp/candidate-layers" "$_diag_tmp/rebuild-layers" >&2 || true
+    fi
+    rm -rf "$_diag_tmp"
+    return 0
+}
+
 build_image "$candidate_ref" "$metadata_file" false
 digest=$(metadata_digest "$metadata_file")
 case "$digest" in
@@ -133,6 +206,7 @@ build_image "$rebuild_ref" "$rebuild_metadata_file" true
 rebuild_digest=$(metadata_digest "$rebuild_metadata_file")
 if [ "$rebuild_digest" != "$digest" ]; then
     echo "clean rebuild digest mismatch: $rebuild_digest != $digest" >&2
+    print_reproducibility_diagnosis "$image_name" "$candidate_tag" "${candidate_tag}-rebuild"
     exit 1
 fi
 
