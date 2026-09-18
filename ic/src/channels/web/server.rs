@@ -455,6 +455,7 @@ pub(super) async fn start_server_with_mascot(
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
         .route("/api/chat/approval", post(chat_approval_handler))
+        .route("/api/chat/pending-gates", get(chat_pending_gates_handler))
         .route("/api/chat/auth-token", post(chat_auth_token_handler))
         .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
         .route("/api/chat/events", get(chat_events_handler))
@@ -1427,6 +1428,24 @@ async fn chat_send_handler(
     ))
 }
 
+pub(crate) async fn chat_pending_gates_handler(
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let gates = crate::bridge::list_engine_pending_gates(&user.user_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Failed to recover pending engine gates");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to list pending gates".into(),
+            )
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(super::types::PendingGatesResponse { gates }),
+    ))
+}
+
 async fn chat_approval_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
@@ -1508,11 +1527,18 @@ async fn chat_approval_handler(
 ///
 /// For Engine V2, the token enters the gate-control path on the exact pending
 /// thread. That path consumes it before normal chat history or LLM handling.
-async fn chat_auth_token_handler(
+pub(crate) async fn chat_auth_token_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<AuthTokenRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let pending = requested_engine_auth_gate(
+        &user.user_id,
+        &req.extension_name,
+        req.request_id,
+        req.thread_id,
+    )
+    .await?;
     let ext_mgr = state.extension_manager.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "Extension manager not available".to_string(),
@@ -1534,8 +1560,14 @@ async fn chat_auth_token_handler(
             resp.instructions = result.verification.as_ref().map(|v| v.instructions.clone());
 
             let engine_resume_queued = if result.activated {
-                queue_engine_auth_resume(&state, &user.user_id, &req.extension_name, &req.token)
-                    .await?
+                queue_engine_auth_resume(
+                    &state,
+                    &user.user_id,
+                    &req.extension_name,
+                    &req.token,
+                    pending.as_ref(),
+                )
+                .await?
             } else {
                 false
             };
@@ -1551,10 +1583,8 @@ async fn chat_auth_token_handler(
                     },
                 );
             } else if result.activated {
-                // Clear auth mode on the active thread
-                clear_auth_mode(&state, &user.user_id).await;
-
                 if !engine_resume_queued {
+                    clear_auth_mode(&state, &user.user_id).await;
                     state.sse.broadcast_for_user(
                         &user.user_id,
                         SseEvent::AuthCompleted {
@@ -1611,13 +1641,20 @@ fn matching_engine_auth_thread<'a>(
     }
 }
 
-async fn queue_engine_auth_resume(
-    state: &GatewayState,
+async fn requested_engine_auth_gate(
     user_id: &str,
     extension_name: &str,
-    token: &str,
-) -> Result<bool, (StatusCode, String)> {
-    let pending = crate::bridge::get_engine_pending_gate(user_id, None)
+    request_id: Option<Uuid>,
+    thread_id: Option<Uuid>,
+) -> Result<Option<crate::gate::pending::PendingGateView>, (StatusCode, String)> {
+    if request_id.is_some() != thread_id.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "request_id and thread_id must be supplied together".into(),
+        ));
+    }
+    let thread_hint = thread_id.map(|id| id.to_string());
+    let pending = crate::bridge::get_engine_pending_gate(user_id, thread_hint.as_deref())
         .await
         .map_err(|error| {
             tracing::warn!(
@@ -1631,16 +1668,51 @@ async fn queue_engine_auth_resume(
                 "Failed to inspect pending authentication state".to_string(),
             )
         })?;
-    let Some(thread_id) = matching_engine_auth_thread(pending.as_ref(), extension_name) else {
+    let pending = pending.filter(|gate| {
+        matching_engine_auth_thread(Some(gate), extension_name).is_some()
+            && request_id.is_none_or(|id| gate.request_id == id.to_string())
+            && thread_id.is_none_or(|id| gate.thread_id == id.to_string())
+    });
+    if request_id.is_some() && pending.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            "Authentication request is stale or no longer available".into(),
+        ));
+    }
+    Ok(pending)
+}
+
+async fn queue_engine_auth_resume(
+    state: &GatewayState,
+    user_id: &str,
+    extension_name: &str,
+    token: &str,
+    pending: Option<&crate::gate::pending::PendingGateView>,
+) -> Result<bool, (StatusCode, String)> {
+    let Some(pending) = pending else {
         return Ok(false);
     };
-
-    let mut message = IncomingMessage::new("gateway", user_id, token)
+    let thread_id = &pending.thread_id;
+    let parse_id = |id: &str| {
+        Uuid::parse_str(id).map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Invalid authentication gate identity".into(),
+            )
+        })
+    };
+    let mut message = IncomingMessage::new("gateway", user_id, "")
         .with_thread(thread_id)
         .with_metadata(serde_json::json!({
             "thread_id": thread_id,
             "user_id": user_id,
         }));
+    message.auth_gate_submission = Some(crate::bridge::router::auth::AuthGateSubmission {
+        request_id: parse_id(&pending.request_id)?,
+        thread_id: lunarwing_engine::ThreadId(parse_id(thread_id)?),
+        credential_name: extension_name.to_string(),
+        token: secrecy::SecretString::from(token.to_string()),
+    });
     if state.owner_id != state.default_sender_id && user_id == state.owner_id {
         message = message.with_sender_id(&state.default_sender_id);
     }
@@ -1666,11 +1738,37 @@ async fn queue_engine_auth_resume(
 }
 
 /// Cancel an in-progress auth flow.
-async fn chat_auth_cancel_handler(
+pub(crate) async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(user): AuthenticatedUser,
-    Json(_req): Json<AuthCancelRequest>,
+    Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
+    let pending = requested_engine_auth_gate(
+        &user.user_id,
+        &req.extension_name,
+        req.request_id,
+        req.thread_id,
+    )
+    .await?;
+    if let Some(pending) = pending {
+        let parse_id = |id: &str| {
+            Uuid::parse_str(id).map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid authentication gate identity".into(),
+                )
+            })
+        };
+        crate::bridge::router::auth::cancel(
+            &IncomingMessage::new("gateway", &user.user_id, ""),
+            lunarwing_engine::ThreadId(parse_id(&pending.thread_id)?),
+            parse_id(&pending.request_id)?,
+            &req.extension_name,
+        )
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        return Ok(Json(ActionResponse::ok("Auth cancelled")));
+    }
     clear_auth_mode(&state, &user.user_id).await;
     Ok(Json(ActionResponse::ok("Auth cancelled")))
 }

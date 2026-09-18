@@ -39,6 +39,8 @@ pub struct EffectBridgeAdapter {
     hooks: Arc<HookRegistry>,
     /// Per-user tools approved with "always" for this process lifetime.
     auto_approved: RwLock<HashSet<(String, String)>>,
+    /// Resolved agent config; global approval only bypasses UnlessAutoApproved.
+    globally_auto_approved: bool,
     /// DB-backed settings store for persisted `tool_permissions.*` checks.
     settings_store: RwLock<Option<Arc<dyn SettingsStore + Send + Sync>>>,
     /// Per-user per-tool sliding window rate limiter.
@@ -63,12 +65,18 @@ impl EffectBridgeAdapter {
             safety,
             hooks,
             auto_approved: RwLock::new(HashSet::new()),
+            globally_auto_approved: false,
             settings_store: RwLock::new(None),
             rate_limiter: RateLimiter::new(),
             mission_manager: RwLock::new(None),
             auth_manager: RwLock::new(None),
             coordination_gate: RwLock::new(None),
         }
+    }
+
+    pub fn with_auto_approve_tools(mut self, enabled: bool) -> Self {
+        self.globally_auto_approved = enabled;
+        self
     }
 
     /// Mark a tool as auto-approved for one user (user said "always").
@@ -682,7 +690,11 @@ impl EffectBridgeAdapter {
             let allow_always = tool.allows_always_approval(&parameters);
             let user_auto_approved = permission_state == Some(PermissionState::AlwaysAllow);
             if !approval_already_granted
-                && requirement.needs_prompt_with_user_grant(false, user_auto_approved, allow_always)
+                && requirement.needs_prompt_with_user_grant(
+                    self.globally_auto_approved,
+                    user_auto_approved,
+                    allow_always,
+                )
             {
                 // Credential presence alone does NOT bypass approval.
                 // Credentials indicate the call *can* be authenticated, not
@@ -796,12 +808,19 @@ impl EffectBridgeAdapter {
             Ok(HookOutcome::Continue { .. }) => {}
         }
 
-        let job_ctx = JobContext::with_user(
+        let mut job_ctx = JobContext::with_user(
             &context.user_id,
             "engine_v2",
             format!("Thread {}", context.thread_id),
         )
         .with_prompt_context(Arc::clone(&context.prompt_context));
+        // The message tool's gateway broadcast requires an explicit thread.
+        // Use this execution's identity, never mutable shared chat defaults.
+        job_ctx.metadata = serde_json::json!({ "notify_thread_id": context.thread_id.to_string() });
+        if context.source_channel.as_deref() == Some("gateway") {
+            job_ctx.metadata["notify_channel"] = serde_json::json!("gateway");
+            job_ctx.metadata["notify_user"] = serde_json::json!(context.user_id);
+        }
 
         let result = crate::tools::execute::execute_tool_with_safety(
             &self.tools,
@@ -1840,6 +1859,108 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
+    async fn global_auto_approve_respects_explicit_and_supervised_gates() {
+        let adapter = make_adapter();
+        adapter.tools.register(Arc::new(ApprovalTestTool)).await;
+        adapter
+            .tools
+            .register(Arc::new(PersistableAlwaysApprovalTestTool))
+            .await;
+        let context = exec_ctx(lunarwing_engine::ThreadId::new(), Some("global-config"));
+        let parameters = serde_json::json!({"value": "hello"});
+        assert!(matches!(
+            adapter
+                .execute_action("approval_test", parameters.clone(), &lease(), &context)
+                .await,
+            Err(EngineError::GatePaused { .. })
+        ));
+        let adapter = adapter.with_auto_approve_tools(true);
+        assert!(
+            !adapter
+                .execute_action("approval_test", parameters.clone(), &lease(), &context)
+                .await
+                .unwrap()
+                .is_error
+        );
+        let always_name = PersistableAlwaysApprovalTestTool.name();
+        assert!(matches!(
+            adapter
+                .execute_action(always_name, parameters.clone(), &lease(), &context)
+                .await,
+            Err(EngineError::GatePaused { .. })
+        ));
+        let mut supervised = context.clone();
+        supervised.supervised_mode = true;
+        assert!(matches!(
+            adapter
+                .execute_action("approval_test", parameters.clone(), &lease(), &supervised)
+                .await,
+            Err(EngineError::GatePaused { .. })
+        ));
+        let mut shared = context;
+        shared.shared_conversation = true;
+        assert!(matches!(
+            adapter
+                .execute_action("approval_test", parameters, &lease(), &shared)
+                .await,
+            Err(EngineError::GatePaused { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn engine_message_tool_supplies_gateway_thread_routing() {
+        use crate::channels::web::{GatewayChannel, types::SseEvent};
+        use futures::{FutureExt, StreamExt};
+        let gateway = GatewayChannel::new(
+            crate::config::GatewayConfig {
+                host: "127.0.0.1".into(),
+                port: 0,
+                auth_token: Some("test-token".into()),
+                mascot_enabled: false,
+                user_id: "alice".into(),
+                workspace_read_scopes: vec![],
+                memory_layers: vec![],
+                user_tokens: None,
+                ws_ping_interval_secs: 30,
+                ws_idle_timeout_secs: 120,
+            },
+            "alice".into(),
+        );
+        let sse = gateway.state().sse.clone();
+        let mut events = sse.subscribe_raw(Some("alice".into())).unwrap();
+        let channels = Arc::new(crate::channels::ChannelManager::new());
+        channels.add(Box::new(gateway)).await;
+        let message_tool = crate::tools::builtin::MessageTool::new(channels);
+        message_tool
+            .set_context(Some("gateway".into()), Some("another-user".into()))
+            .await;
+        let adapter = make_adapter().with_auto_approve_tools(true);
+        adapter.tools.register(Arc::new(message_tool)).await;
+        let mut context = exec_ctx(lunarwing_engine::ThreadId::new(), Some("message-call"));
+        context.user_id = "alice".into();
+        context.source_channel = Some("gateway".into());
+        let result = adapter
+            .execute_action(
+                "message",
+                serde_json::json!({"content":"proactive reply"}),
+                &lease(),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let event = events
+            .next()
+            .now_or_never()
+            .flatten()
+            .expect("message must reach this user");
+        assert!(
+            matches!(event, SseEvent::Response { content, thread_id, .. }
+            if content == "proactive reply" && thread_id == context.thread_id.to_string())
+        );
+    }
+
+    #[tokio::test]
     async fn coordination_gate_blocks_disabled_agent_tools() {
         use lunarwing_safety::SafetyConfig;
 
@@ -2428,7 +2549,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
     }
 
     #[tokio::test]
-    async fn persisted_disabled_permission_denies_execution() {
+    async fn persisted_disabled_permission_denies_execution_even_with_global_auto_approve() {
         use lunarwing_safety::SafetyConfig;
 
         let tools = Arc::new(ToolRegistry::new());
@@ -2440,7 +2561,8 @@ FINAL(echoed + "|" + http_result["error"])"#,
                 injection_check_enabled: false,
             })),
             Arc::new(HookRegistry::default()),
-        );
+        )
+        .with_auto_approve_tools(true);
         let settings = Arc::new(TestSettingsStore::default());
         settings
             .set_setting(

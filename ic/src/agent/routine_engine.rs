@@ -2610,6 +2610,7 @@ mod tests {
             timezone: None,
             attachments: vec![],
             is_internal: false,
+            auth_gate_submission: None,
         }
     }
 

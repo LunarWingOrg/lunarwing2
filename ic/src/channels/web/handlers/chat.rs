@@ -158,73 +158,26 @@ pub async fn chat_auth_token_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Json(req): Json<AuthTokenRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    let ext_mgr = state.extension_manager.as_ref().ok_or((
-        StatusCode::SERVICE_UNAVAILABLE,
-        "Extension manager not available".to_string(),
-    ))?;
-
-    match ext_mgr
-        .configure_token(&req.extension_name, &req.token, &user.user_id)
-        .await
-    {
-        Ok(result) => {
-            let mut resp = ActionResponse::ok(result.message.clone());
-            resp.activated = Some(result.activated);
-            resp.auth_url = result.auth_url.clone();
-            resp.verification = result.verification.clone();
-            resp.instructions = result.verification.as_ref().map(|v| v.instructions.clone());
-
-            if result.verification.is_some() {
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthRequired {
-                        extension_name: req.extension_name.clone(),
-                        instructions: Some(result.message),
-                        auth_url: None,
-                        setup_url: None,
-                    },
-                );
-            } else {
-                clear_auth_mode(&state, &user.user_id).await;
-
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthCompleted {
-                        extension_name: req.extension_name.clone(),
-                        success: true,
-                        message: result.message,
-                    },
-                );
-            }
-
-            Ok(Json(resp))
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if matches!(e, crate::extensions::ExtensionError::ValidationFailed(_)) {
-                state.sse.broadcast_for_user(
-                    &user.user_id,
-                    SseEvent::AuthRequired {
-                        extension_name: req.extension_name.clone(),
-                        instructions: Some(msg.clone()),
-                        auth_url: None,
-                        setup_url: None,
-                    },
-                );
-            }
-            Ok(Json(ActionResponse::fail(msg)))
-        }
-    }
+    crate::channels::web::server::chat_auth_token_handler(
+        State(state),
+        AuthenticatedUser(user),
+        Json(req),
+    )
+    .await
 }
 
 /// Cancel an in-progress auth flow.
 pub async fn chat_auth_cancel_handler(
     State(state): State<Arc<GatewayState>>,
     AuthenticatedUser(identity): AuthenticatedUser,
-    Json(_req): Json<AuthCancelRequest>,
+    Json(req): Json<AuthCancelRequest>,
 ) -> Result<Json<ActionResponse>, (StatusCode, String)> {
-    clear_auth_mode(&state, &identity.user_id).await;
-    Ok(Json(ActionResponse::ok("Auth cancelled")))
+    crate::channels::web::server::chat_auth_cancel_handler(
+        State(state),
+        AuthenticatedUser(identity),
+        Json(req),
+    )
+    .await
 }
 
 /// Clear pending auth mode on the active thread.

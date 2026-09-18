@@ -82,7 +82,17 @@ For non-interactive development or CI only, the current global environment overr
 AGENT_AUTO_APPROVE_TOOLS=true
 ```
 
-The older `AUTO_APPROVE_TOOLS` spelling is not read by the current configuration resolver. `--auto-approve` sets the same runtime override as `AGENT_AUTO_APPROVE_TOOLS=true`.
+The older `AUTO_APPROVE_TOOLS` spelling is accepted as a legacy alias, with a
+name-only migration warning. Prefer `AGENT_AUTO_APPROVE_TOOLS`; it wins when both
+spellings are set in the same configuration layer. Existing precedence across
+environment, runtime overrides, injected settings, and DB defaults is preserved.
+`--auto-approve` sets the canonical runtime override.
+
+Engine V2 uses the resolved setting as well as V1. Global auto-approval bypasses
+only `UnlessAutoApproved` tools: disabled permissions, intrinsic `Always` gates,
+shared-conversation restrictions, and supervised mode still apply. Unknown
+`AGENT_*` / `AUTO_APPROVE_*` keys produce a warning containing only the key name,
+so a misspelled approval setting does not silently look enabled.
 
 Supervised mode (`--supervised` or `AGENT_SUPERVISED_MODE=true`) takes precedence and still gates every tool action.
 

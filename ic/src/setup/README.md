@@ -105,6 +105,14 @@ Config precedence still applies after seeding:
 That means service env files, `.env`, or wrapper scripts can still override the
 seeded `selected_model`, `openai_compatible_base_url`, or other TOML values.
 
+`AGENT_AUTO_APPROVE_TOOLS` is the canonical approval setting. The legacy
+`AUTO_APPROVE_TOOLS` alias is accepted at the same precedence layers and emits a
+name-only migration warning; the canonical spelling wins within a layer. Engine
+V2 consumes the resolved `AgentConfig::auto_approve_tools`, including DB-backed
+defaults. Unknown `AGENT_*` / `AUTO_APPROVE_*` keys emit a name-only warning.
+See [approval behavior](../../../docs/guides/ENABLING_DEV_TOOLS.md#3-keep-or-change-approval-behavior)
+for the restrictions that global auto-approval does not bypass.
+
 **Seed source locations in the repo:**
 - Runtime config template: `deploy/config.toml`
 - Workspace seed templates: `deploy/workspace-template/*.md`

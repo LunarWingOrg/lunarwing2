@@ -77,6 +77,9 @@ fn runtime_overrides() -> &'static Mutex<HashMap<String, String>> {
 
 fn aliased_env_keys(key: &str) -> (&str, Option<&str>) {
     match key {
+        "AGENT_AUTO_APPROVE_TOOLS" | "AUTO_APPROVE_TOOLS" => {
+            ("AGENT_AUTO_APPROVE_TOOLS", Some("AUTO_APPROVE_TOOLS"))
+        }
         "IRONCLAW_OAUTH_CALLBACK_URL" | "LUNARWING_OAUTH_CALLBACK_URL" => (
             "LUNARWING_OAUTH_CALLBACK_URL",
             Some("IRONCLAW_OAUTH_CALLBACK_URL"),
@@ -437,6 +440,33 @@ pub(crate) fn validate_base_url(url: &str, field_name: &str) -> Result<(), Confi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_approve_legacy_alias_preserves_precedence_and_validation() {
+        let _guard = super::lock_env();
+        // SAFETY: the crate-wide guard restores the environment on drop.
+        unsafe {
+            std::env::remove_var("AGENT_AUTO_APPROVE_TOOLS");
+            std::env::set_var("AUTO_APPROVE_TOOLS", "true");
+        }
+        let settings = crate::settings::Settings::default();
+        assert!(
+            crate::config::AgentConfig::resolve(&settings)
+                .unwrap()
+                .auto_approve_tools
+        );
+        unsafe { std::env::set_var("AGENT_AUTO_APPROVE_TOOLS", "false") };
+        assert!(
+            !crate::config::AgentConfig::resolve(&settings)
+                .unwrap()
+                .auto_approve_tools
+        );
+        unsafe {
+            std::env::remove_var("AGENT_AUTO_APPROVE_TOOLS");
+            std::env::set_var("AUTO_APPROVE_TOOLS", "invalid");
+        }
+        assert!(crate::config::AgentConfig::resolve(&settings).is_err());
+    }
+
     use super::*;
 
     #[test]

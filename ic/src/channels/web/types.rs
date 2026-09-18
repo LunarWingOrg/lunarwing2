@@ -111,6 +111,12 @@ pub struct PendingApprovalInfo {
     pub parameters: String,
 }
 
+/// Durable, user-scoped recovery snapshot for SSE/WebSocket clients.
+#[derive(Debug, Serialize)]
+pub struct PendingGatesResponse {
+    pub gates: Vec<crate::gate::pending::PendingGateView>,
+}
+
 // --- Approval ---
 
 #[derive(Debug, Deserialize)]
@@ -1327,12 +1333,17 @@ pub struct SkillInstallRequest {
 pub struct AuthTokenRequest {
     pub extension_name: String,
     pub token: String,
+    /// Exact recovered gate identity. Both IDs must be supplied together.
+    pub request_id: Option<Uuid>,
+    pub thread_id: Option<Uuid>,
 }
 
 /// Request to cancel an in-progress auth flow.
 #[derive(Debug, Deserialize)]
 pub struct AuthCancelRequest {
     pub extension_name: String,
+    pub request_id: Option<Uuid>,
+    pub thread_id: Option<Uuid>,
 }
 
 // --- WebSocket ---
