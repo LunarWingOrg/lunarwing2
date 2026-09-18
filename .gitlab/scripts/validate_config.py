@@ -319,6 +319,12 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
 
 
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:
+    # Host-side runner limits control compile concurrency. A resource group
+    # here would serialize independent hosts across all project pipelines.
+    for name, job in merged.items():
+        if (name.startswith("rust-") or name == "cavepony-wasm") and isinstance(job, dict):
+            if job.get("resource_group"):
+                errors.append(f"{name} must use runner concurrency, not a project resource lock")
     expected = {
         "rust-check-postgres": ("--tests", "--features postgres"),
         "rust-check-libsql": ("--tests", "--features libsql"),
