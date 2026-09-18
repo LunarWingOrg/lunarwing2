@@ -160,37 +160,9 @@ impl Agent {
         thread_id: &str,
         response: String,
     ) -> Option<String> {
-        let event = crate::hooks::HookEvent::ResponseTransform {
-            user_id: message.user_id.clone(),
-            thread_id: thread_id.to_string(),
-            response: response.clone(),
-            channel: Some(message.channel.clone()),
-            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
-        };
-        match self.hooks().run(&event).await {
-            Err(crate::hooks::HookError::Rejected { reason }) => {
-                tracing::debug!(
-                    channel = %message.channel,
-                    user = %message.user_id,
-                    reason = %reason,
-                    "Response transform rejected output; suppressing response"
-                );
-                None
-            }
-            Err(error) => {
-                tracing::warn!(
-                    channel = %message.channel,
-                    user = %message.user_id,
-                    %error,
-                    "Response transform failed closed; suppressing response"
-                );
-                None
-            }
-            Ok(crate::hooks::HookOutcome::Continue {
-                modified: Some(new_response),
-            }) => Some(new_response),
-            _ => Some(response),
-        }
+        self.response_delivery()
+            .transform(message, thread_id, response)
+            .await
     }
 
     /// Hydrate a historical thread from DB into memory if not already present.

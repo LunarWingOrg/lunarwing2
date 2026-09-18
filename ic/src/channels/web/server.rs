@@ -455,6 +455,7 @@ pub(super) async fn start_server_with_mascot(
         // Chat
         .route("/api/chat/send", post(chat_send_handler))
         .route("/api/chat/approval", post(chat_approval_handler))
+        .route("/api/chat/pending-gates", get(chat_pending_gates_handler))
         .route("/api/chat/auth-token", post(chat_auth_token_handler))
         .route("/api/chat/auth-cancel", post(chat_auth_cancel_handler))
         .route("/api/chat/events", get(chat_events_handler))
@@ -1424,6 +1425,24 @@ async fn chat_send_handler(
             message_id: msg_id,
             status: "accepted",
         }),
+    ))
+}
+
+pub(crate) async fn chat_pending_gates_handler(
+    AuthenticatedUser(user): AuthenticatedUser,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let gates = crate::bridge::list_engine_pending_gates(&user.user_id)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Failed to recover pending engine gates");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Failed to list pending gates".into(),
+            )
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(super::types::PendingGatesResponse { gates }),
     ))
 }
 

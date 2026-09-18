@@ -18,6 +18,7 @@ apt-get install --yes --no-install-recommends \
     git \
     gzip \
     jq \
+    nodejs \
     p7zip-full \
     procps \
     tar \

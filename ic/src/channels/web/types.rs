@@ -111,6 +111,12 @@ pub struct PendingApprovalInfo {
     pub parameters: String,
 }
 
+/// Durable, user-scoped recovery snapshot for SSE/WebSocket clients.
+#[derive(Debug, Serialize)]
+pub struct PendingGatesResponse {
+    pub gates: Vec<crate::gate::pending::PendingGateView>,
+}
+
 // --- Approval ---
 
 #[derive(Debug, Deserialize)]

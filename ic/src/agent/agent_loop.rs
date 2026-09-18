@@ -333,6 +333,10 @@ impl Agent {
         self.config.max_tool_iterations
     }
 
+    pub(crate) fn auto_approve_tools(&self) -> bool {
+        self.config.auto_approve_tools
+    }
+
     /// Pending-gate expiry (WI#111): resolved from
     /// `AGENT_PENDING_GATE_EXPIRY_SECS` env / `agent.pending_gate_expiry_secs`
     /// settings via `AgentConfig::resolve`, with config-layer lower and upper
@@ -1424,88 +1428,15 @@ impl Agent {
     }
 
     async fn deliver_outbound_with_hooks(&self, message: &IncomingMessage, response: String) {
-        let event = crate::hooks::HookEvent::Outbound {
-            user_id: message.user_id.clone(),
-            channel: message.channel.clone(),
-            content: response.clone(),
-            thread_id: message.thread_id.clone(),
-            policy_scope: crate::channels::routing_target_from_metadata(&message.metadata),
-        };
-        // Hooks first (they may modify or block), then the shared coalesce
-        // buffer, then the channel send (whose transport rate limiter sees
-        // only flushed messages) — the ordering ISSUE-002 requires.
-        let final_text = match self.hooks().run(&event).await {
-            Err(error) => {
-                tracing::warn!("BeforeOutbound hook blocked response: {error}");
-                None
-            }
-            Ok(crate::hooks::HookOutcome::Continue {
-                modified: Some(new_content),
-            }) => Some(new_content),
-            _ => Some(response),
-        };
-        let Some(text) = final_text else {
-            return;
-        };
-
-        // Phase 4: transport-independent coalescing for coordination
-        // channels. Applies to every channel kind (native and installable
-        // WASM alike) because it lives at the agent's outbound boundary
-        // rather than inside any one channel (ISSUE-002).
-        if let Some(buffer) = &self.deps.coordination_coalesce {
-            let destination = crate::channels::routing_target_from_metadata(&message.metadata)
-                .unwrap_or_else(|| message.channel.clone());
-            let key = crate::channels::coalesce::ChannelKey::new(
-                self.deps.owner_id.clone(),
-                message.channel.clone(),
-                destination,
-                message
-                    .conversation_scope_id
-                    .clone()
-                    .or_else(|| message.thread_id.clone())
-                    .unwrap_or_default(),
-            );
-            let channels = Arc::clone(&self.channels);
-            let msg = coalesced_reply_context(message);
-            let flush: crate::channels::coalesce::FlushFn = Arc::new(move |content| {
-                let channels = Arc::clone(&channels);
-                let msg = msg.clone();
-                Box::pin(async move {
-                    if let Err(error) = channels
-                        .respond(&msg, OutgoingResponse::text(content))
-                        .await
-                    {
-                        tracing::error!(
-                            channel = %msg.channel,
-                            error = %error,
-                            "Failed to send coalesced response to channel"
-                        );
-                    }
-                })
-            });
-            match buffer.submit(key, text, flush).await {
-                crate::channels::coalesce::CoalesceDecision::SendNow(content) => {
-                    self.respond_and_log(message, content).await;
-                }
-                crate::channels::coalesce::CoalesceDecision::Buffered => {}
-            }
-            return;
-        }
-
-        self.respond_and_log(message, text).await;
+        self.response_delivery().deliver(message, response).await;
     }
 
-    async fn respond_and_log(&self, message: &IncomingMessage, content: String) {
-        if let Err(error) = self
-            .channels
-            .respond(message, OutgoingResponse::text(content))
-            .await
-        {
-            tracing::error!(
-                channel = %message.channel,
-                error = %error,
-                "Failed to send response to channel"
-            );
+    pub(crate) fn response_delivery(&self) -> super::response_delivery::ResponseDelivery {
+        super::response_delivery::ResponseDelivery {
+            channels: Arc::clone(&self.channels),
+            hooks: Arc::clone(self.hooks()),
+            owner_id: self.deps.owner_id.clone(),
+            coalesce: self.deps.coordination_coalesce.clone(),
         }
     }
 
@@ -2246,7 +2177,7 @@ fn coordination_activity_is_denied(
     !message.is_internal && gate.is_some_and(|gate| gate.deny_reason(&message.sender_id).is_some())
 }
 
-fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
+pub(super) fn coalesced_reply_context(message: &IncomingMessage) -> IncomingMessage {
     IncomingMessage {
         id: message.id,
         channel: message.channel.clone(),

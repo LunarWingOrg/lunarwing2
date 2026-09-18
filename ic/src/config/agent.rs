@@ -221,6 +221,7 @@ impl AgentConfig {
     }
 
     pub(crate) fn resolve(settings: &Settings) -> Result<Self, ConfigError> {
+        warn_agent_env_keys();
         Ok(Self {
             name: parse_optional_env("AGENT_NAME", settings.agent.name.clone())?,
             max_parallel_jobs: parse_optional_env(
@@ -315,9 +316,71 @@ impl AgentConfig {
     }
 }
 
+/// Diagnose misspelled agent settings without treating unrelated service or
+/// extension variables as daemon config. Log names only, never env values.
+fn warn_agent_env_keys() {
+    for (key, _) in std::env::vars_os() {
+        let Some(key) = key.to_str() else { continue };
+        if let Some(message) = agent_env_key_warning(key) {
+            tracing::warn!(env_key = key, "{message}");
+        }
+    }
+}
+
+fn agent_env_key_warning(key: &str) -> Option<&'static str> {
+    // Keep in sync with AgentConfig::resolve and the engine supervision flag.
+    const KNOWN: &[&str] = &[
+        "AGENT_NAME",
+        "AGENT_MAX_PARALLEL_JOBS",
+        "AGENT_JOB_TIMEOUT_SECS",
+        "AGENT_STUCK_THRESHOLD_SECS",
+        "AGENT_USE_PLANNING",
+        "AGENT_MAX_TOOL_ITERATIONS",
+        "AGENT_AUTO_APPROVE_TOOLS",
+        "AGENT_MAX_TOKENS_PER_JOB",
+        "AGENT_HANDLE_MESSAGE_TIMEOUT_SECS",
+        "AGENT_SELF_REPAIR_OP_TIMEOUT_SECS",
+        "AGENT_SESSION_PRUNE_TIMEOUT_SECS",
+        "AGENT_PENDING_GATE_EXPIRY_SECS",
+        "AGENT_SUPERVISED_MODE",
+    ];
+    if key == "AUTO_APPROVE_TOOLS" {
+        Some("Legacy approval setting; use AGENT_AUTO_APPROVE_TOOLS (preferred when both are set)")
+    } else if (key.starts_with("AGENT_") || key.starts_with("AUTO_APPROVE_"))
+        && !KNOWN.contains(&key)
+    {
+        Some("Unrecognized agent environment key; this setting is ignored")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_env_diagnostics_distinguish_aliases_typos_and_other_services() {
+        assert!(agent_env_key_warning("AGENT_AUTO_APPROVE_TOOLS").is_none());
+        assert!(agent_env_key_warning("AGENT_SUPERVISED_MODE").is_none());
+        assert!(
+            agent_env_key_warning("AUTO_APPROVE_TOOLS")
+                .unwrap()
+                .contains("Legacy")
+        );
+        assert!(
+            agent_env_key_warning("AGENT_AUTO_APROVE_TOOLS")
+                .unwrap()
+                .contains("ignored")
+        );
+        assert!(
+            agent_env_key_warning("AUTO_APPROVE_TOOL")
+                .unwrap()
+                .contains("ignored")
+        );
+        assert!(agent_env_key_warning("PATH").is_none());
+        assert!(agent_env_key_warning("XMPP_BRIDGE_TOKEN").is_none());
+    }
 
     #[test]
     fn test_default_timezone_rejects_invalid() {
