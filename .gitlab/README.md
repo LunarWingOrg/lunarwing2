@@ -359,10 +359,34 @@ Runner cache credentials, if a shared cache backend is used, stay in runner
 `config.toml`. Never expose them as merge-request CI variables. Merge requests,
 tags, schedules, and manually started pipelines use pull-only caches; only the
 `rust-cache-refresh` job on a protected default-branch push publishes compiler
-cache state. Rust jobs report
+cache state. On those pushes it also serves as the default-feature compile gate:
+`rust-check-default` is omitted, and `rust-test-lib`/`cavepony-wasm` wait for
+`rust-cache-refresh` instead. Other contexts run `rust-check-default`. This
+avoids checking the same feature set twice under the project-wide compiler lock
+without allowing merge-request jobs to write caches. Rust jobs report
 before/after disk use, target/cache sizes, and sccache statistics. Cache only
 the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
 data, environment files, or credentials.
+
+### Worker scheduling and pipeline latency
+
+Worker candidates use `needs: []`: on protected default-branch/release-tag pushes,
+play `worker-<name>-candidate` immediately, without waiting for the Rust matrix.
+Its scan runs automatically using that candidate's artifacts; there is no second
+manual scan step. On `master` these lanes remain optional. On release tags the
+candidate and scan remain blocking, and promotion remains manual and requires
+both. A failed candidate may still cause an optional scan to fail for missing
+artifacts; finish/retry the candidate first, then retry the scan if needed.
+Canceled candidates cannot produce a usable scan or promotion.
+
+The `rust-compile-16gb` lock deliberately serializes heavy Rust work across
+pipelines. `waiting_for_resource` is time waiting for another job, not compiler
+runtime. For example, pipeline #3812 waited while #3811 ran its backend tests.
+The changes above remove the container stage barrier and a redundant default
+check; they do not increase safe Rust concurrency. Additional compiler throughput
+requires independently provisioned memory capacity and reviewed runner routing.
+Existing pipelines retain their original job graph; the new scheduling applies
+to pipelines created from the updated configuration.
 
 ### 3. Protect refs and merges
 
