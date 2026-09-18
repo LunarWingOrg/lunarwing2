@@ -116,7 +116,7 @@
 34. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
     - IN PROGRESS 2026-09-17 (`a/goal34/v2.1.2.0`): fixed name-only/final argument assembly and CodeAct nested-fence truncation; added pre-execution REPL argument validation, a distinct bounded repair failure, and `repl_argument_corruption_total` in tenant-aware stream telemetry. Passed: engine 592/592, LLM/provider 598/598, bridge 13/13, real HTTP/SSE integration 6/6, health/export 18/18, clippy `-D warnings`, rustfmt, and targeted ShellCheck. Fresh live-tenant verification is still blocked by this session's `NoNewPrivileges` restriction on sudo; goal remains unchecked. Evidence and prepared host helper: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`
 35. [x] fix ci/cd for opencode2 container pipelines - present in master - see recent master pipeline for hint #3843 - candidate fails usually or always
-36. [ ] work on work item #108 or verify if already addressed previously
+36. [x] work on work item #108 or verify if already addressed previously
 37. [x] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
 
 ## Phase 6 - Documentation
