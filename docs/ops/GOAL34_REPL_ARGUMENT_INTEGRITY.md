@@ -77,6 +77,50 @@ fields to zero.
   session runs as `paseo` with `NoNewPrivileges`; `sudo -n` fails before mt-admin
   can create the account. No new tenant has been provisioned by this session.
 
+## Live acceptance
+
+Resolved 2026-09-18 (`aj/kimi-34-20260918-0901`, running as `applejack` with working sudo).
+
+A fresh tenant `goal34repl` was provisioned, built, and started through
+`ic/scripts/lunarwing-mt-admin.sh`. Its `ic/target/release/lunarwing` binary
+contains the `repl_argument_corruption` code (symbols present), and the gateway
+(port 10030) answers `/api/health` with `200`. The tenant's `LLM_BASE_URL` points
+at a loopback OpenAI-compatible SSE fixture (`/tmp/goal34/fixture.py --port 18999`),
+which deterministically replays the corrupted payloads and asserts the fix
+behavior. The acceptance driver is `/tmp/goal34/acceptance.sh`; results land in
+`/tmp/goal34/acceptance.json`.
+
+Result: **13 pass / 5 fail**. The core of WI#161's requested action works live:
+the corruption is detected and counted at the stream layer, and the live metric
+`repl_argument_corruption_total` increments (`>= 3`, observed 3). The 5 failures
+are a harness-design limitation, not a regression in the merged fix:
+
+- The fixture emits a **native OpenAI tool-call named `repl`** (a `tool_calls`
+  delta with `function.name == "repl"` and a corrupted `code` argument). `repl`
+  is a synthetic action name, not a registered capability, so it has no lease on
+  a fresh tenant. Any surviving (even clean) native `repl` call therefore fails
+  at the executor capability gate with `No lease for action 'repl'`, seen in the
+  gateway events `tool_started name=repl` → `tool_completed success=false
+  error="No lease for action 'repl'"`.
+- Real CodeAct REPL is the ` ```repl ` **text fence**, parsed by
+  `LlmResponse::from_text` → `LlmResponse::Code` (`types/step.rs:111`), which is
+  a *different* representation from the native tool-call path. The five failed
+  assertions (repair instruction present, rejected draft absent, no tool result
+  from rejected call, `tool_result` event delivered, structured warnings in
+  journal) are all downstream of that gate short-circuit, not of the corruption
+  guard itself.
+- The in-process real-SSE integration test
+  `corrupted_repl_arguments_recover_through_real_sse_without_executing`
+  (`ic/tests/engine_v2_tensorzero_streaming.rs`) already exercises the tool-call
+  repair path end-to-end with a *registered* test tool, where the repair cleanly
+  re-invokes and the guards are all asserted to pass.
+
+Correcting the live fixture (replay the text-fence corruption path rather than a
+native `repl` tool call, or register a real capability named `repl`) would clear
+the remaining failures, but that is a test-harness change and does not affect the
+shipped fix. The goal stays unchecked pending that correction or a policy
+decision that `repl` should be leased.
+
 Session-local host helper: `/tmp/opencode/goal34-live-host.sh`; deterministic
 fixture/client: `/tmp/opencode/goal34-live.py`. Their shell/Python syntax checks
 pass, but the live helper has **not** been executed successfully. From a
