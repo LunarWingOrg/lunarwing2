@@ -41,7 +41,7 @@
 
 7. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-8. [x] investigate cargo deny failure in ci/cd pipeline and fix please (possibly already fixed now)
+8. [ ] investigate conversation insights and anything that might cause confabulation incidents. see these work items and their comments for reference: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/143
 
 9. [x] (S) HUMAN ART GOAL - Mascot Design Art Project - ANIMATION PHASE
 
@@ -117,7 +117,7 @@
     - LIVE ACCEPTANCE COMPLETE 2026-09-18 (`rarity/kimi-33-20260918-1201`): completed the pending operator run on fresh tenant `wi162verify` (revision `52c0d329f`, OpenRC). `build-tenant` (release `7m 41s`) + `start-tenant` succeeded; daemon `ready and listening` with `Registered sandboxed shell tool (generic podman sandbox, fail-closed) policy=ReadOnly`. Ran the real-container regression live under the tenant account: `podman_shell_reports_output_truncation` PASSED (`1 passed; 0 failed`) through podman 5.8.2, asserting 32,768 bytes complete vs 40,000 bytes `truncated:true` on stdout+stderr. Gateway/LLM round-trip verified live (TensorZero `lunarwing` responded; LLM invoked `shell`, approval gate fired and was approved). Voice follow-up not run — tenant provisioned `TRANSCRIPTION_ENABLED=false` / no LunarVoice back-end (separate acceptance per runbook). Evidence in `docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md`.
 34. [x] work on https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/161
     - IN PROGRESS 2026-09-17 (`a/goal34/v2.1.2.0`): fixed name-only/final argument assembly and CodeAct nested-fence truncation; added pre-execution REPL argument validation, a distinct bounded repair failure, and `repl_argument_corruption_total` in tenant-aware stream telemetry. Passed: engine 592/592, LLM/provider 598/598, bridge 13/13, real HTTP/SSE integration 6/6, health/export 18/18, clippy `-D warnings`, rustfmt, and targeted ShellCheck. Fresh live-tenant verification is still blocked by this session's `NoNewPrivileges` restriction on sudo; goal remains unchecked. Evidence and prepared host helper: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`
-35. [ ] fix ci/cd for opencode2 container pipelines - present in master - see recent master pipeline for hint #3862 - candidate fails usually or always
+35. [ ] fix ci/cd for opencode2 container pipelines - present in master - see recent master pipeline for hint #3880 - candidate fails usually or always
 36. [x] work on work item #108 or verify if already addressed previously
 37. [x] similar goal item to 36 but for this work item instead: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/135
 
