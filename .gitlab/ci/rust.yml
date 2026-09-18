@@ -10,6 +10,12 @@ rust-check-default:
   resource_group: rust-compile-16gb
   needs:
     - cargo-metadata
+  # The protected cache writer performs this same check on default-branch
+  # pushes. Other contexts keep the pull-only validation job.
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
+      when: never
+    - when: on_success
   script:
     - bash .gitlab/scripts/cargo-ci.sh check -j2 --locked
 
@@ -18,8 +24,7 @@ rust-cache-refresh:
   stage: check
   resource_group: rust-compile-16gb
   needs:
-    - job: rust-check-default
-      artifacts: false
+    - cargo-metadata
   cache:
     - key:
         prefix: "rust-1.96.1-dependencies"
@@ -141,6 +146,10 @@ rust-test-lib:
   needs:
     - job: rust-check-default
       artifacts: false
+      optional: true
+    - job: rust-cache-refresh
+      artifacts: false
+      optional: true
     - job: wasm-channel-test-artifacts
       artifacts: true
   timeout: 2h

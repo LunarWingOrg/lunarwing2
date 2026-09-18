@@ -230,6 +230,14 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
         errors.append("worker candidate and promotion templates must be non-interruptible")
     if candidate.get("retry") != 0 or promotion.get("retry") != 0:
         errors.append("worker publication must not retry after a timeout or partial push")
+    if candidate.get("needs") != []:
+        errors.append("worker candidates must bypass stage barriers with needs: []")
+    for rule in candidate.get("rules", []):
+        if rule.get("when") != "never" and rule.get("when") != "manual":
+            errors.append("worker candidates must remain manual")
+    for rule in merged.get(".worker-scan", {}).get("rules", []):
+        if rule.get("when", "on_success") not in ("on_success", "never"):
+            errors.append("worker scans must automatically follow their candidates")
     for template_name in (".worker-candidate", ".worker-scan", ".worker-promotion"):
         image = image_name(merged.get(template_name, {}).get("image"))
         if not image or VARIABLE_REF_PATTERN.search(image) or not IMAGE_PATTERN.search(image):
@@ -304,6 +312,10 @@ def validate_worker_publication(merged: dict, errors: list[str]) -> None:
             errors.append(f"{candidate_name} must extend .worker-candidate")
         if not extends_template(merged.get(scan_name), ".worker-scan"):
             errors.append(f"{scan_name} must extend .worker-scan")
+        if merged.get(scan_name, {}).get("needs") != [
+            {"job": candidate_name, "artifacts": True}
+        ]:
+            errors.append(f"{scan_name} must download artifacts from its exact candidate")
 
 
 def validate_test_shapes(merged: dict, errors: list[str]) -> None:
@@ -378,6 +390,22 @@ def validate_cache_trust(merged: dict, defaults: dict, errors: list[str]) -> Non
         )
         if any(fragment not in condition for fragment in required):
             errors.append("rust-cache-refresh must require a protected default-branch push")
+        # Exactly one default-feature check per context, while retaining the
+        # literal pull-only cache policy on untrusted validation jobs.
+        check = merged.get("rust-check-default", {})
+        if check.get("rules") != [
+            {"if": condition, "when": "never"}, {"when": "on_success"}
+        ]:
+            errors.append("rust-check-default must complement the protected cache writer")
+        if check.get("script") != refresh.get("script"):
+            errors.append("the cache writer must perform the same default-feature check")
+        if refresh.get("needs") != ["cargo-metadata"]:
+            errors.append("rust-cache-refresh must check directly after cargo-metadata")
+        for name in ("rust-test-lib", "cavepony-wasm"):
+            needs = merged.get(name, {}).get("needs", [])
+            for producer in ("rust-check-default", "rust-cache-refresh"):
+                if {"job": producer, "artifacts": False, "optional": True} not in needs:
+                    errors.append(f"{name} must wait for whichever default check is present")
 
 
 def extract_arg_default(text: str, arg: str) -> str | None:

@@ -10,6 +10,9 @@
   tags:
     - container-build
   stage: containers
+  # Manual candidates must be playable without waiting for the Rust matrix.
+  # Publication remains protected; release promotion still requires a scan.
+  needs: []
   interruptible: false
   retry: 0
   timeout: 8h
@@ -60,7 +63,7 @@
     - |
       if [ ! -f ./worker-image.env ]; then
         echo "ERROR: worker-image.env is missing — the candidate job for this worker failed or did not publish an image." >&2
-        echo "       Check the worker-*-candidate job log (pipeline #3684 reproduced this after an ENOSPC build failure)." >&2
+        echo "       Finish the matching worker-*-candidate job successfully before retrying this scan." >&2
         exit 1
       fi
     - set -a; . ./worker-image.env; set +a
@@ -79,7 +82,8 @@
   rules:
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+\.\d+(-rc[1-9]\d*)?$/ && $CI_COMMIT_REF_PROTECTED == "true"'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_COMMIT_REF_PROTECTED == "true"'
-      when: manual
+      # One manual action per worker: the scan follows its candidate.
+      when: on_success
       allow_failure: true
     - when: never
 
