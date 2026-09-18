@@ -144,23 +144,16 @@ system ID (`lunarwing-rust-docker`, `r_dLo2MDLTpMm2`) serving build slots
 `concurrent-0`, `concurrent-1`, and `concurrent-3` simultaneously, i.e. the
 documented `limit = 1` runner contract had drifted at the host.
 
-Two independent guards, both required:
+Concurrency is now enforced by runner eligibility and host-side limits. The
+operator confirmed that the fleet's runner configuration limits which jobs
+memory-constrained machines accept. The temporary project-wide compile lock
+has been removed so independent runners can work concurrently, including across
+pipelines. This applies to the Rust checks, tests, Clippy, MSRV, and cavepony.
 
-1. **Repo-side (enforced here):** every job that compiles the `lunarwing` lib
-   carries `resource_group: rust-compile-16gb`. GitLab queues same-group jobs
-   project-wide, so overlapping pipelines can never run two giant-crates
-   compiles at once, whatever the runner concurrency setting is. That includes
-   the MSRV check (same lib compile under the pinned toolchain) and
-   `cavepony-wasm`, whose `wit_compat` step compiles the lunarwing lib test
-   binary (MR !997 review). Cheaper jobs (rustfmt, cargo-metadata, wasm
-   channel artifacts) are not in the group.
-2. **Host-side (runner config):** keep `limit = 1` (see §6 runner setup). The
-   resource group cannot see non-project load on the host, so the per-host
-   limit remains the real fence for anything outside this repository.
-
-Recovery: rerun the failed job — nothing in the tree is broken. If failures
-persist, check the runner host for concurrent build slots (`docker ps | grep
-concurrent-` on the runner host) and restore `limit = 1` before anything else.
+On a 16 GB host, keep one heavy compile at a time (`limit = 1` for a dedicated
+Rust runner); larger hosts may use their configured capacity. Account for all
+runner registrations sharing a host when setting limits. If OOMs recur, inspect
+that host's eligible jobs and aggregate concurrency before retrying the job.
 
 ## container-build runner disk (ENOSPC)
 
@@ -215,19 +208,14 @@ candidate job — the scan can only succeed after a candidate publishes
   emits `junit-shell.xml`; the worker scan emits a GitLab
   `container_scanning` report alongside its blocking CRITICAL gate.
 - cargo-deny and redacted current-tree Gitleaks scans.
-- One Rust job per runner host: `limit = 1` in runner `config.toml` is a hard
-  constraint, verified in the activation checklist (§6). Parallel jobs contend for
-  CPUs 0-5 with no in-pipeline guard.
+- Rust concurrency is host-managed: memory-constrained runners restrict eligible
+  jobs and concurrent compiles; larger hosts can accept parallel work.
 - CI parallelism is intentional: `-j2` (libSQL `-j1`) caps peak memory within
   the 16 GB runner for four-way check jobs; `-j6` in AGENTS.md is the local-dev
   budget. Normal test jobs retain line tables only; libSQL test jobs omit debug
   info entirely to avoid OOM near 16 GB.
-- Rust runner memory budget (cross-pipeline guard): every job that compiles the
-  `lunarwing` lib — the giant-crates rustc/clippy-driver invocation — shares the
-  project-wide `rust-compile-16gb` resource group, so only one such compile runs
-  at a time **across all pipelines**, not just within one. This is the repo-side
-  half of the runner budget; `limit = 1` in the runner `config.toml` is the
-  host-side half. See "Rust runner memory budget" below for why both are needed.
+- Rust jobs have no project-wide resource lock. Worker promotion retains its
+  per-worker resource groups to serialize registry publication.
 
 Known false-positive Gitleaks findings are listed by exact fingerprint in
 `/.gitleaksignore`. Broad path or rule exclusions are forbidden. Worker-image
@@ -288,16 +276,17 @@ Create the Rust runner with:
   sccache, 10 GiB for Cargo registries and test targets, and at least 18 GiB of
   safety headroom. The former 80 GiB cache cap on a 25 GB runner let the
   filesystem fail before sccache could evict entries.
-- Per-host job limit: one. Every Cargo job pins itself to CPUs `0-5`; parallel
-  Rust jobs therefore require separate runner hosts or VMs, not overlapping
-  jobs on one host.
+- For the 16 GB host profile below, allow one heavy Rust job at a time.
+  Higher-capacity hosts may accept more according to their configured memory
+  budgets. Cargo jobs pin themselves to CPUs `0-5`, so also account for CPU
+  contention when sizing concurrency.
 - Maximum job timeout: at least eight hours for the protected
   `container-build` runner and at least two hours for Rust runners. The project
   timeout must be at least eight hours; GitLab applies whichever project/runner
   limit is lower. Ordinary validation jobs still use their two-hour YAML cap.
 
-Essential Docker executor settings belong in runner-host `config.toml`, not in
-this repository:
+Example Docker executor settings for the 16 GB host profile belong in runner-host
+`config.toml`, not in this repository:
 
 ```toml
 [[runners]]
@@ -362,7 +351,7 @@ tags, schedules, and manually started pipelines use pull-only caches; only the
 cache state. On those pushes it also serves as the default-feature compile gate:
 `rust-check-default` is omitted, and `rust-test-lib`/`cavepony-wasm` wait for
 `rust-cache-refresh` instead. Other contexts run `rust-check-default`. This
-avoids checking the same feature set twice under the project-wide compiler lock
+avoids checking the same feature set twice
 without allowing merge-request jobs to write caches. Rust jobs report
 before/after disk use, target/cache sizes, and sccache statistics. Cache only
 the dependency paths declared in `defaults.yml`; do not add `target/`, tenant
@@ -379,12 +368,11 @@ both. A failed candidate may still cause an optional scan to fail for missing
 artifacts; finish/retry the candidate first, then retry the scan if needed.
 Canceled candidates cannot produce a usable scan or promotion.
 
-The `rust-compile-16gb` lock deliberately serializes heavy Rust work across
-pipelines. `waiting_for_resource` is time waiting for another job, not compiler
-runtime. For example, pipeline #3812 waited while #3811 ran its backend tests.
-The changes above remove the container stage barrier and a redundant default
-check; they do not increase safe Rust concurrency. Additional compiler throughput
-requires independently provisioned memory capacity and reviewed runner routing.
+The former `rust-compile-16gb` lock serialized heavy Rust work across pipelines:
+for example, pipeline #3812 waited while #3811 ran its backend tests. That lock
+is now removed; ready jobs can run concurrently on eligible runners within their
+configured limits. Container builds also bypass the Rust stage barrier, and the
+default-feature check runs only once per pipeline.
 Existing pipelines retain their original job graph; the new scheduling applies
 to pipelines created from the updated configuration.
 
@@ -475,7 +463,8 @@ Record these results in the MR before making the pipeline mandatory:
 - Exact GitLab and GitLab Runner versions.
 - Runner executor, tags, protected status, CPU/RAM/disk limits, and network
   policy.
-- Confirmation that `limit = 1` is set in each Rust runner's `config.toml`
+- Confirmation that runner eligibility and aggregate host concurrency fit each
+  host's memory budget (`limit = 1` for the dedicated 16 GB Rust profile)
   (prevents CPU 0-5 contention between parallel Rust jobs on one host).
 - CI Lint result and merged-YAML review.
 - One MR commit with exactly one pipeline.
