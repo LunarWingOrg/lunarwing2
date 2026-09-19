@@ -30,7 +30,7 @@ use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus, trigger_dedup_key};
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{MissionContext, Thread, ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{MissionContext, ThreadConfig, ThreadId, ThreadType};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -63,23 +63,6 @@ const RECURRING_LEARNING_MISSION_KEYS: &[&str] = &[
     "skill_maintenance",
 ];
 
-fn recent_conversation_thread_goals(threads: &[Thread], limit: usize) -> Vec<String> {
-    // Stores are not required to return threads in chronological order (e.g.
-    // `HybridStore::list_threads` iterates an in-memory HashMap), so sort by
-    // creation time here instead of relying on slice order plus `.rev()`.
-    let mut conversations: Vec<&Thread> = threads
-        .iter()
-        .filter(|thread| thread.thread_type != ThreadType::Mission)
-        .collect();
-    conversations.sort_by_key(|thread| thread.created_at);
-    conversations
-        .into_iter()
-        .rev()
-        .take(limit)
-        .map(|thread| thread.goal.clone())
-        .collect()
-}
-
 fn is_conversation_insights_mission(mission: &Mission) -> bool {
     mission
         .metadata
@@ -88,20 +71,25 @@ fn is_conversation_insights_mission(mission: &Mission) -> bool {
         == Some(true)
 }
 
-fn mission_context(mission: &Mission, payload: &Option<serde_json::Value>) -> MissionContext {
+fn mission_context(
+    mission: &Mission,
+    batch: Option<crate::types::insight::InsightBatch>,
+    run_id: ThreadId,
+) -> MissionContext {
     if !is_conversation_insights_mission(mission) {
         return MissionContext::General;
     }
-    // Search from the batch, never from the generic extraction instructions or
-    // generated next-focus/history. Missing evidence deliberately recalls nothing.
-    let recall_query = ["thread_goals", "sample_user_messages"]
-        .into_iter()
-        .filter_map(|key| payload.as_ref()?.get(key)?.as_array())
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .collect::<Vec<_>>()
-        .join("\n");
-    MissionContext::ConversationInsights { recall_query }
+    let recall_query = batch
+        .as_ref()
+        .map(|batch| batch.recall_query())
+        .unwrap_or_default();
+    MissionContext::ConversationInsights {
+        recall_query,
+        batch,
+        mission_id: Some(mission.id),
+        run_id: Some(run_id),
+        generation: mission.insight_generation,
+    }
 }
 
 fn is_recurring_learning_mission(mission: &Mission) -> bool {
@@ -512,7 +500,9 @@ impl MissionManager {
             .list_missions(project_id, &user_id)
             .await?
             .into_iter()
-            .find(|mission| mission.name == name && !mission.is_terminal())
+            .find(|mission| {
+                mission.name == name && (!mission.is_terminal() || mission.deleted_at.is_some())
+            })
         {
             let goal = goal.into();
             if existing.goal != goal || existing.cadence != cadence {
@@ -658,11 +648,17 @@ impl MissionManager {
         // An explicit operator pause clears any gate-pause marker so a later
         // gate re-enable does not resume a mission the operator paused.
         match loaded {
-            Some(mut mission) if mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_some() => {
+            Some(mut mission)
+                if mission.metadata.get(GATE_PAUSED_METADATA_KEY).is_some()
+                    || is_conversation_insights_mission(&mission) =>
+            {
                 if let Some(metadata) = mission.metadata.as_object_mut() {
                     metadata.remove(GATE_PAUSED_METADATA_KEY);
                 }
                 mission.status = MissionStatus::Paused;
+                if is_conversation_insights_mission(&mission) {
+                    mission.insight_generation = mission.insight_generation.saturating_add(1);
+                }
                 mission.updated_at = Utc::now();
                 self.store.save_mission(&mission).await?;
             }
@@ -674,6 +670,7 @@ impl MissionManager {
         }
         self.active.write().await.retain(|mid| *mid != id);
         debug!(mission_id = %id, "mission paused");
+        self.stop_insight_workers(id).await?;
         Ok(())
     }
 
@@ -707,6 +704,13 @@ impl MissionManager {
         }
         mission.status = MissionStatus::Active;
         mission.updated_at = Utc::now();
+        if is_conversation_insights_mission(&mission) {
+            mission.deleted_at = None;
+            mission.insight_cursor = Some(crate::types::insight::InsightCursor {
+                completed_at: Utc::now(),
+                thread_id: ThreadId(uuid::Uuid::from_u128(u128::MAX)),
+            });
+        }
         // An explicit operator resume clears any gate-pause marker.
         if let Some(metadata) = mission.metadata.as_object_mut() {
             metadata.remove(GATE_PAUSED_METADATA_KEY);
@@ -767,10 +771,26 @@ impl MissionManager {
     /// caller to present the shared owner id. Current tool path passes user's
     /// own id, so it cannot delete shared missions without an authenticated
     /// admin surface in host application.
+    ///
+    /// Conversation-insights missions are the exception: their deletion is an
+    /// explicit opt-out that persists a disabled tombstone (see G8-F8), so
+    /// the record survives restart and automatic reconciliation until the
+    /// operator resumes it.
     pub async fn delete_mission(&self, id: MissionId, user_id: &str) -> Result<(), EngineError> {
+        self.delete_mission_with_purge(id, user_id, false).await
+    }
+
+    /// Insights keep a disabled tombstone until an explicit resume; optionally
+    /// purge their generated memory, retaining source conversations and audit.
+    pub async fn delete_mission_with_purge(
+        &self,
+        id: MissionId,
+        user_id: &str,
+        purge_insights: bool,
+    ) -> Result<(), EngineError> {
         let lock = mission_lock(&self.fire_locks, id).await;
         let _guard = lock.lock().await;
-        let mission = self
+        let mut mission = self
             .store
             .load_mission(id)
             .await?
@@ -785,9 +805,49 @@ impl MissionManager {
                 entity: format!("mission {id}"),
             });
         }
-        self.store.delete_mission(id).await?;
+        if is_conversation_insights_mission(&mission) {
+            mission.deleted_at = Some(Utc::now());
+            mission.status = MissionStatus::Paused;
+            mission.insight_generation = mission.insight_generation.saturating_add(1);
+            mission.updated_at = Utc::now();
+            self.store.save_mission(&mission).await?;
+            self.active.write().await.retain(|mid| *mid != id);
+            self.stop_insight_workers(id).await?;
+            if purge_insights {
+                self.store
+                    .purge_conversation_insights(mission.project_id, &mission.user_id)
+                    .await?;
+            }
+        } else {
+            if purge_insights {
+                return Err(EngineError::Store {
+                    reason: "purge_insights requires a conversation-insights mission".into(),
+                });
+            }
+            self.store.delete_mission(id).await?;
+        }
         self.active.write().await.retain(|mid| *mid != id);
         debug!(mission_id = %id, "mission deleted by {user_id}");
+        Ok(())
+    }
+
+    async fn stop_insight_workers(&self, mission_id: MissionId) -> Result<(), EngineError> {
+        let Some(mission) = self.store.load_mission(mission_id).await? else {
+            return Ok(());
+        };
+        if !is_conversation_insights_mission(&mission) {
+            return Ok(());
+        }
+        for thread in self
+            .store
+            .list_threads(mission.project_id, &mission.user_id)
+            .await?
+        {
+            if matches!(thread.config.mission_context, MissionContext::ConversationInsights { mission_id: Some(id), .. } if id == mission_id)
+            {
+                let _ = self.thread_manager.stop_thread_system(thread.id).await;
+            }
+        }
         Ok(())
     }
 
@@ -809,7 +869,7 @@ impl MissionManager {
         &self,
         id: MissionId,
         user_id: &str,
-        trigger_payload: Option<serde_json::Value>,
+        mut trigger_payload: Option<serde_json::Value>,
         advance_schedule: bool,
     ) -> Result<Option<ThreadId>, EngineError> {
         if self.task_cancel.is_cancelled() {
@@ -851,6 +911,30 @@ impl MissionManager {
             debug!(mission_id = %id, "skill self-improvement disabled; learning mission suppressed");
             return Ok(None);
         }
+
+        // Insights ignore caller-supplied content and reconstruct evidence from
+        // persisted, eligible inputs under the same lock as the durable cursor.
+        let insight_batch = if is_conversation_insights_mission(&mission) {
+            let threads = self.store.list_threads(mission.project_id, user_id).await?;
+            let Some(batch) = crate::runtime::insights::select_batch(
+                &threads,
+                mission.project_id,
+                user_id,
+                mission.insight_cursor.as_ref(),
+            ) else {
+                debug!(mission_id = %id, "insights skipped: fewer than five new eligible source threads");
+                return Ok(None);
+            };
+            trigger_payload =
+                Some(
+                    serde_json::to_value(&batch).map_err(|error| EngineError::Store {
+                        reason: error.to_string(),
+                    })?,
+                );
+            Some(batch)
+        } else {
+            None
+        };
 
         // Trigger-level dedup (work item #69): a re-delivered payload whose
         // dedup key this mission already processed spawns no thread and
@@ -903,9 +987,10 @@ impl MissionManager {
 
         // Build meta-prompt from mission state + project docs
         let retrieval = RetrievalEngine::new(Arc::clone(&self.store));
-        let mission_context = mission_context(&mission, &trigger_payload);
+        let thread_id = ThreadId::new();
+        let mission_context = mission_context(&mission, insight_batch.clone(), thread_id);
         let project_docs = match &mission_context {
-            MissionContext::ConversationInsights { recall_query } => {
+            MissionContext::ConversationInsights { recall_query, .. } => {
                 retrieval
                     .retrieve_context(mission.project_id, user_id, recall_query, 10)
                     .await
@@ -940,8 +1025,10 @@ impl MissionManager {
         // Reserve history and quota before execution can perform side effects.
         // The trigger dedup key rides the same durable reservation so a failed
         // spawn rolls it back and the payload may be retried.
-        let thread_id = ThreadId::new();
         let mut updated = mission.clone();
+        if let Some(batch) = insight_batch {
+            updated.insight_cursor = Some(batch.cursor);
+        }
         updated.record_thread(thread_id);
         updated.threads_today += 1;
         updated.last_trigger_payload = trigger_payload.clone();
@@ -1104,6 +1191,7 @@ impl MissionManager {
     /// thread, carrying context like trace issues and reflection docs.
     pub async fn fire_on_system_event(
         &self,
+        project_id: ProjectId,
         source: &str,
         event_type: &str,
         user_id: &str,
@@ -1124,7 +1212,9 @@ impl MissionManager {
 
             // Only fire missions owned by this user (per-user learning missions)
             // or globally shared missions.
-            if !mission.is_owned_by(user_id) && !mission.owner_id().is_shared() {
+            if mission.project_id != project_id
+                || (!mission.is_owned_by(user_id) && !mission.owner_id().is_shared())
+            {
                 continue;
             }
 
@@ -1293,14 +1383,7 @@ impl MissionManager {
         const SKILL_EXTRACTION_MIN_STEPS: usize = 5;
         /// Minimum distinct action executions for skill extraction.
         const SKILL_EXTRACTION_MIN_ACTIONS: usize = 3;
-        /// Completed thread interval for conversation insights.
-        const CONVERSATION_INSIGHTS_INTERVAL: u32 = 5;
-
         let handle = tokio::spawn(async move {
-            // Track completed thread count per conversation for insights trigger.
-            let mut conv_thread_counts: std::collections::HashMap<String, u32> =
-                std::collections::HashMap::new();
-
             loop {
                 let received = tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -1355,6 +1438,7 @@ impl MissionManager {
                             });
                             if let Err(error) = mgr
                                 .fire_on_system_event(
+                                    thread.project_id,
                                     "engine",
                                     THREAD_START_EVENT,
                                     &thread.user_id,
@@ -1440,6 +1524,7 @@ impl MissionManager {
 
                             if let Err(e) = mgr
                                 .fire_on_system_event(
+                                    thread.project_id,
                                     "engine",
                                     "thread_completed_with_issues",
                                     &thread.user_id,
@@ -1472,6 +1557,7 @@ impl MissionManager {
                                 });
                                 if let Err(e) = mgr
                                     .fire_on_system_event(
+                                        thread.project_id,
                                         "engine",
                                         SKILL_MAINTENANCE_EVENT,
                                         &thread.user_id,
@@ -1540,6 +1626,7 @@ impl MissionManager {
 
                             if let Err(e) = mgr
                                 .fire_on_system_event(
+                                    thread.project_id,
                                     "engine",
                                     "thread_completed_with_learnings",
                                     &thread.user_id,
@@ -1552,61 +1639,19 @@ impl MissionManager {
                         }
 
                         // ── Trigger 4: Conversation insights ────────────
-                        // Use the thread's project_id as a proxy for conversation scope.
-                        let conv_key = format!("{}:{}", thread.project_id.0, thread.user_id);
-                        let count = conv_thread_counts.entry(conv_key.clone()).or_insert(0);
-                        *count += 1;
-
-                        if (*count).is_multiple_of(CONVERSATION_INSIGHTS_INTERVAL) {
-                            // Collect recent thread goals for context
-                            let thread_goals: Vec<String> = match mgr
-                                .store
-                                .list_threads(thread.project_id, &thread.user_id)
-                                .await
-                            {
-                                Ok(threads) => recent_conversation_thread_goals(
-                                    &threads,
-                                    CONVERSATION_INSIGHTS_INTERVAL as usize,
-                                ),
-                                Err(_) => vec![thread.goal.clone()],
-                            };
-
-                            // Collect sample user messages from recent threads
-                            let sample_messages: Vec<String> = thread
-                                .messages
-                                .iter()
-                                .filter(|m| m.role == crate::types::message::MessageRole::User)
-                                .map(|m| m.content.chars().take(200).collect::<String>())
-                                .take(10)
-                                .collect();
-
-                            let payload = serde_json::json!({
-                                "project_id": thread.project_id.0.to_string(),
-                                "completed_thread_count": *count,
-                                // Stable dedup identity for this batch. The
-                                // per-conversation counter is in-memory, so a
-                                // daemon restart would otherwise re-fire stale
-                                // batches; trigger-level dedup skips them
-                                // (work item #69).
-                                "content_hash": format!(
-                                    "insights:{}:{count}",
-                                    thread.project_id.0
-                                ),
-                                "thread_goals": thread_goals,
-                                "sample_user_messages": sample_messages,
-                            });
-
-                            if let Err(e) = mgr
+                        if thread.thread_type == ThreadType::Foreground
+                            && thread.parent_id.is_none()
+                            && let Err(e) = mgr
                                 .fire_on_system_event(
+                                    thread.project_id,
                                     "engine",
                                     "conversation_insights_due",
                                     &thread.user_id,
-                                    Some(payload),
+                                    None,
                                 )
                                 .await
-                            {
-                                debug!("event listener: failed to fire conversation insights: {e}");
-                            }
+                        {
+                            debug!("event listener: failed to fire conversation insights: {e}");
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1880,6 +1925,9 @@ impl MissionManager {
             .find(|m| m.metadata.get(metadata_key).is_some())
         {
             let mut mission = existing.clone();
+            if mission.deleted_at.is_some() {
+                return Ok(mission.id);
+            }
             let mut changed = false;
             if mission.name != name {
                 mission.name = name.to_string();
@@ -1986,7 +2034,9 @@ impl MissionManager {
 
             // Fire cron missions with the mission's own user_id so artifacts
             // are scoped to the correct tenant.
-            if should_fire {
+            // Durable source scanning also catches completions that raced their
+            // event's persistence, broadcast lag, and work accumulated at restart.
+            if should_fire || is_conversation_insights_mission(&mission) {
                 match self
                     .fire_mission_inner(mid, &mission.user_id, None, true)
                     .await
@@ -2312,7 +2362,11 @@ fn build_meta_prompt(
     // Trigger payload
     if let Some(payload) = trigger_payload {
         let payload_str = serde_json::to_string_pretty(payload).unwrap_or_default();
-        let preview: String = payload_str.chars().take(4000).collect();
+        let preview: String = if insights {
+            payload_str
+        } else {
+            payload_str.chars().take(4000).collect()
+        };
         parts.push(format!("\n## Trigger Payload\n```json\n{preview}\n```"));
     }
 
@@ -2815,7 +2869,7 @@ mod tests {
             Ok(self.threads.read().await.get(&id).cloned())
         }
         async fn list_threads(&self, _: ProjectId, _: &str) -> Result<Vec<Thread>, EngineError> {
-            Ok(vec![])
+            Ok(self.threads.read().await.values().cloned().collect())
         }
         async fn update_thread_state(
             &self,
@@ -3131,6 +3185,22 @@ mod tests {
             "astrolabe",
             "USER_KNOWLEDGE_CANARY",
         );
+        // Host-minted explicit insight so ordinary recall may surface it (F4).
+        let mut lesson = lesson;
+        lesson.insight = Some(crate::types::insight::InsightRecord {
+            version: crate::types::insight::INSIGHT_RECORD_VERSION,
+            kind: crate::types::insight::InsightKind::Explicit,
+            sources: vec![crate::types::insight::InsightSource {
+                message_id: uuid::Uuid::new_v4(),
+                thread_id: ThreadId::new(),
+                conversation_id: None,
+                timestamp: chrono::Utc::now(),
+                text: "USER_KNOWLEDGE_CANARY".into(),
+                truncated: false,
+            }],
+            generated_by: ThreadId::new(),
+            runs: vec![ThreadId::new()],
+        });
         let unrelated = MemoryDoc::new(
             pid,
             "test-user",
@@ -3150,22 +3220,53 @@ mod tests {
             store.save_memory_doc(doc).await.unwrap();
         }
 
-        for (payload, expect_recall) in [
-            (None, false),
-            (
-                Some(serde_json::json!({"sample_user_messages": ["astrolabe"]})),
-                true,
-            ),
-        ] {
-            let tid = mgr
-                .fire_mission(id, "test-user", payload)
-                .await
-                .unwrap()
-                .unwrap();
+        // No eligible sources yet: fire must skip without spawning.
+        let none = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(none.is_none(), "no eligible sources must not spawn a run");
+
+        // Seed five eligible source conversations carrying a real user input.
+        for index in 0..5 {
+            let mut source = Thread::new(
+                format!("source conversation {index}"),
+                ThreadType::Foreground,
+                pid,
+                "test-user",
+                ThreadConfig::default(),
+            );
+            source.created_at = chrono::Utc::now() - chrono::Duration::minutes(20 - index);
+            source.state = ThreadState::Done;
+            source.completed_at = Some(source.created_at + chrono::Duration::minutes(1));
+            source.add_message(crate::types::message::ThreadMessage::user(
+                "I prefer the astrolabe workflow.",
+            ));
+            store.save_thread(&source).await.unwrap();
+        }
+
+        let tid = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("five eligible sources must spawn a run");
+        {
             let thread = wait_for_done(&store, tid).await;
             assert!(thread.config.mission_context.is_conversation_insights());
             assert!(!thread.goal.contains("fix_pattern_database"));
             assert!(!thread.goal.contains("orchestrator:main"));
+            // The meta-prompt embeds the host-selected source batch.
+            assert!(thread.goal.contains("I prefer the astrolabe workflow."));
+            let payload = store
+                .load_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_trigger_payload
+                .expect("batch payload persisted");
+            assert!(
+                payload["sources"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("astrolabe")
+            );
             let system = thread
                 .internal_messages
                 .iter()
@@ -3176,11 +3277,9 @@ mod tests {
             for prompt in [&thread.goal, &system] {
                 assert!(!prompt.contains("MAINTENANCE_CANARY"));
                 assert!(!prompt.contains("UNRELATED_CANARY"));
-                assert_eq!(prompt.contains("USER_KNOWLEDGE_CANARY"), expect_recall);
-                if expect_recall {
-                    assert!(prompt.contains("untrusted_memory_retrieval"));
-                    assert!(prompt.contains(&lesson.id.0.to_string()));
-                }
+                assert!(prompt.contains("USER_KNOWLEDGE_CANARY"));
+                assert!(prompt.contains("untrusted_memory_retrieval"));
+                assert!(prompt.contains(&lesson.id.0.to_string()));
             }
             assert_descendants_keep_insight_context(&mgr, pid, tid).await;
         }
@@ -3242,71 +3341,502 @@ mod tests {
         );
     }
 
-    #[test]
-    fn conversation_insight_goals_exclude_mission_threads() {
-        let project_id = ProjectId::new();
-        let make_thread = |goal: &str, thread_type| {
-            Thread::new(
-                goal,
-                thread_type,
-                project_id,
-                "test-user",
-                ThreadConfig::default(),
-            )
-        };
-        let threads = vec![
-            make_thread("conversation 0", ThreadType::Foreground),
-            make_thread("conversation 1", ThreadType::Foreground),
-            make_thread("mission specification 0", ThreadType::Mission),
-            make_thread("conversation 2", ThreadType::Foreground),
-            make_thread("mission specification 1", ThreadType::Mission),
-            make_thread("research 0", ThreadType::Research),
-            make_thread("conversation 3", ThreadType::Foreground),
-            make_thread("conversation 4", ThreadType::Foreground),
-        ];
+    fn eligible_source_at(
+        source_thread: &mut Thread,
+        text: &str,
+        completed_at: chrono::DateTime<Utc>,
+    ) {
+        source_thread.state = ThreadState::Done;
+        source_thread.completed_at = Some(completed_at);
+        source_thread.add_message(crate::types::message::ThreadMessage::user(text));
+    }
 
-        assert_eq!(
-            recent_conversation_thread_goals(&threads, 5),
+    fn eligible_source(source_thread: &mut Thread, text: &str) {
+        eligible_source_at(source_thread, text, Utc::now());
+    }
+
+    #[test]
+    fn insight_batch_selection_admits_only_eligible_user_sources() {
+        let project_id = ProjectId::new();
+        let other_project = ProjectId::new();
+        let base = chrono::Utc::now() - chrono::Duration::minutes(30);
+
+        let mut conversations: Vec<Thread> = (0..5)
+            .map(|index| {
+                let mut thread = Thread::new(
+                    format!("conversation {index}"),
+                    ThreadType::Foreground,
+                    project_id,
+                    "test-user",
+                    ThreadConfig::default(),
+                );
+                thread.created_at = base + chrono::Duration::minutes(index);
+                eligible_source_at(
+                    &mut thread,
+                    &format!("USER_SAYS_{index}"),
+                    base + chrono::Duration::minutes(index + 1),
+                );
+                thread
+            })
+            .collect();
+        // A sixth conversation completes earliest; batch order must follow
+        // completion, not store iteration order.
+        let mut early = Thread::new(
+            "early conversation",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        early.created_at = base;
+        eligible_source_at(&mut early, "EARLY_USER", base);
+        conversations.push(early);
+
+        let mut mission_thread = Thread::new(
+            "mission specification",
+            ThreadType::Mission,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        eligible_source(&mut mission_thread, "MISSION_GOAL_TEXT");
+
+        let mut research_child = Thread::new(
+            "research child",
+            ThreadType::Research,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        research_child.parent_id = Some(ThreadId::new());
+        eligible_source(&mut research_child, "RESEARCH_GOAL_TEXT");
+
+        let mut other_user = Thread::new(
+            "other user's conversation",
+            ThreadType::Foreground,
+            project_id,
+            "other-user",
+            ThreadConfig::default(),
+        );
+        eligible_source(&mut other_user, "OTHER_USER_TEXT");
+
+        let mut other_project_thread = Thread::new(
+            "other project's conversation",
+            ThreadType::Foreground,
+            other_project,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        eligible_source(&mut other_project_thread, "OTHER_PROJECT_TEXT");
+
+        let mut legacy = Thread::new(
+            "legacy conversation",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        legacy.state = ThreadState::Done;
+        legacy.completed_at = Some(base + chrono::Duration::minutes(1));
+        // No insight_inputs: pre-upgrade thread, fail closed for extraction.
+
+        let mut truncated = Thread::new(
+            "truncated conversation",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        truncated.created_at = base;
+        eligible_source_at(&mut truncated, "LONG_USER", base);
+        truncated.insight_inputs[0].truncated = true;
+
+        let mut threads: Vec<Thread> = vec![
+            truncated,
+            other_project_thread,
+            other_user,
+            research_child,
+            legacy,
+        ];
+        let mission_thread_id = mission_thread.id;
+        threads.push(mission_thread);
+        threads.extend(conversations);
+
+        let batch = crate::runtime::insights::select_batch(&threads, project_id, "test-user", None)
+            .expect("five eligible conversations must form a batch");
+        assert_eq!(batch.sources.len(), 5);
+        assert!(batch.sources.iter().all(|source| {
             [
-                "conversation 4",
-                "conversation 3",
-                "research 0",
-                "conversation 2",
-                "conversation 1",
+                "EARLY_USER",
+                "USER_SAYS_0",
+                "USER_SAYS_1",
+                "USER_SAYS_2",
+                "USER_SAYS_3",
             ]
+            .contains(&source.text.as_str())
+        }));
+        for forbidden in [
+            "MISSION_GOAL_TEXT",
+            "RESEARCH_GOAL_TEXT",
+            "OTHER_USER_TEXT",
+            "OTHER_PROJECT_TEXT",
+            "LONG_USER",
+        ] {
+            assert!(!batch.sources.iter().any(|s| s.text == forbidden));
+        }
+        assert!(
+            batch
+                .sources
+                .iter()
+                .all(|source| source.thread_id != mission_thread_id)
+        );
+
+        // Redelivery with the batch's own cursor skips those sources; only one
+        // strictly newer eligible thread remains, so no batch forms yet — the
+        // dedup identity is content-derived and restart-safe either way.
+        let replay = crate::runtime::insights::select_batch(
+            &threads,
+            project_id,
+            "test-user",
+            Some(&batch.cursor),
+        );
+        assert!(
+            replay.is_none(),
+            "a cursor past four of six sources must not form a new batch"
+        );
+
+        // A sixth strictly newer source completes the next batch with a
+        // distinct, content-derived identity.
+        let mut newest = Thread::new(
+            "newest conversation",
+            ThreadType::Foreground,
+            project_id,
+            "test-user",
+            ThreadConfig::default(),
+        );
+        newest.created_at = base + chrono::Duration::minutes(10);
+        eligible_source_at(
+            &mut newest,
+            "NEWEST_USER",
+            base + chrono::Duration::minutes(10),
+        );
+        threads.push(newest);
+        let mut more: Vec<Thread> = (0..4)
+            .map(|index| {
+                let mut thread = Thread::new(
+                    format!("later conversation {index}"),
+                    ThreadType::Foreground,
+                    project_id,
+                    "test-user",
+                    ThreadConfig::default(),
+                );
+                let completed = base + chrono::Duration::minutes(11 + index);
+                thread.created_at = completed;
+                eligible_source_at(&mut thread, &format!("LATER_USER_{index}"), completed);
+                thread
+            })
+            .collect();
+        threads.append(&mut more);
+        // Six threads are newer than the cursor: USER_SAYS_3 and USER_SAYS_4
+        // were completed after the batch's cursor (identical completed_at is
+        // ordered by thread id) and four new conversations joined them.
+        let replay = crate::runtime::insights::select_batch(
+            &threads,
+            project_id,
+            "test-user",
+            Some(&batch.cursor),
+        )
+        .expect("the newest eligible threads must form the next batch");
+        assert_ne!(replay.content_hash, batch.content_hash);
+        assert!(
+            !replay.sources.iter().any(|source| {
+                ["EARLY_USER", "USER_SAYS_0", "USER_SAYS_1", "USER_SAYS_2"]
+                    .contains(&source.text.as_str())
+            }),
+            "the next batch must contain only strictly newer sources: {:?}",
+            replay
+                .sources
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn conversation_insight_goals_use_recency_not_store_order() {
+    fn insight_batch_requires_five_new_eligible_threads() {
         let project_id = ProjectId::new();
-        let base = chrono::Utc::now();
-        let make_thread = |goal: &str, thread_type, minutes_ago: i64| {
+        let mut threads = Vec::new();
+        for index in 0..4 {
             let mut thread = Thread::new(
-                goal,
-                thread_type,
+                format!("conversation {index}"),
+                ThreadType::Foreground,
                 project_id,
                 "test-user",
                 ThreadConfig::default(),
             );
-            thread.created_at = base - chrono::Duration::minutes(minutes_ago);
-            thread
-        };
-        // Simulate an unordered store result (e.g. HashMap iteration order):
-        // oldest and newest threads interleaved, with a fresh mission thread
-        // that must never leak into the payload.
-        let threads = vec![
-            make_thread("ancient conversation", ThreadType::Foreground, 600),
-            make_thread("newest conversation", ThreadType::Foreground, 1),
-            make_thread("mission specification", ThreadType::Mission, 0),
-            make_thread("middle conversation", ThreadType::Foreground, 30),
-            make_thread("older conversation", ThreadType::Foreground, 120),
-        ];
-
-        assert_eq!(
-            recent_conversation_thread_goals(&threads, 2),
-            ["newest conversation", "middle conversation"]
+            eligible_source(&mut thread, &format!("USER_SAYS_{index}"));
+            threads.push(thread);
+        }
+        assert!(
+            crate::runtime::insights::select_batch(&threads, project_id, "test-user", None)
+                .is_none(),
+            "four eligible threads must not fire a batch"
         );
+    }
+
+    #[tokio::test]
+    async fn insight_batch_survives_manager_restart_and_redelivery() {
+        // G8-F7: batch identity is derived from durable source identities, not
+        // an in-memory counter, and the reserved cursor persists with the
+        // mission. A recreated manager must neither re-fire the consumed batch
+        // nor skip the genuinely newer one.
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::new());
+        let pid = ProjectId::new();
+        let mgr = make_mission_manager(Arc::clone(&store));
+        mgr.ensure_learning_missions_with_gate(pid, "test-user", true)
+            .await
+            .unwrap();
+        let id = mgr
+            .find_by_name(pid, "test-user", "conversation-insights")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        async fn seed(
+            store: &Arc<dyn Store>,
+            pid: ProjectId,
+            count: usize,
+            tag: &str,
+            base_minutes_ago: i64,
+        ) {
+            for index in 0..count {
+                let mut source = Thread::new(
+                    format!("{tag} {index}"),
+                    ThreadType::Foreground,
+                    pid,
+                    "test-user",
+                    ThreadConfig::default(),
+                );
+                source.state = ThreadState::Done;
+                source.completed_at = Some(
+                    chrono::Utc::now() - chrono::Duration::minutes(base_minutes_ago)
+                        + chrono::Duration::seconds(index as i64),
+                );
+                source.add_message(crate::types::message::ThreadMessage::user(format!(
+                    "{tag}_STATEMENT_{index}"
+                )));
+                store.save_thread(&source).await.unwrap();
+            }
+        }
+        seed(&store, pid, 5, "early", 60).await;
+
+        let first = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(first.is_some(), "the first batch must fire");
+        wait_for_done(&store, first.unwrap()).await;
+
+        // "Restart": a fresh manager on the same store.
+        drop(mgr);
+        let mgr = make_mission_manager(Arc::clone(&store));
+        // Redelivery of the consumed batch must not re-fire.
+        let replay = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(replay.is_none(), "the consumed cursor must not re-fire");
+
+        seed(&store, pid, 5, "later", 30).await;
+        let second = mgr.fire_mission(id, "test-user", None).await.unwrap();
+        assert!(
+            second.is_some(),
+            "a genuinely newer batch must fire after restart"
+        );
+        let thread = wait_for_done(&store, second.unwrap()).await;
+        let payload = store
+            .load_mission(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_trigger_payload
+            .unwrap();
+        let texts: Vec<&str> = payload["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|source| source["text"].as_str().unwrap())
+            .collect();
+        assert!(
+            texts.iter().all(|text| text.starts_with("later_")),
+            "the post-restart batch must contain only new sources: {texts:?}"
+        );
+        assert!(thread.goal.contains("later_STATEMENT"));
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn insight_event_dispatch_is_project_scoped() {
+        // G8-F6: a same-user event from project A must not fire this user's
+        // insight mission in project B.
+        let store = Arc::new(TestStore::new());
+        let mgr = Arc::new(make_mission_manager_with_response(
+            Arc::clone(&store) as Arc<dyn Store>,
+            "done",
+        ));
+        let project_a = ProjectId::new();
+        let project_b = ProjectId::new();
+
+        async fn make_mission(store: &TestStore, project_id: ProjectId, name: &str) -> MissionId {
+            let mut mission = Mission::new(
+                project_id,
+                "alice",
+                name,
+                "extract insights",
+                MissionCadence::OnSystemEvent {
+                    source: "engine".into(),
+                    event_type: "conversation_insights_due".into(),
+                },
+            );
+            mission.metadata = serde_json::json!({"conversation_insights": true});
+            store.save_mission(&mission).await.unwrap();
+            mission.id
+        }
+        let a_id = make_mission(&store, project_a, "insights-a").await;
+        let b_id = make_mission(&store, project_b, "insights-b").await;
+        let mut active = mgr.active.write().await;
+        active.push(a_id);
+        active.push(b_id);
+        drop(active);
+
+        // Seed five eligible sources in both projects so batch availability
+        // cannot mask the scoping question.
+        for project_id in [project_a, project_b] {
+            for index in 0..5 {
+                let mut source = Thread::new(
+                    format!("source {index}"),
+                    ThreadType::Foreground,
+                    project_id,
+                    "alice",
+                    ThreadConfig::default(),
+                );
+                source.state = ThreadState::Done;
+                source.completed_at = Some(chrono::Utc::now());
+                source.add_message(crate::types::message::ThreadMessage::user(format!(
+                    "SOURCE_{index}"
+                )));
+                store.save_thread(&source).await.unwrap();
+            }
+        }
+
+        let spawned = mgr
+            .fire_on_system_event(
+                project_a,
+                "engine",
+                "conversation_insights_due",
+                "alice",
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(!spawned.is_empty(), "project A's mission must fire");
+        let mut a_fired: Vec<ProjectId> = Vec::new();
+        for tid in &spawned {
+            if let Some(thread) = store.load_thread(*tid).await.unwrap() {
+                a_fired.push(thread.project_id);
+            }
+        }
+        assert!(
+            a_fired.iter().all(|pid| *pid == project_a),
+            "only project A's mission may fire for a project A event"
+        );
+        let b = store.load_mission(b_id).await.unwrap().unwrap();
+        assert!(
+            b.thread_history.is_empty(),
+            "the same user's mission in project B must not fire"
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn insight_deletion_is_a_persistent_opt_out() {
+        // G8-F8: deleting an insight mission persists a disabled tombstone
+        // that survives reconciliation and same-name recreation, until an
+        // explicit resume re-enables it from the current cursor forward.
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::new());
+        let pid = ProjectId::new();
+        let mgr = make_mission_manager(Arc::clone(&store));
+        mgr.ensure_learning_missions_with_gate(pid, "test-user", true)
+            .await
+            .unwrap();
+        let id = mgr
+            .find_by_name(pid, "test-user", "conversation-insights")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        for index in 0..5 {
+            let mut source = Thread::new(
+                format!("conversation {index}"),
+                ThreadType::Foreground,
+                pid,
+                "test-user",
+                ThreadConfig::default(),
+            );
+            source.state = ThreadState::Done;
+            source.completed_at = Some(chrono::Utc::now());
+            source.add_message(crate::types::message::ThreadMessage::user(format!(
+                "USER_STATEMENT_{index}"
+            )));
+            store.save_thread(&source).await.unwrap();
+        }
+
+        mgr.delete_mission(id, "test-user").await.unwrap();
+        let tombstoned = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            tombstoned.deleted_at.is_some(),
+            "insight deletion is a tombstone"
+        );
+        assert_eq!(tombstoned.status, MissionStatus::Paused);
+        assert!(
+            !mgr.active.read().await.contains(&id),
+            "the tombstoned mission must leave the active index"
+        );
+        assert!(
+            mgr.fire_mission(id, "test-user", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "a tombstoned mission must not fire"
+        );
+
+        // Reconciliation must not resurrect the tombstone.
+        mgr.ensure_learning_missions_with_gate(pid, "test-user", true)
+            .await
+            .unwrap();
+        let after = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            after.deleted_at.is_some(),
+            "reconciliation preserves the opt-out"
+        );
+        assert_eq!(after.status, MissionStatus::Paused);
+        assert!(
+            mgr.find_by_name(pid, "test-user", "conversation-insights")
+                .await
+                .unwrap()
+                .is_some(),
+            "same-name recreation dedupes onto the tombstone"
+        );
+
+        // Explicit resume re-enables from the deletion-time cursor forward.
+        mgr.resume_mission(id, "test-user").await.unwrap();
+        let resumed = store.load_mission(id).await.unwrap().unwrap();
+        assert!(resumed.deleted_at.is_none());
+        assert_eq!(resumed.status, MissionStatus::Active);
+        assert!(
+            mgr.fire_mission(id, "test-user", None)
+                .await
+                .unwrap()
+                .is_none(),
+            "no sources newer than the resume cursor: nothing re-fires"
+        );
+        mgr.shutdown().await;
     }
 
     #[tokio::test]
@@ -5188,6 +5718,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         let spawned = mgr
             .fire_on_system_event(
+                project_id,
                 "engine",
                 "thread_completed_with_issues",
                 "test-user",
@@ -5220,7 +5751,13 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         .unwrap();
 
         let spawned = mgr
-            .fire_on_system_event("engine", "thread_completed_with_issues", "test-user", None)
+            .fire_on_system_event(
+                project_id,
+                "engine",
+                "thread_completed_with_issues",
+                "test-user",
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(spawned.len(), 0, "should not fire non-matching mission");
@@ -5257,7 +5794,13 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         .unwrap();
 
         let spawned = mgr
-            .fire_on_system_event("engine", "thread_completed_with_issues", "test-user", None)
+            .fire_on_system_event(
+                project_id,
+                "engine",
+                "thread_completed_with_issues",
+                "test-user",
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(spawned.len(), 0);
@@ -5423,6 +5966,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         assert_eq!(mission.status, MissionStatus::Paused);
         let spawned = mgr
             .fire_on_system_event(
+                project_id,
                 "engine",
                 "thread_completed_with_issues",
                 "test-user",
@@ -6020,6 +6564,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let payload = serde_json::json!({"source_thread_id": "test", "goal": "test"});
         let spawned = mgr
             .fire_on_system_event(
+                project_id,
                 "engine",
                 "thread_completed_with_issues",
                 "alice",
@@ -6125,18 +6670,26 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             )
             .await
             .unwrap();
+        // Host-selected batches require eligible insight inputs: a top-level
+        // Foreground thread capturing a genuine user statement.
+        let mut mission = store.load_mission(mission_id).await.unwrap().unwrap();
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        store.save_mission(&mission).await.unwrap();
         mgr.start_event_listener("test-user".into()).await;
 
         for index in 0..4 {
             let thread_id = mgr
                 .thread_manager
-                .spawn_thread(
-                    format!("source thread {index}"),
+                .spawn_thread_with_history_and_message(
+                    crate::types::message::ThreadMessage::user(format!("USER_STATEMENT_{index}")),
                     ThreadType::Foreground,
                     project_id,
                     ThreadConfig::default(),
                     None,
                     "test-user",
+                    Vec::new(),
+                    None,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -6145,13 +6698,16 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         let other_user_thread = mgr
             .thread_manager
-            .spawn_thread(
-                "other user's source thread",
+            .spawn_thread_with_history_and_message(
+                crate::types::message::ThreadMessage::user("OTHER_USER_STATEMENT"),
                 ThreadType::Foreground,
                 project_id,
                 ThreadConfig::default(),
                 None,
                 "other-user",
+                Vec::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -6172,44 +6728,59 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         let fifth_thread = mgr
             .thread_manager
-            .spawn_thread(
-                "source thread 4",
+            .spawn_thread_with_history_and_message(
+                crate::types::message::ThreadMessage::user("USER_STATEMENT_4"),
                 ThreadType::Foreground,
                 project_id,
                 ThreadConfig::default(),
                 None,
                 "test-user",
+                Vec::new(),
+                None,
+                None,
             )
             .await
             .unwrap();
         mgr.thread_manager.join_thread(fifth_thread).await.unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let mission = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
                 if mission.thread_history.len() == 1 {
-                    break;
+                    return mission;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("terminal events should fire the matching learning mission");
+        let payload = mission.last_trigger_payload.expect("batch persisted");
+        let texts: Vec<&str> = payload["sources"]
+            .as_array()
+            .expect("sources array")
+            .iter()
+            .map(|source| source["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts.len(), 5, "exactly five eligible sources: {texts:?}");
+        assert!(texts.iter().all(|text| text.starts_with("USER_STATEMENT_")));
     }
 
     // ── Thread-start event dispatch (MR !872 review contract) ──
 
     /// Helper: create an active `engine/thread_start` mission owned by `user`
     /// and return (manager, mission_id, store).
-    async fn thread_start_mission(user: &str) -> (Arc<MissionManager>, MissionId, Arc<TestStore>) {
+    async fn thread_start_mission(
+        user: &str,
+    ) -> (Arc<MissionManager>, MissionId, Arc<TestStore>, ProjectId) {
         let store = Arc::new(TestStore::new());
         let mgr = Arc::new(make_mission_manager_with_response(
             Arc::clone(&store) as Arc<dyn Store>,
             "done",
         ));
+        let project_id = ProjectId::new();
         let mission_id = mgr
             .create_mission(
-                ProjectId::new(),
+                project_id,
                 user,
                 "sanitize-memory",
                 "sanitize stale memory",
@@ -6221,7 +6792,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             )
             .await
             .unwrap();
-        (mgr, mission_id, store)
+        (mgr, mission_id, store, project_id)
     }
 
     /// Wait until the mission has at least `n` threads in its history.
@@ -6241,8 +6812,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     async fn thread_start_fires_once_for_fresh_foreground_thread() {
-        let (mgr, mission_id, _store) = thread_start_mission("test-user").await;
-        let project_id = ProjectId::new();
+        let (mgr, mission_id, _store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         let source = mgr
@@ -6282,8 +6852,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     async fn thread_start_does_not_fire_for_mission_or_research_threads() {
-        let (mgr, mission_id, _store) = thread_start_mission("test-user").await;
-        let project_id = ProjectId::new();
+        let (mgr, mission_id, _store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         for thread_type in [ThreadType::Mission, ThreadType::Research] {
@@ -6334,8 +6903,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
     async fn thread_start_child_foreground_thread_does_not_dispatch() {
         // A Foreground thread with a parent (child) must not dispatch even
         // though its thread_type matches. Only a fresh top-level thread does.
-        let (mgr, mission_id, store) = thread_start_mission("test-user").await;
-        let project_id = ProjectId::new();
+        let (mgr, mission_id, store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         let child = mgr
@@ -6398,8 +6966,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     async fn thread_start_resumes_do_not_dispatch() {
-        let (mgr, mission_id, store) = thread_start_mission("test-user").await;
-        let project_id = ProjectId::new();
+        let (mgr, mission_id, store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         // Drive a real Waiting thread through resume: the loop engine
@@ -6441,8 +7008,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     async fn thread_start_isolated_per_user() {
-        let (mgr, mission_id, _store) = thread_start_mission("test-user").await;
-        let project_id = ProjectId::new();
+        let (mgr, mission_id, _store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         let other = mgr
@@ -6471,7 +7037,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
     #[tokio::test]
     async fn thread_start_duplicate_delivery_deduplicates() {
-        let (mgr, mission_id, _store) = thread_start_mission("test-user").await;
+        let (mgr, mission_id, _store, project_id) = thread_start_mission("test-user").await;
         mgr.start_event_listener("test-user".into()).await;
 
         // Fire the same payload twice through the public structured-event
@@ -6482,13 +7048,25 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             "thread_type": "Foreground",
             "goal": "duplicate",
         });
-        mgr.fire_on_system_event("engine", "thread_start", "test-user", Some(payload.clone()))
-            .await
-            .unwrap();
+        mgr.fire_on_system_event(
+            project_id,
+            "engine",
+            "thread_start",
+            "test-user",
+            Some(payload.clone()),
+        )
+        .await
+        .unwrap();
         let first = await_mission_history(&mgr, mission_id, 1).await;
-        mgr.fire_on_system_event("engine", "thread_start", "test-user", Some(payload))
-            .await
-            .unwrap();
+        mgr.fire_on_system_event(
+            project_id,
+            "engine",
+            "thread_start",
+            "test-user",
+            Some(payload),
+        )
+        .await
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let mission = mgr.get_mission(mission_id).await.unwrap().unwrap();
         assert_eq!(
@@ -7247,6 +7825,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         // nothing for them.
         let spawned = mgr
             .fire_on_system_event(
+                project_id,
                 "engine",
                 "thread_completed_with_learnings",
                 "test-user",

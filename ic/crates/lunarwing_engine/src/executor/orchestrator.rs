@@ -2090,7 +2090,7 @@ async fn handle_retrieve_docs(
         .unwrap_or(5);
 
     let result =
-        if let crate::types::thread::MissionContext::ConversationInsights { recall_query } =
+        if let crate::types::thread::MissionContext::ConversationInsights { recall_query, .. } =
             &thread.config.mission_context
         {
             retrieval

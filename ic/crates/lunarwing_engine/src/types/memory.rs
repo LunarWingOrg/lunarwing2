@@ -62,6 +62,9 @@ pub struct MemoryDoc {
     pub source_thread_id: Option<ThreadId>,
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
+    /// Host-validated evidence; never accepted from model metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<crate::types::insight::InsightRecord>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -98,6 +101,7 @@ impl MemoryDoc {
             source_thread_id: None,
             tags: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
+            insight: None,
             created_at: now,
             updated_at: now,
         }

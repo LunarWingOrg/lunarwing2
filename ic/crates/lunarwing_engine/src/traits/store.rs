@@ -99,6 +99,28 @@ pub trait Store: Send + Sync {
     }
 
     async fn load_memory_doc(&self, id: DocId) -> Result<Option<MemoryDoc>, EngineError>;
+    /// Atomic evidence validation, run-budget enforcement, and insight upsert.
+    /// Must serialize with pause/delete and purge; unsupported adapters deny it.
+    async fn save_conversation_insight(
+        &self,
+        _thread: &Thread,
+        _doc: &MemoryDoc,
+    ) -> Result<DocId, EngineError> {
+        Err(EngineError::Store {
+            reason: "atomic insight persistence is unavailable".into(),
+        })
+    }
+
+    /// Delete only insight documents in this exact project/owner scope.
+    async fn purge_conversation_insights(
+        &self,
+        _project_id: ProjectId,
+        _user_id: &str,
+    ) -> Result<usize, EngineError> {
+        Err(EngineError::Store {
+            reason: "insight purge is unavailable".into(),
+        })
+    }
     async fn list_memory_docs(
         &self,
         project_id: ProjectId,

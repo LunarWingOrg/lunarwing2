@@ -230,6 +230,7 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -294,6 +295,7 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -352,6 +354,7 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

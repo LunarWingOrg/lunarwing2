@@ -3,6 +3,7 @@
 //! - [`MemoryStore`] — project-scoped document CRUD
 //! - [`RetrievalEngine`] — context building from project docs via keyword search
 
+pub mod insights;
 pub mod retrieval;
 pub mod skill_tracker;
 pub mod store;

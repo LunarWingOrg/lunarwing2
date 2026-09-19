@@ -99,6 +99,7 @@ impl RetrievalEngine {
             // Skills use deterministic activation in the orchestrator. Generic
             // retrieval must not bypass that selector and inject them as knowledge.
             .filter(|doc| doc.doc_type != DocType::Skill)
+            .filter(crate::memory::insights::recallable)
             .filter(|doc| purpose == RetrievalPurpose::Mission || !is_engine_maintenance(doc))
             .collect();
         if all_docs.is_empty() {
@@ -519,13 +520,29 @@ mod tests {
     #[tokio::test]
     async fn conversational_retrieval_does_not_fall_back_for_greetings_or_unrelated_queries() {
         let project = ProjectId::new();
-        let engine = RetrievalEngine::new(make_store(vec![MemoryDoc::new(
+        let mut explicit = MemoryDoc::new(
             project,
             "test-user",
             DocType::Lesson,
             "insight:workflow:review",
             "Prefer concise status updates. Add a prompt hint about tools.",
-        )]));
+        );
+        // Host-minted explicit insight: a complete user statement (F4 contract).
+        explicit.insight = Some(crate::types::insight::InsightRecord {
+            version: crate::types::insight::INSIGHT_RECORD_VERSION,
+            kind: crate::types::insight::InsightKind::Explicit,
+            sources: vec![crate::types::insight::InsightSource {
+                message_id: uuid::Uuid::new_v4(),
+                thread_id: crate::types::thread::ThreadId::new(),
+                conversation_id: None,
+                timestamp: chrono::Utc::now(),
+                text: "Prefer concise status updates. Add a prompt hint about tools.".into(),
+                truncated: false,
+            }],
+            generated_by: crate::types::thread::ThreadId::new(),
+            runs: vec![crate::types::thread::ThreadId::new()],
+        });
+        let engine = RetrievalEngine::new(make_store(vec![explicit]));
 
         for query in [
             "",

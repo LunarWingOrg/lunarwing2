@@ -1655,7 +1655,7 @@ async fn handle_rlm_query(
     child_thread.config.mission_context = parent_thread.config.mission_context.clone();
 
     // Add the prompt as a user message
-    child_thread.add_message(ThreadMessage::user(&prompt));
+    child_thread.add_message(ThreadMessage::generated_goal(&prompt));
 
     // Create signal channel and child's lease manager
     let (_tx, rx) = crate::runtime::messaging::signal_channel(8);
@@ -2062,6 +2062,12 @@ async fn handle_save_memory_doc(
     }
 
     let doc_id = doc.id.0.to_string();
+    if thread.config.mission_context.is_conversation_insights() {
+        return match store.save_conversation_insight(thread, &doc).await {
+            Ok(id) => ExtFunctionResult::Return(MontyObject::String(id.0.to_string())),
+            Err(error) => memory_doc_error(ExcType::RuntimeError, error.to_string()),
+        };
+    }
     if let Err(error) = store.save_memory_doc(&doc).await {
         debug!(%error, "__save_memory_doc__: failed to save");
         return memory_doc_error(ExcType::RuntimeError, "failed to persist memory document");
@@ -2802,6 +2808,10 @@ FINAL(doc_id)
             ThreadConfig {
                 mission_context: MissionContext::ConversationInsights {
                     recall_query: "astrolabe".into(),
+                    batch: None,
+                    mission_id: None,
+                    run_id: None,
+                    generation: 0,
                 },
                 ..ThreadConfig::default()
             },

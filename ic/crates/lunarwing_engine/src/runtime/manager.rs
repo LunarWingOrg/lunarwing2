@@ -255,7 +255,7 @@ impl ThreadManager {
         preferred_thread_id: Option<ThreadId>,
         initial_state: Option<serde_json::Value>,
     ) -> Result<ThreadId, EngineError> {
-        let current_message = ThreadMessage::user(goal.into());
+        let current_message = ThreadMessage::generated_goal(goal.into());
         self.spawn_thread_with_history_and_message(
             current_message,
             thread_type,
@@ -1002,8 +1002,9 @@ impl ThreadManager {
     pub async fn inject_message_system(
         &self,
         thread_id: ThreadId,
-        message: ThreadMessage,
+        mut message: ThreadMessage,
     ) -> Result<(), EngineError> {
+        message.provenance = crate::types::provenance::Provenance::System;
         self.send_injected_message(thread_id, message).await
     }
 

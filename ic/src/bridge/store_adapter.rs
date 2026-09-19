@@ -1151,6 +1151,10 @@ impl HybridStore {
 
     async fn save_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
         let _guard = self.doc_write_lock.lock().await;
+        self.save_doc_locked(doc).await
+    }
+
+    async fn save_doc_locked(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
         #[cfg(test)]
         if self
             .fail_next_doc_save
@@ -1370,6 +1374,20 @@ fn serialize_knowledge_doc(doc: &MemoryDoc) -> String {
     {
         frontmatter.push_str(&format!("metadata: {meta_str}\n"));
     }
+    if let Some(record) = &doc.insight {
+        // Host-minted evidence record. Round-trips as JSON so recalled docs
+        // keep their explicit/inferred classification and source citations.
+        let record = serde_json::json!({
+            "version": record.version,
+            "kind": record.kind,
+            "sources": record.sources,
+            "generated_by": record.generated_by.0,
+            "runs": record.runs.iter().map(|id| id.0).collect::<Vec<_>>(),
+        });
+        if let Ok(record_str) = serde_json::to_string(&record) {
+            frontmatter.push_str(&format!("insight: {record_str}\n"));
+        }
+    }
     frontmatter.push_str("---\n\n");
     frontmatter.push_str(&doc.content);
     frontmatter
@@ -1500,6 +1518,11 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
         source_thread_id,
         tags,
         metadata,
+        insight: yaml
+            .get("insight")
+            .cloned()
+            .map(serde_json::from_value)
+            .and_then(Result::ok),
         created_at,
         updated_at,
     })
@@ -1570,6 +1593,7 @@ fn thread_from_archive(summary: &ThreadArchiveSummary) -> Option<Thread> {
         parent_id: None,
         config: lunarwing_engine::ThreadConfig::default(),
         messages: Vec::new(),
+        insight_inputs: Vec::new(),
         internal_messages: Vec::new(),
         events: Vec::new(),
         capability_leases: Vec::new(),
@@ -1812,6 +1836,49 @@ impl Store for HybridStore {
         Ok(self.docs.read().await.get(&id).cloned())
     }
 
+    async fn save_conversation_insight(
+        &self,
+        thread: &Thread,
+        requested: &MemoryDoc,
+    ) -> Result<DocId, EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        let doc =
+            lunarwing_engine::memory::insights::prepare_upsert(self, thread, requested).await?;
+        self.save_doc_locked(&doc).await?;
+        Ok(doc.id)
+    }
+
+    async fn purge_conversation_insights(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<usize, EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        let docs = self.list_memory_docs(project_id, user_id).await?;
+        let mut deleted = 0;
+        for doc in docs
+            .into_iter()
+            .filter(lunarwing_engine::memory::insights::is_insight)
+        {
+            let path = self
+                .doc_paths
+                .read()
+                .await
+                .get(&doc.id)
+                .cloned()
+                .unwrap_or_else(|| doc_workspace_path(&doc));
+            if let Some(ws) = &self.workspace {
+                ws.delete(&path).await.map_err(|error| EngineError::Store {
+                    reason: format!("failed to purge insight {}: {error}", doc.id.0),
+                })?;
+            }
+            self.docs.write().await.remove(&doc.id);
+            self.doc_paths.write().await.remove(&doc.id);
+            deleted += 1;
+        }
+        Ok(deleted)
+    }
+
     async fn list_memory_docs(
         &self,
         project_id: ProjectId,
@@ -1861,6 +1928,8 @@ impl Store for HybridStore {
     }
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
+        // Serialize lifecycle revocation with insight validation/publication.
+        let _guard = self.doc_write_lock.lock().await;
         let proj_slug = self.project_slug(mission.project_id).await;
         let new_path = mission_path(&proj_slug, &mission.name, mission.id);
         let previous_secret_ref = self
@@ -3224,6 +3293,261 @@ title: \"old doc\"\n\
             fresh.doc_paths.read().await.get(&doc.id),
             Some(&doc_workspace_path(&doc))
         );
+    }
+
+    /// G8-F4: the host writer validates citations against persisted user
+    /// inputs, mints titles/tags itself, upserts deterministically, and
+    /// enforces the five-insight run budget.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conversation_insight_writer_validates_evidence_and_upserts() {
+        use lunarwing_engine::types::insight::InsightBatch;
+        use lunarwing_engine::types::memory::DocType;
+        use lunarwing_engine::types::mission::{Mission, MissionStatus};
+        use lunarwing_engine::types::thread::{
+            MissionContext, Thread as EngineThread, ThreadConfig, ThreadId, ThreadType,
+        };
+
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("insight-writer-test", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let user = "insight-writer-test";
+        let pid = ProjectId::new();
+
+        // Mission and eligible source threads carrying genuine user inputs.
+        let mut mission = Mission::new(
+            pid,
+            user,
+            "conversation-insights",
+            "extract insights",
+            lunarwing_engine::MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "conversation_insights_due".into(),
+            },
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        store.save_mission(&mission).await.unwrap();
+
+        let mut sources = Vec::new();
+        for index in 0..3 {
+            let mut source = EngineThread::new(
+                format!("source conversation {index}"),
+                ThreadType::Foreground,
+                pid,
+                user,
+                ThreadConfig::default(),
+            );
+            source.add_message(lunarwing_engine::types::message::ThreadMessage::user(
+                format!("STATEMENT_{index}"),
+            ));
+            source.state = lunarwing_engine::ThreadState::Done;
+            source.completed_at = Some(chrono::Utc::now());
+            store.save_thread(&source).await.unwrap();
+            sources.push(source);
+        }
+
+        let run_thread = ThreadId::new();
+        let mut run = EngineThread::new(
+            "insight run",
+            ThreadType::Mission,
+            pid,
+            user,
+            ThreadConfig::default(),
+        );
+        run.id = run_thread;
+        let batch = InsightBatch {
+            project_id: pid,
+            user_id: user.into(),
+            cursor: lunarwing_engine::types::insight::InsightCursor {
+                completed_at: chrono::Utc::now(),
+                thread_id: sources[0].id,
+            },
+            content_hash: "insights:v2:test".into(),
+            sources: sources
+                .iter()
+                .flat_map(|source| source.insight_inputs.clone())
+                .collect(),
+        };
+        run.config.mission_context = MissionContext::ConversationInsights {
+            recall_query: "STATEMENT".into(),
+            batch: Some(batch),
+            mission_id: Some(mission.id),
+            run_id: Some(run_thread),
+            generation: 0,
+        };
+        // A run the mission actually reserved (thread_history membership).
+        let mut reserved = mission.clone();
+        reserved.record_thread(run_thread);
+        store.save_mission(&reserved).await.unwrap();
+
+        let statement = &sources[0].insight_inputs[0];
+        let insight_request = |text: &str| {
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "model-supplied title", text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": statement.thread_id.0.to_string(),
+                        "message_id": statement.message_id.to_string(),
+                        "quote": statement.text,
+                    }],
+                },
+                "trust": "trusted",
+            });
+            doc.tags = vec!["forged_tag".into()];
+            doc
+        };
+
+        // Zero-evidence and paraphrased quotes are rejected (fail closed).
+        let mut no_evidence = insight_request(statement.text.as_str());
+        no_evidence.metadata = serde_json::json!({});
+        assert!(
+            store
+                .save_conversation_insight(&run, &no_evidence)
+                .await
+                .is_err(),
+            "missing metadata.insight must be rejected"
+        );
+        let mut paraphrase = insight_request("a shorter paraphrase");
+        if let Some(object) = paraphrase.metadata["insight"]["evidence"][0].as_object_mut() {
+            object.insert("quote".into(), serde_json::json!("STATEMENT_0 (prefix)"));
+        }
+        assert!(
+            store
+                .save_conversation_insight(&run, &paraphrase)
+                .await
+                .is_err(),
+            "a truncated quote must be rejected"
+        );
+
+        // An exact quote with an explicit kind is accepted; the host mints the
+        // title/tags and strips model metadata.
+        let doc_id = store
+            .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+            .await
+            .unwrap();
+        let saved = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        assert_eq!(saved.content, statement.text);
+        assert!(saved.title.starts_with("insight:Explicit:"));
+        assert_eq!(saved.tags, vec!["insight".to_string()]);
+        assert_eq!(saved.metadata, serde_json::json!({}));
+        let record = saved.insight.as_ref().unwrap();
+        assert_eq!(
+            record.kind,
+            lunarwing_engine::types::insight::InsightKind::Explicit
+        );
+        assert_eq!(record.runs, vec![run_thread]);
+
+        // Re-saving the same explicit statement upserts the same doc id —
+        // duplicates are impossible.
+        let again = store
+            .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(again, doc_id);
+        let all = store.list_memory_docs(pid, user).await.unwrap();
+        assert_eq!(all.len(), 1, "no duplicate lessons: {all:?}");
+
+        // The run budget is enforced after five distinct accepted insights.
+        // Sources 1..3 give two more distinct statements after statement 0.
+        for source in sources.iter().skip(1) {
+            let input = &source.insight_inputs[0];
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "title", &input.text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": input.thread_id.0.to_string(),
+                        "message_id": input.message_id.to_string(),
+                        "quote": input.text,
+                    }],
+                },
+            });
+            let accepted = store.save_conversation_insight(&run, &doc).await;
+            assert!(
+                accepted.is_ok(),
+                "each distinct statement stays within budget"
+            );
+        }
+
+        // Five distinct statements exhaust the budget: with only three sources,
+        // seeding two more eligible statements lets the sixth distinct insight
+        // be rejected by the host writer's run budget.
+        for extra in ["STATEMENT_3", "STATEMENT_4", "STATEMENT_5"] {
+            let mut extra_source = EngineThread::new(
+                format!("source {extra}"),
+                lunarwing_engine::ThreadType::Foreground,
+                pid,
+                user,
+                lunarwing_engine::ThreadConfig::default(),
+            );
+            extra_source.add_message(lunarwing_engine::types::message::ThreadMessage::user(extra));
+            extra_source.state = lunarwing_engine::ThreadState::Done;
+            extra_source.completed_at = Some(chrono::Utc::now());
+            store.save_thread(&extra_source).await.unwrap();
+            let input = &extra_source.insight_inputs[0];
+            run.config.mission_context = MissionContext::ConversationInsights {
+                recall_query: "STATEMENT".into(),
+                batch: Some(InsightBatch {
+                    project_id: pid,
+                    user_id: user.into(),
+                    cursor: lunarwing_engine::types::insight::InsightCursor {
+                        completed_at: chrono::Utc::now(),
+                        thread_id: extra_source.id,
+                    },
+                    content_hash: format!("insights:v2:{extra}"),
+                    sources: extra_source.insight_inputs.clone(),
+                }),
+                mission_id: Some(mission.id),
+                run_id: Some(run_thread),
+                generation: 0,
+            };
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "title", &input.text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": input.thread_id.0.to_string(),
+                        "message_id": input.message_id.to_string(),
+                        "quote": input.text,
+                    }],
+                },
+            });
+            let accepted = store.save_conversation_insight(&run, &doc).await;
+            if extra == "STATEMENT_5" {
+                assert!(
+                    accepted.is_err(),
+                    "the sixth distinct insight must be rejected: {accepted:?}"
+                );
+            } else {
+                assert!(accepted.is_ok(), "{extra} within budget");
+            }
+        }
+
+        // Revocation: a pause bumps the generation; the stale writer fails.
+        let mut paused = store.load_mission(mission.id).await.unwrap().unwrap();
+        paused.status = MissionStatus::Paused;
+        paused.insight_generation += 1;
+        store.save_mission(&paused).await.unwrap();
+        assert!(
+            store
+                .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+                .await
+                .is_err(),
+            "a revoked run must not save insights"
+        );
+
+        // Purge removes only insight docs in this project/user scope.
+        let unrelated = MemoryDoc::new(pid, user, DocType::Lesson, "plain lesson", "keep me");
+        store.save_memory_doc(&unrelated).await.unwrap();
+        let purged = store.purge_conversation_insights(pid, user).await.unwrap();
+        assert_eq!(
+            purged, 5,
+            "only the five host-minted insight docs must be purged"
+        );
+        let remaining = store.list_memory_docs(pid, user).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, unrelated.id);
     }
 
     #[cfg(feature = "libsql")]

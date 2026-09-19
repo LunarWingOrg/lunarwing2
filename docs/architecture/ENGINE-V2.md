@@ -273,13 +273,20 @@ General mission planning, mission threads, and their host-marked mission childre
 queries retain type-priority/recency fallback. The host selects this policy from
 thread configuration; `__retrieve_docs__` arguments cannot opt a conversation
 into it. **Conversation-insights missions are the exception:** the host assigns
-`MissionContext::ConversationInsights` with a query derived only from the trigger
-batch's goals/message samples. Both meta-prompt construction and first-step
-`__retrieve_docs__` use conversational relevance and maintenance exclusions;
-an empty batch recalls nothing. The context is inherited by managed and inline
-mission children. Model arguments and mutable REPL state cannot switch policies
-or replace the batch query. Retrieved documents retain untrusted source labels.
-Dedicated overlay/orchestrator loading has its own self-modification gate.
+`MissionContext::ConversationInsights` with a query derived only from the
+trigger batch's complete user statements. Both meta-prompt construction and
+first-step `__retrieve_docs__` use conversational relevance and maintenance
+exclusions; an empty batch recalls nothing. The context is inherited by managed
+and inline mission children. Model arguments and mutable REPL state cannot
+switch policies or replace the batch query. Retrieved documents retain
+untrusted source labels. Dedicated overlay/orchestrator loading has its own
+self-modification gate.
+
+Insight-shaped documents have their own recall-eligibility rule (WI #183
+G8-F4): automatic recall surfaces only host-minted, current-version `explicit`
+insight records whose captured sources are complete and equal the doc content.
+`inferred` records and pre-hardening insight-shaped lessons stay inspectable
+through explicit tools but never ride automatic recall.
 
 ### Authenticity hardening (WI#132)
 
@@ -527,18 +534,25 @@ Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
 Initial mission state remains available across approval/authentication pauses,
-while normal terminal cleanup removes it. Conversation-insight cadence is
-tracked per project and user, preventing one user's completions from advancing
-another user's mission.
+while normal terminal cleanup removes it. System-event dispatch is
+project-scoped: `fire_on_system_event` takes the dispatching project as a
+host-supplied argument, and a mission only fires when its project matches — so
+a same-user event in project A cannot fire that user's mission in project B
+(WI #183 G8-F6).
 
 Trigger payloads are deduplicated at fire time: a payload carrying a
 `source_thread_id` and/or `content_hash` that the mission has already processed
 spawns no thread and consumes no daily budget. The processed-key set is
 persisted on the mission (FIFO-bounded to 512 keys), so re-delivered events are
-skipped even across daemon restarts (work item #69). The conversation-insights
-listener currently keys batches by project and an in-memory completion count.
-That counter resets on restart and can collide with a persisted key for an older
-batch, skipping new content; this remains open as G8-F7 in WI #183.
+skipped even across daemon restarts (work item #69). Conversation-insights
+batches are selected durably instead of counted: the mission persists an
+`InsightCursor` (last reserved `completed_at`/`thread_id`) with its thread
+reservation, and batch identity is content-derived from the batch's sorted
+message ids (`insights:v2:<project>:<ids>`), so a restart can neither re-fire
+the consumed batch nor collide a genuinely new one with an old processed key
+(WI #183 G8-F7). The periodic tick also scans for eligible sources directly, so
+completions that raced their event's persistence or arrived during broadcast
+lag still produce runs.
 
 ### Error Diagnosis (`self-improvement`)
 
@@ -558,20 +572,44 @@ batch, skipping new content; this remains open as G8-F7 in WI #183.
 
 ### Conversation Insights (`conversation-insights`)
 
-- **Trigger**: fires every 5 completed threads in a project
-- **Action**: extracts user preferences, domain knowledge, and workflow patterns
-- **Context**: current trigger batch and relevant non-maintenance knowledge.
-  Existing generated `current_focus` and `approach_history` are excluded from the
-  next extraction prompt, including legacy history. FINAL reports are retained
-  for audit, but insights do not update focus or request a generated next agenda.
-- **Host writer**: `__save_memory_doc__` refuses shared and maintenance/control
-  outputs for insight threads and their marked children, even with
-  self-modification enabled. Other missions' control writes require that opt-in.
-  Reserved title prefixes and control tags are checked independently.
-- **Remaining evidence gaps**: input eligibility/source identities, validated
-  insight evidence and stable upserts, project-scoped dispatch, restart-safe
-  batching, and explicit opt-out/purge semantics remain tracked in
-  [WI #183](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/183).
+- **Trigger**: a batch of five newly completed, eligible source threads in the
+  project, or the durable source scan on tick
+- **Evidence**: each top-level Foreground thread captures its ingested User-role
+  statements at ingestion time as complete, untruncated `InsightSource` records
+  (message/thread/conversation identity + timestamp). Generated goals, steer
+  notes, system injections, research/mission threads, failed threads, other
+  users' or projects' threads, legacy pre-upgrade threads, and truncated
+  statements are never sources. The host selects the batch from persisted
+  threads under the mission fire lock; caller-supplied payload content is
+  ignored.
+- **Context**: the current source batch and relevant non-maintenance knowledge.
+  Existing generated `current_focus` and `approach_history` are excluded from
+  the next extraction prompt, including legacy history. FINAL reports are
+  retained for audit, but insights do not update focus or request a generated
+  next agenda.
+- **Host writer**: insight threads write only through the atomic
+  `Store::save_conversation_insight` entry point. Every citation is re-validated
+  against the persisted source statement (whole-statement quote, same
+  project/user, still-eligible thread, reserved run with current status and
+  generation). The host mints the title (`insight:<kind>:<DocId>`), the
+  `insight` tag, and empty metadata; model-supplied identity/trust fields
+  cannot pass through. Explicit statements upsert by exact content and
+  inferred records by evidence set, so duplicates are impossible; at most five
+  distinct insights per run are accepted. A quote records what was said, not
+  that its claims are true.
+- **Recall eligibility**: automatic recall surfaces only host-minted,
+  current-version `explicit` insight records whose sources are complete and
+  equal the doc content. `inferred` records persist for inspection via
+  explicit tools but never ride automatic recall, so prior generated
+  insights cannot become independent user corroboration. Contradictions are
+  kept: a newer complete statement is its own explicit insight.
+- **Opt-out**: deleting the mission persists a `Paused` tombstone
+  (`deleted_at`), bumps `insight_generation` so stale writers fail the gate,
+  stops in-flight runs, and survives both startup reconciliation and
+  same-name recreation. `mission_delete` with `purge_insights` removes only
+  the host-minted insight docs in that project/user scope. An explicit
+  `mission_resume` re-enables extraction from the resume cursor forward;
+  nothing older re-fires.
 
 ### Expected Behavior (`expected-behavior`)
 
