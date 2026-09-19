@@ -4,12 +4,14 @@
 
 Do not substitute bare system-bus `systemctl` or hand-written `rc-service` commands for tenant lifecycle. On systemd hosts, tenant services run in the tenant account's user manager; on Gentoo they are OpenRC services managed through the same MT admin interface.
 
-**Revalidated against source 2026-09-17 (v2.1.2.0).** Every referenced mt-admin
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19.**
+Every referenced mt-admin
 subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
 `tokens`, WeeChat bootstrap recovery) was re-checked against
 `ic/scripts/lunarwing-mt-admin.sh`; no changes were needed beyond adding the
-v2.1.2.0 `fix-podman-userns` repair command below. **Migration note
+v2.1.2.0 `fix-podman-userns` repair command below. The 2026-09-19 repass added
+the `opencode2` worker to the single-worker restart example. **Migration note
 (WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
 explicit `proxy` settings are preserved (mt-admin renders `none` only when
 unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
@@ -197,6 +199,7 @@ Use the worker lifecycle commands for one worker rather than restarting the enti
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles pebble
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode
 sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles kimi
+sudo ic/scripts/lunarwing-mt-admin.sh restart-worker ruffles opencode2
 ```
 
 ## 9. Backup, Restore, Upgrade, and Remove
