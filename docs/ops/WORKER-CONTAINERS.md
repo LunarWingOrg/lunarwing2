@@ -98,8 +98,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.5** at reviewed full commit
-`79169fe966d58fb0e0a5e41133716184a0ab4ca6`; the v2 bridge uses
+**v2.0.8** at reviewed full commit
+`7673ed6bd6547ee0dcb81aab55f1392fb751d652`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -168,7 +168,7 @@ counts, and diffs the layer digests — or, when all layers match, the two image
 configs — pinpointing the first differing entry from the job log alone, which
 is the layer-level comparison work item #177 called for.
 
-Verification (2026-09-18): built upstream commit
+Verification (2026-09-18, v2.0.5): built upstream commit
 `79169fe966d58fb0e0a5e41133716184a0ab4ca6` with Bun 1.4.2 extracted from the
 Dockerfile's pinned amd64 image, using `OPENCODE_VERSION=2.0.5 bun run build --
 --single` in fresh build processes. Original-profile binaries differed in 3,295
@@ -177,6 +177,13 @@ Two patched-profile builds were byte-identical (`cmp`), SHA-256
 `9f71bc51e6d778b0cceec8626a98d4815f3620e4f928358b403e4895f66baf69`.
 This is host-build evidence, not a portable expected image/binary checksum.
 The patched executable passed `--version` (`opencode v2.0.5`) and `serve --help`.
+
+v2.0.8 bump (2026-09-19): upstream `packages/cli/script/build.ts` is
+byte-identical between v2.0.5 and v2.0.8, so the checked build-profile patch
+above applies unchanged; client/schema/protocol SDK changes in
+`7673ed6bd6547ee0dcb81aab55f1392fb751d652` are additive against the bridge's
+`@opencode/client/promise` usage. Whole-image reproducibility remains
+CI-verified per revision.
 Bridge executor, result, workspace-path, build-profile, and study-notes tests
 passed; workspace cleanup was also checked with an injected assertion failure.
 Full image digest verification remains with CI: local Podman could not unpack
