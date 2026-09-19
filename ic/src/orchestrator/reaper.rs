@@ -376,15 +376,22 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
     };
 
     let filter = format!("label={SANDBOX_CONTAINER_LABEL}");
-    let output = match tokio::process::Command::new(bin)
-        .args(["ps", "-a", "--filter", &filter, "--format", "json"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await
+    // Bounded (!1046 review finding 5): a wedged runtime CLI must not stall
+    // the sweep cadence. The sweep now also runs socketless, so stuck probes
+    // would otherwise silently disable orphan recovery on that host.
+    let output = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(bin)
+            .args(["ps", "-a", "--filter", &filter, "--format", "json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
     {
-        Ok(output) if output.status.success() => output,
+        Ok(Ok(output)) if output.status.success() => output,
         _ => {
             tracing::debug!("Reaper: runtime CLI sandbox sweep listing failed");
             return;
@@ -425,15 +432,19 @@ async fn sweep_cli_sandboxes(config: &ReaperConfig) {
             age_secs = age.num_seconds(),
             "Reaper: orphaned sandbox container detected, cleaning up"
         );
-        let status = tokio::process::Command::new(bin)
-            .args(["rm", "-f", &name])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(bin)
+                .args(["rm", "-f", &name])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
         match status {
-            Ok(s) if s.success() => tracing::info!(
+            Ok(Ok(s)) if s.success() => tracing::info!(
                 container = %name,
                 "Reaper: removed orphaned sandbox container"
             ),

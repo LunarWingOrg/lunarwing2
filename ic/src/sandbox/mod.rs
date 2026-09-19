@@ -1,12 +1,10 @@
 //! Generic execution sandbox for secure command execution (podman-first).
 //!
 //! This module provides a complete sandboxing solution for running untrusted commands:
-//! - **Container isolation**: Commands run in ephemeral containers driven by the
-//!   `podman` (preferred) or `docker` CLI — no daemon socket required, mirroring
-//!   the rootless pattern the mt-admin external-worker tooling uses
-//! - **Network proxy**: In proxy mode, network traffic goes through a validating
-//!   proxy (advisory: env-var based); in `none` mode, containers get no network
-//!   at all (kernel-enforced via `--network none`)
+//! - **Network proxy**: `none` (default) disables egress entirely; `proxy-enforced`
+//!   keeps `--network none` and exposes only a per-execution Unix relay to the
+//!   validating public-only proxy (WI#155); legacy `proxy` mode routes traffic
+//!   through the validating proxy advisory (env-var based)
 //! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
 //!
@@ -100,12 +98,17 @@
 //! # Security Properties
 //!
 //! - **No credentials in containers**: Environment variables with secrets never enter containers
-//! - **Network isolation**: Proxy mode routes traffic through the proxy (validated
-//!   domains only — advisory, env-var based); `none` mode removes the network entirely
-//! - **Non-root execution**: Containers run as UID 1000 (keep-id userns where supported)
+//! - **Network isolation**: `none` removes the network entirely (kernel-enforced);
+//!   `proxy-enforced` keeps `--network none` and exposes only a Unix relay to
+//!   the validating public-only proxy; legacy `proxy` is advisory (env-var based)
+//! - **Non-root execution**: keep-id userns (rootless podman) or the daemon's
+//!   own UID/GID (rootless docker maps container root to the host user; rootful
+//!   docker maps numeric host UIDs). Writable workspaces fail closed rather
+//!   than run as container root
 //! - **Read-only root**: Container filesystem is read-only (except workspace mount)
 //! - **Capability dropping**: All Linux capabilities dropped, only essential ones added back
-//! - **Auto-cleanup**: Containers are removed after execution (--rm + kill-on-timeout + reaper)
+//! - **Auto-cleanup**: Cancellation-safe in-flight guard + detached kill/rm
+//!   backstop + API-independent CLI reaper (bounded probes)
 //! - **Timeout enforcement**: Commands are killed after the timeout
 
 pub mod cli_runner;

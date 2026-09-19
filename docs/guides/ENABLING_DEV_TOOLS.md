@@ -37,8 +37,8 @@ The default is an enabled read-only container sandbox. Since v2.1.2.0 the sandbo
 
 | Policy | Filesystem | Network | Execution |
 | --- | --- | --- | --- |
-| `readonly` | workspace mounted read-only | proxied allowlist | container |
-| `workspace_write` | workspace mounted read/write | proxied allowlist | container |
+| `readonly` | workspace mounted read-only | `none` by default; configurable | container |
+| `workspace_write` | workspace mounted read/write | `none` by default; configurable | container |
 | `full_access` | unrestricted host access | unrestricted | direct host shell |
 
 For normal development work, prefer:
@@ -59,9 +59,9 @@ Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and d
 
 Even under `full_access`, the child environment is scrubbed: commands inherit only the allowlisted OS/toolchain variables (the same list the unsandboxed shell tool uses), never daemon credentials such as `DATABASE_URL` or the `SANDBOX_*` launcher variables themselves.
 
-Container egress is tiered through `SANDBOX_NETWORK` (new in v2.1.2.0): `proxy` routes HTTP through the allowlist proxy via `host.containers.internal`, with denied responses prefixed `sandbox-proxy denied:`; `none` passes `--network none` for full network isolation. **Multi-tenant hosts default to `none`** (WI#154): mt-admin renders `SANDBOX_NETWORK=none` into every tenant's `lunarwing.env`, because the advisory proxy mode would let a sandboxed process reach host-loopback services (worker WSS/health ports, tenant PostgreSQL, cross-tenant loopback). `proxy` is an explicit opt-in for tenants that genuinely need allowlisted web access; it is advisory (env-var based) — a process that ignores proxy env vars can egress directly. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
+Container egress is selected through `SANDBOX_NETWORK`: `none` (default) passes `--network none` for full network isolation — no egress at all, including loopback. For web-capable sandboxes choose `proxy-enforced`: the container keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay (public-only destinations, DNS-pinned, redirects rechecked). This requires a local Linux runtime and Python 3 in the image; relay setup fails closed (it never degrades to advisory or direct egress). `proxy` remains as the legacy advisory mode, in which commands can ignore proxy env vars and connect directly to the host/network. Denied responses carry the stable prefix `sandbox-proxy denied:`. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
 
-Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal.
+Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal. Upgrade note (WI#154): the default `SANDBOX_NETWORK` is `none` everywhere in v2.1.2.0 — an explicit `proxy` setting is preserved, but sandboxed web access now requires an explicit choice of `proxy-enforced` (recommended) or the legacy advisory `proxy`. See [WI#179 combined rollout](../ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 ## 3. Keep or Change Approval Behavior
 

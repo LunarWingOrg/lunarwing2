@@ -166,6 +166,10 @@ pub(crate) struct RunSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    /// Host directory holding the per-execution proxy relay socket
+    /// (proxy-enforced mode only). Bind-mounted read-only at
+    /// `/run/lunarwing-proxy`.
+    pub proxy_dir: Option<&'a str>,
     /// Per-container process limit (`--pids-limit`).
     pub pids_limit: u32,
 }
@@ -266,12 +270,51 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 }
             }
         }
+        SandboxNetworkMode::ProxyEnforced => {
+            args.push("--network".into());
+            args.push("none".into());
+            if let Some(dir) = spec.proxy_dir {
+                // Read-only relay socket transport (WI#155). Only this
+                // directory is visible besides the proxy env: no direct
+                // egress path exists anywhere, including localhost.
+                args.extend(["-v".into(), format!("{}:/run/lunarwing-proxy:ro,z", dir)]);
+            }
+            for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+                args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
+            }
+            // A caller-supplied bypass cannot accidentally disable proxy use.
+            args.extend([
+                "-e".into(),
+                "NO_PROXY=".into(),
+                "-e".into(),
+                "no_proxy=".into(),
+            ]);
+        }
     }
 
-    args.push(spec.image.into());
-    args.push("sh".into());
-    args.push("-c".into());
-    args.push(spec.command.into());
+    // Run under `sh` regardless of image entrypoint (worker images bind
+    // their own entrypoint) and always work from the mounted workspace.
+    args.extend([
+        "--entrypoint".into(),
+        "sh".into(),
+        "--workdir".into(),
+        "/workspace".into(),
+        spec.image.into(),
+        "-c".into(),
+    ]);
+    if spec.network == SandboxNetworkMode::ProxyEnforced {
+        // Python relay wrapper (argv-separated: the untrusted command is a
+        // single argv value, never interpolated into the wrapper). Missing
+        // Python 3 fails closed rather than dropping the command unsandboxed.
+        args.extend([
+            "command -v python3 >/dev/null || { echo 'lunarwing-proxy-relay: Python 3 required' >&2; exit 125; }; exec python3 -I -c \"$1\" \"$2\"".into(),
+            "lunarwing-proxy-relay".into(),
+            include_str!("proxy/relay.py").into(),
+            spec.command.into(),
+        ]);
+    } else {
+        args.push(spec.command.into());
+    }
     args
 }
 
@@ -510,6 +553,10 @@ impl CliRunner {
     }
 
     /// Execute a command in a fresh hardened container and collect its output.
+    ///
+    /// Proxy-enforced setup (WI#155) fails closed before any container is
+    /// created: the running proxy/relay prerequisites are verified up front
+    /// so a misconfigured run can never degrade to direct egress.
     pub async fn execute(&self, params: ExecParams<'_>) -> Result<ContainerOutput> {
         let ExecParams {
             command,
@@ -520,9 +567,27 @@ impl CliRunner {
             network,
             proxy_port,
         } = params;
+        if network != SandboxNetworkMode::None && proxy_port == 0 {
+            return Err(SandboxError::ProxyError {
+                reason: format!("{network:?} network mode requires a running proxy"),
+            });
+        }
+        fail_if_writable_root_docker(self.runtime, policy, self.user.as_str())?;
+
+        let relay = if network == SandboxNetworkMode::ProxyEnforced {
+            // Start before container creation; a failed relay never degrades
+            // to advisory or direct egress (fail closed).
+            Some(crate::sandbox::proxy::relay::ProxyRelay::start(proxy_port).await?)
+        } else {
+            None
+        };
         let start_time = std::time::Instant::now();
         let name = format!("lunarwing-sandbox-{}", uuid::Uuid::new_v4());
         let created_at = chrono::Utc::now().to_rfc3339();
+        let proxy_dir = relay
+            .as_ref()
+            .map(|relay| relay.path().to_string_lossy().into_owned());
+        let proxy_dir_ref = proxy_dir.as_deref();
 
         let spec = RunSpec {
             runtime: self.runtime,
@@ -538,6 +603,7 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            proxy_dir: proxy_dir_ref,
             pids_limit: default_pids_limit(),
         };
         let args = build_run_args(&spec);
@@ -550,6 +616,11 @@ impl CliRunner {
         // would make the reaper skip it forever).
         let _inflight_guard = InflightGuard::new(name.clone());
         let result = self.run_container(&name, &args, limits).await;
+        // The relay lives at least as long as the container process; closing
+        // it earlier (e.g. on an outer-task drop racing the detached cleanup)
+        // only cuts in-flight proxy streams for a container the cleanup guard
+        // is already killing.
+        drop(relay);
 
         result.map(|mut output| {
             output.duration = start_time.elapsed();
@@ -640,7 +711,7 @@ impl CliRunner {
                 let (stderr, stderr_trunc) = err_buf.into_string();
 
                 if exit_code != 0
-                    && let Some(err) = classify_run_failure(&stderr, &self.image)
+                    && let Some(err) = classify_run_failure(&stderr, &self.image, exit_code)
                 {
                     return Err(err);
                 }
@@ -698,6 +769,13 @@ impl ContainerCleanupGuard {
 }
 
 impl Drop for ContainerCleanupGuard {
+    /// Known window (!1046 review finding 3): the detached cleanup is a
+    /// `tokio::spawn`, so a daemon shutdown racing an in-flight execution can
+    /// exit the process before the spawned cleanup runs (detached tasks do
+    /// not outlive runtime shutdown). That is a bounded gap, backstopped by
+    /// the independent CLI reaper, which sweeps labeled orphans on its own
+    /// cadence. A synchronous cleanup here is not possible (Drop is sync and
+    /// spawning within an aborting runtime can itself fail).
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -716,18 +794,68 @@ impl Drop for ContainerCleanupGuard {
     }
 }
 
+/// Execute-time container-root guard (!1046 review finding 2).
+///
+/// With rootful Docker and a root daemon, `user_for` resolves `--user 0:0`:
+/// a writable workspace would run as container root. Caps are dropped and the
+/// rootfs is read-only, but "never container root for writable workspaces" is
+/// an explicit contract — refuse this configuration instead of deriving it by
+/// accident from the daemon's UID. Read-only policy under this configuration
+/// is documented as accepted risk in `NetworkSecurity` §5 (rootless podman is
+/// the recommended runtime either way).
+#[cfg(unix)]
+fn fail_if_writable_root_docker(
+    runtime: ContainerRuntime,
+    policy: SandboxPolicy,
+    user: &str,
+) -> Result<()> {
+    if runtime == ContainerRuntime::Docker && policy.allows_writes() && user == "0:0" {
+        return Err(SandboxError::Config {
+            reason: "rootful Docker under a root daemon would run a writable workspace as container root; use rootless podman or a non-root daemon".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fail_if_writable_root_docker(
+    _runtime: ContainerRuntime,
+    _policy: SandboxPolicy,
+    _user: &str,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Map a failed run's stderr to a typed error when it indicates a missing
 /// image (e.g. the image vanished between the initialize-time check and the
-/// run, or auto-pull is off).
-fn classify_run_failure(stderr: &str, image: &str) -> Option<SandboxError> {
+/// run, or auto-pull is off), a relay setup failure (proxy-enforced), or a
+/// runtime setup failure (mount/userns/resource-controller errors reported by
+/// the runtime CLI, exit 125).
+fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<SandboxError> {
+    if stderr.contains("lunarwing-proxy-relay:") {
+        return Some(SandboxError::ProxyError {
+            reason: stderr.trim().into(),
+        });
+    }
     let lower = stderr.to_lowercase();
     let image_missing = lower.contains("image not known")
         || lower.contains("no such image")
         || lower.contains("unable to find image")
         || lower.contains("pull access denied");
-    image_missing.then(|| SandboxError::ImageUnavailable {
-        image: image.to_string(),
-        reason: stderr.trim().to_string(),
+    if image_missing {
+        return Some(SandboxError::ImageUnavailable {
+            image: image.to_string(),
+            reason: stderr.trim().to_string(),
+        });
+    }
+    // Runtime setup failures are sandbox errors, not a successful invocation
+    // with an ordinary command exit code.
+    let runtime_error = exit_code == 125
+        && lower
+            .lines()
+            .any(|line| line.starts_with("error:") || line.starts_with("docker: error"));
+    runtime_error.then(|| SandboxError::ExecutionFailed {
+        reason: stderr.trim().into(),
     })
 }
 
@@ -759,15 +887,26 @@ async fn probe_podman_version() -> Option<(u32, u32)> {
 /// rootless security option). Rootless docker maps container root onto the
 /// host user, so the sandbox must run as `--user 0:0` for bind mounts to be
 /// writable (WI#179 concern 4).
+///
+/// The probe is bounded (!1046 review finding 1): a present-but-wedged daemon
+/// must not hang sandbox initialization forever. On timeout or probe failure
+/// we conservatively report "not rootless" (rootful mapping), which makes
+/// read-only policy work and the execute-time guard fail writable workspaces
+/// closed under a root daemon.
 async fn probe_docker_rootless() -> bool {
-    let output = tokio::process::Command::new("docker")
-        .args(["info", "--format", "{{.SecurityOptions}}"])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("docker")
+            .args(["info", "--format", "{{.SecurityOptions}}"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
     match output {
-        Ok(output) if output.status.success() => {
+        Ok(Ok(output)) if output.status.success() => {
             let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
             text.contains("rootless")
         }
@@ -824,6 +963,7 @@ mod tests {
             env: &EMPTY_ENV,
             network,
             proxy_port,
+            proxy_dir: None,
             pids_limit: 256,
         }
     }
@@ -1056,7 +1196,14 @@ mod tests {
             .iter()
             .position(|a| a == "lunarwing-worker:latest")
             .unwrap();
-        assert_eq!(&args[image_idx + 1..], &["sh", "-c", "echo hi"]);
+        assert_eq!(&args[image_idx + 1..], &["-c", "echo hi"]);
+        assert_eq!(
+            args.windows(2)
+                .find(|w| w[0] == "--entrypoint")
+                .map(|w| w[1].as_str()),
+            Some("sh"),
+            "image entrypoint must not intercept sandbox commands"
+        );
     }
 
     // ── capped buffer ──────────────────────────────────────────────────
@@ -1121,11 +1268,82 @@ mod tests {
         ];
         for stderr in cases {
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest").is_some(),
+                classify_run_failure(stderr, "lunarwing-worker:latest", 125).is_some(),
                 "should classify: {stderr}"
             );
         }
-        assert!(classify_run_failure("sh: foo: command not found", "img").is_none());
+        assert!(classify_run_failure("sh: foo: command not found", "img", 127).is_none());
+        assert!(
+            classify_run_failure("Error: command rejected input", "img", 1).is_none(),
+            "exit 125 marker in unrelated contexts must not mask ordinary errors"
+        );
+    }
+
+    #[test]
+    fn proxy_relay_and_runtime_setup_failures_are_structured() {
+        for (stderr, kind) in [
+            ("lunarwing-proxy-relay: Python 3 required", "proxy_error"),
+            (
+                "Error: statfs /private/channel: permission denied",
+                "execution_failed",
+            ),
+            (
+                "docker: Error response from daemon: invalid mount config",
+                "execution_failed",
+            ),
+        ] {
+            assert_eq!(
+                classify_run_failure(stderr, "image", 125).unwrap().kind(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn enforced_proxy_args_are_confined() {
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = build_run_args(&RunSpec {
+                proxy_dir: Some("/private/channel"),
+                ..spec(
+                    runtime,
+                    KeepIdMode::Off,
+                    SandboxPolicy::WorkspaceWrite,
+                    SandboxNetworkMode::ProxyEnforced,
+                    1234,
+                )
+            });
+            for pair in [
+                ["--user", "1000:1000"],
+                ["--pids-limit", "256"],
+                ["--network", "none"],
+                ["--entrypoint", "sh"],
+                ["--workdir", "/workspace"],
+            ] {
+                assert!(
+                    args.windows(2).any(|w| w == pair),
+                    "missing pair {pair:?} in {args:?}"
+                );
+            }
+            assert!(args.contains(&"/private/channel:/run/lunarwing-proxy:ro,z".to_string()));
+            assert!(args.contains(&"http_proxy=http://127.0.0.1:3128".to_string()));
+            assert!(args.contains(&"NO_PROXY=".to_string()));
+            // The untrusted command is a separate argv value behind the
+            // Python relay wrapper, never interpolated into sh -c directly.
+            let image_idx = args
+                .iter()
+                .position(|a| a == "lunarwing-worker:latest")
+                .unwrap();
+            let tail = &args[image_idx + 1..];
+            assert_eq!(tail[0], "-c");
+            assert_eq!(tail[2], "lunarwing-proxy-relay");
+            assert!(tail[3].contains("lunarwing-proxy-relay:"));
+            assert_eq!(tail.last(), Some(&"echo hi".to_string()));
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("host-gateway") || a.contains("unconfined"))
+            );
+        }
     }
 
     #[test]

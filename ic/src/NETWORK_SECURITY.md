@@ -328,18 +328,34 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 
 | Mode | Mechanism | Enforcement |
 |------|-----------|-------------|
-| `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
-| `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
+| `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `proxy-enforced` (WI#155) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
+| `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
 
-**Default policy (WI#154, v2.1.2.0):** multi-tenant hosts default to
-`SANDBOX_NETWORK=none` — mt-admin renders `SANDBOX_NETWORK=none` into every
-tenant's `lunarwing.env` (preserving an operator-set `proxy` on re-render).
-The advisory `proxy` mode remains the daemon-level default for single-node
-installations, but on MT hosts the loopback reachability surface (worker WSS
-ports, health endpoints, tenant PostgreSQL, cross-tenant loopback) makes
-`none` the only safe default. `proxy` is an explicit opt-in for tenants that
-genuinely need allowlisted web access; the enforced-proxy middle ground is
-tracked separately in WI#155.
+**Default policy (WI#154/155, v2.1.2.0):** the in-code default and mt-admin
+both render `SANDBOX_NETWORK=none` (mt-admin preserves an operator-set `proxy`
+on re-render). `none` is the safe default everywhere. `proxy` is advisory —
+use `proxy-enforced` when sandboxed processes need allowlisted web access.
+`proxy-enforced` is kernel-isolated everywhere except one per-execution Unix
+socket relay to the public-only validating proxy:
+
+- relay placement: `$XDG_RUNTIME_DIR` when it exists and belongs to our euid
+  (fallback: process temp dir). This keeps the socket resolvable across mount
+  namespaces: a `PrivateTmp` daemon and a manager-forked transient-service
+  workload namespace both share `/run/user/<uid>`.
+- relay interior: Python-in-container `--network none` runs a loopback-only
+  socket server bound to `127.0.0.1:3128` and forwards to the host-side proxy.
+  Only the socket directory is bind-mounted (`:ro,z`), Python runs in isolated
+  mode (`python3 -I`), and a failed relay fails closed — it never degrades to
+  advisory or direct egress.
+- destination policy: the proxy rejects non-public destinations (private,
+  loopback, link-local, multicast, CGNAT, and IPv4-mapped forms) and pins DNS
+  to the resolved public addresses for both HTTP forwarding and CONNECT.
+  Redirects are not followed on the host; environment proxies cannot bypass
+  DNS pinning.
+
+The advisory `proxy` mode remains supported for single-node backwards
+compatibility but is no longer any default.
 
 In proxy mode the container is pointed at the proxy via
 `http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns
