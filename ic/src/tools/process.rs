@@ -189,7 +189,7 @@ impl WorkloadSpawner {
             std::process::id(),
             uuid::Uuid::new_v4()
         );
-        let env_file = write_workload_env_file(cmd);
+        let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref());
         let working_dir = cmd
             .as_std()
             .get_current_dir()
@@ -254,14 +254,17 @@ impl ServiceSpec {
 /// scrubbed environment never reaches it by inheritance; the file is the
 /// only channel. Values are double-quoted (EnvironmentFile unquoted values
 /// are C-escape-parsed); values containing a double quote or newline cannot
-/// be represented and are skipped rather than corrupting the file. Failure
-/// degrades to no file (the service then gets the manager's environment).
-fn write_workload_env_file(cmd: &Command) -> Option<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .ok()
+/// be represented and are skipped rather than corrupting the file. The file
+/// lives in the spawner's `XDG_RUNTIME_DIR` when available (the same
+/// runtime dir `systemd-run` uses, so the manager can read it) and falls
+/// back to the temp dir otherwise. Failure degrades to no file (the service
+/// then gets the manager's environment).
+fn write_workload_env_file(cmd: &Command, runtime_dir: Option<&str>) -> Option<PathBuf> {
+    let dir = runtime_dir
         .map(PathBuf::from)
+        .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
         .unwrap_or_else(std::env::temp_dir);
-    let path = runtime_dir.join(format!(
+    let path = dir.join(format!(
         "lunarwing-workload-{}-{}.env",
         std::process::id(),
         uuid::Uuid::new_v4()
@@ -723,7 +726,7 @@ mod tests {
             .env("BAD_QUOTE", "a\"b")
             .env("BAD_NL", "a\nb")
             .current_dir("/some/dir");
-        let path = write_workload_env_file(&cmd).expect("env file written");
+        let path = write_workload_env_file(&cmd, None).expect("env file written");
         let content = std::fs::read_to_string(&path).expect("read env file");
         let _ = std::fs::remove_file(&path);
         assert!(content.contains("PLAIN=\"hello world\""));
