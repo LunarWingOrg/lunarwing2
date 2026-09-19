@@ -477,6 +477,10 @@ pub struct ExecParams<'a> {
 pub struct CliRunner {
     runtime: ContainerRuntime,
     keep_id: KeepIdMode,
+    /// Whether the selected docker runtime runs rootless (container root
+    /// maps onto the host user — always false for podman and for non-unix
+    /// builds that can't probe).
+    docker_rootless: bool,
     /// `--user` value computed at detect time (WI#179 concern 4).
     user: String,
     image: String,
@@ -505,6 +509,7 @@ impl CliRunner {
             return Ok(Self {
                 runtime,
                 keep_id: keep_id_mode_for(runtime, version),
+                docker_rootless,
                 user: user_for(runtime, docker_rootless),
                 image,
             });
@@ -572,7 +577,7 @@ impl CliRunner {
                 reason: format!("{network:?} network mode requires a running proxy"),
             });
         }
-        fail_if_writable_root_docker(self.runtime, policy, self.user.as_str())?;
+        fail_if_writable_root_docker(self.runtime, policy, self.docker_rootless, &self.user)?;
 
         let relay = if network == SandboxNetworkMode::ProxyEnforced {
             // Start before container creation; a failed relay never degrades
@@ -796,22 +801,26 @@ impl Drop for ContainerCleanupGuard {
 
 /// Execute-time container-root guard (!1046 review finding 2).
 ///
-/// With rootful Docker and a root daemon, `user_for` resolves `--user 0:0`:
-/// a writable workspace would run as container root. Caps are dropped and the
-/// rootfs is read-only, but "never container root for writable workspaces" is
-/// an explicit contract — refuse this configuration instead of deriving it by
-/// accident from the daemon's UID. Read-only policy under this configuration
-/// is documented as accepted risk in `NetworkSecurity` §5 (rootless podman is
-/// the recommended runtime either way).
+/// Only ROOTFUL + root-daemon Docker is refused: rootless Docker also maps
+/// `--user 0:0` but container root there maps onto the host user via the
+/// userns (safe; `user_for` documents the mapping). `CliRunner` stores the
+/// rootless flag detected at `detect()` time, so the guard refuses only
+/// `!docker_rootless && allows_writes && user == 0:0` — rootless writable
+/// workspaces keep working with their userns identity.
 #[cfg(unix)]
 fn fail_if_writable_root_docker(
     runtime: ContainerRuntime,
     policy: SandboxPolicy,
+    docker_rootless: bool,
     user: &str,
 ) -> Result<()> {
-    if runtime == ContainerRuntime::Docker && policy.allows_writes() && user == "0:0" {
+    if runtime == ContainerRuntime::Docker
+        && !docker_rootless
+        && policy.allows_writes()
+        && user == "0:0"
+    {
         return Err(SandboxError::Config {
-            reason: "rootful Docker under a root daemon would run a writable workspace as container root; use rootless podman or a non-root daemon".into(),
+            reason: "rootful Docker under a root daemon would run a writable workspace as container root; use rootless podman or a non-root daemon (rootless Docker is allowed — container root there maps onto the host user via userns)".into(),
         });
     }
     Ok(())
@@ -821,6 +830,7 @@ fn fail_if_writable_root_docker(
 fn fail_if_writable_root_docker(
     _runtime: ContainerRuntime,
     _policy: SandboxPolicy,
+    _docker_rootless: bool,
     _user: &str,
 ) -> Result<()> {
     Ok(())
@@ -1366,6 +1376,72 @@ mod tests {
             assert!(inflight_sandbox_containers().contains(&"lunarwing-sandbox-guard".to_string()));
         }
         assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_docker_guard_only_refuses_rootful_under_root() {
+        // Rootless Docker: container root maps onto the host user via the
+        // userns, so `--user 0:0` is SAFE. The guard must not refuse it.
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::WorkspaceWrite,
+                true,
+                "0:0",
+            )
+            .is_ok(),
+            "rootless Docker writable workspaces must not be refused"
+        );
+
+        // Rootful Docker under a NON-root daemon never resolves to 0:0, so
+        // nothing to refuse here either.
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::WorkspaceWrite,
+                false,
+                "1234:1234",
+            )
+            .is_ok(),
+            "rootful Docker under a non-root daemon is fine"
+        );
+
+        // THE REFUSAL: rootful Docker under a root daemon.
+        let refuse = fail_if_writable_root_docker(
+            ContainerRuntime::Docker,
+            SandboxPolicy::WorkspaceWrite,
+            false,
+            "0:0",
+        );
+        assert!(
+            matches!(refuse, Err(SandboxError::Config { reason }) if reason.contains("rootful Docker under a root daemon")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_docker_guard_ignores_readonly_and_non_docker() {
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::ReadOnly,
+                false,
+                "0:0",
+            )
+            .is_ok(),
+            "read-only policy under rootful-Docker-as-root is documented accepted risk"
+        );
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Podman,
+                SandboxPolicy::WorkspaceWrite,
+                false,
+                "0:0",
+            )
+            .is_ok(),
+            "podman never hits the docker guard"
+        );
     }
 
     #[test]
