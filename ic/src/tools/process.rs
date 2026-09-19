@@ -32,17 +32,20 @@
 //! environment stays scrubbed and nothing secret crosses argv.
 //!
 //! Exact workload environment (WI#181): `EnvironmentFile=` only adds to the
-//! environment the user manager passes down, and `UnsetEnvironment=` cannot
-//! clear it wholesale (name-only entries are exact matches — the `*`
-//! wildcard is not supported by `env_match()`). Instead the spawner records
-//! the manager's environment once (its own `/proc/self/environ` at
-//! detection time, which a user service inherits) and serializes that
-//! snapshot plus the caller's additions into the file. Since systemd
-//! compiles the final environment with `EnvironmentFile` entries overriding
-//! inherited ones, the unit sees exactly the snapshot plus additions: any
-//! secret a tenant places in the manager's environment (e.g.
+//! environment the user manager passes down, and `UnsetEnvironment=` takes
+//! explicit variable names (no wildcard form — `*` would be a literal name).
+//! The spawner therefore records the manager's environment once at
+//! detection time by running `env -0` inside the capability probe (a real
+//! manager-forked service, so the capture includes variables the manager
+//! itself injects), and each `prepare_service` adds one
+//! `--property=UnsetEnvironment=<name>` per captured name alongside the
+//! `EnvironmentFile=`. systemd applies the unset list last, so the unit's
+//! environment is exactly the caller's allowlisted assignments from the
+//! file: a secret a tenant places in the manager's environment (e.g. via
 //! `systemctl --user set-environment`) reaches only workloads whose caller
-//! explicitly allowed it, and nothing extra ever does.
+//! explicitly forwarded it. Names added to the manager after daemon start
+//! are not in the snapshot and still inherit (documented drift; the probe
+//! runs once per daemon by design).
 //!
 //! Lifecycle: `systemd-run --wait` proxies stdio and the service's exit
 //! status and returns after the unit is collected (`--collect`), so the
@@ -111,11 +114,12 @@ pub struct WorkloadSpawner {
     /// Value to inject as `XDG_RUNTIME_DIR` when the daemon's own environment
     /// lacked it but the user bus exists (synthesized as `/run/user/<euid>`).
     xdg_runtime_dir: Option<String>,
-    /// The user manager's environment, recorded once at detection time (a
-    /// service inherits the manager's environment, so the daemon's own
-    /// `/proc/self/environ` is that snapshot). Serialized into every
-    /// `EnvironmentFile=` so workload environments are exact and controlled
-    /// — see the module docs on exact workload environments.
+    /// The user manager's environment, captured once at detection time by
+    /// running `env -0` inside the capability probe (a real manager-forked
+    /// service, so the capture includes manager-injected variables). Every
+    /// name here becomes an `UnsetEnvironment=<name>` property on the
+    /// workload unit, so the `EnvironmentFile=` is the unit's exact
+    /// environment — see the module docs on exact workload environments.
     manager_env: std::sync::Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
@@ -219,7 +223,7 @@ impl WorkloadSpawner {
             std::process::id(),
             uuid::Uuid::new_v4()
         );
-        let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref(), &self.manager_env);
+        let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref());
         let working_dir = cmd
             .as_std()
             .get_current_dir()
@@ -240,6 +244,19 @@ impl WorkloadSpawner {
             ));
         if let Some(memory_max) = &self.memory_max {
             rebuilt.arg(format!("--property=MemoryMax={memory_max}"));
+        }
+        // The user manager hands its environment to the service, and
+        // `EnvironmentFile=` only adds to it: without an unset list, a
+        // manager-borne credential would reach the workload despite the
+        // caller's `env_clear()`. Unset every captured manager variable so
+        // the env file is the unit's exact environment (applied by systemd
+        // after all other sources, including the file itself). Only emitted
+        // with an env file: unsetting without additions would leave the
+        // service with no environment at all.
+        if env_file.is_some() {
+            if let Some(property) = unset_environment_property(&self.manager_env) {
+                rebuilt.arg(property);
+            }
         }
         rebuilt.arg(format!("--unit={unit}"));
         if let Some(dir) = working_dir {
@@ -277,30 +294,23 @@ impl ServiceSpec {
     }
 }
 
-/// Serialize the workload environment to a mode-0600 file for
+/// Serialize the command's scrubbed environment to a mode-0600 file for
 /// `systemd-run --property=EnvironmentFile=`, returning the path.
 ///
 /// In service mode the user manager forks the workload, so the daemon's
-/// environment never reaches it by inheritance. `EnvironmentFile=`
-/// assignments override same-named variables inherited from the manager, so
-/// the file is emitted as: (1) the manager's environment snapshot recorded
-/// at spawner detection (making the inherited layer explicit and
-/// reproducible), then (2) the caller's scrubbed additions, which win on
-/// name collisions. The unit therefore sees exactly the snapshot plus the
-/// caller's allowlisted variables — no more, and the daemon's scrubbed
-/// environment stays scrubbed. Values are double-quoted (EnvironmentFile
-/// unquoted values are C-escape-parsed); values containing a double quote
-/// or newline cannot be represented and are skipped rather than corrupting
-/// the file. The file lives in the spawner's `XDG_RUNTIME_DIR` when
-/// available (the same runtime dir `systemd-run` uses, so the manager can
-/// read it) and falls back to the temp dir otherwise. Failure degrades to
-/// no file (the service then inherits the manager's environment, as a
-/// plain `EnvironmentFile=`-less service would).
-fn write_workload_env_file(
-    cmd: &Command,
-    runtime_dir: Option<&str>,
-    manager_env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Option<PathBuf> {
+/// environment never reaches it by inheritance; the file is the channel.
+/// The manager's own environment is cleared separately via the captured
+/// `UnsetEnvironment=` list (see [`unset_environment_property`]), so this
+/// file's assignments are the unit's exact environment. Values are
+/// double-quoted (EnvironmentFile unquoted values are C-escape-parsed);
+/// values containing a double quote or newline cannot be represented and
+/// are skipped rather than corrupting the file. The file lives in the
+/// spawner's `XDG_RUNTIME_DIR` when available (the same runtime dir
+/// `systemd-run` uses, so the manager can read it) and falls back to the
+/// temp dir otherwise. Failure degrades to no file, and the caller must
+/// then also skip the unset property (an unset property with no env file
+/// would empty the service's environment entirely).
+fn write_workload_env_file(cmd: &Command, runtime_dir: Option<&str>) -> Option<PathBuf> {
     let dir = runtime_dir
         .map(PathBuf::from)
         .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
@@ -312,41 +322,55 @@ fn write_workload_env_file(
     ));
     let mut file = std::fs::File::create(&path).ok()?;
     use std::io::Write;
-
-    let mut write_assignment =
-        |file: &mut std::fs::File, key: &str, value: &str| -> std::io::Result<()> {
-            if value.contains('"') || value.contains('\n') {
-                return Ok(());
-            }
-            writeln!(file, "{key}=\"{value}\"")
-        };
-
-    // Manager snapshot first: makes the inherited layer explicit so the
-    // file fully determines the unit's environment.
-    for (key, value) in manager_env {
-        let key = key.to_string_lossy();
-        let value = value.to_string_lossy();
-        if write_assignment(&mut file, &key, &value).is_err() {
-            return None;
-        }
-    }
-    // Caller additions second: same-named variables override the snapshot.
     for (key, value) in cmd.as_std().get_envs() {
         let Some(value) = value else {
             continue;
         };
         let value = value.to_string_lossy();
-        if write_assignment(&mut file, &key.to_string_lossy(), &value).is_err() {
+        if value.contains('"') || value.contains('\n') {
+            continue;
+        }
+        if writeln!(file, "{}=\"{}\"", key.to_string_lossy(), value).is_err() {
             return None;
         }
     }
     if let Some(dir) = cmd.as_std().get_current_dir() {
         let dir = dir.to_string_lossy();
-        if write_assignment(&mut file, "PWD", &dir).is_err() {
-            return None;
+        if !dir.contains('"') && !dir.contains('\n') {
+            let _ = writeln!(file, "PWD=\"{}\"", dir);
         }
     }
     Some(path)
+}
+
+/// Build the `--property=UnsetEnvironment=` argument that clears the user
+/// manager's environment from a workload unit: one space-separated entry
+/// per captured variable name (name-only entries match any value, so no
+/// assignment text needs quoting). Returns `None` for an empty capture
+/// (e.g. process-group fallback or non-Linux), in which case no property
+/// is needed. The list is capped at [`UNSET_ENV_MAX_VARS`] entries so a
+/// pathological manager environment cannot produce an unbounded argv.
+const UNSET_ENV_MAX_VARS: usize = 512;
+
+fn unset_environment_property(
+    manager_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<String> {
+    if manager_env.is_empty() {
+        return None;
+    }
+    let mut names: Vec<String> = Vec::with_capacity(manager_env.len().min(UNSET_ENV_MAX_VARS));
+    for (key, _) in manager_env.iter().take(UNSET_ENV_MAX_VARS) {
+        let key = key.to_string_lossy();
+        // Environment variable names cannot contain spaces; a captured
+        // entry that does cannot be a valid name — skip it.
+        if !key.contains(' ') {
+            names.push(key.into_owned());
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!("--property=UnsetEnvironment={}", names.join(" ")))
 }
 
 /// Process-wide spawner, probed once and cached. Probing never fails the
@@ -378,14 +402,15 @@ async fn detect_spawner() -> WorkloadSpawner {
     }
 
     match probe_systemd_services().await {
-        Ok(()) => {
+        Ok(captured_env) => {
             spawner.isolation = Isolation::SystemdService;
             spawner.xdg_runtime_dir = ensure_xdg_runtime_dir();
-            spawner.manager_env = std::sync::Arc::new(manager_environment_snapshot());
+            spawner.manager_env = std::sync::Arc::new(split_env_entries(&captured_env));
             debug!(
                 slice = %spawner.slice,
                 memory_max = ?spawner.memory_max,
                 timeout_stop_secs = spawner.timeout_stop_secs,
+                manager_env_vars = spawner.manager_env.len(),
                 "workload isolation: systemd user transient services enabled"
             );
         }
