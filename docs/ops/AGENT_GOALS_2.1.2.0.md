@@ -59,7 +59,10 @@
     - Verified: `test-mt-admin-kimi.sh` passes in full (all Kimi mt-admin tests); repo-wide sweep confirms no live 0.42.0 Kimi pin remains (remaining hits are immutable history/release notes and unrelated vendored crates).
 
 ## Phase 3 — Loose Ends (DONE-trail residuals not covered by open WIs)
-13. [ ] update the opencode2 external worker from 2.0.5 to 2.0.8
+13. [x] update the opencode2 external worker from 2.0.5 to 2.0.8
+    - DONE 2026-09-19 (`rarity/kimi-13-20260919-1501`): bumped the opencode2 lane pin from v2.0.5@`79169fe...` to v2.0.8@`7673ed6bd6547ee0dcb81aab55f1392fb751d652` (tag SHA verified against both anomalyco/opencode and sst/opencode remotes). Touched: `opencode2.4lunarwing/Dockerfile` (OPENCODE_VERSION=v2.0.8, OPENCODE_REF=7673ed6...), `.gitlab/scripts/build-worker-image.sh` (source_ref + build_args), `opencode2.4lunarwing/AGENTS.md`, `opencode2.4lunarwing/README.md`, `opencode2.4lunarwing/scripts/prepare_reproducible_build_test.py` (fixture), `docs/ops/WORKER-CONTAINERS.md` (pin + v2.0.8 bump note; v2.0.5 verification block kept as dated historical evidence).
+    - Upstream review (tag 7673ed6b fetched shallow): upstream `packages/cli/script/build.ts` is byte-identical between v2.0.5 and v2.0.8, so the worker's checked reproducible-build patch (`bytecode/splitting: false`) applies unchanged; client/schema/protocol SDK diffs are additive only (session Step `started` field etc.), no removals against the bridge's `@opencode/client/promise` usage; `--single` build flag and `@opencode/client` promise exports unchanged.
+    - Verified: `prepare_reproducible_build_test.py` 3/3 pass; `.gitlab/scripts/validate_config.py` clean (Dockerfile ARG defaults cross-checked against build-worker-image.sh); `bash -n` on the edited CI script. Image build/publish remains with CI per the reproducible-candidate + clean-rebuild digest contract.
 
 14. [x] (S) (CARRY OVER TO 2.1.3.0 ) **Engine V2 interrupt → mascot stuck in `working` up to 30s** (goal #33 residual)
     `ThreadOutcome::Stopped` maps to the empty-string sentinel by !767 design, so engine-interrupt turns emit no terminal `response` event; mascot falls back to 30s idle timer instead of immediate idle. "Parity with legacy `Interrupted.` emission needs a tracker decision." Small polish, user-visible
