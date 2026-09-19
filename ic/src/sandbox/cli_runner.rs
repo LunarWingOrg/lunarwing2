@@ -628,7 +628,7 @@ impl CliRunner {
         // can never leave a live container registered as in-flight (which
         // would make the reaper skip it forever).
         let _inflight_guard = InflightGuard::new(name.to_string());
-        let result = self.run_container(&name, &args, limits).await;
+        let result = self.run_container(name, &args, limits).await;
         // The relay lives at least as long as the container process; closing
         // it earlier (e.g. on an outer-task drop racing the detached cleanup)
         // only cuts in-flight proxy streams for a container the cleanup guard
