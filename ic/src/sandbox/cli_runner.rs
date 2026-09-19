@@ -627,7 +627,7 @@ impl CliRunner {
         // performs its own kill-by-name on cancellation, so a dropped future
         // can never leave a live container registered as in-flight (which
         // would make the reaper skip it forever).
-        let _inflight_guard = InflightGuard::new(name.clone());
+        let _inflight_guard = InflightGuard::new(name.to_string());
         let result = self.run_container(&name, &args, limits).await;
         // The relay lives at least as long as the container process; closing
         // it earlier (e.g. on an outer-task drop racing the detached cleanup)
@@ -811,7 +811,7 @@ impl Drop for ContainerCleanupGuard {
         let bin = self.bin;
         tokio::spawn(async move {
             for args in [vec!["kill", name.as_str()], vec!["rm", "-f", name.as_str()]] {
-                if let Some(status) = run_status(bin, &args).await
+                if let Some(status) = run_status_isolated(bin, &args).await
                     && !status.success()
                 {
                     tracing::debug!(container = %name, "Sandbox cancellation cleanup failed (may already be gone)");
