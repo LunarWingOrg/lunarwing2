@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::context::ContextManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::sandbox::connect_docker;
-use crate::sandbox::{SANDBOX_CONTAINER_LABEL, cli_runner::available_runtime_binary};
+use crate::sandbox::{SANDBOX_CONTAINER_LABEL, cli_runner::selected_runtime_binary};
 
 /// Configuration for the sandbox reaper.
 #[derive(Debug, Clone)]
@@ -56,20 +56,38 @@ impl Default for ReaperConfig {
 
 /// Background task that periodically cleans up orphaned Docker containers.
 pub struct SandboxReaper {
-    docker: bollard::Docker,
+    /// Docker-compatible API handle. `None` on socketless podman deployments:
+    /// the job-container scan is skipped but the generic-sandbox CLI sweep
+    /// still runs (WI#179 concern 2).
+    docker: Option<bollard::Docker>,
     job_manager: Arc<ContainerJobManager>,
     context_manager: Arc<ContextManager>,
     config: ReaperConfig,
 }
 
 impl SandboxReaper {
-    /// Create a new reaper. Connects to Docker eagerly — returns error if Docker unavailable.
+    /// Create a new reaper.
+    ///
+    /// The Docker-compatible connection is optional: when it fails (socketless
+    /// podman, OpenRC hosts), the reaper still starts and runs the
+    /// generic-sandbox CLI sweep, which is independent of the API (WI#179
+    /// concern 2). The job-container scan degrades to a logged warning.
     pub async fn new(
         job_manager: Arc<ContainerJobManager>,
         context_manager: Arc<ContextManager>,
         config: ReaperConfig,
     ) -> Result<Self, crate::sandbox::SandboxError> {
-        let docker = connect_docker().await?;
+        let docker = match connect_docker().await {
+            Ok(docker) => Some(docker),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Reaper: Docker-compatible API unavailable; job-container scan disabled, \
+                     generic-sandbox CLI sweep still active"
+                );
+                None
+            }
+        };
         Ok(Self {
             docker,
             job_manager,
@@ -100,7 +118,13 @@ impl SandboxReaper {
     }
 
     async fn scan_and_reap(&self) {
-        let containers = match self.list_lunarwing_containers().await {
+        // Socketless podman deployments have no API handle: skip the
+        // job-container scan (the CLI sweep below still runs) (WI#179 #2).
+        let Some(docker) = &self.docker else {
+            tracing::debug!("Reaper: no Docker-compatible API, skipping job-container scan");
+            return;
+        };
+        let containers = match self.list_lunarwing_containers(docker).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "Reaper: failed to list Docker containers");
@@ -162,6 +186,7 @@ impl SandboxReaper {
     /// Returns tuples of (container_id, job_id, created_at).
     async fn list_lunarwing_containers(
         &self,
+        docker: &bollard::Docker,
     ) -> Result<Vec<(String, Uuid, DateTime<Utc>)>, bollard::errors::Error> {
         use bollard::container::ListContainersOptions;
 
@@ -174,7 +199,7 @@ impl SandboxReaper {
             ..Default::default()
         };
 
-        let summaries = self.docker.list_containers(Some(options)).await?;
+        let summaries = docker.list_containers(Some(options)).await?;
         let mut result = Vec::new();
 
         for summary in summaries {
@@ -252,8 +277,14 @@ impl SandboxReaper {
         }
 
         // Fall back: direct Docker stop + force remove
-        if let Err(e) = self
-            .docker
+        let Some(docker) = &self.docker else {
+            tracing::debug!(
+                job_id = %job_id,
+                "Reaper: no Docker API handle, cannot reap job container"
+            );
+            return;
+        };
+        if let Err(e) = docker
             .stop_container(
                 container_id,
                 Some(bollard::container::StopContainerOptions { t: 10 }),
@@ -268,8 +299,7 @@ impl SandboxReaper {
             );
         }
 
-        if let Err(e) = self
-            .docker
+        if let Err(e) = docker
             .remove_container(
                 container_id,
                 Some(bollard::container::RemoveContainerOptions {
@@ -302,78 +332,126 @@ impl SandboxReaper {
     /// `lunarwing.job_id` containers — that namespace belongs to the bollard
     /// scan above.
     async fn sweep_cli_sandboxes(&self) {
-        let Some(bin) = available_runtime_binary() else {
-            return; // No runtime CLI: the generic sandbox isn't in use.
-        };
+        sweep_cli_sandboxes(&self.config).await;
+    }
 
-        let filter = format!("label={SANDBOX_CONTAINER_LABEL}");
-        let output = match tokio::process::Command::new(bin)
+    /// Standalone CLI-sweep loop for socketless deployments (WI#179 concern 2).
+    ///
+    /// Runs only the generic-sandbox sweep on a cadence, with no dependency
+    /// on the Docker-compatible API or the orchestrator job manager.
+    pub async fn run_cli_sweep_loop(config: ReaperConfig) {
+        if config.scan_interval.as_secs() == 0 {
+            tracing::error!(
+                "Reaper: scan_interval must be > 0, got {:?}. CLI sweep will not start.",
+                config.scan_interval
+            );
+            return;
+        }
+        let mut interval = tokio::time::interval(config.scan_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            sweep_cli_sandboxes(&config).await;
+        }
+    }
+}
+
+/// One-shot generic-sandbox CLI sweep (also used by the standalone loop and
+/// the e2e test suite). Reaps `lunarwing.sandbox`-labeled containers older
+/// than `config.orphan_threshold` that are not registered as in-flight.
+pub async fn sweep_cli_sandboxes_once(config: &ReaperConfig) {
+    sweep_cli_sandboxes(config).await;
+}
+
+/// Sweep for orphaned generic-sandbox containers via the runtime CLI.
+///
+/// Shared by [`SandboxReaper::sweep_cli_sandboxes`] and the standalone
+/// [`SandboxReaper::run_cli_sweep_loop`] so socketless deployments get the
+/// same orphan cleanup as API-connected ones (WI#179 concern 2).
+async fn sweep_cli_sandboxes(config: &ReaperConfig) {
+    // Prefer the runtime the sandbox runner actually selected; fall back
+    // to the PATH probe (WI#179 concern 2).
+    let Some(bin) = selected_runtime_binary() else {
+        return; // No runtime CLI: the generic sandbox isn't in use.
+    };
+
+    let filter = format!("label={SANDBOX_CONTAINER_LABEL}");
+    // Bounded (!1046 review finding 5): a wedged runtime CLI must not stall
+    // the sweep cadence. The sweep now also runs socketless, so stuck probes
+    // would otherwise silently disable orphan recovery on that host.
+    let output = match tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new(bin)
             .args(["ps", "-a", "--filter", &filter, "--format", "json"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => output,
-            _ => {
-                tracing::debug!("Reaper: runtime CLI sandbox sweep listing failed");
-                return;
-            }
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => {
+            tracing::debug!("Reaper: runtime CLI sandbox sweep listing failed");
+            return;
+        }
+    };
+
+    let now = Utc::now();
+    let threshold = chrono::Duration::from_std(config.orphan_threshold)
+        .unwrap_or_else(|_| chrono::Duration::minutes(10));
+    let inflight = crate::sandbox::inflight_sandbox_containers();
+
+    for (name, created_at) in parse_sandbox_containers(&String::from_utf8_lossy(&output.stdout)) {
+        if inflight.iter().any(|n| n == &name) {
+            tracing::debug!(
+                container = %name,
+                "Reaper: sandbox container currently executing, skipping"
+            );
+            continue;
+        }
+
+        // Age comes from the label (set at creation); fall back to the
+        // runtime's own creation timestamp.
+        let Some(created_at) = created_at else {
+            tracing::warn!(
+                container = %name,
+                "Reaper: sandbox container without parseable creation time, skipping"
+            );
+            continue;
         };
 
-        let now = Utc::now();
-        let threshold = chrono::Duration::from_std(self.config.orphan_threshold)
-            .unwrap_or_else(|_| chrono::Duration::minutes(10));
-        let inflight = crate::sandbox::inflight_sandbox_containers();
+        let age = now.signed_duration_since(created_at);
+        if age < threshold {
+            continue; // Too young — skip
+        }
 
-        for (name, created_at) in parse_sandbox_containers(&String::from_utf8_lossy(&output.stdout))
-        {
-            if inflight.iter().any(|n| n == &name) {
-                tracing::debug!(
-                    container = %name,
-                    "Reaper: sandbox container currently executing, skipping"
-                );
-                continue;
-            }
-
-            // Age comes from the label (set at creation); fall back to the
-            // runtime's own creation timestamp.
-            let Some(created_at) = created_at else {
-                tracing::warn!(
-                    container = %name,
-                    "Reaper: sandbox container without parseable creation time, skipping"
-                );
-                continue;
-            };
-
-            let age = now.signed_duration_since(created_at);
-            if age < threshold {
-                continue; // Too young — skip
-            }
-
-            tracing::info!(
-                container = %name,
-                age_secs = age.num_seconds(),
-                "Reaper: orphaned sandbox container detected, cleaning up"
-            );
-            let status = tokio::process::Command::new(bin)
+        tracing::info!(
+            container = %name,
+            age_secs = age.num_seconds(),
+            "Reaper: orphaned sandbox container detected, cleaning up"
+        );
+        let status = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(bin)
                 .args(["rm", "-f", &name])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            match status {
-                Ok(s) if s.success() => tracing::info!(
-                    container = %name,
-                    "Reaper: removed orphaned sandbox container"
-                ),
-                _ => tracing::warn!(
-                    container = %name,
-                    "Reaper: failed to remove orphaned sandbox container"
-                ),
-            }
+                .kill_on_drop(true)
+                .status(),
+        )
+        .await;
+        match status {
+            Ok(Ok(s)) if s.success() => tracing::info!(
+                container = %name,
+                "Reaper: removed orphaned sandbox container"
+            ),
+            _ => tracing::warn!(
+                container = %name,
+                "Reaper: failed to remove orphaned sandbox container"
+            ),
         }
     }
 }

@@ -838,8 +838,9 @@ pub struct SandboxSettings {
     #[serde(default = "default_sandbox_runtime")]
     pub runtime: String,
 
-    /// Network egress mode for sandboxed policies: "proxy" (allowlist HTTP
-    /// proxy) or "none" (`--network none`, hard isolation).
+    /// Network egress mode for sandboxed policies: "none" (default),
+    /// "proxy-enforced" (isolated allowlist web access), or "proxy"
+    /// (legacy advisory HTTP proxy).
     #[serde(default = "default_sandbox_network")]
     pub network: String,
 
@@ -922,7 +923,7 @@ fn default_sandbox_runtime() -> String {
 }
 
 fn default_sandbox_network() -> String {
-    "proxy".to_string()
+    "none".to_string()
 }
 
 fn default_sandbox_timeout() -> u64 {

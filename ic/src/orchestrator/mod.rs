@@ -53,7 +53,7 @@ pub use job_manager::{
     CompletionResult, ContainerHandle, ContainerJobConfig, ContainerJobManager,
     ContainerJobRequest, JobMode, snapshot_worker_mcp,
 };
-pub use reaper::{ReaperConfig, SandboxReaper};
+pub use reaper::{ReaperConfig, SandboxReaper, sweep_cli_sandboxes_once};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
