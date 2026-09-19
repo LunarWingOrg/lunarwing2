@@ -24,6 +24,8 @@ cron-wrapper.sh
   │     ├── health-lunarvision.sh      (OCR + VL sidecar: health, metrics, VL status)
   │     ├── health-lunarvoice.sh       (enabled local voice sidecars: health + STT readiness)
   │     ├── health-netbird.sh          (opt-in host tunnel readiness)
+  │     ├── health-runtime.sh          (tenant gateway/bridge runtime diagnostics)
+  │     ├── health-knowledge.sh         (knowledge sync/sweep progress monitoring)
   │     └── health-{systemd,openrc,launchd}.sh  (service manager — one, auto-detected)
   │
   └── lunarwing-self-heal.sh           (reads report → restarts → verifies → escalates)
@@ -118,6 +120,8 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
 | lunarvoice | health-lunarvoice.sh | Enabled LunarVoice `/health`, `/ready`, and `/metrics` endpoints | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
+| runtime | health-runtime.sh | Per-tenant gateway `/api/gateway/status` + `/api/chat/pending-gates` and bridge `/v1/status` (ports-registry discovery, bearer tokens from tenant env files) | `gateway_reachable`, `gateway_uptime_secs`, `gateway_connections`, `channels_unhealthy`, `pending_gates` (metric only — approval/auth waits are not stalled execution), `bridge_running`, `bridge_queued_messages`, `bridge_outbound_last_hour`, `bridge_omemo_enabled`, `bridge_prekeys_available` |
+| knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` | `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — absent state reads healthy (sync disabled is not failure) |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
 A check that cannot reach its target generally reports `critical`; several
@@ -184,6 +188,14 @@ workloads.
 | `HEALTH_GATEWAY_STALE_LOCKS_CRITICAL` | health-gateway.sh | `3` | More than this many stale locks → critical |
 | `HEALTH_GATEWAY_ORPHAN_DEGRADED` / `..._ORPHAN_CRITICAL` | health-gateway.sh | `10` / `50` | Orphan-transcript count thresholds |
 | `HEALTH_GATEWAY_OVERSIZED_DEGRADED` | health-gateway.sh | `0` | Oversized (>500 KB) session count before degraded |
+| `HEALTH_RUNTIME_ENABLED` | health-runtime.sh | `auto` | `false` disables; `auto` probes registry tenants or the single-node base env |
+| `HEALTH_RUNTIME_TIMEOUT` | health-runtime.sh | `5` | Per-request curl timeout for gateway/bridge endpoints |
+| `HEALTH_RUNTIME_QUEUE_DEGRADED` / `..._QUEUE_CRITICAL` | health-runtime.sh | `10` / `50` | Bridge delivery backlog thresholds |
+| `HEALTH_RUNTIME_SWEEP_DEADLINE_SECS` | health-runtime.sh | `22` | Fleet sweep deadline; past it, remaining targets are marked unprobed and coverage loss degrades (0 disables) |
+| `HEALTH_KNOWLEDGE_ENABLED` | health-knowledge.sh | `auto` | `false` disables; `auto` probes registry tenants or the single-node base dir |
+| `HEALTH_KNOWLEDGE_SYNC_FAIL_DEGRADED` / `..._CRITICAL` | health-knowledge.sh | `1` / `5` | Consecutive knowledge-sync failure thresholds |
+| `HEALTH_KNOWLEDGE_SWEEP_OVERDUE_HOURS` | health-knowledge.sh | `72` | Sweep last-run age before degraded |
+| `HEALTH_KNOWLEDGE_STATE_ROOT` | health-knowledge.sh | _(unset)_ | Test/override state directory instead of `/home/<user>/lunarwing/state` |
 | `HEALTH_XMPP_LATENCY_DEGRADED_MS` / `..._CRITICAL_MS` | health-xmpp.sh | `500` / `2000` | XMPP latency thresholds |
 | `HEALTH_XMPP_ERROR_DEGRADED` / `..._ERROR_CRITICAL` | health-xmpp.sh | `1` / `5` | XMPP error-count thresholds |
 | `HEALTH_RATELIMIT_THROTTLED_DEGRADED` / `..._CRITICAL` | health-ratelimit.sh | `10` / `50` | Throttled events in the last hour |
@@ -198,6 +210,11 @@ workloads.
 | `SERVICES` | health-openrc.sh | auto-discovered | Override the OpenRC services to probe (space-separated) |
 | `INITD_DIR` | health-openrc.sh | `/etc/init.d` | Init-script directory scanned for tenant services |
 | `HEALTH_OPENRC_STATUS_TIMEOUT` | health-openrc.sh | `8` | Per-unit `rc-service status` timeout (s); `0` disables |
+| `HEALTH_OPENRC_SWEEP_DEADLINE_SECS` | health-openrc.sh | `22` | Fleet sweep deadline; past it, remaining services are emitted as unprobed/skipped and the component degrades for lost coverage (0 disables) |
+| `HEALTH_LUNARVISION_SWEEP_DEADLINE_SECS` | health-lunarvision.sh | `22` | Fleet sweep deadline for tenant targets (same partial-results contract) |
+| `HEALTH_LUNARVOICE_SWEEP_DEADLINE_SECS` | health-lunarvoice.sh | `22` | Fleet sweep deadline for tenant targets (same partial-results contract) |
+| `HEALTH_CHECK_TIMEOUT_SECS` | infrastructure-health-check.sh | `30` | Per-component outer timeout; a component killed after emitting valid JSON keeps its partial report |
+| `LUNARWING_HEALTH_PATH` | cron-wrapper.sh | _(unset)_ | Appended to the safe PATH (which includes `/usr/local/sbin:/usr/sbin` for admin tools) |
 | `HEALTH_OPENRC_CRON_DIRS` | health-openrc.sh | `/etc/cron.hourly /etc/periodic/hourly` | Cron hook dirs scanned for the watchdog hook (scheduler blind-spot check) |
 | `AGENTS` | health-launchd.sh | auto-discovered | Override the launchd labels to probe |
 
