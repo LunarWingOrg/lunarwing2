@@ -63,11 +63,12 @@ THRESHOLD_lunarwing_health_lunarvision_cache_hit_rate="warn:<0.5"
 THRESHOLD_lunarwing_health_netbird_ready="crit:<1"
 
 # Service-manager units: worst unit status (0=healthy 1=degraded 2=critical
-# 3=unknown). Rules evaluate the LARGEST value across all label sets, so
-# "any unhealthy unit" = max of unit_status > 0. (For 0/1 up-down gauges like
-# unit_up, <1 rules only fire when EVERY unit is down — that is why this
-# example uses unit_status instead of unit_up.)
-THRESHOLD_lunarwing_health_unit_status="warn:>0 crit:>1"
+# 3=unknown 4=skipped). Rules evaluate the LARGEST value across all label sets.
+# Intentionally skipped units (status 4, e.g. an unselected worker or a
+# disabled WeeChat backend) are NOT failures, so the example uses equality
+# forms: warn exactly on degraded, crit exactly on critical — skips and
+# unknowns never raise an early warning (WI#180 F5).
+THRESHOLD_lunarwing_health_unit_status="warn:==1 crit:==2"
 
 # Self-heal remediation pressure: many restarts for one service in the flap
 # window is the classic precursor to an escalation page.

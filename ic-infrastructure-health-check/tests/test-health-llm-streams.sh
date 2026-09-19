@@ -102,5 +102,96 @@ assert_contains "$exposition" 'lunarwing_health_llm_streams_corruption_repeated_
 assert_contains "$exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' "S5: REPL corruption exports with tenant and provider labels"
 assert_contains "$exposition" 'lunarwing_health_llm_streams_ttfc_max_ms{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 400' "S5: TTFC exports"
 
+# ── S6: collector → driver → saved report → exporter (WI#180 F2) ─────────────
+# The driver previously dropped check_llm_streams from the final serialized
+# components array: the report degraded with an llm_streams alert but no stream
+# component, and the exporter emitted zero llm_streams metric lines.
+driver_dir="$ROOT/driver"
+mkdir -p "$driver_dir"
+cp "$DIR/../infrastructure-health-check.sh" "$driver_dir/"
+cp "$CHECK" "$driver_dir/health-llm-streams.sh"
+for stub in gateway xmpp omemo ratelimit clickhouse tensorzero models lunarvision lunarvoice netbird; do
+    cat >"$driver_dir/health-$stub.sh" <<EOF
+#!/usr/bin/env bash
+printf '{"component":"$stub","status":"healthy","metrics":{}}'
+EOF
+done
+cat >"$driver_dir/health-systemd.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '{"component":"systemd","status":"healthy","metrics":{}}'
+EOF
+cat >"$driver_dir/send-notification.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$driver_dir"/*.sh
+recent="$(date +%s)"
+write_snapshot "$snapshot" "$recent"
+driver_report_dir="$ROOT/driver-reports"
+mkdir -p "$driver_report_dir"
+env HEALTH_LLM_STREAMS_FILE="$snapshot" HEALTH_LLM_STREAMS_TENANT=alpha \
+    LUNARWING_BASE_DIR="$ROOT/driver-base" HEALTHCHECK_NOTIFY=false \
+    bash "$driver_dir/infrastructure-health-check.sh" >"$ROOT/driver-out.json" 2>/dev/null
+driver_rc=$?
+# The driver writes reports under <base>/workspace/reports/health — copy the
+# saved report so the exporter reads the REAL driver output (not a hand-built one).
+saved_report="$(ls "$ROOT/driver-base/workspace/reports/health"/*.json 2>/dev/null | tail -1)"
+assert_eq "$driver_rc" "1" "S6: driver exits degraded with a recent stream issue"
+assert_contains "$(jq -r '.components[] | select(.component=="llm_streams") | .status' "$saved_report" 2>/dev/null)" "degraded" \
+    "S6: llm_streams component serialized in the saved report"
+assert_eq "$(jq -r '[.components[] | select(.component=="llm_streams")] | length' "$saved_report" 2>/dev/null)" "1" \
+    "S6: exactly one llm_streams component in the saved report"
+assert_contains "$(jq -r '.alerts[].message' "$saved_report" 2>/dev/null)" "llm_streams is degraded" \
+    "S6: llm_streams alert preserved"
+HEALTH_REPORT_DIR="$ROOT/driver-base/workspace/reports/health" HEALTH_METRICS_OUTPUT="$ROOT/driver-metrics.prom" \
+    "$EXPORTER" >/dev/null 2>&1
+driver_exposition="$(cat "$ROOT/driver-metrics.prom")"
+assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_repl_argument_corruption_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 4' \
+    "S6: exporter emits REPL corruption from the driver-saved report"
+assert_contains "$driver_exposition" 'lunarwing_health_llm_streams_retries_total{provider="tensorzero::function_name::FrontierTEE/P",tenant="alpha"} 3' \
+    "S6: exporter emits stream counters from the driver-saved report"
+assert_contains "$driver_exposition" 'lunarwing_health_status{component="llm_streams"} 1' \
+    "S6: llm_streams component status exported"
+
+# ── S7: driver keeps partial JSON when a component hits the outer timeout ─────
+# (WI#180 F4). A slow openrc component emits its partial report (completed
+# observations + unprobed entries) before the driver's outer timeout kills it;
+# the driver must keep that JSON instead of replacing it with unknown/timeout.
+slow_dir="$ROOT/slow-driver"
+mkdir -p "$slow_dir"
+cp "$DIR/../infrastructure-health-check.sh" "$slow_dir/"
+cat >"$slow_dir/health-openrc.sh" <<'EOF'
+#!/usr/bin/env bash
+# Emit a valid partial report immediately, then stall past the outer timeout.
+printf '%s\n' '{"component":"openrc","status":"degraded","metrics":{"services":[{"name":"lunarwing-acme","state":"started","status":"healthy"},{"name":"lunarwing-pg-acme","state":"unprobed","status":"skipped"}]},"issues":["service sweep incomplete: 1 service(s) unprobed"]}'
+sleep 60
+EOF
+chmod +x "$slow_dir/health-openrc.sh"
+for stub in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird; do
+    cat >"$slow_dir/health-$stub.sh" <<EOF
+#!/usr/bin/env bash
+printf '{"component":"$stub","status":"healthy","metrics":{}}'
+EOF
+done
+cat >"$slow_dir/send-notification.sh" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$slow_dir"/*.sh
+slow_report_dir="$ROOT/slow-reports"
+mkdir -p "$slow_report_dir"
+env LUNARWING_SERVICE_MANAGER=openrc LUNARWING_BASE_DIR="$ROOT/slow-base" \
+    HEALTHCHECK_NOTIFY=false HEALTH_CHECK_TIMEOUT_SECS=3 \
+    bash "$slow_dir/infrastructure-health-check.sh" >"$ROOT/slow-out.json" 2>/dev/null
+slow_rc=$?
+slow_saved="$(ls "$ROOT/slow-base/workspace/reports/health"/*.json 2>/dev/null | tail -1)"
+assert_eq "$slow_rc" "1" "S7: driver exits degraded on partial timeout"
+assert_eq "$(jq -r '.components[] | select(.component=="openrc") | .status' "$slow_saved" 2>/dev/null)" "degraded" \
+    "S7: partial openrc JSON retained in the saved report"
+assert_eq "$(jq -r '.components[] | select(.component=="openrc") | .metrics.services[0].name' "$slow_saved" 2>/dev/null)" "lunarwing-acme" \
+    "S7: completed service observation retained"
+assert_eq "$(jq -r '.components[] | select(.component=="openrc") | .metrics.services[1].state' "$slow_saved" 2>/dev/null)" "unprobed" \
+    "S7: unprobed service entry retained"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
