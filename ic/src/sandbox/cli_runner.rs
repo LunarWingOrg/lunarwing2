@@ -477,10 +477,20 @@ impl CliRunner {
         limits: &ResourceLimits,
     ) -> Result<ContainerOutput> {
         // Spawn through the workload spawner: fresh process group +
-        // kill_on_drop + systemd scope isolation when available (BUG-005).
+        // kill_on_drop + systemd transient-service isolation when available
+        // (BUG-005, WI#178/WI#181). The service context is required for the
+        // podman CLI: a daemon-forked child inherits the daemon's
+        // NoNewPrivileges/PrivateTmp context and cannot join the tenant's
+        // rootless user namespace.
         let spawner = crate::tools::process::workload_spawner().await;
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let mut cmd = spawner.command(self.runtime.binary(), &arg_refs);
+
+        // In service mode the manager forks the workload, so the environment
+        // must be handed over via EnvironmentFile= (mode 0600, deleted after
+        // the run) instead of process inheritance. Rebuilds the command, so
+        // stdio must be set after this call.
+        let spec = spawner.prepare_service(&mut cmd);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
@@ -499,7 +509,11 @@ impl CliRunner {
 
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+        let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+            &child,
+            spec.as_ref(),
+            spawner.xdg_runtime_dir(),
+        );
 
         // Drain both pipes concurrently so the child never blocks on a full
         // pipe; collection continues past the cap until EOF.
@@ -513,12 +527,12 @@ impl CliRunner {
             Err(_) => {
                 // Killing the CLI client does not stop the container (conmon
                 // owns it) — kill by name too; `--rm` then cleans it up.
-                guard.kill_tree();
+                guard.kill_tree().await;
                 self.kill_by_name(name).await;
                 Err(SandboxError::Timeout(limits.timeout))
             }
             Ok(Err(e)) => {
-                guard.kill_tree();
+                guard.kill_tree().await;
                 self.kill_by_name(name).await;
                 Err(SandboxError::ExecutionFailed {
                     reason: format!("container wait failed: {e}"),
