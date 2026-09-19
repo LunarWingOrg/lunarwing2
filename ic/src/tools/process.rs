@@ -477,11 +477,18 @@ impl ProcessTreeGuard {
         guard
     }
 
+    /// Remove the transient unit's environment file, if any. Idempotent.
+    fn cleanup_env_file(&mut self) {
+        if let Some(path) = self.env_file.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Stop signaling on drop (child already exited and was reaped).
     pub fn disarm(&mut self) {
         self.pgid = None;
         self.unit = None;
-        self.env_file = None;
+        self.cleanup_env_file();
     }
 
     #[cfg(unix)]
@@ -522,7 +529,7 @@ impl ProcessTreeGuard {
             Self::signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
         }
         self.unit = None;
-        self.env_file = None;
+        self.cleanup_env_file();
     }
 
     /// SIGTERM the tree, wait up to [`TERMINATE_GRACE`], then SIGKILL and reap.
@@ -534,6 +541,7 @@ impl ProcessTreeGuard {
         }
         let Some(pgid) = self.pgid.take() else {
             self.unit = None;
+            self.cleanup_env_file();
             return;
         };
         #[cfg(unix)]
@@ -566,7 +574,7 @@ impl ProcessTreeGuard {
             let _ = child.kill().await;
         }
         self.unit = None;
-        self.env_file = None;
+        self.cleanup_env_file();
     }
 }
 
@@ -577,9 +585,7 @@ impl Drop for ProcessTreeGuard {
             Self::signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
         }
         self.unit = None;
-        if let Some(path) = self.env_file.take() {
-            let _ = std::fs::remove_file(path);
-        }
+        self.cleanup_env_file();
     }
 }
 
