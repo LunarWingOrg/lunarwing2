@@ -813,9 +813,9 @@ KillSignal=SIGTERM
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-# BUG-005: the daemon is capped separately from its transient workloads;
-# shell/compile jobs run in lunarwing-workloads.slice scopes (see
-# ic/src/tools/process.rs), so their memory never lands here.
+# BUG-005/WI#181: the daemon is capped separately from its transient workloads;
+# shell/compile jobs run as transient services under lunarwing-workloads.slice
+# (see ic/src/tools/process.rs), so their memory never lands here.
 MemoryHigh=$DAEMON_MEMORY_HIGH
 MemoryMax=$DAEMON_MEMORY_MAX
 TasksMax=$DAEMON_TASKS_MAX
@@ -824,10 +824,11 @@ TasksMax=$DAEMON_TASKS_MAX
 WantedBy=default.target
 EOF
 
-  # BUG-005: transient workload slices. Agent-spawned shell/compile jobs run
-  # as scopes under lunarwing-workloads.slice; operator-driven builds
-  # (build_tenant) run under lunarwing-build.slice. Slice names are constant
-  # across tenants because each tenant has its own systemd user manager.
+  # BUG-005/WI#181: transient workload slices. Agent-spawned shell/compile jobs
+  # run as transient services under lunarwing-workloads.slice; operator-driven
+  # builds (build_tenant) run under lunarwing-build.slice. Slice names are
+  # constant across tenants because each tenant has its own systemd user
+  # manager.
   cat >"$user_unit_dir/$WORKLOAD_SLICE" <<EOF
 [Unit]
 Description=LunarWing transient agent workloads ($name)

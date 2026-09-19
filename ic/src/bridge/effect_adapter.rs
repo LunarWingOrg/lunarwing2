@@ -506,7 +506,17 @@ impl EffectBridgeAdapter {
             "mission_delete" => {
                 let id = Self::resolve_mission_id(params, context, mgr).await;
                 match id {
-                    Ok(id) => match mgr.delete_mission(id, &context.user_id).await {
+                    Ok(id) => match mgr
+                        .delete_mission_with_purge(
+                            id,
+                            &context.user_id,
+                            params
+                                .get("purge_insights")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        )
+                        .await
+                    {
                         Ok(()) => Ok(serde_json::json!({"status": "deleted"})),
                         Err(e) => Err(e),
                     },

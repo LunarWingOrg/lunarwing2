@@ -40,10 +40,17 @@ pub enum SandboxNetworkMode {
     /// injection). Advisory: enforced via `http_proxy`/`https_proxy` env vars
     /// set in the container, so a process that ignores proxy env vars can
     /// still reach the network directly.
-    #[default]
     Proxy,
+    /// Network-isolated container plus a per-execution Unix-socket relay to
+    /// the allowlist proxy (WI#155): the container keeps `--network none` and
+    /// can only reach the validating proxy through a loopback-side relay. The
+    /// proxy rejects non-public destinations and pins DNS in this mode.
+    /// Requires a local Linux runtime and Python 3 in the image; relay setup
+    /// failures fail closed — they never degrade to direct egress.
+    ProxyEnforced,
     /// Hard network isolation: containers run with `--network none`. No
     /// egress at all, kernel-enforced; the proxy is not started.
+    #[default]
     None,
 }
 
@@ -53,9 +60,10 @@ impl std::str::FromStr for SandboxNetworkMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "proxy" | "allowlist" => Ok(SandboxNetworkMode::Proxy),
+            "proxy-enforced" | "proxy_enforced" => Ok(SandboxNetworkMode::ProxyEnforced),
             "none" | "off" => Ok(SandboxNetworkMode::None),
             _ => Err(format!(
-                "invalid sandbox network mode '{s}', expected 'proxy' or 'none'"
+                "invalid sandbox network mode '{s}', expected 'proxy', 'proxy-enforced', or 'none'"
             )),
         }
     }
@@ -91,7 +99,7 @@ pub struct SandboxConfig {
     pub proxy_port: u16,
     /// Container runtime to drive (default: auto — podman preferred).
     pub runtime: SandboxRuntime,
-    /// Network egress mode for sandboxed policies (default: proxy).
+    /// Network egress mode for sandboxed policies (default: none).
     pub network: SandboxNetworkMode,
 }
 
@@ -109,7 +117,7 @@ impl Default for SandboxConfig {
             auto_pull_image: true,
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
-            network: SandboxNetworkMode::Proxy,
+            network: SandboxNetworkMode::None,
         }
     }
 }
@@ -129,8 +137,8 @@ impl Default for SandboxConfig {
 /// ```
 ///
 /// For sandboxed policies the egress mode comes from
-/// [`SandboxNetworkMode`]: `Proxy` (default, allowlist via the HTTP proxy)
-/// or `None` (`--network none`, kernel-enforced isolation).
+/// [`SandboxNetworkMode`]: `None` (default), `ProxyEnforced` (isolated
+/// allowlist web access), or the legacy advisory `Proxy` mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxPolicy {
     /// Read-only access to workspace, proxied network.
@@ -214,6 +222,17 @@ impl Default for ResourceLimits {
             max_output_bytes: 64 * 1024, // 64 KB
         }
     }
+}
+
+/// Default per-container process limit (`--pids-limit`, WI#179 concern 5).
+///
+/// Pinned explicitly rather than relying on runtime defaults, which vary
+/// between podman (4096) and docker (unlimited on older daemons).
+pub const DEFAULT_PIDS_LIMIT: u32 = 256;
+
+/// Default per-container process limit for [`crate::sandbox::cli_runner`].
+pub fn default_pids_limit() -> u32 {
+    DEFAULT_PIDS_LIMIT
 }
 
 /// Default network allowlist for common development operations.
@@ -335,6 +354,14 @@ mod tests {
             "off".parse::<SandboxNetworkMode>().unwrap(),
             SandboxNetworkMode::None
         );
+        assert_eq!(
+            "proxy-enforced".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::ProxyEnforced
+        );
+        assert_eq!(
+            "proxy_enforced".parse::<SandboxNetworkMode>().unwrap(),
+            SandboxNetworkMode::ProxyEnforced
+        );
         assert!("everything".parse::<SandboxNetworkMode>().is_err());
     }
 
@@ -342,6 +369,6 @@ mod tests {
     fn test_config_defaults_tiered_network() {
         let config = SandboxConfig::default();
         assert_eq!(config.runtime, SandboxRuntime::Auto);
-        assert_eq!(config.network, SandboxNetworkMode::Proxy);
+        assert_eq!(config.network, SandboxNetworkMode::None);
     }
 }

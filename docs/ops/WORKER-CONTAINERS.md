@@ -5,6 +5,23 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## Generic shell sandbox network policy (WI#154/155)
+
+The generic shell sandbox (`ic/src/sandbox/`) defaults to
+`SANDBOX_NETWORK=none`, in code and in mt-admin-rendered multi-tenant envs.
+`proxy-enforced` keeps `--network none` and exposes only a per-execution Unix
+relay to the public-only allowlist proxy — local Linux runtime and a
+Python-3-equipped image are required (the bundled `docker/sandbox.Dockerfile`
+image already includes Python 3). `proxy` remains as the legacy advisory mode.
+
+Rootless podman uses keep-id; rootless docker maps container root onto the
+host user; rootful docker maps numeric UIDs and refuses writable workspaces
+under a root daemon (never container root). The `--pids-limit` is pinned to
+256; the runtime's default seccomp filter is the supported contract. The
+cleanup path is the `ContainerCleanupGuard` detached kill/rm plus the
+API-independent bounded CLI sweep. See
+[`v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+
 ## LunarWing Worker
 
 The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.
@@ -17,6 +34,18 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 ```
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
+
+### Generic sandbox egress default (WI#154)
+
+The generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults to
+**`SANDBOX_NETWORK=none`** on multi-tenant hosts: mt-admin renders
+`SANDBOX_NETWORK=none` into every tenant's `lunarwing.env` (an operator-set
+`proxy` value is preserved on re-render). The advisory `proxy` mode lets a
+sandboxed process that ignores proxy env vars reach host-loopback services —
+worker WSS/health ports, tenant PostgreSQL, and cross-tenant loopback — so it
+is an explicit opt-in (`SANDBOX_NETWORK=proxy`) for tenants that genuinely
+need allowlisted web access. The enforced-proxy middle ground is tracked in
+WI#155. See `ic/src/NETWORK_SECURITY.md` §5 for the tier table.
 
 ## Pebble Worker
 

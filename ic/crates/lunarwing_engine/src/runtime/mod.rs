@@ -5,6 +5,7 @@
 //! - [`messaging`] — inter-thread signal channel
 
 pub mod conversation;
+pub(crate) mod insights;
 pub mod manager;
 pub mod messaging;
 pub mod mission;

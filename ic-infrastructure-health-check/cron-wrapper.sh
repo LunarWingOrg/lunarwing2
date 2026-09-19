@@ -20,8 +20,14 @@
 
 set -euo pipefail
 
-# Set safe PATH
-export PATH=/usr/local/bin:/usr/bin:/bin
+# Set safe PATH. Administrative tools (rc-service, supervise-daemon, podman,
+# systemctl, sudo) commonly live in the sbin directories, which cron's default
+# environment does not include. Dropping them meant the scheduled pipeline
+# could not discover or invoke rc-service on Gentoo-style installs even though
+# an administrator's shell could (WI#180 F3). /usr/local/sbin and /usr/sbin
+# are appended so the standard bin dirs keep precedence.
+# LUNARWING_HEALTH_PATH appends an operator/test-supplied directory last.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin${LUNARWING_HEALTH_PATH:+:$LUNARWING_HEALTH_PATH}
 
 # ── Detect script location ─────────────────────────────────
 

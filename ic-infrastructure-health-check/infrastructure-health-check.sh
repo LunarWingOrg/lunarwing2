@@ -64,9 +64,10 @@ run_check() {
     local exit_code=0
 
     # Run the check with timeout, capture stdout (JSON) and stderr (logs) separately
+    # CHECK_TIMEOUT_SECS is honored for tests; production default stays 30.
     local stderr_file
     stderr_file=$(mktemp "$WORKDIR/check-stderr.XXXXXX")
-    output=$(timeout 30 "$SCRIPT_DIR/$script" 2>"$stderr_file") || exit_code=$?
+    output=$(timeout "${HEALTH_CHECK_TIMEOUT_SECS:-30}" "$SCRIPT_DIR/$script" 2>"$stderr_file") || exit_code=$?
     # Append any stderr from the check to the log
     [ -s "$stderr_file" ] && cat "$stderr_file" >> "$LOG_FILE"
     rm -f "$stderr_file"
@@ -75,7 +76,17 @@ run_check() {
     local duration=$((end - start))
 
     if [ $exit_code -eq 124 ]; then
-        log "WARNING: $component check timed out after 30 seconds"
+        # A component that emitted valid partial JSON before the outer timeout
+        # still carries usable fleet observations — keep them instead of
+        # discarding everything (WI#180 F4). The component's own deadline logic
+        # marks incomplete sweeps; here we only fall back to `unknown` when
+        # nothing usable arrived.
+        if [ -n "$output" ] && echo "$output" | jq . >/dev/null 2>&1; then
+            log "WARNING: $component check timed out after ${HEALTH_CHECK_TIMEOUT_SECS:-30} seconds; keeping partial JSON"
+            echo "$output" | jq --argjson d "$duration" '. + {duration_seconds: $d}'
+            return 1
+        fi
+        log "WARNING: $component check timed out after ${HEALTH_CHECK_TIMEOUT_SECS:-30} seconds"
         echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"timeout\", \"duration_seconds\": $duration}"
         return 1
     fi
@@ -121,6 +132,8 @@ run_check "health-llm-streams.sh" "llm_streams" > "$WORKDIR/check-llm-streams.tm
 run_check "health-lunarvision.sh" "lunarvision" > "$WORKDIR/check-lunarvision.tmp" 2> "$WORKDIR/log-lunarvision.tmp" &
 run_check "health-lunarvoice.sh" "lunarvoice" > "$WORKDIR/check-lunarvoice.tmp" 2> "$WORKDIR/log-lunarvoice.tmp" &
 run_check "health-netbird.sh" "netbird" > "$WORKDIR/check-netbird.tmp" 2> "$WORKDIR/log-netbird.tmp" &
+run_check "health-runtime.sh" "runtime" > "$WORKDIR/check-runtime.tmp" 2> "$WORKDIR/log-runtime.tmp" &
+run_check "health-knowledge.sh" "knowledge" > "$WORKDIR/check-knowledge.tmp" 2> "$WORKDIR/log-knowledge.tmp" &
 case "$SERVICE_MANAGER" in
   systemd) run_check "health-systemd.sh" "systemd" > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
   openrc)  run_check "health-openrc.sh"  "openrc"  > "$WORKDIR/check-svcmgr.tmp" 2> "$WORKDIR/log-svcmgr.tmp" & ;;
@@ -132,7 +145,7 @@ esac
 wait || true
 
 # Append logs to main log file
-for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird svcmgr; do
+for comp in gateway xmpp omemo ratelimit clickhouse tensorzero models llm-streams lunarvision lunarvoice netbird runtime knowledge svcmgr; do
     [ -f "$WORKDIR/log-${comp}.tmp" ] && cat "$WORKDIR/log-${comp}.tmp" >> "$LOG_FILE" && rm -f "$WORKDIR/log-${comp}.tmp"
 done
 
@@ -148,6 +161,8 @@ check_llm_streams=$(cat "$WORKDIR/check-llm-streams.tmp" 2>/dev/null || echo)
 check_lunarvision=$(cat "$WORKDIR/check-lunarvision.tmp" 2>/dev/null || echo)
 check_lunarvoice=$(cat "$WORKDIR/check-lunarvoice.tmp" 2>/dev/null || echo)
 check_netbird=$(cat "$WORKDIR/check-netbird.tmp" 2>/dev/null || echo)
+check_runtime=$(cat "$WORKDIR/check-runtime.tmp" 2>/dev/null || echo)
+check_knowledge=$(cat "$WORKDIR/check-knowledge.tmp" 2>/dev/null || echo)
 check_svcmgr=$(cat "$WORKDIR/check-svcmgr.tmp" 2>/dev/null || echo)
 
 # Cleanup temp files (the WORKDIR itself is removed by the EXIT trap)
@@ -161,11 +176,12 @@ components=(
     "${check_ratelimit:-}"
     "$check_clickhouse"
     "$check_tensorzero"
-    "$check_models"
-    "$check_llm_streams"
+    "$check_models" "$check_llm_streams"
     "$check_lunarvision"
     "$check_lunarvoice"
     "$check_netbird"
+    "$check_runtime"
+    "$check_knowledge"
     "${check_svcmgr:-}"
 )
 
@@ -205,7 +221,8 @@ components_json=""
 for comp in "$check_gateway" "$check_xmpp" \
     "${check_omemo:-}" "${check_ratelimit:-}" \
     "$check_clickhouse" "$check_tensorzero" \
-    "$check_models" "$check_lunarvision" "$check_lunarvoice" "$check_netbird" \
+    "$check_models" "$check_llm_streams" \
+    "$check_lunarvision" "$check_lunarvoice" "$check_netbird" "$check_runtime" "$check_knowledge" \
     "${check_svcmgr:-}"; do
     if [ -n "$comp" ] && echo "$comp" | jq . >/dev/null 2>&1; then
         if [ -n "$components_json" ]; then

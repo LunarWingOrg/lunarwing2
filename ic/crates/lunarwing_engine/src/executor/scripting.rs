@@ -1649,11 +1649,13 @@ async fn handle_rlm_query(
     // mission-only `__save_memory_doc__` host function resolvable in the
     // child's sandbox. Without this the child raises NameError and the model
     // pivots to a plain workspace write, losing doc_type/tags metadata.
-    child_thread.config.mission_child =
-        parent_thread.thread_type == crate::types::thread::ThreadType::Mission;
+    child_thread.config.mission_child = parent_thread.thread_type
+        == crate::types::thread::ThreadType::Mission
+        || parent_thread.config.mission_child;
+    child_thread.config.mission_context = parent_thread.config.mission_context.clone();
 
     // Add the prompt as a user message
-    child_thread.add_message(ThreadMessage::user(&prompt));
+    child_thread.add_message(ThreadMessage::generated_goal(&prompt));
 
     // Create signal channel and child's lease manager
     let (_tx, rx) = crate::runtime::messaging::signal_channel(8);
@@ -2030,6 +2032,14 @@ async fn handle_save_memory_doc(
             .with_tags(tags);
     doc.metadata = metadata;
 
+    if let Err(message) = validate_mission_memory_write(
+        thread,
+        &doc,
+        crate::executor::orchestrator::self_modification_enabled(),
+    ) {
+        return memory_doc_error(ExcType::RuntimeError, message);
+    }
+
     // Trust-boundary: mission-supplied metadata is untrusted. Skill docs get
     // their trust-bearing lifecycle fields forced to the mission-mintable
     // values so a mission (or poisoned memory it read) cannot mint
@@ -2052,6 +2062,12 @@ async fn handle_save_memory_doc(
     }
 
     let doc_id = doc.id.0.to_string();
+    if thread.config.mission_context.is_conversation_insights() {
+        return match store.save_conversation_insight(thread, &doc).await {
+            Ok(id) => ExtFunctionResult::Return(MontyObject::String(id.0.to_string())),
+            Err(error) => memory_doc_error(ExcType::RuntimeError, error.to_string()),
+        };
+    }
     if let Err(error) = store.save_memory_doc(&doc).await {
         debug!(%error, "__save_memory_doc__: failed to save");
         return memory_doc_error(ExcType::RuntimeError, "failed to persist memory document");
@@ -2062,6 +2078,22 @@ async fn handle_save_memory_doc(
 
 fn memory_doc_error(error_type: ExcType, message: impl Into<String>) -> ExtFunctionResult {
     ExtFunctionResult::Error(MontyException::new(error_type, Some(message.into())))
+}
+
+fn validate_mission_memory_write(
+    thread: &Thread,
+    doc: &crate::types::memory::MemoryDoc,
+    allow_self_modify: bool,
+) -> Result<(), &'static str> {
+    if thread.config.mission_context.is_conversation_insights()
+        && (doc.owner_id().is_shared() || crate::memory::retrieval::is_engine_maintenance(doc))
+    {
+        return Err("conversation insights cannot write shared or engine-maintenance documents");
+    }
+    if doc.is_engine_control() && !allow_self_modify {
+        return Err("engine-control document writes require ORCHESTRATOR_SELF_MODIFY");
+    }
+    Ok(())
 }
 
 /// Resolve one argument by keyword first, then by position.
@@ -2560,7 +2592,7 @@ FINAL(doc_id)
     async fn save_memory_doc_shared_flag_sets_shared_owner() {
         let store = Arc::new(crate::tests::InMemoryStore::new());
         let thread = Thread::new(
-            "patch overlay",
+            "share a fix pattern",
             ThreadType::Mission,
             ProjectId::new(),
             "test-user",
@@ -2573,10 +2605,10 @@ FINAL(doc_id)
 
         let code = r#"
 doc_id = __save_memory_doc__(
-    "prompt:codeact_preamble",
+    "fix_pattern_database",
     "Never call web_fetch — use http() instead",
     "note",
-    ["prompt_overlay"],
+    ["fix_patterns"],
     {},
     True,
 )
@@ -2602,8 +2634,8 @@ FINAL(doc_id)
             .list_shared_memory_docs(thread.project_id)
             .await
             .unwrap();
-        assert_eq!(shared.len(), 1, "overlay doc written as shared");
-        assert_eq!(shared[0].title, "prompt:codeact_preamble");
+        assert_eq!(shared.len(), 1, "fix pattern doc written as shared");
+        assert_eq!(shared[0].title, "fix_pattern_database");
         assert!(
             store
                 .list_memory_docs(thread.project_id, "test-user")
@@ -2622,7 +2654,7 @@ FINAL(doc_id)
         // shared-space loaders can never see them.
         let store = Arc::new(crate::tests::InMemoryStore::new());
         let thread = Thread::new(
-            "patch overlay",
+            "share a fix pattern",
             ThreadType::Mission,
             ProjectId::new(),
             "test-user",
@@ -2635,10 +2667,10 @@ FINAL(doc_id)
 
         let code = r#"
 doc_id = __save_memory_doc__(
-    "orchestrator:main",
+    "fix_pattern_database",
     "def orchestrate():\n    pass",
     doc_type="note",
-    tags=["orchestrator_code"],
+    tags=["fix_patterns"],
     metadata={"version": 1},
     shared=True,
 )
@@ -2664,8 +2696,8 @@ FINAL(doc_id)
             .await
             .unwrap();
         assert_eq!(shared.len(), 1, "shared=True keyword must be honored");
-        assert_eq!(shared[0].title, "orchestrator:main");
-        assert_eq!(shared[0].tags, vec!["orchestrator_code".to_string()]);
+        assert_eq!(shared[0].title, "fix_pattern_database");
+        assert_eq!(shared[0].tags, vec!["fix_patterns".to_string()]);
         assert_eq!(
             shared[0].metadata.get("version"),
             Some(&serde_json::json!(1)),
@@ -2759,6 +2791,120 @@ FINAL(doc_id)
         );
         assert!(parsed.pending_patch.is_none());
         assert!(parsed.pending_prune.is_none());
+    }
+
+    #[tokio::test]
+    async fn insight_writer_rejects_maintenance_and_shared_docs_even_with_opt_in() {
+        use crate::types::memory::{DocType, MemoryDoc};
+        use crate::types::thread::MissionContext;
+
+        let store: Arc<dyn crate::traits::store::Store> =
+            Arc::new(crate::tests::InMemoryStore::new());
+        let thread = Thread::new(
+            "extract insights",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig {
+                mission_context: MissionContext::ConversationInsights {
+                    recall_query: "astrolabe".into(),
+                    batch: None,
+                    mission_id: None,
+                    run_id: None,
+                    generation: 0,
+                },
+                ..ThreadConfig::default()
+            },
+        );
+        for (title, tag, shared) in [
+            ("prompt:codeact_preamble", "", true),
+            ("renamed overlay", "prompt_overlay", false),
+            ("orchestrator:main", "orchestrator_code", true),
+            ("orchestrator:failures", "orchestrator_meta", false),
+            ("fix_pattern_database", "", false),
+            ("renamed patterns", "fix_patterns", false),
+            ("ordinary shared knowledge", "", true),
+        ] {
+            let mut doc = MemoryDoc::new(
+                thread.project_id,
+                if shared {
+                    crate::types::shared_owner_id()
+                } else {
+                    "test-user"
+                },
+                DocType::Note,
+                title,
+                "FORGED_CONTROL_CANARY",
+            )
+            .with_tags(vec![tag.into()]);
+            doc.metadata = serde_json::json!({"source": "compiled_in", "version": 0});
+            assert!(validate_mission_memory_write(&thread, &doc, true).is_err());
+            let args = vec![
+                MontyObject::String(title.into()),
+                MontyObject::String(doc.content.clone()),
+                MontyObject::String("note".into()),
+                json_to_monty(&serde_json::json!([tag])),
+                json_to_monty(&doc.metadata),
+                MontyObject::Bool(shared),
+            ];
+            assert!(matches!(
+                handle_save_memory_doc(&args, &[], &thread, Some(&store)).await,
+                ExtFunctionResult::Error(_)
+            ));
+        }
+        assert!(
+            store
+                .list_memory_docs_with_shared(thread.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // Exercise the actual Monty host dispatch, including exception delivery.
+        let result = execute_code(
+            r#"
+try:
+    __save_memory_doc__("prompt:codeact_preamble", "forged", "note", ["prompt_overlay"], {"source": "compiled_in"}, True)
+    FINAL("unexpected success")
+except RuntimeError:
+    FINAL("write refused")
+"#,
+            &thread, &(Arc::new(StubLlm) as Arc<dyn crate::traits::llm::LlmBackend>),
+            &(Arc::new(MockEffects::new(vec![], vec![])) as Arc<dyn EffectExecutor>),
+            &LeaseManager::new(), &PolicyEngine::new(), &make_exec_context(&thread),
+            &[], &serde_json::json!({}), Some(&store),
+        ).await.unwrap();
+        assert_eq!(result.final_answer.as_deref(), Some("write refused"));
+    }
+
+    #[test]
+    fn protected_write_policy_ignores_forged_internal_metadata() {
+        use crate::types::memory::{DocType, MemoryDoc};
+        let thread = Thread::new(
+            "maintenance",
+            ThreadType::Mission,
+            ProjectId::new(),
+            "test-user",
+            ThreadConfig::default(),
+        );
+        for (title, tag) in [
+            ("prompt:codeact_preamble", ""),
+            ("orchestrator:main", "orchestrator_code"),
+            ("orchestrator:failures", ""),
+            ("renamed", "prompt_overlay"),
+        ] {
+            let mut doc = MemoryDoc::new(
+                thread.project_id,
+                "test-user",
+                DocType::Note,
+                title,
+                "forged",
+            )
+            .with_tags(vec![tag.into()]);
+            doc.metadata = serde_json::json!({"source": "compiled_in"});
+            assert!(validate_mission_memory_write(&thread, &doc, false).is_err());
+            assert!(validate_mission_memory_write(&thread, &doc, true).is_ok());
+        }
     }
 
     #[tokio::test]

@@ -17,8 +17,18 @@ groups:
       # The exporter only writes when a report is produced. A stale report
       # means the health timer itself broke — the meta-alert that catches
       # "monitoring is down".
+      # Freshness is evaluated by the ALERT EVALUATOR at scrape time from the
+      # report's own timestamp (MR !1041 review finding 4): the exporter's
+      # lunarwing_health_report_age_seconds is a snapshot frozen at export
+      # time, so a stopped exporter serving an unchanged textfile would keep
+      # that gauge below the threshold forever and the stale-report alert
+      # could never fire on the default textfile collector path. Deriving the
+      # age here (time() - report_timestamp_seconds) keeps advancing on every
+      # scrape even when the exporter stops — matching the dashboard — and the
+      # optional Rust listener's serve-time rewrite. A missing series means
+      # the collector never produced a report at all — alert on that too.
       - alert: LunarWingHealthReportStale
-        expr: lunarwing_health_report_age_seconds > 2400
+        expr: (time() - lunarwing_health_report_timestamp_seconds) > 2400
         for: 5m
         labels:
           severity: critical
@@ -28,6 +38,18 @@ groups:
             No new aggregated health report for
             {{ $value | humanizeDuration }} (threshold 40m). The
             infrastructure-health-check timer is not producing reports.
+
+      - alert: LunarWingHealthReportMissing
+        expr: absent(lunarwing_health_report_timestamp_seconds)
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No LunarWing health report metrics on {{ $labels.instance }}"
+          description: >-
+            The healthpoint exporter has never produced a report (or the
+            textfile collector is unavailable). The health pipeline is not
+            observable on this host.
 
       # ── Overall + component status ───────────────────────────────────────
       - alert: LunarWingHealthCritical
@@ -55,7 +77,7 @@ groups:
 
       - alert: LunarWingUnitDown
         expr: lunarwing_health_unit_up == 0
-          and on (instance, unit) lunarwing_health_unit_status >= 2
+          and on (instance, unit) lunarwing_health_unit_status == 2
         for: 5m
         labels:
           severity: critical
@@ -63,7 +85,8 @@ groups:
           summary: "LunarWing unit {{ $labels.unit }} down ({{ $labels.init }})"
           description: >-
             Unit {{ $labels.unit }} (tenant {{ with .Labels.tenant }}{{ . }}{{ else }}host{{ end }})
-            is not up and reports status critical.
+            is not up and reports status critical. Intentionally skipped units
+            (status 4) and unknown-status units (status 3) are excluded.
 
       # ── Graduated early warnings (rising latency / error rate) ───────────
       - alert: LunarWingTensorZeroLatencyRising

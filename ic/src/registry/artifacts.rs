@@ -115,9 +115,9 @@ pub async fn build_wasm_component(
     }
 
     // Compile workloads run through the workload spawner (fresh process
-    // group, kill_on_drop, systemd scope when available) with a bounded
-    // timeout, so a stuck build cannot run unbounded in the daemon's cgroup
-    // (BUG-005).
+    // group, kill_on_drop, systemd transient service when available) with a
+    // bounded timeout, so a stuck build cannot run unbounded in the daemon's
+    // cgroup (BUG-005, WI#178/WI#181).
     let mut args = vec!["component", "build"];
     if release {
         args.push("--release");
@@ -130,9 +130,18 @@ pub async fn build_wasm_component(
         cmd.env("XDG_RUNTIME_DIR", dir);
     }
 
+    // In service mode the manager forks the workload, so the environment and
+    // working directory must be handed over via EnvironmentFile= (mode 0600,
+    // deleted after the run) and --working-directory=.
+    let spec = spawner.prepare_service(&mut cmd);
+
     // Inherited stdio (spawn default) so build output streams to the terminal.
     let mut child = cmd.spawn()?;
-    let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+    let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+        &child,
+        spec.as_ref(),
+        spawner.xdg_runtime_dir(),
+    );
     const WASM_BUILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
     let status = match tokio::time::timeout(WASM_BUILD_TIMEOUT, child.wait()).await {
         Ok(status) => {

@@ -34,8 +34,9 @@ struct ProxyState {
     decider: Arc<dyn NetworkPolicyDecider>,
     /// Credential resolver (maps secret names to values).
     credential_resolver: Arc<dyn CredentialResolver>,
-    /// Shared HTTP client for forwarding requests.
-    http_client: reqwest::Client,
+    /// Reject non-public destinations and pin DNS for proxy-enforced
+    /// containers (WI#155). Advisory-mode clients are unaffected.
+    public_only: bool,
     /// Request counter for logging.
     request_count: std::sync::atomic::AtomicU64,
     /// Whether the proxy is running.
@@ -77,16 +78,31 @@ pub struct HttpProxy {
 }
 
 impl HttpProxy {
-    /// Create a new HTTP proxy.
+    /// Create a new HTTP proxy (advisory egress: no destination filtering
+    /// beyond the allowlist decider).
     pub fn new(
         decider: Arc<dyn NetworkPolicyDecider>,
         credential_resolver: Arc<dyn CredentialResolver>,
+    ) -> Self {
+        Self::with_egress_policy(decider, credential_resolver, false)
+    }
+
+    /// Create a HTTP proxy; `public_only` additionally rejects non-public
+    /// destinations and pins DNS resolution for every outbound connection.
+    ///
+    /// The effect is not shared HTTP-client state: per-request clients are
+    /// built with explicit DNS pinning and disabled redirects so environment
+    /// proxies cannot bypass the pin and redirects re-enter policy checks.
+    pub(super) fn with_egress_policy(
+        decider: Arc<dyn NetworkPolicyDecider>,
+        credential_resolver: Arc<dyn CredentialResolver>,
+        public_only: bool,
     ) -> Self {
         Self {
             state: Arc::new(ProxyState {
                 decider,
                 credential_resolver,
-                http_client: reqwest::Client::new(),
+                public_only,
                 request_count: std::sync::atomic::AtomicU64::new(0),
                 running: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -276,6 +292,17 @@ async fn handle_connect(
         return error_response(StatusCode::FORBIDDEN, deny_body(reason));
     }
 
+    // Enforced egress: reject non-public targets and pin the CONNECT to the
+    // resolved public addresses (no re-resolution, no env-proxy bypass).
+    let pinned = if state.public_only {
+        match super::egress::resolve_public(&host, authority.port_u16().unwrap_or(443)).await {
+            Ok(addresses) => Some(addresses),
+            Err(reason) => return error_response(StatusCode::FORBIDDEN, deny_body(reason)),
+        }
+    } else {
+        None
+    };
+
     tracing::debug!("Proxy: allowing CONNECT to {}", target_addr);
 
     // Spawn a fire-and-forget task to establish the tunnel after the upgrade
@@ -287,8 +314,15 @@ async fn handle_connect(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let mut client_stream = TokioIo::new(upgraded);
-                match TcpStream::connect(&target).await {
-                    Ok(mut server_stream) => {
+                let connect = async {
+                    if let Some(addresses) = pinned {
+                        TcpStream::connect(addresses.as_slice()).await
+                    } else {
+                        TcpStream::connect(&target).await
+                    }
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
+                    Ok(Ok(mut server_stream)) => {
                         let tunnel_timeout = std::time::Duration::from_secs(30 * 60);
                         match tokio::time::timeout(
                             tunnel_timeout,
@@ -308,8 +342,8 @@ async fn handle_connect(
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Proxy: failed to connect to {}: {}", target, e);
+                    error => {
+                        tracing::debug!(?error, "Proxy: tunnel connection failed");
                     }
                 }
             }
@@ -329,14 +363,21 @@ async fn forward_request(
     decision: NetworkDecision,
     state: Arc<ProxyState>,
 ) -> std::result::Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-    let method = req.method().clone();
     let uri = req.uri().clone();
 
-    // Build the forwarded request
-    let mut builder = state.http_client.request(
-        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
-        uri.to_string(),
-    );
+    // Enforced egress: per-request client with DNS pinning, no redirect
+    // following (redirects re-enter allowlist checks instead of being followed
+    // on the host), and no environment proxy settings that could bypass DNS
+    // pinning.
+    let client = match forwarding_client(&uri, state.public_only).await {
+        Ok(client) => client,
+        Err(reason) => return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason))),
+    };
+
+    let method = req.method().clone();
+    let method =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
+    let mut builder = client.request(method, uri.to_string());
 
     // Copy headers (except hop-by-hop headers)
     for (name, value) in req.headers() {
@@ -438,6 +479,34 @@ async fn forward_request(
             ))
         }
     }
+}
+
+/// Build the forwarding HTTP client for one proxied request.
+///
+/// Advisory mode keeps the historical shared-client semantics (host redirects
+/// are followed transparently). Enforced mode constructs a client that never
+/// follows redirects (they are returned to the container, whose follow-up
+/// request re-enters the allowlist check), ignores environment proxy settings
+/// (so they cannot bypass DNS pinning), and pins every outbound connection to
+/// the previously resolved public addresses.
+async fn forwarding_client(
+    uri: &hyper::Uri,
+    public_only: bool,
+) -> std::result::Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30));
+    if public_only {
+        let url = url::Url::parse(&uri.to_string()).map_err(|_| "invalid proxy URL")?;
+        let host = url.host_str().ok_or("missing proxy host")?;
+        let port = url.port_or_known_default().ok_or("invalid proxy port")?;
+        let addresses = super::egress::resolve_public(host, port).await?;
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("cannot initialize proxy client: {e}"))
 }
 
 /// Check if a header is hop-by-hop (should not be forwarded).
@@ -569,6 +638,49 @@ mod tests {
         assert_eq!(
             deny_body("domain not in allowlist: evil.example".to_string()),
             "sandbox-proxy denied: domain not in allowlist: evil.example"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforced_proxy_blocks_allowlisted_loopback_for_http_and_connect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let proxy = HttpProxy::with_egress_policy(
+            Arc::new(crate::sandbox::proxy::AllowAllDecider),
+            Arc::new(NoCredentialResolver),
+            true,
+        );
+        let addr = proxy.start(0).await.unwrap();
+        for request in [
+            "GET http://127.0.0.1:43210/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "CONNECT 127.0.0.1:43210 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "GET http://[::ffff:127.0.0.1]:43210/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ] {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_to_string(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains("sandbox-proxy denied:"));
+        }
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn enforced_mode_uses_pinned_request_clients() {
+        // redirect::Policy::none() + no_proxy() are the contract that keeps
+        // DNS pinning meaningful: a stray env proxy cannot bypass the pin and
+        // redirects come back to the container for re-validation.
+        let uri: hyper::Uri = "http://127.0.0.1:1/path".parse().unwrap();
+        assert!(
+            forwarding_client(&uri, true).await.is_err(),
+            "non-public targets never reach a forwarding client"
         );
     }
 }

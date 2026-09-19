@@ -90,7 +90,49 @@ pub trait Store: Send + Sync {
     // ── Memory doc operations ───────────────────────────────
 
     async fn save_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError>;
+
+    /// Host-only persistence for compiled seeds and engine failure bookkeeping.
+    /// Never expose this operation to model tools or select it from document
+    /// metadata: `source: compiled_in` is data, not write authority.
+    async fn save_internal_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        self.save_memory_doc(doc).await
+    }
+
     async fn load_memory_doc(&self, id: DocId) -> Result<Option<MemoryDoc>, EngineError>;
+    /// Atomic evidence validation, run-budget enforcement, and insight upsert.
+    ///
+    /// Implementations must serialize validation+publication with mission
+    /// lifecycle persistence (status/generation changes that pause or revoke
+    /// a run) and with insight purge, so a revoked run cannot publish and a
+    /// purge cannot race an in-flight save. Insight missions are tombstoned
+    /// rather than hard-deleted, so `delete_mission` never interacts with
+    /// insight documents; validation additionally fail-closes when the
+    /// mission is missing, inactive, or the run was never reserved.
+    /// Unsupported adapters deny the call.
+    async fn save_conversation_insight(
+        &self,
+        _thread: &Thread,
+        _doc: &MemoryDoc,
+    ) -> Result<DocId, EngineError> {
+        Err(EngineError::Store {
+            reason: "atomic insight persistence is unavailable".into(),
+        })
+    }
+
+    /// Delete only host-minted insight documents — those carrying a validated
+    /// insight record — in this exact project/owner scope. Model- or
+    /// user-authored titles/tags must never widen the purge: `purge_insights`
+    /// is model-invocable, so a doc that merely looks like an insight must
+    /// survive it.
+    async fn purge_conversation_insights(
+        &self,
+        _project_id: ProjectId,
+        _user_id: &str,
+    ) -> Result<usize, EngineError> {
+        Err(EngineError::Store {
+            reason: "insight purge is unavailable".into(),
+        })
+    }
     async fn list_memory_docs(
         &self,
         project_id: ProjectId,

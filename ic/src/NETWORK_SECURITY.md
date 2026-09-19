@@ -328,8 +328,34 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 
 | Mode | Mechanism | Enforcement |
 |------|-----------|-------------|
-| `proxy` (default) | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
-| `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `proxy-enforced` (WI#155) | Container keeps `--network none`; egress only through a per-execution **Unix-socket relay** to the allowlist proxy | **Enforced** — no direct egress path exists anywhere (loopback included); the proxy rejects non-public destinations and pins DNS |
+| `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory (legacy)** — a process that ignores proxy env vars can still egress directly |
+
+**Default policy (WI#154/155, v2.1.2.0):** the in-code default and mt-admin
+both render `SANDBOX_NETWORK=none` (mt-admin preserves an operator-set `proxy`
+on re-render). `none` is the safe default everywhere. `proxy` is advisory —
+use `proxy-enforced` when sandboxed processes need allowlisted web access.
+`proxy-enforced` is kernel-isolated everywhere except one per-execution Unix
+socket relay to the public-only validating proxy:
+
+- relay placement: `$XDG_RUNTIME_DIR` when it exists and belongs to our euid
+  (fallback: process temp dir). This keeps the socket resolvable across mount
+  namespaces: a `PrivateTmp` daemon and a manager-forked transient-service
+  workload namespace both share `/run/user/<uid>`.
+- relay interior: Python-in-container `--network none` runs a loopback-only
+  socket server bound to `127.0.0.1:3128` and forwards to the host-side proxy.
+  Only the socket directory is bind-mounted (`:ro,z`), Python runs in isolated
+  mode (`python3 -I`), and a failed relay fails closed — it never degrades to
+  advisory or direct egress.
+- destination policy: the proxy rejects non-public destinations (private,
+  loopback, link-local, multicast, CGNAT, and IPv4-mapped forms) and pins DNS
+  to the resolved public addresses for both HTTP forwarding and CONNECT.
+  Redirects are not followed on the host; environment proxies cannot bypass
+  DNS pinning.
+
+The advisory `proxy` mode remains supported for single-node backwards
+compatibility but is no longer any default.
 
 In proxy mode the container is pointed at the proxy via
 `http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns
@@ -399,14 +425,26 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Capabilities | Drop ALL, add only CHOWN | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Privilege escalation | `no-new-privileges` | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Root filesystem | Read-only | `src/sandbox/cli_runner.rs` — `--read-only` |
-| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5) | `src/sandbox/cli_runner.rs` — `KeepIdMode` |
+| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5; docker rootless runs `0:0` inside the userns, rootful docker uses the daemon's uid/gid) | `src/sandbox/cli_runner.rs` — `KeepIdMode`, `user_for()` |
+| Process limit | `--pids-limit 256` (explicit; runtime defaults vary) | `src/sandbox/cli_runner.rs` — `build_run_args()`, `default_pids_limit()` |
+| Stop grace | `--stop-timeout 10` so kill/rm terminates PID 1 instead of orphaning | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Seccomp | Runtime default profile (podman/docker default seccomp) — **supported contract**, no custom profile | this document |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
-| Auto-remove | `--rm` + kill-by-name on timeout + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `src/orchestrator/reaper.rs` |
+| Auto-remove | `--rm` + kill-by-name on timeout **and on cancellation** (drop guard) + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `ContainerCleanupGuard`; `src/orchestrator/reaper.rs` |
 | Labels | `lunarwing.sandbox=<RFC3339 created>` for the reaper | `src/sandbox/cli_runner.rs` — `SANDBOX_CONTAINER_LABEL` |
 | Output limits | Capped stdout/stderr collection (UTF-8-safe) | `src/sandbox/cli_runner.rs` — `CappedBuf` |
 | Timeout | Enforced with process-tree kill + `podman kill` | `src/sandbox/cli_runner.rs` — `run_container()` |
+
+**Seccomp decision (WI#179 concern 5):** the supported contract is the
+runtime's default seccomp profile. Podman and Docker both apply a default
+seccomp profile that blocks the majority of syscalls; the sandbox does not
+set a custom profile because none of the candidate profiles would be portable
+across podman and docker without shipping a JSON file to every host. The
+explicit `--pids-limit` is set because process limits are NOT covered by
+runtime defaults uniformly (docker historically had no default pid limit),
+whereas seccomp IS applied by default on both runtimes.
 
 Fail-closed semantics: when the sandbox is enabled and the runtime CLI or
 image is unavailable, shell commands **error** with a structured

@@ -9,7 +9,13 @@ subcommand and flag (`add-tenant` opt-ins, build/install-wasm, worker lifecycle,
 `patch-env`, `render-units`, backup/restore, `upgrade-tenant`, `remove-tenant`,
 `tokens`, WeeChat bootstrap recovery) was re-checked against
 `ic/scripts/lunarwing-mt-admin.sh`; no changes were needed beyond adding the
-v2.1.2.0 `fix-podman-userns` repair command below.
+v2.1.2.0 `fix-podman-userns` repair command below. **Migration note
+(WI#154/155):** `SANDBOX_NETWORK` defaults to `none` everywhere. Existing
+explicit `proxy` settings are preserved (mt-admin renders `none` only when
+unset). Tenants that need sandboxed web access must opt into `proxy-enforced`
+(enforced; local Linux runtime + Python-3 image required) or the legacy
+advisory `proxy`. See
+[`../ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md`](../ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
 
 ## 1. Install Host Prerequisites
 

@@ -231,7 +231,7 @@ impl ConversationManager {
         for (index, note) in notes.iter().enumerate() {
             if let Err(error) = self
                 .thread_manager
-                .inject_message(thread_id, user_id, ThreadMessage::user(note))
+                .inject_message(thread_id, user_id, ThreadMessage::generated_goal(note))
                 .await
             {
                 restore_steer_notes(conv, notes.into_iter().skip(index));
@@ -279,7 +279,7 @@ impl ConversationManager {
             });
         }
         for note in notes {
-            let message = ThreadMessage::user(note.clone());
+            let message = ThreadMessage::generated_goal(note.clone());
             if !thread.internal_messages.is_empty() {
                 thread.add_internal_message(message.clone());
             }
@@ -343,9 +343,10 @@ impl ConversationManager {
         user_message: ThreadMessage,
         project_id: ProjectId,
         user_id: &str,
-        thread_config: ThreadConfig,
+        mut thread_config: ThreadConfig,
         preferred_thread_id: Option<ThreadId>,
     ) -> Result<ThreadId, EngineError> {
+        thread_config.conversation_id = Some(conversation_id);
         let mut convs = self.conversations.write().await;
         let conv = convs.get_mut(&conversation_id).ok_or(EngineError::Store {
             reason: format!("conversation {conversation_id} not found"),
@@ -405,7 +406,11 @@ impl ConversationManager {
                 // Build conversation history from prior entries, followed by any
                 // steer notes that arrived while no foreground thread was running.
                 let mut history = build_history_from_entries(&conv.entries);
-                history.extend(conv.pending_steer_notes.iter().map(ThreadMessage::user));
+                history.extend(
+                    conv.pending_steer_notes
+                        .iter()
+                        .map(ThreadMessage::generated_goal),
+                );
 
                 // Spawn new foreground thread with conversation history
                 let thread_id = self
