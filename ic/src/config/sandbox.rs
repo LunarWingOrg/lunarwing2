@@ -14,7 +14,7 @@ pub struct SandboxModeConfig {
     pub policy: String,
     /// Container runtime CLI: "auto" (podman preferred), "podman", or "docker".
     pub runtime: String,
-    /// Network egress mode for sandboxed policies: "proxy" or "none".
+    /// Network egress: "none", "proxy-enforced", or legacy advisory "proxy".
     pub network: String,
     /// Force sandboxed shell execution even in dev mode (ALLOW_LOCAL_TOOLS).
     /// Default false: dev boxes keep direct host execution.
@@ -50,7 +50,7 @@ impl Default for SandboxModeConfig {
             enabled: true,
             policy: "readonly".to_string(),
             runtime: "auto".to_string(),
-            network: "proxy".to_string(),
+            network: "none".to_string(),
             enforce: false,
             allow_full_access: false,
             timeout_secs: 120,
@@ -152,9 +152,9 @@ impl SandboxModeConfig {
             tracing::error!(
                 value = %self.network,
                 error = %e,
-                "Invalid SANDBOX_NETWORK; falling back to 'proxy'"
+                "Invalid SANDBOX_NETWORK; falling back to 'none'"
             );
-            crate::sandbox::SandboxNetworkMode::Proxy
+            crate::sandbox::SandboxNetworkMode::None
         });
 
         let mut allowlist = crate::sandbox::default_allowlist();
@@ -407,7 +407,37 @@ mod tests {
         };
         let sc = mode.to_sandbox_config();
         assert_eq!(sc.runtime, crate::sandbox::SandboxRuntime::Auto);
-        assert_eq!(sc.network, crate::sandbox::SandboxNetworkMode::Proxy);
+        assert_eq!(sc.network, crate::sandbox::SandboxNetworkMode::None);
+    }
+
+    #[test]
+    fn network_default_and_enforced_mode_survive_settings_resolution() {
+        let _guard = crate::config::helpers::lock_env();
+        for (toml, expected) in [
+            ("", crate::sandbox::SandboxNetworkMode::None),
+            (
+                "[sandbox]\nnetwork = 'proxy-enforced'",
+                crate::sandbox::SandboxNetworkMode::ProxyEnforced,
+            ),
+            (
+                "[sandbox]\nnetwork = 'proxy'",
+                crate::sandbox::SandboxNetworkMode::Proxy,
+            ),
+        ] {
+            let settings = toml::from_str(toml).unwrap();
+            let mode = SandboxModeConfig::resolve(&settings).unwrap();
+            assert_eq!(mode.to_sandbox_config().network, expected);
+        }
+        let mut settings = crate::settings::Settings::default();
+        settings.sandbox.network = "proxy".into();
+        // SAFETY: env access is serialized by the shared config-test mutex.
+        unsafe { std::env::set_var("SANDBOX_NETWORK", "proxy-enforced") };
+        let result = SandboxModeConfig::resolve(&settings);
+        unsafe { std::env::remove_var("SANDBOX_NETWORK") };
+        assert_eq!(
+            result.unwrap().to_sandbox_config().network,
+            crate::sandbox::SandboxNetworkMode::ProxyEnforced
+        );
     }
 
     #[test]

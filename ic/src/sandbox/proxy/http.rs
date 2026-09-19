@@ -34,8 +34,8 @@ struct ProxyState {
     decider: Arc<dyn NetworkPolicyDecider>,
     /// Credential resolver (maps secret names to values).
     credential_resolver: Arc<dyn CredentialResolver>,
-    /// Shared HTTP client for forwarding requests.
-    http_client: reqwest::Client,
+    /// Reject private targets and pin DNS for proxy-enforced containers.
+    public_only: bool,
     /// Request counter for logging.
     request_count: std::sync::atomic::AtomicU64,
     /// Whether the proxy is running.
@@ -82,11 +82,19 @@ impl HttpProxy {
         decider: Arc<dyn NetworkPolicyDecider>,
         credential_resolver: Arc<dyn CredentialResolver>,
     ) -> Self {
+        Self::with_egress_policy(decider, credential_resolver, false)
+    }
+
+    pub(super) fn with_egress_policy(
+        decider: Arc<dyn NetworkPolicyDecider>,
+        credential_resolver: Arc<dyn CredentialResolver>,
+        public_only: bool,
+    ) -> Self {
         Self {
             state: Arc::new(ProxyState {
                 decider,
                 credential_resolver,
-                http_client: reqwest::Client::new(),
+                public_only,
                 request_count: std::sync::atomic::AtomicU64::new(0),
                 running: std::sync::atomic::AtomicBool::new(false),
             }),
@@ -276,6 +284,15 @@ async fn handle_connect(
         return error_response(StatusCode::FORBIDDEN, deny_body(reason));
     }
 
+    let pinned = if state.public_only {
+        match super::egress::resolve_public(&host, authority.port_u16().unwrap_or(443)).await {
+            Ok(addresses) => Some(addresses),
+            Err(reason) => return error_response(StatusCode::FORBIDDEN, deny_body(reason)),
+        }
+    } else {
+        None
+    };
+
     tracing::debug!("Proxy: allowing CONNECT to {}", target_addr);
 
     // Spawn a fire-and-forget task to establish the tunnel after the upgrade
@@ -287,8 +304,15 @@ async fn handle_connect(
         match hyper::upgrade::on(req).await {
             Ok(upgraded) => {
                 let mut client_stream = TokioIo::new(upgraded);
-                match TcpStream::connect(&target).await {
-                    Ok(mut server_stream) => {
+                let connect = async {
+                    if let Some(addresses) = pinned {
+                        TcpStream::connect(addresses.as_slice()).await
+                    } else {
+                        TcpStream::connect(&target).await
+                    }
+                };
+                match tokio::time::timeout(std::time::Duration::from_secs(10), connect).await {
+                    Ok(Ok(mut server_stream)) => {
                         let tunnel_timeout = std::time::Duration::from_secs(30 * 60);
                         match tokio::time::timeout(
                             tunnel_timeout,
@@ -308,8 +332,8 @@ async fn handle_connect(
                             }
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Proxy: failed to connect to {}: {}", target, e);
+                    error => {
+                        tracing::debug!(?error, "Proxy: tunnel connection failed");
                     }
                 }
             }
@@ -332,8 +356,13 @@ async fn forward_request(
     let method = req.method().clone();
     let uri = req.uri().clone();
 
-    // Build the forwarded request
-    let mut builder = state.http_client.request(
+    let client = match forwarding_client(&uri, state.public_only).await {
+        Ok(client) => client,
+        Err(reason) => return Ok(error_response(StatusCode::FORBIDDEN, deny_body(reason))),
+    };
+    // Redirects must come back through the policy check, never be followed by
+    // reqwest on the host. Environment proxies cannot bypass DNS pinning.
+    let mut builder = client.request(
         reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET),
         uri.to_string(),
     );
@@ -438,6 +467,26 @@ async fn forward_request(
             ))
         }
     }
+}
+
+async fn forwarding_client(
+    uri: &hyper::Uri,
+    public_only: bool,
+) -> std::result::Result<reqwest::Client, String> {
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(30));
+    if public_only {
+        let url = url::Url::parse(&uri.to_string()).map_err(|_| "invalid proxy URL")?;
+        let host = url.host_str().ok_or("missing proxy host")?;
+        let port = url.port_or_known_default().ok_or("invalid proxy port")?;
+        let addresses = super::egress::resolve_public(host, port).await?;
+        builder = builder.resolve_to_addrs(host, &addresses);
+    }
+    builder
+        .build()
+        .map_err(|e| format!("cannot initialize proxy client: {e}"))
 }
 
 /// Check if a header is hop-by-hop (should not be forwarded).
@@ -570,5 +619,60 @@ mod tests {
             deny_body("domain not in allowlist: evil.example".to_string()),
             "sandbox-proxy denied: domain not in allowlist: evil.example"
         );
+    }
+
+    #[tokio::test]
+    async fn enforced_proxy_blocks_allowlisted_loopback_for_http_and_connect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = HttpProxy::with_egress_policy(
+            Arc::new(crate::sandbox::proxy::AllowAllDecider),
+            Arc::new(NoCredentialResolver),
+            true,
+        );
+        let addr = proxy.start(0).await.unwrap();
+        for request in [
+            "GET http://127.0.0.1:43210/ HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "CONNECT 127.0.0.1:43210 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            "GET http://[::ffff:127.0.0.1]:43210/ HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ] {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(request.as_bytes()).await.unwrap();
+            let mut response = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_to_string(&mut response),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(response.contains("sandbox-proxy denied:"));
+        }
+        proxy.stop().await;
+    }
+
+    #[tokio::test]
+    async fn forwarding_returns_redirect_without_contacting_new_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let forbidden = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = forbidden.local_addr().unwrap();
+        let addr = origin.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut client, _) = origin.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(client.read(&mut request).await.unwrap() > 0);
+            client.write_all(format!("HTTP/1.1 302 Found\r\nLocation: http://{target}/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        });
+        let uri = format!("http://{addr}/").parse().unwrap();
+        let client = forwarding_client(&uri, false).await.unwrap();
+        let response = client.get(uri.to_string()).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), forbidden.accept())
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
     }
 }

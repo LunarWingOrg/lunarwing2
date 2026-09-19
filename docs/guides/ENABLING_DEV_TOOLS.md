@@ -37,8 +37,8 @@ The default is an enabled read-only container sandbox. Since v2.1.2.0 the sandbo
 
 | Policy | Filesystem | Network | Execution |
 | --- | --- | --- | --- |
-| `readonly` | workspace mounted read-only | proxied allowlist | container |
-| `workspace_write` | workspace mounted read/write | proxied allowlist | container |
+| `readonly` | workspace mounted read-only | `none` by default; configurable | container |
+| `workspace_write` | workspace mounted read/write | `none` by default; configurable | container |
 | `full_access` | unrestricted host access | unrestricted | direct host shell |
 
 For normal development work, prefer:
@@ -59,7 +59,19 @@ Without `SANDBOX_ALLOW_FULL_ACCESS=true`, startup conversion logs an error and d
 
 Even under `full_access`, the child environment is scrubbed: commands inherit only the allowlisted OS/toolchain variables (the same list the unsandboxed shell tool uses), never daemon credentials such as `DATABASE_URL` or the `SANDBOX_*` launcher variables themselves.
 
-Container egress is tiered through `SANDBOX_NETWORK` (new in v2.1.2.0): `proxy` (default) routes HTTP through the allowlist proxy via `host.containers.internal`, with denied responses prefixed `sandbox-proxy denied:`; `none` passes `--network none` for full network isolation. `SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode `ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
+Container egress is selected through `SANDBOX_NETWORK`: `none` (default) passes
+`--network none` for full network isolation. For web-capable sandboxes choose
+`proxy-enforced`: the container remains network-isolated and reaches only the
+allowlist proxy through a Unix socket relay. This requires a local Linux runtime
+and Python 3 in the image; missing support fails closed. `proxy` retains the
+legacy advisory mode in which commands can ignore proxy settings and connect
+directly to the host/network. Proxy denials carry `sandbox-proxy denied:`.
+`SANDBOX_ENFORCE=true` forces the sandboxed shell even when dev-mode
+`ALLOW_LOCAL_TOOLS` would otherwise run it directly on the host.
+
+Explicit existing `proxy` settings are preserved on upgrade; operators should
+select `none` or opt into `proxy-enforced` after testing their image. See
+[WI#179 rollout and acceptance](../ops/v2.1.2.0_GOAL26_SANDBOX_HARDENING.md).
 
 Other supported startup controls include `SANDBOX_TIMEOUT_SECS`, `SANDBOX_MEMORY_LIMIT_MB`, `SANDBOX_CPU_SHARES`, `SANDBOX_IMAGE`, `SANDBOX_AUTO_PULL`, `SANDBOX_EXTRA_DOMAINS`, `SANDBOX_REAPER_INTERVAL_SECS`, and `SANDBOX_ORPHAN_THRESHOLD_SECS`. Keep the proxy domain allowlist minimal.
 

@@ -328,14 +328,53 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 
 | Mode | Mechanism | Enforcement |
 |------|-----------|-------------|
-| `proxy` (default) | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
-| `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `none` (default) | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `proxy-enforced` | `--network none` + per-execution Unix socket transport to the allowlist proxy | **Kernel-enforced direct-network isolation**; only the validating proxy is reachable |
+| `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
+
+**Default/rollout decision (WI#154/#155/#179):** default globally to `none`, rather
+than inferring policy from worker/database installation. This covers fresh
+tenants and upgrades without an explicit network setting. Preserve explicit
+env/settings choices, including legacy `proxy`. For web-capable tenants,
+`proxy-enforced` is the recommended opt-in after image/runtime acceptance.
+
+**Enforced transport:** a host listener in a private temporary directory forwards
+Unix streams only to the daemon's loopback HTTP proxy. The child socket directory
+is mounted read-only into the container; its private parent is not mounted.
+The container's Python 3 relay listens on its own `127.0.0.1:3128`, then starts
+the command only after connecting to the mounted socket. No host gateway, bridge,
+runtime socket, network capability, init service, or host firewall change is
+needed. Ignoring proxy variables can only disable web access, not regain direct
+egress. Relay connections (32 maximum per execution) and socket files are owned
+by the execution supervisor and closed/removed on completion or cancellation.
+
+This mode requires a **local Linux runtime** and Python 3 in the image. Both
+bundled images include Python 3. Remote Docker/Podman VM socket mounts are not
+supported; missing transport/tooling fails closed. SELinux bind mounts retain
+`,z` relabeling; SELinux policy must permit the relay socket, otherwise setup
+fails (never disable labeling automatically).
+
+The enforced proxy rejects non-public destinations for HTTP and CONNECT, even
+if an allowlisted domain resolves there. Validated DNS results are pinned to
+the actual connection; daemon `ALLOW_PRIVATE_IPS` does not relax this rule.
+HTTP redirects are returned to clients for a fresh allowlist check, and host
+HTTP-proxy environment settings are ignored. These last two protections also
+apply to legacy proxy requests. HTTPS remains a byte tunnel after validation.
+
+**Rejected mechanisms:** pasta/slirp port forwarding alone does not restrict
+outbound connections. A per-execution nftables helper would require additional
+capabilities, runtime-specific namespace access and privileged lifecycle rules.
+A TCP bridge to the host would reintroduce host-service reachability. The Unix
+transport uses the same existing `none` boundary on both runtimes instead.
 
 In proxy mode the container is pointed at the proxy via
 `http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns
 maps that alias to the host's loopback, so the proxy's `127.0.0.1` bind is
 reachable) or `http://host.docker.internal:<port>` plus
 `--add-host host.docker.internal:host-gateway` on the docker CLI fallback.
+That legacy alias route depends on runtime networking; Docker's bridge gateway
+does not generally reach a listener bound only to host loopback. Use
+`proxy-enforced` for the portable socket-based path.
 FullAccess keeps full, unsandboxed network.
 
 Policy denials returned by the proxy carry the stable body prefix
@@ -399,14 +438,41 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Capabilities | Drop ALL, add only CHOWN | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Privilege escalation | `no-new-privileges` | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Root filesystem | Read-only | `src/sandbox/cli_runner.rs` — `--read-only` |
-| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5) | `src/sandbox/cli_runner.rs` — `KeepIdMode` |
+| User | Non-root: Podman ≥5 keep-id maps caller to 1000; plain keep-id/Docker uses caller UID/GID; a root operator uses the non-root workspace owner | `src/sandbox/cli_runner.rs` — `container_user()` |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
-| Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
+| Network | `none` (default), `proxy-enforced`, or legacy advisory `proxy` | `src/sandbox/cli_runner.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
-| Auto-remove | `--rm` + kill-by-name on timeout + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `src/orchestrator/reaper.rs` |
+| Auto-remove | `--rm` + cancellation-safe supervisor removal + independent CLI reaper | `src/sandbox/cli_runner.rs`, `src/orchestrator/reaper.rs` |
 | Labels | `lunarwing.sandbox=<RFC3339 created>` for the reaper | `src/sandbox/cli_runner.rs` — `SANDBOX_CONTAINER_LABEL` |
 | Output limits | Capped stdout/stderr collection (UTF-8-safe) | `src/sandbox/cli_runner.rs` — `CappedBuf` |
-| Timeout | Enforced with process-tree kill + `podman kill` | `src/sandbox/cli_runner.rs` — `run_container()` |
+| Timeout | One deadline for initialization/retries/execution; process-tree kill + bounded runtime `rm -f` cleanup | `src/sandbox/manager.rs`, `cli_runner.rs` |
+| Process count | Explicit `--pids-limit 256` | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Seccomp | Supported runtime's default filter; never `unconfined` | Live acceptance requires `/proc/self/status` `Seccomp: 2` |
+
+**Seccomp contract:** use the maintained Podman/Docker default profile, rather
+than duplicating a stale syscall allowlist in LunarWing. Hosts configured with
+unconfined runtime defaults are unsupported. The explicit process limit requires
+working cgroup PID accounting (cgroup v2 on supported rootless installations).
+Live acceptance checks both controls; unsupported resource setup must fail rather
+than be worked around by removing flags.
+
+Docker fallback supports a local Linux daemon without rootless/userns-remap.
+The runner checks Docker's security options and rejects remapped configurations
+instead of using container root, disabling remapping, or chowning the workspace.
+A non-root daemon never assumes another directory owner's identity. When the
+daemon itself runs as root, writable root-owned workspaces are rejected. Prefer rootless Podman keep-id;
+unknown/pre-4.3 rootless Podman fails with an actionable configuration error.
+
+**Cleanup lifetime:** dropping a shell/manager future closes a cancellation
+channel to an owned supervisor. The supervisor drops the run future (including
+pipe readers and the process-tree guard), attempts bounded CLI removal, then
+releases the in-flight registration and relay. Cleanup failures are eligible
+for reaping; timeout messages do not claim a confirmed kill. Hard daemon death
+is recovered by the periodic CLI sweep after the configured orphan age.
+The generic sweep starts with the sandbox shell in `AppBuilder` and shares its
+cached runtime selection. It does not require a worker manager or API socket.
+Explicit `SANDBOX_RUNTIME=podman|docker` no longer falls back to another runtime;
+`auto` alone provides fallback. Job-container reaping remains a separate loop.
 
 Fail-closed semantics: when the sandbox is enabled and the runtime CLI or
 image is unavailable, shell commands **error** with a structured

@@ -29,8 +29,10 @@
 //! ```
 
 pub mod allowlist;
+mod egress;
 pub mod http;
 pub mod policy;
+pub(crate) mod relay;
 
 pub use allowlist::{DomainAllowlist, DomainPattern, DomainValidationResult};
 pub use http::{CredentialResolver, EnvCredentialResolver, HttpProxy, NoCredentialResolver};
@@ -51,6 +53,7 @@ pub struct NetworkProxyBuilder {
     credential_mappings: Vec<CredentialMapping>,
     credential_resolver: Arc<dyn CredentialResolver>,
     policy: SandboxPolicy,
+    public_only: bool,
 }
 
 impl NetworkProxyBuilder {
@@ -61,6 +64,7 @@ impl NetworkProxyBuilder {
             credential_mappings: default_credential_mappings(),
             credential_resolver: Arc::new(EnvCredentialResolver),
             policy: SandboxPolicy::ReadOnly,
+            public_only: false,
         }
     }
 
@@ -70,7 +74,10 @@ impl NetworkProxyBuilder {
             allowlist: config.network_allowlist.clone(),
             credential_mappings: default_credential_mappings(),
             credential_resolver: Arc::new(EnvCredentialResolver),
-            policy: config.policy,
+            // This proxy can serve per-call sandboxed policy overrides even
+            // when the manager's default is FullAccess. Never relax its ACL.
+            policy: SandboxPolicy::ReadOnly,
+            public_only: config.network == crate::sandbox::SandboxNetworkMode::ProxyEnforced,
         }
     }
 
@@ -115,7 +122,7 @@ impl NetworkProxyBuilder {
             ))
         };
 
-        HttpProxy::new(decider, self.credential_resolver)
+        HttpProxy::with_egress_policy(decider, self.credential_resolver, self.public_only)
     }
 
     /// Build and start the proxy on the given port.

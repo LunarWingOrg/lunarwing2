@@ -714,30 +714,25 @@ impl ShellTool {
         workdir: &Path,
         timeout: Duration,
     ) -> Result<ShellCommandOutput, ToolError> {
-        // Override sandbox config timeout if needed
-        let result = tokio::time::timeout(timeout, async {
-            sandbox
-                .execute_with_policy(
-                    cmd,
-                    workdir,
-                    self.sandbox_policy,
-                    std::collections::HashMap::new(),
-                )
-                .await
-        })
-        .await;
+        // One deadline covers initialization, retries and execution. The
+        // manager owns cancellation-safe cleanup even if this future is dropped.
+        let result = sandbox
+            .execute_with_timeout(
+                cmd,
+                workdir,
+                self.sandbox_policy,
+                std::collections::HashMap::new(),
+                timeout,
+            )
+            .await;
 
         match result {
-            Ok(Ok(output)) => Ok(ShellCommandOutput::new(
+            Ok(output) => Ok(ShellCommandOutput::new(
                 output.output,
                 output.exit_code,
                 output.truncated,
             )),
-            Ok(Err(e)) => Err(sandbox_error_envelope(&e)),
-            Err(_) => Err(ToolError::Sandbox(format!(
-                "[sandbox:timeout] sandboxed command exceeded the tool timeout of {timeout:?}; \
-                 the container was killed and nothing ran on the host"
-            ))),
+            Err(e) => Err(sandbox_error_envelope(&e)),
         }
     }
 

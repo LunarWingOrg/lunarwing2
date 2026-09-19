@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use crate::sandbox::cli_runner::{CliRunner, ExecParams};
 use crate::sandbox::config::{ResourceLimits, SandboxConfig, SandboxNetworkMode, SandboxPolicy};
@@ -81,7 +81,8 @@ impl From<crate::sandbox::container::ContainerOutput> for ExecOutput {
 pub struct SandboxManager {
     config: SandboxConfig,
     proxy: Arc<RwLock<Option<HttpProxy>>>,
-    runner: Arc<RwLock<Option<Arc<CliRunner>>>>,
+    runner: OnceCell<Arc<CliRunner>>,
+    init_lock: Mutex<()>,
     initialized: std::sync::atomic::AtomicBool,
 }
 
@@ -91,7 +92,8 @@ impl SandboxManager {
         Self {
             config,
             proxy: Arc::new(RwLock::new(None)),
-            runner: Arc::new(RwLock::new(None)),
+            runner: OnceCell::new(),
+            init_lock: Mutex::new(()),
             initialized: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -114,6 +116,7 @@ impl SandboxManager {
 
     /// Initialize the sandbox (detect runtime CLI, verify image, start proxy).
     pub async fn initialize(&self) -> Result<()> {
+        let _lock = self.init_lock.lock().await;
         if self.initialized.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
@@ -125,8 +128,7 @@ impl SandboxManager {
         }
 
         // Detect the runtime CLI (podman preferred, docker fallback)
-        let runner =
-            Arc::new(CliRunner::detect(self.config.runtime, self.config.image.clone()).await?);
+        let runner = self.runner().await?;
 
         // Check for / pull the image
         if !runner.image_exists().await {
@@ -140,10 +142,9 @@ impl SandboxManager {
             }
         }
 
-        *self.runner.write().await = Some(runner);
-
-        // Start the network proxy only for sandboxed policies in proxy mode.
-        if self.config.policy.is_sandboxed() && self.config.network == SandboxNetworkMode::Proxy {
+        // Any per-call sandboxed policy override needs the same validating
+        // proxy, including when the manager's default policy is FullAccess.
+        if self.config.network != SandboxNetworkMode::None {
             let proxy = NetworkProxyBuilder::from_config(&self.config)
                 .build_and_start(self.config.proxy_port)
                 .await?;
@@ -154,13 +155,10 @@ impl SandboxManager {
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        // Resolve the runtime name before the macro: the read guard's await
-        // inside `tracing::info!` field position would make the future !Send.
+        // Runtime selection is immutable and shared with orphan recovery.
         let runtime_bin = self
             .runner
-            .read()
-            .await
-            .as_ref()
+            .get()
             .map(|r| r.runtime().binary())
             .unwrap_or("unknown");
         tracing::info!(runtime = runtime_bin, "Sandbox initialized");
@@ -169,6 +167,7 @@ impl SandboxManager {
 
     /// Shutdown the sandbox (stop proxy, clean up).
     pub async fn shutdown(&self) {
+        let _lock = self.init_lock.lock().await;
         if let Some(proxy) = self.proxy.write().await.take() {
             proxy.stop().await;
         }
@@ -198,6 +197,41 @@ impl SandboxManager {
         policy: SandboxPolicy,
         env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
+        self.execute_with_timeout(command, cwd, policy, env, self.config.timeout)
+            .await
+    }
+
+    /// A single command deadline, including initialization and retry backoff.
+    /// A caller may shorten, but cannot extend, the operator's timeout.
+    pub async fn execute_with_timeout(
+        &self,
+        command: &str,
+        cwd: &Path,
+        policy: SandboxPolicy,
+        env: HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<ExecOutput> {
+        let timeout = timeout.min(self.config.timeout);
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(
+            deadline,
+            self.execute_inner(command, cwd, policy, env, deadline),
+        )
+        .await
+        {
+            Ok(Err(SandboxError::Timeout(_))) | Err(_) => Err(SandboxError::Timeout(timeout)),
+            Ok(result) => result,
+        }
+    }
+
+    async fn execute_inner(
+        &self,
+        command: &str,
+        cwd: &Path,
+        policy: SandboxPolicy,
+        env: HashMap<String, String>,
+        deadline: tokio::time::Instant,
+    ) -> Result<ExecOutput> {
         // FullAccess policy bypasses the sandbox entirely.
         // Double-check the allow_full_access guard at execution time as well,
         // in case the policy was overridden per-call via execute_with_policy().
@@ -219,7 +253,7 @@ impl SandboxManager {
                 cwd = %cwd.display(),
                 "[FullAccess] Executing command directly on host (no sandbox isolation)"
             );
-            return self.execute_direct(command, cwd, env).await;
+            return self.execute_direct(command, cwd, env, deadline).await;
         }
 
         // Ensure we're initialized
@@ -245,7 +279,7 @@ impl SandboxManager {
             }
 
             match self
-                .try_execute_in_container(command, cwd, policy, env.clone())
+                .try_execute_in_container(command, cwd, policy, env.clone(), deadline)
                 .await
             {
                 Ok(output) => return Ok(output),
@@ -273,6 +307,7 @@ impl SandboxManager {
         cwd: &Path,
         policy: SandboxPolicy,
         env: HashMap<String, String>,
+        deadline: tokio::time::Instant,
     ) -> Result<ExecOutput> {
         let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {
             proxy.addr().await.map(|a| a.port()).unwrap_or(0)
@@ -280,19 +315,12 @@ impl SandboxManager {
             0
         };
 
-        let runner =
-            self.runner
-                .read()
-                .await
-                .clone()
-                .ok_or_else(|| SandboxError::RuntimeNotAvailable {
-                    reason: "container runtime not initialized".to_string(),
-                })?;
+        let runner = self.runner().await?;
 
         let limits = ResourceLimits {
             memory_bytes: self.config.memory_limit_mb * 1024 * 1024,
             cpu_shares: self.config.cpu_shares,
-            timeout: self.config.timeout,
+            timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
             max_output_bytes: 64 * 1024,
         };
 
@@ -323,6 +351,7 @@ impl SandboxManager {
         command: &str,
         cwd: &Path,
         env: HashMap<String, String>,
+        deadline: tokio::time::Instant,
     ) -> Result<ExecOutput> {
         let start = std::time::Instant::now();
 
@@ -365,8 +394,7 @@ impl SandboxManager {
         })?;
         let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
 
-        let output = match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await
-        {
+        let output = match tokio::time::timeout_at(deadline, child.wait_with_output()).await {
             Ok(output) => {
                 guard.disarm();
                 output.map_err(|e| SandboxError::ExecutionFailed {
@@ -431,6 +459,41 @@ impl SandboxManager {
     /// Get the current configuration.
     pub fn config(&self) -> &SandboxConfig {
         &self.config
+    }
+
+    /// Runtime selection is shared by execution and the socketless reaper.
+    async fn runner(&self) -> Result<&Arc<CliRunner>> {
+        self.runner
+            .get_or_try_init(|| async {
+                CliRunner::detect(self.config.runtime, self.config.image.clone())
+                    .await
+                    .map(Arc::new)
+            })
+            .await
+    }
+
+    /// Start generic-sandbox orphan recovery independently of worker/API setup.
+    pub async fn run_reaper(self: Arc<Self>, interval: Duration, threshold: Duration) {
+        if interval.is_zero() {
+            tracing::error!("Sandbox reaper interval must be nonzero");
+            return;
+        }
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let manager = Arc::downgrade(&self);
+        drop(self);
+        loop {
+            ticker.tick().await;
+            // A replaced/dropped tool registry must not keep an obsolete
+            // manager (and its proxy) alive through this background task.
+            let Some(manager) = manager.upgrade() else {
+                break;
+            };
+            match manager.runner().await {
+                Ok(runner) => runner.reap_orphans(threshold).await,
+                Err(error) => tracing::warn!(%error, "Sandbox reaper: runtime unavailable"),
+            }
+        }
     }
 
     /// Check if the sandbox is initialized.
@@ -568,6 +631,53 @@ impl Default for SandboxManagerBuilder {
 mod tests {
     use super::*;
     use crate::sandbox::ContainerOutput;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_shorter_deadline_cleans_up_without_waiting_for_manager_timeout() {
+        use crate::sandbox::cli_runner::{ContainerRuntime, lifecycle_tests::RuntimeFixture};
+        use crate::tools::{Tool, builtin::ShellTool};
+
+        crate::tools::process::workload_spawner().await;
+        let fixture = RuntimeFixture::new(ContainerRuntime::Docker);
+        let manager = Arc::new(SandboxManager::new(SandboxConfig {
+            timeout: Duration::from_secs(60),
+            ..SandboxConfig::default()
+        }));
+        assert!(manager.runner.set(Arc::new(fixture.runner.clone())).is_ok());
+        manager
+            .initialized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let shell = ShellTool::new()
+            .with_sandbox(manager.clone())
+            .with_working_dir(fixture.dir.path().to_owned());
+        let call = tokio::spawn(async move {
+            shell
+                .execute(
+                    serde_json::json!({"command":"sleep 60", "timeout":2}),
+                    &crate::context::JobContext::default(),
+                )
+                .await
+        });
+        let name = fixture.started().await;
+        let error = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("shell deadline shorter than manager deadline")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[sandbox:timeout]"), "{error}");
+        assert!(
+            error.contains("2s"),
+            "report the shell budget, not the manager's 60s: {error}"
+        );
+        assert!(
+            !error.contains("was killed"),
+            "must not claim unconfirmed cleanup"
+        );
+        fixture.removed(&name).await;
+        manager.shutdown().await;
+    }
 
     #[test]
     fn test_exec_output_from_container_output() {

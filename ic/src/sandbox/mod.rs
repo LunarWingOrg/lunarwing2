@@ -4,9 +4,9 @@
 //! - **Container isolation**: Commands run in ephemeral containers driven by the
 //!   `podman` (preferred) or `docker` CLI — no daemon socket required, mirroring
 //!   the rootless pattern the mt-admin external-worker tooling uses
-//! - **Network proxy**: In proxy mode, network traffic goes through a validating
-//!   proxy (advisory: env-var based); in `none` mode, containers get no network
-//!   at all (kernel-enforced via `--network none`)
+//! - **Network proxy**: `none` (default) disables egress; `proxy-enforced`
+//!   retains `--network none` and exposes only a Unix relay to the validating
+//!   proxy. Legacy `proxy` remains advisory (env-var based).
 //! - **Credential injection**: Secrets are injected by the proxy, never exposed in containers
 //! - **Resource limits**: Memory, CPU, and timeout enforcement
 //!
@@ -102,10 +102,10 @@
 //! - **No credentials in containers**: Environment variables with secrets never enter containers
 //! - **Network isolation**: Proxy mode routes traffic through the proxy (validated
 //!   domains only — advisory, env-var based); `none` mode removes the network entirely
-//! - **Non-root execution**: Containers run as UID 1000 (keep-id userns where supported)
+//! - **Non-root execution**: keep-id or the workspace owner's numeric UID/GID
 //! - **Read-only root**: Container filesystem is read-only (except workspace mount)
 //! - **Capability dropping**: All Linux capabilities dropped, only essential ones added back
-//! - **Auto-cleanup**: Containers are removed after execution (--rm + kill-on-timeout + reaper)
+//! - **Auto-cleanup**: `--rm`, cancellation-safe supervisor, independent CLI reaper
 //! - **Timeout enforcement**: Commands are killed after the timeout
 
 pub mod cli_runner;

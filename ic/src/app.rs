@@ -1052,6 +1052,10 @@ impl AppBuilder {
                 self.config.sandbox.to_sandbox_config(),
             ));
             let policy = manager.config().policy;
+            tokio::spawn(Arc::clone(&manager).run_reaper(
+                std::time::Duration::from_secs(self.config.sandbox.reaper_interval_secs),
+                std::time::Duration::from_secs(self.config.sandbox.orphan_threshold_secs),
+            ));
             tools.register_sandboxed_shell(manager, policy);
         } else if self.config.sandbox.enabled && self.config.agent.allow_local_tools {
             tracing::info!(

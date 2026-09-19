@@ -31,7 +31,7 @@ use uuid::Uuid;
 use crate::context::ContextManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::sandbox::connect_docker;
-use crate::sandbox::{SANDBOX_CONTAINER_LABEL, cli_runner::available_runtime_binary};
+use crate::sandbox::{CliRunner, SANDBOX_CONTAINER_LABEL};
 
 /// Configuration for the sandbox reaper.
 #[derive(Debug, Clone)]
@@ -95,7 +95,6 @@ impl SandboxReaper {
         loop {
             interval.tick().await;
             self.scan_and_reap().await;
-            self.sweep_cli_sandboxes().await;
         }
     }
 
@@ -293,29 +292,32 @@ impl SandboxReaper {
             );
         }
     }
+}
 
-    /// Sweep for orphaned **generic sandbox** containers via the runtime CLI.
+impl CliRunner {
+    /// Sweep for orphaned **generic sandbox** containers via the selected CLI.
     ///
     /// These are the `lunarwing.sandbox`-labeled containers created by
     /// `crate::sandbox`'s CLI runner (`--rm` normally cleans them up; this
     /// catches leftovers after crashes or failed kills). Never touches
     /// `lunarwing.job_id` containers — that namespace belongs to the bollard
     /// scan above.
-    async fn sweep_cli_sandboxes(&self) {
-        let Some(bin) = available_runtime_binary() else {
-            return; // No runtime CLI: the generic sandbox isn't in use.
-        };
-
+    /// Runs without constructing `SandboxReaper` or opening an API socket.
+    pub async fn reap_orphans(&self, orphan_threshold: Duration) {
         let filter = format!("label={SANDBOX_CONTAINER_LABEL}");
-        let output = match tokio::process::Command::new(bin)
-            .args(["ps", "-a", "--filter", &filter, "--format", "json"])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
+        let output = match tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new(&self.binary)
+                .args(["ps", "-a", "--filter", &filter, "--format", "json"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
         {
-            Ok(output) if output.status.success() => output,
+            Ok(Ok(output)) if output.status.success() => output,
             _ => {
                 tracing::debug!("Reaper: runtime CLI sandbox sweep listing failed");
                 return;
@@ -323,7 +325,7 @@ impl SandboxReaper {
         };
 
         let now = Utc::now();
-        let threshold = chrono::Duration::from_std(self.config.orphan_threshold)
+        let threshold = chrono::Duration::from_std(orphan_threshold)
             .unwrap_or_else(|_| chrono::Duration::minutes(10));
         let inflight = crate::sandbox::inflight_sandbox_containers();
 
@@ -357,23 +359,7 @@ impl SandboxReaper {
                 age_secs = age.num_seconds(),
                 "Reaper: orphaned sandbox container detected, cleaning up"
             );
-            let status = tokio::process::Command::new(bin)
-                .args(["rm", "-f", &name])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
-            match status {
-                Ok(s) if s.success() => tracing::info!(
-                    container = %name,
-                    "Reaper: removed orphaned sandbox container"
-                ),
-                _ => tracing::warn!(
-                    container = %name,
-                    "Reaper: failed to remove orphaned sandbox container"
-                ),
-            }
+            self.remove_container(&name).await;
         }
     }
 }
@@ -400,12 +386,16 @@ fn parse_sandbox_containers(text: &str) -> Vec<(String, Option<DateTime<Utc>>)> 
         let Some(name) = container_name(&value) else {
             continue;
         };
-        // Creation time: the label value first, then the runtime's unix ts.
-        let created_at = value
-            .get("Labels")
-            .and_then(|labels| labels.get(SANDBOX_CONTAINER_LABEL))
-            .and_then(|v| v.as_str())
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        if !name.starts_with("lunarwing-sandbox-") {
+            continue;
+        }
+        // Docker ps emits Labels as "key=value,key=value", not an object.
+        // Require our label as well as the ps filter before considering removal.
+        let Some(label) = sandbox_label(&value) else {
+            continue;
+        };
+        let created_at = DateTime::parse_from_rfc3339(label)
+            .ok()
             .map(|dt| dt.with_timezone(&Utc))
             .or_else(|| {
                 value
@@ -416,6 +406,18 @@ fn parse_sandbox_containers(text: &str) -> Vec<(String, Option<DateTime<Utc>>)> 
         result.push((name, created_at));
     }
     result
+}
+
+fn sandbox_label(value: &serde_json::Value) -> Option<&str> {
+    let labels = value.get("Labels")?;
+    if let Some(text) = labels.as_str() {
+        text.split(',').find_map(|entry| {
+            let (key, value) = entry.split_once('=')?;
+            (key == SANDBOX_CONTAINER_LABEL).then_some(value)
+        })
+    } else {
+        labels.get(SANDBOX_CONTAINER_LABEL)?.as_str()
+    }
 }
 
 /// Extract a container name from a `ps --format json` record. Podman reports
@@ -459,14 +461,14 @@ mod tests {
     #[test]
     fn parse_sandbox_containers_docker_json_lines_shape() {
         let json = concat!(
-            "{\"Names\":\"/lunarwing-sandbox-d1\",\"Labels\":{\"lunarwing.sandbox\":\"2026-09-04T01:02:03Z\"},\"CreatedAt\":\"2026-09-04 01:02:03 +0000 UTC\"}\n",
-            "{\"Names\":\"/lunarwing-sandbox-d2\",\"Labels\":{},\"Created\":1760000000}\n",
+            "{\"Names\":\"lunarwing-sandbox-d1\",\"Labels\":\"other=x,lunarwing.sandbox=2026-09-04T01:02:03Z\",\"CreatedAt\":\"2026-09-04 01:02:03 +0000 UTC\"}\n",
+            "{\"Names\":\"lunarwing-sandbox-d2\",\"Labels\":\"lunarwing.sandbox=invalid\",\"Created\":1760000000}\n",
         );
         let parsed = parse_sandbox_containers(json);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].0, "lunarwing-sandbox-d1");
         assert!(parsed[0].1.is_some());
-        // No label: falls back to the unix timestamp.
+        // Invalid label timestamp: falls back to the runtime's unix timestamp.
         assert_eq!(parsed[1].0, "lunarwing-sandbox-d2");
         assert!(parsed[1].1.is_some());
     }

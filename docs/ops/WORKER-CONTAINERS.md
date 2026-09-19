@@ -5,6 +5,22 @@ Several container images provide sandboxed and persistent job execution for Luna
 Nanocode is retired and has no active source, build, or runtime image definition.
 See [`NANOCODE-REMOVAL.md`](NANOCODE-REMOVAL.md) for upgrade behavior.
 
+## Generic shell sandbox network policy (WI#179 / #154 / #155)
+
+The generic shell sandbox defaults globally to `SANDBOX_NETWORK=none`, including
+tenants with external workers or PostgreSQL. Web-capable sandboxes should opt
+into `proxy-enforced`, which exposes only a dedicated allowlist-proxy Unix socket
+to a `--network none` container. Both bundled sandbox/worker images include the
+required Python 3. Existing explicit `proxy` configurations retain advisory
+egress and should be reviewed during rollout. The generic runner overrides the
+image entrypoint with `sh` and the working directory with `/workspace`.
+
+Rootless Podman uses keep-id. Docker fallback uses the non-root caller's numeric
+UID/GID (a root operator uses the non-root workspace owner) and supports local
+Linux daemons without UID remapping; unsupported
+rootless/remapped Docker configurations fail with a configuration error.
+See [the implementation and live-acceptance record](v2.1.2.0_GOAL26_SANDBOX_HARDENING.md).
+
 ## LunarWing Worker
 
 The main sandbox worker. Its runtime image includes Git, build-essential, Node.js/npm, Python 3, Rust, and GitHub CLI; it does not install a Claude Code executable. The orchestrator (`ic/src/orchestrator/`) manages container lifecycle, LLM proxying, and credential injection.

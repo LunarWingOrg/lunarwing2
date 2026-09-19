@@ -36,9 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user; UID/GID 1000 must match the sandbox runner's `--user
-# 1000:1000` (with podman >= 5 the runner also pins keep-id:uid=1000,gid=1000
-# so the mounted /workspace is owned by this user regardless of host UID).
+# Podman >= 5 maps the caller to UID/GID 1000 with keep-id. Other supported
+# runtimes select the non-root caller/workspace owner numerically at run time.
+# Python 3 above is also required by SANDBOX_NETWORK=proxy-enforced's relay.
 RUN useradd -m -u 1000 -g 1000 sandbox \
     && mkdir -p /workspace /home/sandbox/.cargo/registry \
     && chown -R sandbox:sandbox /workspace /home/sandbox

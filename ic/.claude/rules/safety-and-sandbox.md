@@ -38,9 +38,16 @@ runtime or image is unavailable, commands error with a structured
 
 ## Network Egress Tiers
 
-- `proxy` (default): allowlist HTTP proxy + credential injection. **Advisory** —
+- `none` (default): `--network none` — kernel-enforced, no egress, no proxy started.
+- `proxy-enforced`: `--network none` plus a per-execution Unix socket relay to
+  the allowlist proxy. Only public destinations; DNS pinned, redirects rechecked.
+  Requires local Linux runtime and Python 3 in the image; setup fails closed.
+- `proxy`: legacy allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via `http_proxy`/`https_proxy` env vars, which a process may ignore.
-- `none`: `--network none` — kernel-enforced, no egress, no proxy started.
+
+Cleanup is supervised independently of the caller's future. The generic CLI
+reaper runs without the worker/API reaper and uses the execution runtime. Keep
+`--pids-limit 256`, non-root identity and the runtime's default seccomp filter.
 
 ## BOUNDARY: generic sandbox vs. orchestrator worker containers
 
