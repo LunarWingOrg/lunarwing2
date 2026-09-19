@@ -1632,11 +1632,12 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             },
             lunarwing_engine::ActionDef {
                 name: "mission_delete".into(),
-                description: "Delete a mission or routine permanently.".into(),
+                description: "Delete a mission or routine. Conversation insights retain a disabled tombstone (explicit resume re-enables); optionally purge their generated memory.".into(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "id": {"type": "string", "description": "Mission/routine ID to delete"}
+                        "id": {"type": "string", "description": "Mission/routine ID to delete"},
+                        "purge_insights": {"type": "boolean", "description": "Also remove generated insights for this mission's project/user. Only for conversation-insights. Source conversations and run audit remain. Default false."}
                     },
                     "required": ["id"]
                 }),
@@ -3071,6 +3072,7 @@ pub async fn handle_expected(
     let fired = if let Some(mgr) = mgr {
         match mgr
             .fire_on_system_event(
+                thread.project_id,
                 "user_feedback",
                 "expected_behavior",
                 &message.user_id,

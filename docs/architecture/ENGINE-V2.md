@@ -236,6 +236,10 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   `SKILL_SELF_IMPROVEMENT=true`.
 - Can be patched by the self-improvement mission and versioned in the Store when
   `ORCHESTRATOR_SELF_MODIFY=true`
+- The same opt-in controls prompt-overlay consumption when assembling a system
+  prompt. Stored overlays, including those with `source: compiled_in`, are inert
+  while disabled. Compiled v0 seeding and failure bookkeeping use the host-only
+  `Store::save_internal_memory_doc` path; model metadata is never write authority.
 - Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
 - Nudges short roleplay or retry prose back into a `repl` block for non-conversational
   goals, with a default two-attempt cap; substantive prose and short conversational
@@ -253,6 +257,7 @@ skills (which have a separate activation path) and engine-maintenance records:
 `orchestrator:failures`. Either a reserved title or a maintenance tag
 (`fix_patterns`, `prompt_overlay`, `orchestrator_code`, `orchestrator_meta`)
 excludes a document, including legacy untagged and renamed tagged records.
+Reserved `prompt:` and `orchestrator:` title prefixes are also excluded.
 
 Relevance uses case-insensitive whole tokens, retaining `_` and `-` inside
 identifiers. Query terms are deduplicated and common conversational filler is
@@ -263,12 +268,25 @@ memories. Partial matches remain eligible when a query has additional terms.
 An empty automatic recall is not evidence that no memory exists; explicit
 `memory_search`/document access is still available.
 
-Mission planning, mission threads, and their host-marked mission children use
+General mission planning, mission threads, and their host-marked mission children use
 `retrieve_mission_context`: maintenance records remain eligible and zero-match
 queries retain type-priority/recency fallback. The host selects this policy from
 thread configuration; `__retrieve_docs__` arguments cannot opt a conversation
-into it. Dedicated overlay/orchestrator loading and stored records are unaffected
-by the conversational filter.
+into it. **Conversation-insights missions are the exception:** the host assigns
+`MissionContext::ConversationInsights` with a query derived only from the
+trigger batch's complete user statements. Both meta-prompt construction and
+first-step `__retrieve_docs__` use conversational relevance and maintenance
+exclusions; an empty batch recalls nothing. The context is inherited by managed
+and inline mission children. Model arguments and mutable REPL state cannot
+switch policies or replace the batch query. Retrieved documents retain
+untrusted source labels. Dedicated overlay/orchestrator loading has its own
+self-modification gate.
+
+Insight-shaped documents have their own recall-eligibility rule (WI #183
+G8-F4): automatic recall surfaces only host-minted, current-version `explicit`
+insight records whose captured sources are complete and equal the doc content.
+`inferred` records and pre-hardening insight-shaped lessons stay inspectable
+through explicit tools but never ride automatic recall.
 
 ### Authenticity hardening (WI#132)
 
@@ -516,17 +534,25 @@ Event payloads are seeded into the mission thread's initial persisted state as
 `state["trigger_payload"]` before execution. Terminal thread events are published
 after final thread persistence so listeners can load complete source state.
 Initial mission state remains available across approval/authentication pauses,
-while normal terminal cleanup removes it. Conversation-insight cadence is
-tracked per project and user, preventing one user's completions from advancing
-another user's mission.
+while normal terminal cleanup removes it. System-event dispatch is
+project-scoped: `fire_on_system_event` takes the dispatching project as a
+host-supplied argument, and a mission only fires when its project matches — so
+a same-user event in project A cannot fire that user's mission in project B
+(WI #183 G8-F6).
 
 Trigger payloads are deduplicated at fire time: a payload carrying a
 `source_thread_id` and/or `content_hash` that the mission has already processed
 spawns no thread and consumes no daily budget. The processed-key set is
 persisted on the mission (FIFO-bounded to 512 keys), so re-delivered events are
-skipped even across daemon restarts (work item #69). The conversation-insights
-listener keys each batch by project and completed-thread count so a restart
-(which resets the in-memory counter) does not re-fire stale batches.
+skipped even across daemon restarts (work item #69). Conversation-insights
+batches are selected durably instead of counted: the mission persists an
+`InsightCursor` (last reserved `completed_at`/`thread_id`) with its thread
+reservation, and batch identity is content-derived from the batch's sorted
+message ids (`insights:v2:<project>:<ids>`), so a restart can neither re-fire
+the consumed batch nor collide a genuinely new one with an old processed key
+(WI #183 G8-F7). The periodic tick also scans for eligible sources directly, so
+completions that raced their event's persistence or arrived during broadcast
+lag still produce runs.
 
 ### Error Diagnosis (`self-improvement`)
 
@@ -546,8 +572,49 @@ listener keys each batch by project and completed-thread count so a restart
 
 ### Conversation Insights (`conversation-insights`)
 
-- **Trigger**: fires every 5 completed threads in a project
-- **Action**: extracts user preferences, domain knowledge, and workflow patterns
+- **Trigger**: a batch of five newly completed, eligible source threads in the
+  project, or the durable source scan on tick
+- **Evidence**: each top-level Foreground thread captures its ingested User-role
+  statements at ingestion time as complete, untruncated `InsightSource` records
+  (message/thread/conversation identity + timestamp). Generated goals, steer
+  notes, system injections, research/mission threads, failed threads, other
+  users' or projects' threads, legacy pre-upgrade threads, and truncated
+  statements are never sources; a single oversized statement (over the
+  per-statement or per-thread bound) disqualifies its entire conversation —
+  fail-closed, so partial evidence is never extracted. The host selects the
+  batch from persisted threads under the mission fire lock; caller-supplied
+  payload content is ignored.
+- **Context**: the current source batch and relevant non-maintenance knowledge.
+  Existing generated `current_focus` and `approach_history` are excluded from
+  the next extraction prompt, including legacy history. FINAL reports are
+  retained for audit, but insights do not update focus or request a generated
+  next agenda.
+- **Host writer**: insight threads write only through the atomic
+  `Store::save_conversation_insight` entry point. Every citation is re-validated
+  against the persisted source statement (whole-statement quote, same
+  project/user, still-eligible thread, reserved run with current status and
+  generation). The host mints the title (`insight:<kind>:<DocId>`), the
+  `insight` tag, and empty metadata; model-supplied identity/trust fields
+  cannot pass through. Explicit statements upsert by exact content and
+  inferred records by evidence set, so duplicates are impossible; at most five
+  distinct insights per run are accepted. A quote records what was said, not
+  that its claims are true.
+- **Recall eligibility**: automatic recall surfaces only host-minted,
+  current-version `explicit` insight records whose sources are complete and
+  equal the doc content. `inferred` records persist for inspection via
+  explicit tools but never ride automatic recall, so prior generated
+  insights cannot become independent user corroboration. Contradictions are
+  kept: a newer complete statement is its own explicit insight.
+- **Opt-out**: deleting the mission persists a `Paused` tombstone
+  (`deleted_at`), bumps `insight_generation` so stale writers fail the gate,
+  stops in-flight runs, and survives both startup reconciliation and
+  same-name recreation. `mission_delete` with `purge_insights` removes only
+  host-minted insight records in that project/user scope — user- or
+  model-authored docs that merely carry an `insight:` title or `insight` tag
+  survive it. An explicit `mission_resume` re-enables extraction from the
+  resume point forward (skip-until-resume): statements made while the mission
+  was paused or tombstoned are never learned, so no disabled-window backlog
+  fires on re-enable.
 
 ### Expected Behavior (`expected-behavior`)
 
@@ -647,14 +714,21 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 33 Store-trait methods for threads, steps, events, projects, docs, leases,
-  missions, and conversations (28 overridden by `HybridStore`; five shared-scope
+- 34 Store-trait methods for threads, steps, events, projects, docs, leases,
+  missions, and conversations (29 overridden by `HybridStore`; five shared-scope
   and global-list helpers use trait defaults)
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
 - Fallback to workspace files on cache miss; terminal cleanup evicts memory but
   preserves persisted output
+- MemoryDoc saves propagate workspace content-write failures. Persistence must
+  succeed before publishing the document/cache path or deleting a rename's old
+  file. Writes are serialized through a store-local lock so cache publication
+  follows durable write ordering. Workspace-less stores remain in-memory.
+- `save_internal_memory_doc` is a separate native-only entry point for compiled
+  seeds and engine bookkeeping. Ordinary saves cannot bypass the control-doc
+  gate using `source: compiled_in` or the failure-tracker title.
 
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
@@ -794,7 +868,7 @@ The engine defines three traits that the host crate implements. This boundary en
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
 | `LlmBackend` | `complete(...) -> LlmOutput`; `complete_stream(...) -> LlmStream` | `LlmProvider` |
-| `Store` | 33 CRUD methods for all engine types | Workspace-backed `HybridStore` |
+| `Store` | 34 CRUD methods for all engine types | Workspace-backed `HybridStore` |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -846,7 +920,7 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
-ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
+ORCHESTRATOR_SELF_MODIFY=false # Compiled orchestrator v0, no stored prompt overlays or model control-doc writes
 
 # ThreadConfig env overrides (read at thread spawn):
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM

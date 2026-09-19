@@ -141,6 +141,13 @@ const MAX_FAILURES_BEFORE_ROLLBACK: u64 = 3;
 pub(crate) const FAILURE_TRACKER_TITLE: &str = "orchestrator:failures";
 pub(crate) const ORCHESTRATOR_META_TAG: &str = "orchestrator_meta";
 
+/// One host policy for runtime code, prompt overlays, and protected writes.
+pub fn self_modification_enabled() -> bool {
+    std::env::var("ORCHESTRATOR_SELF_MODIFY")
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false)
+}
+
 /// Load orchestrator code: runtime version from Store, or compiled-in default.
 ///
 /// When `allow_self_modify` is false, always uses the compiled-in default
@@ -298,7 +305,7 @@ pub async fn record_orchestrator_failure(
     .to_string();
     tracker.updated_at = chrono::Utc::now();
 
-    if let Err(e) = store.save_memory_doc(&tracker).await {
+    if let Err(e) = store.save_internal_memory_doc(&tracker).await {
         debug!("failed to save orchestrator failure tracker: {e}");
     }
 
@@ -317,7 +324,7 @@ pub async fn reset_orchestrator_failures(store: &Arc<dyn Store>, project_id: Pro
         let mut tracker = doc.clone();
         tracker.content = serde_json::json!({"version": 0, "count": 0}).to_string();
         tracker.updated_at = chrono::Utc::now();
-        let _ = store.save_memory_doc(&tracker).await;
+        let _ = store.save_internal_memory_doc(&tracker).await;
     }
 }
 
@@ -2082,17 +2089,24 @@ async fn handle_retrieve_docs(
         })
         .unwrap_or(5);
 
-    let result = if thread.thread_type == crate::types::thread::ThreadType::Mission
-        || thread.config.mission_child
-    {
-        retrieval
-            .retrieve_mission_context(thread.project_id, &thread.user_id, &goal, max_docs)
-            .await
-    } else {
-        retrieval
-            .retrieve_context(thread.project_id, &thread.user_id, &goal, max_docs)
-            .await
-    };
+    let result =
+        if let crate::types::thread::MissionContext::ConversationInsights { recall_query, .. } =
+            &thread.config.mission_context
+        {
+            retrieval
+                .retrieve_context(thread.project_id, &thread.user_id, recall_query, max_docs)
+                .await
+        } else if thread.thread_type == crate::types::thread::ThreadType::Mission
+            || thread.config.mission_child
+        {
+            retrieval
+                .retrieve_mission_context(thread.project_id, &thread.user_id, &goal, max_docs)
+                .await
+        } else {
+            retrieval
+                .retrieve_context(thread.project_id, &thread.user_id, &goal, max_docs)
+                .await
+        };
     match result {
         Ok(docs) => {
             let docs_json: Vec<serde_json::Value> = docs
