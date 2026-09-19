@@ -26,6 +26,17 @@ stale_locks=0
 orphan_count=0
 issues=()
 
+# An absent legacy sessions directory is NOT proof of health (WI#180 F7): the
+# gateway check must distinguish "no legacy artifacts to measure" from "all
+# clear". The tenant-aware runtime probe (health-runtime.sh) queries the live
+# gateway contract; here an absent directory reports degraded with explicit
+# unavailable telemetry instead of healthy with all-zero metrics.
+if [ ! -d "$SESSIONS_DIR" ]; then
+    printf '{"component":"gateway","status":"degraded","timestamp":"%s","metrics":{"enabled":true,"active_sessions":0,"stale_locks":0,"orphan_transcripts":0,"oversized_sessions":0,"legacy_sessions_dir":"absent"},"issues":["legacy sessions directory absent (%s); runtime diagnostics unavailable to this check"]}\n' \
+        "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$SESSIONS_DIR"
+    exit 1
+fi
+
 # Check for stale lock files
 check_stale_locks() {
     local locks_found=0

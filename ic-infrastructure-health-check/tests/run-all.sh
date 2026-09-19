@@ -32,8 +32,9 @@ declare -A SUITES=(
     [watchdog]="test-watchdog-systemd.sh"
     [watchdog-openrc]="test-watchdog-openrc.sh"
     [cron-wrapper]="test-cron-wrapper.sh"
+    [runtime]="test-health-runtime.sh"
 )
-ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird llm-streams metrics-exporter metrics-unit watchdog watchdog-openrc cron-wrapper)
+ORDER=(regression matrix chaos openrc systemd lunarvision init-templates lunarvoice voice-init-templates netbird llm-streams metrics-exporter metrics-unit watchdog watchdog-openrc cron-wrapper runtime)
 
 # --list: print available suites and exit (for CI introspection). Derived from
 # ORDER so it can never drift out of sync with the registered suites.
