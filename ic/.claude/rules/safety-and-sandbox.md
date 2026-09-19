@@ -38,9 +38,17 @@ runtime or image is unavailable, commands error with a structured
 
 ## Network Egress Tiers
 
-- `proxy` (default): allowlist HTTP proxy + credential injection. **Advisory** —
+- `proxy`: allowlist HTTP proxy + credential injection. **Advisory** —
   enforced via `http_proxy`/`https_proxy` env vars, which a process may ignore.
 - `none`: `--network none` — kernel-enforced, no egress, no proxy started.
+
+**Default (WI#154):** multi-tenant hosts default to `none` — mt-admin renders
+`SANDBOX_NETWORK=none` into every tenant's `lunarwing.env` (preserving an
+operator-set `proxy` on re-render). The advisory proxy mode would let a
+sandboxed process reach host-loopback services (worker WSS/health ports,
+tenant PostgreSQL, cross-tenant loopback). `proxy` is an explicit opt-in for
+tenants that need allowlisted web access; the enforced-proxy middle ground is
+tracked in WI#155.
 
 ## BOUNDARY: generic sandbox vs. orchestrator worker containers
 
@@ -53,7 +61,10 @@ TWO container subsystems exist; never mix them:
 Do not pass `SandboxManager`/`CliRunner` into the orchestrator, and do not
 route shell execution through `ContainerJobManager`. The reaper
 (`src/orchestrator/reaper.rs`) is the only shared component and scans the two
-label namespaces separately.
+label namespaces separately. The generic-sandbox CLI sweep is independent of
+the Docker-compatible API: on socketless podman deployments it runs as a
+standalone loop (`SandboxReaper::run_cli_sweep_loop`) and scans the runtime
+the sandbox runner actually selected (WI#179).
 
 ## Zero-Exposure Credential Model
 

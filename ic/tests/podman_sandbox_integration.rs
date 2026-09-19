@@ -17,7 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lunarwing::context::JobContext;
-use lunarwing::sandbox::{SandboxConfig, SandboxManager, SandboxNetworkMode, SandboxPolicy};
+use lunarwing::orchestrator::{ReaperConfig, sweep_cli_sandboxes_once};
+use lunarwing::sandbox::{
+    SandboxConfig, SandboxManager, SandboxNetworkMode, SandboxPolicy,
+    cli_runner::inflight_sandbox_containers,
+};
 use lunarwing::tools::Tool;
 use lunarwing::tools::builtin::ShellTool;
 
@@ -35,6 +39,50 @@ fn gate_open() -> bool {
 fn test_image() -> String {
     std::env::var("LUNARWING_E2E_PODMAN_IMAGE")
         .unwrap_or_else(|_| "quay.io/libpod/alpine:latest".to_string())
+}
+
+/// Runtime CLI binary for direct container assertions (podman on this host).
+fn runtime_bin() -> &'static str {
+    std::env::var("LUNARWING_E2E_PODMAN_RUNTIME")
+        .ok()
+        .filter(|v| v == "docker")
+        .map(|_| "docker")
+        .unwrap_or("podman")
+}
+
+/// Whether a named container currently exists (any state).
+async fn container_exists(name: &str) -> bool {
+    tokio::process::Command::new(runtime_bin())
+        .args(["container", "exists", name])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+}
+
+/// Create a labeled sandbox container directly via the CLI (for reaper tests).
+async fn create_labeled_container(name: &str, created_at: &str) -> bool {
+    tokio::process::Command::new(runtime_bin())
+        .args([
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--label",
+            &format!("lunarwing.sandbox={created_at}"),
+            "--entrypoint",
+            "sleep",
+            test_image().as_str(),
+            "300",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
 }
 
 fn scratch_dir(tag: &str) -> PathBuf {
@@ -156,8 +204,161 @@ async fn podman_timeout_kills_container() {
         .expect_err("sleep 30 must time out");
     assert_eq!(err.kind(), "timeout", "error: {err}");
 
+    // WI#179 concern 6: the timeout must actually remove the container, not
+    // just report an error kind. `--rm` + kill-by-name means no labeled
+    // container may remain shortly after the kill.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if list_sandbox_containers().await.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "container left behind after timeout: {:?}",
+            list_sandbox_containers().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     mgr.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn podman_outer_tool_timeout_cleans_up_container() {
+    if !gate_open() {
+        return;
+    }
+    let dir = scratch_dir("outer-timeout");
+    let mgr = Arc::new(manager(
+        SandboxPolicy::WorkspaceWrite,
+        SandboxNetworkMode::None,
+        Duration::from_secs(120), // manager timeout far longer than the tool's
+    ));
+    mgr.initialize().await.expect("initialize");
+    let tool = ShellTool::new()
+        .with_sandbox(mgr.clone())
+        .with_working_dir(dir.clone())
+        .with_timeout(Duration::from_secs(3));
+
+    // WI#179 concern 1 repro: the shell tool's outer timeout expires before
+    // the manager's configured timeout. The dropped future must still kill
+    // the container and clear the in-flight registry.
+    let result = tool
+        .execute(
+            serde_json::json!({"command": "sleep 60"}),
+            &JobContext::default(),
+        )
+        .await;
+    let err = result.expect_err("sleep 60 must hit the outer tool timeout");
+    match err {
+        lunarwing::tools::ToolError::Sandbox(msg) => assert!(
+            msg.contains("[sandbox:timeout]"),
+            "outer timeout must surface the sandbox timeout envelope: {msg}"
+        ),
+        other => panic!("expected ToolError::Sandbox, got {other:?}"),
+    }
+
+    // In-flight registry must be empty again (no leaked registration).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !inflight_sandbox_containers().is_empty() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        inflight_sandbox_containers().is_empty(),
+        "in-flight registry leaked: {:?}",
+        inflight_sandbox_containers()
+    );
+
+    // And no sandbox container may remain (kill + rm -f on cancellation).
+    let leftovers = list_sandbox_containers().await;
+    assert!(
+        leftovers.is_empty(),
+        "cancelled execution leaked containers: {leftovers:?}"
+    );
+
+    mgr.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn podman_reaper_sweep_skips_inflight_and_reaps_orphans() {
+    if !gate_open() {
+        return;
+    }
+    let dir = scratch_dir("reaper");
+    let mgr = manager(
+        SandboxPolicy::WorkspaceWrite,
+        SandboxNetworkMode::None,
+        Duration::from_secs(120),
+    );
+    mgr.initialize().await.expect("initialize");
+
+    // An old orphan: labeled container created 2h ago, not in-flight.
+    let orphan = format!("lunarwing-sandbox-orphan-{}", uuid::Uuid::new_v4());
+    let old = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+    assert!(
+        create_labeled_container(&orphan, &old).await,
+        "create orphan fixture"
+    );
+
+    // A young container (created now) must survive the sweep.
+    let young = format!("lunarwing-sandbox-young-{}", uuid::Uuid::new_v4());
+    let now = chrono::Utc::now().to_rfc3339();
+    assert!(
+        create_labeled_container(&young, &now).await,
+        "create young fixture"
+    );
+
+    let config = ReaperConfig {
+        scan_interval: Duration::from_secs(300),
+        orphan_threshold: Duration::from_secs(600),
+        ..ReaperConfig::default()
+    };
+    sweep_cli_sandboxes_once(&config).await;
+
+    assert!(
+        !container_exists(&orphan).await,
+        "old orphan must be reaped"
+    );
+    assert!(
+        container_exists(&young).await,
+        "young container must survive the sweep"
+    );
+
+    // Clean up the young fixture.
+    let _ = tokio::process::Command::new(runtime_bin())
+        .args(["rm", "-f", &young])
+        .status()
+        .await;
+
+    mgr.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// List `lunarwing.sandbox`-labeled containers via the runtime CLI.
+async fn list_sandbox_containers() -> Vec<String> {
+    let output = tokio::process::Command::new(runtime_bin())
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "label=lunarwing.sandbox",
+            "--format",
+            "{{.Names}}",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 #[tokio::test]
@@ -279,6 +480,44 @@ async fn podman_proxy_mode_sets_proxy_env() {
     assert!(
         stdout.contains("host.containers.internal") || stdout.contains("host.docker.internal"),
         "http_proxy not wired into the container: {stdout:?}"
+    );
+
+    mgr.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn podman_proxy_mode_enforces_allowlist() {
+    if !gate_open() {
+        return;
+    }
+    let dir = scratch_dir("proxy-deny");
+    let mgr = manager(
+        SandboxPolicy::ReadOnly,
+        SandboxNetworkMode::Proxy,
+        Duration::from_secs(60),
+    );
+    mgr.initialize().await.expect("initialize");
+    assert!(mgr.proxy_port().await.is_some(), "proxy should be running");
+
+    // WI#179 concern 6: the proxy test must prove connectivity + enforcement,
+    // not just the env var. A non-allowlisted domain fetched THROUGH the
+    // proxy must come back with the stable deny body — which also proves the
+    // container reached the proxy (host alias + port wiring work).
+    let out = mgr
+        .execute(
+            "wget -T 5 -t 1 -q -O - http://evil-not-allowlisted.invalid/ 2>&1; echo exit=$?",
+            &dir,
+            HashMap::new(),
+        )
+        .await
+        .expect("execute wget via proxy");
+
+    assert!(
+        out.stdout.contains("sandbox-proxy denied:"),
+        "proxy must deny non-allowlisted domains with the stable prefix; stdout: {} stderr: {}",
+        out.stdout,
+        out.stderr
     );
 
     mgr.shutdown().await;

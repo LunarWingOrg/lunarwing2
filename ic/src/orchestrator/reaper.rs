@@ -358,6 +358,13 @@ impl SandboxReaper {
     }
 }
 
+/// One-shot generic-sandbox CLI sweep (also used by the standalone loop and
+/// the e2e test suite). Reaps `lunarwing.sandbox`-labeled containers older
+/// than `config.orphan_threshold` that are not registered as in-flight.
+pub async fn sweep_cli_sandboxes_once(config: &ReaperConfig) {
+    sweep_cli_sandboxes(config).await;
+}
+
 /// Sweep for orphaned generic-sandbox containers via the runtime CLI.
 ///
 /// Shared by [`SandboxReaper::sweep_cli_sandboxes`] and the standalone

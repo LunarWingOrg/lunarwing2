@@ -409,14 +409,26 @@ Containers that the generic sandbox spawns (`podman run`/`docker run`) are confi
 | Capabilities | Drop ALL, add only CHOWN | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Privilege escalation | `no-new-privileges` | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Root filesystem | Read-only | `src/sandbox/cli_runner.rs` — `--read-only` |
-| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5) | `src/sandbox/cli_runner.rs` — `KeepIdMode` |
+| User | Non-root (`--user 1000:1000`, keep-id userns on podman ≥ 5; docker rootless runs `0:0` inside the userns, rootful docker uses the daemon's uid/gid) | `src/sandbox/cli_runner.rs` — `KeepIdMode`, `user_for()` |
+| Process limit | `--pids-limit 256` (explicit; runtime defaults vary) | `src/sandbox/cli_runner.rs` — `build_run_args()`, `default_pids_limit()` |
+| Stop grace | `--stop-timeout 10` so kill/rm terminates PID 1 instead of orphaning | `src/sandbox/cli_runner.rs` — `build_run_args()` |
+| Seccomp | Runtime default profile (podman/docker default seccomp) — **supported contract**, no custom profile | this document |
 | Workspace mount | Policy-selected `ro`/`rw` + SELinux relabel (`,z`) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
 | Network | Proxy mode (allowlist) or `none` | `src/sandbox/cli_runner.rs`, this document above |
 | Tmpfs | `/tmp` (512 MB), `/home/sandbox/.cargo/registry` (1 GB) | `src/sandbox/cli_runner.rs` — `build_run_args()` |
-| Auto-remove | `--rm` + kill-by-name on timeout + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `src/orchestrator/reaper.rs` |
+| Auto-remove | `--rm` + kill-by-name on timeout **and on cancellation** (drop guard) + reaper sweep | `src/sandbox/cli_runner.rs` — `run_container()`, `ContainerCleanupGuard`; `src/orchestrator/reaper.rs` |
 | Labels | `lunarwing.sandbox=<RFC3339 created>` for the reaper | `src/sandbox/cli_runner.rs` — `SANDBOX_CONTAINER_LABEL` |
 | Output limits | Capped stdout/stderr collection (UTF-8-safe) | `src/sandbox/cli_runner.rs` — `CappedBuf` |
 | Timeout | Enforced with process-tree kill + `podman kill` | `src/sandbox/cli_runner.rs` — `run_container()` |
+
+**Seccomp decision (WI#179 concern 5):** the supported contract is the
+runtime's default seccomp profile. Podman and Docker both apply a default
+seccomp profile that blocks the majority of syscalls; the sandbox does not
+set a custom profile because none of the candidate profiles would be portable
+across podman and docker without shipping a JSON file to every host. The
+explicit `--pids-limit` is set because process limits are NOT covered by
+runtime defaults uniformly (docker historically had no default pid limit),
+whereas seccomp IS applied by default on both runtimes.
 
 Fail-closed semantics: when the sandbox is enabled and the runtime CLI or
 image is unavailable, shell commands **error** with a structured
