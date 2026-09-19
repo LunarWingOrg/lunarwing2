@@ -2,11 +2,15 @@
 
 Use this checklist for manual release validation. The resource-bounded commands, harness sequence, gateway smoke test, external-worker runner, and browser E2E instructions live in [`../ops/PRE-RELEASE-TESTING.md`](../ops/PRE-RELEASE-TESTING.md).
 
-**Revalidated against source 2026-09-17 (v2.1.2.0).** Referenced ops runbook,
+**Revalidated against source 2026-09-17 (v2.1.2.0); re-checked 2026-09-19.**
+Referenced ops runbook,
 `ic/scripts/release-test.sh`, and the channel/worker/multi-tenant tiers were
 re-checked against the current tree. Added the v2.1.2.0 durable cross-channel
 attachment tier below; worker cancellation now exercises the cancel-ack
-handoff (bounded ~3s wait for the worker's terminal `task_result`).
+handoff (bounded ~3s wait for the worker's terminal `task_result`). The
+2026-09-19 repass updated the sandbox network-mode list for the WI#154/155
+`proxy-enforced` mode (default `none` everywhere) and added the OpenCode 2
+worker lane to the workers checklist (mt-admin `--with-opencode2`).
 
 Record the exact commit, host profile, feature set, database backend, init system, and result for every tier. Never carry a previous release's pass count forward.
 
@@ -60,7 +64,7 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 
 ## Tools, Extensions, and Skills
 
-- [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` proxy/none).
+- [ ] Sandbox policy behavior matches the active runtime (`SANDBOX_RUNTIME` auto/podman/docker) and network mode (`SANDBOX_NETWORK` none/proxy-enforced/proxy). Default is `none` (no egress); `proxy-enforced` keeps `--network none` and reaches only the validating allowlist proxy through a per-execution Unix-socket relay; `proxy` is the legacy advisory mode.
 - [ ] HTTP requests obey URL validation, private-address policy, redirects, and capability allowlists.
 - [ ] Memory read, write, tree, and hybrid search preserve workspace semantics.
 - [ ] Secret list/delete operations never return secret values.
@@ -84,7 +88,8 @@ For each enabled channel, test inbound and outbound delivery, sender identity, a
 Test only workers configured for the release candidate. Nanocode is retired and must not appear as a runnable option.
 
 - [ ] Pebble job: creation, NDJSON events, prompt/follow-up, completion, and cancellation.
-- [ ] OpenCode job: connection, event flow, completion, and failure handling.
+- [ ] OpenCode (v1) job: connection, event flow, completion, and failure handling.
+- [ ] OpenCode 2 job (opt-in via mt-admin `--with-opencode2`): connection, event flow, completion, and failure handling.
 - [ ] Kimi Code job: connection, event flow, completion, and failure handling.
 - [ ] Worker disconnect: verify connection-level failover and clear terminal state.
 - [ ] Container boundary: verify secrets are not copied into worker output or environment diagnostics.
