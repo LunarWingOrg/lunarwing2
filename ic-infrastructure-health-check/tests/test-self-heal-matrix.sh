@@ -218,6 +218,11 @@ assert_eq "$(src_fn -- unit_tenant xmpp-bridge-globex.service)"   "globex" "D: u
 assert_eq "$(src_fn -- unit_tenant lunarwing-acme.service)"       "acme"   "D: unit_tenant lunarwing-<t>"
 assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme.service)"     "acme" "D: unit_tenant lunarwing-vision-<t>"
 assert_eq "$(src_fn -- unit_tenant lunarwing-vision-acme-sup.service)" "acme" "D: unit_tenant LunarVision supervisor"
+assert_eq "$(src_fn -- unit_tenant lunarwing-voice-acme.service)"      "acme" "D: unit_tenant lunarwing-voice-<t> (WI#180 F1)"
+assert_eq "$(src_fn -- unit_tenant lunarwing-voice-acme-sup.service)"  "acme" "D: unit_tenant LunarVoice supervisor (WI#180 F1)"
+assert_eq "$(src_fn -- unit_tenant lunarwing-opencode2-acme.service)"  "acme" "D: unit_tenant lunarwing-opencode2-<t> (WI#180 F1)"
+assert_eq "$(src_fn -- unit_tenant lunarwing-opencode2-acme-sup.service)" "acme" "D: unit_tenant opencode2 supervisor (WI#180 F1)"
+assert_eq "$(src_fn -- unit_tenant lunarwing-opencode-acme-sup.service)" "acme" "D: unit_tenant opencode supervisor (WI#180 F1)"
 assert_eq "$(src_fn -- unit_tenant lunarwing.service)"                ""     "D: unit_tenant base unit → no tenant"
 assert_eq "$(src_fn -- unit_tenant clickhouse-server.service)"    ""       "D: unit_tenant foreign unit → no tenant"
 

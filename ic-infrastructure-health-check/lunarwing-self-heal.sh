@@ -220,11 +220,24 @@ unit_tenant() {
         ironclaw-proxy-*)            printf '%s' "${u#ironclaw-proxy-}" ;;
         lunarwing-pg-*)              printf '%s' "${u#lunarwing-pg-}" ;;
         lunarwing-nanocode-*)        printf '%s' "${u#lunarwing-nanocode-}" ;;
-        lunarwing-opencode-*)        printf '%s' "${u#lunarwing-opencode-}" ;;
-        lunarwing-kimi-*)            printf '%s' "${u#lunarwing-kimi-}" ;;
-        lunarwing-pebble-*)          printf '%s' "${u#lunarwing-pebble-}" ;;
+        lunarwing-opencode-*)
+            u="${u#lunarwing-opencode-}"
+            printf '%s' "${u%-sup}" ;;
+        lunarwing-opencode2-*)
+            u="${u#lunarwing-opencode2-}"
+            printf '%s' "${u%-sup}" ;;
+        lunarwing-kimi-*)
+            u="${u#lunarwing-kimi-}"
+            printf '%s' "${u%-sup}" ;;
+        lunarwing-pebble-*)
+            u="${u#lunarwing-pebble-}"
+            printf '%s' "${u%-sup}" ;;
         lunarwing-vision-*)
             u="${u#lunarwing-vision-}"
+            printf '%s' "${u%-sup}" ;;
+
+        lunarwing-voice-*)
+            u="${u#lunarwing-voice-}"
             printf '%s' "${u%-sup}" ;;
 
         lunarwing-weechat-adapter-*) printf '%s' "${u#lunarwing-weechat-adapter-}" ;;

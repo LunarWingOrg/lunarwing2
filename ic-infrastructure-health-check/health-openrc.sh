@@ -120,6 +120,7 @@ unit_tenant() {
         pg-*)                rest="${rest#pg-}" ;;
         nanocode-*)          rest="${rest#nanocode-}" ;;
         opencode-*)          rest="${rest#opencode-}"; rest="${rest%-sup}" ;;
+        opencode2-*)         rest="${rest#opencode2-}"; rest="${rest%-sup}" ;;
         kimi-*)              rest="${rest#kimi-}"; rest="${rest%-sup}" ;;
         pebble-*)            rest="${rest#pebble-}"; rest="${rest%-sup}" ;;
         vision-*)            rest="${rest#vision-}"; rest="${rest%-sup}" ;;
@@ -182,9 +183,10 @@ weechat_unit_disabled() {
 worker_unit_intentionally_stopped() {
   local svc="$1" worker tenant result
   case "$svc" in
-    lunarwing-pebble-*)   worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
-    lunarwing-opencode-*) worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
-    lunarwing-kimi-*)     worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
+    lunarwing-pebble-*)    worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
+    lunarwing-opencode-*)  worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
+    lunarwing-opencode2-*) worker="opencode2"; tenant="${svc#lunarwing-opencode2-}" ;;
+    lunarwing-kimi-*)      worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
     *) return 1 ;;
   esac
   case "$tenant" in *-sup) tenant="${tenant%-sup}" ;; esac

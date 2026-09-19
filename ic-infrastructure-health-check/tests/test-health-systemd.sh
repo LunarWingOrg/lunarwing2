@@ -363,6 +363,18 @@ assert_eq "$(ustat "$oS" lunarwing-voice-acme.service)" "critical" "S2: active b
 assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-voice-acme.service") | .extra.container_health' <<<"$oS")" "unhealthy" "S3: LunarVoice container health exposed"
 assert_eq "$(oall "$oS")" "critical" "S4: LunarVoice container failure drives overall status"
 
+# ── S5: opencode2 container health is probed like the other workers (WI#180 F1) ──
+echo "=== Section S5: opencode2 container health ==="
+s5="$(sb)"; mk_hs_mock "$s5"
+jq -n '{tenants:{acme:{user:"acme"}}}' > "$s5/ports.json"
+unit_set_user "$s5" acme lunarwing-acme.service "loaded active running 0 enabled"
+unit_set_user "$s5" acme lunarwing-opencode2-acme.service "loaded active running 0 generated"
+container_health_user "$s5" acme lunarwing-opencode2-acme unhealthy
+oS5="$(run_hs_registry "$s5")"
+assert_eq "$(ustat "$oS5" lunarwing-opencode2-acme.service)" "critical" "S5: active but unhealthy opencode2 container is critical"
+assert_eq "$(jq -r '.metrics.units[] | select(.name=="lunarwing-opencode2-acme.service") | .extra.container_health' <<<"$oS5")" "unhealthy" "S5: opencode2 container health exposed"
+assert_eq "$(oall "$oS5")" "critical" "S5: opencode2 container failure drives overall status"
+
 # ── T: single-node user scope probes the same bus remediation targets ────────
 echo "=== Section T: single-node user-manager scope ==="
 t="$(sb)"; mk_hs_mock "$t"

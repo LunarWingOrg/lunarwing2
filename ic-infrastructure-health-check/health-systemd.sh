@@ -343,7 +343,7 @@ if [ "$IS_MT" = "true" ] && [ "$MT_DISCOVERY_OK" = "true" ]; then
       # but not serving) is caught instead of reported healthy.
       uhealth=""
       case "$tunit" in
-        lunarwing-pg-*|lunarwing-opencode-*|lunarwing-kimi-*|lunarwing-pebble-*|lunarwing-vision-*|lunarwing-voice-*)
+        lunarwing-pg-*|lunarwing-opencode-*|lunarwing-opencode2-*|lunarwing-kimi-*|lunarwing-pebble-*|lunarwing-vision-*|lunarwing-voice-*)
           uhealth=$(_tenant_ctr_health "$tuser" "$tuid" "${tunit%.service}")
           if [ "$uhealth" = "unhealthy" ] && [ "$uexit" -lt 2 ]; then
             ustatus="critical"; uexit=2; issues+=("$tunit ($tuser) container unhealthy")
