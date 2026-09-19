@@ -204,9 +204,23 @@ overall=healthy
 exit_code=0
 instances='[]'
 all_issues='[]'
+# Fleet sweep deadline (WI#180 F4): same partial-results contract as
+# health-lunarvision.sh — stop starting new probes, keep completed
+# observations, mark the rest unprobed. 0 disables.
+SWEEP_DEADLINE_SECS="${HEALTH_LUNARVOICE_SWEEP_DEADLINE_SECS:-22}"
+sweep_incomplete=false
+unprobed_count=0
 for target in "${targets[@]}"; do
   tenant="${target%%|*}"
   base="${target#*|}"
+  if [ "$SWEEP_DEADLINE_SECS" != "0" ] && [ "$SECONDS" -ge "$SWEEP_DEADLINE_SECS" ]; then
+    sweep_incomplete=true
+    unprobed_count=$((unprobed_count + 1))
+    instances="$(jq -c --arg tenant "$tenant" --arg url "$base/health" \
+      '. + [{tenant:$tenant,url:$url,status:"unprobed",issues:["probe skipped: sweep deadline"]}]' \
+      <<<"$instances")"
+    continue
+  fi
   instance="$(probe "$tenant" "$base")"
   instance_status="$(jq -r '.status' <<<"$instance")"
   if (( $(rank "$instance_status") > $(rank "$overall") )); then
@@ -216,6 +230,17 @@ for target in "${targets[@]}"; do
   all_issues="$(jq -c --argjson more "$(jq '.issues' <<<"$instance")" '. + $more' <<<"$all_issues")"
 done
 case "$overall" in critical) exit_code=2 ;; degraded) exit_code=1 ;; esac
+
+# Incomplete coverage is a monitoring failure: degrade at worst, never mask a
+# worse instance verdict (WI#180 F4).
+if [ "$sweep_incomplete" = "true" ]; then
+  all_issues="$(jq -c --arg msg "target sweep incomplete: $unprobed_count target(s) unprobed (deadline ${SWEEP_DEADLINE_SECS}s); results partial" \
+    '. + [$msg]' <<<"$all_issues")"
+  if (( $(rank "$overall") < 2 )); then
+    overall="degraded"
+    exit_code=1
+  fi
+fi
 
 jq -n \
   --arg timestamp "$TIMESTAMP" --arg status "$overall" --arg discovery "$discovery" \

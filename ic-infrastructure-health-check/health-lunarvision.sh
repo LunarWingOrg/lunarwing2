@@ -325,7 +325,23 @@ cache_hit_rate=0.0
 avg_latency_ms=0
 primary_url=""
 
+# Fleet sweep deadline (WI#180 F4): probing every tenant target sequentially at
+# up to TIMEOUT_SECS each can exhaust the driver's ~30s component budget, which
+# discarded ALL instance results. Stop starting new probes after the deadline,
+# keep the completed observations, and mark the rest unprobed. 0 disables.
+SWEEP_DEADLINE_SECS="${HEALTH_LUNARVISION_SWEEP_DEADLINE_SECS:-22}"
+sweep_incomplete=false
+unprobed_count=0
+
 for entry in "${TARGETS[@]}"; do
+    if [ "$SWEEP_DEADLINE_SECS" != "0" ] && [ "$SECONDS" -ge "$SWEEP_DEADLINE_SECS" ]; then
+        sweep_incomplete=true
+        unprobed_count=$((unprobed_count + 1))
+        instances_json=$(jq -c --arg tenant "${entry%%|*}" --arg url "${entry#*|}/health" \
+            '. + [{tenant:$tenant,url:$url,status:"unprobed",issues:["probe skipped: sweep deadline"]}]' \
+            <<<"$instances_json")
+        continue
+    fi
     tname="${entry%%|*}"
     base_url="${entry#*|}"
     _probe_one "$base_url"
@@ -395,6 +411,16 @@ for entry in "${TARGETS[@]}"; do
 done
 
 [ -z "$primary_url" ] && primary_url="$DEFAULT_SINGLE_NODE_URL"
+
+# Incomplete coverage is a monitoring failure: degrade at worst, never mask a
+# worse instance verdict (WI#180 F4).
+if [ "$sweep_incomplete" = "true" ]; then
+    issues+=("target sweep incomplete: $unprobed_count target(s) unprobed (deadline ${SWEEP_DEADLINE_SECS}s); results partial")
+    if [ "$(_rank "$status")" -lt 2 ]; then
+        status="degraded"
+        exit_code=1
+    fi
+fi
 
 issues_json="[]"
 if [ ${#issues[@]} -gt 0 ]; then

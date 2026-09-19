@@ -64,9 +64,10 @@ run_check() {
     local exit_code=0
 
     # Run the check with timeout, capture stdout (JSON) and stderr (logs) separately
+    # CHECK_TIMEOUT_SECS is honored for tests; production default stays 30.
     local stderr_file
     stderr_file=$(mktemp "$WORKDIR/check-stderr.XXXXXX")
-    output=$(timeout 30 "$SCRIPT_DIR/$script" 2>"$stderr_file") || exit_code=$?
+    output=$(timeout "${HEALTH_CHECK_TIMEOUT_SECS:-30}" "$SCRIPT_DIR/$script" 2>"$stderr_file") || exit_code=$?
     # Append any stderr from the check to the log
     [ -s "$stderr_file" ] && cat "$stderr_file" >> "$LOG_FILE"
     rm -f "$stderr_file"
@@ -75,7 +76,17 @@ run_check() {
     local duration=$((end - start))
 
     if [ $exit_code -eq 124 ]; then
-        log "WARNING: $component check timed out after 30 seconds"
+        # A component that emitted valid partial JSON before the outer timeout
+        # still carries usable fleet observations — keep them instead of
+        # discarding everything (WI#180 F4). The component's own deadline logic
+        # marks incomplete sweeps; here we only fall back to `unknown` when
+        # nothing usable arrived.
+        if [ -n "$output" ] && echo "$output" | jq . >/dev/null 2>&1; then
+            log "WARNING: $component check timed out after ${HEALTH_CHECK_TIMEOUT_SECS:-30} seconds; keeping partial JSON"
+            echo "$output" | jq --argjson d "$duration" '. + {duration_seconds: $d}'
+            return 1
+        fi
+        log "WARNING: $component check timed out after ${HEALTH_CHECK_TIMEOUT_SECS:-30} seconds"
         echo "{\"component\": \"$component\", \"status\": \"unknown\", \"error\": \"timeout\", \"duration_seconds\": $duration}"
         return 1
     fi
