@@ -187,7 +187,7 @@ assert_contains "$BUILD_LIB" 'local source_root="${3:-$LUNARWING_ROOT}"' 'OpenCo
 assert_contains "$BUILD_LIB" 'build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to OpenCode builder'
 assert_contains "$BUILD_LIB" 'build-all refuses dirty worker source in tenant checkout' 'build-all rejects mismatched dirty worker trees'
 KIMI_DOCKERFILE="$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
-assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.43.0' 'Kimi image pins build-arg default'
+assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.43.1' 'Kimi image pins build-arg default'
 assert_contains "$KIMI_DOCKERFILE" 'COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/' 'Kimi image copies the reviewed CLI lock'
 assert_contains "$KIMI_DOCKERFILE" 'npm ci --omit=dev --prefix /opt/kimi-cli' 'Kimi image installs selected package from its lock'
 assert_contains "$KIMI_DOCKERFILE" 'org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"' 'Kimi image records toolchain profile'
