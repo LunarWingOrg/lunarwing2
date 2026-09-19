@@ -180,7 +180,8 @@ is now the supported runtime:
   `--pids-limit 256`, `--stop-timeout 10`, and `lunarwing.sandbox` labels
   with a shared in-flight registry.
 - The sandbox manager swapped bollard for the CLI runner; the egress proxy
-  starts only for sandboxed policies in `proxy` network mode. The shell tool
+  starts for every non-`none` network mode — advisory `proxy` and
+  `proxy-enforced` alike — behind a never-relaxed ACL. The shell tool
   is wired fail-closed via `register_sandboxed_shell` (production sandboxed;
   the dev `ALLOW_LOCAL_TOOLS` path stays direct unless
   `SANDBOX_ENFORCE=true`) with the structured `[sandbox:<kind>]` error
@@ -397,10 +398,14 @@ The OpenCode v2 lane is a full first-class worker:
 
 ### CI/CD Improvements (goals 28, 30, 21)
 
-- Giant-crate compile jobs serialize on the `rust-compile-16gb` resource
-  group, including the previously-bypassing `cavepony-wasm` job — reference
-  pipeline #3742's OOM kill (`sccache: Compile terminated by signal 9`)
-  re-confirmed the class. OOM/ENOSPC operator runbooks added.
+- Giant-crate compile concurrency is runner-managed: the project-wide
+  `rust-compile-16gb` resource-group serialization trialled during the
+  cycle (including the previously-bypassing `cavepony-wasm` job) was
+  deliberately removed again before release — only the per-worker
+  image-promotion resource groups serialize. The OOM class it targeted
+  (reference pipeline #3742's `sccache: Compile terminated by signal 9`)
+  has recurred under concurrent giant builds and remains a documented live
+  caveat; OOM/ENOSPC operator runbooks were added for it.
 - opencode2 gained full protected publication jobs (candidate/scan/promote)
   with the digest-bound reproducible contract and
   `$CI_COMMIT_TAG-opencode2` promotion.
@@ -584,7 +589,9 @@ duplicated-checked alongside the other tenant port maps.
 - Conversation insights: nine-finding hardening program complete (goal 8,
   WI#132/WI#143/WI#183); durable cross-channel attachments; corrupted
   blocking tool responses demoted to text (WI#139 follow-up).
-- CI/CD: giant-crate OOM class serialized on `rust-compile-16gb`; opencode2
+- CI/CD: giant-crate compile concurrency is runner-managed with OOM/ENOSPC
+  runbooks for the known signal-9 class (promotion locks are the only
+  serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
 - Worker pins updated: kimi-code 0.43.1, opencode2 v2.0.8, gitlab tool
   registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
