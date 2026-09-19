@@ -51,11 +51,11 @@
     {
       "id": 2,
       "title": "Report staleness",
-      "description": "Age of the newest aggregated report. Alerting rule fires at 40m.",
+      "description": "Age of the newest aggregated report, derived from the report timestamp at scrape time. Alerting rule fires at 40m.",
       "type": "stat",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
-      "targets": [{ "expr": "lunarwing_health_report_age_seconds", "legendFormat": "{{instance}}" }],
+      "targets": [{ "expr": "time() - lunarwing_health_report_timestamp_seconds", "legendFormat": "{{instance}}" }],
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -159,7 +159,10 @@
       "targets": [{ "expr": "lunarwing_health_unit_status", "legendFormat": "{{init}}: {{unit}}" }],
       "fieldConfig": {
         "defaults": {
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 2 }, { "color": "gray", "value": 3 }] }
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 2 }, { "color": "gray", "value": 3 }, { "color": "blue", "value": 4 }] },
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "healthy", "color": "green" }, "1": { "text": "degraded", "color": "yellow" }, "2": { "text": "critical", "color": "red" }, "3": { "text": "unknown", "color": "gray" }, "4": { "text": "skipped", "color": "blue" } } }
+          ]
         },
         "overrides": []
       }

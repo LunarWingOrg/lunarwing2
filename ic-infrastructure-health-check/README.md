@@ -283,13 +283,13 @@ Exported series (`lunarwing_health_*`):
 
 | Family | Meaning |
 |--------|---------|
-| `overall_status`, `status{component}` | 0 healthy · 1 degraded · 2 critical · 3 unknown/skipped |
-| `report_timestamp_seconds`, `report_age_seconds`, `alerts_total` | staleness guard — alert when the report itself stops |
+| `overall_status`, `status{component}` | 0 healthy · 1 degraded · 2 critical · 3 unknown · 4 skipped |
+| `report_timestamp_seconds`, `report_age_seconds`, `alerts_total` | staleness guard — alert when the report itself stops. `report_age_seconds` is derived from the report timestamp at export time and re-derived at scrape time by the optional listener, so a stopped scheduler keeps advancing the age |
 | `component_enabled{component}` | disabled components export `0` and **no** status series (off ≠ failing) |
 | `check_duration_seconds{component}` | per-check wall time |
 | `<component>_<key>` | every numeric/boolean leaf of `metrics` flattened (booleans 0/1; strings dropped, so no secret material can leak); nested objects keep their path (`cache_hit_rate`) |
 | `lunarvision_*{tenant=…}`, `lunarvoice_*{tenant=…}` | per-tenant instance series from the report's own tenant labels |
-| `unit_status/unit_up/unit_restarts_total{init,unit[,tenant]}` | init-agnostic (systemd/openrc/launchd) unit series |
+| `unit_status/unit_up/unit_restarts_total{init,unit[,tenant]}` | init-agnostic (systemd/openrc/launchd) unit series; `unit_status` uses the same 0–4 code (4 = intentionally skipped/unprobed, never a failure) |
 | `selfheal_*{service}` | restarts, escalated, consecutive_unhealthy, flapping window, backoff next-attempt (absent state file → series omitted) |
 | `early_warning{metric,severity}` | threshold crossings (below) |
 

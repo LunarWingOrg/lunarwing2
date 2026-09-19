@@ -77,12 +77,12 @@ latest_report() {
 #        metrics as strings via jq --arg)
 # Type guards: gsub on null aborts the whole program, and missing/null keys do
 # occur (e.g. units without .extra.tenant_user), so esc/lv must tolerate them.
-STATUS_MAP_NOTE='# status codes: 0=healthy 1=degraded 2=critical 3=unknown/skipped'
+STATUS_MAP_NOTE='# status codes: 0=healthy 1=degraded 2=critical 3=unknown 4=skipped'
 
 REPORT_JQ='
 def esc: if type == "string" then gsub("[^a-zA-Z0-9_:]"; "_") | (if test("^[0-9]") then "_" + . else . end) else "_" end;
 def lv: if type == "string" then gsub("\\\\"; "\\\\") | gsub("\""; "\\\"") | gsub("\n"; "\\n") else "" end;
-def status_code: {"healthy":0,"degraded":1,"critical":2}[.] // 3;
+def status_code: {"healthy":0,"degraded":1,"critical":2,"unknown":3,"skipped":4}[.] // 3;
 def norm: if (type == "string") and test("^-?[0-9]+(\\.[0-9]+)?$") then tonumber else . end;
 
 # Flatten a metrics object into unlabeled series. Structural keys handled
@@ -137,6 +137,8 @@ def providers($comp):
 # Init-agnostic unit series. systemd emits metrics.units[], openrc
 # metrics.services[], launchd metrics.agents[]; shapes differ slightly
 # (active_state vs state, optional restart_count / extra.tenant_user).
+# `skipped` (intentional not-running) is a distinct code (4) so alert rules
+# can separate it from failures (WI#180 F5); `unprobed` maps to unknown (3).
 def units($init):
   [(.metrics.units // []), (.metrics.services // []), (.metrics.agents // [])]
   | flatten(1) | .[] | select(type == "object")
@@ -157,6 +159,10 @@ def units($init):
 | (($rep.timestamp // "") | try fromdateiso8601 catch 0) as $ts
 | [ "lunarwing_health_overall_status " + (($rep.overall_status // "unknown") | status_code | tostring)
   , "lunarwing_health_report_timestamp_seconds " + ($ts | tostring)
+  # Freshness is evaluated from the report timestamp against the evaluator
+  # current time (WI#180 F5): if scheduling stops, the unchanged textfile
+  # keeps serving an age that advances with every scrape instead of a frozen
+  # export-time age that can never trip the stale-report rule.
   , "lunarwing_health_report_age_seconds " + (($NOW | tonumber) - $ts | tostring)
   , "lunarwing_health_alerts_total " + (($rep.alerts // []) | length | tostring)
   ]

@@ -210,8 +210,42 @@ run "$sb_corrupt"
 assert_eq "$RC" "0" "corrupt state.json exits 0 (series omitted)"
 assert_contains "$PROM" 'lunarwing_health_overall_status' "report series still exported"
 
-# ── 8. Early-warning thresholds + notify gating ──────────────────────────────
+# ── 7b. Skipped units are a distinct code, never a failure (WI#180 F5) ──────
 sb="$(mksb)"
+mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
+{"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
+ "components":[{"component":"openrc","status":"healthy","metrics":{"services":[
+   {"name":"lunarwing-weechat-acme","state":"stopped","status":"skipped"},
+   {"name":"lunarwing-opencode2-acme","state":"stopped","status":"skipped"},
+   {"name":"lunarwing-pg-acme","state":"unprobed","status":"skipped"},
+   {"name":"lunarwing-acme","state":"started","status":"healthy"},
+   {"name":"lunarwing-proxy-acme","state":"stopped","status":"critical"}]}}],
+ "alerts":[]}
+EOF
+run "$sb"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-weechat-acme"} 4' "skipped unit -> status 4 (distinct from unknown)"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-opencode2-acme"} 4' "skipped worker -> status 4"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-pg-acme"} 4' "unprobed unit -> status 4 (not a failure)"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-acme"} 0' "healthy unit -> status 0"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-proxy-acme"} 2' "critical unit -> status 2"
+# The example thresholds use equality (warn:==1 crit:==2), so an all-skipped
+# fleet must not raise an early warning (status 4 would have fired under the
+# old >0/>1 forms).
+cat > "$ROOT/th-skip.conf" <<'EOF'
+THRESHOLD_lunarwing_health_unit_status="warn:==1 crit:==2"
+EOF
+sb_skips="$(mksb)"
+mkreport "$sb_skips" "2026-08-15T10:00:00Z.json" <<'EOF'
+{"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
+ "components":[{"component":"openrc","status":"healthy","metrics":{"services":[
+   {"name":"lunarwing-weechat-acme","state":"stopped","status":"skipped"}]}}],
+ "alerts":[]}
+EOF
+run "$sb_skips" HEALTH_METRICS_THRESHOLDS_FILE="$ROOT/th-skip.conf"
+assert_absent "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_unit_status"' \
+    "skipped-only fleet raises no unit-status early warning"
+
+# ── 8. Early-warning thresholds + notify gating ──────────────────────────────sb="$(mksb)"
 mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"degraded",
  "components":[

@@ -128,6 +128,49 @@ fn text_response(status: StatusCode, body: &str) -> Resp {
         .unwrap_or_else(|_| unreachable!("static response parts are always valid"))
 }
 
+/// Recompute `lunarwing_health_report_age_seconds` at serve time from the
+/// report timestamp series in the same exposition (WI#180 F5). The exporter
+/// writes the age once at export time; if scheduling stops, the unchanged
+/// textfile must still serve an age that advances with every scrape, or the
+/// bundled stale-report rule can never fire. When the timestamp series is
+/// absent or unparsable the body is returned unchanged.
+fn rewrite_report_ages(body: &str, now_secs: u64) -> String {
+    let mut ts: Option<u64> = None;
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix("lunarwing_health_report_timestamp_seconds ") else {
+            continue;
+        };
+        let value = rest.split_whitespace().next().unwrap_or("");
+        if let Ok(v) = value.parse::<u64>() {
+            ts = Some(v);
+        }
+        break;
+    }
+    let Some(ts) = ts else {
+        return body.to_string();
+    };
+    let age = now_secs.saturating_sub(ts);
+    let mut out = String::with_capacity(body.len() + 16);
+    for line in body.lines() {
+        if let Some(rest) = line.strip_prefix("lunarwing_health_report_age_seconds") {
+            // rest is "", " <value>", or "{labels} <value>". Preserve any
+            // label set and replace only the value. A label set attaches to
+            // the metric name directly (no space) per exposition format.
+            let (labels, _) = rest.split_once(' ').unwrap_or((rest, ""));
+            out.push_str("lunarwing_health_report_age_seconds");
+            if !labels.is_empty() {
+                out.push_str(labels);
+            }
+            out.push(' ');
+            out.push_str(&age.to_string());
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 async fn handle<B>(
     req: Request<B>,
     state: Arc<State>,
@@ -150,7 +193,11 @@ where
                         "metrics not yet available (exporter has not produced a report)\n",
                     )
                 } else {
-                    text_response(StatusCode::OK, &snap.body)
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    text_response(StatusCode::OK, &rewrite_report_ages(&snap.body, now_secs))
                 }
             }
             ("GET", "/") => text_response(
@@ -323,5 +370,45 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let resp = get("/", Arc::clone(&state)).await.expect("infallible");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn report_age_rewrite_advances_with_serve_time() {
+        // The exporter writes age 0 at export time; an hour later the same
+        // unchanged file must serve an advancing age (WI#180 F5) or the
+        // stale-report rule can never fire.
+        let body = concat!(
+            "lunarwing_health_report_timestamp_seconds 1750000000\n",
+            "lunarwing_health_report_age_seconds 0\n",
+            "lunarwing_health_overall_status 0\n",
+        );
+        let rewritten = rewrite_report_ages(body, 1_750_003_600);
+        assert!(
+            rewritten.contains("lunarwing_health_report_age_seconds 3600"),
+            "age must advance with serve time: {rewritten}"
+        );
+        assert!(rewritten.contains("lunarwing_health_report_timestamp_seconds 1750000000"));
+        assert!(rewritten.contains("lunarwing_health_overall_status 0"));
+    }
+
+    #[test]
+    fn report_age_rewrite_preserves_labels_and_missing_series() {
+        let with_labels = concat!(
+            "lunarwing_health_report_timestamp_seconds 1750000000\n",
+            "lunarwing_health_report_age_seconds{instance=\"a\"} 0\n",
+        );
+        let rewritten = rewrite_report_ages(with_labels, 1_750_000_001);
+        assert!(
+            rewritten.contains("lunarwing_health_report_age_seconds{instance=\"a\"} 1"),
+            "labels preserved: {rewritten}"
+        );
+        // No timestamp series -> body returned unchanged (no invented age).
+        let no_ts = "lunarwing_health_overall_status 0\n";
+        assert_eq!(rewrite_report_ages(no_ts, 1_750_000_001), no_ts);
+        // Timestamp newer than now -> age clamps to 0, never negative.
+        let future = "lunarwing_health_report_timestamp_seconds 1750000100\nlunarwing_health_report_age_seconds 0\n";
+        assert!(
+            rewrite_report_ages(future, 1_750_000_001).contains("lunarwing_health_report_age_seconds 0"),
+        );
     }
 }
