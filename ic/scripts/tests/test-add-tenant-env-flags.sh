@@ -141,6 +141,8 @@ assert_eq "coordination admin token generated" \
 assert_eq "coordination admin port allocated" "$(envval COORD_ADMIN_PORT)" "20009"
 assert_eq "default ENGINE_V2" "$(envval ENGINE_V2)" "true"
 assert_eq "default ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+# WI#154: MT tenants default to kernel-enforced no-egress sandbox networking.
+assert_eq "default SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "none"
 # Legacy IRONCLAW_* aliases must NOT be generated for new tenants (v2.0.8.0);
 # the daemon still accepts them for existing tenants.
 assert_eq "base dir written" "$(envval LUNARWING_BASE_DIR)" "$MT_FIXTURE/state"
@@ -178,6 +180,7 @@ sed -i \
   -e 's/^MASCOT_ENABLED=.*/MASCOT_ENABLED=true/' \
   -e 's/^ENGINE_V2=.*/ENGINE_V2=false/' \
   -e 's/^ENGINE_V2_CHANNELS=.*/ENGINE_V2_CHANNELS=xmpp/' \
+  -e 's/^SANDBOX_NETWORK=.*/SANDBOX_NETWORK=proxy/' \
   "$MT_FIXTURE/env/lunarwing.env"
 cat >>"$MT_FIXTURE/env/lunarwing.env" <<'EOF'
 LW2STUDYMCP_HOME=/srv/lunarwing/lw2studymcp
@@ -218,6 +221,7 @@ assert_eq "rerun preserves LW2STUDYMCP_ALLOW_WRITE" \
   "$(envval LW2STUDYMCP_ALLOW_WRITE)" "1"
 assert_eq "rerun preserves ENGINE_V2" "$(envval ENGINE_V2)" "false"
 assert_eq "rerun preserves ENGINE_V2_CHANNELS" "$(envval ENGINE_V2_CHANNELS)" "xmpp"
+assert_eq "rerun preserves SANDBOX_NETWORK" "$(envval SANDBOX_NETWORK)" "proxy"
 
 # Case 3b: upgrade path — an env written by an older version gains defaults
 # for settings introduced after it was provisioned.
@@ -225,12 +229,14 @@ sed -i \
   -e '/^MASCOT_ENABLED=/d' \
   -e '/^ENGINE_V2=/d' \
   -e '/^ENGINE_V2_CHANNELS=/d' \
+  -e '/^SANDBOX_NETWORK=/d' \
   "$MT_FIXTURE/env/lunarwing.env"
 write_tenant_lunarwing_env fixture-tenant
 assert_eq "upgrade adds MASCOT_ENABLED default" "$(envval MASCOT_ENABLED)" "false"
 assert_eq "upgrade adds ENGINE_V2 default" "$(envval ENGINE_V2)" "true"
 assert_eq "upgrade adds ENGINE_V2_CHANNELS default" \
   "$(envval ENGINE_V2_CHANNELS)" "xmpp,weechat,darkirc"
+assert_eq "upgrade adds SANDBOX_NETWORK default" "$(envval SANDBOX_NETWORK)" "none"
 
 # Case 3c: external LunarVision mode must survive every full env re-render.
 VISION_MODE_FIXTURE=external

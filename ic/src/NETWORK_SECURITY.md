@@ -328,8 +328,18 @@ Sandboxed policies (`readonly`, `workspace_write`) select an egress mode via
 
 | Mode | Mechanism | Enforcement |
 |------|-----------|-------------|
-| `proxy` (default) | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
 | `none` | `--network none` on the container | **Kernel-enforced** — no egress at all; the proxy is not started |
+| `proxy` | HTTP proxy + `http_proxy`/`https_proxy` env vars in the container | **Advisory** — a process that ignores proxy env vars can still egress directly |
+
+**Default policy (WI#154, v2.1.2.0):** multi-tenant hosts default to
+`SANDBOX_NETWORK=none` — mt-admin renders `SANDBOX_NETWORK=none` into every
+tenant's `lunarwing.env` (preserving an operator-set `proxy` on re-render).
+The advisory `proxy` mode remains the daemon-level default for single-node
+installations, but on MT hosts the loopback reachability surface (worker WSS
+ports, health endpoints, tenant PostgreSQL, cross-tenant loopback) makes
+`none` the only safe default. `proxy` is an explicit opt-in for tenants that
+genuinely need allowlisted web access; the enforced-proxy middle ground is
+tracked separately in WI#155.
 
 In proxy mode the container is pointed at the proxy via
 `http://host.containers.internal:<port>` (podman: rootless pasta/slirp4netns

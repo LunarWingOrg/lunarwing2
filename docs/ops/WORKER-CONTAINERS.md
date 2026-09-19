@@ -18,6 +18,18 @@ docker build -f Dockerfile.worker -t lunarwing-worker:latest .
 
 Runs as non-root user `sandbox` (UID 1000) in `/workspace`. Entrypoint is the `lunarwing` binary — the orchestrator passes the full command via Docker cmd.
 
+### Generic sandbox egress default (WI#154)
+
+The generic podman sandbox (`shell` tool, `ic/src/sandbox/`) defaults to
+**`SANDBOX_NETWORK=none`** on multi-tenant hosts: mt-admin renders
+`SANDBOX_NETWORK=none` into every tenant's `lunarwing.env` (an operator-set
+`proxy` value is preserved on re-render). The advisory `proxy` mode lets a
+sandboxed process that ignores proxy env vars reach host-loopback services —
+worker WSS/health ports, tenant PostgreSQL, and cross-tenant loopback — so it
+is an explicit opt-in (`SANDBOX_NETWORK=proxy`) for tenants that genuinely
+need allowlisted web access. The enforced-proxy middle ground is tracked in
+WI#155. See `ic/src/NETWORK_SECURITY.md` §5 for the tier table.
+
 ## Pebble Worker
 
 Rust-based Pebble agentic coding harness. Bridges the NanoGPT community `pebble` binary to the WebSocket protocol. Health on 8443, WebSocket on 9090.

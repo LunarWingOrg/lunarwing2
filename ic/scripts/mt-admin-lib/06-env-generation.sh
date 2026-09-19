@@ -772,6 +772,17 @@ write_tenant_lunarwing_env() {
   engine_v2_channels="$(_env_existing "$path" ENGINE_V2_CHANNELS)"
   engine_v2_channels="${engine_v2_channels:-xmpp,weechat,darkirc}"
 
+  # Sandbox egress (WI#154): multi-tenant hosts run worker WSS ports, tenant
+  # PostgreSQL, and health endpoints on host loopback, and the proxy egress
+  # mode is advisory (env-var based) — a sandboxed process that ignores proxy
+  # env vars can reach every tenant's loopback services. MT tenants therefore
+  # default to SANDBOX_NETWORK=none (kernel-enforced). An operator-selected
+  # SANDBOX_NETWORK=proxy is preserved on re-render (explicit opt-in for
+  # tenants that genuinely need allowlisted web access).
+  local sandbox_network
+  sandbox_network="$(_env_existing "$path" SANDBOX_NETWORK)"
+  sandbox_network="${sandbox_network:-none}"
+
   (
     umask 077
     cat >"$path" <<ENVEOF
@@ -889,6 +900,13 @@ WS_ADAPTER_URL=http://127.0.0.1:${weechat_adapter_port}
 # durable opt-out.
 ENGINE_V2=$engine_v2
 ENGINE_V2_CHANNELS=$engine_v2_channels
+
+# Generic sandbox egress (WI#154): none by default on multi-tenant hosts —
+# the advisory proxy mode would let a sandboxed process reach host-loopback
+# services (worker WSS/health ports, tenant PostgreSQL, cross-tenant
+# loopback). Set SANDBOX_NETWORK=proxy explicitly for tenants that need
+# allowlisted web access.
+SANDBOX_NETWORK=$sandbox_network
 
 # Daemon mode
 CLI_ENABLED=false
