@@ -210,6 +210,15 @@ Step 9: Background Tasks (heartbeat)
 
 `--channels-only` mode runs only Step 6, skipping everything else.
 
+Sandbox networking defaults to `none` in v2.1.2.0 (WI#154/155). This is the
+in-code default (including configs with only `[[sandbox.external_workers]]`), so
+existing unconfigured setups are safe. Existing explicit `proxy` or
+`proxy-enforced` env/DB/TOML network settings retain precedence. Tenants that
+need sandboxed web access select `SANDBOX_NETWORK=proxy-enforced` after
+checking the local Linux runtime and a Python-3-equipped image; legacy `proxy`
+remains advisory. See [`NETWORK_SECURITY.md` §5](../NETWORK_SECURITY.md#5-sandbox-http-proxy)
+and the [item-26 rollout record](../../../docs/ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md).
+
 **Personal onboarding** happens conversationally during the user's first interaction
 with the running assistant (not during the wizard). The `## First-Run Bootstrap` block in
 `src/workspace/mod.rs` injects onboarding instructions from `BOOTSTRAP.md` into the system

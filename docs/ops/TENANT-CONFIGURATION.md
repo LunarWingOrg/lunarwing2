@@ -508,7 +508,7 @@ sudo lunarwing-mt-admin.sh restart-worker <tenant> opencode
 sudo lunarwing-mt-admin.sh kill-worker <tenant> opencode
 ```
 
-The same commands accept `pebble` and `kimi`. Running `podman stop` as root
+The same commands accept `pebble`, `kimi`, and `opencode2`. Running `podman stop` as root
 targets root's unrelated store and runtime directory (`/run/user/0/libpod`), not
 the tenant container. Do not use raw root Podman for tenant workers.
 
@@ -534,6 +534,7 @@ lunarwing-weechat-adapter-<tenant>.service  # weechat WS adapter
 lunarwing-pg-<tenant>.service               # Postgres (rootless Quadlet)
 lunarwing-pebble-<tenant>.service           # pebble worker (rootless Quadlet)
 lunarwing-opencode-<tenant>.service         # opencode worker (rootless Quadlet)
+lunarwing-opencode2-<tenant>.service        # opencode2 worker (rootless Quadlet)
 lunarwing-kimi-<tenant>.service             # Kimi Code worker (rootless Quadlet)
 ```
 
@@ -551,7 +552,7 @@ sudo rc-service lunarwing-proxy-<tenant> restart            # TensorZero proxy
 sudo rc-service lunarwing-pg-<tenant> restart               # Postgres container
 sudo rc-service lunarwing-weechat-<tenant> restart          # weechat backend
 sudo rc-service lunarwing-weechat-adapter-<tenant> restart  # weechat WS adapter
-# workers (if provisioned): lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>, lunarwing-kimi-<tenant>
+# workers (if provisioned): lunarwing-pebble-<tenant>, lunarwing-opencode-<tenant>, lunarwing-opencode2-<tenant>, lunarwing-kimi-<tenant>
 # each worker also has a <unit>-sup babysitter; stop it before stopping a container manually
 ```
 
@@ -614,10 +615,14 @@ transient-scope spawning (see `ic/src/tools/process.rs`).
 
 Each tenant gets a 10-port primary block from `/etc/lunarwing/ports.json`
 (range 10000-19999), a mirrored 10-port extended block in 20000-29999
-(`extended_base = base_port + 10000`), and a two-port Kimi block in
-30000-39999 (`kimi_base = base_port + 20000`). The current registry schema is
-v14. Schema v14 also gives every DarkIRC-enabled tenant a unique, stable,
-non-secret `darkirc_scope_id`; mt-admin creates or migrates that identity and
+(`extended_base = base_port + 10000`), a two-port Kimi block in 30000-39999
+(`kimi_base = base_port + 20000`), a two-port LunarVoice block in
+40000-49999 (`voice_base = base_port + 30000`), and a two-port OpenCode 2
+block in 51000-51999 (`opencode2_base = base_port + 41000`); the host-global
+`health_metrics` slot lives at 50000. The current registry schema is v17.
+Schema v14 gave every DarkIRC-enabled tenant a unique, stable, non-secret
+`darkirc_scope_id`; v15 added the voice block, v16 the health_metrics slot,
+and v17 the OpenCode 2 block. mt-admin creates or migrates that identity and
 rejects invalid or duplicate values.
 
 Primary block:
@@ -656,3 +661,17 @@ Kimi block:
 |--------|---------|
 | kbase+0 | Kimi WSS |
 | kbase+1 | Kimi health |
+
+LunarVoice block:
+
+| Offset | Service |
+|--------|---------|
+| vbase+0 | LunarVoice STT sidecar API |
+| vbase+1 | LunarVoice health |
+
+OpenCode 2 block:
+
+| Offset | Service |
+|--------|---------|
+| obase+0 | OpenCode 2 worker WSS |
+| obase+1 | OpenCode 2 worker health |

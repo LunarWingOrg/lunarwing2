@@ -120,6 +120,7 @@ unit_tenant() {
         pg-*)                rest="${rest#pg-}" ;;
         nanocode-*)          rest="${rest#nanocode-}" ;;
         opencode-*)          rest="${rest#opencode-}"; rest="${rest%-sup}" ;;
+        opencode2-*)         rest="${rest#opencode2-}"; rest="${rest%-sup}" ;;
         kimi-*)              rest="${rest#kimi-}"; rest="${rest%-sup}" ;;
         pebble-*)            rest="${rest#pebble-}"; rest="${rest%-sup}" ;;
         vision-*)            rest="${rest#vision-}"; rest="${rest%-sup}" ;;
@@ -182,9 +183,10 @@ weechat_unit_disabled() {
 worker_unit_intentionally_stopped() {
   local svc="$1" worker tenant result
   case "$svc" in
-    lunarwing-pebble-*)   worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
-    lunarwing-opencode-*) worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
-    lunarwing-kimi-*)     worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
+    lunarwing-pebble-*)    worker="pebble"; tenant="${svc#lunarwing-pebble-}" ;;
+    lunarwing-opencode-*)  worker="opencode"; tenant="${svc#lunarwing-opencode-}" ;;
+    lunarwing-opencode2-*) worker="opencode2"; tenant="${svc#lunarwing-opencode2-}" ;;
+    lunarwing-kimi-*)      worker="kimi"; tenant="${svc#lunarwing-kimi-}" ;;
     *) return 1 ;;
   esac
   case "$tenant" in *-sup) tenant="${tenant%-sup}" ;; esac
@@ -200,7 +202,25 @@ worker_unit_intentionally_stopped() {
   [ "$result" = "stopped" ]
 }
 
+# Component-level sweep deadline (WI#180 F4): the driver gives this component
+# ~30 seconds, and probing every service sequentially at up to STATUS_TIMEOUT
+# each can exceed that budget — which erased ALL per-service results (the
+# driver only saw `unknown/timeout` and self-heal had nothing to act on).
+# Stop starting new probes after the deadline and emit the already-known
+# results plus explicit unprobed entries, so slow probes can never discard
+# completed fleet observations. 0 disables the deadline.
+SWEEP_DEADLINE_SECS="${HEALTH_OPENRC_SWEEP_DEADLINE_SECS:-22}"
+sweep_incomplete=false
+unprobed_count=0
+
 for svc in "${SERVICES_ARR[@]}"; do
+  # Deadline check first: an unprobed service must not read as an outage.
+  if [ "$SWEEP_DEADLINE_SECS" != "0" ] && [ "$SECONDS" -ge "$SWEEP_DEADLINE_SECS" ]; then
+    sweep_incomplete=true
+    unprobed_count=$((unprobed_count + 1))
+    svc_results+=("$(svc_json "$svc" "unprobed" "skipped")")
+    continue
+  fi
   # Init script must exist.
   if ! rc-service --exists "$svc" >/dev/null 2>&1; then
     if retired_nanocode_service "$svc"; then
@@ -368,6 +388,17 @@ fi
 sched_running=null
 if [ -n "$SCHED_RUNNING" ]; then
   sched_running="\"$SCHED_RUNNING\""
+fi
+
+# An incomplete sweep is a monitoring-coverage failure, not a service outage:
+# degrade at worst, never mask a worse per-service verdict, and never report
+# healthy while part of the fleet went unprobed (WI#180 F4).
+if [ "$sweep_incomplete" = "true" ]; then
+  issues+=("service sweep incomplete: $unprobed_count service(s) unprobed (deadline ${SWEEP_DEADLINE_SECS}s); results partial")
+  if [ "$overall_exit" -lt 1 ]; then
+    overall_exit=1
+    overall_status="degraded"
+  fi
 fi
 
 issues_json="[]"

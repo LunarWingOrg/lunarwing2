@@ -62,11 +62,27 @@ pub struct MemoryDoc {
     pub source_thread_id: Option<ThreadId>,
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
+    /// Host-validated evidence; never accepted from model metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insight: Option<crate::types::insight::InsightRecord>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
 impl MemoryDoc {
+    /// Engine-control identities remain protected even when tags or titles are
+    /// changed independently. Metadata supplied by a model cannot grant access.
+    pub fn is_engine_control(&self) -> bool {
+        self.title.starts_with("orchestrator:")
+            || self.title.starts_with("prompt:")
+            || self.tags.iter().any(|tag| {
+                matches!(
+                    tag.as_str(),
+                    "orchestrator_code" | "orchestrator_meta" | "prompt_overlay"
+                )
+            })
+    }
+
     pub fn new(
         project_id: ProjectId,
         user_id: impl Into<String>,
@@ -85,6 +101,7 @@ impl MemoryDoc {
             source_thread_id: None,
             tags: Vec::new(),
             metadata: serde_json::Value::Object(serde_json::Map::new()),
+            insight: None,
             created_at: now,
             updated_at: now,
         }

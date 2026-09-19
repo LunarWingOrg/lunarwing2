@@ -114,6 +114,31 @@ pub enum ThreadType {
 
 // ── Thread configuration ────────────────────────────────────
 
+/// Host-selected mission context. Model arguments and mutable REPL state cannot
+/// grant maintenance recall or relax an insight worker's write restrictions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum MissionContext {
+    #[default]
+    General,
+    ConversationInsights {
+        recall_query: String,
+        #[serde(default)]
+        batch: Option<crate::types::insight::InsightBatch>,
+        #[serde(default)]
+        mission_id: Option<crate::types::mission::MissionId>,
+        #[serde(default)]
+        run_id: Option<ThreadId>,
+        #[serde(default)]
+        generation: u64,
+    },
+}
+
+impl MissionContext {
+    pub fn is_conversation_insights(&self) -> bool {
+        matches!(self, Self::ConversationInsights { .. })
+    }
+}
+
 /// Execution parameters for a thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadConfig {
@@ -204,6 +229,14 @@ pub struct ThreadConfig {
     #[serde(default)]
     pub mission_child: bool,
 
+    /// Assigned by MissionManager and inherited by mission children.
+    #[serde(default)]
+    pub mission_context: MissionContext,
+
+    /// Host-provided conversation identity for newly ingested user evidence.
+    #[serde(default)]
+    pub conversation_id: Option<crate::types::conversation::ConversationId>,
+
     // ── Channel delivery constraints ──
     /// Delivery-constraint guidance appended to the system prompt at thread
     /// creation. Set by the host bridge for rate-metered channels (e.g.
@@ -248,6 +281,8 @@ impl Default for ThreadConfig {
             depth: 0,
             max_depth: 1,
             mission_child: false,
+            mission_context: MissionContext::General,
+            conversation_id: None,
             channel_context: None,
         }
     }
@@ -290,6 +325,10 @@ pub struct Thread {
     pub config: ThreadConfig,
     /// User-visible transcript for the thread.
     pub messages: Vec<ThreadMessage>,
+    /// Only fresh user inputs. Inherited history and generated goals never enter
+    /// this collection. Missing on legacy threads: fail closed for extraction.
+    #[serde(default)]
+    pub insight_inputs: Vec<crate::types::insight::InsightSource>,
     /// Internal execution transcript used by the orchestrator for inference,
     /// tool traces, compaction, and resumable working state.
     #[serde(default)]
@@ -326,6 +365,7 @@ impl Thread {
             parent_id: None,
             config,
             messages: Vec::new(),
+            insight_inputs: Vec::new(),
             internal_messages: Vec::new(),
             events: Vec::new(),
             capability_leases: Vec::new(),
@@ -393,6 +433,24 @@ impl Thread {
 
     /// Add a message to this thread's conversation.
     pub fn add_message(&mut self, message: ThreadMessage) {
+        if self.thread_type == ThreadType::Foreground
+            && self.parent_id.is_none()
+            && !self.config.mission_child
+            && !self.config.mission_context.is_conversation_insights()
+            && message.role == crate::types::message::MessageRole::User
+            && message.provenance == crate::types::provenance::Provenance::User
+            && !message.content.trim().is_empty()
+        {
+            self.insight_inputs
+                .push(crate::types::insight::InsightSource {
+                    message_id: uuid::Uuid::new_v4(),
+                    thread_id: self.id,
+                    conversation_id: self.config.conversation_id,
+                    timestamp: message.timestamp,
+                    text: message.content.clone(),
+                    truncated: false,
+                });
+        }
         let preview = if message.content.chars().count() > 80 {
             let p: String = message.content.chars().take(80).collect();
             format!("{p}...")

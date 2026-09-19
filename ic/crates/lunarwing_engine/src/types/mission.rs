@@ -165,6 +165,17 @@ pub struct Mission {
     #[serde(default)]
     pub processed_trigger_keys: Vec<String>,
 
+    /// Last durably reserved insight source batch. Survives listener restarts.
+    #[serde(default)]
+    pub insight_cursor: Option<crate::types::insight::InsightCursor>,
+
+    /// A deletion tombstone blocks automatic reconciliation and same-name replay.
+    #[serde(default)]
+    pub deleted_at: Option<DateTime<Utc>>,
+    /// Invalidates suspended/in-flight insight writers on opt-out or purge.
+    #[serde(default)]
+    pub insight_generation: u64,
+
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -250,6 +261,9 @@ impl Mission {
             threads_today_date: Some(now.date_naive()),
             last_trigger_payload: None,
             processed_trigger_keys: Vec::new(),
+            insight_cursor: None,
+            deleted_at: None,
+            insight_generation: 0,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             created_at: now,
             updated_at: now,
@@ -340,10 +354,11 @@ impl Mission {
 
     /// Whether the mission is in a terminal state.
     pub fn is_terminal(&self) -> bool {
-        matches!(
-            self.status,
-            MissionStatus::Completed | MissionStatus::Failed
-        )
+        self.deleted_at.is_some()
+            || matches!(
+                self.status,
+                MissionStatus::Completed | MissionStatus::Failed
+            )
     }
 }
 

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -86,6 +86,8 @@ pub struct HybridStore {
     docs: RwLock<HashMap<DocId, MemoryDoc>>,
     /// Tracks current workspace path for each doc so renames can delete the old file.
     doc_paths: RwLock<HashMap<DocId, String>>,
+    /// Serialize persistence and cache publication, including path-changing updates.
+    doc_write_lock: Mutex<()>,
     workspace: Option<Arc<Workspace>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Test-only hook: when set, the next `save_memory_doc` fails once, forcing
@@ -117,6 +119,7 @@ impl HybridStore {
             mission_secret_refs: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
             doc_paths: RwLock::new(HashMap::new()),
+            doc_write_lock: Mutex::new(()),
             workspace,
             secrets_store,
             #[cfg(test)]
@@ -1111,15 +1114,8 @@ impl HybridStore {
     /// Persist a MemoryDoc to workspace. Knowledge docs use frontmatter+markdown,
     /// special docs (orchestrator, prompts) use their native format, and internal
     /// docs use JSON.
-    async fn persist_doc(&self, doc: &MemoryDoc) {
+    async fn persist_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
         let new_path = doc_workspace_path(doc);
-
-        // If the doc previously existed at a different path, delete the old one
-        if let Some(ref old) = self.doc_paths.read().await.get(&doc.id).cloned()
-            && *old != new_path
-        {
-            self.delete_workspace_file(old).await;
-        }
 
         // Choose serialization format based on path
         let content = if is_orchestrator_code_path(&new_path) {
@@ -1130,17 +1126,65 @@ impl HybridStore {
             serialize_knowledge_doc(doc)
         } else {
             // Everything else: JSON
-            match serde_json::to_string_pretty(doc) {
-                Ok(json) => json,
-                Err(e) => {
-                    debug!(path = %new_path, "failed to serialize doc: {e}");
-                    return;
-                }
-            }
+            serde_json::to_string_pretty(doc).map_err(|error| EngineError::Store {
+                reason: format!("failed to serialize memory document at {new_path}: {error}"),
+            })?
         };
 
-        self.persist_text(new_path.clone(), &content).await;
+        if let Some(ws) = &self.workspace {
+            ws.write(&new_path, &content)
+                .await
+                .map_err(|error| EngineError::Store {
+                    reason: format!("failed to persist memory document at {new_path}: {error}"),
+                })?;
+        }
+
+        // Preserve the old durable document and its path if the new write fails.
+        if let Some(old) = self.doc_paths.read().await.get(&doc.id).cloned()
+            && old != new_path
+        {
+            self.delete_workspace_file(&old).await;
+        }
         self.doc_paths.write().await.insert(doc.id, new_path);
+        Ok(())
+    }
+
+    async fn save_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        self.save_doc_locked(doc).await
+    }
+
+    async fn save_doc_locked(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        #[cfg(test)]
+        if self
+            .fail_next_doc_save
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(EngineError::Store {
+                reason: "injected doc save failure".to_string(),
+            });
+        }
+
+        self.persist_doc(doc).await?;
+        self.docs.write().await.insert(doc.id, doc.clone());
+        Ok(())
+    }
+
+    async fn save_model_memory_doc(
+        &self,
+        doc: &MemoryDoc,
+        allow_self_modify: bool,
+    ) -> Result<(), EngineError> {
+        if doc.is_engine_control() && !allow_self_modify {
+            return Err(EngineError::AccessDenied {
+                user_id: doc.user_id.clone(),
+                entity: format!(
+                    "engine-control doc '{}' (self-modification disabled)",
+                    doc.title
+                ),
+            });
+        }
+        self.save_doc(doc).await
     }
 }
 
@@ -1198,11 +1242,6 @@ fn doc_workspace_path(doc: &MemoryDoc) -> String {
 
 fn is_orchestrator_code_path(path: &str) -> bool {
     path.starts_with(ORCHESTRATOR_PREFIX) && path.ends_with(".py")
-}
-
-/// Check if a MemoryDoc is a protected orchestrator or prompt overlay document.
-fn is_protected_orchestrator_doc(doc: &MemoryDoc) -> bool {
-    doc.title.starts_with("orchestrator:") || doc.title.starts_with("prompt:")
 }
 
 fn project_dir(name: &str, project_id: ProjectId) -> String {
@@ -1335,6 +1374,20 @@ fn serialize_knowledge_doc(doc: &MemoryDoc) -> String {
     {
         frontmatter.push_str(&format!("metadata: {meta_str}\n"));
     }
+    if let Some(record) = &doc.insight {
+        // Host-minted evidence record. Round-trips as JSON so recalled docs
+        // keep their explicit/inferred classification and source citations.
+        let record = serde_json::json!({
+            "version": record.version,
+            "kind": record.kind,
+            "sources": record.sources,
+            "generated_by": record.generated_by.0,
+            "runs": record.runs.iter().map(|id| id.0).collect::<Vec<_>>(),
+        });
+        if let Ok(record_str) = serde_json::to_string(&record) {
+            frontmatter.push_str(&format!("insight: {record_str}\n"));
+        }
+    }
     frontmatter.push_str("---\n\n");
     frontmatter.push_str(&doc.content);
     frontmatter
@@ -1465,6 +1518,11 @@ fn deserialize_knowledge_doc(content: &str) -> Option<MemoryDoc> {
         source_thread_id,
         tags,
         metadata,
+        insight: yaml
+            .get("insight")
+            .cloned()
+            .map(serde_json::from_value)
+            .and_then(Result::ok),
         created_at,
         updated_at,
     })
@@ -1535,6 +1593,7 @@ fn thread_from_archive(summary: &ThreadArchiveSummary) -> Option<Thread> {
         parent_id: None,
         config: lunarwing_engine::ThreadConfig::default(),
         messages: Vec::new(),
+        insight_inputs: Vec::new(),
         internal_messages: Vec::new(),
         events: Vec::new(),
         capability_leases: Vec::new(),
@@ -1760,50 +1819,65 @@ impl Store for HybridStore {
     }
 
     async fn save_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
-        // Defense-in-depth: block orchestrator/prompt writes when self-modify is
-        // disabled, even if the caller bypassed tool-level checks.
-        if is_protected_orchestrator_doc(doc) {
-            let allow = std::env::var("ORCHESTRATOR_SELF_MODIFY")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
-            if !allow {
-                // Allow system-internal writes (v0 seeding, failure tracking) but
-                // block LLM-authored patches (version > 0, non-meta titles).
-                let is_system_internal = doc.title == "orchestrator:failures"
-                    || doc
-                        .metadata
-                        .get("source")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| s == "compiled_in");
-                if !is_system_internal {
-                    return Err(EngineError::AccessDenied {
-                        user_id: doc.user_id.clone(),
-                        entity: format!(
-                            "orchestrator doc '{}' (self-modification disabled)",
-                            doc.title
-                        ),
-                    });
-                }
-            }
-        }
+        self.save_model_memory_doc(
+            doc,
+            lunarwing_engine::executor::orchestrator::self_modification_enabled(),
+        )
+        .await
+    }
 
-        #[cfg(test)]
-        if self
-            .fail_next_doc_save
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(EngineError::Store {
-                reason: "injected doc save failure".to_string(),
-            });
-        }
-
-        self.docs.write().await.insert(doc.id, doc.clone());
-        self.persist_doc(doc).await;
-        Ok(())
+    async fn save_internal_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        // Only compiled host callers use this entry point. No metadata field,
+        // special title, or model-facing argument can select it.
+        self.save_doc(doc).await
     }
 
     async fn load_memory_doc(&self, id: DocId) -> Result<Option<MemoryDoc>, EngineError> {
         Ok(self.docs.read().await.get(&id).cloned())
+    }
+
+    async fn save_conversation_insight(
+        &self,
+        thread: &Thread,
+        requested: &MemoryDoc,
+    ) -> Result<DocId, EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        let doc =
+            lunarwing_engine::memory::insights::prepare_upsert(self, thread, requested).await?;
+        self.save_doc_locked(&doc).await?;
+        Ok(doc.id)
+    }
+
+    async fn purge_conversation_insights(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+    ) -> Result<usize, EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        let docs = self.list_memory_docs(project_id, user_id).await?;
+        let mut deleted = 0;
+        // Only host-minted records are purged. The broad title/tag predicate
+        // is deliberately not used here: `purge_insights` is model-invocable,
+        // and a user-authored doc titled `insight:` or tagged `insight` must
+        // not be destroyed by it (MR !1043 finding 1).
+        for doc in docs.into_iter().filter(|doc| doc.insight.is_some()) {
+            let path = self
+                .doc_paths
+                .read()
+                .await
+                .get(&doc.id)
+                .cloned()
+                .unwrap_or_else(|| doc_workspace_path(&doc));
+            if let Some(ws) = &self.workspace {
+                ws.delete(&path).await.map_err(|error| EngineError::Store {
+                    reason: format!("failed to purge insight {}: {error}", doc.id.0),
+                })?;
+            }
+            self.docs.write().await.remove(&doc.id);
+            self.doc_paths.write().await.remove(&doc.id);
+            deleted += 1;
+        }
+        Ok(deleted)
     }
 
     async fn list_memory_docs(
@@ -1855,6 +1929,8 @@ impl Store for HybridStore {
     }
 
     async fn save_mission(&self, mission: &Mission) -> Result<(), EngineError> {
+        // Serialize lifecycle revocation with insight validation/publication.
+        let _guard = self.doc_write_lock.lock().await;
         let proj_slug = self.project_slug(mission.project_id).await;
         let new_path = mission_path(&proj_slug, &mission.name, mission.id);
         let previous_secret_ref = self
@@ -3049,6 +3125,447 @@ title: \"old doc\"\n\
         assert_eq!(
             count, 1,
             "no re-seed duplicates may accumulate across reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_metadata_cannot_select_internal_memory_write_authority() {
+        let store = HybridStore::new(None);
+        let pid = ProjectId::new();
+        for (title, tag) in [
+            (PREAMBLE_OVERLAY_TITLE, "prompt_overlay"),
+            (ORCHESTRATOR_MAIN_TITLE, ORCHESTRATOR_CODE_TAG),
+            (ORCHESTRATOR_FAILURES_TITLE, "orchestrator_meta"),
+            ("renamed overlay", "prompt_overlay"),
+        ] {
+            let mut doc = MemoryDoc::new(
+                pid,
+                shared_owner_id(),
+                DocType::Note,
+                title,
+                "FORGED_CANARY",
+            )
+            .with_tags(vec![tag.into()]);
+            doc.metadata = serde_json::json!({"source": "compiled_in", "version": 0});
+            assert!(matches!(
+                store.save_model_memory_doc(&doc, false).await,
+                Err(EngineError::AccessDenied { .. })
+            ));
+            assert!(store.load_memory_doc(doc.id).await.unwrap().is_none());
+            assert!(!store.doc_paths.read().await.contains_key(&doc.id));
+        }
+
+        let seed = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            ORCHESTRATOR_MAIN_TITLE,
+            lunarwing_engine::executor::orchestrator::load_orchestrator(None, pid, false)
+                .await
+                .0,
+        )
+        .with_tags(vec![ORCHESTRATOR_CODE_TAG.into()]);
+        store.save_internal_memory_doc(&seed).await.unwrap();
+        assert_eq!(
+            store
+                .load_memory_doc(seed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            seed.content
+        );
+        let tracker = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            ORCHESTRATOR_FAILURES_TITLE,
+            "{}",
+        );
+        store.save_internal_memory_doc(&tracker).await.unwrap();
+        assert!(store.load_memory_doc(tracker.id).await.unwrap().is_some());
+
+        let overlay = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            PREAMBLE_OVERLAY_TITLE,
+            "opted-in rule",
+        );
+        store.save_model_memory_doc(&overlay, true).await.unwrap();
+        assert!(store.load_memory_doc(overlay.id).await.unwrap().is_some());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn failed_doc_writes_preserve_cache_durable_content_and_rename_source() {
+        use crate::db::{Database, libsql::LibSqlBackend};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("doc-failure.db"))
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+        let workspace = Arc::new(Workspace::new_with_db(
+            "doc-failure-test",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let conn = backend.connect().await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER reject_doc_write BEFORE UPDATE OF content ON memory_documents
+             WHEN NEW.path LIKE 'engine/knowledge/%' AND NEW.content LIKE '%REJECTED_WRITE_CANARY%'
+             BEGIN SELECT RAISE(FAIL, 'injected memory content write failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let mut doc = MemoryDoc::new(
+            ProjectId::new(),
+            "doc-failure-test",
+            DocType::Lesson,
+            "original",
+            "REJECTED_WRITE_CANARY",
+        );
+        assert!(matches!(
+            store.save_memory_doc(&doc).await,
+            Err(EngineError::Store { .. })
+        ));
+        assert!(store.load_memory_doc(doc.id).await.unwrap().is_none());
+        assert!(!store.doc_paths.read().await.contains_key(&doc.id));
+        let fresh = HybridStore::new(Some(Arc::clone(&workspace)));
+        fresh.load_state_from_workspace().await.unwrap();
+        assert!(fresh.load_memory_doc(doc.id).await.unwrap().is_none());
+
+        doc.content = "ORIGINAL_DURABLE_CONTENT".into();
+        store.save_memory_doc(&doc).await.unwrap();
+        let original_path = doc_workspace_path(&doc);
+        for title in ["original", "renamed"] {
+            let mut rejected = doc.clone();
+            rejected.title = title.into();
+            rejected.content = "REJECTED_WRITE_CANARY".into();
+            assert!(store.save_memory_doc(&rejected).await.is_err());
+            let cached = store.load_memory_doc(doc.id).await.unwrap().unwrap();
+            assert_eq!(cached.content, doc.content);
+            assert_eq!(
+                store.doc_paths.read().await.get(&doc.id),
+                Some(&original_path)
+            );
+            assert!(
+                workspace
+                    .read(&original_path)
+                    .await
+                    .unwrap()
+                    .content
+                    .contains(&doc.content)
+            );
+            let fresh = HybridStore::new(Some(Arc::clone(&workspace)));
+            fresh.load_state_from_workspace().await.unwrap();
+            assert_eq!(
+                fresh
+                    .load_memory_doc(doc.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                doc.content
+            );
+        }
+
+        doc.title = "renamed".into();
+        doc.content = "RETRIED_DURABLE_CONTENT".into();
+        store.save_memory_doc(&doc).await.unwrap();
+        assert!(!workspace.exists(&original_path).await.unwrap());
+        let fresh = HybridStore::new(Some(workspace));
+        fresh.load_state_from_workspace().await.unwrap();
+        assert_eq!(
+            fresh
+                .load_memory_doc(doc.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            doc.content
+        );
+        assert_eq!(
+            fresh.doc_paths.read().await.get(&doc.id),
+            Some(&doc_workspace_path(&doc))
+        );
+    }
+
+    /// G8-F4: the host writer validates citations against persisted user
+    /// inputs, mints titles/tags itself, upserts deterministically, and
+    /// enforces the five-insight run budget.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn conversation_insight_writer_validates_evidence_and_upserts() {
+        use lunarwing_engine::types::insight::InsightBatch;
+        use lunarwing_engine::types::memory::DocType;
+        use lunarwing_engine::types::mission::{Mission, MissionStatus};
+        use lunarwing_engine::types::thread::{
+            MissionContext, Thread as EngineThread, ThreadConfig, ThreadId, ThreadType,
+        };
+
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let workspace = Arc::new(Workspace::new_with_db("insight-writer-test", db));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let user = "insight-writer-test";
+        let pid = ProjectId::new();
+
+        // Mission and eligible source threads carrying genuine user inputs.
+        let mut mission = Mission::new(
+            pid,
+            user,
+            "conversation-insights",
+            "extract insights",
+            lunarwing_engine::MissionCadence::OnSystemEvent {
+                source: "engine".into(),
+                event_type: "conversation_insights_due".into(),
+            },
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        store.save_mission(&mission).await.unwrap();
+
+        let mut sources = Vec::new();
+        for index in 0..3 {
+            let mut source = EngineThread::new(
+                format!("source conversation {index}"),
+                ThreadType::Foreground,
+                pid,
+                user,
+                ThreadConfig::default(),
+            );
+            source.add_message(lunarwing_engine::types::message::ThreadMessage::user(
+                format!("STATEMENT_{index}"),
+            ));
+            source.state = lunarwing_engine::ThreadState::Done;
+            source.completed_at = Some(chrono::Utc::now());
+            store.save_thread(&source).await.unwrap();
+            sources.push(source);
+        }
+
+        let run_thread = ThreadId::new();
+        let mut run = EngineThread::new(
+            "insight run",
+            ThreadType::Mission,
+            pid,
+            user,
+            ThreadConfig::default(),
+        );
+        run.id = run_thread;
+        let batch = InsightBatch {
+            project_id: pid,
+            user_id: user.into(),
+            cursor: lunarwing_engine::types::insight::InsightCursor {
+                completed_at: chrono::Utc::now(),
+                thread_id: sources[0].id,
+            },
+            content_hash: "insights:v2:test".into(),
+            sources: sources
+                .iter()
+                .flat_map(|source| source.insight_inputs.clone())
+                .collect(),
+        };
+        run.config.mission_context = MissionContext::ConversationInsights {
+            recall_query: "STATEMENT".into(),
+            batch: Some(batch),
+            mission_id: Some(mission.id),
+            run_id: Some(run_thread),
+            generation: 0,
+        };
+        // A run the mission actually reserved (thread_history membership).
+        let mut reserved = mission.clone();
+        reserved.record_thread(run_thread);
+        store.save_mission(&reserved).await.unwrap();
+
+        let statement = &sources[0].insight_inputs[0];
+        let insight_request = |text: &str| {
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "model-supplied title", text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": statement.thread_id.0.to_string(),
+                        "message_id": statement.message_id.to_string(),
+                        "quote": statement.text,
+                    }],
+                },
+                "trust": "trusted",
+            });
+            doc.tags = vec!["forged_tag".into()];
+            doc
+        };
+
+        // Zero-evidence and paraphrased quotes are rejected (fail closed).
+        let mut no_evidence = insight_request(statement.text.as_str());
+        no_evidence.metadata = serde_json::json!({});
+        assert!(
+            store
+                .save_conversation_insight(&run, &no_evidence)
+                .await
+                .is_err(),
+            "missing metadata.insight must be rejected"
+        );
+        let mut paraphrase = insight_request("a shorter paraphrase");
+        if let Some(object) = paraphrase.metadata["insight"]["evidence"][0].as_object_mut() {
+            object.insert("quote".into(), serde_json::json!("STATEMENT_0 (prefix)"));
+        }
+        assert!(
+            store
+                .save_conversation_insight(&run, &paraphrase)
+                .await
+                .is_err(),
+            "a truncated quote must be rejected"
+        );
+
+        // An exact quote with an explicit kind is accepted; the host mints the
+        // title/tags and strips model metadata.
+        let doc_id = store
+            .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+            .await
+            .unwrap();
+        let saved = store.load_memory_doc(doc_id).await.unwrap().unwrap();
+        assert_eq!(saved.content, statement.text);
+        assert!(saved.title.starts_with("insight:Explicit:"));
+        assert_eq!(saved.tags, vec!["insight".to_string()]);
+        assert_eq!(saved.metadata, serde_json::json!({}));
+        let record = saved.insight.as_ref().unwrap();
+        assert_eq!(
+            record.kind,
+            lunarwing_engine::types::insight::InsightKind::Explicit
+        );
+        assert_eq!(record.runs, vec![run_thread]);
+
+        // Re-saving the same explicit statement upserts the same doc id —
+        // duplicates are impossible.
+        let again = store
+            .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+            .await
+            .unwrap();
+        assert_eq!(again, doc_id);
+        let all = store.list_memory_docs(pid, user).await.unwrap();
+        assert_eq!(all.len(), 1, "no duplicate lessons: {all:?}");
+
+        // The run budget is enforced after five distinct accepted insights.
+        // Sources 1..3 give two more distinct statements after statement 0.
+        for source in sources.iter().skip(1) {
+            let input = &source.insight_inputs[0];
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "title", &input.text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": input.thread_id.0.to_string(),
+                        "message_id": input.message_id.to_string(),
+                        "quote": input.text,
+                    }],
+                },
+            });
+            let accepted = store.save_conversation_insight(&run, &doc).await;
+            assert!(
+                accepted.is_ok(),
+                "each distinct statement stays within budget"
+            );
+        }
+
+        // Five distinct statements exhaust the budget: with only three sources,
+        // seeding two more eligible statements lets the sixth distinct insight
+        // be rejected by the host writer's run budget.
+        for extra in ["STATEMENT_3", "STATEMENT_4", "STATEMENT_5"] {
+            let mut extra_source = EngineThread::new(
+                format!("source {extra}"),
+                lunarwing_engine::ThreadType::Foreground,
+                pid,
+                user,
+                lunarwing_engine::ThreadConfig::default(),
+            );
+            extra_source.add_message(lunarwing_engine::types::message::ThreadMessage::user(extra));
+            extra_source.state = lunarwing_engine::ThreadState::Done;
+            extra_source.completed_at = Some(chrono::Utc::now());
+            store.save_thread(&extra_source).await.unwrap();
+            let input = &extra_source.insight_inputs[0];
+            run.config.mission_context = MissionContext::ConversationInsights {
+                recall_query: "STATEMENT".into(),
+                batch: Some(InsightBatch {
+                    project_id: pid,
+                    user_id: user.into(),
+                    cursor: lunarwing_engine::types::insight::InsightCursor {
+                        completed_at: chrono::Utc::now(),
+                        thread_id: extra_source.id,
+                    },
+                    content_hash: format!("insights:v2:{extra}"),
+                    sources: extra_source.insight_inputs.clone(),
+                }),
+                mission_id: Some(mission.id),
+                run_id: Some(run_thread),
+                generation: 0,
+            };
+            let mut doc = MemoryDoc::new(pid, user, DocType::Lesson, "title", &input.text);
+            doc.metadata = serde_json::json!({
+                "insight": {
+                    "kind": "explicit",
+                    "evidence": [{
+                        "thread_id": input.thread_id.0.to_string(),
+                        "message_id": input.message_id.to_string(),
+                        "quote": input.text,
+                    }],
+                },
+            });
+            let accepted = store.save_conversation_insight(&run, &doc).await;
+            if extra == "STATEMENT_5" {
+                assert!(
+                    accepted.is_err(),
+                    "the sixth distinct insight must be rejected: {accepted:?}"
+                );
+            } else {
+                assert!(accepted.is_ok(), "{extra} within budget");
+            }
+        }
+
+        // Revocation: a pause bumps the generation; the stale writer fails.
+        let mut paused = store.load_mission(mission.id).await.unwrap().unwrap();
+        paused.status = MissionStatus::Paused;
+        paused.insight_generation += 1;
+        store.save_mission(&paused).await.unwrap();
+        assert!(
+            store
+                .save_conversation_insight(&run, &insight_request(statement.text.as_str()))
+                .await
+                .is_err(),
+            "a revoked run must not save insights"
+        );
+
+        // Purge removes only host-minted insight records in this scope. A
+        // user-authored doc that merely looks like an insight — `insight:`
+        // title or `insight` tag, no host record — must survive the
+        // model-invocable purge (MR !1043 finding 1).
+        let unrelated = MemoryDoc::new(pid, user, DocType::Lesson, "plain lesson", "keep me");
+        let mut user_titled = MemoryDoc::new(
+            pid,
+            user,
+            DocType::Lesson,
+            "insight:workflow:review",
+            "USER_AUTHORED_INSIGHT_TEXT",
+        )
+        .with_tags(vec!["insight".into()]);
+        user_titled.metadata = serde_json::json!({"source": "user"});
+        for doc in [&unrelated, &user_titled] {
+            store.save_memory_doc(doc).await.unwrap();
+        }
+        let purged = store.purge_conversation_insights(pid, user).await.unwrap();
+        assert_eq!(
+            purged, 5,
+            "only the five host-minted insight records must be purged"
+        );
+        let remaining = store.list_memory_docs(pid, user).await.unwrap();
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert!(remaining.iter().any(|d| d.id == unrelated.id));
+        assert!(
+            remaining.iter().any(|d| d.id == user_titled.id),
+            "a user-authored insight-shaped doc must not be destroyed by purge"
         );
     }
 

@@ -1159,7 +1159,14 @@ async fn async_main() -> anyhow::Result<()> {
     // Fill the scheduler slot now that Agent (and its Scheduler) exist.
     *scheduler_slot.write().await = Some(agent.scheduler());
 
-    // Spawn sandbox reaper for orphaned container cleanup
+    // Spawn sandbox reaper for orphaned container cleanup.
+    //
+    // Two independent spawns (WI#179 concern 2):
+    // 1. The full reaper (job-container scan + generic-sandbox CLI sweep)
+    //    when the Docker-compatible API is available.
+    // 2. A CLI-only sweep when it is not (socketless podman deployments):
+    //    the generic sandbox still creates containers, so orphan cleanup
+    //    must not depend on the orchestrator/API connection.
     if let Some(ref jm) = container_job_manager {
         let reaper_jm = Arc::clone(jm);
         let reaper_config = ReaperConfig {
@@ -1173,6 +1180,16 @@ async fn async_main() -> anyhow::Result<()> {
                 Ok(reaper) => reaper.run().await,
                 Err(e) => tracing::error!("Sandbox reaper failed to initialize: {}", e),
             }
+        });
+    } else if config.sandbox.enabled {
+        // Socketless deployment: run the generic-sandbox CLI sweep standalone.
+        let sweep_config = ReaperConfig {
+            scan_interval: Duration::from_secs(config.sandbox.reaper_interval_secs),
+            orphan_threshold: Duration::from_secs(config.sandbox.orphan_threshold_secs),
+            ..ReaperConfig::default()
+        };
+        tokio::spawn(async move {
+            SandboxReaper::run_cli_sweep_loop(sweep_config).await;
         });
     }
 

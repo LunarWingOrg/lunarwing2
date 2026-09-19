@@ -210,8 +210,42 @@ run "$sb_corrupt"
 assert_eq "$RC" "0" "corrupt state.json exits 0 (series omitted)"
 assert_contains "$PROM" 'lunarwing_health_overall_status' "report series still exported"
 
-# ── 8. Early-warning thresholds + notify gating ──────────────────────────────
+# ── 7b. Skipped units are a distinct code, never a failure (WI#180 F5) ──────
 sb="$(mksb)"
+mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
+{"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
+ "components":[{"component":"openrc","status":"healthy","metrics":{"services":[
+   {"name":"lunarwing-weechat-acme","state":"stopped","status":"skipped"},
+   {"name":"lunarwing-opencode2-acme","state":"stopped","status":"skipped"},
+   {"name":"lunarwing-pg-acme","state":"unprobed","status":"skipped"},
+   {"name":"lunarwing-acme","state":"started","status":"healthy"},
+   {"name":"lunarwing-proxy-acme","state":"stopped","status":"critical"}]}}],
+ "alerts":[]}
+EOF
+run "$sb"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-weechat-acme"} 4' "skipped unit -> status 4 (distinct from unknown)"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-opencode2-acme"} 4' "skipped worker -> status 4"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-pg-acme"} 4' "unprobed unit -> status 4 (not a failure)"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-acme"} 0' "healthy unit -> status 0"
+assert_contains "$PROM" 'lunarwing_health_unit_status{init="openrc",unit="lunarwing-proxy-acme"} 2' "critical unit -> status 2"
+# The example thresholds use equality (warn:==1 crit:==2), so an all-skipped
+# fleet must not raise an early warning (status 4 would have fired under the
+# old >0/>1 forms).
+cat > "$ROOT/th-skip.conf" <<'EOF'
+THRESHOLD_lunarwing_health_unit_status="warn:==1 crit:==2"
+EOF
+sb_skips="$(mksb)"
+mkreport "$sb_skips" "2026-08-15T10:00:00Z.json" <<'EOF'
+{"timestamp":"2026-08-15T10:00:00Z","overall_status":"healthy",
+ "components":[{"component":"openrc","status":"healthy","metrics":{"services":[
+   {"name":"lunarwing-weechat-acme","state":"stopped","status":"skipped"}]}}],
+ "alerts":[]}
+EOF
+run "$sb_skips" HEALTH_METRICS_THRESHOLDS_FILE="$ROOT/th-skip.conf"
+assert_absent "$PROM" 'lunarwing_health_early_warning{metric="lunarwing_health_unit_status"' \
+    "skipped-only fleet raises no unit-status early warning"
+
+# ── 8. Early-warning thresholds + notify gating ──────────────────────────────sb="$(mksb)"
 mkreport "$sb" "2026-08-15T10:00:00Z.json" <<'EOF'
 {"timestamp":"2026-08-15T10:00:00Z","overall_status":"degraded",
  "components":[
@@ -334,5 +368,46 @@ EOF
 run "$sb"
 assert_contains "$PROM" 'lunarwing_health_overall_status 2' "newest report used"
 assert_contains "$PROM" 'lunarwing_health_report_timestamp_seconds 1786788000' "timestamp from newest report"
+
+# ── 12. Stopped exporter: staleness must be derivable at scrape time ─────────
+# MR !1041 review finding 4: the exported report_age_seconds is a snapshot
+# frozen at export time. If scheduling stops, the textfile keeps serving the
+# same age forever, so the old alert (age_seconds > 2400) could never fire on
+# the default textfile path. The alert rule now derives the age from the
+# report timestamp at scrape time (time() - report_timestamp_seconds, as the
+# dashboard already does), which keeps advancing on every scrape.
+sb="$(mksb)"
+stale_ts=$(( $(date +%s) - 1800 ))                 # report produced 30m ago
+stale_iso="$(date -u -d "@$stale_ts" +%Y-%m-%dT%H:%M:%SZ)"
+mkreport "$sb" "$stale_iso.json" <<EOF
+{"timestamp":"$stale_iso","overall_status":"healthy","components":[],"alerts":[]}
+EOF
+run "$sb"
+frozen_age="$(grep -oE '^lunarwing_health_report_age_seconds [0-9]+' \
+    "$sb/reports/health/metrics.prom" | awk '{print $2}')"
+exported_ts="$(grep -oE '^lunarwing_health_report_timestamp_seconds [0-9]+' \
+    "$sb/reports/health/metrics.prom" | awk '{print $2}')"
+assert_eq "$exported_ts" "$stale_ts" "12a: report timestamp exported verbatim"
+if [[ "$frozen_age" =~ ^[0-9]+$ ]] && (( frozen_age < 2400 )); then
+    ok "12b: frozen age gauge ($frozen_age) sits below the 2400s threshold"
+else
+    bad "12b: frozen age gauge below threshold" "got age=$frozen_age"
+fi
+# Simulate the exporter having stopped 25 minutes ago: wall time advances to
+# ts+2400+60 while the textfile still serves the frozen gauge. The scrape-time
+# expression fires; the frozen-gauge comparison never would.
+future_now=$(( stale_ts + 2400 + 60 ))
+derived_age=$(( future_now - exported_ts ))
+if (( derived_age > 2400 )); then
+    ok "12c: scrape-time expression (time() - ts = $derived_age) trips the stale threshold"
+else
+    bad "12c: scrape-time expression trips the threshold" "derived=$derived_age"
+fi
+# The committed alert rule must use the scrape-time form (guards against
+# regressing to the frozen-gauge comparison).
+rules_file="$LIB_DIR/../contrib/prometheus-rules-lunarwing-health.yml"
+assert_contains "$(cat "$rules_file")" \
+    "expr: (time() - lunarwing_health_report_timestamp_seconds) > 2400" \
+    "12d: alert rule derives age at evaluation time"
 
 finish

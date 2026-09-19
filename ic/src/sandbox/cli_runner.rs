@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 
-use crate::sandbox::config::{ResourceLimits, SandboxNetworkMode, SandboxPolicy, SandboxRuntime};
+use crate::sandbox::config::{
+    ResourceLimits, SandboxNetworkMode, SandboxPolicy, SandboxRuntime, default_pids_limit,
+};
 use crate::sandbox::container::ContainerOutput;
 use crate::sandbox::error::{Result, SandboxError};
 
@@ -111,6 +113,30 @@ pub(crate) fn keep_id_mode_for(
     }
 }
 
+/// In-container `--user` value that owns the mounted workspace (WI#179 concern 4).
+///
+/// Podman's keep-id ladder maps the in-container UID onto the host user, so
+/// the pinned `1000:1000` always owns the mount. Docker has no per-run userns
+/// flag: rootless docker maps container root onto the host user (so `0:0` is
+/// correct), while rootful docker maps container UIDs 1:1 onto host UIDs (so
+/// the daemon's own euid/egid is correct).
+pub(crate) fn user_for(runtime: ContainerRuntime, docker_rootless: bool) -> String {
+    match runtime {
+        ContainerRuntime::Podman => "1000:1000".to_string(),
+        ContainerRuntime::Docker if docker_rootless => "0:0".to_string(),
+        ContainerRuntime::Docker => {
+            #[cfg(unix)]
+            {
+                format!("{}:{}", nix::unistd::geteuid(), nix::unistd::getegid())
+            }
+            #[cfg(not(unix))]
+            {
+                "1000:1000".to_string()
+            }
+        }
+    }
+}
+
 /// Probe order for runtime detection, honoring the configured preference.
 pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntime; 2] {
     match preferred {
@@ -126,6 +152,9 @@ pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntim
 pub(crate) struct RunSpec<'a> {
     pub runtime: ContainerRuntime,
     pub keep_id: KeepIdMode,
+    /// `--user` value for the container (WI#179 concern 4: must own the
+    /// mounted workspace on the selected runtime).
+    pub user: &'a str,
     pub image: &'a str,
     pub name: &'a str,
     /// Value for the [`SANDBOX_CONTAINER_LABEL`] label (RFC 3339 timestamp).
@@ -137,6 +166,12 @@ pub(crate) struct RunSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    /// Host directory holding the per-execution proxy relay socket
+    /// (proxy-enforced mode only). Bind-mounted read-only at
+    /// `/run/lunarwing-proxy`.
+    pub proxy_dir: Option<&'a str>,
+    /// Per-container process limit (`--pids-limit`).
+    pub pids_limit: u32,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -154,7 +189,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         "--label".into(),
         format!("{}={}", SANDBOX_CONTAINER_LABEL, spec.created_at_label),
         "--user".into(),
-        "1000:1000".into(),
+        spec.user.into(),
     ];
 
     match spec.keep_id {
@@ -173,6 +208,14 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
     args.push(format!("{}m", spec.limits.memory_bytes / (1024 * 1024)));
     args.push("--cpu-shares".into());
     args.push(spec.limits.cpu_shares.to_string());
+    // Explicit process cap: runtime defaults vary, so pin the ceiling instead
+    // of relying on them (WI#179 concern 5).
+    args.push("--pids-limit".into());
+    args.push(spec.pids_limit.to_string());
+    // Kill grace on stop/rm so the reaper's `rm -f` and the runner's own
+    // timeout cleanup terminate the container's PID 1 instead of orphaning it.
+    args.push("--stop-timeout".into());
+    args.push("10".into());
 
     // Security hardening (cross-runtime compatible forms).
     for flag in [
@@ -227,12 +270,51 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
                 }
             }
         }
+        SandboxNetworkMode::ProxyEnforced => {
+            args.push("--network".into());
+            args.push("none".into());
+            if let Some(dir) = spec.proxy_dir {
+                // Read-only relay socket transport (WI#155). Only this
+                // directory is visible besides the proxy env: no direct
+                // egress path exists anywhere, including localhost.
+                args.extend(["-v".into(), format!("{}:/run/lunarwing-proxy:ro,z", dir)]);
+            }
+            for var in ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"] {
+                args.extend(["-e".into(), format!("{var}=http://127.0.0.1:3128")]);
+            }
+            // A caller-supplied bypass cannot accidentally disable proxy use.
+            args.extend([
+                "-e".into(),
+                "NO_PROXY=".into(),
+                "-e".into(),
+                "no_proxy=".into(),
+            ]);
+        }
     }
 
-    args.push(spec.image.into());
-    args.push("sh".into());
-    args.push("-c".into());
-    args.push(spec.command.into());
+    // Run under `sh` regardless of image entrypoint (worker images bind
+    // their own entrypoint) and always work from the mounted workspace.
+    args.extend([
+        "--entrypoint".into(),
+        "sh".into(),
+        "--workdir".into(),
+        "/workspace".into(),
+        spec.image.into(),
+        "-c".into(),
+    ]);
+    if spec.network == SandboxNetworkMode::ProxyEnforced {
+        // Python relay wrapper (argv-separated: the untrusted command is a
+        // single argv value, never interpolated into the wrapper). Missing
+        // Python 3 fails closed rather than dropping the command unsandboxed.
+        args.extend([
+            "command -v python3 >/dev/null || { echo 'lunarwing-proxy-relay: Python 3 required' >&2; exit 125; }; exec python3 -I -c \"$1\" \"$2\"".into(),
+            "lunarwing-proxy-relay".into(),
+            include_str!("proxy/relay.py").into(),
+            spec.command.into(),
+        ]);
+    } else {
+        args.push(spec.command.into());
+    }
     args
 }
 
@@ -309,6 +391,11 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, cap: usiz
 static INFLIGHT: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// Runtime the sandbox runner actually selected at detect time (WI#179
+/// concern 2). The reaper's CLI sweep prefers this so it scans the runtime
+/// that really created the containers, instead of guessing from PATH.
+static SELECTED_RUNTIME: std::sync::OnceLock<ContainerRuntime> = std::sync::OnceLock::new();
+
 /// Snapshot of currently-executing sandbox container names.
 pub fn inflight_sandbox_containers() -> Vec<String> {
     INFLIGHT
@@ -329,6 +416,16 @@ pub fn available_runtime_binary() -> Option<&'static str> {
     }
 }
 
+/// Runtime CLI binary for the reaper's sandbox sweep: the runtime the runner
+/// selected (when the sandbox has been initialized), falling back to the
+/// PATH probe (WI#179 concern 2).
+pub fn selected_runtime_binary() -> Option<&'static str> {
+    SELECTED_RUNTIME
+        .get()
+        .map(ContainerRuntime::binary)
+        .or_else(available_runtime_binary)
+}
+
 fn register_inflight(name: &str) {
     if let Ok(mut names) = INFLIGHT.lock() {
         names.push(name.to_string());
@@ -338,6 +435,30 @@ fn register_inflight(name: &str) {
 fn unregister_inflight(name: &str) {
     if let Ok(mut names) = INFLIGHT.lock() {
         names.retain(|n| n != name);
+    }
+}
+
+/// RAII in-flight registration: unregisters on every exit path, including a
+/// dropped (cancelled) execute future (WI#179 concern 1). Without this, an
+/// outer timeout dropping the future would leave the container name in the
+/// registry forever and the reaper would skip the orphan.
+struct InflightGuard {
+    name: String,
+    armed: bool,
+}
+
+impl InflightGuard {
+    fn new(name: String) -> Self {
+        register_inflight(&name);
+        Self { name, armed: true }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unregister_inflight(&self.name);
+        }
     }
 }
 
@@ -356,6 +477,12 @@ pub struct ExecParams<'a> {
 pub struct CliRunner {
     runtime: ContainerRuntime,
     keep_id: KeepIdMode,
+    /// Whether the selected docker runtime runs rootless (container root
+    /// maps onto the host user — always false for podman and for non-unix
+    /// builds that can't probe).
+    docker_rootless: bool,
+    /// `--user` value computed at detect time (WI#179 concern 4).
+    user: String,
     image: String,
 }
 
@@ -367,20 +494,23 @@ impl CliRunner {
             if !binary_on_path(runtime.binary()) {
                 continue;
             }
-            let version = if runtime == ContainerRuntime::Podman {
-                probe_podman_version().await
-            } else {
-                None
+            let (version, docker_rootless) = match runtime {
+                ContainerRuntime::Podman => (probe_podman_version().await, false),
+                ContainerRuntime::Docker => (None, probe_docker_rootless().await),
             };
             tracing::info!(
                 runtime = runtime.binary(),
                 podman_version = ?version,
+                docker_rootless,
                 keep_id = ?keep_id_mode_for(runtime, version),
                 "Generic sandbox: using container runtime CLI"
             );
+            let _ = SELECTED_RUNTIME.set(runtime);
             return Ok(Self {
                 runtime,
                 keep_id: keep_id_mode_for(runtime, version),
+                docker_rootless,
+                user: user_for(runtime, docker_rootless),
                 image,
             });
         }
@@ -423,6 +553,10 @@ impl CliRunner {
     }
 
     /// Execute a command in a fresh hardened container and collect its output.
+    ///
+    /// Proxy-enforced setup (WI#155) fails closed before any container is
+    /// created: the running proxy/relay prerequisites are verified up front
+    /// so a misconfigured run can never degrade to direct egress.
     pub async fn execute(&self, params: ExecParams<'_>) -> Result<ContainerOutput> {
         self.execute_with_name(
             params,
@@ -447,12 +581,31 @@ impl CliRunner {
             network,
             proxy_port,
         } = params;
+        if network != SandboxNetworkMode::None && proxy_port == 0 {
+            return Err(SandboxError::ProxyError {
+                reason: format!("{network:?} network mode requires a running proxy"),
+            });
+        }
+        fail_if_writable_root_docker(self.runtime, policy, self.docker_rootless, &self.user)?;
+
+        let relay = if network == SandboxNetworkMode::ProxyEnforced {
+            // Start before container creation; a failed relay never degrades
+            // to advisory or direct egress (fail closed).
+            Some(crate::sandbox::proxy::relay::ProxyRelay::start(proxy_port).await?)
+        } else {
+            None
+        };
         let start_time = std::time::Instant::now();
         let created_at = chrono::Utc::now().to_rfc3339();
+        let proxy_dir = relay
+            .as_ref()
+            .map(|relay| relay.path().to_string_lossy().into_owned());
+        let proxy_dir_ref = proxy_dir.as_deref();
 
         let spec = RunSpec {
             runtime: self.runtime,
             keep_id: self.keep_id,
+            user: &self.user,
             image: &self.image,
             name,
             created_at_label: &created_at,
@@ -463,12 +616,24 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            proxy_dir: proxy_dir_ref,
+            pids_limit: default_pids_limit(),
         };
         let args = build_run_args(&spec);
 
-        register_inflight(name);
-        let result = self.run_container(name, &args, limits).await;
-        unregister_inflight(name);
+        // Cancellation-safe in-flight registration (WI#179 concern 1): a
+        // guard unregisters on every exit path — normal return, error, or the
+        // outer shell-tool timeout dropping this future. `run_container` also
+        // performs its own kill-by-name on cancellation, so a dropped future
+        // can never leave a live container registered as in-flight (which
+        // would make the reaper skip it forever).
+        let _inflight_guard = InflightGuard::new(name.clone());
+        let result = self.run_container(&name, &args, limits).await;
+        // The relay lives at least as long as the container process; closing
+        // it earlier (e.g. on an outer-task drop racing the detached cleanup)
+        // only cuts in-flight proxy streams for a container the cleanup guard
+        // is already killing.
+        drop(relay);
 
         result.map(|mut output| {
             output.duration = start_time.elapsed();
@@ -478,6 +643,12 @@ impl CliRunner {
 
     /// Spawn the run command, stream output into capped buffers, enforce the
     /// timeout, and return the container's exit code and output.
+    ///
+    /// Cancellation-safe (WI#179 concern 1): [`ContainerCleanupGuard`] runs
+    /// kill-by-name cleanup on every exit path, including a dropped future
+    /// (the shell tool's outer per-call timeout expiring first, or a task
+    /// abort). Killing the CLI client alone does not stop the container —
+    /// conmon owns it — so the guard issues `kill` + `rm -f` directly.
     async fn run_container(
         &self,
         name: &str,
@@ -522,6 +693,8 @@ impl CliRunner {
             spec.as_ref(),
             spawner.xdg_runtime_dir(),
         );
+        // Detached kill-by-name on cancellation/drop (see struct docs).
+        let mut cleanup = ContainerCleanupGuard::new(name.to_string(), self.runtime.binary());
 
         // Drain both pipes concurrently so the child never blocks on a full
         // pipe; collection continues past the cap until EOF.
@@ -537,17 +710,20 @@ impl CliRunner {
                 // owns it) — kill by name too; `--rm` then cleans it up.
                 guard.kill_tree().await;
                 self.kill_by_name(name).await;
+                cleanup.disarm();
                 Err(SandboxError::Timeout(limits.timeout))
             }
             Ok(Err(e)) => {
                 guard.kill_tree().await;
                 self.kill_by_name(name).await;
+                cleanup.disarm();
                 Err(SandboxError::ExecutionFailed {
                     reason: format!("container wait failed: {e}"),
                 })
             }
             Ok(Ok(status)) => {
                 guard.disarm();
+                cleanup.disarm();
                 let exit_code = status.code().unwrap_or(-1) as i64;
 
                 let (out_buf, err_buf) = match tokio::try_join!(out_task, err_task) {
@@ -562,7 +738,7 @@ impl CliRunner {
                 let (stderr, stderr_trunc) = err_buf.into_string();
 
                 if exit_code != 0
-                    && let Some(err) = classify_run_failure(&stderr, &self.image)
+                    && let Some(err) = classify_run_failure(&stderr, &self.image, exit_code)
                 {
                     return Err(err);
                 }
@@ -591,18 +767,127 @@ impl CliRunner {
     }
 }
 
+/// Cancellation-safe container cleanup (WI#179 concern 1).
+///
+/// When the future owning the run is dropped — the shell tool's outer
+/// per-call timeout expiring before the manager's own timeout, or a task
+/// abort — the CLI child dies via `kill_on_drop`, but the container keeps
+/// running under conmon. This guard spawns a detached `kill` + `rm -f`
+/// sequence on drop so the container is stopped even though no one awaits
+/// the cleanup. `disarm()` is called on every normal exit path.
+struct ContainerCleanupGuard {
+    name: String,
+    bin: &'static str,
+    armed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(name: String, bin: &'static str) -> Self {
+        Self {
+            name,
+            bin,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    /// Known window (!1046 review finding 3): the detached cleanup is a
+    /// `tokio::spawn`, so a daemon shutdown racing an in-flight execution can
+    /// exit the process before the spawned cleanup runs (detached tasks do
+    /// not outlive runtime shutdown). That is a bounded gap, backstopped by
+    /// the independent CLI reaper, which sweeps labeled orphans on its own
+    /// cadence. A synchronous cleanup here is not possible (Drop is sync and
+    /// spawning within an aborting runtime can itself fail).
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        let bin = self.bin;
+        tokio::spawn(async move {
+            for args in [vec!["kill", name.as_str()], vec!["rm", "-f", name.as_str()]] {
+                if let Some(status) = run_status(bin, &args).await
+                    && !status.success()
+                {
+                    tracing::debug!(container = %name, "Sandbox cancellation cleanup failed (may already be gone)");
+                }
+            }
+        });
+    }
+}
+
+/// Execute-time container-root guard (!1046 review finding 2).
+///
+/// Only ROOTFUL + root-daemon Docker is refused: rootless Docker also maps
+/// `--user 0:0` but container root there maps onto the host user via the
+/// userns (safe; `user_for` documents the mapping). `CliRunner` stores the
+/// rootless flag detected at `detect()` time, so the guard refuses only
+/// `!docker_rootless && allows_writes && user == 0:0` — rootless writable
+/// workspaces keep working with their userns identity.
+#[cfg(unix)]
+fn fail_if_writable_root_docker(
+    runtime: ContainerRuntime,
+    policy: SandboxPolicy,
+    docker_rootless: bool,
+    user: &str,
+) -> Result<()> {
+    if runtime == ContainerRuntime::Docker
+        && !docker_rootless
+        && policy.allows_writes()
+        && user == "0:0"
+    {
+        return Err(SandboxError::Config {
+            reason: "rootful Docker under a root daemon would run a writable workspace as container root; use rootless podman or a non-root daemon (rootless Docker is allowed — container root there maps onto the host user via userns)".into(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn fail_if_writable_root_docker(
+    _runtime: ContainerRuntime,
+    _policy: SandboxPolicy,
+    _docker_rootless: bool,
+    _user: &str,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Map a failed run's stderr to a typed error when it indicates a missing
 /// image (e.g. the image vanished between the initialize-time check and the
-/// run, or auto-pull is off).
-fn classify_run_failure(stderr: &str, image: &str) -> Option<SandboxError> {
+/// run, or auto-pull is off), a relay setup failure (proxy-enforced), or a
+/// runtime setup failure (mount/userns/resource-controller errors reported by
+/// the runtime CLI, exit 125).
+fn classify_run_failure(stderr: &str, image: &str, exit_code: i64) -> Option<SandboxError> {
+    if stderr.contains("lunarwing-proxy-relay:") {
+        return Some(SandboxError::ProxyError {
+            reason: stderr.trim().into(),
+        });
+    }
     let lower = stderr.to_lowercase();
     let image_missing = lower.contains("image not known")
         || lower.contains("no such image")
         || lower.contains("unable to find image")
         || lower.contains("pull access denied");
-    image_missing.then(|| SandboxError::ImageUnavailable {
-        image: image.to_string(),
-        reason: stderr.trim().to_string(),
+    if image_missing {
+        return Some(SandboxError::ImageUnavailable {
+            image: image.to_string(),
+            reason: stderr.trim().to_string(),
+        });
+    }
+    // Runtime setup failures are sandbox errors, not a successful invocation
+    // with an ordinary command exit code.
+    let runtime_error = exit_code == 125
+        && lower
+            .lines()
+            .any(|line| line.starts_with("error:") || line.starts_with("docker: error"));
+    runtime_error.then(|| SandboxError::ExecutionFailed {
+        reason: stderr.trim().into(),
     })
 }
 
@@ -660,6 +945,37 @@ async fn probe_podman_version() -> Option<(u32, u32)> {
     parse_podman_version(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Detect whether docker is running rootless (`docker info` reports a
+/// rootless security option). Rootless docker maps container root onto the
+/// host user, so the sandbox must run as `--user 0:0` for bind mounts to be
+/// writable (WI#179 concern 4).
+///
+/// The probe is bounded (!1046 review finding 1): a present-but-wedged daemon
+/// must not hang sandbox initialization forever. On timeout or probe failure
+/// we conservatively report "not rootless" (rootful mapping), which makes
+/// read-only policy work and the execute-time guard fail writable workspaces
+/// closed under a root daemon.
+async fn probe_docker_rootless() -> bool {
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::process::Command::new("docker")
+            .args(["info", "--format", "{{.SecurityOptions}}"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match output {
+        Ok(Ok(output)) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            text.contains("rootless")
+        }
+        _ => false,
+    }
+}
+
 /// Check a binary exists on PATH (`which` on Unix, `where` on Windows).
 fn binary_on_path(bin: &str) -> bool {
     #[cfg(unix)]
@@ -698,6 +1014,7 @@ mod tests {
         RunSpec {
             runtime,
             keep_id,
+            user: "1000:1000",
             image: "lunarwing-worker:latest",
             name: "lunarwing-sandbox-test",
             created_at_label: "2026-09-04T00:00:00Z",
@@ -708,6 +1025,8 @@ mod tests {
             env: &EMPTY_ENV,
             network,
             proxy_port,
+            proxy_dir: None,
+            pids_limit: 256,
         }
     }
 
@@ -817,6 +1136,8 @@ mod tests {
             "--cap-add=CHOWN",
             "--security-opt=no-new-privileges",
             "--read-only",
+            "--pids-limit",
+            "--stop-timeout",
         ] {
             assert!(args.contains(&flag.to_string()), "missing flag {flag}");
         }
@@ -824,6 +1145,8 @@ mod tests {
         assert_eq!(args[tmpfs_idx + 1], "/tmp:size=512m");
         let memory_idx = args.iter().position(|a| a == "--memory").unwrap();
         assert_eq!(args[memory_idx + 1], "2048m");
+        let pids_idx = args.iter().position(|a| a == "--pids-limit").unwrap();
+        assert_eq!(args[pids_idx + 1], "256");
         let label_idx = args.iter().position(|a| a == "--label").unwrap();
         assert_eq!(
             args[label_idx + 1],
@@ -935,7 +1258,14 @@ mod tests {
             .iter()
             .position(|a| a == "lunarwing-worker:latest")
             .unwrap();
-        assert_eq!(&args[image_idx + 1..], &["sh", "-c", "echo hi"]);
+        assert_eq!(&args[image_idx + 1..], &["-c", "echo hi"]);
+        assert_eq!(
+            args.windows(2)
+                .find(|w| w[0] == "--entrypoint")
+                .map(|w| w[1].as_str()),
+            Some("sh"),
+            "image entrypoint must not intercept sandbox commands"
+        );
     }
 
     // ── capped buffer ──────────────────────────────────────────────────
@@ -1000,11 +1330,82 @@ mod tests {
         ];
         for stderr in cases {
             assert!(
-                classify_run_failure(stderr, "lunarwing-worker:latest").is_some(),
+                classify_run_failure(stderr, "lunarwing-worker:latest", 125).is_some(),
                 "should classify: {stderr}"
             );
         }
-        assert!(classify_run_failure("sh: foo: command not found", "img").is_none());
+        assert!(classify_run_failure("sh: foo: command not found", "img", 127).is_none());
+        assert!(
+            classify_run_failure("Error: command rejected input", "img", 1).is_none(),
+            "exit 125 marker in unrelated contexts must not mask ordinary errors"
+        );
+    }
+
+    #[test]
+    fn proxy_relay_and_runtime_setup_failures_are_structured() {
+        for (stderr, kind) in [
+            ("lunarwing-proxy-relay: Python 3 required", "proxy_error"),
+            (
+                "Error: statfs /private/channel: permission denied",
+                "execution_failed",
+            ),
+            (
+                "docker: Error response from daemon: invalid mount config",
+                "execution_failed",
+            ),
+        ] {
+            assert_eq!(
+                classify_run_failure(stderr, "image", 125).unwrap().kind(),
+                kind
+            );
+        }
+    }
+
+    #[test]
+    fn enforced_proxy_args_are_confined() {
+        for runtime in [ContainerRuntime::Podman, ContainerRuntime::Docker] {
+            let args = build_run_args(&RunSpec {
+                proxy_dir: Some("/private/channel"),
+                ..spec(
+                    runtime,
+                    KeepIdMode::Off,
+                    SandboxPolicy::WorkspaceWrite,
+                    SandboxNetworkMode::ProxyEnforced,
+                    1234,
+                )
+            });
+            for pair in [
+                ["--user", "1000:1000"],
+                ["--pids-limit", "256"],
+                ["--network", "none"],
+                ["--entrypoint", "sh"],
+                ["--workdir", "/workspace"],
+            ] {
+                assert!(
+                    args.windows(2).any(|w| w == pair),
+                    "missing pair {pair:?} in {args:?}"
+                );
+            }
+            assert!(args.contains(&"/private/channel:/run/lunarwing-proxy:ro,z".to_string()));
+            assert!(args.contains(&"http_proxy=http://127.0.0.1:3128".to_string()));
+            assert!(args.contains(&"NO_PROXY=".to_string()));
+            // The untrusted command is a separate argv value behind the
+            // Python relay wrapper, never interpolated into sh -c directly.
+            let image_idx = args
+                .iter()
+                .position(|a| a == "lunarwing-worker:latest")
+                .unwrap();
+            let tail = &args[image_idx + 1..];
+            assert_eq!(tail[0], "-c");
+            assert_eq!(tail[2], "lunarwing-proxy-relay");
+            assert!(tail[3].contains("lunarwing-proxy-relay:"));
+            assert_eq!(tail.last(), Some(&"echo hi".to_string()));
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a.contains("host-gateway") || a.contains("unconfined"))
+            );
+        }
     }
 
     #[test]
@@ -1127,5 +1528,95 @@ mod tests {
         .map(|s| s.success())
         .unwrap_or(false);
         assert!(!leftover, "container survived timeout cleanup");
+    }
+
+    #[test]
+    fn inflight_guard_unregisters_on_drop() {
+        let before = inflight_sandbox_containers().len();
+        {
+            let _guard = InflightGuard::new("lunarwing-sandbox-guard".to_string());
+            assert!(inflight_sandbox_containers().contains(&"lunarwing-sandbox-guard".to_string()));
+        }
+        assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_docker_guard_only_refuses_rootful_under_root() {
+        // Rootless Docker: container root maps onto the host user via the
+        // userns, so `--user 0:0` is SAFE. The guard must not refuse it.
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::WorkspaceWrite,
+                true,
+                "0:0",
+            )
+            .is_ok(),
+            "rootless Docker writable workspaces must not be refused"
+        );
+
+        // Rootful Docker under a NON-root daemon never resolves to 0:0, so
+        // nothing to refuse here either.
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::WorkspaceWrite,
+                false,
+                "1234:1234",
+            )
+            .is_ok(),
+            "rootful Docker under a non-root daemon is fine"
+        );
+
+        // THE REFUSAL: rootful Docker under a root daemon.
+        let refuse = fail_if_writable_root_docker(
+            ContainerRuntime::Docker,
+            SandboxPolicy::WorkspaceWrite,
+            false,
+            "0:0",
+        );
+        assert!(
+            matches!(refuse, Err(SandboxError::Config { reason }) if reason.contains("rootful Docker under a root daemon")),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_docker_guard_ignores_readonly_and_non_docker() {
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Docker,
+                SandboxPolicy::ReadOnly,
+                false,
+                "0:0",
+            )
+            .is_ok(),
+            "read-only policy under rootful-Docker-as-root is documented accepted risk"
+        );
+        assert!(
+            fail_if_writable_root_docker(
+                ContainerRuntime::Podman,
+                SandboxPolicy::WorkspaceWrite,
+                false,
+                "0:0",
+            )
+            .is_ok(),
+            "podman never hits the docker guard"
+        );
+    }
+
+    #[test]
+    fn docker_user_mapping_follows_rootless_detection() {
+        // Rootless docker maps container root onto the host user: run as 0:0.
+        assert_eq!(user_for(ContainerRuntime::Docker, true), "0:0");
+        // Rootful docker maps UIDs 1:1: run as the daemon's own uid/gid.
+        #[cfg(unix)]
+        assert_eq!(
+            user_for(ContainerRuntime::Docker, false),
+            format!("{}:{}", nix::unistd::geteuid(), nix::unistd::getegid())
+        );
+        // Podman uses the keep-id ladder and the pinned sandbox user.
+        assert_eq!(user_for(ContainerRuntime::Podman, false), "1000:1000");
     }
 }

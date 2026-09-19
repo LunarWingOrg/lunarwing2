@@ -142,8 +142,11 @@ impl SandboxManager {
 
         *self.runner.write().await = Some(runner);
 
-        // Start the network proxy only for sandboxed policies in proxy mode.
-        if self.config.policy.is_sandboxed() && self.config.network == SandboxNetworkMode::Proxy {
+        // Start the network proxy for every non-isolated egress mode —
+        // advisory and enforced both need the validating proxy. Per-call
+        // policy overrides (including a FullAccess manager default with sandboxed
+        // per-call policies) use the same never-relaxed proxy ACL.
+        if self.config.network != SandboxNetworkMode::None {
             let proxy = NetworkProxyBuilder::from_config(&self.config)
                 .build_and_start(self.config.proxy_port)
                 .await?;

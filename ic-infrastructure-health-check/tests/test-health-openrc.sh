@@ -314,6 +314,29 @@ assert_eq "$(svc_field "$OUT" lunarwing-kimi-acme-sup status)" "critical" "S15: 
 assert_eq "$(svc_field "$OUT" lunarwing-pebble-acme status)" "skipped"  "S15: unselected worker → skipped"
 assert_eq "$RC" 2 "S15: selected down worker exits 2"
 
+# ── S15b: opencode2 worker follows the same intent gate (WI#180 F1) ─────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;             fix_set "$s" lunarwing-acme             " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-opencode2-acme;     fix_set "$s" lunarwing-opencode2-acme     " * status: stopped" 3
+mk_unit "$s" lunarwing-opencode2-acme-sup; fix_set "$s" lunarwing-opencode2-acme-sup " * status: crashed" 1
+mk_worker_registry "$s" acme opencode2 true false
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode2-acme status)"     "skipped" "S15b: desired-running false opencode2 → skipped"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode2-acme-sup status)" "skipped" "S15b: desired-running false opencode2 babysitter → skipped"
+assert_eq "$(jq -r '.status' <<<"$OUT")" "healthy" "S15b: stopped opencode2 cannot trigger remediation"
+assert_eq "$RC" 0 "S15b: stopped opencode2 keeps exit 0"
+
+# ── S15c: selected opencode2 down on a started tenant → critical ─────────────
+s="$(new_scenario)"
+mk_unit "$s" lunarwing-acme;             fix_set "$s" lunarwing-acme             " * status: started" 0; enable_unit "$s" lunarwing-acme
+mk_unit "$s" lunarwing-opencode2-acme;     fix_set "$s" lunarwing-opencode2-acme     " * status: stopped" 3
+mk_unit "$s" lunarwing-opencode2-acme-sup; fix_set "$s" lunarwing-opencode2-acme-sup " * status: stopped" 3
+mk_worker_registry "$s" acme opencode2 true absent
+run_hc "$s" LUNARWING_TENANTS_FILE="$s/ports.json"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode2-acme status)"     "critical" "S15c: enabled opencode2 down → critical"
+assert_eq "$(svc_field "$OUT" lunarwing-opencode2-acme-sup status)" "critical" "S15c: enabled opencode2 babysitter maps to started tenant"
+assert_eq "$RC" 2 "S15c: selected down opencode2 exits 2"
+
 # ── S16: watchdog cron hook + running scheduler → scheduler healthy ─────────
 s="$(new_scenario)"
 mk_unit "$s" lunarwing-acme; fix_set "$s" lunarwing-acme " * status: started" 0
@@ -392,6 +415,37 @@ printf '%s\n' '# BEGIN lunarwing-mt-health managed block' \
   '# END lunarwing-mt-health managed block' >"$s/fix/crontab.tab"
 run_hc "$s"
 assert_eq "$(jq -r '.metrics.scheduler.status' <<<"$OUT")" "healthy" "S22: crontab mt-health hook + running dcron → healthy"
+
+# ── S23: slow fleet probes keep partial results instead of blanking (WI#180 F4) ──
+# Four started-tenant services each delay their status 6s (under the 8s
+# per-unit timeout, over the 5s sweep deadline). The first probe completes and
+# the rest are marked unprobed — the report keeps the completed observation,
+# degrades for lost coverage, and lands well inside the driver's 30s budget.
+if [[ "$HAVE_TIMEOUT" -eq 1 ]]; then
+  s="$(new_scenario)"
+  for u in lunarwing-acme lunarwing-proxy-acme lunarwing-pg-acme lunarwing-weechat-acme; do
+    mk_unit "$s" "$u"; fix_set "$s" "$u" " * status: started" 0 6
+  done
+  enable_unit "$s" lunarwing-acme
+  start=$SECONDS
+  run_hc "$s" HEALTH_OPENRC_SWEEP_DEADLINE_SECS=5
+  dur=$((SECONDS - start))
+  assert_json "$OUT" "S23: emits valid JSON despite slow fleet"
+  assert_eq "$(svc_field "$OUT" lunarwing-acme status)" "healthy" "S23: completed probe result retained"
+  assert_eq "$(svc_field "$OUT" lunarwing-proxy-acme state)" "unprobed" "S23: unprobed service marked unprobed"
+  assert_eq "$(svc_field "$OUT" lunarwing-proxy-acme status)" "skipped" "S23: unprobed service is skipped, not critical"
+  assert_eq "$(jq -r '.status' <<<"$OUT")" "degraded" "S23: lost coverage degrades the component"
+  assert_eq "$RC" 1 "S23: exit 1"
+  if jq -r '.issues[]?' <<<"$OUT" | grep -qF "sweep incomplete"; then
+    ok "S23: incomplete sweep issue surfaced"
+  else
+    bad "S23: incomplete sweep issue surfaced" "issues: $(jq -c '.issues' <<<"$OUT")"
+  fi
+  if [[ "$dur" -le 15 ]]; then ok "S23: run bounded by the sweep deadline (${dur}s)"
+  else bad "S23: run bounded by the sweep deadline" "run took ${dur}s"; fi
+else
+  echo "SKIP: S23 slow-fleet deadline test (no 'timeout' binary)"
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ "$fail" -eq 0 ]]
