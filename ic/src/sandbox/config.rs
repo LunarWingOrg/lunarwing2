@@ -216,6 +216,17 @@ impl Default for ResourceLimits {
     }
 }
 
+/// Default per-container process limit (`--pids-limit`, WI#179 concern 5).
+///
+/// Pinned explicitly rather than relying on runtime defaults, which vary
+/// between podman (4096) and docker (unlimited on older daemons).
+pub const DEFAULT_PIDS_LIMIT: u32 = 256;
+
+/// Default per-container process limit for [`crate::sandbox::cli_runner`].
+pub fn default_pids_limit() -> u32 {
+    DEFAULT_PIDS_LIMIT
+}
+
 /// Default network allowlist for common development operations.
 pub fn default_allowlist() -> Vec<String> {
     vec![

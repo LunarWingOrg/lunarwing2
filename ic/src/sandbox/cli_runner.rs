@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
 
-use crate::sandbox::config::{ResourceLimits, SandboxNetworkMode, SandboxPolicy, SandboxRuntime};
+use crate::sandbox::config::{
+    ResourceLimits, SandboxNetworkMode, SandboxPolicy, SandboxRuntime, default_pids_limit,
+};
 use crate::sandbox::container::ContainerOutput;
 use crate::sandbox::error::{Result, SandboxError};
 
@@ -111,6 +113,30 @@ pub(crate) fn keep_id_mode_for(
     }
 }
 
+/// In-container `--user` value that owns the mounted workspace (WI#179 concern 4).
+///
+/// Podman's keep-id ladder maps the in-container UID onto the host user, so
+/// the pinned `1000:1000` always owns the mount. Docker has no per-run userns
+/// flag: rootless docker maps container root onto the host user (so `0:0` is
+/// correct), while rootful docker maps container UIDs 1:1 onto host UIDs (so
+/// the daemon's own euid/egid is correct).
+pub(crate) fn user_for(runtime: ContainerRuntime, docker_rootless: bool) -> String {
+    match runtime {
+        ContainerRuntime::Podman => "1000:1000".to_string(),
+        ContainerRuntime::Docker if docker_rootless => "0:0".to_string(),
+        ContainerRuntime::Docker => {
+            #[cfg(unix)]
+            {
+                format!("{}:{}", nix::unistd::geteuid(), nix::unistd::getegid())
+            }
+            #[cfg(not(unix))]
+            {
+                "1000:1000".to_string()
+            }
+        }
+    }
+}
+
 /// Probe order for runtime detection, honoring the configured preference.
 pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntime; 2] {
     match preferred {
@@ -126,6 +152,9 @@ pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntim
 pub(crate) struct RunSpec<'a> {
     pub runtime: ContainerRuntime,
     pub keep_id: KeepIdMode,
+    /// `--user` value for the container (WI#179 concern 4: must own the
+    /// mounted workspace on the selected runtime).
+    pub user: &'a str,
     pub image: &'a str,
     pub name: &'a str,
     /// Value for the [`SANDBOX_CONTAINER_LABEL`] label (RFC 3339 timestamp).
@@ -137,6 +166,8 @@ pub(crate) struct RunSpec<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    /// Per-container process limit (`--pids-limit`).
+    pub pids_limit: u32,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -154,7 +185,7 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         "--label".into(),
         format!("{}={}", SANDBOX_CONTAINER_LABEL, spec.created_at_label),
         "--user".into(),
-        "1000:1000".into(),
+        spec.user.into(),
     ];
 
     match spec.keep_id {
@@ -173,6 +204,14 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
     args.push(format!("{}m", spec.limits.memory_bytes / (1024 * 1024)));
     args.push("--cpu-shares".into());
     args.push(spec.limits.cpu_shares.to_string());
+    // Explicit process cap: runtime defaults vary, so pin the ceiling instead
+    // of relying on them (WI#179 concern 5).
+    args.push("--pids-limit".into());
+    args.push(spec.pids_limit.to_string());
+    // Kill grace on stop/rm so the reaper's `rm -f` and the runner's own
+    // timeout cleanup terminate the container's PID 1 instead of orphaning it.
+    args.push("--stop-timeout".into());
+    args.push("10".into());
 
     // Security hardening (cross-runtime compatible forms).
     for flag in [
@@ -309,6 +348,11 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, cap: usiz
 static INFLIGHT: std::sync::LazyLock<std::sync::Mutex<Vec<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
+/// Runtime the sandbox runner actually selected at detect time (WI#179
+/// concern 2). The reaper's CLI sweep prefers this so it scans the runtime
+/// that really created the containers, instead of guessing from PATH.
+static SELECTED_RUNTIME: std::sync::OnceLock<ContainerRuntime> = std::sync::OnceLock::new();
+
 /// Snapshot of currently-executing sandbox container names.
 pub fn inflight_sandbox_containers() -> Vec<String> {
     INFLIGHT
@@ -329,6 +373,16 @@ pub fn available_runtime_binary() -> Option<&'static str> {
     }
 }
 
+/// Runtime CLI binary for the reaper's sandbox sweep: the runtime the runner
+/// selected (when the sandbox has been initialized), falling back to the
+/// PATH probe (WI#179 concern 2).
+pub fn selected_runtime_binary() -> Option<&'static str> {
+    SELECTED_RUNTIME
+        .get()
+        .map(ContainerRuntime::binary)
+        .or_else(available_runtime_binary)
+}
+
 fn register_inflight(name: &str) {
     if let Ok(mut names) = INFLIGHT.lock() {
         names.push(name.to_string());
@@ -338,6 +392,30 @@ fn register_inflight(name: &str) {
 fn unregister_inflight(name: &str) {
     if let Ok(mut names) = INFLIGHT.lock() {
         names.retain(|n| n != name);
+    }
+}
+
+/// RAII in-flight registration: unregisters on every exit path, including a
+/// dropped (cancelled) execute future (WI#179 concern 1). Without this, an
+/// outer timeout dropping the future would leave the container name in the
+/// registry forever and the reaper would skip the orphan.
+struct InflightGuard {
+    name: String,
+    armed: bool,
+}
+
+impl InflightGuard {
+    fn new(name: String) -> Self {
+        register_inflight(&name);
+        Self { name, armed: true }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            unregister_inflight(&self.name);
+        }
     }
 }
 
@@ -356,6 +434,8 @@ pub struct ExecParams<'a> {
 pub struct CliRunner {
     runtime: ContainerRuntime,
     keep_id: KeepIdMode,
+    /// `--user` value computed at detect time (WI#179 concern 4).
+    user: String,
     image: String,
 }
 
@@ -367,20 +447,22 @@ impl CliRunner {
             if !binary_on_path(runtime.binary()) {
                 continue;
             }
-            let version = if runtime == ContainerRuntime::Podman {
-                probe_podman_version().await
-            } else {
-                None
+            let (version, docker_rootless) = match runtime {
+                ContainerRuntime::Podman => (probe_podman_version().await, false),
+                ContainerRuntime::Docker => (None, probe_docker_rootless().await),
             };
             tracing::info!(
                 runtime = runtime.binary(),
                 podman_version = ?version,
+                docker_rootless,
                 keep_id = ?keep_id_mode_for(runtime, version),
                 "Generic sandbox: using container runtime CLI"
             );
+            let _ = SELECTED_RUNTIME.set(runtime);
             return Ok(Self {
                 runtime,
                 keep_id: keep_id_mode_for(runtime, version),
+                user: user_for(runtime, docker_rootless),
                 image,
             });
         }
@@ -445,6 +527,7 @@ impl CliRunner {
         let spec = RunSpec {
             runtime: self.runtime,
             keep_id: self.keep_id,
+            user: &self.user,
             image: &self.image,
             name: &name,
             created_at_label: &created_at,
@@ -455,12 +538,18 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            pids_limit: default_pids_limit(),
         };
         let args = build_run_args(&spec);
 
-        register_inflight(&name);
+        // Cancellation-safe in-flight registration (WI#179 concern 1): a
+        // guard unregisters on every exit path — normal return, error, or the
+        // outer shell-tool timeout dropping this future. `run_container` also
+        // performs its own kill-by-name on cancellation, so a dropped future
+        // can never leave a live container registered as in-flight (which
+        // would make the reaper skip it forever).
+        let _inflight_guard = InflightGuard::new(name.clone());
         let result = self.run_container(&name, &args, limits).await;
-        unregister_inflight(&name);
 
         result.map(|mut output| {
             output.duration = start_time.elapsed();
@@ -470,6 +559,12 @@ impl CliRunner {
 
     /// Spawn the run command, stream output into capped buffers, enforce the
     /// timeout, and return the container's exit code and output.
+    ///
+    /// Cancellation-safe (WI#179 concern 1): [`ContainerCleanupGuard`] runs
+    /// kill-by-name cleanup on every exit path, including a dropped future
+    /// (the shell tool's outer per-call timeout expiring first, or a task
+    /// abort). Killing the CLI client alone does not stop the container —
+    /// conmon owns it — so the guard issues `kill` + `rm -f` directly.
     async fn run_container(
         &self,
         name: &str,
@@ -500,6 +595,8 @@ impl CliRunner {
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+        // Detached kill-by-name on cancellation/drop (see struct docs).
+        let mut cleanup = ContainerCleanupGuard::new(name.to_string(), self.runtime.binary());
 
         // Drain both pipes concurrently so the child never blocks on a full
         // pipe; collection continues past the cap until EOF.
@@ -515,17 +612,20 @@ impl CliRunner {
                 // owns it) — kill by name too; `--rm` then cleans it up.
                 guard.kill_tree();
                 self.kill_by_name(name).await;
+                cleanup.disarm();
                 Err(SandboxError::Timeout(limits.timeout))
             }
             Ok(Err(e)) => {
                 guard.kill_tree();
                 self.kill_by_name(name).await;
+                cleanup.disarm();
                 Err(SandboxError::ExecutionFailed {
                     reason: format!("container wait failed: {e}"),
                 })
             }
             Ok(Ok(status)) => {
                 guard.disarm();
+                cleanup.disarm();
                 let exit_code = status.code().unwrap_or(-1) as i64;
 
                 let (out_buf, err_buf) = match tokio::try_join!(out_task, err_task) {
@@ -569,6 +669,53 @@ impl CliRunner {
     }
 }
 
+/// Cancellation-safe container cleanup (WI#179 concern 1).
+///
+/// When the future owning the run is dropped — the shell tool's outer
+/// per-call timeout expiring before the manager's own timeout, or a task
+/// abort — the CLI child dies via `kill_on_drop`, but the container keeps
+/// running under conmon. This guard spawns a detached `kill` + `rm -f`
+/// sequence on drop so the container is stopped even though no one awaits
+/// the cleanup. `disarm()` is called on every normal exit path.
+struct ContainerCleanupGuard {
+    name: String,
+    bin: &'static str,
+    armed: bool,
+}
+
+impl ContainerCleanupGuard {
+    fn new(name: String, bin: &'static str) -> Self {
+        Self {
+            name,
+            bin,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let name = self.name.clone();
+        let bin = self.bin;
+        tokio::spawn(async move {
+            for args in [vec!["kill", name.as_str()], vec!["rm", "-f", name.as_str()]] {
+                if let Some(status) = run_status(bin, &args).await
+                    && !status.success()
+                {
+                    tracing::debug!(container = %name, "Sandbox cancellation cleanup failed (may already be gone)");
+                }
+            }
+        });
+    }
+}
+
 /// Map a failed run's stderr to a typed error when it indicates a missing
 /// image (e.g. the image vanished between the initialize-time check and the
 /// run, or auto-pull is off).
@@ -606,6 +753,26 @@ async fn probe_podman_version() -> Option<(u32, u32)> {
         .await
         .ok()?;
     parse_podman_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Detect whether docker is running rootless (`docker info` reports a
+/// rootless security option). Rootless docker maps container root onto the
+/// host user, so the sandbox must run as `--user 0:0` for bind mounts to be
+/// writable (WI#179 concern 4).
+async fn probe_docker_rootless() -> bool {
+    let output = tokio::process::Command::new("docker")
+        .args(["info", "--format", "{{.SecurityOptions}}"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            text.contains("rootless")
+        }
+        _ => false,
+    }
 }
 
 /// Check a binary exists on PATH (`which` on Unix, `where` on Windows).
@@ -646,6 +813,7 @@ mod tests {
         RunSpec {
             runtime,
             keep_id,
+            user: "1000:1000",
             image: "lunarwing-worker:latest",
             name: "lunarwing-sandbox-test",
             created_at_label: "2026-09-04T00:00:00Z",
@@ -656,6 +824,7 @@ mod tests {
             env: &EMPTY_ENV,
             network,
             proxy_port,
+            pids_limit: 256,
         }
     }
 
@@ -765,6 +934,8 @@ mod tests {
             "--cap-add=CHOWN",
             "--security-opt=no-new-privileges",
             "--read-only",
+            "--pids-limit",
+            "--stop-timeout",
         ] {
             assert!(args.contains(&flag.to_string()), "missing flag {flag}");
         }
@@ -772,6 +943,8 @@ mod tests {
         assert_eq!(args[tmpfs_idx + 1], "/tmp:size=512m");
         let memory_idx = args.iter().position(|a| a == "--memory").unwrap();
         assert_eq!(args[memory_idx + 1], "2048m");
+        let pids_idx = args.iter().position(|a| a == "--pids-limit").unwrap();
+        assert_eq!(args[pids_idx + 1], "256");
         let label_idx = args.iter().position(|a| a == "--label").unwrap();
         assert_eq!(
             args[label_idx + 1],
@@ -965,5 +1138,29 @@ mod tests {
         // Unregistering an unknown name is a no-op.
         unregister_inflight("lunarwing-sandbox-never-existed");
         assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    #[test]
+    fn inflight_guard_unregisters_on_drop() {
+        let before = inflight_sandbox_containers().len();
+        {
+            let _guard = InflightGuard::new("lunarwing-sandbox-guard".to_string());
+            assert!(inflight_sandbox_containers().contains(&"lunarwing-sandbox-guard".to_string()));
+        }
+        assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    #[test]
+    fn docker_user_mapping_follows_rootless_detection() {
+        // Rootless docker maps container root onto the host user: run as 0:0.
+        assert_eq!(user_for(ContainerRuntime::Docker, true), "0:0");
+        // Rootful docker maps UIDs 1:1: run as the daemon's own uid/gid.
+        #[cfg(unix)]
+        assert_eq!(
+            user_for(ContainerRuntime::Docker, false),
+            format!("{}:{}", nix::unistd::geteuid(), nix::unistd::getegid())
+        );
+        // Podman uses the keep-id ladder and the pinned sandbox user.
+        assert_eq!(user_for(ContainerRuntime::Podman, false), "1000:1000");
     }
 }
