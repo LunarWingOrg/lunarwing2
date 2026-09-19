@@ -31,9 +31,7 @@ use uuid::Uuid;
 use crate::context::ContextManager;
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::sandbox::connect_docker;
-use crate::sandbox::{
-    SANDBOX_CONTAINER_LABEL, cli_runner::selected_runtime_binary,
-};
+use crate::sandbox::{SANDBOX_CONTAINER_LABEL, cli_runner::selected_runtime_binary};
 
 /// Configuration for the sandbox reaper.
 #[derive(Debug, Clone)]
