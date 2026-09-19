@@ -330,8 +330,9 @@ impl SandboxManager {
         let start = std::time::Instant::now();
 
         // Spawn through the workload spawner: fresh process group +
-        // kill_on_drop always, systemd scope isolation when available
-        // (BUG-005). The guard reaps the whole tree on timeout or drop.
+        // kill_on_drop always, systemd transient-service isolation when
+        // available (BUG-005, WI#178/WI#181). The guard reaps the whole
+        // tree on timeout or drop.
         let spawner = crate::tools::process::workload_spawner().await;
         let mut cmd = if cfg!(target_os = "windows") {
             spawner.command("cmd", &["/C", command])
@@ -357,6 +358,13 @@ impl SandboxManager {
         // Caller-provided env (e.g. credentials fetched by the worker runtime)
         // is explicitly provided and safe to forward on top of the scrubbed base.
         cmd.envs(env);
+
+        // In service mode the manager forks the workload, so the scrubbed
+        // environment and working directory must be handed over via
+        // EnvironmentFile= (mode 0600, deleted after the run) and
+        // --working-directory= instead of process inheritance. Rebuilds the
+        // command, so stdio must be set after this call.
+        let spec = spawner.prepare_service(&mut cmd);
         // wait_with_output only captures piped stdio (unlike Command::output,
         // which pipes implicitly): set the pipes explicitly or output is empty.
         cmd.stdin(std::process::Stdio::null())
@@ -366,7 +374,11 @@ impl SandboxManager {
         let child = cmd.spawn().map_err(|e| SandboxError::ExecutionFailed {
             reason: e.to_string(),
         })?;
-        let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+        let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+            &child,
+            spec.as_ref(),
+            spawner.xdg_runtime_dir(),
+        );
 
         let output = match tokio::time::timeout(self.config.timeout, child.wait_with_output()).await
         {
@@ -378,8 +390,9 @@ impl SandboxManager {
             }
             Err(_) => {
                 // The dropped future's kill_on_drop reaps the direct child;
-                // SIGKILL the rest of the process group (BUG-005).
-                guard.kill_tree();
+                // stop the transient unit (service mode) and SIGKILL the
+                // rest of the process group (BUG-005).
+                guard.kill_tree().await;
                 return Err(SandboxError::Timeout(self.config.timeout));
             }
         };

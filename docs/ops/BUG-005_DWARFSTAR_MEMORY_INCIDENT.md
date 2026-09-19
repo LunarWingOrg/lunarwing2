@@ -906,6 +906,13 @@ controls) are addressed in this branch:
   outside `lunarwing-<tenant>.service`. Env knobs:
   `LUNARWING_WORKLOAD_ISOLATION=auto|none`, `LUNARWING_WORKLOAD_SLICE`,
   `LUNARWING_WORKLOAD_MEMORY_MAX`.
+  **Follow-up (2026-09-19, WI#178/WI#181):** the scope shape was replaced by
+  manager-forked transient **services** (`systemd-run --user --wait --pipe`
+  with a generated `--unit=`), because daemon-forked scopes inherit the
+  daemon's `NoNewPrivileges`/`PrivateTmp` context and break podman's
+  rootless userns join from agent shells — see
+  `docs/bugs/BUG-workload-scope-podman-userns.md` and
+  `ic/src/tools/process.rs`.
 - **mt-admin deployment caps.** `render_tenant_systemd_units()` now renders
   `lunarwing-workloads.slice` (default 6G/8G, CPUQuota 800%, TasksMax 2048)
   and `lunarwing-build.slice` (16G/24G), and the daemon unit itself gets

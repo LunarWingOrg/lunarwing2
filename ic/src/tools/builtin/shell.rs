@@ -43,14 +43,16 @@
 //! - Only safe env vars (PATH, HOME, LANG, etc.) forwarded to child processes
 //! - API keys, session tokens, and credentials are NOT inherited
 //!
-//! # Workload Isolation (BUG-005)
+//! # Workload Isolation (BUG-005, WI#178/WI#181)
 //!
 //! Direct execution spawns through `crate::tools::process`: the child leads
 //! its own process group with `kill_on_drop`, and a `ProcessTreeGuard` reaps
 //! the whole tree on timeout or cancellation. On systemd hosts commands are
-//! additionally placed in transient `systemd-run --user` scopes under
+//! additionally placed in transient `systemd-run --user` services under
 //! `lunarwing-workloads.slice`, keeping build memory/CPU out of the daemon's
-//! own service cgroup.
+//! own service cgroup and out of its `NoNewPrivileges`/`PrivateTmp` context
+//! (which breaks podman's rootless userns join — see
+//! `docs/bugs/BUG-workload-scope-podman-userns.md`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -750,7 +752,8 @@ impl ShellTool {
         extra_env: &HashMap<String, String>,
     ) -> Result<ShellCommandOutput, ToolError> {
         // Build command through the workload spawner: fresh process group +
-        // kill_on_drop always, systemd scope isolation when available (BUG-005).
+        // kill_on_drop always, systemd transient-service isolation when
+        // available (BUG-005, WI#178/WI#181).
         let spawner = crate::tools::process::workload_spawner().await;
         let mut command = if cfg!(target_os = "windows") {
             spawner.command("cmd", &["/C", cmd])
@@ -785,12 +788,27 @@ impl ShellTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // In service mode the manager forks the workload, so the scrubbed
+        // environment and working directory must be handed over via
+        // EnvironmentFile= (mode 0600, deleted after the run) and
+        // --working-directory= instead of process inheritance. Rebuilds the
+        // command, so stdio must be set after this call.
+        let spec = spawner.prepare_service(&mut command);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
         // Spawn process and arm the tree guard so every exit path
         // (success, timeout, dropped future) reaps the whole process group.
         let mut child = command
             .spawn()
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to spawn command: {}", e)))?;
-        let mut guard = crate::tools::process::ProcessTreeGuard::new(&child);
+        let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+            &child,
+            spec.as_ref(),
+            spawner.xdg_runtime_dir(),
+        );
 
         // Drain stdout/stderr concurrently with wait() to prevent deadlocks.
         // If we call wait() without draining the pipes and the child's output
@@ -836,7 +854,8 @@ impl ShellTool {
                 e
             ))),
             Err(_) => {
-                // Timeout - SIGTERM the whole process group, then SIGKILL.
+                // Timeout - stop the transient unit (service mode) and
+                // SIGTERM the whole process group, then SIGKILL.
                 guard.terminate(&mut child).await;
                 Err(ToolError::Timeout(timeout))
             }
