@@ -1,11 +1,17 @@
-# Workload-scope podman userns join failure (WI#142)
+# Workload-scope podman userns join failure (WI#142 → WI#178/WI#181)
 
-> **Status: FIX-LANDED (ops tooling + prevention; 2026-09-16).** `fix-podman-userns`
-> repairs a broken tenant userns pairing at runtime, pause.pid hygiene is shared
-> by provisioning and repair, and provisioning pre-warms the pairing from a
-> clean operator context. The structural launcher-side fix (manager-forked
-> transient services instead of daemon-forked scopes) is deliberately NOT taken
-> this round — see "Why the launcher-side fix is not taken (yet)".
+> **Status: STRUCTURALLY FIXED (2026-09-19, WI#181).** The launcher-side fix
+> this doc previously deferred — manager-forked transient **services** instead
+> of daemon-forked scopes — is now landed in `ic/src/tools/process.rs`.
+> Workloads spawn as `systemd-run --user --wait --pipe` transient services
+> (forked by the user manager, the same context class as the tenant's Quadlet
+> units where podman demonstrably works), with the scrubbed environment and
+> working directory handed over via `EnvironmentFile=` (mode 0600, deleted
+> after the run) and `--working-directory=`. Timeout/cancel stops the unit via
+> `systemctl --user stop` before the process-group kill. The older
+> `fix-podman-userns` repair verb remains as the operator-side recovery path
+> for pairings already broken before this fix (e.g. by foreign-euid podman
+> runs).
 
 ## Symptom
 
@@ -86,7 +92,36 @@ current scope design:
   `systemctl --user stop <unit>`. That is a redesign of
   `ic/src/tools/process.rs` lifecycle semantics (BUG-005), not a scoped fix.
 
-## The landed fix (ops tooling)
+## The structural fix (landed 2026-09-19, WI#181)
+
+The issue's option 2 — launch the workload so it shares the podman stack's
+context — is now implemented in `ic/src/tools/process.rs`:
+
+- `WorkloadSpawner` builds `systemd-run --user --wait --pipe --quiet
+  --collect` invocations with a generated `--unit=` name inside
+  `lunarwing-workloads.slice` (same slice, same cgroup accounting as the old
+  scopes), plus `--property=TimeoutStopSec=` and the optional `MemoryMax=`.
+- `prepare_service()` re-marshals the caller's scrubbed environment into a
+  mode-0600 `EnvironmentFile=` (values double-quoted; unrepresentable values
+  skipped) and the working directory into `--working-directory=` — the
+  daemon's scrubbed env never crosses argv and never reaches the manager by
+  inheritance.
+- `ProcessTreeGuard` gains the transient unit: `terminate()`/`kill_tree()`
+  stop the unit via `systemctl --user stop` (SIGTERM, then SIGKILL after
+  `TimeoutStopSec`) before signaling the process group, and `Drop` removes
+  the env file. `--wait` proxies stdio and the service's exit status, so
+  callers keep their normal spawn/wait shape.
+- All four workload call sites (`shell.rs` direct path, sandbox
+  `execute_direct`, sandbox `cli_runner` podman CLI, registry WASM builds)
+  use `prepare_service` + `for_service`.
+
+Because the workload is forked by the user manager, it never inherits the
+daemon's `NoNewPrivileges=true` / `PrivateTmp=true` context — the exact
+context-crossing that broke podman's `setns` join. Verified on a systemd 261
+host: `podman ps` from a transient service with `NoNewPrivileges=true` works
+(exit 0), while the daemon-forked scope shape is the documented failure.
+
+## The repair path (kept for already-broken pairings)
 
 1. **`fix-podman-userns <tenant>`** (`ic/scripts/lunarwing-mt-admin.sh`,
    `repair_tenant_podman_userns` in `ic/scripts/mt-admin-lib/04-tenant-lifecycle.sh`):
