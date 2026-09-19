@@ -408,7 +408,8 @@ mod tests {
         // Timestamp newer than now -> age clamps to 0, never negative.
         let future = "lunarwing_health_report_timestamp_seconds 1750000100\nlunarwing_health_report_age_seconds 0\n";
         assert!(
-            rewrite_report_ages(future, 1_750_000_001).contains("lunarwing_health_report_age_seconds 0"),
+            rewrite_report_ages(future, 1_750_000_001)
+                .contains("lunarwing_health_report_age_seconds 0"),
         );
     }
 }
