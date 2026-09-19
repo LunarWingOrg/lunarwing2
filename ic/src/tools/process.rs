@@ -38,14 +38,15 @@
 //! detection time by running `env -0` inside the capability probe (a real
 //! manager-forked service, so the capture includes variables the manager
 //! itself injects), and each `prepare_service` adds one
-//! `--property=UnsetEnvironment=<name>` per captured name alongside the
-//! `EnvironmentFile=`. systemd applies the unset list last, so the unit's
-//! environment is exactly the caller's allowlisted assignments from the
-//! file: a secret a tenant places in the manager's environment (e.g. via
-//! `systemctl --user set-environment`) reaches only workloads whose caller
-//! explicitly forwarded it. Names added to the manager after daemon start
-//! are not in the snapshot and still inherit (documented drift; the probe
-//! runs once per daemon by design).
+//! `--property=UnsetEnvironment=<name1> <name2> ...` covering every
+//! captured name the caller does not set itself. systemd applies the unset
+//! list as the final step, so the unit's environment is exactly the
+//! caller's allowlisted assignments from the file: a secret a tenant places
+//! in the manager's environment (e.g. via `systemctl --user
+//! set-environment`) reaches only workloads whose caller explicitly
+//! forwarded it. Names added to the manager after daemon start are not in
+//! the snapshot and still inherit (documented drift; the probe runs once
+//! per daemon by design).
 //!
 //! Lifecycle: `systemd-run --wait` proxies stdio and the service's exit
 //! status and returns after the unit is collected (`--collect`), so the
@@ -233,6 +234,18 @@ impl WorkloadSpawner {
                 .then(|| v.map(|s| s.to_owned()))
                 .flatten()
         });
+        // Names the caller sets itself (including PWD synthesized for the
+        // working directory): they must survive, so they are excluded from
+        // the unset list — systemd applies UnsetEnvironment last and would
+        // otherwise strip them right back out of the env file.
+        let mut caller_names: std::collections::HashSet<String> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        if working_dir.is_some() {
+            caller_names.insert("PWD".to_string());
+        }
 
         let mut rebuilt = Command::new("systemd-run");
         rebuilt
@@ -248,15 +261,16 @@ impl WorkloadSpawner {
         // The user manager hands its environment to the service, and
         // `EnvironmentFile=` only adds to it: without an unset list, a
         // manager-borne credential would reach the workload despite the
-        // caller's `env_clear()`. Unset every captured manager variable so
-        // the env file is the unit's exact environment (applied by systemd
-        // after all other sources, including the file itself). Only emitted
-        // with an env file: unsetting without additions would leave the
-        // service with no environment at all.
-        if env_file.is_some() {
-            if let Some(property) = unset_environment_property(&self.manager_env) {
-                rebuilt.arg(property);
-            }
+        // caller's `env_clear()`. Unset every captured manager variable the
+        // caller does not set itself, so the env file is the unit's exact
+        // environment (systemd applies UnsetEnvironment after all other
+        // sources, including the file). Only emitted with an env file:
+        // unsetting without additions would leave the service with no
+        // environment at all.
+        if env_file.is_some()
+            && let Some(property) = unset_environment_property(&self.manager_env, &caller_names)
+        {
+            rebuilt.arg(property);
         }
         rebuilt.arg(format!("--unit={unit}"));
         if let Some(dir) = working_dir {
@@ -346,26 +360,29 @@ fn write_workload_env_file(cmd: &Command, runtime_dir: Option<&str>) -> Option<P
 /// Build the `--property=UnsetEnvironment=` argument that clears the user
 /// manager's environment from a workload unit: one space-separated entry
 /// per captured variable name (name-only entries match any value, so no
-/// assignment text needs quoting). Returns `None` for an empty capture
-/// (e.g. process-group fallback or non-Linux), in which case no property
-/// is needed. The list is capped at [`UNSET_ENV_MAX_VARS`] entries so a
-/// pathological manager environment cannot produce an unbounded argv.
+/// assignment text needs quoting), minus names the caller sets itself —
+/// systemd applies `UnsetEnvironment` last, so including those would strip
+/// the workload's own allowlisted assignments. Returns `None` when there is
+/// nothing to unset. The list is capped at [`UNSET_ENV_MAX_VARS`] entries
+/// so a pathological manager environment cannot produce an unbounded argv.
 const UNSET_ENV_MAX_VARS: usize = 512;
 
 fn unset_environment_property(
     manager_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    caller_names: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if manager_env.is_empty() {
-        return None;
-    }
     let mut names: Vec<String> = Vec::with_capacity(manager_env.len().min(UNSET_ENV_MAX_VARS));
     for (key, _) in manager_env.iter().take(UNSET_ENV_MAX_VARS) {
         let key = key.to_string_lossy();
         // Environment variable names cannot contain spaces; a captured
         // entry that does cannot be a valid name — skip it.
-        if !key.contains(' ') {
-            names.push(key.into_owned());
+        if key.contains(' ') {
+            continue;
         }
+        if caller_names.contains(key.as_ref()) {
+            continue;
+        }
+        names.push(key.into_owned());
     }
     if names.is_empty() {
         return None;
@@ -509,7 +526,9 @@ async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, String> {
 }
 
 /// Parse captured `env -0` entries into (name, value) pairs.
-fn split_env_entries(entries: &[std::ffi::OsString]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+fn split_env_entries(
+    entries: &[std::ffi::OsString],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
     use std::os::unix::ffi::OsStrExt;
     entries
         .iter()
@@ -962,16 +981,28 @@ mod tests {
 
     #[test]
     fn service_prepare_rebuilds_wrapper_with_unit_and_env_file() {
-        // Simulate a detected service-mode spawner without probing.
+        // Simulate a detected service-mode spawner without probing. The
+        // manager-env capture contains a name the caller also sets (PATH)
+        // and two manager-borne names it does not: only the latter two may
+        // end up in the unit's UnsetEnvironment= list (systemd applies the
+        // unset step last, so caller names must be excluded or the env file
+        // values would be stripped right back out).
         let spawner = WorkloadSpawner {
             isolation: Isolation::SystemdService,
             slice: "lunarwing-workloads.slice".to_string(),
             memory_max: Some("1G".to_string()),
             timeout_stop_secs: 10,
             xdg_runtime_dir: None,
+            manager_env: std::sync::Arc::new(vec![
+                ("HOME".into(), "/root".into()),
+                ("MANAGER_SECRET".into(), "hunter2".into()),
+                ("PATH".into(), "/usr/local/bin".into()),
+            ]),
         };
         let mut cmd = spawner.command("sh", &["-c", "echo hi"]);
-        cmd.env("FOO", "bar").current_dir("/tmp");
+        cmd.env("FOO", "bar")
+            .env("PATH", "/usr/bin")
+            .current_dir("/tmp");
         let spec = spawner.prepare_service(&mut cmd).expect("spec");
         assert!(spec.unit.starts_with("lunarwing-workload-"));
         let args: Vec<String> = cmd
@@ -994,12 +1025,13 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("--property=EnvironmentFile="))
         );
-        // The manager's environment is cleared so the env file is the
-        // workload's exact environment (WI#181: a manager-borne credential
-        // must not leak into a service-mode workload).
+        // The manager's environment is cleared — minus names the caller sets
+        // itself (systemd applies UnsetEnvironment last) — so the env file
+        // is the workload's exact environment (WI#181: a manager-borne
+        // credential must not leak into a service-mode workload).
         assert!(
-            args.iter().any(|a| a == "--property=UnsetEnvironment=*"),
-            "service mode must clear the manager-inherited environment"
+            args.contains(&"--property=UnsetEnvironment=HOME MANAGER_SECRET".to_string()),
+            "service mode must unset exactly the manager-only names, got: {args:?}"
         );
         // Inner program and args after the separator.
         let sep = args.iter().position(|a| a == "--").expect("separator");
@@ -1026,6 +1058,7 @@ mod tests {
             // /dev/null is a file, not a directory: File::create fails,
             // write_workload_env_file returns None.
             xdg_runtime_dir: Some("/dev/null".to_string()),
+            manager_env: std::sync::Arc::new(vec![("HOME".into(), "/root".into())]),
         };
         let mut cmd = spawner.command("sh", &["-c", "true"]);
         let spec = spawner.prepare_service(&mut cmd).expect("spec");
@@ -1145,13 +1178,14 @@ mod tests {
     }
 
     /// WI#181 review (MR !1042): `EnvironmentFile=` only adds assignments;
-    /// without `UnsetEnvironment=*` the service inherits the user manager's
-    /// environment, and a non-allowlisted manager credential would reach the
-    /// workload despite the caller's `env_clear()`. Asserting the unit's
-    /// environment is EXACTLY the caller-allowlisted set is stronger than a
-    /// single sentinel: any manager-borne variable (HOME, USER, LANG, and
-    /// any credential the manager carries) leaking through fails the test,
-    /// and the two intended values must still survive.
+    /// without the per-name `UnsetEnvironment=` list the service inherits
+    /// the user manager's environment, and a non-allowlisted manager
+    /// credential would reach the workload despite the caller's
+    /// `env_clear()`. Asserting the unit's environment is EXACTLY the
+    /// caller-allowlisted set is stronger than a single sentinel: any
+    /// manager-borne variable (HOME, USER, LANG, and any credential the
+    /// manager carries) leaking through fails the test, and the two
+    /// intended values must still survive.
     #[tokio::test]
     async fn service_mode_workload_gets_exact_allowlisted_environment() {
         let spawner = workload_spawner().await;
