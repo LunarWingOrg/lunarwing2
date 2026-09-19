@@ -347,6 +347,8 @@ impl ExecutionLoop {
             self.transition_to_broadcast(ThreadState::Running, None)?;
         }
 
+        let allow_self_modify = crate::executor::orchestrator::self_modification_enabled();
+
         // Pre-fetch shared memory docs once — used by both prompt overlay and
         // orchestrator loading, avoiding a duplicate Store query.
         let system_docs = if let Some(store) = self.store.as_ref() {
@@ -382,6 +384,7 @@ impl ExecutionLoop {
                 &actions,
                 &system_docs,
                 self.platform_info.as_ref(),
+                allow_self_modify,
             );
 
             // Mission threads (and their rlm children via config.mission_child
@@ -443,9 +446,6 @@ impl ExecutionLoop {
         // Load versioned Python orchestrator using pre-fetched docs.
         // Self-modification is disabled by default — only the compiled-in v0
         // runs unless explicitly opted in via ORCHESTRATOR_SELF_MODIFY=true.
-        let allow_self_modify = std::env::var("ORCHESTRATOR_SELF_MODIFY")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
         let (orchestrator_code, orchestrator_version) =
             crate::executor::orchestrator::load_orchestrator_from_docs(
                 &system_docs,
@@ -1136,6 +1136,39 @@ mod tests {
                 assert!(!system.contains("<|"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_overlay_obeys_the_same_gate_as_orchestrator_loading() {
+        use crate::types::memory::{DocType, MemoryDoc};
+        use crate::types::message::MessageRole;
+
+        let llm = Arc::new(ResultMockLlm::new(vec![Ok(text_response("FINAL('ok')"))]));
+        let (exec, _tx) =
+            make_loop_with_llm(llm.clone(), Vec::new(), ThreadConfig::default()).await;
+        let overlay = MemoryDoc::new(
+            exec.thread.project_id,
+            crate::types::shared_owner_id(),
+            DocType::Note,
+            crate::executor::prompt::PREAMBLE_OVERLAY_TITLE,
+            "LEGACY_INSTRUCTION_CANARY",
+        )
+        .with_tags(vec![crate::executor::prompt::PROMPT_OVERLAY_TAG.into()]);
+        let store: Arc<dyn crate::traits::store::Store> =
+            Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
+        let mut exec = exec.with_store(store);
+        exec.run().await.unwrap();
+        let allowed = crate::executor::orchestrator::self_modification_enabled();
+        assert_eq!(exec.thread.metadata["orchestrator_version"], 0);
+        let requests = llm.requests();
+        let system = requests[0]
+            .iter()
+            .find(|m| m.role == MessageRole::System)
+            .unwrap();
+        assert_eq!(
+            system.content.contains("LEGACY_INSTRUCTION_CANARY"),
+            allowed
+        );
     }
 
     #[tokio::test]

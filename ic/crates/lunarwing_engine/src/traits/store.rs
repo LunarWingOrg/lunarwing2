@@ -90,6 +90,14 @@ pub trait Store: Send + Sync {
     // ── Memory doc operations ───────────────────────────────
 
     async fn save_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError>;
+
+    /// Host-only persistence for compiled seeds and engine failure bookkeeping.
+    /// Never expose this operation to model tools or select it from document
+    /// metadata: `source: compiled_in` is data, not write authority.
+    async fn save_internal_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        self.save_memory_doc(doc).await
+    }
+
     async fn load_memory_doc(&self, id: DocId) -> Result<Option<MemoryDoc>, EngineError>;
     async fn list_memory_docs(
         &self,

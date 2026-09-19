@@ -308,6 +308,13 @@ impl ThreadManager {
         );
         if let Some(pid) = parent_id {
             thread = thread.with_parent(pid);
+            if let Some(parent) = self.store.load_thread(pid).await?
+                && parent.project_id == thread.project_id
+                && parent.is_owned_by(&thread.user_id)
+                && parent.config.mission_context.is_conversation_insights()
+            {
+                thread.config.mission_context = parent.config.mission_context;
+            }
         }
         // Adopt a caller-supplied thread id (e.g. the gateway UI's thread_id) so
         // downstream event/SSE routing lands on the thread the client is already

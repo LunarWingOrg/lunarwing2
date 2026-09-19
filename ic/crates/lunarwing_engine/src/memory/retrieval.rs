@@ -143,16 +143,21 @@ impl RetrievalEngine {
 /// Reserved maintenance identities and tags also cover legacy untagged docs
 /// and renamed maintenance docs. Shared ownership alone does not make a normal
 /// knowledge document internal.
-fn is_engine_maintenance(doc: &MemoryDoc) -> bool {
-    matches!(
-        doc.title.as_str(),
-        FIX_PATTERN_DB_TITLE | PREAMBLE_OVERLAY_TITLE | ORCHESTRATOR_TITLE | FAILURE_TRACKER_TITLE
-    ) || doc.tags.iter().any(|tag| {
-        matches!(
-            tag.as_str(),
-            FIX_PATTERN_DB_TAG | PROMPT_OVERLAY_TAG | ORCHESTRATOR_TAG | ORCHESTRATOR_META_TAG
+pub(crate) fn is_engine_maintenance(doc: &MemoryDoc) -> bool {
+    doc.is_engine_control()
+        || matches!(
+            doc.title.as_str(),
+            FIX_PATTERN_DB_TITLE
+                | PREAMBLE_OVERLAY_TITLE
+                | ORCHESTRATOR_TITLE
+                | FAILURE_TRACKER_TITLE
         )
-    })
+        || doc.tags.iter().any(|tag| {
+            matches!(
+                tag.as_str(),
+                FIX_PATTERN_DB_TAG | PROMPT_OVERLAY_TAG | ORCHESTRATOR_TAG | ORCHESTRATOR_META_TAG
+            )
+        })
 }
 
 /// Keep identifiers such as `web_search` and `web-fetch` intact on both sides

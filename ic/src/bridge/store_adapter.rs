@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -86,6 +86,8 @@ pub struct HybridStore {
     docs: RwLock<HashMap<DocId, MemoryDoc>>,
     /// Tracks current workspace path for each doc so renames can delete the old file.
     doc_paths: RwLock<HashMap<DocId, String>>,
+    /// Serialize persistence and cache publication, including path-changing updates.
+    doc_write_lock: Mutex<()>,
     workspace: Option<Arc<Workspace>>,
     secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>>,
     /// Test-only hook: when set, the next `save_memory_doc` fails once, forcing
@@ -117,6 +119,7 @@ impl HybridStore {
             mission_secret_refs: RwLock::new(HashMap::new()),
             docs: RwLock::new(HashMap::new()),
             doc_paths: RwLock::new(HashMap::new()),
+            doc_write_lock: Mutex::new(()),
             workspace,
             secrets_store,
             #[cfg(test)]
@@ -1111,15 +1114,8 @@ impl HybridStore {
     /// Persist a MemoryDoc to workspace. Knowledge docs use frontmatter+markdown,
     /// special docs (orchestrator, prompts) use their native format, and internal
     /// docs use JSON.
-    async fn persist_doc(&self, doc: &MemoryDoc) {
+    async fn persist_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
         let new_path = doc_workspace_path(doc);
-
-        // If the doc previously existed at a different path, delete the old one
-        if let Some(ref old) = self.doc_paths.read().await.get(&doc.id).cloned()
-            && *old != new_path
-        {
-            self.delete_workspace_file(old).await;
-        }
 
         // Choose serialization format based on path
         let content = if is_orchestrator_code_path(&new_path) {
@@ -1130,17 +1126,61 @@ impl HybridStore {
             serialize_knowledge_doc(doc)
         } else {
             // Everything else: JSON
-            match serde_json::to_string_pretty(doc) {
-                Ok(json) => json,
-                Err(e) => {
-                    debug!(path = %new_path, "failed to serialize doc: {e}");
-                    return;
-                }
-            }
+            serde_json::to_string_pretty(doc).map_err(|error| EngineError::Store {
+                reason: format!("failed to serialize memory document at {new_path}: {error}"),
+            })?
         };
 
-        self.persist_text(new_path.clone(), &content).await;
+        if let Some(ws) = &self.workspace {
+            ws.write(&new_path, &content)
+                .await
+                .map_err(|error| EngineError::Store {
+                    reason: format!("failed to persist memory document at {new_path}: {error}"),
+                })?;
+        }
+
+        // Preserve the old durable document and its path if the new write fails.
+        if let Some(old) = self.doc_paths.read().await.get(&doc.id).cloned()
+            && old != new_path
+        {
+            self.delete_workspace_file(&old).await;
+        }
         self.doc_paths.write().await.insert(doc.id, new_path);
+        Ok(())
+    }
+
+    async fn save_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        let _guard = self.doc_write_lock.lock().await;
+        #[cfg(test)]
+        if self
+            .fail_next_doc_save
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(EngineError::Store {
+                reason: "injected doc save failure".to_string(),
+            });
+        }
+
+        self.persist_doc(doc).await?;
+        self.docs.write().await.insert(doc.id, doc.clone());
+        Ok(())
+    }
+
+    async fn save_model_memory_doc(
+        &self,
+        doc: &MemoryDoc,
+        allow_self_modify: bool,
+    ) -> Result<(), EngineError> {
+        if doc.is_engine_control() && !allow_self_modify {
+            return Err(EngineError::AccessDenied {
+                user_id: doc.user_id.clone(),
+                entity: format!(
+                    "engine-control doc '{}' (self-modification disabled)",
+                    doc.title
+                ),
+            });
+        }
+        self.save_doc(doc).await
     }
 }
 
@@ -1198,11 +1238,6 @@ fn doc_workspace_path(doc: &MemoryDoc) -> String {
 
 fn is_orchestrator_code_path(path: &str) -> bool {
     path.starts_with(ORCHESTRATOR_PREFIX) && path.ends_with(".py")
-}
-
-/// Check if a MemoryDoc is a protected orchestrator or prompt overlay document.
-fn is_protected_orchestrator_doc(doc: &MemoryDoc) -> bool {
-    doc.title.starts_with("orchestrator:") || doc.title.starts_with("prompt:")
 }
 
 fn project_dir(name: &str, project_id: ProjectId) -> String {
@@ -1760,46 +1795,17 @@ impl Store for HybridStore {
     }
 
     async fn save_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
-        // Defense-in-depth: block orchestrator/prompt writes when self-modify is
-        // disabled, even if the caller bypassed tool-level checks.
-        if is_protected_orchestrator_doc(doc) {
-            let allow = std::env::var("ORCHESTRATOR_SELF_MODIFY")
-                .map(|v| v == "true" || v == "1")
-                .unwrap_or(false);
-            if !allow {
-                // Allow system-internal writes (v0 seeding, failure tracking) but
-                // block LLM-authored patches (version > 0, non-meta titles).
-                let is_system_internal = doc.title == "orchestrator:failures"
-                    || doc
-                        .metadata
-                        .get("source")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|s| s == "compiled_in");
-                if !is_system_internal {
-                    return Err(EngineError::AccessDenied {
-                        user_id: doc.user_id.clone(),
-                        entity: format!(
-                            "orchestrator doc '{}' (self-modification disabled)",
-                            doc.title
-                        ),
-                    });
-                }
-            }
-        }
+        self.save_model_memory_doc(
+            doc,
+            lunarwing_engine::executor::orchestrator::self_modification_enabled(),
+        )
+        .await
+    }
 
-        #[cfg(test)]
-        if self
-            .fail_next_doc_save
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
-            return Err(EngineError::Store {
-                reason: "injected doc save failure".to_string(),
-            });
-        }
-
-        self.docs.write().await.insert(doc.id, doc.clone());
-        self.persist_doc(doc).await;
-        Ok(())
+    async fn save_internal_memory_doc(&self, doc: &MemoryDoc) -> Result<(), EngineError> {
+        // Only compiled host callers use this entry point. No metadata field,
+        // special title, or model-facing argument can select it.
+        self.save_doc(doc).await
     }
 
     async fn load_memory_doc(&self, id: DocId) -> Result<Option<MemoryDoc>, EngineError> {
@@ -3049,6 +3055,174 @@ title: \"old doc\"\n\
         assert_eq!(
             count, 1,
             "no re-seed duplicates may accumulate across reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_metadata_cannot_select_internal_memory_write_authority() {
+        let store = HybridStore::new(None);
+        let pid = ProjectId::new();
+        for (title, tag) in [
+            (PREAMBLE_OVERLAY_TITLE, "prompt_overlay"),
+            (ORCHESTRATOR_MAIN_TITLE, ORCHESTRATOR_CODE_TAG),
+            (ORCHESTRATOR_FAILURES_TITLE, "orchestrator_meta"),
+            ("renamed overlay", "prompt_overlay"),
+        ] {
+            let mut doc = MemoryDoc::new(
+                pid,
+                shared_owner_id(),
+                DocType::Note,
+                title,
+                "FORGED_CANARY",
+            )
+            .with_tags(vec![tag.into()]);
+            doc.metadata = serde_json::json!({"source": "compiled_in", "version": 0});
+            assert!(matches!(
+                store.save_model_memory_doc(&doc, false).await,
+                Err(EngineError::AccessDenied { .. })
+            ));
+            assert!(store.load_memory_doc(doc.id).await.unwrap().is_none());
+            assert!(!store.doc_paths.read().await.contains_key(&doc.id));
+        }
+
+        let seed = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            ORCHESTRATOR_MAIN_TITLE,
+            lunarwing_engine::executor::orchestrator::load_orchestrator(None, pid, false)
+                .await
+                .0,
+        )
+        .with_tags(vec![ORCHESTRATOR_CODE_TAG.into()]);
+        store.save_internal_memory_doc(&seed).await.unwrap();
+        assert_eq!(
+            store
+                .load_memory_doc(seed.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            seed.content
+        );
+        let tracker = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            ORCHESTRATOR_FAILURES_TITLE,
+            "{}",
+        );
+        store.save_internal_memory_doc(&tracker).await.unwrap();
+        assert!(store.load_memory_doc(tracker.id).await.unwrap().is_some());
+
+        let overlay = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            PREAMBLE_OVERLAY_TITLE,
+            "opted-in rule",
+        );
+        store.save_model_memory_doc(&overlay, true).await.unwrap();
+        assert!(store.load_memory_doc(overlay.id).await.unwrap().is_some());
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn failed_doc_writes_preserve_cache_durable_content_and_rename_source() {
+        use crate::db::{Database, libsql::LibSqlBackend};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            LibSqlBackend::new_local(&temp_dir.path().join("doc-failure.db"))
+                .await
+                .unwrap(),
+        );
+        backend.run_migrations().await.unwrap();
+        let workspace = Arc::new(Workspace::new_with_db(
+            "doc-failure-test",
+            Arc::clone(&backend) as Arc<dyn Database>,
+        ));
+        let store = HybridStore::new(Some(Arc::clone(&workspace)));
+        let conn = backend.connect().await.unwrap();
+        conn.execute(
+            "CREATE TRIGGER reject_doc_write BEFORE UPDATE OF content ON memory_documents
+             WHEN NEW.path LIKE 'engine/knowledge/%' AND NEW.content LIKE '%REJECTED_WRITE_CANARY%'
+             BEGIN SELECT RAISE(FAIL, 'injected memory content write failure'); END",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let mut doc = MemoryDoc::new(
+            ProjectId::new(),
+            "doc-failure-test",
+            DocType::Lesson,
+            "original",
+            "REJECTED_WRITE_CANARY",
+        );
+        assert!(matches!(
+            store.save_memory_doc(&doc).await,
+            Err(EngineError::Store { .. })
+        ));
+        assert!(store.load_memory_doc(doc.id).await.unwrap().is_none());
+        assert!(!store.doc_paths.read().await.contains_key(&doc.id));
+        let fresh = HybridStore::new(Some(Arc::clone(&workspace)));
+        fresh.load_state_from_workspace().await.unwrap();
+        assert!(fresh.load_memory_doc(doc.id).await.unwrap().is_none());
+
+        doc.content = "ORIGINAL_DURABLE_CONTENT".into();
+        store.save_memory_doc(&doc).await.unwrap();
+        let original_path = doc_workspace_path(&doc);
+        for title in ["original", "renamed"] {
+            let mut rejected = doc.clone();
+            rejected.title = title.into();
+            rejected.content = "REJECTED_WRITE_CANARY".into();
+            assert!(store.save_memory_doc(&rejected).await.is_err());
+            let cached = store.load_memory_doc(doc.id).await.unwrap().unwrap();
+            assert_eq!(cached.content, doc.content);
+            assert_eq!(
+                store.doc_paths.read().await.get(&doc.id),
+                Some(&original_path)
+            );
+            assert!(
+                workspace
+                    .read(&original_path)
+                    .await
+                    .unwrap()
+                    .content
+                    .contains(&doc.content)
+            );
+            let fresh = HybridStore::new(Some(Arc::clone(&workspace)));
+            fresh.load_state_from_workspace().await.unwrap();
+            assert_eq!(
+                fresh
+                    .load_memory_doc(doc.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                doc.content
+            );
+        }
+
+        doc.title = "renamed".into();
+        doc.content = "RETRIED_DURABLE_CONTENT".into();
+        store.save_memory_doc(&doc).await.unwrap();
+        assert!(!workspace.exists(&original_path).await.unwrap());
+        let fresh = HybridStore::new(Some(workspace));
+        fresh.load_state_from_workspace().await.unwrap();
+        assert_eq!(
+            fresh
+                .load_memory_doc(doc.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            doc.content
+        );
+        assert_eq!(
+            fresh.doc_paths.read().await.get(&doc.id),
+            Some(&doc_workspace_path(&doc))
         );
     }
 

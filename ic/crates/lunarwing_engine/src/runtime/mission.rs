@@ -30,7 +30,7 @@ use crate::types::memory::MemoryDoc;
 use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus, trigger_dedup_key};
 use crate::types::project::ProjectId;
 use crate::types::shared_owner_id;
-use crate::types::thread::{Thread, ThreadConfig, ThreadId, ThreadType};
+use crate::types::thread::{MissionContext, Thread, ThreadConfig, ThreadId, ThreadType};
 
 type MissionExecutionLock = Mutex<()>;
 type MissionLockRegistry = Mutex<HashMap<MissionId, Weak<MissionExecutionLock>>>;
@@ -78,6 +78,30 @@ fn recent_conversation_thread_goals(threads: &[Thread], limit: usize) -> Vec<Str
         .take(limit)
         .map(|thread| thread.goal.clone())
         .collect()
+}
+
+fn is_conversation_insights_mission(mission: &Mission) -> bool {
+    mission
+        .metadata
+        .get("conversation_insights")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn mission_context(mission: &Mission, payload: &Option<serde_json::Value>) -> MissionContext {
+    if !is_conversation_insights_mission(mission) {
+        return MissionContext::General;
+    }
+    // Search from the batch, never from the generic extraction instructions or
+    // generated next-focus/history. Missing evidence deliberately recalls nothing.
+    let recall_query = ["thread_goals", "sample_user_messages"]
+        .into_iter()
+        .filter_map(|key| payload.as_ref()?.get(key)?.as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    MissionContext::ConversationInsights { recall_query }
 }
 
 fn is_recurring_learning_mission(mission: &Mission) -> bool {
@@ -879,10 +903,25 @@ impl MissionManager {
 
         // Build meta-prompt from mission state + project docs
         let retrieval = RetrievalEngine::new(Arc::clone(&self.store));
-        let project_docs = retrieval
-            .retrieve_mission_context(mission.project_id, &mission.user_id, &mission.goal, 10)
-            .await
-            .unwrap_or_default();
+        let mission_context = mission_context(&mission, &trigger_payload);
+        let project_docs = match &mission_context {
+            MissionContext::ConversationInsights { recall_query } => {
+                retrieval
+                    .retrieve_context(mission.project_id, user_id, recall_query, 10)
+                    .await
+            }
+            MissionContext::General => {
+                retrieval
+                    .retrieve_mission_context(
+                        mission.project_id,
+                        &mission.user_id,
+                        &mission.goal,
+                        10,
+                    )
+                    .await
+            }
+        }
+        .unwrap_or_default();
         let meta_prompt = build_meta_prompt(&mission, &project_docs, &trigger_payload);
 
         // Build thread configuration before reserving its durable mission record.
@@ -895,6 +934,7 @@ impl MissionManager {
         };
         let thread_config = ThreadConfig {
             channel_context,
+            mission_context,
             ..ThreadConfig::default()
         };
         // Reserve history and quota before execution can perform side effects.
@@ -1797,7 +1837,7 @@ impl MissionManager {
                 let mut updated = doc.clone();
                 updated.content = DEFAULT_ORCHESTRATOR.to_string();
                 updated.updated_at = chrono::Utc::now();
-                self.store.save_memory_doc(&updated).await?;
+                self.store.save_internal_memory_doc(&updated).await?;
                 debug!("updated orchestrator v0 to match compiled-in default");
             }
             return Ok(());
@@ -1813,7 +1853,7 @@ impl MissionManager {
         )
         .with_tags(vec![ORCHESTRATOR_TAG.to_string()]);
         doc.metadata = serde_json::json!({"version": 0, "source": "compiled_in"});
-        self.store.save_memory_doc(&doc).await?;
+        self.store.save_internal_memory_doc(&doc).await?;
         debug!("seeded orchestrator v0 in workspace");
         Ok(())
     }
@@ -2208,8 +2248,12 @@ fn build_meta_prompt(
         parts.push(format!("Success criteria: {criteria}"));
     }
 
-    // Current focus
-    if let Some(focus) = &mission.current_focus {
+    // Insight extraction is driven by each new batch, never by a generated
+    // agenda from earlier runs (including legacy stored focus/history).
+    let insights = is_conversation_insights_mission(mission);
+    if insights {
+        parts.push("\n## Current Batch\nExtract only from this trigger's source evidence. Prior generated run reports are not user evidence.".into());
+    } else if let Some(focus) = &mission.current_focus {
         parts.push(format!("\n## Current Focus\n{focus}"));
     } else if mission.thread_history.is_empty() {
         parts.push("\n## Current Focus\nThis is the first run. Start by understanding the goal and determining the first step.".into());
@@ -2220,7 +2264,7 @@ fn build_meta_prompt(
     // persisted history itself is FIFO-bounded (MAX_APPROACH_HISTORY); the
     // prompt includes only the most recent entries, each capped in length —
     // full transcripts stay on disk for recall.
-    if !mission.approach_history.is_empty() {
+    if !insights && !mission.approach_history.is_empty() {
         const MAX_PROMPT_APPROACHES: usize = 5;
         const MAX_APPROACH_CHARS: usize = 1000;
         let history = &mission.approach_history;
@@ -2280,6 +2324,11 @@ fn build_meta_prompt(
 
     // Instructions. System-managed learning missions are recurring workers;
     // completing one event must not imply that the mission itself is terminal.
+    let next_focus_instruction = if insights {
+        "2. Which source evidence supports each saved insight; if none, report no new insights"
+    } else {
+        "2. What the next focus should be (for the next thread)"
+    };
     let completion_instruction = if is_recurring_learning_mission(mission) {
         "3. Whether this event/run was handled successfully (yes/no)".to_string()
     } else {
@@ -2298,7 +2347,7 @@ Never embed these phrases inside other sentences."
 Use tools to gather information, analyze data, or take actions. \
 When done, call FINAL() with your response. Include:\n\
 1. What you accomplished in this step\n\
-2. What the next focus should be (for the next thread)\n\
+{next_focus_instruction}\n\
 {completion_instruction}"
     ));
 
@@ -2357,7 +2406,9 @@ async fn process_mission_outcome_and_notify(
 
             // Extract next focus (look for "next focus:" pattern)
             let lower = text.to_lowercase();
-            if let Some(focus_start) = lower.find("next focus:") {
+            if !is_conversation_insights_mission(&mission)
+                && let Some(focus_start) = lower.find("next focus:")
+            {
                 let after = &text[focus_start + "next focus:".len()..];
                 let next_focus: String = after.lines().next().unwrap_or("").trim().to_string();
                 if !next_focus.is_empty() {
@@ -2372,7 +2423,13 @@ async fn process_mission_outcome_and_notify(
 
             // If this is a self-improvement mission, process structured output
             if is_self_improvement_mission(&mission)
-                && let Err(e) = process_self_improvement_output(store, &mission, text).await
+                && let Err(e) = process_self_improvement_output(
+                    store,
+                    &mission,
+                    text,
+                    crate::executor::orchestrator::self_modification_enabled(),
+                )
+                .await
             {
                 debug!(
                     mission_id = %mission_id,
@@ -2503,6 +2560,7 @@ async fn process_self_improvement_output(
     store: &Arc<dyn Store>,
     mission: &Mission,
     response: &str,
+    allow_self_modify: bool,
 ) -> Result<(), EngineError> {
     use crate::executor::prompt::{PREAMBLE_OVERLAY_TITLE, PROMPT_OVERLAY_TAG};
     use crate::types::memory::{DocType, MemoryDoc};
@@ -2521,11 +2579,6 @@ async fn process_self_improvement_output(
     };
 
     let project_id = mission.project_id;
-
-    // Check if self-modification is allowed before applying prompt/orchestrator changes
-    let allow_self_modify = std::env::var("ORCHESTRATOR_SELF_MODIFY")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
 
     // Process prompt additions
     if let Some(additions) = json_val.get("prompt_additions").and_then(|v| v.as_array())
@@ -3005,6 +3058,189 @@ mod tests {
     }
 
     // ── Tests ───────────────────────────────────────────────
+
+    async fn wait_for_done(store: &Arc<dyn Store>, id: ThreadId) -> Thread {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let thread = store.load_thread(id).await.unwrap().unwrap();
+                if thread.state == ThreadState::Done {
+                    break thread;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thread completed")
+    }
+
+    async fn assert_descendants_keep_insight_context(
+        mgr: &MissionManager,
+        pid: ProjectId,
+        parent: ThreadId,
+    ) {
+        let mut parent = parent;
+        // An unmarked Research intermediary must not let its own mission-marked
+        // child regain general maintenance recall or control-write permissions.
+        for mission_child in [false, true] {
+            let child_id = mgr
+                .thread_manager
+                .spawn_thread(
+                    "fix_pattern_database",
+                    ThreadType::Research,
+                    pid,
+                    ThreadConfig {
+                        mission_child,
+                        ..ThreadConfig::default()
+                    },
+                    Some(parent),
+                    "test-user",
+                )
+                .await
+                .unwrap();
+            let child = wait_for_done(&mgr.store, child_id).await;
+            assert!(child.config.mission_context.is_conversation_insights());
+            assert!(
+                !child
+                    .internal_messages
+                    .iter()
+                    .any(|m| m.role == crate::types::message::MessageRole::System
+                        && m.content.contains("MAINTENANCE_CANARY"))
+            );
+            parent = child_id;
+        }
+    }
+
+    #[tokio::test]
+    async fn insights_use_batch_recall_at_both_prompt_stages_and_inherit_policy() {
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store));
+        let pid = ProjectId::new();
+        mgr.ensure_learning_missions_with_gate(pid, "test-user", true)
+            .await
+            .unwrap();
+        let id = mgr
+            .find_by_name(pid, "test-user", "conversation-insights")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let lesson = MemoryDoc::new(
+            pid,
+            "test-user",
+            DocType::Lesson,
+            "astrolabe",
+            "USER_KNOWLEDGE_CANARY",
+        );
+        let unrelated = MemoryDoc::new(
+            pid,
+            "test-user",
+            DocType::Lesson,
+            "durable pattern",
+            "UNRELATED_CANARY",
+        );
+        let maintenance = MemoryDoc::new(
+            pid,
+            shared_owner_id(),
+            DocType::Note,
+            "renamed maintenance",
+            "astrolabe MAINTENANCE_CANARY",
+        )
+        .with_tags(vec![FIX_PATTERN_DB_TAG.into()]);
+        for doc in [&lesson, &unrelated, &maintenance] {
+            store.save_memory_doc(doc).await.unwrap();
+        }
+
+        for (payload, expect_recall) in [
+            (None, false),
+            (
+                Some(serde_json::json!({"sample_user_messages": ["astrolabe"]})),
+                true,
+            ),
+        ] {
+            let tid = mgr
+                .fire_mission(id, "test-user", payload)
+                .await
+                .unwrap()
+                .unwrap();
+            let thread = wait_for_done(&store, tid).await;
+            assert!(thread.config.mission_context.is_conversation_insights());
+            assert!(!thread.goal.contains("fix_pattern_database"));
+            assert!(!thread.goal.contains("orchestrator:main"));
+            let system = thread
+                .internal_messages
+                .iter()
+                .filter(|m| m.role == crate::types::message::MessageRole::System)
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for prompt in [&thread.goal, &system] {
+                assert!(!prompt.contains("MAINTENANCE_CANARY"));
+                assert!(!prompt.contains("UNRELATED_CANARY"));
+                assert_eq!(prompt.contains("USER_KNOWLEDGE_CANARY"), expect_recall);
+                if expect_recall {
+                    assert!(prompt.contains("untrusted_memory_retrieval"));
+                    assert!(prompt.contains(&lesson.id.0.to_string()));
+                }
+            }
+            assert_descendants_keep_insight_context(&mgr, pid, tid).await;
+        }
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn insights_do_not_replay_generated_focus_or_outcome_history() {
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::new());
+        let mut mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "insights",
+            "extract insights",
+            MissionCadence::Manual,
+        );
+        mission.metadata = serde_json::json!({"conversation_insights": true});
+        mission.current_focus = Some("LEGACY_FOCUS_CANARY".into());
+        mission.record_approach("LEGACY_HISTORY_CANARY");
+        store.save_mission(&mission).await.unwrap();
+        process_mission_outcome(
+            &store,
+            mission.id,
+            ThreadId::new(),
+            &ThreadOutcome::Completed {
+                response: Some("No saves.\nNext focus: NEW_FOCUS_CANARY".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let updated = store.load_mission(mission.id).await.unwrap().unwrap();
+        assert_eq!(updated.current_focus, mission.current_focus);
+        assert!(
+            updated
+                .approach_history
+                .iter()
+                .any(|entry| entry.contains("NEW_FOCUS_CANARY"))
+        );
+        let prompt = build_meta_prompt(
+            &updated,
+            &[],
+            &Some(serde_json::json!({"sample_user_messages": ["CURRENT_BATCH_CANARY"]})),
+        );
+        for canary in [
+            "LEGACY_FOCUS_CANARY",
+            "LEGACY_HISTORY_CANARY",
+            "NEW_FOCUS_CANARY",
+        ] {
+            assert!(!prompt.contains(canary));
+        }
+        assert!(prompt.contains("CURRENT_BATCH_CANARY"));
+        assert!(!prompt.contains("What the next focus should be"));
+        assert!(
+            store
+                .list_memory_docs(updated.project_id, "test-user")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     #[test]
     fn conversation_insight_goals_exclude_mission_threads() {
@@ -5043,21 +5279,12 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             },
         );
         mission.metadata = serde_json::json!({"self_improvement": true});
-        let id = mission.id;
         store.save_mission(&mission).await.unwrap();
 
-        // Enable self-modification for this test so prompt additions are applied
-        unsafe { std::env::set_var("ORCHESTRATOR_SELF_MODIFY", "true") };
-
         let response = r#"{"prompt_additions": ["9. Never call web_fetch — use http() instead."], "fix_patterns": [], "level": 1}"#;
-        let outcome = ThreadOutcome::Completed {
-            response: Some(response.into()),
-        };
-        process_mission_outcome(&store, id, ThreadId::new(), &outcome)
+        process_self_improvement_output(&store, &mission, response, true)
             .await
             .unwrap();
-
-        unsafe { std::env::remove_var("ORCHESTRATOR_SELF_MODIFY") };
 
         // Verify prompt overlay was saved
         let docs = store.list_memory_docs(project_id, "system").await.unwrap();

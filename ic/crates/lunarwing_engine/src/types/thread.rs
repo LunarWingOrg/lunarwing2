@@ -114,6 +114,23 @@ pub enum ThreadType {
 
 // ── Thread configuration ────────────────────────────────────
 
+/// Host-selected mission context. Model arguments and mutable REPL state cannot
+/// grant maintenance recall or relax an insight worker's write restrictions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub enum MissionContext {
+    #[default]
+    General,
+    ConversationInsights {
+        recall_query: String,
+    },
+}
+
+impl MissionContext {
+    pub fn is_conversation_insights(&self) -> bool {
+        matches!(self, Self::ConversationInsights { .. })
+    }
+}
+
 /// Execution parameters for a thread.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadConfig {
@@ -204,6 +221,10 @@ pub struct ThreadConfig {
     #[serde(default)]
     pub mission_child: bool,
 
+    /// Assigned by MissionManager and inherited by mission children.
+    #[serde(default)]
+    pub mission_context: MissionContext,
+
     // ── Channel delivery constraints ──
     /// Delivery-constraint guidance appended to the system prompt at thread
     /// creation. Set by the host bridge for rate-metered channels (e.g.
@@ -248,6 +269,7 @@ impl Default for ThreadConfig {
             depth: 0,
             max_depth: 1,
             mission_child: false,
+            mission_context: MissionContext::General,
             channel_context: None,
         }
     }

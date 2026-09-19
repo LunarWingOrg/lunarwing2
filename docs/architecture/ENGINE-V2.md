@@ -236,6 +236,10 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
   `SKILL_SELF_IMPROVEMENT=true`.
 - Can be patched by the self-improvement mission and versioned in the Store when
   `ORCHESTRATOR_SELF_MODIFY=true`
+- The same opt-in controls prompt-overlay consumption when assembling a system
+  prompt. Stored overlays, including those with `source: compiled_in`, are inert
+  while disabled. Compiled v0 seeding and failure bookkeeping use the host-only
+  `Store::save_internal_memory_doc` path; model metadata is never write authority.
 - Falls back to compiled-in default (v0) if disabled or patches fail (3+ consecutive failures triggers rollback)
 - Nudges short roleplay or retry prose back into a `repl` block for non-conversational
   goals, with a default two-attempt cap; substantive prose and short conversational
@@ -253,6 +257,7 @@ skills (which have a separate activation path) and engine-maintenance records:
 `orchestrator:failures`. Either a reserved title or a maintenance tag
 (`fix_patterns`, `prompt_overlay`, `orchestrator_code`, `orchestrator_meta`)
 excludes a document, including legacy untagged and renamed tagged records.
+Reserved `prompt:` and `orchestrator:` title prefixes are also excluded.
 
 Relevance uses case-insensitive whole tokens, retaining `_` and `-` inside
 identifiers. Query terms are deduplicated and common conversational filler is
@@ -263,12 +268,18 @@ memories. Partial matches remain eligible when a query has additional terms.
 An empty automatic recall is not evidence that no memory exists; explicit
 `memory_search`/document access is still available.
 
-Mission planning, mission threads, and their host-marked mission children use
+General mission planning, mission threads, and their host-marked mission children use
 `retrieve_mission_context`: maintenance records remain eligible and zero-match
 queries retain type-priority/recency fallback. The host selects this policy from
 thread configuration; `__retrieve_docs__` arguments cannot opt a conversation
-into it. Dedicated overlay/orchestrator loading and stored records are unaffected
-by the conversational filter.
+into it. **Conversation-insights missions are the exception:** the host assigns
+`MissionContext::ConversationInsights` with a query derived only from the trigger
+batch's goals/message samples. Both meta-prompt construction and first-step
+`__retrieve_docs__` use conversational relevance and maintenance exclusions;
+an empty batch recalls nothing. The context is inherited by managed and inline
+mission children. Model arguments and mutable REPL state cannot switch policies
+or replace the batch query. Retrieved documents retain untrusted source labels.
+Dedicated overlay/orchestrator loading has its own self-modification gate.
 
 ### Authenticity hardening (WI#132)
 
@@ -525,8 +536,9 @@ Trigger payloads are deduplicated at fire time: a payload carrying a
 spawns no thread and consumes no daily budget. The processed-key set is
 persisted on the mission (FIFO-bounded to 512 keys), so re-delivered events are
 skipped even across daemon restarts (work item #69). The conversation-insights
-listener keys each batch by project and completed-thread count so a restart
-(which resets the in-memory counter) does not re-fire stale batches.
+listener currently keys batches by project and an in-memory completion count.
+That counter resets on restart and can collide with a persisted key for an older
+batch, skipping new content; this remains open as G8-F7 in WI #183.
 
 ### Error Diagnosis (`self-improvement`)
 
@@ -548,6 +560,18 @@ listener keys each batch by project and completed-thread count so a restart
 
 - **Trigger**: fires every 5 completed threads in a project
 - **Action**: extracts user preferences, domain knowledge, and workflow patterns
+- **Context**: current trigger batch and relevant non-maintenance knowledge.
+  Existing generated `current_focus` and `approach_history` are excluded from the
+  next extraction prompt, including legacy history. FINAL reports are retained
+  for audit, but insights do not update focus or request a generated next agenda.
+- **Host writer**: `__save_memory_doc__` refuses shared and maintenance/control
+  outputs for insight threads and their marked children, even with
+  self-modification enabled. Other missions' control writes require that opt-in.
+  Reserved title prefixes and control tags are checked independently.
+- **Remaining evidence gaps**: input eligibility/source identities, validated
+  insight evidence and stable upserts, project-scoped dispatch, restart-safe
+  batching, and explicit opt-out/purge semantics remain tracked in
+  [WI #183](https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/183).
 
 ### Expected Behavior (`expected-behavior`)
 
@@ -647,14 +671,21 @@ Wraps tool execution and safety layer as `EffectExecutor`:
 ### HybridStore (`ic/src/bridge/store_adapter.rs`)
 
 Wraps the `Workspace` as the engine's `Store` trait:
-- 33 Store-trait methods for threads, steps, events, projects, docs, leases,
-  missions, and conversations (28 overridden by `HybridStore`; five shared-scope
+- 34 Store-trait methods for threads, steps, events, projects, docs, leases,
+  missions, and conversations (29 overridden by `HybridStore`; five shared-scope
   and global-list helpers use trait defaults)
 - In-memory `HashMap` caches backed by workspace files under `engine/`
 - Human-readable knowledge/orchestrator files plus JSON runtime state under
   `engine/.runtime/`
 - Fallback to workspace files on cache miss; terminal cleanup evicts memory but
   preserves persisted output
+- MemoryDoc saves propagate workspace content-write failures. Persistence must
+  succeed before publishing the document/cache path or deleting a rename's old
+  file. Writes are serialized through a store-local lock so cache publication
+  follows durable write ordering. Workspace-less stores remain in-memory.
+- `save_internal_memory_doc` is a separate native-only entry point for compiled
+  seeds and engine bookkeeping. Ordinary saves cannot bypass the control-doc
+  gate using `source: compiled_in` or the failure-tracker title.
 
 The router dual-writes compatibility conversation history to the relational
 `Database` separately. That database is not the backing store for `HybridStore`.
@@ -794,7 +825,7 @@ The engine defines three traits that the host crate implements. This boundary en
 | Trait | Signature | Host wraps |
 |-------|-----------|------------|
 | `LlmBackend` | `complete(...) -> LlmOutput`; `complete_stream(...) -> LlmStream` | `LlmProvider` |
-| `Store` | 33 CRUD methods for all engine types | Workspace-backed `HybridStore` |
+| `Store` | 34 CRUD methods for all engine types | Workspace-backed `HybridStore` |
 | `EffectExecutor` | `execute_action(name, params, lease, ctx) -> ActionResult` | `ToolRegistry` + `SafetyLayer` |
 
 ## Data Retention Policy
@@ -846,7 +877,7 @@ ENGINE_V2_CHANNELS=xmpp,weechat # Add exact eligible channels
 SKILL_SELF_IMPROVEMENT=false   # Gate skill feedback/patch/prune lifecycle and the
                                # self-improvement/skill-extraction/skill-maintenance
                                # missions (paused while off, resumed on re-enable)
-ORCHESTRATOR_SELF_MODIFY=false # Use only compiled orchestrator v0; block LLM-authored patches
+ORCHESTRATOR_SELF_MODIFY=false # Compiled orchestrator v0, no stored prompt overlays or model control-doc writes
 
 # ThreadConfig env overrides (read at thread spawn):
 ENGINE_V2_TOOL_ASYNC_TIMEOUT_SECS=300   # Per-future timeout for deferred tool/LLM

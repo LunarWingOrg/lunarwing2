@@ -67,6 +67,19 @@ pub struct MemoryDoc {
 }
 
 impl MemoryDoc {
+    /// Engine-control identities remain protected even when tags or titles are
+    /// changed independently. Metadata supplied by a model cannot grant access.
+    pub fn is_engine_control(&self) -> bool {
+        self.title.starts_with("orchestrator:")
+            || self.title.starts_with("prompt:")
+            || self.tags.iter().any(|tag| {
+                matches!(
+                    tag.as_str(),
+                    "orchestrator_code" | "orchestrator_meta" | "prompt_overlay"
+                )
+            })
+    }
+
     pub fn new(
         project_id: ProjectId,
         user_id: impl Into<String>,
