@@ -772,10 +772,10 @@ _port_in_use() {
 }
 
 # Warn (stderr, non-fatal) for every port assigned to tenant '$name' in the
-# registry that is already accepting connections on 127.0.0.1. Reads all four
-# per-tenant port maps so extended/kimi/voice slots are covered too. Only
-# meaningful right after a fresh ports_allocate() — on a running tenant its own
-# services legitimately hold its ports, so callers must not probe those.
+# registry that is already accepting connections on 127.0.0.1. Reads all five
+# per-tenant port maps so extended/kimi/voice/opencode2 slots are covered too.
+# Only meaningful right after a fresh ports_allocate() — on a running tenant
+# its own services legitimately hold its ports, so callers must not probe those.
 ports_warn_block_in_use() {
   local name="$1"
   require_cmd jq
@@ -793,7 +793,8 @@ ports_warn_block_in_use() {
     | [ ((.ports // {}) | to_entries[]),
         ((.extended_ports // {}) | to_entries[]),
         ((.kimi_ports // {}) | to_entries[]),
-        ((.voice_ports // {}) | to_entries[]) ]
+        ((.voice_ports // {}) | to_entries[]),
+        ((.opencode2_ports // {}) | to_entries[]) ]
     | sort_by(.value)[]
     | "\(.key)\t\(.value)"' "$PORTS_REGISTRY" 2>/dev/null)
   if [[ -n "$in_use" ]]; then
@@ -816,7 +817,8 @@ ports_registry_duplicate_ports() {
       | ((.ports // {}) | to_entries[] | .value),
         ((.extended_ports // {}) | to_entries[] | .value),
         ((.kimi_ports // {}) | to_entries[] | .value),
-        ((.voice_ports // {}) | to_entries[] | .value)
+        ((.voice_ports // {}) | to_entries[] | .value),
+        ((.opencode2_ports // {}) | to_entries[] | .value)
     ] + [(.health_metrics_port // empty)]
     | map(select(type == "number"))
     | group_by(.)
@@ -1204,8 +1206,8 @@ ports_list() {
     say "no port registry found; run add-tenant first"
     return 0
   fi
-  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")\t\(.value.voice_ports.voice_service // "-")\t\(.value.voice_ports.voice_health // "-")"' "$PORTS_REGISTRY" \
-    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH,VOICE_SVC,VOICE_HLTH"
+  jq -r '.tenants | to_entries[] | "\(.key)\t\(.value.ports.gateway)\t\(.value.ports.http)\t\(.value.ports.bridge)\t\(.value.ports.postgres)\t\(.value.ports.proxy)\t\(.value.ports.weechat)\t\(.value.ports.weechat_adapter // "-")\t\(.value.extended_ports.darkirc_adapter // "-")\t\(.value.extended_ports.darkirc_irc // "-")\t\(.value.extended_ports.darkirc_rpc // "-")\t\(.value.ports.orchestrator)\t\(.value.ports.nanocode_wss // "-")\t\(.value.ports.pebble_wss // "-")\t\(.value.extended_ports.vision_service // "-")\t\(.value.extended_ports.vision_health // "-")\t\(.value.voice_ports.voice_service // "-")\t\(.value.voice_ports.voice_health // "-")\t\(.value.opencode2_ports.opencode2_wss // "-")\t\(.value.opencode2_ports.opencode2_health // "-")"' "$PORTS_REGISTRY" \
+    | column -t -N "TENANT,GATEWAY,HTTP,BRIDGE,PG,PROXY,WEECHAT,WS_ADPT,DARKIRC_ADPT,DARKIRC_IRC,DARKIRC_RPC,ORCH,NC_RSVD,PEBBLE,VISION_SVC,VISION_HLTH,VOICE_SVC,VOICE_HLTH,OC2_WSS,OC2_HLTH"
 }
 
 tenant_exists_in_registry() {
