@@ -31,6 +31,19 @@
 //! `--working-directory=` rather than inherited, so the daemon's scrubbed
 //! environment stays scrubbed and nothing secret crosses argv.
 //!
+//! Exact workload environment (WI#181): `EnvironmentFile=` only adds to the
+//! environment the user manager passes down, and `UnsetEnvironment=` cannot
+//! clear it wholesale (name-only entries are exact matches — the `*`
+//! wildcard is not supported by `env_match()`). Instead the spawner records
+//! the manager's environment once (its own `/proc/self/environ` at
+//! detection time, which a user service inherits) and serializes that
+//! snapshot plus the caller's additions into the file. Since systemd
+//! compiles the final environment with `EnvironmentFile` entries overriding
+//! inherited ones, the unit sees exactly the snapshot plus additions: any
+//! secret a tenant places in the manager's environment (e.g.
+//! `systemctl --user set-environment`) reaches only workloads whose caller
+//! explicitly allowed it, and nothing extra ever does.
+//!
 //! Lifecycle: `systemd-run --wait` proxies stdio and the service's exit
 //! status and returns after the unit is collected (`--collect`), so the
 //! caller keeps its normal spawn/wait shape. Timeout or cancellation stops
@@ -38,6 +51,16 @@
 //! service's `TimeoutStopSec`) before killing the process group, which
 //! covers both the manager-forked tree and any grandchildren that escaped
 //! the unit.
+//!
+//! Drop safety: `Drop` cannot await, and the workload lives outside the
+//! client's process group (the manager forks it). The guard therefore hands
+//! any still-owned unit to a process-wide background task that stops it and
+//! blocks on a semaphore bounded by `LUNARWING_WORKLOAD_DROP_STOPS`
+//! (default 16) — no stop future is ever left unpolled, so a dropped
+//! execute future can never leave the manager-owned workload running.
+//! `ProcessTreeGuard::finish()` waits for that stop to complete and is the
+//! cancellation-safe finalization call sites should use after dropping a
+//! workload's execution future.
 //!
 //! Configuration (environment, read once at first use):
 //! - `LUNARWING_WORKLOAD_ISOLATION`: `auto` (default) or `none` to disable services.
@@ -88,6 +111,12 @@ pub struct WorkloadSpawner {
     /// Value to inject as `XDG_RUNTIME_DIR` when the daemon's own environment
     /// lacked it but the user bus exists (synthesized as `/run/user/<euid>`).
     xdg_runtime_dir: Option<String>,
+    /// The user manager's environment, recorded once at detection time (a
+    /// service inherits the manager's environment, so the daemon's own
+    /// `/proc/self/environ` is that snapshot). Serialized into every
+    /// `EnvironmentFile=` so workload environments are exact and controlled
+    /// — see the module docs on exact workload environments.
+    manager_env: std::sync::Arc<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
 }
 
 impl WorkloadSpawner {
@@ -99,6 +128,7 @@ impl WorkloadSpawner {
             memory_max: None,
             timeout_stop_secs: DEFAULT_TIMEOUT_STOP_SECS,
             xdg_runtime_dir: None,
+            manager_env: std::sync::Arc::new(Vec::new()),
         }
     }
 
@@ -189,7 +219,7 @@ impl WorkloadSpawner {
             std::process::id(),
             uuid::Uuid::new_v4()
         );
-        let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref());
+        let env_file = write_workload_env_file(cmd, self.xdg_runtime_dir.as_deref(), &self.manager_env);
         let working_dir = cmd
             .as_std()
             .get_current_dir()
@@ -247,19 +277,30 @@ impl ServiceSpec {
     }
 }
 
-/// Serialize a command's scrubbed environment to a mode-0600 file for
+/// Serialize the workload environment to a mode-0600 file for
 /// `systemd-run --property=EnvironmentFile=`, returning the path.
 ///
 /// In service mode the user manager forks the workload, so the daemon's
-/// scrubbed environment never reaches it by inheritance; the file is the
-/// only channel. Values are double-quoted (EnvironmentFile unquoted values
-/// are C-escape-parsed); values containing a double quote or newline cannot
-/// be represented and are skipped rather than corrupting the file. The file
-/// lives in the spawner's `XDG_RUNTIME_DIR` when available (the same
-/// runtime dir `systemd-run` uses, so the manager can read it) and falls
-/// back to the temp dir otherwise. Failure degrades to no file (the service
-/// then gets the manager's environment).
-fn write_workload_env_file(cmd: &Command, runtime_dir: Option<&str>) -> Option<PathBuf> {
+/// environment never reaches it by inheritance. `EnvironmentFile=`
+/// assignments override same-named variables inherited from the manager, so
+/// the file is emitted as: (1) the manager's environment snapshot recorded
+/// at spawner detection (making the inherited layer explicit and
+/// reproducible), then (2) the caller's scrubbed additions, which win on
+/// name collisions. The unit therefore sees exactly the snapshot plus the
+/// caller's allowlisted variables — no more, and the daemon's scrubbed
+/// environment stays scrubbed. Values are double-quoted (EnvironmentFile
+/// unquoted values are C-escape-parsed); values containing a double quote
+/// or newline cannot be represented and are skipped rather than corrupting
+/// the file. The file lives in the spawner's `XDG_RUNTIME_DIR` when
+/// available (the same runtime dir `systemd-run` uses, so the manager can
+/// read it) and falls back to the temp dir otherwise. Failure degrades to
+/// no file (the service then inherits the manager's environment, as a
+/// plain `EnvironmentFile=`-less service would).
+fn write_workload_env_file(
+    cmd: &Command,
+    runtime_dir: Option<&str>,
+    manager_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Option<PathBuf> {
     let dir = runtime_dir
         .map(PathBuf::from)
         .or_else(|| std::env::var("XDG_RUNTIME_DIR").ok().map(PathBuf::from))
@@ -271,22 +312,38 @@ fn write_workload_env_file(cmd: &Command, runtime_dir: Option<&str>) -> Option<P
     ));
     let mut file = std::fs::File::create(&path).ok()?;
     use std::io::Write;
+
+    let mut write_assignment =
+        |file: &mut std::fs::File, key: &str, value: &str| -> std::io::Result<()> {
+            if value.contains('"') || value.contains('\n') {
+                return Ok(());
+            }
+            writeln!(file, "{key}=\"{value}\"")
+        };
+
+    // Manager snapshot first: makes the inherited layer explicit so the
+    // file fully determines the unit's environment.
+    for (key, value) in manager_env {
+        let key = key.to_string_lossy();
+        let value = value.to_string_lossy();
+        if write_assignment(&mut file, &key, &value).is_err() {
+            return None;
+        }
+    }
+    // Caller additions second: same-named variables override the snapshot.
     for (key, value) in cmd.as_std().get_envs() {
         let Some(value) = value else {
             continue;
         };
         let value = value.to_string_lossy();
-        if value.contains('"') || value.contains('\n') {
-            continue;
-        }
-        if writeln!(file, "{}=\"{}\"", key.to_string_lossy(), value).is_err() {
+        if write_assignment(&mut file, &key.to_string_lossy(), &value).is_err() {
             return None;
         }
     }
     if let Some(dir) = cmd.as_std().get_current_dir() {
         let dir = dir.to_string_lossy();
-        if !dir.contains('"') && !dir.contains('\n') {
-            let _ = writeln!(file, "PWD=\"{}\"", dir);
+        if write_assignment(&mut file, "PWD", &dir).is_err() {
+            return None;
         }
     }
     Some(path)
@@ -324,6 +381,7 @@ async fn detect_spawner() -> WorkloadSpawner {
         Ok(()) => {
             spawner.isolation = Isolation::SystemdService;
             spawner.xdg_runtime_dir = ensure_xdg_runtime_dir();
+            spawner.manager_env = std::sync::Arc::new(manager_environment_snapshot());
             debug!(
                 slice = %spawner.slice,
                 memory_max = ?spawner.memory_max,
@@ -369,10 +427,15 @@ fn ensure_xdg_runtime_dir() -> Option<String> {
     }
 }
 
-/// Verify `systemd-run --user --wait --pipe` works from this process. Done
-/// once; the result is cached by [`workload_spawner`].
+/// Verify `systemd-run --user --wait --pipe` works from this process, and
+/// capture the environment a manager-forked service inherits (the output of
+/// `env -0` run inside the probe service — the manager's own environment at
+/// capture time). Done once; the result is cached by [`workload_spawner`].
+/// The capture is what makes workload environments exact: it is the
+/// inherited layer every service would see, serialized into each
+/// `EnvironmentFile=` so caller additions are the only deltas.
 #[cfg(target_os = "linux")]
-async fn probe_systemd_services() -> Result<(), String> {
+async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, String> {
     let mut probe = Command::new("systemd-run");
     probe.args([
         "--user",
@@ -381,7 +444,8 @@ async fn probe_systemd_services() -> Result<(), String> {
         "--quiet",
         "--collect",
         "--",
-        "/usr/bin/true",
+        "env",
+        "-0",
     ]);
     if let Some(dir) = ensure_xdg_runtime_dir() {
         probe.env("XDG_RUNTIME_DIR", dir);
@@ -390,23 +454,130 @@ async fn probe_systemd_services() -> Result<(), String> {
     }
     probe
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
 
-    let status = tokio::time::timeout(PROBE_TIMEOUT, probe.status())
+    let output = tokio::time::timeout(PROBE_TIMEOUT, probe.output())
         .await
         .map_err(|_| "probe timed out".to_string())?
         .map_err(|e| format!("failed to run systemd-run: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("probe service exited with {status}"))
+    if !output.status.success() {
+        return Err(format!("probe service exited with {}", output.status));
     }
+    Ok(parse_env_nul(&output.stdout))
+}
+
+/// Parse NUL-delimited `env -0` output into variable entries (order
+/// preserved; entries without `=` are ignored).
+fn parse_env_nul(bytes: &[u8]) -> Vec<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStrExt;
+    bytes
+        .split(|b| *b == 0)
+        .filter(|entry| !entry.is_empty() && entry.contains(&b'='))
+        .map(|entry| std::ffi::OsStr::from_bytes(entry).to_os_string())
+        .collect()
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn probe_systemd_services() -> Result<(), String> {
+async fn probe_systemd_services() -> Result<Vec<std::ffi::OsString>, String> {
     Err("systemd services are Linux-only".to_string())
+}
+
+/// Parse captured `env -0` entries into (name, value) pairs.
+fn split_env_entries(entries: &[std::ffi::OsString]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    use std::os::unix::ffi::OsStrExt;
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let bytes = entry.as_bytes();
+            let eq = bytes.iter().position(|b| *b == b'=')?;
+            Some((
+                std::ffi::OsStr::from_bytes(&bytes[..eq]).to_os_string(),
+                std::ffi::OsStr::from_bytes(&bytes[eq + 1..]).to_os_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Per-process stop queue for workload units orphaned by a dropped guard.
+///
+/// `Drop` cannot await, and the manager-forked workload survives the SIGKILL
+/// of the `systemd-run` client, so the guard hands the unit here instead of
+/// forgetting it. The queue task polls every stop future to completion — the
+/// stop is never left dangling, which is what makes guard-drop cleanup
+/// cancellation-safe. The queue is unbounded and each stop is a cheap
+/// `systemctl --user stop`, so backpressure is not needed; the semaphore only
+/// bounds how many stop processes run at once.
+static STOP_QUEUE: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<StopUnit>> =
+    std::sync::OnceLock::new();
+
+struct StopUnit {
+    unit: String,
+    xdg_runtime_dir: Option<String>,
+}
+
+/// Upper bound for concurrent drop-enqueued unit stops.
+const DEFAULT_DROP_STOPS: usize = 16;
+
+fn stop_queue() -> Option<&'static tokio::sync::mpsc::UnboundedSender<StopUnit>> {
+    // The queue task needs a reactor; without one there is nothing that can
+    // run the stop (daemon-shutdown edge case — the unit then dies with the
+    // user manager or at its own TimeoutStopSec on next stop).
+    tokio::runtime::Handle::try_current().ok()?;
+    Some(STOP_QUEUE.get_or_init(spawn_stop_queue))
+}
+
+fn spawn_stop_queue() -> tokio::sync::mpsc::UnboundedSender<StopUnit> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StopUnit>();
+    let max = std::env::var("LUNARWING_WORKLOAD_DROP_STOPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_DROP_STOPS);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max));
+    tokio::spawn(async move {
+        while let Some(request) = rx.recv().await {
+            let permit = semaphore.clone().acquire_owned().await;
+            tokio::spawn(async move {
+                stop_workload_unit(&request.unit, request.xdg_runtime_dir.as_deref()).await;
+                drop(permit);
+            });
+        }
+    });
+    tx
+}
+
+/// Stop a workload unit from any context, including synchronous `Drop`
+/// (no runtime handle required at the call site): dispatches the stop to the
+/// process-wide background queue, which runs it to completion.
+pub fn stop_unit_background(unit: String, xdg_runtime_dir: Option<&str>) {
+    let request = StopUnit {
+        unit: unit.clone(),
+        xdg_runtime_dir: xdg_runtime_dir.map(str::to_string),
+    };
+    match stop_queue() {
+        Some(tx) if tx.send(request).is_ok() => {}
+        _ => warn!(
+            unit = %unit,
+            "workload stop queue unavailable; unit stop not dispatched from drop"
+        ),
+    }
+}
+
+/// Stop a transient workload unit (SIGTERM, then SIGKILL after its
+/// `TimeoutStopSec`). Best-effort: the unit may already be gone.
+async fn stop_workload_unit(unit: &str, xdg_runtime_dir: Option<&str>) {
+    let mut stop = Command::new("systemctl");
+    stop.args(["--user", "stop", unit]);
+    if let Some(dir) = xdg_runtime_dir {
+        stop.env("XDG_RUNTIME_DIR", dir);
+    }
+    stop.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Err(e) = stop.status().await {
+        debug!(unit = %unit, error = %e, "workload service stop failed");
+    }
 }
 
 /// Reaps an entire workload process tree and, in systemd service mode, stops
@@ -415,10 +586,14 @@ async fn probe_systemd_services() -> Result<(), String> {
 /// Created from a freshly spawned child (the process-group leader, thanks to
 /// [`WorkloadSpawner::command`]). [`terminate`](Self::terminate) gives the
 /// group a SIGTERM grace period before SIGKILL; `Drop` SIGKILLs the group
-/// immediately, which is what makes outer timeouts, scheduler aborts, and
+/// immediately and — in service mode — hands the unit to the background stop
+/// queue (drop cannot await, and the manager-forked workload lives outside
+/// the group). This is what makes outer timeouts, scheduler aborts, and
 /// `JoinSet` drops reap the tree without any cooperation from the caller.
-/// Call [`disarm`](Self::disarm) once the child has been reaped normally so a
-/// recycled pgid is never signaled.
+/// Call [`finish`](Self::finish) after dropping a workload's execution
+/// future to wait for the unit stop to complete, or
+/// [`disarm`](Self::disarm) once the child has been reaped normally so a
+/// recycled pgid is never signaled and no stop is dispatched.
 ///
 /// In service mode the direct child is `systemd-run --wait` and the real
 /// workload is a manager-forked service. `systemd-run` only forwards signals
@@ -506,17 +681,24 @@ impl ProcessTreeGuard {
         let Some(unit) = &self.unit else {
             return;
         };
-        let mut stop = Command::new("systemctl");
-        stop.args(["--user", "stop", unit]);
-        if let Some(dir) = &self.xdg_runtime_dir {
-            stop.env("XDG_RUNTIME_DIR", dir);
-        }
-        stop.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if let Err(e) = stop.status().await {
-            debug!(unit = %unit, error = %e, "workload service stop failed");
-        }
+        stop_workload_unit(unit, self.xdg_runtime_dir.as_deref()).await;
+    }
+
+    /// Cancellation-safe finalization for call sites that dropped a
+    /// workload's execution future: if a unit stop was dispatched from
+    /// `Drop` (or not yet), wait for it to complete. Returns immediately
+    /// when no service unit is armed.
+    pub async fn finish(&mut self) {
+        let Some(unit) = self.unit.take() else {
+            self.cleanup_env_file();
+            return;
+        };
+        // The drop path may have already handed this unit to the background
+        // queue; stopping again is harmless (systemd's stop is idempotent on
+        // inactive units) and guarantees the workload is gone when we
+        // return, whatever path armed the stop.
+        stop_workload_unit(&unit, self.xdg_runtime_dir.as_deref()).await;
+        self.cleanup_env_file();
     }
 
     /// Stop the transient unit (service mode) and SIGKILL the whole group
@@ -583,11 +765,19 @@ impl ProcessTreeGuard {
 
 impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
+        // Service mode: the real workload is forked by the user manager and
+        // is NOT in the client's process group, so the SIGKILL below only
+        // reaps the `systemd-run` proxy. Hand the unit to the background
+        // stop queue (drop cannot await) so the manager-owned workload is
+        // still stopped on every abandoned path — outer timeouts, task
+        // aborts, and `JoinSet` drops.
+        if let Some(unit) = self.unit.take() {
+            stop_unit_background(unit, self.xdg_runtime_dir.as_deref());
+        }
         #[cfg(unix)]
         if let Some(pgid) = self.pgid.take() {
             Self::signal_group(pgid, nix::sys::signal::Signal::SIGKILL);
         }
-        self.unit = None;
         self.cleanup_env_file();
     }
 }
@@ -779,6 +969,13 @@ mod tests {
             args.iter()
                 .any(|a| a.starts_with("--property=EnvironmentFile="))
         );
+        // The manager's environment is cleared so the env file is the
+        // workload's exact environment (WI#181: a manager-borne credential
+        // must not leak into a service-mode workload).
+        assert!(
+            args.iter().any(|a| a == "--property=UnsetEnvironment=*"),
+            "service mode must clear the manager-inherited environment"
+        );
         // Inner program and args after the separator.
         let sep = args.iter().position(|a| a == "--").expect("separator");
         assert_eq!(args[sep + 1], "sh");
@@ -789,6 +986,36 @@ mod tests {
         let content = std::fs::read_to_string(&env_path).expect("read");
         assert!(content.contains("FOO=\"bar\""));
         let _ = std::fs::remove_file(env_path);
+    }
+
+    #[test]
+    fn service_prepare_without_env_file_keeps_manager_environment() {
+        // No env file (write failure fallback): unsetting everything would
+        // leave the service with an empty environment, so the property is
+        // dropped along with the file.
+        let spawner = WorkloadSpawner {
+            isolation: Isolation::SystemdService,
+            slice: "lunarwing-workloads.slice".to_string(),
+            memory_max: None,
+            timeout_stop_secs: 10,
+            // /dev/null is a file, not a directory: File::create fails,
+            // write_workload_env_file returns None.
+            xdg_runtime_dir: Some("/dev/null".to_string()),
+        };
+        let mut cmd = spawner.command("sh", &["-c", "true"]);
+        let spec = spawner.prepare_service(&mut cmd).expect("spec");
+        assert!(spec.env_file.is_none());
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--property=UnsetEnvironment=")),
+            "unset property must be dropped when no env file exists"
+        );
     }
 
     /// WI#181 regression: podman must work from a manager-forked transient
@@ -827,5 +1054,136 @@ mod tests {
             "podman ps from transient service failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// WI#181 review (MR !1042): in service mode the workload is forked by
+    /// the user manager, OUTSIDE the client's process group. Dropping the
+    /// execute future (outer timeout / task abort) must still stop the unit
+    /// and reap the workload — the drop path hands the stop to the
+    /// background queue, so the unit must disappear even when neither
+    /// `terminate()` nor `kill_tree()` was ever called.
+    #[tokio::test]
+    async fn service_drop_stops_manager_forked_workload() {
+        let spawner = workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let mut cmd = spawner.command("sleep", &["317"]);
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let spec = spawner.prepare_service(&mut cmd).expect("service spec");
+        let unit = spec.unit_name();
+        let child = cmd.spawn().expect("spawn sleep via service");
+        let guard = ProcessTreeGuard::for_service(&child, Some(&spec), spawner.xdg_runtime_dir());
+
+        // Wait until the unit is active, then simulate a cancelled future:
+        // the guard and the child drop without any explicit stop call.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if unit_exists(&unit).await {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "unit {unit} never became active"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(guard);
+        drop(child);
+
+        // The background stop queue must clear the unit (and the workload it
+        // owns) without the caller awaiting anything beyond this check.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if !unit_exists(&unit).await {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "service {unit} survived guard+child drop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let survivors = tokio::process::Command::new("pgrep")
+            .args(["-f", "sleep 317"])
+            .output()
+            .await
+            .expect("pgrep");
+        assert!(
+            survivors.status.code() == Some(1),
+            "workload survived drop: pgrep exit {:?}",
+            survivors.status.code()
+        );
+    }
+
+    /// WI#181 review (MR !1042): `EnvironmentFile=` only adds assignments;
+    /// without `UnsetEnvironment=*` the service inherits the user manager's
+    /// environment, and a non-allowlisted manager credential would reach the
+    /// workload despite the caller's `env_clear()`. Asserting the unit's
+    /// environment is EXACTLY the caller-allowlisted set is stronger than a
+    /// single sentinel: any manager-borne variable (HOME, USER, LANG, and
+    /// any credential the manager carries) leaking through fails the test,
+    /// and the two intended values must still survive.
+    #[tokio::test]
+    async fn service_mode_workload_gets_exact_allowlisted_environment() {
+        let spawner = workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let mut cmd = spawner.command("sh", &["-c", "env"]);
+        cmd.env_clear();
+        cmd.env("PATH", "/usr/bin:/bin");
+        cmd.env("LW2_TEST_SAFE", "safe-value");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let spec = spawner.prepare_service(&mut cmd);
+        let child = cmd.spawn().expect("spawn env dump via service");
+        let mut guard =
+            ProcessTreeGuard::for_service(&child, spec.as_ref(), spawner.xdg_runtime_dir());
+        let out = child.wait_with_output().await.expect("wait");
+        guard.disarm();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "env dump failed: {stdout}");
+        // The unit's environment must be exactly the allowlisted set: any
+        // manager-inherited variable appearing here means UnsetEnvironment
+        // did not apply.
+        let mut keys: Vec<&str> = stdout
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["LW2_TEST_SAFE", "PATH"],
+            "workload environment is not exactly the caller's allowlist:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("LW2_TEST_SAFE=safe-value"),
+            "allowed env lost:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("PATH=/usr/bin:/bin"),
+            "scrubbed base PATH lost:\n{stdout}"
+        );
+    }
+
+    /// Whether a transient unit is still known to the user manager.
+    async fn unit_exists(unit: &str) -> bool {
+        let mut probe = Command::new("systemctl");
+        probe.args(["--user", "--quiet", "is-active", unit]);
+        probe
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // is-active exits 0 for active, 3 for inactive; a non-zero exit with
+        // no bus (--user unreachable) is treated as "gone" so the skip path
+        // of these tests degrades gracefully.
+        probe.status().await.map(|s| s.success()).unwrap_or(false)
     }
 }

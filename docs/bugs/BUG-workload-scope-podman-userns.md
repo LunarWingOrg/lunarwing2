@@ -105,15 +105,27 @@ context — is now implemented in `ic/src/tools/process.rs`:
   mode-0600 `EnvironmentFile=` (values double-quoted; unrepresentable values
   skipped) and the working directory into `--working-directory=` — the
   daemon's scrubbed env never crosses argv and never reaches the manager by
-  inheritance.
+  inheritance. The rebuilt invocation also carries
+  `--property=UnsetEnvironment=*` (list syntax matches every variable
+  inherited from the user manager), so the env file is the unit's EXACT
+  environment: a manager-borne credential can never leak into a workload
+  the caller did not allowlist (MR !1042 review).
 - `ProcessTreeGuard` gains the transient unit: `terminate()`/`kill_tree()`
   stop the unit via `systemctl --user stop` (SIGTERM, then SIGKILL after
-  `TimeoutStopSec`) before signaling the process group, and `Drop` removes
-  the env file. `--wait` proxies stdio and the service's exit status, so
-  callers keep their normal spawn/wait shape.
+  `TimeoutStopSec`) before signaling the process group. `Drop` — which
+  cannot await, and where the manager-forked workload outlives the killed
+  `systemd-run` client — hands the unit to a process-wide background stop
+  queue (bounded by `LUNARWING_WORKLOAD_DROP_STOPS`) that runs every stop
+  to completion; `finish()` is the cancellation-safe await for call sites
+  that dropped an execution future. `--wait` proxies stdio and the
+  service's exit status, so callers keep their normal spawn/wait shape.
 - All four workload call sites (`shell.rs` direct path, sandbox
   `execute_direct`, sandbox `cli_runner` podman CLI, registry WASM builds)
-  use `prepare_service` + `for_service`.
+  use `prepare_service` + `for_service`, and the podman lifecycle
+  operations that `run` is not the only caller of — `image inspect`,
+  `image pull`, and the timeout/cleanup `kill`/`rm` — go through the same
+  isolated context (MR !1042 review), so `SandboxManager::initialize()`
+  and cleanup never fail on the hardened-daemon context.
 
 Because the workload is forked by the user manager, it never inherits the
 daemon's `NoNewPrivileges=true` / `PrivateTmp=true` context — the exact

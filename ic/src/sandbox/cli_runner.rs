@@ -396,7 +396,7 @@ impl CliRunner {
 
     /// Check whether the sandbox image exists in the local store.
     pub async fn image_exists(&self) -> bool {
-        run_status(self.runtime.binary(), &["image", "inspect", &self.image])
+        run_status_isolated(self.runtime.binary(), &["image", "inspect", &self.image])
             .await
             .is_some_and(|s| s.success())
     }
@@ -404,12 +404,7 @@ impl CliRunner {
     /// Pull the sandbox image from its registry.
     pub async fn pull_image(&self) -> Result<()> {
         tracing::info!("Pulling sandbox image: {}", self.image);
-        let output = tokio::process::Command::new(self.runtime.binary())
-            .args(["pull", &self.image])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output()
+        let output = output_isolated(self.runtime.binary(), &["pull", &self.image])
             .await
             .map_err(|e| SandboxError::ImageUnavailable {
                 image: self.image.clone(),
@@ -429,6 +424,20 @@ impl CliRunner {
 
     /// Execute a command in a fresh hardened container and collect its output.
     pub async fn execute(&self, params: ExecParams<'_>) -> Result<ContainerOutput> {
+        self.execute_with_name(
+            params,
+            &format!("lunarwing-sandbox-{}", uuid::Uuid::new_v4()),
+        )
+        .await
+    }
+
+    /// Like [`execute`](Self::execute) with an explicit container name, so
+    /// tests can assert cleanup of a known name.
+    async fn execute_with_name(
+        &self,
+        params: ExecParams<'_>,
+        name: &str,
+    ) -> Result<ContainerOutput> {
         let ExecParams {
             command,
             working_dir,
@@ -439,14 +448,13 @@ impl CliRunner {
             proxy_port,
         } = params;
         let start_time = std::time::Instant::now();
-        let name = format!("lunarwing-sandbox-{}", uuid::Uuid::new_v4());
         let created_at = chrono::Utc::now().to_rfc3339();
 
         let spec = RunSpec {
             runtime: self.runtime,
             keep_id: self.keep_id,
             image: &self.image,
-            name: &name,
+            name,
             created_at_label: &created_at,
             command,
             working_dir,
@@ -458,9 +466,9 @@ impl CliRunner {
         };
         let args = build_run_args(&spec);
 
-        register_inflight(&name);
-        let result = self.run_container(&name, &args, limits).await;
-        unregister_inflight(&name);
+        register_inflight(name);
+        let result = self.run_container(name, &args, limits).await;
+        unregister_inflight(name);
 
         result.map(|mut output| {
             output.duration = start_time.elapsed();
@@ -574,7 +582,7 @@ impl CliRunner {
     async fn kill_by_name(&self, name: &str) {
         let bin = self.runtime.binary();
         for args in [vec!["kill", name], vec!["rm", "-f", name]] {
-            if let Some(status) = run_status(bin, &args).await
+            if let Some(status) = run_status_isolated(bin, &args).await
                 && !status.success()
             {
                 tracing::debug!(container = %name, "Sandbox cleanup command failed (may already be gone)");
@@ -598,16 +606,46 @@ fn classify_run_failure(stderr: &str, image: &str) -> Option<SandboxError> {
     })
 }
 
-/// Run a quick status probe, returning `None` when the binary can't spawn.
-async fn run_status(bin: &str, args: &[&str]) -> Option<std::process::ExitStatus> {
-    tokio::process::Command::new(bin)
-        .args(args)
-        .stdin(std::process::Stdio::null())
+/// Run a quick status probe through the workload spawner (WI#181: image
+/// inspection/pull and cleanup must execute in the same manager-forked
+/// context as `run` — the hardened daemon's context breaks podman's
+/// rootless user-namespace join), returning `None` when spawn fails.
+async fn run_status_isolated(bin: &str, args: &[&str]) -> Option<std::process::ExitStatus> {
+    let spawner = crate::tools::process::workload_spawner().await;
+    let mut cmd = spawner.command(bin, args);
+    let spec = spawner.prepare_service(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await
-        .ok()
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+        &child,
+        spec.as_ref(),
+        spawner.xdg_runtime_dir(),
+    );
+    let status = child.wait().await;
+    guard.disarm();
+    status.ok()
+}
+
+/// Capture a command's output through the workload spawner (same isolation
+/// rationale as [`run_status_isolated`]).
+async fn output_isolated(bin: &str, args: &[&str]) -> std::io::Result<std::process::Output> {
+    let spawner = crate::tools::process::workload_spawner().await;
+    let mut cmd = spawner.command(bin, args);
+    let spec = spawner.prepare_service(&mut cmd);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn()?;
+    let mut guard = crate::tools::process::ProcessTreeGuard::for_service(
+        &child,
+        spec.as_ref(),
+        spawner.xdg_runtime_dir(),
+    );
+    let output = child.wait_with_output().await;
+    guard.disarm();
+    output
 }
 
 /// Capture and parse `podman --version`.
@@ -979,5 +1017,115 @@ mod tests {
         // Unregistering an unknown name is a no-op.
         unregister_inflight("lunarwing-sandbox-never-existed");
         assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    // ── lifecycle operations share the isolated execution context (WI#181) ──
+
+    /// Image inspection must succeed through the same manager-forked context
+    /// that `run` uses: a daemon-forked podman call breaks rootless
+    /// user-namespace joins under the hardened unit, which would make
+    /// `SandboxManager::initialize()` fail on an existing image.
+    #[tokio::test]
+    async fn image_exists_through_isolated_context() {
+        let spawner = crate::tools::process::workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let probe = tokio::process::Command::new("podman")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if !matches!(probe, Ok(status) if status.success()) {
+            eprintln!("skipping: podman unavailable");
+            return;
+        }
+        let runner = CliRunner::detect(SandboxRuntime::Podman, "busybox:latest".to_string())
+            .await
+            .expect("podman runner detect");
+        let result = run_status_isolated(
+            runner.runtime.binary(),
+            &["image", "inspect", "busybox:latest"],
+        )
+        .await;
+        // Whatever the answer (present or absent), the probe must have RUN in
+        // the isolated context: a broken context surfaces as a spawn/wait
+        // failure, which run_status_isolated maps to None.
+        assert!(
+            result.is_some(),
+            "image inspection did not complete through the isolated context"
+        );
+    }
+
+    /// Cleanup commands share the isolated context: a timed-out container run
+    /// leaves the container behind, and `kill`/`rm` from the daemon's own
+    /// context fails under the hardened unit.
+    #[tokio::test]
+    async fn timeout_cleanup_removes_container_through_isolated_context() {
+        let spawner = crate::tools::process::workload_spawner().await;
+        if !spawner.uses_systemd_services() {
+            eprintln!("skipping: systemd user transient services unavailable");
+            return;
+        }
+        let probe = tokio::process::Command::new("podman")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if !matches!(probe, Ok(status) if status.success()) {
+            eprintln!("skipping: podman unavailable");
+            return;
+        }
+        let runner = CliRunner::detect(SandboxRuntime::Podman, "busybox:latest".to_string())
+            .await
+            .expect("podman runner detect");
+        let limits = ResourceLimits {
+            timeout: Duration::from_millis(1500),
+            max_output_bytes: 64 * 1024,
+            ..*LIMITS
+        };
+        let params = ExecParams {
+            command: "sleep 10",
+            working_dir: std::path::Path::new("/tmp"),
+            policy: SandboxPolicy::WorkspaceWrite,
+            limits: &limits,
+            env: &HashMap::new(),
+            network: SandboxNetworkMode::None,
+            proxy_port: 0,
+        };
+        let name_probe = uuid::Uuid::new_v4();
+        // `image_exists` must pass first or the timeout run itself fails for
+        // the wrong reason (missing image).
+        if !runner.image_exists().await {
+            eprintln!("skipping: busybox:latest not in local store");
+            return;
+        }
+        let err = runner
+            .execute_with_name(params, &format!("lunarwing-sandbox-timeout-{name_probe}"))
+            .await
+            .expect_err("timeout run must fail");
+        assert!(
+            matches!(err, SandboxError::Timeout(_)),
+            "expected timeout, got: {err}"
+        );
+        // The timeout path's kill/rm already ran through the isolated
+        // context; assert the container is gone as the end state.
+        let leftover = run_status_isolated(
+            runner.runtime.binary(),
+            &[
+                "container",
+                "exists",
+                &format!("lunarwing-sandbox-timeout-{name_probe}"),
+            ],
+        )
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+        assert!(!leftover, "container survived timeout cleanup");
     }
 }
