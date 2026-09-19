@@ -1856,10 +1856,11 @@ impl Store for HybridStore {
         let _guard = self.doc_write_lock.lock().await;
         let docs = self.list_memory_docs(project_id, user_id).await?;
         let mut deleted = 0;
-        for doc in docs
-            .into_iter()
-            .filter(lunarwing_engine::memory::insights::is_insight)
-        {
+        // Only host-minted records are purged. The broad title/tag predicate
+        // is deliberately not used here: `purge_insights` is model-invocable,
+        // and a user-authored doc titled `insight:` or tagged `insight` must
+        // not be destroyed by it (MR !1043 finding 1).
+        for doc in docs.into_iter().filter(|doc| doc.insight.is_some()) {
             let path = self
                 .doc_paths
                 .read()
@@ -3537,17 +3538,35 @@ title: \"old doc\"\n\
             "a revoked run must not save insights"
         );
 
-        // Purge removes only insight docs in this project/user scope.
+        // Purge removes only host-minted insight records in this scope. A
+        // user-authored doc that merely looks like an insight — `insight:`
+        // title or `insight` tag, no host record — must survive the
+        // model-invocable purge (MR !1043 finding 1).
         let unrelated = MemoryDoc::new(pid, user, DocType::Lesson, "plain lesson", "keep me");
-        store.save_memory_doc(&unrelated).await.unwrap();
+        let mut user_titled = MemoryDoc::new(
+            pid,
+            user,
+            DocType::Lesson,
+            "insight:workflow:review",
+            "USER_AUTHORED_INSIGHT_TEXT",
+        )
+        .with_tags(vec!["insight".into()]);
+        user_titled.metadata = serde_json::json!({"source": "user"});
+        for doc in [&unrelated, &user_titled] {
+            store.save_memory_doc(doc).await.unwrap();
+        }
         let purged = store.purge_conversation_insights(pid, user).await.unwrap();
         assert_eq!(
             purged, 5,
-            "only the five host-minted insight docs must be purged"
+            "only the five host-minted insight records must be purged"
         );
         let remaining = store.list_memory_docs(pid, user).await.unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, unrelated.id);
+        assert_eq!(remaining.len(), 2, "{remaining:?}");
+        assert!(remaining.iter().any(|d| d.id == unrelated.id));
+        assert!(
+            remaining.iter().any(|d| d.id == user_titled.id),
+            "a user-authored insight-shaped doc must not be destroyed by purge"
+        );
     }
 
     #[cfg(feature = "libsql")]

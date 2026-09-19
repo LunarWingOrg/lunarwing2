@@ -579,9 +579,11 @@ lag still produce runs.
   (message/thread/conversation identity + timestamp). Generated goals, steer
   notes, system injections, research/mission threads, failed threads, other
   users' or projects' threads, legacy pre-upgrade threads, and truncated
-  statements are never sources. The host selects the batch from persisted
-  threads under the mission fire lock; caller-supplied payload content is
-  ignored.
+  statements are never sources; a single oversized statement (over the
+  per-statement or per-thread bound) disqualifies its entire conversation —
+  fail-closed, so partial evidence is never extracted. The host selects the
+  batch from persisted threads under the mission fire lock; caller-supplied
+  payload content is ignored.
 - **Context**: the current source batch and relevant non-maintenance knowledge.
   Existing generated `current_focus` and `approach_history` are excluded from
   the next extraction prompt, including legacy history. FINAL reports are
@@ -607,9 +609,12 @@ lag still produce runs.
   (`deleted_at`), bumps `insight_generation` so stale writers fail the gate,
   stops in-flight runs, and survives both startup reconciliation and
   same-name recreation. `mission_delete` with `purge_insights` removes only
-  the host-minted insight docs in that project/user scope. An explicit
-  `mission_resume` re-enables extraction from the resume cursor forward;
-  nothing older re-fires.
+  host-minted insight records in that project/user scope — user- or
+  model-authored docs that merely carry an `insight:` title or `insight` tag
+  survive it. An explicit `mission_resume` re-enables extraction from the
+  resume point forward (skip-until-resume): statements made while the mission
+  was paused or tombstoned are never learned, so no disabled-window backlog
+  fires on re-enable.
 
 ### Expected Behavior (`expected-behavior`)
 

@@ -705,6 +705,11 @@ impl MissionManager {
         mission.status = MissionStatus::Active;
         mission.updated_at = Utc::now();
         if is_conversation_insights_mission(&mission) {
+            // Skip-until-resume: statements made while the mission was paused
+            // or tombstoned are never learned. The cursor advances to the
+            // resume point so no disabled-window backlog fires on re-enable —
+            // the opted-out window is not replayed, and a paused experiment
+            // window cannot contaminate a later measurement.
             mission.deleted_at = None;
             mission.insight_cursor = Some(crate::types::insight::InsightCursor {
                 completed_at: Utc::now(),
@@ -3824,7 +3829,28 @@ mod tests {
             "same-name recreation dedupes onto the tombstone"
         );
 
-        // Explicit resume re-enables from the deletion-time cursor forward.
+        // Five conversations complete while the mission is disabled — a full
+        // batch's worth. Skip-until-resume is the discriminator: after resume,
+        // these must not fire (a deletion-time-cursor semantic would fire them).
+        for index in 0..5 {
+            let mut source = Thread::new(
+                format!("disabled-window conversation {index}"),
+                ThreadType::Foreground,
+                pid,
+                "test-user",
+                ThreadConfig::default(),
+            );
+            source.state = ThreadState::Done;
+            source.completed_at =
+                Some(chrono::Utc::now() + chrono::Duration::seconds(index as i64));
+            source.add_message(crate::types::message::ThreadMessage::user(format!(
+                "DISABLED_WINDOW_STATEMENT_{index}"
+            )));
+            store.save_thread(&source).await.unwrap();
+        }
+
+        // Explicit resume re-enables with skip-until-resume semantics: the
+        // disabled window (and everything before it) stays behind the cursor.
         mgr.resume_mission(id, "test-user").await.unwrap();
         let resumed = store.load_mission(id).await.unwrap().unwrap();
         assert!(resumed.deleted_at.is_none());
@@ -3834,7 +3860,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "no sources newer than the resume cursor: nothing re-fires"
+            "skip-until-resume: conversations completed while disabled must not re-fire"
         );
         mgr.shutdown().await;
     }
