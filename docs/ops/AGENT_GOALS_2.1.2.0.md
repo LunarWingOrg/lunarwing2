@@ -133,7 +133,7 @@
 ## Phase 6 - Documentation
 38. [x] take a look at any documentation that should be updated and update necessary documentation
     - DONE 2026-09-14 (`rarity/kimi-15-20260914-1801`): documentation sweep for 2.1.2.0. Added the missing v2.1.1.0 (Zanshin) row to `docs/releases/README.md` and updated `docs/README.md` so the release index points at v2.1.1.0 as latest (was stale at v2.1.0.0). Updated `docs/ops/WORKER-CONTAINERS.md` Kimi Code pin from 0.41.0 to 0.42.0 to match the item #1 worker bump. Verified no other maintained doc needed changes: architecture/ was handled by item #20, guides/ is item #19, release notes are item #21, and the remaining `0.41.0`/`2.1.1` references live in immutable release notes or correct historical records (PEBBLE-WORKER.md WI#128 note correctly says v2.1.1.0)
-39. [x] (S) Reserved for human to evaluate his progress on his own tasks AND to continue dedicated testing sessions and other related tasks
+39. [x] (S) Reserved
 40. [x] update opencode2 external worker to 2.0.5
 41. [x] review open work items
     - Live tracker query 2026-09-14 00:03 UTC: 14 open issues (#97, #109, #113, #114, #121, #122, #126, #127, #130, #131, #132, #135, #136, #137). Since the v2.1.1.0 audit, #86/#133/#134 closed and #135/#136/#137 opened.
@@ -148,7 +148,7 @@
     - DONE 2026-09-19 (`rarity/kimi-45-20260919-0601`): documentation repass after the goal-38 sweep. Found and fixed real gaps: `docs/ops/MULTITENANCY-PRODUCTION.md` port-blocks section still described only primary/extended/kimi ranges — added the v15 LunarVoice block (40000-49999), the v17 OpenCode 2 block (51000-51999), and the host-global health_metrics slot, and extended the collision-probe note. `docs/ops/TENANT-CONFIGURATION.md` said the registry schema was v14 — corrected to v17 (voice v15, health_metrics v16, opencode2 v17) with the new block tables, and added the opencode2 worker to the lifecycle command list and systemd/OpenRC unit lists. `docs/guides/ENABLING_DEV_TOOLS.md` re-stamped for the goal-31 approval fixes (252352d8b) that landed after its 09-17 revalidation. Fixed a code gap the repass exposed: `ic/scripts/mt-admin-lib/03-ports-registry.sh` allocated opencode2 ports but the collision probe, doctor duplicate check, and `ports list` all omitted the opencode2 map (jq smoke-tested, `check-mt-admin.sh` shellcheck clean). Verified current: ENGINE-V2.md updated in the same commit as its code (de23847d6); WORKER-CONTAINERS.md matches all pins (kimi 0.43.0, opencode v1.18.25@cb7d8b2f, opencode2 v2.0.5@79169fe, pebble v0.5.0@2d0f3786); docs/README.md guide index is complete; item-24/25 changes are not in this branch and their docs live on their own branches.
 46. [ ] a repass of goal 41 since more changes have been made since especially with external worker stuff - IMPORTANT TO GO OVER ALL AND CHECK COMMENTS TOO FOR EACH
 47. [ ] a repass of goal 42 since more changes have been made since especially with external worker stuff
-48. [x] test oc2 its gppd
+48. [x] test oc2
 49. [ ] a repass of goal 43 since more changes have been made since especially with external worker stuff
 50. [x] (S) RESERVED
 
