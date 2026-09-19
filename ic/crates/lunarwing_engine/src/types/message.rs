@@ -66,6 +66,14 @@ pub struct ThreadMessage {
 }
 
 impl ThreadMessage {
+    /// A programmatic goal may need the User role for inference, but is not
+    /// evidence of a human statement.
+    pub fn generated_goal(content: impl Into<String>) -> Self {
+        let mut message = Self::user(content);
+        message.provenance = Provenance::LlmGenerated;
+        message
+    }
+
     /// Create a system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {

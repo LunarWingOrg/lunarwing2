@@ -288,7 +288,7 @@ The port registry lives at `/etc/lunarwing/ports.json` (root-owned, world-readab
 
 ### Port blocks
 
-Each tenant gets a contiguous block of 10 ports from the range `10000-19999`, supporting up to 1000 tenants, plus a mirrored **extended block** of 10 ports in the range `20000-29999` (`extended_base = base_port + 10000`) and a two-port Kimi block in `30000-39999` (`kimi_base = base_port + 20000`).
+Each tenant gets a contiguous block of 10 ports from the range `10000-19999`, supporting up to 1000 tenants, plus a mirrored **extended block** of 10 ports in the range `20000-29999` (`extended_base = base_port + 10000`), a two-port Kimi block in `30000-39999` (`kimi_base = base_port + 20000`), a two-port LunarVoice block in `40000-49999` (`voice_base = base_port + 30000`), and a two-port OpenCode 2 block in `51000-51999` (`opencode2_base = base_port + 41000`). The host-global `health_metrics` slot lives at `50000`.
 
 Primary block (10000-19999):
 
@@ -327,6 +327,22 @@ Kimi block (30000-39999):
 | kbase+0 | kimi_wss | Kimi Code worker WebSocket |
 | kbase+1 | kimi_health | Kimi Code worker `/health` (host self-heal) |
 
+LunarVoice block (40000-49999):
+
+| Offset | Service | Description |
+|--------|---------|-------------|
+| vbase+0 | voice_service | LunarVoice STT sidecar API |
+| vbase+1 | voice_health | LunarVoice sidecar `/health` (host self-heal) |
+
+OpenCode 2 block (51000-51999):
+
+| Offset | Service | Description |
+|--------|---------|-------------|
+| obase+0 | opencode2_wss | OpenCode 2 worker WebSocket |
+| obase+1 | opencode2_health | OpenCode 2 worker `/health` (host self-heal) |
+
+The host-global `health_metrics` slot (50000) is not per-tenant.
+
 ### Example allocation
 
 | Tenant | Base | Gateway | HTTP | Bridge | PG | Proxy | Orchestrator | Legacy reserved | Pebble | Kimi WSS |
@@ -336,7 +352,7 @@ Kimi block (30000-39999):
 
 ### Port collision warnings
 
-The registry only tracks what mt-admin itself allocated, so a freshly allocated block can still collide with a listener mt-admin does not know about — a stale container from a removed tenant, a dev server, or any hand-started process bound to `127.0.0.1`. Since v2.0.9.0, `add-tenant` probes every freshly assigned port (primary, extended, Kimi, and Voice blocks) after allocation and prints a non-fatal `WARNING: port collision ...` naming the affected `slot=port` pairs. Heed it: the tenant's units will otherwise fail later with `EADDRINUSE`.
+The registry only tracks what mt-admin itself allocated, so a freshly allocated block can still collide with a listener mt-admin does not know about — a stale container from a removed tenant, a dev server, or any hand-started process bound to `127.0.0.1`. Since v2.0.9.0, `add-tenant` probes every freshly assigned port (primary, extended, Kimi, Voice, and OpenCode 2 blocks) after allocation and prints a non-fatal `WARNING: port collision ...` naming the affected `slot=port` pairs. Heed it: the tenant's units will otherwise fail later with `EADDRINUSE`.
 
 Independently, `doctor` fails the `no duplicate ports in registry` check when any port number is assigned to more than one slot across the registry (including the host-global `health_metrics` slot), which catches hand-edited or badly migrated registries. The duplicate list is also available directly:
 

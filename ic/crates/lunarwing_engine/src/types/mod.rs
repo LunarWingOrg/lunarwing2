@@ -9,6 +9,7 @@ pub mod capability;
 pub mod conversation;
 pub mod error;
 pub mod event;
+pub mod insight;
 pub mod memory;
 pub mod message;
 pub mod mission;

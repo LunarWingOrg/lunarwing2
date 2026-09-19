@@ -255,7 +255,7 @@ impl ThreadManager {
         preferred_thread_id: Option<ThreadId>,
         initial_state: Option<serde_json::Value>,
     ) -> Result<ThreadId, EngineError> {
-        let current_message = ThreadMessage::user(goal.into());
+        let current_message = ThreadMessage::generated_goal(goal.into());
         self.spawn_thread_with_history_and_message(
             current_message,
             thread_type,
@@ -308,6 +308,13 @@ impl ThreadManager {
         );
         if let Some(pid) = parent_id {
             thread = thread.with_parent(pid);
+            if let Some(parent) = self.store.load_thread(pid).await?
+                && parent.project_id == thread.project_id
+                && parent.is_owned_by(&thread.user_id)
+                && parent.config.mission_context.is_conversation_insights()
+            {
+                thread.config.mission_context = parent.config.mission_context;
+            }
         }
         // Adopt a caller-supplied thread id (e.g. the gateway UI's thread_id) so
         // downstream event/SSE routing lands on the thread the client is already
@@ -995,8 +1002,9 @@ impl ThreadManager {
     pub async fn inject_message_system(
         &self,
         thread_id: ThreadId,
-        message: ThreadMessage,
+        mut message: ThreadMessage,
     ) -> Result<(), EngineError> {
+        message.provenance = crate::types::provenance::Provenance::System;
         self.send_injected_message(thread_id, message).await
     }
 

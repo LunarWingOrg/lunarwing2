@@ -96,8 +96,8 @@ const MAX_PROMPT_OVERLAY_CHARS: usize = 4000;
 /// - Use FINAL(answer) to return the final answer
 /// - Access thread context via the `context` variable
 ///
-/// If a Store is provided, checks for a runtime prompt overlay (a MemoryDoc
-/// with tag "prompt_overlay" and title "prompt:codeact_preamble") and appends
+/// If self-modification is allowed and a Store is provided, checks for a runtime
+/// prompt overlay (tag "prompt_overlay", title "prompt:codeact_preamble") and appends
 /// its content after the compiled preamble. This enables the self-improvement
 /// mission to evolve the system prompt at runtime.
 pub async fn build_codeact_system_prompt(
@@ -105,9 +105,14 @@ pub async fn build_codeact_system_prompt(
     store: Option<&Arc<dyn Store>>,
     project_id: ProjectId,
     platform: Option<&PlatformInfo>,
+    allow_self_modify: bool,
 ) -> String {
-    let overlay = if let Some(store) = store {
-        load_prompt_overlay(store, project_id).await
+    let overlay = if let Some(store) = store.filter(|_| allow_self_modify) {
+        let docs = store
+            .list_shared_memory_docs(project_id)
+            .await
+            .unwrap_or_default();
+        extract_prompt_overlay(&docs, allow_self_modify)
     } else {
         None
     };
@@ -123,8 +128,9 @@ pub fn build_codeact_system_prompt_with_docs(
     actions: &[ActionDef],
     system_docs: &[crate::types::memory::MemoryDoc],
     platform: Option<&PlatformInfo>,
+    allow_self_modify: bool,
 ) -> String {
-    let overlay = extract_prompt_overlay(system_docs);
+    let overlay = extract_prompt_overlay(system_docs, allow_self_modify);
     build_codeact_system_prompt_inner(actions, overlay.as_deref(), platform)
 }
 
@@ -171,14 +177,15 @@ fn build_codeact_system_prompt_inner(
     lunarwing_safety::neutralize_role_token_openers(&prompt)
 }
 
-/// Load the prompt overlay from the Store, if one exists for this project.
-async fn load_prompt_overlay(store: &Arc<dyn Store>, project_id: ProjectId) -> Option<String> {
-    let docs = store.list_shared_memory_docs(project_id).await.ok()?;
-    extract_prompt_overlay(&docs)
-}
-
 /// Extract the prompt overlay from a pre-fetched list of system memory docs.
-pub fn extract_prompt_overlay(docs: &[crate::types::memory::MemoryDoc]) -> Option<String> {
+/// Persisted overlays are inert while self-modification is disabled.
+pub fn extract_prompt_overlay(
+    docs: &[crate::types::memory::MemoryDoc],
+    allow_self_modify: bool,
+) -> Option<String> {
+    if !allow_self_modify {
+        return None;
+    }
     let overlay = docs.iter().find(|d| {
         d.title == PREAMBLE_OVERLAY_TITLE && d.tags.contains(&PROMPT_OVERLAY_TAG.to_string())
     })?;
@@ -203,7 +210,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_without_store_uses_compiled_preamble() {
         let prompt =
-            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None).await;
+            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None, false).await;
         assert!(prompt.contains("Python REPL environment"));
         assert!(prompt.contains("Strategy"));
         assert!(prompt.contains("Only `FINAL(answer)` becomes the durable user response"));
@@ -223,14 +230,20 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
-        let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None)
-                .await;
+        let prompt = build_codeact_system_prompt(
+            &[],
+            Some(&(store as Arc<dyn Store>)),
+            project_id,
+            None,
+            true,
+        )
+        .await;
         assert!(prompt.contains("Learned Rules"));
         assert!(prompt.contains("Never call web_fetch"));
     }
@@ -282,17 +295,49 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
-        let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None)
-                .await;
+        let prompt = build_codeact_system_prompt(
+            &[],
+            Some(&(store as Arc<dyn Store>)),
+            project_id,
+            None,
+            true,
+        )
+        .await;
 
         let snowman_count = prompt.chars().filter(|c| *c == '\u{2603}').count();
         assert_eq!(snowman_count, MAX_PROMPT_OVERLAY_CHARS);
+    }
+
+    #[tokio::test]
+    async fn persisted_overlay_requires_opt_in_in_both_prompt_builders() {
+        let project_id = ProjectId::new();
+        let mut overlay = MemoryDoc::new(
+            project_id,
+            shared_owner_id(),
+            DocType::Note,
+            PREAMBLE_OVERLAY_TITLE,
+            "PERSISTED_OVERLAY_CANARY",
+        )
+        .with_tags(vec![PROMPT_OVERLAY_TAG.into()]);
+        overlay.metadata = serde_json::json!({"source": "compiled_in"});
+        let docs = vec![overlay];
+        let store: Arc<dyn Store> = Arc::new(crate::tests::InMemoryStore::with_docs(docs.clone()));
+        for allowed in [false, true] {
+            for prompt in [
+                build_codeact_system_prompt(&[], Some(&store), project_id, None, allowed).await,
+                build_codeact_system_prompt_with_docs(&[], &docs, None, allowed),
+            ] {
+                assert_eq!(prompt.contains("PERSISTED_OVERLAY_CANARY"), allowed);
+                assert_eq!(prompt.contains("Learned Rules"), allowed);
+                assert!(prompt.contains("Python REPL environment"));
+            }
+        }
     }
 
     #[tokio::test]
@@ -309,14 +354,20 @@ mod tests {
             source_thread_id: None,
             tags: vec![PROMPT_OVERLAY_TAG.into()],
             metadata: serde_json::json!({}),
+            insight: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
 
         let store = Arc::new(crate::tests::InMemoryStore::with_docs(vec![overlay]));
-        let prompt =
-            build_codeact_system_prompt(&[], Some(&(store as Arc<dyn Store>)), project_id, None)
-                .await;
+        let prompt = build_codeact_system_prompt(
+            &[],
+            Some(&(store as Arc<dyn Store>)),
+            project_id,
+            None,
+            true,
+        )
+        .await;
         assert!(!prompt.contains("Should not appear"));
         assert!(!prompt.contains("Learned Rules"));
     }
@@ -332,8 +383,14 @@ mod tests {
             owner_id: Some("alice.near".into()),
             repo_url: Some("https://git.lunarwing.org/lunarwing/lunarwing2".into()),
         };
-        let prompt =
-            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), Some(&info)).await;
+        let prompt = build_codeact_system_prompt(
+            &[],
+            None,
+            ProjectId(uuid::Uuid::nil()),
+            Some(&info),
+            false,
+        )
+        .await;
         assert!(prompt.contains("LunarWing"));
         assert!(prompt.contains("1.2.3"));
         assert!(prompt.contains("lunarwing_cloud"));
@@ -347,7 +404,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_without_platform_info_has_no_platform_section() {
         let prompt =
-            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None).await;
+            build_codeact_system_prompt(&[], None, ProjectId(uuid::Uuid::nil()), None, false).await;
         assert!(!prompt.contains("## Platform"));
     }
 }
