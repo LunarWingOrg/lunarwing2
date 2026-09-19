@@ -129,6 +129,54 @@ oB15="$(run_dry "$b15" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=
 assert_contains "$oB15" "ESCALATING: lunarwing-voice-acme.service (monitor_only" "B15: systemd voice unit escalates monitor-only"
 assert_absent "$oB15" "systemctl --user restart lunarwing-voice-acme.service" "B15: systemd voice unit never restarted"
 
+# B16-B19 — monitor-only diagnostic components (MR !1041 review finding 2):
+# runtime/knowledge failures must escalate with tenant attribution through the
+# monitor-only path (never a restart, never a SERVICE_MAP lookup), even under
+# the standard MT configuration that disables logical remediation.
+b16="$(sb)"; report "$b16" '{components:[{component:"runtime",status:"critical",metrics:{instances:[
+  {tenant:"acme",status:"critical"},
+  {tenant:"beta",status:"healthy"}]}}]}'
+oB16="$(run_dry "$b16" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB16" "ESCALATING: runtime@acme (monitor_only" "B16: runtime failure escalates with tenant attribution"
+assert_absent   "$oB16" "restart"                                     "B16: diagnostics never restart anything"
+assert_absent   "$oB16" "no service mapping for component 'runtime'"  "B16: no service-mapping warning for diagnostics"
+
+b17="$(sb)"; report "$b17" '{components:[{component:"runtime",status:"critical",metrics:{instances:[
+  {tenant:"acme",status:"critical"}]}}]}'
+oB17="$(run_dry "$b17" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_REMEDY_LOGICAL=false)"
+assert_contains "$oB17" "ESCALATING: runtime@acme (monitor_only" "B17: MT logical disable retains runtime escalation"
+
+b18="$(sb)"; report "$b18" '{components:[{component:"knowledge",status:"critical",metrics:{instances:[
+  {tenant:"acme",status:"critical"}]}}]}'
+oB18="$(run_dry "$b18" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB18" "ESCALATING: knowledge@acme (monitor_only" "B18: knowledge failure escalates with tenant attribution"
+
+# B18b — component-level failure with no failing instance (invalid registry,
+# incomplete sweep, unknown outcome): the component itself is attributed so
+# the monitoring gap still escalates; unprobed instances never page per-tenant.
+b18b="$(sb)"; report "$b18b" '{components:[{component:"runtime",status:"degraded",metrics:{instances:[
+  {tenant:"acme",status:"unprobed"},
+  {tenant:"beta",status:"unprobed"}]}}]}'
+oB18b="$(run_dry "$b18b" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB18b" "ESCALATING: runtime (monitor_only"       "B18b: component-level coverage gap escalates"
+assert_absent   "$oB18b" "ESCALATING: runtime@acme"                 "B18b: unprobed instances do not page per-tenant"
+assert_absent   "$oB18b" "ESCALATING: runtime@beta"                 "B18b: unprobed instances do not page per-tenant (beta)"
+
+# B19 — a healthy runtime report clears synthetic diagnostic state
+# (report-as-truth recovery for the tenant-attributed identity).
+b19="$(sb)"; report "$b19" '{components:[{component:"runtime",status:"healthy",metrics:{instances:[
+  {tenant:"acme",status:"healthy"}]}}]}'
+seed_state "$b19" '{"runtime@acme":{retries:1,consecutive_unhealthy:2}}'
+oB19="$(run_raw "$b19" LUNARWING_SERVICE_MANAGER=unknown SELF_HEAL_VERIFY_HEALTH=false -- --report "$b19/report.json" --backoff 0)"
+assert_contains "$oB19" "RECOVERED: cleared state for runtime@acme" "B19: healthy instance clears tenant diagnostic state"
+assert_eq "$(state_of "$b19")" '{}' "B19: recovered diagnostic state cleared"
+
+# B20 — runtime/knowledge absent from the report at all: no synthetic targets,
+# nothing to do (a missing component is not a failure).
+b20="$(sb)"; report "$b20" '{components:[{component:"gateway",status:"healthy",metrics:{}}]}'
+oB20="$(run_dry "$b20" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1)"
+assert_contains "$oB20" "nothing to do" "B20: absent diagnostic components create no targets"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},

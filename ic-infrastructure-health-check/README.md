@@ -1,6 +1,6 @@
 # LunarWing Infrastructure Health Check System
 
-_Last updated: 2026-08-08 — LunarVoice readiness monitoring added._
+_Last updated: 2026-09-19 — MR !1041 review findings addressed (gateway legacy-telemetry verdict, runtime/knowledge monitor-only escalation, bounded sweep budget, scrape-time staleness alert, runtime classification, knowledge enablement)._
 
 Automated health monitoring and self-healing for LunarWing infrastructure.
 Twelve parallel component checks aggregate into a JSON report; a separate
@@ -109,7 +109,7 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 
 | Component | Script | Inspects | Key metrics |
 |-----------|--------|----------|-------------|
-| gateway | health-gateway.sh | `$BASE/agents` session files | `active_sessions`, `stale_locks` (>10 min), `orphan_transcripts` (`*.jsonl` >10 MB), `oversized_sessions` (>500 KB) |
+| gateway | health-gateway.sh | `$BASE/agents` legacy session files — **only when the directory exists**; an absent legacy directory reports healthy with a telemetry note (live gateway health belongs to the runtime component) | `active_sessions`, `stale_locks` (>10 min), `orphan_transcripts` (`*.jsonl` >10 MB), `oversized_sessions` (>500 KB), `legacy_sessions_dir` |
 | xmpp | health-xmpp.sh | TCP reachability of the XMPP server + latency | `connected`, `latency_ms`, `error_count`, `active_sessions` |
 | omemo | health-omemo.sh | OMEMO key/bundle/session store | `devices`, `bundles`, `sessions`, `recent_sessions` |
 | ratelimit | health-ratelimit.sh | `$BASE/ratelimit` throttle logs + queue | `throttled_last_hour`, `queue_depth` |
@@ -120,8 +120,8 @@ Every check writes a single JSON object to stdout (logs go to stderr) and exits
 | lunarvision | health-lunarvision.sh | OCR + VL sidecar `/health` and `/vision/metrics` | `service_status`, `ocr_available`, `vl_available`, `capabilities`, `latency_ms`, cache `hit_rate`, `rate_limited`, `avg_latency_ms` |
 | lunarvoice | health-lunarvoice.sh | Enabled LunarVoice `/health`, `/ready`, and `/metrics` endpoints | per-tenant `ready`, `latency_ms`, request counts, cache hits, errors |
 | netbird | health-netbird.sh | `netbird status --check startup` (opt-in) | `enabled`, `ready`, `probe_exit` |
-| runtime | health-runtime.sh | Per-tenant gateway `/api/gateway/status` + `/api/chat/pending-gates` and bridge `/v1/status` (ports-registry discovery, bearer tokens from tenant env files) | `gateway_reachable`, `gateway_uptime_secs`, `gateway_connections`, `channels_unhealthy`, `pending_gates` (metric only — approval/auth waits are not stalled execution), `bridge_running`, `bridge_queued_messages`, `bridge_outbound_last_hour`, `bridge_omemo_enabled`, `bridge_prekeys_available` |
-| knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` | `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — absent state reads healthy (sync disabled is not failure) |
+| runtime | health-runtime.sh | Per-tenant gateway `/api/gateway/status` + `/api/chat/pending-gates` and bridge `/v1/status` (ports-registry discovery, bearer tokens from tenant env files) | `gateway_reachable`, `gateway_uptime_secs`, `gateway_connections`, `channels_unhealthy` (unhealthy channels degrade the tenant), `pending_gates` (metric only — approval/auth waits are not stalled execution; an unobservable pending-gates endpoint degrades as an observability gap), `bridge_running`, `bridge_queued_messages`, `bridge_outbound_last_hour`, `bridge_omemo_enabled`, `bridge_prekeys_available` |
+| knowledge | health-knowledge.sh | Per-tenant `knowledge_sync_state.json` + `knowledge_sweep_state.json` **and the tenant's actual feature enablement** (`KNOWLEDGE_SYNC_ENABLED` default false, `KNOWLEDGE_SWEEP_ENABLED` default true, plus cadences, from the tenant env file) | `sync_enabled`, `sweep_enabled`, `sync_cadence_hours`, `sweep_cadence_hours`, `sync_consecutive_failures`, `sync_last_error_class`, `sync_deferred_notes`, `sync_last_success_age_seconds`, `sweep_last_run_age_seconds`; monitor-only — disabled features ignore their (possibly stale) state; enabled-but-never-observed degrades only past the startup grace period; overdue derives from the configured cadence |
 | systemd / openrc / launchd | health-{systemd,openrc,launchd}.sh | Service-manager unit state (incl. per-tenant) | `metrics.units` / `.services` / `.agents` |
 
 A check that cannot reach its target generally reports `critical`; several
@@ -189,12 +189,16 @@ workloads.
 | `HEALTH_GATEWAY_ORPHAN_DEGRADED` / `..._ORPHAN_CRITICAL` | health-gateway.sh | `10` / `50` | Orphan-transcript count thresholds |
 | `HEALTH_GATEWAY_OVERSIZED_DEGRADED` | health-gateway.sh | `0` | Oversized (>500 KB) session count before degraded |
 | `HEALTH_RUNTIME_ENABLED` | health-runtime.sh | `auto` | `false` disables; `auto` probes registry tenants or the single-node base env |
-| `HEALTH_RUNTIME_TIMEOUT` | health-runtime.sh | `5` | Per-request curl timeout for gateway/bridge endpoints |
+| `HEALTH_RUNTIME_TIMEOUT` | health-runtime.sh | `5` | Per-request curl timeout for gateway/bridge endpoints; each request is additionally capped by the remaining sweep budget so a slow tenant cannot push the sweep past the driver's outer timeout |
 | `HEALTH_RUNTIME_QUEUE_DEGRADED` / `..._QUEUE_CRITICAL` | health-runtime.sh | `10` / `50` | Bridge delivery backlog thresholds |
-| `HEALTH_RUNTIME_SWEEP_DEADLINE_SECS` | health-runtime.sh | `22` | Fleet sweep deadline; past it, remaining targets are marked unprobed and coverage loss degrades (0 disables) |
+| `HEALTH_RUNTIME_SWEEP_DEADLINE_SECS` | health-runtime.sh | `22` | Fleet sweep deadline; each probe request is budget-capped against it, past it remaining (and budget-exhausted) targets are marked unprobed and coverage loss degrades (0 disables) |
 | `HEALTH_KNOWLEDGE_ENABLED` | health-knowledge.sh | `auto` | `false` disables; `auto` probes registry tenants or the single-node base dir |
-| `HEALTH_KNOWLEDGE_SYNC_FAIL_DEGRADED` / `..._CRITICAL` | health-knowledge.sh | `1` / `5` | Consecutive knowledge-sync failure thresholds |
-| `HEALTH_KNOWLEDGE_SWEEP_OVERDUE_HOURS` | health-knowledge.sh | `72` | Sweep last-run age before degraded |
+| `HEALTH_KNOWLEDGE_SYNC_FAIL_DEGRADED` / `..._CRITICAL` | health-knowledge.sh | `1` / `5` | Consecutive knowledge-sync failure thresholds (enabled sync only) |
+| `HEALTH_KNOWLEDGE_SWEEP_OVERDUE_HOURS` | health-knowledge.sh | cadence × 3 (72h at the default 24h cadence) | Absolute sweep-overdue override; by default the budget derives from the tenant's `KNOWLEDGE_SWEEP_CADENCE_HOURS` × `HEALTH_KNOWLEDGE_SWEEP_OVERDUE_MULTIPLIER` |
+| `HEALTH_KNOWLEDGE_SWEEP_OVERDUE_MULTIPLIER` | health-knowledge.sh | `3` | Sweep-overdue budget as a multiple of the configured cadence |
+| `HEALTH_KNOWLEDGE_SYNC_OVERDUE_MULTIPLIER` | health-knowledge.sh | `3` | Enabled-sync "not attempting" budget as a multiple of `KNOWLEDGE_SYNC_CADENCE_HOURS` |
+| `HEALTH_KNOWLEDGE_STARTUP_GRACE_HOURS` | health-knowledge.sh | `24` | Grace window during which an enabled-but-never-observed feature stays healthy (env-file mtime proxies "enabled since"; `0` degrades immediately) |
+| `HEALTH_KNOWLEDGE_ENV_FILE` | health-knowledge.sh | tenant env file | Override the enablement/cadence source (defaults to `/home/<user>/lunarwing/env/lunarwing.env`, single-node `$BASE/.env`) |
 | `HEALTH_KNOWLEDGE_STATE_ROOT` | health-knowledge.sh | _(unset)_ | Test/override state directory instead of `/home/<user>/lunarwing/state` |
 | `HEALTH_XMPP_LATENCY_DEGRADED_MS` / `..._CRITICAL_MS` | health-xmpp.sh | `500` / `2000` | XMPP latency thresholds |
 | `HEALTH_XMPP_ERROR_DEGRADED` / `..._ERROR_CRITICAL` | health-xmpp.sh | `1` / `5` | XMPP error-count thresholds |
@@ -301,7 +305,7 @@ Exported series (`lunarwing_health_*`):
 | Family | Meaning |
 |--------|---------|
 | `overall_status`, `status{component}` | 0 healthy · 1 degraded · 2 critical · 3 unknown · 4 skipped |
-| `report_timestamp_seconds`, `report_age_seconds`, `alerts_total` | staleness guard — alert when the report itself stops. `report_age_seconds` is derived from the report timestamp at export time and re-derived at scrape time by the optional listener, so a stopped scheduler keeps advancing the age |
+| `report_timestamp_seconds`, `report_age_seconds`, `alerts_total` | staleness guard — alert when the report itself stops. `report_age_seconds` is a **frozen export-time snapshot** (the optional listener re-derives it at serve time); alert rules must derive age at evaluation time (`time() - report_timestamp_seconds`, as the shipped `LunarWingHealthReportStale` rule does) so a stopped exporter serving an unchanged textfile still trips the alert |
 | `component_enabled{component}` | disabled components export `0` and **no** status series (off ≠ failing) |
 | `check_duration_seconds{component}` | per-check wall time |
 | `<component>_<key>` | every numeric/boolean leaf of `metrics` flattened (booleans 0/1; strings dropped, so no secret material can leak); nested objects keep their path (`cache_hit_rate`) |
@@ -380,7 +384,18 @@ wedge it.
 | lunarvision | `ocr-sidecar` | health-lunarvision.sh |
 | lunarvoice | `voice-sidecar` (monitor-only) | health-lunarvoice.sh |
 | netbird | `netbird` (monitor-only unless explicitly delegated) | health-netbird.sh |
+| runtime | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `runtime@<tenant>`; escalates with tenant attribution, never restarts | health-runtime.sh |
+| knowledge | _(none — monitor-only diagnostic)_ per-tenant synthetic identity `knowledge@<tenant>`; escalates with tenant attribution, never restarts | health-knowledge.sh |
 | omemo, ratelimit, models | _(none — feature/external, never remediated)_ | — |
+
+`runtime`/`knowledge` failures become synthetic monitor-only targets: a failing
+tenant instance escalates as `runtime@<tenant>` / `knowledge@<tenant>` (bare
+`runtime` / `knowledge` when a component-level failure has no failing
+instance, e.g. an invalid registry or an incomplete sweep). These identities
+grace-track and page like any monitor-only component — including under the
+standard MT configuration (`SELF_HEAL_REMEDY_LOGICAL=false`) — and a healthy
+instance report clears their state through the report-as-truth path. Unprobed
+instances (coverage notes) never page per tenant.
 
 Logical mappings use configured base names. Init sub-units retain names reported
 by service-manager checks (including `.service`); per-tenant systemd units are
@@ -553,6 +568,12 @@ bash tests/test-health-lunarvoice.sh        # registry-aware voice readiness sce
 | `lunarvoice` | `test-health-lunarvoice.sh` | Exercises disabled mode, STT readiness, metrics, unreachable service, and enabled-only ports-registry discovery. |
 | `voice-init-templates` | `test-lunarvoice-init-templates.sh` | Validates the standalone LunarVoice systemd unit, Compose manifest, and executes the OpenRC lifecycle against mocks. |
 | `netbird` | `test-health-netbird.sh` | Exercises disabled, ready, unready, missing-binary, and timeout behavior against mock CLI. |
+| `llm-streams` | `test-health-llm-streams.sh` | Exercises the daemon-snapshot and MT-fleet llm_streams monitor. |
+| `metrics-exporter` | `test-health-metrics-exporter.sh` | Exercises exposition generation, thresholds, notify dedup, atomic writes, and the scrape-time staleness contract. |
+| `cron-wrapper` | `test-cron-wrapper.sh` | Exercises the scheduled launcher (PATH, sequencing). |
+| `runtime` | `test-health-runtime.sh` | Exercises `health-runtime.sh` (mock curl: discovery, reachability, backlog thresholds, channel health, pending-gates observability, budget-bounded sweeps). |
+| `knowledge` | `test-health-knowledge.sh` | Exercises `health-knowledge.sh` (enablement-aware sync/sweep classification, grace window, cadence-derived overdue budgets). |
+| `gateway` | `test-health-gateway.sh` | Exercises `health-gateway.sh` (absent legacy dir stays healthy; stale locks and oversized sessions still degrade). |
 | `watchdog-openrc` | `test-watchdog-openrc.sh` | Exercises the OpenRC service-level watchdog (start/verify, deep-check guards, bounded rc-service probes, lock contention) against a mock rc-service. |
 | — | `lib.sh` | Shared harness + the mock init system (sourced, not run directly). |
 

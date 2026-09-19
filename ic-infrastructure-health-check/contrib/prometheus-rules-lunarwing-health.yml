@@ -17,13 +17,18 @@ groups:
       # The exporter only writes when a report is produced. A stale report
       # means the health timer itself broke — the meta-alert that catches
       # "monitoring is down".
-      # Freshness is evaluated from the report's own timestamp against the
-      # alert evaluator's current time (WI#180 F5): `age_seconds` is derived
-      # from `report_timestamp_seconds`, so even a stopped exporter serving an
-      # unchanged textfile keeps advancing the age. A missing series means the
-      # collector never produced a report at all — alert on that too.
+      # Freshness is evaluated by the ALERT EVALUATOR at scrape time from the
+      # report's own timestamp (MR !1041 review finding 4): the exporter's
+      # lunarwing_health_report_age_seconds is a snapshot frozen at export
+      # time, so a stopped exporter serving an unchanged textfile would keep
+      # that gauge below the threshold forever and the stale-report alert
+      # could never fire on the default textfile collector path. Deriving the
+      # age here (time() - report_timestamp_seconds) keeps advancing on every
+      # scrape even when the exporter stops — matching the dashboard — and the
+      # optional Rust listener's serve-time rewrite. A missing series means
+      # the collector never produced a report at all — alert on that too.
       - alert: LunarWingHealthReportStale
-        expr: lunarwing_health_report_age_seconds > 2400
+        expr: (time() - lunarwing_health_report_timestamp_seconds) > 2400
         for: 5m
         labels:
           severity: critical

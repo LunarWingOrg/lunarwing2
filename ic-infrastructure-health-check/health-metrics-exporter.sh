@@ -159,10 +159,13 @@ def units($init):
 | (($rep.timestamp // "") | try fromdateiso8601 catch 0) as $ts
 | [ "lunarwing_health_overall_status " + (($rep.overall_status // "unknown") | status_code | tostring)
   , "lunarwing_health_report_timestamp_seconds " + ($ts | tostring)
-  # Freshness is evaluated from the report timestamp against the evaluator
-  # current time (WI#180 F5): if scheduling stops, the unchanged textfile
-  # keeps serving an age that advances with every scrape instead of a frozen
-  # export-time age that can never trip the stale-report rule.
+  # Freshness snapshot at export time. WARNING (MR !1041 review finding 4):
+  # this gauge is FROZEN once written — if scheduling stops, the textfile keeps
+  # serving the same age indefinitely, so alert rules must derive age at
+  # scrape time (time() - lunarwing_health_report_timestamp_seconds, as
+  # contrib/prometheus-rules-lunarwing-health.yml does) instead of comparing
+  # this static value. The optional Rust listener rewrites this series at
+  # serve time; the textfile path does not.
   , "lunarwing_health_report_age_seconds " + (($NOW | tonumber) - $ts | tostring)
   , "lunarwing_health_alerts_total " + (($rep.alerts // []) | length | tostring)
   ]

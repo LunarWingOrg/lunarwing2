@@ -72,10 +72,22 @@ if command -v systemd-analyze >/dev/null 2>&1; then
     while IFS= read -r line; do
         printf '%s\n' "${line//\/usr\/local\/bin\/lunarwing-ocr-sidecar/\/bin\/true}"
     done <"$SYSTEMD_DIRECT" >"$TMP/system/ocr-sidecar.service"
-    if systemd-analyze --user verify "$TMP/user/ocr-sidecar.service" >/dev/null 2>&1; then
-        ok "systemd user unit passes systemd-analyze"
+    # --user verification needs a live user manager (user bus). On hosts where
+    # systemd-analyze exists but no user manager is reachable (containers, CI
+    # runners, no-user-session environments), `--user verify` aborts with
+    # "Failed to initialize manager" before parsing anything — an
+    # environmental false-fail, not a template defect. Probe the user bus the
+    # same way mt-admin does and skip only when it is genuinely unavailable;
+    # the direct system-bus verification below still parses the same directive
+    # set on every host.
+    if systemctl --user show --property=Version >/dev/null 2>&1; then
+        if systemd-analyze --user verify "$TMP/user/ocr-sidecar.service" >/dev/null 2>&1; then
+            ok "systemd user unit passes systemd-analyze"
+        else
+            bad "systemd user unit passes systemd-analyze" "unit parser rejected template"
+        fi
     else
-        bad "systemd user unit passes systemd-analyze" "unit parser rejected template"
+        skip "systemd user unit parsed (no user manager on this host; system-bus verification still runs)"
     fi
     if systemd-analyze verify "$TMP/system/ocr-sidecar.service" >/dev/null 2>&1; then
         ok "direct systemd unit passes systemd-analyze"

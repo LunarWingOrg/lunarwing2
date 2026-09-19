@@ -17,9 +17,17 @@
 #   - gateway unreachable or not running          -> critical (daemon down)
 #   - bridge unreachable/not running when XMPP is configured -> degraded
 #   - bridge delivery backlog (queued messages)    -> degraded/critical
+#   - gateway channels reporting unhealthy         -> degraded (real failure)
 #   - pending gates (approval/auth waits)          -> metric only, never a
-#     failure: normal interactive waits are not stalled execution
+#     failure: normal interactive waits are not stalled execution; but a
+#     reachable gateway whose /api/chat/pending-gates endpoint cannot be
+#     observed is degraded (observability gap)
 #   - discovery unavailable on an MT host          -> degraded (monitoring gap)
+#
+# Bounded sweep: per-request curl timeouts are capped by the remaining sweep
+# budget (HEALTH_RUNTIME_SWEEP_DEADLINE_SECS), so slow or hanging endpoints
+# cannot push the sweep past the driver's outer timeout before the report is
+# emitted.
 #
 # Output: JSON to stdout; exit 0=healthy, 1=degraded, 2=critical.
 #
@@ -73,15 +81,37 @@ env_value() {  # <env-file> <key> -> value (empty when absent/unreadable)
   sed -n "s/^${key}=//p" "$file" 2>/dev/null | tail -1
 }
 
-# Bounded authenticated GET. <url> <token> -> body (empty on failure).
+# Bounded authenticated GET into the global HTTP_BODY. <url> <token>.
+#
+# MUST be called without command substitution: a $(...) subshell would
+# silently discard p_probe_exhausted, which is exactly how the "budget
+# exhausted mid-probe" signal used to get lost.
+#
+# Per-request timeout is capped by the REMAINING sweep budget (MR !1041 review
+# finding 3): a tenant whose endpoints hang must not be able to spend three
+# full HEALTH_RUNTIME_TIMEOUT waits and push the sweep past the driver's outer
+# timeout before any JSON is emitted. When the budget is exhausted mid-probe
+# the call is skipped and p_probe_exhausted is raised so the caller can mark
+# the instance unprobed instead of fabricating an "unreachable" verdict for a
+# request that was never allowed to complete.
 http_get() {
-  local url="$1" token="$2"
+  local url="$1" token="$2" t rem
+  HTTP_BODY=""
+  t="$TIMEOUT_SECS"
+  if [[ "$SWEEP_DEADLINE_SECS" =~ ^[0-9]+$ ]] && [[ "$SWEEP_DEADLINE_SECS" -gt 0 ]]; then
+    rem=$(( SWEEP_DEADLINE_SECS - SECONDS ))
+    if (( rem < 1 )); then
+      p_probe_exhausted=true
+      return 0
+    fi
+    (( t > rem )) && t=$rem
+  fi
   if [[ -n "$token" ]]; then
-    curl -s --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
-      -H "Authorization: Bearer $token" "$url" 2>/dev/null || true
+    HTTP_BODY="$(curl -s --connect-timeout "$t" --max-time "$t" \
+      -H "Authorization: Bearer $token" "$url" 2>/dev/null)" || true
   else
-    curl -s --connect-timeout "$TIMEOUT_SECS" --max-time "$TIMEOUT_SECS" \
-      "$url" 2>/dev/null || true
+    HTTP_BODY="$(curl -s --connect-timeout "$t" --max-time "$t" \
+      "$url" 2>/dev/null)" || true
   fi
 }
 
@@ -96,12 +126,14 @@ probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
   p_gw_channels_unhealthy=0; p_pending_gates=-1
   p_bridge_reachable=false; p_bridge_running=false; p_bridge_queued=-1
   p_bridge_outbound_hour=-1; p_bridge_omemo=false; p_bridge_prekeys=-1
+  p_probe_exhausted=false
   p_issues=()
 
   gw_token="$(env_value "$env_file" GATEWAY_AUTH_TOKEN)"
   bridge_token="$(env_value "$env_file" XMPP_BRIDGE_TOKEN)"
 
-  gw_body="$(http_get "http://127.0.0.1:${gw_port}/api/gateway/status" "$gw_token")"
+  http_get "http://127.0.0.1:${gw_port}/api/gateway/status" "$gw_token"
+  gw_body="$HTTP_BODY"
   if [[ -n "$gw_body" ]] && jq -e . >/dev/null 2>&1 <<<"$gw_body"; then
     p_gw_reachable=true
     p_gw_uptime="$(jq -r '.uptime_secs // 0' <<<"$gw_body" 2>/dev/null || echo 0)"
@@ -112,12 +144,14 @@ probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
   fi
 
   local gates_body
-  gates_body="$(http_get "http://127.0.0.1:${gw_port}/api/chat/pending-gates" "$gw_token")"
+  http_get "http://127.0.0.1:${gw_port}/api/chat/pending-gates" "$gw_token"
+  gates_body="$HTTP_BODY"
   if [[ -n "$gates_body" ]] && jq -e . >/dev/null 2>&1 <<<"$gates_body"; then
     p_pending_gates="$(jq -r '(.gates // []) | length' <<<"$gates_body" 2>/dev/null || echo 0)"
   fi
 
-  bridge_body="$(http_get "http://127.0.0.1:${bridge_port}/v1/status" "$bridge_token")"
+  http_get "http://127.0.0.1:${bridge_port}/v1/status" "$bridge_token"
+  bridge_body="$HTTP_BODY"
   if [[ -n "$bridge_body" ]] && jq -e . >/dev/null 2>&1 <<<"$bridge_body"; then
     p_bridge_reachable=true
     p_bridge_running="$(jq -r '.running // false' <<<"$bridge_body" 2>/dev/null || echo false)"
@@ -133,9 +167,13 @@ probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
   fi
 }
 
-# Fleet sweep deadline (WI#180 F4 contract): keep completed observations,
-# mark the rest unprobed, degrade for lost coverage. 0 disables.
+# Sweep deadline (WI#180 F4 contract): keep completed observations, mark the
+# rest unprobed, degrade for lost coverage. 0 disables. Per-request budgets
+# (see http_get) bound a single tenant's probe so the sweep lands inside this
+# deadline instead of racing the driver's outer timeout (MR !1041 review
+# finding 3).
 SWEEP_DEADLINE_SECS="${HEALTH_RUNTIME_SWEEP_DEADLINE_SECS:-22}"
+[[ "$SWEEP_DEADLINE_SECS" =~ ^[0-9]+$ ]] || SWEEP_DEADLINE_SECS=22
 sweep_incomplete=false
 unprobed_count=0
 
@@ -190,6 +228,18 @@ for target in "${targets[@]}"; do
   bridge_port="${rest%%|*}"; env_file="${rest#*|}"
   probe_one "$tenant" "$gw_port" "$bridge_port" "$env_file"
 
+  # Budget exhausted mid-probe: the instance is UNPROBED, not unhealthy — a
+  # skipped request must not fabricate an "unreachable" verdict (MR !1041
+  # review finding 3).
+  if [[ "$p_probe_exhausted" == "true" ]]; then
+    sweep_incomplete=true
+    unprobed_count=$((unprobed_count + 1))
+    instances="$(jq -c --arg tenant "$tenant" \
+      '. + [{tenant:$tenant,status:"unprobed",issues:["probe skipped: sweep deadline"]}]' \
+      <<<"$instances")"
+    continue
+  fi
+
   inst_status="healthy"; inst_exit=0
   if [[ "$p_gw_reachable" != "true" ]]; then
     inst_status="critical"; inst_exit=2
@@ -198,6 +248,19 @@ for target in "${targets[@]}"; do
   elif [[ "$p_bridge_queued" =~ ^[0-9]+$ ]] && [[ "$p_bridge_queued" -gt "$QUEUE_CRITICAL" ]]; then
     inst_status="critical"; inst_exit=2
     p_issues+=("xmpp bridge delivery backlog critical: ${p_bridge_queued} queued")
+  elif [[ "$p_gw_channels_unhealthy" =~ ^[0-9]+$ ]] && [[ "$p_gw_channels_unhealthy" -gt 0 ]]; then
+    # MR !1041 review finding 5: channels the gateway itself reports unhealthy
+    # must never produce a healthy verdict. A normal approval wait stays
+    # metric-only (pending_gates), but failed channel health is a real
+    # delivery failure.
+    inst_status="degraded"; inst_exit=1
+    p_issues+=("gateway channels unhealthy: ${p_gw_channels_unhealthy} channel(s) reporting unhealthy")
+  elif [[ "$p_pending_gates" == "-1" ]]; then
+    # The pending-gates endpoint is part of the current gateway contract; a
+    # reachable gateway that cannot answer it is an observability gap, not a
+    # normal approval wait (MR !1041 review finding 5).
+    inst_status="degraded"; inst_exit=1
+    p_issues+=("pending-gates diagnostics unavailable (gateway reachable at 127.0.0.1:${gw_port} but /api/chat/pending-gates did not answer)")
   elif [[ "$p_bridge_queued" =~ ^[0-9]+$ ]] && [[ "$p_bridge_queued" -gt "$QUEUE_DEGRADED" ]]; then
     inst_status="degraded"; inst_exit=1
     p_issues+=("xmpp bridge delivery backlog elevated: ${p_bridge_queued} queued")

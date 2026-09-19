@@ -369,4 +369,45 @@ run "$sb"
 assert_contains "$PROM" 'lunarwing_health_overall_status 2' "newest report used"
 assert_contains "$PROM" 'lunarwing_health_report_timestamp_seconds 1786788000' "timestamp from newest report"
 
+# ── 12. Stopped exporter: staleness must be derivable at scrape time ─────────
+# MR !1041 review finding 4: the exported report_age_seconds is a snapshot
+# frozen at export time. If scheduling stops, the textfile keeps serving the
+# same age forever, so the old alert (age_seconds > 2400) could never fire on
+# the default textfile path. The alert rule now derives the age from the
+# report timestamp at scrape time (time() - report_timestamp_seconds, as the
+# dashboard already does), which keeps advancing on every scrape.
+sb="$(mksb)"
+stale_ts=$(( $(date +%s) - 1800 ))                 # report produced 30m ago
+stale_iso="$(date -u -d "@$stale_ts" +%Y-%m-%dT%H:%M:%SZ)"
+mkreport "$sb" "$stale_iso.json" <<EOF
+{"timestamp":"$stale_iso","overall_status":"healthy","components":[],"alerts":[]}
+EOF
+run "$sb"
+frozen_age="$(grep -oE '^lunarwing_health_report_age_seconds [0-9]+' \
+    "$sb/reports/health/metrics.prom" | awk '{print $2}')"
+exported_ts="$(grep -oE '^lunarwing_health_report_timestamp_seconds [0-9]+' \
+    "$sb/reports/health/metrics.prom" | awk '{print $2}')"
+assert_eq "$exported_ts" "$stale_ts" "12a: report timestamp exported verbatim"
+if [[ "$frozen_age" =~ ^[0-9]+$ ]] && (( frozen_age < 2400 )); then
+    ok "12b: frozen age gauge ($frozen_age) sits below the 2400s threshold"
+else
+    bad "12b: frozen age gauge below threshold" "got age=$frozen_age"
+fi
+# Simulate the exporter having stopped 25 minutes ago: wall time advances to
+# ts+2400+60 while the textfile still serves the frozen gauge. The scrape-time
+# expression fires; the frozen-gauge comparison never would.
+future_now=$(( stale_ts + 2400 + 60 ))
+derived_age=$(( future_now - exported_ts ))
+if (( derived_age > 2400 )); then
+    ok "12c: scrape-time expression (time() - ts = $derived_age) trips the stale threshold"
+else
+    bad "12c: scrape-time expression trips the threshold" "derived=$derived_age"
+fi
+# The committed alert rule must use the scrape-time form (guards against
+# regressing to the frozen-gauge comparison).
+rules_file="$LIB_DIR/../contrib/prometheus-rules-lunarwing-health.yml"
+assert_contains "$(cat "$rules_file")" \
+    "expr: (time() - lunarwing_health_report_timestamp_seconds) > 2400" \
+    "12d: alert rule derives age at evaluation time"
+
 finish

@@ -462,9 +462,23 @@ declare -A NO_REMEDY=(
 # still enter the grace/escalation path instead of disappearing as NO_REMEDY.
 declare -A MONITOR_ONLY=()
 MONITOR_ONLY[lunarvoice]=1
+MONITOR_ONLY[runtime]=1
+MONITOR_ONLY[knowledge]=1
 if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
+
+# Monitor-only diagnostic components that own NO service at all (MR !1041
+# review finding 2): runtime and knowledge report per-tenant instance
+# diagnostics, so their failures enter the monitor-only escalation path with
+# tenant attribution (synthetic "<comp>@<tenant>" identities built in main),
+# never a SERVICE_MAP restart. Without this registration, standard MT
+# configuration (SELF_HEAL_REMEDY_LOGICAL=false) silently skipped their
+# critical results because there was no service to map.
+declare -A DIAGNOSTIC_COMPONENTS=(
+    [runtime]=1
+    [knowledge]=1
+)
 
 # Service identities that inherit monitor-only treatment regardless of which
 # component reported them (WI#180 F6): the logical lunarvoice component is
@@ -1009,6 +1023,9 @@ main() {
     while IFS=$'\t' read -r comp cstatus; do
         [[ -n "$comp" ]] || continue
         [[ "$REMEDY_LOGICAL" == "true" || "${MONITOR_ONLY[$comp]:-}" == "1" ]] || continue
+        # Diagnostic components own no service; they are handled per-instance
+        # below (step 1b) with synthetic monitor-only identities.
+        [[ -n "${DIAGNOSTIC_COMPONENTS[$comp]:-}" ]] && continue
         [[ "${NO_REMEDY[$comp]:-}" == "1" ]] && { [[ "$cstatus" != healthy ]] && log "SKIP: component '$comp' has no standalone service (feature/external)"; continue; }
         services="${SERVICE_MAP[$comp]:-}"
         [[ -n "$services" ]] || { [[ "$cstatus" != healthy ]] && log "WARNING: no service mapping for component '$comp'; skipping"; continue; }
@@ -1022,6 +1039,55 @@ main() {
             fi
         done
     done < <(jq -r '.components[] | "\(.component)\t\(.status)"' "$report" 2>/dev/null || true)
+
+    # 1b) Monitor-only diagnostic components (runtime, knowledge — MR !1041
+    # review finding 2): per-instance failures become synthetic monitor-only
+    # targets ("<comp>@<tenant>", or bare "<comp>" for unattributed/legacy
+    # single-node results) so they grace-track and escalate with tenant
+    # attribution even when MT logical remediation is disabled. Healthy
+    # instances clear state through the report-as-truth path; unprobed/unknown
+    # instances are left to the component-level verdict (coverage notes must
+    # not page per tenant).
+    local diag_comp inst_tenant inst_status diag_id diag_cstatus
+    local -a diag_bad=()
+    for diag_comp in runtime knowledge; do
+        diag_bad=()
+        while IFS=$'\t' read -r inst_tenant inst_status; do
+            [[ -n "$inst_tenant" ]] || continue
+            if [[ "$inst_tenant" == "default" ]]; then
+                diag_id="$diag_comp"
+            else
+                diag_id="${diag_comp}@${inst_tenant}"
+            fi
+            case "$inst_status" in
+                healthy) healthy[$diag_id]=1 ;;
+                degraded|critical)
+                    [[ -n "${seen[$diag_id]:-}" ]] && continue
+                    seen[$diag_id]=1
+                    diag_bad+=("$diag_id")
+                    targets+=("$diag_comp:$diag_id")
+                    ;;
+                *) ;;
+            esac
+        done < <(jq -r --arg comp "$diag_comp" '
+            .components[] | select(.component == $comp)
+            | (.metrics.instances // [])[]
+            | "\(.tenant // "default")\t\(.status // "unknown")"
+        ' "$report" 2>/dev/null || true)
+        # Component-level failure with no failing instance (invalid registry,
+        # incomplete sweep, unknown check outcome): attribute the component
+        # itself so the monitoring gap still escalates. Only explicit failure
+        # statuses qualify — an unparseable/absent component creates no
+        # target.
+        diag_cstatus="$(jq -r --arg comp "$diag_comp" \
+            '[.components[] | select(.component == $comp) | .status] | first // "absent"' \
+            "$report" 2>/dev/null || true)"
+        if [[ ${#diag_bad[@]} -eq 0 ]] && [[ "$diag_cstatus" == degraded || "$diag_cstatus" == critical || "$diag_cstatus" == unknown ]]; then
+            [[ -n "${seen[$diag_comp]:-}" ]] && continue
+            seen[$diag_comp]=1
+            targets+=("$diag_comp:$diag_comp")
+        fi
+    done
 
     # 2) Init-system sub-units (systemd/openrc/launchd). Healthy ones populate
     #    `healthy`; unhealthy ones become targets.
