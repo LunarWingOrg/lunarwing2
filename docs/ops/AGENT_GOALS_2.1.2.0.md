@@ -41,7 +41,9 @@
 
 7. [x] (S) **#113 — studynotesfindings — go over all** `[low]` - Never addressed. Sweep/verify all study-notes findings
 
-8. [ ] investigate conversation insights and anything that might cause confabulation incidents. see these work items and their comments for reference: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/143 - create new document in docs/ops detailing findings
+8. [x] investigate conversation insights and anything that might cause confabulation incidents. see these work items and their comments for reference: https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/132 and https://git.lunarwing.org/lunarwing/lunarwing2/-/work_items/143 - create new document in docs/ops detailing findings
+    - DONE investigation 2026-09-19 (`8insights`, inspected `49160e9fe`): reviewed both work items and comments; documented nine open findings, current corruption/provenance contracts, corrections to stale claims, and a controlled incident-reproduction plan in [the Goal 8 findings report](v2.1.2.0_GOAL8_CONVERSATION_INSIGHTS_FINDINGS.md). Eight deterministic characterization probes passed. The September 16 incident's causal trigger remains unconfirmed pending its trace; this checkbox records the completed investigation/report.
+    - Verified: engine baseline **602/602** after removing temporary probes; documentation links/source paths and diff whitespace checks passed. Detailed probe inputs/results and session-local evidence paths are in the report.
 
 9. [x] (S) HUMAN ART GOAL - Mascot Design Art Project - ANIMATION PHASE
 
