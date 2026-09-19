@@ -230,14 +230,37 @@ RUN chmod +x /app/entrypoint.sh /app/health_server.py
 # Fail the BUILD (not container startup) if the bridge's SDK import can't
 # resolve — the client build above is best-effort, so verify the exact import
 # the worker depends on.
-RUN cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
+#
+# Build-time self-tests run under a throwaway HOME rooted in the trap-cleaned
+# TMPDIR: OpenCode 2 appends a timestamped, randomly-IDed line to
+# XDG_DATA_HOME/opencode/log/opencode.log on EVERY start (including
+# `opencode --version`), and Bun keeps caches under $HOME. With the default
+# root HOME both land inside the image layer, so the candidate-vs-rebuild
+# whole-image digest gate failed on every pipeline (work item #177).
+# Redirecting HOME and the XDG dirs keeps every byte of that per-run state
+# out of the image.
+RUN set -eu; \
+    export TMPDIR=/tmp/opencode2-build-tests; \
+    export HOME="$TMPDIR/home"; \
+    export XDG_DATA_HOME="$HOME/.local/share" \
+           XDG_CACHE_HOME="$HOME/.cache" \
+           XDG_CONFIG_HOME="$HOME/.config" \
+           XDG_STATE_HOME="$HOME/.local/state"; \
+    mkdir -p "$HOME"; \
+    trap 'rm -rf /tmp/opencode2-build-tests' EXIT; \
+    cd /app && bun -e 'import("@opencode/client/promise").then(m => { if (typeof m.OpenCode?.make !== "function") { console.error("FATAL: @opencode/client/promise resolved but is missing OpenCode.make"); process.exit(1) } }).catch(e => { console.error("FATAL: cannot import @opencode/client/promise —", e.message); process.exit(1) })'
 # `opencode --version` prints "opencode v<semver>" (name + v + version baked
 # in at build time above). Compare against exactly that, and LOG the actual
 # value on mismatch — a bare `test` fails this step with zero output, which
 # made this lane's repeated silent build failures painful to diagnose.
 RUN set -eu; \
     export TMPDIR=/tmp/opencode2-build-tests PYTHONDONTWRITEBYTECODE=1; \
-    mkdir -p "$TMPDIR"; \
+    export HOME="$TMPDIR/home"; \
+    export XDG_DATA_HOME="$HOME/.local/share" \
+           XDG_CACHE_HOME="$HOME/.cache" \
+           XDG_CONFIG_HOME="$HOME/.config" \
+           XDG_STATE_HOME="$HOME/.local/state"; \
+    mkdir -p "$HOME"; \
     trap 'rm -rf /tmp/opencode2-build-tests' EXIT; \
     actual="$(/usr/local/bin/opencode --version)" \
     && expected="opencode v${OPENCODE_VERSION#v}" \
@@ -248,7 +271,11 @@ RUN set -eu; \
     && bun scripts/opencode_result_test.ts \
     && bun scripts/opencode_task_executor_test.ts \
     && python3 scripts/prepare_reproducible_build_test.py \
-    && python3 scripts/study_notes_config_test.py
+    && python3 scripts/study_notes_config_test.py \
+    && for leaked in /root/.bun /root/.local /root/.cache /root/.config; do \
+           [ ! -e "$leaked" ] \
+           || { echo "FATAL: build-time self-tests leaked per-build state at $leaked — refusing to bake a non-reproducible layer" >&2; exit 1; }; \
+       done
 
 # ── XDG directories for opencode state ────────────────────────
 RUN mkdir -p /home/opencode2/.local/share/opencode \

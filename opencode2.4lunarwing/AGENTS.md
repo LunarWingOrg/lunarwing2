@@ -49,6 +49,17 @@ Base images, Debian package indexes, rustup, and Go archives are pinned;
 refresh their recorded digests/checksums rather than restoring tag-only or
 fallback installs.
 
+The CI publication gate requires the whole image to be byte-reproducible
+(candidate vs uncached clean rebuild; both must report the same digest).
+OpenCode 2 appends a timestamped, randomly-IDed log line to
+`$HOME/.local/share/opencode/log/opencode.log` on EVERY start — including
+`opencode --version` — so any build-time `RUN` that executes the binary must
+run under the throwaway HOME/XDG environment rooted in the trap-cleaned
+`/tmp/opencode2-build-tests` tree (see the self-test `RUN`s), and the
+`/root/.bun` / `/root/.local` / `/root/.cache` / `/root/.config` leak
+tripwires must stay. Never invoke bun or the opencode binary in the image
+build with the default root HOME.
+
 ## Do Not
 
 - Break the `lunarwing-agent-v1` envelope format
