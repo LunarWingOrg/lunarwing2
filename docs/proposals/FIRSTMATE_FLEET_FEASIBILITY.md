@@ -1,7 +1,9 @@
 # FirstMate-led LunarWing/Hermes fleet: feasibility and draft requirements
 
-**Status:** requirements draft; source-reviewed, integration not yet exercised.
-**Date:** 2026-09-17.
+**Status:** requirements draft; source-reviewed; exploratory check #2 (approval
+vertical slice) live-validated 2026-09-17 — see
+[`FIRSTMATE_SLICE_RESULTS.md`](FIRSTMATE_SLICE_RESULTS.md).
+**Date:** 2026-09-17; updated 2026-09-19.
 **Branch:** `experiment/feasibility`, based on LunarWing master `decbdff7e`.
 
 ## 1. Confirmed user requirements
@@ -29,9 +31,15 @@ execution-mode enum or authorize permanent tool grants.
 ## 2. Feasibility conclusion
 
 A FirstMate-led experiment is plausible using LunarWing's existing authenticated
-agent gateway plus a small fleet connector. A production-ready integration needs
-additional lifecycle contracts, especially for approval deadlines, reconnects,
-and ambiguous task submissions.
+agent gateway plus a small fleet connector. Since the first draft, the approval
+vertical slice passed live against a real tenant on stock gateway APIs
+([`FIRSTMATE_SLICE_RESULTS.md`](FIRSTMATE_SLICE_RESULTS.md)): gate discovery via
+the durable `state/pending-gates.json` file, request-scoped approval round
+trip, and a confirmed terminal turn — pull-based, no SSE replay journal, and
+well inside the five-minute target. The largest risks that remain are reconnect
+correctness across missed events, ambiguous task submission (still no
+client-keyed idempotency), and FirstMate's own setup/enrollment burden, which
+has not been trialled at all.
 
 The user accepts the proposed supervisor-plus-connector direction. FirstMate's
 conversational supervisor and local-state approach make it a candidate worth
@@ -104,6 +112,15 @@ Sources: [control adapters][fm-control], [dispatch][fm-spawn],
 - `ExecutionMode::Autonomous` denies `Always`-approval tools rather than asking
   a supervisor. Select an approval-capable execution path for delegated review
   (`ic/src/gate/approval.rs:69-149`).
+- **Live slice findings (tenant `antelope`, 2026-09-17):** the daemon-persisted
+  `state/pending-gates.json` held every field the approval POST needs (request
+  ID, tool name, parameters, description, thread identity, resume kind) and
+  served as the discovery snapshot for the whole flow. **Multi-gate turns are
+  real:** the first approval immediately re-armed a second `shell` call under a
+  new request ID, so one approval never means one completed turn. A missing or
+  mismatched `thread_id` on the approval POST can silently land the decision on
+  the wrong ("Idle") thread — always pass the explicit thread ID
+  ([`FIRSTMATE_SLICE_RESULTS.md`](FIRSTMATE_SLICE_RESULTS.md)).
 
 ### Hermes
 
@@ -191,6 +208,12 @@ during onboarding rather than assuming the source default matches deployment.
 5. Confirm the matching runtime resolution. Record `decision_submitted`,
    `approved`/`denied`/`expired`, and subsequent tool outcome separately.
 
+Steps 1–5 were validated live by the slice. One approval resolves exactly one
+request, and turns can immediately re-arm with a fresh request under a new ID —
+the connector must therefore loop: re-read the pending snapshot after every
+decision and continue until none remain, with a connector-side cap against
+degenerate re-gating (the browser smoke path uses the same pattern).
+
 A response-time target is an operational objective under a stated workload.
 Model/provider delays prevent an unconditional guarantee of an LLM decision by
 a wall-clock deadline. Code can enforce deadline handling and expose a missed
@@ -213,17 +236,27 @@ experiment: whether to keep reviewing while the request is valid, notify the
 operator, or apply another agreed fallback. Expired approvals must be reported
 as expired, and a timeout must not be recorded as an approval.
 
-### Required LunarWing support to validate or add
+### LunarWing support: live-validated vs still open
 
-- Expose request creation/expiry in approval events and pending-gate views.
-- Provide an authenticated, owner-scoped snapshot of unresolved Engine V2
-  approvals for startup/reconnect, including expiry and both relevant thread
-  identities. Subscribe then reconcile, deduplicating events observed during
-  the snapshot.
-- Provide recoverable resolution evidence for an approval whose submission
-  response or resolution event was lost. A stale/not-found request by itself
-  does not establish whether it was approved, denied, or expired.
-- Preserve existing atomic request matching, authorization, and expiry checks.
+Validated by the slice run (no LunarWing changes needed for a v0 connector):
+
+- Pending-gate persistence (`state/pending-gates.json` per tenant) is a usable
+  durable snapshot holding every field `POST /api/chat/approval` needs.
+- The request-scoped approval round trip resolves atomically and resumes the
+  turn; observed timing (~15s send→gate armed, ~5s approve→re-gate, <8s to
+  completion) sits far inside the five-minute target — the dominant cost is the
+  agent's own reasoning, not the approval mechanics.
+
+Still open:
+
+- An authenticated HTTP snapshot of pending gates (including `created_at` and
+  `expires_at`) so a remote connector need not read tenant-local files. Polling
+  the file over SSH works for the experiment but is not a real API contract.
+- Recoverable resolution evidence for approvals that close while the connector
+  is down: a gate leaving the pending file proves closure, not *how* it closed
+  (approved, denied, or expired).
+- Preserve existing atomic request matching, authorization, and expiry checks
+  through any new endpoint.
 - Exercise the selected FirstMate primary harness while it is busy: wakeup,
   decision scheduling, and delivery must be demonstrated rather than inferred
   from watcher liveness.
@@ -247,12 +280,16 @@ The intended recovery sequence is:
 5. Resume ordinary monitoring after reconciliation. A reported stream gap
    triggers the same recovery path.
 
-Cases to examine include a disconnect before an approval event arrives, after
-the decision is submitted but before resolution is observed, and while another
-client resolves the same request. Also exercise connector/supervisor restart
-and reconnect after expiry. Avoid blind task resubmission or inferring approval
-from a missing pending request. The pending snapshot and recoverable resolution
-evidence identified in §5 are dependencies for reliable recovery.
+The slice retired the lowest-level piece of this: `state/pending-gates.json`
+served as the authoritative pending snapshot across the whole approval flow, no
+SSE subscription required. What remains to exercise: a disconnect before an
+approval event arrives, after decision submission but before resolution is
+observed, and while another client resolves the same request (the pending file
+then answers "still pending?" authoritatively but not "was it approved, denied,
+or expired?"). Also exercise connector/supervisor restart, reconnect after
+expiry, and original-deadline recovery (§5 clocks never reset on reconnect).
+Avoid blind task resubmission; never infer approval from a missing pending
+request alone.
 
 ## 7. Acceptance requirements
 
@@ -272,7 +309,9 @@ evidence identified in §5 are dependencies for reliable recovery.
 | F12 | Bound concurrent task attempts and reconnect/retry activity, with cancellation outcomes confirmed against runtime state. |
 
 F8/F9 are target behaviour to implement and measure, not current FirstMate
-capabilities. The user has not selected numerical setup-time targets.
+capabilities. The user has not selected numerical setup-time targets. F5 has
+partial evidence: the single-agent slice resolved every approval well inside
+five minutes; the five-agent burst remains untested.
 
 ## 8. Suggested exploratory checks
 
@@ -282,9 +321,13 @@ other tools the user is evaluating.
 1. **Setup and manual enrollment:** inventory the required FirstMate tools and
    install steps. Manually register an existing test agent and assess the
    simplicity of both initial setup and adding another registration.
-2. **Approval vertical slice:** one existing test agent, one real gated tool call,
-   FirstMate decision, confirmed resolution, and independently observed tool
-   outcome. Include denied, expired, duplicate, and disconnected cases.
+2. **Approval vertical slice** — **PASSED 2026-09-17** (tenant `antelope`;
+   [`FIRSTMATE_SLICE_RESULTS.md`](FIRSTMATE_SLICE_RESULTS.md)): gate-arming
+   probe, file-based discovery, request-scoped approve round trip, and a
+   confirmed `Completed` turn, all pull-based with bearer auth. Not covered yet
+   inside this check: denied, expired, duplicate-request, and intentionally
+   disconnected cases, plus a FirstMate-driven (rather than script-driven)
+   decision.
 3. **Five-agent trial:** manually register at least five existing LunarWing test
    agents and exercise concurrent tasks with different outputs and a simultaneous
    approval burst. Include a busy supervisor and provider delay; measure the
@@ -307,6 +350,10 @@ application-server setup would count against it in the ongoing comparison.
 - Initial host layout and the acceptable measured setup/enrollment effort.
 - Other candidate tools and how their enrollment, approval, and reconnect
   behaviour compares under the same requirements.
+- Connector-side cap for multi-gate loops (a hard number, and what happens when
+  it trips — hold for operator or fail the task).
+- Whether to expose pending gates (with timestamps) as an authenticated HTTP
+  endpoint now, or defer until remote connectors prove file-polling inadequate.
 
 [fm-control]: https://github.com/kunchenguid/firstmate/blob/3eb5b6334a80e06083e3837f0032a5cec39b8e52/bin/fm-control-lib.sh#L61-L115
 [fm-spawn]: https://github.com/kunchenguid/firstmate/blob/3eb5b6334a80e06083e3837f0032a5cec39b8e52/bin/fm-spawn.sh#L130-L146
