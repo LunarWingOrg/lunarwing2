@@ -85,14 +85,14 @@ http_get() {
   fi
 }
 
-# Probe one tenant's runtime. Sets globals: p_gw_reachable p_gw_status
+# Probe one tenant's runtime. Sets globals: p_gw_reachable
 # p_gw_uptime p_gw_connections p_gw_channels_unhealthy p_pending_gates
 # p_bridge_reachable p_bridge_running p_bridge_queued p_bridge_outbound_hour
 # p_bridge_omemo p_bridge_prekeys p_issues (array).
 probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
   local tenant="$1" gw_port="$2" bridge_port="$3" env_file="$4"
   local gw_token bridge_token gw_body bridge_body
-  p_gw_reachable=false; p_gw_status=""; p_gw_uptime=0; p_gw_connections=0
+  p_gw_reachable=false; p_gw_uptime=0; p_gw_connections=0
   p_gw_channels_unhealthy=0; p_pending_gates=-1
   p_bridge_reachable=false; p_bridge_running=false; p_bridge_queued=-1
   p_bridge_outbound_hour=-1; p_bridge_omemo=false; p_bridge_prekeys=-1
@@ -107,7 +107,6 @@ probe_one() {  # <tenant> <gateway-port> <bridge-port> <env-file>
     p_gw_uptime="$(jq -r '.uptime_secs // 0' <<<"$gw_body" 2>/dev/null || echo 0)"
     p_gw_connections="$(jq -r '.total_connections // 0' <<<"$gw_body" 2>/dev/null || echo 0)"
     p_gw_channels_unhealthy="$(jq -r '[.channel_health // {} | to_entries[] | select(.value.healthy == false)] | length' <<<"$gw_body" 2>/dev/null || echo 0)"
-    p_gw_status="$(jq -r '.llm_backend // ""' <<<"$gw_body" 2>/dev/null || true)"
   else
     p_issues+=("gateway unreachable at 127.0.0.1:${gw_port}")
   fi
