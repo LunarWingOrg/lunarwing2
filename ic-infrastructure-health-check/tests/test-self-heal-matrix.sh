@@ -108,6 +108,27 @@ oB13="$(run_dry "$b13" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=
 assert_contains "$oB13" "ESCALATING: voice-sidecar (monitor_only" "B13: LunarVoice is monitor-only"
 assert_absent "$oB13" "restart voice-sidecar" "B13: LunarVoice is never auto-restarted"
 
+# B14 — the monitor-only policy follows the SERVICE, not the reporting
+# component (WI#180 F6): a critical lunarwing-voice-<t> init unit must
+# escalate as monitor-only instead of entering restart remediation.
+b14="$(sb)"; report "$b14" '{components:[{component:"openrc",status:"critical",metrics:{services:[
+  {name:"lunarwing-voice-acme",status:"critical"},
+  {name:"lunarwing-voice-acme-sup",status:"critical"}]}}]}'
+oB14="$(run_dry "$b14" LUNARWING_SERVICE_MANAGER=openrc SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false)"
+assert_contains "$oB14" "ESCALATING: lunarwing-voice-acme (monitor_only" "B14: OpenRC voice unit escalates monitor-only"
+assert_contains "$oB14" "ESCALATING: lunarwing-voice-acme-sup (monitor_only" "B14: OpenRC voice supervisor escalates monitor-only"
+assert_absent "$oB14" "rc-service lunarwing-voice-acme restart" "B14: OpenRC voice unit never restarted"
+assert_absent "$oB14" "rc-service lunarwing-voice-acme-sup restart" "B14: OpenRC voice supervisor never restarted"
+
+# B15 — same bypass on systemd: critical lunarwing-voice-<t>.service units
+# escalate monitor-only instead of restarting on the tenant user bus.
+b15="$(sb)"; d_ports "$b15"
+report "$b15" '{components:[{component:"systemd",status:"critical",metrics:{units:[
+  {name:"lunarwing-voice-acme.service",status:"critical"}]}}]}'
+oB15="$(run_dry "$b15" LUNARWING_SERVICE_MANAGER=systemd SELF_HEAL_GRACE_CHECKS=1 SELF_HEAL_VERIFY_HEALTH=false SELF_HEAL_TENANTS_FILE="$b15/ports.json")"
+assert_contains "$oB15" "ESCALATING: lunarwing-voice-acme.service (monitor_only" "B15: systemd voice unit escalates monitor-only"
+assert_absent "$oB15" "systemctl --user restart lunarwing-voice-acme.service" "B15: systemd voice unit never restarted"
+
 # B9 — three unhealthy logical components, all targeted in one run.
 b9="$(sb)"; report "$b9" '{components:[
   {component:"gateway",   status:"degraded",metrics:{}},

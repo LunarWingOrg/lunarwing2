@@ -466,6 +466,34 @@ if [[ "$NETBIRD_REMEDIATE" != true ]]; then
     MONITOR_ONLY[netbird]=1
 fi
 
+# Service identities that inherit monitor-only treatment regardless of which
+# component reported them (WI#180 F6): the logical lunarvoice component is
+# monitor-only, but the same underlying service reported under openrc/systemd
+# used to enter normal restart remediation because policy was keyed by the
+# reporting component. The LunarVoice service and its -sup supervisor must
+# never be auto-restarted through ANY reporting path.
+declare -A MONITOR_ONLY_SERVICE=()
+MONITOR_ONLY_SERVICE["${LUNARVOICE_SERVICE:-voice-sidecar}"]=1
+MONITOR_ONLY_SERVICE[lunarwing-voice]=1
+MONITOR_ONLY_SERVICE[lunarwing-voice-sup]=1
+
+# Does a service name match a monitor-only service identity? Matches the bare
+# name, a tenant-scoped unit (lunarwing-voice-<t>), and the -sup supervisor.
+service_is_monitor_only() {
+    local svc="$1" bare
+    [[ -n "${MONITOR_ONLY_SERVICE[$svc]:-}" ]] && return 0
+    # Tenant-scoped init units: lunarwing-voice-<tenant>[-sup].
+    case "$svc" in
+        lunarwing-voice-*) return 0 ;;
+    esac
+    # OpenRC/systemd voice-sidecar base name (single-node): voice-sidecar[-sup].
+    bare="${svc%.service}"
+    case "$bare" in
+        voice-sidecar|voice-sidecar-sup) return 0 ;;
+    esac
+    return 1
+}
+
 # ── Exponential backoff with jitter (kumogakure's compute_backoff) ───────────
 #
 # compute_backoff <attempt> -> integer seconds until the next attempt.
@@ -867,7 +895,7 @@ remediate_component() {
             continue
         fi
 
-        if [[ "${MONITOR_ONLY[$comp]:-}" == "1" ]]; then
+        if [[ "${MONITOR_ONLY[$comp]:-}" == "1" ]] || service_is_monitor_only "$svc"; then
             state="$(escalate_and_update_state "$state" "$svc" "$retries" "monitor_only")"
             continue
         fi
