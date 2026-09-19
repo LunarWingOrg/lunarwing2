@@ -5,8 +5,14 @@
 //! with priority scoring by doc type (Lessons and Specs rank higher
 //! than Summaries for context injection).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::executor::orchestrator::{
+    FAILURE_TRACKER_TITLE, ORCHESTRATOR_META_TAG, ORCHESTRATOR_TAG, ORCHESTRATOR_TITLE,
+};
+use crate::executor::prompt::{PREAMBLE_OVERLAY_TITLE, PROMPT_OVERLAY_TAG};
+use crate::runtime::mission::{FIX_PATTERN_DB_TAG, FIX_PATTERN_DB_TITLE};
 use crate::traits::store::Store;
 use crate::types::error::EngineError;
 use crate::types::memory::{DocType, MemoryDoc};
@@ -17,19 +23,23 @@ pub struct RetrievalEngine {
     store: Arc<dyn Store>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetrievalPurpose {
+    Conversation,
+    Mission,
+}
+
 impl RetrievalEngine {
     pub fn new(store: Arc<dyn Store>) -> Self {
         Self { store }
     }
 
-    /// Retrieve relevant memory docs for the given query within a project.
+    /// Retrieve relevant conversational memory within a project.
     ///
-    /// Loads all docs for the project, scores them by keyword relevance and
-    /// doc-type priority, and returns the top `max_docs` results. When no
-    /// keyword matches any document, the result degrades to type-priority +
-    /// recency ordering instead of returning empty: an empty retrieval reads
-    /// to the model as "the data does not exist", which has produced
-    /// confabulated failure narratives from otherwise-correct agents.
+    /// Automatic recall excludes engine-maintenance docs and skills, requires
+    /// whole-token overlap, and returns empty for queries without relevant
+    /// matches. An empty result is not evidence that no stored memory exists;
+    /// explicit memory search remains available for deliberate investigation.
     pub async fn retrieve_context(
         &self,
         project_id: ProjectId,
@@ -37,7 +47,46 @@ impl RetrievalEngine {
         query: &str,
         max_docs: usize,
     ) -> Result<Vec<MemoryDoc>, EngineError> {
-        if max_docs == 0 {
+        self.retrieve_for(
+            project_id,
+            user_id,
+            query,
+            max_docs,
+            RetrievalPurpose::Conversation,
+        )
+        .await
+    }
+
+    /// Mission planning/maintenance can inspect internal docs and fall back to
+    /// type priority + recency when the goal's vocabulary has no overlap.
+    /// This policy is selected by the host, never by conversational model input.
+    pub(crate) async fn retrieve_mission_context(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+        query: &str,
+        max_docs: usize,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
+        self.retrieve_for(
+            project_id,
+            user_id,
+            query,
+            max_docs,
+            RetrievalPurpose::Mission,
+        )
+        .await
+    }
+
+    async fn retrieve_for(
+        &self,
+        project_id: ProjectId,
+        user_id: &str,
+        query: &str,
+        max_docs: usize,
+        purpose: RetrievalPurpose,
+    ) -> Result<Vec<MemoryDoc>, EngineError> {
+        let keywords = extract_keywords(query);
+        if max_docs == 0 || (keywords.is_empty() && purpose == RetrievalPurpose::Conversation) {
             return Ok(Vec::new());
         }
 
@@ -50,21 +99,10 @@ impl RetrievalEngine {
             // Skills use deterministic activation in the orchestrator. Generic
             // retrieval must not bypass that selector and inject them as knowledge.
             .filter(|doc| doc.doc_type != DocType::Skill)
+            .filter(|doc| purpose == RetrievalPurpose::Mission || !is_engine_maintenance(doc))
             .collect();
         if all_docs.is_empty() {
             return Ok(Vec::new());
-        }
-
-        let keywords = extract_keywords(query);
-        if keywords.is_empty() {
-            // No meaningful keywords — return by doc-type priority alone
-            let mut scored: Vec<(f64, MemoryDoc)> = all_docs
-                .into_iter()
-                .map(|doc| (doc_type_weight(doc.doc_type), doc))
-                .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            scored.truncate(max_docs);
-            return Ok(scored.into_iter().map(|(_, doc)| doc).collect());
         }
 
         let mut scored: Vec<(f64, MemoryDoc)> = all_docs
@@ -82,10 +120,9 @@ impl RetrievalEngine {
             })
             .collect();
 
-        if scored.is_empty() {
-            // Zero keyword overlap across the whole corpus. Degrade to the
-            // no-keywords ordering (doc-type priority, then recency) rather
-            // than returning nothing — weak context beats a false "not found".
+        if scored.is_empty() && purpose == RetrievalPurpose::Mission {
+            // Preserve broad mission recall without injecting unrelated records
+            // into ordinary conversations.
             let mut fallback = all_docs;
             fallback.sort_by(|a, b| {
                 let weight = doc_type_weight(b.doc_type)
@@ -103,6 +140,29 @@ impl RetrievalEngine {
     }
 }
 
+/// Reserved maintenance identities and tags also cover legacy untagged docs
+/// and renamed maintenance docs. Shared ownership alone does not make a normal
+/// knowledge document internal.
+fn is_engine_maintenance(doc: &MemoryDoc) -> bool {
+    matches!(
+        doc.title.as_str(),
+        FIX_PATTERN_DB_TITLE | PREAMBLE_OVERLAY_TITLE | ORCHESTRATOR_TITLE | FAILURE_TRACKER_TITLE
+    ) || doc.tags.iter().any(|tag| {
+        matches!(
+            tag.as_str(),
+            FIX_PATTERN_DB_TAG | PROMPT_OVERLAY_TAG | ORCHESTRATOR_TAG | ORCHESTRATOR_META_TAG
+        )
+    })
+}
+
+/// Keep identifiers such as `web_search` and `web-fetch` intact on both sides
+/// of a match; punctuation and whitespace delimit words rather than substrings.
+fn word_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|word| !word.is_empty())
+        .map(str::to_lowercase)
+}
+
 /// Extract lowercase keywords from a query, filtering out stop words.
 fn extract_keywords(query: &str) -> Vec<String> {
     const STOP_WORDS: &[&str] = &[
@@ -111,13 +171,14 @@ fn extract_keywords(query: &str) -> Vec<String> {
         "to", "of", "in", "for", "on", "with", "at", "by", "from", "as", "into", "about", "it",
         "its", "this", "that", "these", "those", "i", "you", "he", "she", "we", "they", "what",
         "which", "who", "how", "when", "where", "why", "and", "or", "but", "not", "no", "if",
-        "then", "so", "up", "out", "just",
+        "then", "so", "up", "out", "just", "hi", "hello", "hey", "thanks", "thank", "please",
+        "there", "now",
     ];
 
-    query
-        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
-        .map(|w| w.to_lowercase())
+    let mut seen = HashSet::new();
+    word_tokens(query)
         .filter(|w| w.len() >= 2 && !STOP_WORDS.contains(&w.as_str()))
+        .filter(|w| seen.insert(w.clone()))
         .collect()
 }
 
@@ -127,15 +188,15 @@ fn keyword_match_score(doc: &MemoryDoc, keywords: &[String]) -> f64 {
         return 0.0;
     }
 
-    let title_lower = doc.title.to_lowercase();
-    let content_lower = doc.content.to_lowercase();
+    let title_tokens: HashSet<_> = word_tokens(&doc.title).collect();
+    let content_tokens: HashSet<_> = word_tokens(&doc.content).collect();
 
     let mut matched = 0usize;
     for kw in keywords {
         // Title matches are worth more
-        if title_lower.contains(kw.as_str()) {
+        if title_tokens.contains(kw) {
             matched += 2;
-        } else if content_lower.contains(kw.as_str()) {
+        } else if content_tokens.contains(kw) {
             matched += 1;
         }
     }
@@ -184,6 +245,34 @@ mod tests {
         assert!(kws.contains(&"web_search".to_string()));
         assert!(kws.contains(&"web-fetch".to_string()));
         assert!(kws.contains(&"tool".to_string()));
+    }
+
+    #[test]
+    fn extract_keywords_deduplicates_and_ignores_conversational_filler() {
+        assert_eq!(
+            extract_keywords("Hi there, please explain MEMORY_SEARCH memory_search now"),
+            vec!["explain", "memory_search"]
+        );
+    }
+
+    #[test]
+    fn keyword_match_requires_whole_tokens_and_preserves_identifiers() {
+        let doc = MemoryDoc::new(
+            ProjectId::new(),
+            "test-user",
+            DocType::Lesson,
+            "Web_Search résumé",
+            "A prompt hint about concatenation and web-fetch.",
+        );
+        for query in ["hi", "cat", "web", "fetch", "search"] {
+            assert_eq!(keyword_match_score(&doc, &[query.into()]), 0.0, "{query}");
+        }
+        for query in ["web_search", "WEB-FETCH", "RÉSUMÉ"] {
+            assert!(
+                keyword_match_score(&doc, &extract_keywords(query)) > 0.0,
+                "{query}"
+            );
+        }
     }
 
     #[test]
@@ -328,7 +417,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_zero_keyword_overlap_returns_recent_fallback() {
+    async fn mission_retrieval_zero_keyword_overlap_returns_recent_fallback() {
         let project = ProjectId::new();
         let mut old_note = MemoryDoc::new(
             project,
@@ -351,18 +440,18 @@ mod tests {
 
         // Vocabulary completely disjoint from every stored doc.
         let docs = engine
-            .retrieve_context(project, "test-user", "quantum flute repair", 5)
+            .retrieve_mission_context(project, "test-user", "quantum flute repair", 5)
             .await
             .unwrap();
 
-        // Recall must degrade to recency-ordered fallback, not empty.
+        // Mission planning retains broad recall when vocabulary has no overlap.
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].title, "Audit: web-gateway auth");
         assert_eq!(docs[1].title, "Audit: scheduler dispatch subsystem");
     }
 
     #[tokio::test]
-    async fn retrieve_fallback_prefers_higher_priority_doc_types() {
+    async fn mission_retrieval_fallback_prefers_higher_priority_doc_types() {
         let project = ProjectId::new();
         let mut summary = MemoryDoc::new(
             project,
@@ -383,7 +472,7 @@ mod tests {
         let engine = RetrievalEngine::new(store);
 
         let docs = engine
-            .retrieve_context(project, "test-user", "unrelated vocabulary here", 5)
+            .retrieve_mission_context(project, "test-user", "unrelated vocabulary here", 5)
             .await
             .unwrap();
 
@@ -393,7 +482,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_keyword_match_beats_fallback() {
+    async fn retrieve_keyword_match_excludes_unrelated_docs() {
         let project = ProjectId::new();
         let mut recent_unrelated = MemoryDoc::new(
             project,
@@ -418,8 +507,109 @@ mod tests {
             .await
             .unwrap();
 
-        // When a keyword match exists it must win over fallback ordering.
+        assert_eq!(docs.len(), 1);
         assert_eq!(docs[0].title, "Audit: scheduler dispatch");
+    }
+
+    #[tokio::test]
+    async fn conversational_retrieval_does_not_fall_back_for_greetings_or_unrelated_queries() {
+        let project = ProjectId::new();
+        let engine = RetrievalEngine::new(make_store(vec![MemoryDoc::new(
+            project,
+            "test-user",
+            DocType::Lesson,
+            "insight:workflow:review",
+            "Prefer concise status updates. Add a prompt hint about tools.",
+        )]));
+
+        for query in [
+            "",
+            "the and is",
+            "Hi there. This is dev build #19 of 2.1.2.0 now",
+            "Hello!",
+            "Thanks",
+            "quantum flute repair",
+        ] {
+            let docs = engine
+                .retrieve_context(project, "test-user", query, 5)
+                .await
+                .unwrap();
+            assert!(docs.is_empty(), "unexpected recall for {query:?}");
+        }
+        // A genuine partial match remains useful even with extra query terms.
+        let docs = engine
+            .retrieve_context(project, "test-user", "review zebra unicorn", 5)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].title, "insight:workflow:review");
+    }
+
+    #[tokio::test]
+    async fn conversational_retrieval_excludes_maintenance_by_title_or_tag() {
+        let project = ProjectId::new();
+        let mut fixtures = Vec::new();
+        for owner in ["test-user", crate::types::shared_owner_id()] {
+            for (title, tag) in [
+                (FIX_PATTERN_DB_TITLE, FIX_PATTERN_DB_TAG),
+                (PREAMBLE_OVERLAY_TITLE, PROMPT_OVERLAY_TAG),
+                (ORCHESTRATOR_TITLE, ORCHESTRATOR_TAG),
+                (FAILURE_TRACKER_TITLE, ORCHESTRATOR_META_TAG),
+            ] {
+                // Both a legacy untagged record and a renamed tagged record.
+                fixtures.push(MemoryDoc::new(
+                    project,
+                    owner,
+                    DocType::Note,
+                    title,
+                    "repair",
+                ));
+                fixtures.push(
+                    MemoryDoc::new(project, owner, DocType::Note, "renamed", "repair")
+                        .with_tags(vec![tag.into()]),
+                );
+            }
+            fixtures.push(MemoryDoc::new(
+                project,
+                owner,
+                DocType::Lesson,
+                "repair handbook",
+                "Normal knowledge",
+            ));
+        }
+        // Scope filtering still applies even for genuine exact matches.
+        fixtures.push(MemoryDoc::new(
+            project,
+            "other-user",
+            DocType::Lesson,
+            "repair private",
+            "private",
+        ));
+        let store = make_store(fixtures);
+        let engine = RetrievalEngine::new(store.clone());
+        let docs = engine
+            .retrieve_context(project, "test-user", "repair", 50)
+            .await
+            .unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(docs.iter().all(|doc| doc.title == "repair handbook"));
+        assert!(docs.iter().any(|doc| doc.owner_id().is_shared()));
+        assert!(docs.iter().any(|doc| doc.user_id == "test-user"));
+
+        let mission_docs = engine
+            .retrieve_mission_context(project, "test-user", "repair", 50)
+            .await
+            .unwrap();
+        assert_eq!(mission_docs.len(), 18);
+        // Filtering affects automatic recall, not the stored records.
+        assert_eq!(
+            store
+                .list_memory_docs_with_shared(project, "test-user")
+                .await
+                .unwrap()
+                .len(),
+            18
+        );
     }
 
     #[tokio::test]

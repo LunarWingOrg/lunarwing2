@@ -244,6 +244,32 @@ The orchestrator (`executor/orchestrator.rs`) is a self-modifiable Python execut
 - Parallel dispatch of tool calls via the `__execute_actions_parallel__` batch host function (Rust executes the batch concurrently with a JoinSet)
 - Default orchestrator source: `ic/crates/lunarwing_engine/orchestrator/default.py`
 
+### Automatic memory recall
+
+`RetrievalEngine::retrieve_context` supplies ordinary conversational context.
+It includes user-owned and shared knowledge in the same project, but excludes
+skills (which have a separate activation path) and engine-maintenance records:
+`fix_pattern_database`, `prompt:codeact_preamble`, `orchestrator:main`, and
+`orchestrator:failures`. Either a reserved title or a maintenance tag
+(`fix_patterns`, `prompt_overlay`, `orchestrator_code`, `orchestrator_meta`)
+excludes a document, including legacy untagged and renamed tagged records.
+
+Relevance uses case-insensitive whole tokens, retaining `_` and `-` inside
+identifiers. Query terms are deduplicated and common conversational filler is
+ignored: `hi` cannot match `hint`, and `web` cannot match `web_search`.
+Conversational recall requires positive keyword overlap; empty/stop-word-only
+queries and zero-match queries return no excerpts rather than unrelated recent
+memories. Partial matches remain eligible when a query has additional terms.
+An empty automatic recall is not evidence that no memory exists; explicit
+`memory_search`/document access is still available.
+
+Mission planning, mission threads, and their host-marked mission children use
+`retrieve_mission_context`: maintenance records remain eligible and zero-match
+queries retain type-priority/recency fallback. The host selects this policy from
+thread configuration; `__retrieve_docs__` arguments cannot opt a conversation
+into it. Dedicated overlay/orchestrator loading and stored records are unaffected
+by the conversational filter.
+
 ### Authenticity hardening (WI#132)
 
 Memory-retrieval and compaction content is LLM-adjacent data, so it is labeled
@@ -253,8 +279,15 @@ and neutralized before it can masquerade as engine-authored state:
   doc-neutralizer was removed in 2.1.2.0 — its only callers were tests, so it
   projected false assurance). Its handler neutralizes role-token openers in
   returned doc content and stamps each doc with
-  `"provenance": "untrusted_memory_retrieval"` so consumers cannot mistake it
-  for engine content.
+  `"provenance": "untrusted_memory_retrieval"`, document ID, optional source
+  thread ID, visibility scope, and update timestamp. The default orchestrator
+  renders these source fields and a fixed untrusted-reference label, with quoted
+  excerpts capped at 500 characters. It explicitly distinguishes retrieved
+  records from current user messages/instructions and notes that records may be
+  stale or mistaken. Missing legacy source fields are labeled `unknown`, never
+  assumed to come from a completed thread; persisted metadata cannot upgrade
+  the trust label. The complete rendered section is role-token-neutralized.
+  Mission meta-prompts also label and quote their retrieved records.
 - Compaction summaries are LLM output that replaces real history. The summary
   is prefixed with an explicit `[Compaction summary — LLM-generated, replaces
   earlier conversation history]` label and its role-token openers are
