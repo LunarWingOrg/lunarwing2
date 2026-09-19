@@ -205,7 +205,8 @@ components_json=""
 for comp in "$check_gateway" "$check_xmpp" \
     "${check_omemo:-}" "${check_ratelimit:-}" \
     "$check_clickhouse" "$check_tensorzero" \
-    "$check_models" "$check_lunarvision" "$check_lunarvoice" "$check_netbird" \
+    "$check_models" "$check_llm_streams" \
+    "$check_lunarvision" "$check_lunarvoice" "$check_netbird" \
     "${check_svcmgr:-}"; do
     if [ -n "$comp" ] && echo "$comp" | jq . >/dev/null 2>&1; then
         if [ -n "$components_json" ]; then
