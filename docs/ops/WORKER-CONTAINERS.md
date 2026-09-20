@@ -276,6 +276,31 @@ selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
 standalone build commands build shared images but do not select a worker for a
 tenant.
 
+### Headless permission contract (WI#195)
+
+The Kimi worker runs every task through `kimi -p --output-format stream-json`,
+a headless batch invocation with no TTY. Upstream 0.40.0+ added a
+dangerous-command guard that prompts before shutdown/rm-class commands in ALL
+permission modes, and 0.43.0 defaults `KIMI_CODE_PERMISSION_MODE_REMINDER=1`
+which injects fixed-mode reminder text into every task's model context. In a
+headless lane every approval prompt is an unanswered stall to the task's full
+timeout (60 min default), and the reminder is pure prompt noise. The worker
+therefore ships three coordinated knobs:
+
+- `config.toml`: `default_permission_mode = "auto"` + `[permission]
+  dangerous_command_guard = false`. `auto` (not `yolo`) is the correct headless
+  mode — yolo still holds dangerous-class commands for approval upstream.
+- `entrypoint.sh`: exports `KIMI_CODE_PERMISSION_MODE_REMINDER=0` and
+  `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false` (defense in depth when a custom
+  `KIMI_CONFIG_SOURCE` drops the baked `[permission]` table). Both stay
+  operator-overridable via the tenant env file.
+- Flag contract pinned by `scripts/kimi_cli_contract_test.ts`, executed for
+  real during the worker image build (`npm test` gate runs the mock suite, then
+  the Docker gate re-runs just the contract lane against the locked CLI):
+  `-p --output-format stream-json` is accepted, `--yolo` is rejected.
+
+Do not re-enable the guard or the reminder without a TTY-capable supervisor.
+
 ## Shared Protocol
 
 All worker images use the `lunarwing-agent-v1` WebSocket subprotocol; the legacy `ironclaw-agent-v1` alias is no longer accepted. Messages are JSON envelopes with `id`, `type`, `timestamp`, `payload`. The worker sends `ready` on connect, receives `task_request`, streams `task_progress`, and sends a final `task_result`.

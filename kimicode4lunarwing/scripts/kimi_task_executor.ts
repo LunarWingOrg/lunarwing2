@@ -91,6 +91,10 @@ function isMetaMessage(line: StreamJsonLine): boolean {
   return line.role === "meta"
 }
 
+function isKnownRole(role: string | undefined): boolean {
+  return role === undefined || role === "assistant" || role === "tool" || role === "meta"
+}
+
 /**
  * Collects stream-json lines into a final assistant-text buffer.
  * Mirrors the opencode worker's extractAssistantText: only the last
@@ -378,6 +382,13 @@ export async function executeTask(
           if (typeof parsed.type === "string") {
             console.error(`[kimi meta] ${truncateUtf8(parsed.type, progressCap)}`)
           }
+        } else if (!isKnownRole(parsed.role)) {
+          // Roles outside {assistant, tool, meta} (a new reasoning role, system/
+          // user echoes) are dropped from output — say so instead of failing
+          // later with the generic "completed without assistant text" error.
+          console.warn(
+            `[kimi stream] unrecognized role ${JSON.stringify(truncateUtf8(String(parsed.role), 64))}: line dropped`,
+          )
         }
       }
     })
@@ -392,7 +403,9 @@ export async function executeTask(
         task_id: request.task_id,
         status: "error",
         output: "",
-        error: "kimi completed without assistant text or tool output",
+        error:
+          "kimi completed without assistant text or tool output " +
+          "(check stderr for dropped stream-json roles or parse failures)",
         duration_ms: durationMs,
       })
       return
