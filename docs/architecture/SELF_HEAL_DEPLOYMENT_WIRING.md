@@ -1,6 +1,6 @@
 # Infrastructure Self-Healing — Deployment & Provisioning Wiring
 
-**Date:** 2026-06-13 (revalidated 2026-09-12, v2.1.2.0)
+**Date:** 2026-06-13 (revalidated 2026-09-19, v2.1.2.0; WI#180 health parity — opencode2 container-health role, monitor-only runtime/knowledge diagnostics)
 **Status:** Reference (as-is) — documents current behavior, not a proposal
 **Related:** `ic-infrastructure-health-check/README.md`, `docs/ops/MULTITENANCY-PRODUCTION.md`, `docs/internal/history/proposals/CHAOS_ENGINEERING_TEST_PLAN.md`
 
@@ -185,6 +185,38 @@ daemon and PostgreSQL are down. Since 2.1.2.0:
   misclassified as quiesced; `crashed` counts as not writing (the container
   branch stays authoritative). Runtime-absent tenants classify as quiesced
   (WI#135 followup).
+
+### WI#180 health-system parity (2.1.2.0)
+
+The WI#180 health-system-parity work extended coverage and remediation without
+changing the pipeline structure documented above:
+
+- **opencode2 container-health role:** `health-systemd.sh` now includes
+  opencode2 in its container-health role list, so an active-but-unhealthy
+  opencode2 container reads critical. `health-openrc.sh` and
+  `lunarwing-self-heal.sh` strip the opencode2 role and `-sup` suffix when
+  resolving a unit to its tenant, so remediation targets the tenant user bus.
+- **Voice role mappings:** voice `-*` units resolve to their tenant across all
+  health consumers. Voice follows a monitor-only policy aligned to its service
+  identity (WI#180 F6).
+- **Monitor-only runtime/knowledge diagnostics:** the `runtime` and `knowledge`
+  healthchecks register as monitor-only diagnostics under MT
+  `SELF_HEAL_REMEDY_LOGICAL=false`. Per-instance failures escalate as
+  `runtime@<tenant>` / `knowledge@<tenant>` — never a restart, no
+  `SERVICE_MAP` lookup. Healthy instances clear state via report-as-truth;
+  component-level gaps escalate bare; unprobed instances never page per tenant.
+- **Gateway hardening:** absent legacy sessions dir is healthy-with-note (not a
+  degradation), stale lock and oversized session issues are now detected, and
+  the `gateway` suite validates the stale-lock/oversized-session checks.
+- **Alert freshness:** `LunarWingHealthReportStale` evaluates
+  `time() - report_timestamp_seconds` at scrape time so a stopped exporter
+  serving a frozen textfile still trips the alert.
+- **Knowledge monitoring is enablement-aware:** reads
+  `KNOWLEDGE_SYNC_ENABLED` / `KNOWLEDGE_SWEEP_ENABLED` and cadences from the
+  tenant env file; disabled features ignore stale/failed/malformed state.
+
+The canonical aggregate suite list grew from 14 to 20 registered suites; see
+`SELF_HEAL_COVERAGE_AUDIT_v2.0.4.0.md` for the updated `ORDER` list.
 
 `ic/scripts/setup-instance.sh` (the deprecated single-instance helper) does not
 reference the health pipeline — it predates the MT integration.

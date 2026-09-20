@@ -1,6 +1,6 @@
 # SSH Agent Harness
 
-**Status:** As-built (revalidated against source 2026-09-12, v2.1.2.0)
+**Status:** As-built (revalidated against source 2026-09-19, v2.1.2.0; worker list extended with OpenCode 2)
 **Code:** `ic/src/bridge/ssh*.rs`, `ic/src/config/ssh.rs`
 **Operator guide:** [`docs/ops/SSH-HARNESS-SETUP.md`](../ops/SSH-HARNESS-SETUP.md)
 **Delivery mechanisms** (how the agent actually runs SSH work — worker mode, the `ssh`/`ssh_git` built-in tools, the WASM `ssh` tool): [`SSH_DELIVERY_MECHANISMS.md`](SSH_DELIVERY_MECHANISMS.md)
@@ -16,8 +16,8 @@ verification, see the operator guide linked above.
 
 ## 1. What it is
 
-The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, and
-Kimi Code) a signing socket and gives interactive chat the built-in `ssh`,
+The SSH Agent harness gives LunarWing worker containers (Pebble, OpenCode, Kimi
+Code, and OpenCode 2) a signing socket and gives interactive chat the built-in `ssh`,
 `ssh_git`, and WASM `ssh` delivery paths. `ssh`, `ssh_git`, and `create_job` are
 excluded from autonomous jobs and routines; the harness does not make direct SSH
 an autonomous routine capability.
@@ -61,7 +61,7 @@ provisioning may have different disk behavior.
                                          ▼
                         ┌──────────── worker container ────────────┐
                         │  git / ssh  ──►  SSH_AUTH_SOCK  ──►  sign │
-                        │  (pebble, opencode, kimi)                │
+                        │  (pebble, opencode, kimi, opencode2)     │
                         └──────────────────────────────────────────┘
 ```
 

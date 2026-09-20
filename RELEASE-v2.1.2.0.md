@@ -30,7 +30,7 @@ Around that core, the armor closes from several directions at once. Workload
 processes on systemd multi-tenant hosts now spawn as manager-forked transient
 services, structurally fixing rootless Podman user-namespace joins from
 tenant scopes (work item #181/#178). External workers gained a new opencode2
-lane (v2 line, pinned at v2.0.8 on a reviewed upstream commit) with a
+lane (v2 line, pinned at v2.0.11 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
 block. The Pebble worker confines daemon-supplied project directories to the
@@ -89,8 +89,8 @@ previous compatibility baseline.
   TypeScript bridge over `@opencode/client/promise`, ports-registry v17
   slots (51000-51999), mt-admin mirroring with a 34-assertion harness, and
   protected CI publication jobs (candidate/scan/promote) with the
-  digest-bound reproducible contract. Pinned at `v2.0.8` on reviewed
-  upstream commit `7673ed6bd6547ee0dcb81aab55f1392fb751d652`; the v1 lane
+  digest-bound reproducible contract. Pinned at `v2.0.11` on reviewed
+  upstream commit `9eb6902aaf3c35ce985b67c605a775992249066b`; the v1 lane
   stays pinned at proven `v1.18.25` and remains the default.
 - **Pebble worker confinement and live cancellation.** The Pebble worker
   now resolves and confines `project_dir` to the workspace root before
@@ -156,7 +156,7 @@ previous compatibility baseline.
 | Tool registry patches | gitlab 0.1.5 (was 0.1.4); cavepony 0.4.2, llm-context 0.1.1, multica-bridge 0.1.2, ssh 0.1.1, vision-analyze 0.1.3, voice-transcribe 0.1.1, web-search 0.2.2, gotify 0.1.0 (no change) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (no change) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
-| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `0.43.1`; opencode2 `v2.0.8` at `7673ed6bd6547ee0dcb81aab55f1392fb751d652`; pebble at upstream HEAD `2d0f3786` |
+| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `0.43.1`; opencode2 `v2.0.11` at `9eb6902aaf3c35ce985b67c605a775992249066b`; pebble at upstream HEAD `2d0f3786` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
@@ -363,8 +363,8 @@ The OpenCode v2 lane is a full first-class worker:
   gained the opencode2 case; `validate_config.py` and
   `promote-worker-image.py` guard the lane.
 - Pin history this cycle: v2.0.4 → v2.0.5 (goal 21/MR !988) → v2.0.8
-  (goal 13), tag SHA-verified against both upstream remotes; upstream
-  bridge-relevant SDK files confirmed unchanged between refs.
+  (goal 13) → v2.0.11 (goal 13), tag SHA-verified against both upstream
+  remotes; upstream bridge-relevant SDK files confirmed unchanged between refs.
 
 ### Pebble Worker Hardening (goals 17, 20, work items #101, #149)
 
@@ -387,8 +387,8 @@ The OpenCode v2 lane is a full first-class worker:
   deliberately not adopted; package-lock integrity matches the npm registry
   per bump). Dockerfile ARG, build-args, package-lock, mt-admin harness
   assertion, and docs synchronized per bump.
-- opencode2 `v2.0.5` → `v2.0.8` at reviewed commit
-  `7673ed6bd6547ee0dcb81aab55f1392fb751d652` (tag SHA verified against both
+- opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` at reviewed commit
+  `9eb6902aaf3c35ce985b67c605a775992249066b` (tag SHA verified against both
   upstream remotes; upstream build script byte-identical between refs, so
   the reproducible-build patch applies unchanged).
 - opencode v1 stays deliberately pinned at `v1.18.25`
@@ -514,7 +514,7 @@ duplicated-checked alongside the other tenant port maps.
    (disabled) heartbeat sweep will now actually sweep — review
    `KNOWLEDGE_SWEEP_*` cadence knobs before enabling at scale.
 8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `0.43.1`,
-   opencode2 `v2.0.8` (`7673ed6b…`), pebble `2d0f3786`. Do not adopt the
+   opencode2 `v2.0.11` (`9eb6902a…`), pebble `2d0f3786`. Do not adopt the
    opencode 2.x line for the opencode lane or the opencode v1.18.29 image;
    do not adopt the kimi-code 2.x line this cycle. Pull worker images by
    the digest recorded in `worker-image-evidence.json`.
@@ -593,5 +593,5 @@ duplicated-checked alongside the other tenant port maps.
   runbooks for the known signal-9 class (promotion locks are the only
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
-- Worker pins updated: kimi-code 0.43.1, opencode2 v2.0.8, gitlab tool
+- Worker pins updated: kimi-code 0.43.1, opencode2 v2.0.11, gitlab tool
   registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
