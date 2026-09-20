@@ -1,6 +1,6 @@
 # Self-Heal Coverage Audit v2.0.4.0
 
-**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-12)
+**Date:** 2026-08-03 (ported and hardened on v2.0.5.0 on 2026-08-05; 435/435 assertions were green at that audit point; suite registration re-verified 2026-09-19)
 **Status:** Goal 2 implementation complete; residual gaps documented below
 **Reference reviewed:** `origin/aj/kimi-24-20260801-1203`
 **Ported from:** `origin/shexpansion/cmc/v2.0.4.0` (commit `d1d3c52`)
@@ -116,3 +116,18 @@ suites. CI invokes aggregate once through `.gitlab/scripts/shell-harnesses.sh`.
 > changed in the 2.1.2.0 cycle; the writer-quiescence work (WI#133/#134/#137)
 > lives in mt-admin tenant lifecycle, not the host health pipeline, and is
 > documented in `SELF_HEAL_DEPLOYMENT_WIRING.md`.
+>
+> **Update (2026-09-19, v2.1.2.0):** the `ORDER` list grew from 14 to 20 suites
+> after the WI#180 health-system-parity work. The six new registered suites are
+> `cron-wrapper`, `runtime`, `knowledge`, and `gateway` (plus the already
+> counted `metrics-exporter`/`metrics-unit` pair was already present; the new
+> additions bring the total to 20). The canonical list is now
+> (`regression matrix chaos openrc systemd lunarvision init-templates
+> lunarvoice voice-init-templates netbird llm-streams metrics-exporter
+> metrics-unit watchdog watchdog-openrc cron-wrapper runtime knowledge
+> gateway`). The `runtime` and `knowledge` suites cover the WI#180
+> tenant-aware runtime diagnostics probe and knowledge publication/sync/sweep
+> monitoring; `gateway` covers the stale-lock and oversized-session gateway
+> checks addressed in the MR !1041 review; `cron-wrapper` validates the
+> scheduled launcher PATH hygiene (WI#180 F3). The audit's detection/remedy
+> table still describes the self-heal pipeline itself.
