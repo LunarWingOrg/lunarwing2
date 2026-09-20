@@ -7,7 +7,7 @@ import { join } from "node:path"
 import { executeTask } from "./kimi_task_executor.js"
 import type { TaskRequest, TaskResult } from "./lunarwing_runtime.js"
 
-function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail"): string {
+function makeMockKimi(behavior: "success" | "empty" | "error" | "env" | "hang" | "large" | "longline" | "no-newline" | "stderr-tail" | "unknown-role"): string {
   const dir = mkdtempSync(join(tmpdir(), "kimi-mock-"))
   const binPath = join(dir, "mock-kimi")
   let script: string
@@ -72,6 +72,18 @@ process.stdout.write(JSON.stringify({ role: "assistant", content: "final without
       script = `#!/usr/bin/env node
 process.stderr.write("x".repeat(70000) + "FINAL-ERROR")
 process.exit(1)
+`
+      break
+    case "unknown-role":
+      script = `#!/usr/bin/env node
+const messages = [
+  { role: "reasoning", content: "internal draft the parser must drop" },
+  { role: "assistant", content: "Done! Here is the result." },
+]
+for (const m of messages) {
+  process.stdout.write(JSON.stringify(m) + "\\n")
+}
+process.exit(0)
 `
       break
   }
@@ -254,6 +266,28 @@ test("executeTask: keeps actionable stderr tail", async () => {
   assert.equal(result?.status, "error")
   assert.match(result?.error || "", /FINAL-ERROR$/)
   assert.ok(Buffer.byteLength(result?.error || "") <= 65_536)
+})
+
+test("executeTask: warns on unrecognized stream-json roles instead of silently dropping", async () => {
+  const bin = makeMockKimi("unknown-role")
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (...args: unknown[]) => { warnings.push(args.join(" ")) }
+  let result: TaskResult | undefined
+  try {
+    ;({ result } = await runExecutor(
+      { task_id: "unknown-role", prompt: "schema drift", timeout_ms: 10_000 },
+      bin,
+    ))
+  } finally {
+    console.warn = originalWarn
+  }
+  assert.equal(result?.status, "success")
+  assert.equal(result?.output, "Done! Here is the result.")
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0]!, /unrecognized role "reasoning"/)
+  // The dropped token content must not leak into the result output.
+  assert.ok(!(result?.output || "").includes("internal draft"))
 })
 
 test("executeTask: invalid workspace emits one error result", async () => {
