@@ -188,6 +188,11 @@ case "$MODE" in
     [ $# -gt 0 ] || die "CLI mode requires prompt arguments"
     log "Mode: CLI — running kimi in print/stream-json mode"
     cd "$WORKSPACE_ROOT"
+    # Permission-mode reminder is model-context prompt noise for a worker
+    # whose permission mode is fixed by baked config; the dangerous-command
+    # guard must also stay off (no TTY for its prompt under headless -p).
+    export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
+    export KIMI_CODE_DANGEROUS_COMMAND_GUARD="${KIMI_CODE_DANGEROUS_COMMAND_GUARD:-false}"
     exec kimi -p "$*" --output-format stream-json
     ;;
 
@@ -199,6 +204,11 @@ case "$MODE" in
     export WS_STATE_FILE
     export WORKSPACE_ROOT
     export KIMI_MODE
+    # Permission-mode reminder is model-context prompt noise for a worker
+    # whose permission mode is fixed by baked config; the dangerous-command
+    # guard must also stay off (no TTY for its prompt under headless -p).
+    export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
+    export KIMI_CODE_DANGEROUS_COMMAND_GUARD="${KIMI_CODE_DANGEROUS_COMMAND_GUARD:-false}"
 
     node /app/scripts/lunarwing_bridge.js &
     BRIDGE_PID=$!
