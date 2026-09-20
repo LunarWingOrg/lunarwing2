@@ -474,11 +474,17 @@ the next occurrence even when the daily thread budget blocks a run; manual
 fires do not shift the cron schedule. Daily thread budgets reset on UTC day
 boundaries.
 
-The daily thread budget (`max_threads_per_day`, default 10, 0 = unlimited) is
-configurable at creation time through `mission_create` and afterwards through
-`mission_update`. `mission_list` and the web mission list/detail views expose
-`threads_today`, `max_threads_per_day`, and a derived `budget_exhausted` flag
-so an active-but-exhausted mission is distinguishable from a dead one. Budget
+The daily thread budget (`max_threads_per_day`,
+default 30 via `DEFAULT_MAX_THREADS_PER_DAY` since work item #189, 0 =
+unlimited) is configurable at creation time through `mission_create` and
+afterwards through `mission_update`. The default moved from 10 to 30 because
+an hourly mission otherwise got only 10 hours of daily coverage; 30 covers a
+full day of hourly fires plus retry headroom. Every successfully spawned
+thread increments `threads_today`, so retries that respawn a thread draw from
+the same budget; only spawn-failure rollback refunds a slot. `mission_list`
+and the web mission list/detail views expose `threads_today`,
+`max_threads_per_day`, and a derived `budget_exhausted` flag so an
+active-but-exhausted mission is distinguishable from a dead one. Budget
 exhaustion is logged at warn level with the mission name and counters; the
 mission stays Active and resumes spawning at the next UTC day rather than
 going terminal. `mission_fire` reports the precise reason when nothing fires

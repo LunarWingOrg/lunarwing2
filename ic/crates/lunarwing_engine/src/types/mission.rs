@@ -196,6 +196,15 @@ pub struct Mission {
 /// an unmonitored blind spot (work item #189); 30 covers hourly cadences with
 /// headroom for retries. Operators can still set any value, including 0 for
 /// unlimited, via `mission_update`.
+///
+/// Budget/retry interaction (WI#188): every successfully spawned thread
+/// increments `threads_today`, so any retry scheme that respawns a thread
+/// draws from the same daily budget — one failed fire plus one retry costs
+/// two slots. The 30-thread default leaves roughly 6 slots of headroom over
+/// an hourly cadence for such respawns. Rollback on spawn failure is the
+/// only refund: a thread that fails to spawn refunds its slot (the fire
+/// rolls back to the pre-fire mission state), and a trigger re-delivery
+/// whose dedup key was already processed spawns nothing and costs nothing.
 pub const DEFAULT_MAX_THREADS_PER_DAY: u32 = 30;
 
 /// System event types the engine emits via `fire_on_system_event` (source
