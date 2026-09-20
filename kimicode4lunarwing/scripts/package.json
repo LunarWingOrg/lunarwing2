@@ -6,7 +6,7 @@
   "description": "LunarWing WebSocket bridge for Kimi Code CLI",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "node --test kimi_result_test.js kimi_task_executor_test.js task_prompt_test.js path_expand_test.js lunarwing_runtime_test.js lunarwing_bridge_test.js entrypoint_config_test.js",
+    "test": "node --test --test-timeout=60000 kimi_result_test.js kimi_task_executor_test.js task_prompt_test.js path_expand_test.js lunarwing_runtime_test.js lunarwing_bridge_test.js entrypoint_config_test.js",
     "smoke": "node smoke_test.js"
   },
   "dependencies": {
