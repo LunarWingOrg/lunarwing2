@@ -143,7 +143,8 @@ pub struct Mission {
     pub notify_channels: Vec<String>,
 
     // ── Budget ──
-    /// Maximum threads per day (0 = unlimited).
+    /// Maximum threads per day (0 = unlimited). New missions without an
+    /// explicit value start at [`DEFAULT_MAX_THREADS_PER_DAY`].
     pub max_threads_per_day: u32,
     /// Threads spawned on `threads_today_date`.
     pub threads_today: u32,
@@ -188,6 +189,14 @@ pub struct Mission {
     #[serde(default)]
     pub last_fired_at: Option<DateTime<Utc>>,
 }
+
+/// Default daily thread budget applied when a mission is created without an
+/// explicit `max_threads_per_day` (0 on the field = unlimited). An hourly
+/// mission needs 24 fires of coverage per day, so the old default of 10 left
+/// an unmonitored blind spot (work item #189); 30 covers hourly cadences with
+/// headroom for retries. Operators can still set any value, including 0 for
+/// unlimited, via `mission_update`.
+pub const DEFAULT_MAX_THREADS_PER_DAY: u32 = 30;
 
 /// System event types the engine emits via `fire_on_system_event` (source
 /// `engine`). User-facing cadence strings cannot subscribe to these with
@@ -256,7 +265,7 @@ impl Mission {
             thread_history: Vec::new(),
             success_criteria: None,
             notify_channels: Vec::new(),
-            max_threads_per_day: 10,
+            max_threads_per_day: DEFAULT_MAX_THREADS_PER_DAY,
             threads_today: 0,
             threads_today_date: Some(now.date_naive()),
             last_trigger_payload: None,
@@ -365,6 +374,21 @@ impl Mission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_mission_defaults_to_thirty_threads_per_day() {
+        // WI#189: the old default of 10 gave an hourly mission only 10 hours
+        // of daily coverage. 30 covers hourly cadences plus retry headroom.
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "hourly",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        assert_eq!(mission.max_threads_per_day, DEFAULT_MAX_THREADS_PER_DAY);
+        assert_eq!(DEFAULT_MAX_THREADS_PER_DAY, 30);
+    }
 
     #[test]
     fn legacy_mission_without_budget_date_still_deserializes() {
