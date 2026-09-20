@@ -2,15 +2,18 @@
 
 The V2 engine is a unified thread-capability-CodeAct execution model that lives in `ic/crates/lunarwing_engine/`. It replaces approximately 10 separate v1 abstractions (Session, Job, Routine, Channel, Tool, Skill, Hook, Observer, Extension, LoopDelegate) with 5 core primitives.
 
-**Revalidated against source 2026-09-12 (v2.1.2.0).** Module map, gate types,
+**Revalidated against source 2026-09-19 (v2.1.2.0).** Module map, gate types,
 mission seeding, lease/policy behavior, env knobs, and bridge boundaries were
 re-checked against the current tree; updates for 2.1.1.0 include the
 best-effort `thread_start` event dispatch (item 9/WI#109 scope A) and the
 `ENGINE_V2_CHANNELS` routing-policy clarification (there is no `none`
 opt-out; unknown entries are ignored). Updates for 2.1.2.0 include the
 WI#132 authenticity hardening (labeled/neutralized memory retrieval,
-compaction summaries, and system-role content) and the removal of the dead
-`executor/context.rs` module.
+compaction summaries, and system-role content), the removal of the dead
+`executor/context.rs` module, and the Goal 8 insights hardening
+(host-validated `save_conversation_insight` writes, eligible-user-evidence
+batching, project-scoped mission dispatch, restart-safe `InsightCursor`
+batching, and explicit insight-mission opt-out with a Paused tombstone).
 
 Enabled at runtime via the `ENGINE_V2=true` environment variable. The gateway
 uses Engine V2 by default when enabled. The bridge router (`ic/src/bridge/router.rs`)
