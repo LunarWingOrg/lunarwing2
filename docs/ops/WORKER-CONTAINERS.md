@@ -98,8 +98,8 @@ keeps its proven v1.18.25 pin; v2 is opt-in per tenant until upstream's
 tenant during the transition (agent routing confusion — plan §5).
 
 **Dockerfile:** `opencode2.4lunarwing/Dockerfile` — pinned to
-**v2.0.8** at reviewed full commit
-`7673ed6bd6547ee0dcb81aab55f1392fb751d652`; the v2 bridge uses
+**v2.0.11** at reviewed full commit
+`9eb6902aaf3c35ce985b67c605a775992249066b`; the v2 bridge uses
 `@opencode/client` (promise API) instead of `@opencode-ai/sdk`, and the
 v2 config file is `config/opencode2.json` (`providers` map,
 `settings.baseURL`, `package`). Container UID/GID is **10003**
@@ -188,6 +188,15 @@ Bridge executor, result, workspace-path, build-profile, and study-notes tests
 passed; workspace cleanup was also checked with an injected assertion failure.
 Full image digest verification remains with CI: local Podman could not unpack
 the base image because this account lacks sufficient subordinate UID/GID mappings.
+
+v2.0.11 bump (2026-09-20): upstream `packages/cli/script/build.ts` is
+byte-identical between v2.0.8 and v2.0.11, so the checked build-profile patch
+above applies unchanged; client/schema/protocol SDK changes in
+`9eb6902aaf3c35ce985b67c605a775992249066b` are additive against the bridge's
+`@opencode/client/promise` usage — `OpenCode.make`, `session.interrupt`,
+`session.execution.{succeeded,failed,interrupted}`, `session.idle`,
+`session.message.list`, and `session.text.delta` all confirmed present.
+Whole-image reproducibility remains CI-verified per revision.
 
 Goal-35 verification (2026-09-18): the #177 root cause was reproduced
 host-side with the pinned Bun — two full self-test sequences with a scratch
