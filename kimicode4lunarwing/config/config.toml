@@ -8,8 +8,19 @@
 # the default: since kimi-code 0.37.2, worker prompts against it fail.
 
 default_model = "tensorzero/FrontierCODE"
-default_permission_mode = "yolo"
+# Headless worker lane: "auto" auto-approves everything, including commands the
+# static analyzer cannot classify. "yolo" is stricter upstream (0.40.0+ holds
+# dangerous-class commands), which a headless -p run can never answer — the task
+# would stall to its full timeout (WI#195 finding 1).
+default_permission_mode = "auto"
 telemetry = false
+
+[permission]
+# The worker is a headless batch executor (kimi -p --output-format stream-json)
+# with no TTY to answer an approval prompt. upstream 0.40.0 added a dangerous
+# -command guard that asks in ALL permission modes; every prompt is an
+# unanswered stall until the task timeout, so the guard must be off here.
+dangerous_command_guard = false
 
 [providers.tensorzero]
 type = "openai"
