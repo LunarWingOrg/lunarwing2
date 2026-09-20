@@ -144,7 +144,14 @@ async fn handle_connection(
     // `activeTasks` map. The read loop stays live while tasks run (task
     // handling is spawned, not awaited), so a mid-task `cancel` envelope
     // reaches its channel instead of queueing behind the task.
-    let mut cancels: HashMap<String, oneshot::Sender<()>> = HashMap::new();
+    //
+    // Shared as `Arc<Mutex<…>>` so the spawned task handler can remove its
+    // own entry on natural completion (WI#158): without shared ownership
+    // the handler could not touch the map and every completed task would
+    // leak a dead `oneshot::Sender` + its task-id `String` for the life of
+    // the connection.
+    let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     // Outbound envelopes are funneled through a channel so spawned task
     // handlers never touch the sink: one writer task drains it while the
@@ -178,9 +185,9 @@ async fn handle_connection(
 
         match envelope.msg_type.as_str() {
             "task_request" => {
-                dispatch_task(envelope, config, &out_tx, &mut cancels, registry).await;
+                dispatch_task(envelope, config, &out_tx, &cancels, registry).await;
             }
-            "cancel" => cancel_task(&envelope, &mut cancels),
+            "cancel" => cancel_task(&envelope, &cancels).await,
             "ping" => {
                 let json = serde_json::to_string(&protocol::pong_envelope())?;
                 if out_tx.send(Message::Text(json.into())).is_err() {
@@ -200,7 +207,10 @@ async fn handle_connection(
 /// already-finished task is logged and ignored (the kimi bridge behaves the
 /// same); a known task's channel fires, the executor kills the pebble
 /// subprocess, and the task handler emits its own `task_result` envelope.
-fn cancel_task(envelope: &Envelope, cancels: &mut HashMap<String, oneshot::Sender<()>>) {
+async fn cancel_task(
+    envelope: &Envelope,
+    cancels: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
+) {
     let payload: CancelPayload = match serde_json::from_value(envelope.payload.clone()) {
         Ok(payload) => payload,
         Err(e) => {
@@ -208,10 +218,20 @@ fn cancel_task(envelope: &Envelope, cancels: &mut HashMap<String, oneshot::Sende
             return;
         }
     };
-    match cancels.remove(&payload.task_id) {
+    let mut map = cancels.lock().await;
+    match map.remove(&payload.task_id) {
         Some(tx) => {
-            let _ = tx.send(());
-            eprintln!("[bridge] task {}: cancel signal sent", payload.task_id);
+            // The receiver is dropped (task already finished) when `send`
+            // fails; the entry was removed so the signal is not falsely
+            // reported as sent.
+            if tx.send(()).is_ok() {
+                eprintln!("[bridge] task {}: cancel signal sent", payload.task_id);
+            } else {
+                eprintln!(
+                    "[bridge] task {}: cancel entry stale (already finished)",
+                    payload.task_id
+                );
+            }
         }
         None => eprintln!(
             "[bridge] cancel: task {} not found or already finished",
@@ -289,7 +309,7 @@ async fn dispatch_task(
     envelope: Envelope,
     config: &BridgeConfig,
     out_tx: &Outbound,
-    cancels: &mut HashMap<String, oneshot::Sender<()>>,
+    cancels: &Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>,
     registry: &Arc<WorkspaceRegistry>,
 ) {
     let request: TaskRequest = match serde_json::from_value(envelope.payload) {
@@ -351,7 +371,10 @@ async fn dispatch_task(
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    cancels.insert(request.task_id.clone(), cancel_tx);
+    cancels
+        .lock()
+        .await
+        .insert(request.task_id.clone(), cancel_tx);
 
     let exec_config = ExecutorConfig {
         pebble_bin: config.pebble_bin.clone(),
@@ -362,16 +385,23 @@ async fn dispatch_task(
 
     // Task handling is spawned, not awaited: the read loop must keep
     // consuming frames so mid-task `cancel` envelopes are received while the
-    // pebble subprocess runs. The handler owns the workspace claim and the
-    // cancel-map entry for the task's lifetime and clears both on exit, then
-    // forwards every executor envelope through the outbound channel.
+    // pebble subprocess runs. The handler owns the workspace claim and removes
+    // its own cancel-map entry on exit (WI#158: previously the entry was never
+    // removed on natural completion, leaking a dead `oneshot::Sender` per
+    // task). It then forwards every executor envelope through the outbound
+    // channel.
     {
         let registry = Arc::clone(registry);
+        let cancels = Arc::clone(cancels);
         let task_id = request.task_id.clone();
         let out_tx = out_tx.clone();
         tokio::spawn(async move {
             executor::run_task(&exec_config, &request, event_tx, cancel_rx).await;
             registry.unregister(&workspace, &task_id).await;
+            // Remove the cancel entry so completed tasks do not leak. A
+            // cancel arriving after this point finds `None` and logs
+            // "not found or already finished" — which is then accurate.
+            cancels.lock().await.remove(&task_id);
             while let Some(event) = event_rx.recv().await {
                 let env = match &event {
                     ExecutorEvent::Progress(e) | ExecutorEvent::Result(e) => e,
@@ -555,33 +585,41 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_fires_the_matching_tasks_channel() {
-        let mut cancels = HashMap::new();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (tx_a, mut rx_a) = oneshot::channel();
         let (tx_b, mut rx_b) = oneshot::channel();
-        cancels.insert("task-a".to_string(), tx_a);
-        cancels.insert("task-b".to_string(), tx_b);
+        cancels.lock().await.insert("task-a".to_string(), tx_a);
+        cancels.lock().await.insert("task-b".to_string(), tx_b);
 
-        cancel_task(&protocol::cancel_envelope("task-a"), &mut cancels);
+        cancel_task(&protocol::cancel_envelope("task-a"), &cancels).await;
 
         assert!(rx_a.try_recv().is_ok(), "task-a cancel must fire");
         assert!(
             rx_b.try_recv().is_err(),
             "task-b cancel must not fire from task-a's envelope"
         );
-        assert!(cancels.contains_key("task-b"), "task-b stays registered");
-        assert!(!cancels.contains_key("task-a"), "task-a entry consumed");
+        assert!(
+            cancels.lock().await.contains_key("task-b"),
+            "task-b stays registered"
+        );
+        assert!(
+            !cancels.lock().await.contains_key("task-a"),
+            "task-a entry consumed"
+        );
     }
 
     #[tokio::test]
     async fn cancel_for_unknown_task_is_ignored() {
-        let mut cancels = HashMap::new();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (tx, mut rx) = oneshot::channel();
-        cancels.insert("task-live".to_string(), tx);
+        cancels.lock().await.insert("task-live".to_string(), tx);
 
-        cancel_task(&protocol::cancel_envelope("task-ghost"), &mut cancels);
+        cancel_task(&protocol::cancel_envelope("task-ghost"), &cancels).await;
 
         assert!(rx.try_recv().is_err(), "no cancel may fire");
-        assert!(cancels.contains_key("task-live"));
+        assert!(cancels.lock().await.contains_key("task-live"));
     }
 
     #[tokio::test]
@@ -593,14 +631,15 @@ mod tests {
         let root = test_config();
         let registry = Arc::new(WorkspaceRegistry::new());
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut cancels = HashMap::new();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
         dispatch_task(
             request_envelope("task-1", Some(&root.workspace_root)),
             &root,
             &out_tx,
-            &mut cancels,
+            &cancels,
             &registry,
         )
         .await;
@@ -646,7 +685,8 @@ mod tests {
         let root = test_config();
         let registry = Arc::new(WorkspaceRegistry::new());
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut cancels = HashMap::new();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         let outside = std::env::temp_dir().join("pebble-bridge-outside-escape");
         std::fs::create_dir_all(&outside).expect("create outside dir");
@@ -656,7 +696,7 @@ mod tests {
             request_envelope("task-escape", Some(&outside_str)),
             &root,
             &out_tx,
-            &mut cancels,
+            &cancels,
             &registry,
         )
         .await;
@@ -667,7 +707,87 @@ mod tests {
             serde_json::from_value(rejection.payload).expect("task_result payload");
         assert_eq!(payload.status, "error");
         assert!(payload.error.as_deref().unwrap_or("").contains("escapes"));
-        assert!(cancels.is_empty(), "rejected task must register no cancel");
+        assert!(
+            cancels.lock().await.is_empty(),
+            "rejected task must register no cancel"
+        );
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Regression for WI#158: every task that completes naturally (not via
+    /// cancel) must remove its own cancel-map entry. Previously the spawned
+    /// handler only released the workspace claim, leaking a dead
+    /// `oneshot::Sender` per task for the life of the connection. After N
+    /// tasks finish on one connection the map must be empty.
+    #[tokio::test]
+    async fn cancels_map_is_empty_after_tasks_complete() {
+        let root = test_config();
+        let registry = Arc::new(WorkspaceRegistry::new());
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Dispatch 3 tasks with distinct workspaces so they do not collide
+        // on the workspace registry. Each fails fast (nonexistent pebble bin)
+        // and the handler removes its cancel entry on exit.
+        for i in 0..3 {
+            let task_workspace =
+                std::env::temp_dir().join(format!("pebble-wi158-task-{i}-{}", std::process::id()));
+            std::fs::create_dir_all(&task_workspace).expect("create task workspace");
+            let ws_str = task_workspace.to_str().expect("utf-8 path").to_string();
+
+            dispatch_task(
+                request_envelope(&format!("task-{i}"), Some(&ws_str)),
+                &root,
+                &out_tx,
+                &cancels,
+                &registry,
+            )
+            .await;
+        }
+
+        // Drain the 3 error results so the handlers finish.
+        for _ in 0..3 {
+            let result = next_envelope(&mut out_rx).await;
+            assert_eq!(result.msg_type, "task_result");
+        }
+
+        // Poll until all handlers have removed their entries or timeout.
+        for _ in 0..100 {
+            if cancels.lock().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!(
+            "cancels map leaked entries after tasks completed: {:?}",
+            cancels.lock().await.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression for WI#158 log-accuracy nit: when a cancel envelope arrives
+    /// for a task whose receiver was already dropped (task finished but the
+    /// stale entry somehow lingered), the log must not say "cancel signal
+    /// sent". This is a defensive test — under the shared-map fix the entry is
+    /// removed on completion, so a post-completion cancel finds `None` and logs
+    /// "not found or already finished" instead.
+    #[tokio::test]
+    async fn cancel_against_dead_receiver_does_not_claim_signal_sent() {
+        let cancels: Arc<Mutex<HashMap<String, oneshot::Sender<()>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = oneshot::channel();
+        // Simulate a finished task: receiver is dropped, but the sender is
+        // still in the map (the pre-fix leak condition).
+        cancels.lock().await.insert("task-dead".to_string(), tx);
+        drop(rx);
+
+        cancel_task(&protocol::cancel_envelope("task-dead"), &cancels).await;
+
+        // The entry is removed regardless (send-then-remove or remove-then-
+        // send), but the key point is the receiver got nothing.
+        assert!(
+            cancels.lock().await.is_empty(),
+            "dead entry must be removed"
+        );
     }
 }
