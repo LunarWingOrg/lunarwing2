@@ -1723,6 +1723,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         store_dyn.clone(),
         Arc::clone(&thread_manager),
     ));
+    // Install the retry-wake self-handle BEFORE any fire path can arm a retry
+    // — interrupted threads on a mission that predates this boot's wake must
+    // never silently drop their reschedule (WI#188).
+    mission_manager.arm_retry_wake().await;
 
     // Wire every mission consumer before recovery or background work can run.
     // Recovered threads may immediately call mission_* or emit an outcome.

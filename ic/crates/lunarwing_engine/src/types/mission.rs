@@ -249,39 +249,6 @@ pub struct MissionRetryPolicy {
     pub max_delay_secs: u64,
 }
 
-/// Persisted retry state riding a failing mission thread's orchestrator-state
-/// metadata (work item #188). The outcome processor writes it onto the failed
-/// thread; the retry sleep task and the post-restart sweep read it back
-/// (`metadata["mission_retry"]`), so a pending re-fire survives the daemon
-/// lifetime without new mission columns.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RetryState {
-    /// 1-based retry attempt currently scheduled (1 = first retry).
-    pub attempt: u32,
-    /// The trigger payload being re-fired (None for payload-less cadences).
-    pub payload: Option<serde_json::Value>,
-    /// UTC time after which the re-fire may run.
-    pub not_before: DateTime<Utc>,
-}
-
-impl RetryState {
-    /// Metadata key under which the retry state rides on the failing thread.
-    pub const METADATA_KEY: &'static str = "mission_retry";
-
-    /// Read a scheduled retry off a thread's state metadata.
-    pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
-        metadata
-            .get(Self::METADATA_KEY)
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-    }
-
-    /// Serialize this state for storage under [`Self::METADATA_KEY`].
-    pub fn to_value(&self) -> serde_json::Value {
-        serde_json::to_value(self)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
-    }
-}
-
 impl Default for MissionRetryPolicy {
     fn default() -> Self {
         Self {
@@ -313,6 +280,43 @@ impl MissionRetryPolicy {
         }
         let clamped = delay_secs.min(self.max_delay_secs as f64) as u64;
         Some(Duration::from_secs(clamped))
+    }
+}
+
+/// Persisted retry state riding the failing mission thread's metadata
+/// (work item #188). The outcome processor writes it onto the failed
+/// thread; the in-memory retry sleep and the post-restart sweep read it
+/// back (`metadata["mission_retry"]`), so a pending re-fire described to
+/// the daemon survives restarts without new mission columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryState {
+    /// 1-based retry attempt currently scheduled (1 = first retry).
+    pub attempt: u32,
+    /// The trigger payload being re-fired (None for payload-less cadences).
+    pub payload: Option<serde_json::Value>,
+    /// UTC time after which the re-fire may run.
+    pub not_before: DateTime<Utc>,
+    /// Lineage of attempts in this fire's lineage (attempt numbers spent),
+    /// persisted so the sweep and diagnostics can tell attempts apart.
+    #[serde(default)]
+    pub lineage: Vec<u32>,
+}
+
+impl RetryState {
+    /// Metadata key under which the retry state rides on the failing thread.
+    pub const METADATA_KEY: &'static str = "mission_retry";
+
+    /// Read a scheduled retry off a thread's state metadata.
+    pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        metadata
+            .get(Self::METADATA_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Serialize this state for storage under [`Self::METADATA_KEY`].
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
     }
 }
 
