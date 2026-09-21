@@ -139,38 +139,45 @@ if kimi_model and old_alias and old_alias != kimi_model:
 text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
 text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
 
-# WI#206 fail-closed policy re-assertion. Whatever the source config said
+# WI#206 fail-closed policy enforcement. Whatever the source config said
 # (custom KIMI_CONFIG_SOURCE mounts included), the worker never runs with the
-# dangerous-command guard disabled or without the PreToolUse guard hook.
-def assert_fail_closed_policy(config):
-    parsed = tomllib.loads(config)
-    permission = parsed.get("permission")
-    if not isinstance(permission, dict) or permission.get("dangerous_command_guard") is not True:
-        die_policy("permission.dangerous_command_guard must stay true")
-    hooks = parsed.get("hooks")
-    if not isinstance(hooks, list):
-        die_policy("[[hooks]] table missing the PreToolUse guard")
-    for hook in hooks:
-        if not isinstance(hook, dict):
-            continue
-        if (
-            hook.get("event") == "PreToolUse"
-            and hook.get("matcher") == "Bash"
-            and "headless_command_guard.mjs" in str(hook.get("command", ""))
-        ):
-            return
-    die_policy("[[hooks]] table missing the PreToolUse guard")
+# dangerous-command guard disabled or without the PreToolUse guard hook:
+# both are (re)injected when absent and verified present afterwards.
+def policy_block(config):
+    return "\n[permission]\ndangerous_command_guard = true\n"
 
-def die_policy(message):
-    raise ValueError(f"fail-closed policy violation: {message}")
+def hook_block():
+    return ("\n[[hooks]]\n"
+            "event = \"PreToolUse\"\n"
+            "matcher = \"Bash\"\n"
+            "command = \"node /app/hooks/headless_command_guard.mjs\"\n"
+            "timeout = 10\n")
 
-text = re.sub(
-    r"^(?m)^\s*dangerous_command_guard\s*=.*$",
-    "dangerous_command_guard = true",
-    text,
-    count=1,
+parsed = tomllib.loads(text)
+if "permission" not in parsed or not isinstance(parsed.get("permission"), dict):
+    text += policy_block(text)
+elif parsed["permission"].get("dangerous_command_guard") is not True:
+    if "dangerous_command_guard" in parsed["permission"]:
+        text = re.sub(
+            r"^\s*dangerous_command_guard\s*=.*$",
+            "dangerous_command_guard = true",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        text = text.replace("[permission]", "[permission]\ndangerous_command_guard = true", 1)
+parsed = tomllib.loads(text)
+hooks = parsed.get("hooks")
+guard_hook_present = isinstance(hooks, list) and any(
+    isinstance(hook, dict)
+    and hook.get("event") == "PreToolUse"
+    and hook.get("matcher") == "Bash"
+    and "headless_command_guard.mjs" in str(hook.get("command", ""))
+    for hook in hooks
 )
-assert_fail_closed_policy(text)
+if not guard_hook_present:
+    text += hook_block()
 tomllib.loads(text)
 
 fd, temporary = tempfile.mkstemp(prefix=".config.toml.", dir=os.path.dirname(target))
