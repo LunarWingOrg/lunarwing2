@@ -196,6 +196,9 @@ pub struct MissionUpdate {
     pub success_criteria: Option<String>,
     /// Replacement webhook secret. Never emitted in mission responses or logs.
     pub webhook_secret: Option<String>,
+    /// Set (`Some`) or clear (`None`) the focus steering the next thread.
+    /// `None` (the outer default) leaves the stored focus untouched.
+    pub current_focus: Option<Option<String>>,
 }
 
 /// Manages mission lifecycle and thread spawning.
@@ -621,6 +624,9 @@ impl MissionManager {
         }
         if let Some(criteria) = updates.success_criteria {
             mission.success_criteria = Some(criteria);
+        }
+        if let Some(focus) = updates.current_focus {
+            mission.current_focus = focus;
         }
 
         mission.updated_at = chrono::Utc::now();
