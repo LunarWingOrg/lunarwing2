@@ -16,6 +16,10 @@ assert_contains() {
   local file="$1" expected="$2" label="$3"
   if grep -Fq -- "$expected" "$file"; then pass "$label"; else fail "$label"; fi
 }
+assert_not_contains() {
+  local file="$1" unexpected="$2" label="$3"
+  if grep -Fq -- "$unexpected" "$file"; then fail "$label"; else pass "$label"; fi
+}
 
 tenant_env_dir() { printf '%s/env\n' "$fixture"; }
 tenant_state_dir() { printf '%s/state\n' "$fixture"; }
@@ -66,7 +70,14 @@ render_worker_quadlet root kimi 8443
 quadlet="$fixture/quadlets/lunarwing-kimi-root.container"
 assert_contains "$quadlet" 'UserNS=keep-id:uid=10002,gid=10002' 'systemd Kimi keeps rootless UID mapping'
 assert_contains "$quadlet" "EnvironmentFile=$fixture/env/kimi-runtime.env" 'systemd Kimi loads protected runtime env'
-assert_contains "$fixture/env/kimi-runtime.env" 'AGENT_AUTH_TOKEN=gate%token' 'runtime env preserves agent token literally'
+minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
+if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
+  pass 'missing scoped token is minted and persisted (WI#210)'
+else
+  fail "worker credential was not minted: [$minted]"
+fi
+assert_contains "$fixture/env/kimi-runtime.env" "AGENT_AUTH_TOKEN=$minted" 'runtime env carries the scoped worker credential'
+assert_not_contains "$fixture/env/kimi-runtime.env" 'AGENT_AUTH_TOKEN=gate%token' 'runtime env never carries the gateway bearer'
 assert_contains "$fixture/env/kimi-runtime.env" 'KIMI_API_KEY=old%key' 'runtime env preserves Kimi API key literally'
 if [[ "$(stat -c '%a' "$fixture/env/kimi-runtime.env")" == "600" ]]; then
   pass 'Kimi runtime env is private'

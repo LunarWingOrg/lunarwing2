@@ -175,6 +175,7 @@ impl SandboxModeConfig {
             proxy_port: 0, // Auto-assign
             runtime,
             network,
+            protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
         }
     }
 }

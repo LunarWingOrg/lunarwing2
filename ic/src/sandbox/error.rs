@@ -52,6 +52,15 @@ pub enum SandboxError {
     #[error("Credential injection failed for {domain}: {reason}")]
     CredentialInjectionFailed { domain: String, reason: String },
 
+    /// The requested mount directory is not permitted in the sandbox.
+    ///
+    /// Raised by the mount guard when an agent-supplied working directory
+    /// resolves into a protected location (the tenant secret directory) or is
+    /// itself credential-bearing. Distinct from `execution_failed` because the
+    /// command never ran: the request was refused before the runtime started.
+    #[error("Sandbox cannot mount {path}: {reason}")]
+    MountPathDenied { path: String, reason: String },
+
     /// Docker API error.
     #[error("Docker API error: {0}")]
     Docker(#[from] bollard::errors::Error),
@@ -90,6 +99,7 @@ impl SandboxError {
             Self::NetworkBlocked { .. } => "network_blocked",
             Self::CredentialInjectionFailed { .. } => "credential_injection_failed",
             Self::Config { .. } => "config",
+            Self::MountPathDenied { .. } => "mount_path_denied",
         }
     }
 
@@ -177,6 +187,13 @@ mod tests {
                 "sandbox_unavailable",
             ),
             (SandboxError::Config { reason: "x".into() }, "config"),
+            (
+                SandboxError::MountPathDenied {
+                    path: "/home/u/lunarwing/env".into(),
+                    reason: "protected".into(),
+                },
+                "mount_path_denied",
+            ),
         ];
 
         for (err, expected_kind) in cases {

@@ -37,6 +37,19 @@ RUN npm ci --ignore-scripts && \
     npm test && \
     rm -rf node_modules/.cache
 
+# ── CLI bitness + flag contract gate ─────────────────────────────────────────
+# WI#195 finding 2: every worker test points KIMI_BIN at a mock, so the real
+# CLI's flag surface was pinned only in a comment. Compile the CLI (locked
+# version — kimi-cli/package-lock.json is the reproducible pin) for the
+# image's node, then re-run just the contract tests with the real binary on
+# PATH. The lane self-skips on host builds (no binary), so this is the only
+# place the contract is asserted for real.
+ARG KIMI_CODE_VERSION
+COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/
+RUN npm ci --omit=dev --prefix /opt/kimi-cli && \
+    PATH="/opt/kimi-cli/node_modules/.bin:$PATH" npm run --prefix /build/scripts test -- \
+      --test-name-pattern "real CLI"
+
 # ──────────────────────────────
 # Stage 2: runtime image
 # ──────────────────────────────

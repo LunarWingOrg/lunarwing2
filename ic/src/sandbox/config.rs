@@ -101,6 +101,14 @@ pub struct SandboxConfig {
     pub runtime: SandboxRuntime,
     /// Network egress mode for sandboxed policies (default: none).
     pub network: SandboxNetworkMode,
+    /// Directories the sandbox must never expose (WI#205).
+    ///
+    /// A mount at or inside one of these is refused; one *containing* one of
+    /// these gets it shadowed by an empty directory bind. Populated from
+    /// `SANDBOX_PROTECTED_PATHS` (mt-admin writes the tenant env directory
+    /// there) plus the base-dir defaults — see
+    /// [`crate::sandbox::mount_guard::resolve_protected_paths`].
+    pub protected_paths: Vec<std::path::PathBuf>,
 }
 
 impl Default for SandboxConfig {
@@ -118,6 +126,7 @@ impl Default for SandboxConfig {
             proxy_port: 0,
             runtime: SandboxRuntime::Auto,
             network: SandboxNetworkMode::None,
+            protected_paths: crate::sandbox::mount_guard::resolve_protected_paths(),
         }
     }
 }

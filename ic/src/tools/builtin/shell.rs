@@ -573,6 +573,7 @@ fn sandbox_error_envelope(err: &crate::sandbox::SandboxError) -> ToolError {
         "resource_limit_exceeded" => "sandbox resource limit exceeded",
         "execution_failed" => "command failed inside the sandbox container",
         "credential_injection_failed" => "sandbox proxy credential injection failed",
+        "mount_path_denied" => "sandbox refused the requested working directory",
         _ => "sandboxed execution failed",
     };
     let mut message = format!(

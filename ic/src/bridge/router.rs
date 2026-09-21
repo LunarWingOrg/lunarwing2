@@ -1557,7 +1557,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "cadence": {"type": "string", "description": "How to run: 'manual', 'hourly', 'daily', 'event:<pattern>', 'system:<source>/<event_type>', 'webhook:<path>', an interval such as '30m' or '6h', or a 5-7 field cron expression with zero seconds. Note: 'event:<pattern>' matches incoming message text containing the pattern; it does not subscribe to internal engine lifecycle events. To subscribe to engine lifecycle events, use 'system:<source>/<event_type>' (e.g. 'system:engine/thread_start')."},
                         "webhook_secret": {"type": "string", "description": "Required non-empty secret for webhook cadence. Never returned by mission APIs."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl']). Defaults to current channel."},
-                        "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 10 when omitted."}
+                        "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited). Defaults to 30 when omitted."}
                     },
                     "required": ["name", "goal"]
                 }),
