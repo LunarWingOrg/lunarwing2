@@ -238,6 +238,68 @@ impl EffectBridgeAdapter {
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     }
 
+    /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
+    /// flips retry on/off, the four scalars together tune the full backoff
+    /// curve; absent leaves the policy untouched. All-or-nothing errors so a
+    /// typo fails loudly instead of silently taking the default.
+    /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
+    /// flips retry on/off, the four scalars together tune the full backoff
+    /// curve; absent params leave the policy untouched. All-or-nothing errors
+    /// so a typo fails loudly instead of silently taking the default.
+    fn mission_retry_policy_from_params(
+        params: &serde_json::Value,
+    ) -> Result<Option<lunarwing_engine::MissionRetryPolicy>, EngineError> {
+        let tuning_keys = [
+            "max_retries",
+            "initial_delay_secs",
+            "backoff_multiplier",
+            "max_delay_secs",
+        ];
+        let any = tuning_keys.iter().any(|key| params.get(*key).is_some());
+        if !any {
+            return Ok(None);
+        }
+        let default = lunarwing_engine::MissionRetryPolicy::default();
+        let max_retries =
+            Self::retry_scalar_u64(params, "max_retries", default.max_retries as u64)?;
+        let initial_delay_secs =
+            Self::retry_scalar_u64(params, "initial_delay_secs", default.initial_delay_secs)?;
+        let max_delay_secs =
+            Self::retry_scalar_u64(params, "max_delay_secs", default.max_delay_secs)?;
+        let backoff_multiplier = match params.get("backoff_multiplier") {
+            None => default.backoff_multiplier,
+            Some(value) => value.as_f64().ok_or_else(|| EngineError::Effect {
+                reason: "backoff_multiplier must be a positive number".into(),
+            })?,
+        };
+        if backoff_multiplier <= 0.0 {
+            return Err(EngineError::Effect {
+                reason: "backoff_multiplier must be positive".into(),
+            });
+        }
+        Ok(Some(lunarwing_engine::MissionRetryPolicy {
+            max_retries: max_retries.min(u32::MAX as u64) as u32,
+            initial_delay_secs,
+            backoff_multiplier,
+            max_delay_secs,
+        }))
+    }
+
+    /// Integer retry scalar with MIN's coerce_to_u64 semantics; string
+    /// numbers parsed too (tool callers sometimes serialize numbers).
+    fn retry_scalar_u64(
+        params: &serde_json::Value,
+        key: &str,
+        default: u64,
+    ) -> Result<u64, EngineError> {
+        match params.get(key) {
+            None => Ok(default),
+            Some(value) => Self::coerce_to_u64(value).ok_or_else(|| EngineError::Effect {
+                reason: format!("{key} must be a non-negative integer"),
+            }),
+        }
+    }
+
     fn mission_updates(
         params: &serde_json::Value,
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
@@ -276,14 +338,25 @@ impl EffectBridgeAdapter {
             .get("webhook_secret")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // current_focus is nested-optional: absent leaves the stored focus,
+        // an explicit JSON null clears it, a string sets it (WI#203).
+        let current_focus = params
+            .get("current_focus")
+            .map(|value| value.as_str().map(str::to_string));
+        // WI#188: mission_update may tune the retry policy with up to 2
+        // scalars; rich tuning (backoff curve) is deliberately a direct
+        // `mission.json` shape, not a per-call tool surface.
+        let retry_policy = Self::mission_retry_policy_from_params(params)?;
         Ok(lunarwing_engine::MissionUpdate {
             name,
             goal,
             cadence,
             notify_channels,
             max_threads_per_day,
+            retry_policy,
             success_criteria,
             webhook_secret,
+            current_focus,
         })
     }
 
@@ -338,21 +411,55 @@ impl EffectBridgeAdapter {
 
         let result = match action_name {
             "mission_create" => {
-                let name = params
+                let name = match params
                     .get("name")
                     .or_else(|| params.get("_args").and_then(|a| a.get(0)))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unnamed mission");
-                let goal = params
+                {
+                    Some(name) => name,
+                    None => {
+                        tracing::warn!(
+                            user = %context.user_id,
+                            "mission_create rejected: missing or non-string 'name' parameter"
+                        );
+                        return Some(Err(EngineError::Effect {
+                            reason: "mission_create requires a non-empty string 'name' parameter"
+                                .to_string(),
+                        }));
+                    }
+                };
+                let goal = match params
                     .get("goal")
                     .or_else(|| params.get("_args").and_then(|a| a.get(1)))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let cadence_str = params
+                {
+                    Some(goal) => goal,
+                    None => {
+                        tracing::warn!(
+                            user = %context.user_id,
+                            "mission_create rejected: missing or non-string 'goal' parameter"
+                        );
+                        return Some(Err(EngineError::Effect {
+                            reason: "mission_create requires a string 'goal' parameter".to_string(),
+                        }));
+                    }
+                };
+                // Cadence is optional in the tool schema; when omitted (or not a
+                // string) the mission is manual-only. Defaulting silently made an
+                // omitted cadence indistinguishable from `cadence: "manual"`
+                // (WI#203), so the fallback is now logged.
+                let cadence_param = params
                     .get("cadence")
                     .or_else(|| params.get("_args").and_then(|a| a.get(2)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("manual");
+                    .and_then(|v| v.as_str());
+                let cadence_str = cadence_param.unwrap_or_else(|| {
+                    tracing::info!(
+                        user = %context.user_id,
+                        mission_name = %name,
+                        "mission_create: no cadence supplied, defaulting to 'manual' (mission will not fire on a schedule)"
+                    );
+                    "manual"
+                });
                 // notify_channels: explicit array, or default to current channel
                 let notify_channels =
                     if let Some(arr) = params.get("notify_channels").and_then(|v| v.as_array()) {
@@ -3255,5 +3362,275 @@ FINAL(echoed + "|" + http_result["error"])"#,
             Some("schema"),
             "name field takes precedence over new_name"
         );
+    }
+
+    /// WI#203: current_focus is nested-optional — absent leaves it, explicit
+    /// JSON null clears it, a string sets it.
+    #[test]
+    fn mission_updates_maps_current_focus_set_clear_and_absent() {
+        let absent = EffectBridgeAdapter::mission_updates(&serde_json::json!({}))
+            .expect("empty params should parse");
+        assert!(absent.current_focus.is_none());
+
+        let set = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "current_focus": "triage open incidents"
+        }))
+        .expect("string current_focus should parse");
+        assert_eq!(
+            set.current_focus.as_ref().map(Option::as_deref),
+            Some(Some("triage open incidents"))
+        );
+
+        let cleared = EffectBridgeAdapter::mission_updates(&serde_json::json!({
+            "current_focus": null
+        }))
+        .expect("null current_focus should parse");
+        assert!(
+            matches!(cleared.current_focus, Some(None)),
+            "explicit null must map to an explicit clear"
+        );
+    }
+
+    // ── WI#203: mission_create param handling ─────────────────────────────
+
+    use lunarwing_engine::{
+        CapabilityRegistry, LeaseManager, MissionManager, PolicyEngine, ThreadManager,
+    };
+
+    /// Minimal LLM for MissionManager construction; create-param validation
+    /// rejects before any LLM call, so the backend is never exercised.
+    struct NeverCalledLlm;
+
+    #[async_trait]
+    impl lunarwing_engine::LlmBackend for NeverCalledLlm {
+        fn model_name(&self) -> &str {
+            "never-called"
+        }
+
+        async fn complete(
+            &self,
+            _messages: &[lunarwing_engine::ThreadMessage],
+            _actions: &[lunarwing_engine::ActionDef],
+            _config: &lunarwing_engine::LlmCallConfig,
+        ) -> Result<lunarwing_engine::LlmOutput, EngineError> {
+            Ok(lunarwing_engine::LlmOutput {
+                response: lunarwing_engine::LlmResponse::Text("never".into()),
+                usage: lunarwing_engine::TokenUsage::default(),
+                finish_reason: "stop".into(),
+            })
+        }
+    }
+
+    struct NeverCalledEffects;
+
+    #[async_trait]
+    impl lunarwing_engine::EffectExecutor for NeverCalledEffects {
+        async fn execute_action(
+            &self,
+            _action_name: &str,
+            _parameters: serde_json::Value,
+            _lease: &lunarwing_engine::CapabilityLease,
+            _context: &lunarwing_engine::ThreadExecutionContext,
+        ) -> Result<lunarwing_engine::ActionResult, EngineError> {
+            Ok(lunarwing_engine::ActionResult {
+                call_id: String::new(),
+                action_name: String::new(),
+                output: serde_json::json!({}),
+                is_error: false,
+                duration: std::time::Duration::from_millis(1),
+            })
+        }
+
+        async fn available_actions(
+            &self,
+            _leases: &[lunarwing_engine::CapabilityLease],
+        ) -> Result<Vec<lunarwing_engine::ActionDef>, EngineError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn adapter_with_mission_manager() -> (EffectBridgeAdapter, Arc<MissionManager>) {
+        let store: Arc<dyn lunarwing_engine::Store> =
+            Arc::new(crate::bridge::store_adapter::HybridStore::new(None));
+        let thread_manager = Arc::new(ThreadManager::new(
+            Arc::new(NeverCalledLlm),
+            Arc::new(NeverCalledEffects),
+            Arc::clone(&store),
+            Arc::new(CapabilityRegistry::new()),
+            Arc::new(LeaseManager::new()),
+            Arc::new(PolicyEngine::new()),
+        ));
+        let mgr = Arc::new(MissionManager::new(store, thread_manager));
+        (make_adapter(), mgr)
+    }
+
+    fn mission_create_ctx() -> lunarwing_engine::ThreadExecutionContext {
+        lunarwing_engine::ThreadExecutionContext {
+            thread_id: lunarwing_engine::ThreadId::new(),
+            thread_type: lunarwing_engine::ThreadType::Foreground,
+            project_id: lunarwing_engine::ProjectId::new(),
+            user_id: "test-user".to_string(),
+            step_id: lunarwing_engine::StepId::new(),
+            current_call_id: None,
+            source_channel: None,
+            supervised_mode: false,
+            shared_conversation: false,
+            supervised_timeout_secs: 300,
+            prompt_context: Arc::from([]),
+        }
+    }
+
+    async fn run_mission_create(
+        adapter: &EffectBridgeAdapter,
+        mgr: &Arc<MissionManager>,
+        params: serde_json::Value,
+    ) -> Option<Result<lunarwing_engine::ActionResult, EngineError>> {
+        adapter.set_mission_manager(Arc::clone(mgr)).await;
+        adapter
+            .handle_mission_call("mission_create", &params, &mission_create_ctx())
+            .await
+    }
+
+    #[tokio::test]
+    async fn mission_create_missing_name_is_an_error_not_an_unnamed_mission() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        for params in [
+            serde_json::json!({}),                        // absent
+            serde_json::json!({"goal": "g"}),             // name key missing
+            serde_json::json!({"name": 42, "goal": "g"}), // wrong JSON type
+        ] {
+            let result = run_mission_create(&adapter, &mgr, params.clone())
+                .await
+                .expect("mission_create must be handled");
+            match result {
+                Err(EngineError::Effect { reason }) => {
+                    assert!(reason.contains("name"), "unexpected error: {reason}");
+                    assert!(
+                        !reason.contains("unnamed mission"),
+                        "must not mint the legacy placeholder: {reason}"
+                    );
+                }
+                other => panic!("params {params} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mission_create_missing_goal_is_an_error() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        for params in [
+            serde_json::json!({"name": "n"}),            // goal key missing
+            serde_json::json!({"name": "n", "goal": 7}), // wrong JSON type
+        ] {
+            let result = run_mission_create(&adapter, &mgr, params.clone())
+                .await
+                .expect("mission_create must be handled");
+            match result {
+                Err(EngineError::Effect { reason }) => {
+                    assert!(reason.contains("goal"), "unexpected error: {reason}");
+                }
+                other => panic!("params {params} must be rejected, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mission_create_full_params_still_succeeds_with_default_manual_cadence() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        let result = run_mission_create(
+            &adapter,
+            &mgr,
+            serde_json::json!({"name": "nightly", "goal": "check backups"}),
+        )
+        .await
+        .expect("mission_create must be handled")
+        .expect("call should not be a transport error");
+        assert!(
+            !result.is_error,
+            "valid create should succeed: {:?}",
+            result.output
+        );
+        assert_eq!(
+            result.output.get("status").and_then(|v| v.as_str()),
+            Some("created")
+        );
+        // Cadence omitted → manual default: mission must not have a schedule.
+        let id_str = result
+            .output
+            .get("mission_id")
+            .and_then(|v| v.as_str())
+            .expect("mission_id in output");
+        let id = lunarwing_engine::MissionId(
+            uuid::Uuid::parse_str(id_str).expect("mission_id parses as UUID"),
+        );
+        let mission = mgr
+            .get_mission(id)
+            .await
+            .expect("mission load should succeed")
+            .expect("mission should exist");
+        assert!(mission.next_fire_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn mission_update_tool_sets_current_focus_end_to_end() {
+        let (adapter, mgr) = adapter_with_mission_manager();
+        adapter.set_mission_manager(Arc::clone(&mgr)).await;
+
+        // Create a mission to update.
+        let created = run_mission_create(
+            &adapter,
+            &mgr,
+            serde_json::json!({"name": "focus-target", "goal": "g"}),
+        )
+        .await
+        .expect("handled")
+        .expect("no transport error");
+        let id = created
+            .output
+            .get("mission_id")
+            .and_then(|v| v.as_str())
+            .expect("mission_id")
+            .to_string();
+
+        // Set focus through the tool path.
+        let updated = adapter
+            .handle_mission_call(
+                "mission_update",
+                &serde_json::json!({"id": id, "current_focus": "review stale alerts"}),
+                &mission_create_ctx(),
+            )
+            .await
+            .expect("mission_update must be handled")
+            .expect("no transport error");
+        assert!(
+            !updated.is_error,
+            "update should succeed: {:?}",
+            updated.output
+        );
+
+        let mid = lunarwing_engine::MissionId(uuid::Uuid::parse_str(&id).expect("uuid"));
+        let mission = mgr.get_mission(mid).await.expect("load").expect("exists");
+        assert_eq!(
+            mission.current_focus.as_deref(),
+            Some("review stale alerts")
+        );
+
+        // Clear focus through the tool path (explicit JSON null).
+        let cleared = adapter
+            .handle_mission_call(
+                "mission_update",
+                &serde_json::json!({"id": id, "current_focus": null}),
+                &mission_create_ctx(),
+            )
+            .await
+            .expect("mission_update must be handled")
+            .expect("no transport error");
+        assert!(
+            !cleared.is_error,
+            "clear should succeed: {:?}",
+            cleared.output
+        );
+        let mission = mgr.get_mission(mid).await.expect("load").expect("exists");
+        assert!(mission.current_focus.is_none());
     }
 }

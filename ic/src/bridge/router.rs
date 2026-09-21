@@ -1612,7 +1612,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             },
             lunarwing_engine::ActionDef {
                 name: "mission_update".into(),
-                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, or success criteria.".into(),
+                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, success criteria, or steering focus.".into(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1623,7 +1623,8 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
-                        "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"}
+                        "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
+                        "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
                     },
                     "required": ["id"]
                 }),
@@ -1722,6 +1723,10 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         store_dyn.clone(),
         Arc::clone(&thread_manager),
     ));
+    // Install the retry-wake self-handle BEFORE any fire path can arm a retry
+    // — interrupted threads on a mission that predates this boot's wake must
+    // never silently drop their reschedule (WI#188).
+    mission_manager.arm_retry_wake().await;
 
     // Wire every mission consumer before recovery or background work can run.
     // Recovered threads may immediately call mission_* or emit an outcome.
@@ -1786,6 +1791,19 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     }
     if let Err(e) = mission_manager.resume_recoverable_threads().await {
         debug!("engine v2: resume_recoverable_threads failed: {e}");
+    }
+    // WI#188: retries armed before the restart ride thread metadata — the
+    // daemon's memory-only sleep timers vanished with the process. Re-arm
+    // them after checkpoint recovery has had first claim on the threads.
+    match mission_manager.recover_pending_mission_retries().await {
+        Ok(rearmed) if !rearmed.is_empty() => {
+            debug!(
+                "engine v2: re-armed {} mission retry wake(s)",
+                rearmed.len()
+            );
+        }
+        Err(e) => debug!("engine v2: recover_pending_mission_retries failed: {e}"),
+        _ => {}
     }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
         mission_manager
