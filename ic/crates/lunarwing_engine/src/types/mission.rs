@@ -306,8 +306,8 @@ impl MissionRetryPolicy {
         if self.max_retries == 0 || attempt == 0 || attempt > self.max_retries {
             return None;
         }
-        let delay_secs = (self.initial_delay_secs as f64)
-            * self.backoff_multiplier.powi((attempt - 1) as i32);
+        let delay_secs =
+            (self.initial_delay_secs as f64) * self.backoff_multiplier.powi((attempt - 1) as i32);
         if !delay_secs.is_finite() || delay_secs <= 0.0 {
             return Some(Duration::from_secs(self.max_delay_secs));
         }
