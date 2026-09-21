@@ -163,12 +163,44 @@ _deregister_worker_unit() {
 # WORKER_AUTH_TOKEN existed; those converge on the next lifecycle pass, which
 # regenerates the env file, rewrites the worker units, and upgrades the
 # config.toml entry together.
+#
+# WI#210: the fallback mints the scoped token on first use instead of leaving
+# the gateway bearer in place. `ensure_worker_auth_token` writes
+# WORKER_AUTH_TOKEN into the tenant env file (0600, same file the daemon
+# reads), so an upgrade-path tenant gets a real scoped credential immediately
+# and never exposes the full gateway bearer to `podman inspect` or the
+# tenant-readable unit file. The gateway-bearer substitution is kept ONLY as a
+# last resort for read-only/unwritable env files, and is always loudly warned.
 resolve_worker_auth_token() {
   local env_path="$1" token
   token="$(_read_env_value "$env_path" WORKER_AUTH_TOKEN)"
-  if [[ -z "$token" ]]; then
-    token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  if [[ -n "$token" ]]; then
+    printf '%s' "$token"
+    return 0
   fi
+
+  # Mint and persist the scoped token. Requires a writable env file; the
+  # caller owns 0600 semantics (same as every other env write).
+  if [[ -w "$env_path" ]] && command -v mktemp >/dev/null 2>&1; then
+    local fresh tmp
+    fresh="$(generate_token)"
+    if [[ -n "$fresh" ]]; then
+      tmp="$(mktemp "${env_path}.tmp.XXXXXX")"
+      if cat "$env_path" >"$tmp" 2>/dev/null \
+        && printf 'WORKER_AUTH_TOKEN=%s\n' "$fresh" >>"$tmp" \
+        && chmod 600 "$tmp" \
+        && mv -f "$tmp" "$env_path"; then
+        echo "WARNING: WORKER_AUTH_TOKEN was missing in $env_path; generated and persisted a scoped worker credential (WI#210)." >&2
+        printf '%s' "$fresh"
+        return 0
+      fi
+      rm -f "$tmp"
+    fi
+  fi
+
+  # Last resort: fail open ONLY after an explicit, loud warning. Never silent.
+  echo "WARNING: could not persist WORKER_AUTH_TOKEN for $env_path; falling back to GATEWAY_AUTH_TOKEN (WI#210 mitigations do NOT apply to this worker until the env file is written)." >&2
+  token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
   printf '%s' "$token"
 }
 

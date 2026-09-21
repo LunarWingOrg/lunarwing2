@@ -205,6 +205,41 @@ impl Drop for EmptyMaskDir {
     }
 }
 
+/// Throwaway empty *file* bind-mounted over credential-bearing files found
+/// inside the mounted tree (WI#211). Removed on drop.
+pub(crate) struct EmptyMaskFile {
+    path: PathBuf,
+}
+
+impl EmptyMaskFile {
+    fn create() -> Result<Self> {
+        let base = shared_mount_source_parent();
+        let path = base.join(format!(
+            "lunarwing-sandbox-mask-file-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::File::create(&path).map_err(|e| SandboxError::ExecutionFailed {
+            reason: format!("failed to create sandbox mask file {}: {e}", path.display()),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EmptyMaskFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Inputs to [`build_run_args`]. Kept as a struct so the arg construction
 /// stays a pure function (unit-testable without any runtime installed).
 pub(crate) struct RunSpec<'a> {
@@ -234,6 +269,10 @@ pub(crate) struct RunSpec<'a> {
     /// workspace mount (WI#205), plus the container paths to shadow with it.
     pub masked: &'a [String],
     pub mask_dir: Option<&'a Path>,
+    /// Empty host file used to shadow credential-bearing files found inside
+    /// the mount (WI#211), plus the container paths to shadow with it.
+    pub masked_files: &'a [String],
+    pub mask_file: Option<&'a Path>,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -315,6 +354,16 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         for destination in spec.masked {
             args.push("-v".into());
             args.push(format!("{}:{destination}:ro,z", mask_source.display()));
+        }
+    }
+
+    // Shadow credential-bearing files found inside the mount with an empty
+    // read-only file bind (WI#211): a copied `lunarwing.env` in a workspace is
+    // unreadable in-container while the surrounding tree still works.
+    if let Some(mask_file) = spec.mask_file {
+        for destination in spec.masked_files {
+            args.push("-v".into());
+            args.push(format!("{}:{destination}:ro,z", mask_file.display()));
         }
     }
 
@@ -668,14 +717,36 @@ impl CliRunner {
         let working_dir = working_dir_owned.as_path();
         // Protected directories inside a legitimate mount are shadowed rather
         // than refused: an agent working at a repo root must keep working, but
-        // must not be able to read `env/` through it.
+        // must not be able to read `env/` through it. Planning is existence-
+        // independent (WI#209): a protected dir that appears mid-run is still
+        // covered by the empty bind, and planning failures are hard refusals.
         let masked =
-            crate::sandbox::mount_guard::masked_dirs_for_mount(working_dir, protected_paths);
+            crate::sandbox::mount_guard::masked_dirs_for_mount(working_dir, protected_paths)?;
         let masked_destinations: Vec<String> = masked
             .iter()
             .filter_map(|dir| crate::sandbox::mount_guard::mask_destination(working_dir, dir))
             .collect();
-        let mask_dir = if masked_destinations.is_empty() {
+        // Credential files outside the enumerated directories (a copied
+        // `lunarwing.env` in a workspace) are shadowed with an empty file bind
+        // (WI#211). Plan-time walk, bounded.
+        let masked_files =
+            crate::sandbox::mount_guard::masked_files_for_mount(working_dir, protected_paths);
+        let mut masked_file_destinations: Vec<String> = Vec::new();
+        for file in &masked_files {
+            let Some(dest) = crate::sandbox::mount_guard::mask_destination(working_dir, file)
+            else {
+                continue;
+            };
+            masked_file_destinations.push(dest);
+        }
+        // A single empty file shadows every credential file; a directory mask
+        // covers protected dirs. Both are host-side throwaway artifacts.
+        let mask_file = if masked_file_destinations.is_empty() {
+            None
+        } else {
+            Some(EmptyMaskFile::create()?)
+        };
+        let mask_dir = if masked_destinations.is_empty() && masked_file_destinations.is_empty() {
             None
         } else {
             Some(EmptyMaskDir::create()?)
@@ -720,6 +791,8 @@ impl CliRunner {
             pids_limit: default_pids_limit(),
             masked: &masked_destinations,
             mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
+            masked_files: &masked_file_destinations,
+            mask_file: mask_file.as_ref().map(EmptyMaskFile::path),
         };
         let args = build_run_args(&spec);
 
@@ -1131,6 +1204,8 @@ mod tests {
             pids_limit: 256,
             masked: &[],
             mask_dir: None,
+            masked_files: &[],
+            mask_file: None,
         }
     }
 

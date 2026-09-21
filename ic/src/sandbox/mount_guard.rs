@@ -156,29 +156,58 @@ pub fn validate_mount_dir(dir: &Path, protected: &[PathBuf]) -> Result<PathBuf, 
 /// The caller shadow-mounts each of these with an empty directory, so a mount
 /// of a legitimate parent (a repository root, a home directory) cannot be used
 /// to read the secrets it contains.
-pub fn masked_dirs_for_mount(mount_root: &Path, protected: &[PathBuf]) -> Vec<PathBuf> {
-    let Ok(root) = mount_root.canonicalize() else {
-        return Vec::new();
-    };
-    protected
+///
+/// Existence is NOT a precondition (WI#209): a protected directory that does
+/// not exist yet at plan time (`<root>/run` on a freshly provisioned tenant)
+/// is still planned for masking via lexical containment. The caller must ensure
+/// the mask destination exists inside the mount before `podman run` (see
+/// `EmptyMaskDir`/pre-mount creation in `cli_runner`); the empty bind then
+/// shadows whatever appears there for the container's whole lifetime.
+///
+/// `mount_root` must be the already-validated canonical root (from
+/// `validate_mount_dir`); resolution failure here is a hard error, never a
+/// silent empty mask list.
+pub fn masked_dirs_for_mount(
+    mount_root: &Path,
+    protected: &[PathBuf],
+) -> Result<Vec<PathBuf>, SandboxError> {
+    let root = mount_root
+        .canonicalize()
+        .map_err(|e| SandboxError::MountPathDenied {
+            path: mount_root.display().to_string(),
+            reason: format!("mount root cannot be resolved for masking: {e}"),
+        })?;
+    Ok(protected
         .iter()
-        .filter(|p| {
-            let resolved = p.canonicalize().unwrap_or_else(|_| (*p).clone());
-            resolved != root && resolved.starts_with(&root)
-        })
+        .filter(|p| contains_protected_dir(&root, p))
         .cloned()
-        .collect()
+        .collect())
 }
 
-/// Container path for a masked directory, given the mount root.
+/// True when `protected` is strictly inside `root`, resolved lexically so the
+/// check holds even while the protected directory does not exist yet (WI#209).
+/// Existing paths are compared canonically first (symlink-safe); nonexistent
+/// ones fall back to component-wise lexical containment, which cannot be
+/// defeated by `..` (the caller canonicalized `root`) or prefix confusion
+/// (`starts_with` is component-wise).
+fn contains_protected_dir(root: &Path, protected: &Path) -> bool {
+    let resolved = protected
+        .canonicalize()
+        .unwrap_or_else(|_| protected.to_path_buf());
+    if resolved != root && resolved.starts_with(root) {
+        return true;
+    }
+    protected != root && protected.starts_with(root)
+}
+
+/// Container path for a masked directory, given the canonical mount root and
+/// the protected directory as returned by [`masked_dirs_for_mount`].
 ///
-/// Returns `None` when the protected dir is not inside the mount (nothing to
-/// mask) or when the relative path cannot be expressed (defensive: the caller
-/// must not mount a mask outside `/workspace`).
+/// Returns `None` when the relative path cannot be expressed (defensive: the
+/// caller must not mount a mask outside `/workspace`). Works for protected
+/// directories that do not exist yet (lexical suffix, no canonicalization).
 pub fn mask_destination(mount_root: &Path, protected_dir: &Path) -> Option<String> {
-    let root = mount_root.canonicalize().ok()?;
-    let target = protected_dir.canonicalize().ok()?;
-    let relative = target.strip_prefix(&root).ok()?;
+    let relative = protected_dir.strip_prefix(mount_root).ok()?;
     if relative.as_os_str().is_empty() {
         return None;
     }
@@ -187,12 +216,76 @@ pub fn mask_destination(mount_root: &Path, protected_dir: &Path) -> Option<Strin
 }
 
 /// True when the path's final component is a credential-bearing file name.
-fn is_protected_file_name(path: &Path) -> bool {
+pub fn is_protected_file_name(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let lowered = name.to_ascii_lowercase();
     lowered.ends_with(ENV_SUFFIX) || PROTECTED_FILE_NAMES.contains(&lowered.as_str())
+}
+
+/// Bound for the credential-file walk of a mounted tree (WI#211).
+const MASK_SCAN_MAX_DEPTH: usize = 5;
+/// Total entries visited before the walk stops expanding.
+const MASK_SCAN_MAX_ENTRIES: usize = 10_000;
+
+/// Credential-bearing files discovered by a bounded walk of the mount tree
+/// (WI#211). Directory masking covers the enumerated protected dirs; this
+/// covers credential files *outside* them — a copied `lunarwing.env` in a
+/// workspace, a backup, a snapshot. Returns canonical file paths the caller
+/// shadows with an empty read-only file bind.
+///
+/// The walk is plan-time only (like directory masking): files created during
+/// execution are not retroactively masked, but the mount is read-only for the
+/// sandboxed policy and writable workspaces are agent-owned task data, not a
+/// security boundary. Protected directories passed in `skip` are not descended
+/// into (they are shadowed whole).
+pub fn masked_files_for_mount(mount_root: &Path, skip: &[PathBuf]) -> Vec<PathBuf> {
+    let Ok(root) = mount_root.canonicalize() else {
+        return Vec::new();
+    };
+    let skipped: Vec<PathBuf> = skip.iter().filter_map(|p| p.canonicalize().ok()).collect();
+    let mut found = Vec::new();
+    let mut entries = 0usize;
+    // Stack of (dir, depth).
+    let mut stack = vec![(root.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if entries >= MASK_SCAN_MAX_ENTRIES {
+            break;
+        }
+        let Ok(children) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in children.flatten() {
+            entries += 1;
+            if entries > MASK_SCAN_MAX_ENTRIES {
+                break;
+            }
+            let path = entry.path();
+            let file_type = entry.file_type();
+            let Ok(ft) = file_type else { continue };
+            if ft.is_symlink() {
+                // Do not follow links during the walk: a link could point at a
+                // file outside the mount (masking it would fail the whole run)
+                // or re-enter a protected dir. The bind-mount surface is the
+                // real file tree only.
+                continue;
+            }
+            if ft.is_file() {
+                if is_protected_file_name(&path) {
+                    found.push(path);
+                }
+            } else if ft.is_dir() && depth + 1 < MASK_SCAN_MAX_DEPTH {
+                if skipped.iter().any(|s| path.starts_with(s)) {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Reject mount roots whose own path contains a lexical traversal component.
@@ -332,7 +425,9 @@ mod tests {
         let resolved = validate_mount_dir(&daemon_cwd, &fixture.protected())
             .expect("daemon cwd must stay mountable");
         assert!(
-            masked_dirs_for_mount(&resolved, &fixture.protected()).is_empty(),
+            masked_dirs_for_mount(&resolved, &fixture.protected())
+                .expect("mask planning")
+                .is_empty(),
             "nothing under the repo needs masking"
         );
     }
@@ -345,6 +440,7 @@ mod tests {
         let resolved = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
             .expect("tenant root allowed");
         let mut destinations: Vec<String> = masked_dirs_for_mount(&resolved, &fixture.protected())
+            .expect("mask planning")
             .iter()
             .filter_map(|dir| mask_destination(&resolved, dir))
             .collect();
@@ -391,6 +487,7 @@ mod tests {
         // Mounting the tenant home puts the protected dirs two levels down.
         let home = fixture.root.clone();
         let mut destinations: Vec<String> = masked_dirs_for_mount(&home, &fixture.protected())
+            .expect("mask planning")
             .iter()
             .filter_map(|dir| mask_destination(&home, dir))
             .collect();
@@ -408,7 +505,8 @@ mod tests {
     #[test]
     fn nothing_to_mask_for_an_unrelated_directory() {
         let fixture = Fixture::new();
-        let masked = masked_dirs_for_mount(&fixture.repo_subdir(), &fixture.protected());
+        let masked =
+            masked_dirs_for_mount(&fixture.repo_subdir(), &fixture.protected()).expect("planning");
         assert!(masked.is_empty(), "expected no masks, got {masked:?}");
     }
 

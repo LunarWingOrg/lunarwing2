@@ -78,7 +78,14 @@ rm -f "$fixture/state/config.toml"
 ensure_external_worker_config root opencode2 opencode2_wss
 assert_contains "$fixture/state/config.toml" 'name = "opencode2"' 'daemon config names the opencode2 worker'
 assert_contains "$fixture/state/config.toml" 'url = "ws://127.0.0.1:51000/ws/agent"' 'daemon config points at the opencode2 WSS port'
-assert_contains "$fixture/state/config.toml" 'auth_token = "gate%token"' 'daemon config carries the gateway token'
+minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
+if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
+  pass 'missing scoped token is minted and persisted (WI#210)'
+else
+  fail "worker credential was not minted: [$minted]"
+fi
+assert_contains "$fixture/state/config.toml" "auth_token = \"$minted\"" 'daemon config carries the scoped worker credential'
+assert_not_contains "$fixture/state/config.toml" 'auth_token = "gate%token"' 'daemon config never carries the gateway bearer'
 if [[ "$(stat -c '%a' "$fixture/state/config.toml")" == "600" ]]; then
   pass 'opencode2 daemon config is private'
 else
@@ -107,7 +114,8 @@ assert_contains "$quadlet" 'PublishPort=127.0.0.1:51001:8443' 'quadlet publishes
 assert_contains "$quadlet" 'Environment=OPENCODE2_MODEL=new-model' 'quadlet inlines the model override'
 assert_contains "$quadlet" 'Environment=OPENCODE2_BASE_URL=https://old.example/v1' 'quadlet inlines the base URL override'
 assert_contains "$quadlet" 'Environment=TENSORZERO_API_KEY=llm%%key' 'quadlet inlines the TensorZero key'
-assert_contains "$quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' 'quadlet inlines the agent token'
+assert_contains "$quadlet" "Environment=AGENT_AUTH_TOKEN=${minted//%/%%}" 'quadlet inlines the scoped worker credential'
+assert_not_contains "$quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' 'quadlet never inlines the gateway bearer'
 assert_contains "$quadlet" 'Exec=--mode websocket' 'quadlet selects websocket mode'
 assert_contains "$quadlet" 'HealthCmd=curl -sf http://127.0.0.1:8443/health' 'quadlet probes the health endpoint'
 
@@ -166,8 +174,9 @@ else
   fail "credential migration duplicated entries ($scoped_entries)"
 fi
 
-# Missing scoped token: fall back to the gateway bearer so pre-WI#205 tenants
-# keep working until their next lifecycle pass rewrites both sides.
+# Missing scoped token (WI#210): resolve_worker_auth_token must mint and
+# persist a scoped WORKER_AUTH_TOKEN rather than silently substituting the
+# gateway bearer, so the upgrade path never re-exposes the gateway credential.
 cat >"$env_file" <<'EOF'
 GATEWAY_AUTH_TOKEN=gate%token
 LLM_API_KEY=llm%key
@@ -175,8 +184,18 @@ OPENCODE2_MODEL=new-model
 OPENCODE2_BASE_URL=https://old.example/v1
 EOF
 render_worker_quadlet root opencode2 8443
-assert_contains "$scoped_quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' \
-  'legacy tenant falls back to the gateway bearer'
+assert_contains "$env_file" 'WORKER_AUTH_TOKEN=' \
+  'upgrade path persists a scoped WORKER_AUTH_TOKEN'
+minted="$(sed -n 's/^WORKER_AUTH_TOKEN=//p' "$env_file" | tail -1)"
+if [[ -n "$minted" && "$minted" != "gate%token" ]]; then
+  pass 'minted worker credential differs from the gateway bearer'
+else
+  fail "minted worker credential fell back to the gateway bearer ($minted)"
+fi
+assert_contains "$scoped_quadlet" "Environment=AGENT_AUTH_TOKEN=${minted//%/%%}" \
+  'quadlet uses the freshly minted scoped credential'
+assert_not_contains "$scoped_quadlet" 'gate%%token' \
+  'quadlet carries no gateway bearer on the upgrade path'
 
 # ── workspace ownership ──────────────────────────────────────────────────────
 # Override consumed by sourced workspace preparation.
