@@ -919,12 +919,23 @@ ENGINE_V2_CHANNELS=$engine_v2_channels
 SANDBOX_NETWORK=$sandbox_network
 
 # Directories the generic sandbox must never expose (WI#205). The sandbox
-# mounts an agent-chosen working directory, and this tenant's env dir holds
-# GATEWAY_AUTH_TOKEN in plaintext. Naming it explicitly is required: the env
-# dir is a SIBLING of LUNARWING_BASE_DIR ($state_dir), so the daemon cannot
-# derive it. The daemon refuses a mount at or inside these paths, and shadows
-# them with an empty mount when a legitimate parent (the repo root) is mounted.
-SANDBOX_PROTECTED_PATHS=$(dirname -- "$path")
+# mounts an agent-chosen working directory, so anything reachable from a mount
+# root is readable in-container. Protected, `:`-separated:
+#
+#   env/    GATEWAY_AUTH_TOKEN, WORKER_AUTH_TOKEN, LLM_API_KEY, DB password
+#   state/  config.toml (worker auth_tokens), pending-gates, workspace-template
+#   run/    lunarwing.sock, and a world-writable ssh-agent.sock (tenant identity)
+#
+# Deliberately NOT the whole tenant root: the daemon's WorkingDirectory is
+# <root>/ic, and the shell tool defaults to the daemon cwd, so protecting the
+# parent would refuse every default sandboxed command. The remaining children
+# (ic/, docs/, per-worker workspaces) hold source, not credentials.
+#
+# Naming these explicitly is required: they are NOT derivable from
+# LUNARWING_BASE_DIR ($state_dir is a child of the root; env/ is a sibling).
+# The daemon refuses a mount at or inside one of these, and shadows them with
+# an empty mount when a legitimate parent (the tenant home) is mounted.
+SANDBOX_PROTECTED_PATHS=$(tenant_lw_root "$name")/env:$(tenant_lw_root "$name")/state:$(tenant_lw_root "$name")/run
 
 # Daemon mode
 CLI_ENABLED=false

@@ -73,9 +73,13 @@ pub fn resolve_protected_paths() -> Vec<PathBuf> {
 
     let base = crate::bootstrap::lunarwing_base_dir();
     paths.push(base.join("env"));
+    paths.push(base.join("state"));
+    paths.push(base.join("run"));
     paths.push(base.clone());
     if let Ok(canonical) = base.canonicalize() {
         paths.push(canonical.join("env"));
+        paths.push(canonical.join("state"));
+        paths.push(canonical.join("run"));
         paths.push(canonical);
     }
 
@@ -221,19 +225,32 @@ mod tests {
             ));
             std::fs::create_dir_all(root.join("lunarwing/env")).expect("env dir");
             std::fs::create_dir_all(root.join("lunarwing/state")).expect("state dir");
+            std::fs::create_dir_all(root.join("lunarwing/run")).expect("run dir");
             std::fs::create_dir_all(root.join("lunarwing/ic/src")).expect("repo dir");
             std::fs::write(
                 root.join("lunarwing/env/lunarwing.env"),
                 "GATEWAY_AUTH_TOKEN=deadbeef\n",
             )
             .expect("env file");
+            std::fs::write(
+                root.join("lunarwing/state/config.toml"),
+                "[sandbox.external_workers]\nauth_token = \"secret\"\n",
+            )
+            .expect("state config");
             std::fs::write(root.join("lunarwing/ic/src/main.rs"), "fn main() {}\n")
                 .expect("source");
             Self { root }
         }
 
+        /// The protected set mt-admin writes: env, state and run under the
+        /// tenant root — deliberately not the root itself, because the
+        /// daemon's working directory lives inside it.
         fn protected(&self) -> Vec<PathBuf> {
-            vec![self.root.join("lunarwing/env")]
+            vec![
+                self.root.join("lunarwing/env"),
+                self.root.join("lunarwing/state"),
+                self.root.join("lunarwing/run"),
+            ]
         }
 
         fn env_dir(&self) -> PathBuf {
@@ -306,30 +323,85 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_repo_root_but_reports_the_dir_to_mask() {
+    fn accepts_the_daemon_working_directory() {
+        // The daemon's cwd is <tenant root>/ic and the shell tool defaults to
+        // it, so the default sandboxed invocation must never be refused. This
+        // is the reason the tenant root itself is not in the protected set.
         let fixture = Fixture::new();
-        // The repo root contains env/, so mounting it is legal (agents run git
-        // there) — but the env dir must be masked.
-        let resolved = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
-            .expect("repo root allowed");
-        let masked = masked_dirs_for_mount(&resolved, &fixture.protected());
-        assert_eq!(masked.len(), 1, "env dir must be masked: {masked:?}");
-        assert_eq!(
-            mask_destination(&resolved, &masked[0]).as_deref(),
-            Some("/workspace/env")
+        let daemon_cwd = fixture.root.join("lunarwing/ic");
+        let resolved = validate_mount_dir(&daemon_cwd, &fixture.protected())
+            .expect("daemon cwd must stay mountable");
+        assert!(
+            masked_dirs_for_mount(&resolved, &fixture.protected()).is_empty(),
+            "nothing under the repo needs masking"
         );
+    }
+
+    #[test]
+    fn accepts_a_repo_root_but_reports_the_dirs_to_mask() {
+        let fixture = Fixture::new();
+        // The tenant root holds env/, state/ and run/, so mounting it is legal
+        // (agents run git there) — but all three must be masked.
+        let resolved = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
+            .expect("tenant root allowed");
+        let mut destinations: Vec<String> = masked_dirs_for_mount(&resolved, &fixture.protected())
+            .iter()
+            .filter_map(|dir| mask_destination(&resolved, dir))
+            .collect();
+        destinations.sort();
+        assert_eq!(
+            destinations,
+            vec![
+                "/workspace/env".to_string(),
+                "/workspace/run".to_string(),
+                "/workspace/state".to_string(),
+            ],
+            "every credential-bearing directory must be shadowed"
+        );
+    }
+
+    #[test]
+    fn rejects_the_state_and_run_directories() {
+        let fixture = Fixture::new();
+        for (label, dir) in [
+            ("state", fixture.root.join("lunarwing/state")),
+            ("run", fixture.root.join("lunarwing/run")),
+        ] {
+            match validate_mount_dir(&dir, &fixture.protected()) {
+                Ok(resolved) => panic!("{label} dir must be denied, got {resolved:?}"),
+                Err(err) => assert_eq!(err.kind(), "mount_path_denied", "{label} denial kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_the_state_config_file() {
+        let fixture = Fixture::new();
+        let config = fixture.root.join("lunarwing/state/config.toml");
+        // Direct file mount: not a credential-suffixed name, but it lives
+        // inside a protected directory, so traversal to it is refused.
+        let err =
+            validate_mount_dir(&config, &fixture.protected()).expect_err("state config denied");
+        assert_eq!(err.kind(), "mount_path_denied");
     }
 
     #[test]
     fn mask_destination_handles_nested_protected_dirs() {
         let fixture = Fixture::new();
-        // Mounting the tenant home puts env two levels down.
+        // Mounting the tenant home puts the protected dirs two levels down.
         let home = fixture.root.clone();
-        let masked = masked_dirs_for_mount(&home, &fixture.protected());
-        assert_eq!(masked.len(), 1);
+        let mut destinations: Vec<String> = masked_dirs_for_mount(&home, &fixture.protected())
+            .iter()
+            .filter_map(|dir| mask_destination(&home, dir))
+            .collect();
+        destinations.sort();
         assert_eq!(
-            mask_destination(&home, &masked[0]).as_deref(),
-            Some("/workspace/lunarwing/env")
+            destinations,
+            vec![
+                "/workspace/lunarwing/env".to_string(),
+                "/workspace/lunarwing/run".to_string(),
+                "/workspace/lunarwing/state".to_string(),
+            ]
         );
     }
 
