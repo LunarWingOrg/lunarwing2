@@ -43,12 +43,14 @@ function readStdin() {
   });
 }
 
-/** Extract the operand tokens of an `rm` invocation (flags stripped). */
+/** Extract the operand tokens of an `rm` invocation (flags and redirects stripped). */
 function rmOperands(commandSegment) {
   return commandSegment
     .split(/\s+/)
     .filter((token) => token.length > 0 && !token.startsWith("-"))
-    .map((token) => token.replace(/^["']|["']$/g, ""));
+    .map((token) => token.replace(/^["']|["']$/g, ""))
+    // A redirection target is not an rm operand (e.g. `2>/dev/null`).
+    .filter((token) => !/^\d*>/.test(token));
 }
 
 function isSafeRmOperand(operand) {
@@ -88,7 +90,10 @@ const DENY_RULES = [
   },
   {
     name: "fork bomb",
-    pattern: /:\s*\(\)\s*\{[^}]*\|[^}]*&[^}]*\}/,
+    // Classic bash fork bomb shapes: `:(){ :|:& };:`, `f(){ f|f& }; f`, and
+    // equivalents — a function definition whose body pipes itself into
+    // itself in the background.
+    pattern: /\([^)]*\)\s*\{[^}]*\|[^}]*&\s*\}/,
   },
   {
     name: "remote content piped into a shell or interpreter",
@@ -114,17 +119,17 @@ function checkDenyRules(segment) {
   for (const rule of DENY_RULES) {
     if (rule.pattern.test(segment)) return rule.name;
   }
-  // dd writing to a raw device (safe char-device targets exempt).
-  const dd = /\bdd\b/.test(segment);
-  if (dd && /\bof=\s*\/dev\/(?!null|zero|full|random|urandom|stdin|stdout|stderr)/.test(segment)) {
-    return "dd targeting a block device";
-  }
   return null;
 }
 
 function evaluate(command) {
   if (command.length > MAX_COMMAND_CHARS) {
     return `command exceeds ${MAX_COMMAND_CHARS} chars`;
+  }
+  // Structural rules (fork bombs) see the whole command: segment splitting
+  // on ;|& would shred the very shape they match.
+  for (const rule of DENY_RULES) {
+    if (rule.pattern.test(command)) return rule.name;
   }
   for (const segment of commandSegments(command)) {
     const denied = checkDenyRules(segment) ?? checkRm(segment);

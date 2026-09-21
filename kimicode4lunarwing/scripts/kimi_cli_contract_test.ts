@@ -3,6 +3,7 @@ import { spawn } from "node:child_process"
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { test } from "node:test"
 
 /**
@@ -166,9 +167,9 @@ function contractEnv(): NodeJS.ProcessEnv {
     // The CLI reads config from $KIMI_CODE_HOME/config.toml in the worker
     // layout; setting both keeps the seed authoritative either way.
     KIMI_CODE_HOME: join(seededHome, ".kimi-code"),
-    // Production guard-off is the baked config + entrypoint exports; these
-    // defaults keep the contract run deterministic if a developer probes.
-    KIMI_CODE_DANGEROUS_COMMAND_GUARD: process.env.KIMI_CODE_DANGEROUS_COMMAND_GUARD ?? "false",
+    // WI#206: the guard env is scrubbed per task in production; the contract
+    // lane must not re-disable it. The mode reminder stays off (prompt noise
+    // for a fixed-mode worker).
     KIMI_CODE_PERMISSION_MODE_REMINDER: process.env.KIMI_CODE_PERMISSION_MODE_REMINDER ?? "0",
     KIMI_CODE_NO_AUTO_UPDATE: "1",
     KIMI_DISABLE_TELEMETRY: "1",
@@ -217,6 +218,83 @@ test(
       run.stderr,
       /--yolo/,
       `rejection should name --yolo; stderr: ${run.stderr.trim().slice(0, 400)}`,
+    )
+  },
+)
+
+// WI#206: the baked [[hooks]] PreToolUse guard table must be valid for the
+// pinned CLI. Two probes, both provider-free:
+//   1. `kimi doctor config` on a seeded config that includes the exact
+//      [[hooks]] entry the worker bakes — doctor validates config.toml shape
+//      and exits 1 on an invalid file.
+//   2. a headless `-p` startup run with that config must not print an
+//      "Ignored invalid config section" warning (the way an unknown or
+//      malformed hooks table would be rejected at runtime).
+// End-to-end denial behavior (hook blocks a dangerous tool call in print
+// mode) was verified against 2.0.2 with a live mock provider during WI#206
+// investigation; the image build has no provider, so it is pinned here at
+// the config-contract level instead.
+test(
+  "real CLI accepts the baked PreToolUse guard hook config (WI#206)",
+  contractOpts,
+  async () => {
+    const guardHome = mkdtempSync(join(tmpdir(), "kimi-guard-home-"))
+    mkdirSync(join(guardHome, ".kimi-code"), { recursive: true })
+    const guardHookPath = fileURLToPath(new URL("../hooks/headless_command_guard.mjs", import.meta.url))
+    const guardConfigPath = join(guardHome, ".kimi-code", "config.toml")
+    writeFileSync(
+      guardConfigPath,
+      [
+        'default_model = "tensorzero/FrontierCODE"',
+        'default_permission_mode = "auto"',
+        "telemetry = false",
+        "",
+        "[providers.tensorzero]",
+        'type = "openai"',
+        'base_url = "http://127.0.0.1:1/openai/v1"',
+        'api_key = "test"',
+        "",
+        '[models."tensorzero/FrontierCODE"]',
+        'provider = "tensorzero"',
+        'model = "tensorzero::function_name::FrontierCODE"',
+        "max_context_size = 859000",
+        'capabilities = ["tool_use"]',
+        "",
+        "[[hooks]]",
+        'event = "PreToolUse"',
+        'matcher = "Bash"',
+        `command = "node ${guardHookPath}"`,
+        "timeout = 10",
+        "",
+      ].join("\n"),
+      { mode: 0o600 },
+    )
+    const doctor = await runCli(
+      realKimiBin,
+      ["doctor", "config", guardConfigPath],
+      { ...contractEnv(), KIMI_CODE_HOME: join(guardHome, ".kimi-code"), HOME: guardHome },
+    )
+    assert.equal(
+      doctor.code,
+      0,
+      `doctor must accept the guard hook config: ${doctor.stdout} ${doctor.stderr}`.slice(0, 600),
+    )
+
+    const probe = await runHeadlessContract(
+      realKimiBin,
+      {
+        ...contractEnv(),
+        KIMI_CODE_HOME: join(guardHome, ".kimi-code"),
+        HOME: guardHome,
+      },
+    )
+    assert.ok(
+      !/Ignored invalid config section/.test(probe.stderr + probe.stdout),
+      `hooks table rejected at runtime: ${(probe.stderr || probe.stdout).trim().slice(0, 400)}`,
+    )
+    assert.ok(
+      probe.sawStreamJsonMeta,
+      `startup probe must engage stream-json; stderr: ${probe.stderr.trim().slice(0, 300)}`,
     )
   },
 )
