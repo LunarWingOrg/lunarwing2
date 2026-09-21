@@ -238,6 +238,68 @@ impl EffectBridgeAdapter {
             .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
     }
 
+    /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
+    /// flips retry on/off, the four scalars together tune the full backoff
+    /// curve; absent leaves the policy untouched. All-or-nothing errors so a
+    /// typo fails loudly instead of silently taking the default.
+    /// Parse the retry-policy tool params (WI#188): `max_retries` on its own
+    /// flips retry on/off, the four scalars together tune the full backoff
+    /// curve; absent params leave the policy untouched. All-or-nothing errors
+    /// so a typo fails loudly instead of silently taking the default.
+    fn mission_retry_policy_from_params(
+        params: &serde_json::Value,
+    ) -> Result<Option<lunarwing_engine::MissionRetryPolicy>, EngineError> {
+        let tuning_keys = [
+            "max_retries",
+            "initial_delay_secs",
+            "backoff_multiplier",
+            "max_delay_secs",
+        ];
+        let any = tuning_keys.iter().any(|key| params.get(*key).is_some());
+        if !any {
+            return Ok(None);
+        }
+        let default = lunarwing_engine::MissionRetryPolicy::default();
+        let max_retries =
+            Self::retry_scalar_u64(params, "max_retries", default.max_retries as u64)?;
+        let initial_delay_secs =
+            Self::retry_scalar_u64(params, "initial_delay_secs", default.initial_delay_secs)?;
+        let max_delay_secs =
+            Self::retry_scalar_u64(params, "max_delay_secs", default.max_delay_secs)?;
+        let backoff_multiplier = match params.get("backoff_multiplier") {
+            None => default.backoff_multiplier,
+            Some(value) => value.as_f64().ok_or_else(|| EngineError::Effect {
+                reason: "backoff_multiplier must be a positive number".into(),
+            })?,
+        };
+        if backoff_multiplier <= 0.0 {
+            return Err(EngineError::Effect {
+                reason: "backoff_multiplier must be positive".into(),
+            });
+        }
+        Ok(Some(lunarwing_engine::MissionRetryPolicy {
+            max_retries: max_retries.min(u32::MAX as u64) as u32,
+            initial_delay_secs,
+            backoff_multiplier,
+            max_delay_secs,
+        }))
+    }
+
+    /// Integer retry scalar with MIN's coerce_to_u64 semantics; string
+    /// numbers parsed too (tool callers sometimes serialize numbers).
+    fn retry_scalar_u64(
+        params: &serde_json::Value,
+        key: &str,
+        default: u64,
+    ) -> Result<u64, EngineError> {
+        match params.get(key) {
+            None => Ok(default),
+            Some(value) => Self::coerce_to_u64(value).ok_or_else(|| EngineError::Effect {
+                reason: format!("{key} must be a non-negative integer"),
+            }),
+        }
+    }
+
     fn mission_updates(
         params: &serde_json::Value,
     ) -> Result<lunarwing_engine::MissionUpdate, EngineError> {
@@ -281,12 +343,17 @@ impl EffectBridgeAdapter {
         let current_focus = params
             .get("current_focus")
             .map(|value| value.as_str().map(str::to_string));
+        // WI#188: mission_update may tune the retry policy with up to 2
+        // scalars; rich tuning (backoff curve) is deliberately a direct
+        // `mission.json` shape, not a per-call tool surface.
+        let retry_policy = Self::mission_retry_policy_from_params(params)?;
         Ok(lunarwing_engine::MissionUpdate {
             name,
             goal,
             cadence,
             notify_channels,
             max_threads_per_day,
+            retry_policy,
             success_criteria,
             webhook_secret,
             current_focus,
