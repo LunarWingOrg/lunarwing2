@@ -568,7 +568,10 @@ mod tests {
 
         // Plan BEFORE run/ exists (WI#209): lexical containment still selects it.
         let masked = masked_dirs_for_mount(&mount_root, &fixture.protected()).expect("planning");
-        assert!(masked.contains(&run_dir), "absent run/ must be masked: {masked:?}");
+        assert!(
+            masked.contains(&run_dir),
+            "absent run/ must be masked: {masked:?}"
+        );
 
         // Concurrent first start: the daemon creates run/ and binds the sockets.
         std::fs::create_dir_all(&run_dir).expect("recreate run dir");
@@ -580,7 +583,12 @@ mod tests {
         // the only control — assert it covers every file created there.
         let destination = mask_destination(&mount_root, &run_dir).expect("mask destination");
         assert_eq!(destination, "/workspace/run");
-        for created in ["lunarwing.sock", "ssh-agent.sock", "pg.secret", "tenant.env"] {
+        for created in [
+            "lunarwing.sock",
+            "ssh-agent.sock",
+            "pg.secret",
+            "tenant.env",
+        ] {
             let sibling = run_dir.join(created);
             let covered = Path::new(&destination).join(created);
             assert!(
@@ -608,9 +616,8 @@ mod tests {
     fn mt_layout_base_dir_derives_env_and_run_siblings() {
         let base = Path::new("/home/tenant/lunarwing/state");
         let paths = resolve_protected_paths_from(None, base);
-        let norm = |p: String| {
-            std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned())
-        };
+        let norm =
+            |p: String| std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
         let rendered: Vec<String> = paths
             .iter()
             .map(|p| norm(p.to_string_lossy().into_owned()))
