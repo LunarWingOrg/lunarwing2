@@ -43,6 +43,40 @@ pub fn load_bundled_skills() -> &'static [(String, String)] {
 mod tests {
     use super::*;
 
+    /// Skills that must never ship in the bundled tenant catalog again.
+    /// Removed per WI#185: contributor-dev workflows (proprietary browser
+    /// extensions, Chrome MCP, PR checklists) are not tenant capabilities.
+    const REMOVED_DEV_SKILLS: &[&str] = &["web-ui-test", "local-test", "review-checklist"];
+
+    #[test]
+    fn bundled_catalog_is_exactly_the_product_skill_set() {
+        let bundled: Vec<&str> = load_bundled_skills()
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        for removed in REMOVED_DEV_SKILLS {
+            assert!(
+                !bundled.contains(removed),
+                "skill '{removed}' was removed from the bundled tenant catalog by WI#185 \
+                 but is embedded again; contributor-dev skills must not ship to tenants"
+            );
+        }
+
+        let expected = [
+            "cavepony",
+            "delegation",
+            "lunarwing-workflow-orchestrator",
+            "multica-poll",
+            "plan-mode",
+            "routine-advisor",
+            "study-notes",
+        ];
+        let mut actual = bundled.clone();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "bundled skill catalog changed; if this is deliberate, update the expected list and the WI#185 record");
+    }
+
     #[test]
     fn cavepony_is_bundled_and_parseable() {
         let (_, content) = load_bundled_skills()
