@@ -4,12 +4,41 @@
  */
 
 import type { WebSocket as WsType } from "ws"
+import { accessSync, constants } from "node:fs"
 
 const WS_HOST = process.env.SMOKE_WS_HOST || "127.0.0.1"
 const WS_PORT = process.env.SMOKE_WS_PORT || "9090"
 const HEALTH_PORT = process.env.SMOKE_HEALTH_PORT || "8443"
 const AUTH_TOKEN = process.env.AGENT_AUTH_TOKEN || ""
 const WS_PATH = process.env.WS_PATH || "/ws/agent"
+
+/**
+ * WI#206: the worker container must not carry host SSH credentials. The
+ * managed tenant launch path no longer mounts the SSH-agent socket; this
+ * check proves the absence inside the running container (it runs in the
+ * agent-smoke service of the same image) so a regression in the mount
+ * wiring surfaces in smoke, not in an incident.
+ */
+async function checkNoSshCredentials(): Promise<boolean> {
+  const failures: string[] = []
+  if (process.env.SSH_AUTH_SOCK) {
+    failures.push(`SSH_AUTH_SOCK is set (${process.env.SSH_AUTH_SOCK})`)
+  }
+  for (const socket of ["/tmp/ssh-agent.sock"]) {
+    try {
+      accessSync(socket, constants.F_OK)
+      failures.push(`${socket} exists`)
+    } catch {
+      // absent — expected
+    }
+  }
+  if (failures.length > 0) {
+    console.error(`[smoke] no-ssh-credentials: FAILED: ${failures.join("; ")}`)
+    return false
+  }
+  console.log(`[smoke] no-ssh-credentials: OK (no agent socket, no SSH_AUTH_SOCK)`)
+  return true
+}
 
 async function checkHealth(): Promise<boolean> {
   try {
@@ -98,6 +127,7 @@ async function main() {
     health: await checkHealth(),
     ready: await checkReady(),
     websocket: await checkWebSocket(),
+    noSshCredentials: await checkNoSshCredentials(),
   }
 
   console.log()
