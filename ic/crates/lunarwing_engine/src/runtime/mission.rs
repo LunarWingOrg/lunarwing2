@@ -3338,6 +3338,7 @@ mod tests {
     use crate::capability::lease::LeaseManager;
     use crate::capability::policy::PolicyEngine;
     use crate::capability::registry::CapabilityRegistry;
+    use crate::runtime::messaging::ThreadFailureKind;
     use crate::traits::effect::EffectExecutor;
     use crate::traits::llm::{LlmCallConfig, LlmOutput};
     use crate::traits::store::Store;
@@ -3348,7 +3349,6 @@ mod tests {
     use crate::types::memory::{DocId, DocType, MemoryDoc};
     use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
     use crate::types::project::{Project, ProjectId};
-    use crate::runtime::messaging::ThreadFailureKind;
     use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
     use crate::types::thread::{Thread, ThreadId, ThreadState};
 
@@ -8787,13 +8787,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
 
         // Failure 1 against a fresh mission: attempt lineage has no prior
         // retry_attempts marker, so the planner rents attempt 1.
-        let first = plan_outcome_retry(
-            &store,
-            &mission,
-            ThreadId::new(),
-            "seed",
-        )
-        .await;
+        let first = plan_outcome_retry(&store, &mission, ThreadId::new(), "seed").await;
         let first = first.expect("failure with spendable attempts rents attempt 1");
         assert_eq!(first.attempt, 1, "first failure rents attempt 1");
 
@@ -8808,13 +8802,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         mission.retry_policy.max_retries = 0;
         let store: Arc<dyn Store> = Arc::new(TestStore::new());
-        let pending = plan_outcome_retry(
-            &store,
-            &mission,
-            ThreadId::new(),
-            "must be capped",
-        )
-        .await;
+        let pending = plan_outcome_retry(&store, &mission, ThreadId::new(), "must be capped").await;
         assert!(
             pending.is_none(),
             "max_retries=0 disables the lineage (pre-WI#188 behavior)"
