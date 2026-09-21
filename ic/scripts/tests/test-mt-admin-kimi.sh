@@ -198,7 +198,25 @@ assert_contains "$BUILD_LIB" 'local source_root="${3:-$LUNARWING_ROOT}"' 'OpenCo
 assert_contains "$BUILD_LIB" 'build_opencode_worker "false" "$with_toolchains" "$(tenant_lw_root "$name")"' 'tenant build passes tenant checkout to OpenCode builder'
 assert_contains "$BUILD_LIB" 'build-all refuses dirty worker source in tenant checkout' 'build-all rejects mismatched dirty worker trees'
 KIMI_DOCKERFILE="$LUNARWING_ROOT/kimicode4lunarwing/Dockerfile"
-assert_contains "$KIMI_DOCKERFILE" 'ARG KIMI_CODE_VERSION=0.43.1' 'Kimi image pins build-arg default'
+# Pin consistency, version-agnostic: the Dockerfile build-arg default, the CI
+# build script, and the committed npm lock must all agree. Deriving the
+# expected value instead of hard-coding it means a future version bump cannot
+# silently desync one surface from the others (it did: 0.43.1 -> 2.0.2 left
+# this assertion behind and red-lit the shell-harnesses job).
+KIMI_PKG_VERSION="$(python3 -c "import json,sys; print(json.load(open('$LUNARWING_ROOT/kimicode4lunarwing/kimi-cli/package.json'))['dependencies']['@moonshot-ai/kimi-code'])" 2>/dev/null)"
+if [[ -n "$KIMI_PKG_VERSION" ]]; then
+  pass "Kimi CLI version is discoverable from package.json ($KIMI_PKG_VERSION)"
+else
+  fail 'Kimi CLI version could not be read from package.json'
+fi
+assert_contains "$KIMI_DOCKERFILE" "ARG KIMI_CODE_VERSION=$KIMI_PKG_VERSION" \
+  'Kimi image build-arg default matches the committed CLI lock'
+assert_contains "$LUNARWING_ROOT/.gitlab/scripts/build-worker-image.sh" "source_ref=$KIMI_PKG_VERSION" \
+  'Kimi worker publication source_ref matches the committed CLI lock'
+# The tenant build path passes KIMI_CODE_VERSION as a build-arg override rather
+# than carrying a default, so assert the flag plumbing, not a literal version.
+assert_contains "$BUILD_LIB" '--build-arg KIMI_CODE_VERSION="${kimi_code_version}"' \
+  'Kimi tenant builder forwards the version build-arg'
 assert_contains "$KIMI_DOCKERFILE" 'COPY kimi-cli/package.json kimi-cli/package-lock.json /opt/kimi-cli/' 'Kimi image copies the reviewed CLI lock'
 assert_contains "$KIMI_DOCKERFILE" 'npm ci --omit=dev --prefix /opt/kimi-cli' 'Kimi image installs selected package from its lock'
 assert_contains "$KIMI_DOCKERFILE" 'org.opencontainers.image.toolchain-profile="${WITH_TOOLCHAINS}"' 'Kimi image records toolchain profile'
