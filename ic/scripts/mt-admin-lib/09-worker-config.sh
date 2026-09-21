@@ -140,18 +140,170 @@ _deregister_worker_unit() {
 # and never logs `External workers configured: <worker>` on startup.
 #
 # The worker container binds 127.0.0.1:<wss_port> (path /ws/agent) and is
-# launched with AGENT_AUTH_TOKEN set to the tenant's GATEWAY_AUTH_TOKEN, so the
-# daemon side must present that same token as the
-# WebSocket bearer — hence auth_token mirrors GATEWAY_AUTH_TOKEN here.
+# launched with AGENT_AUTH_TOKEN set to the tenant's WORKER_AUTH_TOKEN, so the
+# daemon side must present that same token as the WebSocket bearer — hence
+# auth_token mirrors WORKER_AUTH_TOKEN here. This credential is scoped to the
+# worker handshake only; it is never accepted by the gateway API, so a leaked
+# `podman inspect` value no longer yields the tenant's dashboard surface
+# (WI#205).
 #
 # Idempotent: a tenant entry is written once and skipped on re-runs. Exact legacy
 # 5-minute deadlines migrate to the current default. Set
 # LUNARWING_MT_MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS=false to preserve an
 # intentional 5-minute value. Other explicit values remain untouched.
+
+# Scoped bearer for the daemon<->external-worker WebSocket handshake (WI#205).
+#
+# The worker is the WS *server*: it validates an inbound bearer on the upgrade
+# and the daemon presents the same value as `auth_token`. Both sides MUST
+# derive the value through this helper — a mismatch shows up only as a failed
+# handshake ("worker connection refused"), never as a config error.
+#
+# Falls back to GATEWAY_AUTH_TOKEN for tenants provisioned before
+# WORKER_AUTH_TOKEN existed; those converge on the next lifecycle pass, which
+# regenerates the env file, rewrites the worker units, and upgrades the
+# config.toml entry together.
+#
+# WI#210: the fallback mints the scoped token on first use instead of leaving
+# the gateway bearer in place. `ensure_worker_auth_token` writes
+# WORKER_AUTH_TOKEN into the tenant env file (0600, same file the daemon
+# reads), so an upgrade-path tenant gets a real scoped credential immediately
+# and never exposes the full gateway bearer to `podman inspect` or the
+# tenant-readable unit file. The gateway-bearer substitution is kept ONLY as a
+# last resort for read-only/unwritable env files, and is always loudly warned.
+resolve_worker_auth_token() {
+  local env_path="$1" token
+  token="$(_read_env_value "$env_path" WORKER_AUTH_TOKEN)"
+  if [[ -n "$token" ]]; then
+    printf '%s' "$token"
+    return 0
+  fi
+
+  # Mint and persist the scoped token. Requires a writable env file; the
+  # caller owns 0600 semantics (same as every other env write).
+  if [[ -w "$env_path" ]] && command -v mktemp >/dev/null 2>&1; then
+    local fresh tmp
+    fresh="$(generate_token)"
+    if [[ -n "$fresh" ]]; then
+      tmp="$(mktemp "${env_path}.tmp.XXXXXX")"
+      if cat "$env_path" >"$tmp" 2>/dev/null \
+        && printf 'WORKER_AUTH_TOKEN=%s\n' "$fresh" >>"$tmp" \
+        && chmod 600 "$tmp" \
+        && mv -f "$tmp" "$env_path"; then
+        echo "WARNING: WORKER_AUTH_TOKEN was missing in $env_path; generated and persisted a scoped worker credential (WI#210)." >&2
+        printf '%s' "$fresh"
+        return 0
+      fi
+      rm -f "$tmp"
+    fi
+  fi
+
+  # Last resort: fail open ONLY after an explicit, loud warning. Never silent.
+  echo "WARNING: could not persist WORKER_AUTH_TOKEN for $env_path; falling back to GATEWAY_AUTH_TOKEN (WI#210 mitigations do NOT apply to this worker until the env file is written)." >&2
+  token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  printf '%s' "$token"
+}
+
+# Rewrite one worker's `auth_token` when it drifts from the scoped credential.
+#
+# Return contract mirrors upgrade_external_worker_timeout: 0 upgraded,
+# 1 no change needed, 2 failure.
+upgrade_external_worker_auth_token() {
+  local name="$1" worker="$2" config_path="$3" env_path="$4"
+  local awk_status temp_path new_token
+  new_token="$(resolve_worker_auth_token "$env_path")"
+  [[ -n "$new_token" ]] || return 1
+
+  if ! temp_path="$(mktemp "${config_path}.tmp.XXXXXX")"; then
+    return 2
+  fi
+
+  if awk \
+    -v worker="$worker" \
+    -v new_token="$new_token" '
+      # Two-pass shape: first pass records whether the target block already has
+      # a matching token (nothing to do) and which lines to rewrite; second pass
+      # emits. Doing it in one pass risks inserting a duplicate ahead of the
+      # existing key, which TOML rejects as a repeated key.
+      FNR == NR {
+        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
+          in_block = 1
+          target = 0
+          next
+        }
+        if ($0 ~ /^\[/) {
+          in_block = 0
+          target = 0
+          next
+        }
+        if (in_block && $0 == "name = \"" worker "\"") {
+          target = 1
+          next
+        }
+        if (!(in_block && target)) next
+        if ($0 == "auth_token = \"" new_token "\"") { satisfied = 1 }
+        if ($0 ~ /^auth_token[[:space:]]*=/) { has_token = 1 }
+        next
+      }
+      {
+        if ($0 ~ /^\[\[sandbox\.external_workers\]\][[:space:]]*$/) {
+          in_block = 1
+          target = 0
+          print
+          next
+        }
+        if ($0 ~ /^\[/) {
+          in_block = 0
+          target = 0
+          print
+          next
+        }
+        if (in_block && $0 == "name = \"" worker "\"") {
+          target = 1
+          print
+          next
+        }
+        if (in_block && target) {
+          if ($0 ~ /^auth_token[[:space:]]*=/) {
+            if (!satisfied) { print "auth_token = \"" new_token "\""; changed = 1 }
+            else { print }
+            next
+          }
+          if (!has_token && $0 ~ /^url[[:space:]]*=/) {
+            print
+            print "auth_token = \"" new_token "\""
+            changed = 1
+            next
+          }
+        }
+        print
+      }
+      END {
+        if (satisfied) exit 42
+        if (!changed && !has_token) exit 43
+      }
+    ' "$config_path" "$config_path" >"$temp_path"; then
+    if ! chown "$name:$name" "$temp_path" ||
+       ! chmod 600 "$temp_path" ||
+       ! mv -f -- "$temp_path" "$config_path"; then
+      rm -f -- "$temp_path"
+      return 2
+    fi
+    say "scoped worker credential applied for '$worker' (WI#205)"
+    return 0
+  else
+    awk_status=$?
+    rm -f -- "$temp_path"
+    if [[ "$awk_status" -eq 42 ]]; then
+      return 1
+    fi
+    return 2
+  fi
+}
+
 upgrade_external_worker_timeout() {
   local name="$1" worker="$2" config_path="$3"
   local awk_status temp_path
-
   if [[ "$MIGRATE_LEGACY_EXTERNAL_WORKER_TIMEOUTS" != "true" ]] ||
      [[ "$DEFAULT_EXTERNAL_WORKER_TIMEOUT_MS" == "$LEGACY_EXTERNAL_WORKER_TIMEOUT_MS" ]]; then
     return 1
@@ -250,10 +402,26 @@ ensure_external_worker_config() {
       1) say "external worker '$worker' already configured in $config_path (skipping)" ;;
       *) die "failed to upgrade external worker '$worker' timeout in $config_path" ;;
     esac
+    # Migrate a pre-WI#205 entry (gateway bearer) onto the scoped credential.
+    # Runs on the skip path too, so an existing tenant converges without
+    # re-provisioning; the worker units pick up the same value on their next
+    # render because both read it through resolve_worker_auth_token().
+    local auth_status=0
+    upgrade_external_worker_auth_token "$name" "$worker" "$config_path" "$env_path" \
+      || auth_status=$?
+    case "$auth_status" in
+      0 | 1) ;;
+      *) die "failed to apply the scoped worker credential for '$worker' in $config_path" ;;
+    esac
     return 0
   fi
 
-  auth_token="$(_read_env_value "$env_path" GATEWAY_AUTH_TOKEN)"
+  # Scoped worker credential (WI#205). Derived through the shared resolver so
+  # the value can never drift from what the worker container's
+  # AGENT_AUTH_TOKEN will be; tenants provisioned before WORKER_AUTH_TOKEN
+  # existed fall back to the gateway bearer until their next lifecycle pass
+  # migrates both sides together.
+  auth_token="$(resolve_worker_auth_token "$env_path")"
 
   # add-tenant runs before the daemon ever starts, so config.toml usually does
   # not exist yet — create it with a header. Appending a fresh
@@ -1052,9 +1220,9 @@ start_tenant_opencode() {
 
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
+      local agent_token
+      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
       llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
@@ -1251,9 +1419,9 @@ start_tenant_opencode2() {
 
     local -a env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
+      local agent_token
+      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
 
       local llm_api_key
       llm_api_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
@@ -1373,10 +1541,10 @@ write_kimi_runtime_env() {
     [[ -z "$value" ]] || printf '%s=%s\n' "$key" "$value" >>"$temporary"
   done
 
-  value="$(_read_env_value "$source_path" GATEWAY_AUTH_TOKEN)"
+  value="$(resolve_worker_auth_token "$source_path")"
   [[ -n "$value" ]] \
-    || { rm -f "$temporary"; die "Kimi worker requires GATEWAY_AUTH_TOKEN"; }
-  # Worker bridge expects AGENT_AUTH_TOKEN, not daemon's gateway variable name.
+    || { rm -f "$temporary"; die "Kimi worker requires WORKER_AUTH_TOKEN (or GATEWAY_AUTH_TOKEN)"; }
+  # Worker bridge expects AGENT_AUTH_TOKEN, not the daemon's env variable name.
   printf 'AGENT_AUTH_TOKEN=%s\n' "$value" >>"$temporary"
   chown "$name:$name" "$temporary"
   chmod 600 "$temporary"
@@ -1666,9 +1834,9 @@ start_tenant_pebble() {
 
     local env_flags=()
     if [[ -f "$tenant_env_path" ]]; then
-      local gateway_token
-      gateway_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
-      [[ -n "$gateway_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$gateway_token")
+      local agent_token
+      agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
+      [[ -n "$agent_token" ]] && env_flags+=(-e "AGENT_AUTH_TOKEN=$agent_token")
     fi
 
     if [[ -f "$pebble_env_path" ]]; then

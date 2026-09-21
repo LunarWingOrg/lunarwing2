@@ -117,6 +117,7 @@ pub mod container;
 pub mod detect;
 pub mod error;
 pub mod manager;
+pub mod mount_guard;
 pub mod proxy;
 
 pub use cli_runner::{

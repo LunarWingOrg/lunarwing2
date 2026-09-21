@@ -68,6 +68,7 @@ MT_FIXTURE="$(mktemp -d)"
 trap 'rm -rf "$MT_FIXTURE"' EXIT
 
 # Stub tenant_* path helpers to point at the fixture dir.
+tenant_lw_root()    { echo "$MT_FIXTURE"; }
 tenant_env_dir()    { echo "$MT_FIXTURE/env"; }
 tenant_state_dir()  { echo "$MT_FIXTURE/state"; }
 tenant_run_dir()    { echo "$MT_FIXTURE/run"; }
@@ -121,6 +122,11 @@ out="$(run_writer fixture-tenant)"
 assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensorzero::function_name::lunarwing"
 assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
 assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
+# WI#205: the sandbox must be told which tenant directories hold credentials.
+# They are not derivable from LUNARWING_BASE_DIR (state/ is a child of the
+# tenant root; env/ and run/ are siblings), so mt-admin names them explicitly.
+assert_eq "sandbox protects env, state and run under the tenant root" \
+  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env:$MT_FIXTURE/state:$MT_FIXTURE/run"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
 assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"
