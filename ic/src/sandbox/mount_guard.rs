@@ -60,8 +60,28 @@ const ENV_SUFFIX: &str = ".env";
 /// included because they cover the single-node layout, where the env file
 /// genuinely is `<base>/.env`.
 pub fn resolve_protected_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = std::env::var(PROTECTED_PATHS_ENV)
-        .ok()
+    resolve_protected_paths_from(
+        std::env::var(PROTECTED_PATHS_ENV).ok().as_deref(),
+        &crate::bootstrap::lunarwing_base_dir(),
+    )
+}
+
+/// Protected set for an explicit env override and base dir.
+///
+/// Split out of [`resolve_protected_paths`] so the derivation can be tested
+/// without touching process env (parallel tests would race on it).
+///
+/// WI#215: when the multi-tenant layout is detected — the base dir is a
+/// `state/` component *inside* the tenant root, so `env/` and `run/` are
+/// siblings of it, not children — the tenant's `<root>/env` and `<root>/run`
+/// directories are added defensively. A tenant that has not been re-rendered
+/// since `SANDBOX_PROTECTED_PATHS` was introduced (WI#205) would otherwise
+/// leave `<root>/run` (the world-writable `ssh-agent.sock`, the tenant's SSH
+/// identity) unmasked to any sandboxed command mounting the tenant root. The
+/// added paths are inert subdirectories of already-protected single-node
+/// bases, so default protection behaviour is unchanged.
+fn resolve_protected_paths_from(env_raw: Option<&str>, base: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = env_raw
         .map(|raw| {
             raw.split(':')
                 .map(str::trim)
@@ -71,16 +91,17 @@ pub fn resolve_protected_paths() -> Vec<PathBuf> {
         })
         .unwrap_or_default();
 
-    let base = crate::bootstrap::lunarwing_base_dir();
     paths.push(base.join("env"));
     paths.push(base.join("state"));
     paths.push(base.join("run"));
-    paths.push(base.clone());
+    paths.push(base.to_path_buf());
+    add_mt_tenant_siblings(base, &mut paths);
     if let Ok(canonical) = base.canonicalize() {
         paths.push(canonical.join("env"));
         paths.push(canonical.join("state"));
         paths.push(canonical.join("run"));
-        paths.push(canonical);
+        paths.push(canonical.clone());
+        add_mt_tenant_siblings(&canonical, &mut paths);
     }
 
     // Canonicalize what exists so prefix checks compare resolved paths; keep
@@ -92,6 +113,18 @@ pub fn resolve_protected_paths() -> Vec<PathBuf> {
     resolved.sort();
     resolved.dedup();
     resolved
+}
+
+/// Add `<root>/env` and `<root>/run` when `base` looks like an MT state dir
+/// (`<root>/<something>/state`). The explicit list already protects the base
+/// itself, so `state/` is not repeated.
+fn add_mt_tenant_siblings(base: &Path, paths: &mut Vec<PathBuf>) {
+    if base.file_name().and_then(|n| n.to_str()) == Some("state")
+        && let Some(tenant_root) = base.parent()
+    {
+        paths.push(tenant_root.join("env"));
+        paths.push(tenant_root.join("run"));
+    }
 }
 
 /// Canonicalize `dir` and reject it unless it is safe to bind-mount.
@@ -518,6 +551,53 @@ mod tests {
         assert_eq!(err.kind(), "mount_path_denied");
     }
 
+    /// WI#215: pin the "protected dir absent at plan time, created
+    /// concurrently" scenario end to end — mount of a legitimate parent (the
+    /// tenant root) is allowed while `run/` is missing, the missing dir is
+    /// still planned for masking, and after run/` appears the planned
+    /// `/workspace/run` mask destination covers the secrets created inside it.
+    #[test]
+    fn masks_protected_dir_created_after_planning() {
+        let fixture = Fixture::new();
+        let run_dir = fixture.root.join("lunarwing/run");
+        // start/  is fresh: run/ does not exist yet (staging mirrors provisioners).
+        std::fs::remove_dir_all(&run_dir).expect("remove run dir");
+
+        let mount_root = validate_mount_dir(&fixture.repo_root(), &fixture.protected())
+            .expect("tenant root remains mountable while run/ is absent");
+
+        // Plan BEFORE run/ exists (WI#209): lexical containment still selects it.
+        let masked = masked_dirs_for_mount(&mount_root, &fixture.protected()).expect("planning");
+        assert!(
+            masked.contains(&run_dir),
+            "absent run/ must be masked: {masked:?}"
+        );
+
+        // Concurrent first start: the daemon creates run/ and binds the sockets.
+        std::fs::create_dir_all(&run_dir).expect("recreate run dir");
+        std::fs::write(run_dir.join("lunarwing.sock"), "sock").expect("daemon socket");
+        std::fs::write(run_dir.join("ssh-agent.sock"), "sock").expect("ssh-agent socket");
+
+        // Socket names are ordinary files (the WI#211 credential-file walk does
+        // not pick them up), so the plan-time /workspace/run empty-dir shadow is
+        // the only control — assert it covers every file created there.
+        let destination = mask_destination(&mount_root, &run_dir).expect("mask destination");
+        assert_eq!(destination, "/workspace/run");
+        for created in [
+            "lunarwing.sock",
+            "ssh-agent.sock",
+            "pg.secret",
+            "tenant.env",
+        ] {
+            let sibling = run_dir.join(created);
+            let covered = Path::new(&destination).join(created);
+            assert!(
+                sibling.starts_with(&run_dir) && covered.starts_with(&destination),
+                "{created} created post-plan must fall inside the masked /workspace/run"
+            );
+        }
+    }
+
     #[test]
     fn protected_file_names_cover_env_suffix_and_known_secrets() {
         assert!(is_protected_file_name(Path::new("/x/y/lunarwing.env")));
@@ -527,6 +607,65 @@ mod tests {
         assert!(is_protected_file_name(Path::new("/x/y/LUNARWING.ENV")));
         assert!(!is_protected_file_name(Path::new("/x/y/notes.txt")));
         assert!(!is_protected_file_name(Path::new("/x/y/environment.md")));
+    }
+
+    /// WI#215: an MT base dir of `<root>/state` gains the tenant's env/ and
+    /// run/ siblings, closing the stale-render gap (WI#209's fix covered
+    /// existence; this covers which paths are known).
+    #[test]
+    fn mt_layout_base_dir_derives_env_and_run_siblings() {
+        let base = Path::new("/home/tenant/lunarwing/state");
+        let paths = resolve_protected_paths_from(None, base);
+        let norm =
+            |p: String| std::fs::canonicalize(&p).map_or(p, |c| c.to_string_lossy().into_owned());
+        let rendered: Vec<String> = paths
+            .iter()
+            .map(|p| norm(p.to_string_lossy().into_owned()))
+            .collect();
+        for want in [
+            "/home/tenant/lunarwing/env",
+            "/home/tenant/lunarwing/run",
+            "/home/tenant/lunarwing/state",
+        ] {
+            let want = norm(want.to_string());
+            assert!(rendered.contains(&want), "missing {want} in {rendered:?}");
+        }
+        // The tenant root itself stays unprotected: the daemon's working
+        // directory (<root>/ic) must remain mountable.
+        let root = norm("/home/tenant/lunarwing".to_string());
+        assert!(
+            !rendered.contains(&root),
+            "tenant root must not be protected: {rendered:?}"
+        );
+    }
+
+    /// Single-node bases (`~/.ironclaw`, `/var/lib/lunarwing`, ...) do not end
+    /// in `state/`, so no tenant siblings are derived — existing behaviour is
+    /// unchanged.
+    #[test]
+    fn non_mt_base_dir_gains_no_siblings() {
+        let paths = resolve_protected_paths_from(None, Path::new("/home/u/.ironclaw"));
+        assert!(
+            !paths.iter().any(|p| p.ends_with(Path::new("u/env"))),
+            "no sibling env/ derived for a non-MT base: {paths:?}"
+        );
+    }
+
+    /// Explicit SANDBOX_PROTECTED_PATHS entries are preserved alongside the
+    /// derived set (mt-admin's env:state:run triple when rendered).
+    #[test]
+    fn explicit_paths_are_preserved() {
+        let paths = resolve_protected_paths_from(
+            Some("/t/lunarwing/env: /t/lunarwing/state ::/t/lunarwing/run "),
+            Path::new("/home/u/.ironclaw"),
+        );
+        for want in [
+            Path::new("/t/lunarwing/env"),
+            Path::new("/t/lunarwing/state"),
+            Path::new("/t/lunarwing/run"),
+        ] {
+            assert!(paths.contains(&want.to_path_buf()), "missing {want:?}");
+        }
     }
 
     #[test]
