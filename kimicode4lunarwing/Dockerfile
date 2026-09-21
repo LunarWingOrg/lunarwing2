@@ -184,6 +184,7 @@ WORKDIR /app
 COPY --from=builder /build/scripts/ /app/scripts/
 COPY --chown=kimi:kimi entrypoint.sh health_server.py agent_comm_protocol.json ./
 COPY --chown=kimi:kimi config/ ./config/
+COPY --chown=kimi:kimi hooks/ ./hooks/
 
 RUN chmod +x /app/entrypoint.sh /app/health_server.py
 
@@ -211,6 +212,11 @@ RUN mkdir -p /home/kimi/.kimi-code \
              /var/log/lunarwing \
              /app/results \
     && chown -R kimi:kimi /home/kimi /workspace /var/log/lunarwing /app/results
+
+# WI#206: the baked policy (guard config + PreToolUse hook) must not be
+# editable by the runtime user — the worker runs as kimi, so dropping write
+# access means a task inside the container cannot strip its own guard.
+RUN chmod -R a-w /app/config /app/hooks && chmod a-w /app/entrypoint.sh
 
 # ── ports ──────────────────────
 EXPOSE 8443

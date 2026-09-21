@@ -8,19 +8,32 @@
 # the default: since kimi-code 0.37.2, worker prompts against it fail.
 
 default_model = "tensorzero/FrontierCODE"
-# Headless worker lane: "auto" auto-approves everything, including commands the
-# static analyzer cannot classify. "yolo" is stricter upstream (0.40.0+ holds
-# dangerous-class commands), which a headless -p run can never answer — the task
-# would stall to its full timeout (WI#195 finding 1).
+# Print mode (kimi -p) forces the auto permission policy regardless of this
+# value; it stays "auto" so an interactive TUI fallback never stalls on an
+# approval prompt (WI#195). Dangerous-command enforcement lives in the
+# PreToolUse hook below (WI#206): verified against the pinned CLI (2.0.2),
+# the upstream dangerous_command_guard is skipped entirely in auto mode, so
+# the hook — which fires before permission checks in every mode — is the
+# fail-closed mechanism for the headless lane.
 default_permission_mode = "auto"
 telemetry = false
 
 [permission]
-# The worker is a headless batch executor (kimi -p --output-format stream-json)
-# with no TTY to answer an approval prompt. upstream 0.40.0 added a dangerous
-# -command guard that asks in ALL permission modes; every prompt is an
-# unanswered stall until the task timeout, so the guard must be off here.
-dangerous_command_guard = false
+# Kept at the upstream default (true). It is inert under -p/auto today, but
+# leaving it explicitly on means a future upstream change that starts
+# honoring the guard in auto mode fails CLOSED, not open. Never set this to
+# false: KIMI_CODE_DANGEROUS_COMMAND_GUARD is scrubbed per task (WI#206).
+dangerous_command_guard = true
+
+# Fail-closed headless policy (WI#206): every Bash tool call passes through
+# the baked guard before permission checks. Exit code 2 blocks the call and
+# the reason is returned to the model as the tool error — a bounded, explicit
+# denial instead of either auto-execution or an unanswered approval stall.
+[[hooks]]
+event = "PreToolUse"
+matcher = "Bash"
+command = "node /app/hooks/headless_command_guard.mjs"
+timeout = 10
 
 [providers.tensorzero]
 type = "openai"
