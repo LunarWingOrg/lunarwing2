@@ -8688,7 +8688,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         store.save_mission(&mission).await.unwrap();
 
         let failed = ThreadOutcome::Failed {
-            kind: ThreadFailureKind::Model(ModelFailureKind::ProviderOverload),
+            kind: ThreadFailureKind::Model(ModelFailureKind::Transient),
             error: "provider cut".into(),
         };
         let pending = process_mission_outcome(&store, id, ThreadId::new(), &failed)
@@ -8735,12 +8735,11 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             .await
             .unwrap();
 
-        let spawned_thread = mgr
+        let _spawned_thread_first_fire = mgr
             .fire_mission(id, "test-user", None)
             .await
             .unwrap()
             .expect("a first manual fire must spawn so the retry path has context");
-        let _ = spawned;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let store_mission = mgr.get_mission(id).await.unwrap().unwrap();
         let thread_id = *store_mission.thread_history.last().unwrap();
