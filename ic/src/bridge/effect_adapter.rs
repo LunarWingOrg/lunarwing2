@@ -278,11 +278,9 @@ impl EffectBridgeAdapter {
             .map(str::to_string);
         // current_focus is nested-optional: absent leaves the stored focus,
         // an explicit JSON null clears it, a string sets it (WI#203).
-        let current_focus = params.get("current_focus").map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-        });
+        let current_focus = params
+            .get("current_focus")
+            .map(|value| value.as_str().map(str::to_string));
         Ok(lunarwing_engine::MissionUpdate {
             name,
             goal,
@@ -375,8 +373,7 @@ impl EffectBridgeAdapter {
                             "mission_create rejected: missing or non-string 'goal' parameter"
                         );
                         return Some(Err(EngineError::Effect {
-                            reason: "mission_create requires a string 'goal' parameter"
-                                .to_string(),
+                            reason: "mission_create requires a string 'goal' parameter".to_string(),
                         }));
                     }
                 };
@@ -3431,8 +3428,8 @@ FINAL(echoed + "|" + http_result["error"])"#,
     async fn mission_create_missing_name_is_an_error_not_an_unnamed_mission() {
         let (adapter, mgr) = adapter_with_mission_manager();
         for params in [
-            serde_json::json!({}),                     // absent
-            serde_json::json!({"goal": "g"}),           // name key missing
+            serde_json::json!({}),                        // absent
+            serde_json::json!({"goal": "g"}),             // name key missing
             serde_json::json!({"name": 42, "goal": "g"}), // wrong JSON type
         ] {
             let result = run_mission_create(&adapter, &mgr, params.clone())
@@ -3455,8 +3452,8 @@ FINAL(echoed + "|" + http_result["error"])"#,
     async fn mission_create_missing_goal_is_an_error() {
         let (adapter, mgr) = adapter_with_mission_manager();
         for params in [
-            serde_json::json!({"name": "n"}),             // goal key missing
-            serde_json::json!({"name": "n", "goal": 7}),  // wrong JSON type
+            serde_json::json!({"name": "n"}),            // goal key missing
+            serde_json::json!({"name": "n", "goal": 7}), // wrong JSON type
         ] {
             let result = run_mission_create(&adapter, &mgr, params.clone())
                 .await
@@ -3545,11 +3542,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
         );
 
         let mid = lunarwing_engine::MissionId(uuid::Uuid::parse_str(&id).expect("uuid"));
-        let mission = mgr
-            .get_mission(mid)
-            .await
-            .expect("load")
-            .expect("exists");
+        let mission = mgr.get_mission(mid).await.expect("load").expect("exists");
         assert_eq!(
             mission.current_focus.as_deref(),
             Some("review stale alerts")
@@ -3570,11 +3563,7 @@ FINAL(echoed + "|" + http_result["error"])"#,
             "clear should succeed: {:?}",
             cleared.output
         );
-        let mission = mgr
-            .get_mission(mid)
-            .await
-            .expect("load")
-            .expect("exists");
+        let mission = mgr.get_mission(mid).await.expect("load").expect("exists");
         assert!(mission.current_focus.is_none());
     }
 }
