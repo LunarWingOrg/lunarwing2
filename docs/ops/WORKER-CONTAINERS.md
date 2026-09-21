@@ -276,30 +276,54 @@ selection in `/etc/lunarwing/ports.json`. `build-tenant --with-<worker>` and the
 standalone build commands build shared images but do not select a worker for a
 tenant.
 
-### Headless permission contract (WI#195)
+### Headless permission contract (WI#195, WI#206)
 
 The Kimi worker runs every task through `kimi -p --output-format stream-json`,
-a headless batch invocation with no TTY. Upstream 0.40.0+ added a
-dangerous-command guard that prompts before shutdown/rm-class commands in ALL
-permission modes, and 0.43.0 defaults `KIMI_CODE_PERMISSION_MODE_REMINDER=1`
-which injects fixed-mode reminder text into every task's model context. In a
-headless lane every approval prompt is an unanswered stall to the task's full
-timeout (60 min default), and the reminder is pure prompt noise. The worker
-therefore ships three coordinated knobs:
+a headless batch invocation with no TTY. WI#206 investigation against the
+pinned CLI (2.0.2, verified empirically with a mock provider through the real
+`-p` path plus bundle reading) established what print mode actually enforces:
 
-- `config.toml`: `default_permission_mode = "auto"` + `[permission]
-  dangerous_command_guard = false`. `auto` (not `yolo`) is the correct headless
-  mode — yolo still holds dangerous-class commands for approval upstream.
-- `entrypoint.sh`: exports `KIMI_CODE_PERMISSION_MODE_REMINDER=0` and
-  `KIMI_CODE_DANGEROUS_COMMAND_GUARD=false` (defense in depth when a custom
-  `KIMI_CONFIG_SOURCE` drops the baked `[permission]` table). Both stay
-  operator-overridable via the tenant env file.
-- Flag contract pinned by `scripts/kimi_cli_contract_test.ts`, executed for
-  real during the worker image build (`npm test` gate runs the mock suite, then
-  the Docker gate re-runs just the contract lane against the locked CLI):
-  `-p --output-format stream-json` is accepted, `--yolo` is rejected.
+- `-p` forces the **auto** permission policy regardless of
+  `default_permission_mode` (`--yolo`/`--auto` are rejected alongside `-p`).
+- The upstream dangerous-command guard is **skipped entirely in auto mode**
+  (upstream code returns early for auto) — so with the old
+  `dangerous_command_guard = false` bake, dangerous-class commands executed
+  with no approval boundary at all. (Guard on/off changes nothing for
+  stalls either: WI#195's stall no longer reproduces on 2.0.2.)
+- `[[permission.rules]]` from `config.toml` never load in this version —
+  user-configured deny rules are dead config.
+- **PreToolUse hooks fire before permission checks in every mode**: exit code
+  2 blocks the call and the stderr reason is returned to the model as the
+  tool error — a bounded, explicit denial.
 
-Do not re-enable the guard or the reminder without a TTY-capable supervisor.
+The worker therefore ships a fail-closed policy instead of blanket
+auto-approval:
+
+- `config/config.toml`: `dangerous_command_guard = true` (inert under `-p`
+  today, but a future upstream change then fails closed) plus a `[[hooks]]`
+  `PreToolUse` / `Bash` entry invoking the baked guard.
+- `hooks/headless_command_guard.mjs`: denies privilege escalation
+  (`sudo`/`doas`), power/disk destruction (`shutdown`, `reboot`, `mkfs`,
+  `wipefs`, block-device writes), fork bombs, remote-content-piped-to-shell,
+  recursive `chmod`/`chown` on system roots, SSH-agent socket use, and
+  recursive/forced `rm` outside temp roots. Unparseable payloads deny.
+  `/app/config` and `/app/hooks` are read-only to the runtime user, so a
+  task cannot edit its own guard.
+- `entrypoint.sh`: injects the guard + hook into any `KIMI_CONFIG_SOURCE`
+  that lacks them, never exports `KIMI_CODE_DANGEROUS_COMMAND_GUARD`
+  (unsets it), and keeps `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (prompt
+  noise for a fixed-mode worker).
+- `kimi_task_executor.ts`: scrubs `KIMI_CODE_DANGEROUS_COMMAND_GUARD` and
+  `KIMI_CODE_PERMISSION_MODE_REMINDER` from per-task environments, so
+  task-controlled `context.environment` cannot change the approval policy.
+- mt-admin no longer mounts the tenant SSH-agent socket into the kimi
+  container (both the imperative `podman run` and the Quadlet), adds
+  `no-new-privileges`, and bumps `KIMI_ROOTLESS_LAUNCH_CONTRACT` so existing
+  containers force-recreate. Other worker lanes keep the socket.
+
+Verified end-to-end on 2.0.2: `rm -rf <non-temp>`, `sudo`, `shutdown`, and
+`curl … | sh` are denied in ~3s with an explicit reason; ordinary commands
+(`echo`, `grep`, `git status`, builds, tests) execute unchanged.
 
 ## Shared Protocol
 
