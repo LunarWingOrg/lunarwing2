@@ -1792,6 +1792,19 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
     if let Err(e) = mission_manager.resume_recoverable_threads().await {
         debug!("engine v2: resume_recoverable_threads failed: {e}");
     }
+    // WI#188: retries armed before the restart ride thread metadata — the
+    // daemon's memory-only sleep timers vanished with the process. Re-arm
+    // them after checkpoint recovery has had first claim on the threads.
+    match mission_manager.recover_pending_mission_retries().await {
+        Ok(rearmed) if !rearmed.is_empty() => {
+            debug!(
+                "engine v2: re-armed {} mission retry wake(s)",
+                rearmed.len()
+            );
+        }
+        Err(e) => debug!("engine v2: recover_pending_mission_retries failed: {e}"),
+        _ => {}
+    }
     if let Some(budget) = crate::channels::budget::budget_for_channel("darkirc") {
         mission_manager
             .set_channel_context(budget.channel, budget.prompt_guidance())
