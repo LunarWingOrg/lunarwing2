@@ -276,6 +276,13 @@ impl EffectBridgeAdapter {
             .get("webhook_secret")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string);
+        // current_focus is nested-optional: absent leaves the stored focus,
+        // an explicit JSON null clears it, a string sets it (WI#203).
+        let current_focus = params.get("current_focus").map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+        });
         Ok(lunarwing_engine::MissionUpdate {
             name,
             goal,
@@ -284,6 +291,7 @@ impl EffectBridgeAdapter {
             max_threads_per_day,
             success_criteria,
             webhook_secret,
+            current_focus,
         })
     }
 
@@ -338,21 +346,56 @@ impl EffectBridgeAdapter {
 
         let result = match action_name {
             "mission_create" => {
-                let name = params
+                let name = match params
                     .get("name")
                     .or_else(|| params.get("_args").and_then(|a| a.get(0)))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("unnamed mission");
-                let goal = params
+                {
+                    Some(name) => name,
+                    None => {
+                        tracing::warn!(
+                            user = %context.user_id,
+                            "mission_create rejected: missing or non-string 'name' parameter"
+                        );
+                        return Some(Err(EngineError::Effect {
+                            reason: "mission_create requires a non-empty string 'name' parameter"
+                                .to_string(),
+                        }));
+                    }
+                };
+                let goal = match params
                     .get("goal")
                     .or_else(|| params.get("_args").and_then(|a| a.get(1)))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let cadence_str = params
+                {
+                    Some(goal) => goal,
+                    None => {
+                        tracing::warn!(
+                            user = %context.user_id,
+                            "mission_create rejected: missing or non-string 'goal' parameter"
+                        );
+                        return Some(Err(EngineError::Effect {
+                            reason: "mission_create requires a string 'goal' parameter"
+                                .to_string(),
+                        }));
+                    }
+                };
+                // Cadence is optional in the tool schema; when omitted (or not a
+                // string) the mission is manual-only. Defaulting silently made an
+                // omitted cadence indistinguishable from `cadence: "manual"`
+                // (WI#203), so the fallback is now logged.
+                let cadence_param = params
                     .get("cadence")
                     .or_else(|| params.get("_args").and_then(|a| a.get(2)))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("manual");
+                    .and_then(|v| v.as_str());
+                let cadence_str = cadence_param.unwrap_or_else(|| {
+                    tracing::info!(
+                        user = %context.user_id,
+                        mission_name = %name,
+                        "mission_create: no cadence supplied, defaulting to 'manual' (mission will not fire on a schedule)"
+                    );
+                    "manual"
+                });
                 // notify_channels: explicit array, or default to current channel
                 let notify_channels =
                     if let Some(arr) = params.get("notify_channels").and_then(|v| v.as_array()) {
