@@ -1612,7 +1612,7 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
             },
             lunarwing_engine::ActionDef {
                 name: "mission_update".into(),
-                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, or success criteria.".into(),
+                description: "Update a mission/routine. Change name, goal, cadence, notification channels, daily budget, success criteria, or steering focus.".into(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
                     "properties": {
@@ -1623,7 +1623,8 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
                         "webhook_secret": {"type": "string", "description": "Replacement webhook secret. Existing secret is retained when omitted."},
                         "notify_channels": {"type": "array", "items": {"type": "string"}, "description": "Channels to deliver results to (e.g. ['gateway', 'repl'])"},
                         "max_threads_per_day": {"type": "integer", "description": "Max threads per day (0 = unlimited)"},
-                        "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"}
+                        "success_criteria": {"type": "string", "description": "Criteria for declaring mission complete"},
+                        "current_focus": {"type": ["string", "null"], "description": "Steering focus for the next thread. Omit to leave unchanged; pass null to clear."}
                     },
                     "required": ["id"]
                 }),
