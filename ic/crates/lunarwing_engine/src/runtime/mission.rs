@@ -4176,6 +4176,97 @@ mod tests {
         .unwrap();
     }
 
+    /// WI#203: current_focus is now tool-settable via MissionUpdate — verify
+    /// set, leave-unchanged (None), and explicit clear (Some(None)) semantics.
+    #[tokio::test]
+    async fn update_mission_sets_leaves_and_clears_current_focus() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "focus round-trip",
+                "steer the next thread",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        // Default is None.
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .is_none()
+        );
+
+        // Set.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                current_focus: Some(Some("triage open incidents".into())),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .as_deref(),
+            Some("triage open incidents")
+        );
+
+        // Leave unchanged: an update without current_focus must not touch it.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                name: Some("renamed".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .as_deref(),
+            Some("triage open incidents")
+        );
+
+        // Explicit clear.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                current_focus: Some(None),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn shared_mission_lifecycle_requires_shared_owner_identity() {
         let store = Arc::new(TestStore::new());
