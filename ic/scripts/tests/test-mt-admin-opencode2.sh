@@ -122,6 +122,62 @@ assert_contains "$v1_quadlet" 'UserNS=keep-id:uid=10001,gid=10001' 'v1 quadlet k
 assert_not_contains "$v1_quadlet" 'OPENCODE2_MODEL' 'v1 quadlet does not leak opencode2 overrides'
 rm -f "$env_file.bak"
 
+# ── scoped worker credential (WI#205) ────────────────────────────────────────
+# A tenant carrying WORKER_AUTH_TOKEN must never hand the gateway bearer to a
+# worker container or put it in the daemon's worker config.
+cat >"$env_file" <<'EOF'
+GATEWAY_AUTH_TOKEN=gate%token
+WORKER_AUTH_TOKEN=scoped%token
+LLM_API_KEY=llm%key
+OPENCODE2_MODEL=new-model
+OPENCODE2_BASE_URL=https://old.example/v1
+EOF
+
+MT_ROOTLESS=true
+render_worker_quadlet root opencode2 8443
+scoped_quadlet="$fixture/quadlets/lunarwing-opencode2-root.container"
+assert_contains "$scoped_quadlet" 'Environment=AGENT_AUTH_TOKEN=scoped%%token' \
+  'quadlet uses the scoped worker credential'
+assert_not_contains "$scoped_quadlet" 'GATEWAY' \
+  'quadlet carries no gateway bearer'
+
+# The pre-existing config.toml entry still holds the gateway bearer; a re-run
+# must migrate it rather than skip past it.
+rm -f "$fixture/state/config.toml"
+ensure_external_worker_config root opencode2 opencode2_wss
+# Recreate the pre-WI#205 shape in place, then re-run the migrate path.
+python3 - "$fixture/state/config.toml" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path).read().replace('auth_token = "scoped%token"', 'auth_token = "gate%token"')
+open(path, "w").write(text)
+PY
+assert_contains "$fixture/state/config.toml" 'auth_token = "gate%token"' \
+  'legacy config carries the gateway bearer (pre-migration fixture)'
+ensure_external_worker_config root opencode2 opencode2_wss
+assert_contains "$fixture/state/config.toml" 'auth_token = "scoped%token"' \
+  're-run migrates the config to the scoped credential'
+assert_not_contains "$fixture/state/config.toml" 'auth_token = "gate%token"' \
+  'no gateway bearer remains in the worker config'
+scoped_entries="$(grep -c 'name = "opencode2"' "$fixture/state/config.toml")"
+if [[ "$scoped_entries" == "1" ]]; then
+  pass 'credential migration does not duplicate the worker entry'
+else
+  fail "credential migration duplicated entries ($scoped_entries)"
+fi
+
+# Missing scoped token: fall back to the gateway bearer so pre-WI#205 tenants
+# keep working until their next lifecycle pass rewrites both sides.
+cat >"$env_file" <<'EOF'
+GATEWAY_AUTH_TOKEN=gate%token
+LLM_API_KEY=llm%key
+OPENCODE2_MODEL=new-model
+OPENCODE2_BASE_URL=https://old.example/v1
+EOF
+render_worker_quadlet root opencode2 8443
+assert_contains "$scoped_quadlet" 'Environment=AGENT_AUTH_TOKEN=gate%%token' \
+  'legacy tenant falls back to the gateway bearer'
+
 # ── workspace ownership ──────────────────────────────────────────────────────
 # Override consumed by sourced workspace preparation.
 # shellcheck disable=SC2034

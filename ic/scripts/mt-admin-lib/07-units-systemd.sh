@@ -417,7 +417,7 @@ EOF
 }
 
 # Render a per-tenant Quadlet .container for an external worker.
-# Mirrors the imperative env from start_tenant_<worker>: the GATEWAY_AUTH_TOKEN ->
+# Mirrors the imperative env from start_tenant_<worker>: the WORKER_AUTH_TOKEN ->
 # AGENT_AUTH_TOKEN and LLM_API_KEY -> TENSORZERO_API_KEY remap is resolved here and
 # inlined as Environment= in a 0600 tenant-owned unit. Kimi uses a separate
 # mode-0600 runtime env file so its API key never enters generated unit commands.
@@ -452,7 +452,10 @@ render_worker_quadlet() {
   mkdir -p "$qdir"
 
   local agent_token tz_key
-  agent_token="$(_read_env_value "$tenant_env_path" GATEWAY_AUTH_TOKEN)"
+  # Scoped worker credential (WI#205): the worker is the WS server and this is
+  # the only secret it validates. Never the gateway bearer — the value lands in
+  # a tenant-readable 0600 unit and in `podman inspect`.
+  agent_token="$(resolve_worker_auth_token "$tenant_env_path")"
   tz_key="$(_read_env_value "$tenant_env_path" LLM_API_KEY)"
   # systemd treats % as a unit specifier; escape so a token containing % survives.
   agent_token="${agent_token//%/%%}"

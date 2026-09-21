@@ -16,7 +16,7 @@
 //! `ContainerJobManager`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::AsyncReadExt;
@@ -147,6 +147,43 @@ pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntim
     }
 }
 
+/// Throwaway empty directory bind-mounted over protected subdirectories of the
+/// workspace to hide them (WI#205).
+///
+/// Removed on drop. The directory must be readable by the container's mapped
+/// UID; its contents are irrelevant because it is empty by construction.
+pub(crate) struct EmptyMaskDir {
+    path: PathBuf,
+}
+
+impl EmptyMaskDir {
+    fn create() -> Result<Self> {
+        let path =
+            std::env::temp_dir().join(format!("lunarwing-sandbox-mask-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&path).map_err(|e| SandboxError::ExecutionFailed {
+            reason: format!("failed to create sandbox mask dir {}: {e}", path.display()),
+        })?;
+        // Podman maps the in-container UID onto the invoking user, so a
+        // user-owned 0700 directory is the tightest mode that still mounts.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EmptyMaskDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Inputs to [`build_run_args`]. Kept as a struct so the arg construction
 /// stays a pure function (unit-testable without any runtime installed).
 pub(crate) struct RunSpec<'a> {
@@ -172,6 +209,10 @@ pub(crate) struct RunSpec<'a> {
     pub proxy_dir: Option<&'a str>,
     /// Per-container process limit (`--pids-limit`).
     pub pids_limit: u32,
+    /// Empty host directory used to shadow protected subdirectories of the
+    /// workspace mount (WI#205), plus the container paths to shadow with it.
+    pub masked: &'a [String],
+    pub mask_dir: Option<&'a Path>,
 }
 
 /// Build the `<runtime> run ...` argument vector for a sandboxed command.
@@ -243,6 +284,18 @@ pub(crate) fn build_run_args(spec: &RunSpec<'_>) -> Vec<String> {
         "{}:/workspace:{mode},z",
         spec.working_dir.display()
     ));
+
+    // Shadow protected subdirectories of the mount (WI#205). A mount of a
+    // legitimate parent (a repo root containing `env/`) keeps working, but the
+    // secret directory inside it is replaced by an empty bind, so nothing under
+    // it can be read through `/workspace`. The source is a fresh empty
+    // directory, so even a label/permission mistake exposes nothing.
+    if let Some(mask_source) = spec.mask_dir {
+        for destination in spec.masked {
+            args.push("-v".into());
+            args.push(format!("{}:{destination}:ro,z", mask_source.display()));
+        }
+    }
 
     // Caller-provided env first (never secrets: the shell tool passes none).
     for (key, value) in spec.env {
@@ -471,6 +524,8 @@ pub struct ExecParams<'a> {
     pub env: &'a HashMap<String, String>,
     pub network: SandboxNetworkMode,
     pub proxy_port: u16,
+    /// Directories that must never be readable inside the mount (WI#205).
+    pub protected_paths: &'a [std::path::PathBuf],
 }
 
 /// Runs sandboxed commands via the podman/docker CLI.
@@ -580,7 +635,31 @@ impl CliRunner {
             env,
             network,
             proxy_port,
+            protected_paths,
         } = params;
+
+        // Containment gate at the runner boundary (WI#205). `SandboxManager`
+        // validates too; repeating it here keeps the runner safe for any
+        // future direct caller, since `working_dir` becomes the single bind
+        // mount and is frequently agent-supplied.
+        let working_dir_owned =
+            crate::sandbox::mount_guard::validate_mount_dir(working_dir, protected_paths)?;
+        let working_dir = working_dir_owned.as_path();
+        // Protected directories inside a legitimate mount are shadowed rather
+        // than refused: an agent working at a repo root must keep working, but
+        // must not be able to read `env/` through it.
+        let masked =
+            crate::sandbox::mount_guard::masked_dirs_for_mount(working_dir, protected_paths);
+        let masked_destinations: Vec<String> = masked
+            .iter()
+            .filter_map(|dir| crate::sandbox::mount_guard::mask_destination(working_dir, dir))
+            .collect();
+        let mask_dir = if masked_destinations.is_empty() {
+            None
+        } else {
+            Some(EmptyMaskDir::create()?)
+        };
+
         if network != SandboxNetworkMode::None && proxy_port == 0 {
             return Err(SandboxError::ProxyError {
                 reason: format!("{network:?} network mode requires a running proxy"),
@@ -618,6 +697,8 @@ impl CliRunner {
             proxy_port,
             proxy_dir: proxy_dir_ref,
             pids_limit: default_pids_limit(),
+            masked: &masked_destinations,
+            mask_dir: mask_dir.as_ref().map(EmptyMaskDir::path),
         };
         let args = build_run_args(&spec);
 
@@ -1027,7 +1108,57 @@ mod tests {
             proxy_port,
             proxy_dir: None,
             pids_limit: 256,
+            masked: &[],
+            mask_dir: None,
         }
+    }
+
+    /// WI#205: protected subdirectories of the workspace are shadowed by an
+    /// empty read-only bind, and no mask mount appears when nothing needs
+    /// masking.
+    #[test]
+    fn protected_subdirs_are_shadow_mounted() {
+        static MASKED: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(|| vec!["/workspace/env".to_string()]);
+        let mask_dir = Path::new("/tmp/lunarwing-sandbox-mask-test");
+        let mut masked_spec = spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::UidPinned,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxNetworkMode::None,
+            0,
+        );
+        masked_spec.masked = &MASKED;
+        masked_spec.mask_dir = Some(mask_dir);
+
+        let args = build_run_args(&masked_spec);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("/tmp/lunarwing-sandbox-mask-test:/workspace/env:ro,z"),
+            "mask mount missing from: {joined}"
+        );
+        // The workspace mount itself must still be present and precede the mask
+        // so the shadow consistently wins for overlapping paths.
+        let workspace_pos = joined
+            .find("/tmp/proj:/workspace")
+            .expect("workspace mount");
+        let mask_pos = joined.find(":/workspace/env:ro,z").expect("mask mount");
+        assert!(
+            workspace_pos < mask_pos,
+            "workspace mount must be established before the mask: {joined}"
+        );
+
+        let plain = build_run_args(&spec(
+            ContainerRuntime::Podman,
+            KeepIdMode::UidPinned,
+            SandboxPolicy::WorkspaceWrite,
+            SandboxNetworkMode::None,
+            0,
+        ));
+        assert!(
+            !plain.join(" ").contains("lunarwing-sandbox-mask"),
+            "no mask mount expected without protected subdirectories"
+        );
     }
 
     // ── podman version parsing (behavior-pinned) ──────────────────────
@@ -1498,6 +1629,7 @@ mod tests {
             env: &HashMap::new(),
             network: SandboxNetworkMode::None,
             proxy_port: 0,
+            protected_paths: &[],
         };
         let name_probe = uuid::Uuid::new_v4();
         // `image_exists` must pass first or the timeout run itself fails for

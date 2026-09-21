@@ -121,6 +121,10 @@ out="$(run_writer fixture-tenant)"
 assert_eq "default LLM_MODEL" "$(envval LLM_MODEL)" "tensorzero::function_name::lunarwing"
 assert_eq "default GATEWAY_HOST" "$(envval GATEWAY_HOST)" "127.0.0.1"
 assert_eq "default MASCOT_ENABLED" "$(envval MASCOT_ENABLED)" "false"
+# WI#205: the sandbox must be told where the tenant secrets live. The env dir is
+# a sibling of LUNARWING_BASE_DIR, so the daemon cannot derive it.
+assert_eq "sandbox protected paths point at the env dir" \
+  "$(envval SANDBOX_PROTECTED_PATHS)" "$MT_FIXTURE/env"
 assert_eq "default XMPP_ALLOW_FROM" "$(envval XMPP_ALLOW_FROM)" "fixture-tenant@xmpp.localhost"
 assert_eq "default coordination disabled" "$(envval COORD_ENABLED)" "false"
 assert_eq "default coordination agent ID" "$(envval COORD_AGENT_ID)" "fixture-tenant"

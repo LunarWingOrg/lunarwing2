@@ -277,6 +277,13 @@ impl SandboxManager {
         policy: SandboxPolicy,
         env: HashMap<String, String>,
     ) -> Result<ExecOutput> {
+        // Containment: the mounted directory is agent-chosen, so refuse any
+        // path resolving into the tenant secret directory (or a bare secret
+        // file) before the runtime is ever asked to mount it. Fail closed —
+        // the caller must not fall back to an unsandboxed run (WI#205).
+        let cwd =
+            crate::sandbox::mount_guard::validate_mount_dir(cwd, &self.config.protected_paths)?;
+
         let proxy_port = if let Some(proxy) = self.proxy.read().await.as_ref() {
             proxy.addr().await.map(|a| a.port()).unwrap_or(0)
         } else {
@@ -302,12 +309,13 @@ impl SandboxManager {
         let container_output = runner
             .execute(ExecParams {
                 command,
-                working_dir: cwd,
+                working_dir: &cwd,
                 policy,
                 limits: &limits,
                 env: &env,
                 network: self.config.network,
                 proxy_port,
+                protected_paths: &self.config.protected_paths,
             })
             .await?;
         Ok(container_output.into())

@@ -647,6 +647,13 @@ write_tenant_lunarwing_env() {
   local study_notes_home study_notes_state_home study_notes_allow_write knowledge_seed_flag
   local knowledge_sync_enabled knowledge_sync_cadence knowledge_sync_max_records knowledge_sync_max_bytes
   gateway_token="$(_env_existing "$path" GATEWAY_AUTH_TOKEN)";   gateway_token="${gateway_token:-$(generate_token)}"
+  # Per-worker credential for the external-worker WebSocket handshake. External
+  # workers run `WS_ROLE=server` and validate an inbound bearer on the upgrade;
+  # the daemon presents the same value as `auth_token`. This must NOT be the
+  # gateway bearer: the worker never calls the gateway API, and the value is
+  # readable via `podman inspect` / tenant-readable unit files, so reusing the
+  # gateway token handed a contained lane the tenant's full API surface (WI#205).
+  worker_token="$(_env_existing "$path" WORKER_AUTH_TOKEN)";     worker_token="${worker_token:-$(generate_token)}"
   bridge_token="$(_env_existing "$path" XMPP_BRIDGE_TOKEN)";     bridge_token="${bridge_token:-$(generate_token | cut -c1-32)}"
   relay_password="$(_env_existing "$path" RELAY_PASSWORD)";      relay_password="${relay_password:-$(generate_token | cut -c1-32)}"
   secrets_key="$(_env_existing "$path" SECRETS_MASTER_KEY)";     secrets_key="${secrets_key:-$(generate_token)}"
@@ -856,6 +863,9 @@ GATEWAY_ENABLED=true
 GATEWAY_HOST=$gateway_host_effective
 GATEWAY_PORT=$gateway_port
 GATEWAY_AUTH_TOKEN=$gateway_token
+# Scoped bearer for the daemon<->external-worker WebSocket handshake only.
+# Deliberately distinct from GATEWAY_AUTH_TOKEN (WI#205).
+WORKER_AUTH_TOKEN=$worker_token
 MASCOT_ENABLED=$mascot_enabled
 
 # HTTP webhook (bound to localhost only; secret-protected)
@@ -907,6 +917,14 @@ ENGINE_V2_CHANNELS=$engine_v2_channels
 # loopback). Set SANDBOX_NETWORK=proxy explicitly for tenants that need
 # allowlisted web access.
 SANDBOX_NETWORK=$sandbox_network
+
+# Directories the generic sandbox must never expose (WI#205). The sandbox
+# mounts an agent-chosen working directory, and this tenant's env dir holds
+# GATEWAY_AUTH_TOKEN in plaintext. Naming it explicitly is required: the env
+# dir is a SIBLING of LUNARWING_BASE_DIR ($state_dir), so the daemon cannot
+# derive it. The daemon refuses a mount at or inside these paths, and shadows
+# them with an empty mount when a legitimate parent (the repo root) is mounted.
+SANDBOX_PROTECTED_PATHS=$(dirname -- "$path")
 
 # Daemon mode
 CLI_ENABLED=false
