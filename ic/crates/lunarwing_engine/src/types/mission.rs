@@ -4,6 +4,8 @@
 //! threads to make progress. Missions can run on a schedule (cron),
 //! in response to events, or be triggered manually.
 
+use std::time::Duration;
+
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -188,6 +190,14 @@ pub struct Mission {
     /// work item #143 / WI#109 follow-up).
     #[serde(default)]
     pub last_fired_at: Option<DateTime<Utc>>,
+
+    // ── Retry ──
+    /// Automatic retry policy for mission threads that end without
+    /// completing — interrupted (signal-stopped, lost join handle) or
+    /// terminally failed. `max_retries: 0` disables retry entirely (the
+    /// fire is lost, as before work item #188).
+    #[serde(default)]
+    pub retry_policy: MissionRetryPolicy,
 }
 
 /// Default daily thread budget applied when a mission is created without an
@@ -206,6 +216,109 @@ pub struct Mission {
 /// rolls back to the pre-fire mission state), and a trigger re-delivery
 /// whose dedup key was already processed spawns nothing and costs nothing.
 pub const DEFAULT_MAX_THREADS_PER_DAY: u32 = 30;
+
+/// Automatic retry policy for interrupted or failed mission threads
+/// (work item #188). A mission thread that ends without completing —
+/// signal-stopped mid-run, lost join handle, or a terminal model/orchestrator
+/// failure — previously meant a permanently lost fire (event missions) or a
+/// missed cadence window (cron missions). With `max_retries > 0` the manager
+/// schedules a delayed re-fire with exponential backoff. Retry state lives in
+/// the orchestrator-state metadata of the failing thread
+/// (`RetryState::from_metadata`) so a daemon restart can re-arm the pending
+/// re-fire without new persisted schema.
+///
+/// Budget interaction: every retry respawn passes the normal budget gate and
+/// increments `threads_today`, so retries draw from the same daily budget —
+/// with the old default of 10, an hourly mission plus 3 retries per fire
+/// would starve the day by mid-morning (see [`DEFAULT_MAX_THREADS_PER_DAY`]).
+/// A budget-exhausted retry is abandoned by its re-fire attempt.
+///
+/// Redelivery: the outcome processor also releases the trigger dedup key of
+/// the failing fire, so an event/webhook payload that is re-delivered after
+/// an unsuccessful run can fire again (the rollback contract previously
+/// covered spawn failure only).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MissionRetryPolicy {
+    /// Max automatic re-fires per failing fire (0 = no retry).
+    pub max_retries: u32,
+    /// Delay in seconds before the first retry.
+    pub initial_delay_secs: u64,
+    /// Multiplier applied to the delay after each retry.
+    pub backoff_multiplier: f64,
+    /// Maximum delay in seconds (caps exponential growth).
+    pub max_delay_secs: u64,
+}
+
+impl Default for MissionRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            initial_delay_secs: 60,
+            backoff_multiplier: 2.0,
+            max_delay_secs: 3600,
+        }
+    }
+}
+
+impl MissionRetryPolicy {
+    /// Whether automatic retry is enabled at all (`max_retries > 0`).
+    pub fn is_enabled(&self) -> bool {
+        self.max_retries > 0
+    }
+
+    /// Compute the retry delay for the given 1-based attempt number.
+    /// Returns `None` when retries are disabled or the attempt exceeds
+    /// `max_retries` (1 = first retry).
+    pub fn delay_for_attempt(&self, attempt: u32) -> Option<Duration> {
+        if self.max_retries == 0 || attempt == 0 || attempt > self.max_retries {
+            return None;
+        }
+        let delay_secs =
+            (self.initial_delay_secs as f64) * self.backoff_multiplier.powi((attempt - 1) as i32);
+        if !delay_secs.is_finite() || delay_secs <= 0.0 {
+            return Some(Duration::from_secs(self.max_delay_secs));
+        }
+        let clamped = delay_secs.min(self.max_delay_secs as f64) as u64;
+        Some(Duration::from_secs(clamped))
+    }
+}
+
+/// Persisted retry state riding the failing mission thread's metadata
+/// (work item #188). The outcome processor writes it onto the failed
+/// thread; the in-memory retry sleep and the post-restart sweep read it
+/// back (`metadata["mission_retry"]`), so a pending re-fire described to
+/// the daemon survives restarts without new mission columns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryState {
+    /// 1-based retry attempt currently scheduled (1 = first retry).
+    pub attempt: u32,
+    /// The trigger payload being re-fired (None for payload-less cadences).
+    pub payload: Option<serde_json::Value>,
+    /// UTC time after which the re-fire may run.
+    pub not_before: DateTime<Utc>,
+    /// Lineage of attempts in this fire's lineage (attempt numbers spent),
+    /// persisted so the sweep and diagnostics can tell attempts apart.
+    #[serde(default)]
+    pub lineage: Vec<u32>,
+}
+
+impl RetryState {
+    /// Metadata key under which the retry state rides on the failing thread.
+    pub const METADATA_KEY: &'static str = "mission_retry";
+
+    /// Read a scheduled retry off a thread's state metadata.
+    pub fn from_metadata(metadata: &serde_json::Value) -> Option<Self> {
+        metadata
+            .get(Self::METADATA_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+    }
+
+    /// Serialize this state for storage under [`Self::METADATA_KEY`].
+    pub fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self)
+            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
+    }
+}
 
 /// System event types the engine emits via `fire_on_system_event` (source
 /// `engine`). User-facing cadence strings cannot subscribe to these with
@@ -287,6 +400,7 @@ impl Mission {
             updated_at: now,
             next_fire_at: None,
             last_fired_at: None,
+            retry_policy: MissionRetryPolicy::default(),
         }
     }
 
@@ -416,6 +530,62 @@ mod tests {
 
         let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
         assert_eq!(restored.threads_today_date, None);
+    }
+
+    #[test]
+    fn legacy_mission_without_retry_policy_still_deserializes_and_defaults() {
+        // WI#188: missions persisted before the retry field existed must
+        // deserialize unchanged and gain the default retry policy.
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "legacy",
+            "keep working",
+            MissionCadence::Manual,
+        );
+        let mut value = serde_json::to_value(mission).expect("serialize mission");
+        value
+            .as_object_mut()
+            .expect("mission should serialize as object")
+            .remove("retry_policy");
+
+        let restored: Mission = serde_json::from_value(value).expect("deserialize legacy mission");
+        assert_eq!(restored.retry_policy, MissionRetryPolicy::default());
+        assert!(restored.retry_policy.is_enabled());
+    }
+
+    #[test]
+    fn retry_policy_defaults_and_delay_schedule() {
+        let policy = MissionRetryPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        // WI#188 default schedule: 1m → 2m → 4m (capped at 1h); attempt 0
+        // and attempts past max_retries get no delay.
+        assert_eq!(policy.delay_for_attempt(0), None);
+        assert_eq!(policy.delay_for_attempt(1), Some(Duration::from_secs(60)));
+        assert_eq!(policy.delay_for_attempt(2), Some(Duration::from_secs(120)));
+        assert_eq!(policy.delay_for_attempt(3), Some(Duration::from_secs(240)));
+        assert_eq!(policy.delay_for_attempt(4), None);
+    }
+
+    #[test]
+    fn retry_policy_disabled_never_retries() {
+        let policy = MissionRetryPolicy {
+            max_retries: 0,
+            ..MissionRetryPolicy::default()
+        };
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.delay_for_attempt(1), None);
+    }
+
+    #[test]
+    fn retry_policy_delay_is_capped() {
+        let policy = MissionRetryPolicy {
+            max_retries: 10,
+            initial_delay_secs: 60,
+            backoff_multiplier: 10.0,
+            max_delay_secs: 3600,
+        };
+        assert_eq!(policy.delay_for_attempt(5), Some(Duration::from_secs(3600)));
     }
 
     #[test]
