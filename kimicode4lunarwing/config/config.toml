@@ -24,7 +24,7 @@ dangerous_command_guard = false
 
 [providers.tensorzero]
 type = "openai"
-base_url = "http://100.88.232.146:3000/openai/v1"
+base_url = "http://cotterhomelab3.netbird.selfhosted:3000/openai/v1"
 # Non-secret placeholder: the gateway on the private overlay accepts any bearer,
 # and kimi-code refuses to run with an empty api_key. entrypoint.sh overwrites
 # this with KIMI_API_KEY / TENSORZERO_API_KEY when either is provisioned.
