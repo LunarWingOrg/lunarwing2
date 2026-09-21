@@ -2330,6 +2330,11 @@ impl MissionManager {
     /// `mission_retry` marker are supposed to be terminal — a Suspended row
     /// means checkpoint recovery already owns its future, so the sweep
     /// clears the marker instead of double-scheduling.
+    #[cfg(test)]
+    pub(crate) fn store_arc(&self) -> Arc<dyn Store> {
+        Arc::clone(&self.store)
+    }
+
     pub async fn recover_pending_mission_retries(&self) -> Result<Vec<MissionId>, EngineError> {
         let mut scheduled = Vec::new();
         for mission_id in self.active.read().await.clone() {
@@ -3338,10 +3343,12 @@ mod tests {
     use crate::traits::store::Store;
     use crate::types::capability::{ActionDef, CapabilityLease};
     use crate::types::error::EngineError;
+    use crate::types::error::ModelFailureKind;
     use crate::types::event::ThreadEvent;
     use crate::types::memory::{DocId, DocType, MemoryDoc};
     use crate::types::mission::{Mission, MissionCadence, MissionId, MissionStatus};
     use crate::types::project::{Project, ProjectId};
+    use crate::runtime::messaging::ThreadFailureKind;
     use crate::types::step::{ActionResult, LlmResponse, Step, TokenUsage};
     use crate::types::thread::{Thread, ThreadId, ThreadState};
 
@@ -8716,7 +8723,6 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let store = Arc::new(TestStore::new());
         let mgr = make_mission_manager(store.clone() as Arc<dyn Store>);
         let project_id = ProjectId::new();
-
         let id = mgr
             .create_mission(
                 project_id,
@@ -8729,7 +8735,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             .await
             .unwrap();
 
-        let spawned = mgr
+        let spawned_thread = mgr
             .fire_mission(id, "test-user", None)
             .await
             .unwrap()
@@ -8737,10 +8743,10 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         let _ = spawned;
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let store_mission = mgr.get_mission(id).await.unwrap().unwrap();
-        let thread_id = *state_mission.thread_history.last().unwrap();
+        let thread_id = *store_mission.thread_history.last().unwrap();
 
+        let store: Arc<dyn Store> = mgr.store_arc();
         let stopped = ThreadOutcome::Stopped;
-        let store = mgr.make_store_for_test();
         let pending = process_mission_outcome(&store, id, thread_id, &stopped)
             .await
             .unwrap();
@@ -8767,7 +8773,7 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
     async fn retry_attempts_exhausted_after_max_retries() {
         // WI#188: max_retries caps the retry lineage — attempts past
         // max_retries return no pending retry, leaving the fire lost but
-        // durably recorded (the pre-WI#188 behavior after the lineage spent).
+        // durably recorded (the pre-WI#188 behavior after the lineage is spent).
         let store = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
         let mut mission = Mission::new(
@@ -8781,23 +8787,15 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         store.save_mission(&mission).await.unwrap();
 
         // Failure 1 against a fresh mission: attempt lineage has no prior
-        // retry_attempt marker, so the planner rents attempt 1.
-        let mission = Mission::new(
-            ProjectId::new(),
-            "test-user",
-            "capped",
-            "goal",
-            MissionCadence::Manual,
-        );
-        let store: Arc<dyn Store> = Arc::new(TestStore::new());
-        let pending = plan_outcome_retry(
+        // retry_attempts marker, so the planner rents attempt 1.
+        let first = plan_outcome_retry(
             &store,
             &mission,
             ThreadId::new(),
             "seed",
         )
         .await;
-        let first = pending.expect("failure with spendable attempts rents attempt 1");
+        let first = first.expect("failure with spendable attempts rents attempt 1");
         assert_eq!(first.attempt, 1, "first failure rents attempt 1");
 
         // max_retries=0 disables the retry lineage — the fire stays lost
@@ -8811,8 +8809,8 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         );
         mission.retry_policy.max_retries = 0;
         let store: Arc<dyn Store> = Arc::new(TestStore::new());
-        let pending = state::plan_outcome_retry(
-            &state::unused(&store as &dyn Store),
+        let pending = plan_outcome_retry(
+            &store,
             &mission,
             ThreadId::new(),
             "must be capped",
