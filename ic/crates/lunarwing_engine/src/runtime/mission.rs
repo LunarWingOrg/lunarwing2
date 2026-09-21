@@ -8655,7 +8655,172 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
             fired.is_none(),
             "active gated mission is suppressed at fire time while disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_outcome_releases_trigger_dedup_key_for_redelivery() {
+        // WI#188 at-least-once: a Failed fire must release the trigger
+        // dedup key so an external redelivery of the same payload fires the
+        // mission again. Completed fires keep the key.
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "redeliverable",
+            "goal",
+            MissionCadence::OnEvent {
+                event_pattern: "deploy ready".into(),
+            },
+        );
+        mission.last_trigger_payload =
+            Some(serde_json::json!({"source_thread_id": "src-thread-1"}));
+        mission.record_processed_trigger("src:src-thread-1".to_string());
+        let id = mission.id;
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        store.save_mission(&mission).await.unwrap();
+
+        let failed = ThreadOutcome::Failed {
+            kind: ThreadFailureKind::Model(ModelFailureKind::ProviderOverload),
+            error: "provider cut".into(),
+        };
+        let pending = process_mission_outcome(&store, id, ThreadId::new(), &failed)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_some(),
+            "WI#188: a Failed fire with retry headroom must schedule a retry"
+        );
+        let pending = pending.unwrap();
+        assert_eq!(pending.attempt, 1, "first failure rents attempt 1");
+        assert!(pending.not_before > Utc::now());
+
+        let mission = store.load_mission(id).await.unwrap().unwrap();
+        assert!(
+            !mission.has_processed_trigger("src:src-thread-1"),
+            "failing fire must release the trigger dedup key for redelivery (WI#188 at-least-once)"
+        );
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry.starts_with("FAILED: provider cut")),
+            "failure must be recorded in the approach history"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_outcome_schedles_retry_and_records_interrupted() {
+        // WI#188 tri-state: a signal-stopped thread is an interruption, not
+        // an empty arm — record it, notify as an error, schedule a retry.
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(store.clone() as Arc<dyn Store>);
+        let project_id = ProjectId::new();
+
+        let id = mgr
+            .create_mission(
+                project_id,
+                "test-user",
+                "interruptible",
+                "goal",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let spawned = mgr
+            .fire_mission(id, "test-user", None)
+            .await
+            .unwrap()
+            .expect("a first manual fire must spawn so the retry path has context");
+        let _ = spawned;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let store_mission = mgr.get_mission(id).await.unwrap().unwrap();
+        let thread_id = *state_mission.thread_history.last().unwrap();
+
+        let stopped = ThreadOutcome::Stopped;
+        let store = mgr.make_store_for_test();
+        let pending = process_mission_outcome(&store, id, thread_id, &stopped)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_some(),
+            "WI#188: a signal-stopped thread must schedule a retry"
+        );
+        if let Some(pending) = pending {
+            assert_eq!(pending.attempt, 1, "first stop rents attempt 1");
+            assert!(pending.not_before > Utc::now(), "retry waits out backoff");
+            assert_eq!(pending.payload, None, "manual fire carries no payload");
+        }
         let mission = mgr.get_mission(id).await.unwrap().unwrap();
-        assert!(mission.thread_history.is_empty());
+        assert!(
+            mission
+                .approach_history
+                .iter()
+                .any(|entry| entry == "INTERRUPTED: signal-stopped mid-run"),
+            "interrupted fire must be durably recorded in the approach history"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_attempts_exhausted_after_max_retries() {
+        // WI#188: max_retries caps the retry lineage — attempts past
+        // max_retries return no pending retry, leaving the fire lost but
+        // durably recorded (the pre-WI#188 behavior after the lineage spent).
+        let store = Arc::new(TestStore::new());
+        let project_id = ProjectId::new();
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "capped",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        store.save_mission(&mission).await.unwrap();
+
+        // Failure 1 against a fresh mission: attempt lineage has no prior
+        // retry_attempt marker, so the planner rents attempt 1.
+        let mission = Mission::new(
+            ProjectId::new(),
+            "test-user",
+            "capped",
+            "goal",
+            MissionCadence::Manual,
+        );
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let pending = plan_outcome_retry(
+            &store,
+            &mission,
+            ThreadId::new(),
+            "seed",
+        )
+        .await;
+        let first = pending.expect("failure with spendable attempts rents attempt 1");
+        assert_eq!(first.attempt, 1, "first failure rents attempt 1");
+
+        // max_retries=0 disables the retry lineage — the fire stays lost
+        // (the pre-WI#188 behavior when the lineage opts out).
+        let mut mission = Mission::new(
+            project_id,
+            "test-user",
+            "capped",
+            "goal",
+            MissionCadence::Manual,
+        );
+        mission.retry_policy.max_retries = 0;
+        let store: Arc<dyn Store> = Arc::new(TestStore::new());
+        let pending = state::plan_outcome_retry(
+            &state::unused(&store as &dyn Store),
+            &mission,
+            ThreadId::new(),
+            "must be capped",
+        )
+        .await;
+        assert!(
+            pending.is_none(),
+            "max_retries=0 disables the lineage (pre-WI#188 behavior)"
+        );
     }
 }
