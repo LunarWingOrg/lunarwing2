@@ -196,6 +196,9 @@ pub struct MissionUpdate {
     pub success_criteria: Option<String>,
     /// Replacement webhook secret. Never emitted in mission responses or logs.
     pub webhook_secret: Option<String>,
+    /// Set (`Some`) or clear (`None`) the focus steering the next thread.
+    /// `None` (the outer default) leaves the stored focus untouched.
+    pub current_focus: Option<Option<String>>,
 }
 
 /// Manages mission lifecycle and thread spawning.
@@ -621,6 +624,9 @@ impl MissionManager {
         }
         if let Some(criteria) = updates.success_criteria {
             mission.success_criteria = Some(criteria);
+        }
+        if let Some(focus) = updates.current_focus {
+            mission.current_focus = focus;
         }
 
         mission.updated_at = chrono::Utc::now();
@@ -4168,6 +4174,97 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// WI#203: current_focus is now tool-settable via MissionUpdate — verify
+    /// set, leave-unchanged (None), and explicit clear (Some(None)) semantics.
+    #[tokio::test]
+    async fn update_mission_sets_leaves_and_clears_current_focus() {
+        let store = Arc::new(TestStore::new());
+        let mgr = make_mission_manager(Arc::clone(&store) as Arc<dyn Store>);
+        let id = mgr
+            .create_mission(
+                ProjectId::new(),
+                "test-user",
+                "focus round-trip",
+                "steer the next thread",
+                MissionCadence::Manual,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        // Default is None.
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .is_none()
+        );
+
+        // Set.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                current_focus: Some(Some("triage open incidents".into())),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .as_deref(),
+            Some("triage open incidents")
+        );
+
+        // Leave unchanged: an update without current_focus must not touch it.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                name: Some("renamed".into()),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .as_deref(),
+            Some("triage open incidents")
+        );
+
+        // Explicit clear.
+        mgr.update_mission(
+            id,
+            "test-user",
+            MissionUpdate {
+                current_focus: Some(None),
+                ..MissionUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            mgr.get_mission(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .current_focus
+                .is_none()
+        );
     }
 
     #[tokio::test]
