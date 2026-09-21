@@ -74,7 +74,11 @@ mod tests {
         ];
         let mut actual = bundled.clone();
         actual.sort_unstable();
-        assert_eq!(actual, expected, "bundled skill catalog changed; if this is deliberate, update the expected list and the WI#185 record");
+        assert_eq!(
+            actual, expected,
+            "bundled skill catalog changed; if this is deliberate, update the expected list \
+             and the WI#185 record"
+        );
     }
 
     #[test]
