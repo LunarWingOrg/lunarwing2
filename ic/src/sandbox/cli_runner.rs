@@ -152,14 +152,22 @@ pub(crate) fn runtime_probe_order(preferred: SandboxRuntime) -> [ContainerRuntim
 ///
 /// Removed on drop. The directory must be readable by the container's mapped
 /// UID; its contents are irrelevant because it is empty by construction.
+///
+/// Created under the same shared-location parent the proxy relay uses
+/// ([`crate::sandbox::proxy::relay::relay_parent_dir`]): the daemon may run
+/// with `PrivateTmp=true`, and the container CLI is spawned as a
+/// manager-forked transient service in a different mount namespace — a mask
+/// dir under the daemon's private `/tmp` would not be resolvable at
+/// `podman run` time ("statfs …: no such file or directory"). `/run/user/<uid>`
+/// is shared across those namespaces; the process temp dir is the fallback.
 pub(crate) struct EmptyMaskDir {
     path: PathBuf,
 }
 
 impl EmptyMaskDir {
     fn create() -> Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("lunarwing-sandbox-mask-{}", uuid::Uuid::new_v4()));
+        let base = shared_mount_source_parent();
+        let path = base.join(format!("lunarwing-sandbox-mask-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).map_err(|e| SandboxError::ExecutionFailed {
             reason: format!("failed to create sandbox mask dir {}: {e}", path.display()),
         })?;
@@ -176,6 +184,19 @@ impl EmptyMaskDir {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Parent for bind-mount source paths that must stay resolvable from the
+/// container CLI's mount namespace (daemon + `PrivateTmp=true` + manager-
+/// forked service would hide `/tmp`). Same policy as the proxy relay.
+#[cfg(target_os = "linux")]
+fn shared_mount_source_parent() -> PathBuf {
+    crate::sandbox::proxy::relay::relay_parent_dir().unwrap_or_else(|_| std::env::temp_dir())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn shared_mount_source_parent() -> PathBuf {
+    std::env::temp_dir()
 }
 
 impl Drop for EmptyMaskDir {
@@ -1549,6 +1570,45 @@ mod tests {
         // Unregistering an unknown name is a no-op.
         unregister_inflight("lunarwing-sandbox-never-existed");
         assert_eq!(inflight_sandbox_containers().len(), before);
+    }
+
+    #[test]
+    fn empty_mask_dir_lives_in_the_shared_namespace_visible_parent() {
+        // WI#205 fix (review of !1073): the mask source is bind-mounted by the
+        // container CLI, which may run in a different mount namespace than the
+        // daemon (PrivateTmp=true + manager-forked transient service). The
+        // directory must therefore live under the same shared parent the proxy
+        // relay uses — never unconditionally under the process temp dir.
+        let mask = super::EmptyMaskDir::create().expect("mask dir created");
+        let path = mask.path().to_path_buf();
+        assert!(path.exists(), "mask dir must exist while armed");
+        assert!(
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("lunarwing-sandbox-mask-")),
+            "unexpected mask dir name: {}",
+            path.display()
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let expected = super::shared_mount_source_parent();
+            assert_eq!(
+                path.parent(),
+                Some(expected.as_path()),
+                "mask dir must live under the shared (XDG-runtime-dir) parent so it stays \
+                 visible to the service-forked container CLI"
+            );
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        drop(mask);
+        assert!(!path.exists(), "mask dir must be removed on drop");
     }
 
     // ── lifecycle operations share the isolated execution context (WI#181) ──

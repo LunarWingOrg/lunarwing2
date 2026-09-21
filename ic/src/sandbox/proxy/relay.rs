@@ -100,7 +100,7 @@ fn relay_setup() -> std::io::Result<(tempfile::TempDir, PathBuf, tokio::net::Uni
 /// namespace (manager-forked transient services). Falls back to the process
 /// temp dir otherwise.
 #[cfg(target_os = "linux")]
-fn relay_parent_dir() -> std::io::Result<PathBuf> {
+pub(crate) fn relay_parent_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
     if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
