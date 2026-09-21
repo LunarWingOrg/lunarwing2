@@ -464,12 +464,15 @@ render_worker_quadlet() {
   # SSH agent socket: the gateway creates an SSH agent server at startup,
   # with its socket at <tenant_home>/lunarwing/run/ssh-agent.sock (NOT /tmp,
   # because the daemon runs with PrivateTmp=true — a /tmp socket would be
-  # invisible to podman containers). Always include the volume mount + env var
-  # in the quadlet, even if the socket doesn't exist yet at render time — the
-  # daemon creates it before the worker needs it (workers only use SSH when a
-  # create_job with SSH commands is invoked, well after startup). If SSH is
-  # not configured for the tenant, the socket simply won't exist and SSH
-  # commands from the worker will fail with a clear "no agent" error.
+  # invisible to podman containers). Non-kimi workers always include the
+  # volume mount + env var in the quadlet, even if the socket doesn't exist
+  # yet at render time — the daemon creates it before the worker needs it
+  # (workers only use SSH when a create_job with SSH commands is invoked,
+  # well after startup). If SSH is not configured for the tenant, the socket
+  # simply won't exist and SSH commands from the worker will fail with a
+  # clear "no agent" error. The kimi lane no longer mounts it (WI#206): it
+  # is an auto-approved headless executor, and forwarded host credentials
+  # are an unacceptable blast radius there.
   local ssh_agent_socket
   ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
   local study_notes_home="" study_notes_state_home="" study_notes_allow_write=""
@@ -524,13 +527,21 @@ EOF
     elif [[ "$worker" == "opencode2" ]]; then
       printf 'UserNS=%s\n' "$OPENCODE2_USERNS"
     fi
-    # SSH agent socket mount + env (always included — the daemon creates the
-    # socket at startup; if SSH isn't configured, the socket won't exist and
-    # SSH commands from the worker will fail with a clear "no agent" error).
-    # :z label so SELinux (Enforcing on Fedora) permits container_t access to
-    # the tenant-home-labeled socket.
-    printf 'Volume=%s:/tmp/ssh-agent.sock:z\n' "$ssh_agent_socket"
-    printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent.sock\n'
+    # WI#206: the kimi lane gets no SSH-agent socket and no privilege
+    # escalation — it is an auto-approved headless task executor, and a
+    # mounted host agent turns prompt injection into credential use. Other
+    # worker lanes keep the socket (their permission model is interactive).
+    if [[ "$worker" == "kimi" ]]; then
+      printf 'SecurityOpt=no-new-privileges\n'
+    else
+      # SSH agent socket mount + env (always included — the daemon creates the
+      # socket at startup; if SSH isn't configured, the socket won't exist and
+      # SSH commands from the worker will fail with a clear "no agent" error).
+      # :z label so SELinux (Enforcing on Fedora) permits container_t access to
+      # the tenant-home-labeled socket.
+      printf 'Volume=%s:/tmp/ssh-agent.sock:z\n' "$ssh_agent_socket"
+      printf 'Environment=SSH_AUTH_SOCK=/tmp/ssh-agent.sock\n'
+    fi
     # Publish the per-tenant dedicated health port (v8) -> container's 8443, so
     # the host self-heal pipeline can probe the worker directly. Container still
     # listens on HEALTH_PORT=8443 internally (matches image healthcheck).
