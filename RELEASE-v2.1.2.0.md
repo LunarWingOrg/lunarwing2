@@ -261,6 +261,48 @@ is now the supported runtime:
   lean. Evidence: `docs/ops/v2.1.2.0_ITEM26_WI179_SANDBOX_HARDENING.md` and
   `docs/ops/v2.1.2.0_GOAL33_WI162_SHELL_TRUNCATION.md`.
 
+### Sandbox Credential Containment (work items #205, #209, #210, #211, #215)
+
+The sandbox shell could read the tenant env file and obtain the plaintext
+`GATEWAY_AUTH_TOKEN` — not via any env-file mount, but because the single
+bind mount is agent-chosen: an unvalidated `workdir` pointing at the tenant
+config directory exposed `lunarwing.env` (0600, readable through podman
+`keep-id`'s tenant-UID mapping). Two exposures were fixed:
+
+- **Mount guard.** New `ic/src/sandbox/mount_guard.rs`, enforced at both the
+  manager and runner boundaries (defense in depth). Canonicalization happens
+  before any check, so symlinks, `..`, and lexical tricks resolve to the real
+  mounted path. The tenant `env`, `state`, and `run` directories are never
+  mountable (nor is a mount inside them) — with WI#215's defensive sibling
+  derivation covering stale MT renders where only `state`-under-base is
+  known. Credential-bearing filenames (`*.env`, `pg.secret`, `.env`,
+  case-insensitive) are refused anywhere in the tree. A protected directory
+  *inside* an otherwise legitimate mount is shadowed by an empty read-only
+  bind (`--tmpfs` was tested and does not shadow; only the empty-directory
+  bind does). Refusals are a hard `[sandbox:mount_path_denied]` error —
+  never a fallback to unsandboxed execution.
+- **Scoped worker credential.** External workers previously received the
+  tenant's full gateway bearer as their WebSocket handshake secret, readable
+  via `podman inspect` and tenant-readable unit files — while the worker only
+  ever needed to authenticate one inbound task-dispatch handshake. A new
+  per-tenant `WORKER_AUTH_TOKEN` is minted by mt-admin and resolved through
+  one helper across all consumers (daemon `config.toml`, all four worker
+  container envs, the systemd Quadlet). A leaked worker secret now only
+  permits impersonating the daemon toward that one worker's local socket;
+  the gateway never accepts it. Legacy tenants converge via
+  `upgrade_external_worker_auth_token()` on the next lifecycle pass
+  (WI#210: it mints and persists the scoped token instead of silently
+  substituting the gateway bearer on the upgrade path).
+- WI#209 review fixes: masking planning is existence-independent (a
+  protected dir absent at plan time — e.g. `run/` on a fresh tenant — is
+  still planned for masking), and an unresolvable mount root is a hard
+  refusal rather than an empty mask list. WI#211: protected-filename
+  matching applies throughout the mount tree, not only the mount root.
+  Evidence: `docs/ops/v2.1.2.0_WI205_CREDENTIAL_EXPOSURE_FIX.md`; the
+  sandbox-scoped gateway credential (route-scoped badge) remains a proposed
+  follow-up design
+  (`docs/ops/v2.1.2.0_WI205_SANDBOX_SCOPED_CREDENTIAL_DESIGN.md`).
+
 ### Workload Transient Services Under the User Manager (work items #181, #178)
 
 `systemd-run --user --scope` forked the daemon and inherited
@@ -319,6 +361,34 @@ first model call of every thread — an ordering a mission trigger cannot
 satisfy. WI#126 was re-verified (fleet remains terminal-event-driven);
 WI#163, a re-file, was reverified with no code change.
 
+### Mission Reliability: Retry, Budget, and Honest Parameters (work items #188, #189, #203; goals 22, 29, 31)
+
+- **Retry with exponential backoff (WI#188).** An interrupted (signal-stopped)
+  mission fire no longer loses its work permanently: `ThreadOutcome::Stopped`
+  records the interruption in `approach_history`, notifies notify-channels as
+  an error, and schedules a retry per the new `MissionRetryPolicy` on
+  `Mission::retry_policy` (default: `max_retries = 3`, `initial_delay = 60s`,
+  `×2.0` backoff, capped at 1h; `max_retries = 0` disables). The policy is
+  tool-tunable through `mission_create`/`mission_update` (adapter params
+  `max_retries`, `initial_delay_secs`, `backoff_multiplier`, `max_delay_secs`).
+  Retry state is durable on the failing thread's metadata (`RetryState`), so
+  a daemon restart re-arms pending retries after checkpoint recovery.
+  Event/webhook fires release their trigger dedup key on non-completion so an
+  external redelivery can re-fire (at-least-once); a successful retry
+  re-records the key, restoring dedup. `MaxIterations` is deliberately never
+  auto-retried — it is notified with a model-facing suggestion instead.
+- **Daily thread budget default 10 → 30 (WI#189).** An hourly mission
+  without an explicit `max_threads_per_day` now covers a full 24-hour day
+  plus retry headroom instead of going dark after ten hours. Retry respawns
+  draw from the same budget (documented interaction); only spawn-failure
+  rollback refunds a slot, and deduped redeliveries cost nothing.
+- **Honest mission-tool parameters (WI#203).** `mission_create` errors on
+  missing or non-string `name`/`goal` (matching the schema's `required`)
+  instead of silently minting "unnamed mission" or empty-goal missions; the
+  `manual` cadence default is now logged naming the user and mission;
+  `current_focus` is tool-settable via `mission_update` with leave/set/clear
+  semantics (absent → leave, JSON `null` → clear, string → set).
+
 ### Conversation Insights Investigation and Hardening (goal 8, WI#132, WI#143, WI#183)
 
 The release's largest reliability program against confabulation incidents:
@@ -370,6 +440,20 @@ re-imported on every restart. `read_registry_sidecar` now joins on the
 source dir directly with an `is_file()` → `parent()` fallback for legacy
 file-shaped sources; registry provenance stamps into `V2SkillMetadata`
 end-to-end.
+
+### Bundled Skills Trimmed to Product Capabilities (work item #185, goal 30)
+
+`ic/build.rs` compiles all `ic/skills/*/SKILL.md` into the embedded catalog,
+so every fresh tenant previously received all ten bundled skills — three of
+which were LunarWing contributor workflows, not tenant capabilities
+(`web-ui-test`, `local-test`, `review-checklist`; the latter referenced
+proprietary reviewers as product defaults). The catalog now ships exactly
+the seven product skills (cavepony, delegation,
+lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor,
+study-notes), pinned by the `bundled_catalog_is_exactly_the_product_skill_set`
+regression test. Operator opt-in is unaffected: user/workspace skills always
+override bundled ones. Record:
+`docs/ops/v2.1.2.0_ITEM30_WI185_BUNDLED_SKILLS.md`.
 
 ### Host Health Pipeline Rebuild (work item #180)
 
@@ -432,12 +516,26 @@ The OpenCode v2 lane is a full first-class worker:
   cancel envelopes are keyed by `task_id` in a per-connection map and kill
   the pebble subprocess (`Outcome::Cancelled` → `task_result` `cancelled`).
 
-### Kimi Worker and OpenCode Pins (goals 12, 13)
+### Kimi Worker and OpenCode Pins (goals 10, 12, 13)
 
-- kimi-code `0.42.0` → `0.43.0` → `0.43.1` (npm `latest`; the 2.x line
-  deliberately not adopted; package-lock integrity matches the npm registry
+- kimi-code `0.42.0` → `0.43.0` → `0.43.1` → **`2.0.2`** (adopted
+  2026-09-21; npm `latest`; package-lock integrity matches the npm registry
   per bump). Dockerfile ARG, build-args, package-lock, mt-admin harness
-  assertion, and docs synchronized per bump.
+  assertion, and docs synchronized per bump. The 2.0.2 adoption also fixed
+  the baked TensorZero base_url to the NetBird hostname and hardened the CLI
+  contract test for 2.x behavior (provider-connection retries with backoff
+  instead of exit 0; `--yolo` still rejected alongside `-p`; seeded minimal
+  config so model resolution succeeds in clean image builds).
+- **Headless permission contract (WI#195, goal 10).** The worker's default
+  permission mode moved yolo → auto with a new
+  `[permission] dangerous_command_guard = false`; both entrypoint modes
+  export `KIMI_CODE_PERMISSION_MODE_REMINDER=0` (operator-overridable) so
+  headless `-p` runs no longer stall on interactive prompts. A real-CLI
+  contract test lane (`scripts/kimi_cli_contract_test.ts`) executes the
+  installed kimi binary — asserting `-p --output-format stream-json` is
+  accepted and `--yolo` is rejected — and the Dockerfile runs that lane
+  against the pinned version post-`npm test`. Unknown stream-json roles are
+  warn-logged instead of silently dropped.
 - opencode2 `v2.0.5` → `v2.0.8` → `v2.0.11` at reviewed commit
   `9eb6902aaf3c35ce985b67c605a775992249066b` (tag SHA verified against both
   upstream remotes; upstream build script byte-identical between refs, so
@@ -445,7 +543,7 @@ The OpenCode v2 lane is a full first-class worker:
 - opencode v1 stays deliberately pinned at `v1.18.25`
   (`cb7d8b2f5e44876ef98b661dc10590c915af3a9f`) — v1.18.29's live upstream
   regressions remain disqualifying. Pebble remains at upstream HEAD
-  `2d0f3786`.
+  `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`.
 
 ### CI/CD Improvements (goals 28, 30, 21)
 
