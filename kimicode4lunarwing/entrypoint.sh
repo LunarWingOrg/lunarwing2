@@ -76,6 +76,11 @@ done
 # default_model stays resolvable — 0.37.2 fails startup otherwise.
 # KIMI_API_KEY falls back to TENSORZERO_API_KEY for the TensorZero-backed
 # default provider.
+#
+# WI#206: after overrides are applied, the fail-closed policy ([permission]
+# dangerous_command_guard = true and the PreToolUse guard hook) is re-asserted
+# and the guard-disabling env vars are scrubbed from the task environment, so
+# a task (or a prompt-injected command) cannot lower its own approval policy.
 export KIMI_API_KEY="${KIMI_API_KEY:-${TENSORZERO_API_KEY:-}}"
 mkdir -p "$KIMI_CODE_HOME"
 
@@ -133,6 +138,46 @@ if kimi_model and old_alias and old_alias != kimi_model:
     text = retarget_model_entry(text, old_alias, kimi_model)
 text = replace_setting(text, "base_url", os.environ.get("KIMI_BASE_URL", ""), True)
 text = replace_setting(text, "api_key", os.environ.get("KIMI_API_KEY", ""), True)
+
+# WI#206 fail-closed policy enforcement. Whatever the source config said
+# (custom KIMI_CONFIG_SOURCE mounts included), the worker never runs with the
+# dangerous-command guard disabled or without the PreToolUse guard hook:
+# both are (re)injected when absent and verified present afterwards.
+def policy_block(config):
+    return "\n[permission]\ndangerous_command_guard = true\n"
+
+def hook_block():
+    return ("\n[[hooks]]\n"
+            "event = \"PreToolUse\"\n"
+            "matcher = \"Bash\"\n"
+            "command = \"node /app/hooks/headless_command_guard.mjs\"\n"
+            "timeout = 10\n")
+
+parsed = tomllib.loads(text)
+if "permission" not in parsed or not isinstance(parsed.get("permission"), dict):
+    text += policy_block(text)
+elif parsed["permission"].get("dangerous_command_guard") is not True:
+    if "dangerous_command_guard" in parsed["permission"]:
+        text = re.sub(
+            r"^\s*dangerous_command_guard\s*=.*$",
+            "dangerous_command_guard = true",
+            text,
+            count=1,
+            flags=re.MULTILINE,
+        )
+    else:
+        text = text.replace("[permission]", "[permission]\ndangerous_command_guard = true", 1)
+parsed = tomllib.loads(text)
+hooks = parsed.get("hooks")
+guard_hook_present = isinstance(hooks, list) and any(
+    isinstance(hook, dict)
+    and hook.get("event") == "PreToolUse"
+    and hook.get("matcher") == "Bash"
+    and "headless_command_guard.mjs" in str(hook.get("command", ""))
+    for hook in hooks
+)
+if not guard_hook_present:
+    text += hook_block()
 tomllib.loads(text)
 
 fd, temporary = tempfile.mkstemp(prefix=".config.toml.", dir=os.path.dirname(target))
@@ -188,11 +233,12 @@ case "$MODE" in
     [ $# -gt 0 ] || die "CLI mode requires prompt arguments"
     log "Mode: CLI — running kimi in print/stream-json mode"
     cd "$WORKSPACE_ROOT"
-    # Permission-mode reminder is model-context prompt noise for a worker
-    # whose permission mode is fixed by baked config; the dangerous-command
-    # guard must also stay off (no TTY for its prompt under headless -p).
+    # WI#206: never let an inherited environment disable the dangerous-command
+    # guard — print mode (-p) runs the auto policy where the guard is skipped
+    # by upstream, and the PreToolUse hook enforces fail-closed denials. The
+    # mode reminder stays off: it is prompt noise for a fixed-mode worker.
     export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
-    export KIMI_CODE_DANGEROUS_COMMAND_GUARD="${KIMI_CODE_DANGEROUS_COMMAND_GUARD:-false}"
+    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD
     exec kimi -p "$*" --output-format stream-json
     ;;
 
@@ -204,11 +250,12 @@ case "$MODE" in
     export WS_STATE_FILE
     export WORKSPACE_ROOT
     export KIMI_MODE
-    # Permission-mode reminder is model-context prompt noise for a worker
-    # whose permission mode is fixed by baked config; the dangerous-command
-    # guard must also stay off (no TTY for its prompt under headless -p).
+    # WI#206: never let an inherited environment disable the dangerous-command
+    # guard — print mode (-p) runs the auto policy where the guard is skipped
+    # by upstream, and the PreToolUse hook enforces fail-closed denials. The
+    # mode reminder stays off: it is prompt noise for a fixed-mode worker.
     export KIMI_CODE_PERMISSION_MODE_REMINDER="${KIMI_CODE_PERMISSION_MODE_REMINDER:-0}"
-    export KIMI_CODE_DANGEROUS_COMMAND_GUARD="${KIMI_CODE_DANGEROUS_COMMAND_GUARD:-false}"
+    unset KIMI_CODE_DANGEROUS_COMMAND_GUARD
 
     node /app/scripts/lunarwing_bridge.js &
     BRIDGE_PID=$!

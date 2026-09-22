@@ -1704,13 +1704,16 @@ start_tenant_kimi() {
     local host_health_port
     host_health_port="$(ports_get "$name" kimi_health)" || true
     [[ -n "$host_health_port" ]] && health_publish=(-p "127.0.0.1:${host_health_port}:8443")
-    local ssh_agent_socket
-    ssh_agent_socket="$(tenant_run_dir "$name")/ssh-agent.sock"
-    local -a ssh_mount=(-v "${ssh_agent_socket}:/tmp/ssh-agent.sock:z" -e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+    # WI#206 remediation 3: the kimi lane no longer mounts the tenant
+    # SSH-agent socket. The worker is an auto-approved headless task executor —
+    # forwarded host credentials turn prompt injection into credential use.
+    # Tenants needing SSH from worker tasks should use a scoped credential
+    # broker, not the shared tenant agent. Other worker lanes keep the mount.
     _ctr "$name" run -d \
       --name "$container_name" \
       "${healthcheck_args[@]}" \
       "${kimi_userns_args[@]}" \
+      --security-opt no-new-privileges \
       -e LUNARWING_WORKER_ID="worker-kimi-${name}" \
       -e WS_PORT="$wss_port" \
       -e HEALTH_PORT="8443" \
@@ -1719,7 +1722,6 @@ start_tenant_kimi() {
       -e WS_BIND_HOST=0.0.0.0 \
       -e WS_PATH=/ws/agent \
       "${env_flags[@]}" \
-      "${ssh_mount[@]}" \
       -p "127.0.0.1:${wss_port}:${wss_port}" \
       "${health_publish[@]}" \
       -v "$workspace_dir:/workspace:z" \

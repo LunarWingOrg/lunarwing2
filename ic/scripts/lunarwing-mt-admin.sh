@@ -155,7 +155,10 @@ OPENCODE_ROOTLESS_LAUNCH_CONTRACT="userns=${OPENCODE_USERNS}"
 KIMI_CONTAINER_UID="10002"
 KIMI_CONTAINER_GID="10002"
 KIMI_USERNS="keep-id:uid=${KIMI_CONTAINER_UID},gid=${KIMI_CONTAINER_GID}"
-KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS}"
+# WI#206: the kimi lane dropped the SSH-agent mount and gained
+# no-new-privileges; bumping the contract force-recreates existing containers
+# that still carry the socket mount.
+KIMI_ROOTLESS_LAUNCH_CONTRACT="userns=${KIMI_USERNS};no-ssh-agent;no-new-privileges"
 
 # OpenCode 2 worker lane (docs/plans/OPENCODE2_EXTERNAL_WORKER_PLAN.md).
 # Distinct UID so opencode (10001) and opencode2 (10003) on one tenant keep
