@@ -613,9 +613,16 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 
 ### mt-admin and Multi-Tenant Fixes
 
-The opencode2 port map is now included in the collision probe, doctor
-duplicate check, and `ports list`, so v17 allocations are probed and
-duplicated-checked alongside the other tenant port maps.
+- The opencode2 port map is now included in the collision probe, doctor
+  duplicate check, and `ports list`, so v17 allocations are probed and
+  duplicated-checked alongside the other tenant port maps.
+- WI#205 worker-credential migration: `resolve_worker_auth_token()` mints and
+  persists a scoped `WORKER_AUTH_TOKEN` per tenant, and
+  `upgrade_external_worker_auth_token()` converges legacy tenants
+  (`config.toml` auth_token, worker container envs, Quadlet `Environment=`)
+  on the next lifecycle pass. The kimi mt-admin harness derives the pinned
+  CLI version instead of hard-coding it, so pin bumps can no longer leave
+  the assertion stale.
 
 ### Documentation Parity (goals 38, 42, 43, 45)
 
@@ -662,24 +669,35 @@ duplicated-checked alongside the other tenant port maps.
    `KNOWLEDGE_SWEEP_ENABLED`; multi-tenant fleets that relied on the
    (disabled) heartbeat sweep will now actually sweep — review
    `KNOWLEDGE_SWEEP_*` cadence knobs before enabling at scale.
-8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `0.43.1`,
-   opencode2 `v2.0.11` (`9eb6902a…`), pebble `2d0f3786`. Do not adopt the
-   opencode 2.x line for the opencode lane or the opencode v1.18.29 image;
-   do not adopt the kimi-code 2.x line this cycle. Pull worker images by
+8. Worker tool pins: opencode `v1.18.25` (`cb7d8b2f…`), kimi-code `2.0.2`
+   (the 2.x line is now the adopted pin — rebuild the kimi worker image; the
+   0.4x line is superseded), opencode2 `v2.0.11` (`9eb6902a…`), pebble
+   `2d0f3786`. Do not adopt the opencode 2.x line for the opencode lane or
+   the opencode v1.18.29 image. Pull worker images by
    the digest recorded in `worker-image-evidence.json`.
-9. To deploy opencode2 for a tenant, use the mt-admin opencode2 verbs and
+9. **Worker credential migration (WI#205).** On the next mt-admin lifecycle
+   pass, each tenant gains a scoped `WORKER_AUTH_TOKEN`; legacy
+   `config.toml` entries, worker container envs, and Quadlet units converge
+   automatically. No operator action is required, but expect a one-line
+   warning per legacy tenant at migration time. Gateway bearers are no
+   longer handed to worker lanes.
+10. To deploy opencode2 for a tenant, use the mt-admin opencode2 verbs and
    CI-published `worker-opencode2` images; the lane defaults remain
    eval-tenant-scoped per the rollout plan until Phase E acceptance.
-10. Pebble workers enforce workspace-path confinement and concurrent-task
+11. Pebble workers enforce workspace-path confinement and concurrent-task
     exclusivity; daemon-supplied `project_dir` values outside
     `WORKSPACE_ROOT` are now rejected by design.
-11. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
+12. ShellCheck 0.11.0 is the CI floor for contributors; the checksum-pinned
     installer is at `.gitlab/scripts/install-shellcheck.sh`.
-12. Conversation-insights changes add durable cursors, batch identity, and
+13. Conversation-insights changes add durable cursors, batch identity, and
     deletion-as-opt-out state; on upgrade, existing insight stores are
     migrated in place by the production store tests' covered paths — no
     operator action required, but review `docs/ops/v2.1.2.0_GOAL8_INSIGHTS_HARDENING.md`
     for the new authority/eligibility contracts.
+14. **Mission defaults changed.** The daily thread budget default is now 30
+    (was 10), and interrupted mission fires retry automatically with
+    exponential backoff (3 retries default; `max_retries=0` opts out per
+    mission). Tenants with explicit `max_threads_per_day` are unaffected.
 
 ### Security, Deployment, and Release Limitations (carried)
 
