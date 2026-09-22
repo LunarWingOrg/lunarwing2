@@ -480,7 +480,7 @@ All eight findings addressed, then all six review findings:
 - Verified: `tests/run-all.sh` 926 passed / 0 failed across all 19 suites;
   repo-wide ShellCheck exit 0.
 
-### External Workers: opencode2 Lane (goals 13, 17, 21, 30, 48)
+### External Workers: opencode2 Lane (goals 13, 17, 21)
 
 The OpenCode v2 lane is a full first-class worker:
 
@@ -490,7 +490,7 @@ The OpenCode v2 lane is a full first-class worker:
   ports-registry v17 slots (51000-51999), mt-admin mirroring with a
   34-assertion harness, and workspace confinement ported from the kimi
   bridge. The daemon side needed zero Rust change — the external-worker
-  surface was already generic; `opencode2_test` (goal 48) passed.
+  surface was already generic.
 - CI/CD: `worker-opencode2-candidate/scan/promote` jobs extend the shared
   publication templates (digest-pinned images, reproducible candidate +
   clean-rebuild digest contract, Trivy CRITICAL gate + SBOM,
@@ -545,7 +545,7 @@ The OpenCode v2 lane is a full first-class worker:
   regressions remain disqualifying. Pebble remains at upstream HEAD
   `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b`.
 
-### CI/CD Improvements (goals 28, 30, 21)
+### CI/CD Improvements (goals 28, 21)
 
 - Giant-crate compile concurrency is runner-managed: the project-wide
   `rust-compile-16gb` resource-group serialization trialled during the
