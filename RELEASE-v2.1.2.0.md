@@ -624,7 +624,7 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   CLI version instead of hard-coding it, so pin bumps can no longer leave
   the assertion stale.
 
-### Documentation Parity (goals 38, 42, 43, 45)
+### Documentation Parity (goals 38, 42, 43, 45, 47, 49)
 
 - All 31 current guides revalidated against the 2.1.2.0 tree;
   `MT-ADMIN-QUICKSTART` gained `fix-podman-userns`; `ENABLING_DEV_TOOLS`
@@ -638,6 +638,13 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - `MULTITENANCY-PRODUCTION` port blocks now cover the v15 LunarVoice, v16
   health_metrics, and v17 opencode2 blocks; `TENANT-CONFIGURATION` registry
   schema corrected to v17.
+- Goal 47 (guides repass) and goal 49 (architecture repass) revalidated all
+  current docs against the WI#179/181/180/154/155 hardening and worker-pin
+  changes; `TESTING_GUIDE` gained the three sandbox network modes and the
+  opencode2 worker lane; `MT-ADMIN-QUICKSTART` gained
+  `restart-worker <tenant> opencode2`; `SSH_AGENT_HARNESS`/
+  `SSH_DELIVERY_MECHANISMS` cover all four worker types; `SELF_HEAL_*` docs
+  carry the WI#180 parity subsections.
 
 ## Upgrade Notes
 
@@ -712,7 +719,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   carries the exact commands for a runtime host.
 - Live release acceptance remains for goal 31 (WI#164 approval delivery) and
   goal 34 (WI#161 REPL argument integrity) fresh-tenant threads; evidence
-  and limits are in their linked ops records.
+  and limits are in their linked ops records. Goal 33's live acceptance
+  (WI#162 shell truncation on fresh tenant `wi162verify`) completed
+  2026-09-18 and is not carried.
+- WI#205's path-blocking is not a claim that the sandbox is safe against the
+  agent reading the daemon's environment by every other means: podman
+  `keep-id` maps the container UID onto the tenant user, who legitimately
+  owns those files. The durable fix — a sandbox-scoped gateway credential
+  class — is designed but not implemented; see
+  `docs/ops/v2.1.2.0_WI205_SANDBOX_SCOPED_CREDENTIAL_DESIGN.md`.
 - MCP does not auto-install npm/pip packages and does not pass configured
   MCP servers into `lunarwing-agent-v1` external workers.
 - The onboarding web app remains a trusted local console without user
@@ -726,8 +741,10 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
 - GitLab CI publishes protected, digest-bound worker images but does not
   publish daemon packages or deploy tenants automatically; mt-admin still
   performs tenant-local activation.
-- OpenCode v1.18.29/kimi 2.x remain deliberately un-adopted pending upstream
-  proof.
+- OpenCode v1.18.29 remains deliberately un-adopted pending upstream proof
+  (kimi-code 2.0.2 was adopted 2026-09-21 after the CLI contract gate
+  proved the 2.x headless surface; if 2.x upstream regressions appear, the
+  documented fallback is the last-proven 0.43.1 pin).
 
 ### Resolved or Source-Fixed Since v2.1.1.0
 
@@ -748,6 +765,15 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   heartbeat on multi-tenant fleets (WI#121).
 - Skill registry sidecar provenance is read correctly; registry-installed
   skills no longer re-import on every restart.
+- Sandbox cannot mount the tenant `env`/`state`/`run` directories, and
+  workers no longer receive the full gateway bearer (WI#205, incl. the
+  WI#209/#210/#211 review findings and WI#215 sibling derivation).
+- Interrupted mission fires retry with backoff and survive daemon restarts;
+  event/webhook delivery is at-least-once (WI#188). Daily mission budget
+  defaults to 30 (WI#189); mission tools reject nameless/goalless creates
+  and expose `current_focus` (WI#203).
+- Fresh tenants receive only the seven product skills, not contributor
+  workflows (WI#185).
 - GitLab WASM tool no longer collapses to the bare `action` discriminator
   under schema compaction (WI#150).
 - Health pipeline: eight WI#180 findings plus six review findings fixed;
@@ -760,5 +786,6 @@ Evidence: `docs/ops/GOAL34_REPL_ARGUMENT_INTEGRITY.md`.
   runbooks for the known signal-9 class (promotion locks are the only
   serializing resource groups); opencode2
   publication jobs; ShellCheck 0.11.0 floor.
-- Worker pins updated: kimi-code 0.43.1, opencode2 v2.0.11, gitlab tool
-  registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
+- Worker pins updated: kimi-code 2.0.2 (with the WI#195 headless permission
+  contract and deterministic CLI contract gate), opencode2 v2.0.11, gitlab
+  tool registry 0.1.5; opencode stays v1.18.25; pebble stays `2d0f3786`.
