@@ -21,3 +21,4 @@
 | Part 2 of planned overhaul of some LLM engine functionality | v2.2.0.0 |
 | Next Generation MCP Engine Part 4 Completion | v2.2.2.0 |
 | OpenAI API Compatible Responses Support, with or without a custom websocket implementation | v2.2.4.0 |
+| TensorZero integration as a first-class, self-maintained LunarWing component (packaging/lifecycle, managed config, vendor posture, observability unification) | TBD — candidate for v2.1.3.0+ |
