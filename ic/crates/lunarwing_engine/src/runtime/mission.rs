@@ -8669,7 +8669,6 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         // WI#188 at-least-once: a Failed fire must release the trigger
         // dedup key so an external redelivery of the same payload fires the
         // mission again. Completed fires keep the key.
-        let store: Arc<dyn Store> = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
         let mut mission = Mission::new(
             project_id,
@@ -8773,9 +8772,8 @@ persistence failure.\n\nNext focus: keep auditing\nGoal achieved: no"
         // WI#188: max_retries caps the retry lineage — attempts past
         // max_retries return no pending retry, leaving the fire lost but
         // durably recorded (the pre-WI#188 behavior after the lineage is spent).
-        let store = Arc::new(TestStore::new());
         let project_id = ProjectId::new();
-        let mut mission = Mission::new(
+        let mission = Mission::new(
             project_id,
             "test-user",
             "capped",
