@@ -237,7 +237,8 @@ export async function executeTask(
     const promptText = buildTaskPrompt(request)
     // No --yolo flag: this kimi-code version rejects it in combination with
     // -p (print mode). Auto-approval comes from the baked config.toml
-    // (default_permission_mode = "yolo") instead.
+    // (default_permission_mode = "auto" + [permission]
+    // dangerous_command_guard = false) instead.
     const args = ["-p", promptText, "--output-format", "stream-json"]
     // Per-task env is assembled, never injected into the bridge's shared
     // process.env — concurrent tasks in different workspaces must not see
