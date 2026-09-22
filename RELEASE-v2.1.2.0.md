@@ -2,7 +2,7 @@
 
 ## Codename: Yoroi (鎧, armor)
 
-**Release date** 2026-09-19
+**Release date** 2026-09-22
 
 > After the lacing, the plates
 >
@@ -26,14 +26,22 @@ mode that combines `--network none` with a per-execution Unix relay — and
 cancellation-safe container cleanup with an in-flight registry and a
 socketless reaper sweep.
 
-Around that core, the armor closes from several directions at once. Workload
+Around that core, the armor closes from several directions at once. The
+sandbox bind mount is now credential-guarded (work item #205): an
+agent-supplied working directory can no longer point the single mount at the
+tenant `env`/`state`/`run` directories, protected directories inside a
+legitimate mount are shadowed by empty read-only binds, and external workers
+authenticate their inbound dispatch handshake with a new scoped
+`WORKER_AUTH_TOKEN` instead of the full gateway bearer. Workload
 processes on systemd multi-tenant hosts now spawn as manager-forked transient
 services, structurally fixing rootless Podman user-namespace joins from
 tenant scopes (work item #181/#178). External workers gained a new opencode2
 lane (v2 line, pinned at v2.0.11 on a reviewed upstream commit) with a
 reproducible-build bridge over the `@opencode/client/promise` SDK, full
 mt-admin mirroring, CI/CD publication jobs, and its own ports-registry v17
-block. The Pebble worker confines daemon-supplied project directories to the
+block; the kimi worker moved to the 2.x line (`2.0.2`) with a headless-safe
+permission contract and a deterministic CLI contract gate. The Pebble
+worker confines daemon-supplied project directories to the
 workspace root and keeps its WebSocket read loop live so mid-task cancels
 finally land. Session secrets are scrubbed from sandboxed and direct
 workloads alike (work item #141).
@@ -45,10 +53,15 @@ tolerance under sweep deadlines, opencode2/voice unit resolution, and
 self-heal escalation that never restarts on observability gaps. Conversation
 insights — the release's largest reliability investigation — received a
 nine-finding hardening program (goal 8) against confabulation and feedback
-incidents. Durable cross-channel attachments, a pre-execution stale
+incidents. Missions gained a retry policy with exponential backoff,
+restart-safe re-arming, and at-least-once event delivery (work item #188), a
+daily thread budget default raised from 10 to 30 (work item #189), and
+honest mission-tool parameters (work item #203). Durable cross-channel
+attachments, a pre-execution stale
 tool-output sanitizer, keyset-paginated full-store knowledge sweeps that no
-longer depend on the heartbeat, and a compact-schema fix for
-discriminated-union WASM tools round out the correctness work.
+longer depend on the heartbeat, a compact-schema fix for
+discriminated-union WASM tools, and a bundled-skills catalog trimmed to
+product capabilities only (work item #185) round out the correctness work.
 
 The release identifier is `2.1.2.0`; LunarWing-owned Rust crates and channel
 packages use `2.1.2`. Rust 2024 and MSRV `1.96.1` are unchanged. There are no
@@ -156,10 +169,11 @@ previous compatibility baseline.
 | Tool registry patches | gitlab 0.1.5 (was 0.1.4); cavepony 0.4.2, llm-context 0.1.1, multica-bridge 0.1.2, ssh 0.1.1, vision-analyze 0.1.3, voice-transcribe 0.1.1, web-search 0.2.2, gotify 0.1.0 (no change) |
 | WASM runtime | Wasmtime / wasmtime-wasi 36.0.14 (no change) |
 | Dependency resolution | `ic/vendor/` source-replaces crates.io for the `ic/` workspace and satellite manifests rooted under `ic/`; no external version changed, so the vendor snapshot regenerated with no diff |
-| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `0.43.1`; opencode2 `v2.0.11` at `9eb6902aaf3c35ce985b67c605a775992249066b`; pebble at upstream HEAD `2d0f3786` |
+| Worker image tool pins | opencode `v1.18.25` at `cb7d8b2f5e44876ef98b661dc10590c915af3a9f`; kimi-code `2.0.2` (adopted 2026-09-21 after the 2.x line proved out); opencode2 `v2.0.11` at `9eb6902aaf3c35ce985b67c605a775992249066b`; pebble at upstream HEAD `2d0f3786cbebb705cbd4f6212b0aaf47d8d8590b` |
 | Sandbox default | `SANDBOX_NETWORK=none` is the in-code and mt-admin-rendered default; podman is the preferred runtime (`SANDBOX_RUNTIME`) |
 | Worker image publication | Digest-bound reproducible candidates/promotions for kimi, pebble, opencode, and opencode2 |
 | ShellCheck floor | 0.11.0 (checksum-pinned installer; CI gate remains blocking) |
+| Bundled skills | Exactly seven product skills ship to fresh tenants: cavepony, delegation, lunarwing-workflow-orchestrator, multica-poll, plan-mode, routine-advisor, study-notes (WI#185; three contributor-dev skills removed from the embedded catalog) |
 | Gateway mascot default | Disabled; `MASCOT_ENABLED=true` per tenant opts in |
 | CI scope | Protected worker-image candidate publication/promotion is supported for kimi, pebble, opencode, and opencode2; daemon/package publication and tenant deployment remain deferred |
 
