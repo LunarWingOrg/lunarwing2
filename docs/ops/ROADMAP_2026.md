@@ -7,6 +7,7 @@
 | Part 1 of planned overhaul of some LLM engine functionality | v2.1.4.0 |
 | Alpha Release of Desktop/Mobile companion applications for LunarWing -- GNU/Linux and GrapheneOS only | v2.1.4.0 |
 | LunarVision Polish | v2.1.5.0 |
+| Improvements to missions, skill metrics evaluations, and external worker adjacent looping | v2.1.6.0 |
 | LunarHub extension marketplace — phased rollout starting with foundation repairs (unified verified installer, atomic WASM update/rollback, bounded MCP discovery), then binary/artifact distribution, signed catalog + CAS lifecycle, and finally hosted catalog/deep links | v2.1.6.0 |
 | Beta for Desktop/Mobile companion applications for LunarWing (first alpha version should be available by 2.1.4.0) | v2.1.6.0 |
 | firstmate Integration | v2.1.6.0 |
