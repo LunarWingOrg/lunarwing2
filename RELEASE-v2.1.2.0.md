@@ -88,6 +88,20 @@ previous compatibility baseline.
   in-code default is now `none`, matching what mt-admin renders into tenant
   environments. New knobs: `SANDBOX_RUNTIME` / `SANDBOX_NETWORK` /
   `SANDBOX_ENFORCE`.
+- **Sandbox credential containment (WI#205).** New
+  `ic/src/sandbox/mount_guard.rs` validates the sandbox bind mount at both
+  the manager and runner boundaries: canonicalization first (symlinks and
+  `..` resolve before any check), tenant `env`/`state`/`run` directories are
+  never mountable (nor is a mount inside them), credential-bearing filenames
+  (`*.env`, `pg.secret`) are refused anywhere in the tree, and a protected
+  directory inside a legitimate mount is shadowed by an empty read-only
+  bind. Refusals are a hard `[sandbox:mount_path_denied]` error — never a
+  fallback to unsandboxed execution. External workers authenticate their
+  inbound dispatch handshake with a new per-tenant `WORKER_AUTH_TOKEN`
+  (minted and migrated by mt-admin), so a leaked worker secret no longer
+  grants the full gateway API surface. Evidence:
+  [`docs/ops/v2.1.2.0_WI205_CREDENTIAL_EXPOSURE_FIX.md`](docs/ops/v2.1.2.0_WI205_CREDENTIAL_EXPOSURE_FIX.md);
+  the sandbox-scoped credential design remains proposed follow-up.
 - **Workload processes are manager-forked transient services (WI#181).**
   `ic/src/tools/process.rs` replaces `systemd-run --user --scope` with
   `systemd-run --user --wait --pipe --quiet --collect` transient services
@@ -143,6 +157,29 @@ previous compatibility baseline.
   when older than 30 minutes via the orchestrator-stamped `_cached_at`
   marker — purging what the mission trigger could not, because it runs
   before the first inference.
+- **Mission retry with exponential backoff (WI#188).** Mission threads
+  interrupted mid-run no longer lose their fire: `ThreadOutcome::Stopped`
+  records the interruption in `approach_history`, notifies channels as an
+  error, and schedules a retry from the new `MissionRetryPolicy` (default:
+  3 retries, 60s initial delay, ×2 backoff, capped at 1h; `max_retries=0`
+  disables). Retry state is durable on the failing thread's metadata and
+  re-armed after daemon restart; event/webhook fires release their trigger
+  dedup key on non-completion so external redelivery can re-fire (at-least-
+  once). `MaxIterations` is deliberately never auto-retried.
+- **Honest mission-tool parameters (WI#203).** `mission_create` rejects
+  missing/non-string `name` and `goal` instead of silently minting "unnamed
+  mission" or empty-goal missions; the manual-cadence default is logged; and
+  `current_focus` is now tool-settable (`mission_update` schema exposes it,
+  leave/set/clear semantics).
+- **Daily mission thread budget default raised to 30 (WI#189).** An hourly
+  mission without an explicit `max_threads_per_day` now gets full-day
+  coverage plus retry headroom instead of going dark after ten hours.
+  Budget exhaustion is already surfaced (`budget_exhausted`, warn log,
+  explicit fire reason).
+- **Bundled skills are product skills only (WI#185).** The compile-time
+  embedded catalog ships exactly seven skills to fresh tenants; three
+  contributor-dev workflow skills (web-ui-test, local-test,
+  review-checklist) were removed. A regression test pins the catalog.
 - **Host health pipeline rebuilt (WI#180).** The report model now includes
   staleness alerts (`LunarWingHealthReportStale`/`Missing`), monitor-only
   diagnostic components (`health-runtime.sh` probes live gateway and
